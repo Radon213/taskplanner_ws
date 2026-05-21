@@ -3,10 +3,10 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      ssh:
-        - default
+      additional_contexts:
+        btops_ws: ${BTOPS_LOCAL_CONTEXT:-../btops_ws}
       args:
-        BTOPS_REPO_URL: ${BTOPS_REPO_URL:?Set BTOPS_REPO_URL in .env or pass it as a build arg}
+        BTOPS_LOCAL_CONTEXT: ${BTOPS_LOCAL_CONTEXT:-../btops_ws}
         BTOPS_REF: ${BTOPS_REF:-main}
         AUTO_APMS_REPO_URL: ${AUTO_APMS_REPO_URL:-https://github.com/AutoAPMS/auto-apms.git}
         AUTO_APMS_REF: ${AUTO_APMS_REF:-1.5.1}
@@ -29,10 +29,10 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      ssh:
-        - default
+      additional_contexts:
+        btops_ws: ${BTOPS_LOCAL_CONTEXT:-../btops_ws}
       args:
-        BTOPS_REPO_URL: ${BTOPS_REPO_URL:?Set BTOPS_REPO_URL in .env or pass it as a build arg}
+        BTOPS_LOCAL_CONTEXT: ${BTOPS_LOCAL_CONTEXT:-../btops_ws}
         BTOPS_REF: ${BTOPS_REF:-main}
         AUTO_APMS_REPO_URL: ${AUTO_APMS_REPO_URL:-https://github.com/AutoAPMS/auto-apms.git}
         AUTO_APMS_REF: ${AUTO_APMS_REF:-1.5.1}
@@ -51,7 +51,7 @@ services:
       - "${ROSBRIDGE_PORT:-9090}:9090"
     command: >
       bash -lc "
-        colcon build --symlink-install &&
+        colcon build --symlink-install --cmake-args -DBUILD_TESTING=OFF &&
         source install/setup.bash &&
         ros2 launch bringup taskplanner_mock.launch.py
           enable_rosbridge:=true
@@ -65,10 +65,10 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      ssh:
-        - default
+      additional_contexts:
+        btops_ws: ${BTOPS_LOCAL_CONTEXT:-../btops_ws}
       args:
-        BTOPS_REPO_URL: ${BTOPS_REPO_URL:?Set BTOPS_REPO_URL in .env or pass it as a build arg}
+        BTOPS_LOCAL_CONTEXT: ${BTOPS_LOCAL_CONTEXT:-../btops_ws}
         BTOPS_REF: ${BTOPS_REF:-main}
         AUTO_APMS_REPO_URL: ${AUTO_APMS_REPO_URL:-https://github.com/AutoAPMS/auto-apms.git}
         AUTO_APMS_REF: ${AUTO_APMS_REF:-1.5.1}

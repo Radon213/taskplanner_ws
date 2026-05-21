@@ -20,10 +20,10 @@ Generated directories such as `build/`, `install/`, `log/`, `webapp/node_modules
 
 ## External Dependency
 
-This repository intentionally does not vendor `btops_ws`. Docker builds require a separate BT Ops repository URL. The matching dependency repository is:
+This repository intentionally does not vendor `btops_ws`. Docker builds use a local BT Ops checkout as a named build context. The matching dependency repository is:
 
 ```text
-git@github.com:Radon213/btops_ws.git
+https://github.com/Radon213/btops_ws.git
 ```
 
 Create `.env` from the example:
@@ -35,13 +35,13 @@ cp .env.example .env
 Set:
 
 ```bash
-BTOPS_REPO_URL=git@github.com:Radon213/btops_ws.git
+BTOPS_LOCAL_CONTEXT=../btops_ws
 BTOPS_REF=main
 AUTO_APMS_REPO_URL=https://github.com/AutoAPMS/auto-apms.git
 AUTO_APMS_REF=1.5.1
 ```
 
-If the BT Ops repository is private, ensure Docker has access to an SSH agent that can read the repository. For local development, run the build from a shell where `ssh -T git@github.com` succeeds.
+For local development, keep `taskplanner_ws` and `btops_ws` checked out next to each other or update `BTOPS_LOCAL_CONTEXT` to the BT Ops checkout path.
 AutoAPMS is built from source inside the Docker image so the environment does not depend on stale or unavailable ROS apt packages.
 
 ## Docker Quickstart
@@ -49,14 +49,14 @@ AutoAPMS is built from source inside the Docker image so the environment does no
 Build the development image:
 
 ```bash
-docker compose build --ssh default
+docker compose build
 ```
 
 Build inside the container:
 
 ```bash
 docker compose run --rm taskplanner-dev bash
-colcon build --symlink-install
+colcon build --symlink-install --cmake-args -DBUILD_TESTING=OFF
 cd webapp && npm ci && npm run build
 ```
 
@@ -82,7 +82,7 @@ If ROS 2 Jazzy and BT Ops are already installed locally:
 source /opt/ros/jazzy/setup.bash
 source /home/arl/btops_ws/install/setup.bash
 cd /home/arl/taskplanner_ws
-colcon build --symlink-install
+colcon build --symlink-install --cmake-args -DBUILD_TESTING=OFF
 source install/setup.bash
 ros2 launch bringup taskplanner_mock.launch.py
 ```

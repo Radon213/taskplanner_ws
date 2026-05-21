@@ -3,8 +3,8 @@ FROM ros:jazzy-ros-base
 
 SHELL ["/bin/bash", "-c"]
 
-ARG BTOPS_REPO_URL=""
 ARG BTOPS_REF="main"
+ARG BTOPS_LOCAL_CONTEXT="../btops_ws"
 ARG AUTO_APMS_REPO_URL="https://github.com/AutoAPMS/auto-apms.git"
 ARG AUTO_APMS_REF="1.5.1"
 ARG DEBIAN_FRONTEND=noninteractive
@@ -29,23 +29,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ros-jazzy-rosbridge-suite \
     && rm -rf /var/lib/apt/lists/*
 
-RUN if [ -z "${BTOPS_REPO_URL}" ]; then \
-      echo >&2 "ERROR: BTOPS_REPO_URL build arg is required. Example: docker compose build --ssh default --build-arg BTOPS_REPO_URL=<repo-url>"; \
-      exit 2; \
-    fi
-
-RUN mkdir -p /root/.ssh \
-    && ssh-keyscan github.com >> /root/.ssh/known_hosts
-
-RUN --mount=type=ssh mkdir -p "${BTOPS_WS}/src" \
+RUN mkdir -p "${BTOPS_WS}/src" \
     && git clone --depth 1 --branch "${AUTO_APMS_REF}" "${AUTO_APMS_REPO_URL}" "${BTOPS_WS}/src/auto_apms" \
-    && git clone --depth 1 --branch "${BTOPS_REF}" "${BTOPS_REPO_URL}" "${BTOPS_WS}/src/btops_ws_src"
+    && true
+
+COPY --from=btops_ws . ${BTOPS_WS}/src/btops_ws_src
 
 RUN source /opt/ros/jazzy/setup.bash \
     && cd "${BTOPS_WS}" \
-    && rosdep update || true \
+    && (rosdep update || true) \
+    && apt-get update \
     && rosdep install --from-paths src --ignore-src -r -y --skip-keys "ament_python" \
-    && colcon build --symlink-install
+    && rm -rf /var/lib/apt/lists/* \
+    && colcon build --symlink-install --cmake-args -DBUILD_TESTING=OFF
 
 WORKDIR ${TASKPLANNER_WS}
 
