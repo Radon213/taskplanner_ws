@@ -20,7 +20,11 @@ Generated directories such as `build/`, `install/`, `log/`, `webapp/node_modules
 
 ## External Dependency
 
-This repository intentionally does not vendor `btops_ws`. Docker builds require a separate BT Ops repository URL.
+This repository intentionally does not vendor `btops_ws`. Docker builds require a separate BT Ops repository URL. The matching dependency repository is:
+
+```text
+https://github.com/Radon213/btops_ws.git
+```
 
 Create `.env` from the example:
 
@@ -31,18 +35,18 @@ cp .env.example .env
 Set:
 
 ```bash
-BTOPS_REPO_URL=<git url for btops_ws source repository>
+BTOPS_REPO_URL=https://github.com/Radon213/btops_ws.git
 BTOPS_REF=main
 ```
 
-If the BT Ops repository is private, ensure Docker has access to the repository credentials before building.
+If the BT Ops repository is private, ensure Docker has access to the repository credentials before building. For local development, use a credentialed HTTPS URL or make sure the container build environment can authenticate to GitHub.
 
 ## Docker Quickstart
 
 Build the development image:
 
 ```bash
-docker compose build --build-arg BTOPS_REPO_URL=<btops_repo_url>
+docker compose build --build-arg BTOPS_REPO_URL=https://github.com/Radon213/btops_ws.git
 ```
 
 Build inside the container:
