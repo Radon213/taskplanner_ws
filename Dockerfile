@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.7
 FROM ros:jazzy-ros-base
 
 SHELL ["/bin/bash", "-c"]
@@ -18,6 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     git \
     npm \
+    openssh-client \
     python3-colcon-common-extensions \
     python3-pip \
     python3-rosdep \
@@ -26,11 +28,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 RUN if [ -z "${BTOPS_REPO_URL}" ]; then \
-      echo >&2 "ERROR: BTOPS_REPO_URL build arg is required. Example: docker compose build --build-arg BTOPS_REPO_URL=<repo-url>"; \
+      echo >&2 "ERROR: BTOPS_REPO_URL build arg is required. Example: docker compose build --ssh default --build-arg BTOPS_REPO_URL=<repo-url>"; \
       exit 2; \
     fi
 
-RUN mkdir -p "${BTOPS_WS}/src" \
+RUN mkdir -p /root/.ssh \
+    && ssh-keyscan github.com >> /root/.ssh/known_hosts
+
+RUN --mount=type=ssh mkdir -p "${BTOPS_WS}/src" \
     && git clone --depth 1 --branch "${BTOPS_REF}" "${BTOPS_REPO_URL}" "${BTOPS_WS}/src/btops_ws_src"
 
 RUN source /opt/ros/jazzy/setup.bash \

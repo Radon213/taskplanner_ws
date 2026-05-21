@@ -3,6 +3,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      ssh:
+        - default
       args:
         BTOPS_REPO_URL: ${BTOPS_REPO_URL:?Set BTOPS_REPO_URL in .env or pass it as a build arg}
         BTOPS_REF: ${BTOPS_REF:-main}
@@ -25,6 +27,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      ssh:
+        - default
       args:
         BTOPS_REPO_URL: ${BTOPS_REPO_URL:?Set BTOPS_REPO_URL in .env or pass it as a build arg}
         BTOPS_REF: ${BTOPS_REF:-main}
@@ -57,6 +61,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      ssh:
+        - default
       args:
         BTOPS_REPO_URL: ${BTOPS_REPO_URL:?Set BTOPS_REPO_URL in .env or pass it as a build arg}
         BTOPS_REF: ${BTOPS_REF:-main}
