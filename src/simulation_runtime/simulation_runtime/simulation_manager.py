@@ -24,6 +24,8 @@ from surgical_msgs.srv import ControlSimulation, InjectSurgeonOverride, SelectSi
 RESOURCE_ID = "tree/taskplanner_bt_trees::surgical_assist_v1::TaskplannerAssistDemo"
 ENTRY_POINT = "TaskplannerAssistDemo"
 NODE_MANIFESTS = ["taskplanner_bt_nodes::taskplanner_bt_nodes"]
+ALLOWED_OVERRIDE_EVENTS = {"request_tool", "voice_request", "return_tool", "cancel_request"}
+TOOL_REQUIRED_OVERRIDE_EVENTS = {"request_tool", "voice_request", "return_tool"}
 
 
 class SimulationManagerNode(Node):
@@ -38,6 +40,7 @@ class SimulationManagerNode(Node):
 
         self._spec_root = Path(str(self.get_parameter("spec_root").value))
         self._active_bundle = str(self.get_parameter("default_bundle").value)
+        self._active_spec_dir, self._active_spec = self._load_spec_for_bundle(self._active_bundle)
         self._executor_name = str(self.get_parameter("executor_name").value)
         self._tick_rate_hz = float(self.get_parameter("tick_rate_hz").value)
         self._groot2_port = int(self.get_parameter("groot2_port").value)
@@ -122,12 +125,15 @@ class SimulationManagerNode(Node):
             time.sleep(0.05)
         raise TimeoutError("Timed out waiting for async operation to complete.")
 
-    def _spec_dir_for_bundle(self, bundle_name: str) -> Path:
+    def _load_spec_for_bundle(self, bundle_name: str):
         bundle_dir = self._spec_root / bundle_name
         if not bundle_dir.is_dir():
             raise FileNotFoundError(f"bundle '{bundle_name}' not found under {self._spec_root}")
-        load_bundle(bundle_dir)
-        return bundle_dir
+        return bundle_dir, load_bundle(bundle_dir)
+
+    def _spec_dir_for_bundle(self, bundle_name: str) -> Path:
+        spec_dir, _ = self._load_spec_for_bundle(bundle_name)
+        return spec_dir
 
     def _publish_control(self, command: str, repeat_count: int = 2) -> None:
         deadline = time.time() + 2.0
@@ -391,6 +397,34 @@ class SimulationManagerNode(Node):
             # It is fine if the executor was not running yet.
             pass
 
+    def _reset_digital_twin_to_idle(self) -> None:
+        if not self._publish_control_until(
+            "reset",
+            lambda state: (
+                state.active_bundle == self._active_bundle
+                and (not state.running)
+                and state.execution_state == "idle"
+                and self._all_instruments_home(state)
+            ),
+            timeout_sec=8.0,
+            description="idle digital twin frame after reset",
+        ):
+            raise RuntimeError("digital twin did not publish an idle home frame after reset")
+        self._set_idle_state()
+
+    def _stop_digital_twin_to_halted(self) -> None:
+        if not self._publish_control_until(
+            "stop",
+            lambda state: (
+                state.active_bundle == self._active_bundle
+                and (not state.running)
+                and state.execution_state == "halted"
+            ),
+            timeout_sec=5.0,
+            description="halted digital twin frame after stop",
+        ):
+            self.get_logger().warn("digital twin did not publish a halted frame after stop")
+
     def _begin_operation(self, name: str) -> bool:
         with self._operation_lock:
             if self._operation_name:
@@ -554,7 +588,7 @@ class SimulationManagerNode(Node):
     def _stop_sequence(self) -> str:
         self._running = False
         self._execution_state = "stopping"
-        self._publish_control("stop")
+        self._stop_digital_twin_to_halted()
         success, message = self._command_executor("terminate")
         self._wait_for_executor_idle(timeout_sec=8.0)
         if success:
@@ -568,9 +602,8 @@ class SimulationManagerNode(Node):
         self._running = False
         self._execution_state = "resetting"
         self._completion_terminate_started = False
-        self._publish_control("reset")
         self._prepare_executor_for_restart()
-        self._set_idle_state()
+        self._reset_digital_twin_to_idle()
         return "simulation runtime reset to idle"
 
     def _set_idle_state(self) -> None:
@@ -579,17 +612,28 @@ class SimulationManagerNode(Node):
 
     def _handle_select_bundle(self, request, response):
         try:
-            spec_dir = self._spec_dir_for_bundle(request.bundle_name)
+            if self._running and not request.restart_if_running:
+                response.success = False
+                response.message = "cannot switch bundle while simulation is running without restart_if_running=true"
+                response.active_bundle = self._active_bundle
+                response.spec_dir = str(self._active_spec_dir)
+                return response
+
+            spec_dir, spec = self._load_spec_for_bundle(request.bundle_name)
+            if self._running and request.restart_if_running:
+                self._prepare_executor_for_restart()
             self._set_spec_dir_on_runtime(spec_dir)
             self._active_bundle = request.bundle_name
+            self._active_spec_dir = spec_dir
+            self._active_spec = spec
             self._bundle_dirty = True
             if self._running and request.restart_if_running:
                 success, message = self._run_sync("bundle-restart", self._start_sequence)
                 response.success = success
                 response.message = message
             else:
-                self._publish_control("reset")
-                self._set_idle_state()
+                self._prepare_executor_for_restart()
+                self._reset_digital_twin_to_idle()
                 response.success = True
                 response.message = f"active bundle set to {request.bundle_name}"
             response.active_bundle = self._active_bundle
@@ -651,6 +695,9 @@ class SimulationManagerNode(Node):
                 success, message = self._run_sync("resume", self._resume_sequence)
                 response.success = success
                 response.message = message
+            elif command == "status":
+                response.success = True
+                response.message = "simulation status"
             elif command == "reset":
                 self._bundle_dirty = False
                 success, message = self._run_async("reset", self._reset_sequence)
@@ -680,6 +727,34 @@ class SimulationManagerNode(Node):
             return response
 
     def _handle_override(self, request, response):
+        event_type = request.event_type.strip()
+        if event_type not in ALLOWED_OVERRIDE_EVENTS:
+            response.success = False
+            response.message = (
+                f"unsupported surgeon override event_type '{request.event_type}'; "
+                f"expected one of {sorted(ALLOWED_OVERRIDE_EVENTS)}"
+            )
+            return response
+        if self._execution_state == "paused":
+            response.success = False
+            response.message = "simulation paused; resume before injecting surgeon override"
+            return response
+
+        requested_tool = request.requested_tool.strip()
+        canonical_tool = ""
+        if requested_tool:
+            canonical_tool = self._active_spec.resolve_instrument_alias(requested_tool) or ""
+            if not canonical_tool:
+                response.success = False
+                response.message = (
+                    f"unknown tool '{requested_tool}' for active bundle '{self._active_bundle}'"
+                )
+                return response
+        elif event_type in TOOL_REQUIRED_OVERRIDE_EVENTS:
+            response.success = False
+            response.message = f"event_type '{event_type}' requires requested_tool"
+            return response
+
         if request.clear_pending_requests:
             cancel = SurgeonRequest()
             cancel.event_type = "cancel_request"
@@ -687,8 +762,8 @@ class SimulationManagerNode(Node):
             cancel.note = "clear pending requests before override"
             self._override_pub.publish(cancel)
         msg = SurgeonRequest()
-        msg.event_type = request.event_type
-        msg.requested_tool = request.requested_tool
+        msg.event_type = event_type
+        msg.requested_tool = canonical_tool
         msg.voice_text = request.voice_text
         msg.ready_for_handover = bool(request.ready_for_handover)
         msg.ready_for_retrieval = bool(request.ready_for_retrieval)

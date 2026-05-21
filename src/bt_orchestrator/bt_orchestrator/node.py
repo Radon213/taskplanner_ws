@@ -30,15 +30,16 @@ class BlackboardMirror:
         self._service_ready_logged = False
         self._timer = node.create_timer(period_sec, self._flush)
 
-    def queue(self, key: str, value: Any) -> None:
-        if self._desired.get(key) == value:
+    def queue(self, key: str, value: Any, *, force: bool = False) -> None:
+        if not force and self._desired.get(key) == value:
             return
         self._desired[key] = value
         self._dirty_keys.add(key)
 
-    def queue_many(self, values: dict[str, Any]) -> None:
+    def queue_many(self, values: dict[str, Any], *, force_keys: set[str] | None = None) -> None:
+        forced = force_keys or set()
         for key, value in values.items():
-            self.queue(key, value)
+            self.queue(key, value, force=key in forced)
 
     def _flush(self) -> None:
         if not self._dirty_keys or self._request_inflight:
@@ -90,6 +91,9 @@ class DecisionBridgeNode(Node):
         self._summary_pub = self.create_publisher(String, "/bt/decision_summary", 10)
         self._latest_world: WorldState | None = None
         self._last_summary_by_channel: dict[str, str] = {}
+        self._seen_tool_ids: set[str] = set()
+        self._last_procedure_id = ""
+        self._bundle_generation = 0
         self._mirror = BlackboardMirror(self, str(target_node_name), mirror_period_sec)
         self.create_subscription(WorldState, "/twin/world_state", self._on_world, 20)
         self.create_subscription(BTDecision, "/bt/decision", self._on_decision, 20)
@@ -106,7 +110,14 @@ class DecisionBridgeNode(Node):
 
     def _on_world(self, msg: WorldState) -> None:
         self._latest_world = msg
+        if msg.procedure_id != self._last_procedure_id:
+            self._last_procedure_id = msg.procedure_id
+            self._bundle_generation += 1
+        active_tool_ids = {instrument.instrument_id for instrument in msg.instrument_states}
+        force_keys = {"procedure.id", "bundle.generation"}
         mirrored = {
+            "procedure.id": msg.procedure_id,
+            "bundle.generation": int(self._bundle_generation),
             "phase.id": msg.filtered_phase,
             "phase.confidence": float(msg.phase_confidence),
             "phase.uncertain": bool(msg.phase_uncertain),
@@ -123,10 +134,19 @@ class DecisionBridgeNode(Node):
             "cleaner.busy": bool(msg.cleaner_busy),
             "action.guard.handover_allowed": bool(msg.handover_allowed),
             "recovery.required": bool(msg.recovery_required),
+            "safety.flags.csv": ",".join(msg.safety_flags),
             "expected_tools.csv": ",".join(msg.expected_instruments),
             "available_tools.csv": ",".join(msg.available_instruments),
         }
+        for inactive_tool_id in self._seen_tool_ids.difference(active_tool_ids):
+            active_key = f"tool.{inactive_tool_id}.active"
+            mirrored[active_key] = False
+            force_keys.add(active_key)
+            mirrored[f"tool.{inactive_tool_id}.available"] = False
         for instrument in msg.instrument_states:
+            active_key = f"tool.{instrument.instrument_id}.active"
+            mirrored[active_key] = True
+            force_keys.add(active_key)
             mirrored[f"tool.{instrument.instrument_id}.home_location"] = instrument.home_location_id
             mirrored[f"tool.{instrument.instrument_id}.home_type"] = instrument.home_location_type
             mirrored[f"tool.{instrument.instrument_id}.status"] = instrument.status
@@ -138,7 +158,8 @@ class DecisionBridgeNode(Node):
             mirrored[f"tool.{instrument.instrument_id}.lifecycle"] = instrument.lifecycle_stage
             mirrored[f"tool.{instrument.instrument_id}.next_required_transition"] = instrument.next_required_transition
             mirrored[f"tool.{instrument.instrument_id}.available"] = _is_available_status(instrument.status)
-        self._mirror.queue_many(mirrored)
+        self._seen_tool_ids.update(active_tool_ids)
+        self._mirror.queue_many(mirrored, force_keys=force_keys)
         suggestion = select_expected_tool(msg)
         self._publish_summary(
             "world",

@@ -581,6 +581,8 @@ def _make_blackboard_param_names(spec) -> list[str]:
     instrument_ids = spec.list_instrument_ids()
     sample_tool = instrument_ids[0] if instrument_ids else "unknown"
     return [
+        "bb.procedure.id",
+        "bb.bundle.generation",
         "bb.phase.id",
         "bb.request.explicit_tool",
         "bb.request.surgeon_tool",
@@ -589,6 +591,7 @@ def _make_blackboard_param_names(spec) -> list[str]:
         "bb.robot.right_hand_tool",
         "bb.robot.left_hand_tool",
         "bb.cleaner.busy",
+        f"bb.tool.{sample_tool}.active",
         f"bb.tool.{sample_tool}.status",
         f"bb.tool.{sample_tool}.cleanliness",
     ]
@@ -641,6 +644,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--vlm-response-mode", default="live")
     parser.add_argument("--vlm-base-url", default="http://192.168.0.122:1234")
     parser.add_argument("--vlm-model-id", default="gemma-4-26b-a4b-it")
+    parser.add_argument(
+        "--runtime-check",
+        default="all",
+        choices=["all", "functional", "observability"],
+        help=(
+            "all runs functional and BT Ops observability checks; functional skips Groot2/full-tree "
+            "assertions; observability keeps the full runtime-state assertions."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -687,8 +699,13 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as exc:
             override_summary = f"override remained best-effort for {override_tool}: {exc}"
 
-        runtime_state = harness.get_runtime_state()
-        _assert_runtime_state(runtime_state)
+        runtime_state = None
+        if args.runtime_check in {"all", "observability"}:
+            runtime_state = harness.get_runtime_state()
+            try:
+                _assert_runtime_state(runtime_state)
+            except Exception as exc:
+                raise RuntimeError(f"BT Ops observability smoke failed: {exc}") from exc
 
         harness.wait_for_blackboard_params(_make_blackboard_param_names(spec))
 
@@ -708,9 +725,13 @@ def main(argv: list[str] | None = None) -> int:
         print(_format_skill_statuses(harness._skill_statuses))
         print(
             "Runtime checks:"
-            f" full_tree_xml=yes transitions={len(runtime_state.recent_transitions)}"
-            f" blackboard_entries={len(runtime_state.blackboard_entries)}"
-            f" recorded_events={_load_recording_event_count(runtime_state.snapshot.recording_metadata_json)}"
+            + (
+                f" full_tree_xml=yes transitions={len(runtime_state.recent_transitions)}"
+                f" blackboard_entries={len(runtime_state.blackboard_entries)}"
+                f" recorded_events={_load_recording_event_count(runtime_state.snapshot.recording_metadata_json)}"
+                if runtime_state is not None
+                else " functional-only"
+            )
         )
         return 0
     except Exception as exc:

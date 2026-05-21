@@ -313,6 +313,29 @@ button {
   line-height: 1.35;
 }
 
+.dock-action-message {
+  border: 1px solid rgba(105, 193, 255, 0.18);
+  border-radius: 8px;
+  background: rgba(15, 31, 48, 0.72);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 720;
+  line-height: 1.35;
+  padding: 10px 12px;
+  overflow-wrap: anywhere;
+}
+
+.dock-action-message.pending {
+  border-color: rgba(105, 193, 255, 0.28);
+  color: var(--robot-strong);
+}
+
+.dock-action-message.error {
+  border-color: rgba(255, 108, 122, 0.44);
+  background: rgba(72, 28, 38, 0.46);
+  color: #ffd8dd;
+}
+
 .control-stack {
   display: grid;
   gap: 12px;

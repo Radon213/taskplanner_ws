@@ -148,8 +148,28 @@ std::vector<std::string> allTools(const BT::TreeNode & node)
   return splitCsv(csv);
 }
 
+bool toolIsActive(const BT::TreeNode & node, const std::string & tool_id)
+{
+  if (tool_id.empty()) {
+    return false;
+  }
+  bool active = false;
+  readBlackboard(node, makeToolKey(tool_id, "active"), active);
+  return active;
+}
+
+bool hasBlockingSafetyFlag(const BT::TreeNode & node)
+{
+  std::string safety_flags;
+  readBlackboard(node, "safety.flags.csv", safety_flags);
+  return !splitCsv(safety_flags).empty();
+}
+
 bool toolHasStatus(const BT::TreeNode & node, const std::string & tool_id, const std::string & status)
 {
+  if (!toolIsActive(node, tool_id)) {
+    return false;
+  }
   std::string value;
   readBlackboard(node, makeToolKey(tool_id, "status"), value);
   return value == status;
@@ -158,6 +178,9 @@ bool toolHasStatus(const BT::TreeNode & node, const std::string & tool_id, const
 bool toolHasAnyStatus(
   const BT::TreeNode & node, const std::string & tool_id, const std::unordered_set<std::string> & statuses)
 {
+  if (!toolIsActive(node, tool_id)) {
+    return false;
+  }
   std::string value;
   readBlackboard(node, makeToolKey(tool_id, "status"), value);
   return statuses.count(value) > 0;
@@ -184,11 +207,16 @@ bool otherToolOccupiesSurgeonHand(const BT::TreeNode & node, const std::string &
     if (tool_id == excluded_tool) {
       continue;
     }
+    if (!toolIsActive(node, tool_id)) {
+      continue;
+    }
     std::string status;
     std::string location_type;
+    std::string owner;
     readBlackboard(node, makeToolKey(tool_id, "status"), status);
     readBlackboard(node, makeToolKey(tool_id, "location_type"), location_type);
-    if (status == "handed_over" || location_type == "surgeon_hand") {
+    readBlackboard(node, makeToolKey(tool_id, "owner"), owner);
+    if (status == "handed_over" || location_type == "surgeon_hand" || owner == "surgeon") {
       return true;
     }
   }
@@ -197,6 +225,9 @@ bool otherToolOccupiesSurgeonHand(const BT::TreeNode & node, const std::string &
 
 bool toolIsRecoverableFromSurgeon(const BT::TreeNode & node, const std::string & tool_id)
 {
+  if (!toolIsActive(node, tool_id)) {
+    return false;
+  }
   const auto lifecycle = toolLifecycle(node, tool_id);
   return lifecycle == "surgeon_owned" || lifecycle == "mayo_reuse" || lifecycle == "mayo_recovery" ||
          lifecycle == "recovering_left" || lifecycle == "cleaning_left" ||
@@ -205,6 +236,9 @@ bool toolIsRecoverableFromSurgeon(const BT::TreeNode & node, const std::string &
 
 bool toolIsAnticipatoryCandidate(const BT::TreeNode & node, const std::string & tool_id)
 {
+  if (!toolIsActive(node, tool_id)) {
+    return false;
+  }
   std::string status;
   bool contaminated = false;
   readBlackboard(node, makeToolKey(tool_id, "status"), status);
@@ -305,6 +339,12 @@ public:
 private:
   BT::NodeStatus applyWorldState(const surgical_msgs::msg::WorldState & msg)
   {
+    if (msg.procedure_id != last_procedure_id_) {
+      last_procedure_id_ = msg.procedure_id;
+      ++bundle_generation_;
+    }
+    writeBlackboard(*this, "procedure.id", msg.procedure_id);
+    writeBlackboard(*this, "bundle.generation", bundle_generation_);
     writeBlackboard(*this, "phase.id", msg.filtered_phase);
     writeBlackboard(*this, "runtime.running", static_cast<bool>(msg.running));
     writeBlackboard(*this, "runtime.execution_state", msg.execution_state);
@@ -327,15 +367,19 @@ private:
     writeBlackboard(*this, "cleaner.busy", static_cast<bool>(msg.cleaner_busy));
     writeBlackboard(*this, "action.guard.handover_allowed", static_cast<bool>(msg.handover_allowed));
     writeBlackboard(*this, "recovery.required", static_cast<bool>(msg.recovery_required));
+    writeBlackboard(*this, "safety.flags.csv", joinCsv(msg.safety_flags));
     writeBlackboard(*this, "pending_transition_tools.csv", joinCsv(msg.pending_transition_tools));
     writeBlackboard(*this, "active_recovery_tools.csv", joinCsv(msg.active_recovery_tools));
     writeBlackboard(*this, "expected_tools.csv", joinCsv(msg.expected_instruments));
     writeBlackboard(*this, "available_tools.csv", joinCsv(msg.available_instruments));
     std::vector<std::string> all_tools;
     all_tools.reserve(msg.instrument_states.size());
+    std::unordered_set<std::string> active_tools;
 
     for (const auto & instrument : msg.instrument_states) {
       all_tools.push_back(instrument.instrument_id);
+      active_tools.insert(instrument.instrument_id);
+      writeBlackboard(*this, makeToolKey(instrument.instrument_id, "active"), true);
       writeBlackboard(*this, makeToolKey(instrument.instrument_id, "home_location"), instrument.home_location_id);
       writeBlackboard(*this, makeToolKey(instrument.instrument_id, "home_type"), instrument.home_location_type);
       writeBlackboard(*this, makeToolKey(instrument.instrument_id, "status"), instrument.status);
@@ -350,11 +394,22 @@ private:
         *this, makeToolKey(instrument.instrument_id, "next_required_transition"),
         instrument.next_required_transition);
     }
+    for (const auto & tool_id : previous_tools_) {
+      if (active_tools.count(tool_id) > 0) {
+        continue;
+      }
+      writeBlackboard(*this, makeToolKey(tool_id, "active"), false);
+      writeBlackboard(*this, makeToolKey(tool_id, "available"), false);
+    }
+    previous_tools_ = std::move(active_tools);
     writeBlackboard(*this, "all_tools.csv", joinCsv(all_tools));
     return BT::NodeStatus::SUCCESS;
   }
 
   std::shared_ptr<surgical_msgs::msg::WorldState> last_world_state_;
+  std::string last_procedure_id_;
+  int64_t bundle_generation_ = 0;
+  std::unordered_set<std::string> previous_tools_;
 };
 
 class IsProcedureActive : public BT::ConditionNode
@@ -457,6 +512,9 @@ public:
     if (tool_id.empty()) {
       return BT::NodeStatus::FAILURE;
     }
+    if (!toolIsActive(*this, tool_id)) {
+      return BT::NodeStatus::FAILURE;
+    }
     const auto lifecycle = toolLifecycle(*this, tool_id);
     bool contaminated = false;
     readBlackboard(*this, makeToolKey(tool_id, "contaminated"), contaminated);
@@ -482,11 +540,17 @@ public:
 
   BT::NodeStatus tick() override
   {
+    if (hasBlockingSafetyFlag(*this)) {
+      return BT::NodeStatus::FAILURE;
+    }
     if (hasActiveRobotTask(*this)) {
       return BT::NodeStatus::FAILURE;
     }
     std::string selected_tool;
     readBlackboard(*this, "selected.tool", selected_tool);
+    if (!toolIsActive(*this, selected_tool)) {
+      return BT::NodeStatus::FAILURE;
+    }
     if (!selected_tool.empty() && otherToolOccupiesSurgeonHand(*this, selected_tool)) {
       return BT::NodeStatus::FAILURE;
     }
@@ -528,6 +592,9 @@ public:
       tool_id = surgeon_tool;
     }
     if (tool_id.empty()) {
+      return BT::NodeStatus::FAILURE;
+    }
+    if (!toolIsActive(*this, tool_id)) {
       return BT::NodeStatus::FAILURE;
     }
     writeBlackboard(*this, "selected.tool", tool_id);
@@ -585,6 +652,7 @@ public:
     const auto available_tools = splitCsv(available_csv);
     for (const auto & tool_id : expected_tools) {
       if (
+        toolIsActive(*this, tool_id) &&
         std::find(available_tools.begin(), available_tools.end(), tool_id) != available_tools.end())
       {
         writeBlackboard(*this, "selected.tool", tool_id);
@@ -620,7 +688,10 @@ public:
     readBlackboard(*this, "surgeon.intent", surgeon_intent);
     if (!surgeon_request_tool.empty()) {
       const auto lifecycle = toolLifecycle(*this, surgeon_request_tool);
-      if (lifecycle == "mayo_recovery" || lifecycle == "mayo_reuse") {
+      if (
+        toolIsActive(*this, surgeon_request_tool) &&
+        (lifecycle == "mayo_recovery" || lifecycle == "mayo_reuse"))
+      {
         return selectTool(surgeon_request_tool);
       }
     }
@@ -629,7 +700,7 @@ public:
     readBlackboard(*this, "active_recovery_tools.csv", active_recovery_csv);
     for (const auto & tool_id : splitCsv(active_recovery_csv)) {
       const auto lifecycle = toolLifecycle(*this, tool_id);
-      if (!tool_id.empty() && (lifecycle == "mayo_recovery" || lifecycle == "mayo_reuse")) {
+      if (toolIsActive(*this, tool_id) && (lifecycle == "mayo_recovery" || lifecycle == "mayo_reuse")) {
         return selectTool(tool_id);
       }
     }
@@ -679,19 +750,38 @@ public:
 
   BT::NodeStatus tick() override
   {
-    const auto decision = firstInputOrBlackboard(*this, "decision", "bt.decision");
+    auto decision = firstInputOrBlackboard(*this, "decision", "bt.decision");
     std::string action;
     if (const auto input = getInput<std::string>("action")) {
       action = input.value();
     } else {
       readBlackboard(*this, "bt.action", action);
     }
-    const auto rationale = firstInputOrBlackboard(*this, "rationale", "bt.rationale");
+    auto rationale = firstInputOrBlackboard(*this, "rationale", "bt.rationale");
+    std::string explicit_request;
+    std::string surgeon_request;
+    std::string surgeon_intent;
+    readBlackboard(*this, "request.explicit_tool", explicit_request);
+    readBlackboard(*this, "request.surgeon_tool", surgeon_request);
+    readBlackboard(*this, "surgeon.intent", surgeon_intent);
+    const bool higher_priority_pending =
+      decision == "idle" &&
+      (
+        hasRecoveryContext(*this) || !explicit_request.empty() || !surgeon_request.empty() ||
+        surgeon_intent == "return_tool" || surgeon_intent == "extend_hand_for_retrieval");
+    if (higher_priority_pending) {
+      decision = "hold";
+      action = "";
+      rationale = "higher-priority request or recovery context still pending";
+      writeBlackboard(*this, "bt.mode", std::string("guard_wait"));
+    }
     writeBlackboard(*this, "bt.decision", decision);
     writeBlackboard(*this, "bt.action", action);
     writeBlackboard(*this, "bt.rationale", rationale);
     writeBlackboard(*this, "bt.decision_reason", rationale);
-    writeBlackboard(*this, "bt.blocking_guard", std::string{});
+    writeBlackboard(
+      *this, "bt.blocking_guard",
+      higher_priority_pending ? std::string("pending_transition") : std::string{});
     writeBlackboard(*this, "bt.selected_tool_lifecycle", std::string{});
     writeBlackboard(*this, "bt.next_required_transition", std::string{});
     bool clear_selected_tool = true;
@@ -724,9 +814,11 @@ public:
     std::string explicit_request;
     std::string surgeon_request;
     std::string surgeon_intent;
+    std::string owner;
     const auto lifecycle = toolLifecycle(*this, selected_tool);
     bool contaminated = false;
     bool cleaner_busy = false;
+    bool ready_for_handover = false;
     readBlackboard(*this, "action.guard.handover_allowed", world_allowed);
     readBlackboard(*this, "phase.uncertain", uncertain);
     readBlackboard(*this, "robot.state", robot_state);
@@ -734,21 +826,31 @@ public:
     readBlackboard(*this, "request.explicit_tool", explicit_request);
     readBlackboard(*this, "request.surgeon_tool", surgeon_request);
     readBlackboard(*this, "surgeon.intent", surgeon_intent);
+    readBlackboard(*this, "surgeon.ready_handover", ready_for_handover);
     readBlackboard(*this, "cleaner.busy", cleaner_busy);
     readBlackboard(*this, makeToolKey(selected_tool, "contaminated"), contaminated);
+    readBlackboard(*this, makeToolKey(selected_tool, "owner"), owner);
     const bool explicit_request_selected =
       isExplicitSurgeonIntent(surgeon_intent) &&
       (!selected_tool.empty()) &&
       (selected_tool == explicit_request || selected_tool == surgeon_request);
+    const bool active_tool = toolIsActive(*this, selected_tool);
+    const bool prepositioned_right = lifecycle == "prepositioned_right";
+    const bool holder_available = owner.empty() || owner == "none" || (prepositioned_right && owner == "robot_right_hand");
+    const bool usable_lifecycle = lifecycle == "home_rack" || lifecycle == "returned_home" || prepositioned_right;
+    const bool surgeon_side = lifecycle == "surgeon_owned" || lifecycle == "mayo_reuse";
+    const bool blocked_by_safety = hasBlockingSafetyFlag(*this);
 
     const bool allowed =
-      !selected_tool.empty() &&
+      active_tool &&
+      !blocked_by_safety &&
       (
-        lifecycle == "surgeon_owned" || lifecycle == "mayo_reuse" ||
-        (((explicit_request_selected && active_task_id.empty() && !cleaner_busy) ||
-        (world_allowed && !uncertain)) && !contaminated &&
-        (lifecycle == "home_rack" || lifecycle == "returned_home" || lifecycle == "prepositioned_right") &&
-        robot_state != "fault")
+        surgeon_side ||
+        (
+          usable_lifecycle && holder_available && !contaminated && active_task_id.empty() &&
+          !cleaner_busy && !uncertain && robot_state != "fault" &&
+          ((explicit_request_selected && ready_for_handover) || (!explicit_request_selected && world_allowed))
+        )
       );
 
     writeBlackboard(*this, "action.guard.handover_allowed", allowed);
@@ -830,6 +932,10 @@ public:
     }
 
     if (selected_tool.empty()) {
+      return BT::NodeStatus::FAILURE;
+    }
+    if (!toolIsActive(*this, selected_tool)) {
+      writeBlackboard(*this, "bt.blocking_guard", std::string("inactive_tool"));
       return BT::NodeStatus::FAILURE;
     }
 

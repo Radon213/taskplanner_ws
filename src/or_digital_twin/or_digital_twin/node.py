@@ -6,6 +6,7 @@ from collections import deque
 from dataclasses import asdict
 import json
 from pathlib import Path
+import time
 
 from procedure_spec import get_default_spec_dir, load_bundle
 import rclpy
@@ -29,6 +30,7 @@ from surgical_msgs.msg import (
     ToolObservation,
     TwinEvent,
     VLMInferenceProposal,
+    VLMHealth,
     VLMRequestContext,
     VLMReducerDecision,
     WorldState,
@@ -58,14 +60,19 @@ class ORDigitalTwinNode(Node):
         self.declare_parameter("vlm_recent_event_count", 6)
         self.declare_parameter("validation_mode", "bt_twin")
         self.declare_parameter("phase_authority", "reducer")
+        self.declare_parameter("vlm_mode", "mock")
+        self.declare_parameter("vlm_health_timeout_sec", 6.0)
         self._spec_dir = str(self.get_parameter("spec_dir").value)
         self._vlm_recent_event_count = max(1, int(self.get_parameter("vlm_recent_event_count").value))
         self._validation_mode = str(self.get_parameter("validation_mode").value)
         self._phase_authority = str(self.get_parameter("phase_authority").value)
+        self._vlm_mode = str(self.get_parameter("vlm_mode").value)
+        self._vlm_health_timeout_sec = max(0.5, float(self.get_parameter("vlm_health_timeout_sec").value))
         self._twin = ORDigitalTwin(load_bundle(self._spec_dir))
         self._bundle_metadata_cache = self._build_bundle_metadata()
         self._important_events: deque[SimulationEvent] = deque(maxlen=self._vlm_recent_event_count)
         self._latest_outward_signal: SurgeonOutwardSignal | None = None
+        self._vlm_health_by_topic: dict[str, tuple[VLMHealth, float]] = {}
         self.add_on_set_parameters_callback(self._on_parameters_changed)
 
         self._world_pub = self.create_publisher(WorldState, "/twin/world_state", 20)
@@ -86,6 +93,13 @@ class ORDigitalTwinNode(Node):
         self.create_subscription(PhaseTransitionCue, "/surgeon/phase_transition_cue", self._on_phase_transition_cue, 20)
         self.create_subscription(PhaseEvidence, "/vlm/phase_evidence", self._on_phase_evidence, 20)
         self.create_subscription(ToolObservation, "/vlm/tool_observations", self._on_observation, 50)
+        self.create_subscription(VLMHealth, "/vlm/health", lambda msg: self._on_vlm_health("/vlm/health", msg), 10)
+        self.create_subscription(
+            VLMHealth,
+            "/vlm_real/health",
+            lambda msg: self._on_vlm_health("/vlm_real/health", msg),
+            10,
+        )
         self.create_subscription(TwinEvent, "/skill/events", self._on_skill_event, 50)
         self.create_subscription(String, "/surgery/audio/request_text", self._on_request, 20)
         self.create_subscription(SurgeonRequest, "/surgeon/request", self._on_surgeon_request, 20)
@@ -116,10 +130,45 @@ class ORDigitalTwinNode(Node):
                 self._validation_mode = str(parameter.value)
             elif parameter.name == "phase_authority":
                 self._phase_authority = str(parameter.value)
+            elif parameter.name == "vlm_mode":
+                self._vlm_mode = str(parameter.value)
+            elif parameter.name == "vlm_health_timeout_sec":
+                self._vlm_health_timeout_sec = max(0.5, float(parameter.value))
         return SetParametersResult(successful=True)
 
     def _stamp(self):
         return self.get_clock().now().to_msg()
+
+    def _required_vlm_health_topics(self) -> list[str]:
+        if self._vlm_mode == "real":
+            return ["/vlm/health"]
+        if self._vlm_mode == "dual":
+            return ["/vlm_real/health"]
+        return []
+
+    def _on_vlm_health(self, topic: str, msg: VLMHealth) -> None:
+        self._vlm_health_by_topic[topic] = (msg, time.monotonic())
+        self._refresh_vlm_safety_flags()
+
+    def _refresh_vlm_safety_flags(self) -> None:
+        required_topics = self._required_vlm_health_topics()
+        if not required_topics:
+            self._twin.set_safety_flag("vlm_unhealthy", False)
+            return
+        now = time.monotonic()
+        unhealthy = False
+        for topic in required_topics:
+            sample = self._vlm_health_by_topic.get(topic)
+            if sample is None:
+                unhealthy = True
+                continue
+            health, received_at = sample
+            if now - received_at > self._vlm_health_timeout_sec:
+                unhealthy = True
+                continue
+            if not bool(health.connected and health.healthy) or bool(health.last_error):
+                unhealthy = True
+        self._twin.set_safety_flag("vlm_unhealthy", unhealthy)
 
     def _bundle_metadata_payload(self, spec) -> dict:
         requestable_instruments = [
@@ -201,6 +250,7 @@ class ORDigitalTwinNode(Node):
         return augmented
 
     def _publish_world_state(self) -> None:
+        self._refresh_vlm_safety_flags()
         self._twin.normalize_for_publish()
         world = WorldState()
         world.stamp = self._stamp()

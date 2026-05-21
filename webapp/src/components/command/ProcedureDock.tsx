@@ -47,6 +47,18 @@ export function ProcedureDock({
   const pauseResumeDisabled = disabled || commandBusy || startInFlight || (!isRunning && !isPaused);
   const interruptDisabled = disabled || (commandBusy && !startInFlight);
   const statusMessage = vm.runtime.statusMessage;
+  const trimmedActionMessage = actionMessage.trim();
+  const shouldShowActionMessage =
+    Boolean(trimmedActionMessage) &&
+    trimmedActionMessage !== "Ready." &&
+    trimmedActionMessage !== "ROS bridge connected." &&
+    trimmedActionMessage !== runtimeMessage;
+  const actionMessageTone =
+    /failed|error|cannot|unknown|unsupported|offline|timed out|paused;/i.test(trimmedActionMessage)
+      ? "error"
+      : actionPending
+        ? "pending"
+        : "normal";
   const submit = (event: FormEvent) => {
     event.preventDefault();
     onApplyBundle();
@@ -62,6 +74,10 @@ export function ProcedureDock({
         </div>
         <GitBranch size={18} />
       </div>
+
+      {shouldShowActionMessage ? (
+        <div className={`dock-action-message ${actionMessageTone}`}>{trimmedActionMessage}</div>
+      ) : null}
 
       <form className="control-stack" onSubmit={submit}>
         <label className="field">

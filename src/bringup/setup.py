@@ -23,6 +23,7 @@ setup(
             "taskplanner_smoke_test = bringup.smoke_test:main",
             "taskplanner_manual_probe = bringup.manual_probe:main",
             "taskplanner_bt_audit = bringup.bt_audit:main",
+            "taskplanner_edge_probe = bringup.edge_probe:main",
         ],
     },
 )

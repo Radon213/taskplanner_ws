@@ -26,6 +26,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-pip \
     python3-rosdep \
     python3-yaml \
+    python3-zmq \
     ros-jazzy-rosbridge-suite \
     && rm -rf /var/lib/apt/lists/*
 

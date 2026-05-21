@@ -793,6 +793,9 @@ class ORDigitalTwin:
             return
         self.state.safety_flags = [existing for existing in self.state.safety_flags if existing != flag]
 
+    def set_safety_flag(self, flag: str, enabled: bool) -> None:
+        self._set_flag(flag, enabled)
+
     def _record_invariant_violation(
         self, *, reason: str, event_type: str, instrument_id: str, active_tool: str = "", proposed_stage: str = ""
     ) -> None:
@@ -1182,6 +1185,20 @@ class ORDigitalTwin:
         left_conflict = len({state.instrument_id for state in left_candidates}) > 1
         self._set_flag("right_arm_overloaded", right_conflict)
         self._set_flag("left_arm_overloaded", left_conflict)
+        surgeon_owned_count = sum(
+            1 for state in self.instrument_states.values() if state.lifecycle_stage == LIFECYCLE_SURGEON_OWNED
+        )
+        surgeon_owned_overloaded = surgeon_owned_count > 2
+        was_surgeon_overloaded = "surgeon_owned_overloaded" in self.state.safety_flags
+        self._set_flag("surgeon_owned_overloaded", surgeon_owned_overloaded)
+        if surgeon_owned_overloaded and not was_surgeon_overloaded:
+            self._record_event(
+                "InvariantViolationIgnored",
+                {
+                    "reason": "surgeon_owned_overloaded",
+                    "surgeon_owned_count": surgeon_owned_count,
+                },
+            )
         self._clear_satisfied_request()
         self._normalize_robot_state()
         self._complete_if_cleanup_finished()
@@ -1840,6 +1857,8 @@ class ORDigitalTwin:
         ]
 
     def handover_allowed(self) -> bool:
+        if self.state.safety_flags:
+            return False
         if (
             self.spec.bundle.action_guard
             and self.spec.bundle.action_guard.block_handover_when_phase_uncertain
@@ -1848,7 +1867,25 @@ class ORDigitalTwin:
             return False
         if self.state.active_robot_task is not None:
             return False
-        return self.state.robot_state not in {"fault", "retracted"} and not self.state.cleaner_busy
+        if self.state.robot_state in {"fault", "retracted"} or self.state.cleaner_busy:
+            return False
+        requested_tool = self.state.surgeon_request_tool or self.state.explicit_request_tool
+        if not requested_tool:
+            return True
+        requested_state = self.instrument_states.get(requested_tool)
+        if requested_state is None:
+            return False
+        if self.state.surgeon_intent in ACTIVE_REQUEST_INTENTS and not self.state.surgeon_ready_for_handover:
+            return False
+        if requested_state.contaminated:
+            return False
+        if requested_state.lifecycle_stage in {LIFECYCLE_SURGEON_OWNED, LIFECYCLE_MAYO_REUSE}:
+            return False
+        if requested_state.lifecycle_stage not in {LIFECYCLE_HOME_RACK, LIFECYCLE_RETURNED_HOME, LIFECYCLE_PREPOSITIONED_RIGHT}:
+            return False
+        if requested_state.owner not in {"", "none", "robot_right_hand"}:
+            return False
+        return True
 
     def recovery_required(self) -> bool:
         return bool(self.state.active_recovery_tools) or any(

@@ -152,6 +152,7 @@ def generate_launch_description() -> LaunchDescription:
                     {
                         "spec_dir": spec_dir,
                         "validation_mode": validation_mode,
+                        "vlm_mode": vlm_mode,
                         "phase_authority": PythonExpression(
                             ["'legacy_estimator' if '", validation_mode, "' == 'demo' else 'reducer'"]
                         ),
