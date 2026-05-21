@@ -1,0 +1,192 @@
+LoadWorldState:
+  class_name: taskplanner_bt_nodes::LoadWorldState
+  description: Subscribe to /twin/world_state and mirror the relevant fields to the BT blackboard.
+  topic: /twin/world_state
+  port_alias: {}
+  port_default: {}
+  hidden_ports: []
+  wait_timeout: 1
+  request_timeout: 2
+  allow_unreachable: true
+  logger_level: ""
+  extra: ~
+IsProcedureActive:
+  class_name: taskplanner_bt_nodes::IsProcedureActive
+  description: Return FAILURE when authoritative twin marks the procedure completed, terminating the BT loop.
+  topic: ""
+  port_alias: {}
+  port_default: {}
+  hidden_ports: []
+  wait_timeout: 1
+  request_timeout: 2
+  allow_unreachable: true
+  logger_level: ""
+  extra: ~
+IsPhaseCertain:
+  class_name: taskplanner_bt_nodes::IsPhaseCertain
+  description: Return SUCCESS when the mirrored phase uncertainty flag is false.
+  topic: ""
+  port_alias: {}
+  port_default: {}
+  hidden_ports: []
+  wait_timeout: 1
+  request_timeout: 2
+  allow_unreachable: true
+  logger_level: ""
+  extra: ~
+HasExplicitRequest:
+  class_name: taskplanner_bt_nodes::HasExplicitRequest
+  description: Return SUCCESS when an explicit tool request is present on the mirrored blackboard.
+  topic: ""
+  port_alias: {}
+  port_default: {}
+  hidden_ports: []
+  wait_timeout: 1
+  request_timeout: 2
+  allow_unreachable: true
+  logger_level: ""
+  extra: ~
+NeedsRecovery:
+  class_name: taskplanner_bt_nodes::NeedsRecovery
+  description: Return SUCCESS when the mirrored world state requests recovery.
+  topic: ""
+  port_alias: {}
+  port_default: {}
+  hidden_ports: []
+  wait_timeout: 1
+  request_timeout: 2
+  allow_unreachable: true
+  logger_level: ""
+  extra: ~
+IsToolAvailable:
+  class_name: taskplanner_bt_nodes::IsToolAvailable
+  description: Check whether the selected tool is currently available, prepared, or held.
+  topic: ""
+  port_alias: {}
+  port_default: {}
+  hidden_ports: []
+  wait_timeout: 1
+  request_timeout: 2
+  allow_unreachable: true
+  logger_level: ""
+  extra: ~
+CanHandover:
+  class_name: taskplanner_bt_nodes::CanHandover
+  description: Check the mirrored action.guard.handover_allowed flag.
+  topic: ""
+  port_alias: {}
+  port_default: {}
+  hidden_ports: []
+  wait_timeout: 1
+  request_timeout: 2
+  allow_unreachable: true
+  logger_level: ""
+  extra: ~
+SelectExplicitTool:
+  class_name: taskplanner_bt_nodes::SelectExplicitTool
+  description: Select the explicitly requested tool and mirror it to selected.tool.
+  topic: ""
+  port_alias: {}
+  port_default: {}
+  hidden_ports: []
+  wait_timeout: 1
+  request_timeout: 2
+  allow_unreachable: true
+  logger_level: ""
+  extra: ~
+SelectExpectedTool:
+  class_name: taskplanner_bt_nodes::SelectExpectedTool
+  description: Select the first expected instrument that is also available.
+  topic: ""
+  port_alias: {}
+  port_default: {}
+  hidden_ports: []
+  wait_timeout: 1
+  request_timeout: 2
+  allow_unreachable: true
+  logger_level: ""
+  extra: ~
+SelectRecoveryTool:
+  class_name: taskplanner_bt_nodes::SelectRecoveryTool
+  description: Select a tool that should be recovered, prioritizing handed-over tools first.
+  topic: ""
+  port_alias: {}
+  port_default: {}
+  hidden_ports: []
+  wait_timeout: 1
+  request_timeout: 2
+  allow_unreachable: true
+  logger_level: ""
+  extra: ~
+SetIdleDecision:
+  class_name: taskplanner_bt_nodes::SetIdleDecision
+  description: Set the current decision/action blackboard values for passive branches.
+  topic: ""
+  port_alias: {}
+  port_default: {}
+  hidden_ports: []
+  wait_timeout: 1
+  request_timeout: 2
+  allow_unreachable: true
+  logger_level: ""
+  extra: ~
+ApplyActionGuard:
+  class_name: taskplanner_bt_nodes::ApplyActionGuard
+  description: Recompute handover eligibility from the mirrored world state and selected tool.
+  topic: ""
+  port_alias: {}
+  port_default: {}
+  hidden_ports: []
+  wait_timeout: 1
+  request_timeout: 2
+  allow_unreachable: true
+  logger_level: ""
+  extra: ~
+ConfigureHumanoidCommand:
+  class_name: taskplanner_bt_nodes::ConfigureHumanoidCommand
+  description: Translate the current decision mode into humanoid-specific skill command fields.
+  topic: ""
+  port_alias: {}
+  port_default: {}
+  hidden_ports: []
+  wait_timeout: 1
+  request_timeout: 2
+  allow_unreachable: true
+  logger_level: ""
+  extra: ~
+ShouldDispatchDecision:
+  class_name: taskplanner_bt_nodes::ShouldDispatchDecision
+  description: Allow emit/publish only when the intent changes or a cooldown expires.
+  topic: ""
+  port_alias: {}
+  port_default: {}
+  hidden_ports: []
+  wait_timeout: 1
+  request_timeout: 2
+  allow_unreachable: true
+  logger_level: ""
+  extra: ~
+EmitBTDecision:
+  class_name: taskplanner_bt_nodes::EmitBTDecision
+  description: Publish the current BT decision to /bt/decision.
+  topic: /bt/decision
+  port_alias: {}
+  port_default: {}
+  hidden_ports: []
+  wait_timeout: 1
+  request_timeout: 2
+  allow_unreachable: true
+  logger_level: ""
+  extra: ~
+PublishSkillCommand:
+  class_name: taskplanner_bt_nodes::PublishSkillCommand
+  description: Publish the selected skill command to /bt/skill_command.
+  topic: /bt/skill_command
+  port_alias: {}
+  port_default: {}
+  hidden_ports: []
+  wait_timeout: 1
+  request_timeout: 2
+  allow_unreachable: true
+  logger_level: ""
+  extra: ~

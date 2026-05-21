@@ -1,0 +1,28 @@
+const { chromium } = require('./node_modules/playwright');
+(async() => {
+  const browser = await chromium.launch({ headless: true });
+  const page = await browser.newPage({ viewport: { width: 1600, height: 1600 } });
+  const logs = [];
+  page.on('console', msg => logs.push({ type: msg.type(), text: msg.text() }));
+  page.on('pageerror', err => logs.push({ type: 'pageerror', text: String(err) }));
+  await page.goto('http://127.0.0.1:4173/', { waitUntil: 'networkidle' });
+  await page.waitForTimeout(3500);
+  await page.screenshot({ path: '/tmp/taskplanner_verify_idle.png', fullPage: true });
+  await page.getByRole('button', { name: 'Start' }).click();
+  await page.waitForTimeout(9000);
+  await page.screenshot({ path: '/tmp/taskplanner_verify_running.png', fullPage: true });
+  await page.getByRole('button', { name: 'Voice Override' }).click();
+  await page.waitForTimeout(4000);
+  await page.screenshot({ path: '/tmp/taskplanner_verify_override.png', fullPage: true });
+  await page.getByRole('button', { name: 'Reset' }).click();
+  await page.waitForTimeout(3000);
+  await page.selectOption('select', 'nephrectomy');
+  await page.getByRole('button', { name: 'Apply Bundle' }).click();
+  await page.waitForTimeout(3000);
+  await page.getByRole('button', { name: 'Start' }).click();
+  await page.waitForTimeout(9000);
+  await page.screenshot({ path: '/tmp/taskplanner_verify_nephrectomy.png', fullPage: true });
+  const body = await page.locator('body').innerText();
+  console.log(JSON.stringify({ logs, excerpt: body.slice(0, 2200) }, null, 2));
+  await browser.close();
+})();

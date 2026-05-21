@@ -1,0 +1,72 @@
+instruments:
+  - id: grasper
+    display_name: Atraumatic grasper
+    display_name_ko: 비외상성 그라스퍼
+    aliases: [grasper, atraumatic, bowel, 바울]
+    category: exposure
+    requestable: true
+    role: exposure
+    handover_profile: handle_grasp
+
+  - id: bipolar
+    display_name: Bipolar forceps
+    display_name_ko: 바이폴라 포셉
+    aliases: [bipolar, maryland, 바이폴라]
+    category: hemostasis
+    requestable: true
+    role: hemostasis
+    handover_profile: shaft_grasp
+
+  - id: scissors
+    display_name: Curved scissors
+    display_name_ko: 곡선 가위
+    aliases: [scissors, curved, 가위]
+    category: dissection
+    requestable: true
+    role: dissection
+    handover_profile: ring_grasp
+
+  - id: suction_irrigator
+    display_name: Suction irrigator
+    display_name_ko: 석션-세척기
+    aliases: [suction, irrigator, suction irrigator, 흡입]
+    category: suction
+    requestable: true
+    role: suction
+    handover_profile: shaft_grasp
+
+  - id: right_angle
+    display_name: Right-angle clamp
+    display_name_ko: 라이트 앵글 클램프
+    aliases: [mixter, right angle, 라이트앵글]
+    category: dissection
+    requestable: true
+    role: hilar_dissection
+    handover_profile: handle_grasp
+
+  - id: clip_applier
+    display_name: Clip applier
+    display_name_ko: 클립 어플라이어
+    aliases: [clip, clip applier, hemolok, 클립]
+    category: control
+    requestable: true
+    role: pedicle_control
+    handover_profile: handle_grasp
+
+  - id: needle_driver
+    display_name: Needle driver
+    display_name_ko: 니들 드라이버
+    aliases: [needle, needle driver, 니들]
+    category: closure
+    requestable: true
+    role: closure
+    handover_profile: handle_grasp
+
+  - id: forceps
+    display_name: Tissue forceps
+    display_name_ko: 조직 겸자
+    aliases: [forceps, tissue forceps, 포셉]
+    category: grasping
+    requestable: true
+    role: closure
+    handover_profile: pinch_grasp

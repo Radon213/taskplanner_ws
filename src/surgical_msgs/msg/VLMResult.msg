@@ -1,0 +1,16 @@
+builtin_interfaces/Time stamp
+string source
+string schema_version
+string raw_json
+string summary
+string[] phase_ids
+float32[] phase_confidences
+string[] observed_tool_ids
+string[] observed_location_ids
+string[] observed_location_types
+float32[] observed_confidences
+string gesture_event_type
+string gesture_requested_tool
+string gesture_hand_pose
+float32 gesture_confidence
+float32 uncertainty

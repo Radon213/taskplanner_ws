@@ -1,0 +1,10 @@
+builtin_interfaces/Time stamp
+string procedure_id
+string signal_id
+string signal_type
+string tool_id
+string phase_id
+string hand_pose
+string speech_text
+float32 confidence
+string note

@@ -1,0 +1,13 @@
+builtin_interfaces/Time stamp
+string command_id
+string action
+string instrument_id
+string target_location_id
+string target_location_type
+string rationale
+string arm
+string source_location_id
+string source_location_type
+string target_owner
+bool cleaning_required
+string mode

@@ -1,0 +1,111 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<root BTCPP_format="4" main_tree_to_execute="TaskplannerAssistDemo">
+  <BehaviorTree ID="TaskplannerAssistDemo">
+    <KeepRunningUntilFailure>
+      <Sequence name="TaskplannerAssistTick">
+        <RetryUntilSuccessful num_attempts="-1">
+          <LoadWorldState />
+        </RetryUntilSuccessful>
+        <IsProcedureActive />
+        <Fallback name="DecisionRoot">
+          <Sequence name="ExplicitRequest">
+            <HasExplicitRequest />
+            <SelectExplicitTool />
+            <IsToolAvailable />
+            <ApplyActionGuard />
+            <CanHandover />
+            <ConfigureHumanoidCommand
+              decision="explicit_request"
+              mode="explicit_request"
+              rationale="explicit request selected"
+            />
+            <ForceSuccess>
+              <Sequence name="RightHandHandover">
+                <ShouldDispatchDecision cooldown_sec="2.0" />
+                <EmitBTDecision />
+                <PublishSkillCommand />
+              </Sequence>
+            </ForceSuccess>
+          </Sequence>
+
+          <Sequence name="Safety">
+            <Inverter>
+              <IsPhaseCertain />
+            </Inverter>
+            <Inverter>
+              <NeedsRecovery />
+            </Inverter>
+            <SetIdleDecision
+              decision="hold"
+              action=""
+              rationale="phase uncertain; observing without robot motion"
+            />
+            <ForceSuccess>
+              <Sequence name="SafetyDecision">
+                <ShouldDispatchDecision cooldown_sec="2.0" />
+                <EmitBTDecision />
+              </Sequence>
+            </ForceSuccess>
+          </Sequence>
+
+          <Sequence name="Recovery">
+            <NeedsRecovery />
+            <SelectRecoveryTool />
+            <ConfigureHumanoidCommand
+              decision="recovery"
+              mode="recovery"
+              rationale="world state requested recovery"
+            />
+            <ForceSuccess>
+              <Sequence name="LeftHandRecovery">
+                <ShouldDispatchDecision cooldown_sec="1.5" />
+                <EmitBTDecision />
+                <PublishSkillCommand />
+              </Sequence>
+            </ForceSuccess>
+          </Sequence>
+
+          <Sequence name="AnticipatoryHandover">
+            <IsPhaseCertain />
+            <Inverter>
+              <HasExplicitRequest />
+            </Inverter>
+            <Inverter>
+              <NeedsRecovery />
+            </Inverter>
+            <SelectExpectedTool />
+            <IsToolAvailable />
+            <ApplyActionGuard />
+            <CanHandover />
+            <ConfigureHumanoidCommand
+              decision="anticipatory_handover"
+              mode="anticipatory"
+              rationale="phase-driven anticipatory selection"
+            />
+            <ForceSuccess>
+              <Sequence name="AnticipatoryHold">
+                <ShouldDispatchDecision cooldown_sec="2.0" />
+                <EmitBTDecision />
+                <PublishSkillCommand />
+              </Sequence>
+            </ForceSuccess>
+          </Sequence>
+
+          <Sequence name="IdleObserve">
+            <SetIdleDecision
+              decision="idle"
+              action=""
+              rationale="no stronger branch selected"
+            />
+            <ForceSuccess>
+              <Sequence name="IdleDecision">
+                <ShouldDispatchDecision cooldown_sec="2.0" />
+                <EmitBTDecision />
+              </Sequence>
+            </ForceSuccess>
+          </Sequence>
+        </Fallback>
+      </Sequence>
+    </KeepRunningUntilFailure>
+  </BehaviorTree>
+</root>

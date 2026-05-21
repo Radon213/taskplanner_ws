@@ -1,0 +1,9 @@
+builtin_interfaces/Time stamp
+string input_type
+string input_id
+string input_source
+bool accepted
+string reason
+string affected_tool
+string affected_phase
+string detail_json

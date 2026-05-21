@@ -1,0 +1,46 @@
+# ROS / colcon generated artifacts
+build/
+install/
+log/
+
+# Python generated artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Node / Vite generated artifacts
+webapp/node_modules/
+webapp/dist/
+webapp/tsconfig.tsbuildinfo
+webapp/.vite/
+
+# Validation and runtime artifacts
+reports/taskplanner_validation_assets/
+*.bag
+*.db3
+*.mcap
+*.log
+*.tmp
+*.bak
+
+# Local environment and editor files
+.env
+.env.*
+!.env.example
+.nested_git_backup/
+.cache/
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Windows alternate data stream files copied through WSL
+*:Zone.Identifier

@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  docker-build-and-smoke:
+    runs-on: ubuntu-latest
+    env:
+      BTOPS_REPO_URL: ${{ secrets.BTOPS_REPO_URL }}
+      BTOPS_REF: ${{ vars.BTOPS_REF || 'main' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate BTOPS_REPO_URL
+        run: |
+          if [ -z "${BTOPS_REPO_URL}" ]; then
+            echo "BTOPS_REPO_URL secret is required for CI."
+            exit 2
+          fi
+
+      - name: Build Docker image
+        run: |
+          docker compose build \
+            --build-arg BTOPS_REPO_URL="${BTOPS_REPO_URL}" \
+            --build-arg BTOPS_REF="${BTOPS_REF}" \
+            taskplanner-dev
+
+      - name: Build ROS workspace
+        run: |
+          docker compose run --rm taskplanner-dev bash -lc "colcon build --symlink-install"
+
+      - name: Build webapp
+        run: |
+          docker compose run --rm taskplanner-dev bash -lc "cd webapp && npm ci && npm run build"
+
+      - name: Smoke test thyroidectomy
+        run: |
+          docker compose run --rm taskplanner-dev bash -lc "source install/setup.bash && ros2 run bringup taskplanner_smoke_test --spec-name thyroidectomy"
+
+      - name: Smoke test nephrectomy
+        run: |
+          docker compose run --rm taskplanner-dev bash -lc "source install/setup.bash && ros2 run bringup taskplanner_smoke_test --spec-name nephrectomy"

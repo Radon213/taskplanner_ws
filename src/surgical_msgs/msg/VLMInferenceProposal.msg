@@ -1,0 +1,12 @@
+builtin_interfaces/Time stamp
+string source
+string proposal_id
+string instrument_id
+string current_lifecycle
+string proposed_lifecycle
+string proposed_transition
+string location_type
+string location_id
+float32 confidence
+bool visible
+string detail_json

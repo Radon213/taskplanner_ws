@@ -1,0 +1,10 @@
+builtin_interfaces/Time stamp
+string procedure_id
+string filtered_phase
+string decision
+string selected_tool
+string selected_tool_lifecycle
+string next_required_transition
+string blocking_guard
+string decision_reason
+string rationale

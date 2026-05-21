@@ -1,0 +1,114 @@
+entities:
+  - id: humanoid_body
+    type: humanoid
+    x: 31
+    y: 44
+    width: 18
+    height: 28
+    label: Humanoid Assistant
+  - id: surgeon_actor
+    type: surgeon
+    x: 72
+    y: 36
+    width: 16
+    height: 24
+    label: Surgeon
+  - id: thyroid_bed
+    type: surgical_bed
+    x: 56
+    y: 50
+    width: 28
+    height: 20
+    label: OR Bed
+  - id: instrument_rack
+    type: instrument_rack
+    x: 12
+    y: 56
+    width: 20
+    height: 24
+    label: Instrument Rack
+  - id: mayo_stand
+    type: mayo_stand
+    x: 56
+    y: 64
+    width: 24
+    height: 8
+    label: Mayo Stand
+  - id: cleaner_station
+    type: cleaner_station
+    x: 21
+    y: 28
+    width: 12
+    height: 12
+    label: Cleaner
+
+anchors:
+  - id: robot_right_hand
+    attached_to: humanoid_body
+    x: 42
+    y: 41
+    label: Right Hand
+  - id: robot_left_hand
+    attached_to: humanoid_body
+    x: 28
+    y: 47
+    label: Left Hand
+  - id: surgeon_receive_zone
+    attached_to: surgeon_actor
+    x: 66
+    y: 43
+    label: Receive Zone
+  - id: surgeon_return_zone
+    attached_to: surgeon_actor
+    x: 66
+    y: 53
+    label: Return Zone
+  - id: cleaner_slot
+    attached_to: cleaner_station
+    x: 24
+    y: 31
+    label: Cleaner Slot
+  - id: surgeon_hand
+    attached_to: surgeon_actor
+    x: 69
+    y: 47
+    label: Surgeon Hand
+  - id: field_region_thyroid
+    attached_to: thyroid_bed
+    x: 57
+    y: 49
+    label: Thyroid Field
+  - id: mayo_recovery_zone
+    attached_to: mayo_stand
+    x: 50
+    y: 64
+    label: Recovery Zone
+  - id: mayo_reuse_zone
+    attached_to: mayo_stand
+    x: 62
+    y: 64
+    label: Reuse Zone
+  - id: main_tray_slot_1
+    attached_to: instrument_rack
+    x: 15
+    y: 61
+  - id: main_tray_slot_2
+    attached_to: instrument_rack
+    x: 20
+    y: 61
+  - id: main_tray_slot_3
+    attached_to: instrument_rack
+    x: 25
+    y: 61
+  - id: main_tray_slot_4
+    attached_to: instrument_rack
+    x: 15
+    y: 68
+  - id: main_tray_slot_5
+    attached_to: instrument_rack
+    x: 20
+    y: 68
+  - id: main_tray_slot_6
+    attached_to: instrument_rack
+    x: 25
+    y: 68

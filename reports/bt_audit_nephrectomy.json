@@ -1,0 +1,31 @@
+{
+  "blocker_count": 0,
+  "bundle": "nephrectomy",
+  "decision_counts": {
+    "anticipatory_handover": 7,
+    "explicit_request": 8,
+    "hold": 1,
+    "idle": 118,
+    "recovery": 6
+  },
+  "duration_sec": 310.0,
+  "findings": [],
+  "observation_violation_detected": false,
+  "observation_violation_samples": [],
+  "recoverable_events": [
+    "RobotGraspedTool",
+    "RobotTaskCompleted",
+    "RobotTaskStarted",
+    "ToolCleaningCompleted",
+    "ToolCleaningProgress",
+    "ToolHandoverCompleted",
+    "ToolPrepared",
+    "ToolReceivedFromSurgeon",
+    "ToolReturnedToTray",
+    "ToolSentToCleaner"
+  ],
+  "suspicious_count": 0,
+  "vlm_rejected_proposal_detected": false,
+  "vlm_rejection_samples": [],
+  "world_invariant_violations": []
+}

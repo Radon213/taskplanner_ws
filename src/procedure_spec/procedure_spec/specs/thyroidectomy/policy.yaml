@@ -1,0 +1,20 @@
+phase_guard:
+  min_confidence_to_keep: 0.55
+  min_confidence_to_switch: 0.8
+  smoothing_window: 5
+  min_dwell_time_sec: 5.0
+  allow_unknown_phase: true
+
+action_guard:
+  block_handover_when_phase_uncertain: true
+  require_multi_evidence_for_handover: true
+  allow_prepositioning_when_uncertain: false
+  explicit_request_priority: true
+
+humanoid_policy:
+  handover_arm: right
+  recovery_arm: left
+  require_cleaning_after_surgeon_use: true
+  allow_anticipatory_hold: true
+  voice_override_preempts_preposition: true
+  direct_return_to_rack_for_unused_prepositioned_tool: true

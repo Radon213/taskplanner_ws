@@ -1,0 +1,16 @@
+builtin_interfaces/Time stamp
+string instrument_id
+string home_location_type
+string home_location_id
+string location_type
+string location_id
+string owner
+string status
+float32 confidence
+string cleanliness_state
+bool contaminated
+string reserved_for
+string last_holder
+string lifecycle_stage
+string next_required_transition
+string visual_anchor_id

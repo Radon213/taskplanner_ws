@@ -1,0 +1,11 @@
+builtin_interfaces/Time stamp
+bool connected
+bool healthy
+string model_id
+string image_source
+float32 latency_sec
+int32 prompt_chars
+int32 output_chars
+int32 parse_retry_count
+string last_error
+string last_mode

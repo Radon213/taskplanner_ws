@@ -1,0 +1,79 @@
+services:
+  taskplanner-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        BTOPS_REPO_URL: ${BTOPS_REPO_URL:?Set BTOPS_REPO_URL in .env or pass it as a build arg}
+        BTOPS_REF: ${BTOPS_REF:-main}
+    image: taskplanner-ws:dev
+    working_dir: /workspaces/taskplanner_ws
+    volumes:
+      - .:/workspaces/taskplanner_ws
+      - taskplanner_web_node_modules:/workspaces/taskplanner_ws/webapp/node_modules
+    environment:
+      ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}
+      ROS_AUTOMATIC_DISCOVERY_RANGE: ${ROS_AUTOMATIC_DISCOVERY_RANGE:-LOCALHOST}
+      VLM_MODE: ${VLM_MODE:-mock}
+      VLM_BASE_URL: ${VLM_BASE_URL:-http://192.168.0.122:1234}
+      VLM_MODEL_ID: ${VLM_MODEL_ID:-gemma-4-e4b-it}
+    stdin_open: true
+    tty: true
+    command: bash
+
+  taskplanner-runtime:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        BTOPS_REPO_URL: ${BTOPS_REPO_URL:?Set BTOPS_REPO_URL in .env or pass it as a build arg}
+        BTOPS_REF: ${BTOPS_REF:-main}
+    image: taskplanner-ws:dev
+    working_dir: /workspaces/taskplanner_ws
+    volumes:
+      - .:/workspaces/taskplanner_ws
+      - taskplanner_web_node_modules:/workspaces/taskplanner_ws/webapp/node_modules
+    environment:
+      ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}
+      ROS_AUTOMATIC_DISCOVERY_RANGE: ${ROS_AUTOMATIC_DISCOVERY_RANGE:-LOCALHOST}
+      VLM_MODE: ${VLM_MODE:-mock}
+      VLM_BASE_URL: ${VLM_BASE_URL:-http://192.168.0.122:1234}
+      VLM_MODEL_ID: ${VLM_MODEL_ID:-gemma-4-e4b-it}
+    ports:
+      - "${ROSBRIDGE_PORT:-9090}:9090"
+    command: >
+      bash -lc "
+        colcon build --symlink-install &&
+        source install/setup.bash &&
+        ros2 launch bringup taskplanner_mock.launch.py
+          enable_rosbridge:=true
+          rosbridge_port:=${ROSBRIDGE_PORT:-9090}
+          vlm_mode:=${VLM_MODE:-mock}
+          vlm_base_url:=${VLM_BASE_URL:-http://192.168.0.122:1234}
+          vlm_model_id:=${VLM_MODEL_ID:-gemma-4-e4b-it}
+      "
+
+  webapp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        BTOPS_REPO_URL: ${BTOPS_REPO_URL:?Set BTOPS_REPO_URL in .env or pass it as a build arg}
+        BTOPS_REF: ${BTOPS_REF:-main}
+    image: taskplanner-ws:dev
+    working_dir: /workspaces/taskplanner_ws/webapp
+    volumes:
+      - .:/workspaces/taskplanner_ws
+      - taskplanner_web_node_modules:/workspaces/taskplanner_ws/webapp/node_modules
+    environment:
+      VITE_ROSBRIDGE_URL: ws://127.0.0.1:${ROSBRIDGE_PORT:-9090}
+    ports:
+      - "${WEBAPP_PORT:-4173}:4173"
+    command: >
+      bash -lc "
+        npm install &&
+        npm run dev -- --host 0.0.0.0 --port 4173
+      "
+
+volumes:
+  taskplanner_web_node_modules:

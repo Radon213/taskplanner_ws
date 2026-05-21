@@ -1,0 +1,10 @@
+builtin_interfaces/Time stamp
+string decision
+string selected_tool
+string selected_tool_lifecycle
+string next_required_transition
+string action
+bool handover_allowed
+string rationale
+string decision_reason
+string blocking_guard

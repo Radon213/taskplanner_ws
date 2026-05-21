@@ -1,0 +1,10 @@
+builtin_interfaces/Time stamp
+string procedure_id
+string phase_id
+string intent
+string requested_tool
+bool ready_for_handover
+bool ready_for_retrieval
+bool scripted
+string voice_text
+string scene_note

@@ -1,0 +1,10 @@
+builtin_interfaces/Time stamp
+string source
+string proposal_id
+string instrument_id
+string proposed_transition
+string reducer_result
+string reducer_reason
+bool accepted
+float32 confidence
+string detail_json

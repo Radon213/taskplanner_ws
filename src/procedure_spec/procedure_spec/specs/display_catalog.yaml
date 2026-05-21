@@ -1,0 +1,364 @@
+lifecycle:
+  home_rack:
+    display_name: Waiting
+    display_name_ko: 대기
+    tool_display_state: waiting
+    tool_tone: ready
+    badge_tone: neutral
+  returned_home:
+    display_name: Waiting
+    display_name_ko: 대기
+    tool_display_state: waiting
+    tool_tone: ready
+    badge_tone: neutral
+  prepositioned_right:
+    display_name: Handover
+    display_name_ko: 전달
+    tool_display_state: handover
+    tool_tone: active
+    badge_tone: active
+  surgeon_owned:
+    display_name: Using
+    display_name_ko: 사용중
+    tool_display_state: using
+    tool_tone: surgeon
+    badge_tone: active
+  mayo_reuse:
+    display_name: Waiting
+    display_name_ko: 대기
+    tool_display_state: waiting
+    tool_tone: ready
+    badge_tone: neutral
+  mayo_recovery:
+    display_name: Recovery
+    display_name_ko: 회수
+    tool_display_state: recovery
+    tool_tone: recovery
+    badge_tone: warning
+  recovering_left:
+    display_name: Recovery
+    display_name_ko: 회수
+    tool_display_state: recovery
+    tool_tone: recovery
+    badge_tone: warning
+  cleaning_left:
+    display_name: Cleaning
+    display_name_ko: 세척
+    tool_display_state: cleaning
+    tool_tone: cleaning
+    badge_tone: active
+  cleaned_left:
+    display_name: Waiting
+    display_name_ko: 대기
+    tool_display_state: waiting
+    tool_tone: ready
+    badge_tone: neutral
+
+actions:
+  direct_handover:
+    display_name: Direct handover
+    display_name_ko: 바로 전달
+  pick_up_and_handover:
+    display_name: Pick up and handover
+    display_name_ko: 집어서 전달
+  put_down_and_handover:
+    display_name: Put down and handover
+    display_name_ko: 내려놓고 전달
+  retrieve_from_hand:
+    display_name: Retrieve from hand
+    display_name_ko: 손에서 회수
+  retrieve_from_mayo:
+    display_name: Retrieve from Mayo
+    display_name_ko: 메이요에서 회수
+  predict_tool:
+    display_name: Predict tool
+    display_name_ko: 도구 예측
+  tool_handover:
+    display_name: Handover tool
+    display_name_ko: 도구 전달
+  tool_retrieve:
+    display_name: Retrieve tool
+    display_name_ko: 도구 회수
+  tool_predict:
+    display_name: Predict tool
+    display_name_ko: 도구 예측
+  predicted_tool_handover:
+    display_name: Handover predicted tool
+    display_name_ko: 예측 도구 전달
+  replace_and_handover:
+    display_name: Replace and handover
+    display_name_ko: 다른 도구 전달
+
+skill_states:
+  dispatching:
+    display_name: Dispatching action
+    display_name_ko: 액션 전송 중
+  accepted:
+    display_name: Action accepted
+    display_name_ko: 액션 수락됨
+  executing:
+    display_name: In progress
+    display_name_ko: 진행 중
+  picking_from_rack:
+    display_name: Picking tool from rack
+    display_name_ko: 도구 랙에서 도구 집는 중
+  ready_in_right_hand:
+    display_name: Staging tool in right hand
+    display_name_ko: 오른손에 도구 준비 중
+  moving_to_handover:
+    display_name: Moving to handover
+    display_name_ko: 집도의에게 이동 중
+  handover_to_surgeon:
+    display_name: Handing tool to surgeon
+    display_name_ko: 집도의에게 도구 전달 중
+  retrieving_from_mayo:
+    display_name: Retrieving tool from Mayo stand
+    display_name_ko: 메이요 스탠드에서 도구 가져오는 중
+  inserting_into_cleaner:
+    display_name: Inserting tool into cleaner
+    display_name_ko: 클리너에 도구 넣는 중
+  cleaning:
+    display_name: Cleaning
+    display_name_ko: 클리닝 중
+  returning_to_rack:
+    display_name: Returning tool to rack
+    display_name_ko: 도구 랙에 정리하는 중
+  returning_prediction_to_rack:
+    display_name: Returning predicted tool to rack
+    display_name_ko: 예측 도구를 랙에 내려놓는 중
+  completed:
+    display_name: Completed
+    display_name_ko: 완료
+  rejected:
+    display_name: Rejected
+    display_name_ko: 거절됨
+  dispatch_failed:
+    display_name: Dispatch failed
+    display_name_ko: 액션 전송 실패
+  result_failed:
+    display_name: Result failed
+    display_name_ko: 액션 결과 실패
+  server_unavailable:
+    display_name: Action server unavailable
+    display_name_ko: 액션 서버 연결 안 됨
+
+transitions:
+  recover_left:
+    display_name: Recover with left hand
+    display_name_ko: 왼손 회수
+  clean_left:
+    display_name: Clean with left hand
+    display_name_ko: 왼손 세척
+  return_home:
+    display_name: Return home
+    display_name_ko: 랙 복귀
+  return_unused_preposition:
+    display_name: Return unused preposition
+    display_name_ko: 미사용 예비 도구 복귀
+  cleaning:
+    display_name: Cleaning transfer
+    display_name_ko: 세척 이동
+  handover:
+    display_name: Handover path
+    display_name_ko: 전달 경로
+  recovery:
+    display_name: Recovery path
+    display_name_ko: 회수 경로
+  auto_return:
+    display_name: Return to rack
+    display_name_ko: 랙 복귀
+  anticipatory:
+    display_name: Preposition
+    display_name_ko: 예비 배치
+  active_task:
+    display_name: Active task
+    display_name_ko: 작업 진행
+
+intents:
+  idle:
+    display_name: Idle
+    display_name_ko: 대기
+  request_tool:
+    display_name: Request tool
+    display_name_ko: 도구 요청
+  voice_request:
+    display_name: Voice request
+    display_name_ko: 음성 요청
+  return_tool:
+    display_name: Return tool
+    display_name_ko: 도구 반환
+  extend_hand_for_handover:
+    display_name: Extend hand for handover
+    display_name_ko: 전달 대기
+  extend_hand_for_retrieval:
+    display_name: Extend hand for retrieval
+    display_name_ko: 회수 대기
+  cancel_request:
+    display_name: Cancel request
+    display_name_ko: 요청 취소
+  request_procedure_completion:
+    display_name: Request procedure completion
+    display_name_ko: 수술 종료 요청
+  complete_procedure:
+    display_name: Complete procedure
+    display_name_ko: 수술 종료
+  advance_phase_cue:
+    display_name: Advance phase cue
+    display_name_ko: 수술 단계 진전 신호
+
+events:
+  PhaseEvidenceObserved:
+    display_name: Phase evidence observed
+    display_name_ko: 수술 단계 근거 관측
+    severity: normal
+    tone: perception
+  PhaseTransitionCueObserved:
+    display_name: Phase transition cue observed
+    display_name_ko: 단계 전환 신호 관측
+    severity: normal
+    tone: surgeon
+  PhaseTransitionAccepted:
+    display_name: Phase transition accepted
+    display_name_ko: 단계 전환 승인
+    severity: normal
+    tone: normal
+  PhaseTransitionRejected:
+    display_name: Phase transition rejected
+    display_name_ko: 단계 전환 거부
+    severity: warning
+    tone: warning
+  SurgeonActorEventObserved:
+    display_name: Surgeon event observed
+    display_name_ko: 집도의 이벤트 관측
+    severity: normal
+    tone: surgeon
+  VoiceTranscriptObserved:
+    display_name: Voice observed
+    display_name_ko: 음성 관측
+    severity: normal
+    tone: surgeon
+  SurgeonRequestObserved:
+    display_name: Surgeon request observed
+    display_name_ko: 집도의 요청 관측
+    severity: normal
+    tone: surgeon
+  SurgeonRequestUpdated:
+    display_name: Surgeon request updated
+    display_name_ko: 집도의 요청 갱신
+    severity: normal
+    tone: surgeon
+  ExplicitRequestUpdated:
+    display_name: Explicit request updated
+    display_name_ko: 명시 요청 갱신
+    severity: normal
+    tone: surgeon
+  RobotTaskStarted:
+    display_name: Robot task started
+    display_name_ko: 로봇 작업 시작
+    severity: normal
+    tone: robot
+  RobotTaskCompleted:
+    display_name: Robot task completed
+    display_name_ko: 로봇 작업 완료
+    severity: normal
+    tone: robot
+  RobotGraspedTool:
+    display_name: Robot grasped tool
+    display_name_ko: 로봇 도구 집기
+    severity: normal
+    tone: robot
+  ToolPrepared:
+    display_name: Tool prepared
+    display_name_ko: 도구 준비
+    severity: normal
+    tone: robot
+  PredictedToolReturnedToRack:
+    display_name: Predicted tool returned to rack
+    display_name_ko: 예측 도구 랙 복귀
+    severity: normal
+    tone: robot
+  ToolHandoverCompleted:
+    display_name: Tool handover completed
+    display_name_ko: 도구 전달 완료
+    severity: normal
+    tone: surgeon
+  ToolReceivedFromSurgeon:
+    display_name: Tool received from surgeon
+    display_name_ko: 집도의 도구 회수
+    severity: normal
+    tone: robot
+  ToolSentToCleaner:
+    display_name: Tool sent to cleaner
+    display_name_ko: 도구 세척 투입
+    severity: normal
+    tone: cleaning
+  ToolCleaningCompleted:
+    display_name: Tool cleaning completed
+    display_name_ko: 도구 세척 완료
+    severity: normal
+    tone: cleaning
+  ToolReturnedToTray:
+    display_name: Tool returned to tray
+    display_name_ko: 도구 랙 복귀
+    severity: normal
+    tone: robot
+  VLMProposalAccepted:
+    display_name: VLM proposal accepted
+    display_name_ko: VLM 제안 승인
+    severity: normal
+    tone: neutral
+  VLMProposalRejected:
+    display_name: VLM proposal rejected
+    display_name_ko: VLM 제안 거절
+    severity: warning
+    tone: warning
+  VLMProposalIgnored:
+    display_name: VLM proposal ignored
+    display_name_ko: VLM 제안 무시
+    severity: warning
+    tone: warning
+  ProcedureCompleted:
+    display_name: Procedure completed
+    display_name_ko: 수술 완료
+    severity: normal
+    tone: neutral
+  PhaseUpdated:
+    display_name: Phase updated
+    display_name_ko: 단계 갱신
+    severity: normal
+    tone: neutral
+  RecoveryTransactionOpened:
+    display_name: Recovery transaction opened
+    display_name_ko: 회수 절차 시작
+    severity: normal
+    tone: robot
+  RecoveryTransactionClosed:
+    display_name: Recovery transaction closed
+    display_name_ko: 회수 절차 종료
+    severity: normal
+    tone: robot
+  RecoveryTransactionIgnored:
+    display_name: Recovery transaction ignored
+    display_name_ko: 회수 절차 무시
+    severity: warning
+    tone: warning
+  RecoveryTransactionPromotedMayoReuse:
+    display_name: Reuse promoted to recovery
+    display_name_ko: 재사용 도구 회수 전환
+    severity: normal
+    tone: robot
+  InvariantViolationIgnored:
+    display_name: Invariant violation ignored
+    display_name_ko: 불변 조건 위반 무시
+    severity: error
+    tone: warning
+  CleanerConflictQueued:
+    display_name: Cleaner conflict queued
+    display_name_ko: 클리너 충돌 대기열 등록
+    severity: warning
+    tone: warning
+  CleanerBusyToolQueued:
+    display_name: Cleaner busy tool queued
+    display_name_ko: 클리너 사용 중 도구 대기
+    severity: warning
+    tone: warning

@@ -1,0 +1,30 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>bringup</name>
+  <version>0.1.0</version>
+  <description>Bringup launch assets for taskplanner v1.</description>
+  <maintainer email="codex@example.com">Codex</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <exec_depend>auto_apms_behavior_tree</exec_depend>
+  <exec_depend>btops_gateway</exec_depend>
+  <exec_depend>btops_interfaces</exec_depend>
+  <exec_depend>bt_orchestrator</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>or_digital_twin</exec_depend>
+  <exec_depend>phase_estimator</exec_depend>
+  <exec_depend>procedure_spec</exec_depend>
+  <exec_depend>rcl_interfaces</exec_depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>simulation_runtime</exec_depend>
+  <exec_depend>skill_execution</exec_depend>
+  <exec_depend>surgical_msgs</exec_depend>
+  <exec_depend>vlm_node</exec_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

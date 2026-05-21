@@ -1,0 +1,716 @@
+"""Simulation manager service surface for bundle and runtime control."""
+
+from __future__ import annotations
+
+from pathlib import Path
+import socket
+import threading
+import time
+
+from ament_index_python.packages import get_package_share_directory
+from btops_interfaces.srv import CommandExecutor, GetRuntimeState, StartBehavior
+from procedure_spec import load_bundle
+import rclpy
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.node import Node
+from rclpy.parameter import Parameter
+from rclpy.parameter_client import AsyncParameterClient
+from std_msgs.msg import String
+from surgical_msgs.msg import SimulationState, SurgeonRequest
+from surgical_msgs.srv import ControlSimulation, InjectSurgeonOverride, SelectSimulationBundle
+
+
+RESOURCE_ID = "tree/taskplanner_bt_trees::surgical_assist_v1::TaskplannerAssistDemo"
+ENTRY_POINT = "TaskplannerAssistDemo"
+NODE_MANIFESTS = ["taskplanner_bt_nodes::taskplanner_bt_nodes"]
+
+
+class SimulationManagerNode(Node):
+    def __init__(self) -> None:
+        super().__init__("simulation_manager")
+        default_root = Path(get_package_share_directory("procedure_spec")) / "specs"
+        self.declare_parameter("spec_root", str(default_root))
+        self.declare_parameter("default_bundle", "thyroidectomy")
+        self.declare_parameter("executor_name", "tree_executor")
+        self.declare_parameter("tick_rate_hz", 0.1)
+        self.declare_parameter("groot2_port", 0)
+
+        self._spec_root = Path(str(self.get_parameter("spec_root").value))
+        self._active_bundle = str(self.get_parameter("default_bundle").value)
+        self._executor_name = str(self.get_parameter("executor_name").value)
+        self._tick_rate_hz = float(self.get_parameter("tick_rate_hz").value)
+        self._groot2_port = int(self.get_parameter("groot2_port").value)
+        self._running = False
+        self._execution_state = "idle"
+        self._bundle_dirty = False
+        self._operation_name = ""
+        self._operation_cancel = threading.Event()
+        self._operation_lock = threading.Lock()
+        self._completion_terminate_started = False
+        self._latest_state: SimulationState | None = None
+        self._latest_state_lock = threading.Lock()
+        self._callback_group = ReentrantCallbackGroup()
+
+        self._control_pub = self.create_publisher(String, "/simulation/control_state", 10)
+        self._override_pub = self.create_publisher(SurgeonRequest, "/simulation/surgeon_override", 10)
+        self.create_subscription(
+            SimulationState,
+            "/simulation/state",
+            self._on_simulation_state,
+            20,
+            callback_group=self._callback_group,
+        )
+
+        self._start_client = self.create_client(
+            StartBehavior,
+            "/btops/start_behavior",
+            callback_group=self._callback_group,
+        )
+        self._command_client = self.create_client(
+            CommandExecutor,
+            "/btops/command_executor",
+            callback_group=self._callback_group,
+        )
+        self._runtime_client = self.create_client(
+            GetRuntimeState,
+            "/btops/get_runtime_state",
+            callback_group=self._callback_group,
+        )
+        self._parameter_clients = {
+            "/mock_vlm_node": AsyncParameterClient(
+                self, "/mock_vlm_node", callback_group=self._callback_group
+            ),
+            "/real_vlm_node": AsyncParameterClient(
+                self, "/real_vlm_node", callback_group=self._callback_group
+            ),
+            "/phase_estimator": AsyncParameterClient(
+                self, "/phase_estimator", callback_group=self._callback_group
+            ),
+            "/or_digital_twin": AsyncParameterClient(
+                self, "/or_digital_twin", callback_group=self._callback_group
+            ),
+            "/surgeon_actor": AsyncParameterClient(
+                self, "/surgeon_actor", callback_group=self._callback_group
+            ),
+        }
+
+        self.create_service(
+            SelectSimulationBundle,
+            "/simulation/select_bundle",
+            self._handle_select_bundle,
+            callback_group=self._callback_group,
+        )
+        self.create_service(
+            ControlSimulation,
+            "/simulation/control",
+            self._handle_control,
+            callback_group=self._callback_group,
+        )
+        self.create_service(
+            InjectSurgeonOverride,
+            "/simulation/inject_surgeon_override",
+            self._handle_override,
+            callback_group=self._callback_group,
+        )
+
+    def _wait_future(self, future, timeout_sec: float = 10.0):
+        deadline = time.time() + timeout_sec
+        while time.time() < deadline:
+            if future.done():
+                return future.result()
+            time.sleep(0.05)
+        raise TimeoutError("Timed out waiting for async operation to complete.")
+
+    def _spec_dir_for_bundle(self, bundle_name: str) -> Path:
+        bundle_dir = self._spec_root / bundle_name
+        if not bundle_dir.is_dir():
+            raise FileNotFoundError(f"bundle '{bundle_name}' not found under {self._spec_root}")
+        load_bundle(bundle_dir)
+        return bundle_dir
+
+    def _publish_control(self, command: str, repeat_count: int = 2) -> None:
+        deadline = time.time() + 2.0
+        while self._control_pub.get_subscription_count() < 1 and time.time() < deadline:
+            time.sleep(0.05)
+        msg = String()
+        msg.data = command
+        for _ in range(max(1, repeat_count)):
+            self._control_pub.publish(msg)
+            time.sleep(0.05)
+
+    def _on_simulation_state(self, msg: SimulationState) -> None:
+        with self._latest_state_lock:
+            self._latest_state = msg
+        if msg.execution_state == "completed":
+            should_terminate = self._running or self._execution_state != "completed"
+            self._running = False
+            self._execution_state = "completed"
+            if should_terminate and not self._completion_terminate_started:
+                self._completion_terminate_started = True
+                thread = threading.Thread(
+                    target=self._terminate_executor_after_completion,
+                    name="simulation-completion-terminate",
+                    daemon=True,
+                )
+                thread.start()
+
+    def _terminate_executor_after_completion(self) -> None:
+        try:
+            self._command_executor("terminate")
+            self._wait_for_executor_idle(timeout_sec=8.0)
+        except Exception as exc:
+            self.get_logger().warn(f"failed to terminate executor after completion: {exc}")
+        finally:
+            self._running = False
+            self._execution_state = "completed"
+            self._completion_terminate_started = False
+
+    def _wait_for_simulation_state(
+        self,
+        predicate,
+        timeout_sec: float,
+        description: str,
+        *,
+        warn: bool = True,
+    ) -> bool:
+        deadline = time.time() + timeout_sec
+        while time.time() < deadline:
+            with self._latest_state_lock:
+                state = self._latest_state
+            if state is not None:
+                try:
+                    if predicate(state):
+                        return True
+                except Exception:
+                    pass
+            time.sleep(0.1)
+        if warn:
+            self.get_logger().warn(f"Timed out waiting for {description}.")
+        return False
+
+    def _raise_if_operation_cancelled(self) -> None:
+        if self._operation_cancel.is_set():
+            raise RuntimeError("operation interrupted by newer control command")
+
+    @staticmethod
+    def _state_stamp_key(state: SimulationState | None) -> tuple[int, int] | None:
+        if state is None:
+            return None
+        return (int(state.stamp.sec), int(state.stamp.nanosec))
+
+    def _publish_control_until(self, command: str, predicate, timeout_sec: float, description: str) -> bool:
+        deadline = time.time() + timeout_sec
+        attempts = 3
+        for attempt in range(attempts):
+            if self._operation_cancel.is_set():
+                return False
+            with self._latest_state_lock:
+                previous_stamp = self._state_stamp_key(self._latest_state)
+            self._publish_control(command, repeat_count=2)
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            wait_slice = max(0.5, remaining / max(1, attempts - attempt))
+            if self._wait_for_simulation_state(
+                lambda state: self._state_stamp_key(state) != previous_stamp and predicate(state),
+                timeout_sec=min(wait_slice, remaining),
+                description=description,
+                warn=False,
+            ):
+                return True
+        self.get_logger().warn(f"Timed out waiting for {description}.")
+        return False
+
+    @staticmethod
+    def _all_instruments_home(state: SimulationState) -> bool:
+        if not state.instrument_states:
+            return False
+        for instrument in state.instrument_states:
+            home_location_id = str(instrument.home_location_id)
+            home_location_type = str(instrument.home_location_type)
+            if home_location_id and str(instrument.location_id) != home_location_id:
+                return False
+            if home_location_type and str(instrument.location_type) != home_location_type:
+                return False
+        return True
+
+    def _set_spec_dir_on_runtime(self, spec_dir: Path) -> None:
+        deadline = time.time() + 8.0
+        pending_clients = list(self._parameter_clients.items())
+        optional_clients = {"/mock_vlm_node", "/real_vlm_node", "/phase_estimator"}
+        updated_clients: set[str] = set()
+        while pending_clients and time.time() < deadline:
+            still_pending = []
+            for name, client in pending_clients:
+                if client.services_are_ready() or client.wait_for_services(timeout_sec=0.25):
+                    future = client.set_parameters([Parameter(name="spec_dir", value=str(spec_dir))])
+                    self._wait_future(future, timeout_sec=10.0)
+                    updated_clients.add(name)
+                else:
+                    still_pending.append((name, client))
+            pending_clients = still_pending
+        if pending_clients:
+            required_missing = [name for name, _ in pending_clients if name not in optional_clients]
+            for name, _ in pending_clients:
+                if name in optional_clients:
+                    self.get_logger().info(f"optional parameter service unavailable, skipping spec update for {name}")
+            if required_missing:
+                missing = ", ".join(required_missing)
+                raise TimeoutError(f"parameter services not ready for: {missing}")
+        if not updated_clients.intersection({"/mock_vlm_node", "/real_vlm_node"}):
+            self.get_logger().info("no VLM parameter service was available during bundle switch; continuing without direct spec update")
+
+    def _start_behavior(self, clear_blackboard: bool) -> tuple[bool, str]:
+        if not self._start_client.wait_for_service(timeout_sec=5.0):
+            return False, "btops start_behavior service is unavailable"
+        last_message = "btops start_behavior returned no response"
+        retryable_markers = (
+            "/tree_executor/set_parameters",
+            "previous one is still busy",
+            "currently executing",
+            "parameter is not allowed to change while tree executor is running",
+        )
+        for attempt in range(5):
+            self._raise_if_operation_cancelled()
+            self._wait_for_executor_idle(timeout_sec=3.0)
+            requested_groot2_port = self._reserve_groot2_port()
+            request = StartBehavior.Request()
+            request.executor_name = self._executor_name
+            request.mode = "resource"
+            request.category = "tree"
+            request.resource_identity = RESOURCE_ID
+            request.inline_source = ""
+            request.source_format = ""
+            request.build_handler = ""
+            request.entry_point = ENTRY_POINT
+            request.node_manifest_identities = list(NODE_MANIFESTS)
+            request.attach = False
+            request.clear_blackboard = clear_blackboard
+            request.enable_monitoring = True
+            request.tick_rate_hz = float(self._tick_rate_hz)
+            request.requested_groot2_port = int(requested_groot2_port)
+            request.parameter_assignments = []
+            future = self._start_client.call_async(request)
+            deadline = time.time() + 15.0
+            response = None
+            while time.time() < deadline:
+                self._raise_if_operation_cancelled()
+                if future.done():
+                    response = future.result()
+                    break
+                time.sleep(0.05)
+            if response is None:
+                if self._wait_for_executor_running(timeout_sec=4.0):
+                    return True, "simulation started after delayed start_behavior response"
+                time.sleep(0.25 * (attempt + 1))
+                continue
+            if response.success:
+                return True, str(response.message)
+            last_message = str(response.message)
+            lowered_message = last_message.lower()
+            if any(marker in lowered_message for marker in retryable_markers):
+                if self._wait_for_executor_running(timeout_sec=4.0):
+                    return True, last_message
+                self._command_executor("terminate")
+                self._wait_for_executor_idle(timeout_sec=8.0)
+                time.sleep(0.35 * (attempt + 1))
+                continue
+            return False, last_message
+        return False, last_message
+
+    def _reserve_groot2_port(self) -> int:
+        if self._groot2_port > 0:
+            return int(self._groot2_port)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            return int(sock.getsockname()[1])
+
+    def _command_executor(self, command: str) -> tuple[bool, str]:
+        if not self._command_client.wait_for_service(timeout_sec=5.0):
+            return False, "btops command_executor service is unavailable"
+        request = CommandExecutor.Request()
+        request.executor_name = self._executor_name
+        request.command = command
+        future = self._command_client.call_async(request)
+        response = self._wait_future(future, timeout_sec=10.0)
+        if response is None:
+            return False, "btops command_executor returned no response"
+        return bool(response.success), str(response.message)
+
+    def _get_runtime_state(self) -> tuple[bool, str]:
+        if not self._runtime_client.wait_for_service(timeout_sec=5.0):
+            return False, "unknown"
+        request = GetRuntimeState.Request()
+        request.executor_name = self._executor_name
+        future = self._runtime_client.call_async(request)
+        response = self._wait_future(future, timeout_sec=10.0)
+        if response is None or not response.success:
+            return False, "unknown"
+        return True, str(response.snapshot.execution_state).lower()
+
+    def _wait_for_executor_idle(self, timeout_sec: float = 8.0) -> bool:
+        deadline = time.time() + timeout_sec
+        idle_states = {"", "idle", "terminated", "halted", "unknown"}
+        while time.time() < deadline:
+            try:
+                success, state = self._get_runtime_state()
+                if not success or state in idle_states:
+                    return True
+            except Exception:
+                return True
+            time.sleep(0.15)
+        return False
+
+    def _wait_for_executor_running(self, timeout_sec: float = 10.0) -> bool:
+        deadline = time.time() + timeout_sec
+        running_states = {"running", "active", "executing"}
+        while time.time() < deadline:
+            try:
+                success, state = self._get_runtime_state()
+                if success and state in running_states:
+                    return True
+            except Exception:
+                pass
+            time.sleep(0.15)
+        return False
+
+    def _prepare_executor_for_restart(self) -> None:
+        if not self._running and self._execution_state in {"idle", "terminated", "halted"}:
+            try:
+                success, state = self._get_runtime_state()
+                if not success or state in {"", "idle", "terminated", "halted", "unknown"}:
+                    return
+            except Exception:
+                return
+        try:
+            self._command_executor("terminate")
+            self._wait_for_executor_idle(timeout_sec=8.0)
+        except Exception:
+            # It is fine if the executor was not running yet.
+            pass
+
+    def _begin_operation(self, name: str) -> bool:
+        with self._operation_lock:
+            if self._operation_name:
+                return False
+            self._operation_cancel.clear()
+            self._operation_name = name
+            return True
+
+    def _finish_operation(self, name: str) -> None:
+        with self._operation_lock:
+            if self._operation_name == name:
+                self._operation_name = ""
+                self._operation_cancel.clear()
+
+    def _wait_for_operation_clear(self, timeout_sec: float = 10.0) -> bool:
+        deadline = time.time() + timeout_sec
+        while time.time() < deadline:
+            with self._operation_lock:
+                if not self._operation_name:
+                    return True
+            time.sleep(0.1)
+        return False
+
+    def _run_async(self, name: str, target) -> tuple[bool, str]:
+        if not self._begin_operation(name):
+            return False, f"{self._operation_name} already in progress"
+
+        def runner() -> None:
+            try:
+                target()
+            except Exception as exc:
+                self.get_logger().error(f"{name} operation failed: {exc}")
+                if name == "start" and not self._operation_cancel.is_set():
+                    self._publish_control("stop")
+                    self._set_idle_state()
+            finally:
+                self._finish_operation(name)
+
+        thread = threading.Thread(target=runner, name=f"simulation-{name}", daemon=True)
+        thread.start()
+        return True, f"{name} requested"
+
+    def _run_sync(self, name: str, target) -> tuple[bool, str]:
+        if not self._begin_operation(name):
+            return False, f"{self._operation_name} already in progress"
+        try:
+            message = target()
+            return True, str(message or f"{name} completed")
+        except Exception as exc:
+            self.get_logger().error(f"{name} operation failed: {exc}")
+            return False, str(exc)
+        finally:
+            self._finish_operation(name)
+
+    def _start_sequence(self) -> str:
+        self._running = False
+        self._execution_state = "starting"
+        self._completion_terminate_started = False
+        self._prepare_executor_for_restart()
+        self._raise_if_operation_cancelled()
+        if not self._publish_control_until(
+            "reset",
+            lambda state: (
+                state.active_bundle == self._active_bundle
+                and (not state.running)
+                and state.execution_state == "idle"
+                and self._all_instruments_home(state)
+            ),
+            timeout_sec=8.0,
+            description="initial idle digital twin frame",
+        ):
+            self._raise_if_operation_cancelled()
+            raise RuntimeError("digital twin did not publish an idle home frame after reset")
+        self._raise_if_operation_cancelled()
+        if not self._publish_control_until(
+            "start_runtime",
+            lambda state: (
+                state.active_bundle == self._active_bundle
+                and state.running
+                and state.execution_state == "running"
+                and self._all_instruments_home(state)
+            ),
+            timeout_sec=8.0,
+            description="initial home running digital twin frame",
+        ):
+            self._raise_if_operation_cancelled()
+            raise RuntimeError("digital twin did not enter running state before BT start")
+        self._raise_if_operation_cancelled()
+        # Actors can begin observing the prepared running frame while BTops is
+        # starting. Requests are queued in the twin, so this reduces the
+        # perceived wait for the first tool without letting BT run before the
+        # digital twin is initialized.
+        self._publish_control("start_actors")
+        self._raise_if_operation_cancelled()
+        success, message = self._start_behavior(clear_blackboard=True)
+        if success:
+            self._raise_if_operation_cancelled()
+            self._wait_for_executor_running(timeout_sec=10.0)
+            self._raise_if_operation_cancelled()
+            self._running = True
+            self._execution_state = "running"
+            self._bundle_dirty = False
+            self.get_logger().info(message or "simulation started")
+            return message or f"simulation running on {self._active_bundle}"
+        self._publish_control("stop")
+        self._set_idle_state()
+        raise RuntimeError(message or "failed to start simulation")
+
+    def _interrupt_start_sequence(self, command: str) -> str:
+        self._operation_cancel.set()
+        self._running = False
+        self._execution_state = "resetting" if command == "reset" else "stopping"
+        self._publish_control("reset" if command == "reset" else "stop")
+        try:
+            self._command_executor("terminate")
+            self._wait_for_executor_idle(timeout_sec=6.0)
+        except Exception as exc:
+            self.get_logger().warn(f"failed to terminate executor while interrupting start: {exc}")
+        if command == "reset":
+            self._publish_control("reset")
+            self._set_idle_state()
+            return "start interrupted; simulation runtime reset to idle"
+        self._execution_state = "halted"
+        return "start interrupted; simulation stopped"
+
+    def _pause_sequence(self) -> str:
+        if self._execution_state == "paused":
+            return "simulation already paused"
+        if not self._running or self._execution_state != "running":
+            raise RuntimeError("simulation is not running")
+        success, message = self._command_executor("pause")
+        if not success:
+            raise RuntimeError(message or "failed to pause simulation")
+        self._publish_control("pause")
+        self._running = True
+        self._execution_state = "paused"
+        self.get_logger().info(message or "simulation paused")
+        return message or "simulation paused"
+
+    def _resume_sequence(self) -> str:
+        if self._running and self._execution_state == "running":
+            return "simulation already running"
+        if self._execution_state != "paused":
+            raise RuntimeError("simulation is not paused")
+        self._publish_control("resume")
+        self._wait_for_simulation_state(
+            lambda state: state.running and state.execution_state == "running" and len(state.instrument_states) > 0,
+            timeout_sec=5.0,
+            description="resumed digital twin frame",
+        )
+        success, message = self._command_executor("resume")
+        if not success:
+            self._publish_control("pause")
+            raise RuntimeError(message or "failed to resume simulation")
+        self._wait_for_executor_running(timeout_sec=8.0)
+        self._running = True
+        self._execution_state = "running"
+        self.get_logger().info(message or "simulation resumed")
+        return message or "simulation resumed"
+
+    def _stop_sequence(self) -> str:
+        self._running = False
+        self._execution_state = "stopping"
+        self._publish_control("stop")
+        success, message = self._command_executor("terminate")
+        self._wait_for_executor_idle(timeout_sec=8.0)
+        if success:
+            self._execution_state = "halted"
+            self.get_logger().info(message or "simulation stopped")
+            return message or "simulation stopped"
+        self._execution_state = "halted"
+        raise RuntimeError(message or "failed to stop simulation")
+
+    def _reset_sequence(self) -> str:
+        self._running = False
+        self._execution_state = "resetting"
+        self._completion_terminate_started = False
+        self._publish_control("reset")
+        self._prepare_executor_for_restart()
+        self._set_idle_state()
+        return "simulation runtime reset to idle"
+
+    def _set_idle_state(self) -> None:
+        self._running = False
+        self._execution_state = "idle"
+
+    def _handle_select_bundle(self, request, response):
+        try:
+            spec_dir = self._spec_dir_for_bundle(request.bundle_name)
+            self._set_spec_dir_on_runtime(spec_dir)
+            self._active_bundle = request.bundle_name
+            self._bundle_dirty = True
+            if self._running and request.restart_if_running:
+                success, message = self._run_sync("bundle-restart", self._start_sequence)
+                response.success = success
+                response.message = message
+            else:
+                self._publish_control("reset")
+                self._set_idle_state()
+                response.success = True
+                response.message = f"active bundle set to {request.bundle_name}"
+            response.active_bundle = self._active_bundle
+            response.spec_dir = str(spec_dir)
+            return response
+        except Exception as exc:
+            response.success = False
+            response.message = str(exc)
+            response.active_bundle = self._active_bundle
+            response.spec_dir = ""
+            return response
+
+    def _handle_control(self, request, response):
+        command = request.command.strip().lower()
+        try:
+            if self._operation_name == "start":
+                if command in {"stop", "reset"}:
+                    message = self._interrupt_start_sequence(command)
+                    response.success = True
+                    response.message = message
+                    response.running = self._running
+                    response.execution_state = self._execution_state
+                    return response
+                if command == "start":
+                    response.success = True
+                    response.message = "start already in progress"
+                    response.running = self._running
+                    response.execution_state = self._execution_state
+                    return response
+                if command in {"pause", "resume"}:
+                    response.success = False
+                    response.message = "simulation is still starting"
+                    response.running = self._running
+                    response.execution_state = self._execution_state
+                    return response
+            elif command in {"start", "resume"} and self._operation_name in {"stop", "reset", "pause"}:
+                if not self._wait_for_operation_clear(timeout_sec=25.0):
+                    response.success = False
+                    response.message = f"{self._operation_name} already in progress"
+                    response.running = self._running
+                    response.execution_state = self._execution_state
+                    return response
+
+            if command == "start":
+                if self._running and self._execution_state == "running":
+                    response.success = True
+                    response.message = "simulation already running"
+                else:
+                    self._running = False
+                    self._execution_state = "starting"
+                    success, message = self._run_async("start", self._start_sequence)
+                    response.success = success
+                    response.message = message
+            elif command == "pause":
+                success, message = self._run_sync("pause", self._pause_sequence)
+                response.success = success
+                response.message = message
+            elif command == "resume":
+                success, message = self._run_sync("resume", self._resume_sequence)
+                response.success = success
+                response.message = message
+            elif command == "reset":
+                self._bundle_dirty = False
+                success, message = self._run_async("reset", self._reset_sequence)
+                response.success = success
+                response.message = message
+            elif command == "stop":
+                if not self._running and self._execution_state in {"idle", "halted", "terminated"}:
+                    response.success = True
+                    response.message = "simulation already stopped"
+                    response.running = self._running
+                    response.execution_state = self._execution_state
+                    return response
+                success, message = self._run_sync("stop", self._stop_sequence)
+                response.success = success
+                response.message = message
+            else:
+                response.success = False
+                response.message = f"unsupported simulation control command '{request.command}'"
+            response.running = self._running
+            response.execution_state = self._execution_state
+            return response
+        except Exception as exc:
+            response.success = False
+            response.message = str(exc)
+            response.running = self._running
+            response.execution_state = self._execution_state
+            return response
+
+    def _handle_override(self, request, response):
+        if request.clear_pending_requests:
+            cancel = SurgeonRequest()
+            cancel.event_type = "cancel_request"
+            cancel.override = True
+            cancel.note = "clear pending requests before override"
+            self._override_pub.publish(cancel)
+        msg = SurgeonRequest()
+        msg.event_type = request.event_type
+        msg.requested_tool = request.requested_tool
+        msg.voice_text = request.voice_text
+        msg.ready_for_handover = bool(request.ready_for_handover)
+        msg.ready_for_retrieval = bool(request.ready_for_retrieval)
+        msg.override = True
+        msg.note = "simulation_manager override"
+        self._override_pub.publish(msg)
+        response.success = True
+        response.message = "surgeon override published"
+        return response
+
+
+def main() -> None:
+    rclpy.init()
+    node = SimulationManagerNode()
+    executor = MultiThreadedExecutor(num_threads=4)
+    executor.add_node(node)
+    try:
+        executor.spin()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        executor.shutdown()
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()

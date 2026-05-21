@@ -1,0 +1,7 @@
+string bundle_name
+bool restart_if_running
+---
+bool success
+string message
+string active_bundle
+string spec_dir

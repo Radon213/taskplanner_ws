@@ -1,0 +1,9 @@
+builtin_interfaces/Time stamp
+string event_type
+string tool_id
+string phase_id
+string voice_text
+string note
+bool ready_for_handover
+bool ready_for_retrieval
+bool override

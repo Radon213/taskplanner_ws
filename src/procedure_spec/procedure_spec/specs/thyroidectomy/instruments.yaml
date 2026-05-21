@@ -1,0 +1,54 @@
+instruments:
+  - id: retractor
+    display_name: Army-Navy retractor
+    display_name_ko: 아미-네이비 리트랙터
+    aliases: [retractor, army navy, retract, 리트랙터]
+    category: exposure
+    requestable: true
+    role: exposure
+    handover_profile: handle_grasp
+
+  - id: cautery
+    display_name: Cautery (Bovie)
+    display_name_ko: 전기소작기
+    aliases: [cautery, bovie, cautery pen, 전기소작기]
+    category: dissection
+    requestable: true
+    role: hemostasis
+    handover_profile: shaft_grasp
+
+  - id: metzenbaum
+    display_name: Metzenbaum scissors
+    display_name_ko: 메첸바움 가위
+    aliases: [metzen, metz, metzenbaum scissors, 메츤]
+    category: cutting
+    requestable: true
+    role: dissection
+    handover_profile: ring_grasp
+
+  - id: suction
+    display_name: Suction tip
+    display_name_ko: 석션 팁
+    aliases: [suction, suction tip, 흡입기]
+    category: suction
+    requestable: true
+    role: suction
+    handover_profile: shaft_grasp
+
+  - id: right_angle
+    display_name: Right-angle clamp
+    display_name_ko: 라이트 앵글 클램프
+    aliases: [right angle, mixter, 라이트앵글]
+    category: dissection
+    requestable: true
+    role: vessel_control
+    handover_profile: handle_grasp
+
+  - id: forceps
+    display_name: Tissue forceps
+    display_name_ko: 조직 겸자
+    aliases: [forceps, tissue forceps, 포셉]
+    category: grasping
+    requestable: true
+    role: closure
+    handover_profile: pinch_grasp
