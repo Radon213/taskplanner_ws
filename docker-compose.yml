@@ -8,6 +8,8 @@ services:
       args:
         BTOPS_REPO_URL: ${BTOPS_REPO_URL:?Set BTOPS_REPO_URL in .env or pass it as a build arg}
         BTOPS_REF: ${BTOPS_REF:-main}
+        AUTO_APMS_REPO_URL: ${AUTO_APMS_REPO_URL:-https://github.com/AutoAPMS/auto-apms.git}
+        AUTO_APMS_REF: ${AUTO_APMS_REF:-1.5.1}
     image: taskplanner-ws:dev
     working_dir: /workspaces/taskplanner_ws
     volumes:
@@ -32,6 +34,8 @@ services:
       args:
         BTOPS_REPO_URL: ${BTOPS_REPO_URL:?Set BTOPS_REPO_URL in .env or pass it as a build arg}
         BTOPS_REF: ${BTOPS_REF:-main}
+        AUTO_APMS_REPO_URL: ${AUTO_APMS_REPO_URL:-https://github.com/AutoAPMS/auto-apms.git}
+        AUTO_APMS_REF: ${AUTO_APMS_REF:-1.5.1}
     image: taskplanner-ws:dev
     working_dir: /workspaces/taskplanner_ws
     volumes:
@@ -66,6 +70,8 @@ services:
       args:
         BTOPS_REPO_URL: ${BTOPS_REPO_URL:?Set BTOPS_REPO_URL in .env or pass it as a build arg}
         BTOPS_REF: ${BTOPS_REF:-main}
+        AUTO_APMS_REPO_URL: ${AUTO_APMS_REPO_URL:-https://github.com/AutoAPMS/auto-apms.git}
+        AUTO_APMS_REF: ${AUTO_APMS_REF:-1.5.1}
     image: taskplanner-ws:dev
     working_dir: /workspaces/taskplanner_ws/webapp
     volumes:

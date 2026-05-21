@@ -5,6 +5,8 @@ SHELL ["/bin/bash", "-c"]
 
 ARG BTOPS_REPO_URL=""
 ARG BTOPS_REF="main"
+ARG AUTO_APMS_REPO_URL="https://github.com/AutoAPMS/auto-apms.git"
+ARG AUTO_APMS_REF="1.5.1"
 ARG DEBIAN_FRONTEND=noninteractive
 
 ENV ROS_DOMAIN_ID=0
@@ -36,12 +38,13 @@ RUN mkdir -p /root/.ssh \
     && ssh-keyscan github.com >> /root/.ssh/known_hosts
 
 RUN --mount=type=ssh mkdir -p "${BTOPS_WS}/src" \
+    && git clone --depth 1 --branch "${AUTO_APMS_REF}" "${AUTO_APMS_REPO_URL}" "${BTOPS_WS}/src/auto_apms" \
     && git clone --depth 1 --branch "${BTOPS_REF}" "${BTOPS_REPO_URL}" "${BTOPS_WS}/src/btops_ws_src"
 
 RUN source /opt/ros/jazzy/setup.bash \
     && cd "${BTOPS_WS}" \
     && rosdep update || true \
-    && rosdep install --from-paths src --ignore-src -r -y \
+    && rosdep install --from-paths src --ignore-src -r -y --skip-keys "ament_python" \
     && colcon build --symlink-install
 
 WORKDIR ${TASKPLANNER_WS}

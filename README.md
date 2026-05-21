@@ -37,9 +37,12 @@ Set:
 ```bash
 BTOPS_REPO_URL=git@github.com:Radon213/btops_ws.git
 BTOPS_REF=main
+AUTO_APMS_REPO_URL=https://github.com/AutoAPMS/auto-apms.git
+AUTO_APMS_REF=1.5.1
 ```
 
 If the BT Ops repository is private, ensure Docker has access to an SSH agent that can read the repository. For local development, run the build from a shell where `ssh -T git@github.com` succeeds.
+AutoAPMS is built from source inside the Docker image so the environment does not depend on stale or unavailable ROS apt packages.
 
 ## Docker Quickstart
 

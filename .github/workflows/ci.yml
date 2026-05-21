@@ -10,6 +10,8 @@ jobs:
     env:
       BTOPS_REPO_URL: ${{ vars.BTOPS_REPO_URL || 'git@github.com:Radon213/btops_ws.git' }}
       BTOPS_REF: ${{ vars.BTOPS_REF || 'main' }}
+      AUTO_APMS_REPO_URL: ${{ vars.AUTO_APMS_REPO_URL || 'https://github.com/AutoAPMS/auto-apms.git' }}
+      AUTO_APMS_REF: ${{ vars.AUTO_APMS_REF || '1.5.1' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -36,6 +38,8 @@ jobs:
             --ssh default \
             --build-arg BTOPS_REPO_URL="${BTOPS_REPO_URL}" \
             --build-arg BTOPS_REF="${BTOPS_REF}" \
+            --build-arg AUTO_APMS_REPO_URL="${AUTO_APMS_REPO_URL}" \
+            --build-arg AUTO_APMS_REF="${AUTO_APMS_REF}" \
             taskplanner-dev
 
       - name: Build ROS workspace
