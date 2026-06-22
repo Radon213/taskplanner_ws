@@ -16,6 +16,7 @@ def generate_launch_description() -> LaunchDescription:
     vlm_base_url = LaunchConfiguration("vlm_base_url")
     vlm_model_id = LaunchConfiguration("vlm_model_id")
     vlm_api_mode = LaunchConfiguration("vlm_api_mode")
+    vlm_publish_period_sec = LaunchConfiguration("vlm_publish_period_sec")
     vlm_response_mode = LaunchConfiguration("vlm_response_mode")
     validation_mode = LaunchConfiguration("validation_mode")
     enable_no_image_camera = LaunchConfiguration("enable_no_image_camera")
@@ -23,6 +24,12 @@ def generate_launch_description() -> LaunchDescription:
     field_snapshot_url = LaunchConfiguration("field_snapshot_url")
     spec_default = PathJoinSubstitution(
         [FindPackageShare("procedure_spec"), "specs", "thyroidectomy"]
+    )
+    mock_vlm_enabled = PythonExpression(
+        ["'", vlm_mode, "' == 'mock' or '", vlm_mode, "' == 'dual'"]
+    )
+    real_vlm_enabled = PythonExpression(
+        ["'", vlm_mode, "' == 'real' or '", vlm_mode, "' == 'dual'"]
     )
 
     rosbridge_process = ExecuteProcess(
@@ -51,6 +58,7 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("vlm_base_url", default_value="http://host.docker.internal:8000"),
             DeclareLaunchArgument("vlm_model_id", default_value="nvidia/diffusiongemma-26B-A4B-it-NVFP4"),
             DeclareLaunchArgument("vlm_api_mode", default_value="openai_compat"),
+            DeclareLaunchArgument("vlm_publish_period_sec", default_value="1.0"),
             DeclareLaunchArgument("vlm_response_mode", default_value="live"),
             DeclareLaunchArgument("validation_mode", default_value="bt_twin"),
             DeclareLaunchArgument("enable_no_image_camera", default_value="true"),
@@ -73,9 +81,7 @@ def generate_launch_description() -> LaunchDescription:
                 package="vlm_node",
                 executable="mock_vlm",
                 name="mock_vlm_node",
-                condition=IfCondition(
-                    PythonExpression(["'", vlm_mode, "' in ['mock', 'dual']"])
-                ),
+                condition=IfCondition(mock_vlm_enabled),
                 parameters=[
                     {
                         "spec_dir": spec_dir,
@@ -120,15 +126,14 @@ def generate_launch_description() -> LaunchDescription:
                 package="vlm_node",
                 executable="real_vlm",
                 name="real_vlm_node",
-                condition=IfCondition(
-                    PythonExpression(["'", vlm_mode, "' in ['real', 'dual']"])
-                ),
+                condition=IfCondition(real_vlm_enabled),
                 parameters=[
                     {
                         "spec_dir": spec_dir,
                         "base_url": vlm_base_url,
                         "model_id": vlm_model_id,
                         "api_mode": vlm_api_mode,
+                        "publish_period_sec": vlm_publish_period_sec,
                         "response_mode": vlm_response_mode,
                         "output_prefix": PythonExpression(
                             ["'/vlm' if '", vlm_mode, "' == 'real' else '/vlm_real'"]

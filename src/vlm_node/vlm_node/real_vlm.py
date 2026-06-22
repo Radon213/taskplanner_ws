@@ -76,10 +76,14 @@ class RealVLMNode(Node):
         self._oracle_bootstrap_tick = 0
         self._oracle_tick = 0
         self._developer_instruction = (
-            "Return valid JSON only. No markdown. "
-            "Use schema version 1. "
+            "Return exactly one valid JSON object and nothing else. "
+            "All object keys must be double-quoted strings: \"v\", \"ph\", \"to\", \"sg\", \"u\", \"sum\". "
+            "Never omit quotes around keys. Never use true/false/null. "
+            "Confidence values and u must be numeric floats between 0.0 and 1.0, not strings and not booleans. "
             "Use exact tool ids and location ids from context. "
-            "If gesture is absent, emit sg as ['', '', '', 0.0]."
+            "If gesture is absent, sg must be exactly [\"\",\"\",\"\",0.0]. "
+            "If the image is black, blank, or says No image, emit "
+            "{\"v\":\"1\",\"ph\":[[\"exposure\",0.0]],\"to\":[],\"sg\":[\"\",\"\",\"\",0.0],\"u\":1.0,\"sum\":\"no image available\"}."
         )
 
         self._load_parameters()

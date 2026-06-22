@@ -24,7 +24,9 @@ services:
       VLM_BASE_URL: ${VLM_BASE_URL:-http://host.docker.internal:8000}
       VLM_MODEL_ID: ${VLM_MODEL_ID:-nvidia/diffusiongemma-26B-A4B-it-NVFP4}
       VLM_API_MODE: ${VLM_API_MODE:-openai_compat}
+      VLM_PUBLISH_PERIOD_SEC: ${VLM_PUBLISH_PERIOD_SEC:-1.0}
       ENABLE_NO_IMAGE_CAMERA: ${ENABLE_NO_IMAGE_CAMERA:-true}
+      ENABLE_SYNTHETIC_SCENE_CAMERA: ${ENABLE_SYNTHETIC_SCENE_CAMERA:-false}
     stdin_open: true
     tty: true
     command: bash
@@ -54,22 +56,15 @@ services:
       VLM_BASE_URL: ${VLM_BASE_URL:-http://host.docker.internal:8000}
       VLM_MODEL_ID: ${VLM_MODEL_ID:-nvidia/diffusiongemma-26B-A4B-it-NVFP4}
       VLM_API_MODE: ${VLM_API_MODE:-openai_compat}
+      VLM_PUBLISH_PERIOD_SEC: ${VLM_PUBLISH_PERIOD_SEC:-1.0}
       ENABLE_NO_IMAGE_CAMERA: ${ENABLE_NO_IMAGE_CAMERA:-true}
+      ENABLE_SYNTHETIC_SCENE_CAMERA: ${ENABLE_SYNTHETIC_SCENE_CAMERA:-false}
     ports:
       - "${ROSBRIDGE_PORT:-9090}:9090"
     command: >
-      bash -lc "
-        colcon build --symlink-install --cmake-args -DBUILD_TESTING=OFF &&
-        source install/setup.bash &&
-        ros2 launch bringup taskplanner_mock.launch.py
-          enable_rosbridge:=true
-          rosbridge_port:=${ROSBRIDGE_PORT:-9090}
-          vlm_mode:=${VLM_MODE:-mock}
-          vlm_base_url:=${VLM_BASE_URL:-http://host.docker.internal:8000}
-          vlm_model_id:=${VLM_MODEL_ID:-nvidia/diffusiongemma-26B-A4B-it-NVFP4}
-          vlm_api_mode:=${VLM_API_MODE:-openai_compat}
-          enable_no_image_camera:=${ENABLE_NO_IMAGE_CAMERA:-true}
-      "
+      bash -lc "colcon build --symlink-install --cmake-args -DBUILD_TESTING=OFF &&
+      source install/setup.bash &&
+      ros2 launch bringup taskplanner_mock.launch.py enable_rosbridge:=true rosbridge_port:=${ROSBRIDGE_PORT:-9090} vlm_mode:=${VLM_MODE:-mock} vlm_base_url:=${VLM_BASE_URL:-http://host.docker.internal:8000} vlm_model_id:=${VLM_MODEL_ID:-nvidia/diffusiongemma-26B-A4B-it-NVFP4} vlm_api_mode:=${VLM_API_MODE:-openai_compat} vlm_publish_period_sec:=${VLM_PUBLISH_PERIOD_SEC:-1.0} enable_no_image_camera:=${ENABLE_NO_IMAGE_CAMERA:-true} enable_synthetic_scene_camera:=${ENABLE_SYNTHETIC_SCENE_CAMERA:-false}"
 
   webapp:
     build:
