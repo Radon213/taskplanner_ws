@@ -60,3 +60,53 @@ def validate_payload(payload: dict[str, Any]) -> dict[str, Any]:
 def normalize_raw_text(raw_text: str) -> tuple[str, dict[str, Any]]:
     payload = validate_payload(parse_json_payload(raw_text))
     return json.dumps(payload, separators=(",", ":"), sort_keys=True), payload
+
+
+def compact_vlm_json_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "v": {"type": "string", "enum": ["1"]},
+            "ph": {
+                "type": "array",
+                "items": {
+                    "type": "array",
+                    "prefixItems": [
+                        {"type": "string"},
+                        {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                    ],
+                    "minItems": 2,
+                    "maxItems": 2,
+                },
+            },
+            "to": {
+                "type": "array",
+                "items": {
+                    "type": "array",
+                    "prefixItems": [
+                        {"type": "string"},
+                        {"type": "string"},
+                        {"type": "string"},
+                        {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                    ],
+                    "minItems": 4,
+                    "maxItems": 4,
+                },
+            },
+            "sg": {
+                "type": "array",
+                "prefixItems": [
+                    {"type": "string"},
+                    {"type": "string"},
+                    {"type": "string"},
+                    {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                ],
+                "minItems": 4,
+                "maxItems": 4,
+            },
+            "u": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+            "sum": {"type": "string"},
+        },
+        "required": ["v", "ph", "to", "sg", "u", "sum"],
+        "additionalProperties": False,
+    }

@@ -12,6 +12,7 @@ services:
         AUTO_APMS_REF: ${AUTO_APMS_REF:-1.5.1}
     image: taskplanner-ws:dev
     working_dir: /workspaces/taskplanner_ws
+    network_mode: host
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
@@ -21,10 +22,12 @@ services:
       ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}
       ROS_AUTOMATIC_DISCOVERY_RANGE: ${ROS_AUTOMATIC_DISCOVERY_RANGE:-LOCALHOST}
       VLM_MODE: ${VLM_MODE:-mock}
-      VLM_BASE_URL: ${VLM_BASE_URL:-http://host.docker.internal:8000}
-      VLM_MODEL_ID: ${VLM_MODEL_ID:-nvidia/diffusiongemma-26B-A4B-it-NVFP4}
+      VLM_BASE_URL: ${VLM_BASE_URL:-http://127.0.0.1:1234}
+      VLM_MODEL_ID: ${VLM_MODEL_ID:-qwen3.6-35b-a3b-mtp}
       VLM_API_MODE: ${VLM_API_MODE:-openai_compat}
       VLM_PUBLISH_PERIOD_SEC: ${VLM_PUBLISH_PERIOD_SEC:-1.0}
+      VLM_RESPONSE_FORMAT: ${VLM_RESPONSE_FORMAT:-json_schema}
+      VLM_REASONING_EFFORT: ${VLM_REASONING_EFFORT:-none}
       ENABLE_NO_IMAGE_CAMERA: ${ENABLE_NO_IMAGE_CAMERA:-true}
       ENABLE_SYNTHETIC_SCENE_CAMERA: ${ENABLE_SYNTHETIC_SCENE_CAMERA:-false}
     stdin_open: true
@@ -44,6 +47,7 @@ services:
         AUTO_APMS_REF: ${AUTO_APMS_REF:-1.5.1}
     image: taskplanner-ws:dev
     working_dir: /workspaces/taskplanner_ws
+    network_mode: host
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
@@ -53,18 +57,18 @@ services:
       ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}
       ROS_AUTOMATIC_DISCOVERY_RANGE: ${ROS_AUTOMATIC_DISCOVERY_RANGE:-LOCALHOST}
       VLM_MODE: ${VLM_MODE:-mock}
-      VLM_BASE_URL: ${VLM_BASE_URL:-http://host.docker.internal:8000}
-      VLM_MODEL_ID: ${VLM_MODEL_ID:-nvidia/diffusiongemma-26B-A4B-it-NVFP4}
+      VLM_BASE_URL: ${VLM_BASE_URL:-http://127.0.0.1:1234}
+      VLM_MODEL_ID: ${VLM_MODEL_ID:-qwen3.6-35b-a3b-mtp}
       VLM_API_MODE: ${VLM_API_MODE:-openai_compat}
       VLM_PUBLISH_PERIOD_SEC: ${VLM_PUBLISH_PERIOD_SEC:-1.0}
+      VLM_RESPONSE_FORMAT: ${VLM_RESPONSE_FORMAT:-json_schema}
+      VLM_REASONING_EFFORT: ${VLM_REASONING_EFFORT:-none}
       ENABLE_NO_IMAGE_CAMERA: ${ENABLE_NO_IMAGE_CAMERA:-true}
       ENABLE_SYNTHETIC_SCENE_CAMERA: ${ENABLE_SYNTHETIC_SCENE_CAMERA:-false}
-    ports:
-      - "${ROSBRIDGE_PORT:-9090}:9090"
     command: >
       bash -lc "colcon build --symlink-install --cmake-args -DBUILD_TESTING=OFF &&
       source install/setup.bash &&
-      ros2 launch bringup taskplanner_mock.launch.py enable_rosbridge:=true rosbridge_port:=${ROSBRIDGE_PORT:-9090} vlm_mode:=${VLM_MODE:-mock} vlm_base_url:=${VLM_BASE_URL:-http://host.docker.internal:8000} vlm_model_id:=${VLM_MODEL_ID:-nvidia/diffusiongemma-26B-A4B-it-NVFP4} vlm_api_mode:=${VLM_API_MODE:-openai_compat} vlm_publish_period_sec:=${VLM_PUBLISH_PERIOD_SEC:-1.0} enable_no_image_camera:=${ENABLE_NO_IMAGE_CAMERA:-true} enable_synthetic_scene_camera:=${ENABLE_SYNTHETIC_SCENE_CAMERA:-false}"
+      ros2 launch bringup taskplanner_mock.launch.py enable_rosbridge:=true rosbridge_port:=${ROSBRIDGE_PORT:-9090} vlm_mode:=${VLM_MODE:-mock} vlm_base_url:=${VLM_BASE_URL:-http://127.0.0.1:1234} vlm_model_id:=${VLM_MODEL_ID:-qwen3.6-35b-a3b-mtp} vlm_api_mode:=${VLM_API_MODE:-openai_compat} vlm_publish_period_sec:=${VLM_PUBLISH_PERIOD_SEC:-1.0} vlm_response_format:=${VLM_RESPONSE_FORMAT:-json_schema} vlm_reasoning_effort:=${VLM_REASONING_EFFORT:-none} enable_no_image_camera:=${ENABLE_NO_IMAGE_CAMERA:-true} enable_synthetic_scene_camera:=${ENABLE_SYNTHETIC_SCENE_CAMERA:-false}"
 
   webapp:
     build:

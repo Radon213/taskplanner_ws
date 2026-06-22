@@ -38,6 +38,9 @@ class LMStudioClient:
         top_p: float,
         max_output_tokens: int,
         api_mode: str,
+        response_format: str = "",
+        json_schema: dict[str, Any] | None = None,
+        reasoning_effort: str = "",
     ) -> LMStudioResponse:
         if api_mode == "openai_compat":
             return self._request_openai_compat(
@@ -49,6 +52,9 @@ class LMStudioClient:
                 temperature=temperature,
                 top_p=top_p,
                 max_output_tokens=max_output_tokens,
+                response_format=response_format,
+                json_schema=json_schema,
+                reasoning_effort=reasoning_effort,
             )
         try:
             return self._request_native(
@@ -71,6 +77,9 @@ class LMStudioClient:
                 temperature=temperature,
                 top_p=top_p,
                 max_output_tokens=max_output_tokens,
+                response_format=response_format,
+                json_schema=json_schema,
+                reasoning_effort=reasoning_effort,
             )
 
     def _request_native(
@@ -114,6 +123,9 @@ class LMStudioClient:
         temperature: float,
         top_p: float,
         max_output_tokens: int,
+        response_format: str,
+        json_schema: dict[str, Any] | None,
+        reasoning_effort: str,
     ) -> LMStudioResponse:
         url = self._openai_compat_url()
         body = {
@@ -128,6 +140,21 @@ class LMStudioClient:
                 images=images,
             ),
         }
+        if response_format == "json_schema" and json_schema is not None:
+            body["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "taskplanner_vlm_compact_v1",
+                    "strict": True,
+                    "schema": json_schema,
+                },
+            }
+        elif response_format == "json_object":
+            body["response_format"] = {"type": "json_object"}
+        elif response_format == "text":
+            body["response_format"] = {"type": "text"}
+        if reasoning_effort:
+            body["reasoning_effort"] = reasoning_effort
         response = requests.post(url, json=body, timeout=self._timeout_sec)
         response.raise_for_status()
         raw = self._extract_text(response.json())

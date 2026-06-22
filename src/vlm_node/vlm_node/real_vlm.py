@@ -35,7 +35,7 @@ from surgical_msgs.msg import (
 from .common import compact_json
 from .lmstudio_client import LMStudioClient
 from .prompt_builder import PromptBuilder
-from .schema import SchemaValidationError, normalize_raw_text
+from .schema import SchemaValidationError, compact_vlm_json_schema, normalize_raw_text
 
 
 class RealVLMNode(Node):
@@ -49,6 +49,8 @@ class RealVLMNode(Node):
         self.declare_parameter("max_output_tokens", 180)
         self.declare_parameter("temperature", 0.0)
         self.declare_parameter("top_p", 1.0)
+        self.declare_parameter("response_format", "none")
+        self.declare_parameter("reasoning_effort", "")
         self.declare_parameter("retry_count", 2)
         self.declare_parameter("publish_period_sec", 2.0)
         self.declare_parameter("response_mode", "live")
@@ -123,6 +125,8 @@ class RealVLMNode(Node):
         self._max_output_tokens = int(self.get_parameter("max_output_tokens").value)
         self._temperature = float(self.get_parameter("temperature").value)
         self._top_p = float(self.get_parameter("top_p").value)
+        self._response_format = str(self.get_parameter("response_format").value).strip().lower()
+        self._reasoning_effort = str(self.get_parameter("reasoning_effort").value).strip()
         self._retry_count = int(self.get_parameter("retry_count").value)
         self._publish_period_sec = float(self.get_parameter("publish_period_sec").value)
         self._response_mode = str(self.get_parameter("response_mode").value)
@@ -133,6 +137,7 @@ class RealVLMNode(Node):
         self._tray_image_topic = str(self.get_parameter("tray_image_topic").value)
         self._synthetic_image_topic = str(self.get_parameter("synthetic_image_topic").value)
         self._image_stale_sec = float(self.get_parameter("image_stale_sec").value)
+        self._json_schema = compact_vlm_json_schema()
         self._oracle_scenario = list(self._spec.get_mock_perception_stages())
         self._oracle_scenario_length = sum(stage.duration_ticks for stage in self._oracle_scenario)
         self._oracle_bootstrap_tick = int(self._spec.get_mock_perception_bootstrap_tick())
@@ -167,6 +172,8 @@ class RealVLMNode(Node):
                 "max_output_tokens",
                 "temperature",
                 "top_p",
+                "response_format",
+                "reasoning_effort",
                 "retry_count",
                 "publish_period_sec",
                 "response_mode",
@@ -571,6 +578,9 @@ class RealVLMNode(Node):
                     top_p=self._top_p,
                     max_output_tokens=self._max_output_tokens,
                     api_mode=self._api_mode,
+                    response_format=self._response_format,
+                    json_schema=self._json_schema,
+                    reasoning_effort=self._reasoning_effort,
                 )
                 normalized_raw, payload = normalize_raw_text(response.raw_text)
                 return normalized_raw, payload, response.latency_sec, response.mode, attempt, ""

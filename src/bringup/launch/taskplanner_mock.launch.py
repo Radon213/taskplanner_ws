@@ -17,6 +17,8 @@ def generate_launch_description() -> LaunchDescription:
     vlm_model_id = LaunchConfiguration("vlm_model_id")
     vlm_api_mode = LaunchConfiguration("vlm_api_mode")
     vlm_publish_period_sec = LaunchConfiguration("vlm_publish_period_sec")
+    vlm_response_format = LaunchConfiguration("vlm_response_format")
+    vlm_reasoning_effort = LaunchConfiguration("vlm_reasoning_effort")
     vlm_response_mode = LaunchConfiguration("vlm_response_mode")
     validation_mode = LaunchConfiguration("validation_mode")
     enable_no_image_camera = LaunchConfiguration("enable_no_image_camera")
@@ -55,10 +57,12 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("enable_rosbridge", default_value="true"),
             DeclareLaunchArgument("rosbridge_port", default_value="9090"),
             DeclareLaunchArgument("vlm_mode", default_value="mock"),
-            DeclareLaunchArgument("vlm_base_url", default_value="http://host.docker.internal:8000"),
-            DeclareLaunchArgument("vlm_model_id", default_value="nvidia/diffusiongemma-26B-A4B-it-NVFP4"),
+            DeclareLaunchArgument("vlm_base_url", default_value="http://127.0.0.1:1234"),
+            DeclareLaunchArgument("vlm_model_id", default_value="qwen3.6-35b-a3b-mtp"),
             DeclareLaunchArgument("vlm_api_mode", default_value="openai_compat"),
             DeclareLaunchArgument("vlm_publish_period_sec", default_value="1.0"),
+            DeclareLaunchArgument("vlm_response_format", default_value="json_schema"),
+            DeclareLaunchArgument("vlm_reasoning_effort", default_value="none"),
             DeclareLaunchArgument("vlm_response_mode", default_value="live"),
             DeclareLaunchArgument("validation_mode", default_value="bt_twin"),
             DeclareLaunchArgument("enable_no_image_camera", default_value="true"),
@@ -134,6 +138,8 @@ def generate_launch_description() -> LaunchDescription:
                         "model_id": vlm_model_id,
                         "api_mode": vlm_api_mode,
                         "publish_period_sec": vlm_publish_period_sec,
+                        "response_format": vlm_response_format,
+                        "reasoning_effort": vlm_reasoning_effort,
                         "response_mode": vlm_response_mode,
                         "output_prefix": PythonExpression(
                             ["'/vlm' if '", vlm_mode, "' == 'real' else '/vlm_real'"]
