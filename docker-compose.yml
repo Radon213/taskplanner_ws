@@ -12,6 +12,8 @@ services:
         AUTO_APMS_REF: ${AUTO_APMS_REF:-1.5.1}
     image: taskplanner-ws:dev
     working_dir: /workspaces/taskplanner_ws
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - .:/workspaces/taskplanner_ws
       - taskplanner_web_node_modules:/workspaces/taskplanner_ws/webapp/node_modules
@@ -19,8 +21,10 @@ services:
       ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}
       ROS_AUTOMATIC_DISCOVERY_RANGE: ${ROS_AUTOMATIC_DISCOVERY_RANGE:-LOCALHOST}
       VLM_MODE: ${VLM_MODE:-mock}
-      VLM_BASE_URL: ${VLM_BASE_URL:-http://192.168.0.122:1234}
-      VLM_MODEL_ID: ${VLM_MODEL_ID:-gemma-4-e4b-it}
+      VLM_BASE_URL: ${VLM_BASE_URL:-http://host.docker.internal:8000}
+      VLM_MODEL_ID: ${VLM_MODEL_ID:-nvidia/diffusiongemma-26B-A4B-it-NVFP4}
+      VLM_API_MODE: ${VLM_API_MODE:-openai_compat}
+      ENABLE_NO_IMAGE_CAMERA: ${ENABLE_NO_IMAGE_CAMERA:-true}
     stdin_open: true
     tty: true
     command: bash
@@ -38,6 +42,8 @@ services:
         AUTO_APMS_REF: ${AUTO_APMS_REF:-1.5.1}
     image: taskplanner-ws:dev
     working_dir: /workspaces/taskplanner_ws
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - .:/workspaces/taskplanner_ws
       - taskplanner_web_node_modules:/workspaces/taskplanner_ws/webapp/node_modules
@@ -45,8 +51,10 @@ services:
       ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}
       ROS_AUTOMATIC_DISCOVERY_RANGE: ${ROS_AUTOMATIC_DISCOVERY_RANGE:-LOCALHOST}
       VLM_MODE: ${VLM_MODE:-mock}
-      VLM_BASE_URL: ${VLM_BASE_URL:-http://192.168.0.122:1234}
-      VLM_MODEL_ID: ${VLM_MODEL_ID:-gemma-4-e4b-it}
+      VLM_BASE_URL: ${VLM_BASE_URL:-http://host.docker.internal:8000}
+      VLM_MODEL_ID: ${VLM_MODEL_ID:-nvidia/diffusiongemma-26B-A4B-it-NVFP4}
+      VLM_API_MODE: ${VLM_API_MODE:-openai_compat}
+      ENABLE_NO_IMAGE_CAMERA: ${ENABLE_NO_IMAGE_CAMERA:-true}
     ports:
       - "${ROSBRIDGE_PORT:-9090}:9090"
     command: >
@@ -57,8 +65,10 @@ services:
           enable_rosbridge:=true
           rosbridge_port:=${ROSBRIDGE_PORT:-9090}
           vlm_mode:=${VLM_MODE:-mock}
-          vlm_base_url:=${VLM_BASE_URL:-http://192.168.0.122:1234}
-          vlm_model_id:=${VLM_MODEL_ID:-gemma-4-e4b-it}
+          vlm_base_url:=${VLM_BASE_URL:-http://host.docker.internal:8000}
+          vlm_model_id:=${VLM_MODEL_ID:-nvidia/diffusiongemma-26B-A4B-it-NVFP4}
+          vlm_api_mode:=${VLM_API_MODE:-openai_compat}
+          enable_no_image_camera:=${ENABLE_NO_IMAGE_CAMERA:-true}
       "
 
   webapp:

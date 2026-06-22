@@ -21,6 +21,7 @@ setup(
             "mock_vlm = vlm_node.node:main",
             "real_vlm = vlm_node.real_vlm:main",
             "synthetic_scene_camera = vlm_node.synthetic_scene_camera:main",
+            "no_image_camera = vlm_node.no_image_camera:main",
             "snapshot_bridge = vlm_node.snapshot_bridge:main",
         ],
     },

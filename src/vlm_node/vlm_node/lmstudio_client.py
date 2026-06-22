@@ -21,6 +21,11 @@ class LMStudioClient:
         self._base_url = base_url.rstrip("/")
         self._timeout_sec = timeout_sec
 
+    def _openai_compat_url(self) -> str:
+        if self._base_url.endswith("/v1"):
+            return f"{self._base_url}/chat/completions"
+        return f"{self._base_url}/v1/chat/completions"
+
     def request_json(
         self,
         *,
@@ -110,7 +115,7 @@ class LMStudioClient:
         top_p: float,
         max_output_tokens: int,
     ) -> LMStudioResponse:
-        url = f"{self._base_url}/v1/chat/completions"
+        url = self._openai_compat_url()
         body = {
             "model": model_id,
             "temperature": temperature,

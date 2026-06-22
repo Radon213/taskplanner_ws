@@ -1,9 +1,9 @@
 import { useLayoutEffect, useMemo, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
-import { BrainCircuit, Code2, ListTree, RadioTower } from "lucide-react";
+import { BrainCircuit, Code2, ImageIcon, ListTree, RadioTower } from "lucide-react";
 
 import type { useDigitalTwinViewModel } from "../../hooks/useDigitalTwinViewModel";
-import type { BTDecision, SkillStatus, VLMHealth, VLMReducerDecision, VLMResult } from "../../types";
+import type { BTDecision, CompressedImageFrame, SkillStatus, VLMHealth, VLMReducerDecision, VLMResult } from "../../types";
 import { type Language } from "../../utils/display";
 
 type ViewModel = ReturnType<typeof useDigitalTwinViewModel>;
@@ -58,6 +58,7 @@ export function ObservabilityPanel({
   vlmHealth,
   vlmResult,
   vlmReducerDecisions,
+  vlmImage,
 }: {
   vm: ViewModel;
   language: Language;
@@ -66,6 +67,7 @@ export function ObservabilityPanel({
   vlmHealth: VLMHealth;
   vlmResult: VLMResult;
   vlmReducerDecisions: VLMReducerDecision[];
+  vlmImage: CompressedImageFrame | null;
 }) {
   const [tab, setTab] = useState<TabId>("bt");
   const [timelineFilter, setTimelineFilter] = useState<TimelineFilter>("all");
@@ -259,6 +261,26 @@ export function ObservabilityPanel({
               exit={{ opacity: 0, y: -8 }}
               transition={{ duration: 0.18 }}
             >
+              <article className="vlm-image-card wide">
+                <div className="vlm-image-header">
+                  <span>
+                    <ImageIcon size={15} />
+                    {language === "ko" ? "VLM 입력 영상" : "VLM input image"}
+                  </span>
+                  <small>
+                    {vlmImage
+                      ? `${vlmImage.topic} · ${vlmImage.format} · ${Math.max(1, Math.round(vlmImage.sizeBytes / 1024))} KB`
+                      : language === "ko"
+                        ? "frame 없음"
+                        : "no frame"}
+                  </small>
+                </div>
+                {vlmImage ? (
+                  <img src={vlmImage.src} alt={language === "ko" ? "VLM 입력 영상" : "VLM input"} />
+                ) : (
+                  <div className="vlm-image-empty">{language === "ko" ? "아직 수신된 영상 프레임이 없습니다." : "No image frame received yet."}</div>
+                )}
+              </article>
               <DetailCard label={vm.ui.connection} value={vm.vlmStatus.connection} />
               <DetailCard label={vm.ui.health} value={vm.vlmStatus.health} />
               <DetailCard label={vm.ui.model} value={vlmHealth.model_id || vm.ui.none} />

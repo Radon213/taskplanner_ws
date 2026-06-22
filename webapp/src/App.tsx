@@ -76,6 +76,7 @@ export default function App() {
             vlmHealth={ros.vlmHealth}
             vlmResult={ros.vlmResult}
             vlmReducerDecisions={ros.vlmReducerDecisions}
+            vlmImage={ros.vlmImage}
           />
         </div>
 

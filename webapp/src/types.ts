@@ -145,6 +145,15 @@ export type VLMReducerDecision = {
   detail_json: string;
 };
 
+export type CompressedImageFrame = {
+  src: string;
+  format: string;
+  topic: string;
+  frameId: string;
+  sizeBytes: number;
+  receivedAt: number;
+};
+
 export type LayoutEntity = {
   id: string;
   type: string;

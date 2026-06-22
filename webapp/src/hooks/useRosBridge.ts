@@ -3,6 +3,7 @@ import ROSLIB from "roslib";
 
 import type {
   BTDecision,
+  CompressedImageFrame,
   SimulationEvent,
   SimulationState,
   SkillStatus,
@@ -118,6 +119,14 @@ const DEFAULT_VLM_RESULT: VLMResult = {
   uncertainty: 0,
 };
 
+type RosCompressedImage = {
+  header?: {
+    frame_id?: string;
+  };
+  format?: string;
+  data?: string | number[];
+};
+
 export type OverrideAck = {
   eventType: string;
   toolId: string;
@@ -133,6 +142,40 @@ export type OverridePayload = {
 };
 
 export type ControlCommand = "start" | "pause" | "resume" | "stop" | "reset";
+
+function mimeTypeFromCompressedFormat(format: string): string {
+  const normalized = format.toLowerCase();
+  if (normalized.includes("png")) return "image/png";
+  if (normalized.includes("webp")) return "image/webp";
+  return "image/jpeg";
+}
+
+function byteArrayToBase64(data: number[]): string {
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let index = 0; index < data.length; index += chunkSize) {
+    const chunk = data.slice(index, index + chunkSize);
+    binary += String.fromCharCode(...chunk);
+  }
+  return window.btoa(binary);
+}
+
+function compressedImageToFrame(message: RosCompressedImage, topic: string): CompressedImageFrame | null {
+  const data = message.data;
+  if (!data) return null;
+  const format = message.format || "jpeg";
+  const mimeType = mimeTypeFromCompressedFormat(format);
+  const base64 = typeof data === "string" ? data : byteArrayToBase64(data);
+  const src = base64.startsWith("data:") ? base64 : `data:${mimeType};base64,${base64}`;
+  return {
+    src,
+    format,
+    topic,
+    frameId: message.header?.frame_id || "",
+    sizeBytes: typeof data === "string" ? Math.round((data.length * 3) / 4) : data.length,
+    receivedAt: Date.now(),
+  };
+}
 
 function runtimeStatusMessage(state: SimulationState): string {
   if (state.execution_state === "running" && state.running) {
@@ -161,6 +204,7 @@ export function useRosBridge() {
   const [vlmHealth, setVlmHealth] = useState<VLMHealth>(DEFAULT_VLM_HEALTH);
   const [vlmResult, setVlmResult] = useState<VLMResult>(DEFAULT_VLM_RESULT);
   const [vlmReducerDecisions, setVlmReducerDecisions] = useState<VLMReducerDecision[]>([]);
+  const [vlmImage, setVlmImage] = useState<CompressedImageFrame | null>(null);
   const [vlmHealthReceivedAt, setVlmHealthReceivedAt] = useState<number | null>(null);
   const [vlmResultReceivedAt, setVlmResultReceivedAt] = useState<number | null>(null);
   const [events, setEvents] = useState<SimulationEvent[]>([]);
@@ -249,6 +293,12 @@ export function useRosBridge() {
       name: "/vlm/reducer_decisions",
       messageType: "surgical_msgs/msg/VLMReducerDecision",
     });
+    const vlmFieldImageTopic = new ROSLIB.Topic({
+      ros,
+      name: "/surgery/images/field/compressed",
+      messageType: "sensor_msgs/msg/CompressedImage",
+      throttle_rate: 100,
+    });
 
     simulationTopic.subscribe((message: unknown) => {
       const nextState = message as SimulationState;
@@ -300,6 +350,13 @@ export function useRosBridge() {
         setVlmReducerDecisions((current) => [message as VLMReducerDecision, ...current].slice(0, 8));
       });
     });
+    vlmFieldImageTopic.subscribe((message: unknown) => {
+      const frame = compressedImageToFrame(message as RosCompressedImage, "/surgery/images/field/compressed");
+      if (!frame) return;
+      startTransition(() => {
+        setVlmImage(frame);
+      });
+    });
 
     rosRef.current = ros;
 
@@ -313,6 +370,7 @@ export function useRosBridge() {
       vlmHealthTopic.unsubscribe();
       vlmResultTopic.unsubscribe();
       vlmReducerTopic.unsubscribe();
+      vlmFieldImageTopic.unsubscribe();
       if (reconnectTimerRef.current !== null) {
         window.clearTimeout(reconnectTimerRef.current);
         reconnectTimerRef.current = null;
@@ -595,6 +653,7 @@ export function useRosBridge() {
     vlmHealth,
     vlmResult,
     vlmReducerDecisions,
+    vlmImage,
     vlmHealthReceivedAt,
     vlmResultReceivedAt,
     events,

@@ -15,8 +15,10 @@ def generate_launch_description() -> LaunchDescription:
     vlm_mode = LaunchConfiguration("vlm_mode")
     vlm_base_url = LaunchConfiguration("vlm_base_url")
     vlm_model_id = LaunchConfiguration("vlm_model_id")
+    vlm_api_mode = LaunchConfiguration("vlm_api_mode")
     vlm_response_mode = LaunchConfiguration("vlm_response_mode")
     validation_mode = LaunchConfiguration("validation_mode")
+    enable_no_image_camera = LaunchConfiguration("enable_no_image_camera")
     enable_synthetic_scene_camera = LaunchConfiguration("enable_synthetic_scene_camera")
     field_snapshot_url = LaunchConfiguration("field_snapshot_url")
     spec_default = PathJoinSubstitution(
@@ -46,10 +48,12 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("enable_rosbridge", default_value="true"),
             DeclareLaunchArgument("rosbridge_port", default_value="9090"),
             DeclareLaunchArgument("vlm_mode", default_value="mock"),
-            DeclareLaunchArgument("vlm_base_url", default_value="http://192.168.0.122:1234"),
-            DeclareLaunchArgument("vlm_model_id", default_value="gemma-4-26b-a4b-it"),
+            DeclareLaunchArgument("vlm_base_url", default_value="http://host.docker.internal:8000"),
+            DeclareLaunchArgument("vlm_model_id", default_value="nvidia/diffusiongemma-26B-A4B-it-NVFP4"),
+            DeclareLaunchArgument("vlm_api_mode", default_value="openai_compat"),
             DeclareLaunchArgument("vlm_response_mode", default_value="live"),
             DeclareLaunchArgument("validation_mode", default_value="bt_twin"),
+            DeclareLaunchArgument("enable_no_image_camera", default_value="true"),
             DeclareLaunchArgument("enable_synthetic_scene_camera", default_value="true"),
             DeclareLaunchArgument("field_snapshot_url", default_value=""),
             Node(
@@ -90,6 +94,20 @@ def generate_launch_description() -> LaunchDescription:
             ),
             Node(
                 package="vlm_node",
+                executable="no_image_camera",
+                name="no_image_camera",
+                condition=IfCondition(enable_no_image_camera),
+                parameters=[
+                    {
+                        "image_topic": "/surgery/images/field/compressed",
+                        "fps": 30.0,
+                        "label": "No image",
+                    }
+                ],
+                output="screen",
+            ),
+            Node(
+                package="vlm_node",
                 executable="snapshot_bridge",
                 name="field_snapshot_bridge",
                 condition=IfCondition(
@@ -110,6 +128,7 @@ def generate_launch_description() -> LaunchDescription:
                         "spec_dir": spec_dir,
                         "base_url": vlm_base_url,
                         "model_id": vlm_model_id,
+                        "api_mode": vlm_api_mode,
                         "response_mode": vlm_response_mode,
                         "output_prefix": PythonExpression(
                             ["'/vlm' if '", vlm_mode, "' == 'real' else '/vlm_real'"]
