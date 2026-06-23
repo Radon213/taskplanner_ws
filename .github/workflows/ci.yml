@@ -1,59 +1,73 @@
 name: CI
 
 on:
+  push:
+    branches:
+      - main
   pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   docker-build-and-smoke:
     runs-on: ubuntu-latest
     env:
-      BTOPS_REPO_URL: ${{ vars.BTOPS_REPO_URL || 'git@github.com:Radon213/btops_ws.git' }}
+      BTOPS_REPOSITORY: ${{ vars.BTOPS_REPOSITORY || 'Radon213/btops_ws' }}
       BTOPS_REF: ${{ vars.BTOPS_REF || 'main' }}
+      BTOPS_LOCAL_CONTEXT: ./btops_ws
       AUTO_APMS_REPO_URL: ${{ vars.AUTO_APMS_REPO_URL || 'https://github.com/AutoAPMS/auto-apms.git' }}
       AUTO_APMS_REF: ${{ vars.AUTO_APMS_REF || '1.5.1' }}
     steps:
-      - name: Checkout
+      - name: Checkout taskplanner
         uses: actions/checkout@v4
 
-      - name: Configure BT Ops deploy key
-        run: |
-          if [ -z "${BTOPS_DEPLOY_KEY}" ]; then
-            echo "BTOPS_DEPLOY_KEY secret is required for private BT Ops dependency checkout."
-            exit 2
-          fi
-          mkdir -p ~/.ssh
-          printf '%s\n' "${BTOPS_DEPLOY_KEY}" > ~/.ssh/btops_deploy_key
-          chmod 600 ~/.ssh/btops_deploy_key
-          ssh-keyscan github.com >> ~/.ssh/known_hosts
-          eval "$(ssh-agent -s)"
-          ssh-add ~/.ssh/btops_deploy_key
-          echo "SSH_AUTH_SOCK=${SSH_AUTH_SOCK}" >> "${GITHUB_ENV}"
-        env:
-          BTOPS_DEPLOY_KEY: ${{ secrets.BTOPS_DEPLOY_KEY }}
+      - name: Checkout BT Ops
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.BTOPS_REPOSITORY }}
+          ref: ${{ env.BTOPS_REF }}
+          path: btops_ws
+          ssh-key: ${{ secrets.BTOPS_DEPLOY_KEY }}
+          persist-credentials: false
 
       - name: Build Docker image
-        run: |
-          docker compose build \
-            --ssh default \
-            --build-arg BTOPS_REPO_URL="${BTOPS_REPO_URL}" \
-            --build-arg BTOPS_REF="${BTOPS_REF}" \
-            --build-arg AUTO_APMS_REPO_URL="${AUTO_APMS_REPO_URL}" \
-            --build-arg AUTO_APMS_REF="${AUTO_APMS_REF}" \
-            taskplanner-dev
+        run: docker compose build taskplanner-dev
 
       - name: Build ROS workspace
-        run: |
-          docker compose run --rm taskplanner-dev bash -lc "colcon build --symlink-install"
+        run: >
+          docker compose run --rm taskplanner-dev bash -lc
+          "colcon build --symlink-install --cmake-args -DBUILD_TESTING=OFF"
 
       - name: Build webapp
-        run: |
-          docker compose run --rm taskplanner-dev bash -lc "cd webapp && npm ci && npm run build"
+        run: >
+          docker compose run --rm taskplanner-dev bash -lc
+          "cd webapp && npm ci && npm run build"
 
       - name: Smoke test thyroidectomy
-        run: |
-          docker compose run --rm taskplanner-dev bash -lc "source install/setup.bash && ros2 run bringup taskplanner_smoke_test --spec-name thyroidectomy"
+        run: >
+          docker compose run --rm
+          -e VLM_MODE=mock
+          -e SURGEON_ACTOR_MODE=rule
+          taskplanner-dev bash -lc
+          "source install/setup.bash &&
+          ros2 run bringup taskplanner_smoke_test --spec-name thyroidectomy --runtime-check functional"
 
       - name: Smoke test nephrectomy
-        run: |
-          docker compose run --rm taskplanner-dev bash -lc "source install/setup.bash && ros2 run bringup taskplanner_smoke_test --spec-name nephrectomy"
+        run: >
+          docker compose run --rm
+          -e VLM_MODE=mock
+          -e SURGEON_ACTOR_MODE=rule
+          taskplanner-dev bash -lc
+          "source install/setup.bash &&
+          ros2 run bringup taskplanner_smoke_test --spec-name nephrectomy --runtime-check functional"
+
+      - name: Smoke test inguinal hernia repair
+        run: >
+          docker compose run --rm
+          -e VLM_MODE=mock
+          -e SURGEON_ACTOR_MODE=rule
+          taskplanner-dev bash -lc
+          "source install/setup.bash &&
+          ros2 run bringup taskplanner_smoke_test --spec-name inguinal_hernia_repair --runtime-check functional"
