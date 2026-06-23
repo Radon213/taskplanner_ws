@@ -152,6 +152,9 @@ class SurgeonActorNode(Node):
     def _display_tool_name(self, tool_id: str) -> str:
         return TOOL_DISPLAY_NAMES.get(tool_id, tool_id.replace("_", " "))
 
+    def _coerce_phase_id(self, phase_id: str) -> str:
+        return phase_id if phase_id in self._spec.phase_ids else self._spec.default_phase_id
+
     def _cancel_cooldown_window_ticks(self) -> int:
         # Keep the next autonomous request outside the audit's short
         # cancel-request window. Manual/VLM cues still bypass this delay.
@@ -218,6 +221,7 @@ class SurgeonActorNode(Node):
     def _select_requestable_tool(self, phase_id: str, preferred_tool: str = "") -> str:
         if self._world is None:
             return preferred_tool or ""
+        phase_id = self._coerce_phase_id(phase_id)
         candidates: list[str] = []
         if preferred_tool:
             candidates.append(preferred_tool)
@@ -241,6 +245,7 @@ class SurgeonActorNode(Node):
         return ""
 
     def _choose_voice_text(self, phase_id: str, tool_id: str) -> tuple[str, str]:
+        phase_id = self._coerce_phase_id(phase_id)
         templates = self._voice_templates_by_phase.get(phase_id, [])
         for template_tool, voice_text, note in templates:
             if template_tool == tool_id and voice_text.strip():
@@ -251,6 +256,7 @@ class SurgeonActorNode(Node):
     def _tool_might_be_reused(self, tool_id: str, current_phase: str) -> bool:
         if not tool_id:
             return False
+        current_phase = self._coerce_phase_id(current_phase)
         if self._is_terminal_phase(current_phase) and self._terminal_phase_ready():
             return False
         if tool_id in self._spec.get_expected_instruments(current_phase):
@@ -291,7 +297,7 @@ class SurgeonActorNode(Node):
     def _terminal_phase_ready(self) -> bool:
         if self._world is None:
             return False
-        phase_id = self._world.filtered_phase or self._spec.default_phase_id
+        phase_id = self._coerce_phase_id(self._world.filtered_phase or self._spec.default_phase_id)
         if not self._is_terminal_phase(phase_id):
             return False
         guard = self._spec.bundle.phase_guard
@@ -334,6 +340,7 @@ class SurgeonActorNode(Node):
         """Only cue phase advancement after the surgeon has actually exercised the phase tools."""
         if self._world is None:
             return False
+        phase_id = self._coerce_phase_id(phase_id)
         expected_tools = list(self._spec.get_expected_instruments(phase_id))
         if not expected_tools:
             return True
@@ -361,7 +368,7 @@ class SurgeonActorNode(Node):
     def _phase_advance_candidate(self) -> str:
         if self._world is None:
             return ""
-        current_phase = self._world.filtered_phase or self._spec.default_phase_id
+        current_phase = self._coerce_phase_id(self._world.filtered_phase or self._spec.default_phase_id)
         guard = self._spec.bundle.phase_guard
         dwell_elapsed = self._current_time_sec() - self._phase_entered_sec
         min_dwell_sec = max(
@@ -628,7 +635,7 @@ class SurgeonActorNode(Node):
 
     def _decide(self) -> ActorDecision:
         assert self._world is not None
-        phase_id = self._world.filtered_phase or self._spec.default_phase_id
+        phase_id = self._coerce_phase_id(self._world.filtered_phase or self._spec.default_phase_id)
         expected_tools = list(self._spec.get_expected_instruments(phase_id))
         current_tool = self._current_surgeon_tool()
 
@@ -858,9 +865,14 @@ class SurgeonActorNode(Node):
         self._decay_active_voice()
 
     def _on_control(self, msg: String) -> None:
-        command = msg.data.strip().lower()
+        raw_command = msg.data.strip()
+        command, _, start_phase_id = raw_command.partition(":")
+        command = command.strip().lower()
+        start_phase_id = start_phase_id.strip()
         if command in {"start", "start_actors"}:
             self._phase_hint = None
+            if start_phase_id:
+                self._current_phase_id = self._coerce_phase_id(start_phase_id)
             self._phase_entered_sec = self._current_time_sec()
             self._active = True
         elif command == "pause":
@@ -873,7 +885,7 @@ class SurgeonActorNode(Node):
             self._active = False
             self._world = None
             self._phase_hint = None
-            self._current_phase_id = self._spec.default_phase_id
+            self._current_phase_id = self._coerce_phase_id(start_phase_id) if start_phase_id else self._spec.default_phase_id
             self._phase_entered_sec = self._current_time_sec()
             self._active_voice_text = ""
             self._voice_hold_ticks = 0
@@ -921,7 +933,7 @@ class SurgeonActorNode(Node):
                 self._last_lifecycle_by_tool.pop(tool_id, None)
                 self._surgeon_tool_received_sec.pop(tool_id, None)
         self._world = msg
-        self._current_phase_id = msg.filtered_phase or self._spec.default_phase_id
+        self._current_phase_id = self._coerce_phase_id(msg.filtered_phase or self._spec.default_phase_id)
         if previous_phase != self._current_phase_id:
             self._phase_entered_sec = self._current_time_sec()
 

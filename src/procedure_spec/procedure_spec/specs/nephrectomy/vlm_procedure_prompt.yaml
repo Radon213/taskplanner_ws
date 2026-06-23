@@ -1,0 +1,200 @@
+id: nephrectomy_doctor_prompt_v2
+
+procedure:
+  id: "nephrectomy"
+  name: "Open Nephrectomy"
+  ko: "신장절제술"
+  scope: "general open surgery reference scenario"
+
+phase_labels:
+  normal:
+    P01: "Flank incision and muscle entry"
+    P02: "Retroperitoneal exposure"
+    P03: "Ureter and lower pole dissection"
+    P04: "Renal hilum dissection"
+    P05: "Renal vessel ligation and division"
+    P06: "Kidney mobilization and layered closure"
+  interrupt:
+    P07: "Bleeding/Hemostasis interrupt"
+
+phase_labels_ko:
+  normal:
+    P01: "측복부 절개/근육 진입"
+    P02: "후복막 노출"
+    P03: "요관/하극 박리"
+    P04: "신장문 박리"
+    P05: "신장 혈관 결찰/분리"
+    P06: "신장 유리/층별 봉합"
+  interrupt:
+    P07: "출혈/지혈 인터럽트"
+
+tools:
+  T01: "#10 Scalpel"
+  T02: "DeBakey forceps"
+  T03: "Long-tip electrocautery pencil"
+  T04: "Richardson retractor"
+  T05: "Deaver retractor"
+  T06: "Metzenbaum scissors"
+  T07: "Right-angle clamp"
+  T08: "Satinsky vascular clamp"
+  T09: "Needle driver"
+  T10: "Poole suction tip"
+
+phase_flow:
+  normal_sequence:
+    - from: "P01"
+      to: "P02"
+      transition_cues:
+        anatomy: "skin, subcutaneous tissue, and flank muscle layers are opened"
+        action: "deep retraction starts and retroperitoneal plane is developed"
+        tool_cue: "T01/T03 incision work shifts to T04/T05 retraction"
+
+    - from: "P02"
+      to: "P03"
+      transition_cues:
+        anatomy: "peritoneum is swept medially; Gerota fascia/psoas plane is exposed"
+        action: "surgeon follows lower pole structures toward ureter"
+        tool_cue: "T04/T05 exposure shifts to T02/T06 fine dissection"
+
+    - from: "P03"
+      to: "P04"
+      transition_cues:
+        anatomy: "ureter is identified, controlled, or used as traction toward the hilum"
+        action: "dissection proceeds cranially to renal vessels"
+        tool_cue: "T06/T07 become dominant around lower pole and ureter"
+
+    - from: "P04"
+      to: "P05"
+      transition_cues:
+        anatomy: "renal artery and renal vein are isolated at the hilum"
+        action: "surgeon stops dissection and prepares vascular control"
+        tool_cue: "T07/T08 requested after hilar skeletonization"
+
+    - from: "P05"
+      to: "P06"
+      transition_cues:
+        anatomy: "renal artery/vein are clamped, ligated, and divided"
+        action: "kidney is freed from remaining attachments and wound closure begins"
+        tool_cue: "T08/T09 vascular control shifts back to T05/T06/T09 closure"
+
+  interrupt_transition:
+    phase: "P07"
+    enter_when:
+      visual: "blood pools in the open field or vascular control becomes urgent"
+      action: "dissection, ligation, or closure pauses for suction/clamp/cautery"
+      tool_cue: "T10, T03, T07, or T08 requested for suction, cautery, or vascular control"
+    exit_when:
+      visual: "open field is dry and vascular control is stable"
+      return_to: "previous_normal_phase"
+
+phase_details:
+  P01:
+    visual_cues:
+      - "flank/subcostal skin incision; T01 opens skin and fascia"
+      - "muscle layers divided with T03; T02 handles tissue edges"
+    expected_tool_sequence:
+      - current: "T01"
+        next: "T02"
+        cue: "skin edge or fascia needs grasping"
+      - current: "T02"
+        next: "T03"
+        cue: "subcutaneous tissue and muscle require cautery"
+      - current: "T03"
+        next: "T04"
+        cue: "deep wound exposure begins"
+
+  P02:
+    visual_cues:
+      - "T04/T05 retract flank wound while peritoneum is swept medially"
+      - "retroperitoneal fat, psoas, or Gerota fascia becomes visible"
+    expected_tool_sequence:
+      - current: "T04"
+        next: "T05"
+        cue: "deeper retroperitoneal exposure needs broad retraction"
+      - current: "T05"
+        next: "T06"
+        cue: "thin fascial attachments need sharp division"
+      - current: "T06"
+        next: "T10"
+        cue: "field needs clearing during exposure"
+
+  P03:
+    visual_cues:
+      - "lower pole, ureter, or gonadal vessels are visible"
+      - "T02/T06 dissect while T04/T05 maintain exposure"
+    expected_tool_sequence:
+      - current: "T02"
+        next: "T06"
+        cue: "lower pole tissue is tensioned for sharp dissection"
+      - current: "T06"
+        next: "T07"
+        cue: "ureter or small vessel needs encircling/clamping"
+      - current: "T07"
+        next: "T03"
+        cue: "small collateral vessel needs cautery"
+
+  P04:
+    visual_cues:
+      - "renal vein and renal artery are approached at the hilum"
+      - "T07 works behind or around hilar structures"
+    expected_tool_sequence:
+      - current: "T06"
+        next: "T07"
+        cue: "hilar vessel needs right-angle dissection"
+      - current: "T07"
+        next: "T10"
+        cue: "hilar view needs suction before clamp placement"
+      - current: "T10"
+        next: "T08"
+        cue: "renal vein/artery control is imminent"
+
+  P05:
+    visual_cues:
+      - "renal artery and vein are clamped or encircled"
+      - "vascular ligation/division is the focus"
+    expected_tool_sequence:
+      - current: "T07"
+        next: "T08"
+        cue: "major renal vessel requires vascular clamp"
+      - current: "T08"
+        next: "T09"
+        cue: "suture ligature or tie placement follows clamping"
+      - current: "T09"
+        next: "T10"
+        cue: "field check after vessel division"
+
+  P06:
+    visual_cues:
+      - "kidney is detached from fat capsule/upper pole/lateral attachments"
+      - "specimen is removed; fascial and skin layers close"
+    expected_tool_sequence:
+      - current: "T05"
+        next: "T06"
+        cue: "remaining upper/lateral attachments need division"
+      - current: "T06"
+        next: "T10"
+        cue: "renal fossa and wound bed are checked"
+      - current: "T10"
+        next: "T09"
+        cue: "layered fascial or skin closure begins"
+
+  P07:
+    visual_cues:
+      - "blood obscures open wound, retroperitoneum, ureter, or hilum"
+      - "surgeon stops normal dissection and focuses on hemostasis"
+    expected_tool_sequence:
+      - current: "any"
+        next: "T10"
+        cue: "suction is needed to identify the bleeding point"
+      - current: "T10"
+        next: "T03"
+        cue: "small oozing point can be cauterized"
+      - current: "T03"
+        next: "T07"
+        cue: "bleeding vessel needs clamp or right-angle control"
+      - current: "T07"
+        next: "T08"
+        cue: "major vessel or hilar bleeding needs vascular clamp"
+    phase_return:
+      target: "previous_normal_phase"
+      cue: "field is dry and vascular control is stable"

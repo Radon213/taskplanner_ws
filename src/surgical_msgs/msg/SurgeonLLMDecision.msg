@@ -1,0 +1,13 @@
+builtin_interfaces/Time stamp
+string model_id
+string raw_json
+bool accepted
+string reject_reason
+string action
+string tool
+string request_mode
+string speech
+string hidden_phase
+float32 latency_sec
+int32 seed
+string overlay_json

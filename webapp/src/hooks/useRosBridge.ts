@@ -7,10 +7,12 @@ import type {
   SimulationEvent,
   SimulationState,
   SkillStatus,
+  SurgeonLLMDecision,
   SurgeonState,
   VLMHealth,
   VLMReducerDecision,
   VLMResult,
+  WorldState,
 } from "../types";
 
 const DEFAULT_STATE: SimulationState = {
@@ -54,6 +56,21 @@ const DEFAULT_SURGEON: SurgeonState = {
   scripted: true,
   voice_text: "",
   scene_note: "",
+};
+
+const DEFAULT_SURGEON_LLM_DECISION: SurgeonLLMDecision = {
+  model_id: "",
+  raw_json: "",
+  accepted: false,
+  reject_reason: "",
+  action: "",
+  tool: "",
+  request_mode: "",
+  speech: "",
+  hidden_phase: "",
+  latency_sec: 0,
+  seed: 0,
+  overlay_json: "",
 };
 
 const DEFAULT_BT_DECISION: BTDecision = {
@@ -119,12 +136,44 @@ const DEFAULT_VLM_RESULT: VLMResult = {
   uncertainty: 0,
 };
 
+const DEFAULT_WORLD_STATE: WorldState = {
+  procedure_id: "",
+  running: false,
+  execution_state: "idle",
+  filtered_phase: "",
+  phase_confidence: 0,
+  phase_uncertain: true,
+  phase_stability: 0,
+  expected_instruments: [],
+  available_instruments: [],
+  right_hand_tool: "",
+  left_hand_tool: "",
+  prepositioned_tool: "",
+  predicted_tool: "",
+  predicted_tool_confidence: 0,
+  predicted_tool_stability_sec: 0,
+  surgeon_request_tool: "",
+};
+
 type RosCompressedImage = {
   header?: {
     frame_id?: string;
   };
   format?: string;
   data?: string | number[];
+};
+
+type RosServiceResponseMessage = {
+  result?: boolean;
+  values?: Record<string, unknown> | string;
+};
+
+type RosServiceConnection = {
+  idCounter?: number;
+  on: (event: string, callback: (message: RosServiceResponseMessage) => void) => void;
+  off?: (event: string, callback: (message: RosServiceResponseMessage) => void) => void;
+  removeListener?: (event: string, callback: (message: RosServiceResponseMessage) => void) => void;
+  callOnConnection: (message: Record<string, unknown>) => void;
 };
 
 export type OverrideAck = {
@@ -142,6 +191,9 @@ export type OverridePayload = {
 };
 
 export type ControlCommand = "start" | "pause" | "resume" | "stop" | "reset";
+
+const ROS_PARAM_BOOL = 1;
+const ROS_PARAM_STRING = 4;
 
 function mimeTypeFromCompressedFormat(format: string): string {
   const normalized = format.toLowerCase();
@@ -197,8 +249,11 @@ export function useRosBridge() {
   const [url, setUrl] = useState("ws://127.0.0.1:9090");
   const [connected, setConnected] = useState(false);
   const [bundle, setBundle] = useState("");
+  const [startPhase, setStartPhase] = useState("");
   const [simulationState, setSimulationState] = useState<SimulationState>(DEFAULT_STATE);
+  const [worldState, setWorldState] = useState<WorldState>(DEFAULT_WORLD_STATE);
   const [surgeonState, setSurgeonState] = useState<SurgeonState>(DEFAULT_SURGEON);
+  const [surgeonLlmDecision, setSurgeonLlmDecision] = useState<SurgeonLLMDecision>(DEFAULT_SURGEON_LLM_DECISION);
   const [btDecision, setBtDecision] = useState<BTDecision>(DEFAULT_BT_DECISION);
   const [skillStatus, setSkillStatus] = useState<SkillStatus>(DEFAULT_SKILL_STATUS);
   const [vlmHealth, setVlmHealth] = useState<VLMHealth>(DEFAULT_VLM_HEALTH);
@@ -211,6 +266,7 @@ export function useRosBridge() {
   const [actionPending, setActionPending] = useState("");
   const [actionMessage, setActionMessage] = useState("Ready.");
   const [overrideAck, setOverrideAck] = useState<OverrideAck | null>(null);
+  const [actorEnabled, setActorEnabledState] = useState(true);
 
   const rosRef = useRef<unknown>(null);
   const simulationStateRef = useRef<SimulationState>(DEFAULT_STATE);
@@ -218,8 +274,9 @@ export function useRosBridge() {
   const bundleDirtyRef = useRef(false);
   const eventSequenceRef = useRef(0);
   const actionRunIdRef = useRef(0);
+  const bundleApplyRunIdRef = useRef(0);
 
-  const activeBundle = simulationState.active_bundle || bundle;
+  const activeBundle = bundle || simulationState.active_bundle;
 
   useEffect(() => {
     let disposed = false;
@@ -258,6 +315,11 @@ export function useRosBridge() {
       name: "/simulation/state",
       messageType: "surgical_msgs/msg/SimulationState",
     });
+    const worldTopic = new ROSLIB.Topic({
+      ros,
+      name: "/twin/world_state",
+      messageType: "surgical_msgs/msg/WorldState",
+    });
     const eventTopic = new ROSLIB.Topic({
       ros,
       name: "/simulation/event",
@@ -267,6 +329,11 @@ export function useRosBridge() {
       ros,
       name: "/surgeon/state",
       messageType: "surgical_msgs/msg/SurgeonState",
+    });
+    const surgeonLlmDecisionTopic = new ROSLIB.Topic({
+      ros,
+      name: "/surgeon/llm_decision",
+      messageType: "surgical_msgs/msg/SurgeonLLMDecision",
     });
     const btDecisionTopic = new ROSLIB.Topic({
       ros,
@@ -305,6 +372,11 @@ export function useRosBridge() {
       simulationStateRef.current = nextState;
       setSimulationState(nextState);
     });
+    worldTopic.subscribe((message: unknown) => {
+      startTransition(() => {
+        setWorldState(message as WorldState);
+      });
+    });
     eventTopic.subscribe((message: unknown) => {
       startTransition(() => {
         eventSequenceRef.current += 1;
@@ -321,6 +393,11 @@ export function useRosBridge() {
     surgeonTopic.subscribe((message: unknown) => {
       startTransition(() => {
         setSurgeonState(message as SurgeonState);
+      });
+    });
+    surgeonLlmDecisionTopic.subscribe((message: unknown) => {
+      startTransition(() => {
+        setSurgeonLlmDecision(message as SurgeonLLMDecision);
       });
     });
     btDecisionTopic.subscribe((message: unknown) => {
@@ -363,8 +440,10 @@ export function useRosBridge() {
     return () => {
       disposed = true;
       simulationTopic.unsubscribe();
+      worldTopic.unsubscribe();
       eventTopic.unsubscribe();
       surgeonTopic.unsubscribe();
+      surgeonLlmDecisionTopic.unsubscribe();
       btDecisionTopic.unsubscribe();
       skillStatusTopic.unsubscribe();
       vlmHealthTopic.unsubscribe();
@@ -418,27 +497,80 @@ export function useRosBridge() {
     if (!rosRef.current || !connected) {
       throw new Error("ROS bridge is offline.");
     }
-    const service = new ROSLIB.Service({
-      ros: rosRef.current as never,
-      name,
-      serviceType,
-    });
+    const ros = rosRef.current as RosServiceConnection;
     return new Promise<Record<string, unknown>>((resolve, reject) => {
-      const timeout = window.setTimeout(() => {
+      const serviceCallId = `call_service:${name}:${Number(ros.idCounter ?? 0) + 1}`;
+      ros.idCounter = Number(ros.idCounter ?? 0) + 1;
+      const timeoutSec = Math.max(1, timeoutMs / 1000);
+      let timeout = 0;
+      const cleanup = (handler: (message: RosServiceResponseMessage) => void) => {
+        window.clearTimeout(timeout);
+        if (typeof ros.off === "function") {
+          ros.off(serviceCallId, handler);
+        } else if (typeof ros.removeListener === "function") {
+          ros.removeListener(serviceCallId, handler);
+        }
+      };
+      const handler = (message: RosServiceResponseMessage) => {
+        cleanup(handler);
+        if (message.result === false) {
+          reject(new Error(String(message.values || `Service call failed for ${name}.`)));
+          return;
+        }
+        resolve(typeof message.values === "object" && message.values !== null ? message.values : {});
+      };
+      timeout = window.setTimeout(() => {
+        cleanup(handler);
         reject(new Error(`Timed out waiting for service response from ${name}`));
       }, timeoutMs);
-      service.callService(
-        new ROSLIB.ServiceRequest(request),
-        (response: Record<string, unknown>) => {
-          window.clearTimeout(timeout);
-          resolve(response);
-        },
-        (error: unknown) => {
-          window.clearTimeout(timeout);
-          reject(error instanceof Error ? error : new Error(String(error)));
-        },
-      );
+      ros.on(serviceCallId, handler);
+      ros.callOnConnection({
+        op: "call_service",
+        id: serviceCallId,
+        service: name,
+        type: serviceType,
+        args: new ROSLIB.ServiceRequest(request),
+        timeout: timeoutSec,
+      });
     });
+  }
+
+  function stringParameter(name: string, value: string) {
+    return {
+      name,
+      value: {
+        type: ROS_PARAM_STRING,
+        string_value: value,
+      },
+    };
+  }
+
+  function boolParameter(name: string, value: boolean) {
+    return {
+      name,
+      value: {
+        type: ROS_PARAM_BOOL,
+        bool_value: value,
+      },
+    };
+  }
+
+  async function setNodeParameters(
+    nodeName: string,
+    parameters: Array<ReturnType<typeof stringParameter> | ReturnType<typeof boolParameter>>,
+  ) {
+    const response = await callService(
+      `/${nodeName}/set_parameters`,
+      "rcl_interfaces/srv/SetParameters",
+      { parameters },
+      10000,
+    );
+    const results = Array.isArray(response.results) ? response.results : [];
+    const failed = results.find((result) => result && typeof result === "object" && !(result as { successful?: boolean }).successful);
+    if (failed) {
+      const reason = String((failed as { reason?: string }).reason || "parameter update rejected");
+      throw new Error(reason);
+    }
   }
 
   async function runAction(label: string, work: () => Promise<void>) {
@@ -449,7 +581,9 @@ export function useRosBridge() {
     try {
       await work();
     } catch (error) {
-      setActionMessage(error instanceof Error ? error.message : String(error));
+      if (actionRunIdRef.current === runId) {
+        setActionMessage(error instanceof Error ? error.message : String(error));
+      }
     } finally {
       if (actionRunIdRef.current === runId) {
         setActionPending("");
@@ -485,29 +619,42 @@ export function useRosBridge() {
     );
   }
 
-  async function applyBundle() {
+  async function applyBundle(targetBundle = bundle) {
+    const selectedBundle = targetBundle || bundle;
+    if (!selectedBundle) return;
+    const applyRunId = bundleApplyRunIdRef.current + 1;
+    bundleApplyRunIdRef.current = applyRunId;
+    const stateAtRequest = simulationStateRef.current;
+    setBundle(selectedBundle);
+    bundleDirtyRef.current = true;
     await runAction("Applying bundle", async () => {
       const response = await callService(
         "/simulation/select_bundle",
         "surgical_msgs/srv/SelectSimulationBundle",
         {
-          bundle_name: bundle,
-          restart_if_running: simulationState.running,
+          bundle_name: selectedBundle,
+          restart_if_running: stateAtRequest.running,
         },
-        simulationState.running ? 22000 : 12000,
+        stateAtRequest.running ? 22000 : 12000,
       );
       const success = response.success === undefined ? true : Boolean(response.success);
       if (!success) {
-        throw new Error(String(response.message || `Failed to apply ${bundle}.`));
+        throw new Error(String(response.message || `Failed to apply ${selectedBundle}.`));
       }
+      if (bundleApplyRunIdRef.current !== applyRunId) {
+        return;
+      }
+      const appliedBundle = String(response.active_bundle || selectedBundle);
       bundleDirtyRef.current = false;
+      setBundle(appliedBundle);
+      setStartPhase("");
       setOverrideAck(null);
       setSimulationState((current) => ({
         ...current,
-        active_bundle: String(response.active_bundle || bundle),
-        procedure_id: String(response.active_bundle || bundle),
+        active_bundle: appliedBundle,
+        procedure_id: appliedBundle,
       }));
-      setActionMessage(String(response.message || `Bundle switched to ${bundle}.`));
+      setActionMessage(String(response.message || `Bundle switched to ${appliedBundle}.`));
     });
   }
 
@@ -527,7 +674,7 @@ export function useRosBridge() {
         const response = await callService(
           "/simulation/control",
           "surgical_msgs/srv/ControlSimulation",
-          { command },
+          { command, start_phase_id: command === "start" ? startPhase : "" },
           command === "start" ? 45000 : command === "reset" ? 30000 : 20000,
         );
         const success = response.success === undefined ? true : Boolean(response.success);
@@ -633,6 +780,30 @@ export function useRosBridge() {
     });
   }
 
+  async function setVlmModel(modelId: string) {
+    await runAction("Updating VLM model", async () => {
+      await setNodeParameters("real_vlm_node", [stringParameter("model_id", modelId)]);
+      setVlmHealth((current) => ({ ...current, model_id: modelId }));
+      setActionMessage(`VLM model set to ${modelId}.`);
+    });
+  }
+
+  async function setActorModel(modelId: string) {
+    await runAction("Updating LLM surgeon model", async () => {
+      await setNodeParameters("surgeon_actor", [stringParameter("model_id", modelId)]);
+      setSurgeonLlmDecision((current) => ({ ...current, model_id: modelId }));
+      setActionMessage(`LLM surgeon model set to ${modelId}.`);
+    });
+  }
+
+  async function setActorEnabled(enabled: boolean) {
+    await runAction(enabled ? "Enabling LLM surgeon" : "Disabling LLM surgeon", async () => {
+      await setNodeParameters("surgeon_actor", [boolParameter("enabled", enabled)]);
+      setActorEnabledState(enabled);
+      setActionMessage(enabled ? "LLM surgeon enabled." : "LLM surgeon disabled.");
+    });
+  }
+
   const runtimeMessage = runtimeStatusMessage(simulationState);
   const simulationReady = connected && simulationState.instrument_states.length > 0;
   const shouldPreferRuntimeMessage =
@@ -645,9 +816,13 @@ export function useRosBridge() {
     connected,
     bundle,
     setBundleSelection,
+    startPhase,
+    setStartPhase,
     activeBundle,
     simulationState,
+    worldState,
     surgeonState,
+    surgeonLlmDecision,
     btDecision,
     skillStatus,
     vlmHealth,
@@ -662,8 +837,12 @@ export function useRosBridge() {
     runtimeMessage,
     simulationReady,
     overrideAck,
+    actorEnabled,
     applyBundle,
     control,
     sendOverride,
+    setVlmModel,
+    setActorModel,
+    setActorEnabled,
   };
 }

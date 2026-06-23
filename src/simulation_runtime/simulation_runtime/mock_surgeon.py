@@ -525,9 +525,14 @@ class MockSurgeonNode(Node):
         self._decay_active_voice()
 
     def _on_control(self, msg: String) -> None:
-        command = msg.data.strip().lower()
+        raw_command = msg.data.strip()
+        command, _, start_phase_id = raw_command.partition(":")
+        command = command.strip().lower()
+        start_phase_id = start_phase_id.strip()
         if command == "start":
             self._active = True
+            if start_phase_id:
+                self._current_phase_id = start_phase_id
         elif command == "pause":
             self._active = False
         elif command == "resume":
@@ -538,6 +543,8 @@ class MockSurgeonNode(Node):
             self._active = False
             self._tick = 0
             self._last_stage_name = ""
+            if start_phase_id:
+                self._current_phase_id = start_phase_id
             self._active_voice_text = ""
             self._voice_hold_ticks = 0
             self._clear_active_override()

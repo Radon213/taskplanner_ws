@@ -20,6 +20,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/SimulationEvent.msg"
   "msg/SimulationState.msg"
   "msg/SurgeonActorEvent.msg"
+  "msg/SurgeonLLMDecision.msg"
   "msg/SurgeonOutwardSignal.msg"
   "msg/SkillCommand.msg"
   "msg/SkillStatus.msg"

@@ -1,0 +1,197 @@
+id: inguinal_hernia_repair_doctor_prompt_v1
+
+procedure:
+  id: "inguinal_hernia_repair"
+  name: "Open Inguinal Hernia Repair"
+  ko: "서혜부 탈장술"
+  scope: "general open Lichtenstein-style scenario"
+
+phase_labels:
+  normal:
+    P01: "Skin incision and superficial access"
+    P02: "External oblique exposure/opening"
+    P03: "Cord mobilization and sac identification"
+    P04: "Hernia sac management"
+    P05: "Mesh placement and fixation"
+    P06: "Canal and skin closure"
+  interrupt:
+    P07: "Bleeding/Hemostasis interrupt"
+
+phase_labels_ko:
+  normal:
+    P01: "피부 절개/표층 접근"
+    P02: "외복사근막 노출/절개"
+    P03: "정삭 유리/탈장낭 확인"
+    P04: "탈장낭 처리"
+    P05: "메쉬 배치/고정"
+    P06: "서혜관/피부 봉합"
+  interrupt:
+    P07: "출혈/지혈 인터럽트"
+
+tools:
+  T01: "Scalpel handle with #15 blade"
+  T02: "Toothed dissecting forceps"
+  T03: "Monopolar diathermy pencil"
+  T04: "Fine dissecting scissors"
+  T05: "Langenbeck retractor"
+  T06: "Crile hemostat"
+  T07: "Penrose drain"
+  T08: "Babcock forceps"
+  T09: "Polypropylene mesh"
+  T10: "Mayo-Hegar needle holder"
+
+phase_flow:
+  normal_sequence:
+    - from: "P01"
+      to: "P02"
+      transition_cues:
+        anatomy: "subcutaneous tissue/Scarpa fascia divided and external oblique aponeurosis appears"
+        action: "skin incision work changes to fascial exposure"
+        tool_cue: "T01/T03 superficial access transitions to T05/T04 exposure"
+
+    - from: "P02"
+      to: "P03"
+      transition_cues:
+        anatomy: "external oblique opened and inguinal canal/cord structures visible"
+        action: "fascial edges are retracted; cord mobilization starts"
+        tool_cue: "T05 exposure followed by T06/T07 cord loop preparation"
+
+    - from: "P03"
+      to: "P04"
+      transition_cues:
+        anatomy: "hernia sac is separated from cord structures"
+        action: "sac is elevated, dissected to neck, or reduced"
+        tool_cue: "T08 requested after T07 traction"
+
+    - from: "P04"
+      to: "P05"
+      transition_cues:
+        anatomy: "sac is reduced/ligated and posterior wall is exposed"
+        action: "mesh is brought to the field"
+        tool_cue: "T09 requested after T08/T10 sac work"
+
+    - from: "P05"
+      to: "P06"
+      transition_cues:
+        anatomy: "mesh lies flat over posterior wall with slit around cord"
+        action: "mesh fixation complete; external oblique/skin closure begins"
+        tool_cue: "T10 remains active for layered closure"
+
+  interrupt_transition:
+    phase: "P07"
+    enter_when:
+      visual: "blood obscures superficial wound, cord, sac, or mesh field"
+      action: "dissection/fixation pauses for hemostasis"
+      tool_cue: "T03, T06, or T02 requested for cautery/clamping/exposure"
+    exit_when:
+      visual: "field is dry enough for dissection or suturing"
+      return_to: "previous_normal_phase"
+
+phase_details:
+  P01:
+    visual_cues:
+      - "groin skin incision; T01 and T02 at skin/subcutaneous tissue"
+      - "T03 used for superficial bleeding and Scarpa fascia"
+    expected_tool_sequence:
+      - current: "T01"
+        next: "T02"
+        cue: "skin edge needs grasping"
+      - current: "T02"
+        next: "T03"
+        cue: "subcutaneous tissue and small vessels need cautery"
+      - current: "T03"
+        next: "T05"
+        cue: "deeper exposure requires retraction"
+
+  P02:
+    visual_cues:
+      - "external oblique aponeurosis and external ring visible with T05 retraction"
+      - "T04 opens fascia along fiber direction while T02 elevates edge"
+    expected_tool_sequence:
+      - current: "T05"
+        next: "T02"
+        cue: "fascial edge needs lifting"
+      - current: "T02"
+        next: "T04"
+        cue: "external oblique aponeurosis is ready to open"
+      - current: "T04"
+        next: "T06"
+        cue: "fascial edges need clamping/retraction"
+
+  P03:
+    visual_cues:
+      - "spermatic cord/round ligament region exposed"
+      - "T07 loop or traction around cord while T04/T06 dissects"
+    expected_tool_sequence:
+      - current: "T06"
+        next: "T07"
+        cue: "cord structure needs looping for traction"
+      - current: "T07"
+        next: "T04"
+        cue: "cremasteric fibers or sac attachments need sharp dissection"
+      - current: "T04"
+        next: "T08"
+        cue: "hernia sac is identified and needs atraumatic grasp"
+
+  P04:
+    visual_cues:
+      - "hernia sac separated from cord structures"
+      - "direct sac reduced or indirect sac neck controlled"
+    expected_tool_sequence:
+      - current: "T08"
+        next: "T04"
+        cue: "sac attachments require careful division"
+      - current: "T04"
+        next: "T06"
+        cue: "sac neck or small vessel needs clamp"
+      - current: "T06"
+        next: "T10"
+        cue: "sac ligation/purse-string or tissue repair begins"
+
+  P05:
+    visual_cues:
+      - "posterior inguinal wall visible; mesh is placed under external oblique"
+      - "mesh slit wraps around cord/internal ring"
+    expected_tool_sequence:
+      - current: "T10"
+        next: "T09"
+        cue: "field is ready for mesh"
+      - current: "T09"
+        next: "T02"
+        cue: "mesh edge needs fine positioning"
+      - current: "T02"
+        next: "T10"
+        cue: "mesh fixation to inguinal ligament/internal oblique begins"
+
+  P06:
+    visual_cues:
+      - "mesh fixation complete; external oblique closure starts"
+      - "skin/subcutaneous closure proceeds"
+    expected_tool_sequence:
+      - current: "T10"
+        next: "T02"
+        cue: "tissue edge needs alignment during closure"
+      - current: "T02"
+        next: "T03"
+        cue: "final superficial hemostasis before skin closure"
+      - current: "T03"
+        next: "T10"
+        cue: "skin or subcutaneous closure resumes"
+
+  P07:
+    visual_cues:
+      - "blood obscures subcutaneous tissue, cord, or mesh field"
+      - "surgeon stops dissection/fixation and controls bleeding"
+    expected_tool_sequence:
+      - current: "any"
+        next: "T03"
+        cue: "small superficial bleeding needs cautery"
+      - current: "T03"
+        next: "T06"
+        cue: "bleeding point needs clamp or traction"
+      - current: "T06"
+        next: "T02"
+        cue: "field needs exposure while cautery/clamp is applied"
+    phase_return:
+      target: "previous_normal_phase"
+      cue: "field is dry and normal dissection/fixation can continue"

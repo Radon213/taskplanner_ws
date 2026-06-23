@@ -1,14 +1,25 @@
 import { useLayoutEffect, useMemo, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
-import { BrainCircuit, Code2, ImageIcon, ListTree, RadioTower } from "lucide-react";
+import { BrainCircuit, Code2, ListTree, RadioTower } from "lucide-react";
 
 import type { useDigitalTwinViewModel } from "../../hooks/useDigitalTwinViewModel";
-import type { BTDecision, CompressedImageFrame, SkillStatus, VLMHealth, VLMReducerDecision, VLMResult } from "../../types";
+import type {
+  BTDecision,
+  CompressedImageFrame,
+  SimulationState,
+  SkillStatus,
+  SurgeonState,
+  VLMHealth,
+  VLMReducerDecision,
+  VLMResult,
+  WorldState,
+} from "../../types";
 import { type Language } from "../../utils/display";
 
 type ViewModel = ReturnType<typeof useDigitalTwinViewModel>;
 type TabId = "bt" | "vlm" | "raw";
 type TimelineFilter = "all" | "normal" | "warning" | "error";
+type DetailTone = "normal" | "match" | "mismatch";
 
 function timelineItemSortParts(uiId: string, fallback: number): { time: number; sequence: number; fallback: number } {
   const [timestamp, sequence] = uiId.split("-");
@@ -29,9 +40,9 @@ function compareTimelineItems(a: { uiId: string }, b: { uiId: string }, aFallbac
   return right.fallback - left.fallback;
 }
 
-function DetailCard({ label, value }: { label: string; value: string | number }) {
+function DetailCard({ label, value, tone = "normal" }: { label: string; value: string | number; tone?: DetailTone }) {
   return (
-    <article className="detail-card">
+    <article className={`detail-card tone-${tone}`}>
       <span>{label}</span>
       <strong>{value || "none"}</strong>
     </article>
@@ -50,11 +61,36 @@ function TimelineMeta({ value }: { value: string }) {
   );
 }
 
+function parseVlmToolLabel(vlmResult: VLMResult, displayToolName: (toolId: string) => string, noneLabel: string): string {
+  if (!vlmResult.raw_json) return noneLabel;
+  try {
+    const payload = JSON.parse(vlmResult.raw_json) as { tool?: unknown };
+    const rawTool = payload.tool;
+    if (Array.isArray(rawTool) && Array.isArray(rawTool[0])) {
+      const first = rawTool[0] as unknown[];
+      const toolId = String(first[0] || "");
+      const confidence = Number(first[1] || 0);
+      return toolId ? `${displayToolName(toolId)} (${Math.round(confidence * 100)}%)` : noneLabel;
+    }
+    if (Array.isArray(rawTool) && rawTool.length === 2) {
+      const toolId = String(rawTool[0] || "");
+      const confidence = Number(rawTool[1] || 0);
+      return toolId ? `${displayToolName(toolId)} (${Math.round(confidence * 100)}%)` : noneLabel;
+    }
+  } catch {
+    return noneLabel;
+  }
+  return noneLabel;
+}
+
 export function ObservabilityPanel({
   vm,
   language,
   btDecision,
   skillStatus,
+  simulationState,
+  worldState,
+  surgeonState,
   vlmHealth,
   vlmResult,
   vlmReducerDecisions,
@@ -64,6 +100,9 @@ export function ObservabilityPanel({
   language: Language;
   btDecision: BTDecision;
   skillStatus: SkillStatus;
+  simulationState: SimulationState;
+  worldState: WorldState;
+  surgeonState: SurgeonState;
   vlmHealth: VLMHealth;
   vlmResult: VLMResult;
   vlmReducerDecisions: VLMReducerDecision[];
@@ -105,6 +144,28 @@ export function ObservabilityPanel({
     { id: "warning", label: vm.ui.timelineWarning },
     { id: "error", label: vm.ui.timelineError },
   ];
+  const groundPhase = surgeonState.phase_id || "";
+  const vlmPhase = vlmResult.phase_ids[0] || "";
+  const systemPhase = simulationState.filtered_phase || "";
+  const groundLabel = groundPhase ? vm.displayPhaseName(groundPhase) : vm.ui.none;
+  const vlmPhaseLabel = vlmPhase
+    ? `${vm.displayPhaseName(vlmPhase)} (${Math.round((vlmResult.phase_confidences[0] || 0) * 100)}%)`
+    : vm.ui.none;
+  const systemPhaseLabel = systemPhase ? vm.displayPhaseName(systemPhase) : vm.ui.none;
+  const vlmMatchesGround = Boolean(groundPhase && vlmPhase && groundPhase === vlmPhase);
+  const systemMatchesGround = Boolean(groundPhase && systemPhase && groundPhase === systemPhase);
+  const vlmPhaseTone: DetailTone = groundPhase && vlmPhase ? (vlmMatchesGround ? "match" : "mismatch") : "normal";
+  const systemPhaseTone: DetailTone = groundPhase && systemPhase ? (systemMatchesGround ? "match" : "mismatch") : "normal";
+  const phaseCheckTone: DetailTone = groundPhase && vlmPhase && systemPhase ? (vlmMatchesGround && systemMatchesGround ? "match" : "mismatch") : "normal";
+  const phaseMatchLabel = groundPhase
+    ? language === "ko"
+      ? `VLM ${vlmMatchesGround ? "일치" : "불일치"} · 시스템 ${systemMatchesGround ? "일치" : "불일치"}`
+      : `VLM ${vlmMatchesGround ? "match" : "mismatch"} · system ${systemMatchesGround ? "match" : "mismatch"}`
+    : vm.ui.none;
+  const rawVlmToolLabel = parseVlmToolLabel(vlmResult, vm.displayToolName, vm.ui.none);
+  const systemPredictedToolLabel = worldState.predicted_tool
+    ? `${vm.displayToolName(worldState.predicted_tool)} (${Math.round((worldState.predicted_tool_confidence || 0) * 100)}%, ${Math.round(worldState.predicted_tool_stability_sec || 0)}s)`
+    : vm.ui.none;
 
   useLayoutEffect(() => {
     if (!followLatestRef.current) return;
@@ -261,26 +322,18 @@ export function ObservabilityPanel({
               exit={{ opacity: 0, y: -8 }}
               transition={{ duration: 0.18 }}
             >
-              <article className="vlm-image-card wide">
-                <div className="vlm-image-header">
-                  <span>
-                    <ImageIcon size={15} />
-                    {language === "ko" ? "VLM 입력 영상" : "VLM input image"}
-                  </span>
-                  <small>
-                    {vlmImage
-                      ? `${vlmImage.topic} · ${vlmImage.format} · ${Math.max(1, Math.round(vlmImage.sizeBytes / 1024))} KB`
-                      : language === "ko"
-                        ? "frame 없음"
-                        : "no frame"}
-                  </small>
-                </div>
-                {vlmImage ? (
-                  <img src={vlmImage.src} alt={language === "ko" ? "VLM 입력 영상" : "VLM input"} />
-                ) : (
-                  <div className="vlm-image-empty">{language === "ko" ? "아직 수신된 영상 프레임이 없습니다." : "No image frame received yet."}</div>
-                )}
-              </article>
+              <DetailCard
+                label={language === "ko" ? "VLM 입력 영상" : "VLM input image"}
+                value={
+                  vlmImage
+                    ? language === "ko"
+                      ? `수술대 위 표시 · ${Math.max(1, Math.round(vlmImage.sizeBytes / 1024))} KB`
+                      : `shown on bed · ${Math.max(1, Math.round(vlmImage.sizeBytes / 1024))} KB`
+                    : language === "ko"
+                      ? "frame 없음"
+                      : "no frame"
+                }
+              />
               <DetailCard label={vm.ui.connection} value={vm.vlmStatus.connection} />
               <DetailCard label={vm.ui.health} value={vm.vlmStatus.health} />
               <DetailCard label={vm.ui.model} value={vlmHealth.model_id || vm.ui.none} />
@@ -288,7 +341,16 @@ export function ObservabilityPanel({
               <DetailCard label={vm.ui.source} value={vlmResult.source || vm.ui.none} />
               <DetailCard label={vm.ui.imageSource} value={vlmHealth.image_source || vm.ui.none} />
               <DetailCard label={vm.ui.latency} value={vlmHealth.latency_sec ? `${vlmHealth.latency_sec.toFixed(3)}s` : vm.ui.none} />
-              <DetailCard label={vm.ui.currentPhase} value={vlmResult.phase_ids[0] ? `${vm.metrics.phase} (${Math.round((vlmResult.phase_confidences[0] || 0) * 100)}%)` : vm.ui.none} />
+              <DetailCard label={language === "ko" ? "집도의 정답 단계" : "Actor ground"} value={groundLabel} />
+              <DetailCard label={language === "ko" ? "VLM 제안 단계" : "VLM proposed phase"} value={vlmPhaseLabel} tone={vlmPhaseTone} />
+              <DetailCard label={language === "ko" ? "시스템 최종 단계" : "System final phase"} value={systemPhaseLabel} tone={systemPhaseTone} />
+              <DetailCard label={language === "ko" ? "단계 검증" : "Phase check"} value={phaseMatchLabel} tone={phaseCheckTone} />
+              <DetailCard label={language === "ko" ? "VLM 제안 다음 도구" : "VLM proposed next tool"} value={rawVlmToolLabel} />
+              <DetailCard label={language === "ko" ? "시스템 최종 다음 도구" : "System final next tool"} value={systemPredictedToolLabel} />
+              <DetailCard
+                label={language === "ko" ? "E2E 지표 형식" : "E2E metric format"}
+                value={language === "ko" ? "정답 / 제안 / 평가가능" : "correct / proposed / evaluable"}
+              />
               <article className="detail-card wide">
                 <span>{vm.ui.reducer}</span>
                 <strong>

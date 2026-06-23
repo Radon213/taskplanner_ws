@@ -153,6 +153,8 @@ class ProcedureBundle:
     procedure_id: str
     procedure_display_name: str
     procedure_display_name_ko: str
+    normal_phase_ids: list[str] = field(default_factory=list)
+    interrupt_phase_ids: list[str] = field(default_factory=list)
     phases: list[PhaseSpec] = field(default_factory=list)
     instruments: list[InstrumentSpec] = field(default_factory=list)
     display_catalog: dict[str, dict] = field(default_factory=dict)

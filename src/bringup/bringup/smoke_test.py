@@ -54,6 +54,7 @@ RECOVERY_ACTIONS = {
     "retrieve_from_mayo",
     "tool_retrieve",
     "return_tool_to_rack",
+    "return_unused_preposition",
 }
 
 

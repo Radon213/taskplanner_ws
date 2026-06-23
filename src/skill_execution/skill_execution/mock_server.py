@@ -27,6 +27,7 @@ ALLOWED_ACTIONS = {
     "tool_predict",
     "predicted_tool_handover",
     "replace_and_handover",
+    "return_unused_preposition",
 }
 
 ACTION_ALIASES = {
@@ -36,6 +37,7 @@ ACTION_ALIASES = {
     "put_down_and_handover": "replace_and_handover",
     "retrieve_from_mayo": "tool_retrieve",
     "retrieve_from_hand": "tool_retrieve",
+    "return_unused_preposition": "return_unused_preposition",
 }
 
 
@@ -339,18 +341,54 @@ class MockSkillActionServer(Node):
         message = ""
 
         if action == "tool_predict":
+            current_tool = self._world.right_hand_tool if self._world is not None else ""
+            replacing_tool = bool(current_tool and current_tool != goal.instrument_id)
             duration_sec = self._rack_pick_sec + self._rack_to_handover_sec
+            if replacing_tool:
+                duration_sec += self._cleaner_to_rack_sec
             self._publish_task_state(
                 goal,
                 task_event_type="RobotTaskStarted",
                 task_type=goal.action,
-                source_anchor_id=goal.source_location_id or "main_tray_slot_1",
+                source_anchor_id="robot_right_hand" if replacing_tool else (goal.source_location_id or "main_tray_slot_1"),
                 target_anchor_id="robot_right_hand",
                 duration_sec=duration_sec,
             )
-            self._step_sleep(goal_handle, "picking_from_rack", f"picking {goal.instrument_id} from rack", 0.02, 0.38, self._rack_pick_sec, 4, generation)
+            pick_start = 0.02
+            if replacing_tool:
+                self._step_sleep(
+                    goal_handle,
+                    "returning_prediction_to_rack",
+                    f"returning predicted {current_tool} to the rack",
+                    0.02,
+                    0.28,
+                    self._cleaner_to_rack_sec,
+                    4,
+                    generation,
+                )
+                self._maybe_return_prepositioned_tool(goal)
+                pick_start = 0.30
+            self._step_sleep(
+                goal_handle,
+                "picking_from_rack",
+                f"picking {goal.instrument_id} from rack",
+                pick_start,
+                0.60,
+                self._rack_pick_sec,
+                4,
+                generation,
+            )
             self._publish_pick_if_needed(goal)
-            self._step_sleep(goal_handle, "ready_in_right_hand", f"holding {goal.instrument_id} ready in the right hand", 0.38, 0.94, self._rack_to_handover_sec, 4, generation)
+            self._step_sleep(
+                goal_handle,
+                "ready_in_right_hand",
+                f"holding {goal.instrument_id} ready in the right hand",
+                0.60,
+                0.94,
+                self._rack_to_handover_sec,
+                4,
+                generation,
+            )
             event = self._make_event(
                 goal,
                 "ToolPrepared",
@@ -465,6 +503,50 @@ class MockSkillActionServer(Node):
                 arm=goal.arm or "right",
             )
             message = "predicted tool replaced and requested tool handed over"
+        elif action == "return_unused_preposition":
+            instrument = self._find_instrument(goal.instrument_id)
+            home_location_id = goal.target_location_id or (
+                instrument.home_location_id if instrument is not None else "main_tray_slot_1"
+            )
+            home_location_type = goal.target_location_type or (
+                instrument.home_location_type if instrument is not None else "tray_slot"
+            )
+            duration_sec = self._cleaner_to_rack_sec
+            self._publish_task_state(
+                goal,
+                task_event_type="RobotTaskStarted",
+                task_type=goal.action,
+                source_anchor_id=goal.source_location_id or "robot_right_hand",
+                target_anchor_id=home_location_id,
+                duration_sec=duration_sec,
+            )
+            self._step_sleep(
+                goal_handle,
+                "returning_prediction_to_rack",
+                f"returning unused predicted {goal.instrument_id} to the rack",
+                0.05,
+                0.96,
+                duration_sec,
+                4,
+                generation,
+            )
+            event = self._make_event(
+                goal,
+                "PredictedToolReturnedToRack",
+                location_id=home_location_id,
+                location_type=home_location_type,
+                owner="none",
+                status="available",
+                source_location_id=goal.source_location_id or "robot_right_hand",
+                source_location_type=goal.source_location_type or "robot_right_hand",
+                target_location_id=home_location_id,
+                target_location_type=home_location_type,
+                target_owner="none",
+                arm=goal.arm or "right",
+                cleaning_required=False,
+                detail={"reason": "unused prepositioned tool returned during cleanup"},
+            )
+            message = "unused predicted tool returned to rack"
         elif action == "tool_retrieve":
             instrument = self._find_instrument(goal.instrument_id)
             home_location_id = goal.target_location_id or (

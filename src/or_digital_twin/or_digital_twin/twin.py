@@ -6,6 +6,7 @@ from collections import deque
 from dataclasses import asdict
 from typing import Any
 import json
+import math
 import re
 import time
 
@@ -43,6 +44,15 @@ ACTIVE_RETURN_INTENTS = {"return_tool", "extend_hand_for_retrieval"}
 RIGHT_HAND_LIFECYCLES = {LIFECYCLE_PREPOSITIONED_RIGHT}
 LEFT_HAND_LIFECYCLES = {LIFECYCLE_RECOVERING_LEFT}
 PENDING_TRANSITIONS_REQUIRE_ACTION = {"recover_left", "clean_left", "return_home", "return_unused_preposition"}
+MAYO_REUSE_SOFT_LIMIT = 2
+PHASE_INTERACTION_MIN_FRACTION = 0.4
+BLOCKING_SAFETY_FLAGS = {
+    "right_arm_overloaded",
+    "left_arm_overloaded",
+    "surgeon_owned_overloaded",
+    "duplicate_tool_holder",
+    "vlm_unhealthy",
+}
 ALLOWED_EVENT_TRANSITIONS = {
     LIFECYCLE_HOME_RACK: {LIFECYCLE_PREPOSITIONED_RIGHT, LIFECYCLE_RETURNED_HOME},
     LIFECYCLE_RETURNED_HOME: {LIFECYCLE_PREPOSITIONED_RIGHT, LIFECYCLE_SURGEON_OWNED},
@@ -60,6 +70,7 @@ OBSERVATION_STICKY_DIRECT_BLOCKS = {
     (LIFECYCLE_MAYO_REUSE, LIFECYCLE_MAYO_RECOVERY),
 }
 SURGEON_ACTOR_LOCATION_EVENTS = {
+    "place_on_mayo": ("mayo_reuse_zone", "mayo_reuse_zone", LIFECYCLE_MAYO_REUSE),
     "place_on_mayo_reuse": ("mayo_reuse_zone", "mayo_reuse_zone", LIFECYCLE_MAYO_REUSE),
     "place_on_mayo_recovery": ("mayo_recovery_zone", "mayo_recovery_zone", LIFECYCLE_MAYO_RECOVERY),
     "continue_using": ("surgeon_hand", "surgeon_hand", LIFECYCLE_SURGEON_OWNED),
@@ -170,6 +181,10 @@ class ORDigitalTwin:
         self._observation_violation_cooldowns: dict[tuple[str, str, str, str], float] = {}
         self._phase_evidence_history: deque[dict[str, Any]] = deque(maxlen=8)
         self._pending_phase_cues: dict[str, dict[str, Any]] = {}
+        self._phase_decision_cooldowns: dict[tuple[str, str, str], float] = {}
+        self._last_normal_phase_before_interrupt = ""
+        self._active_interrupt_event_phase = ""
+        self._active_interrupt_event_seen_sec = 0.0
         self._phase_entered_sec = self._monotonic_sec()
         self.reset_spec(spec)
 
@@ -189,6 +204,9 @@ class ORDigitalTwin:
         self._observation_violation_cooldowns.clear()
         self._phase_evidence_history.clear()
         self._pending_phase_cues.clear()
+        self._phase_decision_cooldowns.clear()
+        self._last_normal_phase_before_interrupt = ""
+        self._clear_active_interrupt_context()
         self._phase_entered_sec = self._monotonic_sec()
         for instrument_id in self.spec.list_instrument_ids():
             location_id = self.spec.get_initial_location(instrument_id) or "unknown"
@@ -211,6 +229,35 @@ class ORDigitalTwin:
 
     def reset_runtime(self) -> None:
         self.reset_spec(self.spec, seed_from_perception=False)
+
+    def set_initial_phase(self, phase_id: str) -> str:
+        requested_phase = str(phase_id or "").strip()
+        resolved_phase = requested_phase if requested_phase in self.spec.phase_ids else self.spec.default_phase_id
+        if requested_phase and requested_phase != resolved_phase:
+            self._record_invariant_violation(
+                reason="start_phase_out_of_bundle_scope",
+                phase_id=requested_phase,
+                active_procedure=self.spec.procedure_id,
+            )
+        self.state.filtered_phase = resolved_phase
+        self.state.phase_confidence = 1.0
+        self.state.phase_uncertain = False
+        self.state.phase_stability = 1.0
+        self._phase_entered_sec = self._monotonic_sec()
+        self._phase_evidence_history.clear()
+        self._pending_phase_cues.clear()
+        self._phase_decision_cooldowns.clear()
+        self._last_normal_phase_before_interrupt = ""
+        self._clear_active_interrupt_context()
+        self._recompute_transient_state()
+        self._record_event(
+            "InitialPhaseSelected",
+            {
+                "phase_id": resolved_phase,
+                "requested_phase_id": requested_phase,
+            },
+        )
+        return resolved_phase
 
     def set_execution_state(self, running: bool, execution_state: str) -> None:
         self.state.running = running
@@ -400,12 +447,89 @@ class ORDigitalTwin:
             if state.lifecycle_stage == LIFECYCLE_MAYO_REUSE:
                 self._open_recovery_transaction(state.instrument_id, reason)
 
+    def _place_surgeon_owned_on_mayo_for_completion_cleanup(self, reason: str) -> None:
+        if self.state.execution_state != "finishing":
+            return
+        for state in list(self.instrument_states.values()):
+            if state.lifecycle_stage != LIFECYCLE_SURGEON_OWNED:
+                continue
+            if not self._apply_event_transition(
+                state=state,
+                next_stage=LIFECYCLE_MAYO_RECOVERY,
+                event_type="CompletionHeldToolPlacedOnMayo",
+                location_type="mayo_recovery_zone",
+                location_id="mayo_recovery_zone",
+                confidence=max(state.confidence, 0.86),
+            ):
+                continue
+            self._open_recovery_transaction(state.instrument_id, reason)
+            self._record_event(
+                "CompletionHeldToolPlacedOnMayo",
+                {
+                    "instrument_id": state.instrument_id,
+                    "reason": reason,
+                },
+            )
+
+    def _queue_mayo_capacity_recovery(self) -> None:
+        if self.state.execution_state not in {"running", "finishing"}:
+            return
+        if (
+            self.state.active_recovery_tools
+            or self.state.active_robot_task is not None
+            or self.state.left_hand_tool
+            or self.state.cleaner_busy
+        ):
+            return
+        reusable_states = [
+            state
+            for state in self.instrument_states.values()
+            if state.lifecycle_stage == LIFECYCLE_MAYO_REUSE
+        ]
+        if len(reusable_states) <= MAYO_REUSE_SOFT_LIMIT:
+            return
+        protected_tools = {
+            tool_id
+            for tool_id in {
+                self.state.surgeon_request_tool,
+                self.state.explicit_request_tool,
+                self.state.predicted_tool,
+            }
+            if tool_id
+        }
+        candidates = [state for state in reusable_states if state.instrument_id not in protected_tools]
+        if not candidates:
+            return
+        selected = min(candidates, key=lambda state: state.last_update_sec or 0.0)
+        if not self._apply_event_transition(
+            state=selected,
+            next_stage=LIFECYCLE_MAYO_RECOVERY,
+            event_type="MayoCapacityRecoveryQueued",
+            location_type="mayo_recovery_zone",
+            location_id="mayo_recovery_zone",
+            confidence=max(selected.confidence, 0.82),
+        ):
+            return
+        self._open_recovery_transaction(selected.instrument_id, "mayo_capacity_soft_limit")
+        self._record_event(
+            "MayoCapacityRecoveryQueued",
+            {
+                "instrument_id": selected.instrument_id,
+                "mayo_reuse_count": len(reusable_states),
+                "soft_limit": MAYO_REUSE_SOFT_LIMIT,
+                "protected_tools": sorted(protected_tools),
+            },
+        )
+
     def _begin_completion_cleanup(self) -> None:
         self._clear_surgeon_request_state()
         self.state.surgeon_intent = "procedure_finishing"
         if self.state.execution_state != "completed":
             self.state.running = True
             self.state.execution_state = "finishing"
+            self._place_surgeon_owned_on_mayo_for_completion_cleanup(
+                "completion_cleanup_place_held_on_mayo"
+            )
             self._queue_mayo_reuse_for_completion_cleanup("completion_cleanup_queue_mayo_reuse")
 
     def _mark_completed(self) -> None:
@@ -519,11 +643,13 @@ class ORDigitalTwin:
         expected = list(self.spec.get_expected_instruments(phase_id))
         if not expected:
             return True
+        completed_count = 0
         for tool_id in expected:
             state = self.instrument_states.get(tool_id)
             if state is None:
-                return False
+                continue
             if state.ever_surgeon_owned:
+                completed_count += 1
                 continue
             if state.lifecycle_stage in {
                 LIFECYCLE_SURGEON_OWNED,
@@ -534,22 +660,44 @@ class ORDigitalTwin:
                 LIFECYCLE_CLEANED_LEFT,
                 LIFECYCLE_RETURNED_HOME,
             }:
-                continue
-            return False
-        return True
+                completed_count += 1
+        required_count = max(1, math.ceil(len(expected) * PHASE_INTERACTION_MIN_FRACTION))
+        return completed_count >= required_count
 
     def _phase_blocking_reason(self) -> str:
-        if self.state.active_robot_task is not None:
-            return "active_robot_task_pending"
-        if self.state.pending_transition_tools:
-            return "pending_tool_transition"
-        if self.state.active_recovery_tools:
-            return "active_recovery_pending"
-        if self.state.cleaner_busy:
-            return "cleaner_busy"
-        if self.state.left_hand_tool:
-            return "left_hand_occupied"
+        # Phase is a belief about the surgical context, not about whether the
+        # humanoid has finished its current action. BT/action guards already
+        # block new robot commands while execution or recovery is pending.
         return ""
+
+    def _set_active_interrupt_context(self, phase_id: str, reason: str) -> None:
+        if not phase_id or not self.spec.is_interrupt_phase(phase_id):
+            return
+        self._active_interrupt_event_phase = phase_id
+        self._active_interrupt_event_seen_sec = self._monotonic_sec()
+        self.state.predicted_tool = ""
+        self.state.predicted_tool_confidence = 0.0
+        self.state.predicted_tool_stability_sec = 0.0
+        self.state.recent_event_types.appendleft(f"ActiveInterruptContext:{phase_id}")
+        self._record_event(
+            "ActiveInterruptContextUpdated",
+            {
+                "phase_id": phase_id,
+                "reason": reason,
+            },
+        )
+
+    def _clear_active_interrupt_context(self) -> None:
+        self._active_interrupt_event_phase = ""
+        self._active_interrupt_event_seen_sec = 0.0
+
+    def _active_context_phase_id(self) -> str:
+        if not self._active_interrupt_event_phase:
+            return self.state.filtered_phase
+        if self._monotonic_sec() - self._active_interrupt_event_seen_sec > 8.0:
+            self._clear_active_interrupt_context()
+            return self.state.filtered_phase
+        return self._active_interrupt_event_phase
 
     def _record_phase_decision(
         self,
@@ -559,10 +707,19 @@ class ORDigitalTwin:
         reason: str,
         confidence: float,
         cue_id: str = "",
+        current_phase: str | None = None,
     ) -> dict[str, Any]:
+        decision_current_phase = current_phase or self.state.filtered_phase
+        if not accepted:
+            key = (decision_current_phase, target_phase, reason)
+            now = self._monotonic_sec()
+            last_seen = self._phase_decision_cooldowns.get(key, -9999.0)
+            if now - last_seen < 3.0:
+                return {}
+            self._phase_decision_cooldowns[key] = now
         event_type = "PhaseTransitionAccepted" if accepted else "PhaseTransitionRejected"
         payload = {
-            "current_phase": self.state.filtered_phase,
+            "current_phase": decision_current_phase,
             "target_phase": target_phase,
             "accepted": accepted,
             "reason": reason,
@@ -572,9 +729,91 @@ class ORDigitalTwin:
         self._record_event(event_type, payload)
         return {"event_type": event_type, **payload}
 
+    def _record_interrupt_event_decision(
+        self,
+        *,
+        target_phase: str,
+        accepted: bool,
+        reason: str,
+        confidence: float,
+        cue_id: str = "",
+        current_phase: str | None = None,
+    ) -> dict[str, Any]:
+        decision_current_phase = current_phase or self.state.filtered_phase
+        key = (decision_current_phase, target_phase, reason)
+        now = self._monotonic_sec()
+        last_seen = self._phase_decision_cooldowns.get(key, -9999.0)
+        if now - last_seen < 5.0:
+            return {}
+        self._phase_decision_cooldowns[key] = now
+        event_type = "InterruptEventDetected" if accepted else "InterruptEventRejected"
+        payload = {
+            "current_phase": decision_current_phase,
+            "target_phase": target_phase,
+            "accepted": accepted,
+            "reason": reason,
+            "confidence": float(confidence),
+            "cue_id": cue_id,
+        }
+        self.event_history.append({"event_type": event_type, **payload})
+        self.state.recent_event_types.appendleft(f"{event_type}:{target_phase}")
+        return {"event_type": event_type, **payload}
+
+    def _phase_evidence_stable_enough(self, target_phase: str, *, require_full_window: bool = True) -> tuple[bool, float, int]:
+        guard = self.spec.bundle.phase_guard
+        average_confidence, average_uncertainty, sample_count = self._phase_evidence_summary(target_phase)
+        required_samples = max(2, int(guard.smoothing_window)) if require_full_window else 1
+        stable = (
+            sample_count >= required_samples
+            and average_confidence >= float(guard.min_confidence_to_switch)
+            and average_uncertainty <= 0.45
+        )
+        return stable, average_confidence, sample_count
+
+    def _static_or_dynamic_transition_allowed(self, current_phase: str, target_phase: str) -> bool:
+        if self.spec.is_transition_allowed(current_phase, target_phase):
+            return True
+        if self.spec.is_interrupt_phase(current_phase):
+            return bool(target_phase and target_phase == self._last_normal_phase_before_interrupt)
+        return False
+
+    def _approve_phase_transition(
+        self,
+        target_phase: str,
+        *,
+        reason: str,
+        confidence: float,
+        cue_id: str = "",
+    ) -> dict[str, Any]:
+        current_phase = self.state.filtered_phase or self.spec.default_phase_id
+        if self.spec.is_interrupt_phase(target_phase) and self.spec.is_normal_phase(current_phase):
+            self._last_normal_phase_before_interrupt = current_phase
+        elif self.spec.is_normal_phase(target_phase):
+            self._last_normal_phase_before_interrupt = ""
+        self.state.filtered_phase = target_phase
+        self.state.phase_confidence = float(confidence)
+        self.state.phase_uncertain = False
+        self.state.phase_stability = min(1.0, float(confidence))
+        self._phase_entered_sec = self._monotonic_sec()
+        self._pending_phase_cues.clear()
+        self._phase_decision_cooldowns.clear()
+        if self.state.robot_state == "retracted":
+            self.state.robot_state = "idle"
+        self._recompute_transient_state()
+        return self._record_phase_decision(
+            target_phase=target_phase,
+            accepted=True,
+            reason=reason,
+            confidence=confidence,
+            cue_id=cue_id,
+            current_phase=current_phase,
+        )
+
     def _try_approve_phase_transition(self, target_phase: str, *, cue_id: str = "") -> dict[str, Any]:
         current_phase = self.state.filtered_phase or self.spec.default_phase_id
         guard = self.spec.bundle.phase_guard
+        if self.state.execution_state in {"finishing", "completed"}:
+            return {}
         if not target_phase or target_phase == current_phase:
             return self._record_phase_decision(
                 target_phase=target_phase or current_phase,
@@ -591,7 +830,7 @@ class ORDigitalTwin:
                 confidence=0.0,
                 cue_id=cue_id,
             )
-        if not self.spec.is_transition_allowed(current_phase, target_phase):
+        if not self._static_or_dynamic_transition_allowed(current_phase, target_phase):
             return self._record_phase_decision(
                 target_phase=target_phase,
                 accepted=False,
@@ -600,6 +839,50 @@ class ORDigitalTwin:
                 cue_id=cue_id,
             )
         cue = self._pending_phase_cues.get(target_phase)
+        if self.spec.is_interrupt_phase(target_phase):
+            stable, average_confidence, sample_count = self._phase_evidence_stable_enough(target_phase)
+            if stable:
+                return self._record_interrupt_event_decision(
+                    target_phase=target_phase,
+                    accepted=True,
+                    reason="stable_interrupt_event_evidence",
+                    confidence=average_confidence,
+                    cue_id=cue_id,
+                    current_phase=current_phase,
+                )
+            return self._record_interrupt_event_decision(
+                target_phase=target_phase,
+                accepted=False,
+                reason="interrupt_phase_evidence_not_stable",
+                confidence=average_confidence,
+                cue_id=cue_id,
+                current_phase=current_phase,
+            )
+        if self.spec.is_interrupt_phase(current_phase) and self.spec.is_normal_phase(target_phase):
+            expected_return = self._last_normal_phase_before_interrupt
+            if expected_return and target_phase != expected_return:
+                return self._record_phase_decision(
+                    target_phase=target_phase,
+                    accepted=False,
+                    reason="interrupt_return_target_not_previous_phase",
+                    confidence=0.0,
+                    cue_id=cue_id,
+                )
+            stable, average_confidence, sample_count = self._phase_evidence_stable_enough(target_phase)
+            if stable:
+                return self._approve_phase_transition(
+                    target_phase,
+                    reason="stable_interrupt_return_evidence",
+                    confidence=average_confidence,
+                    cue_id=cue_id,
+                )
+            return self._record_phase_decision(
+                target_phase=target_phase,
+                accepted=False,
+                reason="interrupt_return_evidence_not_stable",
+                confidence=average_confidence,
+                cue_id=cue_id,
+            )
         if cue is None:
             return self._record_phase_decision(
                 target_phase=target_phase,
@@ -637,37 +920,11 @@ class ORDigitalTwin:
             )
 
         average_confidence, average_uncertainty, sample_count = self._phase_evidence_summary(target_phase)
-        if sample_count < max(1, int(guard.smoothing_window)):
-            return self._record_phase_decision(
-                target_phase=target_phase,
-                accepted=False,
-                reason="insufficient_phase_evidence_history",
-                confidence=average_confidence,
-                cue_id=str(cue.get("cue_id", cue_id)),
-            )
-        if average_confidence < float(guard.min_confidence_to_switch) or average_uncertainty > 0.45:
-            return self._record_phase_decision(
-                target_phase=target_phase,
-                accepted=False,
-                reason="phase_evidence_not_stable",
-                confidence=average_confidence,
-                cue_id=str(cue.get("cue_id", cue_id)),
-            )
-
-        self.state.filtered_phase = target_phase
-        self.state.phase_confidence = float(average_confidence)
-        self.state.phase_uncertain = False
-        self.state.phase_stability = min(1.0, average_confidence)
-        self._phase_entered_sec = self._monotonic_sec()
-        self._pending_phase_cues.clear()
-        if self.state.robot_state == "retracted":
-            self.state.robot_state = "idle"
-        self._recompute_transient_state()
-        return self._record_phase_decision(
-            target_phase=target_phase,
-            accepted=True,
-            reason="surgeon_cue_and_stable_phase_evidence",
-            confidence=average_confidence,
+        cue_confidence = max(float(cue.get("confidence", 0.0)), average_confidence)
+        return self._approve_phase_transition(
+            target_phase,
+            reason="surgeon_cue_accepted",
+            confidence=cue_confidence,
             cue_id=str(cue.get("cue_id", cue_id)),
         )
 
@@ -698,7 +955,7 @@ class ORDigitalTwin:
 
     def apply_phase_evidence(self, evidence: PhaseEvidence) -> list[dict[str, Any]]:
         scores = {
-            str(phase_id): float(confidence)
+            self.spec.resolve_phase_id(str(phase_id)) or str(phase_id): float(confidence)
             for phase_id, confidence in zip(evidence.phase_ids, evidence.phase_confidences)
         }
         if not scores:
@@ -723,9 +980,23 @@ class ORDigitalTwin:
             },
         )
         decisions: list[dict[str, Any]] = []
+        current_phase = self.state.filtered_phase or self.spec.default_phase_id
+        ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+        if ranked:
+            top_phase = ranked[0][0]
+            if top_phase != current_phase and self.spec.is_interrupt_phase(current_phase):
+                decisions.append(self._try_approve_phase_transition(top_phase))
+            if self.spec.is_normal_phase(current_phase):
+                for phase_id, confidence in ranked:
+                    if phase_id == current_phase or not self.spec.is_interrupt_phase(phase_id):
+                        continue
+                    if float(confidence) < 0.35:
+                        continue
+                    decisions.append(self._try_approve_phase_transition(phase_id))
+                    break
         for target_phase in list(self._pending_phase_cues):
             decisions.append(self._try_approve_phase_transition(target_phase))
-        return decisions
+        return [decision for decision in decisions if decision]
 
     def _open_recovery_transaction(self, instrument_id: str, reason: str) -> None:
         if not instrument_id or instrument_id not in self.instrument_states:
@@ -799,7 +1070,8 @@ class ORDigitalTwin:
     def _record_invariant_violation(
         self, *, reason: str, event_type: str, instrument_id: str, active_tool: str = "", proposed_stage: str = ""
     ) -> None:
-        self._set_flag(reason, True)
+        if reason in BLOCKING_SAFETY_FLAGS:
+            self._set_flag(reason, True)
         self._record_event(
             "InvariantViolationIgnored",
             {
@@ -875,6 +1147,75 @@ class ORDigitalTwin:
             observed_stage=observed_stage,
             location_type=location_type,
             location_id=location_id,
+            confidence=confidence,
+        )
+
+    def promote_mayo_recovery_from_vlm(
+        self,
+        *,
+        instrument_id: str,
+        confidence: float,
+        source: str,
+        proposal_id: str,
+        stamp_sec: float,
+    ) -> dict[str, Any] | None:
+        resolved = self.spec.resolve_instrument_alias(instrument_id) or instrument_id
+        state = self.instrument_states.get(resolved)
+        if state is None:
+            return None
+        current_stage = state.lifecycle_stage
+        if current_stage not in {LIFECYCLE_MAYO_REUSE, LIFECYCLE_MAYO_RECOVERY}:
+            return self._record_vlm_proposal_decision(
+                reducer_result="rejected",
+                reducer_reason="mayo_retrieve_tool_not_on_mayo",
+                source=source,
+                proposal_id=proposal_id,
+                instrument_id=resolved,
+                current_stage=current_stage,
+                observed_stage=LIFECYCLE_MAYO_RECOVERY,
+                location_type="mayo_recovery_zone",
+                location_id="mayo_recovery_zone",
+                confidence=confidence,
+            )
+
+        self.state.surgeon_intent = "return_tool"
+        self.state.surgeon_request_tool = resolved
+        self.state.surgeon_ready_for_handover = False
+        self.state.surgeon_ready_for_retrieval = True
+        self._open_recovery_transaction(resolved, "vlm_mayo_retrieve_stable")
+        if current_stage != LIFECYCLE_MAYO_RECOVERY:
+            self._current_event_stamp_sec = stamp_sec
+            if not self._apply_event_transition(
+                state=state,
+                next_stage=LIFECYCLE_MAYO_RECOVERY,
+                event_type="VLMStableMayoRetrieve",
+                location_type="mayo_recovery_zone",
+                location_id="mayo_recovery_zone",
+                confidence=confidence,
+            ):
+                return self._record_vlm_proposal_decision(
+                    reducer_result="rejected",
+                    reducer_reason="illegal_mayo_recovery_promotion",
+                    source=source,
+                    proposal_id=proposal_id,
+                    instrument_id=resolved,
+                    current_stage=current_stage,
+                    observed_stage=LIFECYCLE_MAYO_RECOVERY,
+                    location_type="mayo_recovery_zone",
+                    location_id="mayo_recovery_zone",
+                    confidence=confidence,
+                )
+        self._recompute_transient_state()
+        return self._record_vlm_proposal_decision(
+            reducer_result="accepted",
+            reducer_reason="stable_mayo_retrieve",
+            source=source,
+            proposal_id=proposal_id,
+            instrument_id=resolved,
+            current_stage=current_stage,
+            observed_stage=LIFECYCLE_MAYO_RECOVERY,
+            location_type="mayo_recovery_zone",
+            location_id="mayo_recovery_zone",
             confidence=confidence,
         )
 
@@ -1145,6 +1486,7 @@ class ORDigitalTwin:
         self._refresh_active_robot_task()
         self._normalize_surgeon_hand_conflicts()
         self._normalize_cleaner_conflicts()
+        self._place_surgeon_owned_on_mayo_for_completion_cleanup("completion_cleanup_recompute_place_held")
         self._queue_mayo_reuse_for_completion_cleanup("completion_cleanup_recompute")
         for tool_id in list(self.state.active_recovery_tools):
             state = self.instrument_states.get(tool_id)
@@ -1173,6 +1515,7 @@ class ORDigitalTwin:
         )
         if not self.state.cleaner_busy:
             self.state.cleaner_remaining_sec = 0.0
+        self._queue_mayo_capacity_recovery()
 
         pending_tools: list[str] = []
         for state in self.instrument_states.values():
@@ -1210,10 +1553,11 @@ class ORDigitalTwin:
             if state.lifecycle_stage == LIFECYCLE_SURGEON_OWNED
             and (state.location_type == "surgeon_hand" or state.status == "handed_over")
         ]
-        if len(hand_states) <= 1:
+        if len(hand_states) <= 2:
             return
         hand_states.sort(key=lambda state: state.last_update_sec or 0.0, reverse=True)
-        for stale_state in hand_states[1:]:
+        kept_tools = [state.instrument_id for state in hand_states[:2]]
+        for stale_state in hand_states[2:]:
             self._set_lifecycle(
                 stale_state,
                 LIFECYCLE_MAYO_RECOVERY,
@@ -1225,7 +1569,7 @@ class ORDigitalTwin:
                 "SurgeonHandConflictNormalized",
                 {
                     "instrument_id": stale_state.instrument_id,
-                    "kept_tool": hand_states[0].instrument_id,
+                    "kept_tools": kept_tools,
                     "target_stage": LIFECYCLE_MAYO_RECOVERY,
                 },
             )
@@ -1311,14 +1655,17 @@ class ORDigitalTwin:
         return bool(self.state.left_hand_tool and self.state.left_hand_tool != instrument_id)
 
     def _surgeon_hand_conflict(self, instrument_id: str) -> str:
-        for tool_id, state in self.instrument_states.items():
-            if tool_id == instrument_id:
-                continue
-            if state.lifecycle_stage != LIFECYCLE_SURGEON_OWNED:
-                continue
-            if state.location_type == "surgeon_hand" or state.status == "handed_over":
-                return tool_id
-        return ""
+        hand_states = [
+            state
+            for tool_id, state in self.instrument_states.items()
+            if tool_id != instrument_id
+            and state.lifecycle_stage == LIFECYCLE_SURGEON_OWNED
+            and (state.location_type == "surgeon_hand" or state.status == "handed_over")
+        ]
+        if len(hand_states) < 2:
+            return ""
+        hand_states.sort(key=lambda state: state.last_update_sec or 0.0)
+        return hand_states[0].instrument_id
 
     def update_explicit_request(self, request_text: str) -> str:
         if not request_text.strip():
@@ -1431,6 +1778,17 @@ class ORDigitalTwin:
             cue.confidence = 0.96
             cue.reason = event.note or event_type
             self.apply_phase_transition_cue(cue)
+        elif event_type == "field_event":
+            self._set_active_interrupt_context(phase_id, "surgeon_actor_field_event")
+        elif event_type == "field_event_resolved":
+            self._clear_active_interrupt_context()
+            self._record_event(
+                "ActiveInterruptContextCleared",
+                {
+                    "phase_id": phase_id,
+                    "reason": "surgeon_actor_field_event_resolved",
+                },
+            )
         elif event_type == "request_procedure_completion":
             self._begin_completion_cleanup()
         elif event_type == "complete_procedure":
@@ -1463,7 +1821,7 @@ class ORDigitalTwin:
                     self.state.surgeon_intent = "continue_using"
                     self.state.surgeon_ready_for_handover = False
                     self.state.surgeon_ready_for_retrieval = False
-                elif event_type == "place_on_mayo_reuse":
+                elif event_type in {"place_on_mayo", "place_on_mayo_reuse"}:
                     self.state.surgeon_intent = "park_for_reuse"
                     self.state.surgeon_ready_for_handover = False
                     self.state.surgeon_ready_for_retrieval = False
@@ -1844,7 +2202,7 @@ class ORDigitalTwin:
         )
 
     def get_expected_instruments(self) -> list[str]:
-        phase_id = self.state.filtered_phase
+        phase_id = self._active_context_phase_id()
         if phase_id not in self.spec.phase_ids:
             phase_id = self.spec.default_phase_id
         return self.spec.get_expected_instruments(phase_id)
@@ -1857,7 +2215,7 @@ class ORDigitalTwin:
         ]
 
     def handover_allowed(self) -> bool:
-        if self.state.safety_flags:
+        if any(flag in BLOCKING_SAFETY_FLAGS for flag in self.state.safety_flags):
             return False
         if (
             self.spec.bundle.action_guard
@@ -1880,6 +2238,14 @@ class ORDigitalTwin:
         if requested_state.contaminated:
             return False
         if requested_state.lifecycle_stage in {LIFECYCLE_SURGEON_OWNED, LIFECYCLE_MAYO_REUSE}:
+            return False
+        surgeon_owned_count = sum(
+            1
+            for state in self.instrument_states.values()
+            if state.lifecycle_stage == LIFECYCLE_SURGEON_OWNED
+            and (state.location_type == "surgeon_hand" or state.status == "handed_over")
+        )
+        if surgeon_owned_count >= 2:
             return False
         if requested_state.lifecycle_stage not in {LIFECYCLE_HOME_RACK, LIFECYCLE_RETURNED_HOME, LIFECYCLE_PREPOSITIONED_RIGHT}:
             return False

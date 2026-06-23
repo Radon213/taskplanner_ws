@@ -76,6 +76,9 @@ class TwinState:
     right_hand_tool: str = ""
     left_hand_tool: str = ""
     prepositioned_tool: str = ""
+    predicted_tool: str = ""
+    predicted_tool_confidence: float = 0.0
+    predicted_tool_stability_sec: float = 0.0
     surgeon_intent: str = ""
     surgeon_request_tool: str = ""
     surgeon_ready_for_handover: bool = False

@@ -87,6 +87,9 @@ class SimulationManagerNode(Node):
             "/real_vlm_node": AsyncParameterClient(
                 self, "/real_vlm_node", callback_group=self._callback_group
             ),
+            "/no_image_camera": AsyncParameterClient(
+                self, "/no_image_camera", callback_group=self._callback_group
+            ),
             "/phase_estimator": AsyncParameterClient(
                 self, "/phase_estimator", callback_group=self._callback_group
             ),
@@ -144,6 +147,20 @@ class SimulationManagerNode(Node):
         for _ in range(max(1, repeat_count)):
             self._control_pub.publish(msg)
             time.sleep(0.05)
+
+    @staticmethod
+    def _control_with_phase(command: str, phase_id: str = "") -> str:
+        phase_id = str(phase_id or "").strip()
+        return f"{command}:{phase_id}" if phase_id else command
+
+    def _normalize_start_phase(self, phase_id: str = "") -> str:
+        requested = str(phase_id or "").strip()
+        if not requested:
+            return ""
+        if requested not in self._active_spec.phase_ids:
+            allowed = ", ".join(self._active_spec.phase_ids)
+            raise ValueError(f"unknown start phase '{requested}' for {self._active_bundle}; allowed: {allowed}")
+        return requested
 
     def _on_simulation_state(self, msg: SimulationState) -> None:
         with self._latest_state_lock:
@@ -242,28 +259,59 @@ class SimulationManagerNode(Node):
         return True
 
     def _set_spec_dir_on_runtime(self, spec_dir: Path) -> None:
-        deadline = time.time() + 8.0
-        pending_clients = list(self._parameter_clients.items())
-        optional_clients = {"/mock_vlm_node", "/real_vlm_node", "/phase_estimator"}
+        optional_clients = {
+            "/mock_vlm_node",
+            "/real_vlm_node",
+            "/no_image_camera",
+            "/phase_estimator",
+            "/surgeon_actor",
+        }
+        required_clients = [
+            (name, client) for name, client in self._parameter_clients.items() if name not in optional_clients
+        ]
+        optional_parameter_clients = [
+            (name, client) for name, client in self._parameter_clients.items() if name in optional_clients
+        ]
         updated_clients: set[str] = set()
+
+        def update_client(name, client, wait_sec: float) -> bool:
+            ready = client.services_are_ready()
+            if not ready and wait_sec > 0:
+                ready = client.wait_for_services(timeout_sec=wait_sec)
+            if ready:
+                future = client.set_parameters([Parameter(name="spec_dir", value=str(spec_dir))])
+                response = self._wait_future(future, timeout_sec=10.0)
+                results = getattr(response, "results", response or [])
+                failed = [
+                    result
+                    for result in results
+                    if not bool(getattr(result, "successful", False))
+                ]
+                if failed:
+                    reason = "; ".join(str(getattr(result, "reason", "")) for result in failed).strip()
+                    raise RuntimeError(f"spec update rejected by {name}: {reason or 'unknown reason'}")
+                updated_clients.add(name)
+                return True
+            return False
+
+        deadline = time.time() + 8.0
+        pending_clients = required_clients
         while pending_clients and time.time() < deadline:
             still_pending = []
             for name, client in pending_clients:
-                if client.services_are_ready() or client.wait_for_services(timeout_sec=0.25):
-                    future = client.set_parameters([Parameter(name="spec_dir", value=str(spec_dir))])
-                    self._wait_future(future, timeout_sec=10.0)
-                    updated_clients.add(name)
-                else:
+                if not update_client(name, client, wait_sec=0.25):
                     still_pending.append((name, client))
             pending_clients = still_pending
         if pending_clients:
-            required_missing = [name for name, _ in pending_clients if name not in optional_clients]
-            for name, _ in pending_clients:
-                if name in optional_clients:
+            missing = ", ".join(name for name, _ in pending_clients)
+            raise TimeoutError(f"parameter services not ready for: {missing}")
+
+        for name, client in optional_parameter_clients:
+            try:
+                if not update_client(name, client, wait_sec=0.05):
                     self.get_logger().info(f"optional parameter service unavailable, skipping spec update for {name}")
-            if required_missing:
-                missing = ", ".join(required_missing)
-                raise TimeoutError(f"parameter services not ready for: {missing}")
+            except Exception as exc:
+                self.get_logger().warn(f"optional spec update failed for {name}: {exc}")
         if not updated_clients.intersection({"/mock_vlm_node", "/real_vlm_node"}):
             self.get_logger().info("no VLM parameter service was available during bundle switch; continuing without direct spec update")
 
@@ -371,7 +419,12 @@ class SimulationManagerNode(Node):
 
     def _wait_for_executor_running(self, timeout_sec: float = 10.0) -> bool:
         deadline = time.time() + timeout_sec
-        running_states = {"running", "active", "executing"}
+        # AutoAPMS reports a successful StartTreeExecutor dispatch as
+        # "accepted" and later often "succeeded" while the tree keeps ticking.
+        # Treat those as live executor states so startup and bundle restart do
+        # not burn the full timeout waiting for a state string that this backend
+        # does not emit.
+        running_states = {"running", "active", "executing", "starting", "accepted", "succeeded"}
         while time.time() < deadline:
             try:
                 success, state = self._get_runtime_state()
@@ -479,11 +532,14 @@ class SimulationManagerNode(Node):
         finally:
             self._finish_operation(name)
 
-    def _start_sequence(self) -> str:
+    def _start_sequence(self, start_phase_id: str = "", *, prepare_executor: bool = True) -> str:
+        start_phase_id = self._normalize_start_phase(start_phase_id)
+        target_phase_id = start_phase_id or self._active_spec.default_phase_id
         self._running = False
         self._execution_state = "starting"
         self._completion_terminate_started = False
-        self._prepare_executor_for_restart()
+        if prepare_executor:
+            self._prepare_executor_for_restart()
         self._raise_if_operation_cancelled()
         if not self._publish_control_until(
             "reset",
@@ -500,15 +556,16 @@ class SimulationManagerNode(Node):
             raise RuntimeError("digital twin did not publish an idle home frame after reset")
         self._raise_if_operation_cancelled()
         if not self._publish_control_until(
-            "start_runtime",
+            self._control_with_phase("start_runtime", start_phase_id),
             lambda state: (
                 state.active_bundle == self._active_bundle
                 and state.running
                 and state.execution_state == "running"
+                and state.filtered_phase == target_phase_id
                 and self._all_instruments_home(state)
             ),
             timeout_sec=8.0,
-            description="initial home running digital twin frame",
+            description=f"initial home running digital twin frame at {target_phase_id}",
         ):
             self._raise_if_operation_cancelled()
             raise RuntimeError("digital twin did not enter running state before BT start")
@@ -517,7 +574,7 @@ class SimulationManagerNode(Node):
         # starting. Requests are queued in the twin, so this reduces the
         # perceived wait for the first tool without letting BT run before the
         # digital twin is initialized.
-        self._publish_control("start_actors")
+        self._publish_control(self._control_with_phase("start_actors", start_phase_id))
         self._raise_if_operation_cancelled()
         success, message = self._start_behavior(clear_blackboard=True)
         if success:
@@ -528,7 +585,8 @@ class SimulationManagerNode(Node):
             self._execution_state = "running"
             self._bundle_dirty = False
             self.get_logger().info(message or "simulation started")
-            return message or f"simulation running on {self._active_bundle}"
+            phase_suffix = f" from {target_phase_id}" if start_phase_id else ""
+            return message or f"simulation running on {self._active_bundle}{phase_suffix}"
         self._publish_control("stop")
         self._set_idle_state()
         raise RuntimeError(message or "failed to start simulation")
@@ -612,7 +670,32 @@ class SimulationManagerNode(Node):
 
     def _handle_select_bundle(self, request, response):
         try:
-            if self._running and not request.restart_if_running:
+            interrupted_start = False
+            if self._operation_name == "start":
+                if not request.restart_if_running:
+                    response.success = False
+                    response.message = "cannot switch bundle while simulation is starting without restart_if_running=true"
+                    response.active_bundle = self._active_bundle
+                    response.spec_dir = str(self._active_spec_dir)
+                    return response
+                self._interrupt_start_sequence("reset")
+                if not self._wait_for_operation_clear(timeout_sec=12.0):
+                    response.success = False
+                    response.message = "start operation is still stopping; retry bundle switch"
+                    response.active_bundle = self._active_bundle
+                    response.spec_dir = str(self._active_spec_dir)
+                    return response
+                interrupted_start = True
+            elif self._operation_name:
+                if not self._wait_for_operation_clear(timeout_sec=25.0):
+                    response.success = False
+                    response.message = f"{self._operation_name} already in progress"
+                    response.active_bundle = self._active_bundle
+                    response.spec_dir = str(self._active_spec_dir)
+                    return response
+
+            was_running = interrupted_start or self._running or self._execution_state in {"starting", "running", "paused"}
+            if was_running and not request.restart_if_running:
                 response.success = False
                 response.message = "cannot switch bundle while simulation is running without restart_if_running=true"
                 response.active_bundle = self._active_bundle
@@ -620,15 +703,18 @@ class SimulationManagerNode(Node):
                 return response
 
             spec_dir, spec = self._load_spec_for_bundle(request.bundle_name)
-            if self._running and request.restart_if_running:
+            if was_running and request.restart_if_running:
                 self._prepare_executor_for_restart()
             self._set_spec_dir_on_runtime(spec_dir)
             self._active_bundle = request.bundle_name
             self._active_spec_dir = spec_dir
             self._active_spec = spec
             self._bundle_dirty = True
-            if self._running and request.restart_if_running:
-                success, message = self._run_sync("bundle-restart", self._start_sequence)
+            if was_running and request.restart_if_running:
+                success, message = self._run_sync(
+                    "bundle-restart",
+                    lambda: self._start_sequence(prepare_executor=False),
+                )
                 response.success = success
                 response.message = message
             else:
@@ -648,6 +734,7 @@ class SimulationManagerNode(Node):
 
     def _handle_control(self, request, response):
         command = request.command.strip().lower()
+        requested_start_phase = str(getattr(request, "start_phase_id", "") or "").strip()
         try:
             if self._operation_name == "start":
                 if command in {"stop", "reset"}:
@@ -678,13 +765,24 @@ class SimulationManagerNode(Node):
                     return response
 
             if command == "start":
+                try:
+                    normalized_start_phase = self._normalize_start_phase(requested_start_phase)
+                except ValueError as exc:
+                    response.success = False
+                    response.message = str(exc)
+                    response.running = self._running
+                    response.execution_state = self._execution_state
+                    return response
                 if self._running and self._execution_state == "running":
                     response.success = True
                     response.message = "simulation already running"
                 else:
                     self._running = False
                     self._execution_state = "starting"
-                    success, message = self._run_async("start", self._start_sequence)
+                    success, message = self._run_async(
+                        "start",
+                        lambda: self._start_sequence(normalized_start_phase),
+                    )
                     response.success = success
                     response.message = message
             elif command == "pause":

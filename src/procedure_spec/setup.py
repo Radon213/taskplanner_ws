@@ -1,6 +1,19 @@
+from pathlib import Path
+
 from setuptools import find_packages, setup
 
+
 package_name = "procedure_spec"
+
+
+def spec_data_files() -> list[tuple[str, list[str]]]:
+    specs_root = Path("procedure_spec/specs")
+    grouped: dict[Path, list[str]] = {}
+    for path in sorted(specs_root.rglob("*.yaml")):
+        destination = Path("share") / package_name / path.parent.relative_to("procedure_spec")
+        grouped.setdefault(destination, []).append(str(path))
+    return [(str(destination), files) for destination, files in sorted(grouped.items())]
+
 
 setup(
     name=package_name,
@@ -9,36 +22,7 @@ setup(
     data_files=[
         ("share/ament_index/resource_index/packages", [f"resource/{package_name}"]),
         (f"share/{package_name}", ["package.xml"]),
-        (
-            f"share/{package_name}/specs",
-            [
-                "procedure_spec/specs/display_catalog.yaml",
-            ],
-        ),
-        (
-            f"share/{package_name}/specs/thyroidectomy",
-            [
-                "procedure_spec/specs/thyroidectomy/procedure.yaml",
-                "procedure_spec/specs/thyroidectomy/instruments.yaml",
-                "procedure_spec/specs/thyroidectomy/mock_perception.yaml",
-                "procedure_spec/specs/thyroidectomy/mock_surgeon.yaml",
-                "procedure_spec/specs/thyroidectomy/scene_layout.yaml",
-                "procedure_spec/specs/thyroidectomy/simulation_layout.yaml",
-                "procedure_spec/specs/thyroidectomy/policy.yaml",
-            ],
-        ),
-        (
-            f"share/{package_name}/specs/nephrectomy",
-            [
-                "procedure_spec/specs/nephrectomy/procedure.yaml",
-                "procedure_spec/specs/nephrectomy/instruments.yaml",
-                "procedure_spec/specs/nephrectomy/mock_perception.yaml",
-                "procedure_spec/specs/nephrectomy/mock_surgeon.yaml",
-                "procedure_spec/specs/nephrectomy/scene_layout.yaml",
-                "procedure_spec/specs/nephrectomy/simulation_layout.yaml",
-                "procedure_spec/specs/nephrectomy/policy.yaml",
-            ],
-        ),
+        *spec_data_files(),
     ],
     install_requires=["setuptools", "PyYAML"],
     zip_safe=True,

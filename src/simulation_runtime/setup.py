@@ -10,7 +10,7 @@ setup(
         ("share/ament_index/resource_index/packages", [f"resource/{package_name}"]),
         (f"share/{package_name}", ["package.xml"]),
     ],
-    install_requires=["setuptools"],
+    install_requires=["setuptools", "requests"],
     zip_safe=True,
     maintainer="Codex",
     maintainer_email="codex@example.com",
@@ -21,6 +21,7 @@ setup(
             "simulation_manager = simulation_runtime.simulation_manager:main",
             "mock_surgeon = simulation_runtime.mock_surgeon:main",
             "surgeon_actor = simulation_runtime.surgeon_actor:main",
+            "llm_surgeon_actor = simulation_runtime.llm_surgeon_actor:main",
         ],
     },
 )

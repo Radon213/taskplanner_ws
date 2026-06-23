@@ -7,6 +7,7 @@ import type {
   StageToolChipPlacement,
   useDigitalTwinViewModel,
 } from "../../hooks/useDigitalTwinViewModel";
+import type { CompressedImageFrame } from "../../types";
 
 type ViewModel = ReturnType<typeof useDigitalTwinViewModel>;
 
@@ -94,9 +95,11 @@ function PhaseStepper({ steps, label }: { steps: StagePhaseStep[]; label: string
 
 export function OperatingRoomStage({
   vm,
+  vlmImage,
   onStageAspectChange,
 }: {
   vm: ViewModel;
+  vlmImage: CompressedImageFrame | null;
   onStageAspectChange?: (ratio: number) => void;
 }) {
   const reduceMotion = useReducedMotion();
@@ -137,6 +140,12 @@ export function OperatingRoomStage({
   const surgeonAlertClockKey = surgeonAlertBubbles
     .map((bubble) => `${bubble.id}:${bubble.occurredAt ?? 0}`)
     .join("|");
+  const interruptAlertKey = vm.stage.interruptAlert
+    ? vm.stage.interruptAlert.eventKey
+    : "";
+  const [hiddenInterruptAlertKey, setHiddenInterruptAlertKey] = useState("");
+  const visibleInterruptAlert =
+    vm.stage.interruptAlert && hiddenInterruptAlertKey !== interruptAlertKey ? vm.stage.interruptAlert : null;
 
   useEffect(() => {
     if (!surgeonAlertBubbles.some((bubble) => bubble.occurredAt)) return;
@@ -145,14 +154,45 @@ export function OperatingRoomStage({
     return () => window.clearInterval(timer);
   }, [surgeonAlertClockKey]);
 
+  useEffect(() => {
+    if (!interruptAlertKey) {
+      setHiddenInterruptAlertKey("");
+      return;
+    }
+    setHiddenInterruptAlertKey("");
+    const timer = window.setTimeout(() => setHiddenInterruptAlertKey(interruptAlertKey), 5200);
+    return () => window.clearTimeout(timer);
+  }, [interruptAlertKey]);
+
   return (
     <section className="stage-card foxglove-stage-card" aria-label={vm.ui.stageTitle}>
-      <div className="stage-header">
-        <div>
-          <p className="section-kicker">{vm.ui.stageTitle}</p>
-          <h2>{vm.stage.procedureLabel}</h2>
+      <div className="stage-chrome">
+        <div className="stage-header">
+          <div>
+            <p className="section-kicker">{vm.ui.stageTitle}</p>
+            <h2>{vm.stage.procedureLabel}</h2>
+          </div>
+          <PhaseStepper steps={vm.stage.phaseSteps} label={vm.ui.phaseOverview} />
         </div>
-        <PhaseStepper steps={vm.stage.phaseSteps} label={vm.ui.phaseOverview} />
+
+        <AnimatePresence initial={false}>
+          {visibleInterruptAlert ? (
+            <motion.div
+              key={visibleInterruptAlert.phaseId}
+              className="phase-interrupt-alert"
+              role="status"
+              aria-live="polite"
+              initial={{ opacity: 0, y: reduceMotion ? 0 : -6 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: reduceMotion ? 0 : -4 }}
+              transition={{ duration: reduceMotion ? 0.1 : 0.18 }}
+            >
+              <span>{visibleInterruptAlert.title}</span>
+              <strong>{visibleInterruptAlert.label}</strong>
+              <p>{visibleInterruptAlert.message}</p>
+            </motion.div>
+          ) : null}
+        </AnimatePresence>
       </div>
 
       <div className="or-stage foxglove-board" ref={boardRef}>
@@ -238,6 +278,13 @@ export function OperatingRoomStage({
           </motion.div>
           <div className="surgical-bed-body" aria-hidden="true">
             <span />
+          </div>
+          <div className="surgical-bed-vlm-frame" aria-label={vm.language === "ko" ? "VLM 입력 영상" : "VLM input image"}>
+            {vlmImage ? (
+              <img src={vlmImage.src} alt={vm.language === "ko" ? "VLM 입력 영상" : "VLM input"} />
+            ) : (
+              <div>{vm.language === "ko" ? "영상 프레임 없음" : "No image frame"}</div>
+            )}
           </div>
         </div>
 
@@ -375,9 +422,9 @@ export function OperatingRoomStage({
                 title={chip.label}
               >
                 <motion.article
-                  className={`tool-chip ${chip.displayState} ${chip.highlight} ${chip.active ? "active" : ""} ${
+                  className={`tool-chip ${chip.layoutVariant} ${chip.displayState} ${chip.highlight} ${chip.active ? "active" : ""} ${
                     chip.contaminated ? "contaminated" : ""
-                  } ${chip.compact ? "compact" : ""}`}
+                  } ${chip.compact ? "compact" : ""} density-${chip.density}`}
                   initial={{ opacity: 0, scale: reduceMotion ? 1 : 0.96 }}
                   animate={{ opacity: 1, scale: 1 }}
                   transition={{ duration: reduceMotion ? 0.1 : 0.2, ease: [0.22, 1, 0.36, 1] }}

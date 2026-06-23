@@ -9,7 +9,7 @@ from pathlib import Path
 import time
 from typing import Any
 
-from procedure_spec import get_default_spec_dir, load_bundle
+from procedure_spec import ProcedurePriorScorer, compact_procedure_prompt, get_default_spec_dir, load_bundle
 import requests
 import rclpy
 from rcl_interfaces.msg import SetParametersResult
@@ -21,9 +21,11 @@ from surgical_msgs.msg import (
     BTDecision,
     EventDigest,
     PhaseEvidence,
+    SkillStatus,
     SimulationState,
+    SurgeonOutwardSignal,
+    SurgeonRequest,
     SurgeonGestureEvidence,
-    SurgeonState,
     ToolObservation,
     TwinEvent,
     VLMHealth,
@@ -38,6 +40,28 @@ from .prompt_builder import PromptBuilder
 from .schema import SchemaValidationError, compact_vlm_json_schema, normalize_raw_text
 
 
+PUBLIC_DIGITAL_TWIN_EVENT_TYPES = {
+    "RobotTaskStarted",
+    "RobotTaskCompleted",
+    "RobotGraspedTool",
+    "ToolPrepared",
+    "ToolHandoverCompleted",
+    "ToolReceivedFromSurgeon",
+    "ToolSentToCleaner",
+    "ToolCleaningProgress",
+    "ToolCleaningCompleted",
+    "ToolReturnedToTray",
+    "PredictedToolReturnedToRack",
+    "ProcedureCompleted",
+    "SurgeonRequestObserved",
+    "VLMStableMayoRetrieve",
+    "VLMPredictedToolStable",
+    "VoiceTranscriptObserved",
+    "InvariantViolation",
+    "InvariantViolationIgnored",
+}
+
+
 class RealVLMNode(Node):
     def __init__(self) -> None:
         super().__init__("real_vlm_node")
@@ -46,7 +70,7 @@ class RealVLMNode(Node):
         self.declare_parameter("model_id", "gemma-4-26b-a4b-it")
         self.declare_parameter("api_mode", "lmstudio_native")
         self.declare_parameter("request_timeout_sec", 20.0)
-        self.declare_parameter("max_output_tokens", 180)
+        self.declare_parameter("max_output_tokens", 320)
         self.declare_parameter("temperature", 0.0)
         self.declare_parameter("top_p", 1.0)
         self.declare_parameter("response_format", "none")
@@ -61,18 +85,25 @@ class RealVLMNode(Node):
         self.declare_parameter("tray_image_topic", "/surgery/images/tray/compressed")
         self.declare_parameter("synthetic_image_topic", "/surgery/images/synthetic/compressed")
         self.declare_parameter("image_stale_sec", 5.0)
+        self.declare_parameter("context_mode", "world")
 
         self._prompt_builder = PromptBuilder()
         self._active = False
         self._world: WorldState | None = None
         self._simulation: SimulationState | None = None
-        self._surgeon_state: SurgeonState | None = None
         self._latest_bt: BTDecision | None = None
         self._recent_events: deque[EventDigest] = deque(maxlen=6)
         self._latest_images: dict[str, tuple[float, bytes, str]] = {}
         self._last_good_raw = ""
         self._last_good_payload: dict[str, Any] | None = None
         self._replay_payload: dict[str, Any] | None = None
+        self._recent_observed_signals: deque[dict[str, Any]] = deque(maxlen=12)
+        self._recent_speech: deque[dict[str, Any]] = deque(maxlen=10)
+        self._recent_skill_statuses: deque[dict[str, Any]] = deque(maxlen=8)
+        self._actor_overlay: dict[str, Any] = {}
+        self._last_simulation_bundle = ""
+        self._last_world_phase = ""
+        self._phase_entered_wall_sec = time.time()
         self._oracle_scenario = []
         self._oracle_scenario_length = 0
         self._oracle_bootstrap_tick = 0
@@ -84,8 +115,7 @@ class RealVLMNode(Node):
             "Confidence values and u must be numeric floats between 0.0 and 1.0, not strings and not booleans. "
             "Use exact tool ids and location ids from context. "
             "If gesture is absent, sg must be exactly [\"\",\"\",\"\",0.0]. "
-            "If the image is black, blank, or says No image, emit "
-            "{\"v\":\"1\",\"ph\":[[\"exposure\",0.0]],\"to\":[],\"sg\":[\"\",\"\",\"\",0.0],\"u\":1.0,\"sum\":\"no image available\"}."
+            "If the image is black, blank, or text-only, keep the current context phase at low confidence, emit no tool observations, and set u to 1.0."
         )
 
         self._load_parameters()
@@ -106,7 +136,11 @@ class RealVLMNode(Node):
         self.create_subscription(SimulationState, "/simulation/state", self._on_simulation, 20)
         self.create_subscription(TwinEvent, "/twin/events", self._on_event, 50)
         self.create_subscription(BTDecision, "/bt/decision", self._on_bt_decision, 20)
-        self.create_subscription(SurgeonState, "/surgeon/state", self._on_surgeon_state, 20)
+        self.create_subscription(SurgeonRequest, "/surgeon/request", self._on_surgeon_request, 20)
+        self.create_subscription(SurgeonOutwardSignal, "/surgeon/outward_signal", self._on_outward_signal, 20)
+        self.create_subscription(SkillStatus, "/skill/status", self._on_skill_status, 50)
+        self.create_subscription(String, "/surgeon/actor_overlay", self._on_actor_overlay, 20)
+        self.create_subscription(String, "/surgery/audio/request_text", self._on_request_text, 20)
         self.create_subscription(CompressedImage, self._field_image_topic, self._make_image_cb("field"), 10)
         self.create_subscription(CompressedImage, self._tray_image_topic, self._make_image_cb("tray"), 10)
         self.create_subscription(CompressedImage, self._synthetic_image_topic, self._make_image_cb("synthetic"), 10)
@@ -114,30 +148,47 @@ class RealVLMNode(Node):
 
         self._timer = self.create_timer(self._publish_period_sec, self._tick)
 
-    def _load_parameters(self) -> None:
-        self._spec_dir = str(self.get_parameter("spec_dir").value)
+    def _load_parameters(self, overrides: dict[str, Any] | None = None) -> None:
+        override_values = overrides or {}
+
+        def param_value(name: str) -> Any:
+            return override_values.get(name, self.get_parameter(name).value)
+
+        self._spec_dir = str(param_value("spec_dir"))
         self._spec = load_bundle(self._spec_dir)
-        self._system_prompt = self._prompt_builder.build(self._spec_dir)
-        self._base_url = str(self.get_parameter("base_url").value)
-        self._model_id = str(self.get_parameter("model_id").value)
-        self._api_mode = str(self.get_parameter("api_mode").value)
-        self._request_timeout_sec = float(self.get_parameter("request_timeout_sec").value)
-        self._max_output_tokens = int(self.get_parameter("max_output_tokens").value)
-        self._temperature = float(self.get_parameter("temperature").value)
-        self._top_p = float(self.get_parameter("top_p").value)
-        self._response_format = str(self.get_parameter("response_format").value).strip().lower()
-        self._reasoning_effort = str(self.get_parameter("reasoning_effort").value).strip()
-        self._retry_count = int(self.get_parameter("retry_count").value)
-        self._publish_period_sec = float(self.get_parameter("publish_period_sec").value)
-        self._response_mode = str(self.get_parameter("response_mode").value)
-        self._replay_response_path = str(self.get_parameter("replay_response_path").value)
-        self._output_prefix = str(self.get_parameter("output_prefix").value).rstrip("/")
-        self._context_prefix = str(self.get_parameter("context_prefix").value).rstrip("/")
-        self._field_image_topic = str(self.get_parameter("field_image_topic").value)
-        self._tray_image_topic = str(self.get_parameter("tray_image_topic").value)
-        self._synthetic_image_topic = str(self.get_parameter("synthetic_image_topic").value)
-        self._image_stale_sec = float(self.get_parameter("image_stale_sec").value)
-        self._json_schema = compact_vlm_json_schema()
+        self._base_url = str(param_value("base_url"))
+        self._model_id = str(param_value("model_id"))
+        self._api_mode = str(param_value("api_mode"))
+        self._request_timeout_sec = float(param_value("request_timeout_sec"))
+        self._max_output_tokens = int(param_value("max_output_tokens"))
+        self._temperature = float(param_value("temperature"))
+        self._top_p = float(param_value("top_p"))
+        self._response_format = str(param_value("response_format")).strip().lower()
+        self._reasoning_effort = str(param_value("reasoning_effort")).strip()
+        self._retry_count = int(param_value("retry_count"))
+        self._publish_period_sec = float(param_value("publish_period_sec"))
+        self._response_mode = str(param_value("response_mode"))
+        self._replay_response_path = str(param_value("replay_response_path"))
+        self._output_prefix = str(param_value("output_prefix")).rstrip("/")
+        self._context_prefix = str(param_value("context_prefix")).rstrip("/")
+        self._field_image_topic = str(param_value("field_image_topic"))
+        self._tray_image_topic = str(param_value("tray_image_topic"))
+        self._synthetic_image_topic = str(param_value("synthetic_image_topic"))
+        self._image_stale_sec = float(param_value("image_stale_sec"))
+        self._context_mode = str(param_value("context_mode")).strip().lower()
+        if self._context_mode == "actor_log":
+            self._procedure_prompt = compact_procedure_prompt(self._spec_dir)
+            self._prior_scorer = ProcedurePriorScorer(self._spec, self._procedure_prompt)
+            self._system_prompt = self._actor_log_system_prompt()
+            self._developer_instruction = self._actor_log_developer_instruction()
+            self._json_schema = compact_vlm_json_schema("3")
+        else:
+            self._context_mode = "world"
+            self._procedure_prompt = compact_procedure_prompt(self._spec_dir)
+            self._prior_scorer = ProcedurePriorScorer(self._spec, self._procedure_prompt)
+            self._system_prompt = self._prompt_builder.build(self._spec_dir)
+            self._developer_instruction = self._world_developer_instruction()
+            self._json_schema = compact_vlm_json_schema("1")
         self._oracle_scenario = list(self._spec.get_mock_perception_stages())
         self._oracle_scenario_length = sum(stage.duration_ticks for stage in self._oracle_scenario)
         self._oracle_bootstrap_tick = int(self._spec.get_mock_perception_bootstrap_tick())
@@ -160,8 +211,79 @@ class RealVLMNode(Node):
     def _topic(self, prefix: str, suffix: str) -> str:
         return f"{prefix}/{suffix}".replace("//", "/")
 
+    def _world_developer_instruction(self) -> str:
+        return (
+            "Return exactly one valid JSON object and nothing else. "
+            "All object keys must be double-quoted strings: \"v\", \"ph\", \"to\", \"sg\", \"u\", \"sum\". "
+            "Never omit quotes around keys. Never use true/false/null. "
+            "Confidence values and u must be numeric floats between 0.0 and 1.0, not strings and not booleans. "
+            "Use exact tool ids and location ids from context. "
+            "If gesture is absent, sg must be exactly [\"\",\"\",\"\",0.0]. "
+            "If the image is black, blank, or text-only, keep the current context phase at low confidence, emit no tool observations, and set u to 1.0."
+        )
+
+    def _actor_log_system_prompt(self) -> str:
+        phases = [
+            {
+                "id": phase.id,
+                "next": list(phase.possible_next),
+                "tools": list(phase.expected_instruments),
+            }
+            for phase in self._spec.bundle.phases
+        ]
+        tools = [
+            {
+                "id": instrument.id,
+                "name": instrument.display_name,
+                "role": instrument.role,
+                "requestable": bool(getattr(instrument, "requestable", True)),
+            }
+            for instrument in self._spec.bundle.instruments
+        ]
+        return (
+            "You are the VLM-side interpreter for a surgical task-planning simulator. "
+            "The visual input may be a black No image frame with text overlays. "
+            "Infer the likely surgical phase, next requested tool, handover intent, and Mayo stand recovery/reuse need from visible overlay text, public speech, public signals, skill status, digital-twin events, and procedure-derived candidates. "
+            "Do not assume the surgeon actor's hidden phase; infer from public speech, visible gestures, Mayo contents, and procedure flow. "
+            "Separate the current/held tool from the next tool that is likely to be requested soon. "
+            "Prefer public visual/events over previous predictions; use previous predictions only as weak temporal smoothing. "
+            "If no public evidence indicates phase progression, keep the current runtime phase high and mark uncertainty rather than jumping ahead from tool order alone. "
+            "Use context.candidates as the procedure prior. When public evidence is weak, keep its ranking; only reorder it when speech, visible gesture, image evidence, or recent tool events clearly justify it. "
+            "Mayo stand text is visual evidence that a tool is on Mayo, but it does not reveal whether the tool should be recovered or reused. "
+            "Field event text is public visual evidence of an intermittent surgical event; treat it as an event overlay, not as the current surgical phase. "
+            "Use recover only when the tool is no longer likely to be reused soon. Use reuse when it is likely needed again. "
+            "In this simulator, a tool placed on Mayo after use should usually become recover unless recent speech or the doctor sequence clearly indicates near-term reuse. "
+            "If Mayo has tools and recent public observations show a different tool request or handover after the Mayo placement, evaluate the older Mayo tool as recover. "
+            "When any Mayo tool is recover, mayo_retrieve must name the highest-confidence recover tool; do not leave mayo_retrieve empty. "
+            "The doctor procedure prompt may use Pxx/Txx ids. Use the runtime_phase and tools[*].rt crosswalk, and emit only runtime phase/tool ids in JSON. "
+            "If a doctor tool has an empty runtime id, treat it as an unmodeled cue and do not emit it as the requested tool. "
+            "Return exactly one JSON object with top-k phase and tool candidates. "
+            f"Runtime ontology: {json.dumps({'phases': phases, 'tools': tools}, separators=(',', ':'))}. "
+            f"Doctor procedure prompt: {json.dumps(self._procedure_prompt, separators=(',', ':'))}"
+        )
+
+    def _actor_log_developer_instruction(self) -> str:
+        return (
+            "Return schema v3 only: "
+            "{\"v\":\"3\",\"phase\":[[phase_id,confidence]],\"tool\":[[tool_id,confidence]],"
+            "\"intent\":[intent_type,tool_id,confidence],\"mayo\":[[tool_id,\"recover|reuse\",confidence]],"
+            "\"mayo_retrieve\":[tool_id,confidence],\"u\":uncertainty,\"sum\":\"short reason\"}. "
+            "Emit 1-4 phase candidates and 1-4 next-tool candidates using exact phase ids and tool ids from context. "
+            "intent_type should be handover when speech/hand indicates a tool request; otherwise use none. "
+            "tool rows must rank the most likely next runtime tools requested soon, not Pxx/Txx doctor ids. "
+            "Do not rank a tool merely because it is currently held, on Mayo, or being cleaned; rank it only if it is likely to be requested again. "
+            "If public evidence is ambiguous, copy the order of candidates.tool and lower confidence instead of guessing a different tool. "
+            "If candidates.tool is non-empty and its top row differs from previous.tool, do not repeat previous.tool unless fresh speech explicitly requests it. "
+            "Use mayo rows to classify visible Mayo tools as recover or reuse. "
+            "For each visible Mayo tool, emit one mayo row. If a Mayo tool is not the current requested tool and is not the immediate next reusable tool, mark recover with confidence >=0.55. "
+            "If no Mayo tool should be recovered, mayo_retrieve must be [\"\",0.0]. "
+            "Never include markdown or extra text."
+        )
+
     def _on_parameters_changed(self, params):
         reload_required = False
+        overrides = {parameter.name: parameter.value for parameter in params}
+        spec_changed = "spec_dir" in overrides
         for parameter in params:
             if parameter.name in {
                 "spec_dir",
@@ -179,11 +301,22 @@ class RealVLMNode(Node):
                 "response_mode",
                 "replay_response_path",
                 "image_stale_sec",
+                "context_mode",
             }:
                 reload_required = True
         if reload_required:
             try:
-                self._load_parameters()
+                self._load_parameters(overrides)
+                if spec_changed:
+                    self._recent_events.clear()
+                    self._last_good_raw = ""
+                    self._last_good_payload = None
+                    self._recent_observed_signals.clear()
+                    self._recent_speech.clear()
+                    self._recent_skill_statuses.clear()
+                    self._actor_overlay = {}
+                    self._phase_entered_wall_sec = time.time()
+                    self._oracle_tick = 0
             except Exception as exc:
                 return SetParametersResult(successful=False, reason=str(exc))
         return SetParametersResult(successful=True)
@@ -209,10 +342,22 @@ class RealVLMNode(Node):
         return self._oracle_scenario[-1]
 
     def _on_world(self, msg: WorldState) -> None:
+        phase = str(getattr(msg, "filtered_phase", "") or "")
+        if phase and self._last_world_phase and phase != self._last_world_phase:
+            self._reset_transient_public_evidence()
+            self._phase_entered_wall_sec = time.time()
+        elif phase and not self._last_world_phase:
+            self._phase_entered_wall_sec = time.time()
+        if phase:
+            self._last_world_phase = phase
         self._world = msg
         self._publish_context_summaries()
 
     def _on_simulation(self, msg: SimulationState) -> None:
+        active_bundle = str(getattr(msg, "active_bundle", "") or "")
+        if active_bundle and active_bundle != self._last_simulation_bundle:
+            self._last_simulation_bundle = active_bundle
+            self._reset_public_evidence()
         self._simulation = msg
         self._publish_context_summaries()
 
@@ -247,6 +392,7 @@ class RealVLMNode(Node):
             }
         )
         self._recent_events.append(digest)
+        self._ingest_public_twin_event(msg, detail)
         self._event_digest_pub.publish(digest)
         self._publish_context_summaries()
 
@@ -255,13 +401,133 @@ class RealVLMNode(Node):
         self._bt_snapshot_pub.publish(self._bt_snapshot_msg())
         self._publish_context_summaries()
 
-    def _on_surgeon_state(self, msg: SurgeonState) -> None:
-        self._surgeon_state = msg
-        self._publish_context_summaries()
+    def _append_public_speech(self, text: str) -> None:
+        clean = str(text or "").strip()
+        if clean:
+            self._recent_speech.append({"text": clean[:240], "at": round(time.time(), 2)})
+
+    def _append_public_signal(
+        self,
+        *,
+        signal_type: str,
+        tool_id: str = "",
+        hand_pose: str = "",
+        speech_text: str = "",
+    ) -> None:
+        signal: dict[str, Any] = {}
+        if signal_type in {
+            "request_tool",
+            "voice_request",
+            "place_on_mayo",
+            "continue_using",
+            "small_talk",
+            "advance_phase",
+            "advance_phase_cue",
+            "request_procedure_completion",
+            "complete_procedure",
+        }:
+            signal["type"] = signal_type
+        if hand_pose:
+            signal["hand"] = hand_pose
+        if tool_id:
+            signal["tool"] = tool_id
+        if speech_text:
+            signal["speech"] = speech_text[:160]
+        if signal:
+            signal["at"] = round(time.time(), 2)
+            self._recent_observed_signals.append(signal)
+
+    def _ingest_public_twin_event(self, msg: TwinEvent, detail: dict[str, Any]) -> None:
+        event_type = str(msg.event_type or "")
+        tool_id = str(msg.instrument_id or detail.get("requested_tool") or detail.get("tool") or "")
+        voice_text = str(detail.get("voice_text") or detail.get("text") or "")
+        actor_event_type = str(detail.get("event_type") or event_type)
+        if event_type in {"VoiceTranscriptObserved", "SurgeonRequestObserved", "SurgeonActorEventObserved"}:
+            self._append_public_speech(voice_text)
+        if event_type == "SurgeonRequestObserved":
+            self._append_public_signal(
+                signal_type=actor_event_type if actor_event_type in {"request_tool", "voice_request"} else "request_tool",
+                tool_id=tool_id,
+                speech_text=voice_text,
+            )
+        elif event_type == "SurgeonActorEventObserved" and actor_event_type in {
+            "request_tool",
+            "voice_request",
+            "place_on_mayo",
+            "advance_phase",
+            "advance_phase_cue",
+            "small_talk",
+        }:
+            self._append_public_signal(
+                signal_type=actor_event_type,
+                tool_id=tool_id,
+                speech_text=voice_text,
+            )
+
+    def _on_surgeon_request(self, msg: SurgeonRequest) -> None:
+        tool_id = self._spec.resolve_instrument_alias(msg.requested_tool) or str(msg.requested_tool or "")
+        if not tool_id and msg.voice_text:
+            tool_id = self._tool_from_public_speech([{"text": msg.voice_text}])
+        event_type = str(msg.event_type or "request_tool")
+        if event_type not in {"request_tool", "voice_request"}:
+            return
+        self._append_public_signal(
+            signal_type=event_type,
+            tool_id=tool_id,
+            speech_text=msg.voice_text,
+        )
+        self._append_public_speech(msg.voice_text)
+
+    def _on_outward_signal(self, msg: SurgeonOutwardSignal) -> None:
+        self._append_public_signal(
+            signal_type=msg.signal_type,
+            tool_id=msg.tool_id,
+            hand_pose=msg.hand_pose,
+            speech_text=msg.speech_text,
+        )
+        self._append_public_speech(msg.speech_text)
+
+    def _on_request_text(self, msg: String) -> None:
+        self._append_public_speech(msg.data)
+
+    def _on_skill_status(self, msg: SkillStatus) -> None:
+        if msg.state != "completed":
+            return
+        self._recent_skill_statuses.append(
+            {
+                "at": round(time.time(), 2),
+                "action": msg.action,
+                "tool": msg.instrument_id,
+                "state": msg.state,
+                "success": bool(msg.success),
+                "message": msg.message,
+            }
+        )
+
+    def _on_actor_overlay(self, msg: String) -> None:
+        try:
+            payload = json.loads(msg.data)
+        except json.JSONDecodeError:
+            return
+        if isinstance(payload, dict):
+            mayo = payload.get("mayo", [])
+            field_event = payload.get("field_event", [])
+            if isinstance(field_event, list):
+                field_event_lines = [str(item) for item in field_event if str(item)]
+            elif isinstance(field_event, str) and field_event:
+                field_event_lines = [field_event]
+            else:
+                field_event_lines = []
+            self._actor_overlay = {
+                "hand": str(payload.get("hand", "") or ""),
+                "mayo": [str(item) for item in mayo if str(item)] if isinstance(mayo, list) else [],
+                "field_event": field_event_lines,
+            }
 
     def _on_control(self, msg: String) -> None:
-        command = msg.data.strip().lower()
+        command = msg.data.strip().partition(":")[0].strip().lower()
         if command in {"start", "start_actors"}:
+            self._reset_public_evidence()
             self._active = True
         elif command == "pause":
             self._active = False
@@ -273,9 +539,23 @@ class RealVLMNode(Node):
             self._active = False
             self._world = None
             self._simulation = None
+            self._last_world_phase = ""
+            self._phase_entered_wall_sec = time.time()
             self._last_good_raw = ""
             self._last_good_payload = None
+            self._reset_public_evidence()
             self._oracle_tick = 0
+
+    def _reset_public_evidence(self) -> None:
+        self._recent_events.clear()
+        self._reset_transient_public_evidence()
+        self._actor_overlay = {}
+        self._phase_entered_wall_sec = time.time()
+
+    def _reset_transient_public_evidence(self) -> None:
+        self._recent_observed_signals.clear()
+        self._recent_speech.clear()
+        self._recent_skill_statuses.clear()
 
     def _bt_snapshot_msg(self) -> BTContextSnapshot:
         snapshot = BTContextSnapshot()
@@ -297,7 +577,8 @@ class RealVLMNode(Node):
         if self._world is None or self._simulation is None:
             return
         context_msg, context_dict = self._assemble_context()
-        self._request_context_pub.publish(context_msg)
+        if self._context_mode != "actor_log":
+            self._request_context_pub.publish(context_msg)
 
         phase_summary = String()
         phase_summary.data = compact_json(
@@ -427,6 +708,181 @@ class RealVLMNode(Node):
         msg.compact_json = compact_json(context_dict)
         return msg, context_dict
 
+    def _public_event_digests(self) -> list[EventDigest]:
+        return [event for event in self._recent_events if event.event_type in PUBLIC_DIGITAL_TWIN_EVENT_TYPES][-6:]
+
+    def _public_digital_twin_context(self) -> dict[str, Any]:
+        if self._world is None or self._simulation is None:
+            return {}
+        _, world_context = self._assemble_context()
+        public_events = [
+            {
+                "t": event.event_type,
+                "tool": event.instrument_id,
+                "anchor": event.anchor_id,
+                "stamp_sec": float(event.stamp.sec) + float(event.stamp.nanosec) / 1_000_000_000.0,
+            }
+            for event in self._public_event_digests()
+        ]
+        return {
+            "hands": world_context.get("hands", {}),
+            "request": {
+                "tool": self._world.surgeon_request_tool or self._world.explicit_request_tool,
+                "intent": self._world.surgeon_intent,
+                "ready_for_handover": bool(self._world.surgeon_ready_for_handover),
+                "ready_for_retrieval": bool(self._world.surgeon_ready_for_retrieval),
+            },
+            "tools": world_context.get("tools", []),
+            "events": public_events[-6:],
+        }
+
+    def _actor_log_request_context_msg(self, context: dict[str, Any], compact_context: str) -> VLMRequestContext:
+        msg = VLMRequestContext()
+        stamp = self.get_clock().now().to_msg()
+        msg.stamp = stamp
+        msg.procedure_id = self._spec.procedure_id
+        if self._world is not None:
+            msg.right_hand_tool = self._world.right_hand_tool
+            msg.left_hand_tool = self._world.left_hand_tool
+            msg.prepositioned_tool = self._world.prepositioned_tool
+            msg.cleaner_busy = bool(self._world.cleaner_busy)
+            msg.cleaner_remaining_sec = float(self._world.cleaner_remaining_sec)
+            msg.active_tool_ids = [str(row.get("id", "")) for row in context.get("digital_twin", {}).get("tools", []) if row.get("id")]
+            msg.recent_events = self._public_event_digests()
+        msg.compact_json = compact_context
+        return msg
+
+    def _tool_from_public_speech(self, speech_rows: list[dict[str, Any]]) -> str:
+        for row in reversed(speech_rows):
+            text = str(row.get("text", "")).strip()
+            if not text:
+                continue
+            resolved = self._spec.resolve_instrument_alias(text)
+            if resolved:
+                return resolved
+            lowered = text.lower()
+            for instrument in self._spec.bundle.instruments:
+                names = [instrument.id, instrument.display_name, *list(getattr(instrument, "aliases", []))]
+                if any(name and str(name).lower() in lowered for name in names):
+                    return instrument.id
+        return ""
+
+    def _tools_from_public_speech(self, speech_rows: list[dict[str, Any]]) -> list[str]:
+        tools: list[str] = []
+        for row in speech_rows:
+            text = str(row.get("text", "")).strip()
+            if not text:
+                continue
+            lowered = text.lower()
+            for instrument in self._spec.bundle.instruments:
+                names = [instrument.id, instrument.display_name, *list(getattr(instrument, "aliases", []))]
+                if any(name and str(name).lower() in lowered for name in names) and instrument.id not in tools:
+                    tools.append(instrument.id)
+        return tools
+
+    def _canonical_tool_id(self, raw_tool: object) -> str:
+        tool_id = str(raw_tool or "").strip()
+        if not tool_id:
+            return ""
+        return self._spec.resolve_instrument_alias(tool_id) or tool_id
+
+    def _canonical_phase_id(self, raw_phase: object) -> str:
+        phase_id = str(raw_phase or "").strip()
+        if not phase_id:
+            return ""
+        return self._spec.resolve_phase_id(phase_id) or phase_id
+
+    def _actor_log_prior_evidence(self) -> dict[str, Any]:
+        visual = dict(self._actor_overlay)
+        speech_rows = self._fresh_rows(self._recent_speech, max_age_sec=18.0)
+        observed_signals = self._fresh_rows(self._recent_observed_signals, max_age_sec=8.0)
+        skill_statuses = self._fresh_rows(self._recent_skill_statuses, max_age_sec=22.0)
+        public_events = [
+            {
+                "t": event.event_type,
+                "tool": event.instrument_id,
+                "anchor": event.anchor_id,
+                "stamp_sec": float(event.stamp.sec) + float(event.stamp.nanosec) / 1_000_000_000.0,
+            }
+            for event in self._public_event_digests()
+        ]
+        hand_tools: list[str] = []
+        recent_tools: list[str] = []
+        current_phase = ""
+        if self._world is not None:
+            current_phase = self._world.filtered_phase
+            # For next-request prediction, only surgeon-owned tools count as
+            # already progressed. Robot-held/prepositioned tools are visible
+            # context, but the surgeon may still ask for them next.
+            hand_tools = [
+                instrument.instrument_id
+                for instrument in self._world.instrument_states
+                if instrument.lifecycle_stage == "surgeon_owned"
+            ]
+        return {
+            "current_phase": current_phase or self._spec.default_phase_id,
+            "phase_entered_sec": self._phase_entered_wall_sec,
+            "speech": speech_rows,
+            "speech_tools": self._tools_from_public_speech([row for row in speech_rows if isinstance(row, dict)]),
+            "recent_tools": recent_tools,
+            "observed_signals": observed_signals,
+            "skill_status": skill_statuses,
+            "mayo_tools": list(visual.get("mayo", [])) if isinstance(visual.get("mayo", []), list) else [],
+            "field_event": list(visual.get("field_event", [])) if isinstance(visual.get("field_event", []), list) else [],
+            "hand_tools": hand_tools,
+            "events": public_events,
+        }
+
+    def _fresh_rows(self, rows: deque[dict[str, Any]], *, max_age_sec: float) -> list[dict[str, Any]]:
+        now = time.time()
+        fresh: list[dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            try:
+                at = float(row.get("at", 0.0))
+            except (TypeError, ValueError):
+                at = 0.0
+            if at <= 0.0 or now - at <= max_age_sec:
+                fresh.append(dict(row))
+        return fresh
+
+    def _assemble_actor_log_context_dict(self) -> dict[str, Any]:
+        evidence = self._actor_log_prior_evidence()
+        candidates = self._prior_scorer.score(evidence)
+        context = {
+            "proc": self._spec.procedure_id,
+            "procedure_prompt_id": str(self._procedure_prompt.get("id", "")) if isinstance(self._procedure_prompt, dict) else "",
+            "phases": [
+                {"id": phase.id, "tools": list(phase.expected_instruments), "next": list(phase.possible_next)}
+                for phase in self._spec.bundle.phases
+            ],
+            "tools": [
+                {
+                    "id": instrument.id,
+                    "role": instrument.role,
+                    "requestable": bool(getattr(instrument, "requestable", True)),
+                }
+                for instrument in self._spec.bundle.instruments
+            ],
+            "evidence_window": {
+                "visual": dict(self._actor_overlay),
+                "speech": list(evidence.get("speech", [])),
+                "observed_signals": list(evidence.get("observed_signals", [])),
+                "skill_status": list(evidence.get("skill_status", [])),
+            },
+            "digital_twin": self._public_digital_twin_context(),
+            "candidates": candidates,
+            "previous": {
+                "phase": self._last_good_payload.get("phase", ["", 0.0]) if self._last_good_payload else ["", 0.0],
+                "tool": self._last_good_payload.get("tool", ["", 0.0]) if self._last_good_payload else ["", 0.0],
+            },
+        }
+        return context
+
+    def _assemble_actor_log_context(self) -> str:
+        return compact_json(self._assemble_actor_log_context_dict())
+
     def _select_images(self) -> tuple[list[tuple[str, bytes, str]], str]:
         now = time.time()
 
@@ -548,6 +1004,165 @@ class RealVLMNode(Node):
             "sum": summary,
         }
 
+    def _actor_log_fallback_payload(self, context_dict: dict[str, Any]) -> dict[str, Any]:
+        evidence_window = context_dict.get("evidence_window", {}) if isinstance(context_dict, dict) else {}
+        visual = evidence_window.get("visual", {}) if isinstance(evidence_window, dict) else {}
+        mayo = visual.get("mayo", []) if isinstance(visual, dict) else []
+        speech = evidence_window.get("speech", []) if isinstance(evidence_window, dict) else []
+        speech_rows = speech if isinstance(speech, list) else []
+        requested_tool = self._tool_from_public_speech([row for row in speech_rows if isinstance(row, dict)])
+        observed_signals = evidence_window.get("observed_signals", []) if isinstance(evidence_window, dict) else []
+        latest_signal = observed_signals[-1] if isinstance(observed_signals, list) and observed_signals else {}
+        has_request_signal = isinstance(latest_signal, dict) and str(latest_signal.get("type", "")) in {"request_tool", "voice_request"}
+        intent_type = "handover" if requested_tool and has_request_signal else "none"
+        candidates = context_dict.get("candidates", {}) if isinstance(context_dict, dict) else {}
+        phase_rows = list(candidates.get("phase", [])) if isinstance(candidates, dict) else []
+        tool_rows = list(candidates.get("tool", [])) if isinstance(candidates, dict) else []
+        if not phase_rows:
+            phase_rows = [[self._spec.default_phase_id, 0.35]]
+        if requested_tool and not any(row[0] == requested_tool for row in tool_rows if isinstance(row, list) and row):
+            tool_rows = [[requested_tool, 0.72], *tool_rows[:3]]
+        if not tool_rows:
+            tool_rows = [["", 0.0]]
+        immediate_reuse_tool = ""
+        for row in tool_rows:
+            if isinstance(row, list) and row and str(row[0]):
+                immediate_reuse_tool = str(row[0])
+                break
+        mayo_entries: list[list[Any]] = []
+        recover_candidates: list[tuple[str, float]] = []
+        for tool_id in (mayo if isinstance(mayo, list) else []):
+            tool_id = str(tool_id)
+            if not tool_id:
+                continue
+            if tool_id == requested_tool or tool_id == immediate_reuse_tool:
+                mayo_entries.append([tool_id, "reuse", 0.62])
+            else:
+                confidence = 0.62 if requested_tool else 0.56
+                mayo_entries.append([tool_id, "recover", confidence])
+                recover_candidates.append((tool_id, confidence))
+        mayo_retrieve = ["", 0.0]
+        if recover_candidates:
+            mayo_retrieve = [recover_candidates[0][0], recover_candidates[0][1]]
+        return {
+            "v": "3",
+            "phase": phase_rows[:4],
+            "tool": tool_rows[:4],
+            "intent": [intent_type, requested_tool if intent_type != "none" else "", 0.7 if intent_type != "none" else 0.0],
+            "mayo": mayo_entries,
+            "mayo_retrieve": mayo_retrieve,
+            "u": 0.55,
+            "sum": "actor-log fallback",
+        }
+
+    def _fallback_payload(self, context_dict: dict[str, Any]) -> dict[str, Any]:
+        if self._context_mode == "actor_log":
+            return self._actor_log_fallback_payload(context_dict)
+        return self._oracle_payload(context_dict)
+
+    def _candidate_rows(self, context_dict: dict[str, Any], key: str) -> list[list[Any]]:
+        candidates = context_dict.get("candidates", {}) if isinstance(context_dict, dict) else {}
+        rows = candidates.get(key, []) if isinstance(candidates, dict) else []
+        cleaned: list[list[Any]] = []
+        for row in rows if isinstance(rows, list) else []:
+            if not isinstance(row, list) or len(row) < 2:
+                continue
+            item_id = str(row[0])
+            if not item_id:
+                continue
+            try:
+                confidence = float(row[1])
+            except (TypeError, ValueError):
+                continue
+            cleaned.append([item_id, max(0.0, min(1.0, confidence))])
+        return cleaned
+
+    def _merge_ranked_rows(self, preferred: list[list[Any]], model_rows: list[list[Any]], *, limit: int) -> list[list[Any]]:
+        merged: list[list[Any]] = []
+        seen: set[str] = set()
+        for row in [*preferred, *model_rows]:
+            if not isinstance(row, list) or len(row) < 2:
+                continue
+            item_id = str(row[0])
+            if not item_id or item_id in seen:
+                continue
+            try:
+                confidence = float(row[1])
+            except (TypeError, ValueError):
+                continue
+            seen.add(item_id)
+            merged.append([item_id, round(max(0.0, min(1.0, confidence)), 3)])
+            if len(merged) >= limit:
+                break
+        return merged
+
+    def _normal_phase_rows(self, rows: list[list[Any]], *, fallback_phase: str = "") -> list[list[Any]]:
+        normal_rows = [
+            row
+            for row in rows
+            if isinstance(row, list)
+            and row
+            and not self._spec.is_interrupt_phase(str(row[0]))
+        ]
+        if normal_rows:
+            return normal_rows
+        if fallback_phase and not self._spec.is_interrupt_phase(fallback_phase):
+            return [[fallback_phase, 0.35]]
+        return []
+
+    def _stabilize_actor_log_payload(self, payload: dict[str, Any], context_dict: dict[str, Any]) -> dict[str, Any]:
+        if str(payload.get("v", "")) != "3":
+            return payload
+        stabilized = dict(payload)
+        evidence_window = context_dict.get("evidence_window", {}) if isinstance(context_dict, dict) else {}
+        visual = evidence_window.get("visual", {}) if isinstance(evidence_window, dict) else {}
+        speech = evidence_window.get("speech", []) if isinstance(evidence_window, dict) else []
+        speech_rows = speech if isinstance(speech, list) else []
+        observed_signals = evidence_window.get("observed_signals", []) if isinstance(evidence_window, dict) else []
+        latest_signal = observed_signals[-1] if isinstance(observed_signals, list) and observed_signals else {}
+        requested_tool = self._tool_from_public_speech([row for row in speech_rows if isinstance(row, dict)])
+        has_request_signal = isinstance(latest_signal, dict) and str(latest_signal.get("type", "")) in {
+            "request_tool",
+            "voice_request",
+        }
+
+        phase_candidates = self._candidate_rows(context_dict, "phase")
+        candidate_evidence = context_dict.get("candidates", {}).get("evidence", {}) if isinstance(context_dict, dict) else {}
+        fallback_phase = str(candidate_evidence.get("current_phase", "") if isinstance(candidate_evidence, dict) else "")
+        model_phase_rows = [
+            [str(row[0]), float(row[1])]
+            for row in stabilized.get("phase", [])
+            if isinstance(row, list) and len(row) >= 2 and str(row[0])
+        ]
+        if phase_candidates:
+            stabilized["phase"] = self._normal_phase_rows(
+                self._merge_ranked_rows(phase_candidates, model_phase_rows, limit=4),
+                fallback_phase=fallback_phase,
+            )[:4]
+        elif model_phase_rows:
+            stabilized["phase"] = self._normal_phase_rows(model_phase_rows, fallback_phase=fallback_phase)[:4]
+
+        tool_candidates = self._candidate_rows(context_dict, "tool")
+        model_tool_rows = [
+            [str(row[0]), float(row[1])]
+            for row in stabilized.get("tool", [])
+            if isinstance(row, list) and len(row) >= 2 and str(row[0])
+        ]
+        if tool_candidates:
+            stabilized["tool"] = self._merge_ranked_rows(tool_candidates, model_tool_rows, limit=4)
+
+        intent = stabilized.get("intent", ["none", "", 0.0])
+        if not isinstance(intent, list) or len(intent) < 3:
+            intent = ["none", "", 0.0]
+        if requested_tool and has_request_signal:
+            intent = ["handover", requested_tool, max(0.72, min(1.0, float(intent[2]) if len(intent) > 2 else 0.0))]
+        stabilized["intent"] = [str(intent[0]), str(intent[1]), round(max(0.0, min(1.0, float(intent[2]))), 3)]
+
+        summary = str(stabilized.get("sum", ""))
+        if tool_candidates or phase_candidates:
+            stabilized["sum"] = (summary + "; candidate-stabilized").strip("; ")[:180]
+        return stabilized
+
     def _run_model(self, context_json: str, images: list[tuple[str, bytes, str]]) -> tuple[str, dict[str, Any], float, str, int, str]:
         retries_used = 0
         if self._response_mode == "replay":
@@ -557,7 +1172,7 @@ class RealVLMNode(Node):
             normalized_raw, payload = normalize_raw_text(raw)
             return normalized_raw, payload, 0.0, "replay", retries_used, ""
         if self._response_mode == "oracle":
-            payload = self._oracle_payload(json.loads(context_json))
+            payload = self._fallback_payload(json.loads(context_json))
             raw = json.dumps(payload, separators=(",", ":"), sort_keys=True)
             normalized_raw, payload = normalize_raw_text(raw)
             return normalized_raw, payload, 0.0, "oracle", retries_used, ""
@@ -589,7 +1204,7 @@ class RealVLMNode(Node):
                 retries_used = attempt + 1
         if self._last_good_payload is not None:
             return self._last_good_raw, self._last_good_payload, 0.0, "last_good", retries_used, last_error
-        payload = self._oracle_payload(json.loads(context_json))
+        payload = self._fallback_payload(json.loads(context_json))
         raw = json.dumps(payload, separators=(",", ":"), sort_keys=True)
         normalized_raw, payload = normalize_raw_text(raw)
         return normalized_raw, payload, 0.0, "oracle_fallback", retries_used, last_error
@@ -597,11 +1212,21 @@ class RealVLMNode(Node):
     def _tick(self, force: bool = False) -> None:
         if not force and not self._active:
             return
-        if self._world is None or self._simulation is None:
-            return
-        request_context, context_dict = self._assemble_context()
+        context_stamp = self.get_clock().now().to_msg()
+        if self._context_mode == "actor_log":
+            context_dict = self._assemble_actor_log_context_dict()
+            request_context_json = compact_json(context_dict)
+            request_context_msg = self._actor_log_request_context_msg(context_dict, request_context_json)
+            context_stamp = request_context_msg.stamp
+            self._request_context_pub.publish(request_context_msg)
+        else:
+            if self._world is None or self._simulation is None:
+                return
+            request_context, context_dict = self._assemble_context()
+            request_context_json = request_context.compact_json
+            context_stamp = request_context.stamp
         images, image_source = self._select_images()
-        prompt_chars = len(self._system_prompt) + len(self._developer_instruction) + len(request_context.compact_json)
+        prompt_chars = len(self._system_prompt) + len(self._developer_instruction) + len(request_context_json)
         raw_json = ""
         payload: dict[str, Any] | None = None
         latency_sec = 0.0
@@ -612,7 +1237,7 @@ class RealVLMNode(Node):
         connected = True
         try:
             raw_json, payload, latency_sec, mode, parse_retry_count, last_error = self._run_model(
-                request_context.compact_json,
+                request_context_json,
                 images,
             )
         except Exception as exc:  # pragma: no cover - safety net
@@ -624,16 +1249,31 @@ class RealVLMNode(Node):
                 payload = self._last_good_payload
                 mode = "last_good"
             else:
-                payload = self._oracle_payload(context_dict)
+                payload = self._fallback_payload(context_dict)
                 raw_json = json.dumps(payload, separators=(",", ":"), sort_keys=True)
                 mode = "oracle_fallback"
         if payload is None:
             return
+        if self._context_mode == "actor_log":
+            payload = self._stabilize_actor_log_payload(payload, context_dict)
+            raw_json = json.dumps(payload, separators=(",", ":"), sort_keys=True)
         if mode not in {"last_good", "oracle_fallback"}:
             self._last_good_raw = raw_json
             self._last_good_payload = payload
 
-        self._publish_vlm_outputs(payload, raw_json, image_source=image_source, latency_sec=latency_sec, prompt_chars=prompt_chars, parse_retry_count=parse_retry_count, last_error=last_error, mode=mode, healthy=healthy, connected=connected)
+        self._publish_vlm_outputs(
+            payload,
+            raw_json,
+            observation_stamp=context_stamp,
+            image_source=image_source,
+            latency_sec=latency_sec,
+            prompt_chars=prompt_chars,
+            parse_retry_count=parse_retry_count,
+            last_error=last_error,
+            mode=mode,
+            healthy=healthy,
+            connected=connected,
+        )
         if self._response_mode == "oracle":
             self._oracle_tick += 1
 
@@ -642,6 +1282,7 @@ class RealVLMNode(Node):
         payload: dict[str, Any],
         raw_json: str,
         *,
+        observation_stamp,
         image_source: str,
         latency_sec: float,
         prompt_chars: int,
@@ -651,60 +1292,116 @@ class RealVLMNode(Node):
         healthy: bool,
         connected: bool,
     ) -> None:
-        stamp = self.get_clock().now().to_msg()
+        stamp = observation_stamp
+        schema_version = str(payload.get("v", "1"))
+        if schema_version == "3":
+            phase_rows = [
+                [str(item[0]), float(item[1])]
+                for item in payload.get("phase", [])
+                if isinstance(item, list) and len(item) == 2 and str(item[0])
+            ]
+            if not phase_rows:
+                phase_rows = [[self._spec.default_phase_id, 0.0]]
+            observed_rows = [
+                [str(item[0]), "mayo_stand", "mayo_stand", float(item[2])]
+                for item in payload.get("mayo", [])
+                if isinstance(item, list) and len(item) == 3 and str(item[0])
+            ]
+            intent = payload.get("intent", ["", "", 0.0])
+            intent_type = str(intent[0])
+            gesture_type = "request_tool" if intent_type in {"handover", "request_tool"} else intent_type
+            hand_pose = "open_receive" if gesture_type == "request_tool" else ""
+            gesture_row = [gesture_type, str(intent[1]), hand_pose, float(intent[2])]
+            uncertainty = float(payload.get("u", 0.0))
+            summary = str(payload.get("sum", ""))
+        elif schema_version == "2":
+            phase_rows = [[str(payload["phase"][0]), float(payload["phase"][1])]]
+            observed_rows = [
+                [str(item[0]), "mayo_stand", "mayo_stand", float(item[2])]
+                for item in payload.get("mayo", [])
+                if str(item[0])
+            ]
+            intent = payload.get("intent", ["", "", 0.0])
+            intent_type = str(intent[0])
+            gesture_type = "request_tool" if intent_type in {"handover", "request_tool"} else intent_type
+            hand_pose = "open_receive" if gesture_type == "request_tool" else ""
+            gesture_row = [gesture_type, str(intent[1]), hand_pose, float(intent[2])]
+            uncertainty = float(payload.get("u", 0.0))
+            summary = str(payload.get("sum", ""))
+        else:
+            phase_rows = list(payload["ph"])
+            observed_rows = list(payload["to"])
+            gesture_row = list(payload["sg"])
+            uncertainty = float(payload.get("u", 0.0))
+            summary = str(payload.get("sum", ""))
+
+        phase_rows = [
+            [self._canonical_phase_id(item[0]), item[1]]
+            for item in phase_rows
+            if item and self._canonical_phase_id(item[0])
+        ]
+        observed_rows = [
+            [self._canonical_tool_id(item[0]), item[1], item[2], item[3]]
+            for item in observed_rows
+            if item and self._canonical_tool_id(item[0])
+        ]
+        if len(gesture_row) >= 2:
+            gesture_row[1] = self._canonical_tool_id(gesture_row[1])
+
         phase_evidence = PhaseEvidence()
         phase_evidence.stamp = stamp
         phase_evidence.source = f"real_vlm:{self._spec.procedure_id}:{mode}"
-        phase_evidence.phase_ids = [item[0] for item in payload["ph"]]
-        phase_evidence.phase_confidences = [float(item[1]) for item in payload["ph"]]
-        phase_evidence.visible_instrument_ids = [item[0] for item in payload["to"]]
-        phase_evidence.visible_instrument_confidences = [float(item[3]) for item in payload["to"]]
-        phase_evidence.scene_summary = str(payload.get("sum", ""))
-        phase_evidence.uncertainty = float(payload.get("u", 0.0))
+        phase_evidence.phase_ids = [item[0] for item in phase_rows]
+        phase_evidence.phase_confidences = [float(item[1]) for item in phase_rows]
+        phase_evidence.visible_instrument_ids = [item[0] for item in observed_rows]
+        phase_evidence.visible_instrument_confidences = [float(item[3]) for item in observed_rows]
+        phase_evidence.scene_summary = summary
+        phase_evidence.uncertainty = uncertainty
         self._phase_pub.publish(phase_evidence)
 
-        for tool_id, location_id, location_type, confidence in payload["to"]:
-            observation = ToolObservation()
-            observation.stamp = stamp
-            observation.instrument_id = tool_id
-            observation.location_id = location_id
-            observation.location_type = location_type
-            observation.confidence = float(confidence)
-            observation.visible = True
-            self._tool_pub.publish(observation)
+        if schema_version == "1":
+            for tool_id, location_id, location_type, confidence in observed_rows:
+                observation = ToolObservation()
+                observation.stamp = stamp
+                observation.instrument_id = tool_id
+                observation.location_id = location_id
+                observation.location_type = location_type
+                observation.confidence = float(confidence)
+                observation.visible = True
+                self._tool_pub.publish(observation)
 
         gesture = SurgeonGestureEvidence()
         gesture.stamp = stamp
         gesture.procedure_id = self._spec.procedure_id
         gesture.phase_id = phase_evidence.phase_ids[0] if phase_evidence.phase_ids else ""
-        gesture.event_type = str(payload["sg"][0])
-        gesture.requested_tool = str(payload["sg"][1])
-        gesture.hand_pose = str(payload["sg"][2])
-        gesture.confidence = float(payload["sg"][3])
-        gesture.note = str(payload.get("sum", ""))
+        gesture.event_type = str(gesture_row[0])
+        gesture.requested_tool = str(gesture_row[1])
+        gesture.hand_pose = str(gesture_row[2])
+        gesture.confidence = float(gesture_row[3])
+        gesture.note = summary
         self._gesture_pub.publish(gesture)
 
         result = VLMResult()
         result.stamp = stamp
         result.source = phase_evidence.source
-        result.schema_version = "1"
+        result.schema_version = schema_version
         result.raw_json = raw_json
-        result.summary = str(payload.get("sum", ""))
+        result.summary = summary
         result.phase_ids = list(phase_evidence.phase_ids)
         result.phase_confidences = list(phase_evidence.phase_confidences)
-        result.observed_tool_ids = [item[0] for item in payload["to"]]
-        result.observed_location_ids = [item[1] for item in payload["to"]]
-        result.observed_location_types = [item[2] for item in payload["to"]]
-        result.observed_confidences = [float(item[3]) for item in payload["to"]]
+        result.observed_tool_ids = [item[0] for item in observed_rows]
+        result.observed_location_ids = [item[1] for item in observed_rows]
+        result.observed_location_types = [item[2] for item in observed_rows]
+        result.observed_confidences = [float(item[3]) for item in observed_rows]
         result.gesture_event_type = gesture.event_type
         result.gesture_requested_tool = gesture.requested_tool
         result.gesture_hand_pose = gesture.hand_pose
         result.gesture_confidence = gesture.confidence
-        result.uncertainty = float(payload.get("u", 0.0))
+        result.uncertainty = uncertainty
         self._result_pub.publish(result)
 
         health = VLMHealth()
-        health.stamp = stamp
+        health.stamp = self.get_clock().now().to_msg()
         health.connected = bool(connected)
         health.healthy = bool(healthy and not last_error)
         health.model_id = self._model_id

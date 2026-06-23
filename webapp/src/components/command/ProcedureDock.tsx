@@ -1,4 +1,3 @@
-import type { FormEvent } from "react";
 import { GitBranch, Pause, Play, RotateCcw, Square, Wifi } from "lucide-react";
 
 import type { ControlCommand } from "../../hooks/useRosBridge";
@@ -11,7 +10,9 @@ export function ProcedureDock({
   url,
   setUrl,
   bundle,
-  setBundleSelection,
+  onBundleChange,
+  startPhase,
+  setStartPhase,
   connected,
   actionPending,
   actionMessage,
@@ -20,14 +21,15 @@ export function ProcedureDock({
   executionState,
   isRunning,
   isPaused,
-  onApplyBundle,
   onControl,
 }: {
   vm: ViewModel;
   url: string;
   setUrl: (url: string) => void;
   bundle: string;
-  setBundleSelection: (bundle: string) => void;
+  onBundleChange: (bundle: string) => void;
+  startPhase: string;
+  setStartPhase: (phaseId: string) => void;
   connected: boolean;
   actionPending: string;
   actionMessage: string;
@@ -36,13 +38,13 @@ export function ProcedureDock({
   executionState: string;
   isRunning: boolean;
   isPaused: boolean;
-  onApplyBundle: () => void;
   onControl: (command: ControlCommand) => void;
 }) {
   const startInFlight = executionState === "starting" || actionPending.toLowerCase().includes("starting");
   const commandBusy = Boolean(actionPending);
   const disabled = !connected || !bundle;
   const formDisabled = disabled || commandBusy;
+  const phaseSelectDisabled = disabled || commandBusy || isRunning || startInFlight;
   const startDisabled = disabled || commandBusy || !runtimeReady || isRunning || startInFlight;
   const pauseResumeDisabled = disabled || commandBusy || startInFlight || (!isRunning && !isPaused);
   const interruptDisabled = disabled || (commandBusy && !startInFlight);
@@ -59,11 +61,6 @@ export function ProcedureDock({
       : actionPending
         ? "pending"
         : "normal";
-  const submit = (event: FormEvent) => {
-    event.preventDefault();
-    onApplyBundle();
-  };
-
   return (
     <aside className="dock procedure-dock">
       <div className="dock-header">
@@ -76,10 +73,10 @@ export function ProcedureDock({
       </div>
 
       {shouldShowActionMessage ? (
-        <div className={`dock-action-message ${actionMessageTone}`}>{trimmedActionMessage}</div>
+        <div className={["dock-action-message", actionMessageTone].join(" ")}>{trimmedActionMessage}</div>
       ) : null}
 
-      <form className="control-stack" onSubmit={submit}>
+      <div className="control-stack">
         <label className="field">
           <span>{vm.ui.bridgeUrl}</span>
           <div className="field-with-icon">
@@ -90,7 +87,7 @@ export function ProcedureDock({
 
         <label className="field">
           <span>{vm.ui.surgery}</span>
-          <select value={bundle} onChange={(event) => setBundleSelection(event.target.value)}>
+          <select value={bundle} disabled={formDisabled} onChange={(event) => onBundleChange(event.target.value)}>
             {vm.bundleOptions.map((option) => (
               <option value={option.id} key={option.id}>
                 {option.label}
@@ -99,11 +96,22 @@ export function ProcedureDock({
           </select>
         </label>
 
-        <button className="button button-secondary full" type="submit" disabled={formDisabled}>
-          <GitBranch size={16} />
-          {vm.ui.selectSurgery}
-        </button>
-      </form>
+        <label className="field">
+          <span>{vm.ui.startPhase}</span>
+          <select
+            value={startPhase}
+            disabled={phaseSelectDisabled}
+            onChange={(event) => setStartPhase(event.target.value)}
+          >
+            <option value="">{vm.ui.fromBeginning}</option>
+            {vm.stage.phaseSteps.map((phase, index) => (
+              <option value={phase.id} key={phase.id}>
+                {index + 1}. {phase.label}
+              </option>
+            ))}
+          </select>
+        </label>
+      </div>
 
       <div className="transport-controls" aria-label={vm.ui.control}>
         <button className="button button-primary" disabled={startDisabled} onClick={() => onControl("start")} type="button">

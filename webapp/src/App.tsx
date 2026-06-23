@@ -16,9 +16,11 @@ export default function App() {
     if (typeof window === "undefined") return "ko";
     return window.localStorage.getItem("taskplanner.language") === "en" ? "en" : "ko";
   });
-  const [overrideTool, setOverrideTool] = useState("");
-  const [voiceText, setVoiceText] = useState("");
   const [stageAspectRatio, setStageAspectRatio] = useState(1.55);
+  const [modelOptions, setModelOptions] = useState<string[]>([]);
+  const [modelCatalogStatus, setModelCatalogStatus] = useState("loading");
+  const [vlmModelSelection, setVlmModelSelection] = useState("");
+  const [actorModelSelection, setActorModelSelection] = useState("google/gemma-4-12b-qat");
 
   useEffect(() => {
     window.localStorage.setItem("taskplanner.language", language);
@@ -39,21 +41,65 @@ export default function App() {
     stageAspectRatio,
   });
 
-  const overrideOptions = vm.requestableTools;
-  const overrideOptionSignature = overrideOptions.map((option) => `${option.id}:${option.voicePrompt}`).join("|");
+  useEffect(() => {
+    let disposed = false;
+    async function refreshModels() {
+      try {
+        const response = await fetch("http://127.0.0.1:1234/v1/models");
+        if (!response.ok) throw new Error(`model endpoint returned ${response.status}`);
+        const payload = (await response.json()) as { data?: Array<{ id?: string }> };
+        const ids = (payload.data ?? []).map((item) => String(item.id || "")).filter(Boolean);
+        if (disposed) return;
+        setModelOptions(ids);
+        setModelCatalogStatus(ids.length ? "connected" : "empty");
+      } catch (error) {
+        if (disposed) return;
+        setModelOptions([]);
+        setModelCatalogStatus(error instanceof Error ? error.message : "model endpoint unavailable");
+      }
+    }
+    void refreshModels();
+    const timer = window.setInterval(() => void refreshModels(), 5000);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, []);
 
   useEffect(() => {
-    const first = overrideOptions[0];
-    if (!first) return;
-    if (!overrideOptions.some((option) => option.id === overrideTool)) {
-      setOverrideTool(first.id);
-      setVoiceText(first.voicePrompt);
+    if (ros.vlmHealth.model_id) {
+      setVlmModelSelection(ros.vlmHealth.model_id);
     }
-  }, [overrideOptionSignature, overrideOptions, overrideTool]);
+  }, [ros.vlmHealth.model_id]);
+
+  useEffect(() => {
+    if (ros.surgeonLlmDecision.model_id) {
+      setActorModelSelection(ros.surgeonLlmDecision.model_id);
+    }
+  }, [ros.surgeonLlmDecision.model_id]);
+
+  useEffect(() => {
+    if (!modelOptions.length) return;
+    setVlmModelSelection((current) => current || modelOptions.find((id) => id.toLowerCase().includes("qwen")) || modelOptions[0]);
+    setActorModelSelection((current) => current || modelOptions.find((id) => id.toLowerCase().includes("gemma")) || modelOptions[0]);
+  }, [modelOptions]);
 
   return (
     <div className="app-shell">
-      <StatusRibbon vm={vm} connected={ros.connected} language={language} onLanguageChange={setLanguage} />
+      <StatusRibbon
+        vm={vm}
+        connected={ros.connected}
+        language={language}
+        onLanguageChange={setLanguage}
+        modelOptions={modelOptions}
+        modelCatalogStatus={modelCatalogStatus}
+        vlmModel={vlmModelSelection}
+        actionPending={ros.actionPending}
+        onVlmModelChange={(modelId) => {
+          setVlmModelSelection(modelId);
+          void ros.setVlmModel(modelId);
+        }}
+      />
 
       <motion.main
         className="mission-layout"
@@ -64,6 +110,7 @@ export default function App() {
         <div className="board-column">
           <OperatingRoomStage
             vm={vm}
+            vlmImage={ros.vlmImage}
             onStageAspectChange={(ratio) => {
               setStageAspectRatio((current) => (Math.abs(current - ratio) > 0.01 ? ratio : current));
             }}
@@ -73,6 +120,9 @@ export default function App() {
             language={language}
             btDecision={ros.btDecision}
             skillStatus={ros.skillStatus}
+            simulationState={ros.simulationState}
+            worldState={ros.worldState}
+            surgeonState={ros.surgeonState}
             vlmHealth={ros.vlmHealth}
             vlmResult={ros.vlmResult}
             vlmReducerDecisions={ros.vlmReducerDecisions}
@@ -86,7 +136,12 @@ export default function App() {
             url={ros.url}
             setUrl={ros.setUrl}
             bundle={ros.bundle}
-            setBundleSelection={ros.setBundleSelection}
+            onBundleChange={(nextBundle) => {
+              ros.setBundleSelection(nextBundle);
+              void ros.applyBundle(nextBundle);
+            }}
+            startPhase={ros.startPhase}
+            setStartPhase={ros.setStartPhase}
             connected={ros.connected}
             actionPending={ros.actionPending}
             actionMessage={ros.actionMessage}
@@ -95,29 +150,24 @@ export default function App() {
             executionState={ros.simulationState.execution_state}
             isRunning={ros.simulationState.running}
             isPaused={ros.simulationState.execution_state === "paused"}
-            onApplyBundle={() => void ros.applyBundle()}
             onControl={(command) => void ros.control(command)}
           />
 
           <SurgeonIntentDock
             vm={vm}
             language={language}
-            overrideOptions={overrideOptions}
-            overrideTool={overrideTool}
-            setOverrideTool={(tool) => {
-              setOverrideTool(tool);
-              setVoiceText(overrideOptions.find((option) => option.id === tool)?.voicePrompt ?? `${tool} please`);
-            }}
-            voiceText={voiceText}
-            setVoiceText={setVoiceText}
+            llmDecision={ros.surgeonLlmDecision}
+            actorEnabled={ros.actorEnabled}
+            modelOptions={modelOptions}
+            modelCatalogStatus={modelCatalogStatus}
+            actorModel={actorModelSelection}
             connected={ros.connected}
             actionPending={ros.actionPending}
-            onOverride={(payload) =>
-              void ros.sendOverride({
-                ...payload,
-                toolLabel: vm.displayToolName(payload.requestedTool),
-              })
-            }
+            onActorEnabledChange={(enabled) => void ros.setActorEnabled(enabled)}
+            onActorModelChange={(modelId) => {
+              setActorModelSelection(modelId);
+              void ros.setActorModel(modelId);
+            }}
           />
         </div>
       </motion.main>

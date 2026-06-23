@@ -17,12 +17,25 @@ export function StatusRibbon({
   connected,
   language,
   onLanguageChange,
+  modelOptions,
+  modelCatalogStatus,
+  vlmModel,
+  actionPending,
+  onVlmModelChange,
 }: {
   vm: ViewModel;
   connected: boolean;
   language: Language;
   onLanguageChange: (language: Language) => void;
+  modelOptions: string[];
+  modelCatalogStatus: string;
+  vlmModel: string;
+  actionPending: string;
+  onVlmModelChange: (modelId: string) => void;
 }) {
+  const vlmSelectDisabled = !connected || Boolean(actionPending) || !modelOptions.length;
+  const selectedVlmModel = vlmModel || modelOptions[0] || "";
+
   return (
     <header className="top-ribbon">
       <div className="brand-block">
@@ -40,10 +53,26 @@ export function StatusRibbon({
           <Radio size={16} />
           <span>{connected ? vm.ui.rosOnline : vm.ui.rosOffline}</span>
         </div>
-        <div className={`system-pill ${vm.vlmStatus.className}`}>
-          <span>{vm.vlmStatus.kind}</span>
+        <label className={`system-pill model-pill ${vm.vlmStatus.className}`}>
+          <span>VLM</span>
+          <select
+            value={selectedVlmModel}
+            disabled={vlmSelectDisabled}
+            title={modelCatalogStatus}
+            onChange={(event) => onVlmModelChange(event.target.value)}
+          >
+            {modelOptions.length ? (
+              modelOptions.map((modelId) => (
+                <option value={modelId} key={modelId}>
+                  {modelId}
+                </option>
+              ))
+            ) : (
+              <option value="">{modelCatalogStatus || vm.ui.none}</option>
+            )}
+          </select>
           <strong>{vm.vlmStatus.health}</strong>
-        </div>
+        </label>
         <div className="language-control" aria-label={vm.ui.language}>
           <Languages size={15} />
           <button className={language === "ko" ? "active" : ""} onClick={() => onLanguageChange("ko")} type="button">

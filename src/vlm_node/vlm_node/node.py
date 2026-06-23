@@ -86,6 +86,18 @@ class MockVLMNode(Node):
         self._completion_request_emitted = False
         self._completion_confirm_emitted = False
 
+    def _terminal_normal_phase_id(self) -> str:
+        normal_phase_ids = list(getattr(self._spec, "normal_phase_ids", []))
+        if normal_phase_ids:
+            return normal_phase_ids[-1]
+        return self._spec.phase_ids[-1] if self._spec.phase_ids else ""
+
+    def _is_late_normal_phase(self, phase_id: str) -> bool:
+        normal_phase_ids = list(getattr(self._spec, "normal_phase_ids", []))
+        if not normal_phase_ids or phase_id not in normal_phase_ids:
+            return False
+        return normal_phase_ids.index(phase_id) >= max(0, len(normal_phase_ids) - 2)
+
     def _state_backed_observations_enabled(self) -> bool:
         return bool(self.get_parameter("state_backed_observations").value)
 
@@ -278,7 +290,7 @@ class MockVLMNode(Node):
         if gesture.requested_tool not in expected_tools:
             score += 0.12
             factors.append("phase no longer expects tool")
-        if phase_id in {"closure", "pedicle_control", "vessel_control"}:
+        if self._is_late_normal_phase(phase_id):
             score += 0.08
             factors.append("late-phase exchange context")
         if self._tool_recently_in(gesture.requested_tool, {"surgical_field", "surgeon_hand", "return_zone"}):
@@ -803,14 +815,14 @@ class MockVLMNode(Node):
         return False
 
     def _completion_gesture_from_state(self, state: SimulationState) -> dict[str, object] | None:
-        terminal_phase = self._spec.phase_ids[-1] if self._spec.phase_ids else ""
+        terminal_phase = self._terminal_normal_phase_id()
         if state.filtered_phase != terminal_phase:
             self._completion_request_emitted = False
             self._completion_confirm_emitted = False
             return None
-        # State-backed VLM acts like a camera recognizer: after a stable closure
-        # view, it infers the surgeon's completion request. The twin reducer,
-        # not the VLM, decides whether that request can change runtime state.
+        # State-backed VLM acts like a camera recognizer: after a stable terminal
+        # phase view, it infers the surgeon's completion request. The twin
+        # reducer, not the VLM, decides whether that request can change runtime state.
         if (
             state.execution_state == "running"
             and self._state_phase_ticks >= max(3, int(self._spec.get_phase_min_duration(terminal_phase)))
@@ -819,9 +831,9 @@ class MockVLMNode(Node):
             self._completion_request_emitted = True
             return {
                 "event_type": "request_procedure_completion",
-                "hand_pose": "closure_done_signal",
+                "hand_pose": "terminal_phase_done_signal",
                 "confidence": 0.94,
-                "note": "VLM observes the surgeon signaling that closure is complete and cleanup should begin.",
+                "note": "VLM observes the surgeon signaling that the terminal phase is complete and cleanup should begin.",
             }
         if (
             state.execution_state == "finishing"
@@ -838,7 +850,7 @@ class MockVLMNode(Node):
         return None
 
     def _on_control(self, msg: String) -> None:
-        command = msg.data.strip().lower()
+        command = msg.data.strip().partition(":")[0].strip().lower()
         if command in {"start", "start_actors"}:
             state_backed = self._state_backed_observations_enabled()
             scene_backed = self._perception_scene_observations_enabled()

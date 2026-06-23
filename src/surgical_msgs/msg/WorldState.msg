@@ -18,6 +18,9 @@ string[] recent_event_types
 string right_hand_tool
 string left_hand_tool
 string prepositioned_tool
+string predicted_tool
+float32 predicted_tool_confidence
+float32 predicted_tool_stability_sec
 string surgeon_intent
 string surgeon_request_tool
 bool surgeon_ready_for_handover

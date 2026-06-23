@@ -47,6 +47,25 @@ export type SimulationState = {
   layout_json?: string;
 };
 
+export type WorldState = {
+  procedure_id: string;
+  running: boolean;
+  execution_state: string;
+  filtered_phase: string;
+  phase_confidence: number;
+  phase_uncertain: boolean;
+  phase_stability: number;
+  expected_instruments: string[];
+  available_instruments: string[];
+  right_hand_tool: string;
+  left_hand_tool: string;
+  prepositioned_tool: string;
+  predicted_tool: string;
+  predicted_tool_confidence: number;
+  predicted_tool_stability_sec: number;
+  surgeon_request_tool: string;
+};
+
 export type SimulationEvent = {
   ui_id?: string;
   event_type: string;
@@ -68,6 +87,21 @@ export type SurgeonState = {
   scripted: boolean;
   voice_text: string;
   scene_note: string;
+};
+
+export type SurgeonLLMDecision = {
+  model_id: string;
+  raw_json: string;
+  accepted: boolean;
+  reject_reason: string;
+  action: string;
+  tool: string;
+  request_mode: string;
+  speech: string;
+  hidden_phase: string;
+  latency_sec: number;
+  seed: number;
+  overlay_json: string;
 };
 
 export type BTDecision = {
@@ -207,6 +241,8 @@ export type LayoutDisplayMetadata = {
     display_name?: string;
     display_name_ko?: string;
   }>;
+  normal_phase_ids?: string[];
+  interrupt_phase_ids?: string[];
   instruments?: Array<{
     id: string;
     display_name?: string;
@@ -229,6 +265,8 @@ export type LayoutDisplayMetadata = {
       display_name?: string;
       display_name_ko?: string;
     }>;
+    normal_phase_ids?: string[];
+    interrupt_phase_ids?: string[];
     instruments?: Array<{
       id: string;
       display_name?: string;

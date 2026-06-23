@@ -8,7 +8,13 @@ import json
 from pathlib import Path
 import time
 
-from procedure_spec import get_default_spec_dir, load_bundle
+from procedure_spec import (
+    ProcedurePriorScorer,
+    compact_procedure_prompt,
+    discover_prompt_bundle_dirs,
+    get_default_spec_dir,
+    load_bundle,
+)
 import rclpy
 from rcl_interfaces.msg import SetParametersResult
 from rclpy.node import Node
@@ -33,6 +39,7 @@ from surgical_msgs.msg import (
     VLMHealth,
     VLMRequestContext,
     VLMReducerDecision,
+    VLMResult,
     WorldState,
 )
 
@@ -62,17 +69,33 @@ class ORDigitalTwinNode(Node):
         self.declare_parameter("phase_authority", "reducer")
         self.declare_parameter("vlm_mode", "mock")
         self.declare_parameter("vlm_health_timeout_sec", 6.0)
+        self.declare_parameter("mayo_retrieve_confidence_threshold", 0.5)
+        self.declare_parameter("mayo_reuse_suppress_threshold", 0.5)
+        self.declare_parameter("mayo_stability_sec", 5.0)
+        self.declare_parameter("tool_predict_confidence_threshold", 0.8)
+        self.declare_parameter("tool_predict_stability_sec", 3.0)
         self._spec_dir = str(self.get_parameter("spec_dir").value)
         self._vlm_recent_event_count = max(1, int(self.get_parameter("vlm_recent_event_count").value))
         self._validation_mode = str(self.get_parameter("validation_mode").value)
         self._phase_authority = str(self.get_parameter("phase_authority").value)
         self._vlm_mode = str(self.get_parameter("vlm_mode").value)
         self._vlm_health_timeout_sec = max(0.5, float(self.get_parameter("vlm_health_timeout_sec").value))
+        self._mayo_retrieve_threshold = float(self.get_parameter("mayo_retrieve_confidence_threshold").value)
+        self._mayo_reuse_threshold = float(self.get_parameter("mayo_reuse_suppress_threshold").value)
+        self._mayo_stability_sec = max(0.1, float(self.get_parameter("mayo_stability_sec").value))
+        self._tool_predict_threshold = float(self.get_parameter("tool_predict_confidence_threshold").value)
+        self._tool_predict_stability_sec = max(0.1, float(self.get_parameter("tool_predict_stability_sec").value))
         self._twin = ORDigitalTwin(load_bundle(self._spec_dir))
+        self._prior_scorer = ProcedurePriorScorer(self._twin.spec, compact_procedure_prompt(self._spec_dir))
         self._bundle_metadata_cache = self._build_bundle_metadata()
         self._important_events: deque[SimulationEvent] = deque(maxlen=self._vlm_recent_event_count)
         self._latest_outward_signal: SurgeonOutwardSignal | None = None
         self._vlm_health_by_topic: dict[str, tuple[VLMHealth, float]] = {}
+        self._mayo_retrieve_stability: dict[str, dict] = {}
+        self._mayo_reuse_stability: dict[str, dict] = {}
+        self._mayo_promoted_tools: set[str] = set()
+        self._tool_predict_stability: dict[str, dict] = {}
+        self._phase_entered_ros_sec = self._stamp_sec(self._stamp())
         self.add_on_set_parameters_callback(self._on_parameters_changed)
 
         self._world_pub = self.create_publisher(WorldState, "/twin/world_state", 20)
@@ -93,6 +116,8 @@ class ORDigitalTwinNode(Node):
         self.create_subscription(PhaseTransitionCue, "/surgeon/phase_transition_cue", self._on_phase_transition_cue, 20)
         self.create_subscription(PhaseEvidence, "/vlm/phase_evidence", self._on_phase_evidence, 20)
         self.create_subscription(ToolObservation, "/vlm/tool_observations", self._on_observation, 50)
+        self.create_subscription(VLMResult, "/vlm/result", self._on_vlm_result, 20)
+        self.create_subscription(VLMResult, "/vlm_real/result", self._on_vlm_result, 20)
         self.create_subscription(VLMHealth, "/vlm/health", lambda msg: self._on_vlm_health("/vlm/health", msg), 10)
         self.create_subscription(
             VLMHealth,
@@ -115,8 +140,14 @@ class ORDigitalTwinNode(Node):
                 try:
                     self._spec_dir = str(parameter.value)
                     self._twin.reset_spec(load_bundle(self._spec_dir))
+                    self._prior_scorer = ProcedurePriorScorer(self._twin.spec, compact_procedure_prompt(self._spec_dir))
                     self._bundle_metadata_cache = self._build_bundle_metadata()
                     self._important_events.clear()
+                    self._mayo_retrieve_stability.clear()
+                    self._mayo_reuse_stability.clear()
+                    self._mayo_promoted_tools.clear()
+                    self._tool_predict_stability.clear()
+                    self._phase_entered_ros_sec = self._stamp_sec(self._stamp())
                     self._publish_world_state()
                 except Exception as exc:
                     return SetParametersResult(
@@ -134,6 +165,16 @@ class ORDigitalTwinNode(Node):
                 self._vlm_mode = str(parameter.value)
             elif parameter.name == "vlm_health_timeout_sec":
                 self._vlm_health_timeout_sec = max(0.5, float(parameter.value))
+            elif parameter.name == "mayo_retrieve_confidence_threshold":
+                self._mayo_retrieve_threshold = float(parameter.value)
+            elif parameter.name == "mayo_reuse_suppress_threshold":
+                self._mayo_reuse_threshold = float(parameter.value)
+            elif parameter.name == "mayo_stability_sec":
+                self._mayo_stability_sec = max(0.1, float(parameter.value))
+            elif parameter.name == "tool_predict_confidence_threshold":
+                self._tool_predict_threshold = float(parameter.value)
+            elif parameter.name == "tool_predict_stability_sec":
+                self._tool_predict_stability_sec = max(0.1, float(parameter.value))
         return SetParametersResult(successful=True)
 
     def _stamp(self):
@@ -178,6 +219,8 @@ class ORDigitalTwinNode(Node):
             "id": spec.bundle.procedure_id,
             "display_name": spec.bundle.procedure_display_name,
             "display_name_ko": spec.bundle.procedure_display_name_ko,
+            "normal_phase_ids": list(spec.normal_phase_ids),
+            "interrupt_phase_ids": list(spec.interrupt_phase_ids),
             "requestable_instruments": requestable_instruments,
             "phases": [
                 {
@@ -208,9 +251,7 @@ class ORDigitalTwinNode(Node):
         if not parent_dir.is_dir():
             return [self._bundle_metadata_payload(self._twin.spec)]
         bundles: list[dict] = []
-        for candidate in sorted(parent_dir.iterdir(), key=lambda path: path.name):
-            if not (candidate / "procedure.yaml").is_file():
-                continue
+        for candidate in discover_prompt_bundle_dirs(parent_dir):
             try:
                 bundles.append(self._bundle_metadata_payload(load_bundle(candidate)))
             except Exception as exc:
@@ -272,6 +313,9 @@ class ORDigitalTwinNode(Node):
         world.right_hand_tool = self._twin.state.right_hand_tool
         world.left_hand_tool = self._twin.state.left_hand_tool
         world.prepositioned_tool = self._twin.state.prepositioned_tool
+        world.predicted_tool = self._twin.state.predicted_tool
+        world.predicted_tool_confidence = float(self._twin.state.predicted_tool_confidence)
+        world.predicted_tool_stability_sec = float(self._twin.state.predicted_tool_stability_sec)
         world.surgeon_intent = self._twin.state.surgeon_intent
         world.surgeon_request_tool = self._twin.state.surgeon_request_tool
         world.surgeon_ready_for_handover = bool(self._twin.state.surgeon_ready_for_handover)
@@ -366,6 +410,8 @@ class ORDigitalTwinNode(Node):
                         "display_name_ko": self._twin.spec.bundle.procedure_display_name_ko,
                     },
                     "display_catalog": self._twin.spec.bundle.display_catalog,
+                    "normal_phase_ids": list(self._twin.spec.normal_phase_ids),
+                    "interrupt_phase_ids": list(self._twin.spec.interrupt_phase_ids),
                     "requestable_instruments": [
                         instrument.id
                         for instrument in self._twin.spec.bundle.instruments
@@ -688,6 +734,8 @@ class ORDigitalTwinNode(Node):
             detail=decision,
             mode=input_type,
         )
+        if accepted and event_type == "PhaseTransitionAccepted" and target_phase:
+            self._phase_entered_ros_sec = self._stamp_sec(self._stamp())
 
     def _on_phase_transition_cue(self, msg: PhaseTransitionCue) -> None:
         decision = self._twin.apply_phase_transition_cue(msg)
@@ -699,14 +747,112 @@ class ORDigitalTwinNode(Node):
         self._publish_world_state()
 
     def _on_phase_evidence(self, msg: PhaseEvidence) -> None:
-        decisions = self._twin.apply_phase_evidence(msg)
+        fused = self._fuse_phase_evidence(msg)
+        decisions = self._twin.apply_phase_evidence(fused)
         for decision in decisions:
             self._publish_phase_decision_outputs(
                 decision,
                 input_type="phase_evidence",
-                input_source=msg.source or "mock_vlm",
+                input_source=fused.source or msg.source or "mock_vlm",
             )
         self._publish_world_state()
+
+    def _runtime_prior_evidence(self) -> dict:
+        hand_tools = [
+            tool
+            for tool in [
+                self._twin.state.right_hand_tool,
+                self._twin.state.left_hand_tool,
+                self._twin.state.prepositioned_tool,
+            ]
+            if tool
+        ]
+        hand_tools.extend(
+            tool_id
+            for tool_id, state in self._twin.instrument_states.items()
+            if state.lifecycle_stage == "surgeon_owned"
+        )
+        mayo_tools = [
+            tool_id
+            for tool_id, state in self._twin.instrument_states.items()
+            if state.lifecycle_stage in {"mayo_reuse", "mayo_recovery"}
+        ]
+        events = [
+            {
+                "t": event.event_type,
+                "tool": event.instrument_id,
+                "anchor": event.to_anchor or event.from_anchor,
+                "stamp_sec": self._stamp_sec(event.stamp),
+            }
+            for event in self._important_events
+            if event.event_type
+            in {
+                "ToolHandoverCompleted",
+                "ToolReceivedFromSurgeon",
+                "ToolSentToCleaner",
+                "ToolCleaningCompleted",
+                "ToolReturnedToTray",
+                "RobotTaskCompleted",
+            }
+        ]
+        recent_tools = [
+            {"tool": event["tool"], "at": event["stamp_sec"]}
+            for event in events
+            if event.get("tool")
+        ]
+        return {
+            "current_phase": self._twin._active_context_phase_id(),
+            "phase_entered_sec": self._phase_entered_ros_sec,
+            "recent_tools": recent_tools,
+            "mayo_tools": mayo_tools,
+            "hand_tools": hand_tools,
+            "events": events,
+        }
+
+    def _fuse_phase_evidence(self, msg: PhaseEvidence) -> PhaseEvidence:
+        if "real_vlm" not in str(msg.source):
+            return msg
+        prior = self._prior_scorer.score(self._runtime_prior_evidence()).get("phase", [])
+        prior_scores = {str(item[0]): float(item[1]) for item in prior if isinstance(item, list) and len(item) == 2}
+        vlm_scores = {
+            self._twin.spec.resolve_phase_id(str(phase_id)) or str(phase_id): float(confidence)
+            for phase_id, confidence in zip(msg.phase_ids, msg.phase_confidences)
+            if str(phase_id)
+        }
+        if not prior_scores or not vlm_scores:
+            return msg
+        current_phase = self._twin.state.filtered_phase or self._twin.spec.default_phase_id
+        candidates = set(prior_scores) | set(vlm_scores) | {current_phase}
+        fused_scores: dict[str, float] = {}
+        for phase_id in candidates:
+            vlm_score = float(vlm_scores.get(phase_id, 0.0))
+            prior_score = float(prior_scores.get(phase_id, 0.0))
+            agreement = 0.08 if vlm_score >= 0.35 and prior_score >= 0.35 else 0.0
+            fused_scores[phase_id] = min(1.0, 0.68 * vlm_score + 0.34 * prior_score + agreement)
+        ranked = sorted(fused_scores.items(), key=lambda item: item[1], reverse=True)[:4]
+        fused = PhaseEvidence()
+        fused.stamp = msg.stamp
+        fused.source = f"{msg.source}:fusion"
+        fused.phase_ids = [item[0] for item in ranked]
+        fused.phase_confidences = [float(item[1]) for item in ranked]
+        fused.visible_instrument_ids = list(msg.visible_instrument_ids)
+        fused.visible_instrument_confidences = list(msg.visible_instrument_confidences)
+        fused.uncertainty = min(1.0, max(0.0, float(msg.uncertainty) + (0.15 if ranked and ranked[0][0] != current_phase and ranked[0][1] < 0.8 else 0.0)))
+        fused.scene_summary = f"{msg.scene_summary}; phase_fusion={ranked[:2]}"
+        self._publish_reducer_decision_event(
+            input_type="vlm_phase_fusion",
+            input_id=f"phase_fusion:{self._stamp_sec(msg.stamp):.3f}",
+            input_source=msg.source,
+            accepted=bool(ranked),
+            reason="phase_prior_fused",
+            affected_phase=ranked[0][0] if ranked else "",
+            detail={
+                "vlm": vlm_scores,
+                "prior": prior_scores,
+                "fused": ranked,
+            },
+        )
+        return fused
 
     def _publish_vlm_reducer_decision(self, result: dict) -> None:
         decision = VLMReducerDecision()
@@ -747,11 +893,11 @@ class ORDigitalTwinNode(Node):
         self._reducer_decision_pub.publish(event)
 
     def _outward_hand_pose(self, event_type: str) -> str:
-        if event_type in {"request_tool", "voice_request", "extend_hand_for_handover"}:
+        if event_type in {"request_tool", "extend_hand_for_handover"}:
             return "open_receive"
         if event_type in {"return_tool", "extend_hand_for_retrieval", "place_on_mayo_recovery"}:
             return "present_return"
-        if event_type == "place_on_mayo_reuse":
+        if event_type in {"place_on_mayo", "place_on_mayo_reuse"}:
             return "park_on_mayo_reuse"
         if event_type == "continue_using":
             return "using_tool"
@@ -786,10 +932,12 @@ class ORDigitalTwinNode(Node):
         proposal_id: str,
         current_lifecycle: str,
         proposed_lifecycle: str,
+        source: str = "legacy_tool_observation",
+        detail: dict | None = None,
     ) -> None:
         proposal = VLMInferenceProposal()
         proposal.stamp = self._stamp()
-        proposal.source = "legacy_tool_observation"
+        proposal.source = source
         proposal.proposal_id = proposal_id
         proposal.instrument_id = msg.instrument_id
         proposal.current_lifecycle = current_lifecycle
@@ -799,18 +947,424 @@ class ORDigitalTwinNode(Node):
         proposal.location_id = msg.location_id
         proposal.confidence = float(msg.confidence)
         proposal.visible = bool(msg.visible)
-        proposal.detail_json = json.dumps(
-            {
+        detail_payload = {
                 "legacy_message": "ToolObservation",
                 "instrument_id": msg.instrument_id,
                 "location_type": msg.location_type,
                 "location_id": msg.location_id,
                 "confidence": float(msg.confidence),
                 "visible": bool(msg.visible),
-            },
-            sort_keys=True,
-        )
+        }
+        if detail:
+            detail_payload.update(detail)
+        proposal.detail_json = json.dumps(detail_payload, sort_keys=True)
         self._vlm_proposal_pub.publish(proposal)
+
+    def _stamp_sec(self, msg_stamp) -> float:
+        value = float(msg_stamp.sec) + float(msg_stamp.nanosec) / 1_000_000_000.0
+        if value > 0.0:
+            return value
+        stamp = self._stamp()
+        return float(stamp.sec) + float(stamp.nanosec) / 1_000_000_000.0
+
+    def _update_stability(
+        self,
+        tracker: dict[str, dict],
+        *,
+        tool_id: str,
+        confidence: float,
+        threshold: float,
+        stability_sec: float,
+        now_sec: float,
+    ) -> tuple[bool, float]:
+        if not tool_id or confidence < threshold:
+            if tool_id:
+                tracker.pop(tool_id, None)
+            return (False, 0.0)
+        entry = tracker.get(tool_id)
+        if entry is None or now_sec - float(entry.get("last_seen", now_sec)) > 2.5:
+            entry = {"first_seen": now_sec, "last_seen": now_sec, "confidence": confidence}
+            tracker[tool_id] = entry
+        else:
+            entry["last_seen"] = now_sec
+            entry["confidence"] = confidence
+        duration = now_sec - float(entry["first_seen"])
+        return (duration >= stability_sec, duration)
+
+    def _stable_reuse_tools(self, now_sec: float) -> set[str]:
+        stable = set()
+        for tool_id, entry in list(self._mayo_reuse_stability.items()):
+            if now_sec - float(entry.get("last_seen", now_sec)) > 2.5:
+                self._mayo_reuse_stability.pop(tool_id, None)
+                continue
+            if now_sec - float(entry.get("first_seen", now_sec)) >= self._mayo_stability_sec:
+                stable.add(tool_id)
+        return stable
+
+    def _clear_stale_tool_prediction(self, now_sec: float) -> None:
+        for tool_id, entry in list(self._tool_predict_stability.items()):
+            if now_sec - float(entry.get("last_seen", now_sec)) > 2.5:
+                self._tool_predict_stability.pop(tool_id, None)
+        if not self._twin.state.predicted_tool:
+            return
+        entry = self._tool_predict_stability.get(self._twin.state.predicted_tool)
+        if entry is None:
+            self._twin.state.predicted_tool = ""
+            self._twin.state.predicted_tool_confidence = 0.0
+            self._twin.state.predicted_tool_stability_sec = 0.0
+
+    def _clear_tool_prediction_state(self) -> None:
+        self._tool_predict_stability.clear()
+        self._twin.state.predicted_tool = ""
+        self._twin.state.predicted_tool_confidence = 0.0
+        self._twin.state.predicted_tool_stability_sec = 0.0
+
+    def _tool_available_for_prediction(self, tool_id: str) -> bool:
+        current_state = self._twin.instrument_states.get(tool_id)
+        return bool(
+            current_state is not None
+            and not current_state.contaminated
+            and current_state.lifecycle_stage in {"home_rack", "returned_home"}
+        )
+
+    def _vlm_tool_rows(self, payload: dict) -> list[list]:
+        raw = payload.get("tool", [])
+        if str(payload.get("v", "")) == "3":
+            return [
+                [str(item[0]), float(item[1])]
+                for item in raw
+                if isinstance(item, list) and len(item) == 2 and str(item[0])
+            ]
+        if isinstance(raw, list) and len(raw) == 2 and str(raw[0]):
+            return [[str(raw[0]), float(raw[1])]]
+        return []
+
+    def _fused_tool_prediction(self, payload: dict, now_sec: float) -> tuple[str, float, dict]:
+        vlm_rows = self._vlm_tool_rows(payload)
+        vlm_scores = {
+            self._twin.spec.resolve_instrument_alias(str(tool_id)) or str(tool_id): float(confidence)
+            for tool_id, confidence in vlm_rows
+            if str(tool_id)
+        }
+        prior = self._prior_scorer.score(self._runtime_prior_evidence()).get("tool", [])
+        prior_scores = {
+            self._twin.spec.resolve_instrument_alias(str(item[0])) or str(item[0]): float(item[1])
+            for item in prior
+            if isinstance(item, list) and len(item) == 2 and str(item[0])
+        }
+        candidates = sorted(set(vlm_scores) | set(prior_scores))
+        fused_scores: dict[str, float] = {}
+        unavailable: dict[str, str] = {}
+        for tool_id in candidates:
+            if tool_id not in self._twin.instrument_states:
+                continue
+            if not self._tool_available_for_prediction(tool_id):
+                state = self._twin.instrument_states.get(tool_id)
+                unavailable[tool_id] = state.lifecycle_stage if state is not None else "missing"
+                continue
+            vlm_score = float(vlm_scores.get(tool_id, 0.0))
+            prior_score = float(prior_scores.get(tool_id, 0.0))
+            agreement = 0.15 if vlm_score >= 0.35 and prior_score >= 0.35 else 0.0
+            fused_scores[tool_id] = min(1.0, 0.15 + 0.62 * vlm_score + 0.28 * prior_score + agreement)
+        if not fused_scores:
+            return "", 0.0, {"vlm": vlm_scores, "prior": prior_scores, "unavailable": unavailable, "fused": {}}
+        best_tool, best_confidence = max(fused_scores.items(), key=lambda item: item[1])
+        selected_tool = best_tool
+        selected_confidence = best_confidence
+        vlm_top = max(vlm_scores.items(), key=lambda item: item[1])[0] if vlm_scores else ""
+        prior_top = max(prior_scores.items(), key=lambda item: item[1])[0] if prior_scores else ""
+        strong_new_consensus = bool(best_tool and best_tool == vlm_top and best_tool == prior_top)
+        sticky_margin = 0.06 if strong_new_consensus else 0.12
+        for tracked_tool, entry in self._tool_predict_stability.items():
+            if tracked_tool != best_tool and strong_new_consensus:
+                continue
+            if now_sec - float(entry.get("last_seen", now_sec)) > 2.5:
+                continue
+            tracked_score = fused_scores.get(tracked_tool)
+            if tracked_score is None:
+                continue
+            if tracked_score >= best_confidence - sticky_margin:
+                selected_tool = tracked_tool
+                selected_confidence = tracked_score
+                break
+        return selected_tool, selected_confidence, {
+            "vlm": vlm_scores,
+            "prior": prior_scores,
+            "unavailable": unavailable,
+            "fused": fused_scores,
+            "selected": selected_tool,
+            "vlm_top": vlm_top,
+            "prior_top": prior_top,
+            "strong_new_consensus": strong_new_consensus,
+        }
+
+    def _handle_vlm_tool_prediction(self, payload: dict, msg: VLMResult, now_sec: float) -> None:
+        if str(payload.get("v", "")) == "2" and "real_vlm" not in str(msg.source):
+            raw_tool = payload.get("tool", ["", 0.0])
+            if not isinstance(raw_tool, list) or len(raw_tool) != 2:
+                self._clear_stale_tool_prediction(now_sec)
+                return
+            tool_id = self._twin.spec.resolve_instrument_alias(str(raw_tool[0])) or str(raw_tool[0])
+            try:
+                confidence = float(raw_tool[1])
+            except (TypeError, ValueError):
+                self._clear_stale_tool_prediction(now_sec)
+                return
+            fusion_detail = {"legacy_v2": True, "tool": tool_id, "confidence": confidence}
+        else:
+            tool_id, confidence, fusion_detail = self._fused_tool_prediction(payload, now_sec)
+        if not tool_id:
+            self._clear_stale_tool_prediction(now_sec)
+            if fusion_detail.get("unavailable"):
+                self._publish_reducer_decision_event(
+                    input_type="vlm_tool_prediction",
+                    input_id=f"tool_prediction:none:{now_sec:.3f}",
+                    input_source=msg.source,
+                    accepted=False,
+                    reason="no_available_fused_tool_prediction",
+                    detail=fusion_detail,
+                )
+            return
+        current_prediction = self._twin.state.predicted_tool
+        if (
+            current_prediction
+            and current_prediction != tool_id
+            and (
+                bool(fusion_detail.get("strong_new_consensus"))
+                or confidence >= self._tool_predict_threshold
+            )
+        ):
+            self._tool_predict_stability.pop(current_prediction, None)
+            self._twin.state.predicted_tool = ""
+            self._twin.state.predicted_tool_confidence = 0.0
+            self._twin.state.predicted_tool_stability_sec = 0.0
+            self._publish_reducer_decision_event(
+                input_type="vlm_tool_prediction",
+                input_id=f"tool_prediction_clear:{current_prediction}:{now_sec:.3f}",
+                input_source=msg.source,
+                accepted=False,
+                reason="cleared_stale_tool_prediction_for_new_consensus",
+                affected_tool=current_prediction,
+                detail={
+                    "replacement_candidate": tool_id,
+                    "confidence": confidence,
+                    "fusion": fusion_detail,
+                },
+            )
+        stable, duration = self._update_stability(
+            self._tool_predict_stability,
+            tool_id=tool_id,
+            confidence=confidence,
+            threshold=self._tool_predict_threshold,
+            stability_sec=self._tool_predict_stability_sec,
+            now_sec=now_sec,
+        )
+        self._clear_stale_tool_prediction(now_sec)
+        if not stable:
+            self._publish_reducer_decision_event(
+                input_type="vlm_tool_prediction",
+                input_id=f"tool_prediction:{tool_id}:{now_sec:.3f}",
+                input_source=msg.source,
+                accepted=False,
+                reason="awaiting_tool_prediction_stability",
+                affected_tool=tool_id,
+                detail={
+                    "confidence": confidence,
+                    "duration_sec": round(duration, 3),
+                    "threshold_sec": self._tool_predict_stability_sec,
+                    "fusion": fusion_detail,
+                },
+            )
+            return
+        current_state = self._twin.instrument_states.get(tool_id)
+        if current_state is None or current_state.contaminated or current_state.lifecycle_stage not in {"home_rack", "returned_home"}:
+            self._publish_reducer_decision_event(
+                input_type="vlm_tool_prediction",
+                input_id=f"tool_prediction:{tool_id}:{now_sec:.3f}",
+                input_source=msg.source,
+                accepted=False,
+                reason="predicted_tool_not_available_for_preposition",
+                affected_tool=tool_id,
+                detail={
+                    "confidence": confidence,
+                    "lifecycle": current_state.lifecycle_stage if current_state else "",
+                    "fusion": fusion_detail,
+                },
+            )
+            if self._twin.state.predicted_tool == tool_id:
+                self._twin.state.predicted_tool = ""
+                self._twin.state.predicted_tool_confidence = 0.0
+                self._twin.state.predicted_tool_stability_sec = 0.0
+            return
+        changed = self._twin.state.predicted_tool != tool_id
+        self._twin.state.predicted_tool = tool_id
+        self._twin.state.predicted_tool_confidence = confidence
+        self._twin.state.predicted_tool_stability_sec = duration
+        self._publish_reducer_decision_event(
+            input_type="vlm_tool_prediction",
+            input_id=f"tool_prediction:{tool_id}:{now_sec:.3f}",
+            input_source=msg.source,
+            accepted=True,
+            reason="stable_tool_prediction",
+            affected_tool=tool_id,
+            detail={
+                "confidence": confidence,
+                "duration_sec": round(duration, 3),
+                "threshold_sec": self._tool_predict_stability_sec,
+                "fusion": fusion_detail,
+            },
+        )
+        if changed:
+            self._publish_event(
+                "VLMPredictedToolStable",
+                instrument_id=tool_id,
+                confidence=confidence,
+                detail={
+                    "source": msg.source,
+                    "duration_sec": round(duration, 3),
+                    "threshold_sec": self._tool_predict_stability_sec,
+                },
+                mode="accepted",
+            )
+            self._publish_world_state()
+
+    def _on_vlm_result(self, msg: VLMResult) -> None:
+        if str(msg.schema_version) not in {"2", "3"}:
+            return
+        try:
+            payload = json.loads(msg.raw_json)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(payload, dict) or str(payload.get("v", "")) not in {"2", "3"}:
+            return
+        now_sec = self._stamp_sec(msg.stamp)
+        interrupt_visible = any(
+            self._twin.spec.is_interrupt_phase(self._twin.spec.resolve_phase_id(str(phase_id)) or str(phase_id))
+            and float(confidence) >= 0.5
+            for phase_id, confidence in zip(msg.phase_ids, msg.phase_confidences)
+        )
+        if interrupt_visible:
+            self._tool_predict_stability.clear()
+            if self._twin.state.predicted_tool:
+                self._twin.state.predicted_tool = ""
+                self._twin.state.predicted_tool_confidence = 0.0
+                self._twin.state.predicted_tool_stability_sec = 0.0
+        self._handle_vlm_tool_prediction(payload, msg, now_sec)
+        recover_votes: set[str] = set()
+        for item in payload.get("mayo", []):
+            if not isinstance(item, list) or len(item) != 3:
+                continue
+            tool_id = self._twin.spec.resolve_instrument_alias(str(item[0])) or str(item[0])
+            decision = str(item[1])
+            try:
+                confidence = float(item[2])
+            except (TypeError, ValueError):
+                continue
+            if decision == "reuse":
+                self._update_stability(
+                    self._mayo_reuse_stability,
+                    tool_id=tool_id,
+                    confidence=confidence,
+                    threshold=self._mayo_reuse_threshold,
+                    stability_sec=self._mayo_stability_sec,
+                    now_sec=now_sec,
+                )
+            elif tool_id:
+                if decision == "recover":
+                    recover_votes.add(tool_id)
+                self._mayo_reuse_stability.pop(tool_id, None)
+
+        retrieve = payload.get("mayo_retrieve", ["", 0.0])
+        if not isinstance(retrieve, list) or len(retrieve) != 2:
+            return
+        tool_id = self._twin.spec.resolve_instrument_alias(str(retrieve[0])) or str(retrieve[0])
+        try:
+            confidence = float(retrieve[1])
+        except (TypeError, ValueError):
+            return
+        if not tool_id:
+            return
+        stable, duration = self._update_stability(
+            self._mayo_retrieve_stability,
+            tool_id=tool_id,
+            confidence=confidence,
+            threshold=self._mayo_retrieve_threshold,
+            stability_sec=self._mayo_stability_sec,
+            now_sec=now_sec,
+        )
+        if not stable:
+            self._publish_reducer_decision_event(
+                input_type="vlm_mayo_retrieve",
+                input_id=f"mayo_retrieve:{tool_id}:{now_sec:.3f}",
+                input_source=msg.source,
+                accepted=False,
+                reason="awaiting_mayo_retrieve_stability",
+                affected_tool=tool_id,
+                detail={
+                    "confidence": confidence,
+                    "duration_sec": round(duration, 3),
+                    "threshold_sec": self._mayo_stability_sec,
+                },
+            )
+            return
+        if tool_id in self._stable_reuse_tools(now_sec) and tool_id not in recover_votes:
+            self._publish_reducer_decision_event(
+                input_type="vlm_mayo_retrieve",
+                input_id=f"mayo_retrieve:{tool_id}:{now_sec:.3f}",
+                input_source=msg.source,
+                accepted=False,
+                reason="mayo_reuse_stable_suppressed_recovery",
+                affected_tool=tool_id,
+                detail={"confidence": confidence},
+            )
+            return
+        if tool_id in self._mayo_promoted_tools:
+            current_state = self._twin.instrument_states.get(tool_id)
+            if current_state is not None and current_state.lifecycle_stage in {"mayo_reuse", "mayo_recovery"}:
+                return
+            self._mayo_promoted_tools.discard(tool_id)
+        observation = ToolObservation()
+        observation.stamp = msg.stamp if msg.stamp.sec or msg.stamp.nanosec else self._stamp()
+        observation.instrument_id = tool_id
+        observation.location_id = "mayo_recovery_zone"
+        observation.location_type = "mayo_recovery_zone"
+        observation.confidence = confidence
+        observation.visible = True
+        proposal_id = f"mayo_retrieve:{tool_id}:{now_sec:.3f}:{confidence:.2f}"
+        current_state = self._twin.instrument_states.get(tool_id)
+        current_lifecycle = current_state.lifecycle_stage if current_state is not None else ""
+        result = self._twin.promote_mayo_recovery_from_vlm(
+            instrument_id=tool_id,
+            confidence=confidence,
+            source="vlm_mayo_retrieve",
+            proposal_id=proposal_id,
+            stamp_sec=now_sec,
+        )
+        if result:
+            self._mayo_promoted_tools.add(tool_id)
+            self._publish_vlm_inference_proposal(
+                observation,
+                proposal_id=proposal_id,
+                current_lifecycle=current_lifecycle,
+                proposed_lifecycle=str(result.get("proposed_lifecycle", "mayo_recovery")),
+                source="vlm_mayo_retrieve",
+                detail={
+                    "schema_version": "2",
+                    "mayo_stability_sec": round(duration, 3),
+                    "raw_mayo_retrieve": retrieve,
+                },
+            )
+            self._publish_vlm_reducer_decision(result)
+            self._publish_event(
+                str(result.get("event_type", "VLMProposalIgnored")),
+                instrument_id=tool_id,
+                location_id="mayo_recovery_zone",
+                location_type="mayo_recovery_zone",
+                confidence=confidence,
+                detail=result,
+                mode=str(result.get("reducer_result", "ignored")),
+            )
+            self._publish_world_state()
 
     def _on_observation(self, msg: ToolObservation) -> None:
         stamp_sec = float(msg.stamp.sec) + float(msg.stamp.nanosec) / 1_000_000_000.0
@@ -894,6 +1448,8 @@ class ORDigitalTwinNode(Node):
 
     def _on_surgeon_request(self, msg: SurgeonRequest) -> None:
         resolved = self._twin.update_surgeon_request(msg)
+        if resolved and str(msg.event_type) in {"request_tool", "voice_request"}:
+            self._clear_tool_prediction_state()
         queue_detail = self._twin.request_queue_summary()
         self._publish_event(
             "SurgeonRequestObserved",
@@ -942,9 +1498,16 @@ class ORDigitalTwinNode(Node):
         self._publish_world_state()
 
     def _on_control(self, msg: String) -> None:
-        command = msg.data.strip().lower()
+        raw_command = msg.data.strip()
+        command, _, start_phase_id = raw_command.partition(":")
+        command = command.strip().lower()
+        start_phase_id = start_phase_id.strip()
         if command in {"start", "start_runtime"}:
             self._twin.reset_spec(self._twin.spec, seed_from_perception=False)
+            self._phase_entered_ros_sec = self._stamp_sec(self._stamp())
+            if start_phase_id:
+                self._twin.set_initial_phase(start_phase_id)
+                self._phase_entered_ros_sec = self._stamp_sec(self._stamp())
             self._twin.set_execution_state(True, "running")
         elif command == "pause":
             self._twin.set_execution_state(True, "paused")
@@ -954,6 +1517,7 @@ class ORDigitalTwinNode(Node):
             self._twin.set_execution_state(False, "halted")
         elif command == "reset":
             self._twin.reset_runtime()
+            self._phase_entered_ros_sec = self._stamp_sec(self._stamp())
             self._twin.set_execution_state(False, "idle")
         self._publish_world_state()
 

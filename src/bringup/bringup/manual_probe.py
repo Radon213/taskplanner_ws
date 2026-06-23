@@ -12,7 +12,7 @@ from procedure_spec import get_default_spec_dir, load_bundle
 import rclpy
 from rclpy.parameter import Parameter
 from rclpy.parameter_client import AsyncParameterClient
-from surgical_msgs.msg import BTDecision, SurgeonGestureEvidence, TwinEvent
+from surgical_msgs.msg import BTDecision, SkillCommand, SurgeonGestureEvidence, TwinEvent, VLMResult
 
 from .smoke_test import ManagedProcess, SmokeHarness
 
@@ -48,8 +48,11 @@ class ManualProbeHarness(SmokeHarness):
         self._parameter_client = AsyncParameterClient(self, "/surgeon_actor")
         self._decision_log: list[BTDecision] = []
         self._event_log: list[TwinEvent] = []
+        self._skill_command_log: list[SkillCommand] = []
         self._surgeon_request_log: list[tuple[float, str, str]] = []
+        self._vlm_result_pub = self.create_publisher(VLMResult, "/vlm/result", 20)
         self.create_subscription(BTDecision, "/bt/decision", self._on_probe_decision, 20)
+        self.create_subscription(SkillCommand, "/bt/skill_command", self._skill_command_log.append, 20)
         self.create_subscription(TwinEvent, "/skill/events", self._on_probe_event, 50)
 
     def _on_probe_decision(self, msg: BTDecision) -> None:
@@ -165,6 +168,47 @@ class ManualProbeHarness(SmokeHarness):
             while time.time() < end_time:
                 rclpy.spin_once(self, timeout_sec=0.05)
 
+    def emit_stable_tool_prediction(
+        self,
+        *,
+        phase_id: str,
+        tool_id: str,
+        confidence: float = 0.92,
+        duration_sec: float = 6.5,
+    ) -> None:
+        end_time = time.time() + duration_sec
+        while time.time() < end_time:
+            payload = {
+                "v": "2",
+                "phase": [phase_id, 0.95],
+                "tool": [tool_id, confidence],
+                "intent": ["none", "", 0.0],
+                "mayo": [],
+                "mayo_retrieve": ["", 0.0],
+                "u": 0.05,
+                "sum": f"manual stable next-tool prediction for {tool_id}",
+            }
+            msg = VLMResult()
+            msg.stamp = self.get_clock().now().to_msg()
+            msg.source = "manual_probe"
+            msg.schema_version = "2"
+            msg.raw_json = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+            msg.summary = payload["sum"]
+            msg.phase_ids = [phase_id]
+            msg.phase_confidences = [0.95]
+            msg.observed_tool_ids = []
+            msg.observed_location_ids = []
+            msg.observed_location_types = []
+            msg.observed_confidences = []
+            msg.gesture_event_type = ""
+            msg.gesture_requested_tool = ""
+            msg.gesture_hand_pose = ""
+            msg.gesture_confidence = 0.0
+            msg.uncertainty = 0.05
+            self._vlm_result_pub.publish(msg)
+            rclpy.spin_once(self, timeout_sec=0.05)
+            time.sleep(0.45)
+
     def wait_for_request_transition(self, event_type: str, tool_id: str, timeout_sec: float = 10.0) -> None:
         self.wait_until(
             lambda: any(
@@ -193,6 +237,16 @@ class ManualProbeHarness(SmokeHarness):
             ),
             timeout_sec,
             f"skill event {event_type}:{tool_id}",
+        )
+
+    def wait_for_skill_command(self, action: str, tool_id: str, timeout_sec: float = 12.0) -> None:
+        self.wait_until(
+            lambda: any(
+                command.action == action and command.instrument_id == tool_id
+                for command in self._skill_command_log
+            ),
+            timeout_sec,
+            f"skill command {action}:{tool_id}",
         )
 
 
@@ -277,10 +331,19 @@ def main(argv: list[str] | None = None) -> int:
         harness.wait_for_skill_event("ToolCleaningCompleted", recovery_tool)
         harness.wait_for_skill_event("ToolReturnedToTray", recovery_tool)
 
+        prediction_tool = harness.choose_probe_tool()
+        prediction_phase = harness._latest_world.filtered_phase if harness._latest_world else phase_id
+        harness.emit_stable_tool_prediction(
+            phase_id=prediction_phase,
+            tool_id=prediction_tool,
+            duration_sec=6.5,
+        )
+        harness.wait_for_skill_command("predict_tool", prediction_tool)
         harness.wait_until(
-            lambda: harness._latest_world is not None and bool(harness._latest_world.prepositioned_tool),
+            lambda: harness._latest_world is not None
+            and harness._latest_world.prepositioned_tool == prediction_tool,
             16.0,
-            "prepositioned tool to appear for override probe",
+            "stable VLM-predicted tool to become prepositioned for override probe",
         )
         if harness._latest_world is None:
             raise RuntimeError("No world state available for override probe.")
@@ -293,7 +356,7 @@ def main(argv: list[str] | None = None) -> int:
             note=f"manual override request cue for {override_tool}",
         )
         harness.wait_for_request_transition("request_tool", override_tool)
-        harness.wait_for_skill_event("ToolReturnedToTray", prepositioned_tool)
+        harness.wait_for_skill_event("PredictedToolReturnedToRack", prepositioned_tool)
         harness.wait_for_skill_event("ToolHandoverCompleted", override_tool)
 
         result = ProbeResult(

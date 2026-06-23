@@ -65,11 +65,13 @@ actions:
     display_name: Put down and handover
     display_name_ko: 내려놓고 전달
   retrieve_from_hand:
-    display_name: Retrieve from hand
-    display_name_ko: 손에서 회수
+    display_name: Retrieve from hand (legacy/manual)
+    display_name_ko: 손에서 회수(레거시/수동)
+    normal_flow: false
   retrieve_from_mayo:
     display_name: Retrieve from Mayo
     display_name_ko: 메이요에서 회수
+    normal_flow: true
   predict_tool:
     display_name: Predict tool
     display_name_ko: 도구 예측

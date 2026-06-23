@@ -1,0 +1,179 @@
+id: thyroidectomy_doctor_prompt_v1
+
+procedure:
+  id: "thyroidectomy"
+  name: "Open Thyroidectomy"
+  ko: "갑상선절제술"
+  scope: "physician-document partial scenario"
+
+phase_labels:
+  normal:
+    P01: "Skin incision"
+    P02: "Skin flap elevation"
+    P03: "Strap muscle Exposure"
+    P04: "thyroid Exposure"
+    P05: "Thyroid vessels ligation"
+  interrupt:
+    P06: "Bleeding/Hemostasis interrupt"
+
+phase_labels_ko:
+  normal:
+    P01: "피부 절개"
+    P02: "피부판 거상"
+    P03: "띠근 노출"
+    P04: "갑상선 노출"
+    P05: "갑상선 혈관 결찰"
+  interrupt:
+    P06: "출혈/지혈 인터럽트"
+
+tools:
+  T01: "#15 Scalpel"
+  T02: "Adson forceps"
+  T03: "Allis clamp forceps"
+  T04: "Bovie surgical cautery"
+  T05: "army navy retractor"
+  T06: "Senn miller retractor"
+  T07: "Bipolar cautery"
+  T08: "Mosquito forceps"
+  T09: "Harmonics shears"
+  T10: "Yankeur suction"
+
+phase_flow:
+  normal_sequence:
+    - from: "P01"
+      to: "P02"
+      transition_cues:
+        anatomy: "skin flap/skin edge is ready to be lifted"
+        action: "Allis clamp grasps or elevates skin flap"
+        tool_cue: "T03 appears after T01/T04 incision work"
+
+    - from: "P02"
+      to: "P03"
+      transition_cues:
+        anatomy: "strap muscle begins to appear under elevated flap"
+        action: "flap elevation is mostly complete; dissection approaches midline strap muscle"
+        tool_cue: "T05/T06 maintain flap exposure while T02/T04 works deeper"
+
+    - from: "P03"
+      to: "P04"
+      transition_cues:
+        anatomy: "thyroid region appears after strap muscle exposure/division"
+        action: "strap muscle is retracted up/down/left/right"
+        tool_cue: "T05 or T06 changes traction direction"
+
+    - from: "P04"
+      to: "P05"
+      transition_cues:
+        anatomy: "superior pole or thyroid vessels become visible"
+        action: "small vessel/pedicle is isolated"
+        tool_cue: "T02 or T08 works near vessel before T09 request"
+
+  interrupt_transition:
+    phase: "P06"
+    enter_when:
+      visual: "blood, smoke, or fluid obscures the operative field"
+      action: "surgeon pauses dissection to clear field or control bleeding"
+      tool_cue: "T10, T07, or T04 is requested for visibility/hemostasis"
+    exit_when:
+      visual: "field is clear and active bleeding is controlled"
+      return_to: "previous_normal_phase"
+
+phase_details:
+  P01:
+    visual_cues:
+      - "neck skin incision"
+      - "skin/subcutaneous fat visible"
+      - "T01 or T04 at incision line"
+    expected_tool_sequence:
+      - current: "T01"
+        next: "T04"
+        cue: "skin incision complete; subcutaneous dissection starts"
+      - current: "T04"
+        next: "T03"
+        cue: "skin edge/flap ready to grasp"
+
+  P02:
+    visual_cues:
+      - "T03 holds skin flap"
+      - "T05/T06 maintains superficial exposure"
+      - "connective tissue under flap divided"
+    expected_tool_sequence:
+      - current: "T03"
+        next: "T05"
+        cue: "flap needs counter-traction"
+      - current: "T05"
+        next: "T06"
+        cue: "more superficial exposure needed"
+      - current: "T06"
+        next: "T02"
+        cue: "fine tissue handling begins"
+      - current: "T02"
+        next: "T04"
+        cue: "tissue tensioned for dissection"
+
+  P03:
+    visual_cues:
+      - "strap muscle visible"
+      - "midline strap muscle exposure/division"
+      - "T05 holds skin flap"
+    expected_tool_sequence:
+      - current: "T05"
+        next: "T02"
+        cue: "fine grasping before division"
+      - current: "T02"
+        next: "T04"
+        cue: "strap/midline tissue tensioned"
+
+  P04:
+    visual_cues:
+      - "thyroid exposed"
+      - "strap muscle retracted up/down/left/right"
+      - "fine dissection around thyroid"
+    expected_tool_sequence:
+      - current: "T05"
+        next: "T06"
+        cue: "focused thyroid exposure needed"
+      - current: "T06"
+        next: "T02"
+        cue: "fine handling around thyroid"
+      - current: "T02"
+        next: "T08"
+        cue: "small tissue/vessel pedicle needs grasping"
+      - current: "T08"
+        next: "T07"
+        cue: "minor bleeding or precise coagulation"
+
+  P05:
+    visual_cues:
+      - "superior pole/vessels visible"
+      - "vessel pedicle isolated"
+      - "T02 or T08 near vessel"
+    expected_tool_sequence:
+      - current: "T02"
+        next: "T08"
+        cue: "vessel/pedicle needs clamping"
+      - current: "T08"
+        next: "T09"
+        cue: "pedicle isolated; ready for ligation"
+      - current: "T09"
+        next: "T07"
+        cue: "post-ligation bleeding/coagulation"
+
+  P06:
+    visual_cues:
+      - "blood, smoke, or fluid reduces field visibility"
+      - "active dissection pauses"
+      - "surgeon focuses on clearing or coagulating"
+    expected_tool_sequence:
+      - current: "any"
+        next: "T10"
+        cue: "field must be cleared first"
+      - current: "T10"
+        next: "T07"
+        cue: "specific bleeding point is visible"
+      - current: "T07"
+        next: "T04"
+        cue: "broader cautery/dissection can resume"
+    phase_return:
+      target: "previous_normal_phase"
+      cue: "field is clear and bleeding is controlled"

@@ -80,7 +80,7 @@
             <ConfigureHumanoidCommand
               decision="anticipatory_handover"
               mode="anticipatory"
-              rationale="phase-driven anticipatory selection"
+              rationale="stable VLM next-tool prediction"
             />
             <ForceSuccess>
               <Sequence name="AnticipatoryHold">

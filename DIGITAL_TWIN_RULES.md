@@ -37,40 +37,49 @@ These rules are the source of truth for debugging runtime behavior.
 
 ## Surgeon Interaction Rules
 
-1. Empty-hand extension toward the receive zone is produced by VLM hand-cue evidence
-   and becomes handover readiness only after stabilization in `mock_surgeon`.
-2. Extension with a used tool toward the return zone is produced by VLM hand-cue
-   evidence and becomes recovery readiness only after stabilization in `mock_surgeon`.
-3. `request_tool` and `return_tool` intents must not be independently scripted outside
-   the VLM cue path; `mock_surgeon` only owns voice, override, and cue fusion.
+1. Empty-hand extension toward the receive zone is a handover cue. It can be
+   produced by VLM evidence, manual override, or the LLM surgeon actor.
+2. The normal used-tool return path is not direct hand retrieval. The surgeon
+   places used or reusable tools on the Mayo stand.
+3. `request_tool` may be explicit voice, implicit hand extension, or voice+hand.
 4. Voice requests may override an anticipatory/prepositioned tool.
 5. A voice request must be visible in the UI immediately as active spoken intent.
-6. A returned tool is assumed used/contaminated unless explicitly modeled otherwise.
+6. A Mayo-placed tool is assumed used/contaminated unless explicitly modeled otherwise.
+7. `retrieve_from_hand` is legacy/manual-only and must not be dispatched by the
+   normal BT recovery branch.
 
 ## VLM Retrieval Inference Rules
 
-1. `mock_vlm` is the single raw producer of `SurgeonGestureEvidence`.
-2. Return-cue confidence is probabilistic and must combine:
+1. VLM may run in mock/world mode or actor-log mode.
+2. Thyroidectomy actor-log mode uses the bundled
+   `procedure_spec/specs/thyroidectomy/vlm_procedure_prompt.yaml` as the
+   procedure prompt asset. The asset may use compact Pxx/Txx doctor ids, but
+   runtime JSON and BT decisions must use runtime phase/tool ids.
+3. Return-cue confidence is probabilistic and must combine:
    - current phase context
    - whether the tool is still expected in that phase
    - the tool's observed location (`mayo_recovery_zone`, `return_zone`, field, reuse zone)
    - recent tool history on surgeon-side locations
    - observed hand pose
    - phase uncertainty
-3. A tool in `mayo_recovery_zone` should increase recovery probability.
-4. A tool in `mayo_reuse_zone` should decrease recovery probability unless another
-   cue strongly indicates return.
-5. Context-only inference may synthesize a `return_tool` cue when a tool appears in a
-   strong recovery location even if a perfect hand cue is not visible.
-6. Stabilization must suppress one-frame noise; transient raw cues must not directly
+4. In actor-log mode, VLM reports a single visible Mayo stand plus `mayo` reuse/recover
+   assessments and a top `mayo_retrieve` candidate.
+5. `mayo_retrieve` requires confidence >= 0.5 for at least 5 seconds before the
+   reducer may promote a tool to recovery.
+6. A same-tool `reuse` assessment with confidence >= 0.5 for at least 5 seconds
+   suppresses recovery promotion.
+7. VLM `tool` prediction requires confidence >= 0.8 for at least 5 seconds before
+   BT may dispatch `predict_tool`.
+8. Stabilization must suppress one-frame noise; transient raw cues must not directly
    become BT-visible intent.
 
 ## Contamination and Cleaning Rules
 
 1. Any instrument that reaches the surgeon is considered used.
 2. A used instrument is contaminated and must not be returned directly to the rack.
-3. The only valid recovery chain for a used tool is:
-   - surgeon hand or return zone
+3. The normal recovery chain for a used tool is:
+   - surgeon hand
+   - Mayo stand
    - robot left hand
    - cleaner hold
    - robot left hand
@@ -82,14 +91,15 @@ These rules are the source of truth for debugging runtime behavior.
 
 ## Mayo Stand Semantics
 
-1. The mayo stand is split into two semantic sub-zones:
-   - humanoid-adjacent `mayo_recovery_zone`
-   - surgeon-adjacent `mayo_reuse_zone`
-2. `mayo_recovery_zone` means the tool is waiting for robot pickup.
-3. `mayo_reuse_zone` means the tool is temporarily parked for likely continued surgeon-side use.
-4. VLM must report which mayo sub-zone a tool occupies, not just "mayo stand".
-5. A tool in `mayo_recovery_zone` is a valid recovery candidate.
-6. A tool in `mayo_reuse_zone` is not automatically a recovery candidate unless a separate return cue or event reclassifies it.
+1. The VLM-facing scene presents a single Mayo stand and a visible list of tools.
+2. Internally, `mayo_reuse_zone` means the tool is parked on Mayo but not yet
+   confirmed for robot pickup.
+3. Internally, `mayo_recovery_zone` means the reducer has promoted the tool for
+   robot pickup.
+4. The overlay must not expose `reuse` or `recover` labels to VLM; those are VLM
+   judgments, not visual ground truth.
+5. A tool on Mayo becomes a valid recovery candidate only after stable VLM
+   `mayo_retrieve` evidence or procedure-completion cleanup.
 
 ## Rack and Home-Slot Rules
 
@@ -105,10 +115,11 @@ These rules are the source of truth for debugging runtime behavior.
 3. Handover must not select a second right-hand tool while the right hand is occupied.
 4. `explicit_request` may only fire when a stabilized VLM request or voice override
    is active for a valid tool.
-5. `recovery` may only fire when a surgeon-presented tool or active left-arm cleaning
-   pipeline exists.
+5. `recovery` in normal flow dispatches `retrieve_from_mayo` only. Direct hand
+   retrieval is reserved for legacy/manual test paths.
 6. `anticipatory_handover` may only fire when explicit and pending recovery conditions
-   are absent and the selected tool is phase-appropriate.
+   are absent and the selected tool comes from stable VLM next-tool prediction
+   (`confidence >= 0.8` for at least 5 seconds).
 7. Reset returns the simulation to idle and clears transient execution state.
 8. Reset must not auto-start the BT.
 9. Switching bundles while stopped must not require relaunching the workspace.

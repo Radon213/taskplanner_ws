@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useEffect, useMemo, useRef } from "react";
 
 import { layouts } from "../layouts";
 import { applyVisualLayout } from "../visualLayouts";
@@ -8,6 +8,7 @@ import type {
   InstrumentState,
   LayoutAnchor,
   LayoutBundle,
+  LayoutDisplayMetadata,
   LayoutEntity,
   SimulationEvent,
   SimulationState,
@@ -121,12 +122,22 @@ export type StageSurgicalBed = {
   active: boolean;
 };
 
+export type StageInterruptAlert = {
+  phaseId: string;
+  label: string;
+  title: string;
+  message: string;
+  eventKey: string;
+};
+
 export type StageToolDisplayState = "waiting" | "handover" | "using" | "recovery" | "cleaning";
 
 export type StageToolChipBadge = {
   label: string;
   tone: "neutral" | "active" | "warning" | "danger" | "predicted";
 };
+
+export type StageToolChipDensity = "comfortable" | "regular" | "dense" | "micro";
 
 export type StageToolChipPlacement = {
   id: string;
@@ -147,6 +158,8 @@ export type StageToolChipPlacement = {
   footerBadges: StageToolChipBadge[];
   contaminated: boolean;
   active: boolean;
+  layoutVariant: "card" | "mayoList";
+  density: StageToolChipDensity;
 };
 
 export type StageBoardRoute = {
@@ -589,6 +602,36 @@ function gridRectForHolder(
   };
 }
 
+function mayoListRectForHolder(
+  holderId: StageHolderId,
+  index: number,
+  count: number,
+  holderRects: Record<StageHolderId, StageHolderRect>,
+): StageHolderRect & { scale: number; compact: boolean; gridIndex: number } {
+  const contentRect = contentRectForHolder(holderId, holderRects[holderId]);
+  const rowCount = Math.max(1, count);
+  const rowGap = rowCount > 1 ? 0.45 : 0;
+  const rowHeight = Math.max(1.9, (contentRect.height - rowGap * (rowCount - 1)) / rowCount);
+  const rowWidth = contentRect.width * 0.5;
+  return {
+    left: contentRect.left + contentRect.width / 2,
+    top: contentRect.top + rowHeight / 2 + index * (rowHeight + rowGap),
+    width: rowWidth,
+    height: rowHeight,
+    scale: Math.min(1, rowHeight / TOOL_CARD_H),
+    compact: false,
+    gridIndex: index,
+  };
+}
+
+function toolChipDensityForHolder(holderId: StageHolderId, count: number, compact: boolean): StageToolChipDensity {
+  if (holderId !== "mayo_recovery" && holderId !== "mayo_reuse") return compact ? "dense" : "regular";
+  if (count <= 1) return "comfortable";
+  if (count <= 3) return "regular";
+  if (count <= 4) return "dense";
+  return "micro";
+}
+
 function chipRectForHolder(
   holderId: StageHolderId,
   index: number,
@@ -597,6 +640,9 @@ function chipRectForHolder(
 ): StageHolderRect & { scale: number; compact: boolean; gridIndex: number } {
   if (holderId === "rack") {
     return { ...rackSlotRect(index), scale: 1, compact: false, gridIndex: index };
+  }
+  if (holderId === "mayo_recovery" || holderId === "mayo_reuse") {
+    return mayoListRectForHolder(holderId, index, holderCount, holderRects);
   }
   return gridRectForHolder(holderId, index, holderCount, holderRects);
 }
@@ -647,23 +693,139 @@ function isLayoutBundle(value: unknown): value is LayoutBundle {
   return Array.isArray(candidate.entities) && Array.isArray(candidate.anchors);
 }
 
+type BundleMetadata = NonNullable<LayoutDisplayMetadata["bundles"]>[number];
+
+function bundleMetadataFor(metadata: LayoutDisplayMetadata | undefined, bundleName: string): BundleMetadata | undefined {
+  if (!bundleName) return undefined;
+  return metadata?.bundles?.find((bundle) => bundle.id === bundleName);
+}
+
+function selectedBundleMetadata(
+  metadata: LayoutDisplayMetadata | undefined,
+  bundleName: string,
+): LayoutDisplayMetadata | undefined {
+  const selected = bundleMetadataFor(metadata, bundleName);
+  if (!selected) {
+    if (!metadata || !bundleName || metadata.procedure?.id === bundleName) return metadata;
+    return {
+      display_catalog: metadata.display_catalog,
+      bundles: metadata.bundles,
+    };
+  }
+  return {
+    procedure: {
+      id: selected.id,
+      display_name: selected.display_name,
+      display_name_ko: selected.display_name_ko,
+    },
+    phases: selected.phases ?? [],
+    normal_phase_ids: selected.normal_phase_ids ?? [],
+    interrupt_phase_ids: selected.interrupt_phase_ids ?? [],
+    instruments: selected.instruments ?? [],
+    requestable_instruments: selected.requestable_instruments ?? [],
+    display_catalog: metadata?.display_catalog,
+    bundles: metadata?.bundles,
+  };
+}
+
+function genericProcedureLayout(bundleName: string, instrumentCount = RACK_SLOT_COUNT): LayoutBundle {
+  const slotCount = Math.max(RACK_SLOT_COUNT, instrumentCount);
+  return {
+    entities: [
+      { id: "humanoid_body", type: "humanoid", x: 36.5, y: 34, width: 17, height: 32, label: "Humanoid Assistant" },
+      { id: "surgeon_actor", type: "surgeon", x: 84.5, y: 29, width: 12, height: 27, label: "Surgeon" },
+      { id: `${bundleName || "procedure"}_bed`, type: "surgical_bed", x: 58, y: 32.5, width: 24, height: 28, label: "OR Bed" },
+      { id: "instrument_rack", type: "instrument_rack", x: 9.5, y: 43.5, width: 23, height: 32, label: "Instrument Rack" },
+      { id: "mayo_stand", type: "mayo_stand", x: 55.5, y: 62.5, width: 29, height: 8.5, label: "Mayo Stand" },
+      { id: "cleaner_station", type: "cleaner_station", x: 13, y: 14, width: 11.5, height: 11.5, label: "Cleaner" },
+      { id: "unknown_zone", type: "unknown_zone", x: 88, y: 62, width: 10, height: 8, label: "Unresolved" },
+    ],
+    anchors: [
+      { id: "cleaner_slot", attached_to: "cleaner_station", x: 18.8, y: 19.8, label: "Cleaner Slot" },
+      { id: "robot_left_hand", attached_to: "humanoid_body", x: 37.5, y: 46, label: "Left Hand" },
+      { id: "robot_right_hand", attached_to: "humanoid_body", x: 53.5, y: 41.5, label: "Right Hand" },
+      { id: "surgeon_receive_zone", attached_to: "surgeon_actor", x: 79.8, y: 43.5, label: "Receive Zone" },
+      { id: "surgeon_return_zone", attached_to: "surgeon_actor", x: 78.5, y: 53, label: "Return Zone" },
+      { id: "surgeon_hand", attached_to: "surgeon_actor", x: 88, y: 42.5, label: "Surgeon Hand" },
+      { id: "field_region_procedure", attached_to: `${bundleName || "procedure"}_bed`, x: 66.2, y: 44.8, label: "Surgical Field" },
+      { id: "mayo_recovery_zone", attached_to: "mayo_stand", x: 61.5, y: 66.5, label: "Recovery Zone" },
+      { id: "mayo_reuse_zone", attached_to: "mayo_stand", x: 76.5, y: 66.5, label: "Reuse Zone" },
+      { id: "unknown_zone_anchor", attached_to: "unknown_zone", x: 93, y: 66, label: "Unresolved" },
+      ...Array.from({ length: slotCount }, (_, index) => ({
+        id: `main_tray_slot_${index + 1}`,
+        attached_to: "instrument_rack",
+        x: 14.5 + (index % RACK_SLOT_COLUMNS) * 9,
+        y: 51.5 + Math.floor(index / RACK_SLOT_COLUMNS) * 6.2,
+      })),
+    ],
+  };
+}
+
+function layoutWithSelectedMetadata(
+  layout: LayoutBundle,
+  metadata: LayoutDisplayMetadata | undefined,
+  bundleName: string,
+): LayoutBundle {
+  const selectedMetadata = selectedBundleMetadata(metadata, bundleName);
+  return selectedMetadata ? { ...layout, metadata: selectedMetadata } : layout;
+}
+
+function layoutJsonProcedureId(layoutJson: string | undefined): string {
+  if (!layoutJson) return "";
+  try {
+    const parsed = JSON.parse(layoutJson) as unknown;
+    return isLayoutBundle(parsed) ? parsed.metadata?.procedure?.id ?? "" : "";
+  } catch {
+    return "";
+  }
+}
+
+function placeholderInstrumentStates(metadata: LayoutDisplayMetadata | undefined): InstrumentState[] {
+  const instruments = metadata?.instruments ?? [];
+  return instruments.map((instrument, index) => {
+    const slotId = `main_tray_slot_${index + 1}`;
+    return {
+      instrument_id: instrument.id,
+      home_location_type: "tray_slot",
+      home_location_id: slotId,
+      location_type: "tray_slot",
+      location_id: slotId,
+      owner: "rack",
+      status: "ready",
+      confidence: 1,
+      cleanliness_state: "ready",
+      contaminated: false,
+      reserved_for: "",
+      last_holder: "",
+      lifecycle_stage: "home",
+      next_required_transition: "",
+      visual_anchor_id: slotId,
+    };
+  });
+}
+
 function runtimeLayout(bundleName: string, state: SimulationState): LayoutBundle {
+  const curated = layouts[bundleName];
   if (state.layout_json) {
     try {
       const parsed = JSON.parse(state.layout_json) as unknown;
-      if (isLayoutBundle(parsed)) return parsed;
+      if (isLayoutBundle(parsed)) {
+        const parsedProcedureId = parsed.metadata?.procedure?.id ?? "";
+        if (!bundleName || !parsedProcedureId || parsedProcedureId === bundleName) {
+          return parsed;
+        }
+        const selected = bundleMetadataFor(parsed.metadata, bundleName);
+        const fallback = curated ?? genericProcedureLayout(bundleName, selected?.instruments?.length);
+        return layoutWithSelectedMetadata(fallback, parsed.metadata, bundleName);
+      }
     } catch {
       // Fall back to the curated bundle below when ROS sends a partial frame during startup.
     }
   }
-  const curated = layouts[bundleName];
   if (curated) {
-    return {
-      entities: curated.entities,
-      anchors: curated.anchors,
-    };
+    return curated;
   }
-  return layouts.thyroidectomy;
+  return genericProcedureLayout(bundleName);
 }
 
 type LocalizedDisplayRecord = {
@@ -680,6 +842,24 @@ function localizedDisplayName(
   if (!record) return fallback;
   const localized = language === "ko" ? record.display_name_ko || record.display_name : record.display_name || record.display_name_ko;
   return localized?.trim() || fallback;
+}
+
+function phaseIdList(values: unknown): string[] {
+  return Array.isArray(values) ? values.map((value) => String(value)).filter(Boolean) : [];
+}
+
+function interruptPhaseIdsFromMetadata(metadata: LayoutDisplayMetadata | undefined): string[] {
+  const declared = phaseIdList(metadata?.interrupt_phase_ids);
+  if (declared.length) return declared;
+  return (metadata?.phases ?? [])
+    .filter((phase) => `${phase.id} ${phase.display_name ?? ""}`.toLowerCase().includes("interrupt"))
+    .map((phase) => phase.id);
+}
+
+function normalPhaseIdsFromMetadata(metadata: LayoutDisplayMetadata | undefined, interruptIds: Set<string>): string[] {
+  const declared = phaseIdList(metadata?.normal_phase_ids).filter((phaseId) => !interruptIds.has(phaseId));
+  if (declared.length) return declared;
+  return (metadata?.phases ?? []).map((phase) => phase.id).filter((phaseId) => !interruptIds.has(phaseId));
 }
 
 function catalogEntry(
@@ -1018,7 +1198,8 @@ export function useDigitalTwinViewModel({
   vlmResultReceivedAt: number | null;
   stageAspectRatio?: number;
 }) {
-  return useMemo(() => {
+  const lastNormalPhaseRef = useRef("");
+  const viewModel = useMemo(() => {
     const ui = getUiCopy(language);
     const logicalLayout = runtimeLayout(activeBundle, simulationState);
     const layout = applyVisualLayout(activeBundle, logicalLayout);
@@ -1091,9 +1272,22 @@ export function useDigitalTwinViewModel({
       mayo_reuse: ui.reuse,
     };
     const labelForHolder = (holderId: StageHolderId) => holderLabels[holderId];
-    const runtimeAllowsActiveTask = simulationState.running && simulationState.execution_state !== "completed";
+    const runtimeBundleId = simulationState.active_bundle || simulationState.procedure_id || "";
+    const runtimeStateMatchesActiveBundle = !activeBundle || !runtimeBundleId || runtimeBundleId === activeBundle;
+    const runtimeFrameProcedureId = layoutJsonProcedureId(simulationState.layout_json);
+    const runtimeFrameMatchesActiveBundle =
+      runtimeStateMatchesActiveBundle && (!activeBundle || !runtimeFrameProcedureId || runtimeFrameProcedureId === activeBundle);
+    const metadataInstrumentStates = placeholderInstrumentStates(metadata);
+    const displayInstrumentStates =
+      runtimeFrameMatchesActiveBundle && simulationState.instrument_states.length
+        ? simulationState.instrument_states
+        : metadataInstrumentStates;
+    const displayEvents = runtimeFrameMatchesActiveBundle ? events : [];
+    const displayRecentEvents = runtimeFrameMatchesActiveBundle ? simulationState.recent_events : [];
+    const runtimeAllowsActiveTask =
+      runtimeFrameMatchesActiveBundle && simulationState.running && simulationState.execution_state !== "completed";
 
-    const surgeonOwnedInstruments = simulationState.instrument_states.filter(
+    const surgeonOwnedInstruments = displayInstrumentStates.filter(
       (instrument) =>
         instrument.lifecycle_stage === "surgeon_owned" ||
         instrument.lifecycle_stage === "mayo_reuse",
@@ -1142,7 +1336,7 @@ export function useDigitalTwinViewModel({
       return anchorMap[instrument.location_id] ?? byLocationType ?? anchorMap[instrument.home_location_id] ?? unknownAnchor;
     }
 
-    const grouped = simulationState.instrument_states.reduce(
+    const grouped = displayInstrumentStates.reduce(
       (groups, instrument) => {
         const anchor = anchorForInstrument(instrument);
         if (!anchor) return groups;
@@ -1185,7 +1379,7 @@ export function useDigitalTwinViewModel({
     );
 
     const leftHandInstrument = simulationState.left_hand_tool
-      ? simulationState.instrument_states.find((instrument) => instrument.instrument_id === simulationState.left_hand_tool)
+      ? displayInstrumentStates.find((instrument) => instrument.instrument_id === simulationState.left_hand_tool)
       : undefined;
     const returnAnchorId = leftHandInstrument?.home_location_id || "main_tray_slot_1";
     const routes: StageRoute[] = [];
@@ -1241,7 +1435,7 @@ export function useDigitalTwinViewModel({
     const boardRackSlotCount = rackSlotIds.length;
     const rackSlotIndexById = new Map(rackSlotIds.map((slotId, index) => [slotId, index]));
     const instrumentByHomeSlot = new Map(
-      simulationState.instrument_states
+      displayInstrumentStates
         .filter((instrument) => instrument.home_location_id)
         .map((instrument) => [instrument.home_location_id, instrument]),
     );
@@ -1264,7 +1458,7 @@ export function useDigitalTwinViewModel({
         (intent) => intent === "request_tool" || intent === "voice_request" || intent === "extend_hand_for_handover",
       );
     const requestedHighlightToolId = activeRequestIntent ? overrideAck?.toolId || requestedSurgeonToolId : "";
-    const activeRecoveryToolIds = new Set(simulationState.active_recovery_tools ?? []);
+    const activeRecoveryToolIds = new Set(runtimeFrameMatchesActiveBundle ? simulationState.active_recovery_tools ?? [] : []);
     const toolChipPlacements: StageToolChipPlacement[] = BOARD_HOLDER_ORDER.flatMap((holderId) => {
       const instruments = [...(boardGrouped[holderId] ?? [])].sort((left, right) => {
         if (holderId === "rack") {
@@ -1295,12 +1489,12 @@ export function useDigitalTwinViewModel({
         const predictionEligible =
           holderId === "humanoid_right" &&
           displayState === "handover";
-          const predicted =
-            !requested && predictionEligible && (active || instrument.instrument_id === simulationState.prepositioned_tool);
-          const footerBadges = footerBadgesForInstrument(instrument, catalog, language, ui, activeRecoveryToolIds);
-          return {
-            id: instrument.instrument_id,
-            label,
+        const predicted =
+          !requested && predictionEligible && (active || instrument.instrument_id === simulationState.prepositioned_tool);
+        const footerBadges = footerBadgesForInstrument(instrument, catalog, language, ui, activeRecoveryToolIds);
+        return {
+          id: instrument.instrument_id,
+          label,
           shortLabel: toolShortLabel(label),
           holderId,
           holderLabel: holderShortLabel(holderId, language),
@@ -1311,19 +1505,21 @@ export function useDigitalTwinViewModel({
           scale: rect.scale,
           compact: rect.compact,
           gridIndex: rect.gridIndex,
-            displayState,
-            highlight: requested ? "requested" : predicted ? "predicted" : "normal",
-            lifecycle: catalogLabel(
-              catalog,
-              "lifecycle",
-              displayLifecycleForInstrument(instrument, activeRecoveryToolIds),
-              language,
-              titleize(displayLifecycleForInstrument(instrument, activeRecoveryToolIds)),
-            ),
-            footerBadges,
-            contaminated: instrument.contaminated,
-            active,
-          };
+          density: toolChipDensityForHolder(holderId, instruments.length, rect.compact),
+          displayState,
+          highlight: requested ? "requested" : predicted ? "predicted" : "normal",
+          lifecycle: catalogLabel(
+            catalog,
+            "lifecycle",
+            displayLifecycleForInstrument(instrument, activeRecoveryToolIds),
+            language,
+            titleize(displayLifecycleForInstrument(instrument, activeRecoveryToolIds)),
+          ),
+          footerBadges,
+          contaminated: instrument.contaminated,
+          active,
+          layoutVariant: holderId === "mayo_recovery" || holderId === "mayo_reuse" ? "mayoList" : "card",
+        };
       });
     });
 
@@ -1344,7 +1540,7 @@ export function useDigitalTwinViewModel({
       ];
     });
 
-    const activeVoiceCommand = activeVoiceCommandFromEvents(events);
+    const activeVoiceCommand = activeVoiceCommandFromEvents(displayEvents);
     const latestVoiceText = activeVoiceCommand?.text ?? "";
     const activeVoiceText =
       latestVoiceText ||
@@ -1377,18 +1573,51 @@ export function useDigitalTwinViewModel({
           ? `${localizedToolName(displayRequestedTool || activeToolId)} request`
           : "");
 
-    const phaseName = localizedPhaseName(simulationState.filtered_phase);
-    const procedurePhaseSpecs = metadata?.phases?.length
-      ? metadata.phases.map((phase) => ({ id: phase.id }))
-      : simulationState.filtered_phase
-        ? [{ id: simulationState.filtered_phase }]
+    const interruptPhaseIdSet = new Set(interruptPhaseIdsFromMetadata(metadata));
+    const normalPhaseIds = normalPhaseIdsFromMetadata(metadata, interruptPhaseIdSet);
+    const rawPhaseId = runtimeFrameMatchesActiveBundle ? simulationState.filtered_phase : normalPhaseIds[0] || "";
+    const currentPhaseIsInterrupt = Boolean(rawPhaseId && interruptPhaseIdSet.has(rawPhaseId));
+    const recentInterruptEvent = displayRecentEvents.find((event) =>
+      event === "InterruptEventDetected" || event.startsWith("InterruptEventDetected:")
+    );
+    const recentInterruptPhaseId = recentInterruptEvent?.includes(":")
+      ? recentInterruptEvent.split(":")[1]
+      : "";
+    const activeInterruptPhaseId = currentPhaseIsInterrupt
+      ? rawPhaseId
+      : recentInterruptPhaseId && interruptPhaseIdSet.has(recentInterruptPhaseId)
+        ? recentInterruptPhaseId
+        : "";
+    const surgeonNormalPhaseId =
+      runtimeFrameMatchesActiveBundle && normalPhaseIds.includes(surgeonState.phase_id) ? surgeonState.phase_id : "";
+    const displayedPhaseId = currentPhaseIsInterrupt
+      ? lastNormalPhaseRef.current || surgeonNormalPhaseId || normalPhaseIds[0] || rawPhaseId
+      : rawPhaseId;
+    const phaseName = localizedPhaseName(displayedPhaseId);
+    const interruptLabel = activeInterruptPhaseId ? localizedPhaseName(activeInterruptPhaseId) : "";
+    const procedurePhaseSpecs = normalPhaseIds.length
+      ? normalPhaseIds.map((phaseId) => ({ id: phaseId }))
+      : displayedPhaseId
+        ? [{ id: displayedPhaseId }]
         : [];
-    const activePhaseIndex = procedurePhaseSpecs.findIndex((phase) => phase.id === simulationState.filtered_phase);
+    const activePhaseIndex = procedurePhaseSpecs.findIndex((phase) => phase.id === displayedPhaseId);
     const phaseSteps: StagePhaseStep[] = procedurePhaseSpecs.map((phase, index) => ({
       id: phase.id,
       label: localizedPhaseName(phase.id),
       state: activePhaseIndex === -1 ? "future" : index < activePhaseIndex ? "past" : index === activePhaseIndex ? "active" : "future",
     }));
+    const interruptAlert: StageInterruptAlert | null = activeInterruptPhaseId
+      ? {
+          phaseId: activeInterruptPhaseId,
+          label: interruptLabel,
+          title: ui.interruptAlertTitle,
+          eventKey: `${activeInterruptPhaseId}:${displayRecentEvents.join("|")}`,
+          message:
+            language === "ko"
+              ? `${interruptLabel} 이벤트를 감지했습니다. 진행 단계는 ${phaseName}로 유지합니다.`
+              : `${interruptLabel} event detected. Procedure progress remains at ${phaseName}.`,
+        }
+      : null;
     const activeHolderIds = new Set<StageHolderId>();
     for (const route of activeBoardRoutes) {
       activeHolderIds.add(route.sourceHolderId);
@@ -1517,7 +1746,7 @@ export function useDigitalTwinViewModel({
         occurredAt: activeVoiceCommand?.occurredAt,
       });
     }
-    const queuedHandoverCues = activeHandoverCuesFromEvents(events);
+    const queuedHandoverCues = activeHandoverCuesFromEvents(displayEvents);
     if (queuedHandoverCues.length) {
       for (const cue of queuedHandoverCues) {
         const cueToolLabel = localizedToolName(cue.toolId);
@@ -1546,7 +1775,7 @@ export function useDigitalTwinViewModel({
         tone: "surgeon",
         left: surgeonAlertLeft,
         top: surgeonAlertTop,
-        occurredAt: readySignalOccurredAt(events, "handover", displayRequestedTool || activeToolId),
+        occurredAt: readySignalOccurredAt(displayEvents, "handover", displayRequestedTool || activeToolId),
       });
     }
     if (displayReadyForRetrieval) {
@@ -1564,7 +1793,7 @@ export function useDigitalTwinViewModel({
         tone: "surgeon",
         left: surgeonAlertLeft,
         top: surgeonAlertTop,
-        occurredAt: readySignalOccurredAt(events, "retrieval", displayRequestedTool || activeToolId),
+        occurredAt: readySignalOccurredAt(displayEvents, "retrieval", displayRequestedTool || activeToolId),
       });
     }
     boardActionBubbles.push(
@@ -1592,9 +1821,9 @@ export function useDigitalTwinViewModel({
             tone: "override",
           }
         : undefined;
-    const newestFirstEvents = events
+    const newestFirstEvents = displayEvents
       .map((event, index) => ({ event, index }))
-      .sort((a, b) => compareTimelineEvents(a.event, b.event, a.index, b.index, events.length))
+      .sort((a, b) => compareTimelineEvents(a.event, b.event, a.index, b.index, displayEvents.length))
       .map(({ event }) => event);
     const timeline: TimelineItem[] = newestFirstEvents.length
       ? newestFirstEvents.map((event, index) => {
@@ -1608,7 +1837,7 @@ export function useDigitalTwinViewModel({
             severity: eventSeverity(event.event_type, detail, catalog),
           };
         })
-      : simulationState.recent_events.slice(0, 8).map((event, index) => ({
+      : displayRecentEvents.slice(0, 8).map((event, index) => ({
           id: `${event}-${index}`,
           uiId: `${event}-${index}`,
           title: catalogLabel(catalog, "events", event, language, titleize(event)),
@@ -1617,13 +1846,49 @@ export function useDigitalTwinViewModel({
           severity: eventSeverity(event, {}, catalog),
         }));
 
-    const vlmModeFingerprint = `${vlmHealth.model_id} ${vlmHealth.last_mode} ${vlmResult.source}`.toLowerCase();
-    const vlmIsMock = vlmModeFingerprint.includes("mock");
+    const vlmShouldRun =
+      simulationState.running || ["starting", "running", "finishing"].includes(simulationState.execution_state);
+    const hasVlmHealth = vlmHealthReceivedAt !== null;
+    const vlmConnectionLabel = !vlmShouldRun
+      ? hasVlmHealth && vlmHealth.connected
+        ? language === "ko"
+          ? "연결됨"
+          : "connected"
+        : language === "ko"
+          ? "대기"
+          : "idle"
+      : !hasVlmHealth
+        ? language === "ko"
+          ? "확인 중"
+          : "checking"
+        : vlmHealth.connected
+          ? language === "ko"
+            ? "연결됨"
+            : "connected"
+          : language === "ko"
+            ? "끊김"
+            : "disconnected";
+    const vlmHealthLabel = !vlmShouldRun
+      ? language === "ko"
+        ? "대기"
+        : "idle"
+      : !hasVlmHealth
+        ? language === "ko"
+          ? "확인 중"
+          : "checking"
+        : vlmHealth.healthy
+          ? language === "ko"
+            ? "정상"
+            : "healthy"
+          : language === "ko"
+            ? "주의"
+            : "degraded";
+    const vlmClassName = !vlmShouldRun || !hasVlmHealth ? "idle" : vlmHealth.connected && vlmHealth.healthy ? "ok" : "warn";
     const vlmStatus = {
-      kind: vlmIsMock ? "Mock VLM" : "Real VLM",
-      connection: vlmHealth.connected ? (language === "ko" ? "연결됨" : "connected") : (language === "ko" ? "끊김" : "disconnected"),
-      health: vlmHealth.healthy ? (language === "ko" ? "정상" : "healthy") : (language === "ko" ? "주의" : "degraded"),
-      className: vlmHealth.connected && vlmHealth.healthy ? "ok" : "warn",
+      kind: "VLM",
+      connection: vlmConnectionLabel,
+      health: vlmHealthLabel,
+      className: vlmClassName,
       healthAge: elapsedLabel(vlmHealthReceivedAt, language),
       resultAge: elapsedLabel(vlmResultReceivedAt, language),
     };
@@ -1655,6 +1920,10 @@ export function useDigitalTwinViewModel({
       stage: {
         procedureLabel: localizedProcedureName,
         phaseName,
+        rawPhaseId,
+        displayedPhaseId,
+        currentPhaseKind: currentPhaseIsInterrupt ? "interrupt" : "normal",
+        interruptAlert,
         phaseSteps,
         robotTaskLabel,
         activeTaskProgress,
@@ -1689,6 +1958,7 @@ export function useDigitalTwinViewModel({
         statusMessage: runtimeStatusText(simulationState, ui, localizedProcedureName, language),
       },
       displayToolName: localizedToolName,
+      displayPhaseName: localizedPhaseName,
       displayBundleName: localizedBundleName,
       displayActionName: localizedActionName,
       displayTransitionName: localizedTransitionName,
@@ -1710,4 +1980,12 @@ export function useDigitalTwinViewModel({
     vlmResultReceivedAt,
     stageAspectRatio,
   ]);
+
+  useEffect(() => {
+    if (viewModel.stage.currentPhaseKind === "normal" && viewModel.stage.rawPhaseId) {
+      lastNormalPhaseRef.current = viewModel.stage.rawPhaseId;
+    }
+  }, [viewModel.stage.currentPhaseKind, viewModel.stage.rawPhaseId]);
+
+  return viewModel;
 }

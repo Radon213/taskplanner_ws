@@ -26,6 +26,7 @@ ALLOWED_ACTIONS = {
     "tool_predict",
     "predicted_tool_handover",
     "replace_and_handover",
+    "return_unused_preposition",
 }
 
 
@@ -153,9 +154,10 @@ class SkillActionBridge(Node):
             "put_down_and_handover": "replace_and_handover",
             "retrieve_from_mayo": "tool_retrieve",
             "retrieve_from_hand": "tool_retrieve",
+            "return_unused_preposition": "return_unused_preposition",
         }.get(command.action, command.action)
         if action == "tool_predict":
-            return 2.2
+            return 3.2
         if action == "tool_handover":
             return 3.2
         if action == "predicted_tool_handover":
@@ -164,6 +166,8 @@ class SkillActionBridge(Node):
             return 4.2
         if action == "tool_retrieve":
             return 6.8
+        if action == "return_unused_preposition":
+            return 1.0
         return 1.0
 
     def _on_feedback(

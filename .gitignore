@@ -19,7 +19,13 @@ webapp/tsconfig.tsbuildinfo
 webapp/.vite/
 
 # Validation and runtime artifacts
+reports/*.json
+reports/*.png
+reports/*.jpg
+reports/*.jpeg
 reports/taskplanner_validation_assets/
+test_outputs/
+.playwright-cli/
 *.bag
 *.db3
 *.mcap

@@ -26,8 +26,19 @@ from .models import (
     SimulationAnchor,
     SimulationEntity,
 )
+from .prompt_bundle import build_raw_bundle_from_prompt, has_procedure_prompt
 from .query_api import ProcedureSpec
 from .validator import validate_bundle_paths, validate_raw_bundle
+
+LEGACY_PROMPT_CONFLICT_FILES = (
+    "procedure.yaml",
+    "instruments.yaml",
+    "scene_layout.yaml",
+    "policy.yaml",
+    "simulation_layout.yaml",
+    "mock_surgeon.yaml",
+    "mock_perception.yaml",
+)
 
 
 def _read_yaml(path: Path) -> dict:
@@ -60,6 +71,15 @@ def _instrument_requestable(instrument: dict) -> bool:
     return bool(instrument.get("requestable", ui_requestable))
 
 
+def _reject_prompt_legacy_conflicts(bundle_path: Path) -> None:
+    conflicts = [name for name in LEGACY_PROMPT_CONFLICT_FILES if (bundle_path / name).is_file()]
+    if conflicts:
+        joined = ", ".join(conflicts)
+        raise ValueError(
+            f"{bundle_path} uses a procedure prompt YAML; remove legacy bundle files: {joined}"
+        )
+
+
 def get_default_spec_dir() -> Path:
     share = Path(get_package_share_directory("procedure_spec"))
     return share / "specs" / "thyroidectomy"
@@ -73,19 +93,23 @@ def load_bundle(bundle_dir: str | Path | None = None) -> ProcedureSpec:
         _read_optional_yaml(common_catalog_path),
         _read_optional_yaml(bundle_catalog_path),
     )
-    validate_bundle_paths(bundle_path)
-    raw_bundle = {
-        "procedure": _read_yaml(bundle_path / "procedure.yaml"),
-        "instruments": _read_yaml(bundle_path / "instruments.yaml"),
-        "scene_layout": _read_yaml(bundle_path / "scene_layout.yaml"),
-        "policy": _read_yaml(bundle_path / "policy.yaml"),
-        "simulation_layout": _read_yaml(bundle_path / "simulation_layout.yaml"),
-        "mock_surgeon": _read_yaml(bundle_path / "mock_surgeon.yaml"),
-        "display_catalog": display_catalog,
-    }
-    mock_perception_path = bundle_path / "mock_perception.yaml"
-    if mock_perception_path.is_file():
-        raw_bundle["mock_perception"] = _read_yaml(mock_perception_path)
+    if has_procedure_prompt(bundle_path):
+        _reject_prompt_legacy_conflicts(bundle_path)
+        raw_bundle = build_raw_bundle_from_prompt(bundle_path, display_catalog)
+    else:
+        validate_bundle_paths(bundle_path)
+        raw_bundle = {
+            "procedure": _read_yaml(bundle_path / "procedure.yaml"),
+            "instruments": _read_yaml(bundle_path / "instruments.yaml"),
+            "scene_layout": _read_yaml(bundle_path / "scene_layout.yaml"),
+            "policy": _read_yaml(bundle_path / "policy.yaml"),
+            "simulation_layout": _read_yaml(bundle_path / "simulation_layout.yaml"),
+            "mock_surgeon": _read_yaml(bundle_path / "mock_surgeon.yaml"),
+            "display_catalog": display_catalog,
+        }
+        mock_perception_path = bundle_path / "mock_perception.yaml"
+        if mock_perception_path.is_file():
+            raw_bundle["mock_perception"] = _read_yaml(mock_perception_path)
     validate_raw_bundle(raw_bundle)
 
     procedure = raw_bundle["procedure"]
@@ -102,6 +126,8 @@ def load_bundle(bundle_dir: str | Path | None = None) -> ProcedureSpec:
         procedure_display_name_ko=str(
             procedure.get("procedure_display_name_ko", procedure.get("procedure_display_name", procedure["procedure_id"]))
         ),
+        normal_phase_ids=[str(item) for item in procedure.get("normal_phase_ids", [])],
+        interrupt_phase_ids=[str(item) for item in procedure.get("interrupt_phase_ids", [])],
         phases=[
             PhaseSpec(
                 id=str(phase["id"]),
