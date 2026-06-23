@@ -1,5 +1,10 @@
 # PLAN3 Authoritative Single-Twin V2 Review
 
+> Archived historical review. This document records an earlier design/validation
+> round and is not the current system reference. For the `0.1.0` baseline, use
+> the top-level `README.md`, `SYSTEM_STRUCTURE.md`, `DIGITAL_TWIN_RULES.md`, and
+> `RELEASE_NOTES.md`.
+
 ## Executive Verdict
 
 초기 검증(`20260423_213701_KST`)에서는 PLAN3의 방향을 상당히 반영했지만, 아직 "Authoritative Single-Twin V2가 안정적으로 동작한다"고 판정하기는 어려웠다.

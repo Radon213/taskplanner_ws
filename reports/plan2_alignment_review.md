@@ -1,5 +1,10 @@
 # Plan2 Alignment Review
 
+> Archived historical review. This document records an earlier design/validation
+> round and is not the current system reference. For the `0.1.0` baseline, use
+> the top-level `README.md`, `SYSTEM_STRUCTURE.md`, `DIGITAL_TWIN_RULES.md`, and
+> `RELEASE_NOTES.md`.
+
 - Review basis: [Plan2.md](/mnt/c/Users/skado/Downloads/Plan2.md)
 - Workspace: `/home/arl/taskplanner_ws`
 - Validation run: `2026-04-22 23:01 KST` / evidence root [20260422_230106](/home/arl/taskplanner_ws/reports/taskplanner_validation_assets/20260422_230106)

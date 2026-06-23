@@ -1,5 +1,9 @@
 # Taskplanner Validation Feedback Log
 
+> Archived historical validation log. This document preserves earlier issue
+> tracking evidence. For the current `0.1.0` baseline and validation commands,
+> use the top-level `README.md`, `SYSTEM_STRUCTURE.md`, and `RELEASE_NOTES.md`.
+
 이 문서는 `/home/arl/taskplanner_ws` 전체 검증 결과를 누적 관리하는 로그다. 이후 재검증 시 기존 내용을 지우지 말고 `## Run ...` 섹션을 아래에 계속 추가한다. `Active Issue Register`는 과거 이슈를 삭제하지 않고 상태와 개선 정도만 갱신한다.
 
 운영 규칙:

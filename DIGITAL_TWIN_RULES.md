@@ -50,11 +50,12 @@ These rules are the source of truth for debugging runtime behavior.
 
 ## VLM Retrieval Inference Rules
 
-1. VLM may run in mock/world mode or actor-log mode.
-2. Thyroidectomy actor-log mode uses the bundled
-   `procedure_spec/specs/thyroidectomy/vlm_procedure_prompt.yaml` as the
-   procedure prompt asset. The asset may use compact Pxx/Txx doctor ids, but
-   runtime JSON and BT decisions must use runtime phase/tool ids.
+1. VLM may run in real, mock, or dual mode, but the default integration path is
+   real VLM mode.
+2. Real VLM mode uses the selected procedure bundle's
+   `vlm_procedure_prompt.yaml` as the procedure prompt asset. The asset may use
+   compact Pxx/Txx ids, but runtime JSON, reducer decisions, and BT decisions
+   must use the active bundle's canonical phase/tool ids.
 3. Return-cue confidence is probabilistic and must combine:
    - current phase context
    - whether the tool is still expected in that phase
@@ -62,15 +63,19 @@ These rules are the source of truth for debugging runtime behavior.
    - recent tool history on surgeon-side locations
    - observed hand pose
    - phase uncertainty
-4. In actor-log mode, VLM reports a single visible Mayo stand plus `mayo` reuse/recover
+4. The VLM context must contain only public evidence that could exist in the
+   real system: image/overlay cues, voice transcript, visible Mayo tools,
+   digital-twin public events, skill status, and BT context. It must not contain
+   hidden LLM actor ground truth or YAML-derived answer hints.
+5. VLM reports a single visible Mayo stand plus `mayo` reuse/recover
    assessments and a top `mayo_retrieve` candidate.
-5. `mayo_retrieve` requires confidence >= 0.5 for at least 5 seconds before the
+6. `mayo_retrieve` requires confidence >= 0.5 for at least 5 seconds before the
    reducer may promote a tool to recovery.
-6. A same-tool `reuse` assessment with confidence >= 0.5 for at least 5 seconds
+7. A same-tool `reuse` assessment with confidence >= 0.5 for at least 5 seconds
    suppresses recovery promotion.
-7. VLM `tool` prediction requires confidence >= 0.8 for at least 5 seconds before
+8. VLM `tool` prediction requires confidence >= 0.8 for at least 3 seconds before
    BT may dispatch `predict_tool`.
-8. Stabilization must suppress one-frame noise; transient raw cues must not directly
+9. Stabilization must suppress one-frame noise; transient raw cues must not directly
    become BT-visible intent.
 
 ## Contamination and Cleaning Rules
