@@ -107,7 +107,7 @@ export default function App() {
         animate={{ opacity: 1, y: 0 }}
         transition={{ duration: 0.38, ease: [0.22, 1, 0.36, 1] }}
       >
-        <div className="board-column">
+        <div className="stage-area">
           <OperatingRoomStage
             vm={vm}
             vlmImage={ros.vlmImage}
@@ -115,22 +115,28 @@ export default function App() {
               setStageAspectRatio((current) => (Math.abs(current - ratio) > 0.01 ? ratio : current));
             }}
           />
-          <ObservabilityPanel
+        </div>
+
+        <div className="surgeon-area">
+          <SurgeonIntentDock
             vm={vm}
             language={language}
-            btDecision={ros.btDecision}
-            skillStatus={ros.skillStatus}
-            simulationState={ros.simulationState}
-            worldState={ros.worldState}
-            surgeonState={ros.surgeonState}
-            vlmHealth={ros.vlmHealth}
-            vlmResult={ros.vlmResult}
-            vlmReducerDecisions={ros.vlmReducerDecisions}
-            vlmImage={ros.vlmImage}
+            llmDecision={ros.surgeonLlmDecision}
+            actorEnabled={ros.actorEnabled}
+            modelOptions={modelOptions}
+            modelCatalogStatus={modelCatalogStatus}
+            actorModel={actorModelSelection}
+            connected={ros.connected}
+            actionPending={ros.actionPending}
+            onActorEnabledChange={(enabled) => void ros.setActorEnabled(enabled)}
+            onActorModelChange={(modelId) => {
+              setActorModelSelection(modelId);
+              void ros.setActorModel(modelId);
+            }}
           />
         </div>
 
-        <div className="side-column command-column">
+        <div className="runtime-area">
           <ProcedureDock
             vm={vm}
             url={ros.url}
@@ -152,22 +158,36 @@ export default function App() {
             isPaused={ros.simulationState.execution_state === "paused"}
             onControl={(command) => void ros.control(command)}
           />
-
-          <SurgeonIntentDock
+          <ObservabilityPanel
             vm={vm}
             language={language}
-            llmDecision={ros.surgeonLlmDecision}
-            actorEnabled={ros.actorEnabled}
-            modelOptions={modelOptions}
-            modelCatalogStatus={modelCatalogStatus}
-            actorModel={actorModelSelection}
-            connected={ros.connected}
-            actionPending={ros.actionPending}
-            onActorEnabledChange={(enabled) => void ros.setActorEnabled(enabled)}
-            onActorModelChange={(modelId) => {
-              setActorModelSelection(modelId);
-              void ros.setActorModel(modelId);
-            }}
+            btDecision={ros.btDecision}
+            skillStatus={ros.skillStatus}
+            simulationState={ros.simulationState}
+            worldState={ros.worldState}
+            surgeonState={ros.surgeonState}
+            vlmHealth={ros.vlmHealth}
+            vlmResult={ros.vlmResult}
+            vlmReducerDecisions={ros.vlmReducerDecisions}
+            vlmImage={ros.vlmImage}
+            variant="decision"
+          />
+        </div>
+
+        <div className="timeline-area">
+          <ObservabilityPanel
+            vm={vm}
+            language={language}
+            btDecision={ros.btDecision}
+            skillStatus={ros.skillStatus}
+            simulationState={ros.simulationState}
+            worldState={ros.worldState}
+            surgeonState={ros.surgeonState}
+            vlmHealth={ros.vlmHealth}
+            vlmResult={ros.vlmResult}
+            vlmReducerDecisions={ros.vlmReducerDecisions}
+            vlmImage={ros.vlmImage}
+            variant="timeline"
           />
         </div>
       </motion.main>

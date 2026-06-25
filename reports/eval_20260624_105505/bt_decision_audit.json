@@ -1,0 +1,192 @@
+{
+  "bundles": [
+    {
+      "blocker_count": 2,
+      "bundle": "thyroidectomy",
+      "decision_counts": {
+        "anticipatory_handover": 2,
+        "explicit_request": 5,
+        "hold": 2,
+        "idle": 13,
+        "recovery": 1
+      },
+      "duration_sec": 45.0,
+      "findings": [],
+      "observation_violation_detected": false,
+      "observation_violation_samples": [],
+      "recoverable_events": [
+        "RobotGraspedTool",
+        "RobotTaskCompleted",
+        "RobotTaskStarted",
+        "ToolHandoverCompleted",
+        "ToolPrepared"
+      ],
+      "suspicious_count": 0,
+      "vlm_rejected_proposal_detected": false,
+      "vlm_rejection_samples": [],
+      "world_invariant_violations": [
+        "surgeon held multiple active tools simultaneously: ['T01', 'T04']",
+        "surgeon held multiple active tools simultaneously: ['T03', 'T04']"
+      ]
+    },
+    {
+      "blocker_count": 3,
+      "bundle": "nephrectomy",
+      "decision_counts": {
+        "anticipatory_handover": 2,
+        "explicit_request": 5,
+        "hold": 2,
+        "idle": 13,
+        "recovery": 1
+      },
+      "duration_sec": 45.0,
+      "findings": [],
+      "observation_violation_detected": false,
+      "observation_violation_samples": [],
+      "recoverable_events": [
+        "PredictedToolReturnedToRack",
+        "RobotGraspedTool",
+        "RobotTaskCompleted",
+        "RobotTaskStarted",
+        "ToolCleaningCompleted",
+        "ToolCleaningProgress",
+        "ToolHandoverCompleted",
+        "ToolPrepared",
+        "ToolReceivedFromSurgeon",
+        "ToolReturnedToTray",
+        "ToolSentToCleaner"
+      ],
+      "suspicious_count": 0,
+      "vlm_rejected_proposal_detected": false,
+      "vlm_rejection_samples": [],
+      "world_invariant_violations": [
+        "surgeon held multiple active tools simultaneously: ['T01', 'T02']",
+        "surgeon held multiple active tools simultaneously: ['T02', 'T10']",
+        "surgeon held multiple active tools simultaneously: ['T03', 'T10']"
+      ]
+    },
+    {
+      "blocker_count": 2,
+      "bundle": "inguinal_hernia_repair",
+      "decision_counts": {
+        "anticipatory_handover": 2,
+        "explicit_request": 5,
+        "hold": 2,
+        "idle": 13,
+        "recovery": 1
+      },
+      "duration_sec": 45.0,
+      "findings": [],
+      "observation_violation_detected": false,
+      "observation_violation_samples": [],
+      "recoverable_events": [
+        "RobotGraspedTool",
+        "RobotTaskCompleted",
+        "RobotTaskStarted",
+        "ToolCleaningCompleted",
+        "ToolCleaningProgress",
+        "ToolHandoverCompleted",
+        "ToolPrepared",
+        "ToolReceivedFromSurgeon",
+        "ToolReturnedToTray",
+        "ToolSentToCleaner"
+      ],
+      "suspicious_count": 0,
+      "vlm_rejected_proposal_detected": true,
+      "vlm_rejection_samples": [
+        {
+          "decision": "idle",
+          "phase": "P01",
+          "recent_events": [
+            "PhaseEvidenceObserved",
+            "RobotTaskCompleted",
+            "ToolReturnedToTray",
+            "RecoveryTransactionClosed",
+            "ToolCleaningCompleted",
+            "ToolCleaningProgress",
+            "VLMProposalRejected",
+            "PhaseEvidenceObserved",
+            "ToolCleaningProgress",
+            "SurgeonActorEventApplied",
+            "ToolCleaningProgress",
+            "ToolCleaningProgress",
+            "VLMProposalRejected",
+            "PhaseEvidenceObserved",
+            "ToolCleaningProgress",
+            "ToolCleaningProgress",
+            "ToolCleaningProgress",
+            "VLMProposalRejected",
+            "PhaseEvidenceObserved",
+            "ToolCleaningProgress"
+          ],
+          "selected_tool": "",
+          "timestamp_sec": 1782266474.4221652
+        },
+        {
+          "decision": "explicit_request",
+          "phase": "P01",
+          "recent_events": [
+            "SurgeonRequestUpdated",
+            "SurgeonRequestQueued",
+            "SurgeonActorEventApplied",
+            "PhaseEvidenceObserved",
+            "PhaseEvidenceObserved",
+            "RobotTaskCompleted",
+            "ToolReturnedToTray",
+            "RecoveryTransactionClosed",
+            "ToolCleaningCompleted",
+            "ToolCleaningProgress",
+            "VLMProposalRejected",
+            "PhaseEvidenceObserved",
+            "ToolCleaningProgress",
+            "SurgeonActorEventApplied",
+            "ToolCleaningProgress",
+            "ToolCleaningProgress",
+            "VLMProposalRejected",
+            "PhaseEvidenceObserved",
+            "ToolCleaningProgress",
+            "ToolCleaningProgress"
+          ],
+          "selected_tool": "T06",
+          "timestamp_sec": 1782266476.4219832
+        },
+        {
+          "decision": "explicit_request",
+          "phase": "P01",
+          "recent_events": [
+            "PhaseEvidenceObserved",
+            "PhaseEvidenceObserved",
+            "RobotGraspedTool",
+            "RobotTaskStarted",
+            "SurgeonRequestUpdated",
+            "SurgeonRequestQueued",
+            "SurgeonActorEventApplied",
+            "PhaseEvidenceObserved",
+            "PhaseEvidenceObserved",
+            "RobotTaskCompleted",
+            "ToolReturnedToTray",
+            "RecoveryTransactionClosed",
+            "ToolCleaningCompleted",
+            "ToolCleaningProgress",
+            "VLMProposalRejected",
+            "PhaseEvidenceObserved",
+            "ToolCleaningProgress",
+            "SurgeonActorEventApplied",
+            "ToolCleaningProgress",
+            "ToolCleaningProgress"
+          ],
+          "selected_tool": "T06",
+          "timestamp_sec": 1782266479.1215248
+        }
+      ],
+      "world_invariant_violations": [
+        "surgeon held multiple active tools simultaneously: ['T01', 'T02']",
+        "surgeon held multiple active tools simultaneously: ['T02', 'T03']"
+      ]
+    }
+  ],
+  "duration_sec": 45.0,
+  "failures": [],
+  "generated_at": 1782266482.469086,
+  "mode": "attached_to_existing_runtime"
+}

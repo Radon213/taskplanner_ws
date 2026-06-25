@@ -146,15 +146,17 @@ button {
   align-items: center;
   justify-content: flex-end;
   gap: 10px;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
+  min-width: 0;
 }
 
 .system-pill,
-.language-control {
+.language-control,
+.ribbon-model-control {
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  min-height: 36px;
+  min-height: 48px;
   padding: 8px 10px;
   border: 1px solid var(--line);
   border-radius: var(--radius);
@@ -162,6 +164,12 @@ button {
   color: var(--soft);
   font-size: 13px;
   font-weight: 750;
+}
+
+.system-pill,
+.language-control {
+  flex: 0 0 auto;
+  white-space: nowrap;
 }
 
 .system-pill.ok {
@@ -183,25 +191,71 @@ button {
   color: var(--text);
 }
 
-.model-pill {
-  max-width: 420px;
+.ribbon-model-control {
+  flex: 1 1 520px;
+  min-width: min(440px, 100%);
+  max-width: 620px;
 }
 
-.model-pill select {
-  min-width: 190px;
-  max-width: 260px;
-  height: 30px;
+.ribbon-model-control.ok {
+  border-color: rgba(112, 221, 209, 0.34);
+}
+
+.ribbon-model-control.warn {
+  border-color: rgba(255, 138, 116, 0.32);
+}
+
+.ribbon-model-control.idle {
+  border-color: rgba(220, 231, 235, 0.14);
+}
+
+.ribbon-model-label {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 860;
+  letter-spacing: 0;
+  white-space: nowrap;
+}
+
+.ribbon-model-control select {
+  flex: 1 1 280px;
+  min-width: 180px;
+  height: 32px;
+  overflow: hidden;
   border: 1px solid rgba(220, 231, 235, 0.14);
-  border-radius: var(--radius);
+  border-radius: calc(var(--radius) - 2px);
   background: rgba(8, 12, 14, 0.42);
   color: var(--text);
-  font-size: 12px;
-  font-weight: 720;
-  padding: 0 8px;
+  font-size: 13px;
+  font-weight: 780;
+  padding: 0 12px;
+  text-overflow: ellipsis;
 }
 
-.model-pill select:disabled {
+.ribbon-model-control select:disabled {
   color: var(--muted);
+}
+
+.ribbon-model-control > strong {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 860;
+  white-space: nowrap;
+}
+
+.model-select-field {
+  min-width: 0;
+}
+
+.model-select-field select {
+  overflow: hidden;
+  min-width: 0;
+  font-weight: 780;
+  text-overflow: ellipsis;
 }
 
 .language-control button {
@@ -1384,17 +1438,6 @@ button {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
-.llm-speech-card {
-  display: grid;
-  gap: 8px;
-  margin-top: 10px;
-  padding: 12px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  background: rgba(255, 255, 255, 0.04);
-}
-
-.llm-speech-card span,
 .llm-meta-row span {
   display: inline-flex;
   align-items: center;
@@ -1404,12 +1447,136 @@ button {
   font-weight: 760;
 }
 
-.llm-speech-card strong {
-  min-height: 22px;
+.llm-speech-log {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 9px;
+  min-height: 180px;
+  margin-top: 10px;
+  padding: 12px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background:
+    linear-gradient(180deg, rgba(105, 193, 255, 0.045), rgba(255, 255, 255, 0.022)),
+    rgba(255, 255, 255, 0.035);
+}
+
+.llm-speech-log-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+}
+
+.llm-speech-log-header span {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 7px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 820;
+}
+
+.llm-speech-log-header small {
+  display: inline-flex;
+  min-width: 22px;
+  justify-content: center;
+  padding: 3px 7px;
+  border: 1px solid rgba(105, 193, 255, 0.22);
+  border-radius: 999px;
+  background: rgba(105, 193, 255, 0.08);
+  color: var(--robot-strong);
+  font-size: 10px;
+  font-weight: 900;
+  line-height: 1;
+}
+
+.llm-speech-log-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-right: 4px;
+  scrollbar-gutter: stable;
+}
+
+.llm-speech-log-list::-webkit-scrollbar {
+  width: 7px;
+}
+
+.llm-speech-log-list::-webkit-scrollbar-track {
+  background: rgba(255, 255, 255, 0.035);
+  border-radius: 999px;
+}
+
+.llm-speech-log-list::-webkit-scrollbar-thumb {
+  border: 2px solid rgba(14, 24, 38, 0.82);
+  border-radius: 999px;
+  background: rgba(157, 176, 203, 0.38);
+}
+
+.llm-speech-log-item {
+  display: grid;
+  flex: 0 0 auto;
+  min-width: 0;
+  padding: 9px 10px;
+  border: 1px solid rgba(120, 146, 186, 0.2);
+  border-radius: var(--radius-sm, calc(var(--radius) - 4px));
+  background: rgba(8, 17, 29, 0.48);
+}
+
+.llm-speech-log-item[data-latest="true"] {
+  border-color: rgba(105, 193, 255, 0.46);
+  background:
+    radial-gradient(circle at 8% 16%, rgba(105, 193, 255, 0.16), transparent 32%),
+    rgba(12, 28, 46, 0.6);
+  animation: speechGlow 1.6s ease-out;
+}
+
+.llm-speech-log-item div {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.llm-speech-log-item strong {
+  display: -webkit-box;
+  overflow: hidden;
   color: var(--text);
-  font-size: 15px;
-  line-height: 1.35;
+  font-size: 13px;
+  font-weight: 840;
+  line-height: 1.24;
   overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.llm-speech-log-item small {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 760;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.llm-speech-log-empty {
+  display: grid;
+  flex: 1;
+  min-height: 0;
+  place-items: center;
+  border: 1px dashed rgba(157, 176, 203, 0.22);
+  border-radius: var(--radius-sm, calc(var(--radius) - 4px));
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 800;
 }
 
 .llm-meta-row {
@@ -1451,6 +1618,11 @@ button {
 .explain-panel {
   min-width: 0;
   padding: 16px;
+}
+
+.explain-panel {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
 }
 
 .panel-title-row.compact {
@@ -1512,18 +1684,38 @@ button {
 }
 
 .timeline-strip {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(min(100%, 190px), 1fr));
+  --timeline-card-width: clamp(190px, 22vw, 260px);
+  display: flex;
+  flex-direction: row;
   align-items: stretch;
   justify-content: flex-start;
   gap: 10px;
-  overflow-x: hidden;
+  overflow-x: auto;
+  overflow-y: hidden;
   overflow-anchor: none;
   padding: 2px 1px 6px;
+  scroll-behavior: smooth;
+  scrollbar-gutter: stable;
+}
+
+.timeline-strip::-webkit-scrollbar {
+  height: 7px;
+}
+
+.timeline-strip::-webkit-scrollbar-track {
+  background: rgba(255, 255, 255, 0.035);
+  border-radius: 999px;
+}
+
+.timeline-strip::-webkit-scrollbar-thumb {
+  border: 2px solid rgba(14, 24, 38, 0.82);
+  border-radius: 999px;
+  background: rgba(157, 176, 203, 0.38);
 }
 
 .timeline-item {
   display: grid;
+  flex: 0 0 var(--timeline-card-width);
   min-width: 0;
   overflow-anchor: none;
   grid-template-columns: 10px minmax(0, 1fr);
@@ -1539,7 +1731,7 @@ button {
 }
 
 .timeline-empty {
-  grid-column: 1 / -1;
+  flex: 1 1 100%;
   min-height: 116px;
   display: grid;
   place-items: center;
@@ -1644,6 +1836,30 @@ button {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 8px;
+}
+
+.decision-scroll {
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-right: 4px;
+  scrollbar-gutter: stable;
+}
+
+.decision-scroll::-webkit-scrollbar {
+  width: 7px;
+}
+
+.decision-scroll::-webkit-scrollbar-track {
+  background: rgba(255, 255, 255, 0.035);
+  border-radius: 999px;
+}
+
+.decision-scroll::-webkit-scrollbar-thumb {
+  border: 2px solid rgba(14, 24, 38, 0.82);
+  border-radius: 999px;
+  background: rgba(157, 176, 203, 0.38);
 }
 
 .detail-card.wide {
@@ -1756,6 +1972,26 @@ button {
   }
 }
 
+@keyframes speechGlow {
+  0% {
+    box-shadow:
+      0 0 0 0 rgba(105, 193, 255, 0.34),
+      inset 0 0 0 1px rgba(105, 193, 255, 0.2);
+    transform: translateY(-2px);
+  }
+  55% {
+    box-shadow:
+      0 0 0 7px rgba(105, 193, 255, 0),
+      inset 0 0 0 1px rgba(105, 193, 255, 0.12);
+  }
+  100% {
+    box-shadow:
+      0 0 0 0 rgba(105, 193, 255, 0),
+      inset 0 0 0 1px rgba(105, 193, 255, 0);
+    transform: translateY(0);
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
@@ -1782,7 +2018,7 @@ button {
   .surgeon-dock .dock-header,
   .surgeon-dock .intent-state,
   .surgeon-dock .llm-control-row,
-  .surgeon-dock .llm-speech-card,
+  .surgeon-dock .llm-speech-log,
   .surgeon-dock .llm-meta-row,
   .surgeon-dock .llm-reason {
     grid-column: span 1;
@@ -1808,6 +2044,7 @@ button {
 
   .ribbon-cluster {
     justify-content: flex-start;
+    flex-wrap: wrap;
   }
 
   .stage-card {
@@ -2118,7 +2355,7 @@ body {
 .side-column .surgeon-dock .intent-state,
 .side-column .surgeon-dock .override-grid,
 .side-column .surgeon-dock .llm-control-row,
-.side-column .surgeon-dock .llm-speech-card,
+.side-column .surgeon-dock .llm-speech-log,
 .side-column .surgeon-dock .llm-meta-row,
 .side-column .surgeon-dock .llm-reason {
   grid-column: auto;
@@ -3605,5 +3842,323 @@ body {
 
   .stage-task.secondary {
     text-align: left;
+  }
+}
+
+/* 16:9 command-center layout.
+   The wide breakpoint intentionally uses the full browser canvas so the OR
+   stage, LLM surgeon, runtime controls, decision layer, and event timeline read
+   as one bounded dashboard instead of a vertically scrolling page. */
+#root {
+  min-height: 100vh;
+}
+
+.stage-area,
+.surgeon-area,
+.runtime-area,
+.timeline-area {
+  min-width: 0;
+  min-height: 0;
+}
+
+.stage-area,
+.surgeon-area {
+  display: grid;
+}
+
+.runtime-area {
+  display: grid;
+  gap: 14px;
+  align-content: start;
+}
+
+.timeline-area {
+  display: grid;
+}
+
+.stage-area {
+  grid-area: stage;
+}
+
+.surgeon-area {
+  grid-area: surgeon;
+}
+
+.runtime-area {
+  grid-area: runtime;
+}
+
+.timeline-area {
+  grid-area: timeline;
+}
+
+.observability-panel-timeline,
+.observability-panel-decision {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 0;
+  margin-top: 0;
+  min-width: 0;
+  min-height: 0;
+}
+
+.observability-panel-timeline .timeline-panel,
+.observability-panel-decision .explain-panel {
+  min-height: 0;
+}
+
+.mission-layout {
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-areas:
+    "stage"
+    "surgeon"
+    "runtime"
+    "timeline";
+}
+
+@media (min-width: 1280px) {
+  .app-shell {
+    width: min(100%, 2560px);
+  }
+
+  .mission-layout {
+    grid-template-columns: minmax(600px, 1.58fr) minmax(250px, 0.48fr) minmax(300px, 0.56fr);
+    grid-template-areas:
+      "stage surgeon runtime"
+      "timeline timeline timeline";
+    align-items: stretch;
+  }
+
+  .runtime-area {
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+
+  .stage-card,
+  .surgeon-area > .dock,
+  .runtime-area > .dock,
+  .runtime-area > .observability-panel,
+  .runtime-area .explain-panel,
+  .timeline-area > .observability-panel,
+  .timeline-area .timeline-panel {
+    height: 100%;
+  }
+
+  .surgeon-area > .dock,
+  .runtime-area > .dock,
+  .runtime-area .explain-panel,
+  .timeline-area .timeline-panel {
+    overflow: hidden;
+  }
+
+  .observability-panel-decision .detail-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .observability-panel-decision .panel-title-row.compact {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 8px;
+    margin-bottom: 10px;
+  }
+
+  .observability-panel-decision .tab-switch {
+    display: grid;
+    width: 100%;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .observability-panel-decision .tab-switch button {
+    min-width: 0;
+    justify-content: center;
+    padding-inline: 6px;
+  }
+
+  .observability-panel-decision .detail-card {
+    padding: 9px 10px;
+  }
+
+  .observability-panel-decision .detail-card strong {
+    font-size: 13px;
+  }
+
+  .timeline-area .timeline-panel {
+    display: grid;
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+
+  .timeline-area .timeline-strip {
+    --timeline-card-width: calc((100% - 70px) / 8);
+    overflow: hidden;
+    padding-bottom: 0;
+  }
+
+  .timeline-area .timeline-item,
+  .timeline-area .timeline-empty {
+    min-height: 0;
+  }
+
+  .llm-surgeon-dock {
+    display: grid;
+    grid-template-rows: auto auto auto minmax(0, 1fr) auto auto;
+    align-content: stretch;
+  }
+
+  .llm-surgeon-dock .dock-header,
+  .procedure-dock .dock-header,
+  .runtime-area .panel-title-row {
+    margin-bottom: 10px;
+  }
+
+  .llm-surgeon-dock .llm-control-row {
+    grid-template-columns: minmax(86px, 0.42fr) minmax(0, 1fr);
+    gap: 8px;
+    margin-bottom: 10px;
+  }
+
+  .llm-surgeon-dock .llm-intent-state {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    align-content: start;
+    gap: 7px;
+    margin-bottom: 10px;
+    overflow: hidden;
+  }
+
+  .llm-surgeon-dock .intent-state article,
+  .llm-surgeon-dock .llm-speech-log,
+  .llm-surgeon-dock .llm-meta-row span,
+  .runtime-area .detail-card {
+    padding: 9px 10px;
+  }
+
+  .llm-surgeon-dock .intent-state strong {
+    font-size: 13px;
+  }
+
+  .llm-surgeon-dock .llm-speech-log {
+    min-height: 0;
+    margin-top: 0;
+  }
+
+  .llm-surgeon-dock .llm-meta-row,
+  .llm-surgeon-dock .llm-reason {
+    margin-top: 8px;
+  }
+
+  .runtime-area .control-stack {
+    gap: 8px;
+  }
+
+  .runtime-area .field {
+    gap: 5px;
+  }
+
+  .runtime-area .field input,
+  .runtime-area .field select,
+  .runtime-area .field-with-icon {
+    min-height: 36px;
+  }
+
+  .runtime-area .field-with-icon input {
+    min-height: 34px;
+  }
+
+  .runtime-area .transport-controls {
+    gap: 8px;
+    margin-top: 10px;
+  }
+
+  .runtime-area .button,
+  .surgeon-area .actor-toggle {
+    min-height: 38px;
+    padding: 8px 12px;
+  }
+
+  .stage-area .stage-card {
+    overflow: hidden;
+  }
+
+  .stage-area .stage-chrome {
+    gap: 8px;
+    margin-bottom: 10px;
+  }
+
+  .stage-area .stage-header h2 {
+    font-size: clamp(24px, 1.8vw, 36px);
+  }
+
+  .stage-area .phase-step {
+    min-height: 48px;
+    padding: 7px 8px;
+  }
+
+  .stage-area .phase-step strong {
+    font-size: 10px;
+  }
+
+  .stage-area .foxglove-board {
+    height: 100%;
+    min-height: 0;
+    max-height: none;
+  }
+}
+
+@media (min-width: 1440px) and (min-height: 850px) {
+  html,
+  body,
+  #root {
+    height: 100%;
+    overflow: hidden;
+  }
+
+  .app-shell {
+    display: grid;
+    height: 100dvh;
+    grid-template-rows: auto minmax(0, 1fr);
+    gap: 14px;
+    padding: 16px;
+  }
+
+  .mission-layout {
+    min-height: 0;
+    margin-top: 0;
+    grid-template-rows: minmax(0, 1fr) clamp(168px, 19vh, 248px);
+    gap: 14px;
+  }
+
+  .top-ribbon {
+    min-height: 74px;
+  }
+
+  .brand-block h1 {
+    font-size: clamp(24px, 1.55vw, 34px);
+  }
+
+  .brand-block span {
+    margin-top: 4px;
+  }
+
+  .dock,
+  .stage-card,
+  .timeline-panel,
+  .explain-panel {
+    padding: 14px;
+  }
+}
+
+@media (min-width: 1920px) and (min-height: 1000px) {
+  .mission-layout {
+    grid-template-columns: minmax(900px, 1.7fr) minmax(320px, 0.5fr) minmax(400px, 0.62fr);
+    grid-template-rows: minmax(0, 1fr) clamp(190px, 20vh, 280px);
+  }
+
+  .timeline-area .timeline-strip {
+    --timeline-card-width: calc((100% - 84px) / 8);
+    gap: 12px;
+  }
+}
+
+@media (max-width: 1279px) {
+  .runtime-area {
+    grid-template-columns: 1fr;
   }
 }

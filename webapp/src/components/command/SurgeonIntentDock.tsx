@@ -1,3 +1,5 @@
+import { useEffect, useRef, useState } from "react";
+import { AnimatePresence, motion } from "framer-motion";
 import { BrainCircuit, Clock3, MessageSquareText, Power, PowerOff, UserRound } from "lucide-react";
 
 import type { useDigitalTwinViewModel } from "../../hooks/useDigitalTwinViewModel";
@@ -5,6 +7,16 @@ import type { SurgeonLLMDecision } from "../../types";
 import { type Language } from "../../utils/display";
 
 type ViewModel = ReturnType<typeof useDigitalTwinViewModel>;
+type SpeechLogItem = {
+  id: string;
+  text: string;
+  action: string;
+  tool: string;
+  atMs: number;
+};
+
+const SPEECH_LOG_TTL_MS = 180_000;
+const SPEECH_LOG_LIMIT = 24;
 
 function parseActorPayload(rawJson: string): { nextDwellSec: number | null; reasonCode: string } {
   if (!rawJson) return { nextDwellSec: null, reasonCode: "" };
@@ -33,6 +45,14 @@ function parseOverlay(rawJson: string): { heldTool: string; mayoTools: string[] 
   }
 }
 
+function relativeAgeLabel(atMs: number, nowMs: number): string {
+  const elapsedSec = Math.max(0, Math.floor((nowMs - atMs) / 1000));
+  if (elapsedSec < 2) return "now";
+  if (elapsedSec < 60) return `${elapsedSec}s ago`;
+  const elapsedMin = Math.floor(elapsedSec / 60);
+  return `${elapsedMin}m ago`;
+}
+
 export function SurgeonIntentDock({
   vm,
   language,
@@ -58,6 +78,10 @@ export function SurgeonIntentDock({
   onActorEnabledChange: (enabled: boolean) => void;
   onActorModelChange: (modelId: string) => void;
 }) {
+  const [speechLog, setSpeechLog] = useState<SpeechLogItem[]>([]);
+  const [nowMs, setNowMs] = useState(Date.now());
+  const lastSpeechSignatureRef = useRef("");
+  const speechLogListRef = useRef<HTMLDivElement>(null);
   const payload = parseActorPayload(llmDecision.raw_json);
   const overlay = parseOverlay(llmDecision.overlay_json);
   const selectedActorModel = actorModel || llmDecision.model_id || modelOptions[0] || "";
@@ -79,6 +103,37 @@ export function SurgeonIntentDock({
       : "accepted"
     : llmDecision.reject_reason || (language === "ko" ? "대기" : "waiting");
 
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      const nextNow = Date.now();
+      setNowMs(nextNow);
+      setSpeechLog((current) => current.filter((item) => nextNow - item.atMs <= SPEECH_LOG_TTL_MS));
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    const speech = llmDecision.speech.trim();
+    if (!speech) return;
+    const signature = [speech, llmDecision.action, llmDecision.tool, llmDecision.request_mode].join("|");
+    if (signature === lastSpeechSignatureRef.current) return;
+    lastSpeechSignatureRef.current = signature;
+    const atMs = Date.now();
+    const item: SpeechLogItem = {
+      id: `${atMs}-${Math.random().toString(36).slice(2, 8)}`,
+      text: speech,
+      action: llmDecision.action,
+      tool: llmDecision.tool,
+      atMs,
+    };
+    setNowMs(atMs);
+    setSpeechLog((current) => [item, ...current.filter((entry) => atMs - entry.atMs <= SPEECH_LOG_TTL_MS)].slice(0, SPEECH_LOG_LIMIT));
+  }, [llmDecision.action, llmDecision.request_mode, llmDecision.speech, llmDecision.tool]);
+
+  useEffect(() => {
+    speechLogListRef.current?.scrollTo({ top: 0, behavior: "smooth" });
+  }, [speechLog[0]?.id]);
+
   return (
     <aside className="dock surgeon-dock llm-surgeon-dock">
       <div className="dock-header">
@@ -99,7 +154,7 @@ export function SurgeonIntentDock({
           {actorEnabled ? <Power size={16} /> : <PowerOff size={16} />}
           {actorEnabled ? (language === "ko" ? "켜짐" : "On") : language === "ko" ? "꺼짐" : "Off"}
         </button>
-        <label className="field compact">
+        <label className="field compact model-select-field">
           <span>{vm.ui.model}</span>
           <select
             value={selectedActorModel}
@@ -155,12 +210,47 @@ export function SurgeonIntentDock({
         </article>
       </div>
 
-      <div className="llm-speech-card">
-        <span>
-          <MessageSquareText size={15} />
-          {vm.ui.spoken}
-        </span>
-        <strong>{llmDecision.speech || vm.surgeon.spoken}</strong>
+      <div className="llm-speech-log">
+        <div className="llm-speech-log-header">
+          <span>
+            <MessageSquareText size={15} />
+            {language === "ko" ? "최근 발화" : "Recent speech"}
+          </span>
+          <small>{speechLog.length ? `${speechLog.length}` : vm.ui.none}</small>
+        </div>
+        <div className="llm-speech-log-list" aria-live="polite" ref={speechLogListRef}>
+          <AnimatePresence initial={false}>
+            {speechLog.map((item, index) => (
+              <motion.article
+                key={item.id}
+                className="llm-speech-log-item"
+                layout
+                initial={{ opacity: 0, y: -10, scale: 0.98 }}
+                animate={{ opacity: 1, y: 0, scale: 1 }}
+                exit={{ opacity: 0, y: 8, scale: 0.98 }}
+                transition={{
+                  opacity: { duration: 0.18 },
+                  y: { duration: 0.22 },
+                  scale: { duration: 0.22 },
+                  layout: { duration: 0.24, ease: [0.22, 1, 0.36, 1] },
+                }}
+                data-latest={index === 0 ? "true" : "false"}
+              >
+                <div>
+                  <strong>{item.text}</strong>
+                  <small>
+                    {relativeAgeLabel(item.atMs, nowMs)}
+                    {item.action ? ` · ${item.action}` : ""}
+                    {item.tool ? ` · ${vm.displayToolName(item.tool)}` : ""}
+                  </small>
+                </div>
+              </motion.article>
+            ))}
+          </AnimatePresence>
+          {speechLog.length === 0 ? (
+            <div className="llm-speech-log-empty">{language === "ko" ? "최근 발화 없음" : "No recent speech"}</div>
+          ) : null}
+        </div>
       </div>
 
       <div className="llm-meta-row">

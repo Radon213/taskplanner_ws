@@ -273,6 +273,7 @@ export function useRosBridge() {
   const reconnectTimerRef = useRef<number | null>(null);
   const bundleDirtyRef = useRef(false);
   const eventSequenceRef = useRef(0);
+  const suppressEventsUntilRef = useRef(0);
   const actionRunIdRef = useRef(0);
   const bundleApplyRunIdRef = useRef(0);
 
@@ -368,7 +369,11 @@ export function useRosBridge() {
     });
 
     simulationTopic.subscribe((message: unknown) => {
-      const nextState = message as SimulationState;
+      const receivedState = message as SimulationState;
+      const nextState =
+        !receivedState.running && receivedState.execution_state === "idle" && receivedState.recent_events.length
+          ? { ...receivedState, recent_events: [] }
+          : receivedState;
       simulationStateRef.current = nextState;
       setSimulationState(nextState);
     });
@@ -378,16 +383,21 @@ export function useRosBridge() {
       });
     });
     eventTopic.subscribe((message: unknown) => {
+      const receivedAt = Date.now();
+      if (receivedAt < suppressEventsUntilRef.current) return;
+      eventSequenceRef.current += 1;
+      const event = message as SimulationEvent;
+      const eventWithUiId = {
+        ...event,
+        ui_id: [
+          receivedAt,
+          eventSequenceRef.current,
+          event.event_type || "event",
+          event.instrument_id || "none",
+        ].join("-"),
+      };
       startTransition(() => {
-        eventSequenceRef.current += 1;
-        const event = message as SimulationEvent;
-        setEvents((current) => [
-          {
-            ...event,
-            ui_id: `${Date.now()}-${eventSequenceRef.current}`,
-          },
-          ...current,
-        ].slice(0, 16));
+        setEvents((current) => [eventWithUiId, ...current].slice(0, 32));
       });
     });
     surgeonTopic.subscribe((message: unknown) => {
@@ -591,6 +601,20 @@ export function useRosBridge() {
     }
   }
 
+  function clearEventLog(options: { suppressMs?: number } = {}) {
+    if (options.suppressMs) {
+      suppressEventsUntilRef.current = Date.now() + options.suppressMs;
+    }
+    eventSequenceRef.current = 0;
+    setEvents([]);
+    setSimulationState((current) => {
+      if (!current.recent_events.length) return current;
+      const next = { ...current, recent_events: [] };
+      simulationStateRef.current = next;
+      return next;
+    });
+  }
+
   async function waitForControlTarget(command: ControlCommand, timeoutMs: number) {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
@@ -649,6 +673,7 @@ export function useRosBridge() {
       setBundle(appliedBundle);
       setStartPhase("");
       setOverrideAck(null);
+      clearEventLog({ suppressMs: 500 });
       setSimulationState((current) => ({
         ...current,
         active_bundle: appliedBundle,
@@ -670,6 +695,13 @@ export function useRosBridge() {
               ? "Stopping simulation"
               : "Resetting simulation";
     await runAction(label, async () => {
+      if (command === "start") {
+        suppressEventsUntilRef.current = 0;
+        clearEventLog();
+      }
+      if (command === "reset") {
+        clearEventLog({ suppressMs: 1200 });
+      }
       try {
         const response = await callService(
           "/simulation/control",
@@ -683,7 +715,7 @@ export function useRosBridge() {
         }
         setOverrideAck(null);
         if (command === "reset") {
-          setEvents([]);
+          clearEventLog({ suppressMs: 1200 });
           setSurgeonState({
             ...DEFAULT_SURGEON,
             procedure_id: simulationState.active_bundle || bundle,
@@ -724,7 +756,7 @@ export function useRosBridge() {
             );
             if (command === "reset") {
               setOverrideAck(null);
-              setEvents([]);
+              clearEventLog({ suppressMs: 1200 });
               const current = simulationStateRef.current;
               setSurgeonState({
                 ...DEFAULT_SURGEON,

@@ -404,7 +404,16 @@ class RealVLMNode(Node):
     def _append_public_speech(self, text: str) -> None:
         clean = str(text or "").strip()
         if clean:
-            self._recent_speech.append({"text": clean[:240], "at": round(time.time(), 2)})
+            now = round(time.time(), 2)
+            if self._recent_speech:
+                last = self._recent_speech[-1]
+                try:
+                    last_age = now - float(last.get("at", 0.0))
+                except (TypeError, ValueError):
+                    last_age = 999.0
+                if str(last.get("text", "")) == clean[:240] and last_age <= 1.0:
+                    return
+            self._recent_speech.append({"text": clean[:240], "at": now})
 
     def _append_public_signal(
         self,
@@ -414,6 +423,8 @@ class RealVLMNode(Node):
         hand_pose: str = "",
         speech_text: str = "",
     ) -> None:
+        if signal_type in {"advance_phase", "advance_phase_cue"}:
+            return
         signal: dict[str, Any] = {}
         if signal_type in {
             "request_tool",
@@ -421,8 +432,6 @@ class RealVLMNode(Node):
             "place_on_mayo",
             "continue_using",
             "small_talk",
-            "advance_phase",
-            "advance_phase_cue",
             "request_procedure_completion",
             "complete_procedure",
         }:
@@ -431,8 +440,6 @@ class RealVLMNode(Node):
             signal["hand"] = hand_pose
         if tool_id:
             signal["tool"] = tool_id
-        if speech_text:
-            signal["speech"] = speech_text[:160]
         if signal:
             signal["at"] = round(time.time(), 2)
             self._recent_observed_signals.append(signal)
@@ -442,26 +449,22 @@ class RealVLMNode(Node):
         tool_id = str(msg.instrument_id or detail.get("requested_tool") or detail.get("tool") or "")
         voice_text = str(detail.get("voice_text") or detail.get("text") or "")
         actor_event_type = str(detail.get("event_type") or event_type)
-        if event_type in {"VoiceTranscriptObserved", "SurgeonRequestObserved", "SurgeonActorEventObserved"}:
+        if event_type == "VoiceTranscriptObserved":
             self._append_public_speech(voice_text)
         if event_type == "SurgeonRequestObserved":
             self._append_public_signal(
                 signal_type=actor_event_type if actor_event_type in {"request_tool", "voice_request"} else "request_tool",
                 tool_id=tool_id,
-                speech_text=voice_text,
             )
         elif event_type == "SurgeonActorEventObserved" and actor_event_type in {
             "request_tool",
             "voice_request",
             "place_on_mayo",
-            "advance_phase",
-            "advance_phase_cue",
             "small_talk",
         }:
             self._append_public_signal(
                 signal_type=actor_event_type,
                 tool_id=tool_id,
-                speech_text=voice_text,
             )
 
     def _on_surgeon_request(self, msg: SurgeonRequest) -> None:
@@ -474,18 +477,14 @@ class RealVLMNode(Node):
         self._append_public_signal(
             signal_type=event_type,
             tool_id=tool_id,
-            speech_text=msg.voice_text,
         )
-        self._append_public_speech(msg.voice_text)
 
     def _on_outward_signal(self, msg: SurgeonOutwardSignal) -> None:
         self._append_public_signal(
             signal_type=msg.signal_type,
             tool_id=msg.tool_id,
             hand_pose=msg.hand_pose,
-            speech_text=msg.speech_text,
         )
-        self._append_public_speech(msg.speech_text)
 
     def _on_request_text(self, msg: String) -> None:
         self._append_public_speech(msg.data)

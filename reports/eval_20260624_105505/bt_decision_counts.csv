@@ -1,0 +1,4 @@
+bundle,procedure,decision:anticipatory_handover,decision:explicit_request,decision:hold,decision:idle,decision:recovery,action:direct_handover,action:pick_up_and_handover,action:predict_tool,action:put_down_and_handover,action:retrieve_from_mayo,blockers,suspicious
+thyroidectomy,Thyroidectomy,1,4,2,16,0,3,1,3,0,2,0,0
+nephrectomy,Nephrectomy,3,3,2,12,1,2,1,3,1,2,0,0
+inguinal_hernia_repair,Inguinal hernia repair,2,3,1,14,1,2,2,2,0,2,0,0

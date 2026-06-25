@@ -1,0 +1,340 @@
+{
+  "bundles": [
+    {
+      "actor": {
+        "accepted": 12,
+        "actions": {
+          "advance_phase": 2,
+          "place_on_mayo": 2,
+          "request_tool": 4,
+          "small_talk": 4
+        },
+        "interrupt_phase_cues": {},
+        "latency_sec": {
+          "avg": 1.746,
+          "count": 10,
+          "max": 2.387,
+          "p95": 2.15
+        },
+        "phase_ground_last": "P03",
+        "recent_accepted_decisions": [
+          {
+            "action": "request_tool",
+            "hidden_phase": "P01",
+            "mode": "voice",
+            "reason": "",
+            "speech": "Let's start with the skin incision. Can I get the #15 scalpel?",
+            "t": 3.26,
+            "tool": "T01"
+          },
+          {
+            "action": "request_tool",
+            "hidden_phase": "P01",
+            "mode": "voice_hand",
+            "reason": "",
+            "speech": "Bovie, please.",
+            "t": 14.34,
+            "tool": "T04"
+          },
+          {
+            "action": "advance_phase",
+            "hidden_phase": "P02",
+            "mode": "none",
+            "reason": "",
+            "speech": "",
+            "t": 21.62,
+            "tool": ""
+          },
+          {
+            "action": "place_on_mayo",
+            "hidden_phase": "P02",
+            "mode": "voice_hand",
+            "reason": "",
+            "speech": "",
+            "t": 25.66,
+            "tool": "T01"
+          },
+          {
+            "action": "request_tool",
+            "hidden_phase": "P02",
+            "mode": "voice_hand",
+            "reason": "",
+            "speech": "Allis clamp, please.",
+            "t": 32.81,
+            "tool": "T03"
+          },
+          {
+            "action": "place_on_mayo",
+            "hidden_phase": "P02",
+            "mode": "voice_hand",
+            "reason": "",
+            "speech": "",
+            "t": 42.27,
+            "tool": "T04"
+          },
+          {
+            "action": "request_tool",
+            "hidden_phase": "P02",
+            "mode": "voice",
+            "reason": "",
+            "speech": "Need the army navy retractor.",
+            "t": 46.04,
+            "tool": "T05"
+          },
+          {
+            "action": "advance_phase",
+            "hidden_phase": "P03",
+            "mode": "none",
+            "reason": "",
+            "speech": "",
+            "t": 52.62,
+            "tool": ""
+          },
+          {
+            "action": "small_talk",
+            "hidden_phase": "P03",
+            "mode": "none",
+            "reason": "",
+            "speech": "Let's maintain exposure.",
+            "t": 56.56,
+            "tool": ""
+          },
+          {
+            "action": "small_talk",
+            "hidden_phase": "P03",
+            "mode": "none",
+            "reason": "",
+            "speech": "Field looks stable.",
+            "t": 60.23,
+            "tool": ""
+          },
+          {
+            "action": "small_talk",
+            "hidden_phase": "P03",
+            "mode": "none",
+            "reason": "",
+            "speech": "Keep the Mayo organized.",
+            "t": 64.52,
+            "tool": ""
+          },
+          {
+            "action": "small_talk",
+            "hidden_phase": "P03",
+            "mode": "none",
+            "reason": "",
+            "speech": "Field looks stable.",
+            "t": 68.21,
+            "tool": ""
+          }
+        ],
+        "recent_rejected_decisions": [],
+        "reject_reasons": {},
+        "rejected": 0,
+        "request_modes": {
+          "none": 6,
+          "voice": 2,
+          "voice_hand": 4
+        }
+      },
+      "bt": {
+        "blocking_guards": {
+          "pending_transition": 1
+        },
+        "decisions": {
+          "anticipatory_handover": 3,
+          "explicit_request": 4,
+          "hold": 3,
+          "idle": 23,
+          "recovery": 2
+        },
+        "handover_actions": 4,
+        "recovery_actions": {
+          "retrieve_from_mayo": 2
+        },
+        "reducer_reasons": {
+          "awaiting_mayo_retrieve_stability": 10,
+          "awaiting_tool_prediction_stability": 30,
+          "phase_prior_fused": 45,
+          "stable_tool_prediction": 15
+        },
+        "skill_actions": {
+          "direct_handover": 3,
+          "pick_up_and_handover": 1,
+          "predict_tool": 3,
+          "retrieve_from_mayo": 2
+        }
+      },
+      "bundle": "thyroidectomy",
+      "duration_sec": 70.0,
+      "events": {
+        "outward": {
+          "advance_phase_cue": 2,
+          "place_on_mayo": 2,
+          "request_tool": 2,
+          "small_talk": 4,
+          "voice_request": 2
+        },
+        "skill": {
+          "RobotGraspedTool": 4,
+          "RobotTaskCompleted": 9,
+          "RobotTaskStarted": 9,
+          "ToolCleaningCompleted": 2,
+          "ToolCleaningProgress": 18,
+          "ToolHandoverCompleted": 4,
+          "ToolPrepared": 3,
+          "ToolReceivedFromSurgeon": 2,
+          "ToolReturnedToTray": 2,
+          "ToolSentToCleaner": 2
+        },
+        "twin": {
+          "RobotGraspedTool": 4,
+          "RobotTaskCompleted": 9,
+          "RobotTaskStarted": 9,
+          "SurgeonActorEventObserved": 12,
+          "SurgeonRequestObserved": 4,
+          "ToolCleaningCompleted": 2,
+          "ToolCleaningProgress": 18,
+          "ToolHandoverCompleted": 4,
+          "ToolPrepared": 3,
+          "ToolReceivedFromSurgeon": 2,
+          "ToolReturnedToTray": 2,
+          "ToolSentToCleaner": 2,
+          "VLMPredictedToolStable": 5,
+          "VLMProposalAccepted": 2,
+          "VLMProposalRejected": 4,
+          "VoiceTranscriptObserved": 8
+        }
+      },
+      "final_execution_state": "running",
+      "final_phase": "P03",
+      "image_frames": 2113,
+      "image_hz_est": 30.19,
+      "overlay": {
+        "final_visible_mayo_tools": [],
+        "final_world_mayo_tools": [],
+        "leak_count": 0,
+        "recent_visible_mayo_tools": [
+          "T04"
+        ],
+        "recovery_hidden_world_mayo_tools": [],
+        "samples": 28,
+        "visible_minus_world_mayo": [],
+        "with_hand": 7,
+        "with_mayo": 10,
+        "world_minus_visible_mayo": []
+      },
+      "select_latency_sec": 0.926,
+      "simulation_bundle": "thyroidectomy",
+      "spec_scope": {
+        "actor_out_of_scope_phase_ids": [],
+        "actor_out_of_scope_tools": [],
+        "phase_ids": [
+          "P01",
+          "P02",
+          "P03",
+          "P04",
+          "P05",
+          "P06"
+        ],
+        "simulation_out_of_scope_tools": [],
+        "tool_ids": [
+          "T01",
+          "T02",
+          "T03",
+          "T04",
+          "T05",
+          "T06",
+          "T07",
+          "T08",
+          "T09",
+          "T10"
+        ],
+        "vlm_out_of_scope_phase_ids": [],
+        "vlm_out_of_scope_tools": [],
+        "world_out_of_scope_tools": []
+      },
+      "start_latency_sec": 0.001,
+      "vlm": {
+        "context_forbidden_fragments": [],
+        "errors": {},
+        "health_samples": 45,
+        "healthy_samples": 45,
+        "latency_sec": {
+          "avg": 1.503,
+          "count": 45,
+          "max": 2.398,
+          "p95": 2.153
+        },
+        "modes": {
+          "openai_compat": 45
+        },
+        "phase_alignment": {
+          "recent_mismatches": [],
+          "samples": 38,
+          "scoreboard": {
+            "format": "correct / proposed / evaluable",
+            "system": {
+              "correct": 38,
+              "display": "38 / 38 / 38",
+              "evaluable": 38,
+              "proposed": 38
+            },
+            "vlm": {
+              "correct": 38,
+              "display": "38 / 38 / 38",
+              "evaluable": 38,
+              "proposed": 38
+            }
+          },
+          "stale_context_phase_skipped": 0,
+          "transition_grace_skipped": 7
+        },
+        "prompt_chars": {
+          "max": 10181,
+          "min": 8391
+        },
+        "results": 45,
+        "schema_versions": {
+          "3": 45
+        },
+        "tool_alignment": {
+          "confusion_top": {
+            "T03->T03": 2,
+            "T04->T04": 6,
+            "T05->T05": 5
+          },
+          "duplicate_request_skipped": 0,
+          "field_event_skipped": 0,
+          "insufficient_system_lead_skipped": 5,
+          "mayo_visible_ground_skipped": 0,
+          "phase_advance_skipped": 4,
+          "recent_field_event_skipped": 0,
+          "recent_mismatches": [],
+          "samples": 13,
+          "scoreboard": {
+            "format": "correct / proposed / evaluable",
+            "system": {
+              "correct": 13,
+              "display": "13 / 13 / 13",
+              "evaluable": 13,
+              "proposed": 13
+            },
+            "vlm": {
+              "correct": 13,
+              "display": "13 / 13 / 13",
+              "evaluable": 13,
+              "proposed": 13
+            }
+          },
+          "stale_context_phase_skipped": 0,
+          "transition_grace_skipped": 7,
+          "visible_field_event_skipped": 0
+        }
+      },
+      "world_invariant_violations": [],
+      "world_procedure": "thyroidectomy"
+    }
+  ],
+  "failures": [],
+  "generated_at": 1782268456.6240437
+}

@@ -735,7 +735,7 @@ class LLMSurgeonActorNode(Node):
                 [
                     "Hold on, let's address the field.",
                     "Pause there. I need the field controlled.",
-                    "Let's stabilize this before moving on.",
+                    "Let's stabilize this.",
                 ]
             ),
             "phase": target_phase,
@@ -932,17 +932,7 @@ class LLMSurgeonActorNode(Node):
         return None
 
     def _phase_advance_speech(self, next_phase: str) -> str:
-        phase_name = next_phase
-        for phase in self._spec.bundle.phases:
-            if phase.id == next_phase:
-                phase_name = phase.display_name or next_phase
-                break
-        templates = [
-            "Let's move on.",
-            "Next step.",
-            "Let's proceed to {phase}.",
-        ]
-        return self._rng.choice(templates).format(phase=phase_name)[:240]
+        return ""
 
     def _place_held_before_completion_decision(self, reason_code: str) -> dict[str, Any]:
         tool = self._held_tools[0] if self._held_tools else ""
@@ -1061,6 +1051,11 @@ class LLMSurgeonActorNode(Node):
             "Humanoid actions always succeed, but you must wait for completed skill feedback before assuming a delivered or recovered tool. "
             "After using a tool, place it on the Mayo stand instead of handing it directly back. "
             "Use small_talk sometimes, but keep it realistic and short. "
+            "Never reveal phase labels, Pxx ids, current stage names, next stage names, or phase-transition intent in spoken speech. "
+            "Phase changes are silent internal simulation state updates; never speak a line whose purpose is to announce, hint, or confirm a phase transition. "
+            "For action=advance_phase, speech must be an empty string. "
+            "Do not say phrases like 'next step', 'move on', 'proceed to', 'advance to', or any procedure phase name. "
+            "Only tool-request speech may mention the requested tool; small_talk must not mention phase or progress state. "
             "When requesting a tool, choose voice, hand, or voice_hand. "
             "The surgeon can hold at most two tools. If context.held_capacity_remaining is positive, you may request a different needed tool while still holding one tool. "
             "If two tools are already held, place one held tool on Mayo before requesting another tool. "
@@ -1409,6 +1404,7 @@ class LLMSurgeonActorNode(Node):
                 self._record_event("pickup_from_mayo", tool, {"speech": speech})
                 self._publish_state("continue_using", tool, speech, False, False, decision["reason_code"])
         elif action == "advance_phase":
+            speech = ""
             if phase != self._current_phase_id and not self._actor_transition_allowed(self._current_phase_id, phase):
                 accepted = False
                 reject_reason = "illegal_phase_transition"
@@ -1635,14 +1631,12 @@ class LLMSurgeonActorNode(Node):
     def _request_speech(self, tool: str, speech: str, request_mode: str) -> str:
         if request_mode == "hand":
             return ""
-        if speech and self._tool_is_spoken(tool, speech):
-            return speech[:240]
         display = self._tool_display_by_id.get(tool, tool)
         templates = [
             "{tool}, please.",
             "Let's have the {tool}.",
-            "{tool} next.",
             "Can I get the {tool}?",
+            "I need the {tool}.",
         ]
         return self._rng.choice(templates).format(tool=display)[:240]
 
@@ -1650,11 +1644,10 @@ class LLMSurgeonActorNode(Node):
         lines = [
             "Field looks stable.",
             "Let's keep the field steady.",
-            "We are moving carefully here.",
             "Keep the Mayo organized.",
-            "Good, let's continue.",
-            "Let's maintain exposure.",
             "Keep the field organized.",
+            "Thank you.",
+            "Hold steady.",
         ]
         return self._rng.choice(lines)
 

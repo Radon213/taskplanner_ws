@@ -1,5 +1,5 @@
 import { useLayoutEffect, useMemo, useRef, useState } from "react";
-import { AnimatePresence, motion } from "framer-motion";
+import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
 import { BrainCircuit, Code2, ListTree, RadioTower } from "lucide-react";
 
 import type { useDigitalTwinViewModel } from "../../hooks/useDigitalTwinViewModel";
@@ -20,25 +20,7 @@ type ViewModel = ReturnType<typeof useDigitalTwinViewModel>;
 type TabId = "bt" | "vlm" | "raw";
 type TimelineFilter = "all" | "normal" | "warning" | "error";
 type DetailTone = "normal" | "match" | "mismatch";
-
-function timelineItemSortParts(uiId: string, fallback: number): { time: number; sequence: number; fallback: number } {
-  const [timestamp, sequence] = uiId.split("-");
-  const timeValue = Number(timestamp);
-  const sequenceValue = Number(sequence);
-  return {
-    time: Number.isFinite(timeValue) ? timeValue : -1,
-    sequence: Number.isFinite(sequenceValue) ? sequenceValue : 0,
-    fallback,
-  };
-}
-
-function compareTimelineItems(a: { uiId: string }, b: { uiId: string }, aFallback: number, bFallback: number): number {
-  const left = timelineItemSortParts(a.uiId, aFallback);
-  const right = timelineItemSortParts(b.uiId, bFallback);
-  if (left.time !== right.time) return right.time - left.time;
-  if (left.sequence !== right.sequence) return right.sequence - left.sequence;
-  return right.fallback - left.fallback;
-}
+type PanelVariant = "combined" | "timeline" | "decision";
 
 function DetailCard({ label, value, tone = "normal" }: { label: string; value: string | number; tone?: DetailTone }) {
   return (
@@ -95,6 +77,7 @@ export function ObservabilityPanel({
   vlmResult,
   vlmReducerDecisions,
   vlmImage,
+  variant = "combined",
 }: {
   vm: ViewModel;
   language: Language;
@@ -107,22 +90,15 @@ export function ObservabilityPanel({
   vlmResult: VLMResult;
   vlmReducerDecisions: VLMReducerDecision[];
   vlmImage: CompressedImageFrame | null;
+  variant?: PanelVariant;
 }) {
   const [tab, setTab] = useState<TabId>("bt");
   const [timelineFilter, setTimelineFilter] = useState<TimelineFilter>("all");
   const timelineStripRef = useRef<HTMLDivElement>(null);
   const followLatestRef = useRef(true);
   const [followLatest, setFollowLatest] = useState(true);
-  const newestFirstTimeline = useMemo(
-    () =>
-      vm.timeline
-        .map((item, index) => ({ item, index }))
-        .sort((a, b) =>
-          compareTimelineItems(a.item, b.item, vm.timeline.length - a.index, vm.timeline.length - b.index),
-        )
-        .map(({ item }) => item),
-    [vm.timeline],
-  );
+  const prefersReducedMotion = useReducedMotion();
+  const newestFirstTimeline = useMemo(() => vm.timeline, [vm.timeline]);
   const timelineCounts = useMemo(
     () => ({
       all: newestFirstTimeline.length,
@@ -197,8 +173,7 @@ export function ObservabilityPanel({
     });
   }
 
-  return (
-    <section className="observability-panel">
+  const timelinePanel = (
       <div className="timeline-panel">
         <div className="panel-title-row">
           <div>
@@ -232,28 +207,34 @@ export function ObservabilityPanel({
           ref={timelineStripRef}
           onScroll={handleTimelineScroll}
         >
-          {visibleTimeline.map((item, index) => (
-            <motion.article
-              key={item.id}
-              layout
-              data-timeline-index={index}
-              data-timeline-ui-id={item.uiId}
-              data-timeline-severity={item.severity}
-              className={`timeline-item ${item.tone} severity-${item.severity}`}
-              initial={{ opacity: 0, x: -22, scale: 0.98 }}
-              animate={{ opacity: 1, x: 0, scale: 1 }}
-              transition={{
-                opacity: { duration: 0.16 },
-                scale: { duration: 0.16 },
-                x: { duration: 0.2 },
-                layout: { duration: 0.26, ease: [0.22, 1, 0.36, 1] },
-              }}
-            >
-              <span />
-              <strong>{item.title}</strong>
-              <TimelineMeta value={item.meta} />
-            </motion.article>
-          ))}
+          <AnimatePresence initial={false}>
+            {visibleTimeline.map((item, index) => (
+              <motion.article
+                key={item.uiId || item.id}
+                layout="position"
+                data-timeline-index={index}
+                data-timeline-ui-id={item.uiId}
+                data-timeline-severity={item.severity}
+                className={`timeline-item ${item.tone} severity-${item.severity}`}
+                initial={prefersReducedMotion ? false : { opacity: 0, x: -26 }}
+                animate={{ opacity: 1, x: 0 }}
+                exit={prefersReducedMotion ? undefined : { opacity: 0, x: 22 }}
+                transition={
+                  prefersReducedMotion
+                    ? { duration: 0 }
+                    : {
+                        opacity: { duration: 0.16 },
+                        x: { duration: 0.22, ease: [0.22, 1, 0.36, 1] },
+                        layout: { duration: 0.34, ease: [0.22, 1, 0.36, 1] },
+                      }
+                }
+              >
+                <span />
+                <strong>{item.title}</strong>
+                <TimelineMeta value={item.meta} />
+              </motion.article>
+            ))}
+          </AnimatePresence>
           {visibleTimeline.length === 0 ? (
             <div className="timeline-empty">
               {language === "ko" ? "이 필터에 표시할 이벤트가 없습니다." : "No events match this filter."}
@@ -261,7 +242,9 @@ export function ObservabilityPanel({
           ) : null}
         </div>
       </div>
+  );
 
+  const decisionPanel = (
       <div className="explain-panel">
         <div className="panel-title-row compact">
           <div>
@@ -284,98 +267,114 @@ export function ObservabilityPanel({
           </div>
         </div>
 
-        <AnimatePresence mode="wait">
-          {tab === "bt" ? (
-            <motion.div
-              key="bt"
-              className="detail-grid"
-              initial={{ opacity: 0, y: 8 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -8 }}
-              transition={{ duration: 0.18 }}
-            >
-              <DetailCard label={vm.ui.selectedTool} value={btDecision.selected_tool ? vm.displayToolName(btDecision.selected_tool) : vm.ui.none} />
-              <DetailCard
-                label={vm.ui.lifecycle}
-                value={btDecision.selected_tool_lifecycle ? vm.displayLifecycleName(btDecision.selected_tool_lifecycle) : vm.ui.none}
-              />
-              <DetailCard
-                label={vm.ui.nextTransition}
-                value={btDecision.next_required_transition ? vm.displayTransitionName(btDecision.next_required_transition) : vm.ui.none}
-              />
-              <DetailCard label={vm.ui.guard} value={btDecision.blocking_guard || vm.ui.none} />
-              <DetailCard label={vm.ui.skill} value={skillStatus.action ? vm.displayActionName(skillStatus.action) : vm.ui.none} />
-              <DetailCard label={vm.ui.progress} value={`${Math.round((skillStatus.progress || 0) * 100)}%`} />
-              <article className="detail-card wide">
-                <span>{vm.ui.rationale}</span>
-                <strong>{btDecision.decision_reason || btDecision.rationale || vm.ui.none}</strong>
-              </article>
-            </motion.div>
-          ) : null}
+        <div className="decision-scroll">
+          <AnimatePresence mode="wait">
+            {tab === "bt" ? (
+              <motion.div
+                key="bt"
+                className="detail-grid"
+                initial={{ opacity: 0, y: 8 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -8 }}
+                transition={{ duration: 0.18 }}
+              >
+                <DetailCard label={vm.ui.selectedTool} value={btDecision.selected_tool ? vm.displayToolName(btDecision.selected_tool) : vm.ui.none} />
+                <DetailCard
+                  label={vm.ui.lifecycle}
+                  value={btDecision.selected_tool_lifecycle ? vm.displayLifecycleName(btDecision.selected_tool_lifecycle) : vm.ui.none}
+                />
+                <DetailCard
+                  label={vm.ui.nextTransition}
+                  value={btDecision.next_required_transition ? vm.displayTransitionName(btDecision.next_required_transition) : vm.ui.none}
+                />
+                <DetailCard label={vm.ui.guard} value={btDecision.blocking_guard || vm.ui.none} />
+                <DetailCard label={vm.ui.skill} value={skillStatus.action ? vm.displayActionName(skillStatus.action) : vm.ui.none} />
+                <DetailCard label={vm.ui.progress} value={`${Math.round((skillStatus.progress || 0) * 100)}%`} />
+                <article className="detail-card wide">
+                  <span>{vm.ui.rationale}</span>
+                  <strong>{btDecision.decision_reason || btDecision.rationale || vm.ui.none}</strong>
+                </article>
+              </motion.div>
+            ) : null}
 
-          {tab === "vlm" ? (
-            <motion.div
-              key="vlm"
-              className="detail-grid"
-              initial={{ opacity: 0, y: 8 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -8 }}
-              transition={{ duration: 0.18 }}
-            >
-              <DetailCard
-                label={language === "ko" ? "VLM 입력 영상" : "VLM input image"}
-                value={
-                  vlmImage
-                    ? language === "ko"
-                      ? `수술대 위 표시 · ${Math.max(1, Math.round(vlmImage.sizeBytes / 1024))} KB`
-                      : `shown on bed · ${Math.max(1, Math.round(vlmImage.sizeBytes / 1024))} KB`
-                    : language === "ko"
-                      ? "frame 없음"
-                      : "no frame"
-                }
-              />
-              <DetailCard label={vm.ui.connection} value={vm.vlmStatus.connection} />
-              <DetailCard label={vm.ui.health} value={vm.vlmStatus.health} />
-              <DetailCard label={vm.ui.model} value={vlmHealth.model_id || vm.ui.none} />
-              <DetailCard label={vm.ui.mode} value={vlmHealth.last_mode || vm.ui.none} />
-              <DetailCard label={vm.ui.source} value={vlmResult.source || vm.ui.none} />
-              <DetailCard label={vm.ui.imageSource} value={vlmHealth.image_source || vm.ui.none} />
-              <DetailCard label={vm.ui.latency} value={vlmHealth.latency_sec ? `${vlmHealth.latency_sec.toFixed(3)}s` : vm.ui.none} />
-              <DetailCard label={language === "ko" ? "집도의 정답 단계" : "Actor ground"} value={groundLabel} />
-              <DetailCard label={language === "ko" ? "VLM 제안 단계" : "VLM proposed phase"} value={vlmPhaseLabel} tone={vlmPhaseTone} />
-              <DetailCard label={language === "ko" ? "시스템 최종 단계" : "System final phase"} value={systemPhaseLabel} tone={systemPhaseTone} />
-              <DetailCard label={language === "ko" ? "단계 검증" : "Phase check"} value={phaseMatchLabel} tone={phaseCheckTone} />
-              <DetailCard label={language === "ko" ? "VLM 제안 다음 도구" : "VLM proposed next tool"} value={rawVlmToolLabel} />
-              <DetailCard label={language === "ko" ? "시스템 최종 다음 도구" : "System final next tool"} value={systemPredictedToolLabel} />
-              <DetailCard
-                label={language === "ko" ? "E2E 지표 형식" : "E2E metric format"}
-                value={language === "ko" ? "정답 / 제안 / 평가가능" : "correct / proposed / evaluable"}
-              />
-              <article className="detail-card wide">
-                <span>{vm.ui.reducer}</span>
-                <strong>
-                  {vlmReducerDecisions[0]
-                    ? `${vlmReducerDecisions[0].reducer_result}: ${vlmReducerDecisions[0].reducer_reason}`
-                    : vm.ui.none}
-                </strong>
-              </article>
-            </motion.div>
-          ) : null}
+            {tab === "vlm" ? (
+              <motion.div
+                key="vlm"
+                className="detail-grid"
+                initial={{ opacity: 0, y: 8 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -8 }}
+                transition={{ duration: 0.18 }}
+              >
+                <DetailCard
+                  label={language === "ko" ? "VLM 입력 영상" : "VLM input image"}
+                  value={
+                    vlmImage
+                      ? language === "ko"
+                        ? `수술대 위 표시 · ${Math.max(1, Math.round(vlmImage.sizeBytes / 1024))} KB`
+                        : `shown on bed · ${Math.max(1, Math.round(vlmImage.sizeBytes / 1024))} KB`
+                      : language === "ko"
+                        ? "frame 없음"
+                        : "no frame"
+                  }
+                />
+                <DetailCard label={vm.ui.connection} value={vm.vlmStatus.connection} />
+                <DetailCard label={vm.ui.health} value={vm.vlmStatus.health} />
+                <DetailCard label={vm.ui.model} value={vlmHealth.model_id || vm.ui.none} />
+                <DetailCard label={vm.ui.mode} value={vlmHealth.last_mode || vm.ui.none} />
+                <DetailCard label={vm.ui.source} value={vlmResult.source || vm.ui.none} />
+                <DetailCard label={vm.ui.imageSource} value={vlmHealth.image_source || vm.ui.none} />
+                <DetailCard label={vm.ui.latency} value={vlmHealth.latency_sec ? `${vlmHealth.latency_sec.toFixed(3)}s` : vm.ui.none} />
+                <DetailCard label={language === "ko" ? "집도의 정답 단계" : "Actor ground"} value={groundLabel} />
+                <DetailCard label={language === "ko" ? "VLM 제안 단계" : "VLM proposed phase"} value={vlmPhaseLabel} tone={vlmPhaseTone} />
+                <DetailCard label={language === "ko" ? "시스템 최종 단계" : "System final phase"} value={systemPhaseLabel} tone={systemPhaseTone} />
+                <DetailCard label={language === "ko" ? "단계 검증" : "Phase check"} value={phaseMatchLabel} tone={phaseCheckTone} />
+                <DetailCard label={language === "ko" ? "VLM 제안 다음 도구" : "VLM proposed next tool"} value={rawVlmToolLabel} />
+                <DetailCard label={language === "ko" ? "시스템 최종 다음 도구" : "System final next tool"} value={systemPredictedToolLabel} />
+                <DetailCard
+                  label={language === "ko" ? "E2E 지표 형식" : "E2E metric format"}
+                  value={language === "ko" ? "정답 / 제안 / 평가가능" : "correct / proposed / evaluable"}
+                />
+                <article className="detail-card wide">
+                  <span>{vm.ui.reducer}</span>
+                  <strong>
+                    {vlmReducerDecisions[0]
+                      ? `${vlmReducerDecisions[0].reducer_result}: ${vlmReducerDecisions[0].reducer_reason}`
+                      : vm.ui.none}
+                  </strong>
+                </article>
+              </motion.div>
+            ) : null}
 
-          {tab === "raw" ? (
-            <motion.pre
-              key="raw"
-              className="raw-block"
-              initial={{ opacity: 0, y: 8 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -8 }}
-              transition={{ duration: 0.18 }}
-            >
-              {vlmResult.raw_json || "{}"}
-            </motion.pre>
-          ) : null}
-        </AnimatePresence>
+            {tab === "raw" ? (
+              <motion.pre
+                key="raw"
+                className="raw-block"
+                initial={{ opacity: 0, y: 8 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -8 }}
+                transition={{ duration: 0.18 }}
+              >
+                {vlmResult.raw_json || "{}"}
+              </motion.pre>
+            ) : null}
+          </AnimatePresence>
+        </div>
       </div>
+  );
+
+  if (variant === "timeline") {
+    return <section className="observability-panel observability-panel-timeline">{timelinePanel}</section>;
+  }
+
+  if (variant === "decision") {
+    return <section className="observability-panel observability-panel-decision">{decisionPanel}</section>;
+  }
+
+  return (
+    <section className="observability-panel">
+      {timelinePanel}
+      {decisionPanel}
     </section>
   );
 }

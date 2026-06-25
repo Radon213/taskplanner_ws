@@ -1,0 +1,1372 @@
+{
+  "bundles": [
+    {
+      "actor": {
+        "accepted": 8,
+        "actions": {
+          "advance_phase": 2,
+          "place_on_mayo": 2,
+          "request_tool": 4
+        },
+        "interrupt_phase_cues": {},
+        "latency_sec": {
+          "avg": 1.821,
+          "count": 6,
+          "max": 2.033,
+          "p95": 1.863
+        },
+        "phase_ground_last": "P03",
+        "recent_accepted_decisions": [
+          {
+            "action": "request_tool",
+            "hidden_phase": "P01",
+            "mode": "voice",
+            "reason": "",
+            "speech": "Let's start with the skin incision. Pass me the #15 scalpel.",
+            "t": 2.79,
+            "tool": "T01"
+          },
+          {
+            "action": "request_tool",
+            "hidden_phase": "P01",
+            "mode": "voice_hand",
+            "reason": "",
+            "speech": "Good. Now I need the Bovie for the subcutaneous dissection.",
+            "t": 13.82,
+            "tool": "T04"
+          },
+          {
+            "action": "advance_phase",
+            "hidden_phase": "P02",
+            "mode": "none",
+            "reason": "",
+            "speech": "Let's proceed to Skin flap elevation.",
+            "t": 21.21,
+            "tool": ""
+          },
+          {
+            "action": "place_on_mayo",
+            "hidden_phase": "P02",
+            "mode": "voice_hand",
+            "reason": "",
+            "speech": "",
+            "t": 24.68,
+            "tool": "T04"
+          },
+          {
+            "action": "request_tool",
+            "hidden_phase": "P02",
+            "mode": "voice",
+            "reason": "",
+            "speech": "I need the Allis clamp to start getting some counter-traction on this flap.",
+            "t": 32.43,
+            "tool": "T03"
+          },
+          {
+            "action": "place_on_mayo",
+            "hidden_phase": "P02",
+            "mode": "none",
+            "reason": "",
+            "speech": "",
+            "t": 41.99,
+            "tool": "T01"
+          },
+          {
+            "action": "advance_phase",
+            "hidden_phase": "P03",
+            "mode": "none",
+            "reason": "",
+            "speech": "Let's move on.",
+            "t": 48.46,
+            "tool": ""
+          },
+          {
+            "action": "request_tool",
+            "hidden_phase": "P03",
+            "mode": "voice_hand",
+            "reason": "",
+            "speech": "I need the army navy retractor to help with the exposure.",
+            "t": 51.96,
+            "tool": "T05"
+          }
+        ],
+        "recent_rejected_decisions": [],
+        "reject_reasons": {},
+        "rejected": 0,
+        "request_modes": {
+          "none": 3,
+          "voice": 2,
+          "voice_hand": 3
+        }
+      },
+      "bt": {
+        "blocking_guards": {},
+        "decisions": {
+          "anticipatory_handover": 3,
+          "explicit_request": 4,
+          "hold": 1,
+          "idle": 16,
+          "recovery": 2
+        },
+        "handover_actions": 4,
+        "recovery_actions": {
+          "retrieve_from_mayo": 2
+        },
+        "reducer_reasons": {
+          "awaiting_mayo_retrieve_stability": 15,
+          "awaiting_tool_prediction_stability": 28,
+          "phase_prior_fused": 40,
+          "stable_tool_prediction": 12
+        },
+        "skill_actions": {
+          "direct_handover": 3,
+          "pick_up_and_handover": 1,
+          "predict_tool": 3,
+          "retrieve_from_mayo": 2
+        }
+      },
+      "bundle": "thyroidectomy",
+      "duration_sec": 60.0,
+      "events": {
+        "outward": {
+          "advance_phase_cue": 2,
+          "place_on_mayo": 2,
+          "request_tool": 2,
+          "voice_request": 2
+        },
+        "skill": {
+          "RobotGraspedTool": 4,
+          "RobotTaskCompleted": 9,
+          "RobotTaskStarted": 9,
+          "ToolCleaningCompleted": 2,
+          "ToolCleaningProgress": 18,
+          "ToolHandoverCompleted": 4,
+          "ToolPrepared": 3,
+          "ToolReceivedFromSurgeon": 2,
+          "ToolReturnedToTray": 2,
+          "ToolSentToCleaner": 2
+        },
+        "twin": {
+          "RobotGraspedTool": 4,
+          "RobotTaskCompleted": 9,
+          "RobotTaskStarted": 9,
+          "SurgeonActorEventObserved": 8,
+          "SurgeonRequestObserved": 4,
+          "ToolCleaningCompleted": 2,
+          "ToolCleaningProgress": 18,
+          "ToolHandoverCompleted": 4,
+          "ToolPrepared": 3,
+          "ToolReceivedFromSurgeon": 2,
+          "ToolReturnedToTray": 2,
+          "ToolSentToCleaner": 2,
+          "VLMPredictedToolStable": 4,
+          "VLMProposalAccepted": 2,
+          "VLMProposalRejected": 3,
+          "VoiceTranscriptObserved": 6
+        }
+      },
+      "final_execution_state": "running",
+      "final_phase": "P03",
+      "image_frames": 1816,
+      "image_hz_est": 30.27,
+      "overlay": {
+        "final_visible_mayo_tools": [],
+        "final_world_mayo_tools": [],
+        "leak_count": 0,
+        "recent_visible_mayo_tools": [
+          "T01",
+          "T04"
+        ],
+        "recovery_hidden_world_mayo_tools": [],
+        "samples": 22,
+        "visible_minus_world_mayo": [],
+        "with_hand": 7,
+        "with_mayo": 11,
+        "world_minus_visible_mayo": []
+      },
+      "select_latency_sec": 0.917,
+      "simulation_bundle": "thyroidectomy",
+      "spec_scope": {
+        "actor_out_of_scope_phase_ids": [],
+        "actor_out_of_scope_tools": [],
+        "phase_ids": [
+          "P01",
+          "P02",
+          "P03",
+          "P04",
+          "P05",
+          "P06"
+        ],
+        "simulation_out_of_scope_tools": [],
+        "tool_ids": [
+          "T01",
+          "T02",
+          "T03",
+          "T04",
+          "T05",
+          "T06",
+          "T07",
+          "T08",
+          "T09",
+          "T10"
+        ],
+        "vlm_out_of_scope_phase_ids": [],
+        "vlm_out_of_scope_tools": [],
+        "world_out_of_scope_tools": []
+      },
+      "start_latency_sec": 0.001,
+      "vlm": {
+        "context_forbidden_fragments": [],
+        "errors": {},
+        "health_samples": 40,
+        "healthy_samples": 40,
+        "latency_sec": {
+          "avg": 1.479,
+          "count": 40,
+          "max": 2.548,
+          "p95": 2.343
+        },
+        "modes": {
+          "openai_compat": 40
+        },
+        "phase_alignment": {
+          "recent_mismatches": [
+            {
+              "candidate_phase": [
+                [
+                  "P03",
+                  1.0
+                ],
+                [
+                  "P02",
+                  0.45
+                ]
+              ],
+              "context_debug": {
+                "candidate_evidence": {
+                  "allowed_next": [
+                    "P03"
+                  ],
+                  "current_phase": "P02",
+                  "interrupt_event_active": false,
+                  "recent_tools": [
+                    "T01"
+                  ],
+                  "speech_tools": []
+                },
+                "digital_twin": {
+                  "events": [
+                    {
+                      "anchor": "",
+                      "stamp_sec": 1782266121.989192,
+                      "t": "VoiceTranscriptObserved",
+                      "tool": ""
+                    },
+                    {
+                      "anchor": "",
+                      "stamp_sec": 1782266121.9893303,
+                      "t": "SurgeonRequestObserved",
+                      "tool": "T04"
+                    },
+                    {
+                      "anchor": "surgeon_receive_zone",
+                      "stamp_sec": 1782266122.0049317,
+                      "t": "RobotTaskStarted",
+                      "tool": "T04"
+                    },
+                    {
+                      "anchor": "surgeon_receive_zone",
+                      "stamp_sec": 1782266123.005582,
+                      "t": "ToolHandoverCompleted",
+                      "tool": "T04"
+                    },
+                    {
+                      "anchor": "surgeon_receive_zone",
+                      "stamp_sec": 1782266123.0057032,
+                      "t": "RobotTaskCompleted",
+                      "tool": "T04"
+                    }
+                  ],
+                  "hands": {
+                    "cb": false,
+                    "ct": 0.0,
+                    "lh": "",
+                    "pre": "",
+                    "rh": ""
+                  }
+                },
+                "evidence_window": {
+                  "observed_signals": [
+                    {
+                      "at": 1782266138.37,
+                      "speech": "Let's proceed to Skin flap elevation.",
+                      "type": "advance_phase_cue"
+                    }
+                  ],
+                  "skill_status": [
+                    {
+                      "action": "pick_up_and_handover",
+                      "at": 1782266135.9,
+                      "message": "tool handed over to surgeon",
+                      "state": "completed",
+                      "success": true,
+                      "tool": "T01"
+                    }
+                  ],
+                  "speech": [
+                    {
+                      "at": 1782266138.37,
+                      "text": "Let's proceed to Skin flap elevation."
+                    }
+                  ],
+                  "visual": {
+                    "field_event": [],
+                    "hand": "",
+                    "mayo": [
+                      "T04"
+                    ]
+                  }
+                }
+              },
+              "ground": "P02",
+              "system": "P02",
+              "system_match": true,
+              "t": 30.2,
+              "vlm": "P03",
+              "vlm_candidates": [
+                [
+                  "P03",
+                  1.0
+                ],
+                [
+                  "P02",
+                  0.45
+                ]
+              ],
+              "vlm_match": false
+            },
+            {
+              "candidate_phase": [
+                [
+                  "P03",
+                  1.0
+                ],
+                [
+                  "P02",
+                  0.7
+                ]
+              ],
+              "context_debug": {
+                "candidate_evidence": {
+                  "allowed_next": [
+                    "P03"
+                  ],
+                  "current_phase": "P02",
+                  "interrupt_event_active": false,
+                  "recent_tools": [
+                    "T01"
+                  ],
+                  "speech_tools": []
+                },
+                "digital_twin": {
+                  "events": [
+                    {
+                      "anchor": "",
+                      "stamp_sec": 1782266121.9893303,
+                      "t": "SurgeonRequestObserved",
+                      "tool": "T04"
+                    },
+                    {
+                      "anchor": "surgeon_receive_zone",
+                      "stamp_sec": 1782266122.0049317,
+                      "t": "RobotTaskStarted",
+                      "tool": "T04"
+                    },
+                    {
+                      "anchor": "surgeon_receive_zone",
+                      "stamp_sec": 1782266123.005582,
+                      "t": "ToolHandoverCompleted",
+                      "tool": "T04"
+                    },
+                    {
+                      "anchor": "surgeon_receive_zone",
+                      "stamp_sec": 1782266123.0057032,
+                      "t": "RobotTaskCompleted",
+                      "tool": "T04"
+                    },
+                    {
+                      "anchor": "",
+                      "stamp_sec": 1782266129.3765826,
+                      "t": "VoiceTranscriptObserved",
+                      "tool": ""
+                    }
+                  ],
+                  "hands": {
+                    "cb": false,
+                    "ct": 0.0,
+                    "lh": "",
+                    "pre": "T03",
+                    "rh": "T03"
+                  }
+                },
+                "evidence_window": {
+                  "observed_signals": [
+                    {
+                      "at": 1782266138.37,
+                      "speech": "Let's proceed to Skin flap elevation.",
+                      "type": "advance_phase_cue"
+                    }
+                  ],
+                  "skill_status": [
+                    {
+                      "action": "pick_up_and_handover",
+                      "at": 1782266135.9,
+                      "message": "tool handed over to surgeon",
+                      "state": "completed",
+                      "success": true,
+                      "tool": "T01"
+                    }
+                  ],
+                  "speech": [
+                    {
+                      "at": 1782266138.37,
+                      "text": "Let's proceed to Skin flap elevation."
+                    },
+                    {
+                      "at": 1782266140.8,
+                      "text": "Let's proceed to Skin flap elevation."
+                    }
+                  ],
+                  "visual": {
+                    "field_event": [],
+                    "hand": "",
+                    "mayo": [
+                      "T04"
+                    ]
+                  }
+                }
+              },
+              "ground": "P02",
+              "system": "P02",
+              "system_match": true,
+              "t": 32.63,
+              "vlm": "P03",
+              "vlm_candidates": [
+                [
+                  "P03",
+                  1.0
+                ],
+                [
+                  "P02",
+                  0.7
+                ]
+              ],
+              "vlm_match": false
+            }
+          ],
+          "samples": 33,
+          "scoreboard": {
+            "format": "correct / proposed / evaluable",
+            "system": {
+              "correct": 33,
+              "display": "33 / 33 / 33",
+              "evaluable": 33,
+              "proposed": 33
+            },
+            "vlm": {
+              "correct": 31,
+              "display": "31 / 33 / 33",
+              "evaluable": 33,
+              "proposed": 33
+            }
+          },
+          "stale_context_phase_skipped": 1,
+          "transition_grace_skipped": 6
+        },
+        "prompt_chars": {
+          "max": 11033,
+          "min": 8391
+        },
+        "results": 42,
+        "schema_versions": {
+          "3": 42
+        },
+        "tool_alignment": {
+          "confusion_top": {
+            "T03->T03": 2,
+            "T04->T04": 5
+          },
+          "duplicate_request_skipped": 0,
+          "field_event_skipped": 0,
+          "insufficient_system_lead_skipped": 3,
+          "mayo_visible_ground_skipped": 0,
+          "phase_advance_skipped": 13,
+          "recent_field_event_skipped": 0,
+          "recent_mismatches": [
+            {
+              "candidate_tool": [
+                [
+                  "T03",
+                  1.0
+                ],
+                [
+                  "T05",
+                  0.18
+                ],
+                [
+                  "T02",
+                  0.18
+                ],
+                [
+                  "T06",
+                  0.115
+                ]
+              ],
+              "context_debug": {
+                "candidate_evidence": {
+                  "allowed_next": [
+                    "P03"
+                  ],
+                  "current_phase": "P02",
+                  "interrupt_event_active": false,
+                  "recent_tools": [
+                    "T01"
+                  ],
+                  "speech_tools": []
+                },
+                "digital_twin": {
+                  "events": [
+                    {
+                      "anchor": "robot_right_hand",
+                      "stamp_sec": 1782266120.5076463,
+                      "t": "RobotTaskCompleted",
+                      "tool": "T04"
+                    },
+                    {
+                      "anchor": "",
+                      "stamp_sec": 1782266121.989192,
+                      "t": "VoiceTranscriptObserved",
+                      "tool": ""
+                    },
+                    {
+                      "anchor": "",
+                      "stamp_sec": 1782266121.9893303,
+                      "t": "SurgeonRequestObserved",
+                      "tool": "T04"
+                    },
+                    {
+                      "anchor": "surgeon_receive_zone",
+                      "stamp_sec": 1782266122.0049317,
+                      "t": "RobotTaskStarted",
+                      "tool": "T04"
+                    },
+                    {
+                      "anchor": "surgeon_receive_zone",
+                      "stamp_sec": 1782266123.005582,
+                      "t": "ToolHandoverCompleted",
+                      "tool": "T04"
+                    }
+                  ],
+                  "hands": {
+                    "cb": false,
+                    "ct": 0.0,
+                    "lh": "",
+                    "pre": "",
+                    "rh": ""
+                  }
+                },
+                "evidence_window": {
+                  "observed_signals": [],
+                  "skill_status": [
+                    {
+                      "action": "pick_up_and_handover",
+                      "at": 1782266135.9,
+                      "message": "tool handed over to surgeon",
+                      "state": "completed",
+                      "success": true,
+                      "tool": "T01"
+                    }
+                  ],
+                  "speech": [],
+                  "visual": {
+                    "field_event": [],
+                    "hand": "",
+                    "mayo": [
+                      "T04"
+                    ]
+                  }
+                }
+              },
+              "ground": "T03",
+              "lead_sec": 4.7,
+              "previous_request": "T04",
+              "system": "",
+              "system_match": false,
+              "t": 27.73,
+              "vlm": "T03",
+              "vlm_match": true
+            },
+            {
+              "candidate_tool": [
+                [
+                  "T03",
+                  1.0
+                ],
+                [
+                  "T05",
+                  0.18
+                ],
+                [
+                  "T02",
+                  0.18
+                ],
+                [
+                  "T06",
+                  0.115
+                ]
+              ],
+              "context_debug": {
+                "candidate_evidence": {
+                  "allowed_next": [
+                    "P03"
+                  ],
+                  "current_phase": "P02",
+                  "interrupt_event_active": false,
+                  "recent_tools": [
+                    "T01"
+                  ],
+                  "speech_tools": []
+                },
+                "digital_twin": {
+                  "events": [
+                    {
+                      "anchor": "",
+                      "stamp_sec": 1782266121.989192,
+                      "t": "VoiceTranscriptObserved",
+                      "tool": ""
+                    },
+                    {
+                      "anchor": "",
+                      "stamp_sec": 1782266121.9893303,
+                      "t": "SurgeonRequestObserved",
+                      "tool": "T04"
+                    },
+                    {
+                      "anchor": "surgeon_receive_zone",
+                      "stamp_sec": 1782266122.0049317,
+                      "t": "RobotTaskStarted",
+                      "tool": "T04"
+                    },
+                    {
+                      "anchor": "surgeon_receive_zone",
+                      "stamp_sec": 1782266123.005582,
+                      "t": "ToolHandoverCompleted",
+                      "tool": "T04"
+                    },
+                    {
+                      "anchor": "surgeon_receive_zone",
+                      "stamp_sec": 1782266123.0057032,
+                      "t": "RobotTaskCompleted",
+                      "tool": "T04"
+                    }
+                  ],
+                  "hands": {
+                    "cb": false,
+                    "ct": 0.0,
+                    "lh": "",
+                    "pre": "",
+                    "rh": ""
+                  }
+                },
+                "evidence_window": {
+                  "observed_signals": [],
+                  "skill_status": [
+                    {
+                      "action": "pick_up_and_handover",
+                      "at": 1782266135.9,
+                      "message": "tool handed over to surgeon",
+                      "state": "completed",
+                      "success": true,
+                      "tool": "T01"
+                    }
+                  ],
+                  "speech": [],
+                  "visual": {
+                    "field_event": [],
+                    "hand": "",
+                    "mayo": [
+                      "T04"
+                    ]
+                  }
+                }
+              },
+              "ground": "T03",
+              "lead_sec": 3.43,
+              "previous_request": "T04",
+              "system": "",
+              "system_match": false,
+              "t": 29.0,
+              "vlm": "T03",
+              "vlm_match": true
+            }
+          ],
+          "samples": 7,
+          "scoreboard": {
+            "format": "correct / proposed / evaluable",
+            "system": {
+              "correct": 5,
+              "display": "5 / 5 / 7",
+              "evaluable": 7,
+              "proposed": 5
+            },
+            "vlm": {
+              "correct": 7,
+              "display": "7 / 7 / 7",
+              "evaluable": 7,
+              "proposed": 7
+            }
+          },
+          "stale_context_phase_skipped": 1,
+          "transition_grace_skipped": 6,
+          "visible_field_event_skipped": 0
+        }
+      },
+      "world_invariant_violations": [],
+      "world_procedure": "thyroidectomy"
+    },
+    {
+      "actor": {
+        "accepted": 9,
+        "actions": {
+          "field_event": 1,
+          "place_on_mayo": 4,
+          "request_tool": 4
+        },
+        "interrupt_phase_cues": {
+          "P07": 1
+        },
+        "latency_sec": {
+          "avg": 2.161,
+          "count": 3,
+          "max": 2.477,
+          "p95": 2.085
+        },
+        "phase_ground_last": "P01",
+        "recent_accepted_decisions": [
+          {
+            "action": "request_tool",
+            "hidden_phase": "P01",
+            "mode": "voice",
+            "reason": "",
+            "speech": "Let's get started. Scalpel, please.",
+            "t": 3.24,
+            "tool": "T01"
+          },
+          {
+            "action": "request_tool",
+            "hidden_phase": "P01",
+            "mode": "voice_hand",
+            "reason": "",
+            "speech": "I've made the initial incision. Give me the DeBakey forceps, please.",
+            "t": 14.19,
+            "tool": "T02"
+          },
+          {
+            "action": "place_on_mayo",
+            "hidden_phase": "P01",
+            "mode": "none",
+            "reason": "",
+            "speech": "",
+            "t": 23.6,
+            "tool": "T01"
+          },
+          {
+            "action": "field_event",
+            "hidden_phase": "P01",
+            "mode": "none",
+            "reason": "",
+            "speech": "Hold on, let's address the field.",
+            "t": 29.51,
+            "tool": ""
+          },
+          {
+            "action": "request_tool",
+            "hidden_phase": "P01",
+            "mode": "hand",
+            "reason": "",
+            "speech": "",
+            "t": 31.76,
+            "tool": "T10"
+          },
+          {
+            "action": "place_on_mayo",
+            "hidden_phase": "P01",
+            "mode": "none",
+            "reason": "",
+            "speech": "",
+            "t": 41.26,
+            "tool": "T02"
+          },
+          {
+            "action": "request_tool",
+            "hidden_phase": "P01",
+            "mode": "hand",
+            "reason": "",
+            "speech": "",
+            "t": 46.26,
+            "tool": "T03"
+          },
+          {
+            "action": "place_on_mayo",
+            "hidden_phase": "P01",
+            "mode": "none",
+            "reason": "",
+            "speech": "",
+            "t": 53.26,
+            "tool": "T10"
+          },
+          {
+            "action": "place_on_mayo",
+            "hidden_phase": "P01",
+            "mode": "none",
+            "reason": "",
+            "speech": "",
+            "t": 57.51,
+            "tool": "T03"
+          }
+        ],
+        "recent_rejected_decisions": [],
+        "reject_reasons": {},
+        "rejected": 0,
+        "request_modes": {
+          "hand": 2,
+          "none": 5,
+          "voice": 1,
+          "voice_hand": 1
+        }
+      },
+      "bt": {
+        "blocking_guards": {},
+        "decisions": {
+          "anticipatory_handover": 3,
+          "explicit_request": 4,
+          "hold": 1,
+          "idle": 19,
+          "recovery": 2
+        },
+        "handover_actions": 4,
+        "recovery_actions": {
+          "retrieve_from_mayo": 2
+        },
+        "reducer_reasons": {
+          "awaiting_mayo_retrieve_stability": 17,
+          "awaiting_tool_prediction_stability": 32,
+          "phase_prior_fused": 40,
+          "stable_tool_prediction": 8
+        },
+        "skill_actions": {
+          "direct_handover": 2,
+          "pick_up_and_handover": 1,
+          "predict_tool": 3,
+          "put_down_and_handover": 1,
+          "retrieve_from_mayo": 2
+        }
+      },
+      "bundle": "nephrectomy",
+      "duration_sec": 60.0,
+      "events": {
+        "outward": {
+          "field_event": 1,
+          "place_on_mayo": 4,
+          "request_tool": 3,
+          "small_talk": 1,
+          "voice_request": 1
+        },
+        "skill": {
+          "PredictedToolReturnedToRack": 1,
+          "RobotGraspedTool": 5,
+          "RobotTaskCompleted": 8,
+          "RobotTaskStarted": 9,
+          "ToolCleaningCompleted": 1,
+          "ToolCleaningProgress": 12,
+          "ToolHandoverCompleted": 4,
+          "ToolPrepared": 3,
+          "ToolReceivedFromSurgeon": 2,
+          "ToolReturnedToTray": 1,
+          "ToolSentToCleaner": 2
+        },
+        "twin": {
+          "PredictedToolReturnedToRack": 1,
+          "RobotGraspedTool": 5,
+          "RobotTaskCompleted": 8,
+          "RobotTaskStarted": 9,
+          "SurgeonActorEventObserved": 10,
+          "SurgeonRequestObserved": 4,
+          "ToolCleaningCompleted": 1,
+          "ToolCleaningProgress": 12,
+          "ToolHandoverCompleted": 4,
+          "ToolPrepared": 3,
+          "ToolReceivedFromSurgeon": 2,
+          "ToolReturnedToTray": 1,
+          "ToolSentToCleaner": 2,
+          "VLMPredictedToolStable": 3,
+          "VLMProposalAccepted": 1,
+          "VLMProposalRejected": 4,
+          "VoiceTranscriptObserved": 3
+        }
+      },
+      "final_execution_state": "running",
+      "final_phase": "P01",
+      "image_frames": 1813,
+      "image_hz_est": 30.22,
+      "overlay": {
+        "final_visible_mayo_tools": [
+          "T03",
+          "T10"
+        ],
+        "final_world_mayo_tools": [
+          "T03",
+          "T10"
+        ],
+        "leak_count": 0,
+        "recent_visible_mayo_tools": [
+          "T01",
+          "T02",
+          "T03",
+          "T10"
+        ],
+        "recovery_hidden_world_mayo_tools": [],
+        "samples": 23,
+        "visible_minus_world_mayo": [],
+        "with_hand": 10,
+        "with_mayo": 15,
+        "world_minus_visible_mayo": []
+      },
+      "select_latency_sec": 3.471,
+      "simulation_bundle": "nephrectomy",
+      "spec_scope": {
+        "actor_out_of_scope_phase_ids": [],
+        "actor_out_of_scope_tools": [],
+        "phase_ids": [
+          "P01",
+          "P02",
+          "P03",
+          "P04",
+          "P05",
+          "P06",
+          "P07"
+        ],
+        "simulation_out_of_scope_tools": [],
+        "tool_ids": [
+          "T01",
+          "T02",
+          "T03",
+          "T04",
+          "T05",
+          "T06",
+          "T07",
+          "T08",
+          "T09",
+          "T10"
+        ],
+        "vlm_out_of_scope_phase_ids": [],
+        "vlm_out_of_scope_tools": [],
+        "world_out_of_scope_tools": []
+      },
+      "start_latency_sec": 0.001,
+      "vlm": {
+        "context_forbidden_fragments": [],
+        "errors": {},
+        "health_samples": 40,
+        "healthy_samples": 40,
+        "latency_sec": {
+          "avg": 1.465,
+          "count": 40,
+          "max": 2.986,
+          "p95": 1.875
+        },
+        "modes": {
+          "openai_compat": 40
+        },
+        "phase_alignment": {
+          "recent_mismatches": [],
+          "samples": 40,
+          "scoreboard": {
+            "format": "correct / proposed / evaluable",
+            "system": {
+              "correct": 40,
+              "display": "40 / 40 / 40",
+              "evaluable": 40,
+              "proposed": 40
+            },
+            "vlm": {
+              "correct": 40,
+              "display": "40 / 40 / 40",
+              "evaluable": 40,
+              "proposed": 40
+            }
+          },
+          "stale_context_phase_skipped": 0,
+          "transition_grace_skipped": 0
+        },
+        "prompt_chars": {
+          "max": 11566,
+          "min": 9215
+        },
+        "results": 40,
+        "schema_versions": {
+          "3": 40
+        },
+        "tool_alignment": {
+          "confusion_top": {
+            "T02->T02": 5
+          },
+          "duplicate_request_skipped": 0,
+          "field_event_skipped": 10,
+          "insufficient_system_lead_skipped": 2,
+          "mayo_visible_ground_skipped": 0,
+          "phase_advance_skipped": 0,
+          "recent_field_event_skipped": 1,
+          "recent_mismatches": [],
+          "samples": 5,
+          "scoreboard": {
+            "format": "correct / proposed / evaluable",
+            "system": {
+              "correct": 5,
+              "display": "5 / 5 / 5",
+              "evaluable": 5,
+              "proposed": 5
+            },
+            "vlm": {
+              "correct": 5,
+              "display": "5 / 5 / 5",
+              "evaluable": 5,
+              "proposed": 5
+            }
+          },
+          "stale_context_phase_skipped": 0,
+          "transition_grace_skipped": 0,
+          "visible_field_event_skipped": 9
+        }
+      },
+      "world_invariant_violations": [],
+      "world_procedure": "nephrectomy"
+    },
+    {
+      "actor": {
+        "accepted": 9,
+        "actions": {
+          "field_event": 1,
+          "place_on_mayo": 4,
+          "request_tool": 4
+        },
+        "interrupt_phase_cues": {
+          "P07": 1
+        },
+        "latency_sec": {
+          "avg": 2.104,
+          "count": 3,
+          "max": 2.375,
+          "p95": 2.232
+        },
+        "phase_ground_last": "P01",
+        "recent_accepted_decisions": [
+          {
+            "action": "request_tool",
+            "hidden_phase": "P01",
+            "mode": "voice",
+            "reason": "",
+            "speech": "Let's start with the incision. Scalpel, please.",
+            "t": 3.14,
+            "tool": "T01"
+          },
+          {
+            "action": "request_tool",
+            "hidden_phase": "P01",
+            "mode": "voice_hand",
+            "reason": "",
+            "speech": "I need the toothed dissecting forceps to grasp the skin edge.",
+            "t": 13.97,
+            "tool": "T02"
+          },
+          {
+            "action": "place_on_mayo",
+            "hidden_phase": "P01",
+            "mode": "voice",
+            "reason": "",
+            "speech": "",
+            "t": 23.49,
+            "tool": "T01"
+          },
+          {
+            "action": "field_event",
+            "hidden_phase": "P01",
+            "mode": "none",
+            "reason": "",
+            "speech": "Hold on, let's address the field.",
+            "t": 29.51,
+            "tool": ""
+          },
+          {
+            "action": "request_tool",
+            "hidden_phase": "P01",
+            "mode": "hand",
+            "reason": "",
+            "speech": "",
+            "t": 31.76,
+            "tool": "T03"
+          },
+          {
+            "action": "place_on_mayo",
+            "hidden_phase": "P01",
+            "mode": "none",
+            "reason": "",
+            "speech": "",
+            "t": 38.01,
+            "tool": "T02"
+          },
+          {
+            "action": "request_tool",
+            "hidden_phase": "P01",
+            "mode": "voice",
+            "reason": "",
+            "speech": "Can I get the Crile hemostat?",
+            "t": 42.26,
+            "tool": "T06"
+          },
+          {
+            "action": "place_on_mayo",
+            "hidden_phase": "P01",
+            "mode": "none",
+            "reason": "",
+            "speech": "",
+            "t": 51.01,
+            "tool": "T03"
+          },
+          {
+            "action": "place_on_mayo",
+            "hidden_phase": "P01",
+            "mode": "none",
+            "reason": "",
+            "speech": "",
+            "t": 57.26,
+            "tool": "T06"
+          }
+        ],
+        "recent_rejected_decisions": [],
+        "reject_reasons": {},
+        "rejected": 0,
+        "request_modes": {
+          "hand": 1,
+          "none": 4,
+          "voice": 3,
+          "voice_hand": 1
+        }
+      },
+      "bt": {
+        "blocking_guards": {},
+        "decisions": {
+          "anticipatory_handover": 2,
+          "explicit_request": 4,
+          "hold": 2,
+          "idle": 17,
+          "recovery": 2
+        },
+        "handover_actions": 4,
+        "recovery_actions": {
+          "retrieve_from_mayo": 2
+        },
+        "reducer_reasons": {
+          "awaiting_mayo_retrieve_stability": 15,
+          "awaiting_tool_prediction_stability": 37,
+          "phase_prior_fused": 41,
+          "stable_tool_prediction": 4
+        },
+        "skill_actions": {
+          "direct_handover": 2,
+          "pick_up_and_handover": 2,
+          "predict_tool": 2,
+          "retrieve_from_mayo": 2
+        }
+      },
+      "bundle": "inguinal_hernia_repair",
+      "duration_sec": 60.0,
+      "events": {
+        "outward": {
+          "field_event": 1,
+          "place_on_mayo": 4,
+          "request_tool": 2,
+          "small_talk": 1,
+          "voice_request": 2
+        },
+        "skill": {
+          "RobotGraspedTool": 4,
+          "RobotTaskCompleted": 8,
+          "RobotTaskStarted": 8,
+          "ToolCleaningCompleted": 2,
+          "ToolCleaningProgress": 18,
+          "ToolHandoverCompleted": 4,
+          "ToolPrepared": 2,
+          "ToolReceivedFromSurgeon": 2,
+          "ToolReturnedToTray": 2,
+          "ToolSentToCleaner": 2
+        },
+        "twin": {
+          "RobotGraspedTool": 4,
+          "RobotTaskCompleted": 8,
+          "RobotTaskStarted": 8,
+          "SurgeonActorEventObserved": 10,
+          "SurgeonRequestObserved": 4,
+          "ToolCleaningCompleted": 2,
+          "ToolCleaningProgress": 18,
+          "ToolHandoverCompleted": 4,
+          "ToolPrepared": 2,
+          "ToolReceivedFromSurgeon": 2,
+          "ToolReturnedToTray": 2,
+          "ToolSentToCleaner": 2,
+          "VLMPredictedToolStable": 2,
+          "VLMProposalAccepted": 2,
+          "VLMProposalRejected": 4,
+          "VoiceTranscriptObserved": 4
+        }
+      },
+      "final_execution_state": "running",
+      "final_phase": "P01",
+      "image_frames": 1813,
+      "image_hz_est": 30.22,
+      "overlay": {
+        "final_visible_mayo_tools": [
+          "T03",
+          "T06"
+        ],
+        "final_world_mayo_tools": [
+          "T03",
+          "T06"
+        ],
+        "leak_count": 0,
+        "recent_visible_mayo_tools": [
+          "T02",
+          "T03",
+          "T06"
+        ],
+        "recovery_hidden_world_mayo_tools": [],
+        "samples": 25,
+        "visible_minus_world_mayo": [],
+        "with_hand": 7,
+        "with_mayo": 16,
+        "world_minus_visible_mayo": []
+      },
+      "select_latency_sec": 2.119,
+      "simulation_bundle": "inguinal_hernia_repair",
+      "spec_scope": {
+        "actor_out_of_scope_phase_ids": [],
+        "actor_out_of_scope_tools": [],
+        "phase_ids": [
+          "P01",
+          "P02",
+          "P03",
+          "P04",
+          "P05",
+          "P06",
+          "P07"
+        ],
+        "simulation_out_of_scope_tools": [],
+        "tool_ids": [
+          "T01",
+          "T02",
+          "T03",
+          "T04",
+          "T05",
+          "T06",
+          "T07",
+          "T08",
+          "T09",
+          "T10"
+        ],
+        "vlm_out_of_scope_phase_ids": [],
+        "vlm_out_of_scope_tools": [],
+        "world_out_of_scope_tools": []
+      },
+      "start_latency_sec": 0.001,
+      "vlm": {
+        "context_forbidden_fragments": [],
+        "errors": {},
+        "health_samples": 41,
+        "healthy_samples": 41,
+        "latency_sec": {
+          "avg": 1.428,
+          "count": 41,
+          "max": 2.821,
+          "p95": 1.753
+        },
+        "modes": {
+          "openai_compat": 41
+        },
+        "phase_alignment": {
+          "recent_mismatches": [],
+          "samples": 41,
+          "scoreboard": {
+            "format": "correct / proposed / evaluable",
+            "system": {
+              "correct": 41,
+              "display": "41 / 41 / 41",
+              "evaluable": 41,
+              "proposed": 41
+            },
+            "vlm": {
+              "correct": 41,
+              "display": "41 / 41 / 41",
+              "evaluable": 41,
+              "proposed": 41
+            }
+          },
+          "stale_context_phase_skipped": 0,
+          "transition_grace_skipped": 0
+        },
+        "prompt_chars": {
+          "max": 11273,
+          "min": 9099
+        },
+        "results": 41,
+        "schema_versions": {
+          "3": 41
+        },
+        "tool_alignment": {
+          "confusion_top": {
+            "T02->T02": 6
+          },
+          "duplicate_request_skipped": 0,
+          "field_event_skipped": 10,
+          "insufficient_system_lead_skipped": 1,
+          "mayo_visible_ground_skipped": 0,
+          "phase_advance_skipped": 0,
+          "recent_field_event_skipped": 1,
+          "recent_mismatches": [],
+          "samples": 6,
+          "scoreboard": {
+            "format": "correct / proposed / evaluable",
+            "system": {
+              "correct": 6,
+              "display": "6 / 6 / 6",
+              "evaluable": 6,
+              "proposed": 6
+            },
+            "vlm": {
+              "correct": 6,
+              "display": "6 / 6 / 6",
+              "evaluable": 6,
+              "proposed": 6
+            }
+          },
+          "stale_context_phase_skipped": 0,
+          "transition_grace_skipped": 0,
+          "visible_field_event_skipped": 5
+        }
+      },
+      "world_invariant_violations": [],
+      "world_procedure": "inguinal_hernia_repair"
+    }
+  ],
+  "failures": [],
+  "generated_at": 1782266296.5415933
+}

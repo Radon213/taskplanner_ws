@@ -53,8 +53,8 @@ export function StatusRibbon({
           <Radio size={16} />
           <span>{connected ? vm.ui.rosOnline : vm.ui.rosOffline}</span>
         </div>
-        <label className={`system-pill model-pill ${vm.vlmStatus.className}`}>
-          <span>VLM</span>
+        <div className={`ribbon-model-control ${vm.vlmStatus.className}`}>
+          <span className="ribbon-model-label">VLM</span>
           <select
             value={selectedVlmModel}
             disabled={vlmSelectDisabled}
@@ -72,7 +72,7 @@ export function StatusRibbon({
             )}
           </select>
           <strong>{vm.vlmStatus.health}</strong>
-        </label>
+        </div>
         <div className="language-control" aria-label={vm.ui.language}>
           <Languages size={15} />
           <button className={language === "ko" ? "active" : ""} onClick={() => onLanguageChange("ko")} type="button">

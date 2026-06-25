@@ -1,0 +1,239 @@
+{
+  "bundles": [
+    {
+      "blocker_count": 0,
+      "bundle": "thyroidectomy",
+      "decision_counts": {
+        "anticipatory_handover": 1,
+        "explicit_request": 4,
+        "hold": 2,
+        "idle": 16
+      },
+      "duration_sec": 45.0,
+      "findings": [],
+      "observation_violation_detected": false,
+      "observation_violation_samples": [],
+      "recoverable_events": [
+        "RobotGraspedTool",
+        "RobotTaskCompleted",
+        "RobotTaskStarted",
+        "ToolHandoverCompleted",
+        "ToolPrepared"
+      ],
+      "suspicious_count": 0,
+      "vlm_rejected_proposal_detected": false,
+      "vlm_rejection_samples": [],
+      "world_invariant_violations": []
+    },
+    {
+      "blocker_count": 0,
+      "bundle": "nephrectomy",
+      "decision_counts": {
+        "anticipatory_handover": 3,
+        "explicit_request": 3,
+        "hold": 2,
+        "idle": 12,
+        "recovery": 1
+      },
+      "duration_sec": 45.0,
+      "findings": [],
+      "observation_violation_detected": false,
+      "observation_violation_samples": [],
+      "recoverable_events": [
+        "PredictedToolReturnedToRack",
+        "RobotGraspedTool",
+        "RobotTaskCompleted",
+        "RobotTaskStarted",
+        "ToolCleaningCompleted",
+        "ToolCleaningProgress",
+        "ToolHandoverCompleted",
+        "ToolPrepared",
+        "ToolReceivedFromSurgeon",
+        "ToolReturnedToTray",
+        "ToolSentToCleaner"
+      ],
+      "suspicious_count": 0,
+      "vlm_rejected_proposal_detected": true,
+      "vlm_rejection_samples": [
+        {
+          "decision": "anticipatory_handover",
+          "phase": "P01",
+          "recent_events": [
+            "RobotTaskCompleted",
+            "ToolReturnedToTray",
+            "RecoveryTransactionClosed",
+            "ToolCleaningCompleted",
+            "ToolCleaningProgress",
+            "PhaseEvidenceObserved",
+            "ToolCleaningProgress",
+            "SurgeonActorEventApplied",
+            "ToolCleaningProgress",
+            "VLMProposalRejected",
+            "PhaseEvidenceObserved",
+            "ToolCleaningProgress",
+            "ToolCleaningProgress",
+            "ToolCleaningProgress",
+            "VLMProposalRejected",
+            "PhaseEvidenceObserved",
+            "ToolCleaningProgress",
+            "ToolCleaningProgress",
+            "ToolCleaningProgress",
+            "ToolSentToCleaner"
+          ],
+          "selected_tool": "T03",
+          "timestamp_sec": 1782267136.8513432
+        },
+        {
+          "decision": "idle",
+          "phase": "P01",
+          "recent_events": [
+            "PhaseEvidenceObserved",
+            "RobotGraspedTool",
+            "PhaseEvidenceObserved",
+            "RobotTaskStarted",
+            "RobotTaskCompleted",
+            "ToolReturnedToTray",
+            "RecoveryTransactionClosed",
+            "ToolCleaningCompleted",
+            "ToolCleaningProgress",
+            "PhaseEvidenceObserved",
+            "ToolCleaningProgress",
+            "SurgeonActorEventApplied",
+            "ToolCleaningProgress",
+            "VLMProposalRejected",
+            "PhaseEvidenceObserved",
+            "ToolCleaningProgress",
+            "ToolCleaningProgress",
+            "ToolCleaningProgress",
+            "VLMProposalRejected",
+            "PhaseEvidenceObserved"
+          ],
+          "selected_tool": "",
+          "timestamp_sec": 1782267138.6512191
+        }
+      ],
+      "world_invariant_violations": []
+    },
+    {
+      "blocker_count": 0,
+      "bundle": "inguinal_hernia_repair",
+      "decision_counts": {
+        "anticipatory_handover": 2,
+        "explicit_request": 3,
+        "hold": 1,
+        "idle": 14,
+        "recovery": 1
+      },
+      "duration_sec": 45.0,
+      "findings": [],
+      "observation_violation_detected": false,
+      "observation_violation_samples": [],
+      "recoverable_events": [
+        "RobotGraspedTool",
+        "RobotTaskCompleted",
+        "RobotTaskStarted",
+        "ToolCleaningCompleted",
+        "ToolCleaningProgress",
+        "ToolHandoverCompleted",
+        "ToolPrepared",
+        "ToolReceivedFromSurgeon",
+        "ToolReturnedToTray",
+        "ToolSentToCleaner"
+      ],
+      "suspicious_count": 0,
+      "vlm_rejected_proposal_detected": true,
+      "vlm_rejection_samples": [
+        {
+          "decision": "explicit_request",
+          "phase": "P01",
+          "recent_events": [
+            "RobotTaskCompleted",
+            "ToolReturnedToTray",
+            "RecoveryTransactionClosed",
+            "ToolCleaningCompleted",
+            "PhaseEvidenceObserved",
+            "ToolCleaningProgress",
+            "ToolCleaningProgress",
+            "ToolCleaningProgress",
+            "PhaseEvidenceObserved",
+            "ToolCleaningProgress",
+            "ToolCleaningProgress",
+            "ToolCleaningProgress",
+            "VLMProposalRejected",
+            "PhaseEvidenceObserved",
+            "ToolCleaningProgress",
+            "ToolCleaningProgress",
+            "ToolCleaningProgress",
+            "ToolSentToCleaner",
+            "VLMProposalRejected",
+            "PhaseEvidenceObserved"
+          ],
+          "selected_tool": "T03",
+          "timestamp_sec": 1782267182.7229178
+        },
+        {
+          "decision": "idle",
+          "phase": "P01",
+          "recent_events": [
+            "RobotTaskCompleted",
+            "ToolHandoverCompleted",
+            "SurgeonRequestDequeued",
+            "PhaseEvidenceObserved",
+            "RobotTaskStarted",
+            "RobotTaskCompleted",
+            "ToolReturnedToTray",
+            "RecoveryTransactionClosed",
+            "ToolCleaningCompleted",
+            "PhaseEvidenceObserved",
+            "ToolCleaningProgress",
+            "ToolCleaningProgress",
+            "ToolCleaningProgress",
+            "PhaseEvidenceObserved",
+            "ToolCleaningProgress",
+            "ToolCleaningProgress",
+            "ToolCleaningProgress",
+            "VLMProposalRejected",
+            "PhaseEvidenceObserved",
+            "ToolCleaningProgress"
+          ],
+          "selected_tool": "",
+          "timestamp_sec": 1782267183.8233802
+        },
+        {
+          "decision": "idle",
+          "phase": "P01",
+          "recent_events": [
+            "PhaseEvidenceObserved",
+            "PhaseEvidenceObserved",
+            "RobotTaskCompleted",
+            "ToolHandoverCompleted",
+            "SurgeonRequestDequeued",
+            "PhaseEvidenceObserved",
+            "RobotTaskStarted",
+            "RobotTaskCompleted",
+            "ToolReturnedToTray",
+            "RecoveryTransactionClosed",
+            "ToolCleaningCompleted",
+            "PhaseEvidenceObserved",
+            "ToolCleaningProgress",
+            "ToolCleaningProgress",
+            "ToolCleaningProgress",
+            "PhaseEvidenceObserved",
+            "ToolCleaningProgress",
+            "ToolCleaningProgress",
+            "ToolCleaningProgress",
+            "VLMProposalRejected"
+          ],
+          "selected_tool": "",
+          "timestamp_sec": 1782267185.9233837
+        }
+      ],
+      "world_invariant_violations": []
+    }
+  ],
+  "duration_sec": 45.0,
+  "failures": [],
+  "generated_at": 1782267192.6224103,
+  "mode": "attached_to_existing_runtime",
+  "policy_note": "surgeon may hold up to two active tools"
+}

@@ -1826,25 +1826,37 @@ export function useDigitalTwinViewModel({
       .sort((a, b) => compareTimelineEvents(a.event, b.event, a.index, b.index, displayEvents.length))
       .map(({ event }) => event);
     const timeline: TimelineItem[] = newestFirstEvents.length
-      ? newestFirstEvents.map((event, index) => {
-          const detail = parseEventDetail(event.detail);
+      ? (() => {
+          const seenUiIds = new Map<string, number>();
+          return newestFirstEvents.map((event, index) => {
+            const detail = parseEventDetail(event.detail);
+            const fallbackUiId = `${event.event_type}-${event.instrument_id}-${event.status}-${event.detail}`;
+            const baseUiId = event.ui_id ?? fallbackUiId;
+            const occurrence = seenUiIds.get(baseUiId) ?? 0;
+            seenUiIds.set(baseUiId, occurrence + 1);
+            const uniqueUiId = occurrence ? `${baseUiId}-${occurrence}` : baseUiId;
+            return {
+              id: `${uniqueUiId}-${event.event_type}-${event.instrument_id}-${index}`,
+              uiId: uniqueUiId,
+              title: readableEventTitle(event, catalog, language, localizedToolName),
+              meta: readableEventMeta(event, catalog, language, localizedToolName, anchorNameForId),
+              tone: eventTone(event.event_type, detail, catalog),
+              severity: eventSeverity(event.event_type, detail, catalog),
+            };
+          });
+        })()
+      : displayRecentEvents.slice(0, 8).map((event, index, recentEvents) => {
+          const sameEventOrdinalFromTail = recentEvents.slice(index).filter((candidate) => candidate === event).length;
+          const stableKey = `${event}-${sameEventOrdinalFromTail}`;
           return {
-            id: `${event.event_type}-${event.instrument_id}-${index}`,
-            uiId: event.ui_id ?? `${event.event_type}-${event.instrument_id}-${event.status}-${event.detail}`,
-            title: readableEventTitle(event, catalog, language, localizedToolName),
-            meta: readableEventMeta(event, catalog, language, localizedToolName, anchorNameForId),
-            tone: eventTone(event.event_type, detail, catalog),
-            severity: eventSeverity(event.event_type, detail, catalog),
+            id: `recent-${stableKey}`,
+            uiId: `recent-${stableKey}`,
+            title: catalogLabel(catalog, "events", event, language, titleize(event)),
+            meta: activeBundle,
+            tone: "neutral" as const,
+            severity: eventSeverity(event, {}, catalog),
           };
-        })
-      : displayRecentEvents.slice(0, 8).map((event, index) => ({
-          id: `${event}-${index}`,
-          uiId: `${event}-${index}`,
-          title: catalogLabel(catalog, "events", event, language, titleize(event)),
-          meta: activeBundle,
-          tone: "neutral" as const,
-          severity: eventSeverity(event, {}, catalog),
-        }));
+        });
 
     const vlmShouldRun =
       simulationState.running || ["starting", "running", "finishing"].includes(simulationState.execution_state);

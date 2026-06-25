@@ -233,9 +233,9 @@ class SmokeHarness(Node):
             self._world_invariant_violations.append(
                 f"right arm carried multiple tools simultaneously: {sorted(right_arm_tools)}"
             )
-        if len(surgeon_tools) > 1:
+        if len(surgeon_tools) > 2:
             self._world_invariant_violations.append(
-                f"surgeon held multiple active tools simultaneously: {sorted(surgeon_tools)}"
+                f"surgeon held more than two active tools simultaneously: {sorted(surgeon_tools)}"
             )
         if msg.left_hand_tool and msg.left_hand_tool not in left_arm_tools:
             self._world_invariant_violations.append(

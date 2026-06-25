@@ -1,0 +1,119 @@
+{
+  "bundles": [
+    "thyroidectomy",
+    "nephrectomy",
+    "inguinal_hernia_repair"
+  ],
+  "failures": [
+    {
+      "bundle": "thyroidectomy",
+      "error": "failed to set actor seed 240625: stdout='' stderr='Node not found\\n'",
+      "repeat_index": 1,
+      "seed": 240625,
+      "traceback": "Traceback (most recent call last):\n  File \"/workspaces/taskplanner_ws/reports/full_run_eval_runner.py\", line 198, in main\n    result = run_one(\n             ^^^^^^^^\n  File \"/workspaces/taskplanner_ws/reports/full_run_eval_runner.py\", line 106, in run_one\n    set_actor_seed(seed)\n  File \"/workspaces/taskplanner_ws/reports/full_run_eval_runner.py\", line 59, in set_actor_seed\n    raise RuntimeError(\nRuntimeError: failed to set actor seed 240625: stdout='' stderr='Node not found\\n'\n"
+    },
+    {
+      "bundle": "thyroidectomy",
+      "error": "failed to set actor seed 240626: stdout='' stderr='Node not found\\n'",
+      "repeat_index": 2,
+      "seed": 240626,
+      "traceback": "Traceback (most recent call last):\n  File \"/workspaces/taskplanner_ws/reports/full_run_eval_runner.py\", line 198, in main\n    result = run_one(\n             ^^^^^^^^\n  File \"/workspaces/taskplanner_ws/reports/full_run_eval_runner.py\", line 106, in run_one\n    set_actor_seed(seed)\n  File \"/workspaces/taskplanner_ws/reports/full_run_eval_runner.py\", line 59, in set_actor_seed\n    raise RuntimeError(\nRuntimeError: failed to set actor seed 240626: stdout='' stderr='Node not found\\n'\n"
+    },
+    {
+      "bundle": "thyroidectomy",
+      "error": "failed to set actor seed 240627: stdout='' stderr='Node not found\\n'",
+      "repeat_index": 3,
+      "seed": 240627,
+      "traceback": "Traceback (most recent call last):\n  File \"/workspaces/taskplanner_ws/reports/full_run_eval_runner.py\", line 198, in main\n    result = run_one(\n             ^^^^^^^^\n  File \"/workspaces/taskplanner_ws/reports/full_run_eval_runner.py\", line 106, in run_one\n    set_actor_seed(seed)\n  File \"/workspaces/taskplanner_ws/reports/full_run_eval_runner.py\", line 59, in set_actor_seed\n    raise RuntimeError(\nRuntimeError: failed to set actor seed 240627: stdout='' stderr='Node not found\\n'\n"
+    },
+    {
+      "bundle": "thyroidectomy",
+      "error": "failed to set actor seed 240628: stdout='' stderr='Node not found\\n'",
+      "repeat_index": 4,
+      "seed": 240628,
+      "traceback": "Traceback (most recent call last):\n  File \"/workspaces/taskplanner_ws/reports/full_run_eval_runner.py\", line 198, in main\n    result = run_one(\n             ^^^^^^^^\n  File \"/workspaces/taskplanner_ws/reports/full_run_eval_runner.py\", line 106, in run_one\n    set_actor_seed(seed)\n  File \"/workspaces/taskplanner_ws/reports/full_run_eval_runner.py\", line 59, in set_actor_seed\n    raise RuntimeError(\nRuntimeError: failed to set actor seed 240628: stdout='' stderr='Node not found\\n'\n"
+    },
+    {
+      "bundle": "thyroidectomy",
+      "error": "failed to set actor seed 240629: stdout='' stderr='Node not found\\n'",
+      "repeat_index": 5,
+      "seed": 240629,
+      "traceback": "Traceback (most recent call last):\n  File \"/workspaces/taskplanner_ws/reports/full_run_eval_runner.py\", line 198, in main\n    result = run_one(\n             ^^^^^^^^\n  File \"/workspaces/taskplanner_ws/reports/full_run_eval_runner.py\", line 106, in run_one\n    set_actor_seed(seed)\n  File \"/workspaces/taskplanner_ws/reports/full_run_eval_runner.py\", line 59, in set_actor_seed\n    raise RuntimeError(\nRuntimeError: failed to set actor seed 240629: stdout='' stderr='Node not found\\n'\n"
+    },
+    {
+      "bundle": "nephrectomy",
+      "error": "failed to set actor seed 240725: stdout='' stderr='Node not found\\n'",
+      "repeat_index": 1,
+      "seed": 240725,
+      "traceback": "Traceback (most recent call last):\n  File \"/workspaces/taskplanner_ws/reports/full_run_eval_runner.py\", line 198, in main\n    result = run_one(\n             ^^^^^^^^\n  File \"/workspaces/taskplanner_ws/reports/full_run_eval_runner.py\", line 106, in run_one\n    set_actor_seed(seed)\n  File \"/workspaces/taskplanner_ws/reports/full_run_eval_runner.py\", line 59, in set_actor_seed\n    raise RuntimeError(\nRuntimeError: failed to set actor seed 240725: stdout='' stderr='Node not found\\n'\n"
+    },
+    {
+      "bundle": "nephrectomy",
+      "error": "failed to set actor seed 240726: stdout='' stderr='Node not found\\n'",
+      "repeat_index": 2,
+      "seed": 240726,
+      "traceback": "Traceback (most recent call last):\n  File \"/workspaces/taskplanner_ws/reports/full_run_eval_runner.py\", line 198, in main\n    result = run_one(\n             ^^^^^^^^\n  File \"/workspaces/taskplanner_ws/reports/full_run_eval_runner.py\", line 106, in run_one\n    set_actor_seed(seed)\n  File \"/workspaces/taskplanner_ws/reports/full_run_eval_runner.py\", line 59, in set_actor_seed\n    raise RuntimeError(\nRuntimeError: failed to set actor seed 240726: stdout='' stderr='Node not found\\n'\n"
+    },
+    {
+      "bundle": "nephrectomy",
+      "error": "failed to set actor seed 240727: stdout='' stderr='Node not found\\n'",
+      "repeat_index": 3,
+      "seed": 240727,
+      "traceback": "Traceback (most recent call last):\n  File \"/workspaces/taskplanner_ws/reports/full_run_eval_runner.py\", line 198, in main\n    result = run_one(\n             ^^^^^^^^\n  File \"/workspaces/taskplanner_ws/reports/full_run_eval_runner.py\", line 106, in run_one\n    set_actor_seed(seed)\n  File \"/workspaces/taskplanner_ws/reports/full_run_eval_runner.py\", line 59, in set_actor_seed\n    raise RuntimeError(\nRuntimeError: failed to set actor seed 240727: stdout='' stderr='Node not found\\n'\n"
+    },
+    {
+      "bundle": "nephrectomy",
+      "error": "failed to set actor seed 240728: stdout='' stderr='Node not found\\n'",
+      "repeat_index": 4,
+      "seed": 240728,
+      "traceback": "Traceback (most recent call last):\n  File \"/workspaces/taskplanner_ws/reports/full_run_eval_runner.py\", line 198, in main\n    result = run_one(\n             ^^^^^^^^\n  File \"/workspaces/taskplanner_ws/reports/full_run_eval_runner.py\", line 106, in run_one\n    set_actor_seed(seed)\n  File \"/workspaces/taskplanner_ws/reports/full_run_eval_runner.py\", line 59, in set_actor_seed\n    raise RuntimeError(\nRuntimeError: failed to set actor seed 240728: stdout='' stderr='Node not found\\n'\n"
+    },
+    {
+      "bundle": "nephrectomy",
+      "error": "failed to set actor seed 240729: stdout='' stderr='Node not found\\n'",
+      "repeat_index": 5,
+      "seed": 240729,
+      "traceback": "Traceback (most recent call last):\n  File \"/workspaces/taskplanner_ws/reports/full_run_eval_runner.py\", line 198, in main\n    result = run_one(\n             ^^^^^^^^\n  File \"/workspaces/taskplanner_ws/reports/full_run_eval_runner.py\", line 106, in run_one\n    set_actor_seed(seed)\n  File \"/workspaces/taskplanner_ws/reports/full_run_eval_runner.py\", line 59, in set_actor_seed\n    raise RuntimeError(\nRuntimeError: failed to set actor seed 240729: stdout='' stderr='Node not found\\n'\n"
+    },
+    {
+      "bundle": "inguinal_hernia_repair",
+      "error": "failed to set actor seed 240825: stdout='' stderr='Node not found\\n'",
+      "repeat_index": 1,
+      "seed": 240825,
+      "traceback": "Traceback (most recent call last):\n  File \"/workspaces/taskplanner_ws/reports/full_run_eval_runner.py\", line 198, in main\n    result = run_one(\n             ^^^^^^^^\n  File \"/workspaces/taskplanner_ws/reports/full_run_eval_runner.py\", line 106, in run_one\n    set_actor_seed(seed)\n  File \"/workspaces/taskplanner_ws/reports/full_run_eval_runner.py\", line 59, in set_actor_seed\n    raise RuntimeError(\nRuntimeError: failed to set actor seed 240825: stdout='' stderr='Node not found\\n'\n"
+    },
+    {
+      "bundle": "inguinal_hernia_repair",
+      "error": "failed to set actor seed 240826: stdout='' stderr='Node not found\\n'",
+      "repeat_index": 2,
+      "seed": 240826,
+      "traceback": "Traceback (most recent call last):\n  File \"/workspaces/taskplanner_ws/reports/full_run_eval_runner.py\", line 198, in main\n    result = run_one(\n             ^^^^^^^^\n  File \"/workspaces/taskplanner_ws/reports/full_run_eval_runner.py\", line 106, in run_one\n    set_actor_seed(seed)\n  File \"/workspaces/taskplanner_ws/reports/full_run_eval_runner.py\", line 59, in set_actor_seed\n    raise RuntimeError(\nRuntimeError: failed to set actor seed 240826: stdout='' stderr='Node not found\\n'\n"
+    },
+    {
+      "bundle": "inguinal_hernia_repair",
+      "error": "failed to set actor seed 240827: stdout='' stderr='Node not found\\n'",
+      "repeat_index": 3,
+      "seed": 240827,
+      "traceback": "Traceback (most recent call last):\n  File \"/workspaces/taskplanner_ws/reports/full_run_eval_runner.py\", line 198, in main\n    result = run_one(\n             ^^^^^^^^\n  File \"/workspaces/taskplanner_ws/reports/full_run_eval_runner.py\", line 106, in run_one\n    set_actor_seed(seed)\n  File \"/workspaces/taskplanner_ws/reports/full_run_eval_runner.py\", line 59, in set_actor_seed\n    raise RuntimeError(\nRuntimeError: failed to set actor seed 240827: stdout='' stderr='Node not found\\n'\n"
+    },
+    {
+      "bundle": "inguinal_hernia_repair",
+      "error": "failed to set actor seed 240828: stdout='' stderr='Node not found\\n'",
+      "repeat_index": 4,
+      "seed": 240828,
+      "traceback": "Traceback (most recent call last):\n  File \"/workspaces/taskplanner_ws/reports/full_run_eval_runner.py\", line 198, in main\n    result = run_one(\n             ^^^^^^^^\n  File \"/workspaces/taskplanner_ws/reports/full_run_eval_runner.py\", line 106, in run_one\n    set_actor_seed(seed)\n  File \"/workspaces/taskplanner_ws/reports/full_run_eval_runner.py\", line 59, in set_actor_seed\n    raise RuntimeError(\nRuntimeError: failed to set actor seed 240828: stdout='' stderr='Node not found\\n'\n"
+    },
+    {
+      "bundle": "inguinal_hernia_repair",
+      "error": "failed to set actor seed 240829: stdout='' stderr='Node not found\\n'",
+      "repeat_index": 5,
+      "seed": 240829,
+      "traceback": "Traceback (most recent call last):\n  File \"/workspaces/taskplanner_ws/reports/full_run_eval_runner.py\", line 198, in main\n    result = run_one(\n             ^^^^^^^^\n  File \"/workspaces/taskplanner_ws/reports/full_run_eval_runner.py\", line 106, in run_one\n    set_actor_seed(seed)\n  File \"/workspaces/taskplanner_ws/reports/full_run_eval_runner.py\", line 59, in set_actor_seed\n    raise RuntimeError(\nRuntimeError: failed to set actor seed 240829: stdout='' stderr='Node not found\\n'\n"
+    }
+  ],
+  "generated_at": 1782269084.6024458,
+  "mode": "full_start_to_completion",
+  "repeats_per_bundle": 5,
+  "runs": [],
+  "timeout_sec": 420.0
+}

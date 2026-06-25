@@ -37,8 +37,18 @@ def _recoverable_tools(world: WorldState) -> list[str]:
     ]
 
 
+def _unused_preposition_tools(world: WorldState) -> list[str]:
+    return [
+        instrument.instrument_id
+        for instrument in world.instrument_states
+        if instrument.lifecycle_stage == "prepositioned_right"
+        or (instrument.instrument_id == world.right_hand_tool and instrument.owner == "robot_right_hand")
+    ]
+
+
 def _active_recovery_context(world: WorldState) -> tuple[bool, bool, list[str]]:
     recoverable = _recoverable_tools(world)
+    unused_preposition = _unused_preposition_tools(world)
     pending_recovery = bool(
         world.surgeon_ready_for_retrieval
         or world.surgeon_intent in {"return_tool", "extend_hand_for_retrieval"}
@@ -51,6 +61,7 @@ def _active_recovery_context(world: WorldState) -> tuple[bool, bool, list[str]]:
             instrument.next_required_transition in {"recover_left", "clean_left", "return_home"}
             for instrument in world.instrument_states
         )
+        or unused_preposition
     )
     return pending_recovery, pipeline_active, recoverable
 
@@ -514,7 +525,7 @@ class BTAuditHarness(SmokeHarness):
         return {
             "bundle": self._bundle_name,
             "duration_sec": duration_sec,
-            "decision_counts": self._decision_count,
+            "decision_counts": dict(self._decision_count),
             "world_invariant_violations": sorted(set(self._world_invariant_violations)),
             "observation_violation_detected": self._observation_violation_detected,
             "observation_violation_samples": self._observation_violation_samples[:5],
