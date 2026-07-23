@@ -12,6 +12,7 @@ def generate_launch_description() -> LaunchDescription:
     spec_dir = LaunchConfiguration("spec_dir")
     enable_rosbridge = LaunchConfiguration("enable_rosbridge")
     rosbridge_port = LaunchConfiguration("rosbridge_port")
+    rosbridge_address = LaunchConfiguration("rosbridge_address")
     rosbridge_service_timeout = LaunchConfiguration("rosbridge_service_timeout")
     vlm_mode = LaunchConfiguration("vlm_mode")
     vlm_base_url = LaunchConfiguration("vlm_base_url")
@@ -23,11 +24,17 @@ def generate_launch_description() -> LaunchDescription:
     vlm_reasoning_effort = LaunchConfiguration("vlm_reasoning_effort")
     vlm_response_mode = LaunchConfiguration("vlm_response_mode")
     vlm_context_mode = LaunchConfiguration("vlm_context_mode")
+    vlm_image_stale_sec = LaunchConfiguration("vlm_image_stale_sec")
     surgeon_actor_mode = LaunchConfiguration("surgeon_actor_mode")
     actor_base_url = LaunchConfiguration("actor_base_url")
     actor_model_id = LaunchConfiguration("actor_model_id")
     actor_response_format = LaunchConfiguration("actor_response_format")
     actor_reasoning_effort = LaunchConfiguration("actor_reasoning_effort")
+    retrieval_choice_mode = LaunchConfiguration("retrieval_choice_mode")
+    retrieval_choice_base_url = LaunchConfiguration("retrieval_choice_base_url")
+    retrieval_choice_model_id = LaunchConfiguration("retrieval_choice_model_id")
+    retrieval_choice_response_format = LaunchConfiguration("retrieval_choice_response_format")
+    retrieval_choice_request_timeout_sec = LaunchConfiguration("retrieval_choice_request_timeout_sec")
     validation_mode = LaunchConfiguration("validation_mode")
     enable_no_image_camera = LaunchConfiguration("enable_no_image_camera")
     enable_synthetic_scene_camera = LaunchConfiguration("enable_synthetic_scene_camera")
@@ -43,6 +50,7 @@ def generate_launch_description() -> LaunchDescription:
     )
     rule_surgeon_actor_enabled = PythonExpression(["'", surgeon_actor_mode, "' == 'rule'"])
     llm_surgeon_actor_enabled = PythonExpression(["'", surgeon_actor_mode, "' == 'llm'"])
+    retrieval_choice_enabled = PythonExpression(["'", retrieval_choice_mode, "' == 'llm'"])
 
     rosbridge_process = ExecuteProcess(
         condition=IfCondition(enable_rosbridge),
@@ -54,7 +62,7 @@ def generate_launch_description() -> LaunchDescription:
                     "'if ros2 pkg prefix rosbridge_server >/dev/null 2>&1; then "
                     "ros2 run rosbridge_server rosbridge_websocket --ros-args -p port:=' + str(",
                     rosbridge_port,
-                    ") + ' -p default_call_service_timeout:=' + str(",
+                    ") + ' -p address:=127.0.0.1 -p default_call_service_timeout:=' + str(",
                     rosbridge_service_timeout,
                     ") + '; else echo \"[taskplanner_mock] rosbridge_server is not installed\"; fi'",
                 ]
@@ -68,22 +76,29 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("spec_dir", default_value=spec_default),
             DeclareLaunchArgument("enable_rosbridge", default_value="true"),
             DeclareLaunchArgument("rosbridge_port", default_value="9090"),
+            DeclareLaunchArgument("rosbridge_address", default_value="127.0.0.1"),
             DeclareLaunchArgument("rosbridge_service_timeout", default_value="30.0"),
             DeclareLaunchArgument("vlm_mode", default_value="real"),
             DeclareLaunchArgument("vlm_base_url", default_value="http://127.0.0.1:1234"),
             DeclareLaunchArgument("vlm_model_id", default_value="qwen3.6-35b-a3b-mtp@q2_k_xl"),
             DeclareLaunchArgument("vlm_api_mode", default_value="openai_compat"),
-            DeclareLaunchArgument("vlm_publish_period_sec", default_value="1.0"),
+            DeclareLaunchArgument("vlm_publish_period_sec", default_value="5.0"),
             DeclareLaunchArgument("vlm_max_output_tokens", default_value="320"),
             DeclareLaunchArgument("vlm_response_format", default_value="json_schema"),
             DeclareLaunchArgument("vlm_reasoning_effort", default_value="none"),
             DeclareLaunchArgument("vlm_response_mode", default_value="live"),
             DeclareLaunchArgument("vlm_context_mode", default_value="actor_log"),
+            DeclareLaunchArgument("vlm_image_stale_sec", default_value="3.0"),
             DeclareLaunchArgument("surgeon_actor_mode", default_value="llm"),
             DeclareLaunchArgument("actor_base_url", default_value="http://127.0.0.1:1234"),
             DeclareLaunchArgument("actor_model_id", default_value="google/gemma-4-12b-qat"),
             DeclareLaunchArgument("actor_response_format", default_value="json_schema"),
             DeclareLaunchArgument("actor_reasoning_effort", default_value="none"),
+            DeclareLaunchArgument("retrieval_choice_mode", default_value="none"),
+            DeclareLaunchArgument("retrieval_choice_base_url", default_value="http://127.0.0.1:1234"),
+            DeclareLaunchArgument("retrieval_choice_model_id", default_value="qwen2.5-vl-7b-instruct"),
+            DeclareLaunchArgument("retrieval_choice_response_format", default_value="json_object"),
+            DeclareLaunchArgument("retrieval_choice_request_timeout_sec", default_value="20.0"),
             DeclareLaunchArgument("validation_mode", default_value="bt_twin"),
             DeclareLaunchArgument("enable_no_image_camera", default_value="true"),
             DeclareLaunchArgument("enable_synthetic_scene_camera", default_value="false"),
@@ -144,7 +159,12 @@ def generate_launch_description() -> LaunchDescription:
                 condition=IfCondition(
                     PythonExpression(["'", field_snapshot_url, "' != ''"])
                 ),
-                parameters=[{"snapshot_url": field_snapshot_url}],
+                parameters=[
+                    {
+                        "snapshot_url": field_snapshot_url,
+                        "max_source_age_sec": vlm_image_stale_sec,
+                    }
+                ],
                 output="screen",
             ),
             Node(
@@ -164,6 +184,7 @@ def generate_launch_description() -> LaunchDescription:
                         "reasoning_effort": vlm_reasoning_effort,
                         "response_mode": vlm_response_mode,
                         "context_mode": vlm_context_mode,
+                        "image_stale_sec": vlm_image_stale_sec,
                         "output_prefix": PythonExpression(
                             ["'/vlm' if '", vlm_mode, "' == 'real' else '/vlm_real'"]
                         ),
@@ -201,6 +222,22 @@ def generate_launch_description() -> LaunchDescription:
                         "response_format": actor_response_format,
                         "reasoning_effort": actor_reasoning_effort,
                         "decision_period_sec": 0.25,
+                    }
+                ],
+                output="screen",
+            ),
+            Node(
+                package="simulation_runtime",
+                executable="llm_retrieval_choice_selector",
+                name="llm_retrieval_choice_selector",
+                condition=IfCondition(retrieval_choice_enabled),
+                parameters=[
+                    {
+                        "base_url": retrieval_choice_base_url,
+                        "model_id": retrieval_choice_model_id,
+                        "response_format": retrieval_choice_response_format,
+                        "request_timeout_sec": retrieval_choice_request_timeout_sec,
+                        "enabled": True,
                     }
                 ],
                 output="screen",

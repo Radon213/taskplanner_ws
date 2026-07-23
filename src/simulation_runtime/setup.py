@@ -22,6 +22,7 @@ setup(
             "mock_surgeon = simulation_runtime.mock_surgeon:main",
             "surgeon_actor = simulation_runtime.surgeon_actor:main",
             "llm_surgeon_actor = simulation_runtime.llm_surgeon_actor:main",
+            "llm_retrieval_choice_selector = simulation_runtime.llm_retrieval_choice_selector:main",
         ],
     },
 )

@@ -17,7 +17,7 @@ from rclpy.node import Node
 from rclpy.parameter import Parameter
 from rclpy.parameter_client import AsyncParameterClient
 from std_msgs.msg import String
-from surgical_msgs.msg import SimulationState, SurgeonRequest
+from surgical_msgs.msg import SimulationState, SurgeonActorEvent, SurgeonRequest
 from surgical_msgs.srv import ControlSimulation, InjectSurgeonOverride, SelectSimulationBundle
 
 
@@ -37,6 +37,7 @@ class SimulationManagerNode(Node):
         self.declare_parameter("executor_name", "tree_executor")
         self.declare_parameter("tick_rate_hz", 0.1)
         self.declare_parameter("groot2_port", 0)
+        self.declare_parameter("manual_override_actor_mute_sec", 300.0)
 
         self._spec_root = Path(str(self.get_parameter("spec_root").value))
         self._active_bundle = str(self.get_parameter("default_bundle").value)
@@ -44,6 +45,7 @@ class SimulationManagerNode(Node):
         self._executor_name = str(self.get_parameter("executor_name").value)
         self._tick_rate_hz = float(self.get_parameter("tick_rate_hz").value)
         self._groot2_port = int(self.get_parameter("groot2_port").value)
+        self._manual_override_actor_mute_sec = float(self.get_parameter("manual_override_actor_mute_sec").value)
         self._running = False
         self._execution_state = "idle"
         self._bundle_dirty = False
@@ -57,6 +59,8 @@ class SimulationManagerNode(Node):
 
         self._control_pub = self.create_publisher(String, "/simulation/control_state", 10)
         self._override_pub = self.create_publisher(SurgeonRequest, "/simulation/surgeon_override", 10)
+        self._direct_request_pub = self.create_publisher(SurgeonRequest, "/surgeon/request", 10)
+        self._direct_actor_event_pub = self.create_publisher(SurgeonActorEvent, "/surgeon/actor_event", 10)
         self.create_subscription(
             SimulationState,
             "/simulation/state",
@@ -853,23 +857,50 @@ class SimulationManagerNode(Node):
             response.message = f"event_type '{event_type}' requires requested_tool"
             return response
 
+        # Manual override test path:
+        # 1) mute the autonomous LLM actor briefly
+        # 2) clear pending request queue when requested
+        # 3) publish the manual cue directly to /surgeon/request so the digital twin sees it
+        # 4) keep /simulation/surgeon_override and /surgeon/actor_event for observability
+        mute_msg = String()
+        mute_msg.data = f"mute_actor:{self._manual_override_actor_mute_sec:.1f}"
+        self._control_pub.publish(mute_msg)
+
         if request.clear_pending_requests:
             cancel = SurgeonRequest()
+            cancel.stamp = self.get_clock().now().to_msg()
             cancel.event_type = "cancel_request"
             cancel.override = True
-            cancel.note = "clear pending requests before override"
+            cancel.note = "clear pending requests before manual override"
             self._override_pub.publish(cancel)
+            self._direct_request_pub.publish(cancel)
+
         msg = SurgeonRequest()
+        msg.stamp = self.get_clock().now().to_msg()
         msg.event_type = event_type
         msg.requested_tool = canonical_tool
         msg.voice_text = request.voice_text
         msg.ready_for_handover = bool(request.ready_for_handover)
         msg.ready_for_retrieval = bool(request.ready_for_retrieval)
         msg.override = True
-        msg.note = "simulation_manager override"
+        msg.note = f"simulation_manager manual_override actor_muted_sec={self._manual_override_actor_mute_sec:.1f}"
         self._override_pub.publish(msg)
+        self._direct_request_pub.publish(msg)
+
+        actor_event = SurgeonActorEvent()
+        actor_event.stamp = msg.stamp
+        actor_event.event_type = event_type
+        actor_event.tool_id = canonical_tool
+        actor_event.phase_id = ""
+        actor_event.voice_text = request.voice_text
+        actor_event.note = msg.note
+        actor_event.ready_for_handover = bool(request.ready_for_handover)
+        actor_event.ready_for_retrieval = bool(request.ready_for_retrieval)
+        actor_event.override = True
+        self._direct_actor_event_pub.publish(actor_event)
+
         response.success = True
-        response.message = "surgeon override published"
+        response.message = f"manual surgeon override published; autonomous actor muted for {self._manual_override_actor_mute_sec:.1f}s"
         return response
 
 

@@ -68,7 +68,8 @@ class ORDigitalTwinNode(Node):
         self.declare_parameter("validation_mode", "bt_twin")
         self.declare_parameter("phase_authority", "reducer")
         self.declare_parameter("vlm_mode", "mock")
-        self.declare_parameter("vlm_health_timeout_sec", 6.0)
+        self.declare_parameter("vlm_health_timeout_sec", 30.0)
+        self.declare_parameter("vlm_evidence_gap_timeout_sec", 30.0)
         self.declare_parameter("mayo_retrieve_confidence_threshold", 0.5)
         self.declare_parameter("mayo_reuse_suppress_threshold", 0.5)
         self.declare_parameter("mayo_stability_sec", 5.0)
@@ -80,6 +81,10 @@ class ORDigitalTwinNode(Node):
         self._phase_authority = str(self.get_parameter("phase_authority").value)
         self._vlm_mode = str(self.get_parameter("vlm_mode").value)
         self._vlm_health_timeout_sec = max(0.5, float(self.get_parameter("vlm_health_timeout_sec").value))
+        self._vlm_evidence_gap_timeout_sec = max(
+            1.0,
+            float(self.get_parameter("vlm_evidence_gap_timeout_sec").value),
+        )
         self._mayo_retrieve_threshold = float(self.get_parameter("mayo_retrieve_confidence_threshold").value)
         self._mayo_reuse_threshold = float(self.get_parameter("mayo_reuse_suppress_threshold").value)
         self._mayo_stability_sec = max(0.1, float(self.get_parameter("mayo_stability_sec").value))
@@ -165,6 +170,8 @@ class ORDigitalTwinNode(Node):
                 self._vlm_mode = str(parameter.value)
             elif parameter.name == "vlm_health_timeout_sec":
                 self._vlm_health_timeout_sec = max(0.5, float(parameter.value))
+            elif parameter.name == "vlm_evidence_gap_timeout_sec":
+                self._vlm_evidence_gap_timeout_sec = max(1.0, float(parameter.value))
             elif parameter.name == "mayo_retrieve_confidence_threshold":
                 self._mayo_retrieve_threshold = float(parameter.value)
             elif parameter.name == "mayo_reuse_suppress_threshold":
@@ -209,6 +216,10 @@ class ORDigitalTwinNode(Node):
                 continue
             if not bool(health.connected and health.healthy) or bool(health.last_error):
                 unhealthy = True
+        if unhealthy:
+            self._clear_tool_prediction_state()
+            self._mayo_retrieve_stability.clear()
+            self._mayo_reuse_stability.clear()
         self._twin.set_safety_flag("vlm_unhealthy", unhealthy)
 
     def _bundle_metadata_payload(self, spec) -> dict:
@@ -982,7 +993,10 @@ class ORDigitalTwinNode(Node):
                 tracker.pop(tool_id, None)
             return (False, 0.0)
         entry = tracker.get(tool_id)
-        if entry is None or now_sec - float(entry.get("last_seen", now_sec)) > 2.5:
+        if (
+            entry is None
+            or now_sec - float(entry.get("last_seen", now_sec)) > self._vlm_evidence_gap_timeout_sec
+        ):
             entry = {"first_seen": now_sec, "last_seen": now_sec, "confidence": confidence}
             tracker[tool_id] = entry
         else:
@@ -994,7 +1008,10 @@ class ORDigitalTwinNode(Node):
     def _stable_reuse_tools(self, now_sec: float) -> set[str]:
         stable = set()
         for tool_id, entry in list(self._mayo_reuse_stability.items()):
-            if now_sec - float(entry.get("last_seen", now_sec)) > 2.5:
+            if (
+                now_sec - float(entry.get("last_seen", now_sec))
+                > self._vlm_evidence_gap_timeout_sec
+            ):
                 self._mayo_reuse_stability.pop(tool_id, None)
                 continue
             if now_sec - float(entry.get("first_seen", now_sec)) >= self._mayo_stability_sec:
@@ -1003,7 +1020,10 @@ class ORDigitalTwinNode(Node):
 
     def _clear_stale_tool_prediction(self, now_sec: float) -> None:
         for tool_id, entry in list(self._tool_predict_stability.items()):
-            if now_sec - float(entry.get("last_seen", now_sec)) > 2.5:
+            if (
+                now_sec - float(entry.get("last_seen", now_sec))
+                > self._vlm_evidence_gap_timeout_sec
+            ):
                 self._tool_predict_stability.pop(tool_id, None)
         if not self._twin.state.predicted_tool:
             return
@@ -1078,7 +1098,10 @@ class ORDigitalTwinNode(Node):
         for tracked_tool, entry in self._tool_predict_stability.items():
             if tracked_tool != best_tool and strong_new_consensus:
                 continue
-            if now_sec - float(entry.get("last_seen", now_sec)) > 2.5:
+            if (
+                now_sec - float(entry.get("last_seen", now_sec))
+                > self._vlm_evidence_gap_timeout_sec
+            ):
                 continue
             tracked_score = fused_scores.get(tracked_tool)
             if tracked_score is None:

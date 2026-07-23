@@ -28,6 +28,7 @@ from .models import (
     TwinState,
     LIFECYCLE_CLEANED_LEFT,
     LIFECYCLE_CLEANING_LEFT,
+    LIFECYCLE_DROPPED_FLOOR,
     LIFECYCLE_HOME_RACK,
     LIFECYCLE_MAYO_RECOVERY,
     LIFECYCLE_MAYO_REUSE,
@@ -43,7 +44,13 @@ ACTIVE_REQUEST_INTENTS = {"request_tool", "voice_request", "extend_hand_for_hand
 ACTIVE_RETURN_INTENTS = {"return_tool", "extend_hand_for_retrieval"}
 RIGHT_HAND_LIFECYCLES = {LIFECYCLE_PREPOSITIONED_RIGHT}
 LEFT_HAND_LIFECYCLES = {LIFECYCLE_RECOVERING_LEFT}
-PENDING_TRANSITIONS_REQUIRE_ACTION = {"recover_left", "clean_left", "return_home", "return_unused_preposition"}
+PENDING_TRANSITIONS_REQUIRE_ACTION = {
+    "recover_left",
+    "clean_left",
+    "return_home",
+    "return_unused_preposition",
+    "human_recovery_required",
+}
 MAYO_REUSE_SOFT_LIMIT = 2
 PHASE_INTERACTION_MIN_FRACTION = 0.4
 BLOCKING_SAFETY_FLAGS = {
@@ -52,14 +59,16 @@ BLOCKING_SAFETY_FLAGS = {
     "surgeon_owned_overloaded",
     "duplicate_tool_holder",
     "vlm_unhealthy",
+    "dropped_tool_requires_human",
 }
 ALLOWED_EVENT_TRANSITIONS = {
     LIFECYCLE_HOME_RACK: {LIFECYCLE_PREPOSITIONED_RIGHT, LIFECYCLE_RETURNED_HOME},
     LIFECYCLE_RETURNED_HOME: {LIFECYCLE_PREPOSITIONED_RIGHT, LIFECYCLE_SURGEON_OWNED},
-    LIFECYCLE_PREPOSITIONED_RIGHT: {LIFECYCLE_PREPOSITIONED_RIGHT, LIFECYCLE_SURGEON_OWNED, LIFECYCLE_RETURNED_HOME},
-    LIFECYCLE_SURGEON_OWNED: {LIFECYCLE_SURGEON_OWNED, LIFECYCLE_MAYO_REUSE, LIFECYCLE_MAYO_RECOVERY, LIFECYCLE_RECOVERING_LEFT},
-    LIFECYCLE_MAYO_REUSE: {LIFECYCLE_MAYO_REUSE, LIFECYCLE_SURGEON_OWNED, LIFECYCLE_MAYO_RECOVERY, LIFECYCLE_RECOVERING_LEFT},
-    LIFECYCLE_MAYO_RECOVERY: {LIFECYCLE_MAYO_RECOVERY, LIFECYCLE_RECOVERING_LEFT},
+    LIFECYCLE_PREPOSITIONED_RIGHT: {LIFECYCLE_PREPOSITIONED_RIGHT, LIFECYCLE_SURGEON_OWNED, LIFECYCLE_RETURNED_HOME, LIFECYCLE_DROPPED_FLOOR},
+    LIFECYCLE_SURGEON_OWNED: {LIFECYCLE_SURGEON_OWNED, LIFECYCLE_MAYO_REUSE, LIFECYCLE_MAYO_RECOVERY, LIFECYCLE_RECOVERING_LEFT, LIFECYCLE_DROPPED_FLOOR},
+    LIFECYCLE_MAYO_REUSE: {LIFECYCLE_MAYO_REUSE, LIFECYCLE_SURGEON_OWNED, LIFECYCLE_MAYO_RECOVERY, LIFECYCLE_RECOVERING_LEFT, LIFECYCLE_DROPPED_FLOOR},
+    LIFECYCLE_MAYO_RECOVERY: {LIFECYCLE_MAYO_RECOVERY, LIFECYCLE_RECOVERING_LEFT, LIFECYCLE_DROPPED_FLOOR},
+    LIFECYCLE_DROPPED_FLOOR: {LIFECYCLE_RETURNED_HOME},
     LIFECYCLE_RECOVERING_LEFT: {LIFECYCLE_RECOVERING_LEFT, LIFECYCLE_CLEANING_LEFT, LIFECYCLE_RETURNED_HOME},
     LIFECYCLE_CLEANING_LEFT: {LIFECYCLE_CLEANING_LEFT, LIFECYCLE_CLEANED_LEFT},
     LIFECYCLE_CLEANED_LEFT: {LIFECYCLE_CLEANED_LEFT, LIFECYCLE_RETURNED_HOME},
@@ -114,6 +123,8 @@ def _status_for_lifecycle(state: InstrumentBelief) -> str:
         return "parked_for_reuse"
     if state.lifecycle_stage == LIFECYCLE_MAYO_RECOVERY:
         return "awaiting_retrieval"
+    if state.lifecycle_stage == LIFECYCLE_DROPPED_FLOOR:
+        return "requires_human_recovery"
     if state.lifecycle_stage == LIFECYCLE_RECOVERING_LEFT:
         return "received_return"
     if state.lifecycle_stage == LIFECYCLE_CLEANING_LEFT:
@@ -134,6 +145,8 @@ def _location_for_lifecycle(state: InstrumentBelief, lifecycle_stage: str) -> tu
         return ("mayo_reuse_zone", "mayo_reuse_zone")
     if lifecycle_stage == LIFECYCLE_MAYO_RECOVERY:
         return ("mayo_recovery_zone", "mayo_recovery_zone")
+    if lifecycle_stage == LIFECYCLE_DROPPED_FLOOR:
+        return ("floor_zone", "floor_zone")
     if lifecycle_stage == LIFECYCLE_RECOVERING_LEFT:
         return ("robot_left_hand", "robot_left_hand")
     if lifecycle_stage == LIFECYCLE_CLEANING_LEFT:
@@ -152,6 +165,8 @@ def _observed_lifecycle_for_location(state: InstrumentBelief, location_type: str
         return LIFECYCLE_MAYO_REUSE
     if location_type == "mayo_recovery_zone":
         return LIFECYCLE_MAYO_RECOVERY
+    if location_type == "floor_zone":
+        return LIFECYCLE_DROPPED_FLOOR
     if location_type == "robot_left_hand":
         return LIFECYCLE_RECOVERING_LEFT
     if location_type == "cleaner_slot":
@@ -309,6 +324,8 @@ class ORDigitalTwin:
             return "robot_left_hand"
         if lifecycle_stage in {LIFECYCLE_CLEANING_LEFT, LIFECYCLE_CLEANED_LEFT} or location_type == "cleaner_slot":
             return "cleaner_slot"
+        if lifecycle_stage == LIFECYCLE_DROPPED_FLOOR or location_type == "floor_zone":
+            return "floor_zone"
         if lifecycle_stage == LIFECYCLE_MAYO_REUSE or location_type == "mayo_reuse_zone":
             return "mayo_reuse_zone"
         if lifecycle_stage == LIFECYCLE_MAYO_RECOVERY or location_type == "mayo_recovery_zone":
@@ -340,6 +357,90 @@ class ORDigitalTwin:
         self.state.surgeon_request_tool = ""
         self.state.surgeon_ready_for_handover = False
         self.state.surgeon_ready_for_retrieval = False
+
+
+    def _is_emergency_interrupt_phase(self, phase_id: str, reason: str = "") -> bool:
+        if not phase_id or not self.spec.is_interrupt_phase(phase_id):
+            return False
+        reason_l = (reason or "").lower()
+        return phase_id == "P06" or any(
+            keyword in reason_l
+            for keyword in ("bleed", "bleeding", "hemostasis", "haemostasis", "blood", "emergency")
+        )
+
+    def _apply_emergency_interrupt_preemption(
+        self,
+        *,
+        target_phase: str,
+        reason: str,
+        cue_id: str = "",
+        priority_tool: str = "T10",
+    ) -> None:
+        if not self._is_emergency_interrupt_phase(target_phase, reason):
+            return
+
+        previous_task = asdict(self.state.active_robot_task) if self.state.active_robot_task else {}
+        previous_queue = [cue.instrument_id for cue in self.state.surgeon_request_queue]
+        previous_request_tool = self.state.surgeon_request_tool
+        previous_pending = list(self.state.pending_transition_tools)
+
+        if self.state.active_robot_task is not None:
+            self._record_event(
+                "RobotTaskPreemptedByEmergency",
+                {
+                    "target_phase": target_phase,
+                    "reason": reason,
+                    "cue_id": cue_id,
+                    "previous_task": previous_task,
+                },
+            )
+            self._clear_active_robot_task()
+
+        self.state.pending_transition_tools = []
+        self._clear_surgeon_request_state()
+
+        resolved_priority_tool = self.spec.resolve_instrument_alias(priority_tool) or priority_tool
+        if resolved_priority_tool in self.instrument_states:
+            self._enqueue_surgeon_request(
+                event_type="voice_request",
+                instrument_id=resolved_priority_tool,
+                voice_text="Emergency bleeding: suction please",
+                note=f"emergency_preemption:{target_phase}:{reason}",
+                ready_for_handover=True,
+                ready_for_retrieval=False,
+                override=True,
+            )
+
+        self.state.surgeon_intent = "voice_request"
+        self.state.surgeon_ready_for_handover = True
+
+        self._record_event(
+            "EmergencyInterruptPreemptionApplied",
+            {
+                "target_phase": target_phase,
+                "reason": reason,
+                "cue_id": cue_id,
+                "priority_tool": resolved_priority_tool,
+                "previous_request_tool": previous_request_tool,
+                "previous_queue": previous_queue,
+                "previous_pending_transition_tools": previous_pending,
+            },
+        )
+
+
+    def _active_requested_tool_id(self) -> str:
+        return self.state.surgeon_request_tool or self.state.explicit_request_tool or ""
+
+    def _is_active_requested_tool(self, instrument_id: str) -> bool:
+        return bool(instrument_id) and instrument_id == self._active_requested_tool_id()
+
+    def _surgeon_owned_hand_states(self) -> list[InstrumentBelief]:
+        return [
+            state
+            for state in self.instrument_states.values()
+            if state.lifecycle_stage == LIFECYCLE_SURGEON_OWNED
+            and (state.location_type == "surgeon_hand" or state.status == "handed_over")
+        ]
 
     def _active_request_cue(self) -> SurgeonRequestCue | None:
         return self.state.surgeon_request_queue[0] if self.state.surgeon_request_queue else None
@@ -788,6 +889,13 @@ class ORDigitalTwin:
         current_phase = self.state.filtered_phase or self.spec.default_phase_id
         if self.spec.is_interrupt_phase(target_phase) and self.spec.is_normal_phase(current_phase):
             self._last_normal_phase_before_interrupt = current_phase
+            self._set_active_interrupt_context(target_phase, reason)
+            self._apply_emergency_interrupt_preemption(
+                target_phase=target_phase,
+                reason=reason,
+                cue_id=cue_id,
+                priority_tool="T10",
+            )
         elif self.spec.is_normal_phase(target_phase):
             self._last_normal_phase_before_interrupt = ""
         self.state.filtered_phase = target_phase
@@ -840,15 +948,49 @@ class ORDigitalTwin:
             )
         cue = self._pending_phase_cues.get(target_phase)
         if self.spec.is_interrupt_phase(target_phase):
+            cue_confidence = float(cue.get("confidence", 0.0)) if cue is not None else 0.0
+            cue_source = str(cue.get("source", "")) if cue is not None else ""
+            cue_reason = str(cue.get("reason", "")) if cue is not None else ""
+            emergency_keywords = ("bleed", "bleeding", "hemostasis", "haemostasis", "blood", "emergency")
+            manual_emergency_cue = (
+                cue is not None
+                and cue_confidence >= 0.90
+                and (
+                    cue_source in {"manual_test", "simulation_manager", "surgeon_actor", "manual", "test"}
+                    or any(keyword in cue_reason.lower() for keyword in emergency_keywords)
+                )
+            )
+            if manual_emergency_cue:
+                self._record_interrupt_event_decision(
+                    target_phase=target_phase,
+                    accepted=True,
+                    reason="manual_emergency_interrupt_cue",
+                    confidence=cue_confidence,
+                    cue_id=cue_id,
+                    current_phase=current_phase,
+                )
+                return self._approve_phase_transition(
+                    target_phase,
+                    reason="manual_emergency_interrupt_cue",
+                    confidence=cue_confidence,
+                    cue_id=cue_id,
+                )
+
             stable, average_confidence, sample_count = self._phase_evidence_stable_enough(target_phase)
             if stable:
-                return self._record_interrupt_event_decision(
+                self._record_interrupt_event_decision(
                     target_phase=target_phase,
                     accepted=True,
                     reason="stable_interrupt_event_evidence",
                     confidence=average_confidence,
                     cue_id=cue_id,
                     current_phase=current_phase,
+                )
+                return self._approve_phase_transition(
+                    target_phase,
+                    reason="stable_interrupt_event_evidence",
+                    confidence=average_confidence,
+                    cue_id=cue_id,
                 )
             return self._record_interrupt_event_decision(
                 target_phase=target_phase,
@@ -868,6 +1010,28 @@ class ORDigitalTwin:
                     confidence=0.0,
                     cue_id=cue_id,
                 )
+            if self._is_emergency_interrupt_phase(current_phase, ""):
+                cue = self._pending_phase_cues.get(target_phase)
+                cue_reason = str(cue.get("reason", "")) if cue is not None else ""
+                cue_source = str(cue.get("source", "")) if cue is not None else ""
+                resolved_keywords = ("resolved", "clear", "cleared", "controlled", "hemostasis complete", "bleeding resolved")
+                explicit_resolved = (
+                    cue is not None
+                    and (
+                        cue_source in {"manual_test", "simulation_manager", "surgeon_actor", "manual", "test"}
+                        or any(keyword in cue_reason.lower() for keyword in resolved_keywords)
+                    )
+                    and any(keyword in cue_reason.lower() for keyword in resolved_keywords)
+                )
+                if not explicit_resolved:
+                    return self._record_phase_decision(
+                        target_phase=target_phase,
+                        accepted=False,
+                        reason="emergency_interrupt_return_requires_resolution",
+                        confidence=0.0,
+                        cue_id=cue_id,
+                    )
+
             stable, average_confidence, sample_count = self._phase_evidence_stable_enough(target_phase)
             if stable:
                 return self._approve_phase_transition(
@@ -951,6 +1115,22 @@ class ORDigitalTwin:
                 "reason": cue.reason,
             },
         )
+        # Manual sudden_bleeding test: accept emergency interrupt cue immediately.
+        # Without this, /surgeon/phase_transition_cue can be published but the
+        # filtered_phase may remain P03, so the dashboard does not show bleeding
+        # and BT never enters the emergency suction path.
+        if (
+            target_phase == "P06"
+            and cue.source == "manual_test"
+            and cue_id == "manual_sudden_bleeding"
+        ):
+            return self._approve_phase_transition(
+                target_phase,
+                reason="manual_emergency_interrupt_cue",
+                confidence=float(cue.confidence),
+                cue_id=cue_id,
+            )
+
         return self._try_approve_phase_transition(target_phase, cue_id=cue_id)
 
     def apply_phase_evidence(self, evidence: PhaseEvidence) -> list[dict[str, Any]]:
@@ -969,7 +1149,19 @@ class ORDigitalTwin:
                 "summary": evidence.scene_summary,
             }
         )
-        self.state.phase_uncertain = bool(float(evidence.uncertainty) > 0.35)
+        current_phase = self.state.filtered_phase or self.spec.default_phase_id
+        current_confidence = float(scores.get(current_phase, 0.0))
+        minimum_keep_confidence = (
+            float(self.spec.bundle.phase_guard.min_confidence_to_keep)
+            if self.spec.bundle.phase_guard is not None
+            else 0.5
+        )
+        self.state.phase_confidence = current_confidence
+        self.state.phase_stability = current_confidence
+        self.state.phase_uncertain = bool(
+            float(evidence.uncertainty) > 0.35
+            or current_confidence < minimum_keep_confidence
+        )
         self._record_event(
             "PhaseEvidenceObserved",
             {
@@ -980,7 +1172,6 @@ class ORDigitalTwin:
             },
         )
         decisions: list[dict[str, Any]] = []
-        current_phase = self.state.filtered_phase or self.spec.default_phase_id
         ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
         if ranked:
             top_phase = ranked[0][0]
@@ -1002,6 +1193,21 @@ class ORDigitalTwin:
         if not instrument_id or instrument_id not in self.instrument_states:
             return
         state = self.instrument_states[instrument_id]
+        if self._is_active_requested_tool(instrument_id) and self.state.surgeon_intent in ACTIVE_REQUEST_INTENTS:
+            self._record_event(
+                "RecoveryBlockedForActiveRequest",
+                {
+                    "instrument_id": instrument_id,
+                    "reason": reason,
+                    "active_request_tool": self._active_requested_tool_id(),
+                    "surgeon_intent": self.state.surgeon_intent,
+                    "lifecycle_stage": state.lifecycle_stage,
+                    "location_type": state.location_type,
+                    "location_id": state.location_id,
+                },
+            )
+            return
+
         if state.lifecycle_stage == LIFECYCLE_MAYO_REUSE:
             self._record_event(
                 "RecoveryTransactionMarkedMayoReuse",
@@ -1256,6 +1462,12 @@ class ORDigitalTwin:
             state.cleanliness_state = "used"
             state.contaminated = True
             state.last_holder = "surgeon"
+        elif lifecycle_stage == LIFECYCLE_DROPPED_FLOOR:
+            state.cleanliness_state = "contaminated"
+            state.contaminated = True
+            state.owner = "none"
+            state.status = "requires_human_recovery"
+            state.last_holder = "floor"
         elif lifecycle_stage == LIFECYCLE_CLEANING_LEFT:
             state.cleanliness_state = "cleaning"
             state.contaminated = True
@@ -1430,7 +1642,6 @@ class ORDigitalTwin:
 
         if self.state.surgeon_intent in ACTIVE_REQUEST_INTENTS and requested_state.lifecycle_stage in {
             LIFECYCLE_SURGEON_OWNED,
-            LIFECYCLE_MAYO_REUSE,
         }:
             self._dequeue_active_request("requested_tool_handed_over")
             return
@@ -1444,6 +1655,13 @@ class ORDigitalTwin:
             self._dequeue_active_request("requested_tool_retrieved")
 
     def _derive_next_required_transition(self, state: InstrumentBelief) -> str:
+        if (
+            self._is_active_requested_tool(state.instrument_id)
+            and self.state.surgeon_intent in ACTIVE_REQUEST_INTENTS
+            and state.lifecycle_stage in {LIFECYCLE_MAYO_REUSE, LIFECYCLE_MAYO_RECOVERY}
+            and not self._recovery_transaction_active(state.instrument_id)
+        ):
+            return ""
         if state.lifecycle_stage == LIFECYCLE_PREPOSITIONED_RIGHT:
             if self.state.execution_state in {"finishing", "completed"}:
                 return "return_unused_preposition"
@@ -1474,6 +1692,8 @@ class ORDigitalTwin:
             return ""
         if state.lifecycle_stage == LIFECYCLE_MAYO_RECOVERY:
             return "recover_left"
+        if state.lifecycle_stage == LIFECYCLE_DROPPED_FLOOR:
+            return "human_recovery_required"
         if state.lifecycle_stage == LIFECYCLE_RECOVERING_LEFT:
             return "clean_left" if state.contaminated else "return_home"
         if state.lifecycle_stage == LIFECYCLE_CLEANING_LEFT:
@@ -1515,6 +1735,12 @@ class ORDigitalTwin:
         )
         if not self.state.cleaner_busy:
             self.state.cleaner_remaining_sec = 0.0
+        dropped_floor_tools = [
+            state.instrument_id
+            for state in self.instrument_states.values()
+            if state.lifecycle_stage == LIFECYCLE_DROPPED_FLOOR
+        ]
+        self._set_flag("dropped_tool_requires_human", bool(dropped_floor_tools))
         self._queue_mayo_capacity_recovery()
 
         pending_tools: list[str] = []
@@ -1547,17 +1773,43 @@ class ORDigitalTwin:
         self._complete_if_cleanup_finished()
 
     def _normalize_surgeon_hand_conflicts(self) -> None:
-        hand_states = [
-            state
-            for state in self.instrument_states.values()
-            if state.lifecycle_stage == LIFECYCLE_SURGEON_OWNED
-            and (state.location_type == "surgeon_hand" or state.status == "handed_over")
-        ]
+        hand_states = self._surgeon_owned_hand_states()
         if len(hand_states) <= 2:
             return
-        hand_states.sort(key=lambda state: state.last_update_sec or 0.0, reverse=True)
+
+        requested_tool = self._active_requested_tool_id()
+        hand_states.sort(
+            key=lambda state: (
+                0 if state.instrument_id == requested_tool else 1,
+                -(state.last_update_sec or 0.0),
+                state.instrument_id,
+            )
+        )
         kept_tools = [state.instrument_id for state in hand_states[:2]]
+
+        self._record_event(
+            "StateInvariantViolation",
+            {
+                "reason": "surgeon_hand_capacity_exceeded",
+                "surgeon_hand_tools": [state.instrument_id for state in hand_states],
+                "kept_tools": kept_tools,
+                "active_request_tool": requested_tool,
+                "policy": "max_two_surgeon_hand_tools_requested_tool_protected",
+            },
+        )
+
         for stale_state in hand_states[2:]:
+            if stale_state.instrument_id == requested_tool:
+                self._record_event(
+                    "RecoveryBlockedForActiveRequest",
+                    {
+                        "instrument_id": stale_state.instrument_id,
+                        "reason": "surgeon_hand_conflict_requested_tool_protected",
+                        "active_request_tool": requested_tool,
+                    },
+                )
+                continue
+
             self._set_lifecycle(
                 stale_state,
                 LIFECYCLE_MAYO_RECOVERY,
@@ -1571,6 +1823,7 @@ class ORDigitalTwin:
                     "instrument_id": stale_state.instrument_id,
                     "kept_tools": kept_tools,
                     "target_stage": LIFECYCLE_MAYO_RECOVERY,
+                    "active_request_tool": requested_tool,
                 },
             )
             self._open_recovery_transaction(stale_state.instrument_id, "surgeon_hand_conflict_normalized")
@@ -1697,13 +1950,19 @@ class ORDigitalTwin:
                     break
 
         if request.event_type == "cancel_request":
+            previous_queue = [cue.instrument_id for cue in self.state.surgeon_request_queue]
+            previous_active = self.state.surgeon_request_tool
+            self._clear_surgeon_request_state()
+            self.state.surgeon_intent = "idle"
             self._record_event(
-                "LegacyCancelRequestIgnored",
+                "SurgeonRequestQueueCleared",
                 {
                     "requested_tool": resolved,
                     "voice_text": request.voice_text,
-                    "queue_length": len(self.state.surgeon_request_queue),
-                    "active_request_tool": self.state.surgeon_request_tool,
+                    "previous_queue": previous_queue,
+                    "previous_active_request_tool": previous_active,
+                    "override": bool(request.override),
+                    "reason": request.note or "cancel_request",
                 },
             )
         elif request.event_type == "request_procedure_completion":
@@ -1796,6 +2055,33 @@ class ORDigitalTwin:
                 self._begin_completion_cleanup()
             else:
                 self._mark_completed()
+        elif event_type in {"human_recovered_dropped_tool", "human_recovered_floor_tool"} and state is not None:
+            if state.lifecycle_stage != LIFECYCLE_DROPPED_FLOOR:
+                self._record_event(
+                    "HumanRecoveryIgnored",
+                    {
+                        "instrument_id": tool_id,
+                        "reason": "tool_not_in_floor_drop_state",
+                        "lifecycle_stage": state.lifecycle_stage,
+                    },
+                )
+            elif self._apply_event_transition(
+                state=state,
+                next_stage=LIFECYCLE_RETURNED_HOME,
+                event_type=event_type,
+                location_type=state.home_location_type,
+                location_id=state.home_location_id,
+                confidence=max(state.confidence, 0.96),
+            ):
+                self.state.surgeon_intent = "human_recovered_dropped_tool"
+                self._record_event(
+                    "DroppedToolHumanRecovered",
+                    {
+                        "instrument_id": tool_id,
+                        "target_stage": LIFECYCLE_RETURNED_HOME,
+                        "reason": event.note or "human_removed_dropped_tool_and_replaced_sterile_equivalent",
+                    },
+                )
         elif event_type in SURGEON_ACTOR_LOCATION_EVENTS and state is not None:
             location_type, location_id, next_stage = SURGEON_ACTOR_LOCATION_EVENTS[event_type]
             reuse_tool_marked_for_recovery = (
@@ -1822,9 +2108,15 @@ class ORDigitalTwin:
                     self.state.surgeon_ready_for_handover = False
                     self.state.surgeon_ready_for_retrieval = False
                 elif event_type in {"place_on_mayo", "place_on_mayo_reuse"}:
-                    self.state.surgeon_intent = "park_for_reuse"
-                    self.state.surgeon_ready_for_handover = False
-                    self.state.surgeon_ready_for_retrieval = False
+                    if self._active_request_cue() is not None:
+                        # Keep the active requested tool alive after parking another tool on Mayo.
+                        # This is used when surgeon hand is full and a retrieval-choice selector
+                        # chooses one currently held tool to free hand capacity.
+                        self._sync_active_request_from_queue()
+                    else:
+                        self.state.surgeon_intent = "park_for_reuse"
+                        self.state.surgeon_ready_for_handover = False
+                        self.state.surgeon_ready_for_retrieval = False
                 elif event_type == "place_on_mayo_recovery":
                     self.state.surgeon_intent = "return_tool"
                     self.state.surgeon_ready_for_handover = False

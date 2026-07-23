@@ -1,0 +1,87 @@
+flowchart LR
+  T_bt_decision(["/bt/decision<br/>surgical_msgs/msg/BTDecision"])
+  N_tree_executor["/tree_executor"]
+  N_tree_executor --> T_bt_decision
+  N_tree_executor --> T_bt_decision
+  N_tree_executor --> T_bt_decision
+  N_tree_executor --> T_bt_decision
+  N_tree_executor --> T_bt_decision
+  T_bt_decision_summary(["/bt/decision_summary<br/>std_msgs/msg/String"])
+  N_bt_decision_bridge["/bt_decision_bridge"]
+  N_bt_decision_bridge --> T_bt_decision_summary
+  T_bt_skill_command(["/bt/skill_command<br/>surgical_msgs/msg/SkillCommand"])
+  N_tree_executor --> T_bt_skill_command
+  N_tree_executor --> T_bt_skill_command
+  N_tree_executor --> T_bt_skill_command
+  T_btops_blackboard_event(["/btops/blackboard_event<br/>btops_interfaces/msg/BlackboardEvent"])
+  N_btops_gateway["/btops_gateway"]
+  N_btops_gateway --> T_btops_blackboard_event
+  T_btops_catalog(["/btops/catalog<br/>btops_interfaces/msg/CatalogSnapshot"])
+  N_btops_gateway --> T_btops_catalog
+  T_btops_execution_snapshot(["/btops/execution_snapshot<br/>btops_interfaces/msg/ExecutionSnapshot"])
+  N_btops_gateway --> T_btops_execution_snapshot
+  T_btops_problem(["/btops/problem<br/>btops_interfaces/msg/ProblemEvent"])
+  N_btops_gateway --> T_btops_problem
+  T_btops_transition_event(["/btops/transition_event<br/>btops_interfaces/msg/TransitionEvent"])
+  N_btops_gateway --> T_btops_transition_event
+  T_phase_filtered(["/phase/filtered<br/>surgical_msgs/msg/FilteredPhase"])
+  N_NODE_NAMESPACE_UNKNOWN___NODE_NAME_UNKNOWN_["_NODE_NAMESPACE_UNKNOWN_/_NODE_NAME_UNKNOWN_"]
+  T_phase_filtered --> N_NODE_NAMESPACE_UNKNOWN___NODE_NAME_UNKNOWN_
+  T_simulation_control_state(["/simulation/control_state<br/>std_msgs/msg/String"])
+  T_simulation_control_state --> N_NODE_NAMESPACE_UNKNOWN___NODE_NAME_UNKNOWN_
+  T_simulation_event(["/simulation/event<br/>surgical_msgs/msg/SimulationEvent"])
+  N_or_digital_twin["/or_digital_twin"]
+  N_or_digital_twin --> T_simulation_event
+  T_simulation_perception_scene(["/simulation/perception_scene<br/>surgical_msgs/msg/PerceptionScene"])
+  N_or_digital_twin --> T_simulation_perception_scene
+  T_simulation_state(["/simulation/state<br/>surgical_msgs/msg/SimulationState"])
+  N_or_digital_twin --> T_simulation_state
+  T_simulation_state --> N_NODE_NAMESPACE_UNKNOWN___NODE_NAME_UNKNOWN_
+  T_simulation_surgeon_override(["/simulation/surgeon_override<br/>surgical_msgs/msg/SurgeonRequest"])
+  T_simulation_surgeon_override --> N_NODE_NAMESPACE_UNKNOWN___NODE_NAME_UNKNOWN_
+  T_skill_events(["/skill/events<br/>surgical_msgs/msg/TwinEvent"])
+  N_mock_skill_server["/mock_skill_server"]
+  N_mock_skill_server --> T_skill_events
+  T_skill_execute__action_feedback(["/skill/execute/_action/feedback<br/>surgical_msgs/action/ExecuteSkill_FeedbackMessage"])
+  N_mock_skill_server --> T_skill_execute__action_feedback
+  T_skill_execute__action_status(["/skill/execute/_action/status<br/>action_msgs/msg/GoalStatusArray"])
+  N_mock_skill_server --> T_skill_execute__action_status
+  T_skill_status(["/skill/status<br/>surgical_msgs/msg/SkillStatus"])
+  N_no_image_camera["/no_image_camera"]
+  T_skill_status --> N_no_image_camera
+  T_surgeon_actor_overlay(["/surgeon/actor_overlay<br/>std_msgs/msg/String"])
+  T_surgeon_actor_overlay --> N_no_image_camera
+  T_surgeon_outward_signal(["/surgeon/outward_signal<br/>surgical_msgs/msg/SurgeonOutwardSignal"])
+  N_or_digital_twin --> T_surgeon_outward_signal
+  T_surgeon_outward_signal --> N_no_image_camera
+  T_surgery_images_field_compressed(["/surgery/images/field/compressed<br/>sensor_msgs/msg/CompressedImage"])
+  N_no_image_camera --> T_surgery_images_field_compressed
+  T_tree_executor_cmd__action_feedback(["/tree_executor/cmd/_action/feedback<br/>auto_apms_interfaces/action/CommandTreeExecutor_FeedbackMessage"])
+  N_tree_executor --> T_tree_executor_cmd__action_feedback
+  T_tree_executor_cmd__action_status(["/tree_executor/cmd/_action/status<br/>action_msgs/msg/GoalStatusArray"])
+  N_tree_executor --> T_tree_executor_cmd__action_status
+  T_tree_executor_start__action_feedback(["/tree_executor/start/_action/feedback<br/>auto_apms_interfaces/action/StartTreeExecutor_FeedbackMessage"])
+  N_tree_executor --> T_tree_executor_start__action_feedback
+  T_tree_executor_start__action_status(["/tree_executor/start/_action/status<br/>action_msgs/msg/GoalStatusArray"])
+  N_tree_executor --> T_tree_executor_start__action_status
+  T_twin_events(["/twin/events<br/>surgical_msgs/msg/TwinEvent"])
+  N_or_digital_twin --> T_twin_events
+  T_twin_important_event(["/twin/important_event<br/>surgical_msgs/msg/SimulationEvent"])
+  N_or_digital_twin --> T_twin_important_event
+  T_twin_reducer_decisions(["/twin/reducer_decisions<br/>surgical_msgs/msg/ReducerDecisionEvent"])
+  N_or_digital_twin --> T_twin_reducer_decisions
+  T_twin_tool_states(["/twin/tool_states<br/>surgical_msgs/msg/InstrumentState"])
+  N_or_digital_twin --> T_twin_tool_states
+  T_twin_vlm_context_summary(["/twin/vlm_context_summary<br/>std_msgs/msg/String"])
+  N_or_digital_twin --> T_twin_vlm_context_summary
+  T_twin_vlm_request_context(["/twin/vlm_request_context<br/>surgical_msgs/msg/VLMRequestContext"])
+  N_or_digital_twin --> T_twin_vlm_request_context
+  T_twin_world_state(["/twin/world_state<br/>surgical_msgs/msg/WorldState"])
+  N_or_digital_twin --> T_twin_world_state
+  T_twin_world_state --> N_NODE_NAMESPACE_UNKNOWN___NODE_NAME_UNKNOWN_
+  T_vlm_inference_proposals(["/vlm/inference_proposals<br/>surgical_msgs/msg/VLMInferenceProposal"])
+  N_or_digital_twin --> T_vlm_inference_proposals
+  T_vlm_reducer_decisions(["/vlm/reducer_decisions<br/>surgical_msgs/msg/VLMReducerDecision"])
+  N_or_digital_twin --> T_vlm_reducer_decisions
+  T_vlm_surgeon_gesture_evidence(["/vlm/surgeon_gesture_evidence<br/>surgical_msgs/msg/SurgeonGestureEvidence"])
+  T_vlm_surgeon_gesture_evidence --> N_NODE_NAMESPACE_UNKNOWN___NODE_NAME_UNKNOWN_
