@@ -45,6 +45,15 @@ jobs:
           docker compose run --rm taskplanner-dev bash -lc
           "cd webapp && npm ci && npm run build"
 
+      - name: Run integration unit tests
+        run: >
+          docker compose run --rm taskplanner-dev bash -lc
+          "source install/setup.bash &&
+          python3 -m unittest
+          tools.test_serve_image_raw_snapshot
+          tools.test_pr1_digital_twin
+          tools.test_pr1_real_vlm -v"
+
       - name: Smoke test thyroidectomy
         run: >
           docker compose run --rm

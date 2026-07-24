@@ -7,6 +7,7 @@ from dataclasses import asdict
 import json
 import os
 from pathlib import Path
+import re
 import time
 from typing import Any
 
@@ -80,9 +81,9 @@ class RealVLMNode(Node):
     def __init__(self) -> None:
         super().__init__("real_vlm_node")
         self.declare_parameter("spec_dir", str(get_default_spec_dir()))
-        self.declare_parameter("base_url", "http://192.168.0.122:1234")
+        self.declare_parameter("base_url", "http://127.0.0.1:1234")
         self.declare_parameter("api_key", "")
-        self.declare_parameter("model_id", "gemma-4-26b-a4b-it")
+        self.declare_parameter("model_id", "qwen3.6-35b-a3b-mtp@q2_k_xl")
         self.declare_parameter("api_mode", "lmstudio_native")
         self.declare_parameter("request_timeout_sec", 20.0)
         self.declare_parameter("max_output_tokens", 320)
@@ -100,6 +101,7 @@ class RealVLMNode(Node):
         self.declare_parameter("tray_image_topic", "/surgery/images/tray/compressed")
         self.declare_parameter("synthetic_image_topic", "/surgery/images/synthetic/compressed")
         self.declare_parameter("image_stale_sec", 5.0)
+        self.declare_parameter("require_field_image", True)
         self.declare_parameter("context_mode", "world")
 
         self._prompt_builder = PromptBuilder()
@@ -211,6 +213,7 @@ class RealVLMNode(Node):
         self._tray_image_topic = str(param_value("tray_image_topic"))
         self._synthetic_image_topic = str(param_value("synthetic_image_topic"))
         self._image_stale_sec = float(param_value("image_stale_sec"))
+        self._require_field_image = bool(param_value("require_field_image"))
         self._context_mode = str(param_value("context_mode")).strip().lower()
         if self._context_mode == "actor_log":
             self._procedure_prompt = compact_procedure_prompt(self._spec_dir)
@@ -321,6 +324,8 @@ class RealVLMNode(Node):
             "If public evidence is ambiguous, copy the order of candidates.tool and lower confidence instead of guessing a different tool. "
             "If candidates.tool is non-empty and its top row differs from previous.tool, do not repeat previous.tool unless fresh speech explicitly requests it. "
             "Use mayo rows to classify visible Mayo tools as recover or reuse. "
+            "Never put a tool in mayo or mayo_retrieve when digital_twin.tools shows it in robot_right_hand, robot_left_hand, cleaner_slot, tray_slot, home_rack, returned_home, prepositioned_right, recovering_left, cleaning_left, or cleaned_left. "
+            "A prepositioned robot hand tool is not on Mayo even if it appears near the Mayo stand in the image. "
             "For each visible Mayo tool, emit one mayo row. If a Mayo tool is not the current requested tool and is not the immediate next reusable tool, mark recover with confidence >=0.55. "
             "If no Mayo tool should be recovered, mayo_retrieve must be [\"\",0.0]. "
             "When pending_bed_robot_arm_group_request is absent, not retraction/retraction, or lacks enough direction evidence, bed_robot_arm_group must be null. "
@@ -356,6 +361,7 @@ class RealVLMNode(Node):
                 "response_mode",
                 "replay_response_path",
                 "image_stale_sec",
+                "require_field_image",
                 "context_mode",
             }:
                 reload_required = True
@@ -391,9 +397,8 @@ class RealVLMNode(Node):
 
     def _make_image_cb(self, label: str):
         def _cb(msg: CompressedImage) -> None:
-            stamp = float(msg.header.stamp.sec) + float(msg.header.stamp.nanosec) / 1_000_000_000.0
             mime_type = "image/jpeg" if msg.format.lower() in {"jpeg", "jpg"} else "image/png"
-            self._latest_images[label] = (stamp, bytes(msg.data), mime_type)
+            self._latest_images[label] = (time.monotonic(), bytes(msg.data), mime_type)
 
         return _cb
 
@@ -952,13 +957,145 @@ class RealVLMNode(Node):
         tool_id = str(raw_tool or "").strip()
         if not tool_id:
             return ""
-        return self._spec.resolve_instrument_alias(tool_id) or tool_id
+        resolved = self._spec.resolve_instrument_alias(tool_id)
+        if resolved:
+            return resolved
+        cleaned = tool_id.strip(" \t\r\n,;:'\"`[]{}()")
+        resolved = self._spec.resolve_instrument_alias(cleaned)
+        if resolved:
+            return resolved
+        match = re.search(r"(?i)\bt[\s_-]*0*\d+\b", cleaned)
+        return self._spec.resolve_instrument_alias(match.group(0)) if match else ""
 
     def _canonical_phase_id(self, raw_phase: object) -> str:
         phase_id = str(raw_phase or "").strip()
         if not phase_id:
             return ""
-        return self._spec.resolve_phase_id(phase_id) or phase_id
+        resolved = self._spec.resolve_phase_id(phase_id)
+        if resolved:
+            return resolved
+        cleaned = phase_id.strip(" \t\r\n,;:'\"`[]{}()")
+        resolved = self._spec.resolve_phase_id(cleaned)
+        if resolved:
+            return resolved
+        match = re.search(r"(?i)\bp[\s_-]*0*\d+\b", cleaned)
+        return self._spec.resolve_phase_id(match.group(0)) if match else ""
+
+    @staticmethod
+    def _canonical_intent_type(raw_intent: object) -> str:
+        cleaned = str(raw_intent or "").strip().strip(" \t\r\n,;:'\"`[]{}()").lower()
+        aliases = {
+            "handover": "handover",
+            "request": "request_tool",
+            "request_tool": "request_tool",
+            "voice_request": "request_tool",
+            "return": "return_tool",
+            "return_tool": "return_tool",
+            "recover": "return_tool",
+            "none": "none",
+            "no_intent": "none",
+            "": "none",
+        }
+        return aliases.get(cleaned, "none")
+
+    def _canonicalize_payload_ids(self, payload: dict[str, Any]) -> dict[str, Any]:
+        canonical = json.loads(json.dumps(payload))
+        version = str(canonical.get("v", ""))
+        if version == "3":
+            canonical["phase"] = [
+                [phase_id, float(row[1])]
+                for row in canonical.get("phase", [])
+                if isinstance(row, list)
+                and len(row) == 2
+                and (phase_id := self._canonical_phase_id(row[0]))
+            ]
+            canonical["tool"] = [
+                [tool_id, float(row[1])]
+                for row in canonical.get("tool", [])
+                if isinstance(row, list)
+                and len(row) == 2
+                and (tool_id := self._canonical_tool_id(row[0]))
+            ]
+        elif version == "2":
+            phase = canonical.get("phase", ["", 0.0])
+            tool = canonical.get("tool", ["", 0.0])
+            phase_id = (
+                self._canonical_phase_id(phase[0])
+                if isinstance(phase, list) and len(phase) == 2
+                else ""
+            )
+            tool_id = (
+                self._canonical_tool_id(tool[0])
+                if isinstance(tool, list) and len(tool) == 2
+                else ""
+            )
+            canonical["phase"] = [
+                phase_id,
+                float(phase[1]) if phase_id else 0.0,
+            ]
+            canonical["tool"] = [
+                tool_id,
+                float(tool[1]) if tool_id else 0.0,
+            ]
+        else:
+            canonical["ph"] = [
+                [phase_id, float(row[1])]
+                for row in canonical.get("ph", [])
+                if isinstance(row, list)
+                and len(row) == 2
+                and (phase_id := self._canonical_phase_id(row[0]))
+            ]
+            canonical["to"] = [
+                [tool_id, str(row[1]), str(row[2]), float(row[3])]
+                for row in canonical.get("to", [])
+                if isinstance(row, list)
+                and len(row) == 4
+                and (tool_id := self._canonical_tool_id(row[0]))
+            ]
+
+        intent_key = "intent" if version in {"2", "3"} else "sg"
+        intent = canonical.get(intent_key, ["none", "", 0.0] if intent_key == "intent" else ["", "", "", 0.0])
+        if intent_key == "intent" and isinstance(intent, list) and len(intent) == 3:
+            intent_type = self._canonical_intent_type(intent[0])
+            intent_tool = self._canonical_tool_id(intent[1])
+            if intent_type == "none" or not intent_tool:
+                canonical[intent_key] = ["none", "", 0.0]
+            else:
+                canonical[intent_key] = [
+                    intent_type,
+                    intent_tool,
+                    float(intent[2]),
+                ]
+        elif intent_key == "sg" and isinstance(intent, list) and len(intent) == 4:
+            event_type = self._canonical_intent_type(intent[0])
+            intent_tool = self._canonical_tool_id(intent[1])
+            if event_type == "none" or not intent_tool:
+                canonical[intent_key] = ["", "", "", 0.0]
+            else:
+                canonical[intent_key] = [
+                    event_type,
+                    intent_tool,
+                    str(intent[2]),
+                    float(intent[3]),
+                ]
+
+        mayo_rows = []
+        for row in canonical.get("mayo", []):
+            if not isinstance(row, list) or len(row) != 3:
+                continue
+            tool_id = self._canonical_tool_id(row[0])
+            decision = str(row[1]).strip().strip(" \t\r\n,;:'\"`[]{}()").lower()
+            if tool_id and decision in {"recover", "reuse"}:
+                mayo_rows.append([tool_id, decision, float(row[2])])
+        canonical["mayo"] = mayo_rows
+        retrieve = canonical.get("mayo_retrieve", ["", 0.0])
+        if isinstance(retrieve, list) and len(retrieve) == 2:
+            retrieve_tool = self._canonical_tool_id(retrieve[0])
+            canonical["mayo_retrieve"] = [
+                retrieve_tool,
+                float(retrieve[1]) if retrieve_tool else 0.0,
+            ]
+        return canonical
 
     def _actor_log_prior_evidence(self) -> dict[str, Any]:
         visual = dict(self._actor_overlay)
@@ -1056,7 +1193,7 @@ class RealVLMNode(Node):
         return compact_json(self._assemble_actor_log_context_dict())
 
     def _select_images(self) -> tuple[list[tuple[str, bytes, str]], str]:
-        now = time.time()
+        now = time.monotonic()
 
         def fresh(label: str) -> tuple[bytes, str] | None:
             payload = self._latest_images.get(label)
@@ -1357,11 +1494,67 @@ class RealVLMNode(Node):
         if requested_tool and has_request_signal:
             intent = ["handover", requested_tool, max(0.72, min(1.0, float(intent[2]) if len(intent) > 2 else 0.0))]
         stabilized["intent"] = [str(intent[0]), str(intent[1]), round(max(0.0, min(1.0, float(intent[2]))), 3)]
+        self._suppress_non_mayo_recovery_candidates(stabilized, context_dict)
 
         summary = str(stabilized.get("sum", ""))
         if tool_candidates or phase_candidates:
             stabilized["sum"] = (summary + "; candidate-stabilized").strip("; ")[:180]
         return stabilized
+
+    def _suppress_non_mayo_recovery_candidates(
+        self,
+        payload: dict[str, Any],
+        context_dict: dict[str, Any],
+    ) -> None:
+        digital_twin = context_dict.get("digital_twin", {}) if isinstance(context_dict, dict) else {}
+        hands = digital_twin.get("hands", {}) if isinstance(digital_twin, dict) else {}
+        tools = digital_twin.get("tools", []) if isinstance(digital_twin, dict) else []
+        blocked_tools = {
+            str(hands.get(key, ""))
+            for key in ("rh", "lh", "pre")
+            if str(hands.get(key, ""))
+        }
+        for row in tools if isinstance(tools, list) else []:
+            if not isinstance(row, dict):
+                continue
+            tool_id = str(row.get("id", ""))
+            lifecycle = str(row.get("lc", ""))
+            location_type = str(row.get("lt", ""))
+            if not tool_id:
+                continue
+            if lifecycle in {
+                "home_rack",
+                "returned_home",
+                "prepositioned_right",
+                "recovering_left",
+                "cleaning_left",
+                "cleaned_left",
+                "dropped_floor",
+            }:
+                blocked_tools.add(tool_id)
+            if location_type in {
+                "tray_slot",
+                "robot_right_hand",
+                "robot_left_hand",
+                "cleaner_slot",
+                "floor_zone",
+            }:
+                blocked_tools.add(tool_id)
+        if not blocked_tools:
+            return
+
+        mayo_rows = []
+        for row in payload.get("mayo", []):
+            if not isinstance(row, list) or len(row) < 3:
+                continue
+            if str(row[0]) in blocked_tools:
+                continue
+            mayo_rows.append(row)
+        payload["mayo"] = mayo_rows
+
+        retrieve = payload.get("mayo_retrieve", ["", 0.0])
+        if isinstance(retrieve, list) and retrieve and str(retrieve[0]) in blocked_tools:
+            payload["mayo_retrieve"] = ["", 0.0]
 
     def _run_model(self, context_json: str, images: list[tuple[str, bytes, str]]) -> tuple[str, dict[str, Any], float, str, int, str]:
         retries_used = 0
@@ -1450,6 +1643,23 @@ class RealVLMNode(Node):
         last_error = ""
         healthy = True
         connected = True
+        if (
+            self._response_mode == "live"
+            and self._require_field_image
+            and "field" not in image_source.split("+")
+        ):
+            self._publish_health(
+                image_source=image_source,
+                latency_sec=0.0,
+                prompt_chars=prompt_chars,
+                output_chars=0,
+                parse_retry_count=0,
+                last_error="no fresh field image",
+                mode="no_fresh_image",
+                healthy=False,
+                connected=True,
+            )
+            return
         try:
             raw_json, payload, latency_sec, mode, parse_retry_count, last_error = self._run_model(
                 request_context_json,
@@ -1469,6 +1679,23 @@ class RealVLMNode(Node):
                 mode = "oracle_fallback"
         if payload is None:
             return
+        if self._response_mode == "live" and (
+            not healthy or last_error or mode in {"last_good", "oracle_fallback"}
+        ):
+            self._publish_health(
+                image_source=image_source,
+                latency_sec=latency_sec,
+                prompt_chars=prompt_chars,
+                output_chars=len(raw_json),
+                parse_retry_count=parse_retry_count,
+                last_error=last_error or f"unsafe VLM fallback mode: {mode}",
+                mode=mode,
+                healthy=False,
+                connected=connected,
+            )
+            return
+        payload = self._canonicalize_payload_ids(payload)
+        raw_json = json.dumps(payload, separators=(",", ":"), sort_keys=True)
         if self._context_mode == "actor_log":
             payload = self._stabilize_actor_log_payload(payload, context_dict)
             raw_json = json.dumps(payload, separators=(",", ":"), sort_keys=True)
@@ -1608,6 +1835,33 @@ class RealVLMNode(Node):
         self._bed_robot_arm_group_proposal_pub.publish(message)
         self._last_bed_robot_arm_group_proposal_request_id = request_id
 
+    def _publish_health(
+        self,
+        *,
+        image_source: str,
+        latency_sec: float,
+        prompt_chars: int,
+        output_chars: int,
+        parse_retry_count: int,
+        last_error: str,
+        mode: str,
+        healthy: bool,
+        connected: bool,
+    ) -> None:
+        health = VLMHealth()
+        health.stamp = self.get_clock().now().to_msg()
+        health.connected = bool(connected)
+        health.healthy = bool(healthy and not last_error)
+        health.model_id = self._model_id
+        health.image_source = image_source
+        health.latency_sec = float(latency_sec)
+        health.prompt_chars = int(prompt_chars)
+        health.output_chars = int(output_chars)
+        health.parse_retry_count = int(parse_retry_count)
+        health.last_error = last_error
+        health.last_mode = mode
+        self._health_pub.publish(health)
+
     def _publish_vlm_outputs(
         self,
         payload: dict[str, Any],
@@ -1737,19 +1991,17 @@ class RealVLMNode(Node):
             stamp,
         )
 
-        health = VLMHealth()
-        health.stamp = self.get_clock().now().to_msg()
-        health.connected = bool(connected)
-        health.healthy = bool(healthy and not last_error)
-        health.model_id = self._model_id
-        health.image_source = image_source
-        health.latency_sec = float(latency_sec)
-        health.prompt_chars = int(prompt_chars)
-        health.output_chars = len(raw_json)
-        health.parse_retry_count = int(parse_retry_count)
-        health.last_error = last_error
-        health.last_mode = mode
-        self._health_pub.publish(health)
+        self._publish_health(
+            image_source=image_source,
+            latency_sec=latency_sec,
+            prompt_chars=prompt_chars,
+            output_chars=len(raw_json),
+            parse_retry_count=parse_retry_count,
+            last_error=last_error,
+            mode=mode,
+            healthy=healthy,
+            connected=connected,
+        )
 
 
 def main() -> None:

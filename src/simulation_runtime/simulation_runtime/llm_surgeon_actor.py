@@ -133,6 +133,7 @@ class LLMSurgeonActorNode(Node):
         self._pending_group_requests: dict[str, dict[str, str]] = {}
         self._bed_group_states: dict[str, dict[str, Any]] = {}
         self._bed_group_status_stamp_ns: dict[str, int] = {}
+        self._manual_override_mute_until_sec = 0.0
 
         self._load_parameters()
         self._schedule_interrupt_for_phase(self._current_phase_id, "init")
@@ -427,6 +428,19 @@ class LLMSurgeonActorNode(Node):
         command, _, start_phase_id = raw_command.partition(":")
         command = command.strip().lower()
         start_phase_id = start_phase_id.strip()
+
+        if command == "mute_actor":
+            try:
+                mute_sec = max(0.0, float(start_phase_id or 8.0))
+            except ValueError:
+                mute_sec = 8.0
+            self._manual_override_mute_until_sec = max(
+                self._manual_override_mute_until_sec,
+                self._now() + mute_sec,
+            )
+            self._record_event("manual_override_actor_muted", "", {"mute_sec": mute_sec})
+            self._schedule_next_decision(mute_sec + 0.2)
+            return
         if command in {"start", "start_actors", "resume"}:
             if command in {"start", "start_actors"} and start_phase_id:
                 self._set_initial_phase(start_phase_id, "control_start_phase")
@@ -446,6 +460,7 @@ class LLMSurgeonActorNode(Node):
             self._active = False
         elif command == "reset":
             self._control_running = False
+            self._manual_override_mute_until_sec = 0.0
             self._reset_runtime(start_phase_id)
 
     def _reset_bed_robot_arm_group_states(self) -> None:
@@ -1518,6 +1533,8 @@ class LLMSurgeonActorNode(Node):
 
     def _tick(self) -> None:
         if not self._enabled or not self._active:
+            return
+        if self._now() < self._manual_override_mute_until_sec:
             return
         if self._now() < self._next_decision_time:
             return

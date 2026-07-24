@@ -122,6 +122,7 @@ class SurgeonActorNode(Node):
             )
         self._current_phase_id = self._spec.default_phase_id
         self._phase_entered_sec = self._current_time_sec()
+        self._manual_override_mute_until_sec = 0.0
 
     def _on_parameters_changed(self, params):
         for parameter in params:
@@ -857,6 +858,8 @@ class SurgeonActorNode(Node):
         if self._override_queue:
             self._activate_override(self._override_queue.popleft())
             return
+        if self._current_time_sec() < self._manual_override_mute_until_sec:
+            return
 
         decision = self._decide()
         self._publish_request_transition(decision)
@@ -869,7 +872,16 @@ class SurgeonActorNode(Node):
         command, _, start_phase_id = raw_command.partition(":")
         command = command.strip().lower()
         start_phase_id = start_phase_id.strip()
-        if command in {"start", "start_actors"}:
+        if command == "mute_actor":
+            try:
+                mute_sec = max(0.0, float(start_phase_id or 8.0))
+            except ValueError:
+                mute_sec = 8.0
+            self._manual_override_mute_until_sec = max(
+                self._manual_override_mute_until_sec,
+                self._current_time_sec() + mute_sec,
+            )
+        elif command in {"start", "start_actors"}:
             self._phase_hint = None
             if start_phase_id:
                 self._current_phase_id = self._coerce_phase_id(start_phase_id)
@@ -883,6 +895,7 @@ class SurgeonActorNode(Node):
             self._active = False
         elif command == "reset":
             self._active = False
+            self._manual_override_mute_until_sec = 0.0
             self._world = None
             self._phase_hint = None
             self._current_phase_id = self._coerce_phase_id(start_phase_id) if start_phase_id else self._spec.default_phase_id

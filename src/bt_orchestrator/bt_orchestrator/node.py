@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import rclpy
@@ -93,6 +94,8 @@ class DecisionBridgeNode(Node):
         self._last_summary_by_channel: dict[str, str] = {}
         self._seen_tool_ids: set[str] = set()
         self._last_procedure_id = ""
+        self._last_running = False
+        self._last_full_refresh_sec = 0.0
         self._bundle_generation = 0
         self._mirror = BlackboardMirror(self, str(target_node_name), mirror_period_sec)
         self.create_subscription(WorldState, "/twin/world_state", self._on_world, 20)
@@ -110,9 +113,16 @@ class DecisionBridgeNode(Node):
 
     def _on_world(self, msg: WorldState) -> None:
         self._latest_world = msg
-        if msg.procedure_id != self._last_procedure_id:
+        procedure_changed = msg.procedure_id != self._last_procedure_id
+        runtime_started = bool(msg.running and not self._last_running)
+        now_sec = time.monotonic()
+        periodic_refresh = now_sec - self._last_full_refresh_sec >= 1.0
+        if periodic_refresh:
+            self._last_full_refresh_sec = now_sec
+        if procedure_changed:
             self._last_procedure_id = msg.procedure_id
             self._bundle_generation += 1
+        self._last_running = bool(msg.running)
         active_tool_ids = {instrument.instrument_id for instrument in msg.instrument_states}
         force_keys = {"procedure.id", "bundle.generation"}
         mirrored = {
@@ -158,6 +168,8 @@ class DecisionBridgeNode(Node):
             mirrored[f"tool.{instrument.instrument_id}.lifecycle"] = instrument.lifecycle_stage
             mirrored[f"tool.{instrument.instrument_id}.next_required_transition"] = instrument.next_required_transition
             mirrored[f"tool.{instrument.instrument_id}.available"] = _is_available_status(instrument.status)
+        if procedure_changed or runtime_started or periodic_refresh:
+            force_keys.update(mirrored)
         self._seen_tool_ids.update(active_tool_ids)
         self._mirror.queue_many(mirrored, force_keys=force_keys)
         suggestion = select_expected_tool(msg)

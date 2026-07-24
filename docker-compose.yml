@@ -13,6 +13,7 @@ services:
     image: taskplanner-ws:dev
     working_dir: /workspaces/taskplanner_ws
     network_mode: host
+    ipc: host
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
@@ -21,12 +22,15 @@ services:
     environment:
       ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}
       ROS_AUTOMATIC_DISCOVERY_RANGE: ${ROS_AUTOMATIC_DISCOVERY_RANGE:-LOCALHOST}
+      RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}
+      FASTRTPS_DEFAULT_PROFILES_FILE: ${FASTRTPS_DEFAULT_PROFILES_FILE:-/workspaces/taskplanner_ws/config/fastdds_udp.xml}
       VLM_MODE: ${VLM_MODE:-real}
       VLM_BASE_URL: ${VLM_BASE_URL:-http://127.0.0.1:1234}
       VLM_API_KEY: ${VLM_API_KEY:-}
       VLM_MODEL_ID: ${VLM_MODEL_ID:-qwen3.6-35b-a3b-mtp@q2_k_xl}
       VLM_API_MODE: ${VLM_API_MODE:-openai_compat}
       VLM_PUBLISH_PERIOD_SEC: ${VLM_PUBLISH_PERIOD_SEC:-1.0}
+      VLM_IMAGE_STALE_SEC: ${VLM_IMAGE_STALE_SEC:-3.0}
       VLM_MAX_OUTPUT_TOKENS: ${VLM_MAX_OUTPUT_TOKENS:-320}
       VLM_RESPONSE_FORMAT: ${VLM_RESPONSE_FORMAT:-json_schema}
       VLM_REASONING_EFFORT: ${VLM_REASONING_EFFORT:-none}
@@ -39,6 +43,7 @@ services:
       ACTOR_REASONING_EFFORT: ${ACTOR_REASONING_EFFORT:-none}
       ENABLE_NO_IMAGE_CAMERA: ${ENABLE_NO_IMAGE_CAMERA:-true}
       ENABLE_SYNTHETIC_SCENE_CAMERA: ${ENABLE_SYNTHETIC_SCENE_CAMERA:-false}
+      FIELD_SNAPSHOT_URL: ${FIELD_SNAPSHOT_URL:-}
     stdin_open: true
     tty: true
     command: bash
@@ -57,6 +62,7 @@ services:
     image: taskplanner-ws:dev
     working_dir: /workspaces/taskplanner_ws
     network_mode: host
+    ipc: host
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
@@ -65,12 +71,15 @@ services:
     environment:
       ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}
       ROS_AUTOMATIC_DISCOVERY_RANGE: ${ROS_AUTOMATIC_DISCOVERY_RANGE:-LOCALHOST}
+      RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}
+      FASTRTPS_DEFAULT_PROFILES_FILE: ${FASTRTPS_DEFAULT_PROFILES_FILE:-/workspaces/taskplanner_ws/config/fastdds_udp.xml}
       VLM_MODE: ${VLM_MODE:-real}
       VLM_BASE_URL: ${VLM_BASE_URL:-http://127.0.0.1:1234}
       VLM_API_KEY: ${VLM_API_KEY:-}
       VLM_MODEL_ID: ${VLM_MODEL_ID:-qwen3.6-35b-a3b-mtp@q2_k_xl}
       VLM_API_MODE: ${VLM_API_MODE:-openai_compat}
       VLM_PUBLISH_PERIOD_SEC: ${VLM_PUBLISH_PERIOD_SEC:-1.0}
+      VLM_IMAGE_STALE_SEC: ${VLM_IMAGE_STALE_SEC:-3.0}
       VLM_MAX_OUTPUT_TOKENS: ${VLM_MAX_OUTPUT_TOKENS:-320}
       VLM_RESPONSE_FORMAT: ${VLM_RESPONSE_FORMAT:-json_schema}
       VLM_REASONING_EFFORT: ${VLM_REASONING_EFFORT:-none}
@@ -83,10 +92,11 @@ services:
       ACTOR_REASONING_EFFORT: ${ACTOR_REASONING_EFFORT:-none}
       ENABLE_NO_IMAGE_CAMERA: ${ENABLE_NO_IMAGE_CAMERA:-true}
       ENABLE_SYNTHETIC_SCENE_CAMERA: ${ENABLE_SYNTHETIC_SCENE_CAMERA:-false}
+      FIELD_SNAPSHOT_URL: ${FIELD_SNAPSHOT_URL:-}
     command: >
       bash -lc "colcon build --symlink-install --cmake-args -DBUILD_TESTING=OFF &&
       source install/setup.bash &&
-      ros2 launch bringup taskplanner_mock.launch.py enable_rosbridge:=true rosbridge_port:=${ROSBRIDGE_PORT:-9090} vlm_mode:=${VLM_MODE:-real} vlm_base_url:=${VLM_BASE_URL:-http://127.0.0.1:1234} vlm_model_id:=${VLM_MODEL_ID:-qwen3.6-35b-a3b-mtp@q2_k_xl} vlm_api_mode:=${VLM_API_MODE:-openai_compat} vlm_publish_period_sec:=${VLM_PUBLISH_PERIOD_SEC:-1.0} vlm_max_output_tokens:=${VLM_MAX_OUTPUT_TOKENS:-320} vlm_response_format:=${VLM_RESPONSE_FORMAT:-json_schema} vlm_reasoning_effort:=${VLM_REASONING_EFFORT:-none} vlm_context_mode:=${VLM_CONTEXT_MODE:-actor_log} surgeon_actor_mode:=${SURGEON_ACTOR_MODE:-llm} actor_base_url:=${ACTOR_BASE_URL:-http://127.0.0.1:1234} actor_model_id:=${ACTOR_MODEL_ID:-google/gemma-4-12b-qat} actor_response_format:=${ACTOR_RESPONSE_FORMAT:-json_schema} actor_reasoning_effort:=${ACTOR_REASONING_EFFORT:-none} enable_no_image_camera:=${ENABLE_NO_IMAGE_CAMERA:-true} enable_synthetic_scene_camera:=${ENABLE_SYNTHETIC_SCENE_CAMERA:-false}"
+      ros2 launch bringup taskplanner_mock.launch.py enable_rosbridge:=true rosbridge_port:=${ROSBRIDGE_PORT:-9090} rosbridge_address:=${ROSBRIDGE_ADDRESS:-127.0.0.1} vlm_mode:=${VLM_MODE:-real} vlm_base_url:=${VLM_BASE_URL:-http://127.0.0.1:1234} vlm_model_id:=${VLM_MODEL_ID:-qwen3.6-35b-a3b-mtp@q2_k_xl} vlm_api_mode:=${VLM_API_MODE:-openai_compat} vlm_publish_period_sec:=${VLM_PUBLISH_PERIOD_SEC:-1.0} vlm_image_stale_sec:=${VLM_IMAGE_STALE_SEC:-3.0} vlm_max_output_tokens:=${VLM_MAX_OUTPUT_TOKENS:-320} vlm_response_format:=${VLM_RESPONSE_FORMAT:-json_schema} vlm_reasoning_effort:=${VLM_REASONING_EFFORT:-none} vlm_context_mode:=${VLM_CONTEXT_MODE:-actor_log} surgeon_actor_mode:=${SURGEON_ACTOR_MODE:-llm} actor_base_url:=${ACTOR_BASE_URL:-http://127.0.0.1:1234} actor_model_id:=${ACTOR_MODEL_ID:-google/gemma-4-12b-qat} actor_response_format:=${ACTOR_RESPONSE_FORMAT:-json_schema} actor_reasoning_effort:=${ACTOR_REASONING_EFFORT:-none} enable_no_image_camera:=${ENABLE_NO_IMAGE_CAMERA:-true} enable_synthetic_scene_camera:=${ENABLE_SYNTHETIC_SCENE_CAMERA:-false} $${FIELD_SNAPSHOT_URL:+field_snapshot_url:=$${FIELD_SNAPSHOT_URL}}"
 
   webapp:
     build:
@@ -107,7 +117,7 @@ services:
     environment:
       VITE_ROSBRIDGE_URL: ws://127.0.0.1:${ROSBRIDGE_PORT:-9090}
     ports:
-      - "${WEBAPP_PORT:-4173}:4173"
+      - "127.0.0.1:${WEBAPP_PORT:-4173}:4173"
     command: >
       bash -lc "
         npm install &&
