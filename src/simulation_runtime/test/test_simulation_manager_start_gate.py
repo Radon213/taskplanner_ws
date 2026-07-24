@@ -117,3 +117,16 @@ def test_bundle_switch_quiesces_old_runtime_before_spec_change_and_restart():
         "restart-new",
     ]
     assert manager._operation_name == ""
+
+
+def test_bundle_switch_quiescence_accepts_launch_time_bundle_before_spec_update():
+    manager = SimulationManagerNode.__new__(SimulationManagerNode)
+    events: list[str] = []
+    manager._reset_digital_twin_to_idle = lambda *, expected_bundle=None: events.append(
+        f"reset:{expected_bundle!r}"
+    )
+    manager._prepare_executor_for_restart = lambda: events.append("executor-idle")
+
+    manager._quiesce_runtime_for_bundle_change()
+
+    assert events == ["reset:''", "executor-idle"]

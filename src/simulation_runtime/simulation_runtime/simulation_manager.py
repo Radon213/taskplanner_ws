@@ -469,11 +469,12 @@ class SimulationManagerNode(Node):
             # It is fine if the executor was not running yet.
             pass
 
-    def _reset_digital_twin_to_idle(self) -> None:
+    def _reset_digital_twin_to_idle(self, *, expected_bundle: str | None = None) -> None:
+        bundle = self._active_bundle if expected_bundle is None else expected_bundle
         if not self._publish_control_until(
             "reset",
             lambda state: (
-                state.active_bundle == self._active_bundle
+                (not bundle or state.active_bundle == bundle)
                 and (not state.running)
                 and state.execution_state == "idle"
                 and self._all_instruments_home(state)
@@ -490,7 +491,11 @@ class SimulationManagerNode(Node):
         # Reset first so actors, group orchestrator/bridge, and downstream
         # action servers stop accepting work even while BT termination is in
         # progress.  Only then is it safe to mutate the shared spec_dir.
-        self._reset_digital_twin_to_idle()
+        # The launch-time digital twin may already use the requested spec while
+        # the manager still holds its default bundle name. This first reset is
+        # only a quiescence barrier; the post-update reset verifies the exact
+        # selected bundle.
+        self._reset_digital_twin_to_idle(expected_bundle="")
         self._prepare_executor_for_restart()
 
     def _stop_digital_twin_to_halted(self) -> None:
