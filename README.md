@@ -22,6 +22,8 @@ operator dashboard.
 - `retrieve_from_hand` remains only as a legacy/manual path.
 - Bleeding/hemostasis is modeled as an interrupt event, not as a normal
   sequential phase.
+- Bed-mounted arms are exposed only as the logical `suction` and `retraction`
+  groups; the planner never selects or counts physical member arms.
 
 ## Repository Layout
 
@@ -59,6 +61,18 @@ To add another surgery, create a new directory with one
 `src/procedure_spec/procedure_spec/specs/display_catalog.yaml`. The dashboard
 and runtime bundle switch use this YAML-driven catalog.
 
+### Bed Robot-Arm Group Contract
+
+Retraction requests use exactly one group Action with one of `UP`, `DOWN`,
+`LEFT`, `RIGHT`, `LEFT_RIGHT`, or `UP_DOWN`. Explicit distances are converted
+to millimetres without planner-side clamping; qualitative distances are limited
+to 1–30 mm and a request without a distance defaults to 10 mm. The downstream
+group controller remains responsible for physical arm selection, collision and
+force control, and final safety-limit rejection.
+
+The operator dashboard shows request-correlated speech, VLM interpretation, BT
+validation, group Action, and group status at <http://127.0.0.1:4173/>.
+
 ## External Dependency
 
 This repository intentionally does not vendor `btops_ws`. Docker builds use a
@@ -82,10 +96,22 @@ BTOPS_REF=main
 AUTO_APMS_REPO_URL=https://github.com/AutoAPMS/auto-apms.git
 AUTO_APMS_REF=1.5.1
 VLM_BASE_URL=http://127.0.0.1:1234
+VLM_API_KEY=
 VLM_MODEL_ID=qwen3.6-35b-a3b-mtp@q2_k_xl
 ACTOR_BASE_URL=http://127.0.0.1:1234
+ACTOR_API_KEY=
 ACTOR_MODEL_ID=google/gemma-4-12b-qat
 ```
+
+Set `VLM_API_KEY` or `ACTOR_API_KEY` when the selected OpenAI-compatible server
+requires Bearer authentication, as Unsloth Studio does. On a VRAM-constrained
+host, both URLs and model IDs can point to the same loaded model; the VLM and
+surgeon actor then share one set of weights.
+
+The web UI refreshes both model selectors every five seconds through the ROS
+model-catalog services. Each service queries its node's current base URL with
+its configured credentials, so LM Studio, Unsloth Studio, and vLLM catalogs do
+not need a browser-side URL or API key.
 
 For the default real-mode demo, LM Studio should expose an OpenAI-compatible
 server at `http://127.0.0.1:1234`.

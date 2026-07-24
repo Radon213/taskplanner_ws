@@ -5,11 +5,20 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import asdict
 import json
+import os
 from pathlib import Path
 import time
 from typing import Any
 
-from procedure_spec import ProcedurePriorScorer, compact_procedure_prompt, get_default_spec_dir, load_bundle
+from procedure_spec import (
+    BedRobotArmGroupNormalizationError,
+    ProcedurePriorScorer,
+    compact_procedure_prompt,
+    get_default_spec_dir,
+    infer_retraction_direction,
+    load_bundle,
+    normalize_retraction_request,
+)
 import requests
 import rclpy
 from rcl_interfaces.msg import SetParametersResult
@@ -17,6 +26,10 @@ from rclpy.node import Node
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
 from surgical_msgs.msg import (
+    BedRobotArmGroupActionProposal,
+    BedRobotArmGroupCommand,
+    BedRobotArmGroupRequest,
+    BedRobotArmGroupStatus,
     BTContextSnapshot,
     BTDecision,
     EventDigest,
@@ -33,6 +46,7 @@ from surgical_msgs.msg import (
     VLMResult,
     WorldState,
 )
+from surgical_msgs.srv import ListModels
 
 from .common import compact_json
 from .lmstudio_client import LMStudioClient
@@ -67,6 +81,7 @@ class RealVLMNode(Node):
         super().__init__("real_vlm_node")
         self.declare_parameter("spec_dir", str(get_default_spec_dir()))
         self.declare_parameter("base_url", "http://192.168.0.122:1234")
+        self.declare_parameter("api_key", "")
         self.declare_parameter("model_id", "gemma-4-26b-a4b-it")
         self.declare_parameter("api_mode", "lmstudio_native")
         self.declare_parameter("request_timeout_sec", 20.0)
@@ -100,6 +115,8 @@ class RealVLMNode(Node):
         self._recent_observed_signals: deque[dict[str, Any]] = deque(maxlen=12)
         self._recent_speech: deque[dict[str, Any]] = deque(maxlen=10)
         self._recent_skill_statuses: deque[dict[str, Any]] = deque(maxlen=8)
+        self._latest_bed_robot_arm_group_request: BedRobotArmGroupRequest | None = None
+        self._last_bed_robot_arm_group_proposal_request_id = ""
         self._actor_overlay: dict[str, Any] = {}
         self._last_simulation_bundle = ""
         self._last_world_phase = ""
@@ -131,6 +148,12 @@ class RealVLMNode(Node):
         self._phase_pub = self.create_publisher(PhaseEvidence, self._topic(self._output_prefix, "phase_evidence"), 10)
         self._tool_pub = self.create_publisher(ToolObservation, self._topic(self._output_prefix, "tool_observations"), 30)
         self._gesture_pub = self.create_publisher(SurgeonGestureEvidence, self._topic(self._output_prefix, "surgeon_gesture_evidence"), 10)
+        self._bed_robot_arm_group_proposal_pub = self.create_publisher(
+            BedRobotArmGroupActionProposal,
+            self._topic(self._output_prefix, "bed_robot_arm_group_proposal"),
+            10,
+        )
+        self._model_catalog_service = self.create_service(ListModels, "~/list_models", self._on_list_models)
 
         self.create_subscription(WorldState, "/twin/world_state", self._on_world, 20)
         self.create_subscription(SimulationState, "/simulation/state", self._on_simulation, 20)
@@ -141,6 +164,18 @@ class RealVLMNode(Node):
         self.create_subscription(SkillStatus, "/skill/status", self._on_skill_status, 50)
         self.create_subscription(String, "/surgeon/actor_overlay", self._on_actor_overlay, 20)
         self.create_subscription(String, "/surgery/audio/request_text", self._on_request_text, 20)
+        self.create_subscription(
+            BedRobotArmGroupRequest,
+            "/surgeon/bed_robot_arm_group_request",
+            self._on_bed_robot_arm_group_request,
+            20,
+        )
+        self.create_subscription(
+            BedRobotArmGroupStatus,
+            "/bed_robot_arm_group/status",
+            self._on_bed_robot_arm_group_status,
+            20,
+        )
         self.create_subscription(CompressedImage, self._field_image_topic, self._make_image_cb("field"), 10)
         self.create_subscription(CompressedImage, self._tray_image_topic, self._make_image_cb("tray"), 10)
         self.create_subscription(CompressedImage, self._synthetic_image_topic, self._make_image_cb("synthetic"), 10)
@@ -157,6 +192,7 @@ class RealVLMNode(Node):
         self._spec_dir = str(param_value("spec_dir"))
         self._spec = load_bundle(self._spec_dir)
         self._base_url = str(param_value("base_url"))
+        self._api_key = str(param_value("api_key") or os.environ.get("VLM_API_KEY", ""))
         self._model_id = str(param_value("model_id"))
         self._api_mode = str(param_value("api_mode"))
         self._request_timeout_sec = float(param_value("request_timeout_sec"))
@@ -181,7 +217,7 @@ class RealVLMNode(Node):
             self._prior_scorer = ProcedurePriorScorer(self._spec, self._procedure_prompt)
             self._system_prompt = self._actor_log_system_prompt()
             self._developer_instruction = self._actor_log_developer_instruction()
-            self._json_schema = compact_vlm_json_schema("3")
+            self._json_schema = compact_vlm_json_schema("4")
         else:
             self._context_mode = "world"
             self._procedure_prompt = compact_procedure_prompt(self._spec_dir)
@@ -192,7 +228,11 @@ class RealVLMNode(Node):
         self._oracle_scenario = list(self._spec.get_mock_perception_stages())
         self._oracle_scenario_length = sum(stage.duration_ticks for stage in self._oracle_scenario)
         self._oracle_bootstrap_tick = int(self._spec.get_mock_perception_bootstrap_tick())
-        self._client = LMStudioClient(base_url=self._base_url, timeout_sec=self._request_timeout_sec)
+        self._client = LMStudioClient(
+            base_url=self._base_url,
+            timeout_sec=self._request_timeout_sec,
+            api_key=self._api_key,
+        )
         self._replay_payload = self._load_replay_payload(self._replay_response_path)
 
     def _load_replay_payload(self, replay_path: str) -> dict[str, Any] | None:
@@ -257,6 +297,11 @@ class RealVLMNode(Node):
             "When any Mayo tool is recover, mayo_retrieve must name the highest-confidence recover tool; do not leave mayo_retrieve empty. "
             "The doctor procedure prompt may use Pxx/Txx ids. Use the runtime_phase and tools[*].rt crosswalk, and emit only runtime phase/tool ids in JSON. "
             "If a doctor tool has an empty runtime id, treat it as an unmodeled cue and do not emit it as the requested tool. "
+            "You also interpret pending logical bed-robot-arm-group retraction requests. "
+            "The planner knows only the suction and retraction groups; never infer or emit a physical arm id, arm count, or per-arm command. "
+            "Suction is routed deterministically outside the VLM, so never produce a suction proposal. "
+            "For a pending retraction request, choose exactly one of UP, DOWN, LEFT, RIGHT, LEFT_RIGHT, or UP_DOWN only when speech or visual evidence supports the direction. "
+            "If direction evidence is insufficient, emit a null bed_robot_arm_group so no action is issued. "
             "Return exactly one JSON object with top-k phase and tool candidates. "
             f"Runtime ontology: {json.dumps({'phases': phases, 'tools': tools}, separators=(',', ':'))}. "
             f"Doctor procedure prompt: {json.dumps(self._procedure_prompt, separators=(',', ':'))}"
@@ -264,10 +309,11 @@ class RealVLMNode(Node):
 
     def _actor_log_developer_instruction(self) -> str:
         return (
-            "Return schema v3 only: "
-            "{\"v\":\"3\",\"phase\":[[phase_id,confidence]],\"tool\":[[tool_id,confidence]],"
+            "Return schema v4 only: "
+            "{\"v\":\"4\",\"phase\":[[phase_id,confidence]],\"tool\":[[tool_id,confidence]],"
             "\"intent\":[intent_type,tool_id,confidence],\"mayo\":[[tool_id,\"recover|reuse\",confidence]],"
-            "\"mayo_retrieve\":[tool_id,confidence],\"u\":uncertainty,\"sum\":\"short reason\"}. "
+            "\"mayo_retrieve\":[tool_id,confidence],\"u\":uncertainty,\"sum\":\"short reason\","
+            "\"bed_robot_arm_group\":null_or_retraction_object}. "
             "Emit 1-4 phase candidates and 1-4 next-tool candidates using exact phase ids and tool ids from context. "
             "intent_type should be handover when speech/hand indicates a tool request; otherwise use none. "
             "tool rows must rank the most likely next runtime tools requested soon, not Pxx/Txx doctor ids. "
@@ -277,6 +323,14 @@ class RealVLMNode(Node):
             "Use mayo rows to classify visible Mayo tools as recover or reuse. "
             "For each visible Mayo tool, emit one mayo row. If a Mayo tool is not the current requested tool and is not the immediate next reusable tool, mark recover with confidence >=0.55. "
             "If no Mayo tool should be recovered, mayo_retrieve must be [\"\",0.0]. "
+            "When pending_bed_robot_arm_group_request is absent, not retraction/retraction, or lacks enough direction evidence, bed_robot_arm_group must be null. "
+            "Otherwise bed_robot_arm_group must contain exactly request_id, group_id, operation, direction, distance_mm, distance_origin, raw_distance_text, end_effector_profile, rationale, confidence. "
+            "Copy request_id exactly; group_id and operation must both be retraction; copy the requested end_effector_profile; never name a physical arm. "
+            "Direction is one of UP, DOWN, LEFT, RIGHT, LEFT_RIGHT, UP_DOWN. Korean aliases include 위/위쪽/상방, 아래/아래쪽/하방, 왼쪽/좌측, 오른쪽/우측, 좌우/양쪽, 상하/위와 아래. "
+            "Distance precedence: explicit number plus mm/cm wins and cm is multiplied by 10; an explicit number without a unit means mm; qualitative anchors are 아주 살짝/미세하게=1, 살짝=5, 조금/조금 더=10, 많이=20, 아주 많이/최대한=30; no distance expression defaults to 10 mm. "
+            "Do not clamp explicit distances: 5 cm must remain 50 mm. Only qualitative inference is restricted to 1..30 mm. "
+            "Set distance_origin to exactly explicit_with_unit, explicit_unit_inferred, qualitative_inferred, or defaulted and preserve the matched phrase in raw_distance_text (empty for defaulted). "
+            "A deterministic normalizer will recompute numbers and units from the request, so never approximate an explicit value. "
             "Never include markdown or extra text."
         )
 
@@ -288,6 +342,7 @@ class RealVLMNode(Node):
             if parameter.name in {
                 "spec_dir",
                 "base_url",
+                "api_key",
                 "model_id",
                 "api_mode",
                 "request_timeout_sec",
@@ -315,11 +370,24 @@ class RealVLMNode(Node):
                     self._recent_speech.clear()
                     self._recent_skill_statuses.clear()
                     self._actor_overlay = {}
+                    self._latest_bed_robot_arm_group_request = None
+                    self._last_bed_robot_arm_group_proposal_request_id = ""
                     self._phase_entered_wall_sec = time.time()
                     self._oracle_tick = 0
             except Exception as exc:
                 return SetParametersResult(successful=False, reason=str(exc))
         return SetParametersResult(successful=True)
+
+    def _on_list_models(self, _request, response):
+        try:
+            response.model_ids = self._client.list_models()
+            response.success = True
+            response.message = f"{len(response.model_ids)} model(s) from {self._base_url}"
+        except Exception as exc:
+            response.success = False
+            response.model_ids = []
+            response.message = f"Model catalog unavailable at {self._base_url}: {exc}"
+        return response
 
     def _make_image_cb(self, label: str):
         def _cb(msg: CompressedImage) -> None:
@@ -489,6 +557,86 @@ class RealVLMNode(Node):
     def _on_request_text(self, msg: String) -> None:
         self._append_public_speech(msg.data)
 
+    def _on_bed_robot_arm_group_request(self, msg: BedRobotArmGroupRequest) -> None:
+        """Track only VLM-routed logical retraction requests.
+
+        Suction start/stop is intentionally absent here: the BT group lane
+        routes those operations deterministically without asking the VLM.
+        """
+        self._append_public_speech(msg.voice_text)
+        if str(msg.group_id) != "retraction" or str(msg.operation) != "retraction":
+            return
+        request_id = str(msg.request_id).strip()
+        if not request_id:
+            self.get_logger().warning("Ignoring retraction request without request_id")
+            return
+        if (
+            self._latest_bed_robot_arm_group_request is not None
+            and self._latest_bed_robot_arm_group_request.request_id == request_id
+        ):
+            return
+        if self._latest_bed_robot_arm_group_request is not None:
+            self.get_logger().warning(
+                "Ignoring retraction request %s while request %s is still pending"
+                % (
+                    request_id,
+                    self._latest_bed_robot_arm_group_request.request_id,
+                )
+            )
+            return
+        self._latest_bed_robot_arm_group_request = msg
+        self._last_bed_robot_arm_group_proposal_request_id = ""
+
+    def _on_bed_robot_arm_group_status(self, msg: BedRobotArmGroupStatus) -> None:
+        pending = self._latest_bed_robot_arm_group_request
+        if pending is None or str(msg.request_id) != str(pending.request_id):
+            return
+        if bool(msg.terminal):
+            self._latest_bed_robot_arm_group_request = None
+
+    def _bed_robot_arm_group_state_rows(self) -> list[dict[str, Any]]:
+        if self._world is None:
+            return []
+        rows: list[dict[str, Any]] = []
+        for state in getattr(self._world, "bed_robot_arm_groups", []):
+            group_id = str(getattr(state, "group_id", ""))
+            if group_id not in {"suction", "retraction"}:
+                continue
+            rows.append(
+                {
+                    "group_id": group_id,
+                    "connected": bool(getattr(state, "connected", False)),
+                    "state": str(getattr(state, "state", "")),
+                    "operation": str(getattr(state, "operation", "")),
+                    "direction": str(getattr(state, "direction", "")),
+                    "distance_mm": round(float(getattr(state, "distance_mm", 0.0)), 3),
+                    "distance_origin": str(getattr(state, "distance_origin", "")),
+                    "end_effector_profile": str(
+                        getattr(state, "end_effector_profile", "")
+                    ),
+                    "active_request_id": str(getattr(state, "active_request_id", "")),
+                    "progress": round(float(getattr(state, "progress", 0.0)), 3),
+                    "error_code": str(getattr(state, "error_code", "")),
+                    "rejection_reason": str(getattr(state, "rejection_reason", "")),
+                }
+            )
+        return rows
+
+    def _pending_bed_robot_arm_group_request_context(self) -> dict[str, Any] | None:
+        request = self._latest_bed_robot_arm_group_request
+        if request is None:
+            return None
+        return {
+            "request_id": str(request.request_id),
+            "group_id": str(request.group_id),
+            "operation": str(request.operation),
+            "voice_text": str(request.voice_text),
+            "procedure_id": str(request.procedure_id),
+            "phase_id": str(request.phase_id),
+            "end_effector_profile": str(request.end_effector_profile),
+            "source": str(request.source),
+        }
+
     def _on_skill_status(self, msg: SkillStatus) -> None:
         if msg.state != "completed":
             return
@@ -549,6 +697,8 @@ class RealVLMNode(Node):
         self._recent_events.clear()
         self._reset_transient_public_evidence()
         self._actor_overlay = {}
+        self._latest_bed_robot_arm_group_request = None
+        self._last_bed_robot_arm_group_proposal_request_id = ""
         self._phase_entered_wall_sec = time.time()
 
     def _reset_transient_public_evidence(self) -> None:
@@ -665,6 +815,10 @@ class RealVLMNode(Node):
             "exp": list(self._world.expected_instruments),
             "tools": tool_rows,
             "pending": list(self._world.pending_transition_tools),
+            "bed_robot_arm_groups": self._bed_robot_arm_group_state_rows(),
+            "pending_bed_robot_arm_group_request": (
+                self._pending_bed_robot_arm_group_request_context()
+            ),
             "ev": [
                 {
                     "t": event.event_type,
@@ -704,6 +858,13 @@ class RealVLMNode(Node):
         msg.pending_transition_tools = list(self._world.pending_transition_tools)
         msg.recent_events = recent_events
         msg.bt_snapshot = bt_snapshot
+        msg.bed_robot_arm_groups = list(
+            getattr(self._world, "bed_robot_arm_groups", [])
+        )
+        pending_group_request = self._latest_bed_robot_arm_group_request
+        msg.has_pending_bed_robot_arm_group_request = pending_group_request is not None
+        if pending_group_request is not None:
+            msg.pending_bed_robot_arm_group_request = pending_group_request
         msg.compact_json = compact_json(context_dict)
         return msg, context_dict
 
@@ -732,6 +893,7 @@ class RealVLMNode(Node):
                 "ready_for_retrieval": bool(self._world.surgeon_ready_for_retrieval),
             },
             "tools": world_context.get("tools", []),
+            "bed_robot_arm_groups": self._bed_robot_arm_group_state_rows(),
             "events": public_events[-6:],
         }
 
@@ -748,6 +910,13 @@ class RealVLMNode(Node):
             msg.cleaner_remaining_sec = float(self._world.cleaner_remaining_sec)
             msg.active_tool_ids = [str(row.get("id", "")) for row in context.get("digital_twin", {}).get("tools", []) if row.get("id")]
             msg.recent_events = self._public_event_digests()
+            msg.bed_robot_arm_groups = list(
+                getattr(self._world, "bed_robot_arm_groups", [])
+            )
+        pending_group_request = self._latest_bed_robot_arm_group_request
+        msg.has_pending_bed_robot_arm_group_request = pending_group_request is not None
+        if pending_group_request is not None:
+            msg.pending_bed_robot_arm_group_request = pending_group_request
         msg.compact_json = compact_context
         return msg
 
@@ -871,6 +1040,10 @@ class RealVLMNode(Node):
                 "skill_status": list(evidence.get("skill_status", [])),
             },
             "digital_twin": self._public_digital_twin_context(),
+            "bed_robot_arm_groups": self._bed_robot_arm_group_state_rows(),
+            "pending_bed_robot_arm_group_request": (
+                self._pending_bed_robot_arm_group_request_context()
+            ),
             "candidates": candidates,
             "previous": {
                 "phase": self._last_good_payload.get("phase", ["", 0.0]) if self._last_good_payload else ["", 0.0],
@@ -1044,7 +1217,7 @@ class RealVLMNode(Node):
         if recover_candidates:
             mayo_retrieve = [recover_candidates[0][0], recover_candidates[0][1]]
         return {
-            "v": "3",
+            "v": "4",
             "phase": phase_rows[:4],
             "tool": tool_rows[:4],
             "intent": [intent_type, requested_tool if intent_type != "none" else "", 0.7 if intent_type != "none" else 0.0],
@@ -1052,6 +1225,34 @@ class RealVLMNode(Node):
             "mayo_retrieve": mayo_retrieve,
             "u": 0.55,
             "sum": "actor-log fallback",
+            "bed_robot_arm_group": self._fallback_bed_robot_arm_group_proposal(),
+        }
+
+    def _fallback_bed_robot_arm_group_proposal(self) -> dict[str, Any] | None:
+        """Build a safe oracle fallback only when speech states direction.
+
+        A missing spoken direction cannot be recovered from the fallback path,
+        because that path has no trustworthy visual reasoning.  Returning null
+        turns into an explicit invalid proposal and therefore no group action.
+        """
+        request = self._latest_bed_robot_arm_group_request
+        if request is None or not infer_retraction_direction(request.voice_text):
+            return None
+        try:
+            normalized = normalize_retraction_request(request.voice_text)
+        except BedRobotArmGroupNormalizationError:
+            return None
+        return {
+            "request_id": str(request.request_id),
+            "group_id": "retraction",
+            "operation": "retraction",
+            "direction": normalized.direction,
+            "distance_mm": float(normalized.distance_mm),
+            "distance_origin": normalized.distance_origin,
+            "raw_distance_text": normalized.raw_distance_text,
+            "end_effector_profile": str(request.end_effector_profile),
+            "rationale": "direction and distance normalized from explicit speech",
+            "confidence": 0.76,
         }
 
     def _fallback_payload(self, context_dict: dict[str, Any]) -> dict[str, Any]:
@@ -1110,7 +1311,7 @@ class RealVLMNode(Node):
         return []
 
     def _stabilize_actor_log_payload(self, payload: dict[str, Any], context_dict: dict[str, Any]) -> dict[str, Any]:
-        if str(payload.get("v", "")) != "3":
+        if str(payload.get("v", "")) not in {"3", "4"}:
             return payload
         stabilized = dict(payload)
         evidence_window = context_dict.get("evidence_window", {}) if isinstance(context_dict, dict) else {}
@@ -1208,6 +1409,21 @@ class RealVLMNode(Node):
         normalized_raw, payload = normalize_raw_text(raw)
         return normalized_raw, payload, 0.0, "oracle_fallback", retries_used, last_error
 
+    def _cacheable_payload(
+        self,
+        raw_json: str,
+        payload: dict[str, Any],
+    ) -> tuple[str, dict[str, Any]]:
+        """Remove one-shot group commands from temporal phase/tool memory."""
+        if str(payload.get("v", "")) != "4" or payload.get("bed_robot_arm_group") is None:
+            return raw_json, payload
+        cache_payload = dict(payload)
+        cache_payload["bed_robot_arm_group"] = None
+        return (
+            json.dumps(cache_payload, separators=(",", ":"), sort_keys=True),
+            cache_payload,
+        )
+
     def _tick(self, force: bool = False) -> None:
         if not force and not self._active:
             return
@@ -1257,8 +1473,10 @@ class RealVLMNode(Node):
             payload = self._stabilize_actor_log_payload(payload, context_dict)
             raw_json = json.dumps(payload, separators=(",", ":"), sort_keys=True)
         if mode not in {"last_good", "oracle_fallback"}:
-            self._last_good_raw = raw_json
-            self._last_good_payload = payload
+            self._last_good_raw, self._last_good_payload = self._cacheable_payload(
+                raw_json,
+                payload,
+            )
 
         self._publish_vlm_outputs(
             payload,
@@ -1275,6 +1493,120 @@ class RealVLMNode(Node):
         )
         if self._response_mode == "oracle":
             self._oracle_tick += 1
+
+    def _validate_bed_robot_arm_group_proposal(
+        self,
+        proposal: dict[str, Any],
+        request: BedRobotArmGroupRequest,
+    ) -> str:
+        if str(proposal.get("request_id", "")) != str(request.request_id):
+            return "request_id does not match the pending retraction request"
+        if str(proposal.get("group_id", "")) != "retraction":
+            return "VLM proposal must target the retraction group"
+        if str(proposal.get("operation", "")) != "retraction":
+            return "VLM proposal operation must be retraction"
+
+        requested_profile = str(request.end_effector_profile).strip()
+        proposed_profile = str(proposal.get("end_effector_profile", "")).strip()
+        if requested_profile and proposed_profile != requested_profile:
+            return "end_effector_profile does not match the pending request"
+
+        distance_origin = str(proposal.get("distance_origin", ""))
+        raw_distance_text = str(proposal.get("raw_distance_text", "")).strip()
+        voice_text = str(request.voice_text).strip()
+        if distance_origin == "defaulted" and raw_distance_text:
+            return "defaulted distance must have empty raw_distance_text"
+        if raw_distance_text:
+            compact_raw = "".join(raw_distance_text.split())
+            compact_voice = "".join(voice_text.split())
+            if compact_raw not in compact_voice:
+                return "raw_distance_text is not present in the source request"
+
+        try:
+            distance_mm = float(proposal.get("distance_mm", 0.0))
+            normalized = normalize_retraction_request(
+                voice_text,
+                vlm_direction=str(proposal.get("direction", "")),
+                qualitative_distance_mm=(
+                    distance_mm if distance_origin == "qualitative_inferred" else None
+                ),
+            )
+        except (BedRobotArmGroupNormalizationError, TypeError, ValueError) as exc:
+            return f"deterministic request normalization failed: {exc}"
+
+        if normalized.direction != str(proposal.get("direction", "")):
+            return (
+                "direction contradicts the source request: "
+                f"expected {normalized.direction}"
+            )
+        if normalized.distance_origin != distance_origin:
+            return (
+                "distance_origin contradicts the source request: "
+                f"expected {normalized.distance_origin}"
+            )
+        if abs(float(normalized.distance_mm) - distance_mm) > 1e-6:
+            return (
+                "distance_mm contradicts deterministic source normalization: "
+                f"expected {normalized.distance_mm:g} mm"
+            )
+        return ""
+
+    def _publish_bed_robot_arm_group_proposal(
+        self,
+        payload: dict[str, Any],
+        raw_json: str,
+        stamp,
+    ) -> None:
+        if str(payload.get("v", "")) != "4":
+            return
+        request = self._latest_bed_robot_arm_group_request
+        if request is None:
+            return
+        request_id = str(request.request_id)
+        if request_id == self._last_bed_robot_arm_group_proposal_request_id:
+            return
+
+        group_payload = payload.get("bed_robot_arm_group")
+        message = BedRobotArmGroupActionProposal()
+        message.stamp = stamp
+        message.schema_version = "4"
+        message.raw_json = raw_json
+        command = BedRobotArmGroupCommand()
+        command.stamp = stamp
+        command.request_id = request_id
+        command.command_id = f"vlm-{request_id}"
+        command.group_id = "retraction"
+        command.operation = "retraction"
+        command.end_effector_profile = str(request.end_effector_profile)
+
+        if not isinstance(group_payload, dict):
+            message.valid = False
+            message.validation_error = (
+                "VLM declined retraction: insufficient direction evidence"
+            )
+        else:
+            command.request_id = str(group_payload.get("request_id", request_id))
+            command.command_id = f"vlm-{command.request_id}"
+            command.group_id = str(group_payload.get("group_id", ""))
+            command.operation = str(group_payload.get("operation", ""))
+            command.direction = str(group_payload.get("direction", ""))
+            command.distance_mm = float(group_payload.get("distance_mm", 0.0))
+            command.distance_origin = str(group_payload.get("distance_origin", ""))
+            command.raw_distance_text = str(group_payload.get("raw_distance_text", ""))
+            command.end_effector_profile = str(
+                group_payload.get("end_effector_profile", "")
+            )
+            command.rationale = str(group_payload.get("rationale", ""))
+            command.confidence = float(group_payload.get("confidence", 0.0))
+            message.validation_error = self._validate_bed_robot_arm_group_proposal(
+                group_payload,
+                request,
+            )
+            message.valid = not bool(message.validation_error)
+
+        message.command = command
+        self._bed_robot_arm_group_proposal_pub.publish(message)
+        self._last_bed_robot_arm_group_proposal_request_id = request_id
 
     def _publish_vlm_outputs(
         self,
@@ -1293,7 +1625,7 @@ class RealVLMNode(Node):
     ) -> None:
         stamp = observation_stamp
         schema_version = str(payload.get("v", "1"))
-        if schema_version == "3":
+        if schema_version in {"3", "4"}:
             phase_rows = [
                 [str(item[0]), float(item[1])]
                 for item in payload.get("phase", [])
@@ -1398,6 +1730,12 @@ class RealVLMNode(Node):
         result.gesture_confidence = gesture.confidence
         result.uncertainty = uncertainty
         self._result_pub.publish(result)
+
+        self._publish_bed_robot_arm_group_proposal(
+            payload,
+            raw_json,
+            stamp,
+        )
 
         health = VLMHealth()
         health.stamp = self.get_clock().now().to_msg()

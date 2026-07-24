@@ -1,0 +1,9 @@
+builtin_interfaces/Time stamp
+string request_id
+string group_id
+string operation
+string voice_text
+string procedure_id
+string phase_id
+string end_effector_profile
+string source

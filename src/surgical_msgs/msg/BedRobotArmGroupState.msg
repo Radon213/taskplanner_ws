@@ -1,0 +1,16 @@
+builtin_interfaces/Time stamp
+string group_id
+bool connected
+string state
+string operation
+string direction
+float32 distance_mm
+string distance_origin
+string raw_distance_text
+string end_effector_profile
+string active_request_id
+string active_command_id
+float32 progress
+string error_code
+string error_message
+string rejection_reason

@@ -9,9 +9,12 @@ from __future__ import annotations
 
 from collections import deque
 import json
+import os
 import random
+import re
 import time
 from typing import Any
+import uuid
 
 from procedure_spec import compact_procedure_prompt, get_default_spec_dir, load_bundle
 import requests
@@ -20,12 +23,15 @@ from rcl_interfaces.msg import SetParametersResult
 from rclpy.node import Node
 from std_msgs.msg import String
 from surgical_msgs.msg import (
+    BedRobotArmGroupRequest,
+    BedRobotArmGroupStatus,
     SkillStatus,
     SurgeonActorEvent,
     SurgeonLLMDecision,
     SurgeonRequest,
     SurgeonState,
 )
+from surgical_msgs.srv import ListModels
 
 
 HANDOVER_ACTIONS = {
@@ -64,6 +70,7 @@ class LLMSurgeonActorNode(Node):
         super().__init__("llm_surgeon_actor")
         self.declare_parameter("spec_dir", str(get_default_spec_dir()))
         self.declare_parameter("base_url", "http://127.0.0.1:1234")
+        self.declare_parameter("api_key", "")
         self.declare_parameter("model_id", "google/gemma-4-12b-qat")
         self.declare_parameter("request_timeout_sec", 20.0)
         self.declare_parameter("decision_period_sec", 0.25)
@@ -123,6 +130,9 @@ class LLMSurgeonActorNode(Node):
         self._interrupt_used_tools: set[str] = set()
         self._last_interrupt_completed_sec = -1_000_000_000.0
         self._field_event_lines: list[str] = []
+        self._pending_group_requests: dict[str, dict[str, str]] = {}
+        self._bed_group_states: dict[str, dict[str, Any]] = {}
+        self._bed_group_status_stamp_ns: dict[str, int] = {}
 
         self._load_parameters()
         self._schedule_interrupt_for_phase(self._current_phase_id, "init")
@@ -130,13 +140,25 @@ class LLMSurgeonActorNode(Node):
 
         self._state_pub = self.create_publisher(SurgeonState, "/surgeon/state", 20)
         self._request_pub = self.create_publisher(SurgeonRequest, "/surgeon/request", 20)
+        self._bed_group_request_pub = self.create_publisher(
+            BedRobotArmGroupRequest,
+            "/surgeon/bed_robot_arm_group_request",
+            20,
+        )
         self._voice_pub = self.create_publisher(String, "/surgery/audio/request_text", 10)
         self._actor_event_pub = self.create_publisher(SurgeonActorEvent, "/surgeon/actor_event", 20)
         self._overlay_pub = self.create_publisher(String, "/surgeon/actor_overlay", 20)
         self._decision_pub = self.create_publisher(SurgeonLLMDecision, "/surgeon/llm_decision", 20)
+        self._model_catalog_service = self.create_service(ListModels, "~/list_models", self._on_list_models)
 
         self.create_subscription(String, "/simulation/control_state", self._on_control, 20)
         self.create_subscription(SkillStatus, "/skill/status", self._on_skill_status, 50)
+        self.create_subscription(
+            BedRobotArmGroupStatus,
+            "/bed_robot_arm_group/status",
+            self._on_bed_robot_arm_group_status,
+            50,
+        )
 
         self._timer = self.create_timer(self._decision_period_sec, self._tick)
         self._publish_overlay()
@@ -151,6 +173,7 @@ class LLMSurgeonActorNode(Node):
         self._spec_dir = str(param_value("spec_dir"))
         self._spec = load_bundle(self._spec_dir)
         self._base_url = str(param_value("base_url")).rstrip("/")
+        self._api_key = str(param_value("api_key") or os.environ.get("ACTOR_API_KEY", ""))
         self._model_id = str(param_value("model_id"))
         self._request_timeout_sec = float(param_value("request_timeout_sec"))
         self._decision_period_sec = float(param_value("decision_period_sec"))
@@ -234,6 +257,7 @@ class LLMSurgeonActorNode(Node):
         ]
         self._phase_ids = list(self._spec.phase_ids)
         self._procedure_prompt = compact_procedure_prompt(self._spec_dir)
+        self._reset_bed_robot_arm_group_states()
         self._normal_phase_ids = list(getattr(self._spec, "normal_phase_ids", []))
         self._interrupt_phase_ids = set(getattr(self._spec, "interrupt_phase_ids", []))
         if isinstance(self._procedure_prompt, dict):
@@ -323,6 +347,8 @@ class LLMSurgeonActorNode(Node):
                 reload_required = True
             elif parameter.name == "base_url":
                 self._base_url = str(parameter.value).rstrip("/")
+            elif parameter.name == "api_key":
+                self._api_key = str(parameter.value)
             elif parameter.name == "model_id":
                 self._model_id = str(parameter.value)
             elif parameter.name == "enabled":
@@ -348,6 +374,46 @@ class LLMSurgeonActorNode(Node):
             except Exception as exc:
                 return SetParametersResult(successful=False, reason=str(exc))
         return SetParametersResult(successful=True)
+
+    def _headers(self) -> dict[str, str]:
+        if not self._api_key:
+            return {}
+        return {"Authorization": f"Bearer {self._api_key}"}
+
+    def _models_url(self) -> str:
+        if self._base_url.endswith("/v1"):
+            return f"{self._base_url}/models"
+        return f"{self._base_url}/v1/models"
+
+    def _on_list_models(self, _request, response):
+        try:
+            api_response = requests.get(
+                self._models_url(),
+                headers=self._headers(),
+                timeout=self._request_timeout_sec,
+            )
+            api_response.raise_for_status()
+            payload = api_response.json()
+            rows = payload.get("data", payload.get("models", [])) if isinstance(payload, dict) else payload
+            model_ids: list[str] = []
+            if isinstance(rows, list):
+                for row in rows:
+                    if isinstance(row, str):
+                        model_id = row.strip()
+                    elif isinstance(row, dict):
+                        model_id = str(row.get("id") or row.get("model") or row.get("name") or "").strip()
+                    else:
+                        model_id = ""
+                    if model_id and model_id not in model_ids:
+                        model_ids.append(model_id)
+            response.success = True
+            response.model_ids = model_ids
+            response.message = f"{len(model_ids)} model(s) from {self._base_url}"
+        except Exception as exc:
+            response.success = False
+            response.model_ids = []
+            response.message = f"Model catalog unavailable at {self._base_url}: {exc}"
+        return response
 
     def _stamp(self):
         return self.get_clock().now().to_msg()
@@ -382,6 +448,25 @@ class LLMSurgeonActorNode(Node):
             self._control_running = False
             self._reset_runtime(start_phase_id)
 
+    def _reset_bed_robot_arm_group_states(self) -> None:
+        bed_group_spec = self._spec.get_bed_robot_arm_group_spec()
+        self._bed_group_states = {
+            group.id: {
+                "connected": bool(group.enabled),
+                "state": "standby",
+                "operation": "",
+                "direction": "",
+                "distance_mm": 0.0,
+                "distance_origin": "",
+                "end_effector_profile": group.initial_end_effector_profile,
+                "progress": 0.0,
+                "error_code": "",
+                "rejection_reason": "",
+            }
+            for group in (bed_group_spec.groups if bed_group_spec is not None else [])
+        }
+        self._bed_group_status_stamp_ns = {}
+
     def _reset_runtime(self, start_phase_id: str = "") -> None:
         self._active = False
         self._control_running = False
@@ -389,6 +474,8 @@ class LLMSurgeonActorNode(Node):
         self._mayo_tools = []
         self._pending_action = ""
         self._pending_tool = ""
+        self._pending_group_requests.clear()
+        self._reset_bed_robot_arm_group_states()
         self._current_phase_id = start_phase_id if start_phase_id in self._phase_ids else self._spec.default_phase_id
         self._phase_entered_sec = self._now()
         self._phase_used_tools = set()
@@ -473,6 +560,88 @@ class LLMSurgeonActorNode(Node):
             self._schedule_next_decision(self._rng.uniform(1.0, 3.0))
         elif action in {"predict_tool", "tool_predict"}:
             self._record_event("skill_predict_completed", tool_id, {"action": action})
+
+    def _on_bed_robot_arm_group_status(self, msg: BedRobotArmGroupStatus) -> None:
+        group_id = str(msg.group_id or "").strip()
+        if group_id not in {"suction", "retraction"}:
+            return
+        status_ns = int(msg.stamp.sec) * 1_000_000_000 + int(msg.stamp.nanosec)
+        current_ns = self._bed_group_status_stamp_ns.get(group_id, 0)
+        if current_ns and status_ns < current_ns:
+            return
+        state = self._bed_group_states.setdefault(group_id, {})
+        pending = self._pending_group_requests.get(group_id)
+        is_health = not str(msg.operation or "").strip() and str(
+            msg.request_id or ""
+        ).startswith("health-")
+        mismatched_pending = bool(
+            pending is not None
+            and msg.request_id
+            and msg.request_id != pending.get("request_id")
+        )
+        if mismatched_pending:
+            return
+        next_state = msg.state or state.get("state", "standby")
+        connected = next_state not in {"offline", "fault"}
+        if is_health:
+            connected = bool(msg.success) and msg.error_code != "server_unavailable"
+            health_state = (
+                "offline"
+                if not connected
+                else (
+                    (msg.state or "standby")
+                    if state.get("state") == "offline"
+                    else state.get("state", "standby")
+                )
+            )
+            changed = bool(
+                state.get("connected") != connected
+                or state.get("state") != health_state
+            )
+            state.update(
+                {
+                    "connected": connected,
+                    "state": health_state,
+                }
+            )
+            if changed:
+                self._bed_group_status_stamp_ns[group_id] = status_ns
+            return
+        self._bed_group_status_stamp_ns[group_id] = status_ns
+        state.update(
+            {
+                "connected": connected,
+                "state": next_state,
+                "operation": msg.operation,
+                "direction": msg.direction,
+                "distance_mm": float(msg.distance_mm),
+                "distance_origin": msg.distance_origin,
+                "progress": float(msg.progress),
+                "error_code": msg.error_code,
+                "rejection_reason": (
+                    "" if msg.outcome == "cancelled_by_runtime_control" else msg.rejection_reason
+                ),
+            }
+        )
+        if msg.end_effector_profile and bool(msg.terminal and msg.success):
+            state["end_effector_profile"] = msg.end_effector_profile
+        if bool(msg.terminal) and pending is not None and msg.request_id == pending.get("request_id"):
+            self._pending_group_requests.pop(group_id, None)
+            self._record_event(
+                "bed_robot_arm_group_completed" if msg.success else "bed_robot_arm_group_rejected",
+                "",
+                {
+                    "request_id": msg.request_id,
+                    "group_id": group_id,
+                    "operation": msg.operation,
+                    "outcome": msg.outcome,
+                    "direction": msg.direction,
+                    "distance_mm": float(msg.distance_mm),
+                    "error_code": msg.error_code,
+                    "rejection_reason": msg.rejection_reason,
+                },
+            )
+            self._schedule_next_decision(0.5)
 
     def _clear_pending(self, reason: str, tool_id: str) -> None:
         if self._pending_tool and self._pending_tool != tool_id:
@@ -733,9 +902,9 @@ class LLMSurgeonActorNode(Node):
             "request_mode": "none",
             "speech": self._rng.choice(
                 [
-                    "Hold on, let's address the field.",
-                    "Pause there. I need the field controlled.",
-                    "Let's stabilize this.",
+                    "잠시 멈추고 수술 시야를 정리하겠습니다.",
+                    "잠시 멈춰 주세요. 수술 시야를 먼저 안정시키겠습니다.",
+                    "수술 시야를 안정시키겠습니다.",
                 ]
             ),
             "phase": target_phase,
@@ -824,9 +993,9 @@ class LLMSurgeonActorNode(Node):
             "request_mode": "none",
             "speech": self._rng.choice(
                 [
-                    "Field is stable. Let's continue.",
-                    "That's controlled, back to the main step.",
-                    "Good, continue with the procedure.",
+                    "수술 시야가 안정됐습니다. 계속하겠습니다.",
+                    "상황이 조절됐습니다. 수술을 계속하겠습니다.",
+                    "좋습니다. 그대로 수술을 이어가겠습니다.",
                 ]
             ),
             "phase": return_phase,
@@ -892,6 +1061,8 @@ class LLMSurgeonActorNode(Node):
     def _auto_phase_progression_decision(self) -> dict[str, Any] | None:
         if not self._autonomous_phase_progression_enabled:
             return None
+        if self._pending_action or self._pending_group_requests:
+            return None
         if self._current_phase_id in self._interrupt_phase_ids:
             return None
         elapsed = self._phase_elapsed_sec()
@@ -924,7 +1095,7 @@ class LLMSurgeonActorNode(Node):
                 "action": "complete_procedure",
                 "tool": "",
                 "request_mode": "none",
-                "speech": "That completes this segment.",
+                "speech": "수술을 마쳤습니다.",
                 "phase": self._current_phase_id,
                 "next_dwell_sec": self._min_dwell_sec,
                 "reason_code": f"phase_watchdog_terminal:{used_count}/{expected_count}:elapsed={elapsed:.1f}",
@@ -990,6 +1161,7 @@ class LLMSurgeonActorNode(Node):
                         "wait",
                         "small_talk",
                         "request_tool",
+                        "request_bed_robot_arm_group",
                         "place_on_mayo",
                         "pickup_from_mayo",
                         "advance_phase",
@@ -998,6 +1170,19 @@ class LLMSurgeonActorNode(Node):
                 },
                 "tool": {"type": "string", "enum": ["", *self._tool_ids]},
                 "request_mode": {"type": "string", "enum": ["none", "voice", "hand", "voice_hand"]},
+                "group_id": {"type": "string", "enum": ["", "suction", "retraction"]},
+                "group_operation": {
+                    "type": "string",
+                    "enum": [
+                        "",
+                        "suction_start",
+                        "suction_stop",
+                        "retraction",
+                        "release_retraction",
+                        "change_end_effector",
+                    ],
+                },
+                "end_effector_profile": {"type": "string"},
                 "speech": {"type": "string"},
                 "phase": {"type": "string", "enum": self._phase_ids},
                 "next_dwell_sec": {"type": "number", "minimum": 0.5, "maximum": 10.0},
@@ -1008,6 +1193,9 @@ class LLMSurgeonActorNode(Node):
                 "action",
                 "tool",
                 "request_mode",
+                "group_id",
+                "group_operation",
+                "end_effector_profile",
                 "speech",
                 "phase",
                 "next_dwell_sec",
@@ -1056,7 +1244,14 @@ class LLMSurgeonActorNode(Node):
             "For action=advance_phase, speech must be an empty string. "
             "Do not say phrases like 'next step', 'move on', 'proceed to', 'advance to', or any procedure phase name. "
             "Only tool-request speech may mention the requested tool; small_talk must not mention phase or progress state. "
+            "Every non-empty spoken sentence must be concise, natural Korean. "
+            "Tool display names may remain as supplied, but the surrounding request and all other speech must be Korean. "
             "When requesting a tool, choose voice, hand, or voice_hand. "
+            "Use action=request_bed_robot_arm_group only for a phase-appropriate entry in context.bed_robot_arm_group.available_cues. "
+            "For that action, copy one cue utterance exactly into speech, set group_id/group_operation/end_effector_profile from the cue, and set tool='' and request_mode='none'. "
+            "Never mention or choose a physical robot-arm number, ID, member count, or mounting position; address only the suction or retraction logical group. "
+            "Retraction speech may use an explicit distance or a qualitative expression such as 조금/많이; the downstream VLM determines one of six directions and mm. "
+            "Do not repeat a group cue while that group has a pending request. Suction, retraction, and humanoid work are independent, so another lane may continue while one group is active. "
             "The surgeon can hold at most two tools. If context.held_capacity_remaining is positive, you may request a different needed tool while still holding one tool. "
             "If two tools are already held, place one held tool on Mayo before requesting another tool. "
             "If a needed tool is already in context.mayo_stand, use pickup_from_mayo instead of request_tool. "
@@ -1073,6 +1268,72 @@ class LLMSurgeonActorNode(Node):
             f"Runtime phases/tools: {json.dumps({'phases': phases, 'instruments': instruments}, separators=(',', ':'))}. "
             f"Doctor procedure prompt: {json.dumps(self._procedure_prompt, separators=(',', ':'))}"
         )
+
+    def _available_bed_robot_arm_group_cues(self) -> list[dict[str, Any]]:
+        phase_id = self._current_phase_id
+        rows: list[dict[str, Any]] = []
+        for cue in self._spec.get_bed_robot_arm_group_cues(phase_id):
+            if cue.group_id in self._pending_group_requests:
+                continue
+            state = self._bed_group_states.get(cue.group_id, {})
+            if not bool(state.get("connected", False)):
+                continue
+            execution_state = str(state.get("state", "standby"))
+            if cue.operation == "suction_start" and execution_state != "standby":
+                continue
+            if cue.operation == "suction_stop" and execution_state != "suctioning":
+                continue
+            if cue.operation == "release_retraction" and execution_state != "holding":
+                continue
+            if cue.operation == "retraction" and execution_state not in {"standby", "holding"}:
+                continue
+            if (
+                cue.end_effector_profile
+                and state.get("end_effector_profile", "") != cue.end_effector_profile
+            ):
+                continue
+            utterances = list(cue.utterances)
+            if not utterances:
+                continue
+            rows.append(
+                {
+                    "cue_id": cue.id,
+                    "group_id": cue.group_id,
+                    "operation": cue.operation,
+                    "utterances": utterances,
+                    "directions": list(cue.directions),
+                    "default_distance_mm": float(cue.default_distance_mm),
+                    "end_effector_profile": cue.end_effector_profile,
+                    "feedback_text": cue.feedback_text,
+                }
+            )
+        for transition in self._spec.get_bed_robot_arm_end_effector_transitions(phase_id):
+            if transition.group_id in self._pending_group_requests:
+                continue
+            state = self._bed_group_states.get(transition.group_id, {})
+            if not bool(state.get("connected", False)):
+                continue
+            if str(state.get("state", "standby")) != "holding":
+                continue
+            if state.get("end_effector_profile", "") != transition.from_profile:
+                continue
+            utterances = list(transition.utterances)
+            if not utterances:
+                continue
+            rows.append(
+                {
+                    "cue_id": transition.id,
+                    "group_id": transition.group_id,
+                    "operation": "change_end_effector",
+                    "utterances": utterances,
+                    "directions": [],
+                    "default_distance_mm": 0.0,
+                    "end_effector_profile": transition.to_profile,
+                    "from_end_effector_profile": transition.from_profile,
+                    "feedback_text": transition.feedback_text,
+                }
+            )
+        return rows
 
     def _actor_context(self) -> dict[str, Any]:
         expected_tools = self._spec.get_expected_instruments(self._current_phase_id)
@@ -1104,6 +1365,16 @@ class LLMSurgeonActorNode(Node):
             "held_capacity_remaining": self._held_capacity_remaining(),
             "mayo_stand": list(self._mayo_tools),
             "pending": {"action": self._pending_action, "tool": self._pending_tool},
+            "bed_robot_arm_group": {
+                "states": self._bed_group_states,
+                "pending": self._pending_group_requests,
+                "available_cues": self._available_bed_robot_arm_group_cues(),
+                "directions": ["UP", "DOWN", "LEFT", "RIGHT", "LEFT_RIGHT", "UP_DOWN"],
+                "distance_rule": (
+                    "explicit cm/mm and unitless numeric values are not clamped; "
+                    "qualitative values are 1..30 mm; missing distance defaults to 10 mm"
+                ),
+            },
             "interrupt_event": {
                 "enabled": self._interrupt_events_enabled,
                 "scheduled": bool(self._scheduled_interrupt_phase_id),
@@ -1123,7 +1394,12 @@ class LLMSurgeonActorNode(Node):
                 "pickup_from_mayo is valid only for a tool already listed in mayo_stand.",
                 "request_tool is invalid for tools already held or visible on Mayo.",
                 "Use complete_procedure only when the current scenario segment is done.",
-                "If pending.action is not empty, wait or make small talk.",
+                (
+                    "If pending.action is not empty, do not start another tool or phase action; "
+                    "a bed robot-arm group cue for a non-pending group remains allowed."
+                ),
+                "A bed robot-arm group request is allowed only from bed_robot_arm_group.available_cues and must use one exact utterance.",
+                "Never include a physical arm ID or arm count in speech.",
                 "Interrupt events are procedure-defined intermittent phases. If interrupt_event.active is true, stabilize it with that phase's expected tools, then return to interrupt_event.return_phase.",
             ],
         }
@@ -1157,6 +1433,7 @@ class LLMSurgeonActorNode(Node):
         response = requests.post(
             f"{self._base_url}/v1/chat/completions",
             json=body,
+            headers=self._headers(),
             timeout=self._request_timeout_sec,
         )
         latency = time.perf_counter() - start
@@ -1185,9 +1462,24 @@ class LLMSurgeonActorNode(Node):
         if str(payload.get("v", "")) != "1":
             raise ValueError("unsupported actor schema version")
         action = str(payload.get("action", "wait"))
+        allowed_actions = {
+            "wait",
+            "small_talk",
+            "request_tool",
+            "request_bed_robot_arm_group",
+            "place_on_mayo",
+            "pickup_from_mayo",
+            "advance_phase",
+            "complete_procedure",
+        }
+        if action not in allowed_actions:
+            raise ValueError(f"unsupported actor action: {action}")
         tool = str(payload.get("tool", ""))
         phase = str(payload.get("phase", self._current_phase_id)) or self._current_phase_id
         request_mode = str(payload.get("request_mode", "none"))
+        group_id = str(payload.get("group_id", ""))
+        group_operation = str(payload.get("group_operation", ""))
+        end_effector_profile = str(payload.get("end_effector_profile", ""))
         if tool:
             resolved = self._resolve_tool(tool)
             if not resolved:
@@ -1195,11 +1487,29 @@ class LLMSurgeonActorNode(Node):
             tool = resolved
         if phase not in self._phase_ids:
             raise ValueError(f"unknown phase: {phase}")
+        if action == "request_bed_robot_arm_group":
+            operations = {
+                "suction": {"suction_start", "suction_stop"},
+                "retraction": {
+                    "retraction",
+                    "release_retraction",
+                    "change_end_effector",
+                },
+            }
+            if group_id not in operations or group_operation not in operations[group_id]:
+                raise ValueError("invalid logical bed robot-arm group operation")
+        else:
+            group_id = ""
+            group_operation = ""
+            end_effector_profile = ""
         return {
             "v": "1",
             "action": action,
             "tool": tool,
             "request_mode": request_mode,
+            "group_id": group_id,
+            "group_operation": group_operation,
+            "end_effector_profile": end_effector_profile,
             "speech": str(payload.get("speech", ""))[:240],
             "phase": phase,
             "next_dwell_sec": float(payload.get("next_dwell_sec", self._min_dwell_sec)),
@@ -1207,25 +1517,26 @@ class LLMSurgeonActorNode(Node):
         }
 
     def _tick(self) -> None:
-        if not self._enabled or not self._active or self._pending_action:
+        if not self._enabled or not self._active:
             return
         if self._now() < self._next_decision_time:
             return
-        interrupt_decision = self._interrupt_trigger_decision()
-        if interrupt_decision is not None:
-            raw = json.dumps({"source": "interrupt_scheduler", **interrupt_decision}, separators=(",", ":"))
-            self._apply_decision(interrupt_decision, raw, 0.0)
-            return
-        interrupt_decision = self._interrupt_management_decision()
-        if interrupt_decision is not None:
-            raw = json.dumps({"source": "interrupt_scheduler", **interrupt_decision}, separators=(",", ":"))
-            self._apply_decision(interrupt_decision, raw, 0.0)
-            return
-        auto_decision = self._auto_phase_progression_decision()
-        if auto_decision is not None:
-            raw = json.dumps({"source": "phase_watchdog", **auto_decision}, separators=(",", ":"))
-            self._apply_decision(auto_decision, raw, 0.0)
-            return
+        if not self._pending_action and not self._pending_group_requests:
+            interrupt_decision = self._interrupt_trigger_decision()
+            if interrupt_decision is not None:
+                raw = json.dumps({"source": "interrupt_scheduler", **interrupt_decision}, separators=(",", ":"))
+                self._apply_decision(interrupt_decision, raw, 0.0)
+                return
+            interrupt_decision = self._interrupt_management_decision()
+            if interrupt_decision is not None:
+                raw = json.dumps({"source": "interrupt_scheduler", **interrupt_decision}, separators=(",", ":"))
+                self._apply_decision(interrupt_decision, raw, 0.0)
+                return
+            auto_decision = self._auto_phase_progression_decision()
+            if auto_decision is not None:
+                raw = json.dumps({"source": "phase_watchdog", **auto_decision}, separators=(",", ":"))
+                self._apply_decision(auto_decision, raw, 0.0)
+                return
         context = self._actor_context()
         try:
             payload, raw, latency = self._request_model(context)
@@ -1248,10 +1559,78 @@ class LLMSurgeonActorNode(Node):
             self._record_event("actor_decision_rejected", "", {"reason": str(exc)})
             self._schedule_next_decision(2.0)
 
+    def _match_bed_robot_arm_group_cue(
+        self,
+        *,
+        group_id: str,
+        operation: str,
+        speech: str,
+        end_effector_profile: str,
+    ) -> dict[str, Any] | None:
+        if re.search(
+            r"(?:bed[_ -]?arm|robot[_ -]?arm)\s*\d|"
+            r"로봇\s*팔\s*(?:\d+|[일이삼]번)|"
+            r"(?:\d+|[일이삼])\s*번\s*(?:로봇\s*)?팔",
+            speech,
+            flags=re.IGNORECASE,
+        ):
+            return None
+        for cue in self._available_bed_robot_arm_group_cues():
+            if cue["group_id"] != group_id or cue["operation"] != operation:
+                continue
+            if speech not in cue["utterances"]:
+                continue
+            expected_profile = str(cue.get("end_effector_profile", ""))
+            if expected_profile != end_effector_profile:
+                continue
+            return cue
+        return None
+
+    def _mask_decision_for_pending_lanes(
+        self, decision: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Keep independent lanes live without overlapping one lane's work."""
+
+        action = str(decision.get("action", "wait"))
+        blocked_by_humanoid = bool(self._pending_action) and action not in {
+            "request_bed_robot_arm_group",
+            "wait",
+            "small_talk",
+        }
+        blocked_phase_change = bool(self._pending_group_requests) and action in {
+            "advance_phase",
+            "complete_procedure",
+        }
+        if not blocked_by_humanoid and not blocked_phase_change:
+            return decision
+        masked = dict(decision)
+        masked.update(
+            {
+                "action": "wait",
+                "tool": "",
+                "request_mode": "none",
+                "group_id": "",
+                "group_operation": "",
+                "end_effector_profile": "",
+                "speech": "",
+                "phase": self._current_phase_id,
+                "reason_code": (
+                    "pending_humanoid_lane"
+                    if blocked_by_humanoid
+                    else "pending_bed_robot_arm_group_lane"
+                ),
+            }
+        )
+        return masked
+
     def _apply_decision(self, decision: dict[str, Any], raw: str, latency: float) -> None:
+        decision = self._mask_decision_for_pending_lanes(decision)
         action = str(decision["action"])
         tool = str(decision["tool"])
         request_mode = str(decision["request_mode"])
+        group_id = str(decision.get("group_id", ""))
+        group_operation = str(decision.get("group_operation", ""))
+        end_effector_profile = str(decision.get("end_effector_profile", ""))
         speech = str(decision["speech"])
         next_dwell = max(self._min_dwell_sec, min(self._max_dwell_sec, float(decision["next_dwell_sec"])))
         phase = str(decision["phase"])
@@ -1349,6 +1728,64 @@ class LLMSurgeonActorNode(Node):
                 if speech:
                     self._publish_voice(speech)
                 self._publish_state("request_tool", tool, speech, True, False, decision["reason_code"])
+        elif action == "request_bed_robot_arm_group":
+            cue = self._match_bed_robot_arm_group_cue(
+                group_id=group_id,
+                operation=group_operation,
+                speech=speech,
+                end_effector_profile=end_effector_profile,
+            )
+            if tool or request_mode != "none":
+                accepted = False
+                reject_reason = "group_request_must_not_use_tool_or_hand_request_mode"
+            elif group_id in self._pending_group_requests:
+                accepted = False
+                reject_reason = "bed_robot_arm_group_request_already_pending"
+            elif cue is None:
+                accepted = False
+                reject_reason = "group_request_not_grounded_in_current_phase_cue"
+            else:
+                request_id = f"actor-{uuid.uuid4().hex}"
+                msg = BedRobotArmGroupRequest()
+                msg.stamp = self._stamp()
+                msg.request_id = request_id
+                msg.group_id = group_id
+                msg.operation = group_operation
+                msg.voice_text = speech
+                msg.procedure_id = self._spec.procedure_id
+                msg.phase_id = self._current_phase_id
+                msg.end_effector_profile = end_effector_profile
+                msg.source = "llm_surgeon_actor"
+                self._pending_group_requests[group_id] = {
+                    "request_id": request_id,
+                    "cue_id": str(cue.get("cue_id", "")),
+                    "operation": group_operation,
+                    "speech": speech,
+                }
+                self._bed_group_request_pub.publish(msg)
+                self._publish_actor_event("bed_robot_arm_group_request", "", speech)
+                self._last_speech = speech
+                self._last_hand_overlay = ""
+                self._record_event(
+                    "bed_robot_arm_group_request",
+                    "",
+                    {
+                        "request_id": request_id,
+                        "cue_id": cue.get("cue_id", ""),
+                        "group_id": group_id,
+                        "operation": group_operation,
+                        "end_effector_profile": end_effector_profile,
+                        "speech": speech,
+                    },
+                )
+                self._publish_state(
+                    "request_bed_robot_arm_group",
+                    "",
+                    speech,
+                    False,
+                    False,
+                    str(cue.get("feedback_text", decision["reason_code"])),
+                )
         elif action == "place_on_mayo":
             placed_tool = tool if tool in self._held_tools else self._primary_held_tool()
             if not placed_tool or placed_tool not in self._held_tools:
@@ -1452,7 +1889,8 @@ class LLMSurgeonActorNode(Node):
                     f"place_held_before_completion:{decision['reason_code']}",
                 )
             else:
-                self._last_speech = speech or "All done."
+                speech = self._sanitize_non_request_speech(speech)
+                self._last_speech = speech or "수술을 마쳤습니다."
                 self._last_hand_overlay = ""
                 self._publish_actor_event("request_procedure_completion", "", self._last_speech)
                 self._publish_voice(self._last_speech)
@@ -1572,6 +2010,8 @@ class LLMSurgeonActorNode(Node):
     def _sanitize_non_request_speech(self, speech: str, *, allowed_tool: str = "") -> str:
         if not speech.strip():
             return ""
+        if not self._contains_hangul(speech):
+            return ""
         if self._speech_has_phase_cue(speech):
             return ""
         mentioned_other_tool = any(
@@ -1620,6 +2060,8 @@ class LLMSurgeonActorNode(Node):
         sanitized = str(speech or "").strip()[:240]
         if not sanitized:
             return self._small_talk_line()
+        if not self._contains_hangul(sanitized):
+            return self._small_talk_line()
         if self._speech_has_phase_cue(sanitized):
             return self._small_talk_line()
         if self._last_speech and sanitized == self._last_speech:
@@ -1633,23 +2075,27 @@ class LLMSurgeonActorNode(Node):
             return ""
         display = self._tool_display_by_id.get(tool, tool)
         templates = [
-            "{tool}, please.",
-            "Let's have the {tool}.",
-            "Can I get the {tool}?",
-            "I need the {tool}.",
+            "{tool} 주세요.",
+            "{tool} 부탁합니다.",
+            "{tool} 준비해 주세요.",
+            "{tool} 전달해 주세요.",
         ]
         return self._rng.choice(templates).format(tool=display)[:240]
 
     def _small_talk_line(self) -> str:
         lines = [
-            "Field looks stable.",
-            "Let's keep the field steady.",
-            "Keep the Mayo organized.",
-            "Keep the field organized.",
-            "Thank you.",
-            "Hold steady.",
+            "수술 시야가 안정적입니다.",
+            "시야를 안정적으로 유지해 주세요.",
+            "메이요 스탠드를 정리해 주세요.",
+            "수술 시야를 정돈해 주세요.",
+            "감사합니다.",
+            "그대로 유지해 주세요.",
         ]
         return self._rng.choice(lines)
+
+    @staticmethod
+    def _contains_hangul(text: str) -> bool:
+        return bool(re.search(r"[가-힣]", str(text or "")))
 
     def _diversify_decision(self, decision: dict[str, Any]) -> dict[str, Any]:
         next_decision = dict(decision)

@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, startTransition } from "react";
 import ROSLIB from "roslib";
 
 import type {
+  BedRobotArmGroupState,
   BTDecision,
   CompressedImageFrame,
   SimulationEvent,
@@ -41,6 +42,7 @@ const DEFAULT_STATE: SimulationState = {
   active_robot_task_target_anchor: "",
   active_robot_task_progress: 0,
   active_robot_task_remaining_sec: 0,
+  bed_robot_arm_groups: [],
   instrument_states: [],
   recent_events: [],
   layout_json: "",
@@ -153,6 +155,7 @@ const DEFAULT_WORLD_STATE: WorldState = {
   predicted_tool_confidence: 0,
   predicted_tool_stability_sec: 0,
   surgeon_request_tool: "",
+  bed_robot_arm_groups: [],
 };
 
 type RosCompressedImage = {
@@ -175,6 +178,59 @@ type RosServiceConnection = {
   removeListener?: (event: string, callback: (message: RosServiceResponseMessage) => void) => void;
   callOnConnection: (message: Record<string, unknown>) => void;
 };
+
+const BED_ROBOT_ARM_GROUP_IDS = new Set(["suction", "retraction"]);
+
+function normalizeBedRobotArmGroupState(message: unknown): BedRobotArmGroupState | null {
+  if (!message || typeof message !== "object") return null;
+  const group = message as Partial<BedRobotArmGroupState>;
+  if (!group.group_id || !BED_ROBOT_ARM_GROUP_IDS.has(group.group_id)) return null;
+  return {
+    stamp: group.stamp ?? { sec: 0, nanosec: 0 },
+    group_id: group.group_id,
+    connected: Boolean(group.connected),
+    state: group.state ?? "offline",
+    operation: group.operation ?? "",
+    direction: group.direction ?? "",
+    distance_mm: Number.isFinite(Number(group.distance_mm)) ? Number(group.distance_mm) : 0,
+    distance_origin: group.distance_origin ?? "",
+    raw_distance_text: group.raw_distance_text ?? "",
+    end_effector_profile: group.end_effector_profile ?? "",
+    active_request_id: group.active_request_id ?? "",
+    active_command_id: group.active_command_id ?? "",
+    progress: Number.isFinite(Number(group.progress)) ? Number(group.progress) : 0,
+    error_code: group.error_code ?? "",
+    error_message: group.error_message ?? "",
+    rejection_reason: group.rejection_reason ?? "",
+  };
+}
+
+function normalizeBedRobotArmGroupStates(message: unknown): BedRobotArmGroupState[] {
+  if (!Array.isArray(message)) return [];
+  return message
+    .map((group) => normalizeBedRobotArmGroupState(group))
+    .filter((group): group is BedRobotArmGroupState => group !== null);
+}
+
+function normalizeSimulationState(message: unknown): SimulationState {
+  const state = message && typeof message === "object" ? (message as Partial<SimulationState>) : {};
+  return {
+    ...DEFAULT_STATE,
+    ...state,
+    bed_robot_arm_groups: normalizeBedRobotArmGroupStates(state.bed_robot_arm_groups),
+    instrument_states: Array.isArray(state.instrument_states) ? state.instrument_states : [],
+    recent_events: Array.isArray(state.recent_events) ? state.recent_events : [],
+  };
+}
+
+function normalizeWorldState(message: unknown): WorldState {
+  const state = message && typeof message === "object" ? (message as Partial<WorldState>) : {};
+  return {
+    ...DEFAULT_WORLD_STATE,
+    ...state,
+    bed_robot_arm_groups: normalizeBedRobotArmGroupStates(state.bed_robot_arm_groups),
+  };
+}
 
 export type OverrideAck = {
   eventType: string;
@@ -262,6 +318,10 @@ export function useRosBridge() {
   const [vlmImage, setVlmImage] = useState<CompressedImageFrame | null>(null);
   const [vlmHealthReceivedAt, setVlmHealthReceivedAt] = useState<number | null>(null);
   const [vlmResultReceivedAt, setVlmResultReceivedAt] = useState<number | null>(null);
+  const [vlmModelOptions, setVlmModelOptions] = useState<string[]>([]);
+  const [vlmModelCatalogStatus, setVlmModelCatalogStatus] = useState("loading");
+  const [actorModelOptions, setActorModelOptions] = useState<string[]>([]);
+  const [actorModelCatalogStatus, setActorModelCatalogStatus] = useState("loading");
   const [events, setEvents] = useState<SimulationEvent[]>([]);
   const [actionPending, setActionPending] = useState("");
   const [actionMessage, setActionMessage] = useState("Ready.");
@@ -369,7 +429,7 @@ export function useRosBridge() {
     });
 
     simulationTopic.subscribe((message: unknown) => {
-      const receivedState = message as SimulationState;
+      const receivedState = normalizeSimulationState(message);
       const nextState =
         !receivedState.running && receivedState.execution_state === "idle" && receivedState.recent_events.length
           ? { ...receivedState, recent_events: [] }
@@ -379,7 +439,7 @@ export function useRosBridge() {
     });
     worldTopic.subscribe((message: unknown) => {
       startTransition(() => {
-        setWorldState(message as WorldState);
+        setWorldState(normalizeWorldState(message));
       });
     });
     eventTopic.subscribe((message: unknown) => {
@@ -544,6 +604,104 @@ export function useRosBridge() {
       });
     });
   }
+
+  useEffect(() => {
+    let disposed = false;
+    let refreshing = false;
+
+    async function refreshVlmModels() {
+      if (!connected || refreshing) return;
+      refreshing = true;
+      try {
+        const response = await callService(
+          "/real_vlm_node/list_models",
+          "surgical_msgs/srv/ListModels",
+          {},
+          10000,
+        );
+        if (!Boolean(response.success)) {
+          throw new Error(String(response.message || "VLM model catalog unavailable."));
+        }
+        const modelIds = Array.isArray(response.model_ids)
+          ? response.model_ids.map((modelId) => String(modelId)).filter(Boolean)
+          : [];
+        if (disposed) return;
+        setVlmModelOptions(modelIds);
+        setVlmModelCatalogStatus(String(response.message || (modelIds.length ? "connected" : "empty")));
+      } catch (error) {
+        if (disposed) return;
+        setVlmModelOptions([]);
+        setVlmModelCatalogStatus(error instanceof Error ? error.message : "VLM model catalog unavailable.");
+      } finally {
+        refreshing = false;
+      }
+    }
+
+    if (!connected) {
+      setVlmModelOptions([]);
+      setVlmModelCatalogStatus("ROS bridge offline");
+      return () => {
+        disposed = true;
+      };
+    }
+
+    setVlmModelCatalogStatus("loading");
+    void refreshVlmModels();
+    const timer = window.setInterval(() => void refreshVlmModels(), 5000);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [connected, url]);
+
+  useEffect(() => {
+    let disposed = false;
+    let refreshing = false;
+
+    async function refreshActorModels() {
+      if (!connected || refreshing) return;
+      refreshing = true;
+      try {
+        const response = await callService(
+          "/surgeon_actor/list_models",
+          "surgical_msgs/srv/ListModels",
+          {},
+          10000,
+        );
+        if (!Boolean(response.success)) {
+          throw new Error(String(response.message || "Actor model catalog unavailable."));
+        }
+        const modelIds = Array.isArray(response.model_ids)
+          ? response.model_ids.map((modelId) => String(modelId)).filter(Boolean)
+          : [];
+        if (disposed) return;
+        setActorModelOptions(modelIds);
+        setActorModelCatalogStatus(String(response.message || (modelIds.length ? "connected" : "empty")));
+      } catch (error) {
+        if (disposed) return;
+        setActorModelOptions([]);
+        setActorModelCatalogStatus(error instanceof Error ? error.message : "Actor model catalog unavailable.");
+      } finally {
+        refreshing = false;
+      }
+    }
+
+    if (!connected) {
+      setActorModelOptions([]);
+      setActorModelCatalogStatus("ROS bridge offline");
+      return () => {
+        disposed = true;
+      };
+    }
+
+    setActorModelCatalogStatus("loading");
+    void refreshActorModels();
+    const timer = window.setInterval(() => void refreshActorModels(), 5000);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [connected, url]);
 
   function stringParameter(name: string, value: string) {
     return {
@@ -863,6 +1021,10 @@ export function useRosBridge() {
     vlmImage,
     vlmHealthReceivedAt,
     vlmResultReceivedAt,
+    vlmModelOptions,
+    vlmModelCatalogStatus,
+    actorModelOptions,
+    actorModelCatalogStatus,
     events,
     actionPending,
     actionMessage: displayActionMessage,

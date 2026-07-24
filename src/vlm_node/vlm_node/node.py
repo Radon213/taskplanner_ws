@@ -7,12 +7,19 @@ import json
 import random
 from time import perf_counter
 
-from procedure_spec import get_default_spec_dir, load_bundle
+from procedure_spec import (
+    BedRobotArmGroupNormalizationError,
+    get_default_spec_dir,
+    load_bundle,
+    normalize_retraction_request,
+)
 import rclpy
 from rcl_interfaces.msg import SetParametersResult
 from rclpy.node import Node
 from std_msgs.msg import String
 from surgical_msgs.msg import (
+    BedRobotArmGroupActionProposal,
+    BedRobotArmGroupRequest,
     PhaseEvidence,
     PerceptionScene,
     SimulationState,
@@ -40,6 +47,12 @@ class MockVLMNode(Node):
         self._result_pub = self.create_publisher(VLMResult, "/vlm/result", 10)
         self._health_pub = self.create_publisher(VLMHealth, "/vlm/health", 10)
         self._request_pub = self.create_publisher(String, "/surgery/audio/request_text", 10)
+        self._bed_group_proposal_pub = self.create_publisher(
+            BedRobotArmGroupActionProposal,
+            "/vlm/bed_robot_arm_group_proposal",
+            20,
+        )
+        self._seen_bed_group_request_ids: set[str] = set()
         self._tool_location_history: dict[str, deque[str]] = {}
         self._latest_state: SimulationState | None = None
         self._latest_scene: PerceptionScene | None = None
@@ -54,12 +67,106 @@ class MockVLMNode(Node):
         self.declare_parameter("perception_scene_observations", True)
         self.declare_parameter("state_backed_observations", False)
         self.declare_parameter("scripted_gestures_enabled", False)
+        self.declare_parameter("bed_robot_arm_group_proposals_enabled", True)
         self._load_spec(self._spec_dir)
         self.add_on_set_parameters_callback(self._on_parameters_changed)
         self.create_subscription(String, "/simulation/control_state", self._on_control, 20)
         self.create_subscription(PerceptionScene, "/simulation/perception_scene", self._on_scene, 20)
         self.create_subscription(SurgeonOutwardSignal, "/surgeon/outward_signal", self._on_outward_signal, 20)
         self.create_subscription(SimulationState, "/simulation/state", self._on_state, 20)
+        self.create_subscription(
+            BedRobotArmGroupRequest,
+            "/surgeon/bed_robot_arm_group_request",
+            self._on_bed_robot_arm_group_request,
+            20,
+        )
+
+    @staticmethod
+    def _mock_qualitative_distance_mm(voice_text: str) -> float | None:
+        """Provide deterministic interpolation for non-anchor mock phrases."""
+
+        text = str(voice_text)
+        if any(token in text for token in ("중간 정도", "적당히", "적당하게")):
+            return 15.0
+        if "약간" in text:
+            return 3.0
+        if any(token in text for token in ("강하게", "세게")):
+            return 25.0
+        if "덜" in text:
+            return 5.0
+        if "더" in text:
+            return 10.0
+        return None
+
+    @classmethod
+    def _normalize_mock_group_request(cls, voice_text: str):
+        return normalize_retraction_request(
+            voice_text,
+            qualitative_distance_mm=cls._mock_qualitative_distance_mm(voice_text),
+        )
+
+    def _on_bed_robot_arm_group_request(
+        self, msg: BedRobotArmGroupRequest
+    ) -> None:
+        if not bool(self.get_parameter("bed_robot_arm_group_proposals_enabled").value):
+            return
+        if msg.group_id != "retraction" or msg.operation != "retraction":
+            return
+        request_id = str(msg.request_id or "").strip()
+        if not request_id or request_id in self._seen_bed_group_request_ids:
+            return
+        self._seen_bed_group_request_ids.add(request_id)
+
+        proposal = BedRobotArmGroupActionProposal()
+        proposal.stamp = self.get_clock().now().to_msg()
+        proposal.schema_version = "4"
+        command = proposal.command
+        command.stamp = proposal.stamp
+        command.request_id = request_id
+        command.command_id = f"mock-vlm-{request_id}"
+        command.group_id = "retraction"
+        command.operation = "retraction"
+        command.end_effector_profile = msg.end_effector_profile
+        try:
+            normalized = self._normalize_mock_group_request(msg.voice_text)
+        except BedRobotArmGroupNormalizationError as exc:
+            proposal.valid = False
+            proposal.validation_error = (
+                "mock VLM cannot ground one of the six retraction directions: "
+                f"{exc}"
+            )
+            command.rationale = "insufficient spoken direction evidence in mock mode"
+            command.confidence = 0.0
+        else:
+            proposal.valid = True
+            command.direction = normalized.direction
+            command.distance_mm = float(normalized.distance_mm)
+            command.distance_origin = normalized.distance_origin
+            command.raw_distance_text = normalized.raw_distance_text
+            command.rationale = "deterministic mock VLM interpretation of surgeon speech"
+            command.confidence = 0.99
+        proposal.raw_json = json.dumps(
+            {
+                "v": "4",
+                "bed_robot_arm_group": {
+                    "request_id": command.request_id,
+                    "group_id": command.group_id,
+                    "operation": command.operation,
+                    "direction": command.direction,
+                    "distance_mm": float(command.distance_mm),
+                    "distance_origin": command.distance_origin,
+                    "raw_distance_text": command.raw_distance_text,
+                    "end_effector_profile": command.end_effector_profile,
+                    "rationale": command.rationale,
+                    "confidence": float(command.confidence),
+                }
+                if proposal.valid
+                else None,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        self._bed_group_proposal_pub.publish(proposal)
 
     def _load_spec(self, spec_dir: str) -> None:
         self._spec = load_bundle(spec_dir)
@@ -85,6 +192,7 @@ class MockVLMNode(Node):
         self._delivered_by_phase = {}
         self._completion_request_emitted = False
         self._completion_confirm_emitted = False
+        self._seen_bed_group_request_ids.clear()
 
     def _terminal_normal_phase_id(self) -> str:
         normal_phase_ids = list(getattr(self._spec, "normal_phase_ids", []))
@@ -885,6 +993,7 @@ class MockVLMNode(Node):
             self._delivered_by_phase = {}
             self._completion_request_emitted = False
             self._completion_confirm_emitted = False
+            self._seen_bed_group_request_ids.clear()
 
     def _on_scene(self, msg: PerceptionScene) -> None:
         self._latest_scene = msg

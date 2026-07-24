@@ -17,4 +17,7 @@ string[] non_home_tool_ids
 string[] pending_transition_tools
 surgical_msgs/EventDigest[] recent_events
 surgical_msgs/BTContextSnapshot bt_snapshot
+surgical_msgs/BedRobotArmGroupState[] bed_robot_arm_groups
+bool has_pending_bed_robot_arm_group_request
+surgical_msgs/BedRobotArmGroupRequest pending_bed_robot_arm_group_request
 string compact_json

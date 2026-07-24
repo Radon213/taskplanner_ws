@@ -3,6 +3,8 @@ import { useEffect, useMemo, useRef } from "react";
 import { layouts } from "../layouts";
 import { applyVisualLayout } from "../visualLayouts";
 import type {
+  BedRobotArmGroupId,
+  BedRobotArmGroupState,
   DisplayCatalog,
   DisplayCatalogEntry,
   InstrumentState,
@@ -122,6 +124,31 @@ export type StageSurgicalBed = {
   active: boolean;
 };
 
+export type StageBedRobotArmGroup = {
+  groupId: BedRobotArmGroupId;
+  title: string;
+  eyebrow: string;
+  connected: boolean;
+  connectionLabel: string;
+  state: string;
+  stateLabel: string;
+  statusTone: "offline" | "idle" | "active" | "warning" | "danger";
+  operationLabel: string;
+  directionLabel: string;
+  distanceMm: number;
+  endEffectorLabel: string;
+  progress: number;
+  progressLabel: string;
+  errorMessage: string;
+  labels: {
+    operation: string;
+    direction: string;
+    distance: string;
+    endEffector: string;
+    progress: string;
+  };
+};
+
 export type StageInterruptAlert = {
   phaseId: string;
   label: string;
@@ -199,8 +226,33 @@ export type TimelineItem = {
   uiId: string;
   title: string;
   meta: string;
+  requestId?: string;
+  groupId?: BedRobotArmGroupId;
   tone: "neutral" | "robot" | "surgeon" | "cleaning" | "warning";
   severity: "normal" | "warning" | "error";
+};
+
+export type BedRobotArmGroupTraceStepId = "surgeon" | "vlm" | "bt" | "action" | "status";
+
+export type BedRobotArmGroupTraceStep = {
+  id: BedRobotArmGroupTraceStepId;
+  label: string;
+  state: "pending" | "active" | "complete" | "rejected" | "skipped";
+  stateLabel: string;
+  detail: string;
+};
+
+export type BedRobotArmGroupTrace = {
+  requestId: string;
+  commandId: string;
+  groupId: BedRobotArmGroupId;
+  groupLabel: string;
+  operationLabel: string;
+  summary: string;
+  outcomeLabel: string;
+  tone: "neutral" | "active" | "success" | "danger";
+  latestUiId: string;
+  steps: BedRobotArmGroupTraceStep[];
 };
 
 export type BundleOption = {
@@ -231,7 +283,8 @@ function timelineSortParts(event: SimulationEvent, index: number, total: number)
 
 type ActiveVoiceCommand = {
   text: string;
-  toolId: string;
+  toolId?: string;
+  groupRequestId?: string;
   occurredAt: number;
 };
 
@@ -269,6 +322,26 @@ function activeVoiceCommandFromEvents(events: SimulationEvent[]): ActiveVoiceCom
     const detailEventType = detailString(detail, "event_type");
     const voiceText = detailString(detail, "voice_text");
     const requestedTool = requestedToolFromDetail(event, detail);
+    const groupRequestId = detailString(detail, "request_id");
+    const groupId = detailString(detail, "group_id");
+
+    const isGroupRequestEvent =
+      event.event_type === "BedRobotArmGroupRequestObserved" ||
+      (event.event_type === "SurgeonActorEventObserved" && detailEventType === "bed_robot_arm_group_request");
+
+    if (
+      voiceText &&
+      groupRequestId &&
+      isGroupRequestEvent &&
+      (event.event_type === "SurgeonActorEventObserved" || groupId === "suction" || groupId === "retraction")
+    ) {
+      activeCommand = {
+        text: voiceText,
+        groupRequestId,
+        occurredAt: eventReceivedAt(event),
+      };
+      continue;
+    }
 
     if (
       voiceText &&
@@ -287,8 +360,19 @@ function activeVoiceCommandFromEvents(events: SimulationEvent[]): ActiveVoiceCom
 
     if (
       activeCommand &&
+      activeCommand.toolId &&
       event.event_type === "ToolHandoverCompleted" &&
       requestedToolFromDetail(event, detail) === activeCommand.toolId
+    ) {
+      activeCommand = undefined;
+      continue;
+    }
+
+    if (
+      activeCommand?.groupRequestId &&
+      (event.event_type === "BedRobotArmGroupCommandCompleted" ||
+        event.event_type === "BedRobotArmGroupCommandRejected") &&
+      groupRequestId === activeCommand.groupRequestId
     ) {
       activeCommand = undefined;
     }
@@ -909,6 +993,26 @@ function detailPercent(detail: Record<string, unknown>, key: string): string {
   return typeof value === "number" ? `${Math.round(value * 100)}%` : "";
 }
 
+function detailNumber(detail: Record<string, unknown>, key: string): number | undefined {
+  const value = detail[key];
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : undefined;
+  }
+  return undefined;
+}
+
+function detailBoolean(detail: Record<string, unknown>, key: string): boolean | undefined {
+  const value = detail[key];
+  if (typeof value === "boolean") return value;
+  if (typeof value === "string") {
+    if (value.toLowerCase() === "true") return true;
+    if (value.toLowerCase() === "false") return false;
+  }
+  return undefined;
+}
+
 function displayTransition(value: string, catalog: DisplayCatalog | undefined, language: Language): string {
   if (!value) return "";
   return value
@@ -941,6 +1045,14 @@ function eventSeverity(
 ): TimelineItem["severity"] {
   const detailSeverity = detailString(detail, "severity");
   if (detailSeverity === "error" || detailSeverity === "warning" || detailSeverity === "normal") return detailSeverity;
+  if (
+    eventType === "BedRobotArmGroupCommandRejected" ||
+    detailString(detail, "error_code") ||
+    detailString(detail, "validation_error") ||
+    detailString(detail, "state") === "fault"
+  ) {
+    return "error";
+  }
   const catalogSeverity = catalogEntry(catalog, "events", eventType)?.severity;
   return catalogSeverity === "error" || catalogSeverity === "warning" ? catalogSeverity : "normal";
 }
@@ -968,7 +1080,9 @@ function readableEventTitle(
   toolNameForId: (instrumentId: string) => string,
 ): string {
   const detail = parseEventDetail(event.detail);
-  const eventLabel = catalogLabel(catalog, "events", event.event_type, language, titleize(event.event_type));
+  const eventLabel =
+    BED_ROBOT_ARM_EVENT_LABELS[event.event_type]?.[language] ||
+    catalogLabel(catalog, "events", event.event_type, language, titleize(event.event_type));
   const toolId = event.instrument_id || detailString(detail, "tool_id") || detailString(detail, "instrument_id");
   return toolId ? `${toolNameForId(toolId)} · ${eventLabel}` : eventLabel;
 }
@@ -992,6 +1106,7 @@ function readableEventMeta(
     detailString(detail, "proposal_id");
   const reason =
     detailString(detail, "reason") ||
+    detailString(detail, "rationale") ||
     detailString(detail, "reducer_reason") ||
     detailString(detail, "blocking_guard") ||
     detailString(detail, "note");
@@ -999,28 +1114,81 @@ function readableEventMeta(
   const source = anchorNameForId(event.from_anchor || detailString(detail, "source") || detailString(detail, "source_anchor_id"));
   const target = anchorNameForId(event.to_anchor || detailString(detail, "target") || detailString(detail, "target_anchor_id"));
   const action = detailString(detail, "action") || detailString(detail, "task_type") || detailString(detail, "skill");
+  const requestId = detailString(detail, "request_id");
   const commandId = detailString(detail, "command_id") || detailString(detail, "task_id");
+  const groupId = detailString(detail, "group_id");
+  const operation = detailString(detail, "operation");
+  const direction = detailString(detail, "direction");
+  const distanceMm = detailNumber(detail, "distance_mm");
+  const distanceOrigin = detailString(detail, "distance_origin");
+  const rawDistanceText = detailString(detail, "raw_distance_text");
+  const outcome = detailString(detail, "outcome");
+  const groupState = detailString(detail, "state");
+  const endEffectorProfile = detailString(detail, "end_effector_profile");
+  const validationError = detailString(detail, "validation_error");
   const parts: string[] = [];
+
+  const groupLabel =
+    groupId === "suction"
+      ? language === "ko"
+        ? "석션 로봇암"
+        : "Suction group"
+      : groupId === "retraction"
+        ? language === "ko"
+          ? "리트랙션 로봇암"
+          : "Retraction group"
+        : groupId;
+  const operationLabel = localizedGroupValue(BED_ROBOT_ARM_OPERATION_LABELS, operation, language, titleize(operation));
+  const directionLabel = localizedGroupValue(BED_ROBOT_ARM_DIRECTION_LABELS, direction, language, titleize(direction));
+  const stateLabel = localizedGroupValue(BED_ROBOT_ARM_STATE_LABELS, groupState, language, titleize(groupState));
+  const distanceOriginLabel = localizedGroupValue(
+    BED_ROBOT_ARM_DISTANCE_ORIGIN_LABELS,
+    distanceOrigin,
+    language,
+    titleize(distanceOrigin),
+  );
 
   if (language === "ko") {
     if (tool) parts.push(`도구: ${tool}`);
     if (voice) parts.push(`음성: "${voice}"`);
+    if (requestId) parts.push(`요청 ID: ${requestId}`);
+    if (groupLabel) parts.push(`그룹: ${groupLabel}`);
+    if (operationLabel) parts.push(`명령: ${operationLabel}`);
+    if (directionLabel) parts.push(`방향: ${directionLabel}`);
+    if (distanceMm !== undefined && operation === "retraction") parts.push(`거리: ${distanceMm} mm`);
+    if (distanceOriginLabel) parts.push(`거리 근거: ${distanceOriginLabel}`);
+    if (rawDistanceText) parts.push(`거리 원문: "${rawDistanceText}"`);
+    if (endEffectorProfile) parts.push(`엔드이펙터: ${endEffectorProfile}`);
+    if (groupState) parts.push(`그룹 상태: ${stateLabel}`);
+    if (outcome) parts.push(`결과: ${outcome}`);
+    if (validationError) parts.push(`검증 오류: ${validationError}`);
     if (proposal) parts.push(`제안: ${displayTransition(proposal, catalog, language)}`);
     if (reason) parts.push(`사유: ${reason}`);
     if (source || target) parts.push(`경로: ${source || "?"} -> ${target || "?"}`);
     if (action) parts.push(`작업: ${catalogLabel(catalog, "actions", action, language, titleize(action))}`);
-    if (commandId) parts.push(`ID: ${commandId.slice(0, 12)}`);
+    if (commandId) parts.push(`명령 ID: ${commandId}`);
     if (event.arm) parts.push(`팔: ${event.arm}`);
     if (confidence) parts.push(`신뢰도: ${confidence}`);
     if (event.status) parts.push(`상태: ${event.status}`);
   } else {
     if (tool) parts.push(`Tool: ${tool}`);
     if (voice) parts.push(`Voice: "${voice}"`);
+    if (requestId) parts.push(`Request ID: ${requestId}`);
+    if (groupLabel) parts.push(`Group: ${groupLabel}`);
+    if (operationLabel) parts.push(`Operation: ${operationLabel}`);
+    if (directionLabel) parts.push(`Direction: ${directionLabel}`);
+    if (distanceMm !== undefined && operation === "retraction") parts.push(`Distance: ${distanceMm} mm`);
+    if (distanceOriginLabel) parts.push(`Distance origin: ${distanceOriginLabel}`);
+    if (rawDistanceText) parts.push(`Raw distance: "${rawDistanceText}"`);
+    if (endEffectorProfile) parts.push(`End effector: ${endEffectorProfile}`);
+    if (groupState) parts.push(`Group status: ${stateLabel}`);
+    if (outcome) parts.push(`Outcome: ${outcome}`);
+    if (validationError) parts.push(`Validation error: ${validationError}`);
     if (proposal) parts.push(`Proposal: ${displayTransition(proposal, catalog, language)}`);
     if (reason) parts.push(`Reason: ${reason}`);
     if (source || target) parts.push(`Route: ${source || "?"} -> ${target || "?"}`);
     if (action) parts.push(`Task: ${catalogLabel(catalog, "actions", action, language, titleize(action))}`);
-    if (commandId) parts.push(`ID: ${commandId.slice(0, 12)}`);
+    if (commandId) parts.push(`Command ID: ${commandId}`);
     if (event.arm) parts.push(`Arm: ${event.arm}`);
     if (confidence) parts.push(`Confidence: ${confidence}`);
     if (event.status) parts.push(`Status: ${event.status}`);
@@ -1169,6 +1337,474 @@ function runtimeStatusText(state: SimulationState, ui: ReturnType<typeof getUiCo
     return language === "ko" ? "시뮬레이션 런타임이 대기 상태로 초기화되었습니다." : "Simulation runtime reset to idle.";
   }
   return ui.idle;
+}
+
+const BED_ROBOT_ARM_GROUP_ORDER: BedRobotArmGroupId[] = ["suction", "retraction"];
+
+const BED_ROBOT_ARM_DIRECTION_LABELS: Record<string, { ko: string; en: string }> = {
+  UP: { ko: "상", en: "Up" },
+  DOWN: { ko: "하", en: "Down" },
+  LEFT: { ko: "좌", en: "Left" },
+  RIGHT: { ko: "우", en: "Right" },
+  LEFT_RIGHT: { ko: "좌우 동시", en: "Left + right" },
+  UP_DOWN: { ko: "상하 동시", en: "Up + down" },
+};
+
+const BED_ROBOT_ARM_STATE_LABELS: Record<string, { ko: string; en: string }> = {
+  offline: { ko: "오프라인", en: "Offline" },
+  standby: { ko: "대기", en: "Standby" },
+  suctioning: { ko: "석션중", en: "Suctioning" },
+  stopping: { ko: "정지중", en: "Stopping" },
+  retracting: { ko: "견인 이동중", en: "Retracting" },
+  holding: { ko: "견인 유지중", en: "Holding" },
+  releasing: { ko: "견인 해제중", en: "Releasing" },
+  changing_end_effector: { ko: "엔드이펙터 교환중", en: "Changing end effector" },
+  approaching: { ko: "접근중", en: "Approaching" },
+  fault: { ko: "오류", en: "Fault" },
+};
+
+const BED_ROBOT_ARM_OPERATION_LABELS: Record<string, { ko: string; en: string }> = {
+  suction_start: { ko: "석션 시작", en: "Start suction" },
+  suction_stop: { ko: "석션 정지", en: "Stop suction" },
+  retraction: { ko: "리트랙션", en: "Retraction" },
+  release_retraction: { ko: "견인 해제", en: "Release retraction" },
+  change_end_effector: { ko: "엔드이펙터 교환", en: "Change end effector" },
+};
+
+const BED_ROBOT_ARM_DISTANCE_ORIGIN_LABELS: Record<string, { ko: string; en: string }> = {
+  explicit_with_unit: { ko: "명시 단위", en: "Explicit unit" },
+  explicit_unit_inferred: { ko: "단위 추론(mm)", en: "Unit inferred (mm)" },
+  qualitative_inferred: { ko: "정성 표현 추론", en: "Qualitative inference" },
+  defaulted: { ko: "기본값", en: "Default" },
+};
+
+const BED_ROBOT_ARM_EVENT_LABELS: Record<string, { ko: string; en: string }> = {
+  BedRobotArmGroupRequestObserved: { ko: "베드 로봇암 요청 수신", en: "Bed robot request observed" },
+  BedRobotArmGroupProposalObserved: { ko: "VLM 그룹 명령 해석", en: "VLM group interpretation" },
+  BedRobotArmGroupCommandApproved: { ko: "BT 그룹 명령 승인", en: "BT group command approved" },
+  BedRobotArmGroupStatusUpdated: { ko: "그룹 Action 상태", en: "Group Action status" },
+  BedRobotArmGroupCommandCompleted: { ko: "그룹 Action 완료", en: "Group Action completed" },
+  BedRobotArmGroupCommandRejected: { ko: "그룹 Action 거부", en: "Group Action rejected" },
+};
+
+function localizedGroupValue(
+  values: Record<string, { ko: string; en: string }>,
+  key: string,
+  language: Language,
+  fallback: string,
+): string {
+  const value = values[key];
+  return value ? value[language] : fallback;
+}
+
+function bedRobotArmGroupTone(group: BedRobotArmGroupState): StageBedRobotArmGroup["statusTone"] {
+  if (!group.connected || group.state === "offline") return "offline";
+  if (group.state === "fault" || group.error_code || group.error_message || group.rejection_reason) return "danger";
+  if (["stopping", "releasing", "changing_end_effector", "approaching"].includes(group.state)) return "warning";
+  if (["suctioning", "retracting", "holding"].includes(group.state)) return "active";
+  return "idle";
+}
+
+function emptyBedRobotArmGroupState(groupId: BedRobotArmGroupId): BedRobotArmGroupState {
+  return {
+    stamp: { sec: 0, nanosec: 0 },
+    group_id: groupId,
+    connected: false,
+    state: "offline",
+    operation: "",
+    direction: "",
+    distance_mm: 0,
+    distance_origin: "",
+    raw_distance_text: "",
+    end_effector_profile: "",
+    active_request_id: "",
+    active_command_id: "",
+    progress: 0,
+    error_code: "",
+    error_message: "",
+    rejection_reason: "",
+  };
+}
+
+function buildBedRobotArmGroups(groups: BedRobotArmGroupState[], language: Language): StageBedRobotArmGroup[] {
+  const groupById = new Map(groups.map((group) => [group.group_id, group]));
+  return BED_ROBOT_ARM_GROUP_ORDER.map((groupId) => {
+    const group = groupById.get(groupId) ?? emptyBedRobotArmGroupState(groupId);
+    const progress = clamp(Number.isFinite(group.progress) ? group.progress : 0, 0, 1);
+    const stateLabel = localizedGroupValue(
+      BED_ROBOT_ARM_STATE_LABELS,
+      group.state,
+      language,
+      group.state ? titleize(group.state) : language === "ko" ? "대기" : "Standby",
+    );
+    const operationLabel = localizedGroupValue(
+      BED_ROBOT_ARM_OPERATION_LABELS,
+      group.operation,
+      language,
+      language === "ko" ? "명령 대기" : "Awaiting command",
+    );
+    const directionLabel = localizedGroupValue(
+      BED_ROBOT_ARM_DIRECTION_LABELS,
+      group.direction,
+      language,
+      language === "ko" ? "방향 대기" : "Awaiting direction",
+    );
+    const errorDetail = group.error_message || group.rejection_reason || group.error_code;
+    return {
+      groupId,
+      title:
+        groupId === "suction"
+          ? language === "ko"
+            ? "석션 로봇암"
+            : "Suction Robot Group"
+          : language === "ko"
+            ? "리트랙션 로봇암"
+            : "Retraction Robot Group",
+      eyebrow: language === "ko" ? "베드 로봇암 그룹" : "Bed robot group",
+      connected: group.connected,
+      connectionLabel: group.connected
+        ? language === "ko"
+          ? "연결됨"
+          : "Connected"
+        : language === "ko"
+          ? "연결 끊김"
+          : "Disconnected",
+      state: group.state,
+      stateLabel,
+      statusTone: bedRobotArmGroupTone(group),
+      operationLabel,
+      directionLabel,
+      distanceMm: Number.isFinite(group.distance_mm) ? group.distance_mm : 0,
+      endEffectorLabel: group.end_effector_profile || (language === "ko" ? "미지정" : "Not assigned"),
+      progress,
+      progressLabel: `${Math.round(progress * 100)}%`,
+      errorMessage: errorDetail
+        ? language === "ko"
+          ? `제어 오류: ${errorDetail}`
+          : `Control error: ${errorDetail}`
+        : "",
+      labels: {
+        operation: language === "ko" ? "동작" : "Operation",
+        direction: language === "ko" ? "방향" : "Direction",
+        distance: language === "ko" ? "이동량" : "Distance",
+        endEffector: language === "ko" ? "엔드이펙터" : "End effector",
+        progress: language === "ko" ? "진행률" : "Progress",
+      },
+    };
+  });
+}
+
+type BedRobotArmGroupTraceAccumulator = {
+  requestId: string;
+  commandId: string;
+  groupId: BedRobotArmGroupId;
+  operation: string;
+  direction: string;
+  distanceMm?: number;
+  distanceOrigin: string;
+  voiceText: string;
+  endEffectorProfile: string;
+  outcome: string;
+  latestState: string;
+  error: string;
+  latestUiId: string;
+  requestSeen: boolean;
+  proposalSeen: boolean;
+  proposalValid?: boolean;
+  proposalError: string;
+  commandApproved: boolean;
+  statusSeen: boolean;
+  terminal: boolean;
+  terminalSuccess?: boolean;
+};
+
+const BED_ROBOT_ARM_GROUP_EVENT_TYPES = new Set([
+  "BedRobotArmGroupRequestObserved",
+  "BedRobotArmGroupProposalObserved",
+  "BedRobotArmGroupCommandApproved",
+  "BedRobotArmGroupStatusUpdated",
+  "BedRobotArmGroupCommandCompleted",
+  "BedRobotArmGroupCommandRejected",
+]);
+
+function traceStateLabel(state: BedRobotArmGroupTraceStep["state"], language: Language): string {
+  const labels: Record<BedRobotArmGroupTraceStep["state"], { ko: string; en: string }> = {
+    pending: { ko: "대기", en: "Pending" },
+    active: { ko: "진행", en: "Active" },
+    complete: { ko: "완료", en: "Done" },
+    rejected: { ko: "거부", en: "Rejected" },
+    skipped: { ko: "우회", en: "Bypassed" },
+  };
+  return labels[state][language];
+}
+
+function buildBedRobotArmGroupTraces(
+  newestFirstEvents: SimulationEvent[],
+  language: Language,
+): BedRobotArmGroupTrace[] {
+  const accumulators = new Map<string, BedRobotArmGroupTraceAccumulator>();
+
+  for (const event of newestFirstEvents) {
+    const detail = parseEventDetail(event.detail);
+    const detailEventType = detailString(detail, "event_type");
+    const isGroupActorEvent =
+      event.event_type === "SurgeonActorEventObserved" && detailEventType === "bed_robot_arm_group_request";
+    if (!BED_ROBOT_ARM_GROUP_EVENT_TYPES.has(event.event_type) && !isGroupActorEvent) continue;
+
+    const requestId = detailString(detail, "request_id");
+    const rawGroupId = detailString(detail, "group_id");
+    const eventOperation = detailString(detail, "operation");
+    if (
+      !requestId ||
+      requestId.startsWith("health-") ||
+      !eventOperation ||
+      (rawGroupId !== "suction" && rawGroupId !== "retraction")
+    ) {
+      continue;
+    }
+    const groupId: BedRobotArmGroupId = rawGroupId;
+    let trace = accumulators.get(requestId);
+    if (!trace) {
+      trace = {
+        requestId,
+        commandId: "",
+        groupId,
+        operation: "",
+        direction: "",
+        distanceOrigin: "",
+        voiceText: "",
+        endEffectorProfile: "",
+        outcome: "",
+        latestState: "",
+        error: "",
+        latestUiId: event.ui_id || `${event.event_type}-${requestId}`,
+        requestSeen: false,
+        proposalSeen: false,
+        proposalError: "",
+        commandApproved: false,
+        statusSeen: false,
+        terminal: false,
+      };
+      accumulators.set(requestId, trace);
+    }
+
+    trace.commandId ||= detailString(detail, "command_id");
+    trace.operation ||= eventOperation;
+    trace.direction ||= detailString(detail, "direction");
+    trace.distanceMm ??= detailNumber(detail, "distance_mm");
+    trace.distanceOrigin ||= detailString(detail, "distance_origin");
+    trace.voiceText ||= detailString(detail, "voice_text");
+    trace.endEffectorProfile ||= detailString(detail, "end_effector_profile");
+    trace.outcome ||= detailString(detail, "outcome");
+    trace.latestState ||= detailString(detail, "state") || event.status;
+    trace.error ||=
+      detailString(detail, "validation_error") ||
+      detailString(detail, "rejection_reason") ||
+      detailString(detail, "error_code") ||
+      detailString(detail, "reason") ||
+      detailString(detail, "message");
+
+    if (event.event_type === "BedRobotArmGroupRequestObserved" || isGroupActorEvent) {
+      trace.requestSeen = true;
+    }
+    if (event.event_type === "BedRobotArmGroupProposalObserved") {
+      trace.proposalSeen = true;
+      trace.proposalValid = detailBoolean(detail, "valid");
+      trace.proposalError = detailString(detail, "validation_error");
+      trace.direction = detailString(detail, "direction") || trace.direction;
+      trace.distanceMm = detailNumber(detail, "distance_mm") ?? trace.distanceMm;
+      trace.distanceOrigin = detailString(detail, "distance_origin") || trace.distanceOrigin;
+    }
+    if (event.event_type === "BedRobotArmGroupCommandApproved") {
+      trace.commandApproved = true;
+    }
+    if (
+      event.event_type === "BedRobotArmGroupStatusUpdated" ||
+      event.event_type === "BedRobotArmGroupCommandCompleted" ||
+      event.event_type === "BedRobotArmGroupCommandRejected"
+    ) {
+      trace.statusSeen = true;
+    }
+    if (
+      event.event_type === "BedRobotArmGroupCommandCompleted" ||
+      event.event_type === "BedRobotArmGroupCommandRejected" ||
+      detailBoolean(detail, "terminal") === true
+    ) {
+      trace.terminal = true;
+      trace.terminalSuccess =
+        event.event_type === "BedRobotArmGroupCommandCompleted" || detailBoolean(detail, "success") === true;
+    }
+  }
+
+  return [...accumulators.values()].slice(0, 3).map((trace) => {
+    const groupLabel =
+      trace.groupId === "suction"
+        ? language === "ko"
+          ? "석션 로봇암"
+          : "Suction group"
+        : language === "ko"
+          ? "리트랙션 로봇암"
+          : "Retraction group";
+    const operationLabel = localizedGroupValue(
+      BED_ROBOT_ARM_OPERATION_LABELS,
+      trace.operation,
+      language,
+      titleize(trace.operation),
+    );
+    const directionLabel = localizedGroupValue(
+      BED_ROBOT_ARM_DIRECTION_LABELS,
+      trace.direction,
+      language,
+      titleize(trace.direction),
+    );
+    const distanceOriginLabel = localizedGroupValue(
+      BED_ROBOT_ARM_DISTANCE_ORIGIN_LABELS,
+      trace.distanceOrigin,
+      language,
+      titleize(trace.distanceOrigin),
+    );
+    const stateLabel = localizedGroupValue(
+      BED_ROBOT_ARM_STATE_LABELS,
+      trace.latestState,
+      language,
+      titleize(trace.latestState),
+    );
+    const distanceLabel = trace.distanceMm !== undefined ? `${trace.distanceMm} mm` : "";
+    const movementLabel = [directionLabel, distanceLabel].filter(Boolean).join(" · ");
+    const summary = [operationLabel, movementLabel, trace.endEffectorProfile].filter(Boolean).join(" · ");
+    const failureDetail = trace.error || trace.outcome;
+
+    const requestState: BedRobotArmGroupTraceStep["state"] = trace.requestSeen ? "complete" : "skipped";
+    const vlmState: BedRobotArmGroupTraceStep["state"] =
+      trace.groupId === "suction"
+        ? "skipped"
+        : trace.proposalSeen
+          ? trace.proposalValid === false
+            ? "rejected"
+            : "complete"
+          : trace.terminal
+            ? "rejected"
+            : trace.requestSeen
+              ? "active"
+              : "pending";
+    const btState: BedRobotArmGroupTraceStep["state"] = trace.commandApproved
+      ? "complete"
+      : trace.terminal
+        ? "rejected"
+        : trace.groupId === "suction" || trace.proposalSeen
+          ? "active"
+          : "pending";
+    const actionState: BedRobotArmGroupTraceStep["state"] = trace.commandApproved
+      ? trace.statusSeen
+        ? trace.terminal && trace.terminalSuccess === false
+          ? "rejected"
+          : "complete"
+        : "active"
+      : trace.terminal
+        ? "skipped"
+        : "pending";
+    const statusState: BedRobotArmGroupTraceStep["state"] = trace.terminal
+      ? trace.terminalSuccess
+        ? "complete"
+        : "rejected"
+      : trace.statusSeen
+        ? "active"
+        : "pending";
+
+    const steps: BedRobotArmGroupTraceStep[] = [
+      {
+        id: "surgeon",
+        label: language === "ko" ? "집도의 발화" : "Surgeon utterance",
+        state: requestState,
+        stateLabel: traceStateLabel(requestState, language),
+        detail:
+          trace.voiceText ||
+          (language === "ko" ? "발화 이벤트가 로그 범위를 벗어났습니다." : "Utterance is outside the event window."),
+      },
+      {
+        id: "vlm",
+        label: language === "ko" ? "VLM 해석" : "VLM interpretation",
+        state: vlmState,
+        stateLabel: traceStateLabel(vlmState, language),
+        detail:
+          trace.groupId === "suction"
+            ? language === "ko"
+              ? "VLM 없이 결정적 라우팅"
+              : "Deterministic route without VLM"
+            : trace.proposalError ||
+              [movementLabel, distanceOriginLabel].filter(Boolean).join(" · ") ||
+              (language === "ko" ? "해석 대기" : "Awaiting interpretation"),
+      },
+      {
+        id: "bt",
+        label: language === "ko" ? "BT 검증" : "BT validation",
+        state: btState,
+        stateLabel: traceStateLabel(btState, language),
+        detail: trace.commandApproved
+          ? language === "ko"
+            ? "가드 통과"
+            : "Guards passed"
+          : failureDetail || (language === "ko" ? "가드 검증 대기" : "Awaiting guard validation"),
+      },
+      {
+        id: "action",
+        label: language === "ko" ? "그룹 Action" : "Group Action",
+        state: actionState,
+        stateLabel: traceStateLabel(actionState, language),
+        detail: trace.commandId
+          ? trace.commandId
+          : trace.terminal
+            ? language === "ko"
+              ? "Action 미출력"
+              : "Action not emitted"
+            : language === "ko"
+              ? "Action 전달 대기"
+              : "Awaiting Action dispatch",
+      },
+      {
+        id: "status",
+        label: language === "ko" ? "그룹 상태" : "Group status",
+        state: statusState,
+        stateLabel: traceStateLabel(statusState, language),
+        detail:
+          [stateLabel, trace.outcome, failureDetail].filter((value, index, values) => value && values.indexOf(value) === index).join(" · ") ||
+          (language === "ko" ? "상태 수신 대기" : "Awaiting group status"),
+      },
+    ];
+
+    return {
+      requestId: trace.requestId,
+      commandId: trace.commandId,
+      groupId: trace.groupId,
+      groupLabel,
+      operationLabel,
+      summary: summary || (language === "ko" ? "그룹 명령" : "Group command"),
+      outcomeLabel: trace.terminal
+        ? trace.terminalSuccess
+          ? language === "ko"
+            ? "완료"
+            : "Completed"
+          : language === "ko"
+            ? `거부${failureDetail ? ` · ${failureDetail}` : ""}`
+            : `Rejected${failureDetail ? ` · ${failureDetail}` : ""}`
+        : trace.statusSeen || trace.commandApproved
+          ? language === "ko"
+            ? "실행 중"
+            : "In progress"
+          : language === "ko"
+            ? "해석 중"
+            : "Interpreting",
+      tone: trace.terminal
+        ? trace.terminalSuccess
+          ? "success"
+          : "danger"
+        : trace.commandApproved || trace.statusSeen
+          ? "active"
+          : "neutral",
+      latestUiId: trace.latestUiId,
+      steps,
+    };
+  });
 }
 
 export function useDigitalTwinViewModel({
@@ -1729,6 +2365,10 @@ export function useDigitalTwinViewModel({
       rect: mayoStandRect,
       active: activeHolderIds.has("mayo_recovery") || activeHolderIds.has("mayo_reuse"),
     };
+    const boardBedRobotArmGroups = buildBedRobotArmGroups(
+      runtimeFrameMatchesActiveBundle ? simulationState.bed_robot_arm_groups : [],
+      language,
+    );
     const boardActionBubbles: StageActionBubble[] = [];
     const surgeonAlertBubbles: StageActionBubble[] = [];
     const surgeonRect = holderRects.surgeon;
@@ -1825,6 +2465,7 @@ export function useDigitalTwinViewModel({
       .map((event, index) => ({ event, index }))
       .sort((a, b) => compareTimelineEvents(a.event, b.event, a.index, b.index, displayEvents.length))
       .map(({ event }) => event);
+    const bedRobotArmGroupTraces = buildBedRobotArmGroupTraces(newestFirstEvents, language);
     const timeline: TimelineItem[] = newestFirstEvents.length
       ? (() => {
           const seenUiIds = new Map<string, number>();
@@ -1835,11 +2476,17 @@ export function useDigitalTwinViewModel({
             const occurrence = seenUiIds.get(baseUiId) ?? 0;
             seenUiIds.set(baseUiId, occurrence + 1);
             const uniqueUiId = occurrence ? `${baseUiId}-${occurrence}` : baseUiId;
+            const rawGroupId = detailString(detail, "group_id");
             return {
               id: `${uniqueUiId}-${event.event_type}-${event.instrument_id}-${index}`,
               uiId: uniqueUiId,
               title: readableEventTitle(event, catalog, language, localizedToolName),
               meta: readableEventMeta(event, catalog, language, localizedToolName, anchorNameForId),
+              requestId: detailString(detail, "request_id") || undefined,
+              groupId:
+                rawGroupId === "suction" || rawGroupId === "retraction"
+                  ? rawGroupId
+                  : undefined,
               tone: eventTone(event.event_type, detail, catalog),
               severity: eventSeverity(event.event_type, detail, catalog),
             };
@@ -1921,6 +2568,7 @@ export function useDigitalTwinViewModel({
       boardHumanoidGroup,
       boardSurgicalBed,
       boardMayoStand,
+      boardBedRobotArmGroups,
       boardRackSlotCount,
       boardRackSlots,
       toolChipPlacements,
@@ -1928,6 +2576,7 @@ export function useDigitalTwinViewModel({
       boardAudioBubble,
       boardActionBubbles,
       timeline,
+      bedRobotArmGroupTraces,
       activeToolId,
       stage: {
         procedureLabel: localizedProcedureName,

@@ -1,8 +1,8 @@
-import { useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
 import { BrainCircuit, Code2, ListTree, RadioTower } from "lucide-react";
 
-import type { useDigitalTwinViewModel } from "../../hooks/useDigitalTwinViewModel";
+import type { BedRobotArmGroupTrace, useDigitalTwinViewModel } from "../../hooks/useDigitalTwinViewModel";
 import type {
   BTDecision,
   CompressedImageFrame,
@@ -40,6 +40,59 @@ function TimelineMeta({ value }: { value: string }) {
         <span key={part}>{part}</span>
       ))}
     </small>
+  );
+}
+
+function compactIdentifier(value: string): string {
+  if (value.length <= 24) return value;
+  return `${value.slice(0, 14)}…${value.slice(-6)}`;
+}
+
+function BedRobotArmGroupTraceCard({
+  trace,
+  language,
+}: {
+  trace: BedRobotArmGroupTrace;
+  language: Language;
+}) {
+  const requestLabel = language === "ko" ? "요청 ID" : "Request ID";
+  return (
+    <article
+      className={`bed-group-trace-card tone-${trace.tone}`}
+      data-slot="bed-robot-arm-group-trace"
+      data-bed-group-request-id={trace.requestId}
+      data-bed-group-id={trace.groupId}
+      aria-label={`${trace.groupLabel}, ${requestLabel} ${trace.requestId}`}
+    >
+      <div className="bed-group-trace-card-header">
+        <div>
+          <strong>{trace.groupLabel}</strong>
+          <span>{trace.summary}</span>
+        </div>
+        <em title={trace.outcomeLabel}>{trace.outcomeLabel}</em>
+      </div>
+      <code title={trace.requestId}>
+        {requestLabel}: {compactIdentifier(trace.requestId)}
+      </code>
+      <ol aria-label={language === "ko" ? "그룹 요청 처리 단계" : "Group request processing stages"}>
+        {trace.steps.map((step) => (
+          <li
+            key={step.id}
+            className={`state-${step.state}`}
+            data-bed-group-trace-step={step.id}
+            title={step.detail}
+            aria-label={`${step.label}: ${step.stateLabel}. ${step.detail}`}
+          >
+            <span className="bed-group-trace-marker" aria-hidden="true" />
+            <div>
+              <strong>{step.label}</strong>
+              <small title={step.detail}>{step.detail}</small>
+            </div>
+            <em>{step.stateLabel}</em>
+          </li>
+        ))}
+      </ol>
+    </article>
   );
 }
 
@@ -173,6 +226,20 @@ export function ObservabilityPanel({
     });
   }
 
+  function handleTabKeyDown(event: KeyboardEvent<HTMLButtonElement>, currentTab: TabId) {
+    const tabOrder: TabId[] = ["bt", "vlm", "raw"];
+    const currentIndex = tabOrder.indexOf(currentTab);
+    let nextTab: TabId | undefined;
+    if (event.key === "ArrowRight") nextTab = tabOrder[(currentIndex + 1) % tabOrder.length];
+    if (event.key === "ArrowLeft") nextTab = tabOrder[(currentIndex - 1 + tabOrder.length) % tabOrder.length];
+    if (event.key === "Home") nextTab = tabOrder[0];
+    if (event.key === "End") nextTab = tabOrder[tabOrder.length - 1];
+    if (!nextTab) return;
+    event.preventDefault();
+    setTab(nextTab);
+    window.requestAnimationFrame(() => document.getElementById(`observability-tab-${nextTab}`)?.focus());
+  }
+
   const timelinePanel = (
       <div className="timeline-panel">
         <div className="panel-title-row">
@@ -181,14 +248,12 @@ export function ObservabilityPanel({
             <h2>{vm.ui.timelineLog}</h2>
           </div>
           <div className="timeline-toolbar">
-            <div className="timeline-filter" role="tablist" aria-label={vm.ui.timelineFilter}>
+            <div className="timeline-filter" role="group" aria-label={vm.ui.timelineFilter}>
               {timelineFilters.map((filter) => (
                 <button
                   key={filter.id}
                   type="button"
                   aria-pressed={timelineFilter === filter.id}
-                  aria-selected={timelineFilter === filter.id}
-                  role="tab"
                   data-timeline-filter={filter.id}
                   className={timelineFilter === filter.id ? "active" : ""}
                   onClick={() => handleFilterChange(filter.id)}
@@ -215,6 +280,8 @@ export function ObservabilityPanel({
                 data-timeline-index={index}
                 data-timeline-ui-id={item.uiId}
                 data-timeline-severity={item.severity}
+                data-bed-group-request-id={item.requestId}
+                data-bed-group-id={item.groupId}
                 className={`timeline-item ${item.tone} severity-${item.severity}`}
                 initial={prefersReducedMotion ? false : { opacity: 0, x: -26 }}
                 animate={{ opacity: 1, x: 0 }}
@@ -252,15 +319,45 @@ export function ObservabilityPanel({
             <h2>{tab === "bt" ? vm.ui.bt : tab === "vlm" ? vm.ui.vlm : vm.ui.rawResult}</h2>
           </div>
           <div className="tab-switch" role="tablist" aria-label={vm.ui.observability}>
-            <button className={tab === "bt" ? "active" : ""} onClick={() => setTab("bt")} type="button">
+            <button
+              id="observability-tab-bt"
+              className={tab === "bt" ? "active" : ""}
+              onClick={() => setTab("bt")}
+              type="button"
+              role="tab"
+              aria-selected={tab === "bt"}
+              aria-controls="observability-panel-bt"
+              tabIndex={tab === "bt" ? 0 : -1}
+              onKeyDown={(event) => handleTabKeyDown(event, "bt")}
+            >
               <ListTree size={15} />
               {vm.ui.bt}
             </button>
-            <button className={tab === "vlm" ? "active" : ""} onClick={() => setTab("vlm")} type="button">
+            <button
+              id="observability-tab-vlm"
+              className={tab === "vlm" ? "active" : ""}
+              onClick={() => setTab("vlm")}
+              type="button"
+              role="tab"
+              aria-selected={tab === "vlm"}
+              aria-controls="observability-panel-vlm"
+              tabIndex={tab === "vlm" ? 0 : -1}
+              onKeyDown={(event) => handleTabKeyDown(event, "vlm")}
+            >
               <BrainCircuit size={15} />
               {vm.ui.vlm}
             </button>
-            <button className={tab === "raw" ? "active" : ""} onClick={() => setTab("raw")} type="button">
+            <button
+              id="observability-tab-raw"
+              className={tab === "raw" ? "active" : ""}
+              onClick={() => setTab("raw")}
+              type="button"
+              role="tab"
+              aria-selected={tab === "raw"}
+              aria-controls="observability-panel-raw"
+              tabIndex={tab === "raw" ? 0 : -1}
+              onKeyDown={(event) => handleTabKeyDown(event, "raw")}
+            >
               <Code2 size={15} />
               Raw
             </button>
@@ -268,15 +365,47 @@ export function ObservabilityPanel({
         </div>
 
         <div className="decision-scroll">
+          <section className="bed-group-trace-section" aria-labelledby="bed-group-trace-title">
+            <div className="bed-group-trace-title-row">
+              <div>
+                <h3 id="bed-group-trace-title">
+                  {language === "ko" ? "베드 로봇암 요청 추적" : "Bed robot request trace"}
+                </h3>
+                <p>
+                  {language === "ko"
+                    ? "같은 요청 ID로 발화부터 그룹 상태까지 연결합니다."
+                    : "Links the utterance to group status with one request ID."}
+                </p>
+              </div>
+              <span aria-label={language === "ko" ? "최근 요청 수" : "Recent request count"}>
+                {vm.bedRobotArmGroupTraces.length}
+              </span>
+            </div>
+            {vm.bedRobotArmGroupTraces.length ? (
+              <div className="bed-group-trace-list" aria-live="polite">
+                {vm.bedRobotArmGroupTraces.slice(0, 2).map((trace) => (
+                  <BedRobotArmGroupTraceCard key={trace.requestId} trace={trace} language={language} />
+                ))}
+              </div>
+            ) : (
+              <p className="bed-group-trace-empty">
+                {language === "ko" ? "아직 관측된 그룹 요청이 없습니다." : "No group request has been observed yet."}
+              </p>
+            )}
+          </section>
+
           <AnimatePresence mode="wait">
             {tab === "bt" ? (
               <motion.div
+                id="observability-panel-bt"
                 key="bt"
                 className="detail-grid"
-                initial={{ opacity: 0, y: 8 }}
+                role="tabpanel"
+                aria-labelledby="observability-tab-bt"
+                initial={prefersReducedMotion ? false : { opacity: 0, y: 8 }}
                 animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: -8 }}
-                transition={{ duration: 0.18 }}
+                exit={prefersReducedMotion ? undefined : { opacity: 0, y: -8 }}
+                transition={{ duration: prefersReducedMotion ? 0 : 0.18 }}
               >
                 <DetailCard label={vm.ui.selectedTool} value={btDecision.selected_tool ? vm.displayToolName(btDecision.selected_tool) : vm.ui.none} />
                 <DetailCard
@@ -299,12 +428,15 @@ export function ObservabilityPanel({
 
             {tab === "vlm" ? (
               <motion.div
+                id="observability-panel-vlm"
                 key="vlm"
                 className="detail-grid"
-                initial={{ opacity: 0, y: 8 }}
+                role="tabpanel"
+                aria-labelledby="observability-tab-vlm"
+                initial={prefersReducedMotion ? false : { opacity: 0, y: 8 }}
                 animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: -8 }}
-                transition={{ duration: 0.18 }}
+                exit={prefersReducedMotion ? undefined : { opacity: 0, y: -8 }}
+                transition={{ duration: prefersReducedMotion ? 0 : 0.18 }}
               >
                 <DetailCard
                   label={language === "ko" ? "VLM 입력 영상" : "VLM input image"}
@@ -348,12 +480,15 @@ export function ObservabilityPanel({
 
             {tab === "raw" ? (
               <motion.pre
+                id="observability-panel-raw"
                 key="raw"
                 className="raw-block"
-                initial={{ opacity: 0, y: 8 }}
+                role="tabpanel"
+                aria-labelledby="observability-tab-raw"
+                initial={prefersReducedMotion ? false : { opacity: 0, y: 8 }}
                 animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: -8 }}
-                transition={{ duration: 0.18 }}
+                exit={prefersReducedMotion ? undefined : { opacity: 0, y: -8 }}
+                transition={{ duration: prefersReducedMotion ? 0 : 0.18 }}
               >
                 {vlmResult.raw_json || "{}"}
               </motion.pre>

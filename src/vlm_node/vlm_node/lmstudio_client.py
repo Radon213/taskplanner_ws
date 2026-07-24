@@ -17,14 +17,49 @@ class LMStudioResponse:
 
 
 class LMStudioClient:
-    def __init__(self, *, base_url: str, timeout_sec: float) -> None:
+    def __init__(self, *, base_url: str, timeout_sec: float, api_key: str = "") -> None:
         self._base_url = base_url.rstrip("/")
         self._timeout_sec = timeout_sec
+        self._api_key = api_key.strip()
+
+    def _headers(self) -> dict[str, str]:
+        if not self._api_key:
+            return {}
+        return {"Authorization": f"Bearer {self._api_key}"}
 
     def _openai_compat_url(self) -> str:
         if self._base_url.endswith("/v1"):
             return f"{self._base_url}/chat/completions"
         return f"{self._base_url}/v1/chat/completions"
+
+    def _openai_compat_models_url(self) -> str:
+        if self._base_url.endswith("/v1"):
+            return f"{self._base_url}/models"
+        return f"{self._base_url}/v1/models"
+
+    def list_models(self) -> list[str]:
+        response = requests.get(
+            self._openai_compat_models_url(),
+            headers=self._headers(),
+            timeout=self._timeout_sec,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        rows: Any = payload.get("data", payload.get("models", [])) if isinstance(payload, dict) else payload
+        if not isinstance(rows, list):
+            return []
+
+        model_ids: list[str] = []
+        for row in rows:
+            if isinstance(row, str):
+                model_id = row.strip()
+            elif isinstance(row, dict):
+                model_id = str(row.get("id") or row.get("model") or row.get("name") or "").strip()
+            else:
+                model_id = ""
+            if model_id and model_id not in model_ids:
+                model_ids.append(model_id)
+        return model_ids
 
     def request_json(
         self,
@@ -107,7 +142,12 @@ class LMStudioClient:
                 images=images,
             ),
         }
-        response = requests.post(url, json=body, timeout=self._timeout_sec)
+        response = requests.post(
+            url,
+            json=body,
+            headers=self._headers(),
+            timeout=self._timeout_sec,
+        )
         response.raise_for_status()
         raw = self._extract_text(response.json())
         return LMStudioResponse(raw_text=raw, latency_sec=response.elapsed.total_seconds(), mode="native")
@@ -155,7 +195,12 @@ class LMStudioClient:
             body["response_format"] = {"type": "text"}
         if reasoning_effort:
             body["reasoning_effort"] = reasoning_effort
-        response = requests.post(url, json=body, timeout=self._timeout_sec)
+        response = requests.post(
+            url,
+            json=body,
+            headers=self._headers(),
+            timeout=self._timeout_sec,
+        )
         response.raise_for_status()
         raw = self._extract_text(response.json())
         return LMStudioResponse(
@@ -195,9 +240,12 @@ class LMStudioClient:
                 }
             )
 
+        system_content = system_prompt
+        if developer_prompt:
+            system_content = f"{system_prompt}\n\n{developer_prompt}"
+
         return [
-            {"role": "system", "content": system_prompt},
-            {"role": "system", "content": developer_prompt},
+            {"role": "system", "content": system_content},
             {"role": "user", "content": user_content},
         ]
 

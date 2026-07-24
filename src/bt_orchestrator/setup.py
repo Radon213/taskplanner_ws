@@ -18,6 +18,7 @@ setup(
     license="Apache-2.0",
     entry_points={
         "console_scripts": [
+            "bed_robot_arm_group_orchestrator = bt_orchestrator.bed_robot_arm_group_orchestrator:main",
             "decision_bridge = bt_orchestrator.node:main",
         ],
     },

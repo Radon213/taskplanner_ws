@@ -27,3 +27,4 @@ float32 active_robot_task_remaining_sec
 surgical_msgs/InstrumentState[] instrument_states
 string[] recent_events
 string layout_json
+surgical_msgs/BedRobotArmGroupState[] bed_robot_arm_groups

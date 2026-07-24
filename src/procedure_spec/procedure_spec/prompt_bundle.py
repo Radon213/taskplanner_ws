@@ -467,5 +467,6 @@ def build_raw_bundle_from_prompt(bundle_dir: str | Path, display_catalog: dict[s
         "simulation_layout": _build_simulation_layout(procedure_id, tool_ids),
         "mock_surgeon": _build_mock_surgeon(phase_tools, tools),
         "mock_perception": _build_mock_perception(phase_tools, tool_ids),
+        "bed_robot_arm_groups": prompt.get("bed_robot_arm_groups", {}),
         "display_catalog": display_catalog,
     }

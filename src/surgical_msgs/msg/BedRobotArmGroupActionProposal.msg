@@ -1,0 +1,6 @@
+builtin_interfaces/Time stamp
+string schema_version
+surgical_msgs/BedRobotArmGroupCommand command
+bool valid
+string validation_error
+string raw_json

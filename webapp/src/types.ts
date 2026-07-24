@@ -16,6 +16,61 @@ export type InstrumentState = {
   visual_anchor_id: string;
 };
 
+export type RosTime = {
+  sec: number;
+  nanosec: number;
+};
+
+export type BedRobotArmGroupId = "suction" | "retraction";
+
+export type BedRobotArmGroupOperation =
+  | ""
+  | "suction_start"
+  | "suction_stop"
+  | "retraction"
+  | "release_retraction"
+  | "change_end_effector";
+
+export type BedRobotArmGroupDirection = "" | "UP" | "DOWN" | "LEFT" | "RIGHT" | "LEFT_RIGHT" | "UP_DOWN";
+
+export type BedRobotArmGroupDistanceOrigin =
+  | ""
+  | "explicit_with_unit"
+  | "explicit_unit_inferred"
+  | "qualitative_inferred"
+  | "defaulted";
+
+export type BedRobotArmGroupExecutionState =
+  | "offline"
+  | "standby"
+  | "suctioning"
+  | "stopping"
+  | "retracting"
+  | "holding"
+  | "releasing"
+  | "changing_end_effector"
+  | "approaching"
+  | "fault";
+
+export type BedRobotArmGroupState = {
+  stamp: RosTime;
+  group_id: BedRobotArmGroupId;
+  connected: boolean;
+  state: BedRobotArmGroupExecutionState;
+  operation: BedRobotArmGroupOperation;
+  direction: BedRobotArmGroupDirection;
+  distance_mm: number;
+  distance_origin: BedRobotArmGroupDistanceOrigin;
+  raw_distance_text: string;
+  end_effector_profile: string;
+  active_request_id: string;
+  active_command_id: string;
+  progress: number;
+  error_code: string;
+  error_message: string;
+  rejection_reason: string;
+};
+
 export type SimulationState = {
   procedure_id: string;
   active_bundle: string;
@@ -42,6 +97,7 @@ export type SimulationState = {
   active_robot_task_target_anchor: string;
   active_robot_task_progress: number;
   active_robot_task_remaining_sec: number;
+  bed_robot_arm_groups: BedRobotArmGroupState[];
   instrument_states: InstrumentState[];
   recent_events: string[];
   layout_json?: string;
@@ -64,6 +120,7 @@ export type WorldState = {
   predicted_tool_confidence: number;
   predicted_tool_stability_sec: number;
   surgeon_request_tool: string;
+  bed_robot_arm_groups: BedRobotArmGroupState[];
 };
 
 export type SimulationEvent = {

@@ -1,0 +1,13 @@
+surgical_msgs/BedRobotArmGroupCommand command
+---
+bool success
+string outcome
+string final_state
+string message
+string error_code
+string rejection_reason
+string end_effector_profile
+---
+string state
+float32 progress
+string message

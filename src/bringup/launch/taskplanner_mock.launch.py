@@ -5,6 +5,7 @@ from launch.actions import DeclareLaunchArgument, ExecuteProcess
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution, PythonExpression
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
 
 
@@ -111,6 +112,10 @@ def generate_launch_description() -> LaunchDescription:
                         "spec_dir": spec_dir,
                         "perception_scene_observations": True,
                         "state_backed_observations": False,
+                        "bed_robot_arm_group_proposals_enabled": ParameterValue(
+                            PythonExpression(["'", vlm_mode, "' == 'mock'"]),
+                            value_type=bool,
+                        ),
                     }
                 ],
                 output="screen",
@@ -253,6 +258,23 @@ def generate_launch_description() -> LaunchDescription:
             ),
             Node(
                 package="skill_execution",
+                executable="mock_bed_robot_arm_group_server",
+                name="mock_bed_robot_arm_group_server",
+                parameters=[
+                    {
+                        "spec_dir": spec_dir,
+                        "max_retraction_mm": 30.0,
+                        "suction_transition_sec": 0.4,
+                        "retraction_sec": 1.2,
+                        "release_sec": 0.6,
+                        "end_effector_change_sec": 1.2,
+                        "approach_sec": 0.6,
+                    }
+                ],
+                output="screen",
+            ),
+            Node(
+                package="skill_execution",
                 executable="skill_action_bridge",
                 name="skill_action_bridge",
                 parameters=[
@@ -265,10 +287,37 @@ def generate_launch_description() -> LaunchDescription:
                 output="screen",
             ),
             Node(
+                package="skill_execution",
+                executable="bed_robot_arm_group_action_bridge",
+                name="bed_robot_arm_group_action_bridge",
+                parameters=[
+                    {
+                        "min_repeat_interval_sec": 2.0,
+                        "server_wait_timeout_sec": 3.0,
+                    }
+                ],
+                output="screen",
+            ),
+            Node(
                 package="bt_orchestrator",
                 executable="decision_bridge",
                 name="bt_decision_bridge",
                 parameters=[{"target_node_name": "/tree_executor", "mirror_period_sec": 0.2}],
+                output="screen",
+            ),
+            Node(
+                package="bt_orchestrator",
+                executable="bed_robot_arm_group_orchestrator",
+                name="bed_robot_arm_group_orchestrator",
+                parameters=[
+                    {
+                        "spec_dir": spec_dir,
+                        "vlm_confidence_threshold": 0.6,
+                        "visual_direction_confidence_threshold": 0.75,
+                        # real_vlm: 20 sec per attempt * 3 attempts + margin
+                        "vlm_proposal_timeout_sec": 70.0,
+                    }
+                ],
                 output="screen",
             ),
             Node(

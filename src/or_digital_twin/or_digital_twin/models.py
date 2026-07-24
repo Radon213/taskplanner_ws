@@ -52,6 +52,36 @@ class ActiveRobotTask:
 
 
 @dataclass(slots=True)
+class BedRobotArmGroupBelief:
+    """Aggregate state for a logical bed-mounted robot-arm controller group.
+
+    The planner intentionally does not model physical member arms.  A downstream
+    controller is free to realize one logical group with any number of devices.
+    """
+
+    group_id: str
+    connected: bool = True
+    state: str = "standby"
+    operation: str = ""
+    direction: str = ""
+    distance_mm: float = 0.0
+    distance_origin: str = ""
+    raw_distance_text: str = ""
+    end_effector_profile: str = ""
+    active_request_id: str = ""
+    active_command_id: str = ""
+    progress: float = 0.0
+    error_code: str = ""
+    error_message: str = ""
+    rejection_reason: str = ""
+    # Source timestamp of the last command/status reduction.  World snapshots
+    # must keep this value stable instead of pretending that an unchanged
+    # aggregate was updated whenever the periodic snapshot was published.
+    last_update_stamp_sec: int = 0
+    last_update_stamp_nanosec: int = 0
+
+
+@dataclass(slots=True)
 class SurgeonRequestCue:
     event_type: str
     instrument_id: str
@@ -91,3 +121,4 @@ class TwinState:
     running: bool = False
     execution_state: str = "idle"
     active_robot_task: ActiveRobotTask | None = None
+    bed_robot_arm_groups: dict[str, BedRobotArmGroupBelief] = field(default_factory=dict)

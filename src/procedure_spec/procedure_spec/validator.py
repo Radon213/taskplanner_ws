@@ -4,6 +4,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from .bed_robot_arm_group import (
+    BED_ROBOT_ARM_GROUP_IDS,
+    DISTANCE_ORIGINS,
+    RETRACTION_DIRECTIONS,
+)
+
 
 REQUIRED_FILES = (
     "procedure.yaml",
@@ -104,6 +110,14 @@ REQUIRED_EVENT_DISPLAY_KEYS = {
     "ProcedureCompleted",
 }
 
+ALLOWED_BED_ROBOT_ARM_OPERATIONS = {
+    "suction_start",
+    "suction_stop",
+    "retraction",
+    "release_retraction",
+    "change_end_effector",
+}
+
 
 class SpecValidationError(ValueError):
     """Raised when a procedure specification bundle is invalid."""
@@ -157,6 +171,197 @@ def _validate_display_catalog(catalog: object) -> None:
                 raise SpecValidationError(f"display_catalog.yaml {section}.{key} requires display_name.")
             if not entry_map.get("display_name_ko"):
                 raise SpecValidationError(f"display_catalog.yaml {section}.{key} requires display_name_ko.")
+
+
+def _validate_bed_robot_arm_groups(payload: object, phase_ids: set[str]) -> None:
+    if payload is None or payload == {}:
+        return
+    config = _require_mapping(payload, "bed_robot_arm_groups")
+
+    directions = [str(item) for item in _require_list(
+        config.get("direction_enum"), "bed_robot_arm_groups direction_enum"
+    )]
+    if set(directions) != set(RETRACTION_DIRECTIONS) or len(directions) != len(RETRACTION_DIRECTIONS):
+        raise SpecValidationError(
+            "bed_robot_arm_groups direction_enum must contain exactly: "
+            + ", ".join(RETRACTION_DIRECTIONS)
+        )
+
+    distance_policy = _require_mapping(
+        config.get("distance_policy"), "bed_robot_arm_groups distance_policy"
+    )
+    default_distance = float(distance_policy.get("default_distance_mm", 0.0))
+    qualitative_min = float(distance_policy.get("qualitative_min_mm", 0.0))
+    qualitative_max = float(distance_policy.get("qualitative_max_mm", 0.0))
+    if default_distance != 10.0:
+        raise SpecValidationError("bed_robot_arm_groups default_distance_mm must be 10.")
+    if qualitative_min != 1.0 or qualitative_max != 30.0:
+        raise SpecValidationError(
+            "bed_robot_arm_groups qualitative distance range must be 1..30 mm."
+        )
+    if [str(item) for item in distance_policy.get("precedence", [])] != list(DISTANCE_ORIGINS):
+        raise SpecValidationError(
+            "bed_robot_arm_groups distance precedence must be explicit_with_unit, "
+            "explicit_unit_inferred, qualitative_inferred, defaulted."
+        )
+    if float(distance_policy.get("cm_to_mm_multiplier", 0.0)) != 10.0:
+        raise SpecValidationError("bed_robot_arm_groups cm_to_mm_multiplier must be 10.")
+    if str(distance_policy.get("unitless_numeric_unit", "")) != "mm":
+        raise SpecValidationError("bed_robot_arm_groups unitless numeric values must use mm.")
+    if distance_policy.get("clamp_explicit_values") is not False:
+        raise SpecValidationError("bed_robot_arm_groups explicit distances must not be clamped.")
+    if distance_policy.get("qualitative_integer_mm") is not True:
+        raise SpecValidationError("bed_robot_arm_groups qualitative distances must use integer mm.")
+    anchors = _require_mapping(
+        distance_policy.get("qualitative_anchors"),
+        "bed_robot_arm_groups distance_policy.qualitative_anchors",
+    )
+    for phrase, value in anchors.items():
+        if not str(phrase).strip():
+            raise SpecValidationError("bed_robot_arm_groups qualitative anchor requires text.")
+        distance = float(value)
+        if distance < qualitative_min or distance > qualitative_max:
+            raise SpecValidationError(
+                f"bed_robot_arm_groups qualitative anchor '{phrase}' must be within 1..30 mm."
+            )
+    if set(str(item) for item in distance_policy.get("distance_origins", [])) != set(DISTANCE_ORIGINS):
+        raise SpecValidationError(
+            "bed_robot_arm_groups distance_origins must contain exactly: "
+            + ", ".join(DISTANCE_ORIGINS)
+        )
+
+    groups = _require_mapping(config.get("groups"), "bed_robot_arm_groups groups")
+    if set(groups) != set(BED_ROBOT_ARM_GROUP_IDS):
+        raise SpecValidationError(
+            "bed_robot_arm_groups groups must define exactly suction and retraction."
+        )
+    allowed_by_group: dict[str, set[str]] = {}
+    enabled_groups: set[str] = set()
+    for group_id, raw_group in groups.items():
+        group = _require_mapping(raw_group, f"bed_robot_arm_groups groups.{group_id}")
+        if not isinstance(group.get("enabled"), bool):
+            raise SpecValidationError(
+                f"bed_robot_arm_groups groups.{group_id}.enabled must be boolean."
+            )
+        if bool(group["enabled"]):
+            enabled_groups.add(str(group_id))
+        operations = {
+            str(item)
+            for item in _require_list(
+                group.get("allowed_operations"),
+                f"bed_robot_arm_groups groups.{group_id}.allowed_operations",
+            )
+        }
+        unsupported = sorted(operations - ALLOWED_BED_ROBOT_ARM_OPERATIONS)
+        if unsupported:
+            raise SpecValidationError(
+                f"bed_robot_arm_groups group '{group_id}' has unsupported operations: "
+                + ", ".join(unsupported)
+            )
+        allowed_by_group[str(group_id)] = operations
+        if bool(group["enabled"]) and not str(group.get("initial_end_effector_profile", "")).strip():
+            raise SpecValidationError(
+                f"enabled bed_robot_arm_groups group '{group_id}' requires initial_end_effector_profile."
+            )
+
+    cue_ids: set[str] = set()
+    for raw_cue in _require_list(config.get("cues"), "bed_robot_arm_groups cues"):
+        cue = _require_mapping(raw_cue, "bed_robot_arm_groups cue")
+        cue_id = str(cue.get("id", "")).strip()
+        phase_id = str(cue.get("phase_id", "")).strip()
+        group_id = str(cue.get("group_id", "")).strip()
+        operation = str(cue.get("operation", "")).strip()
+        if not cue_id or cue_id in cue_ids:
+            raise SpecValidationError(
+                f"bed_robot_arm_groups cue id '{cue_id}' must be non-empty and unique."
+            )
+        cue_ids.add(cue_id)
+        if phase_id not in phase_ids:
+            raise SpecValidationError(
+                f"bed_robot_arm_groups cue '{cue_id}' references unknown phase '{phase_id}'."
+            )
+        if group_id not in enabled_groups:
+            raise SpecValidationError(
+                f"bed_robot_arm_groups cue '{cue_id}' references disabled group '{group_id}'."
+            )
+        if operation not in allowed_by_group[group_id]:
+            raise SpecValidationError(
+                f"bed_robot_arm_groups cue '{cue_id}' operation '{operation}' is not allowed for {group_id}."
+            )
+        utterances = [
+            str(item).strip()
+            for item in _require_list(
+                cue.get("utterances"), f"bed_robot_arm_groups cue '{cue_id}' utterances"
+            )
+        ]
+        if not utterances or any(not item for item in utterances):
+            raise SpecValidationError(
+                f"bed_robot_arm_groups cue '{cue_id}' requires non-empty utterances."
+            )
+        cue_directions = [
+            str(item)
+            for item in _require_list(
+                cue.get("directions", []), f"bed_robot_arm_groups cue '{cue_id}' directions"
+            )
+        ]
+        unsupported_directions = sorted(set(cue_directions) - set(RETRACTION_DIRECTIONS))
+        if unsupported_directions:
+            raise SpecValidationError(
+                f"bed_robot_arm_groups cue '{cue_id}' has unsupported directions: "
+                + ", ".join(unsupported_directions)
+            )
+        if operation == "retraction":
+            if not cue_directions:
+                raise SpecValidationError(
+                    f"bed_robot_arm_groups retraction cue '{cue_id}' requires directions."
+                )
+            default_mm = float(cue.get("default_distance_mm", 0.0))
+            if default_mm < qualitative_min or default_mm > qualitative_max:
+                raise SpecValidationError(
+                    f"bed_robot_arm_groups cue '{cue_id}' default distance must be within 1..30 mm."
+                )
+
+    transition_ids: set[str] = set()
+    transitions = _require_list(
+        config.get("end_effector_transitions", []),
+        "bed_robot_arm_groups end_effector_transitions",
+    )
+    for raw_transition in transitions:
+        transition = _require_mapping(raw_transition, "bed_robot_arm_groups end-effector transition")
+        transition_id = str(transition.get("id", "")).strip()
+        phase_id = str(transition.get("phase_id", "")).strip()
+        group_id = str(transition.get("group_id", "")).strip()
+        if not transition_id or transition_id in transition_ids:
+            raise SpecValidationError(
+                f"bed_robot_arm_groups transition id '{transition_id}' must be non-empty and unique."
+            )
+        transition_ids.add(transition_id)
+        if phase_id not in phase_ids:
+            raise SpecValidationError(
+                f"bed_robot_arm_groups transition '{transition_id}' references unknown phase '{phase_id}'."
+            )
+        if group_id not in enabled_groups:
+            raise SpecValidationError(
+                f"bed_robot_arm_groups transition '{transition_id}' references disabled group '{group_id}'."
+            )
+        if "change_end_effector" not in allowed_by_group[group_id]:
+            raise SpecValidationError(
+                f"bed_robot_arm_groups transition '{transition_id}' requires change_end_effector permission."
+            )
+        if not str(transition.get("from_profile", "")).strip() or not str(
+            transition.get("to_profile", "")
+        ).strip():
+            raise SpecValidationError(
+                f"bed_robot_arm_groups transition '{transition_id}' requires from_profile and to_profile."
+            )
+        utterances = _require_list(
+            transition.get("utterances"),
+            f"bed_robot_arm_groups transition '{transition_id}' utterances",
+        )
+        if not utterances or any(not str(item).strip() for item in utterances):
+            raise SpecValidationError(
+                f"bed_robot_arm_groups transition '{transition_id}' requires non-empty utterances."
+            )
 
 
 
@@ -221,6 +426,8 @@ def validate_raw_bundle(raw_bundle: dict[str, object]) -> None:
                 raise SpecValidationError(
                     f"phase '{phase_id}' references unknown instrument '{instrument_id}'."
                 )
+
+    _validate_bed_robot_arm_groups(raw_bundle.get("bed_robot_arm_groups"), phase_ids)
 
     location_entries = _require_list(scene_layout.get("locations"), "scene_layout.yaml locations")
     location_ids: set[str] = set()

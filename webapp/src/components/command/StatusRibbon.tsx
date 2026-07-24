@@ -58,6 +58,7 @@ export function StatusRibbon({
           <select
             value={selectedVlmModel}
             disabled={vlmSelectDisabled}
+            aria-label="VLM model"
             title={modelCatalogStatus}
             onChange={(event) => onVlmModelChange(event.target.value)}
           >

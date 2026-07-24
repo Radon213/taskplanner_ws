@@ -12,6 +12,8 @@ import time
 
 from procedure_spec import ProcedureSpec
 from surgical_msgs.msg import (
+    BedRobotArmGroupRequest,
+    BedRobotArmGroupStatus,
     FilteredPhase,
     PhaseEvidence,
     PhaseTransitionCue,
@@ -23,6 +25,7 @@ from surgical_msgs.msg import (
 
 from .models import (
     ActiveRobotTask,
+    BedRobotArmGroupBelief,
     InstrumentBelief,
     SurgeonRequestCue,
     TwinState,
@@ -36,6 +39,9 @@ from .models import (
     LIFECYCLE_RETURNED_HOME,
     LIFECYCLE_SURGEON_OWNED,
 )
+
+
+BED_ROBOT_ARM_GROUP_IDS = ("suction", "retraction")
 
 
 SURGEON_OWNED_LOCATION_TYPES = {"surgeon_hand", "surgical_field", "bed_fixed_tool", "return_zone"}
@@ -198,6 +204,20 @@ class ORDigitalTwin:
             phase_uncertain=True,
             phase_stability=0.0,
         )
+        group_spec = self.spec.get_bed_robot_arm_group_spec()
+        profile_defaults = {
+            group.id: group.initial_end_effector_profile
+            for group in (group_spec.groups if group_spec is not None else [])
+        }
+        self.state.bed_robot_arm_groups = {
+            group_id: BedRobotArmGroupBelief(
+                group_id=group_id,
+                connected=True,
+                state="standby",
+                end_effector_profile=str(profile_defaults.get(group_id, "")),
+            )
+            for group_id in BED_ROBOT_ARM_GROUP_IDS
+        }
         self.instrument_states = {}
         self.event_history.clear()
         self._observation_candidates.clear()
@@ -226,6 +246,197 @@ class ORDigitalTwin:
         if seed_from_perception:
             self._seed_from_initial_perception()
         self._recompute_transient_state()
+
+    def update_bed_robot_arm_group_request(self, request: BedRobotArmGroupRequest) -> None:
+        """Record an accepted public request without inventing physical arm state."""
+
+        group_id = str(request.group_id or "").strip().lower()
+        belief = self.state.bed_robot_arm_groups.get(group_id)
+        if belief is None:
+            self._record_event(
+                "BedRobotArmGroupRequestRejected",
+                {
+                    "request_id": request.request_id,
+                    "group_id": group_id,
+                    "operation": request.operation,
+                    "reason": "unknown_group",
+                },
+            )
+            return
+        # Public requests are observations, not yet approved controller work.
+        # Active IDs and operation are committed by the BT command/status path
+        # so a rejected duplicate cannot overwrite an in-flight group action.
+        self._record_event(
+            "BedRobotArmGroupRequestObserved",
+            {
+                "request_id": request.request_id,
+                "group_id": group_id,
+                "operation": request.operation,
+                "voice_text": request.voice_text,
+                "source": request.source,
+                "end_effector_profile": request.end_effector_profile,
+            },
+        )
+
+    def update_bed_robot_arm_group_status(self, status: BedRobotArmGroupStatus) -> None:
+        """Reduce group-controller feedback into the authoritative twin state."""
+
+        group_id = str(status.group_id or "").strip().lower()
+        belief = self.state.bed_robot_arm_groups.get(group_id)
+        if belief is None:
+            return
+        status_ns = int(status.stamp.sec) * 1_000_000_000 + int(
+            status.stamp.nanosec
+        )
+        current_ns = int(belief.last_update_stamp_sec) * 1_000_000_000 + int(
+            belief.last_update_stamp_nanosec
+        )
+        if current_ns and status_ns < current_ns:
+            self._record_event(
+                "BedRobotArmGroupStatusIgnored",
+                {
+                    "request_id": status.request_id,
+                    "command_id": status.command_id,
+                    "group_id": group_id,
+                    "operation": status.operation,
+                    "state": status.state,
+                    "outcome": status.outcome,
+                    "reason": "status_older_than_current_group_state",
+                },
+            )
+            return
+        mismatched_active_request = bool(
+            belief.active_request_id
+            and status.request_id
+            and status.request_id != belief.active_request_id
+        )
+        if mismatched_active_request:
+            self._record_event(
+                "BedRobotArmGroupCommandRejected" if status.terminal else "BedRobotArmGroupStatusIgnored",
+                {
+                    "request_id": status.request_id,
+                    "command_id": status.command_id,
+                    "group_id": group_id,
+                    "operation": status.operation,
+                    "state": status.state,
+                    "outcome": status.outcome,
+                    "success": bool(status.success),
+                    "terminal": bool(status.terminal),
+                    "error_code": status.error_code,
+                    "rejection_reason": status.rejection_reason,
+                    "reason": "status_request_does_not_match_active_group_request",
+                    "active_request_id": belief.active_request_id,
+                },
+            )
+            return
+        is_health = not str(status.operation or "").strip() and str(
+            status.request_id or ""
+        ).startswith("health-")
+        if is_health:
+            available = (
+                str(status.error_code) != "server_unavailable"
+                and bool(status.success)
+            )
+            next_state = (
+                "offline"
+                if not available
+                else (
+                    str(status.state or "standby")
+                    if belief.state == "offline"
+                    else belief.state
+                )
+            )
+            changed = bool(
+                belief.connected != available
+                or belief.state != next_state
+            )
+            belief.connected = available
+            belief.state = next_state
+            # Health heartbeats report transport availability only.  Do not
+            # erase (or replace with ``server_unavailable``) the last
+            # operational error returned by the group controller: that
+            # rejection must remain inspectable in the twin and UI until a
+            # later operation supplies a new result.
+            if changed:
+                belief.last_update_stamp_sec = int(status.stamp.sec)
+                belief.last_update_stamp_nanosec = int(status.stamp.nanosec)
+            self._record_event(
+                "BedRobotArmGroupAvailabilityChanged",
+                {
+                    "request_id": status.request_id,
+                    "group_id": group_id,
+                    "state": next_state,
+                    "outcome": status.outcome,
+                    "available": available,
+                    "changed": changed,
+                },
+            )
+            return
+        belief.last_update_stamp_sec = int(status.stamp.sec)
+        belief.last_update_stamp_nanosec = int(status.stamp.nanosec)
+        next_state = str(status.state or belief.state or "standby")
+        belief.connected = (
+            str(status.error_code) != "server_unavailable"
+            and next_state not in {"offline", "fault"}
+        )
+        belief.state = next_state
+        belief.operation = str(status.operation)
+        belief.direction = str(status.direction)
+        belief.distance_mm = float(status.distance_mm)
+        belief.distance_origin = str(status.distance_origin)
+        belief.raw_distance_text = str(status.raw_distance_text)
+        belief.active_request_id = str(status.request_id or belief.active_request_id)
+        belief.active_command_id = str(status.command_id or belief.active_command_id)
+        belief.progress = max(0.0, min(1.0, float(status.progress)))
+        belief.error_code = str(status.error_code)
+        control_cancelled = str(status.outcome) == "cancelled_by_runtime_control"
+        belief.error_message = (
+            str(status.message)
+            if bool(status.terminal) and not bool(status.success) and not control_cancelled
+            else ""
+        )
+        belief.rejection_reason = (
+            "" if control_cancelled else str(status.rejection_reason)
+        )
+        if status.end_effector_profile and bool(status.terminal and status.success):
+            belief.end_effector_profile = str(status.end_effector_profile)
+        if bool(status.terminal):
+            belief.active_request_id = ""
+            belief.active_command_id = ""
+        if control_cancelled:
+            event_type = "BedRobotArmGroupCommandCancelled"
+        elif not status.operation and status.request_id.startswith("health-"):
+            event_type = "BedRobotArmGroupAvailabilityChanged"
+        else:
+            event_type = "BedRobotArmGroupCommandCompleted" if bool(status.terminal and status.success) else (
+                "BedRobotArmGroupCommandRejected" if bool(status.terminal) else "BedRobotArmGroupStatusUpdated"
+            )
+        self._record_event(
+            event_type,
+            {
+                "request_id": status.request_id,
+                "command_id": status.command_id,
+                "group_id": group_id,
+                "operation": status.operation,
+                "state": status.state,
+                "outcome": status.outcome,
+                "success": bool(status.success),
+                "terminal": bool(status.terminal),
+                "direction": status.direction,
+                "distance_mm": float(status.distance_mm),
+                "distance_origin": status.distance_origin,
+                "end_effector_profile": status.end_effector_profile,
+                "error_code": status.error_code,
+                "rejection_reason": status.rejection_reason,
+            },
+        )
+
+    def bed_robot_arm_group_payload(self) -> list[dict[str, Any]]:
+        return [
+            asdict(self.state.bed_robot_arm_groups[group_id])
+            for group_id in BED_ROBOT_ARM_GROUP_IDS
+            if group_id in self.state.bed_robot_arm_groups
+        ]
 
     def reset_runtime(self) -> None:
         self.reset_spec(self.spec, seed_from_perception=False)

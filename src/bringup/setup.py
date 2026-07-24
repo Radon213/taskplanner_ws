@@ -26,6 +26,7 @@ setup(
             "taskplanner_edge_probe = bringup.edge_probe:main",
             "taskplanner_thyroidectomy_llm_e2e_probe = bringup.thyroidectomy_llm_e2e_probe:main",
             "taskplanner_thyroidectomy_prediction_probe = bringup.thyroidectomy_prediction_probe:main",
+            "taskplanner_thyroidectomy_timeline_recorder = bringup.thyroidectomy_timeline_recorder:main",
             "taskplanner_multi_bundle_runtime_probe = bringup.multi_bundle_runtime_probe:main",
         ],
     },

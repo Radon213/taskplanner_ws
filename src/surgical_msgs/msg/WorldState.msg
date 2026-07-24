@@ -37,3 +37,4 @@ string active_robot_task_source_anchor
 string active_robot_task_target_anchor
 float32 active_robot_task_progress
 float32 active_robot_task_remaining_sec
+surgical_msgs/BedRobotArmGroupState[] bed_robot_arm_groups

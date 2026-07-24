@@ -8,6 +8,7 @@ import type {
   useDigitalTwinViewModel,
 } from "../../hooks/useDigitalTwinViewModel";
 import type { CompressedImageFrame } from "../../types";
+import { BedRobotArmGroupCard } from "./BedRobotArmGroupCard";
 
 type ViewModel = ReturnType<typeof useDigitalTwinViewModel>;
 
@@ -173,6 +174,15 @@ export function OperatingRoomStage({
             <h2>{vm.stage.procedureLabel}</h2>
           </div>
           <PhaseStepper steps={vm.stage.phaseSteps} label={vm.ui.phaseOverview} />
+        </div>
+
+        <div
+          className="bed-robot-group-rail"
+          aria-label={vm.language === "ko" ? "베드 로봇암 그룹 상태" : "Bed robot group status"}
+        >
+          {vm.boardBedRobotArmGroups.map((group) => (
+            <BedRobotArmGroupCard key={group.groupId} group={group} />
+          ))}
         </div>
 
         <AnimatePresence initial={false}>

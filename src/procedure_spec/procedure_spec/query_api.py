@@ -162,6 +162,25 @@ class ProcedureSpec:
     def get_humanoid_policy(self):
         return self.bundle.humanoid_policy
 
+    def get_bed_robot_arm_group_spec(self):
+        return self.bundle.bed_robot_arm_groups
+
+    def get_bed_robot_arm_group_cues(self, phase_id: str = ""):
+        spec = self.bundle.bed_robot_arm_groups
+        if not spec:
+            return []
+        if not phase_id:
+            return list(spec.cues)
+        return [cue for cue in spec.cues if cue.phase_id == phase_id]
+
+    def get_bed_robot_arm_end_effector_transitions(self, phase_id: str = ""):
+        spec = self.bundle.bed_robot_arm_groups
+        if not spec:
+            return []
+        if not phase_id:
+            return list(spec.end_effector_transitions)
+        return [transition for transition in spec.end_effector_transitions if transition.phase_id == phase_id]
+
     def resolve_instrument_alias(self, raw_name: str) -> str | None:
         normalized = raw_name.strip().lower()
         direct = self._alias_index.get(normalized)

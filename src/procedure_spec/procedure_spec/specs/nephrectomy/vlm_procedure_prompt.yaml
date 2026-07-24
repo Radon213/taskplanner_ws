@@ -40,6 +40,73 @@ tools:
   T09: "Needle driver"
   T10: "Poole suction tip"
 
+bed_robot_arm_groups:
+  direction_enum: [UP, DOWN, LEFT, RIGHT, LEFT_RIGHT, UP_DOWN]
+  distance_policy:
+    precedence: [explicit_with_unit, explicit_unit_inferred, qualitative_inferred, defaulted]
+    default_distance_mm: 10
+    qualitative_min_mm: 1
+    qualitative_max_mm: 30
+    cm_to_mm_multiplier: 10
+    unitless_numeric_unit: mm
+    clamp_explicit_values: false
+    qualitative_integer_mm: true
+    distance_origins: [explicit_with_unit, explicit_unit_inferred, qualitative_inferred, defaulted]
+    qualitative_anchors:
+      "아주 살짝": 1
+      "미세하게": 1
+      "살짝": 5
+      "조금": 10
+      "조금 더": 10
+      "많이": 20
+      "아주 많이": 30
+      "최대한": 30
+  groups:
+    suction:
+      enabled: false
+      initial_end_effector_profile: ""
+      allowed_operations: [suction_start, suction_stop, change_end_effector]
+    retraction:
+      enabled: true
+      initial_end_effector_profile: mayo
+      allowed_operations: [retraction, release_retraction, change_end_effector]
+  cues:
+    - id: mayo_muscle_exposure
+      phase_id: P01
+      group_id: retraction
+      operation: retraction
+      utterances:
+        - "메이요를 위로 조금 당겨줘"
+        - "메이요를 아래로 조금 당겨줘"
+      directions: [UP, DOWN, LEFT, RIGHT, LEFT_RIGHT, UP_DOWN]
+      default_distance_mm: 10
+      end_effector_profile: mayo
+      feedback_text: "메이요 리트랙터로 근육층 노출을 유지합니다."
+    - id: malleable_exposure_adjustment
+      phase_id: P02
+      group_id: retraction
+      operation: retraction
+      utterances:
+        - "말레어블 오른쪽으로 1센치 더 당겨줘"
+        - "말레어블 왼쪽으로 1센치 더 당겨줘"
+        - "말레어블 위로 1센치 더 당겨줘"
+        - "말레어블 아래로 1센치 더 당겨줘"
+        - "말레어블 오른쪽, 왼쪽 동시에 1센치 더 당겨줘"
+        - "말레어블 위, 아래 동시에 1센치 더 당겨줘"
+        - "말레어블 상하로 동시에 조금 더 당겨줘"
+      directions: [UP, DOWN, LEFT, RIGHT, LEFT_RIGHT, UP_DOWN]
+      default_distance_mm: 10
+      end_effector_profile: malleable
+      feedback_text: "말레어블 리트랙터 위치를 조정합니다."
+  end_effector_transitions:
+    - id: mayo_to_malleable
+      phase_id: P02
+      group_id: retraction
+      from_profile: mayo
+      to_profile: malleable
+      utterances: ["말레어블로 교체해줘", "말레어블 리트랙터로 바꿔줘"]
+      feedback_text: "말레어블 리트랙터용 엔드이펙터로 교환합니다."
+
 phase_flow:
   normal_sequence:
     - from: "P01"

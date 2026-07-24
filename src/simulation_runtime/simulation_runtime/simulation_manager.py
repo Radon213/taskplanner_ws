@@ -99,6 +99,16 @@ class SimulationManagerNode(Node):
             "/surgeon_actor": AsyncParameterClient(
                 self, "/surgeon_actor", callback_group=self._callback_group
             ),
+            "/bed_robot_arm_group_orchestrator": AsyncParameterClient(
+                self,
+                "/bed_robot_arm_group_orchestrator",
+                callback_group=self._callback_group,
+            ),
+            "/mock_bed_robot_arm_group_server": AsyncParameterClient(
+                self,
+                "/mock_bed_robot_arm_group_server",
+                callback_group=self._callback_group,
+            ),
         }
 
         self.create_service(
@@ -465,6 +475,15 @@ class SimulationManagerNode(Node):
             raise RuntimeError("digital twin did not publish an idle home frame after reset")
         self._set_idle_state()
 
+    def _quiesce_runtime_for_bundle_change(self) -> None:
+        """Close every execution gate before any runtime spec is replaced."""
+
+        # Reset first so actors, group orchestrator/bridge, and downstream
+        # action servers stop accepting work even while BT termination is in
+        # progress.  Only then is it safe to mutate the shared spec_dir.
+        self._reset_digital_twin_to_idle()
+        self._prepare_executor_for_restart()
+
     def _stop_digital_twin_to_halted(self) -> None:
         if not self._publish_control_until(
             "stop",
@@ -570,20 +589,17 @@ class SimulationManagerNode(Node):
             self._raise_if_operation_cancelled()
             raise RuntimeError("digital twin did not enter running state before BT start")
         self._raise_if_operation_cancelled()
-        # Actors can begin observing the prepared running frame while BTops is
-        # starting. Requests are queued in the twin, so this reduces the
-        # perceived wait for the first tool without letting BT run before the
-        # digital twin is initialized.
-        self._publish_control(self._control_with_phase("start_actors", start_phase_id))
-        self._raise_if_operation_cancelled()
         success, message = self._start_behavior(clear_blackboard=True)
         if success:
             self._raise_if_operation_cancelled()
-            self._wait_for_executor_running(timeout_sec=10.0)
-            self._raise_if_operation_cancelled()
-            self._running = True
-            self._execution_state = "running"
-            self._bundle_dirty = False
+            if not self._wait_for_executor_running(timeout_sec=10.0):
+                self._publish_control("stop")
+                self._set_idle_state()
+                raise RuntimeError("behavior tree executor did not enter a running state")
+            # This is also the bed-group dispatch gate.  No surgeon actor or
+            # external group request can cause motion before BT startup is
+            # positively confirmed.
+            self._commit_start_actors(start_phase_id)
             self.get_logger().info(message or "simulation started")
             phase_suffix = f" from {target_phase_id}" if start_phase_id else ""
             return message or f"simulation running on {self._active_bundle}{phase_suffix}"
@@ -591,10 +607,29 @@ class SimulationManagerNode(Node):
         self._set_idle_state()
         raise RuntimeError(message or "failed to start simulation")
 
+    def _commit_start_actors(self, start_phase_id: str = "") -> None:
+        """Atomically commit the final start gate against stop/reset.
+
+        Holding the operation lock across the cancellation check, control
+        publication, and local state commit guarantees one of two orders:
+        start_actors then reset, or reset with no later start_actors.
+        """
+
+        with self._operation_lock:
+            if self._operation_cancel.is_set():
+                raise RuntimeError("operation interrupted by newer control command")
+            self._publish_control(
+                self._control_with_phase("start_actors", start_phase_id)
+            )
+            self._running = True
+            self._execution_state = "running"
+            self._bundle_dirty = False
+
     def _interrupt_start_sequence(self, command: str) -> str:
-        self._operation_cancel.set()
-        self._running = False
-        self._execution_state = "resetting" if command == "reset" else "stopping"
+        with self._operation_lock:
+            self._operation_cancel.set()
+            self._running = False
+            self._execution_state = "resetting" if command == "reset" else "stopping"
         self._publish_control("reset" if command == "reset" else "stop")
         try:
             self._command_executor("terminate")
@@ -702,26 +737,31 @@ class SimulationManagerNode(Node):
                 response.spec_dir = str(self._active_spec_dir)
                 return response
 
-            spec_dir, spec = self._load_spec_for_bundle(request.bundle_name)
-            if was_running and request.restart_if_running:
-                self._prepare_executor_for_restart()
-            self._set_spec_dir_on_runtime(spec_dir)
-            self._active_bundle = request.bundle_name
-            self._active_spec_dir = spec_dir
-            self._active_spec = spec
-            self._bundle_dirty = True
-            if was_running and request.restart_if_running:
-                success, message = self._run_sync(
-                    "bundle-restart",
-                    lambda: self._start_sequence(prepare_executor=False),
-                )
-                response.success = success
-                response.message = message
-            else:
-                self._prepare_executor_for_restart()
-                self._reset_digital_twin_to_idle()
-                response.success = True
-                response.message = f"active bundle set to {request.bundle_name}"
+            if not self._begin_operation("bundle-switch"):
+                response.success = False
+                response.message = f"{self._operation_name} already in progress"
+                response.active_bundle = self._active_bundle
+                response.spec_dir = str(self._active_spec_dir)
+                return response
+
+            try:
+                spec_dir, spec = self._load_spec_for_bundle(request.bundle_name)
+                self._quiesce_runtime_for_bundle_change()
+                self._set_spec_dir_on_runtime(spec_dir)
+                self._active_bundle = request.bundle_name
+                self._active_spec_dir = spec_dir
+                self._active_spec = spec
+                self._bundle_dirty = True
+                if was_running and request.restart_if_running:
+                    response.message = self._start_sequence(prepare_executor=False)
+                    response.success = True
+                else:
+                    # Publish a fresh idle frame from the newly selected spec.
+                    self._reset_digital_twin_to_idle()
+                    response.success = True
+                    response.message = f"active bundle set to {request.bundle_name}"
+            finally:
+                self._finish_operation("bundle-switch")
             response.active_bundle = self._active_bundle
             response.spec_dir = str(spec_dir)
             return response

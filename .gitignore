@@ -24,6 +24,8 @@ reports/*.png
 reports/*.jpg
 reports/*.jpeg
 reports/taskplanner_validation_assets/
+reports/*_surgery_timeline.txt
+reports/*_timeline_recorder*.exit
 test_outputs/
 .playwright-cli/
 *.bag

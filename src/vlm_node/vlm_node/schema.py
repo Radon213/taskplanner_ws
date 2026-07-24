@@ -3,7 +3,15 @@
 from __future__ import annotations
 
 import json
+import math
 from typing import Any
+
+from procedure_spec import (
+    DISTANCE_ORIGINS,
+    RETRACTION_DIRECTIONS,
+    BedRobotArmGroupNormalizationError,
+    validate_retraction_distance_proposal,
+)
 
 
 class SchemaValidationError(ValueError):
@@ -213,6 +221,104 @@ def _validate_v3_payload(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _validate_v4_bed_robot_arm_group(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise SchemaValidationError("'bed_robot_arm_group' must be an object or null")
+
+    required = {
+        "request_id",
+        "group_id",
+        "operation",
+        "direction",
+        "distance_mm",
+        "distance_origin",
+        "raw_distance_text",
+        "end_effector_profile",
+        "rationale",
+        "confidence",
+    }
+    missing = sorted(required - set(value))
+    extra = sorted(set(value) - required)
+    if missing:
+        raise SchemaValidationError(
+            "bed_robot_arm_group is missing fields: " + ", ".join(missing)
+        )
+    if extra:
+        raise SchemaValidationError(
+            "bed_robot_arm_group has unsupported fields: " + ", ".join(extra)
+        )
+
+    request_id = str(value["request_id"]).strip()
+    group_id = str(value["group_id"]).strip()
+    operation = str(value["operation"]).strip()
+    direction = str(value["direction"]).strip().upper()
+    distance_origin = str(value["distance_origin"]).strip()
+    raw_distance_text = str(value["raw_distance_text"]).strip()
+    confidence = float(value["confidence"])
+    distance_mm = float(value["distance_mm"])
+
+    if not request_id:
+        raise SchemaValidationError("bed_robot_arm_group request_id must be non-empty")
+    # Suction is routed deterministically and does not come from VLM.  Schema
+    # v4 therefore carries only a retraction proposal, still at group level.
+    if group_id != "retraction":
+        raise SchemaValidationError("bed_robot_arm_group group_id must be retraction")
+    if operation != "retraction":
+        raise SchemaValidationError("bed_robot_arm_group operation must be retraction")
+    if direction not in RETRACTION_DIRECTIONS:
+        raise SchemaValidationError(
+            "bed_robot_arm_group direction must be one of "
+            + ", ".join(RETRACTION_DIRECTIONS)
+        )
+    if distance_origin not in DISTANCE_ORIGINS:
+        raise SchemaValidationError(
+            "bed_robot_arm_group distance_origin must be one of " + ", ".join(DISTANCE_ORIGINS)
+        )
+    if not math.isfinite(confidence) or confidence < 0.0 or confidence > 1.0:
+        raise SchemaValidationError("bed_robot_arm_group confidence must be between 0 and 1")
+    if distance_origin.startswith("explicit_") and not raw_distance_text:
+        raise SchemaValidationError(
+            "bed_robot_arm_group raw_distance_text is required for an explicit distance"
+        )
+    try:
+        normalized_distance = validate_retraction_distance_proposal(
+            raw_distance_text=raw_distance_text,
+            distance_mm=distance_mm,
+            distance_origin=distance_origin,
+        )
+    except BedRobotArmGroupNormalizationError as exc:
+        raise SchemaValidationError(f"invalid bed_robot_arm_group distance: {exc}") from exc
+
+    return {
+        "request_id": request_id,
+        "group_id": group_id,
+        "operation": operation,
+        "direction": direction,
+        "distance_mm": normalized_distance.distance_mm,
+        "distance_origin": normalized_distance.distance_origin,
+        "raw_distance_text": raw_distance_text,
+        "end_effector_profile": str(value["end_effector_profile"]).strip(),
+        "rationale": str(value["rationale"]).strip(),
+        "confidence": confidence,
+    }
+
+
+def _validate_v4_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    if str(payload.get("v", "")) != "4":
+        raise SchemaValidationError("missing or unsupported schema version")
+    v3_payload = dict(payload)
+    v3_payload["v"] = "3"
+    v3_payload.pop("bed_robot_arm_group", None)
+    normalized = _validate_v3_payload(v3_payload)
+    normalized["v"] = "4"
+    normalized["bed_robot_arm_group"] = _validate_v4_bed_robot_arm_group(
+        payload.get("bed_robot_arm_group")
+    )
+    return normalized
+
+
 def validate_payload(payload: dict[str, Any]) -> dict[str, Any]:
     version = str(payload.get("v", ""))
     if version == "1":
@@ -221,6 +327,8 @@ def validate_payload(payload: dict[str, Any]) -> dict[str, Any]:
         return _validate_v2_payload(payload)
     if version == "3":
         return _validate_v3_payload(payload)
+    if version == "4":
+        return _validate_v4_payload(payload)
     raise SchemaValidationError("missing or unsupported schema version")
 
 
@@ -230,6 +338,55 @@ def normalize_raw_text(raw_text: str) -> tuple[str, dict[str, Any]]:
 
 
 def compact_vlm_json_schema(version: str = "1") -> dict[str, Any]:
+    if str(version) == "4":
+        schema = compact_vlm_json_schema("3")
+        schema["properties"] = dict(schema["properties"])
+        schema["properties"]["v"] = {"type": "string", "enum": ["4"]}
+        schema["properties"]["bed_robot_arm_group"] = {
+            "anyOf": [
+                {"type": "null"},
+                {
+                    "type": "object",
+                    "properties": {
+                        "request_id": {"type": "string", "minLength": 1},
+                        "group_id": {"type": "string", "enum": ["retraction"]},
+                        "operation": {"type": "string", "enum": ["retraction"]},
+                        "direction": {
+                            "type": "string",
+                            "enum": list(RETRACTION_DIRECTIONS),
+                        },
+                        "distance_mm": {"type": "number", "exclusiveMinimum": 0.0},
+                        "distance_origin": {
+                            "type": "string",
+                            "enum": list(DISTANCE_ORIGINS),
+                        },
+                        "raw_distance_text": {"type": "string"},
+                        "end_effector_profile": {"type": "string"},
+                        "rationale": {"type": "string"},
+                        "confidence": {
+                            "type": "number",
+                            "minimum": 0.0,
+                            "maximum": 1.0,
+                        },
+                    },
+                    "required": [
+                        "request_id",
+                        "group_id",
+                        "operation",
+                        "direction",
+                        "distance_mm",
+                        "distance_origin",
+                        "raw_distance_text",
+                        "end_effector_profile",
+                        "rationale",
+                        "confidence",
+                    ],
+                    "additionalProperties": False,
+                },
+            ]
+        }
+        schema["required"] = [*schema["required"], "bed_robot_arm_group"]
+        return schema
     if str(version) == "3":
         pair_array = {
             "type": "array",

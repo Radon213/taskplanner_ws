@@ -81,6 +81,10 @@ def compact_procedure_prompt(bundle_dir: str | Path) -> dict[str, Any]:
         if rows:
             phase_sequences[str(phase_id)] = rows
 
+    bed_robot_arm_groups = payload.get("bed_robot_arm_groups", {})
+    if not isinstance(bed_robot_arm_groups, dict):
+        bed_robot_arm_groups = {}
+
     return {
         "id": str(payload.get("id", "thyroidectomy_procedure_prompt")),
         "procedure": str((payload.get("procedure", {}) or {}).get("name", "")),
@@ -95,4 +99,7 @@ def compact_procedure_prompt(bundle_dir: str | Path) -> dict[str, Any]:
         },
         "flow": flow,
         "seq": phase_sequences,
+        # Preserve the group-level scenario contract.  This intentionally has
+        # no physical arm identifiers or arm-count assumptions.
+        "bed_robot_arm_groups": bed_robot_arm_groups,
     }

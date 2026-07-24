@@ -20,6 +20,11 @@ from rcl_interfaces.msg import SetParametersResult
 from rclpy.node import Node
 from std_msgs.msg import String
 from surgical_msgs.msg import (
+    BedRobotArmGroupActionProposal,
+    BedRobotArmGroupCommand,
+    BedRobotArmGroupRequest,
+    BedRobotArmGroupState,
+    BedRobotArmGroupStatus,
     FilteredPhase,
     InstrumentState,
     BTContextSnapshot,
@@ -59,6 +64,12 @@ class ORDigitalTwinNode(Node):
         "ToolReturnedToTray",
         "RobotTaskStarted",
         "RobotTaskCompleted",
+        "BedRobotArmGroupRequestObserved",
+        "BedRobotArmGroupProposalObserved",
+        "BedRobotArmGroupCommandApproved",
+        "BedRobotArmGroupCommandCompleted",
+        "BedRobotArmGroupCommandRejected",
+        "BedRobotArmGroupCommandCancelled",
     }
 
     def __init__(self) -> None:
@@ -86,6 +97,7 @@ class ORDigitalTwinNode(Node):
         self._tool_predict_threshold = float(self.get_parameter("tool_predict_confidence_threshold").value)
         self._tool_predict_stability_sec = max(0.1, float(self.get_parameter("tool_predict_stability_sec").value))
         self._twin = ORDigitalTwin(load_bundle(self._spec_dir))
+        self._stamp_all_bed_robot_arm_groups()
         self._prior_scorer = ProcedurePriorScorer(self._twin.spec, compact_procedure_prompt(self._spec_dir))
         self._bundle_metadata_cache = self._build_bundle_metadata()
         self._important_events: deque[SimulationEvent] = deque(maxlen=self._vlm_recent_event_count)
@@ -95,6 +107,7 @@ class ORDigitalTwinNode(Node):
         self._mayo_reuse_stability: dict[str, dict] = {}
         self._mayo_promoted_tools: set[str] = set()
         self._tool_predict_stability: dict[str, dict] = {}
+        self._pending_bed_robot_arm_group_requests: dict[str, BedRobotArmGroupRequest] = {}
         self._phase_entered_ros_sec = self._stamp_sec(self._stamp())
         self.add_on_set_parameters_callback(self._on_parameters_changed)
 
@@ -126,6 +139,36 @@ class ORDigitalTwinNode(Node):
             10,
         )
         self.create_subscription(TwinEvent, "/skill/events", self._on_skill_event, 50)
+        self.create_subscription(
+            BedRobotArmGroupRequest,
+            "/surgeon/bed_robot_arm_group_request",
+            self._on_bed_robot_arm_group_request,
+            20,
+        )
+        self.create_subscription(
+            BedRobotArmGroupActionProposal,
+            "/vlm/bed_robot_arm_group_proposal",
+            self._on_bed_robot_arm_group_proposal,
+            20,
+        )
+        self.create_subscription(
+            BedRobotArmGroupActionProposal,
+            "/vlm_real/bed_robot_arm_group_proposal",
+            self._on_bed_robot_arm_group_proposal,
+            20,
+        )
+        self.create_subscription(
+            BedRobotArmGroupCommand,
+            "/bt/bed_robot_arm_group_command",
+            self._on_bed_robot_arm_group_command,
+            20,
+        )
+        self.create_subscription(
+            BedRobotArmGroupStatus,
+            "/bed_robot_arm_group/status",
+            self._on_bed_robot_arm_group_status,
+            50,
+        )
         self.create_subscription(String, "/surgery/audio/request_text", self._on_request, 20)
         self.create_subscription(SurgeonRequest, "/surgeon/request", self._on_surgeon_request, 20)
         self.create_subscription(FilteredPhase, "/phase/filtered", self._on_phase, 20)
@@ -140,6 +183,7 @@ class ORDigitalTwinNode(Node):
                 try:
                     self._spec_dir = str(parameter.value)
                     self._twin.reset_spec(load_bundle(self._spec_dir))
+                    self._stamp_all_bed_robot_arm_groups()
                     self._prior_scorer = ProcedurePriorScorer(self._twin.spec, compact_procedure_prompt(self._spec_dir))
                     self._bundle_metadata_cache = self._build_bundle_metadata()
                     self._important_events.clear()
@@ -147,6 +191,7 @@ class ORDigitalTwinNode(Node):
                     self._mayo_reuse_stability.clear()
                     self._mayo_promoted_tools.clear()
                     self._tool_predict_stability.clear()
+                    self._pending_bed_robot_arm_group_requests.clear()
                     self._phase_entered_ros_sec = self._stamp_sec(self._stamp())
                     self._publish_world_state()
                 except Exception as exc:
@@ -333,6 +378,10 @@ class ORDigitalTwinNode(Node):
         world.active_robot_task_target_anchor = active_task.target_anchor_id if active_task else ""
         world.active_robot_task_progress = float(active_task.progress) if active_task else 0.0
         world.active_robot_task_remaining_sec = float(active_task.remaining_sec) if active_task else 0.0
+        world.bed_robot_arm_groups = [
+            self._bed_robot_arm_group_state_message(payload, world.stamp)
+            for payload in self._twin.bed_robot_arm_group_payload()
+        ]
         world.instrument_states = []
         for payload in self._twin.instrument_payload():
             msg = InstrumentState()
@@ -385,6 +434,7 @@ class ORDigitalTwinNode(Node):
         simulation.active_robot_task_remaining_sec = float(active_task.remaining_sec) if active_task else 0.0
         simulation.recent_events = list(self._twin.state.recent_event_types)
         simulation.instrument_states = list(world.instrument_states)
+        simulation.bed_robot_arm_groups = list(world.bed_robot_arm_groups)
         simulation.layout_json = json.dumps(
             {
                 "entities": [
@@ -446,6 +496,47 @@ class ORDigitalTwinNode(Node):
         self._simulation_state_pub.publish(simulation)
         self._publish_perception_scene(world)
         self._publish_vlm_context(world)
+
+    def _stamp_all_bed_robot_arm_groups(self) -> None:
+        stamp = self._stamp()
+        for belief in self._twin.state.bed_robot_arm_groups.values():
+            belief.last_update_stamp_sec = int(stamp.sec)
+            belief.last_update_stamp_nanosec = int(stamp.nanosec)
+
+    @staticmethod
+    def _set_bed_robot_arm_group_stamp(belief, stamp) -> None:
+        belief.last_update_stamp_sec = int(stamp.sec)
+        belief.last_update_stamp_nanosec = int(stamp.nanosec)
+
+    def _bed_robot_arm_group_state_message(self, payload: dict, stamp) -> BedRobotArmGroupState:
+        """Serialize only the public aggregate group contract into ROS state."""
+
+        msg = BedRobotArmGroupState()
+        update_sec = int(payload.get("last_update_stamp_sec", 0))
+        update_nanosec = int(payload.get("last_update_stamp_nanosec", 0))
+        if update_sec or update_nanosec:
+            msg.stamp.sec = update_sec
+            msg.stamp.nanosec = update_nanosec
+        else:
+            # This fallback is only for manually constructed test twins.  The
+            # runtime stamps all groups once at construction/reset.
+            msg.stamp = stamp
+        msg.group_id = str(payload.get("group_id", ""))
+        msg.connected = bool(payload.get("connected", False))
+        msg.state = str(payload.get("state", "standby"))
+        msg.operation = str(payload.get("operation", ""))
+        msg.direction = str(payload.get("direction", ""))
+        msg.distance_mm = float(payload.get("distance_mm", 0.0))
+        msg.distance_origin = str(payload.get("distance_origin", ""))
+        msg.raw_distance_text = str(payload.get("raw_distance_text", ""))
+        msg.end_effector_profile = str(payload.get("end_effector_profile", ""))
+        msg.active_request_id = str(payload.get("active_request_id", ""))
+        msg.active_command_id = str(payload.get("active_command_id", ""))
+        msg.progress = float(payload.get("progress", 0.0))
+        msg.error_code = str(payload.get("error_code", ""))
+        msg.error_message = str(payload.get("error_message", ""))
+        msg.rejection_reason = str(payload.get("rejection_reason", ""))
+        return msg
 
     def _publish_perception_scene(self, world: WorldState) -> None:
         scene = PerceptionScene()
@@ -571,6 +662,31 @@ class ORDigitalTwinNode(Node):
         active_tool_ids, non_home_tool_ids, tool_rows = self._context_tool_rows(world)
         recent_events = list(self._important_events)[-self._vlm_recent_event_count :]
         recent_payload = [self._event_payload(event) for event in recent_events]
+        bed_group_rows = [
+            {
+                "group_id": group.group_id,
+                "connected": bool(group.connected),
+                "state": group.state,
+                "operation": group.operation,
+                "direction": group.direction,
+                "distance_mm": round(float(group.distance_mm), 3),
+                "distance_origin": group.distance_origin,
+                "raw_distance_text": group.raw_distance_text,
+                "end_effector_profile": group.end_effector_profile,
+                "active_request_id": group.active_request_id,
+                "active_command_id": group.active_command_id,
+                "progress": round(float(group.progress), 3),
+                "error_code": group.error_code,
+                "error_message": group.error_message,
+                "rejection_reason": group.rejection_reason,
+            }
+            for group in world.bed_robot_arm_groups
+        ]
+        pending_group_request = (
+            list(self._pending_bed_robot_arm_group_requests.values())[-1]
+            if self._pending_bed_robot_arm_group_requests
+            else None
+        )
         active_task = {
             "id": world.active_robot_task_id,
             "type": world.active_robot_task_type,
@@ -608,6 +724,21 @@ class ORDigitalTwinNode(Node):
                 "remaining_sec": round(float(world.cleaner_remaining_sec), 2),
             },
             "active_robot_task": active_task,
+            "bed_robot_arm_groups": bed_group_rows,
+            "pending_bed_robot_arm_group_request": (
+                {
+                    "request_id": pending_group_request.request_id,
+                    "group_id": pending_group_request.group_id,
+                    "operation": pending_group_request.operation,
+                    "voice_text": pending_group_request.voice_text,
+                    "procedure_id": pending_group_request.procedure_id,
+                    "phase_id": pending_group_request.phase_id,
+                    "end_effector_profile": pending_group_request.end_effector_profile,
+                    "source": pending_group_request.source,
+                }
+                if pending_group_request is not None
+                else None
+            ),
             "expected_tools": list(world.expected_instruments),
             "pending_transition_tools": list(world.pending_transition_tools),
             "active_recovery_tools": list(world.active_recovery_tools),
@@ -638,6 +769,10 @@ class ORDigitalTwinNode(Node):
         request_context.active_tool_ids = active_tool_ids
         request_context.non_home_tool_ids = non_home_tool_ids
         request_context.pending_transition_tools = list(world.pending_transition_tools)
+        request_context.bed_robot_arm_groups = list(world.bed_robot_arm_groups)
+        request_context.has_pending_bed_robot_arm_group_request = pending_group_request is not None
+        if pending_group_request is not None:
+            request_context.pending_bed_robot_arm_group_request = pending_group_request
         for event in recent_events:
             digest = EventDigest()
             digest.stamp = event.stamp
@@ -1439,6 +1574,153 @@ class ORDigitalTwinNode(Node):
         self._record_important_event(simulation_event)
         self._publish_world_state()
 
+    def _on_bed_robot_arm_group_request(self, msg: BedRobotArmGroupRequest) -> None:
+        group_id = str(msg.group_id or "").strip().lower()
+        if group_id in {"suction", "retraction"} and msg.request_id:
+            self._pending_bed_robot_arm_group_requests[msg.request_id] = msg
+        self._twin.update_bed_robot_arm_group_request(msg)
+        self._publish_event(
+            "BedRobotArmGroupRequestObserved",
+            phase_id=msg.phase_id,
+            status="pending",
+            mode="bed_robot_arm_group_request",
+            detail={
+                "request_id": msg.request_id,
+                "group_id": group_id,
+                "operation": msg.operation,
+                "voice_text": msg.voice_text,
+                "procedure_id": msg.procedure_id,
+                "phase_id": msg.phase_id,
+                "end_effector_profile": msg.end_effector_profile,
+                "source": msg.source,
+            },
+        )
+        self._publish_world_state()
+
+    def _on_bed_robot_arm_group_proposal(self, msg: BedRobotArmGroupActionProposal) -> None:
+        command = msg.command
+        self._publish_event(
+            "BedRobotArmGroupProposalObserved",
+            phase_id=self._twin.state.filtered_phase,
+            status="valid" if msg.valid else "rejected",
+            confidence=float(command.confidence),
+            mode="vlm_bed_robot_arm_group_proposal",
+            detail={
+                "schema_version": msg.schema_version,
+                "valid": bool(msg.valid),
+                "validation_error": msg.validation_error,
+                "request_id": command.request_id,
+                "command_id": command.command_id,
+                "group_id": command.group_id,
+                "operation": command.operation,
+                "direction": command.direction,
+                "distance_mm": float(command.distance_mm),
+                "distance_origin": command.distance_origin,
+                "raw_distance_text": command.raw_distance_text,
+                "end_effector_profile": command.end_effector_profile,
+                "rationale": command.rationale,
+                "confidence": float(command.confidence),
+            },
+        )
+        self._publish_world_state()
+
+    def _on_bed_robot_arm_group_command(self, msg: BedRobotArmGroupCommand) -> None:
+        belief = self._twin.state.bed_robot_arm_groups.get(msg.group_id)
+        state_update_ignored = False
+        if belief is not None:
+            command_stamp = msg.stamp
+            if not int(command_stamp.sec) and not int(command_stamp.nanosec):
+                command_stamp = self._stamp()
+            command_ns = int(command_stamp.sec) * 1_000_000_000 + int(
+                command_stamp.nanosec
+            )
+            current_ns = int(belief.last_update_stamp_sec) * 1_000_000_000 + int(
+                belief.last_update_stamp_nanosec
+            )
+            state_update_ignored = bool(current_ns and command_ns <= current_ns)
+            if not state_update_ignored:
+                self._set_bed_robot_arm_group_stamp(belief, command_stamp)
+                belief.active_request_id = msg.request_id
+                belief.active_command_id = msg.command_id
+                belief.operation = msg.operation
+                belief.direction = msg.direction
+                belief.distance_mm = float(msg.distance_mm)
+                belief.distance_origin = msg.distance_origin
+                belief.raw_distance_text = msg.raw_distance_text
+                belief.progress = 0.0
+                belief.error_code = ""
+                belief.error_message = ""
+                belief.rejection_reason = ""
+        self._publish_event(
+            "BedRobotArmGroupCommandApproved",
+            phase_id=self._twin.state.filtered_phase,
+            status="approved",
+            confidence=float(msg.confidence),
+            mode="bt_bed_robot_arm_group_guard",
+            detail={
+                "request_id": msg.request_id,
+                "command_id": msg.command_id,
+                "group_id": msg.group_id,
+                "operation": msg.operation,
+                "direction": msg.direction,
+                "distance_mm": float(msg.distance_mm),
+                "distance_origin": msg.distance_origin,
+                "raw_distance_text": msg.raw_distance_text,
+                "end_effector_profile": msg.end_effector_profile,
+                "rationale": msg.rationale,
+                "confidence": float(msg.confidence),
+                "state_update_ignored_stale": state_update_ignored,
+            },
+        )
+        self._publish_world_state()
+
+    def _on_bed_robot_arm_group_status(self, msg: BedRobotArmGroupStatus) -> None:
+        if not int(msg.stamp.sec) and not int(msg.stamp.nanosec):
+            msg.stamp = self._stamp()
+        self._twin.update_bed_robot_arm_group_status(msg)
+        if bool(msg.terminal) and msg.request_id:
+            self._pending_bed_robot_arm_group_requests.pop(msg.request_id, None)
+        if msg.outcome == "cancelled_by_runtime_control":
+            event_type = "BedRobotArmGroupCommandCancelled"
+        elif not msg.operation and msg.request_id.startswith("health-"):
+            event_type = "BedRobotArmGroupAvailabilityChanged"
+        elif bool(msg.terminal):
+            event_type = (
+                "BedRobotArmGroupCommandCompleted"
+                if bool(msg.success)
+                else "BedRobotArmGroupCommandRejected"
+            )
+        else:
+            event_type = "BedRobotArmGroupStatusUpdated"
+        self._publish_event(
+            event_type,
+            status=msg.state,
+            confidence=float(msg.confidence),
+            mode="bed_robot_arm_group_status",
+            detail={
+                "request_id": msg.request_id,
+                "command_id": msg.command_id,
+                "group_id": msg.group_id,
+                "operation": msg.operation,
+                "state": msg.state,
+                "outcome": msg.outcome,
+                "terminal": bool(msg.terminal),
+                "success": bool(msg.success),
+                "message": msg.message,
+                "direction": msg.direction,
+                "distance_mm": float(msg.distance_mm),
+                "distance_origin": msg.distance_origin,
+                "raw_distance_text": msg.raw_distance_text,
+                "end_effector_profile": msg.end_effector_profile,
+                "progress": float(msg.progress),
+                "elapsed_sec": float(msg.elapsed_sec),
+                "remaining_sec": float(msg.remaining_sec),
+                "error_code": msg.error_code,
+                "rejection_reason": msg.rejection_reason,
+            },
+        )
+        self._publish_world_state()
+
     def _on_request(self, msg: String) -> None:
         self._publish_event(
             "VoiceTranscriptObserved",
@@ -1503,7 +1785,9 @@ class ORDigitalTwinNode(Node):
         command = command.strip().lower()
         start_phase_id = start_phase_id.strip()
         if command in {"start", "start_runtime"}:
+            self._pending_bed_robot_arm_group_requests.clear()
             self._twin.reset_spec(self._twin.spec, seed_from_perception=False)
+            self._stamp_all_bed_robot_arm_groups()
             self._phase_entered_ros_sec = self._stamp_sec(self._stamp())
             if start_phase_id:
                 self._twin.set_initial_phase(start_phase_id)
@@ -1514,9 +1798,12 @@ class ORDigitalTwinNode(Node):
         elif command == "resume":
             self._twin.set_execution_state(True, "running")
         elif command == "stop":
+            self._pending_bed_robot_arm_group_requests.clear()
             self._twin.set_execution_state(False, "halted")
         elif command == "reset":
+            self._pending_bed_robot_arm_group_requests.clear()
             self._twin.reset_runtime()
+            self._stamp_all_bed_robot_arm_groups()
             self._phase_entered_ros_sec = self._stamp_sec(self._stamp())
             self._twin.set_execution_state(False, "idle")
         self._publish_world_state()

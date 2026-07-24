@@ -9,6 +9,10 @@ from ament_index_python.packages import get_package_share_directory
 
 from .models import (
     ActionGuardPolicy,
+    BedRobotArmEndEffectorTransitionSpec,
+    BedRobotArmGroupCueSpec,
+    BedRobotArmGroupSpec,
+    BedRobotArmProcedureSpec,
     HumanoidPolicy,
     InitialPlacement,
     InstrumentSpec,
@@ -119,6 +123,7 @@ def load_bundle(bundle_dir: str | Path | None = None) -> ProcedureSpec:
     simulation_layout = raw_bundle["simulation_layout"]
     mock_perception = raw_bundle.get("mock_perception", {})
     mock_surgeon = raw_bundle["mock_surgeon"]
+    bed_robot_arm_groups = raw_bundle.get("bed_robot_arm_groups", {})
 
     bundle = ProcedureBundle(
         procedure_id=str(procedure["procedure_id"]),
@@ -197,6 +202,100 @@ def load_bundle(bundle_dir: str | Path | None = None) -> ProcedureSpec:
                 policy["humanoid_policy"]["direct_return_to_rack_for_unused_prepositioned_tool"]
             ),
         ),
+        bed_robot_arm_groups=BedRobotArmProcedureSpec(
+            directions=[str(item) for item in bed_robot_arm_groups.get("direction_enum", [])],
+            distance_precedence=[
+                str(item)
+                for item in (bed_robot_arm_groups.get("distance_policy", {}) or {}).get(
+                    "precedence", []
+                )
+            ],
+            default_distance_mm=float(
+                (bed_robot_arm_groups.get("distance_policy", {}) or {}).get(
+                    "default_distance_mm", 10.0
+                )
+            ),
+            qualitative_min_mm=float(
+                (bed_robot_arm_groups.get("distance_policy", {}) or {}).get(
+                    "qualitative_min_mm", 1.0
+                )
+            ),
+            qualitative_max_mm=float(
+                (bed_robot_arm_groups.get("distance_policy", {}) or {}).get(
+                    "qualitative_max_mm", 30.0
+                )
+            ),
+            cm_to_mm_multiplier=float(
+                (bed_robot_arm_groups.get("distance_policy", {}) or {}).get(
+                    "cm_to_mm_multiplier", 10.0
+                )
+            ),
+            unitless_numeric_unit=str(
+                (bed_robot_arm_groups.get("distance_policy", {}) or {}).get(
+                    "unitless_numeric_unit", "mm"
+                )
+            ),
+            clamp_explicit_values=bool(
+                (bed_robot_arm_groups.get("distance_policy", {}) or {}).get(
+                    "clamp_explicit_values", False
+                )
+            ),
+            qualitative_integer_mm=bool(
+                (bed_robot_arm_groups.get("distance_policy", {}) or {}).get(
+                    "qualitative_integer_mm", True
+                )
+            ),
+            qualitative_anchors={
+                str(phrase): float(distance)
+                for phrase, distance in (
+                    (bed_robot_arm_groups.get("distance_policy", {}) or {}).get(
+                        "qualitative_anchors", {}
+                    )
+                    or {}
+                ).items()
+            },
+            groups=[
+                BedRobotArmGroupSpec(
+                    id=str(group_id),
+                    enabled=bool(group.get("enabled", False)),
+                    initial_end_effector_profile=str(
+                        group.get("initial_end_effector_profile", "")
+                    ),
+                    allowed_operations=[
+                        str(operation) for operation in group.get("allowed_operations", [])
+                    ],
+                )
+                for group_id, group in (bed_robot_arm_groups.get("groups", {}) or {}).items()
+            ],
+            cues=[
+                BedRobotArmGroupCueSpec(
+                    id=str(cue["id"]),
+                    phase_id=str(cue["phase_id"]),
+                    group_id=str(cue["group_id"]),
+                    operation=str(cue["operation"]),
+                    utterances=[str(item) for item in cue.get("utterances", [])],
+                    directions=[str(item) for item in cue.get("directions", [])],
+                    default_distance_mm=float(cue.get("default_distance_mm", 0.0)),
+                    end_effector_profile=str(cue.get("end_effector_profile", "")),
+                    feedback_text=str(cue.get("feedback_text", "")),
+                )
+                for cue in bed_robot_arm_groups.get("cues", [])
+            ],
+            end_effector_transitions=[
+                BedRobotArmEndEffectorTransitionSpec(
+                    id=str(transition["id"]),
+                    phase_id=str(transition["phase_id"]),
+                    group_id=str(transition["group_id"]),
+                    from_profile=str(transition["from_profile"]),
+                    to_profile=str(transition["to_profile"]),
+                    utterances=[str(item) for item in transition.get("utterances", [])],
+                    feedback_text=str(transition.get("feedback_text", "")),
+                )
+                for transition in bed_robot_arm_groups.get("end_effector_transitions", [])
+            ],
+        )
+        if bed_robot_arm_groups
+        else None,
         simulation_entities=[
             SimulationEntity(
                 id=str(entity["id"]),

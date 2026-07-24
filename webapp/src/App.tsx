@@ -17,10 +17,8 @@ export default function App() {
     return window.localStorage.getItem("taskplanner.language") === "en" ? "en" : "ko";
   });
   const [stageAspectRatio, setStageAspectRatio] = useState(1.55);
-  const [modelOptions, setModelOptions] = useState<string[]>([]);
-  const [modelCatalogStatus, setModelCatalogStatus] = useState("loading");
   const [vlmModelSelection, setVlmModelSelection] = useState("");
-  const [actorModelSelection, setActorModelSelection] = useState("google/gemma-4-12b-qat");
+  const [actorModelSelection, setActorModelSelection] = useState("");
 
   useEffect(() => {
     window.localStorage.setItem("taskplanner.language", language);
@@ -42,31 +40,6 @@ export default function App() {
   });
 
   useEffect(() => {
-    let disposed = false;
-    async function refreshModels() {
-      try {
-        const response = await fetch("http://127.0.0.1:1234/v1/models");
-        if (!response.ok) throw new Error(`model endpoint returned ${response.status}`);
-        const payload = (await response.json()) as { data?: Array<{ id?: string }> };
-        const ids = (payload.data ?? []).map((item) => String(item.id || "")).filter(Boolean);
-        if (disposed) return;
-        setModelOptions(ids);
-        setModelCatalogStatus(ids.length ? "connected" : "empty");
-      } catch (error) {
-        if (disposed) return;
-        setModelOptions([]);
-        setModelCatalogStatus(error instanceof Error ? error.message : "model endpoint unavailable");
-      }
-    }
-    void refreshModels();
-    const timer = window.setInterval(() => void refreshModels(), 5000);
-    return () => {
-      disposed = true;
-      window.clearInterval(timer);
-    };
-  }, []);
-
-  useEffect(() => {
     if (ros.vlmHealth.model_id) {
       setVlmModelSelection(ros.vlmHealth.model_id);
     }
@@ -79,10 +52,18 @@ export default function App() {
   }, [ros.surgeonLlmDecision.model_id]);
 
   useEffect(() => {
-    if (!modelOptions.length) return;
-    setVlmModelSelection((current) => current || modelOptions.find((id) => id.toLowerCase().includes("qwen")) || modelOptions[0]);
-    setActorModelSelection((current) => current || modelOptions.find((id) => id.toLowerCase().includes("gemma")) || modelOptions[0]);
-  }, [modelOptions]);
+    if (!ros.vlmModelOptions.length) return;
+    setVlmModelSelection(
+      (current) => current || ros.vlmModelOptions.find((id) => id.toLowerCase().includes("qwen")) || ros.vlmModelOptions[0],
+    );
+  }, [ros.vlmModelOptions]);
+
+  useEffect(() => {
+    if (!ros.actorModelOptions.length) return;
+    setActorModelSelection(
+      (current) => current || ros.actorModelOptions.find((id) => id.toLowerCase().includes("gemma")) || ros.actorModelOptions[0],
+    );
+  }, [ros.actorModelOptions]);
 
   return (
     <div className="app-shell">
@@ -91,8 +72,8 @@ export default function App() {
         connected={ros.connected}
         language={language}
         onLanguageChange={setLanguage}
-        modelOptions={modelOptions}
-        modelCatalogStatus={modelCatalogStatus}
+        modelOptions={ros.vlmModelOptions}
+        modelCatalogStatus={ros.vlmModelCatalogStatus}
         vlmModel={vlmModelSelection}
         actionPending={ros.actionPending}
         onVlmModelChange={(modelId) => {
@@ -123,8 +104,8 @@ export default function App() {
             language={language}
             llmDecision={ros.surgeonLlmDecision}
             actorEnabled={ros.actorEnabled}
-            modelOptions={modelOptions}
-            modelCatalogStatus={modelCatalogStatus}
+            modelOptions={ros.actorModelOptions}
+            modelCatalogStatus={ros.actorModelCatalogStatus}
             actorModel={actorModelSelection}
             connected={ros.connected}
             actionPending={ros.actionPending}

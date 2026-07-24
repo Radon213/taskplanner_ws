@@ -67,6 +67,55 @@ class HumanoidPolicy:
 
 
 @dataclass(slots=True)
+class BedRobotArmGroupSpec:
+    id: str
+    enabled: bool
+    initial_end_effector_profile: str
+    allowed_operations: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class BedRobotArmGroupCueSpec:
+    id: str
+    phase_id: str
+    group_id: str
+    operation: str
+    utterances: list[str] = field(default_factory=list)
+    directions: list[str] = field(default_factory=list)
+    default_distance_mm: float = 0.0
+    end_effector_profile: str = ""
+    feedback_text: str = ""
+
+
+@dataclass(slots=True)
+class BedRobotArmEndEffectorTransitionSpec:
+    id: str
+    phase_id: str
+    group_id: str
+    from_profile: str
+    to_profile: str
+    utterances: list[str] = field(default_factory=list)
+    feedback_text: str = ""
+
+
+@dataclass(slots=True)
+class BedRobotArmProcedureSpec:
+    directions: list[str] = field(default_factory=list)
+    distance_precedence: list[str] = field(default_factory=list)
+    default_distance_mm: float = 10.0
+    qualitative_min_mm: float = 1.0
+    qualitative_max_mm: float = 30.0
+    cm_to_mm_multiplier: float = 10.0
+    unitless_numeric_unit: str = "mm"
+    clamp_explicit_values: bool = False
+    qualitative_integer_mm: bool = True
+    qualitative_anchors: dict[str, float] = field(default_factory=dict)
+    groups: list[BedRobotArmGroupSpec] = field(default_factory=list)
+    cues: list[BedRobotArmGroupCueSpec] = field(default_factory=list)
+    end_effector_transitions: list[BedRobotArmEndEffectorTransitionSpec] = field(default_factory=list)
+
+
+@dataclass(slots=True)
 class SimulationEntity:
     id: str
     type: str
@@ -163,6 +212,7 @@ class ProcedureBundle:
     phase_guard: PhaseGuardPolicy | None = None
     action_guard: ActionGuardPolicy | None = None
     humanoid_policy: HumanoidPolicy | None = None
+    bed_robot_arm_groups: BedRobotArmProcedureSpec | None = None
     simulation_entities: list[SimulationEntity] = field(default_factory=list)
     simulation_anchors: list[SimulationAnchor] = field(default_factory=list)
     mock_perception: MockPerceptionScenario | None = None

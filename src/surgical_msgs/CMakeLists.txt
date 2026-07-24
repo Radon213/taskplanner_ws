@@ -7,9 +7,15 @@ find_package(builtin_interfaces REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
+  "action/ExecuteBedRobotArmGroup.action"
   "action/ExecuteSkill.action"
   "msg/BTDecision.msg"
   "msg/BTContextSnapshot.msg"
+  "msg/BedRobotArmGroupActionProposal.msg"
+  "msg/BedRobotArmGroupCommand.msg"
+  "msg/BedRobotArmGroupRequest.msg"
+  "msg/BedRobotArmGroupState.msg"
+  "msg/BedRobotArmGroupStatus.msg"
   "msg/EventDigest.msg"
   "msg/FilteredPhase.msg"
   "msg/InstrumentState.msg"
@@ -37,6 +43,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/WorldState.msg"
   "srv/ControlSimulation.srv"
   "srv/InjectSurgeonOverride.srv"
+  "srv/ListModels.srv"
   "srv/SelectSimulationBundle.srv"
   DEPENDENCIES action_msgs builtin_interfaces
 )
