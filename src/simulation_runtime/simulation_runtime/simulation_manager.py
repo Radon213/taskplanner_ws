@@ -37,6 +37,8 @@ class SimulationManagerNode(Node):
         self.declare_parameter("executor_name", "tree_executor")
         self.declare_parameter("tick_rate_hz", 0.1)
         self.declare_parameter("groot2_port", 0)
+        self.declare_parameter("surgeon_actor_mode", "llm")
+        self.declare_parameter("manual_override_actor_mute_sec", 8.0)
 
         self._spec_root = Path(str(self.get_parameter("spec_root").value))
         self._active_bundle = str(self.get_parameter("default_bundle").value)
@@ -44,6 +46,12 @@ class SimulationManagerNode(Node):
         self._executor_name = str(self.get_parameter("executor_name").value)
         self._tick_rate_hz = float(self.get_parameter("tick_rate_hz").value)
         self._groot2_port = int(self.get_parameter("groot2_port").value)
+        self._surgeon_actor_mode = str(
+            self.get_parameter("surgeon_actor_mode").value
+        ).strip().lower()
+        self._manual_override_actor_mute_sec = float(
+            self.get_parameter("manual_override_actor_mute_sec").value
+        )
         self._running = False
         self._execution_state = "idle"
         self._bundle_dirty = False
@@ -57,6 +65,7 @@ class SimulationManagerNode(Node):
 
         self._control_pub = self.create_publisher(String, "/simulation/control_state", 10)
         self._override_pub = self.create_publisher(SurgeonRequest, "/simulation/surgeon_override", 10)
+        self._direct_request_pub = self.create_publisher(SurgeonRequest, "/surgeon/request", 10)
         self.create_subscription(
             SimulationState,
             "/simulation/state",
@@ -853,23 +862,46 @@ class SimulationManagerNode(Node):
             response.message = f"event_type '{event_type}' requires requested_tool"
             return response
 
+        # Manual input has one authoritative route. The legacy rule actor consumes
+        # /simulation/surgeon_override; LLM/disabled actor modes use the public
+        # /surgeon/request topic directly.
+        mute_msg = String()
+        mute_msg.data = f"mute_actor:{self._manual_override_actor_mute_sec:.1f}"
+        self._control_pub.publish(mute_msg)
+
+        def publish_manual_request(msg: SurgeonRequest) -> None:
+            if self._surgeon_actor_mode == "rule":
+                self._override_pub.publish(msg)
+            else:
+                self._direct_request_pub.publish(msg)
+
         if request.clear_pending_requests:
             cancel = SurgeonRequest()
+            cancel.stamp = self.get_clock().now().to_msg()
             cancel.event_type = "cancel_request"
             cancel.override = True
-            cancel.note = "clear pending requests before override"
-            self._override_pub.publish(cancel)
+            cancel.note = "clear pending requests before manual override"
+            publish_manual_request(cancel)
+
         msg = SurgeonRequest()
+        msg.stamp = self.get_clock().now().to_msg()
         msg.event_type = event_type
         msg.requested_tool = canonical_tool
         msg.voice_text = request.voice_text
         msg.ready_for_handover = bool(request.ready_for_handover)
         msg.ready_for_retrieval = bool(request.ready_for_retrieval)
         msg.override = True
-        msg.note = "simulation_manager override"
-        self._override_pub.publish(msg)
+        msg.note = (
+            "simulation_manager manual_override "
+            f"actor_muted_sec={self._manual_override_actor_mute_sec:.1f}"
+        )
+        publish_manual_request(msg)
+
         response.success = True
-        response.message = "surgeon override published"
+        response.message = (
+            "manual surgeon override published; autonomous actor muted for "
+            f"{self._manual_override_actor_mute_sec:.1f}s"
+        )
         return response
 
 

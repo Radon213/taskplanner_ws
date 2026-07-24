@@ -9,6 +9,8 @@ import { OperatingRoomStage } from "./components/stage/OperatingRoomStage";
 import { useDigitalTwinViewModel } from "./hooks/useDigitalTwinViewModel";
 import { useRosBridge } from "./hooks/useRosBridge";
 import { type Language } from "./utils/display";
+const LMSTUDIO_BASE_URL = (import.meta.env.VITE_LMSTUDIO_BASE_URL || "http://127.0.0.1:1234").replace(/\/$/, "");
+
 
 export default function App() {
   const ros = useRosBridge();
@@ -45,7 +47,7 @@ export default function App() {
     let disposed = false;
     async function refreshModels() {
       try {
-        const response = await fetch("http://127.0.0.1:1234/v1/models");
+        const response = await fetch(`${LMSTUDIO_BASE_URL}/v1/models`);
         if (!response.ok) throw new Error(`model endpoint returned ${response.status}`);
         const payload = (await response.json()) as { data?: Array<{ id?: string }> };
         const ids = (payload.data ?? []).map((item) => String(item.id || "")).filter(Boolean);

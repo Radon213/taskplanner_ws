@@ -307,6 +307,16 @@ class MultiBundleRuntimeProbe(Node):
         while time.time() < deadline:
             rclpy.spin_once(self, timeout_sec=0.2)
 
+    def spin_until_procedure_complete(self, max_duration_sec: float) -> float:
+        """Observe a running procedure until completion or the safety timeout."""
+        started_at = time.monotonic()
+        deadline = started_at + max_duration_sec
+        while time.monotonic() < deadline:
+            rclpy.spin_once(self, timeout_sec=0.2)
+            if self.simulation is not None and self.simulation.execution_state == "completed":
+                break
+        return time.monotonic() - started_at
+
     def _phase_at(self, rows, stamp_sec: float, attr: str) -> str:
         latest = ""
         for row in rows:
@@ -955,8 +965,12 @@ class MultiBundleRuntimeProbe(Node):
             35.0,
             f"{bundle} running world",
         )
-        self.spin_for(duration_sec)
-        report = self.report_bundle(bundle, duration_sec, select_latency, start_latency)
+        observed_duration_sec = self.spin_until_procedure_complete(duration_sec)
+        report = self.report_bundle(bundle, observed_duration_sec, select_latency, start_latency)
+        report["max_duration_sec"] = duration_sec
+        report["completed_before_timeout"] = bool(
+            self.simulation is not None and self.simulation.execution_state == "completed"
+        )
         self.control("stop", allow_failure=True, timeout_sec=25.0)
         return report
 

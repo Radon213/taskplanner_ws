@@ -643,8 +643,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("--vlm-mode", default="mock", choices=["mock", "real", "dual"])
     parser.add_argument("--vlm-response-mode", default="live")
-    parser.add_argument("--vlm-base-url", default="http://192.168.0.122:1234")
-    parser.add_argument("--vlm-model-id", default="gemma-4-26b-a4b-it")
+    parser.add_argument("--vlm-base-url", default="http://127.0.0.1:1234")
+    parser.add_argument("--vlm-model-id", default="qwen3.6-35b-a3b-mtp@q2_k_xl")
+    parser.add_argument(
+        "--surgeon-actor-mode",
+        default=os.environ.get("SURGEON_ACTOR_MODE", "rule"),
+        choices=["rule", "llm", "none"],
+        help="Surgeon actor used by the spawned runtime.",
+    )
     parser.add_argument(
         "--runtime-check",
         default="all",
@@ -674,6 +680,7 @@ def main(argv: list[str] | None = None) -> int:
             f"vlm_response_mode:={args.vlm_response_mode}",
             f"vlm_base_url:={args.vlm_base_url}",
             f"vlm_model_id:={args.vlm_model_id}",
+            f"surgeon_actor_mode:={args.surgeon_actor_mode}",
         ],
     )
 

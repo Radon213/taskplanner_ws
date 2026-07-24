@@ -209,6 +209,10 @@ class ORDigitalTwinNode(Node):
                 continue
             if not bool(health.connected and health.healthy) or bool(health.last_error):
                 unhealthy = True
+        if unhealthy:
+            self._clear_tool_prediction_state()
+            self._mayo_retrieve_stability.clear()
+            self._mayo_reuse_stability.clear()
         self._twin.set_safety_flag("vlm_unhealthy", unhealthy)
 
     def _bundle_metadata_payload(self, spec) -> dict:

@@ -12,6 +12,7 @@ def generate_launch_description() -> LaunchDescription:
     spec_dir = LaunchConfiguration("spec_dir")
     enable_rosbridge = LaunchConfiguration("enable_rosbridge")
     rosbridge_port = LaunchConfiguration("rosbridge_port")
+    rosbridge_address = LaunchConfiguration("rosbridge_address")
     rosbridge_service_timeout = LaunchConfiguration("rosbridge_service_timeout")
     vlm_mode = LaunchConfiguration("vlm_mode")
     vlm_base_url = LaunchConfiguration("vlm_base_url")
@@ -23,6 +24,7 @@ def generate_launch_description() -> LaunchDescription:
     vlm_reasoning_effort = LaunchConfiguration("vlm_reasoning_effort")
     vlm_response_mode = LaunchConfiguration("vlm_response_mode")
     vlm_context_mode = LaunchConfiguration("vlm_context_mode")
+    vlm_image_stale_sec = LaunchConfiguration("vlm_image_stale_sec")
     surgeon_actor_mode = LaunchConfiguration("surgeon_actor_mode")
     actor_base_url = LaunchConfiguration("actor_base_url")
     actor_model_id = LaunchConfiguration("actor_model_id")
@@ -54,7 +56,9 @@ def generate_launch_description() -> LaunchDescription:
                     "'if ros2 pkg prefix rosbridge_server >/dev/null 2>&1; then "
                     "ros2 run rosbridge_server rosbridge_websocket --ros-args -p port:=' + str(",
                     rosbridge_port,
-                    ") + ' -p default_call_service_timeout:=' + str(",
+                    ") + ' -p address:=' + '",
+                    rosbridge_address,
+                    "' + ' -p default_call_service_timeout:=' + str(",
                     rosbridge_service_timeout,
                     ") + '; else echo \"[taskplanner_mock] rosbridge_server is not installed\"; fi'",
                 ]
@@ -68,6 +72,7 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("spec_dir", default_value=spec_default),
             DeclareLaunchArgument("enable_rosbridge", default_value="true"),
             DeclareLaunchArgument("rosbridge_port", default_value="9090"),
+            DeclareLaunchArgument("rosbridge_address", default_value="127.0.0.1"),
             DeclareLaunchArgument("rosbridge_service_timeout", default_value="30.0"),
             DeclareLaunchArgument("vlm_mode", default_value="real"),
             DeclareLaunchArgument("vlm_base_url", default_value="http://127.0.0.1:1234"),
@@ -79,6 +84,7 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("vlm_reasoning_effort", default_value="none"),
             DeclareLaunchArgument("vlm_response_mode", default_value="live"),
             DeclareLaunchArgument("vlm_context_mode", default_value="actor_log"),
+            DeclareLaunchArgument("vlm_image_stale_sec", default_value="3.0"),
             DeclareLaunchArgument("surgeon_actor_mode", default_value="llm"),
             DeclareLaunchArgument("actor_base_url", default_value="http://127.0.0.1:1234"),
             DeclareLaunchArgument("actor_model_id", default_value="google/gemma-4-12b-qat"),
@@ -144,7 +150,12 @@ def generate_launch_description() -> LaunchDescription:
                 condition=IfCondition(
                     PythonExpression(["'", field_snapshot_url, "' != ''"])
                 ),
-                parameters=[{"snapshot_url": field_snapshot_url}],
+                parameters=[
+                    {
+                        "snapshot_url": field_snapshot_url,
+                        "max_source_age_sec": vlm_image_stale_sec,
+                    }
+                ],
                 output="screen",
             ),
             Node(
@@ -164,6 +175,7 @@ def generate_launch_description() -> LaunchDescription:
                         "reasoning_effort": vlm_reasoning_effort,
                         "response_mode": vlm_response_mode,
                         "context_mode": vlm_context_mode,
+                        "image_stale_sec": vlm_image_stale_sec,
                         "output_prefix": PythonExpression(
                             ["'/vlm' if '", vlm_mode, "' == 'real' else '/vlm_real'"]
                         ),
@@ -275,7 +287,13 @@ def generate_launch_description() -> LaunchDescription:
                 package="simulation_runtime",
                 executable="simulation_manager",
                 name="simulation_manager",
-                parameters=[{"default_bundle": "thyroidectomy"}],
+                parameters=[
+                    {
+                        "default_bundle": "thyroidectomy",
+                        "surgeon_actor_mode": surgeon_actor_mode,
+                        "manual_override_actor_mute_sec": 8.0,
+                    }
+                ],
                 output="screen",
             ),
             rosbridge_process,

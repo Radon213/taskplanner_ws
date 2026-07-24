@@ -47,6 +47,9 @@ These rules are the source of truth for debugging runtime behavior.
 6. A Mayo-placed tool is assumed used/contaminated unless explicitly modeled otherwise.
 7. `retrieve_from_hand` is legacy/manual-only and must not be dispatched by the
    normal BT recovery branch.
+8. A floor-dropped tool is not a robot recovery target. Robot dispatch must hold
+   until a human recovery event removes the contaminated tool from the field and
+   either starts cleaning or provides a sterile replacement.
 
 ## VLM Retrieval Inference Rules
 
@@ -89,10 +92,15 @@ These rules are the source of truth for debugging runtime behavior.
    - cleaner hold
    - robot left hand
    - home rack slot
-4. Cleaning takes time and is not instantaneous.
-5. During cleaning, the left arm remains occupied and the cleaner timer must count down.
-6. After cleaning completes, the instrument may be returned to the rack.
-7. The robot may only enter `retracted` when both hands are empty and the cleaner is idle.
+4. The floor-drop chain is:
+   - surgeon/robot/Mayo side
+   - floor zone
+   - human recovery
+   - cleaner, removed-from-field, or sterile replacement flow
+5. Cleaning takes time and is not instantaneous.
+6. During cleaning, the left arm remains occupied and the cleaner timer must count down.
+7. After cleaning completes, the instrument may be returned to the rack.
+8. The robot may only enter `retracted` when both hands are empty and the cleaner is idle.
 
 ## Mayo Stand Semantics
 
