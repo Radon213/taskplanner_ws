@@ -227,6 +227,10 @@ This is restricted clinical research data. Do not redistribute it without
 explicit authorization from the data owner.
 EOF
 
+python3 "${ROOT_DIR}/scripts/validate_replay_data_package.py" \
+  "${STAGING_DIR}" \
+  --report "${STAGING_DIR}/DATA_VALIDATION.json"
+
 (
   cd "${STAGING_DIR}"
   find . -type f ! -name DATA_CHECKSUMS.sha256 -print0 \
