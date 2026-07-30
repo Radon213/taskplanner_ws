@@ -209,6 +209,7 @@ TASKPLANNER_SOURCE_MEDIA_ROOT=/path/to/0704_original_media \
 TASKPLANNER_SHADOW_PACKAGE_ROOT=/path/to/0704_rosbag2 \
 TASKPLANNER_REVIEW_MEDIA_ROOT=/path/to/review_media \
 TASKPLANNER_PERCEPTION_ASSET_ROOT=/path/to/0704_RFDETR \
+TASKPLANNER_ANNOTATIONS_ROOT=/path/to/restricted_case_annotations \
 TASKPLANNER_DERIVED_BAGS_ROOT=/path/to/derived_annotated_bags \
 TASKPLANNER_AUDIO_SOURCE_ROOT=/path/to/0704_audio \
 TASKPLANNER_KEYFRAME_ROOT=/path/to/0704_keyframes \
@@ -223,6 +224,11 @@ paths and paths relative to the release, so assets already stored beside the
 release on the same NAS remain a single source of truth. This avoids filling a
 local rclone VFS cache during NAS-to-NAS copies.
 
+Case annotation JSON is normally ignored by Git and should be backed up under
+the restricted data area, then supplied through
+`TASKPLANNER_ANNOTATIONS_ROOT`. Only schemas and tooling belong in the source
+release.
+
 Provider-managed LLM/VLM downloads, credentials, caches, and transient runtime
 traces remain external. The mapped assets are restricted clinical research
 data and must not be redistributed without explicit authorization.
@@ -231,7 +237,7 @@ Configure runtime paths from the generated asset map:
 
 ```text
 SHADOW_DATASET_ROOT=<shadow_dataset path>/bags
-TASKPLANNER_ANNOTATION_ROOT=<release>/source/taskplanner_ws/annotations/observable_tool_events
+TASKPLANNER_ANNOTATION_ROOT=<annotations path>/observable_tool_events
 TASKPLANNER_ANNOTATION_CACHE=<review_media path>
 RFDETR_MODEL_ROOT=<rfdetr_assets path>/models
 ```

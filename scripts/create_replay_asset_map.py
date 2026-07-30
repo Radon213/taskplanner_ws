@@ -78,6 +78,14 @@ def asset_record(
     return payload
 
 
+def storage_mode_for(path: Path, release_dir: Path) -> str:
+    try:
+        path.resolve().relative_to(release_dir.resolve())
+    except ValueError:
+        return "referenced"
+    return "bundled_source"
+
+
 def require_file(path: Path, label: str, missing: list[str]) -> None:
     if not path.is_file():
         missing.append(f"{label}: {path}")
@@ -254,14 +262,14 @@ def main() -> int:
             release_dir=release_dir,
             required_for=["replay", "evaluation"],
             cases=CASE_IDS,
-            storage_mode="bundled_source",
+            storage_mode=storage_mode_for(args.annotations, release_dir),
         ),
         asset_record(
             name="evaluation_reports",
             path=args.reports,
             release_dir=release_dir,
             required_for=["audit"],
-            storage_mode="bundled_source",
+            storage_mode=storage_mode_for(args.reports, release_dir),
         ),
     ]
 

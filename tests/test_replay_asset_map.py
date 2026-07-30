@@ -90,6 +90,8 @@ def run_main(
     release: Path,
     taskplanner: Path,
     assets: list[list[str]],
+    *,
+    annotations: Path | None = None,
 ) -> int:
     values = {name: path for name, path, _ in assets}
     monkeypatch.setattr(
@@ -109,7 +111,7 @@ def run_main(
             "--rfdetr",
             values["rfdetr_assets"],
             "--annotations",
-            str(taskplanner / "annotations"),
+            str(annotations or taskplanner / "annotations"),
             "--reports",
             str(taskplanner / "reports"),
             "--derived-bags",
@@ -159,3 +161,29 @@ def test_create_asset_map_reports_missing_required_file(
 
     assert result == 1
     assert not (release / "data").exists()
+
+
+def test_external_annotations_are_recorded_as_referenced(
+    tmp_path: Path, monkeypatch
+) -> None:
+    release, taskplanner = build_release(tmp_path)
+    assets = build_assets(tmp_path / "assets")
+    external_annotations = tmp_path / "external-annotations"
+    (taskplanner / "annotations").rename(external_annotations)
+
+    result = run_main(
+        monkeypatch,
+        release,
+        taskplanner,
+        assets,
+        annotations=external_annotations,
+    )
+
+    assert result == 0
+    payload = json.loads(
+        (release / "data" / "DATA_PACKAGE.json").read_text()
+    )
+    annotations = next(
+        item for item in payload["assets"] if item["name"] == "annotations"
+    )
+    assert annotations["storage_mode"] == "referenced"

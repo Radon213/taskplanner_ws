@@ -27,6 +27,8 @@ TASKPLANNER_ALLOW_VFS_COPY=true is also set. Use direct rclone transfer instead
 of a VFS mount for large remote packages.
 
 Optional inputs:
+  TASKPLANNER_ANNOTATIONS_ROOT
+  TASKPLANNER_REPORTS_ROOT
   TASKPLANNER_DERIVED_BAGS_ROOT
   TASKPLANNER_AUDIO_SOURCE_ROOT
   TASKPLANNER_KEYFRAME_ROOT
@@ -60,6 +62,8 @@ KEYFRAME_ROOT="${TASKPLANNER_KEYFRAME_ROOT:-}"
 LEGACY_PERCEPTION_ROOT="${TASKPLANNER_LEGACY_PERCEPTION_ROOT:-}"
 LEGACY_DETECTION_ROOT="${TASKPLANNER_LEGACY_DETECTION_ROOT:-}"
 DERIVED_BAGS_ROOT="${TASKPLANNER_DERIVED_BAGS_ROOT:-${ROOT_DIR}/annotated_bags}"
+ANNOTATIONS_ROOT="${TASKPLANNER_ANNOTATIONS_ROOT:-${RELEASE_DIR}/source/taskplanner_ws/annotations}"
+REPORTS_ROOT="${TASKPLANNER_REPORTS_ROOT:-${RELEASE_DIR}/source/taskplanner_ws/reports}"
 DATA_MODE="${TASKPLANNER_DATA_MODE:-reference}"
 
 require_directory() {
@@ -75,10 +79,11 @@ require_directory "${SOURCE_MEDIA_ROOT}" "original media"
 require_directory "${SHADOW_PACKAGE_ROOT}" "shadow rosbag package"
 require_directory "${REVIEW_MEDIA_ROOT}" "synchronized review media"
 require_directory "${PERCEPTION_ASSET_ROOT}" "RF-DETR assets"
-require_directory "${ROOT_DIR}/annotations/clinical_video/cases" \
+require_directory "${ANNOTATIONS_ROOT}/clinical_video/cases" \
   "clinical annotations"
-require_directory "${ROOT_DIR}/annotations/observable_tool_events/cases" \
+require_directory "${ANNOTATIONS_ROOT}/observable_tool_events/cases" \
   "observable annotations"
+require_directory "${REPORTS_ROOT}" "evaluation reports"
 require_directory "${DERIVED_BAGS_ROOT}" "derived annotated bags"
 
 FINAL_DATA_DIR="${RELEASE_DIR}/data"
@@ -125,8 +130,8 @@ PY
     --shadow-dataset "${SHADOW_PACKAGE_ROOT}" \
     --review-media "${REVIEW_MEDIA_ROOT}" \
     --rfdetr "${PERCEPTION_ASSET_ROOT}" \
-    --annotations "${RELEASE_DIR}/source/taskplanner_ws/annotations" \
-    --reports "${RELEASE_DIR}/source/taskplanner_ws/reports" \
+    --annotations "${ANNOTATIONS_ROOT}" \
+    --reports "${REPORTS_ROOT}" \
     "${asset_args[@]}"
 
   cat >> "${RELEASE_DIR}/README.md" <<'EOF'
@@ -198,12 +203,12 @@ review_case_ids=(
 )
 
 copy_tree \
-  "${ROOT_DIR}/annotations/clinical_video" \
+  "${ANNOTATIONS_ROOT}/clinical_video" \
   "${STAGING_DIR}/annotations/clinical_video"
 copy_tree \
-  "${ROOT_DIR}/annotations/observable_tool_events" \
+  "${ANNOTATIONS_ROOT}/observable_tool_events" \
   "${STAGING_DIR}/annotations/observable_tool_events"
-copy_tree "${ROOT_DIR}/reports" "${STAGING_DIR}/evaluation_reports"
+copy_tree "${REPORTS_ROOT}" "${STAGING_DIR}/evaluation_reports"
 copy_tree "${DERIVED_BAGS_ROOT}" "${STAGING_DIR}/derived_bags"
 
 for case_id in "${case_ids[@]}"; do
