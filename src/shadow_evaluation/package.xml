@@ -3,7 +3,7 @@
   <name>shadow_evaluation</name>
   <version>0.1.0</version>
   <description>Strict shadow replay recorders, adapters, and evaluation-only sinks.</description>
-  <maintainer email="codex@example.com">Codex</maintainer>
+  <maintainer email="Radon213@users.noreply.github.com">Radon213</maintainer>
   <license>Apache-2.0</license>
 
   <buildtool_depend>ament_python</buildtool_depend>

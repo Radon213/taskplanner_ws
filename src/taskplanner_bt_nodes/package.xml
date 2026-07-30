@@ -3,7 +3,7 @@
   <name>taskplanner_bt_nodes</name>
   <version>0.1.0</version>
   <description>Custom BehaviorTree.CPP v4 nodes for taskplanner v1.</description>
-  <maintainer email="codex@example.com">Codex</maintainer>
+  <maintainer email="Radon213@users.noreply.github.com">Radon213</maintainer>
   <license>Apache-2.0</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
