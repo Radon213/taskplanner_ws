@@ -81,7 +81,8 @@ copy_tree() {
   local source="$1"
   local destination="$2"
   mkdir -p "${destination}"
-  rsync -aL --partial --human-readable "${source}/" "${destination}/"
+  rsync -aL --partial --inplace --human-readable \
+    "${source}/" "${destination}/"
 }
 
 case_ids=(
