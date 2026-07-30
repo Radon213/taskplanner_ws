@@ -195,6 +195,28 @@ source/version manifest, container image manifest, external-asset template, and
 SHA-256 checksums. External datasets, annotations, model weights, caches, and
 runtime traces are deliberately excluded.
 
+For an authorized internal release that must reproduce Shadow Replay and its
+evaluation, attach the restricted data companion after creating the source
+package:
+
+```bash
+TASKPLANNER_SOURCE_MEDIA_ROOT=/path/to/0704_original_media \
+TASKPLANNER_SHADOW_PACKAGE_ROOT=/path/to/0704_rosbag2 \
+TASKPLANNER_REVIEW_MEDIA_ROOT=/path/to/review_media \
+TASKPLANNER_PERCEPTION_ASSET_ROOT=/path/to/0704_RFDETR \
+TASKPLANNER_AUDIO_SOURCE_ROOT=/path/to/0704_audio \
+TASKPLANNER_KEYFRAME_ROOT=/path/to/0704_keyframes \
+TASKPLANNER_LEGACY_PERCEPTION_ROOT=/path/to/0704_YOLO \
+scripts/package_replay_data.sh /path/to/taskplanner-backup/releases/<release>
+```
+
+This adds original media, replay bags, synchronized review proxies, canonical
+annotations, annotation reports, derived bags, and perception assets under
+`data/`, with an independent `DATA_CHECKSUMS.sha256`. Provider-managed
+LLM/VLM downloads, credentials, caches, and transient runtime traces remain
+external. The data companion is restricted clinical research data and must not
+be redistributed without explicit authorization.
+
 ## Diagnostics
 
 ```bash

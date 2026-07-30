@@ -17,7 +17,9 @@ Creates a versioned, checksummed deployment source package containing:
   - a machine-readable version manifest
 
 Datasets, annotations, model weights, caches, and runtime output are external
-assets and are intentionally not included.
+assets and are intentionally not included by this source-packaging step.
+Use `scripts/package_replay_data.sh` to attach an authorized, checksummed
+replay/evaluation data companion to the resulting release.
 EOF
 }
 
@@ -257,8 +259,10 @@ Start with \`docs/DEPLOYMENT.md\`. Copy
 \`source/taskplanner_ws/.env\`, then configure external dataset and model paths.
 
 Video datasets, annotations, model weights, caches, and runtime traces are not
-included. Their required locations are documented in the deployment guide and
-\`manifests/EXTERNAL_ASSETS.example.json\`.
+included by the source-packaging step. Their required locations are documented
+in the deployment guide and \`manifests/EXTERNAL_ASSETS.example.json\`.
+An authorized replay/evaluation data companion can be attached with
+\`scripts/package_replay_data.sh\`.
 
 The expanded \`source/\` tree materializes repository symlinks for NAS/FUSE
 compatibility. The exact Git object and file-mode representation is preserved

@@ -11,3 +11,8 @@ downloaded separately and are not relicensed by Taskplanner.
 Surgical videos, timestamped annotations, model weights, credentials, caches,
 and runtime traces are external assets. They must not be redistributed with the
 source package unless their owner has separately approved that distribution.
+
+An internal deployment release may attach surgical media and annotations as a
+separate checksummed data companion after owner authorization. That companion
+remains restricted clinical research data; inclusion in a private backup does
+not grant redistribution or publication rights.
