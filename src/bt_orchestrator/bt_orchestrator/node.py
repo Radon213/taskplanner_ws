@@ -134,6 +134,11 @@ class DecisionBridgeNode(Node):
             "phase.stability": float(msg.phase_stability),
             "request.explicit_tool": msg.explicit_request_tool,
             "request.surgeon_tool": msg.surgeon_request_tool,
+            "request.generation": int(msg.surgeon_request_generation),
+            "request.additional_instance_assumed": bool(
+                msg.surgeon_request_additional_instance_assumed
+            ),
+            "request.voice_backed": bool(msg.explicit_request_voice_backed),
             "surgeon.intent": msg.surgeon_intent,
             "surgeon.ready_handover": bool(msg.surgeon_ready_for_handover),
             "surgeon.ready_retrieval": bool(msg.surgeon_ready_for_retrieval),
@@ -189,6 +194,7 @@ class DecisionBridgeNode(Node):
                 "bt.decision_reason": msg.decision_reason,
                 "bt.blocking_guard": msg.blocking_guard,
                 "selected.tool": msg.selected_tool,
+                "request.generation": int(msg.request_generation),
                 "bt.selected_tool_lifecycle": msg.selected_tool_lifecycle,
                 "bt.next_required_transition": msg.next_required_transition,
                 "action.guard.handover_allowed": bool(msg.handover_allowed),

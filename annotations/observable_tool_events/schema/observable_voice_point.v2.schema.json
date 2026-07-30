@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "taskplanner.observable_voice_point.v2",
+  "title": "Causally available source transcript point for annotation review context",
+  "description": "time_sec preserves the source utterance start. available_sec is the earliest time at which the complete text may be exposed and must be greater than or equal to end_sec; the extractor enforces this cross-field invariant.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "case_id",
+    "event_id",
+    "event_type",
+    "time_sec",
+    "end_sec",
+    "available_sec",
+    "text",
+    "source_topic",
+    "source_record_timestamp_ns",
+    "source_message_index",
+    "source_wav",
+    "source_authority",
+    "scoring_role",
+    "availability_policy"
+  ],
+  "properties": {
+    "schema": {
+      "const": "taskplanner.observable_voice_point.v2"
+    },
+    "case_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]+$"
+    },
+    "event_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]+-V[0-9]{4,}$"
+    },
+    "event_type": {
+      "const": "voice_utterance"
+    },
+    "time_sec": {
+      "type": "number",
+      "minimum": 0,
+      "description": "Source utterance start time; not the complete-text availability time."
+    },
+    "end_sec": {
+      "type": "number",
+      "minimum": 0,
+      "description": "Source utterance end time."
+    },
+    "available_sec": {
+      "type": "number",
+      "minimum": 0,
+      "description": "Earliest causal publication time for the complete text. The extractor enforces available_sec >= end_sec."
+    },
+    "text": {
+      "type": "string",
+      "minLength": 1
+    },
+    "source_topic": {
+      "const": "/surgery/transcript"
+    },
+    "source_record_timestamp_ns": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "source_message_index": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "source_wav": {
+      "type": "string",
+      "minLength": 1
+    },
+    "source_authority": {
+      "const": "public_runtime_transcript"
+    },
+    "scoring_role": {
+      "const": "context_only_not_ground_truth"
+    },
+    "availability_policy": {
+      "const": "not_before_utterance_end"
+    }
+  }
+}

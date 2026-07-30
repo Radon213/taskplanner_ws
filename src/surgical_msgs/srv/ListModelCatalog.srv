@@ -1,0 +1,7 @@
+---
+bool success
+string active_provider_id
+string active_model_id
+ModelProviderStatus[] providers
+ModelCatalogEntry[] models
+string message

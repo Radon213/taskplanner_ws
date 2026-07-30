@@ -6,6 +6,7 @@ log/
 # Python generated artifacts
 __pycache__/
 *.py[cod]
+.venv*/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
@@ -34,6 +35,22 @@ test_outputs/
 *.log
 *.tmp
 *.bak
+
+# External datasets, annotations, and generated replay artifacts
+/annotated_bags/
+/annotations/clinical_video/cases/
+/annotations/observable_tool_events/cases/
+/annotations/observable_tool_events/proposals/
+/annotations/observable_tool_events/reports/
+/output/
+/unsloth_compiled_cache/
+/tools/real_surgery_annotation/web_interaction_review/rfdetr_overlays/
+/tools/real_surgery_annotation/web_interaction_review/phase_catalogs/
+/tools/real_surgery_annotation/_materialize_*_once.py
+/tools/real_surgery_annotation/run_0704_5_gui.sh
+/tools/real_surgery_annotation/run_0704_6_interaction_review.sh
+/tools/real_surgery_annotation/run_0704_multicase_clinical_review.sh
+/tools/real_surgery_annotation/reaudit_0704_11_12_duplicates.py
 
 # Local environment and editor files
 .env

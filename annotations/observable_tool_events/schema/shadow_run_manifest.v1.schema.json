@@ -1,0 +1,191 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "taskplanner.shadow_run_manifest.v1",
+  "title": "Taskplanner shadow replay run manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "run_id",
+    "case_id",
+    "mode",
+    "status",
+    "created_at",
+    "source_bag",
+    "reference",
+    "procedure",
+    "runtime",
+    "topics",
+    "artifacts",
+    "information_boundary"
+  ],
+  "properties": {
+    "schema": {
+      "const": "taskplanner.shadow_run_manifest.v1"
+    },
+    "run_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "case_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]+$"
+    },
+    "mode": {
+      "enum": [
+        "strict",
+        "reconciled",
+        "oracle"
+      ]
+    },
+    "status": {
+      "enum": [
+        "prepared",
+        "running",
+        "complete",
+        "failed",
+        "interrupted"
+      ]
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "started_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "completed_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "source_bag": {
+      "$ref": "#/$defs/hashedArtifact"
+    },
+    "reference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "annotation_manifest",
+        "event_file",
+        "authority",
+        "runtime_visible"
+      ],
+      "properties": {
+        "annotation_manifest": {
+          "$ref": "#/$defs/hashedArtifact"
+        },
+        "event_file": {
+          "$ref": "#/$defs/hashedArtifact"
+        },
+        "tool_catalog": {
+          "$ref": "#/$defs/hashedArtifact"
+        },
+        "authority": {
+          "enum": [
+            "human",
+            "assistant_video_adjudication",
+            "mixed"
+          ]
+        },
+        "runtime_visible": {
+          "type": "boolean"
+        }
+      }
+    },
+    "procedure": {
+      "$ref": "#/$defs/hashedArtifact"
+    },
+    "runtime": {
+      "type": "object"
+    },
+    "topics": {
+      "type": "object",
+      "required": [
+        "replayed",
+        "excluded"
+      ],
+      "properties": {
+        "replayed": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^/"
+          }
+        },
+        "excluded": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^/"
+          }
+        },
+        "remappings": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string",
+            "pattern": "^/"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "artifacts": {
+      "type": "object"
+    },
+    "information_boundary": {
+      "type": "object",
+      "required": [
+        "strict",
+        "ground_truth_runtime_visible",
+        "checked"
+      ],
+      "properties": {
+        "strict": {
+          "type": "boolean"
+        },
+        "ground_truth_runtime_visible": {
+          "type": "boolean"
+        },
+        "checked": {
+          "type": "boolean"
+        },
+        "static_ok": {
+          "type": "boolean"
+        },
+        "runtime_ok": {
+          "type": "boolean"
+        },
+        "report": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "error": {
+      "type": "string"
+    }
+  },
+  "$defs": {
+    "hashedArtifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "sha256"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    }
+  }
+}

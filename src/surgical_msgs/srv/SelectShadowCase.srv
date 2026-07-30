@@ -1,0 +1,5 @@
+string case_id
+---
+bool success
+string message
+string state_json

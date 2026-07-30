@@ -40,6 +40,7 @@ DEFAULT_BUNDLES = ("thyroidectomy", "nephrectomy", "inguinal_hernia_repair")
 HANDOVER_ACTIONS = {
     "direct_handover",
     "pick_up_and_handover",
+    "pick_up_from_mayo_and_handover",
     "put_down_and_handover",
     "tool_handover",
     "predicted_tool_handover",

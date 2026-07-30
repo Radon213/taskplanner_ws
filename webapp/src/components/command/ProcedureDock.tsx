@@ -1,14 +1,16 @@
-import { GitBranch, Pause, Play, RotateCcw, Square, Wifi } from "lucide-react";
+import { GitBranch, Pause, Play, RadioTower, RotateCcw, Square, Wifi } from "lucide-react";
 
 import type { ControlCommand } from "../../hooks/useRosBridge";
 import type { useDigitalTwinViewModel } from "../../hooks/useDigitalTwinViewModel";
+import type { TaskplannerRuntimeMode } from "../../runtimeModes";
 
 type ViewModel = ReturnType<typeof useDigitalTwinViewModel>;
 
 export function ProcedureDock({
   vm,
   url,
-  setUrl,
+  runtimeMode,
+  onRuntimeModeChange,
   bundle,
   onBundleChange,
   startPhase,
@@ -21,11 +23,13 @@ export function ProcedureDock({
   executionState,
   isRunning,
   isPaused,
+  canPauseResume,
   onControl,
 }: {
   vm: ViewModel;
   url: string;
-  setUrl: (url: string) => void;
+  runtimeMode: TaskplannerRuntimeMode;
+  onRuntimeModeChange: (mode: TaskplannerRuntimeMode) => void;
   bundle: string;
   onBundleChange: (bundle: string) => void;
   startPhase: string;
@@ -38,6 +42,7 @@ export function ProcedureDock({
   executionState: string;
   isRunning: boolean;
   isPaused: boolean;
+  canPauseResume: boolean;
   onControl: (command: ControlCommand) => void;
 }) {
   const startInFlight = executionState === "starting" || actionPending.toLowerCase().includes("starting");
@@ -46,7 +51,8 @@ export function ProcedureDock({
   const formDisabled = disabled || commandBusy;
   const phaseSelectDisabled = disabled || commandBusy || isRunning || startInFlight;
   const startDisabled = disabled || commandBusy || !runtimeReady || isRunning || startInFlight;
-  const pauseResumeDisabled = disabled || commandBusy || startInFlight || (!isRunning && !isPaused);
+  const pauseResumeDisabled =
+    disabled || commandBusy || startInFlight || !canPauseResume;
   const interruptDisabled = disabled || (commandBusy && !startInFlight);
   const statusMessage = vm.runtime.statusMessage;
   const trimmedActionMessage = actionMessage.trim();
@@ -61,6 +67,26 @@ export function ProcedureDock({
       : actionPending
         ? "pending"
         : "normal";
+  const runtimeModeOptions: Array<{
+    id: TaskplannerRuntimeMode;
+    label: string;
+    detail: string;
+  }> =
+    vm.language === "ko"
+      ? [
+          { id: "live", label: "실제 통합 모드", detail: "실시간 로봇 · 영상 · 음성" },
+          { id: "llm", label: "LLM 집도의 모드", detail: "LLM 기반 검증 시뮬레이션" },
+          { id: "shadow", label: "리플레이 (Shadow) 모드", detail: "기록 영상 재생 및 평가" },
+        ]
+      : [
+          { id: "live", label: "Live integration", detail: "Live robot, vision, and speech" },
+          { id: "llm", label: "LLM surgeon", detail: "LLM-driven validation simulation" },
+          { id: "shadow", label: "Replay (Shadow)", detail: "Recorded replay and evaluation" },
+        ];
+  const selectedRuntimeMode =
+    runtimeModeOptions.find((option) => option.id === runtimeMode) ??
+    runtimeModeOptions[1];
+
   return (
     <aside className="dock procedure-dock">
       <div className="dock-header">
@@ -78,11 +104,36 @@ export function ProcedureDock({
 
       <div className="control-stack">
         <label className="field">
-          <span>{vm.ui.bridgeUrl}</span>
-          <div className="field-with-icon">
-            <Wifi size={15} />
-            <input value={url} onChange={(event) => setUrl(event.target.value)} />
+          <span>{vm.language === "ko" ? "실행 모드" : "Runtime mode"}</span>
+          <div className="runtime-mode-select">
+            <RadioTower size={16} aria-hidden="true" />
+            <select
+              value={runtimeMode}
+              onChange={(event) =>
+                onRuntimeModeChange(event.target.value as TaskplannerRuntimeMode)
+              }
+            >
+              {runtimeModeOptions.map((option) => (
+                <option value={option.id} key={option.id}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+            <i className={connected ? "connected" : "offline"}>
+              {connected
+                ? vm.language === "ko"
+                  ? "연결"
+                  : "Online"
+                : vm.language === "ko"
+                  ? "대기"
+                  : "Offline"}
+            </i>
           </div>
+          <small className="runtime-mode-detail">{selectedRuntimeMode.detail}</small>
+          <small className="runtime-endpoint" title={url}>
+            <Wifi size={12} aria-hidden="true" />
+            {url}
+          </small>
         </label>
 
         <label className="field">

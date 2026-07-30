@@ -1,0 +1,270 @@
+schema: taskplanner.demo_procedure_phase_catalog.v3
+procedure_id: thyroidectomy_taskplanner_demonstration_v5
+phase_namespace: thyroidectomy_demo_v5_functional_state_provisional
+authority: user_authorized_ai_assistant_cross_case_video_synthesis
+reviewer_model: codex-gpt-5.6-sol
+runtime_status: evaluation_only_provisional_not_frozen
+
+development_scope:
+  calibration_cases:
+    - "0704_6"
+    - "0704_7"
+    - "0704_8"
+    - "0704_9"
+    - "0704_10"
+    - "0704_11"
+    - "0704_12"
+    - "0704_13"
+    - "0704_14"
+    - "0704_15"
+    - "0704_16"
+    - "0704_17"
+  case_count: 12
+  held_out_eligible: false
+  reason: >
+    All twelve videos were used to refine the ontology and boundary rules.
+    Generalization must be measured on future videos that did not influence
+    this catalog, prompt, or reference boundaries.
+  case_timestamps_in_this_catalog: false
+  case_phase_accuracy_enabled: false
+
+optimization_objective:
+  primary: >
+    Define ordered operative states that a multimodal Taskplanner VLM can
+    distinguish from persistent surgical-field geometry and tool-to-tissue
+    interaction, while retaining clinically useful state transitions.
+  anti_overfit: >
+    Phase identity must not depend on a case number, normalized clip time,
+    one named instrument, or one exact request/handover sequence.
+  causal_runtime: >
+    The online decision may use only evidence available at the decision time.
+    A later event can confirm an offline audit but cannot be required to make
+    an earlier boundary valid at runtime.
+
+cross_case_tool_pattern:
+  stable_observations:
+    - fixed retraction is established before sustained target manipulation
+    - focal target control follows retraction-supported target work
+  variable_observations:
+    - Allis is present before Mosquito in only a subset of cases
+    - bipolar may occur before Mosquito, after Mosquito, both, or not at all
+    - Bovie and bipolar ordering is not a Phase definition
+  interpretation: >
+    Instruments are examples of functional roles. Their names and order are
+    supporting evidence only.
+
+information_boundary:
+  ground_truth_runtime_input_allowed: false
+  case_specific_phase_events_runtime_input_allowed: false
+  catalog_runtime_input_allowed: false
+  runtime_copy_rule: >
+    Publish only a separately reviewed case-agnostic prompt. Never expose a
+    calibration timestamp, adjudication, evaluation mask, or future event to
+    the VLM, reducer, DT reducer, or behavior tree.
+
+granularity_policy:
+  full_multimodal:
+    detailed_phases: [P03, P04, P05, P06]
+    requirement: usable surgical-field image plus causal public context
+  degraded_without_surgical_field_image:
+    detailed_phase_claim_allowed: false
+    coarse_groups:
+      M01: [P03]
+      M02: [P04, P05]
+      M03: [P06]
+    rule: >
+      P04 and P05 share M02 because voice, handover, or Mayo detections alone
+      cannot prove retractor seating versus sustained target engagement.
+
+assignment_rules:
+  state_onset: >
+    Record the first frame where the new functional state is visible. Confirm
+    that the state itself persists for roughly 1-2 seconds; do not move the
+    timestamp to the end of that confirmation horizon.
+  evidence_required:
+    - persistent operative-field configuration
+    - persistent tool-to-tissue interaction
+  context_only:
+    - causally available public voice transcript
+    - confirmed tool request and transfer chronology
+    - fallible tool-recognition output
+  insufficient_alone:
+    - spoken phase or instrument name
+    - one request, correction, or handover
+    - one detector box
+    - one energy-tool appearance
+    - normalized clip time
+    - a future treatment event
+  left_censoring: >
+    Current clips begin in an already open field. P03 at frame 0 records only
+    the visible active state and does not claim that the P03 transition was
+    observed.
+  gaps: >
+    Never invent an exact transition inside a visual gap. Keep adjacent
+    candidates or an interval uncertainty when the before/after state differs.
+  cleanup: >
+    Instrument clearance is a nonclinical workflow tail, not a separate
+    clinical Phase. Continue the last active phase to the scorable endpoint
+    and mask cleanup.
+
+phase_order: [P01, P02, P03, P04, P05, P06, P07, P08, P09]
+
+coarse_phase_groups:
+  - group_id: M01
+    name: pre_retraction_central_dissection
+    name_ko: 고정 견인 전 중앙 수술야 박리
+    members: [P03]
+  - group_id: M02
+    name: retraction_supported_target_work
+    name_ko: 고정 견인 하 표적 조직 작업
+    members: [P04, P05]
+  - group_id: M03
+    name: focal_target_control_and_treatment
+    name_ko: 국소 표적 제어 및 처치
+    members: [P06]
+
+phases:
+  - phase_id: P01
+    name: patient_positioning_and_field_preparation
+    name_ko: 환자 체위 및 수술부위 준비
+    definition_source: authored_unobserved_placeholder
+    observed_in_current_calibration_clips: false
+    observable_definition: >
+      Positioning, preparation, draping, and setup occur before active tissue
+      access.
+    annotation_rule: do_not_create_case_event_without_visible_evidence
+
+  - phase_id: P02
+    name: skin_incision_and_flap_elevation
+    name_ko: 피부 절개 및 피판 거상
+    definition_source: authored_unobserved_placeholder
+    observed_in_current_calibration_clips: false
+    observable_definition: >
+      Skin and superficial layers are opened to establish the operative field.
+    annotation_rule: do_not_create_case_event_without_visible_evidence
+
+  - phase_id: P03
+    name: central_dissection_before_fixed_retraction
+    name_ko: 고정 견인 전 중앙 수술야 박리
+    definition_source: cross_case_video_observed
+    observed_in_current_calibration_clips: true
+    observable_definition: >
+      Central-field dissection continues before a fixed retractor produces a
+      persistently wider and deeper field.
+    positive_cues:
+      - already open central field
+      - tissue handling with optional energy dissection
+      - no persistent fixed-retraction geometry
+    negative_cues:
+      - a fixed retractor is seated and persistently widening the field
+      - a small focal target is already under sustained localized control
+    tool_role_examples:
+      tissue_handling: [Adson, Allis]
+      dissection_or_hemostasis: [Bovie, bipolar]
+    boundary_rule: frame_0_left_censored_active_state_only
+
+  - phase_id: P04
+    name: fixed_retraction_and_exposure_establishment
+    name_ko: 고정 견인 배치 및 노출 확립
+    definition_source: cross_case_video_observed
+    observed_in_current_calibration_clips: true
+    observable_definition: >
+      A fixed retractor becomes seated at the wound edge and produces a
+      persistent change in operative-field geometry before sustained direct
+      target manipulation begins.
+    positive_cues:
+      - retractor blade seated at the wound edge
+      - persistent widening or deepening of the exposed field
+      - exposure establishment remains the dominant action
+    negative_cues:
+      - approach, rotation, request, or handover without seating
+      - stable direct target manipulation is already underway
+    tool_role_examples:
+      fixed_retraction: [Army-Navy, Middeldorpf, equivalent fixed retractor]
+    boundary_rule: >
+      First visibly seated fixed-retraction state that persists. A second
+      retractor is common but not required.
+
+  - phase_id: P05
+    name: retraction_supported_target_manipulation
+    name_ko: 견인 유지 하 표적 조직 조작
+    definition_source: cross_case_video_observed
+    observed_in_current_calibration_clips: true
+    observable_definition: >
+      Fixed retraction remains stable while the exposed central target is
+      directly grasped and manipulated for dissection or preparation.
+    positive_cues:
+      - stable fixed retraction
+      - sustained target-directed grasping or manipulation
+      - optional energy use without a persistent focal-control state
+    negative_cues:
+      - tool entry or alignment without target contact
+      - a small focal point is already isolated under persistent local control
+    tool_role_examples:
+      target_grasp_or_traction: [Adson, Allis]
+      optional_dissection_energy: [Bovie, bipolar]
+      focal_control_preparation: [Mosquito]
+    boundary_rule: >
+      First sustained direct target contact under stable retraction, not the
+      request or handover timestamp.
+
+  - phase_id: P06
+    name: focal_target_control_and_treatment
+    name_ko: 국소 표적 제어 및 처치
+    definition_source: cross_case_video_observed
+    observed_in_current_calibration_clips: true
+    observable_definition: >
+      A small focal tissue point is persistently isolated, clamped, or
+      equivalently controlled under stable exposure. Localized energy
+      treatment can follow in either order or after a delay.
+    positive_cues:
+      - jaws contact a focal target and close or lock
+      - the controlled tissue moves with the instrument or remains isolated
+      - the localized control state persists for roughly 1-2 seconds
+    negative_cues:
+      - energy-tool exchange or contact without visible focal control
+      - broad Allis traction without focal isolation
+      - detector identity without visible tool-to-tissue interaction
+    tool_role_examples:
+      focal_control: [Mosquito, Allis, equivalent clamp]
+      localized_treatment: [bipolar, Bovie]
+    boundary_rule: >
+      First persistent focal-control state. Do not wait for later energy to set
+      the boundary. If current focal control is occluded, keep P05/P06
+      uncertain until direct current evidence appears; never backfill from a
+      future energy event.
+
+  - phase_id: P07
+    name: thyroid_resection_and_specimen_extraction
+    name_ko: 갑상선 절제 및 검체 적출
+    definition_source: authored_unobserved_placeholder
+    observed_in_current_calibration_clips: false
+    observable_definition: >
+      The target is visibly freed and removed from the field as a specimen.
+    annotation_rule: do_not_create_case_event_without_visible_evidence
+
+  - phase_id: P08
+    name: final_hemostasis_and_field_inspection
+    name_ko: 최종 지혈 및 수술야 확인
+    definition_source: authored_unobserved_placeholder
+    observed_in_current_calibration_clips: false
+    observable_definition: >
+      Active dissection pauses while the field is inspected and remaining
+      bleeding is treated.
+    annotation_rule: do_not_create_case_event_without_visible_evidence
+
+  - phase_id: P09
+    name: wound_closure
+    name_ko: 창상 봉합
+    definition_source: authored_unobserved_placeholder
+    observed_in_current_calibration_clips: false
+    observable_definition: >
+      Open layers are approximated and the skin is closed and dressed.
+    annotation_rule: do_not_create_case_event_without_visible_evidence
+
+freeze_gates:
+  - complete independent clinical review of the functional-state definitions
+  - verify every calibration boundary against current-frame evidence
+  - benchmark detailed and coarse outputs separately
+  - freeze the case-agnostic runtime prompt before collecting held-out cases
+  - score held-out performance only on videos not used above

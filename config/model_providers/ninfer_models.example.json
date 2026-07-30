@@ -1,0 +1,17 @@
+{
+  "models": [
+    {
+      "id": "qwen3.6-35b-a3b",
+      "display_name": "Qwen3.6 35B A3B",
+      "capability": "vision",
+      "artifact_path": "/absolute/path/to/qwen3_6_35b_a3b.ninfer",
+      "start_command": [
+        "/absolute/path/to/ninfer-model-launcher",
+        "vision"
+      ],
+      "environment": {
+        "NINFER_MAX_CONTEXT": "8192"
+      }
+    }
+  ]
+}

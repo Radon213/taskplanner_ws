@@ -1,0 +1,11 @@
+builtin_interfaces/Time stamp
+builtin_interfaces/Time start_stamp
+builtin_interfaces/Time end_stamp
+string utterance_id
+string text
+bool is_final
+bool has_confidence
+float32 confidence
+string speaker_role
+string language
+string source

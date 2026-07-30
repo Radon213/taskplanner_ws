@@ -255,8 +255,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--spec-name", default="thyroidectomy")
     parser.add_argument("--vlm-mode", default="mock", choices=["mock", "real", "dual"])
     parser.add_argument("--vlm-response-mode", default="live")
-    parser.add_argument("--vlm-base-url", default="http://192.168.0.122:1234")
-    parser.add_argument("--vlm-model-id", default="gemma-4-26b-a4b-it")
+    parser.add_argument("--vlm-base-url", default="http://127.0.0.1:8001")
+    parser.add_argument("--vlm-model-id", default="unsloth/gemma-4-E4B-it-NVFP4")
     return parser.parse_args(argv)
 
 

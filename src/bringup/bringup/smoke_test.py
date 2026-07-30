@@ -43,6 +43,7 @@ EXPECTED_SKILL_EVENTS = {
 HANDOVER_ACTIONS = {
     "direct_handover",
     "pick_up_and_handover",
+    "pick_up_from_mayo_and_handover",
     "put_down_and_handover",
     "tool_handover",
     "predicted_tool_handover",
@@ -643,8 +644,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("--vlm-mode", default="mock", choices=["mock", "real", "dual"])
     parser.add_argument("--vlm-response-mode", default="live")
-    parser.add_argument("--vlm-base-url", default="http://127.0.0.1:1234")
-    parser.add_argument("--vlm-model-id", default="qwen3.6-35b-a3b-mtp@q2_k_xl")
+    parser.add_argument("--vlm-base-url", default="http://127.0.0.1:8001")
+    parser.add_argument("--vlm-model-id", default="unsloth/gemma-4-E4B-it-NVFP4")
     parser.add_argument(
         "--surgeon-actor-mode",
         default=os.environ.get("SURGEON_ACTOR_MODE", "rule"),

@@ -1,5 +1,6 @@
 builtin_interfaces/Time stamp
 string instrument_id
+string instance_id
 string home_location_type
 string home_location_id
 string location_type
@@ -14,3 +15,11 @@ string last_holder
 string lifecycle_stage
 string next_required_transition
 string visual_anchor_id
+bool procedure_future_use_expected
+string mayo_placement_evidence
+float64 last_observed_sec
+float32 mayo_reuse_confidence
+float32 mayo_reuse_stability_sec
+float32 mayo_recovery_confidence
+float32 mayo_recovery_stability_sec
+string mayo_evidence_source

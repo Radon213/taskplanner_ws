@@ -20,6 +20,7 @@ LIFECYCLE_RETURNED_HOME = "returned_home"
 @dataclass(slots=True)
 class InstrumentBelief:
     instrument_id: str
+    instance_id: str
     home_location_type: str
     home_location_id: str
     location_type: str
@@ -36,6 +37,12 @@ class InstrumentBelief:
     visual_anchor_id: str = ""
     ever_surgeon_owned: bool = False
     last_update_sec: float = 0.0
+    mayo_placement_evidence: str = ""
+    mayo_reuse_confidence: float = 0.0
+    mayo_reuse_stability_sec: float = 0.0
+    mayo_recovery_confidence: float = 0.0
+    mayo_recovery_stability_sec: float = 0.0
+    mayo_evidence_source: str = ""
 
 
 @dataclass(slots=True)
@@ -43,6 +50,7 @@ class ActiveRobotTask:
     task_id: str = ""
     task_type: str = ""
     instrument_id: str = ""
+    instrument_instance_id: str = ""
     arm: str = ""
     source_anchor_id: str = ""
     target_anchor_id: str = ""
@@ -86,11 +94,14 @@ class BedRobotArmGroupBelief:
 class SurgeonRequestCue:
     event_type: str
     instrument_id: str
+    instance_id: str = ""
+    generation: int = 0
     voice_text: str = ""
     note: str = ""
     ready_for_handover: bool = True
     ready_for_retrieval: bool = False
     override: bool = False
+    shadow_additional_instance_assumed: bool = False
 
 
 @dataclass(slots=True)
@@ -112,14 +123,27 @@ class TwinState:
     predicted_tool_stability_sec: float = 0.0
     surgeon_intent: str = ""
     surgeon_request_tool: str = ""
+    surgeon_request_instance_id: str = ""
+    surgeon_request_generation: int = 0
+    surgeon_request_additional_instance_assumed: bool = False
     surgeon_ready_for_handover: bool = False
     surgeon_ready_for_retrieval: bool = False
+    implicit_request_visible: bool = False
+    implicit_request_tool: str = ""
+    implicit_request_hand_pose: str = ""
+    implicit_request_confidence: float = 0.0
+    implicit_request_stability_sec: float = 0.0
+    implicit_request_generation: int = 0
     surgeon_request_queue: deque[SurgeonRequestCue] = field(default_factory=deque)
     cleaner_busy: bool = False
     cleaner_remaining_sec: float = 0.0
     pending_transition_tools: list[str] = field(default_factory=list)
     active_recovery_tools: list[str] = field(default_factory=list)
+    active_recovery_tool_instances: list[str] = field(default_factory=list)
     running: bool = False
     execution_state: str = "idle"
     active_robot_task: ActiveRobotTask | None = None
     bed_robot_arm_groups: dict[str, BedRobotArmGroupBelief] = field(default_factory=dict)
+    right_hand_tool_instance_id: str = ""
+    left_hand_tool_instance_id: str = ""
+    prepositioned_tool_instance_id: str = ""

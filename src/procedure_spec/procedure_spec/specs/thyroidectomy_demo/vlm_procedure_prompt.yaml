@@ -1,0 +1,422 @@
+# Case-agnostic runtime copy of the video-derived demonstration catalog.
+# Evaluation timestamps, per-case observed flags, and review decisions are
+# deliberately excluded. Authored phases absent from a source clip remain
+# procedure priors, not claims about that clip.
+
+id: thyroidectomy_demo_prompt_v3
+
+procedure:
+  id: "thyroidectomy_demo"
+  name: "Open Thyroidectomy Demonstration"
+  ko: "갑상선절제술(시연)"
+  default_phase_id: "P03"
+  scope: >
+    Cross-case open-thyroidectomy demonstration protocol. Detailed runtime
+    phases are functional operative-field states, not fixed timestamp bins or
+    exact instrument-order templates.
+
+phase_inference_policy:
+  primary_evidence: >
+    Classify the persistent operative-field geometry and tool-to-tissue
+    interaction visible in the current surgical-field image.
+  tool_order_role: >
+    Public voice, handover, and tool-recognition order are supportive context
+    only. No exact instrument sequence is required or sufficient for a Phase.
+  tool_only_detailed_phase_transition_allowed: false
+  tool_sequence_open_set_anchor_allowed: false
+  boundary_rule: >
+    Use the first frame of a new functional state only when that state itself
+    persists for roughly 1-2 seconds. Later events may support an offline audit
+    but must not be required to make the online boundary causal.
+  uncertainty_rule: >
+    When a required visual distinction is occluded or absent, retain adjacent
+    low-confidence candidates instead of advancing from a tool name alone.
+  degraded_mode_rule: >
+    Without a usable surgical-field image, do not separate P04 from P05.
+    Report their shared M02 coarse state until direct visual evidence returns.
+  time_prior_role: forbidden
+  case_specific_timestamp_role: forbidden
+
+phase_groups:
+  M01:
+    name: pre_retraction_central_dissection
+    name_ko: 고정 견인 전 중앙 수술야 박리
+    members: [P03]
+  M02:
+    name: retraction_supported_target_work
+    name_ko: 고정 견인 하 표적 조직 작업
+    members: [P04, P05]
+    use_when: surgical-field image cannot distinguish exposure establishment from target manipulation
+  M03:
+    name: focal_target_control_and_treatment
+    name_ko: 국소 표적 제어 및 처치
+    members: [P06]
+
+phase_labels:
+  normal:
+    P01: "Patient positioning and operative-field preparation"
+    P02: "Skin incision and flap elevation"
+    P03: "Central-field dissection before fixed retraction"
+    P04: "Fixed retraction and exposure establishment"
+    P05: "Retraction-supported target manipulation"
+    P06: "Focal target control and treatment"
+    P07: "Thyroid resection and specimen extraction"
+    P08: "Final hemostasis and operative-field inspection"
+    P09: "Wound closure"
+    P10: "Procedure completion and instrument clearance"
+  interrupt: {}
+
+phase_labels_ko:
+  normal:
+    P01: "환자 체위 및 수술부위 준비"
+    P02: "피부 절개 및 피판 거상"
+    P03: "고정 견인 전 중앙 수술야 박리"
+    P04: "고정 견인 배치 및 노출 확립"
+    P05: "견인 유지 하 표적 조직 조작"
+    P06: "국소 표적 제어 및 처치"
+    P07: "갑상선 절제 및 검체 적출"
+    P08: "최종 지혈 및 수술야 확인"
+    P09: "창상 봉합"
+    P10: "수술 종료 및 기구 정리"
+  interrupt: {}
+
+tools:
+  T01: "#15 Scalpel"
+  T02: "Adson forceps"
+  T03: "Allis clamp forceps"
+  T04: "Bovie surgical cautery"
+  T05: "Army navy retractor"
+  T07: "Bipolar cautery"
+  T08: "Mosquito forceps"
+  T11: "Thyroid retractor (Middeldorpf)"
+
+# Physical tray inventory confirmed from the demonstration setup. Suction is
+# supplied by the bed-mounted suction group, not by a handover instrument.
+tool_inventory:
+  T01: 1
+  T02: 2
+  T03: 2
+  T04: 1
+  T05: 2
+  T07: 1
+  T08: 1
+  T11: 2
+
+# The demonstration begins inside an already-open field. Both Allis instances
+# are already deployed and in active surgeon use rather than waiting on the rack.
+initial_instrument_states:
+  - instrument_id: T03
+    instance_id: T03#1
+    location_id: field_region_procedure
+    lifecycle_stage: surgeon_owned
+    confidence: 1.0
+  - instrument_id: T03
+    instance_id: T03#2
+    location_id: field_region_procedure
+    lifecycle_stage: surgeon_owned
+    confidence: 1.0
+
+bed_robot_arm_groups:
+  direction_enum: [UP, DOWN, LEFT, RIGHT, LEFT_RIGHT, UP_DOWN]
+  distance_policy:
+    precedence: [explicit_with_unit, explicit_unit_inferred, qualitative_inferred, defaulted]
+    default_distance_mm: 10
+    qualitative_min_mm: 1
+    qualitative_max_mm: 30
+    cm_to_mm_multiplier: 10
+    unitless_numeric_unit: mm
+    clamp_explicit_values: false
+    qualitative_integer_mm: true
+    distance_origins: [explicit_with_unit, explicit_unit_inferred, qualitative_inferred, defaulted]
+    qualitative_anchors:
+      "아주 살짝": 1
+      "미세하게": 1
+      "살짝": 5
+      "조금": 10
+      "조금 더": 10
+      "많이": 20
+      "아주 많이": 30
+      "최대한": 30
+  groups:
+    suction:
+      enabled: true
+      initial_end_effector_profile: suction
+      allowed_operations: [suction_start, suction_stop, change_end_effector]
+    retraction:
+      enabled: false
+      initial_end_effector_profile: ""
+      allowed_operations: [retraction, release_retraction, change_end_effector]
+  cues:
+    - id: demo_air_suction_p03
+      phase_id: P03
+      group_id: suction
+      operation: suction_start
+      utterances: ["air suction", "suction", "석션", "석션 시작", "석션 주세요"]
+      directions: []
+      default_distance_mm: 0
+      end_effector_profile: suction
+      feedback_text: "흡인을 시작합니다."
+    - id: demo_air_suction_p06
+      phase_id: P06
+      group_id: suction
+      operation: suction_start
+      utterances: ["air suction", "suction", "석션", "석션 시작", "석션 주세요"]
+      directions: []
+      default_distance_mm: 0
+      end_effector_profile: suction
+      feedback_text: "흡인을 시작합니다."
+    - id: demo_air_suction_p08
+      phase_id: P08
+      group_id: suction
+      operation: suction_start
+      utterances: ["air suction", "suction", "석션", "석션 시작", "석션 주세요"]
+      directions: []
+      default_distance_mm: 0
+      end_effector_profile: suction
+      feedback_text: "흡인을 시작합니다."
+    - id: demo_air_suction_stop_p03
+      phase_id: P03
+      group_id: suction
+      operation: suction_stop
+      utterances: ["suction off", "stop suction", "석션 빼", "석션 정지"]
+      directions: []
+      default_distance_mm: 0
+      end_effector_profile: suction
+      feedback_text: "흡인을 정지합니다."
+    - id: demo_air_suction_stop_p06
+      phase_id: P06
+      group_id: suction
+      operation: suction_stop
+      utterances: ["suction off", "stop suction", "석션 빼", "석션 정지"]
+      directions: []
+      default_distance_mm: 0
+      end_effector_profile: suction
+      feedback_text: "흡인을 정지합니다."
+    - id: demo_air_suction_stop_p08
+      phase_id: P08
+      group_id: suction
+      operation: suction_stop
+      utterances: ["suction off", "stop suction", "석션 빼", "석션 정지"]
+      directions: []
+      default_distance_mm: 0
+      end_effector_profile: suction
+      feedback_text: "흡인을 정지합니다."
+  end_effector_transitions: []
+
+phase_flow:
+  normal_sequence:
+    - from: "P01"
+      to: "P02"
+      transition_cues:
+        anatomy: "the anterior neck is positioned, prepared, and exposed within the sterile field"
+        action: "operative access begins with the skin incision"
+        tool_cue: "preparation activity gives way to cutting or electrocautery work"
+
+    - from: "P02"
+      to: "P03"
+      transition_cues:
+        anatomy: "the superficial flap is elevated and the midline strap-muscle plane becomes accessible"
+        action: "superficial opening gives way to midline dissection"
+        tool_cue: "broad superficial exposure changes to T02-guided T04 dissection"
+
+    - from: "P03"
+      to: "P04"
+      transition_cues:
+        anatomy: "fixed lateral retraction creates a persistently wider and deeper field"
+        action: "a retractor becomes seated at the wound edge and the changed field geometry persists"
+        tool_cue: "T05 is common, but any visibly equivalent fixed retractor can support this transition"
+
+    - from: "P04"
+      to: "P05"
+      transition_cues:
+        anatomy: "the exposed central target remains accessible under fixed retraction"
+        action: "direct target grasping and tissue-directed manipulation become sustained"
+        tool_cue: "T02 or T03 may engage the target; the handover itself is not the boundary"
+
+    - from: "P05"
+      to: "P06"
+      transition_cues:
+        anatomy: "a small focal tissue point is isolated under stable exposure"
+        action: "persistent localized clamp or equivalent control replaces broad target manipulation"
+        tool_cue: "T08 is common, while T03 or an equivalent control may substitute; T07/T04 can follow in either order or after a delay"
+
+    - from: "P06"
+      to: "P07"
+      transition_cues:
+        anatomy: "remaining attachments have been controlled and the thyroid specimen is free"
+        action: "division changes to specimen handling and extraction"
+        tool_cue: "clamp/energy work stops and the specimen is removed from the field"
+
+    - from: "P07"
+      to: "P08"
+      transition_cues:
+        anatomy: "the specimen is absent and the resection bed is visible"
+        action: "active resection pauses for inspection and residual hemostasis"
+        tool_cue: "the suction group clears the field while T07 or T04 is used only as needed"
+
+    - from: "P08"
+      to: "P09"
+      transition_cues:
+        anatomy: "the field remains dry and tissue layers are ready for approximation"
+        action: "inspection ends and layer-by-layer closure begins"
+        tool_cue: "dissection and hemostatic instruments give way to closure instruments"
+
+    - from: "P09"
+      to: "P10"
+      transition_cues:
+        anatomy: "the wound is closed and no operative target remains exposed"
+        action: "operative manipulation stops and remaining instruments are cleared"
+        tool_cue: "returns predominate with no new operative handover"
+
+phase_details:
+  P01:
+    visual_cues:
+      - "patient positioning, operative-field preparation, draping, and instrument setup"
+      - "no active tissue access"
+    expected_tool_sequence: []
+
+  P02:
+    visual_cues:
+      - "skin incision and opening of the superficial tissue layers"
+      - "flap elevation expands the superficial operative field"
+    expected_tool_sequence:
+      - current: "T04"
+        next: "T02"
+        cue: "the superficial edge needs controlled grasping during flap elevation"
+
+  P03:
+    visual_cues:
+      - "an open central neck field before stable bilateral deep retraction"
+      - "central dissection continues without a persistently widened fixed-retraction geometry"
+    exclusion_cues:
+      - "a fixed retractor is already seated and persistently widening the field"
+      - "a small focal target is already under sustained localized control"
+    tool_roles:
+      tissue_handling: [T02, T03]
+      dissection_or_hemostasis: [T04, T07]
+    expected_tool_sequence:
+      - current: "T02"
+        next: "T02"
+        cue: "a second Adson is common for counter-traction but not required"
+      - current: "T02"
+        next: "T04"
+        cue: "one common option is energy dissection of tensioned tissue"
+      - current: "T02"
+        next: "T07"
+        cue: "precise bipolar work is an alternative within the same functional state"
+      - current: "T04"
+        next: "T02"
+        cue: "tissue handling may resume after energy work"
+      - current: "T07"
+        next: "T02"
+        cue: "tissue handling may resume after focal energy work"
+
+  P04:
+    visual_cues:
+      - "a fixed retractor is seated at the wound edge and persistently changes field geometry"
+      - "exposure establishment is dominant; sustained direct target manipulation has not yet begun"
+    exclusion_cues:
+      - "a retractor is only approaching, rotating, or being handed over"
+      - "stable exposure is already followed by sustained central target manipulation"
+    tool_roles:
+      fixed_retraction: [T05, T11]
+      subsequent_target_handling: [T02, T03]
+    expected_tool_sequence:
+      - current: "T05"
+        next: "T05"
+        cue: "a second fixed retractor is common but not required"
+      - current: "T05"
+        next: "T02"
+        cue: "fine target handling may follow once exposure is stable"
+      - current: "T05"
+        next: "T03"
+        cue: "Allis can substitute when firmer target handling is needed"
+
+  P05:
+    visual_cues:
+      - "fixed retraction remains stable while an exposed central target is directly manipulated"
+      - "broad or fine target grasping persists, without a clearly isolated small focal control state"
+    exclusion_cues:
+      - "the tool is only entering or aligning after a handover"
+      - "a small focal point is already under persistent localized clamp or equivalent control"
+    tool_roles:
+      target_grasp_or_traction: [T02, T03]
+      optional_dissection_energy: [T04, T07]
+      possible_focal_control_preparation: [T08]
+    expected_tool_sequence:
+      - current: "T02"
+        next: "T08"
+        cue: "Mosquito is one option when a small focal point becomes ready for control"
+      - current: "T02"
+        next: "T03"
+        cue: "Allis is an alternative for firmer target manipulation"
+      - current: "T03"
+        next: "T08"
+        cue: "focal control may follow firmer target exposure"
+      - current: "T02"
+        next: "T07"
+        cue: "energy use can occur during target dissection and does not alone establish P06"
+      - current: "T02"
+        next: "T04"
+        cue: "Bovie use can occur during target dissection and does not alone establish P06"
+
+  P06:
+    visual_cues:
+      - "a small focal tissue point is persistently isolated or clamped under stable exposure"
+      - "localized energy treatment may follow, but the stable focal-control state is the causal boundary"
+    exclusion_cues:
+      - "an energy tool is merely exchanged or used without a visible focal-control state"
+      - "broad Allis traction or ordinary target manipulation is present without focal isolation"
+    tool_roles:
+      focal_control: [T08, T03]
+      localized_treatment_alternatives: [T07, T04]
+    expected_tool_sequence:
+      - current: "T08"
+        next: "T07"
+        cue: "bipolar is one treatment option for the controlled point"
+      - current: "T08"
+        next: "T04"
+        cue: "Bovie is an alternative treatment option and may occur without prior bipolar"
+      - current: "T03"
+        next: "T07"
+        cue: "a visibly equivalent focal control can be followed by bipolar"
+      - current: "T03"
+        next: "T04"
+        cue: "a visibly equivalent focal control can be followed by Bovie"
+      - current: "T07"
+        next: "T04"
+        cue: "broader treatment may follow precise energy, but this order is not required"
+
+  P07:
+    visual_cues:
+      - "final attachments are divided"
+      - "the thyroid specimen is separated and removed from the operative field"
+    expected_tool_sequence:
+      - current: "T02"
+        next: "T04"
+        cue: "a remaining attachment is tensioned for final division"
+
+  P08:
+    visual_cues:
+      - "active resection has stopped and the resection bed is inspected"
+      - "suction and focal energy instruments are used only for residual field control"
+    expected_tool_sequence:
+      - current: "T04"
+        next: "T07"
+        cue: "suction-group field clearance reveals a focal point requiring hemostasis"
+      - current: "T07"
+        next: "T04"
+        cue: "broader touch-up is needed before closure"
+
+  P09:
+    visual_cues:
+      - "the open tissue layers are approximated"
+      - "skin closure and dressing replace dissection activity"
+    expected_tool_sequence: []
+
+  P10:
+    visual_cues:
+      - "the wound is closed or active demonstration work has stopped"
+      - "instruments and retractors are returned without a new operative handover"
+      - "this is a workflow completion state, not an independent clinical resection step"
+    expected_tool_sequence: []

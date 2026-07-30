@@ -25,6 +25,7 @@ setup(
         *spec_data_files(),
     ],
     install_requires=["setuptools", "PyYAML"],
+    tests_require=["pytest"],
     zip_safe=True,
     maintainer="Codex",
     maintainer_email="codex@example.com",

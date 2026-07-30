@@ -1,0 +1,244 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "taskplanner.explicit_dt_interaction_projection.v1",
+  "title": "Explicit event-ID projection from observed interactions to a Taskplanner DT reference",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "case_id",
+    "projection_id",
+    "authority",
+    "source_adjudications",
+    "operations"
+  ],
+  "properties": {
+    "schema": {
+      "const": "taskplanner.explicit_dt_interaction_projection.v1"
+    },
+    "case_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]+$"
+    },
+    "projection_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "authority": {
+      "const": "authorized_ai_assistant_explicit_event_id_projection"
+    },
+    "source_adjudications": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "sha256"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    },
+    "operations": {
+      "type": "array",
+      "items": {
+        "oneOf": [
+          {
+            "$ref": "#/$defs/keep"
+          },
+          {
+            "$ref": "#/$defs/exclude_cleanup_chain"
+          },
+          {
+            "$ref": "#/$defs/exclude_non_target_event"
+          },
+          {
+            "$ref": "#/$defs/collapse_return_chain"
+          },
+          {
+            "$ref": "#/$defs/compound_handover_chain"
+          }
+        ]
+      }
+    }
+  },
+  "$defs": {
+    "operation_base": {
+      "type": "object",
+      "required": [
+        "operation_id",
+        "operation",
+        "source_event_ids",
+        "reason"
+      ],
+      "properties": {
+        "operation_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "operation": {
+          "type": "string"
+        },
+        "source_event_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]+-(?:R|T)[0-9]{4,}$"
+          }
+        },
+        "physical_chain_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "keep": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/operation_base"
+        },
+        {
+          "type": "object",
+          "unevaluatedProperties": false,
+          "properties": {
+            "operation_id": true,
+            "operation": {
+              "const": "keep"
+            },
+            "source_event_ids": {
+              "minItems": 1,
+              "maxItems": 1
+            },
+            "reason": true
+          }
+        }
+      ]
+    },
+    "exclude_cleanup_chain": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/operation_base"
+        },
+        {
+          "type": "object",
+          "unevaluatedProperties": false,
+          "required": [
+            "physical_chain_id"
+          ],
+          "properties": {
+            "operation_id": true,
+            "operation": {
+              "const": "exclude_cleanup_chain"
+            },
+            "source_event_ids": {
+              "minItems": 2,
+              "maxItems": 2
+            },
+            "physical_chain_id": true,
+            "reason": true
+          }
+        }
+      ]
+    },
+    "exclude_non_target_event": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/operation_base"
+        },
+        {
+          "type": "object",
+          "unevaluatedProperties": false,
+          "properties": {
+            "operation_id": true,
+            "operation": {
+              "const": "exclude_non_target_event"
+            },
+            "source_event_ids": {
+              "minItems": 1,
+              "maxItems": 1
+            },
+            "reason": true
+          }
+        }
+      ]
+    },
+    "collapse_return_chain": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/operation_base"
+        },
+        {
+          "type": "object",
+          "unevaluatedProperties": false,
+          "required": [
+            "physical_chain_id",
+            "output_event_id",
+            "timestamp_source_event_id"
+          ],
+          "properties": {
+            "operation_id": true,
+            "operation": {
+              "const": "collapse_return_chain"
+            },
+            "source_event_ids": {
+              "minItems": 2,
+              "maxItems": 2
+            },
+            "physical_chain_id": true,
+            "output_event_id": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_-]+-T[0-9]{4,}$"
+            },
+            "timestamp_source_event_id": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_-]+-T[0-9]{4,}$"
+            },
+            "reason": true
+          }
+        }
+      ]
+    },
+    "compound_handover_chain": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/operation_base"
+        },
+        {
+          "type": "object",
+          "unevaluatedProperties": false,
+          "required": [
+            "physical_chain_id",
+            "target_event_id"
+          ],
+          "properties": {
+            "operation_id": true,
+            "operation": {
+              "const": "compound_handover_chain"
+            },
+            "source_event_ids": {
+              "minItems": 2,
+              "maxItems": 2
+            },
+            "physical_chain_id": true,
+            "target_event_id": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_-]+-T[0-9]{4,}$"
+            },
+            "reason": true
+          }
+        }
+      ]
+    }
+  }
+}

@@ -1,5 +1,6 @@
-import { type CSSProperties, useEffect, useRef, useState } from "react";
+import { type CSSProperties, useEffect, useMemo, useRef, useState } from "react";
 import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
+import { Hand, ScanLine } from "lucide-react";
 
 import type {
   StagePhaseStep,
@@ -7,8 +8,13 @@ import type {
   StageToolChipPlacement,
   useDigitalTwinViewModel,
 } from "../../hooks/useDigitalTwinViewModel";
-import type { CompressedImageFrame } from "../../types";
+import type { PerceptionLayerHealth } from "../../hooks/useRosBridge";
 import { BedRobotArmGroupCard } from "./BedRobotArmGroupCard";
+import {
+  StageCameraToggleViewport,
+  StageCameraViewport,
+  type StageCameraFrames,
+} from "./StageCameraViewport";
 
 type ViewModel = ReturnType<typeof useDigitalTwinViewModel>;
 
@@ -23,6 +29,201 @@ type BoardMetrics = {
   width: number;
   height: number;
 };
+
+type QuantifiedToolChipPlacement = StageToolChipPlacement & {
+  quantity?: number;
+  count?: number;
+  instanceIds?: string[];
+};
+
+type DisplayToolChipPlacement = StageToolChipPlacement & {
+  quantity: number;
+  instanceIds: string[];
+};
+
+type SystemSurgeonRequest = {
+  confirmed: boolean;
+  requestedTool: string;
+};
+
+const HIGHLIGHT_PRIORITY: Record<StageToolChipPlacement["highlight"], number> = {
+  requested: 2,
+  predicted: 1,
+  normal: 0,
+};
+
+function normalizedToolGroupKey(value: string): string {
+  return value.trim().replace(/\s+/g, " ").toLocaleLowerCase();
+}
+
+function quantityForChip(chip: QuantifiedToolChipPlacement): number {
+  const rawQuantity = chip.quantity ?? chip.count ?? 1;
+  return Number.isFinite(rawQuantity) ? Math.max(1, Math.floor(rawQuantity)) : 1;
+}
+
+function quantityStackSpread(quantity: number): number {
+  return Math.min(10, Math.max(0, quantity - 1) * 4);
+}
+
+function quantityStackLayerOffset(layerDepth: number, quantity: number): number {
+  const layerCount = Math.max(1, quantity - 1);
+  return (quantityStackSpread(quantity) * layerDepth) / layerCount;
+}
+
+function instanceIdsForChip(chip: QuantifiedToolChipPlacement): string[] {
+  const ids = chip.instanceIds?.filter(Boolean) ?? [];
+  return ids.length ? ids : chip.id ? [chip.id] : [];
+}
+
+function mergeToolBadges(chips: StageToolChipPlacement[]): StageToolChipBadge[] {
+  const badges = new Map<string, StageToolChipBadge>();
+  for (const chip of chips) {
+    for (const badge of chip.footerBadges) {
+      badges.set(`${badge.tone}:${badge.label}`, badge);
+    }
+  }
+  return [...badges.values()];
+}
+
+function rankedRackRepresentative(chips: QuantifiedToolChipPlacement[]): QuantifiedToolChipPlacement | undefined {
+  return [...chips].sort((left, right) => {
+    if (left.active !== right.active) return left.active ? -1 : 1;
+    const highlightDelta = HIGHLIGHT_PRIORITY[right.highlight] - HIGHLIGHT_PRIORITY[left.highlight];
+    if (highlightDelta) return highlightDelta;
+    return left.gridIndex - right.gridIndex || left.id.localeCompare(right.id);
+  })[0];
+}
+
+function aggregateRackTools(chips: StageToolChipPlacement[], vm: ViewModel): DisplayToolChipPlacement[] {
+  const quantifiedChips = chips as QuantifiedToolChipPlacement[];
+  const chipsByLabel = new Map<string, QuantifiedToolChipPlacement[]>();
+  for (const chip of quantifiedChips) {
+    const key = normalizedToolGroupKey(chip.label) || chip.id;
+    chipsByLabel.set(key, [...(chipsByLabel.get(key) ?? []), chip]);
+  }
+
+  const inventoryByLabel = new Map<
+    string,
+    { id: string; label: string; count: number }
+  >();
+  const selectedBundleInstruments = vm.layout.metadata?.bundles?.find(
+    (bundle) => bundle.id === vm.activeBundle,
+  )?.instruments;
+  const inventoryInstruments = selectedBundleInstruments?.length
+    ? selectedBundleInstruments
+    : vm.layout.metadata?.instruments ?? [];
+  for (const instrument of inventoryInstruments) {
+    const label = vm.displayToolName(instrument.id);
+    inventoryByLabel.set(normalizedToolGroupKey(label) || instrument.id, {
+      id: instrument.id,
+      label,
+      count: Math.max(1, Math.floor(instrument.inventory_count ?? 1)),
+    });
+  }
+
+  const rackPlacements: DisplayToolChipPlacement[] = [];
+  const processedRackLabels = new Set<string>();
+
+  for (const [labelKey, group] of chipsByLabel) {
+    const rackChips = group.filter((chip) => chip.holderId === "rack");
+    const inventory = inventoryByLabel.get(labelKey);
+    const outsideQuantity = group
+      .filter((chip) => chip.holderId !== "rack")
+      .reduce((total, chip) => total + quantityForChip(chip), 0);
+    const rackQuantity = inventory
+      ? Math.max(0, inventory.count - outsideQuantity)
+      : rackChips.reduce((total, chip) => total + quantityForChip(chip), 0);
+    if (rackQuantity <= 0) continue;
+
+    const representative = rankedRackRepresentative(rackChips);
+    if (representative) {
+      rackPlacements.push({
+        ...representative,
+        quantity: rackQuantity,
+        instanceIds: [...new Set(rackChips.flatMap(instanceIdsForChip))],
+        contaminated: rackChips.some((chip) => chip.contaminated),
+        active: rackChips.some((chip) => chip.active),
+        footerBadges: mergeToolBadges(rackChips),
+      });
+      processedRackLabels.add(labelKey);
+      continue;
+    }
+
+    const source = group[0];
+    const slot = vm.boardRackSlots.find(
+      (candidate) => candidate.instrumentId === inventory?.id || normalizedToolGroupKey(candidate.label) === labelKey,
+    );
+    if (!source || !slot) continue;
+    rackPlacements.push({
+      ...source,
+      id: `rack-inventory-${inventory?.id ?? labelKey}`,
+      label: inventory?.label ?? source.label,
+      holderId: "rack",
+      holderLabel: vm.language === "ko" ? "랙" : "Rack",
+      left: slot.rect.left,
+      top: slot.rect.top,
+      width: slot.rect.width,
+      height: slot.rect.height,
+      scale: 1,
+      compact: false,
+      gridIndex: vm.boardRackSlots.findIndex((candidate) => candidate.id === slot.id),
+      displayState: "waiting",
+      highlight: "normal",
+      lifecycle: vm.ui.waitingState,
+      footerBadges: [{ label: vm.ui.waitingState, tone: "neutral" }],
+      contaminated: false,
+      active: false,
+      layoutVariant: "card",
+      density: "regular",
+      quantity: rackQuantity,
+      instanceIds: [],
+    });
+    processedRackLabels.add(labelKey);
+  }
+
+  for (const [labelKey, inventory] of inventoryByLabel) {
+    if (processedRackLabels.has(labelKey) || chipsByLabel.has(labelKey)) continue;
+    const slot = vm.boardRackSlots.find((candidate) => candidate.instrumentId === inventory.id);
+    if (!slot) continue;
+    rackPlacements.push({
+      id: `rack-inventory-${inventory.id}`,
+      label: inventory.label,
+      shortLabel: slot.shortLabel,
+      holderId: "rack",
+      holderLabel: vm.language === "ko" ? "랙" : "Rack",
+      left: slot.rect.left,
+      top: slot.rect.top,
+      width: slot.rect.width,
+      height: slot.rect.height,
+      scale: 1,
+      compact: false,
+      gridIndex: vm.boardRackSlots.findIndex((candidate) => candidate.id === slot.id),
+      displayState: "waiting",
+      highlight: "normal",
+      lifecycle: vm.ui.waitingState,
+      footerBadges: [{ label: vm.ui.waitingState, tone: "neutral" }],
+      contaminated: false,
+      active: false,
+      layoutVariant: "card",
+      density: "regular",
+      quantity: inventory.count,
+      instanceIds: [],
+    });
+  }
+
+  const nonRackPlacements = quantifiedChips
+    .filter((chip) => chip.holderId !== "rack")
+    .map((chip) => ({
+      ...chip,
+      quantity: quantityForChip(chip),
+      instanceIds: instanceIdsForChip(chip),
+    }));
+
+  return [
+    ...rackPlacements.sort((left, right) => left.gridIndex - right.gridIndex),
+    ...nonRackPlacements,
+  ];
+}
 
 function chipAttentionBadges(chip: StageToolChipPlacement, vm: ViewModel): StageToolChipBadge[] {
   const badges: StageToolChipBadge[] = [];
@@ -96,11 +297,23 @@ function PhaseStepper({ steps, label }: { steps: StagePhaseStep[]; label: string
 
 export function OperatingRoomStage({
   vm,
-  vlmImage,
+  cameraFrames,
+  perceptionCameraFrames,
+  perceptionOverlayFrames,
+  perceptionHealth,
+  perceptionControlPending,
+  onPerceptionEnabledChange,
+  systemSurgeonRequest,
   onStageAspectChange,
 }: {
   vm: ViewModel;
-  vlmImage: CompressedImageFrame | null;
+  cameraFrames?: StageCameraFrames;
+  perceptionCameraFrames?: StageCameraFrames;
+  perceptionOverlayFrames?: StageCameraFrames;
+  perceptionHealth?: PerceptionLayerHealth;
+  perceptionControlPending?: boolean;
+  onPerceptionEnabledChange?: (enabled: boolean) => void;
+  systemSurgeonRequest: SystemSurgeonRequest;
   onStageAspectChange?: (ratio: number) => void;
 }) {
   const reduceMotion = useReducedMotion();
@@ -108,6 +321,50 @@ export function OperatingRoomStage({
   const boardMetricsRef = useRef<BoardMetrics>({ width: 1, height: 1 });
   const previousToolRectsRef = useRef<Record<string, ToolMotionSnapshot>>({});
   const [nowMs, setNowMs] = useState(Date.now());
+  const displayToolPlacements = useMemo(
+    () => aggregateRackTools(vm.toolChipPlacements, vm),
+    [vm],
+  );
+  const cameraLiveLabel = vm.language === "ko" ? "영상 수신 중" : "Live";
+  const cameraWaitingLabel = vm.language === "ko" ? "연결 대기" : "Waiting";
+  const recognitionLiveLabel = vm.language === "ko" ? "인식 결과" : "Detected";
+  const recognitionWaitingLabel =
+    vm.language === "ko" ? "인식 결과 대기" : "Waiting for detections";
+  const perceptionEnabled = Boolean(
+    perceptionHealth?.received && perceptionHealth.enabled,
+  );
+  const perceptionAvailable = Boolean(perceptionHealth?.received);
+  const perceptionError = perceptionHealth?.status === "error";
+  const perceptionStateLabel = !perceptionAvailable
+    ? vm.language === "ko"
+      ? "사용 불가"
+      : "Unavailable"
+    : perceptionError
+      ? vm.language === "ko"
+        ? "오류"
+        : "Error"
+      : perceptionEnabled
+        ? vm.language === "ko"
+          ? "켜짐"
+          : "On"
+        : vm.language === "ko"
+          ? "꺼짐"
+          : "Off";
+  const perceptionControlLabel =
+    vm.language === "ko" ? "객체 인식" : "Object detection";
+  const perceptionTitle =
+    perceptionHealth?.lastError ||
+    (perceptionEnabled
+      ? vm.language === "ko"
+        ? "RF-DETR 객체 인식 결과를 영상에 표시합니다."
+        : "Show RF-DETR detections in the camera views."
+      : vm.language === "ko"
+        ? "원본 영상을 표시합니다."
+        : "Show raw camera frames.");
+  const surgeonRequestConfirmed = systemSurgeonRequest.confirmed;
+  const confirmedRequestTool = systemSurgeonRequest.requestedTool
+    ? vm.displayToolName(systemSurgeonRequest.requestedTool)
+    : vm.ui.none;
 
   useEffect(() => {
     const board = boardRef.current;
@@ -131,11 +388,11 @@ export function OperatingRoomStage({
 
   useEffect(() => {
     const nextRects: Record<string, ToolMotionSnapshot> = {};
-    for (const chip of vm.toolChipPlacements) {
+    for (const chip of displayToolPlacements) {
       nextRects[chip.id] = snapshotForChip(chip);
     }
     previousToolRectsRef.current = nextRects;
-  }, [vm.toolChipPlacements]);
+  }, [displayToolPlacements]);
 
   const surgeonAlertBubbles = vm.boardActionBubbles.filter((bubble) => bubble.id.startsWith("surgeon-"));
   const surgeonAlertClockKey = surgeonAlertBubbles
@@ -172,6 +429,34 @@ export function OperatingRoomStage({
           <div>
             <p className="section-kicker">{vm.ui.stageTitle}</p>
             <h2>{vm.stage.procedureLabel}</h2>
+            <button
+              type="button"
+              className={`stage-perception-toggle ${
+                perceptionEnabled ? "enabled" : "disabled"
+              } ${perceptionError ? "error" : ""}`}
+              role="switch"
+              aria-checked={perceptionEnabled}
+              aria-label={`${perceptionControlLabel}: ${perceptionStateLabel}`}
+              title={perceptionTitle}
+              disabled={
+                !perceptionAvailable ||
+                Boolean(perceptionControlPending) ||
+                !onPerceptionEnabledChange
+              }
+              onClick={() =>
+                onPerceptionEnabledChange?.(!perceptionEnabled)
+              }
+            >
+              <ScanLine aria-hidden="true" size={16} strokeWidth={2.1} />
+              <span>{perceptionControlLabel}</span>
+              <strong>
+                {perceptionControlPending
+                  ? vm.language === "ko"
+                    ? "변경 중"
+                    : "Updating"
+                  : perceptionStateLabel}
+              </strong>
+            </button>
           </div>
           <PhaseStepper steps={vm.stage.phaseSteps} label={vm.ui.phaseOverview} />
         </div>
@@ -289,13 +574,34 @@ export function OperatingRoomStage({
           <div className="surgical-bed-body" aria-hidden="true">
             <span />
           </div>
-          <div className="surgical-bed-vlm-frame" aria-label={vm.language === "ko" ? "VLM 입력 영상" : "VLM input image"}>
-            {vlmImage ? (
-              <img src={vlmImage.src} alt={vm.language === "ko" ? "VLM 입력 영상" : "VLM input"} />
-            ) : (
-              <div>{vm.language === "ko" ? "영상 프레임 없음" : "No image frame"}</div>
-            )}
-          </div>
+          <StageCameraToggleViewport
+            frames={{
+              cam2: cameraFrames?.cam2,
+              flir:
+                cameraFrames?.flir ??
+                (perceptionEnabled ? perceptionCameraFrames?.flir : null),
+            }}
+            overlays={
+              perceptionEnabled
+                ? { flir: perceptionOverlayFrames?.flir }
+                : undefined
+            }
+            cameraIds={["cam2", "flir"]}
+            initialCamera="flir"
+            liveLabel={cameraLiveLabel}
+            liveLabels={{
+              flir: perceptionEnabled
+                ? recognitionLiveLabel
+                : cameraLiveLabel,
+            }}
+            emptyLabel={cameraWaitingLabel}
+            emptyLabels={{
+              flir: perceptionEnabled
+                ? recognitionWaitingLabel
+                : cameraWaitingLabel,
+            }}
+            className="surgical-bed-camera-view"
+          />
         </div>
 
         <div
@@ -328,20 +634,39 @@ export function OperatingRoomStage({
                 height: `${holder.rect.height}%`,
               }}
             >
-              <div className="holder-title">
-                <strong>{holder.label}</strong>
-                {inlineBadges?.length ? (
-                  <div className="holder-inline-badges" aria-label={`${holder.label} status`}>
-                    {inlineBadges.map((badge) => (
-                      <span key={`${holder.id}-${badge.label}`} className={badge.tone}>
-                        {badge.label}
-                      </span>
-                    ))}
-                  </div>
-                ) : holder.meta ? (
-                  <span>{holder.meta}</span>
-                ) : null}
-              </div>
+              {holder.id !== "mayo" ? (
+                <div className="holder-title">
+                  <strong>{holder.label}</strong>
+                  {inlineBadges?.length ? (
+                    <div className="holder-inline-badges" aria-label={`${holder.label} status`}>
+                      {inlineBadges.map((badge) => (
+                        <span key={`${holder.id}-${badge.label}`} className={badge.tone}>
+                          {badge.label}
+                        </span>
+                      ))}
+                    </div>
+                  ) : holder.meta ? (
+                    <span>{holder.meta}</span>
+                  ) : null}
+                </div>
+              ) : null}
+              {holder.id === "surgeon" && surgeonRequestConfirmed ? (
+                <div
+                  className="surgeon-hand-status active"
+                  role="status"
+                  aria-live="polite"
+                  data-system-source="reducer-world-state"
+                  data-system-event="tool-request-confirmed"
+                >
+                  <Hand aria-hidden="true" size={14} strokeWidth={2.2} />
+                  <span>
+                    {vm.language === "ko"
+                      ? "도구 요청 확정"
+                      : "Tool request confirmed"}
+                  </span>
+                  <strong>{confirmedRequestTool}</strong>
+                </div>
+              ) : null}
               {holderSurgeonAlerts.length ? (
                 <div className="holder-alert-stack" aria-label={`${holder.label} alerts`}>
                   <AnimatePresence initial={false}>
@@ -383,6 +708,55 @@ export function OperatingRoomStage({
           );
         })}
 
+        <StageCameraViewport
+          cameraId="cam1"
+          frame={cameraFrames?.cam1}
+          liveLabel={cameraLiveLabel}
+          emptyLabel={cameraWaitingLabel}
+          className="independent-stage-camera cam1-stage-camera"
+          style={{
+            left: `${vm.boardCameraRects.cam1.left}%`,
+            top: `${vm.boardCameraRects.cam1.top}%`,
+            width: `${vm.boardCameraRects.cam1.width}%`,
+            height: `${vm.boardCameraRects.cam1.height}%`,
+          }}
+        />
+
+        <StageCameraToggleViewport
+          frames={{
+            cam3: cameraFrames?.cam3,
+            cam4:
+              cameraFrames?.cam4 ??
+              (perceptionEnabled ? perceptionCameraFrames?.cam4 : null),
+          }}
+          overlays={
+            perceptionEnabled
+              ? { cam4: perceptionOverlayFrames?.cam4 }
+              : undefined
+          }
+          cameraIds={["cam3", "cam4"]}
+          initialCamera="cam3"
+          liveLabel={cameraLiveLabel}
+          liveLabels={{
+            cam4: perceptionEnabled
+              ? recognitionLiveLabel
+              : cameraLiveLabel,
+          }}
+          emptyLabel={cameraWaitingLabel}
+          emptyLabels={{
+            cam4: perceptionEnabled
+              ? recognitionWaitingLabel
+              : cameraWaitingLabel,
+          }}
+          className="independent-stage-camera cam3-stage-camera"
+          style={{
+            left: `${vm.boardCameraRects.cam3.left}%`,
+            top: `${vm.boardCameraRects.cam3.top}%`,
+            width: `${vm.boardCameraRects.cam3.width}%`,
+            height: `${vm.boardCameraRects.cam3.height}%`,
+          }}
+        />
+
         <div className="rack-slots-layer" aria-hidden="true">
           {vm.boardRackSlots.map((slot) => (
             <span
@@ -408,7 +782,7 @@ export function OperatingRoomStage({
         </div>
 
         <div className="stage-tools board-tools">
-          {vm.toolChipPlacements.map((chip) => {
+          {displayToolPlacements.map((chip) => {
             const footerBadges = [...chip.footerBadges, ...chipAttentionBadges(chip, vm)];
             const previousRect = previousToolRects[chip.id];
             const moveDurationMs = toolMoveDurationMs(chip, previousRect, boardMetricsRef.current, Boolean(reduceMotion));
@@ -422,7 +796,14 @@ export function OperatingRoomStage({
                 data-move-duration-ms={moveDurationMs}
                 data-grid-index={chip.gridIndex}
                 data-compact={chip.compact ? "true" : "false"}
-                style={anchorStyleForChip(chip, moveDurationMs)}
+                data-tool-count={chip.quantity}
+                data-tool-instance-ids={chip.instanceIds.join(",")}
+                style={
+                  {
+                    ...anchorStyleForChip(chip, moveDurationMs),
+                    "--tool-stack-spread": `${quantityStackSpread(chip.quantity)}px`,
+                  } as CSSProperties
+                }
                 transition={{
                   layout: {
                     duration: reduceMotion ? 0.12 : moveDurationMs / 1000,
@@ -431,10 +812,28 @@ export function OperatingRoomStage({
                 }}
                 title={chip.label}
               >
+                {chip.quantity > 1 ? (
+                  <span className="tool-chip-stack-layers" aria-hidden="true">
+                    {Array.from({ length: chip.quantity - 1 }, (_, index) => {
+                      const layerDepth = chip.quantity - 1 - index;
+                      return (
+                        <span
+                          className="tool-chip-stack-layer"
+                          key={`${chip.id}-quantity-layer-${layerDepth}`}
+                          style={
+                            {
+                              "--tool-stack-offset": `${quantityStackLayerOffset(layerDepth, chip.quantity)}px`,
+                            } as CSSProperties
+                          }
+                        />
+                      );
+                    })}
+                  </span>
+                ) : null}
                 <motion.article
                   className={`tool-chip ${chip.layoutVariant} ${chip.displayState} ${chip.highlight} ${chip.active ? "active" : ""} ${
                     chip.contaminated ? "contaminated" : ""
-                  } ${chip.compact ? "compact" : ""} density-${chip.density}`}
+                  } ${chip.compact ? "compact" : ""} ${chip.quantity > 1 ? "quantity-stack" : ""} density-${chip.density}`}
                   initial={{ opacity: 0, scale: reduceMotion ? 1 : 0.96 }}
                   animate={{ opacity: 1, scale: 1 }}
                   transition={{ duration: reduceMotion ? 0.1 : 0.2, ease: [0.22, 1, 0.36, 1] }}
@@ -445,6 +844,18 @@ export function OperatingRoomStage({
                       <span className="chip-label-short">{chip.shortLabel}</span>
                     </strong>
                   </div>
+                  {chip.quantity > 1 ? (
+                    <span
+                      className="tool-quantity-badge"
+                      aria-label={
+                        vm.language === "ko"
+                          ? `${chip.label} ${chip.quantity}개`
+                          : `${chip.quantity} ${chip.label} instruments`
+                      }
+                    >
+                      ×{chip.quantity}
+                    </span>
+                  ) : null}
                   <div className="tool-chip-footer-badges" aria-label={`${chip.label} status`}>
                     {footerBadges.map((badge) => (
                       <span key={`${chip.id}-${badge.label}`} className={badge.tone}>

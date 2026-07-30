@@ -1,0 +1,6 @@
+fastapi==0.141.1
+numpy==2.3.2
+opencv-python-headless==5.0.0.93
+rfdetr==1.9.0
+supervision==0.29.1
+uvicorn==0.52.0

@@ -1,5 +1,55 @@
 services:
+  vllm-manager:
+    build:
+      context: docker/vllm-manager
+      dockerfile: Dockerfile
+      args:
+        VLLM_IMAGE: ${VLLM_IMAGE:-vllm/vllm-openai:v0.26.0@sha256:ffb2d59b1c059a5bd8d781320c9f5189de8293693b7d95da54befddaa54abf52}
+    image: taskplanner-vllm-manager:0.1.0
+    restart: "no"
+    network_mode: host
+    ipc: host
+    gpus: all
+    stop_grace_period: 60s
+    volumes:
+      - ${HF_CACHE_DIR:-${HOME}/.cache/huggingface}:/root/.cache/huggingface
+      - ${VLLM_CACHE_DIR:-${HOME}/.cache/vllm}:/root/.cache/vllm
+    environment:
+      PYTORCH_CUDA_ALLOC_CONF: ${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+      VLLM_API_KEY: ${VLLM_API_KEY:-}
+      VLLM_MANAGER_BIND_HOST: ${VLLM_MANAGER_BIND_HOST:-127.0.0.1}
+      VLLM_MANAGER_PORT: ${VLLM_MANAGER_PORT:-8001}
+      VLLM_MANAGER_WORKER_HOST: ${VLLM_MANAGER_WORKER_HOST:-127.0.0.1}
+      VLLM_MANAGER_WORKER_PORT: ${VLLM_MANAGER_WORKER_PORT:-8002}
+      VLLM_MANAGER_CATALOG_PATH: ${VLLM_MANAGER_CATALOG_PATH:-/opt/taskplanner-vllm-manager/models.json}
+      VLLM_MANAGER_HF_CACHE_ROOT: ${VLLM_MANAGER_HF_CACHE_ROOT:-/root/.cache/huggingface}
+      VLLM_MANAGER_MODEL_ID: ${VLLM_MANAGER_MODEL_ID:-unsloth/gemma-4-E4B-it-NVFP4}
+      VLLM_MANAGER_SERVED_MODEL_NAME: ${VLLM_MANAGER_SERVED_MODEL_NAME:-}
+      VLLM_MANAGER_MAX_MODEL_LEN: ${VLLM_MANAGER_MAX_MODEL_LEN:-8192}
+      VLLM_MANAGER_MAX_NUM_SEQS: ${VLLM_MANAGER_MAX_NUM_SEQS:-1}
+      VLLM_MANAGER_GPU_MEMORY_UTILIZATION: ${VLLM_MANAGER_GPU_MEMORY_UTILIZATION:-0.80}
+      VLLM_MANAGER_GENERATION_CONFIG: ${VLLM_MANAGER_GENERATION_CONFIG:-vllm}
+      VLLM_MANAGER_REASONING_PARSER: ${VLLM_MANAGER_REASONING_PARSER:-gemma4}
+      VLLM_MANAGER_SLEEP_ENABLED: ${VLLM_MANAGER_SLEEP_ENABLED:-true}
+      VLLM_MANAGER_AUTO_START: ${VLLM_MANAGER_AUTO_START:-false}
+      VLLM_MANAGER_STARTUP_TIMEOUT_SEC: ${VLLM_MANAGER_STARTUP_TIMEOUT_SEC:-600}
+      VLLM_MANAGER_SHUTDOWN_TIMEOUT_SEC: ${VLLM_MANAGER_SHUTDOWN_TIMEOUT_SEC:-45}
+      VLLM_MANAGER_REQUEST_TIMEOUT_SEC: ${VLLM_MANAGER_REQUEST_TIMEOUT_SEC:-600}
+      VLLM_MANAGER_EXTRA_ARGS: ${VLLM_MANAGER_EXTRA_ARGS:-}
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=2)"
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
   taskplanner-dev:
+    profiles:
+      - dev
     build:
       context: .
       dockerfile: Dockerfile
@@ -9,8 +59,12 @@ services:
         BTOPS_LOCAL_CONTEXT: ${BTOPS_LOCAL_CONTEXT:-../btops_ws}
         BTOPS_REF: ${BTOPS_REF:-main}
         AUTO_APMS_REPO_URL: ${AUTO_APMS_REPO_URL:-https://github.com/AutoAPMS/auto-apms.git}
-        AUTO_APMS_REF: ${AUTO_APMS_REF:-1.5.1}
+        AUTO_APMS_REF: ${AUTO_APMS_REF:-19ac8d558e35f657b8464694c5ddc524c6c31861}
+        TASKPLANNER_BUILD_VERSION: ${TASKPLANNER_BUILD_VERSION:-0.1.0-dev}
+        TASKPLANNER_BUILD_SHA: ${TASKPLANNER_BUILD_SHA:-unknown}
+        TASKPLANNER_SHADOW_CONTRACT_VERSION: ${TASKPLANNER_SHADOW_CONTRACT_VERSION:-shadow-rfdetr-preflight-v1}
     image: taskplanner-ws:dev
+    restart: "no"
     working_dir: /workspaces/taskplanner_ws
     network_mode: host
     ipc: host
@@ -24,19 +78,29 @@ services:
       ROS_AUTOMATIC_DISCOVERY_RANGE: ${ROS_AUTOMATIC_DISCOVERY_RANGE:-LOCALHOST}
       RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}
       FASTRTPS_DEFAULT_PROFILES_FILE: ${FASTRTPS_DEFAULT_PROFILES_FILE:-/workspaces/taskplanner_ws/config/fastdds_udp.xml}
+      INPUT_PROFILE: ${INPUT_PROFILE:-simulation}
+      EXECUTION_BACKEND: ${EXECUTION_BACKEND:-mock}
+      SPEECH_INPUT_MODE: ${SPEECH_INPUT_MODE:-utterance}
+      SENTENCE_INPUT_TOPIC: ${SENTENCE_INPUT_TOPIC:-/sensors/surgeon/sentence}
+      SPEECH_MIN_CONFIDENCE: ${SPEECH_MIN_CONFIDENCE:-0.55}
+      SPEECH_MAX_AGE_SEC: ${SPEECH_MAX_AGE_SEC:-3.0}
+      SPEECH_SOURCE_TIMEOUT_SEC: ${SPEECH_SOURCE_TIMEOUT_SEC:-5.0}
       VLM_MODE: ${VLM_MODE:-real}
-      VLM_BASE_URL: ${VLM_BASE_URL:-http://127.0.0.1:1234}
+      VLM_BASE_URL: ${VLM_BASE_URL:-http://127.0.0.1:8001}
+      VLM_PROVIDER_ID: ${VLM_PROVIDER_ID:-vllm}
       VLM_API_KEY: ${VLM_API_KEY:-}
-      VLM_MODEL_ID: ${VLM_MODEL_ID:-qwen3.6-35b-a3b-mtp@q2_k_xl}
+      VLM_MODEL_ID: ${VLM_MODEL_ID:-unsloth/gemma-4-E4B-it-NVFP4}
       VLM_API_MODE: ${VLM_API_MODE:-openai_compat}
       VLM_PUBLISH_PERIOD_SEC: ${VLM_PUBLISH_PERIOD_SEC:-1.0}
       VLM_IMAGE_STALE_SEC: ${VLM_IMAGE_STALE_SEC:-3.0}
       VLM_MAX_OUTPUT_TOKENS: ${VLM_MAX_OUTPUT_TOKENS:-320}
+      VLM_GENERATION_SEED: ${VLM_GENERATION_SEED:-0}
       VLM_RESPONSE_FORMAT: ${VLM_RESPONSE_FORMAT:-json_schema}
       VLM_REASONING_EFFORT: ${VLM_REASONING_EFFORT:-none}
       VLM_CONTEXT_MODE: ${VLM_CONTEXT_MODE:-actor_log}
       SURGEON_ACTOR_MODE: ${SURGEON_ACTOR_MODE:-llm}
       ACTOR_BASE_URL: ${ACTOR_BASE_URL:-http://127.0.0.1:1234}
+      ACTOR_PROVIDER_ID: ${ACTOR_PROVIDER_ID:-auto}
       ACTOR_API_KEY: ${ACTOR_API_KEY:-}
       ACTOR_MODEL_ID: ${ACTOR_MODEL_ID:-google/gemma-4-12b-qat}
       ACTOR_RESPONSE_FORMAT: ${ACTOR_RESPONSE_FORMAT:-json_schema}
@@ -44,11 +108,179 @@ services:
       ENABLE_NO_IMAGE_CAMERA: ${ENABLE_NO_IMAGE_CAMERA:-true}
       ENABLE_SYNTHETIC_SCENE_CAMERA: ${ENABLE_SYNTHETIC_SCENE_CAMERA:-false}
       FIELD_SNAPSHOT_URL: ${FIELD_SNAPSHOT_URL:-}
+      MODEL_PROVIDER_DISCOVERY_TIMEOUT_SEC: ${MODEL_PROVIDER_DISCOVERY_TIMEOUT_SEC:-2.5}
+      MODEL_PROVIDER_RUNTIME_TIMEOUT_SEC: ${MODEL_PROVIDER_RUNTIME_TIMEOUT_SEC:-900}
+      LMSTUDIO_BASE_URL: ${LMSTUDIO_BASE_URL:-http://127.0.0.1:1234}
+      LMSTUDIO_API_KEY: ${LMSTUDIO_API_KEY:-}
+      LMSTUDIO_PROVIDER_ENABLED: ${LMSTUDIO_PROVIDER_ENABLED:-true}
+      LMSTUDIO_PROVIDER_MANAGED: ${LMSTUDIO_PROVIDER_MANAGED:-true}
+      UNSLOTH_BASE_URL: ${UNSLOTH_BASE_URL:-http://127.0.0.1:8888}
+      UNSLOTH_API_KEY: ${UNSLOTH_API_KEY:-${VLM_API_KEY:-}}
+      UNSLOTH_PROVIDER_ENABLED: ${UNSLOTH_PROVIDER_ENABLED:-true}
+      UNSLOTH_PROVIDER_MANAGED: ${UNSLOTH_PROVIDER_MANAGED:-true}
+      VLLM_BASE_URL: ${VLLM_BASE_URL:-http://127.0.0.1:8001}
+      VLLM_API_KEY: ${VLLM_API_KEY:-}
+      VLLM_PROVIDER_ENABLED: ${VLLM_PROVIDER_ENABLED:-true}
+      VLLM_PROVIDER_MANAGED: ${VLLM_PROVIDER_MANAGED:-true}
+      NINFER_BASE_URL: ${NINFER_BASE_URL:-http://127.0.0.1:8080}
+      NINFER_API_KEY: ${NINFER_API_KEY:-}
+      NINFER_PROVIDER_ENABLED: ${NINFER_PROVIDER_ENABLED:-true}
+      NINFER_PROVIDER_MANAGED: ${NINFER_PROVIDER_MANAGED:-true}
+      NINFER_MANAGER_ENABLED: ${NINFER_MANAGER_ENABLED:-true}
+      ENABLE_RFDETR_PERCEPTION: ${ENABLE_RFDETR_PERCEPTION:-true}
+      REQUIRE_PERCEPTION_ON_START: ${REQUIRE_PERCEPTION_ON_START:-false}
+      RFDETR_SERVICE_URL: ${RFDETR_SERVICE_URL:-http://127.0.0.1:8010}
+      RFDETR_PREFLIGHT_TIMEOUT_SEC: ${RFDETR_PREFLIGHT_TIMEOUT_SEC:-2.0}
+      FLIR_INPUT_TOPIC: ${FLIR_INPUT_TOPIC:-/surgery/images/flir/compressed}
+      CAM4_INPUT_TOPIC: ${CAM4_INPUT_TOPIC:-/surgery/images/cam4/compressed}
+      SEGMENTED_FLIR_TOPIC: ${SEGMENTED_FLIR_TOPIC:-/surgery/images/flir/segmented/compressed}
+      CAM4_SEMANTICS_TOPIC: ${CAM4_SEMANTICS_TOPIC:-/surgery/perception/cam4/semantics/json}
+      TASKPLANNER_REBUILD_ON_START: ${TASKPLANNER_REBUILD_ON_START:-false}
     stdin_open: true
     tty: true
     command: bash
 
+  object-perception:
+    profiles:
+      - live
+      - replay
+    build:
+      context: .
+      dockerfile: docker/rfdetr-perception/Dockerfile
+      args:
+        RFDETR_BASE_IMAGE: ${RFDETR_BASE_IMAGE:-pytorch/pytorch:2.8.0-cuda12.9-cudnn9-runtime@sha256:e05438443ae3c407e8d04447091a959dbb6757b6290b128770c3c787d4bd442b}
+    image: taskplanner-rfdetr-perception:0.1.0
+    restart: "no"
+    network_mode: host
+    ipc: host
+    gpus: all
+    stop_grace_period: 30s
+    volumes:
+      - ${RFDETR_MODEL_ROOT:-${HOME}/.local/share/taskplanner/models/rfdetr}:/models/rfdetr:ro
+    environment:
+      RFDETR_FLIR_CHECKPOINT: /models/rfdetr/${RFDETR_FLIR_CHECKPOINT_REL:-flir/checkpoint_best_total.pth}
+      RFDETR_CAM4_CHECKPOINT: /models/rfdetr/${RFDETR_CAM4_CHECKPOINT_REL:-cam4/checkpoint_best_total.pth}
+      RFDETR_BIND_HOST: ${RFDETR_BIND_HOST:-127.0.0.1}
+      RFDETR_PORT: ${RFDETR_PORT:-8010}
+      RFDETR_FRAME_RATE: ${RFDETR_FRAME_RATE:-15.0}
+      RFDETR_JPEG_QUALITY: ${RFDETR_JPEG_QUALITY:-90}
+    command:
+      - python
+      - -m
+      - vlm_node.rfdetr_service
+      - --host
+      - ${RFDETR_BIND_HOST:-127.0.0.1}
+      - --port
+      - ${RFDETR_PORT:-8010}
+      - --frame-rate
+      - ${RFDETR_FRAME_RATE:-15.0}
+      - --jpeg-quality
+      - ${RFDETR_JPEG_QUALITY:-90}
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:${RFDETR_PORT:-8010}/health', timeout=2)"
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 180s
+
+  shadow-runner:
+    profiles:
+      - replay
+      - shadow
+    image: taskplanner-ws:dev
+    restart: "no"
+    user: "${TASKPLANNER_UID:-1000}:${TASKPLANNER_GID:-1000}"
+    working_dir: /workspaces/taskplanner_ws
+    network_mode: host
+    ipc: host
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - .:/workspaces/taskplanner_ws
+      - ${SHADOW_DATASET_ROOT:-${HOME}/.local/share/taskplanner/datasets/shadow}:/datasets/shadow:ro
+      - ${TASKPLANNER_RUN_ROOT:-${HOME}/.local/share/taskplanner/runs}:/taskplanner-runs
+    environment:
+      HOME: /tmp/taskplanner-shadow
+      ROS_DOMAIN_ID: ${SHADOW_ROS_DOMAIN_ID:-71}
+      ROS_AUTOMATIC_DISCOVERY_RANGE: LOCALHOST
+      RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}
+      FASTRTPS_DEFAULT_PROFILES_FILE: /workspaces/taskplanner_ws/config/fastdds_udp.xml
+      VLM_BASE_URL: ${VLM_BASE_URL:-http://127.0.0.1:8001}
+      VLM_PROVIDER_ID: ${VLM_PROVIDER_ID:-vllm}
+      VLM_API_KEY: ${VLM_API_KEY:-}
+      VLM_MODEL_ID: ${VLM_MODEL_ID:-unsloth/gemma-4-E4B-it-NVFP4}
+      VLM_API_MODE: ${VLM_API_MODE:-openai_compat}
+      MODEL_PROVIDER_DISCOVERY_TIMEOUT_SEC: ${MODEL_PROVIDER_DISCOVERY_TIMEOUT_SEC:-2.5}
+      MODEL_PROVIDER_RUNTIME_TIMEOUT_SEC: ${MODEL_PROVIDER_RUNTIME_TIMEOUT_SEC:-900}
+      LMSTUDIO_BASE_URL: ${LMSTUDIO_BASE_URL:-http://127.0.0.1:1234}
+      LMSTUDIO_API_KEY: ${LMSTUDIO_API_KEY:-}
+      LMSTUDIO_PROVIDER_ENABLED: ${LMSTUDIO_PROVIDER_ENABLED:-true}
+      LMSTUDIO_PROVIDER_MANAGED: ${LMSTUDIO_PROVIDER_MANAGED:-true}
+      UNSLOTH_BASE_URL: ${UNSLOTH_BASE_URL:-http://127.0.0.1:8888}
+      UNSLOTH_API_KEY: ${UNSLOTH_API_KEY:-${VLM_API_KEY:-}}
+      UNSLOTH_PROVIDER_ENABLED: ${UNSLOTH_PROVIDER_ENABLED:-true}
+      UNSLOTH_PROVIDER_MANAGED: ${UNSLOTH_PROVIDER_MANAGED:-true}
+      VLLM_BASE_URL: ${VLLM_BASE_URL:-http://127.0.0.1:8001}
+      VLLM_API_KEY: ${VLLM_API_KEY:-}
+      VLLM_PROVIDER_ENABLED: ${VLLM_PROVIDER_ENABLED:-true}
+      VLLM_PROVIDER_MANAGED: ${VLLM_PROVIDER_MANAGED:-true}
+      NINFER_BASE_URL: ${NINFER_BASE_URL:-http://127.0.0.1:8080}
+      NINFER_API_KEY: ${NINFER_API_KEY:-}
+      NINFER_PROVIDER_ENABLED: ${NINFER_PROVIDER_ENABLED:-true}
+      NINFER_PROVIDER_MANAGED: ${NINFER_PROVIDER_MANAGED:-true}
+      NINFER_MANAGER_ENABLED: ${NINFER_MANAGER_ENABLED:-true}
+      # shadow-runner uses host networking, so loopback reaches the host service.
+      # host.docker.internal remains registered for non-host-network overrides.
+      RFDETR_SERVICE_URL: ${RFDETR_SERVICE_URL:-http://127.0.0.1:8010}
+      RFDETR_PREFLIGHT_TIMEOUT_SEC: ${RFDETR_PREFLIGHT_TIMEOUT_SEC:-2.0}
+      TASKPLANNER_SHADOW_TRACE_ROOT: /taskplanner-runs/shadow
+      SHADOW_CASE_ID: ${SHADOW_CASE_ID:-0704_6}
+      SHADOW_BUNDLE_ID: ${SHADOW_BUNDLE_ID:-thyroidectomy_demo}
+      SHADOW_REQUIRE_VLM: ${SHADOW_REQUIRE_VLM:-false}
+      SHADOW_REPLAY_MODE: ${SHADOW_REPLAY_MODE:-elastic_demo}
+      SHADOW_REPLAY_RATE: ${SHADOW_REPLAY_RATE:-1.0}
+      ROSBRIDGE_SHADOW_PORT: ${ROSBRIDGE_SHADOW_PORT:-9099}
+      TASKPLANNER_REBUILD_ON_START: ${TASKPLANNER_REBUILD_ON_START:-false}
+    depends_on:
+      vllm-manager:
+        condition: service_healthy
+      webapp:
+        condition: service_started
+    command: >
+      bash -lc "if [ '$${TASKPLANNER_REBUILD_ON_START:-false}' = 'true' ]; then
+        colcon build --symlink-install --cmake-args -DBUILD_TESTING=OFF;
+      elif [ ! -f install/setup.bash ]; then
+        echo 'Taskplanner install/setup.bash is missing; rerun launcher with --build' >&2;
+        exit 2;
+      fi &&
+      source /opt/ros/jazzy/setup.bash &&
+      source /opt/btops_ws/install/setup.bash &&
+      source install/setup.bash &&
+      exec ros2 launch bringup taskplanner_shadow.launch.py
+      case_id:=$${SHADOW_CASE_ID}
+      source_bag_path:=/datasets/shadow/$${SHADOW_CASE_ID}
+      default_bundle:=$${SHADOW_BUNDLE_ID}
+      interactive_replay:=true
+      require_vlm:=$${SHADOW_REQUIRE_VLM}
+      replay_mode:=$${SHADOW_REPLAY_MODE}
+      replay_rate:=$${SHADOW_REPLAY_RATE}
+      enable_rfdetr_perception:=true
+      rfdetr_service_url:=$${RFDETR_SERVICE_URL}
+      vlm_base_url:=$${VLM_BASE_URL}
+      vlm_provider_id:=$${VLM_PROVIDER_ID}
+      vlm_model_id:=$${VLM_MODEL_ID}
+      vlm_api_mode:=$${VLM_API_MODE}
+      enable_rosbridge:=true
+      rosbridge_port:=$${ROSBRIDGE_SHADOW_PORT}"
+
   taskplanner-runtime:
+    profiles:
+      - live
+      - llm-surgeon
     build:
       context: .
       dockerfile: Dockerfile
@@ -58,8 +290,12 @@ services:
         BTOPS_LOCAL_CONTEXT: ${BTOPS_LOCAL_CONTEXT:-../btops_ws}
         BTOPS_REF: ${BTOPS_REF:-main}
         AUTO_APMS_REPO_URL: ${AUTO_APMS_REPO_URL:-https://github.com/AutoAPMS/auto-apms.git}
-        AUTO_APMS_REF: ${AUTO_APMS_REF:-1.5.1}
+        AUTO_APMS_REF: ${AUTO_APMS_REF:-19ac8d558e35f657b8464694c5ddc524c6c31861}
+        TASKPLANNER_BUILD_VERSION: ${TASKPLANNER_BUILD_VERSION:-0.1.0-dev}
+        TASKPLANNER_BUILD_SHA: ${TASKPLANNER_BUILD_SHA:-unknown}
+        TASKPLANNER_SHADOW_CONTRACT_VERSION: ${TASKPLANNER_SHADOW_CONTRACT_VERSION:-shadow-rfdetr-preflight-v1}
     image: taskplanner-ws:dev
+    restart: "no"
     working_dir: /workspaces/taskplanner_ws
     network_mode: host
     ipc: host
@@ -73,19 +309,32 @@ services:
       ROS_AUTOMATIC_DISCOVERY_RANGE: ${ROS_AUTOMATIC_DISCOVERY_RANGE:-LOCALHOST}
       RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}
       FASTRTPS_DEFAULT_PROFILES_FILE: ${FASTRTPS_DEFAULT_PROFILES_FILE:-/workspaces/taskplanner_ws/config/fastdds_udp.xml}
+      ROSBRIDGE_PORT: ${ROSBRIDGE_PORT:-9090}
+      ROSBRIDGE_ADDRESS: ${ROSBRIDGE_ADDRESS:-127.0.0.1}
+      ROSBRIDGE_SERVICE_TIMEOUT: ${ROSBRIDGE_SERVICE_TIMEOUT:-30.0}
+      INPUT_PROFILE: ${INPUT_PROFILE:-simulation}
+      EXECUTION_BACKEND: ${EXECUTION_BACKEND:-mock}
+      SPEECH_INPUT_MODE: ${SPEECH_INPUT_MODE:-utterance}
+      SENTENCE_INPUT_TOPIC: ${SENTENCE_INPUT_TOPIC:-/sensors/surgeon/sentence}
+      SPEECH_MIN_CONFIDENCE: ${SPEECH_MIN_CONFIDENCE:-0.55}
+      SPEECH_MAX_AGE_SEC: ${SPEECH_MAX_AGE_SEC:-3.0}
+      SPEECH_SOURCE_TIMEOUT_SEC: ${SPEECH_SOURCE_TIMEOUT_SEC:-5.0}
       VLM_MODE: ${VLM_MODE:-real}
-      VLM_BASE_URL: ${VLM_BASE_URL:-http://127.0.0.1:1234}
+      VLM_BASE_URL: ${VLM_BASE_URL:-http://127.0.0.1:8001}
+      VLM_PROVIDER_ID: ${VLM_PROVIDER_ID:-vllm}
       VLM_API_KEY: ${VLM_API_KEY:-}
-      VLM_MODEL_ID: ${VLM_MODEL_ID:-qwen3.6-35b-a3b-mtp@q2_k_xl}
+      VLM_MODEL_ID: ${VLM_MODEL_ID:-unsloth/gemma-4-E4B-it-NVFP4}
       VLM_API_MODE: ${VLM_API_MODE:-openai_compat}
       VLM_PUBLISH_PERIOD_SEC: ${VLM_PUBLISH_PERIOD_SEC:-1.0}
       VLM_IMAGE_STALE_SEC: ${VLM_IMAGE_STALE_SEC:-3.0}
       VLM_MAX_OUTPUT_TOKENS: ${VLM_MAX_OUTPUT_TOKENS:-320}
+      VLM_GENERATION_SEED: ${VLM_GENERATION_SEED:-0}
       VLM_RESPONSE_FORMAT: ${VLM_RESPONSE_FORMAT:-json_schema}
       VLM_REASONING_EFFORT: ${VLM_REASONING_EFFORT:-none}
       VLM_CONTEXT_MODE: ${VLM_CONTEXT_MODE:-actor_log}
       SURGEON_ACTOR_MODE: ${SURGEON_ACTOR_MODE:-llm}
       ACTOR_BASE_URL: ${ACTOR_BASE_URL:-http://127.0.0.1:1234}
+      ACTOR_PROVIDER_ID: ${ACTOR_PROVIDER_ID:-auto}
       ACTOR_API_KEY: ${ACTOR_API_KEY:-}
       ACTOR_MODEL_ID: ${ACTOR_MODEL_ID:-google/gemma-4-12b-qat}
       ACTOR_RESPONSE_FORMAT: ${ACTOR_RESPONSE_FORMAT:-json_schema}
@@ -93,10 +342,52 @@ services:
       ENABLE_NO_IMAGE_CAMERA: ${ENABLE_NO_IMAGE_CAMERA:-true}
       ENABLE_SYNTHETIC_SCENE_CAMERA: ${ENABLE_SYNTHETIC_SCENE_CAMERA:-false}
       FIELD_SNAPSHOT_URL: ${FIELD_SNAPSHOT_URL:-}
+      MODEL_PROVIDER_DISCOVERY_TIMEOUT_SEC: ${MODEL_PROVIDER_DISCOVERY_TIMEOUT_SEC:-2.5}
+      MODEL_PROVIDER_RUNTIME_TIMEOUT_SEC: ${MODEL_PROVIDER_RUNTIME_TIMEOUT_SEC:-900}
+      LMSTUDIO_BASE_URL: ${LMSTUDIO_BASE_URL:-http://127.0.0.1:1234}
+      LMSTUDIO_API_KEY: ${LMSTUDIO_API_KEY:-}
+      LMSTUDIO_PROVIDER_ENABLED: ${LMSTUDIO_PROVIDER_ENABLED:-true}
+      LMSTUDIO_PROVIDER_MANAGED: ${LMSTUDIO_PROVIDER_MANAGED:-true}
+      UNSLOTH_BASE_URL: ${UNSLOTH_BASE_URL:-http://127.0.0.1:8888}
+      UNSLOTH_API_KEY: ${UNSLOTH_API_KEY:-${VLM_API_KEY:-}}
+      UNSLOTH_PROVIDER_ENABLED: ${UNSLOTH_PROVIDER_ENABLED:-true}
+      UNSLOTH_PROVIDER_MANAGED: ${UNSLOTH_PROVIDER_MANAGED:-true}
+      VLLM_BASE_URL: ${VLLM_BASE_URL:-http://127.0.0.1:8001}
+      VLLM_API_KEY: ${VLLM_API_KEY:-}
+      VLLM_PROVIDER_ENABLED: ${VLLM_PROVIDER_ENABLED:-true}
+      VLLM_PROVIDER_MANAGED: ${VLLM_PROVIDER_MANAGED:-true}
+      NINFER_BASE_URL: ${NINFER_BASE_URL:-http://127.0.0.1:8080}
+      NINFER_API_KEY: ${NINFER_API_KEY:-}
+      NINFER_PROVIDER_ENABLED: ${NINFER_PROVIDER_ENABLED:-true}
+      NINFER_PROVIDER_MANAGED: ${NINFER_PROVIDER_MANAGED:-true}
+      NINFER_MANAGER_ENABLED: ${NINFER_MANAGER_ENABLED:-true}
+      ENABLE_RFDETR_PERCEPTION: ${ENABLE_RFDETR_PERCEPTION:-true}
+      REQUIRE_PERCEPTION_ON_START: ${REQUIRE_PERCEPTION_ON_START:-false}
+      RFDETR_SERVICE_URL: ${RFDETR_SERVICE_URL:-http://127.0.0.1:8010}
+      RFDETR_PREFLIGHT_TIMEOUT_SEC: ${RFDETR_PREFLIGHT_TIMEOUT_SEC:-2.0}
+      FLIR_INPUT_TOPIC: ${FLIR_INPUT_TOPIC:-/surgery/images/flir/compressed}
+      CAM4_INPUT_TOPIC: ${CAM4_INPUT_TOPIC:-/surgery/images/cam4/compressed}
+      SEGMENTED_FLIR_TOPIC: ${SEGMENTED_FLIR_TOPIC:-/surgery/images/flir/segmented/compressed}
+      CAM4_SEMANTICS_TOPIC: ${CAM4_SEMANTICS_TOPIC:-/surgery/perception/cam4/semantics/json}
+      TASKPLANNER_REBUILD_ON_START: ${TASKPLANNER_REBUILD_ON_START:-false}
+    depends_on:
+      vllm-manager:
+        condition: service_healthy
+      webapp:
+        condition: service_started
     command: >
-      bash -lc "colcon build --symlink-install --cmake-args -DBUILD_TESTING=OFF &&
+      bash -lc "if [ '$${TASKPLANNER_REBUILD_ON_START:-false}' = 'true' ]; then
+        colcon build --symlink-install --cmake-args -DBUILD_TESTING=OFF;
+      elif [ ! -f install/setup.bash ]; then
+        echo 'Taskplanner install/setup.bash is missing; rerun launcher with --build' >&2;
+        exit 2;
+      fi &&
       source install/setup.bash &&
-      ros2 launch bringup taskplanner_mock.launch.py enable_rosbridge:=true rosbridge_port:=${ROSBRIDGE_PORT:-9090} rosbridge_address:=${ROSBRIDGE_ADDRESS:-127.0.0.1} vlm_mode:=${VLM_MODE:-real} vlm_base_url:=${VLM_BASE_URL:-http://127.0.0.1:1234} vlm_model_id:=${VLM_MODEL_ID:-qwen3.6-35b-a3b-mtp@q2_k_xl} vlm_api_mode:=${VLM_API_MODE:-openai_compat} vlm_publish_period_sec:=${VLM_PUBLISH_PERIOD_SEC:-1.0} vlm_image_stale_sec:=${VLM_IMAGE_STALE_SEC:-3.0} vlm_max_output_tokens:=${VLM_MAX_OUTPUT_TOKENS:-320} vlm_response_format:=${VLM_RESPONSE_FORMAT:-json_schema} vlm_reasoning_effort:=${VLM_REASONING_EFFORT:-none} vlm_context_mode:=${VLM_CONTEXT_MODE:-actor_log} surgeon_actor_mode:=${SURGEON_ACTOR_MODE:-llm} actor_base_url:=${ACTOR_BASE_URL:-http://127.0.0.1:1234} actor_model_id:=${ACTOR_MODEL_ID:-google/gemma-4-12b-qat} actor_response_format:=${ACTOR_RESPONSE_FORMAT:-json_schema} actor_reasoning_effort:=${ACTOR_REASONING_EFFORT:-none} enable_no_image_camera:=${ENABLE_NO_IMAGE_CAMERA:-true} enable_synthetic_scene_camera:=${ENABLE_SYNTHETIC_SCENE_CAMERA:-false} $${FIELD_SNAPSHOT_URL:+field_snapshot_url:=$${FIELD_SNAPSHOT_URL}}"
+      if [ '${INPUT_PROFILE:-simulation}' = 'external' ]; then
+        exec ros2 launch bringup taskplanner_live.launch.py;
+      else
+        exec ros2 launch bringup taskplanner_mock.launch.py enable_rosbridge:=true rosbridge_port:=${ROSBRIDGE_PORT:-9090} rosbridge_address:=${ROSBRIDGE_ADDRESS:-127.0.0.1} input_profile:=${INPUT_PROFILE:-simulation} execution_backend:=${EXECUTION_BACKEND:-mock} speech_input_mode:=${SPEECH_INPUT_MODE:-utterance} sentence_input_topic:=${SENTENCE_INPUT_TOPIC:-/sensors/surgeon/sentence} speech_min_confidence:=${SPEECH_MIN_CONFIDENCE:-0.55} speech_max_age_sec:=${SPEECH_MAX_AGE_SEC:-3.0} speech_source_timeout_sec:=${SPEECH_SOURCE_TIMEOUT_SEC:-5.0} vlm_mode:=${VLM_MODE:-real} vlm_base_url:=${VLM_BASE_URL:-http://127.0.0.1:8001} vlm_provider_id:=${VLM_PROVIDER_ID:-vllm} vlm_model_id:=${VLM_MODEL_ID:-unsloth/gemma-4-E4B-it-NVFP4} vlm_api_mode:=${VLM_API_MODE:-openai_compat} vlm_publish_period_sec:=${VLM_PUBLISH_PERIOD_SEC:-1.0} vlm_image_stale_sec:=${VLM_IMAGE_STALE_SEC:-3.0} vlm_max_output_tokens:=${VLM_MAX_OUTPUT_TOKENS:-320} vlm_generation_seed:=${VLM_GENERATION_SEED:-0} vlm_response_format:=${VLM_RESPONSE_FORMAT:-json_schema} vlm_reasoning_effort:=${VLM_REASONING_EFFORT:-none} vlm_context_mode:=${VLM_CONTEXT_MODE:-actor_log} surgeon_actor_mode:=${SURGEON_ACTOR_MODE:-llm} actor_base_url:=${ACTOR_BASE_URL:-http://127.0.0.1:1234} actor_provider_id:=${ACTOR_PROVIDER_ID:-auto} actor_model_id:=${ACTOR_MODEL_ID:-google/gemma-4-12b-qat} actor_response_format:=${ACTOR_RESPONSE_FORMAT:-json_schema} actor_reasoning_effort:=${ACTOR_REASONING_EFFORT:-none} enable_rfdetr_perception:=${ENABLE_RFDETR_PERCEPTION:-true} rfdetr_service_url:=${RFDETR_SERVICE_URL:-http://127.0.0.1:8010} flir_input_topic:=${FLIR_INPUT_TOPIC:-/surgery/images/flir/compressed} cam4_input_topic:=${CAM4_INPUT_TOPIC:-/surgery/images/cam4/compressed} field_image_topic:=${SEGMENTED_FLIR_TOPIC:-/surgery/images/flir/segmented/compressed} cam4_semantics_topic:=${CAM4_SEMANTICS_TOPIC:-/surgery/perception/cam4/semantics/json} enable_no_image_camera:=${ENABLE_NO_IMAGE_CAMERA:-true} enable_synthetic_scene_camera:=${ENABLE_SYNTHETIC_SCENE_CAMERA:-false} $${FIELD_SNAPSHOT_URL:+field_snapshot_url:=$${FIELD_SNAPSHOT_URL}};
+      fi"
 
   webapp:
     build:
@@ -108,19 +399,37 @@ services:
         BTOPS_LOCAL_CONTEXT: ${BTOPS_LOCAL_CONTEXT:-../btops_ws}
         BTOPS_REF: ${BTOPS_REF:-main}
         AUTO_APMS_REPO_URL: ${AUTO_APMS_REPO_URL:-https://github.com/AutoAPMS/auto-apms.git}
-        AUTO_APMS_REF: ${AUTO_APMS_REF:-1.5.1}
+        AUTO_APMS_REF: ${AUTO_APMS_REF:-19ac8d558e35f657b8464694c5ddc524c6c31861}
+        TASKPLANNER_BUILD_VERSION: ${TASKPLANNER_BUILD_VERSION:-0.1.0-dev}
+        TASKPLANNER_BUILD_SHA: ${TASKPLANNER_BUILD_SHA:-unknown}
+        TASKPLANNER_SHADOW_CONTRACT_VERSION: ${TASKPLANNER_SHADOW_CONTRACT_VERSION:-shadow-rfdetr-preflight-v1}
     image: taskplanner-ws:dev
+    restart: "no"
     working_dir: /workspaces/taskplanner_ws/webapp
     volumes:
       - .:/workspaces/taskplanner_ws
       - taskplanner_web_node_modules:/workspaces/taskplanner_ws/webapp/node_modules
     environment:
-      VITE_ROSBRIDGE_URL: ws://127.0.0.1:${ROSBRIDGE_PORT:-9090}
+      VITE_ROSBRIDGE_URL: ${VITE_ROSBRIDGE_URL:-}
+      VITE_ROSBRIDGE_PORT: ${ROSBRIDGE_PORT:-9090}
+      VITE_DEFAULT_RUNTIME_MODE: ${VITE_DEFAULT_RUNTIME_MODE:-llm}
+      VITE_ROSBRIDGE_LIVE_URL: ${VITE_ROSBRIDGE_LIVE_URL:-}
+      VITE_ROSBRIDGE_LIVE_PORT: ${ROSBRIDGE_LIVE_PORT:-9090}
+      VITE_ROSBRIDGE_LLM_URL: ${VITE_ROSBRIDGE_LLM_URL:-}
+      VITE_ROSBRIDGE_LLM_PORT: ${ROSBRIDGE_LLM_PORT:-9090}
+      VITE_ROSBRIDGE_SHADOW_URL: ${VITE_ROSBRIDGE_SHADOW_URL:-}
+      VITE_ROSBRIDGE_SHADOW_PORT: ${ROSBRIDGE_SHADOW_PORT:-9099}
+      WEBAPP_INSTALL_ON_START: ${WEBAPP_INSTALL_ON_START:-false}
     ports:
       - "127.0.0.1:${WEBAPP_PORT:-4173}:4173"
     command: >
       bash -lc "
-        npm install &&
+        if [ '$${WEBAPP_INSTALL_ON_START:-false}' = 'true' ]; then
+          npm install;
+        elif [ ! -x node_modules/.bin/vite ]; then
+          echo 'webapp node_modules is missing; rerun launcher with --build' >&2;
+          exit 2;
+        fi &&
         npm run dev -- --host 0.0.0.0 --port 4173
       "
 

@@ -12,6 +12,62 @@ from .procedure_prompt import PROMPT_FILE_NAMES, load_procedure_prompt
 
 
 _TOOL_ID_RE = re.compile(r"\bT\d{2}\b")
+_FIELD_DEPLOYED_ROLE_NAMES = {
+    "field_deployed",
+    "fixed_retraction",
+}
+_GENERIC_TOOL_WORDS = {
+    "atraumatic",
+    "bag",
+    "blade",
+    "cautery",
+    "clamp",
+    "diathermy",
+    "dissecting",
+    "dissector",
+    "driver",
+    "endoscopic",
+    "fine",
+    "forceps",
+    "handle",
+    "hemostat",
+    "holder",
+    "instrument",
+    "irrigator",
+    "laparoscopic",
+    "long",
+    "needle",
+    "pencil",
+    "retractor",
+    "retrieval",
+    "scalpel",
+    "scissors",
+    "shears",
+    "stapler",
+    "suction",
+    "surgical",
+    "tip",
+    "tool",
+    "with",
+}
+_GENERIC_KO_TOOL_WORDS = {
+    "가위",
+    "그라스퍼",
+    "기구",
+    "니들",
+    "드라이버",
+    "리트랙터",
+    "메스",
+    "박리기",
+    "석션",
+    "소작기",
+    "스테이플러",
+    "시어",
+    "어플라이어",
+    "전기소작기",
+    "클램프",
+    "포셉",
+}
 
 _KO_TOOL_NAMES = {
     "#15 Scalpel": "15번 메스",
@@ -28,6 +84,8 @@ _KO_TOOL_NAMES = {
     "Mosquito forceps": "모스키토 포셉",
     "Harmonics shears": "하모닉 시어",
     "Yankeur suction": "양카우어 석션",
+    "Kocher retractor": "코처 리트랙터",
+    "Thyroid retractor (Middeldorpf)": "갑상선 리트랙터(미들돌프)",
     "Laparoscopic atraumatic grasper": "복강경 비외상성 그라스퍼",
     "Laparoscopic hook cautery": "복강경 후크 전기소작기",
     "Laparoscopic scissors": "복강경 가위",
@@ -160,32 +218,51 @@ def _handover_profile(category: str, name: str) -> str:
     return "handle_grasp"
 
 
-def _tool_aliases(tool_id: str, name: str) -> list[str]:
+def _distinctive_name_aliases(name: str, generic_words: set[str]) -> list[str]:
+    words = [
+        word
+        for word in re.findall(r"[a-z0-9가-힣]+", name.lower())
+        if word and not word.isdigit() and word not in generic_words
+    ]
+    if not words:
+        return []
+    aliases = [" ".join(words)]
+    aliases.extend(words)
+    return aliases
+
+
+def _tool_aliases(tool_id: str, name: str, localized_name: str = "") -> list[str]:
     aliases = [name, tool_id]
     lower = name.lower()
     aliases.append(lower)
     aliases.extend(part.strip() for part in re.split(r"[/(),#-]", lower) if part.strip())
-    if "retractor" in lower:
-        aliases.append("retractor")
-        aliases.append("리트랙터")
-    if "cautery" in lower or "bovie" in lower or "diathermy" in lower:
-        aliases.extend(["cautery", "bovie", "전기소작기"])
-    if "suction" in lower:
-        aliases.extend(["suction", "석션", "흡입"])
-    if "forceps" in lower:
-        aliases.extend(["forceps", "포셉"])
-    if "scalpel" in lower or "blade" in lower:
-        aliases.extend(["scalpel", "메스"])
-    if "hemostat" in lower:
-        aliases.extend(["hemostat", "지혈겸자"])
+    aliases.extend(_distinctive_name_aliases(lower, _GENERIC_TOOL_WORDS))
+    if localized_name:
+        localized_lower = localized_name.lower()
+        aliases.append(localized_name)
+        aliases.append(localized_lower)
+        aliases.extend(
+            _distinctive_name_aliases(localized_lower, _GENERIC_KO_TOOL_WORDS)
+        )
+    if "bovie" in lower or "monopolar" in lower:
+        aliases.extend(["bovie", "보비"])
+    if "bipolar" in lower:
+        aliases.extend(["bipolar", "바이폴라"])
     if "mesh" in lower:
         aliases.extend(["mesh", "메쉬"])
-    if "needle" in lower:
-        aliases.extend(["needle", "needle holder", "니들"])
     if "mosquito" in lower:
         aliases.extend(["mosquito", "모스키토"])
     if "harmonics" in lower or "shear" in lower:
         aliases.extend(["harmonics", "harmonic", "하모닉"])
+    if "kocher" in lower or "middeldorpf" in lower or "thyroid retractor" in lower:
+        aliases.extend(
+            [
+                "thyroid retractor",
+                "middeldorpf retractor",
+                "갑상선 리트랙터",
+                "미들돌프 리트랙터",
+            ]
+        )
     return _ordered_unique([alias for alias in aliases if alias])
 
 
@@ -196,6 +273,45 @@ def _prompt_tools(prompt: dict[str, Any]) -> OrderedDict[str, str]:
         for tool_id, name in tools.items():
             result[str(tool_id)] = str(name)
     return result
+
+
+def _prompt_inventory(
+    prompt: dict[str, Any],
+    tool_ids: list[str],
+) -> dict[str, int]:
+    raw_inventory = prompt.get("tool_inventory", {})
+    inventory: dict[str, int] = {}
+    if raw_inventory not in ({}, None) and not isinstance(raw_inventory, dict):
+        raise ValueError("procedure prompt tool_inventory must be a mapping.")
+    for tool_id in tool_ids:
+        raw_count = (
+            raw_inventory.get(tool_id, 1)
+            if isinstance(raw_inventory, dict)
+            else 1
+        )
+        if isinstance(raw_count, bool):
+            raise ValueError(
+                f"procedure prompt tool_inventory.{tool_id} must be a positive integer."
+            )
+        try:
+            count = int(raw_count)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"procedure prompt tool_inventory.{tool_id} must be a positive integer."
+            ) from exc
+        if count <= 0 or float(raw_count) != float(count):
+            raise ValueError(
+                f"procedure prompt tool_inventory.{tool_id} must be a positive integer."
+            )
+        inventory[tool_id] = count
+    if isinstance(raw_inventory, dict):
+        unknown = sorted(set(str(key) for key in raw_inventory) - set(tool_ids))
+        if unknown:
+            raise ValueError(
+                "procedure prompt tool_inventory references unknown tools: "
+                + ", ".join(unknown)
+            )
+    return inventory
 
 
 def _phase_tools(prompt: dict[str, Any], known_tools: set[str]) -> dict[str, list[str]]:
@@ -215,7 +331,51 @@ def _phase_tools(prompt: dict[str, Any], known_tools: set[str]) -> dict[str, lis
             tools.extend(_tool_ids_in_text(item.get("current"), known_tools))
             tools.extend(_tool_ids_in_text(item.get("next"), known_tools))
             tools.extend(_tool_ids_in_text(item.get("cue"), known_tools))
+        tool_roles = detail.get("tool_roles", {})
+        if isinstance(tool_roles, dict):
+            for role_tools in tool_roles.values():
+                items = (
+                    role_tools
+                    if isinstance(role_tools, list)
+                    else [role_tools]
+                )
+                for item in items:
+                    tools.extend(_tool_ids_in_text(item, known_tools))
         phase_tools[str(phase_id)] = _ordered_unique(tools)
+    return phase_tools
+
+
+def _phase_field_deployed_tools(
+    prompt: dict[str, Any],
+    known_tools: set[str],
+) -> dict[str, list[str]]:
+    phase_tools: dict[str, list[str]] = {}
+    phase_details = prompt.get("phase_details", {})
+    if not isinstance(phase_details, dict):
+        return phase_tools
+    for phase_id, detail in phase_details.items():
+        if not isinstance(detail, dict):
+            continue
+        tool_roles = detail.get("tool_roles", {})
+        if not isinstance(tool_roles, dict):
+            continue
+        deployed: list[str] = []
+        for raw_role, raw_tools in tool_roles.items():
+            role = re.sub(
+                r"[^a-z0-9]+",
+                "_",
+                str(raw_role).strip().lower(),
+            ).strip("_")
+            if role not in _FIELD_DEPLOYED_ROLE_NAMES:
+                continue
+            items = raw_tools if isinstance(raw_tools, list) else [raw_tools]
+            for item in items:
+                raw_tool = str(item or "").strip()
+                if not raw_tool:
+                    continue
+                matched = _tool_ids_in_text(raw_tool, known_tools)
+                deployed.extend(matched or [raw_tool])
+        phase_tools[str(phase_id)] = _ordered_unique(deployed)
     return phase_tools
 
 
@@ -241,7 +401,10 @@ def _phase_next_map(prompt: dict[str, Any], phase_ids: list[str], interrupt_ids:
     return {phase_id: _ordered_unique(next_ids) for phase_id, next_ids in phase_next.items()}
 
 
-def _build_scene_layout(tool_ids: list[str]) -> dict[str, Any]:
+def _build_scene_layout(
+    tool_ids: list[str],
+    initial_instrument_states: Any = None,
+) -> dict[str, Any]:
     locations = [
         {"id": f"main_tray_slot_{index + 1}", "type": "tray_slot"}
         for index in range(len(tool_ids))
@@ -265,6 +428,11 @@ def _build_scene_layout(tool_ids: list[str]) -> dict[str, Any]:
             {"instrument_id": tool_id, "location_id": f"main_tray_slot_{index + 1}"}
             for index, tool_id in enumerate(tool_ids)
         ],
+        "initial_instrument_states": (
+            initial_instrument_states
+            if isinstance(initial_instrument_states, list)
+            else []
+        ),
     }
 
 
@@ -420,12 +588,17 @@ def build_raw_bundle_from_prompt(bundle_dir: str | Path, display_catalog: dict[s
     if not tools:
         raise ValueError(f"{bundle_path} procedure prompt must define tools.")
     tool_ids = list(tools.keys())
+    tool_inventory = _prompt_inventory(prompt, tool_ids)
     known_tools = set(tool_ids)
     phase_labels, phase_labels_ko, normal_phase_ids, interrupt_ids = _phase_label_maps(prompt)
     if not phase_labels:
         raise ValueError(f"{bundle_path} procedure prompt must define phase_labels.")
     phase_ids = list(phase_labels.keys())
     phase_tools = _phase_tools(prompt, known_tools)
+    phase_field_deployed_tools = _phase_field_deployed_tools(
+        prompt,
+        known_tools,
+    )
     phase_next = _phase_next_map(prompt, phase_ids, interrupt_ids)
 
     return {
@@ -433,6 +606,7 @@ def build_raw_bundle_from_prompt(bundle_dir: str | Path, display_catalog: dict[s
             "procedure_id": procedure_id,
             "procedure_display_name": procedure_name,
             "procedure_display_name_ko": procedure_name_ko,
+            "default_phase_id": str(procedure_payload.get("default_phase_id", "")),
             "normal_phase_ids": normal_phase_ids,
             "interrupt_phase_ids": sorted(interrupt_ids),
             "phases": [
@@ -442,6 +616,9 @@ def build_raw_bundle_from_prompt(bundle_dir: str | Path, display_catalog: dict[s
                     "display_name_ko": phase_labels_ko.get(phase_id, phase_labels[phase_id]),
                     "possible_next": phase_next.get(phase_id, []),
                     "expected_instruments": phase_tools.get(phase_id, []),
+                    "field_deployed_instruments": (
+                        phase_field_deployed_tools.get(phase_id, [])
+                    ),
                     "min_duration_sec": 2.0 if phase_id in interrupt_ids else 5.0,
                 }
                 for phase_id in phase_ids
@@ -453,8 +630,13 @@ def build_raw_bundle_from_prompt(bundle_dir: str | Path, display_catalog: dict[s
                     "id": tool_id,
                     "display_name": tool_name,
                     "display_name_ko": _KO_TOOL_NAMES.get(tool_name, tool_name),
-                    "aliases": _tool_aliases(tool_id, tool_name),
+                    "aliases": _tool_aliases(
+                        tool_id,
+                        tool_name,
+                        _KO_TOOL_NAMES.get(tool_name, tool_name),
+                    ),
                     "category": _tool_category(tool_name),
+                    "inventory_count": tool_inventory[tool_id],
                     "requestable": True,
                     "role": _tool_category(tool_name),
                     "handover_profile": _handover_profile(_tool_category(tool_name), tool_name),
@@ -462,7 +644,10 @@ def build_raw_bundle_from_prompt(bundle_dir: str | Path, display_catalog: dict[s
                 for tool_id, tool_name in tools.items()
             ]
         },
-        "scene_layout": _build_scene_layout(tool_ids),
+        "scene_layout": _build_scene_layout(
+            tool_ids,
+            prompt.get("initial_instrument_states", []),
+        ),
         "policy": _build_policy(),
         "simulation_layout": _build_simulation_layout(procedure_id, tool_ids),
         "mock_surgeon": _build_mock_surgeon(phase_tools, tools),

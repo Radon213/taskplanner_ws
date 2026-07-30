@@ -46,7 +46,6 @@ class MockVLMNode(Node):
         self._gesture_pub = self.create_publisher(SurgeonGestureEvidence, "/vlm/surgeon_gesture_evidence", 20)
         self._result_pub = self.create_publisher(VLMResult, "/vlm/result", 10)
         self._health_pub = self.create_publisher(VLMHealth, "/vlm/health", 10)
-        self._request_pub = self.create_publisher(String, "/surgery/audio/request_text", 10)
         self._bed_group_proposal_pub = self.create_publisher(
             BedRobotArmGroupActionProposal,
             "/vlm/bed_robot_arm_group_proposal",
@@ -560,10 +559,6 @@ class MockVLMNode(Node):
         if self._scripted_gestures_enabled():
             self._publish_gesture(stage, evidence.stamp)
 
-        request = String()
-        request.data = stage.explicit_request if self._scripted_gestures_enabled() else ""
-        self._request_pub.publish(request)
-
         raw_json = json.dumps(
             {
                 "v": "mock-1",
@@ -658,10 +653,6 @@ class MockVLMNode(Node):
             evidence_msg.confidence = float(completion_gesture["confidence"])
             evidence_msg.note = completion_gesture["note"]
             self._gesture_pub.publish(evidence_msg)
-
-        request = String()
-        request.data = ""
-        self._request_pub.publish(request)
 
         raw_json = json.dumps(
             {
@@ -798,10 +789,6 @@ class MockVLMNode(Node):
         gesture = self._gesture_from_scene(scene, stamp)
         if gesture is not None:
             self._gesture_pub.publish(gesture)
-        request = String()
-        request.data = scene.speech_text or ""
-        self._request_pub.publish(request)
-
         raw_json = json.dumps(
             {
                 "v": "mock-2",

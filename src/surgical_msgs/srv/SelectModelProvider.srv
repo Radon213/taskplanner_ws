@@ -1,0 +1,7 @@
+string provider_id
+string model_id
+---
+bool success
+string provider_id
+string model_id
+string message

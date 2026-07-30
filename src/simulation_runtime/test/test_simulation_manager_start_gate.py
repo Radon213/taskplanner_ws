@@ -17,7 +17,10 @@ except ModuleNotFoundError:
     sys.modules["btops_interfaces"] = btops_package
     sys.modules["btops_interfaces.srv"] = btops_srv
 
-from simulation_runtime.simulation_manager import SimulationManagerNode
+from simulation_runtime.simulation_manager import (
+    RETRYABLE_START_ERROR_MARKERS,
+    SimulationManagerNode,
+)
 
 
 class _Logger:
@@ -130,3 +133,162 @@ def test_bundle_switch_quiescence_accepts_launch_time_bundle_before_spec_update(
     manager._quiesce_runtime_for_bundle_change()
 
     assert events == ["reset:''", "executor-idle"]
+
+
+def test_external_start_rejects_failed_integration_preflight():
+    manager = SimulationManagerNode.__new__(SimulationManagerNode)
+    manager._require_integration_preflight = True
+    manager._integration_preflight_client = SimpleNamespace(
+        wait_for_service=lambda timeout_sec: True,
+        call_async=lambda _request: object(),
+    )
+    manager._wait_future = lambda _future, timeout_sec: SimpleNamespace(
+        success=False,
+        message="integration not ready: skill_action_server",
+    )
+
+    try:
+        manager._check_integration_preflight()
+    except RuntimeError as exc:
+        assert str(exc) == "integration not ready: skill_action_server"
+    else:
+        raise AssertionError("preflight failure did not block the start")
+
+
+def test_external_start_accepts_ready_integration_preflight():
+    manager = SimulationManagerNode.__new__(SimulationManagerNode)
+    manager._require_integration_preflight = True
+    manager._integration_preflight_client = SimpleNamespace(
+        wait_for_service=lambda timeout_sec: True,
+        call_async=lambda _request: object(),
+    )
+    manager._wait_future = lambda _future, timeout_sec: SimpleNamespace(
+        success=True,
+        message="integration ready",
+    )
+
+    manager._check_integration_preflight()
+
+
+def test_empty_node_manifest_catalog_is_a_retryable_start_error():
+    assert "node_manifest_identities is empty" in RETRYABLE_START_ERROR_MARKERS
+
+
+def test_duplicate_transport_controls_are_idempotent_while_in_progress():
+    for command in ("pause", "resume", "reset", "stop"):
+        manager = SimulationManagerNode.__new__(SimulationManagerNode)
+        manager._operation_name = command
+        manager._running = command in {"pause", "resume"}
+        manager._execution_state = {
+            "pause": "running",
+            "resume": "paused",
+            "reset": "resetting",
+            "stop": "stopping",
+        }[command]
+
+        result = manager._handle_control(
+            SimpleNamespace(command=command, start_phase_id=""),
+            SimpleNamespace(),
+        )
+
+        assert result.success is True
+        assert result.message == f"{command} already in progress"
+
+
+def _instrument_state(
+    instance_id: str,
+    *,
+    location_id: str,
+    location_type: str,
+    lifecycle_stage: str,
+    home_location_id: str,
+    home_location_type: str,
+):
+    return SimpleNamespace(
+        instance_id=instance_id,
+        location_id=location_id,
+        location_type=location_type,
+        lifecycle_stage=lifecycle_stage,
+        home_location_id=home_location_id,
+        home_location_type=home_location_type,
+    )
+
+
+def test_start_layout_accepts_configured_deployed_instruments():
+    manager = SimulationManagerNode.__new__(SimulationManagerNode)
+    manager._active_spec = SimpleNamespace(
+        get_initial_instrument_states=lambda: [
+            SimpleNamespace(
+                instance_id="T03#1",
+                location_id="field_region_procedure",
+                lifecycle_stage="surgeon_owned",
+            ),
+            SimpleNamespace(
+                instance_id="T03#2",
+                location_id="field_region_procedure",
+                lifecycle_stage="surgeon_owned",
+            ),
+        ]
+    )
+    state = SimpleNamespace(
+        instrument_states=[
+            _instrument_state(
+                "T01#1",
+                location_id="main_tray_slot_1",
+                location_type="tray_slot",
+                lifecycle_stage="home_rack",
+                home_location_id="main_tray_slot_1",
+                home_location_type="tray_slot",
+            ),
+            _instrument_state(
+                "T03#1",
+                location_id="field_region_procedure",
+                location_type="surgical_field",
+                lifecycle_stage="surgeon_owned",
+                home_location_id="main_tray_slot_3",
+                home_location_type="tray_slot",
+            ),
+            _instrument_state(
+                "T03#2",
+                location_id="field_region_procedure",
+                location_type="surgical_field",
+                lifecycle_stage="surgeon_owned",
+                home_location_id="main_tray_slot_3",
+                home_location_type="tray_slot",
+            ),
+        ]
+    )
+
+    assert manager._all_instruments_at_initial_layout(state) is True
+
+
+def test_start_layout_rejects_missing_or_misplaced_configured_instrument():
+    manager = SimulationManagerNode.__new__(SimulationManagerNode)
+    manager._active_spec = SimpleNamespace(
+        get_initial_instrument_states=lambda: [
+            SimpleNamespace(
+                instance_id="T03#1",
+                location_id="field_region_procedure",
+                lifecycle_stage="surgeon_owned",
+            ),
+            SimpleNamespace(
+                instance_id="T03#2",
+                location_id="field_region_procedure",
+                lifecycle_stage="surgeon_owned",
+            ),
+        ]
+    )
+    state = SimpleNamespace(
+        instrument_states=[
+            _instrument_state(
+                "T03#1",
+                location_id="main_tray_slot_3",
+                location_type="tray_slot",
+                lifecycle_stage="home_rack",
+                home_location_id="main_tray_slot_3",
+                home_location_type="tray_slot",
+            ),
+        ]
+    )
+
+    assert manager._all_instruments_at_initial_layout(state) is False

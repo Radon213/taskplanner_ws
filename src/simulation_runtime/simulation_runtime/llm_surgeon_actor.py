@@ -19,24 +19,34 @@ import uuid
 from procedure_spec import compact_procedure_prompt, get_default_spec_dir, load_bundle
 import requests
 import rclpy
+from model_provider_registry import ModelProviderRegistry, force_disable_thinking
 from rcl_interfaces.msg import SetParametersResult
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from std_msgs.msg import String
 from surgical_msgs.msg import (
     BedRobotArmGroupRequest,
     BedRobotArmGroupStatus,
+    ModelCatalogEntry,
+    ModelProviderStatus,
+    SpeechUtterance,
     SkillStatus,
     SurgeonActorEvent,
     SurgeonLLMDecision,
-    SurgeonRequest,
     SurgeonState,
 )
-from surgical_msgs.srv import ListModels
+from surgical_msgs.srv import (
+    ControlModelRuntime,
+    ListModelCatalog,
+    ListModels,
+    SelectModelProvider,
+)
 
 
 HANDOVER_ACTIONS = {
     "direct_handover",
     "pick_up_and_handover",
+    "pick_up_from_mayo_and_handover",
     "put_down_and_handover",
     "tool_handover",
     "predicted_tool_handover",
@@ -70,6 +80,7 @@ class LLMSurgeonActorNode(Node):
         super().__init__("llm_surgeon_actor")
         self.declare_parameter("spec_dir", str(get_default_spec_dir()))
         self.declare_parameter("base_url", "http://127.0.0.1:1234")
+        self.declare_parameter("provider_id", os.environ.get("ACTOR_PROVIDER_ID", "auto"))
         self.declare_parameter("api_key", "")
         self.declare_parameter("model_id", "google/gemma-4-12b-qat")
         self.declare_parameter("request_timeout_sec", 20.0)
@@ -89,6 +100,7 @@ class LLMSurgeonActorNode(Node):
         self.declare_parameter("request_mode_voice_weight", 0.35)
         self.declare_parameter("request_mode_hand_weight", 0.25)
         self.declare_parameter("request_mode_voice_hand_weight", 0.40)
+        self.declare_parameter("require_voice_for_tool_requests", False)
         self.declare_parameter("small_talk_chance", 0.18)
         self.declare_parameter("same_request_mode_limit", 2)
         self.declare_parameter("autonomous_phase_progression_enabled", True)
@@ -135,22 +147,44 @@ class LLMSurgeonActorNode(Node):
         self._bed_group_status_stamp_ns: dict[str, int] = {}
         self._manual_override_mute_until_sec = 0.0
 
+        self._provider_model_selections: dict[str, str] = {}
+        initial_base_url = str(self.get_parameter("base_url").value)
+        initial_api_key = str(
+            self.get_parameter("api_key").value or os.environ.get("ACTOR_API_KEY", "")
+        )
+        self._provider_registry = ModelProviderRegistry.from_environment(
+            legacy_base_url=initial_base_url,
+            legacy_api_key=initial_api_key,
+        )
         self._load_parameters()
         self._schedule_interrupt_for_phase(self._current_phase_id, "init")
         self.add_on_set_parameters_callback(self._on_parameters_changed)
 
         self._state_pub = self.create_publisher(SurgeonState, "/surgeon/state", 20)
-        self._request_pub = self.create_publisher(SurgeonRequest, "/surgeon/request", 20)
-        self._bed_group_request_pub = self.create_publisher(
-            BedRobotArmGroupRequest,
-            "/surgeon/bed_robot_arm_group_request",
+        self._speech_pub = self.create_publisher(
+            SpeechUtterance,
+            "/sensors/speech/utterance",
             20,
         )
-        self._voice_pub = self.create_publisher(String, "/surgery/audio/request_text", 10)
         self._actor_event_pub = self.create_publisher(SurgeonActorEvent, "/surgeon/actor_event", 20)
         self._overlay_pub = self.create_publisher(String, "/surgeon/actor_overlay", 20)
         self._decision_pub = self.create_publisher(SurgeonLLMDecision, "/surgeon/llm_decision", 20)
         self._model_catalog_service = self.create_service(ListModels, "~/list_models", self._on_list_models)
+        self._provider_catalog_service = self.create_service(
+            ListModelCatalog,
+            "~/list_model_catalog",
+            self._on_list_model_catalog,
+        )
+        self._provider_select_service = self.create_service(
+            SelectModelProvider,
+            "~/select_model_provider",
+            self._on_select_model_provider,
+        )
+        self._provider_control_service = self.create_service(
+            ControlModelRuntime,
+            "~/control_model_runtime",
+            self._on_control_model_runtime,
+        )
 
         self.create_subscription(String, "/simulation/control_state", self._on_control, 20)
         self.create_subscription(SkillStatus, "/skill/status", self._on_skill_status, 50)
@@ -159,6 +193,12 @@ class LLMSurgeonActorNode(Node):
             "/bed_robot_arm_group/status",
             self._on_bed_robot_arm_group_status,
             50,
+        )
+        self.create_subscription(
+            BedRobotArmGroupRequest,
+            "/surgeon/bed_robot_arm_group_request",
+            self._on_bed_robot_arm_group_request,
+            20,
         )
 
         self._timer = self.create_timer(self._decision_period_sec, self._tick)
@@ -173,9 +213,20 @@ class LLMSurgeonActorNode(Node):
 
         self._spec_dir = str(param_value("spec_dir"))
         self._spec = load_bundle(self._spec_dir)
-        self._base_url = str(param_value("base_url")).rstrip("/")
-        self._api_key = str(param_value("api_key") or os.environ.get("ACTOR_API_KEY", ""))
+        configured_base_url = str(param_value("base_url")).rstrip("/")
+        configured_api_key = str(
+            param_value("api_key") or os.environ.get("ACTOR_API_KEY", "")
+        )
+        provider = self._provider_registry.resolve(
+            str(param_value("provider_id")),
+            fallback_base_url=configured_base_url,
+            fallback_api_key=configured_api_key,
+        )
+        self._provider_id = provider.provider_id
+        self._base_url = provider.base_url
+        self._api_key = provider.api_key
         self._model_id = str(param_value("model_id"))
+        self._provider_model_selections[self._provider_id] = self._model_id
         self._request_timeout_sec = float(param_value("request_timeout_sec"))
         self._decision_period_sec = float(param_value("decision_period_sec"))
         self._temperature = float(param_value("temperature"))
@@ -207,6 +258,9 @@ class LLMSurgeonActorNode(Node):
             "hand": max(0.0, float(param_value("request_mode_hand_weight"))),
             "voice_hand": max(0.0, float(param_value("request_mode_voice_hand_weight"))),
         }
+        self._require_voice_for_tool_requests = bool(
+            param_value("require_voice_for_tool_requests")
+        )
         self._small_talk_chance = max(0.0, min(1.0, float(param_value("small_talk_chance"))))
         self._same_request_mode_limit = max(1, int(param_value("same_request_mode_limit")))
         self._autonomous_phase_progression_enabled = bool(param_value("autonomous_phase_progression_enabled"))
@@ -312,7 +366,36 @@ class LLMSurgeonActorNode(Node):
         reload_required = False
         overrides = {parameter.name: parameter.value for parameter in params}
         spec_changed = "spec_dir" in overrides
+        connection_names = {"base_url", "provider_id", "api_key", "model_id"}
+        if connection_names.intersection(overrides):
+            try:
+                configured_base_url = str(
+                    overrides.get("base_url", self.get_parameter("base_url").value)
+                ).rstrip("/")
+                configured_api_key = str(
+                    overrides.get("api_key", self.get_parameter("api_key").value)
+                    or os.environ.get("ACTOR_API_KEY", "")
+                )
+                provider = self._provider_registry.resolve(
+                    str(
+                        overrides.get(
+                            "provider_id",
+                            self.get_parameter("provider_id").value,
+                        )
+                    ),
+                    fallback_base_url=configured_base_url,
+                    fallback_api_key=configured_api_key,
+                )
+                self._provider_id = provider.provider_id
+                self._base_url = provider.base_url
+                self._api_key = provider.api_key
+                self._model_id = str(overrides.get("model_id", self._model_id))
+                self._provider_model_selections[self._provider_id] = self._model_id
+            except Exception as exc:
+                return SetParametersResult(successful=False, reason=str(exc))
         for parameter in params:
+            if parameter.name in connection_names:
+                continue
             if parameter.name in {
                 "spec_dir",
                 "request_timeout_sec",
@@ -331,6 +414,7 @@ class LLMSurgeonActorNode(Node):
                 "request_mode_voice_weight",
                 "request_mode_hand_weight",
                 "request_mode_voice_hand_weight",
+                "require_voice_for_tool_requests",
                 "small_talk_chance",
                 "same_request_mode_limit",
                 "autonomous_phase_progression_enabled",
@@ -346,12 +430,6 @@ class LLMSurgeonActorNode(Node):
                 "interrupt_event_tool_fraction",
             }:
                 reload_required = True
-            elif parameter.name == "base_url":
-                self._base_url = str(parameter.value).rstrip("/")
-            elif parameter.name == "api_key":
-                self._api_key = str(parameter.value)
-            elif parameter.name == "model_id":
-                self._model_id = str(parameter.value)
             elif parameter.name == "enabled":
                 self._enabled = bool(parameter.value)
                 if not self._enabled:
@@ -407,6 +485,8 @@ class LLMSurgeonActorNode(Node):
                         model_id = ""
                     if model_id and model_id not in model_ids:
                         model_ids.append(model_id)
+            if self._model_id and self._model_id not in model_ids:
+                model_ids.insert(0, self._model_id)
             response.success = True
             response.model_ids = model_ids
             response.message = f"{len(model_ids)} model(s) from {self._base_url}"
@@ -414,6 +494,197 @@ class LLMSurgeonActorNode(Node):
             response.success = False
             response.model_ids = []
             response.message = f"Model catalog unavailable at {self._base_url}: {exc}"
+        return response
+
+    def _on_list_model_catalog(self, _request, response):
+        probes = self._provider_registry.probe_all()
+        online_count = sum(1 for probe in probes if probe.reachable)
+        model_count = 0
+        response.active_provider_id = self._provider_id
+        response.active_model_id = self._model_id
+        response.providers = []
+        response.models = []
+
+        for probe in probes:
+            provider_status = ModelProviderStatus()
+            provider_status.provider_id = probe.provider.provider_id
+            provider_status.provider_name = probe.provider.display_name
+            provider_status.endpoint = probe.provider.base_url
+            provider_status.reachable = probe.reachable
+            provider_status.status = probe.status
+            provider_status.detail = probe.detail
+            provider_status.latency_sec = float(probe.latency_sec)
+            provider_status.model_count = len(probe.models)
+            response.providers.append(provider_status)
+
+            for model in probe.models:
+                entry = ModelCatalogEntry()
+                entry.provider_id = model.provider_id
+                entry.provider_name = model.provider_name
+                entry.model_id = model.model_id
+                entry.display_name = model.display_name
+                entry.capability = model.capability
+                entry.load_state = model.load_state
+                entry.selectable = model.selectable
+                entry.detail = model.detail
+                entry.runtime_managed = model.runtime_managed
+                entry.available_actions = list(model.available_actions)
+                response.models.append(entry)
+                model_count += 1
+
+        advertised = {
+            (str(entry.provider_id), str(entry.model_id))
+            for entry in response.models
+        }
+        reachable_by_provider = {
+            probe.provider.provider_id: probe.reachable for probe in probes
+        }
+        for remembered_provider_id, remembered_model_id in self._provider_model_selections.items():
+            if not remembered_model_id or (
+                remembered_provider_id,
+                remembered_model_id,
+            ) in advertised:
+                continue
+            provider = self._provider_registry.get_provider(remembered_provider_id)
+            configured = ModelCatalogEntry()
+            configured.provider_id = remembered_provider_id
+            configured.provider_name = (
+                provider.display_name
+                if provider is not None
+                else remembered_provider_id
+            )
+            configured.model_id = remembered_model_id
+            configured.display_name = remembered_model_id
+            configured.capability = "unknown"
+            matching_entry = next(
+                (
+                    entry
+                    for entry in response.models
+                    if str(entry.provider_id) == remembered_provider_id
+                    and self._provider_registry.canonical_model_id(
+                        remembered_provider_id,
+                        str(entry.model_id),
+                    )
+                    == self._provider_registry.canonical_model_id(
+                        remembered_provider_id,
+                        remembered_model_id,
+                    )
+                ),
+                None,
+            )
+            override = self._provider_registry.runtime_state(
+                remembered_provider_id,
+                remembered_model_id,
+            )
+            if override is not None:
+                configured.load_state, configured.detail = override
+            elif matching_entry is not None:
+                configured.load_state = str(matching_entry.load_state)
+                configured.detail = str(matching_entry.detail)
+            else:
+                configured.load_state = "configured"
+                configured.detail = "Configured model was not returned by /v1/models"
+            configured.selectable = reachable_by_provider.get(
+                remembered_provider_id,
+                False,
+            )
+            configured.runtime_managed = bool(
+                provider is not None and provider.runtime_commands
+            )
+            configured.available_actions = list(
+                self._provider_registry.available_actions(
+                    remembered_provider_id,
+                    configured.load_state,
+                )
+            )
+            response.models.insert(0, configured)
+            model_count += 1
+
+        response.success = online_count > 0
+        response.message = (
+            f"{online_count}/{len(probes)} providers online; {model_count} model(s)"
+        )
+        return response
+
+    def _on_select_model_provider(self, request, response):
+        provider_id = str(request.provider_id).strip().lower()
+        model_id = str(request.model_id).strip()
+        response.provider_id = self._provider_id
+        response.model_id = self._model_id
+        if not provider_id or not model_id:
+            response.success = False
+            response.message = "provider_id and model_id are required"
+            return response
+        provider = self._provider_registry.get_provider(provider_id)
+        if provider is None:
+            response.success = False
+            response.message = f"Unknown model provider: {provider_id}"
+            return response
+        probe = self._provider_registry.probe(provider_id)
+        if not probe.reachable:
+            response.success = False
+            response.message = (
+                f"{provider.display_name} is unavailable: {probe.status} ({probe.detail})"
+            )
+            return response
+        available_models = {model.model_id: model for model in probe.models}
+        remembered_model = self._provider_model_selections.get(provider_id, "")
+        catalog_model = available_models.get(model_id)
+        if catalog_model is None:
+            catalog_model = self._provider_registry.matching_model(
+                provider_id,
+                model_id,
+                probe.models,
+            )
+        if catalog_model is None and model_id != remembered_model:
+            response.success = False
+            response.message = (
+                f"{model_id} is not advertised by {provider.display_name}"
+            )
+            return response
+        runtime_note = ""
+        if provider.managed and catalog_model is not None:
+            runtime = self._provider_registry.ensure_runtime_ready(
+                provider_id,
+                catalog_model,
+                requested_model_id=model_id,
+            )
+            if not runtime.success:
+                response.success = False
+                response.message = runtime.message
+                return response
+            runtime_note = f"; runtime {runtime.state}"
+
+        result = self.set_parameters_atomically(
+            [
+                Parameter("provider_id", value=provider_id),
+                Parameter("model_id", value=model_id),
+            ]
+        )
+        if not result.successful:
+            response.success = False
+            response.message = result.reason or "Provider selection was rejected"
+            return response
+        response.success = True
+        response.provider_id = self._provider_id
+        response.model_id = self._model_id
+        response.message = (
+            f"LLM surgeon provider set to {provider.display_name}; model set to "
+            f"{model_id}{runtime_note}"
+        )
+        return response
+
+    def _on_control_model_runtime(self, request, response):
+        result = self._provider_registry.control_runtime(
+            str(request.provider_id),
+            str(request.model_id),
+            str(request.command),
+        )
+        response.success = result.success
+        response.provider_id = result.provider_id
+        response.model_id = result.model_id
+        response.state = result.state
+        response.message = result.message
         return response
 
     def _stamp(self):
@@ -589,10 +860,11 @@ class LLMSurgeonActorNode(Node):
         is_health = not str(msg.operation or "").strip() and str(
             msg.request_id or ""
         ).startswith("health-")
+        pending_request_id = str(pending.get("request_id", "")) if pending else ""
         mismatched_pending = bool(
-            pending is not None
+            pending_request_id
             and msg.request_id
-            and msg.request_id != pending.get("request_id")
+            and msg.request_id != pending_request_id
         )
         if mismatched_pending:
             return
@@ -640,7 +912,11 @@ class LLMSurgeonActorNode(Node):
         )
         if msg.end_effector_profile and bool(msg.terminal and msg.success):
             state["end_effector_profile"] = msg.end_effector_profile
-        if bool(msg.terminal) and pending is not None and msg.request_id == pending.get("request_id"):
+        if (
+            bool(msg.terminal)
+            and pending is not None
+            and (not pending_request_id or msg.request_id == pending_request_id)
+        ):
             self._pending_group_requests.pop(group_id, None)
             self._record_event(
                 "bed_robot_arm_group_completed" if msg.success else "bed_robot_arm_group_rejected",
@@ -657,6 +933,18 @@ class LLMSurgeonActorNode(Node):
                 },
             )
             self._schedule_next_decision(0.5)
+
+    def _on_bed_robot_arm_group_request(self, msg: BedRobotArmGroupRequest) -> None:
+        """Bind an actor speech cue to the public deterministic voice router."""
+        group_id = str(msg.group_id or "").strip()
+        pending = self._pending_group_requests.get(group_id)
+        if pending is None or pending.get("request_id"):
+            return
+        if str(msg.source or "") == "llm_surgeon_actor":
+            return
+        if str(msg.operation or "") != str(pending.get("operation", "")):
+            return
+        pending["request_id"] = str(msg.request_id or "")
 
     def _clear_pending(self, reason: str, tool_id: str) -> None:
         if self._pending_tool and self._pending_tool != tool_id:
@@ -1178,7 +1466,6 @@ class LLMSurgeonActorNode(Node):
                         "request_tool",
                         "request_bed_robot_arm_group",
                         "place_on_mayo",
-                        "pickup_from_mayo",
                         "advance_phase",
                         "complete_procedure",
                     ],
@@ -1269,10 +1556,10 @@ class LLMSurgeonActorNode(Node):
             "Do not repeat a group cue while that group has a pending request. Suction, retraction, and humanoid work are independent, so another lane may continue while one group is active. "
             "The surgeon can hold at most two tools. If context.held_capacity_remaining is positive, you may request a different needed tool while still holding one tool. "
             "If two tools are already held, place one held tool on Mayo before requesting another tool. "
-            "If a needed tool is already in context.mayo_stand, use pickup_from_mayo instead of request_tool. "
-            "Never request a tool that is already in context.held_tools or context.mayo_stand. "
+            "If a needed tool is already in context.mayo_stand, request it normally; the humanoid will pick it up from Mayo and hand it over. "
+            "Never request a tool that is already in context.held_tools. "
             "Never use place_on_mayo unless the chosen tool is listed in context.held_tools. "
-            "Never use pickup_from_mayo unless the chosen tool is currently listed in context.mayo_stand. "
+            "Do not self-pick tools from Mayo; pickup_from_mayo is normalized to a humanoid request. "
             "Interrupt phases are procedure-defined intermittent field events, not a fixed final step. "
             "When context.interrupt_event.active is true, prioritize the active interrupt phase's expected tools, then advance back to context.interrupt_event.return_phase once stable. "
             "Follow the doctor procedure prompt flow when choosing phase progress and next tool timing. "
@@ -1404,10 +1691,10 @@ class LLMSurgeonActorNode(Node):
             "recent_events": list(self._recent_events),
             "rules": [
                 "Normal return path is surgeon hand -> Mayo stand -> robot left hand -> cleaner -> rack.",
-                "Use place_on_mayo for used tools unless pickup_from_mayo is needed for reuse.",
+                "Use place_on_mayo for a used tool when the surgeon is finished with it for now.",
                 "place_on_mayo is valid only for a tool in held_tools.",
-                "pickup_from_mayo is valid only for a tool already listed in mayo_stand.",
-                "request_tool is invalid for tools already held or visible on Mayo.",
+                "If a needed tool is in mayo_stand, use request_tool; the humanoid retrieves it from Mayo and hands it over.",
+                "request_tool is invalid only for tools already in held_tools.",
                 "Use complete_procedure only when the current scenario segment is done.",
                 (
                     "If pending.action is not empty, do not start another tool or phase action; "
@@ -1444,6 +1731,7 @@ class LLMSurgeonActorNode(Node):
             }
         elif self._response_format == "json_object":
             body["response_format"] = {"type": "json_object"}
+        force_disable_thinking(body, provider_id=self._provider_id)
         start = time.perf_counter()
         response = requests.post(
             f"{self._base_url}/v1/chat/completions",
@@ -1652,6 +1940,13 @@ class LLMSurgeonActorNode(Node):
         next_dwell = max(self._min_dwell_sec, min(self._max_dwell_sec, float(decision["next_dwell_sec"])))
         phase = str(decision["phase"])
 
+        if action == "pickup_from_mayo":
+            action = "request_tool"
+            request_mode = self._weighted_request_mode(
+                request_mode if request_mode in {"voice", "hand", "voice_hand"} else "voice"
+            )
+            speech = self._request_speech(tool, speech, request_mode)
+
         accepted = True
         reject_reason = ""
         if action == "request_tool":
@@ -1697,28 +1992,6 @@ class LLMSurgeonActorNode(Node):
                 self._publish_actor_event("continue_using", tool, speech)
                 self._record_event("continue_using", tool, {"source_action": "request_tool", "speech": speech})
                 self._publish_state("continue_using", tool, speech, False, False, "requested_tool_already_held")
-            elif tool in self._mayo_tools:
-                action = "pickup_from_mayo"
-                if self._held_capacity_remaining() <= 0:
-                    action = "place_on_mayo"
-                    tool, reject_reason = self._place_held_to_free_hand(
-                        reason_code="free_hand_before_mayo_pickup",
-                        source_action="request_tool",
-                        wanted_tool=tool,
-                    )
-                    accepted = not bool(reject_reason)
-                    request_mode = "none"
-                    speech = ""
-                else:
-                    speech = ""
-                    self._remove_from_mayo(tool)
-                    self._add_held_tool(tool)
-                    self._mark_phase_tool_used(tool)
-                    self._last_speech = speech
-                    self._last_hand_overlay = ""
-                    self._publish_actor_event("continue_using", tool, speech)
-                    self._record_event("pickup_from_mayo", tool, {"source_action": "request_tool", "speech": speech})
-                    self._publish_state("continue_using", tool, speech, False, False, "requested_tool_was_on_mayo")
             elif self._held_capacity_remaining() <= 0:
                 action = "place_on_mayo"
                 tool, reject_reason = self._place_held_to_free_hand(
@@ -1735,7 +2008,6 @@ class LLMSurgeonActorNode(Node):
             else:
                 event_type = "voice_request" if request_mode == "voice" else "request_tool"
                 hand_overlay = "Surgeon hand extending" if request_mode in {"hand", "voice_hand"} else ""
-                self._publish_request(event_type, tool, speech, ready_for_handover=True)
                 self._publish_actor_event(event_type, tool, speech, ready_for_handover=True)
                 self._pending_action = "handover"
                 self._pending_tool = tool
@@ -1761,25 +2033,17 @@ class LLMSurgeonActorNode(Node):
             elif cue is None:
                 accepted = False
                 reject_reason = "group_request_not_grounded_in_current_phase_cue"
+            elif not speech:
+                accepted = False
+                reject_reason = "bed_robot_arm_group_request_requires_spoken_cue"
             else:
-                request_id = f"actor-{uuid.uuid4().hex}"
-                msg = BedRobotArmGroupRequest()
-                msg.stamp = self._stamp()
-                msg.request_id = request_id
-                msg.group_id = group_id
-                msg.operation = group_operation
-                msg.voice_text = speech
-                msg.procedure_id = self._spec.procedure_id
-                msg.phase_id = self._current_phase_id
-                msg.end_effector_profile = end_effector_profile
-                msg.source = "llm_surgeon_actor"
                 self._pending_group_requests[group_id] = {
-                    "request_id": request_id,
+                    "request_id": "",
                     "cue_id": str(cue.get("cue_id", "")),
                     "operation": group_operation,
                     "speech": speech,
                 }
-                self._bed_group_request_pub.publish(msg)
+                self._publish_voice(speech)
                 self._publish_actor_event("bed_robot_arm_group_request", "", speech)
                 self._last_speech = speech
                 self._last_hand_overlay = ""
@@ -1787,7 +2051,7 @@ class LLMSurgeonActorNode(Node):
                     "bed_robot_arm_group_request",
                     "",
                     {
-                        "request_id": request_id,
+                        "request_id": "",
                         "cue_id": cue.get("cue_id", ""),
                         "group_id": group_id,
                         "operation": group_operation,
@@ -1956,29 +2220,26 @@ class LLMSurgeonActorNode(Node):
             self._record_event("actor_decision_rejected", tool, {"reason": reject_reason, "action": action})
             self._schedule_next_decision(1.5)
 
-    def _publish_request(self, event_type: str, tool: str, speech: str, *, ready_for_handover: bool = False) -> None:
-        msg = SurgeonRequest()
-        msg.stamp = self._stamp()
-        msg.event_type = event_type
-        msg.requested_tool = tool
-        msg.voice_text = speech
-        msg.ready_for_handover = bool(ready_for_handover)
-        msg.ready_for_retrieval = False
-        msg.override = False
-        msg.note = "llm_surgeon_actor"
-        self._request_pub.publish(msg)
-
     def _weighted_request_mode(self, model_mode: str) -> str:
         valid_modes = {"voice", "hand", "voice_hand"}
+        if self._require_voice_for_tool_requests:
+            valid_modes = {"voice", "voice_hand"}
+            if model_mode == "hand":
+                model_mode = "voice_hand"
         mode = model_mode if model_mode in valid_modes and self._rng.random() < 0.45 else ""
         if not mode:
-            modes = [item for item, weight in self._request_mode_weights.items() if weight > 0.0]
+            modes = [
+                item
+                for item, weight in self._request_mode_weights.items()
+                if item in valid_modes and weight > 0.0
+            ]
             weights = [self._request_mode_weights[item] for item in modes]
-            mode = self._rng.choices(modes or ["voice", "hand", "voice_hand"], weights=weights or None, k=1)[0]
+            fallback_modes = ["voice", "voice_hand"] if self._require_voice_for_tool_requests else ["voice", "hand", "voice_hand"]
+            mode = self._rng.choices(modes or fallback_modes, weights=weights or None, k=1)[0]
         if len(self._request_mode_history) >= self._same_request_mode_limit:
             recent = list(self._request_mode_history)[-self._same_request_mode_limit :]
             if recent and all(item == mode for item in recent):
-                alternatives = [item for item in ("voice", "hand", "voice_hand") if item != mode]
+                alternatives = [item for item in valid_modes if item != mode]
                 mode = self._rng.choice(alternatives)
         return mode
 
@@ -2284,9 +2545,23 @@ class LLMSurgeonActorNode(Node):
         self._actor_event_pub.publish(msg)
 
     def _publish_voice(self, speech: str) -> None:
-        msg = String()
-        msg.data = speech
-        self._voice_pub.publish(msg)
+        text = str(speech or "").strip()
+        if not text:
+            return
+        stamp = self._stamp()
+        msg = SpeechUtterance()
+        msg.stamp = stamp
+        msg.start_stamp = stamp
+        msg.end_stamp = stamp
+        msg.utterance_id = f"actor-{uuid.uuid4().hex}"
+        msg.text = text
+        msg.is_final = True
+        msg.has_confidence = True
+        msg.confidence = 1.0
+        msg.speaker_role = "surgeon"
+        msg.language = "und"
+        msg.source = "llm_surgeon_actor"
+        self._speech_pub.publish(msg)
 
     def _publish_state(
         self,

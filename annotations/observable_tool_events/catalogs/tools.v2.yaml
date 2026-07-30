@@ -1,0 +1,65 @@
+schema: taskplanner.observable_tool_catalog.v2
+procedure: thyroidectomy
+tools:
+  - id: scalpel
+    name: Scalpel
+    procedure_refs: [T01]
+    aliases: ["#15 Scalpel", "Scalpel"]
+    status: procedure
+  - id: adson_forceps
+    name: Adson forceps
+    procedure_refs: [T02]
+    aliases: ["Adson Forceps", "Adson tissue forceps"]
+    status: procedure
+  - id: bipolar_forceps
+    name: Bipolar forceps
+    procedure_refs: [T07]
+    aliases: ["Bipolar Forceps", "Bipolar cautery"]
+    status: procedure
+  - id: allis_forceps
+    name: Allis forceps
+    procedure_refs: [T03]
+    aliases: ["Allis Forceps", "Allis clamp forceps"]
+    status: procedure
+  - id: kocher_retractor
+    name: Thyroid retractor (Middeldorpf)
+    procedure_refs: [T11]
+    aliases: ["Thyroid Retractor", "Middeldorpf retractor", "Kocher Retractor"]
+    status: procedure
+    notes: "Legacy canonical id retained; clinician-facing name follows the confirmed demonstration inventory."
+  - id: bovie
+    name: Bovie surgical cautery
+    procedure_refs: [T04]
+    aliases: ["Bovie", "Bovie surgical cautery", "bovie_cautery"]
+    status: procedure
+  - id: army_navy_retractor
+    name: Army-Navy retractor
+    procedure_refs: [T05]
+    aliases: ["Army-Navy Retractor", "army navy retractor"]
+    status: procedure
+  - id: senn_miller_retractor
+    name: Senn-Miller retractor
+    procedure_refs: [T06]
+    aliases: ["Senn Miller retractor", "Senn-Miller retractor"]
+    status: procedure
+  - id: mosquito_forceps
+    name: Mosquito forceps
+    procedure_refs: [T08]
+    aliases: ["Mosquito", "Mosquito forceps"]
+    status: procedure
+  - id: harmonic_shears
+    name: Harmonic shears
+    procedure_refs: [T09]
+    aliases: ["Harmonic shears", "Harmonics shears"]
+    status: procedure
+  - id: yankauer_suction
+    name: Yankauer suction
+    procedure_refs: [T10]
+    aliases: ["Yankauer suction", "Yankeur suction"]
+    status: procedure
+  - id: retractor_bundle_unresolved
+    name: Retractor bundle (type/count unresolved)
+    procedure_refs: []
+    aliases: ["retractor bundle"]
+    status: observation_only
+    notes: "Use only when a visible bundle transfer is confirmed but individual retractor type, count, or final placement is not observable."

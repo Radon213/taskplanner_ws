@@ -65,7 +65,13 @@ VLM and image input layer.
 
 Executables:
 
-- `real_vlm`: LM Studio/OpenAI-compatible VLM node.
+- `real_vlm`: provider-aware OpenAI-compatible VLM node.
+- `model_provider_registry`: concurrently discovers LM Studio, Unsloth Studio,
+  and vLLM catalogs while keeping endpoint credentials inside the ROS runtime.
+  LM Studio uses its native catalog for loaded/unloaded state when available.
+- `vllm-manager`: optional always-on lifecycle manager and OpenAI-compatible
+  proxy. It keeps port 8001 observable while the GPU worker on port 8002 is
+  unloaded, loading, ready, sleeping, waking, or failed.
 - `mock_vlm`: legacy/test VLM node.
 - `no_image_camera`: 30 FPS synthetic black image with public overlay cues.
 - `synthetic_scene_camera`: legacy synthetic scene image publisher.
@@ -78,7 +84,13 @@ Real VLM public inputs include:
 - `/twin/events`
 - `/bt/decision`
 - `/skill/status`
-- public voice transcript and actor-observed events
+- admitted public voice transcript
+- bed robot arm requests/status derived from speech and controller feedback
+
+The real VLM does not subscribe to validation-only `/surgeon/state`,
+`/surgeon/actor_event`, or `/surgeon/actor_overlay`. The system-fused phase is
+not fed back as the raw VLM phase answer. See
+`docs/EXTERNAL_INPUT_CONTRACT.md` for the LAN integration boundary.
 
 The no-image overlay may show visible/public cues only:
 
@@ -139,6 +151,12 @@ Outputs:
 
 Important reducer behavior:
 
+- An admitted public surgeon sentence can become a canonical explicit request without
+  passing through the VLM.
+- Matching transcript and `/surgeon/request` messages are coalesced.
+- VLM failure degrades to explicit voice handover; inferred phase, prediction,
+  and Mayo classification remain closed.
+
 - fail closed on stale/invalid/unhealthy inputs;
 - reject impossible observations without mutating world state;
 - stabilize Mayo recovery and next-tool prediction before BT can act;
@@ -164,7 +182,8 @@ Main tree:
 - `surgical_assist_v1.xml`
 
 The main recovery branch dispatches `retrieve_from_mayo`; direct hand retrieval
-is legacy/manual-only.
+is legacy/manual-only. A handover request for a tool already on Mayo instead
+dispatches `pick_up_from_mayo_and_handover` through the right arm.
 
 ### `taskplanner_bt_nodes`
 
@@ -187,8 +206,10 @@ Executables:
 - `mock_skill_server`
 
 The bridge converts `/bt/skill_command` into `/skill/execute` ROS action goals.
-The mock server always completes configured actions and emits public
-`/skill/status` plus `/skill/events`.
+The action interface remains wire-compatible and uses the `action` string
+`pick_up_from_mayo_and_handover` for the Mayo-to-surgeon path. The mock server
+always completes configured actions and emits public `/skill/status` plus
+`/skill/events`.
 
 ### `surgical_msgs`
 
@@ -264,8 +285,9 @@ docker compose up taskplanner-runtime webapp
 Default launch values:
 
 - `vlm_mode=real`
-- `vlm_base_url=http://127.0.0.1:1234`
-- `vlm_model_id=qwen3.6-35b-a3b-mtp@q2_k_xl`
+- `vlm_provider_id=vllm`
+- `vlm_base_url=http://127.0.0.1:8001`
+- `vlm_model_id=unsloth/gemma-4-E4B-it-NVFP4`
 - `vlm_response_format=json_schema`
 - `surgeon_actor_mode=llm`
 - `actor_model_id=google/gemma-4-12b-qat`
@@ -308,6 +330,34 @@ used only for validation scoring.
   -> /vlm/tool_observations
 ```
 
+### Model providers
+
+```text
+React model selector
+  -> ROS list/select/control services
+  -> model_provider_registry
+     -> LM Studio native catalog + load/unload API
+     -> Unsloth Studio catalog + load/unload API
+     -> vLLM manager :8001 /v1/models
+        -> lifecycle API
+        -> on-demand vLLM worker :8002
+```
+
+The vLLM manager is a control plane, catalog, and proxy rather than a loaded
+model server. Its worker is started only on demand. Lifecycle commands return
+immediately and state changes are observed through the normal five-second
+catalog refresh. Native LM Studio and Unsloth requests run on background
+threads so a long model load never blocks a ROS service callback. Their
+provider-native catalogs remain the final source of truth after an optimistic
+`loading` or `unloading` state. Taskplanner exposes only the actions supported
+by each provider: LM Studio and Unsloth provide load/unload, while managed vLLM
+also provides sleep/wake.
+
+Selecting an unloaded managed model invokes its load operation automatically.
+The same controls are available explicitly beside both the VLM and LLM surgeon
+selectors. Provider credentials remain inside the ROS processes and are not
+included in catalog messages sent to the browser.
+
 ### Digital twin
 
 ```text
@@ -335,8 +385,8 @@ public actor events + VLM proposals + skill events + control state
 
 - The deployed robot action server is not implemented in this repository. The
   current action server is a deterministic mock server.
-- VLM quality depends on the selected local LM Studio model and structured JSON
-  behavior.
+- VLM quality depends on the selected local provider/model and structured JSON
+  behavior. Provider discovery confirms API reachability, not task suitability.
 - The no-image camera is a test replacement for the unavailable surgery video
   feed; it is intentionally not a realistic visual model.
 - The LLM surgeon actor exists for validation diversity and must remain separate

@@ -22,6 +22,18 @@ type TimelineFilter = "all" | "normal" | "warning" | "error";
 type DetailTone = "normal" | "match" | "mismatch";
 type PanelVariant = "combined" | "timeline" | "decision";
 
+const VLM_IMPLICIT_REQUEST_EVENTS = new Set([
+  "extend_hand_for_handover",
+  "implicit_tool_request",
+  "request_tool",
+]);
+const VLM_IMPLICIT_REQUEST_POSES = new Set([
+  "hand_extending",
+  "open_palm",
+  "open_receive",
+  "palm_up",
+]);
+
 function DetailCard({ label, value, tone = "normal" }: { label: string; value: string | number; tone?: DetailTone }) {
   return (
     <article className={`detail-card tone-${tone}`}>
@@ -118,6 +130,38 @@ function parseVlmToolLabel(vlmResult: VLMResult, displayToolName: (toolId: strin
   return noneLabel;
 }
 
+function parseVlmMayoLabel(
+  vlmResult: VLMResult,
+  displayToolName: (toolId: string) => string,
+  noneLabel: string,
+  language: Language,
+): string {
+  if (!vlmResult.raw_json) return noneLabel;
+  try {
+    const payload = JSON.parse(vlmResult.raw_json) as { mayo?: unknown };
+    if (!Array.isArray(payload.mayo)) return noneLabel;
+    const rows = payload.mayo.flatMap((row) => {
+      if (!Array.isArray(row) || row.length < 3) return [];
+      const toolId = String(row[0] ?? "");
+      const decision = String(row[1] ?? "").toLowerCase();
+      const confidence = Number(row[2]);
+      if (!toolId || !Number.isFinite(confidence)) return [];
+      const decisionLabel =
+        decision === "reuse"
+          ? language === "ko"
+            ? "재사용"
+            : "reuse"
+          : language === "ko"
+            ? "회수"
+            : "recover";
+      return [`${displayToolName(toolId)} ${decisionLabel} ${Math.round(confidence * 100)}%`];
+    });
+    return rows.length ? rows.join(" · ") : noneLabel;
+  } catch {
+    return noneLabel;
+  }
+}
+
 export function ObservabilityPanel({
   vm,
   language,
@@ -192,6 +236,46 @@ export function ObservabilityPanel({
       : `VLM ${vlmMatchesGround ? "match" : "mismatch"} · system ${systemMatchesGround ? "match" : "mismatch"}`
     : vm.ui.none;
   const rawVlmToolLabel = parseVlmToolLabel(vlmResult, vm.displayToolName, vm.ui.none);
+  const rawVlmMayoLabel = parseVlmMayoLabel(
+    vlmResult,
+    vm.displayToolName,
+    vm.ui.none,
+    language,
+  );
+  const implicitRequestDetected =
+    VLM_IMPLICIT_REQUEST_EVENTS.has(vlmResult.gesture_event_type) &&
+    VLM_IMPLICIT_REQUEST_POSES.has(vlmResult.gesture_hand_pose) &&
+    vlmResult.gesture_confidence > 0;
+  const implicitRequestToolLabel = vlmResult.gesture_requested_tool
+    ? vm.displayToolName(vlmResult.gesture_requested_tool)
+    : language === "ko"
+      ? "도구 미확정"
+      : "tool unresolved";
+  const implicitRequestLabel = implicitRequestDetected
+    ? language === "ko"
+      ? `감지 · ${implicitRequestToolLabel} (${Math.round(vlmResult.gesture_confidence * 100)}%)`
+      : `Detected · ${implicitRequestToolLabel} (${Math.round(vlmResult.gesture_confidence * 100)}%)`
+    : language === "ko"
+      ? "감지 안 됨"
+      : "Not detected";
+  const finalMayoLabel = simulationState.instrument_states
+    .filter((instrument) =>
+      instrument.lifecycle_stage === "mayo_reuse" ||
+      instrument.lifecycle_stage === "mayo_recovery" ||
+      instrument.location_type === "mayo_stand" ||
+      instrument.location_type === "mayo_reuse_zone" ||
+      instrument.location_type === "mayo_recovery_zone")
+    .map((instrument) => {
+      const recovery =
+        instrument.lifecycle_stage === "mayo_recovery" ||
+        instrument.next_required_transition === "recover_left" ||
+        simulationState.active_recovery_tools.includes(instrument.instrument_id);
+      const decision = recovery
+        ? language === "ko" ? "회수 확정" : "recovery"
+        : language === "ko" ? "재사용 유지" : "keep for reuse";
+      return `${vm.displayToolName(instrument.instrument_id)} ${decision}`;
+    })
+    .join(" · ") || vm.ui.none;
   const systemPredictedToolLabel = worldState.predicted_tool
     ? `${vm.displayToolName(worldState.predicted_tool)} (${Math.round((worldState.predicted_tool_confidence || 0) * 100)}%, ${Math.round(worldState.predicted_tool_stability_sec || 0)}s)`
     : vm.ui.none;
@@ -443,8 +527,8 @@ export function ObservabilityPanel({
                   value={
                     vlmImage
                       ? language === "ko"
-                        ? `수술대 위 표시 · ${Math.max(1, Math.round(vlmImage.sizeBytes / 1024))} KB`
-                        : `shown on bed · ${Math.max(1, Math.round(vlmImage.sizeBytes / 1024))} KB`
+                        ? `${vlmHealth.image_source === "flir_raw_fallback" ? "원본 FLIR 폴백" : "RF-DETR 분할 FLIR"} · ${Math.max(1, Math.round(vlmImage.sizeBytes / 1024))} KB`
+                        : `${vlmHealth.image_source === "flir_raw_fallback" ? "Raw FLIR fallback" : "RF-DETR segmented FLIR"} · ${Math.max(1, Math.round(vlmImage.sizeBytes / 1024))} KB`
                       : language === "ko"
                         ? "frame 없음"
                         : "no frame"
@@ -456,6 +540,11 @@ export function ObservabilityPanel({
                 <DetailCard label={vm.ui.mode} value={vlmHealth.last_mode || vm.ui.none} />
                 <DetailCard label={vm.ui.source} value={vlmResult.source || vm.ui.none} />
                 <DetailCard label={vm.ui.imageSource} value={vlmHealth.image_source || vm.ui.none} />
+                <DetailCard
+                  label={language === "ko" ? "암묵적 도구 요청" : "Implicit tool request"}
+                  value={implicitRequestLabel}
+                  tone={implicitRequestDetected ? "match" : "normal"}
+                />
                 <DetailCard label={vm.ui.latency} value={vlmHealth.latency_sec ? `${vlmHealth.latency_sec.toFixed(3)}s` : vm.ui.none} />
                 <DetailCard label={language === "ko" ? "집도의 정답 단계" : "Actor ground"} value={groundLabel} />
                 <DetailCard label={language === "ko" ? "VLM 제안 단계" : "VLM proposed phase"} value={vlmPhaseLabel} tone={vlmPhaseTone} />
@@ -463,10 +552,22 @@ export function ObservabilityPanel({
                 <DetailCard label={language === "ko" ? "단계 검증" : "Phase check"} value={phaseMatchLabel} tone={phaseCheckTone} />
                 <DetailCard label={language === "ko" ? "VLM 제안 다음 도구" : "VLM proposed next tool"} value={rawVlmToolLabel} />
                 <DetailCard label={language === "ko" ? "시스템 최종 다음 도구" : "System final next tool"} value={systemPredictedToolLabel} />
+                <article className="detail-card wide">
+                  <span>{language === "ko" ? "Mayo VLM 원시 판단" : "Raw VLM Mayo decision"}</span>
+                  <strong>{rawVlmMayoLabel}</strong>
+                </article>
+                <article className="detail-card wide">
+                  <span>{language === "ko" ? "Mayo DT 최종 판단" : "Final DT Mayo decision"}</span>
+                  <strong>{finalMayoLabel}</strong>
+                </article>
                 <DetailCard
                   label={language === "ko" ? "E2E 지표 형식" : "E2E metric format"}
                   value={language === "ko" ? "정답 / 제안 / 평가가능" : "correct / proposed / evaluable"}
                 />
+                <article className="detail-card wide">
+                  <span>{language === "ko" ? "임상 분석" : "Clinical analysis"}</span>
+                  <strong>{vlmResult.summary || vm.ui.none}</strong>
+                </article>
                 <article className="detail-card wide">
                   <span>{vm.ui.reducer}</span>
                   <strong>

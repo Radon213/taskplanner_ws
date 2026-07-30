@@ -12,12 +12,18 @@ from procedure_spec import get_default_spec_dir, load_bundle
 import rclpy
 from rcl_interfaces.msg import SetParametersResult
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
 from surgical_msgs.msg import SkillStatus, SurgeonOutwardSignal
 
 
-RECOVERY_ACTIONS = {"retrieve_from_mayo", "retrieve_from_hand", "tool_retrieve"}
+RECOVERY_ACTIONS = {
+    "pick_up_from_mayo_and_handover",
+    "retrieve_from_mayo",
+    "retrieve_from_hand",
+    "tool_retrieve",
+}
 RECOVERY_STARTED_STATES = {
     "dispatching",
     "accepted",
@@ -72,7 +78,11 @@ class NoImageCameraNode(Node):
         self._tool_display_names = self._load_tool_display_names(self._spec_dir)
         self._speech = ""
         self._render_key: tuple[object, ...] | None = None
-        self._publisher = self.create_publisher(CompressedImage, self._image_topic, 10)
+        self._publisher = self.create_publisher(
+            CompressedImage,
+            self._image_topic,
+            qos_profile_sensor_data,
+        )
         self._jpeg_payload = self._render_payload([])
         self.create_subscription(
             SurgeonOutwardSignal,

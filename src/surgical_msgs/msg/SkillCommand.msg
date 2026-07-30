@@ -2,6 +2,8 @@ builtin_interfaces/Time stamp
 string command_id
 string action
 string instrument_id
+string instrument_instance_id
+uint64 request_generation
 string target_location_id
 string target_location_type
 string rationale

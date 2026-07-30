@@ -109,8 +109,24 @@ class ProcedurePriorScorer:
             for key, value in (self.prompt.get("runtime_phase", {}) or {}).items()
             if str(value)
         }
+        phase_policy = self.prompt.get("phase_policy", {}) or {}
+        if not isinstance(phase_policy, dict):
+            phase_policy = {}
+        self._tool_only_detailed_phase_transition_allowed = bool(
+            phase_policy.get(
+                "tool_only_detailed_phase_transition_allowed",
+                True,
+            )
+        )
+        self._tool_sequence_open_set_anchor_allowed = bool(
+            phase_policy.get(
+                "tool_sequence_open_set_anchor_allowed",
+                True,
+            )
+        )
         self._sequence_rows: list[tuple[str, str, str]] = []
         self._sequence_tools_by_phase: dict[str, list[str]] = defaultdict(list)
+        self._primary_sequence_by_phase: dict[str, list[str]] = defaultdict(list)
         for prompt_phase, rows in (self.prompt.get("seq", {}) or {}).items():
             runtime_phase = self._runtime_phase.get(str(prompt_phase), str(prompt_phase))
             if runtime_phase not in self.spec.phase_ids:
@@ -129,6 +145,14 @@ class ProcedurePriorScorer:
                         and tool_id not in self._sequence_tools_by_phase[runtime_phase]
                     ):
                         self._sequence_tools_by_phase[runtime_phase].append(tool_id)
+                primary = self._primary_sequence_by_phase[runtime_phase]
+                if not primary:
+                    if current_tool in self._requestable:
+                        primary.append(current_tool)
+                    if next_tool in self._requestable:
+                        primary.append(next_tool)
+                elif current_tool == primary[-1] and next_tool in self._requestable:
+                    primary.append(next_tool)
 
     def _resolve_tool(self, raw: Any) -> str:
         text = str(raw or "").strip()
@@ -253,6 +277,58 @@ class ProcedurePriorScorer:
                 return tool_id
         return ""
 
+    def _next_primary_sequence_tool(
+        self,
+        phase_id: str,
+        observed_tools: list[str],
+    ) -> str:
+        sequence = self._primary_sequence_by_phase.get(phase_id, [])
+        if not sequence:
+            return self._first_unprogressed_tool(
+                self._sequence_tools(phase_id),
+                set(observed_tools),
+            )
+        cursor = 0
+        for observed_tool in observed_tools:
+            if cursor >= len(sequence):
+                break
+            if observed_tool == sequence[cursor]:
+                cursor += 1
+                continue
+            try:
+                later_index = sequence.index(observed_tool, cursor + 1)
+            except ValueError:
+                continue
+            # Public evidence may omit an unspoken handover. Follow a later
+            # observed sequence item instead of freezing the prior forever.
+            cursor = later_index + 1
+        return sequence[cursor] if cursor < len(sequence) else ""
+
+    def _normal_transition_signatures(
+        self,
+        current_phase: str,
+        allowed_next: set[str],
+    ) -> dict[str, set[str]]:
+        current_tools = set(self._sequence_tools(current_phase))
+        interrupt_tools = {
+            tool_id
+            for phase_id in self._interrupt_phase_ids
+            for tool_id in self._sequence_tools(phase_id)
+        }
+        signatures: dict[str, set[str]] = {}
+        for phase_id in allowed_next:
+            if phase_id in self._interrupt_phase_ids:
+                continue
+            next_tools = set(self._sequence_tools(phase_id))
+            signature = {
+                tool_id
+                for tool_id in next_tools.difference(current_tools, interrupt_tools)
+                if tool_id in self._requestable
+            }
+            if signature:
+                signatures[phase_id] = signature
+        return signatures
+
     def _row_after_phase_entry(self, row: Any, phase_entered_sec: float) -> bool:
         if phase_entered_sec <= 0.0 or not isinstance(row, dict):
             return True
@@ -326,6 +402,125 @@ class ProcedurePriorScorer:
                 recent_tools.append(resolved)
         return speech_tools, recent_tools
 
+    def _sequence_alignment_score(
+        self,
+        observed_tools: list[str],
+        phase_sequence: list[str],
+    ) -> tuple[int, int]:
+        """Return ordered matches and adjacent transitions for one phase.
+
+        This is deliberately a small dynamic-programming prior, not a phase
+        labeler. It lets a left-censored replay use public tool exchanges to
+        compare every procedure phase before a temporal anchor exists.
+        """
+        if not observed_tools or not phase_sequence:
+            return 0, 0
+        rows = len(observed_tools) + 1
+        cols = len(phase_sequence) + 1
+        lcs = [[0] * cols for _ in range(rows)]
+        for row in range(1, rows):
+            for col in range(1, cols):
+                if observed_tools[row - 1] == phase_sequence[col - 1]:
+                    lcs[row][col] = lcs[row - 1][col - 1] + 1
+                else:
+                    lcs[row][col] = max(
+                        lcs[row - 1][col],
+                        lcs[row][col - 1],
+                    )
+        adjacent = 0
+        phase_pairs = set(zip(phase_sequence, phase_sequence[1:]))
+        for pair in zip(observed_tools, observed_tools[1:]):
+            if pair in phase_pairs:
+                adjacent += 1
+        return lcs[-1][-1], adjacent
+
+    def score_open_set(self, evidence: dict[str, Any]) -> dict[str, Any]:
+        """Rank all normal phases from public evidence without a phase anchor."""
+        speech_tools, recent_tools = self._evidence_tools(evidence)
+        observed_tools = list(speech_tools[-8:] or recent_tools[-12:])
+        if len(observed_tools) < 2:
+            return {
+                "phase": [],
+                "tool": [],
+                "evidence": {
+                    "current_phase": "",
+                    "allowed_next": [],
+                    "phase_search_mode": "open_set",
+                    "tool_sequence_open_set_anchor_allowed": (
+                        self._tool_sequence_open_set_anchor_allowed
+                    ),
+                    "speech_tools": speech_tools[-4:],
+                    "recent_tools": recent_tools[-8:],
+                },
+            }
+
+        phase_scores: dict[str, float] = defaultdict(float)
+        alignment_by_phase: dict[str, tuple[int, int]] = {}
+        for phase_id in self.spec.normal_phase_ids:
+            sequence = list(
+                self._primary_sequence_by_phase.get(phase_id)
+                or self._sequence_tools(phase_id)
+            )
+            matches, adjacent = self._sequence_alignment_score(
+                observed_tools,
+                sequence,
+            )
+            if matches <= 0:
+                continue
+            alignment_by_phase[phase_id] = (matches, adjacent)
+            coverage = matches / max(1, len(sequence))
+            precision = matches / max(1, min(len(observed_tools), len(sequence)))
+            phase_scores[phase_id] += (
+                0.03
+                + coverage * 0.10
+                + precision * 0.30
+                + min(0.48, matches * 0.12)
+                + min(0.24, adjacent * 0.10)
+            )
+            if observed_tools[-1] in sequence:
+                phase_scores[phase_id] += 0.03
+
+        ranked_phases = _rank(phase_scores, limit=4)
+        tool_scores: dict[str, float] = defaultdict(float)
+        for rank, row in enumerate(ranked_phases[:2]):
+            phase_id = str(row[0])
+            sequence = list(
+                self._primary_sequence_by_phase.get(phase_id)
+                or self._sequence_tools(phase_id)
+            )
+            next_tool = self._next_primary_sequence_tool(
+                phase_id,
+                observed_tools,
+            )
+            if next_tool:
+                tool_scores[next_tool] += max(0.35, 1.0 - rank * 0.35)
+            for tool_id in self._expected_by_phase.get(phase_id, []):
+                if tool_id in self._requestable:
+                    tool_scores[tool_id] += max(0.04, 0.12 - rank * 0.04)
+
+        return {
+            "phase": ranked_phases,
+            "tool": _rank(tool_scores, limit=5),
+            "evidence": {
+                "current_phase": "",
+                "allowed_next": [],
+                "phase_search_mode": "open_set",
+                "tool_sequence_open_set_anchor_allowed": (
+                    self._tool_sequence_open_set_anchor_allowed
+                ),
+                "speech_tools": speech_tools[-4:],
+                "recent_tools": recent_tools[-8:],
+                "observed_tool_sequence": observed_tools,
+                "sequence_alignment": {
+                    phase_id: {
+                        "matches": values[0],
+                        "adjacent": values[1],
+                    }
+                    for phase_id, values in alignment_by_phase.items()
+                },
+            },
+        }
+
     def score(self, evidence: dict[str, Any]) -> dict[str, Any]:
         current_phase = str(evidence.get("current_phase", "") or self.spec.default_phase_id)
         if current_phase not in self.spec.phase_ids:
@@ -397,6 +592,22 @@ class ProcedurePriorScorer:
                 mentioned_transition_phases.add(phase_id)
         if advance_transition_phases.difference({current_phase}):
             phase_scores[current_phase] *= 0.25
+
+        transition_evidence = speech_tools[-4:] if speech_tools else recent_tools[-6:]
+        signature_transition_hits: dict[str, int] = {}
+        for phase_id, signature in self._normal_transition_signatures(
+            current_phase,
+            regular_allowed_next,
+        ).items():
+            hits = [tool_id for tool_id in transition_evidence if tool_id in signature]
+            if not hits:
+                continue
+            hit_count = len(hits)
+            signature_transition_hits[phase_id] = hit_count
+            phase_scores[phase_id] += 0.95 + min(0.70, (hit_count - 1) * 0.35)
+            phase_scores[current_phase] *= 0.55 if hit_count == 1 else 0.30
+            mentioned_transition_phases.add(phase_id)
+
         mayo_tools = {self._resolve_tool(tool) for tool in evidence.get("mayo_tools", []) or []}
         hand_tools = {self._resolve_tool(tool) for tool in evidence.get("hand_tools", []) or []}
         mayo_tools.discard("")
@@ -405,7 +616,17 @@ class ProcedurePriorScorer:
         current_sequence_set = set(current_sequence)
         current_expected_set = set(self._expected_by_phase.get(current_phase, []))
         current_progressed_tools = set(recent_tools[-6:]) | set(speech_tools[-3:]) | mayo_tools | hand_tools
-        current_sequence_tool = self._first_unprogressed_tool(current_sequence, current_progressed_tools)
+        ordered_progress_tools = (
+            list(speech_tools[-8:])
+            if speech_tools
+            else list(recent_tools[-12:])
+        )
+        if not ordered_progress_tools:
+            ordered_progress_tools = sorted(mayo_tools | hand_tools)
+        current_sequence_tool = self._next_primary_sequence_tool(
+            current_phase,
+            ordered_progress_tools,
+        )
         current_sequence_order = {tool_id: index for index, tool_id in enumerate(current_sequence)}
 
         def phase_tool_weight(phase_id: str, tool_id: str, base_weight: float) -> float:
@@ -588,11 +809,11 @@ class ProcedurePriorScorer:
                     tool_scores[tool_id] *= 0.28
 
         for tool_id in set(speech_tools[-3:]):
-            if tool_id in tool_scores:
+            if tool_id in tool_scores and tool_id != current_sequence_tool:
                 tool_scores[tool_id] *= 0.34
 
         for tool_id in mayo_tools.union(hand_tools):
-            if tool_id in tool_scores:
+            if tool_id in tool_scores and tool_id != current_sequence_tool:
                 tool_scores[tool_id] *= 0.45
 
         if current_sequence_tool and not field_event_text:
@@ -606,6 +827,39 @@ class ProcedurePriorScorer:
                     tool_scores[tool_id] *= 0.72
                 else:
                     tool_scores[tool_id] *= 0.45
+
+        if signature_transition_hits and not field_event_text:
+            strongest_phase, strongest_count = max(
+                signature_transition_hits.items(),
+                key=lambda item: (item[1], phase_scores[item[0]]),
+            )
+            phase_scores[current_phase] *= (
+                0.45 if strongest_count == 1 else 0.25
+            )
+            phase_scores[strongest_phase] += (
+                0.45 + min(0.35, (strongest_count - 1) * 0.18)
+            )
+
+        if (
+            not self._tool_only_detailed_phase_transition_allowed
+            and not advance_transition_phases
+        ):
+            # Voice, handover and detector identities remain useful next-tool
+            # context, but cannot by themselves establish a new visual
+            # functional state. Keep the known current detailed phase ahead
+            # of every normal alternative; the VLM's current surgical-field
+            # image can still outrank this prior downstream.
+            current_score = max(phase_scores[current_phase], 0.01)
+            for phase_id in list(phase_scores):
+                if (
+                    phase_id == current_phase
+                    or phase_id in self._interrupt_phase_ids
+                ):
+                    continue
+                phase_scores[phase_id] = min(
+                    phase_scores[phase_id],
+                    current_score * 0.92,
+                )
 
         rankable_phase_scores = {
             phase_id: score
@@ -622,5 +876,8 @@ class ProcedurePriorScorer:
                 "speech_tools": speech_tools[-4:],
                 "recent_tools": recent_tools[-8:],
                 "allowed_next": sorted(regular_allowed_next),
+                "tool_only_detailed_phase_transition_allowed": (
+                    self._tool_only_detailed_phase_transition_allowed
+                ),
             },
         }

@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 import random
+import uuid
 
 from procedure_spec import get_default_spec_dir, load_bundle
 import rclpy
@@ -13,6 +14,7 @@ from rclpy.node import Node
 from std_msgs.msg import String
 from surgical_msgs.msg import (
     FilteredPhase,
+    SpeechUtterance,
     SurgeonActorEvent,
     SurgeonGestureEvidence,
     SurgeonRequest,
@@ -99,7 +101,11 @@ class SurgeonActorNode(Node):
 
         self._state_pub = self.create_publisher(SurgeonState, "/surgeon/state", 20)
         self._request_pub = self.create_publisher(SurgeonRequest, "/surgeon/request", 20)
-        self._voice_pub = self.create_publisher(String, "/surgery/audio/request_text", 10)
+        self._speech_pub = self.create_publisher(
+            SpeechUtterance,
+            "/sensors/speech/utterance",
+            20,
+        )
         self._actor_event_pub = self.create_publisher(SurgeonActorEvent, "/surgeon/actor_event", 20)
 
         self.create_subscription(String, "/simulation/control_state", self._on_control, 20)
@@ -541,10 +547,25 @@ class SurgeonActorNode(Node):
 
     def _publish_request(self, request: SurgeonRequest) -> None:
         request.stamp = self.get_clock().now().to_msg()
-        self._request_pub.publish(request)
-        voice = String()
-        voice.data = request.voice_text if request.voice_text else ""
-        self._voice_pub.publish(voice)
+        if request.override:
+            self._request_pub.publish(request)
+            return
+        text = str(request.voice_text or "").strip()
+        if not text:
+            return
+        utterance = SpeechUtterance()
+        utterance.stamp = request.stamp
+        utterance.start_stamp = request.stamp
+        utterance.end_stamp = request.stamp
+        utterance.utterance_id = f"rule-actor-{uuid.uuid4().hex}"
+        utterance.text = text
+        utterance.is_final = True
+        utterance.has_confidence = True
+        utterance.confidence = 1.0
+        utterance.speaker_role = "surgeon"
+        utterance.language = "und"
+        utterance.source = "rule_surgeon_actor"
+        self._speech_pub.publish(utterance)
 
     def _publish_actor_event(self, decision: ActorDecision, *, override: bool = False) -> None:
         if not decision.actor_event_type:

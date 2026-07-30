@@ -12,6 +12,7 @@ class PhaseSpec:
     display_name_ko: str
     possible_next: list[str]
     expected_instruments: list[str]
+    field_deployed_instruments: list[str] = field(default_factory=list)
     min_duration_sec: float = 0.0
 
 
@@ -22,6 +23,7 @@ class InstrumentSpec:
     display_name_ko: str
     aliases: list[str]
     category: str
+    inventory_count: int = 1
     requestable: bool = True
     role: str = ""
     handover_profile: str = ""
@@ -37,6 +39,15 @@ class SceneLocation:
 class InitialPlacement:
     instrument_id: str
     location_id: str
+
+
+@dataclass(slots=True)
+class InitialInstrumentState:
+    instrument_id: str
+    instance_id: str
+    location_id: str
+    lifecycle_stage: str
+    confidence: float = 1.0
 
 
 @dataclass(slots=True)
@@ -202,6 +213,7 @@ class ProcedureBundle:
     procedure_id: str
     procedure_display_name: str
     procedure_display_name_ko: str
+    default_phase_id: str = ""
     normal_phase_ids: list[str] = field(default_factory=list)
     interrupt_phase_ids: list[str] = field(default_factory=list)
     phases: list[PhaseSpec] = field(default_factory=list)
@@ -209,6 +221,9 @@ class ProcedureBundle:
     display_catalog: dict[str, dict] = field(default_factory=dict)
     locations: list[SceneLocation] = field(default_factory=list)
     initial_placements: list[InitialPlacement] = field(default_factory=list)
+    initial_instrument_states: list[InitialInstrumentState] = field(
+        default_factory=list
+    )
     phase_guard: PhaseGuardPolicy | None = None
     action_guard: ActionGuardPolicy | None = None
     humanoid_policy: HumanoidPolicy | None = None

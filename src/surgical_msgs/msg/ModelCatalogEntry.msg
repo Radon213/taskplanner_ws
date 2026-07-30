@@ -1,0 +1,10 @@
+string provider_id
+string provider_name
+string model_id
+string display_name
+string capability
+string load_state
+bool selectable
+string detail
+bool runtime_managed
+string[] available_actions

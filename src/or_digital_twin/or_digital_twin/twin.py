@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections import deque
+from collections import Counter, defaultdict, deque
 from dataclasses import asdict
 from typing import Any
 import json
@@ -57,7 +57,6 @@ PENDING_TRANSITIONS_REQUIRE_ACTION = {
     "return_unused_preposition",
     "human_recovery_required",
 }
-MAYO_REUSE_SOFT_LIMIT = 2
 PHASE_INTERACTION_MIN_FRACTION = 0.4
 BLOCKING_SAFETY_FLAGS = {
     "right_arm_overloaded",
@@ -72,8 +71,8 @@ ALLOWED_EVENT_TRANSITIONS = {
     LIFECYCLE_RETURNED_HOME: {LIFECYCLE_PREPOSITIONED_RIGHT, LIFECYCLE_SURGEON_OWNED},
     LIFECYCLE_PREPOSITIONED_RIGHT: {LIFECYCLE_PREPOSITIONED_RIGHT, LIFECYCLE_SURGEON_OWNED, LIFECYCLE_RETURNED_HOME, LIFECYCLE_DROPPED_FLOOR},
     LIFECYCLE_SURGEON_OWNED: {LIFECYCLE_SURGEON_OWNED, LIFECYCLE_MAYO_REUSE, LIFECYCLE_MAYO_RECOVERY, LIFECYCLE_RECOVERING_LEFT, LIFECYCLE_DROPPED_FLOOR},
-    LIFECYCLE_MAYO_REUSE: {LIFECYCLE_MAYO_REUSE, LIFECYCLE_SURGEON_OWNED, LIFECYCLE_MAYO_RECOVERY, LIFECYCLE_RECOVERING_LEFT, LIFECYCLE_DROPPED_FLOOR},
-    LIFECYCLE_MAYO_RECOVERY: {LIFECYCLE_MAYO_RECOVERY, LIFECYCLE_RECOVERING_LEFT, LIFECYCLE_DROPPED_FLOOR},
+    LIFECYCLE_MAYO_REUSE: {LIFECYCLE_MAYO_REUSE, LIFECYCLE_PREPOSITIONED_RIGHT, LIFECYCLE_SURGEON_OWNED, LIFECYCLE_MAYO_RECOVERY, LIFECYCLE_RECOVERING_LEFT, LIFECYCLE_DROPPED_FLOOR},
+    LIFECYCLE_MAYO_RECOVERY: {LIFECYCLE_MAYO_RECOVERY, LIFECYCLE_PREPOSITIONED_RIGHT, LIFECYCLE_SURGEON_OWNED, LIFECYCLE_RECOVERING_LEFT, LIFECYCLE_DROPPED_FLOOR},
     LIFECYCLE_DROPPED_FLOOR: {LIFECYCLE_RETURNED_HOME},
     LIFECYCLE_RECOVERING_LEFT: {LIFECYCLE_RECOVERING_LEFT, LIFECYCLE_CLEANING_LEFT, LIFECYCLE_RETURNED_HOME},
     LIFECYCLE_CLEANING_LEFT: {LIFECYCLE_CLEANING_LEFT, LIFECYCLE_CLEANED_LEFT},
@@ -84,6 +83,13 @@ OBSERVATION_STICKY_DIRECT_BLOCKS = {
     (LIFECYCLE_SURGEON_OWNED, LIFECYCLE_RETURNED_HOME),
     (LIFECYCLE_MAYO_REUSE, LIFECYCLE_MAYO_RECOVERY),
 }
+CAM4_MAYO_OBSERVATION_SOURCES = frozenset(
+    {
+        "cam4_rfdetr_mayo_observation",
+        "vlm_cam4_mayo_observation",
+    }
+)
+CAM4_MAYO_TRANSITION_MIN_CONFIDENCE = 0.60
 SURGEON_ACTOR_LOCATION_EVENTS = {
     "place_on_mayo": ("mayo_reuse_zone", "mayo_reuse_zone", LIFECYCLE_MAYO_REUSE),
     "place_on_mayo_reuse": ("mayo_reuse_zone", "mayo_reuse_zone", LIFECYCLE_MAYO_REUSE),
@@ -98,8 +104,117 @@ def _stamp_to_sec(stamp) -> float:
 
 def _normalize_request_text(raw_text: str) -> list[str]:
     lowered = raw_text.lower()
-    cleaned = re.sub(r"[^a-z0-9_가-힣\s]", " ", lowered)
-    return [token for token in cleaned.split() if token and token not in {"please", "tool"}]
+    stop_words = {
+        "but",
+        "instead",
+        "please",
+        "rather",
+        "tool",
+        "the",
+        "a",
+        "an",
+        "다시",
+        "줘",
+        "주세요",
+        "부탁해",
+        "부탁합니다",
+    }
+
+    def tokens_for(text: str) -> list[str]:
+        cleaned = re.sub(r"[^a-z0-9_가-힣\s]", " ", text)
+        return [
+            token
+            for token in cleaned.split()
+            if token and token not in stop_words
+        ]
+
+    def ngrams(tokens: list[str], *, latest_first: bool) -> list[str]:
+        spans = [
+            (start, width, " ".join(tokens[start : start + width]))
+            for width in range(1, len(tokens) + 1)
+            for start in range(0, len(tokens) - width + 1)
+        ]
+        if latest_first:
+            spans.sort(key=lambda item: (item[0] + item[1], item[1]), reverse=True)
+        else:
+            spans.sort(key=lambda item: (-item[1], item[0]))
+        return [candidate for _, _, candidate in spans if candidate]
+
+    candidates: list[str] = []
+    correction_parts = re.split(
+        r"\b(?:not|instead(?:\s+of)?|rather(?:\s+than)?)\b|"
+        r"(?:아니(?:야|고|라)?|말고)",
+        lowered,
+    )
+    if len(correction_parts) > 1:
+        for candidate in ngrams(tokens_for(correction_parts[-1]), latest_first=True):
+            if candidate not in candidates:
+                candidates.append(candidate)
+    for candidate in ngrams(tokens_for(lowered), latest_first=False):
+        if candidate not in candidates:
+            candidates.append(candidate)
+    return candidates
+
+
+def _requests_additional_instance(raw_text: str) -> bool:
+    lowered = str(raw_text or "").lower().replace("\xa0", " ")
+    return bool(
+        re.search(
+            r"\b(?:one\s+more|another|an\s+additional|a\s+second)\b|"
+            r"(?:하나|하나만|한\s*개|한개)\s*더",
+            lowered,
+        )
+    )
+
+
+def _instrument_mention_count(
+    spec: ProcedureSpec,
+    instrument_id: str,
+    raw_text: str,
+) -> int:
+    text_tokens = re.findall(r"[0-9a-z_가-힣]+", str(raw_text or "").lower())
+    if not text_tokens:
+        return 0
+    instrument = next(
+        (
+            item
+            for item in spec.bundle.instruments
+            if item.id == instrument_id
+        ),
+        None,
+    )
+    if instrument is None:
+        return 0
+    alias_tokens = {
+        tuple(re.findall(r"[0-9a-z_가-힣]+", str(alias).lower()))
+        for alias in {
+            instrument.id,
+            instrument.display_name,
+            instrument.display_name_ko,
+            *instrument.aliases,
+        }
+    }
+    aliases = sorted(
+        (tokens for tokens in alias_tokens if tokens),
+        key=lambda tokens: (-len(tokens), tokens),
+    )
+    count = 0
+    index = 0
+    while index < len(text_tokens):
+        matched = next(
+            (
+                tokens
+                for tokens in aliases
+                if tuple(text_tokens[index : index + len(tokens)]) == tokens
+            ),
+            None,
+        )
+        if matched is None:
+            index += 1
+            continue
+        count += 1
+        index += len(matched)
+    return count
 
 
 def _owner_for_lifecycle(state: InstrumentBelief) -> str:
@@ -167,7 +282,7 @@ def _observed_lifecycle_for_location(state: InstrumentBelief, location_type: str
         return LIFECYCLE_PREPOSITIONED_RIGHT
     if location_type in SURGEON_OWNED_LOCATION_TYPES:
         return LIFECYCLE_SURGEON_OWNED
-    if location_type == "mayo_reuse_zone":
+    if location_type in {"mayo_stand", "mayo_reuse_zone"}:
         return LIFECYCLE_MAYO_REUSE
     if location_type == "mayo_recovery_zone":
         return LIFECYCLE_MAYO_RECOVERY
@@ -185,6 +300,8 @@ def _observed_lifecycle_for_location(state: InstrumentBelief, location_type: str
 
 
 def _is_available_for_handover(state: InstrumentBelief) -> bool:
+    if state.lifecycle_stage in {LIFECYCLE_MAYO_REUSE, LIFECYCLE_MAYO_RECOVERY}:
+        return True
     return (
         state.lifecycle_stage in {LIFECYCLE_HOME_RACK, LIFECYCLE_RETURNED_HOME, LIFECYCLE_PREPOSITIONED_RIGHT}
         and not state.contaminated
@@ -194,11 +311,46 @@ def _is_available_for_handover(state: InstrumentBelief) -> bool:
 class ORDigitalTwin:
     """Event-driven runtime belief manager."""
 
-    def __init__(self, spec: ProcedureSpec):
+    def __init__(
+        self,
+        spec: ProcedureSpec,
+        *,
+        allow_shadow_request_capacity_reconciliation: bool = False,
+        allow_shadow_type_instance_requests: bool = False,
+        allow_open_set_phase_bootstrap: bool = False,
+        phase_transition_required_counts: dict[
+            tuple[str, str], dict[str, int]
+        ] | None = None,
+    ):
         self.spec = spec
+        self._allow_shadow_request_capacity_reconciliation = bool(
+            allow_shadow_request_capacity_reconciliation
+        )
+        self._allow_shadow_type_instance_requests = bool(
+            allow_shadow_type_instance_requests
+        )
+        self._allow_open_set_phase_bootstrap = bool(
+            allow_open_set_phase_bootstrap
+        )
+        self._configured_phase_transition_required_counts = {
+            (str(source), str(target)): {
+                str(tool_id): max(1, int(count))
+                for tool_id, count in requirements.items()
+            }
+            for (source, target), requirements in (
+                phase_transition_required_counts or {}
+            ).items()
+        }
+        self._request_generation_counter = 0
+        self._shadow_assumption_audit: deque[dict[str, Any]] = deque()
         self.event_history: deque[dict[str, Any]] = deque(maxlen=200)
+        self._bed_robot_arm_group_status_signatures: dict[str, tuple[Any, ...]] = {}
+        self._bed_robot_arm_group_ignored_status_signatures: dict[
+            tuple[str, str], tuple[Any, ...]
+        ] = {}
         self.instrument_states: dict[str, InstrumentBelief] = {}
         self._observation_candidates: dict[str, dict[str, Any]] = {}
+        self._shadow_counterfactual_locked_instances: set[str] = set()
         self._observation_violation_cooldowns: dict[tuple[str, str, str, str], float] = {}
         self._phase_evidence_history: deque[dict[str, Any]] = deque(maxlen=8)
         self._pending_phase_cues: dict[str, dict[str, Any]] = {}
@@ -206,7 +358,13 @@ class ORDigitalTwin:
         self._last_normal_phase_before_interrupt = ""
         self._active_interrupt_event_phase = ""
         self._active_interrupt_event_seen_sec = 0.0
+        self._phase_bootstrap_open = self._allow_open_set_phase_bootstrap
         self._phase_entered_sec = self._monotonic_sec()
+        self._initial_phase_floor_index = 0
+        self._phase_instance_interactions: dict[
+            str, dict[str, set[str]]
+        ] = defaultdict(lambda: defaultdict(set))
+        self._inventory_violation_signature: tuple[Any, ...] | None = None
         self.reset_spec(spec)
 
     def reset_spec(self, spec: ProcedureSpec | None = None, *, seed_from_perception: bool = False) -> None:
@@ -235,32 +393,180 @@ class ORDigitalTwin:
         }
         self.instrument_states = {}
         self.event_history.clear()
+        self._bed_robot_arm_group_status_signatures.clear()
+        self._bed_robot_arm_group_ignored_status_signatures.clear()
         self._observation_candidates.clear()
+        self._shadow_counterfactual_locked_instances.clear()
         self._observation_violation_cooldowns.clear()
         self._phase_evidence_history.clear()
         self._pending_phase_cues.clear()
         self._phase_decision_cooldowns.clear()
+        self._shadow_assumption_audit.clear()
         self._last_normal_phase_before_interrupt = ""
         self._clear_active_interrupt_context()
+        self._phase_bootstrap_open = self._allow_open_set_phase_bootstrap
         self._phase_entered_sec = self._monotonic_sec()
+        self._initial_phase_floor_index = self._normal_phase_index(
+            self.spec.default_phase_id
+        )
+        self._phase_instance_interactions.clear()
+        self._inventory_violation_signature = None
         for instrument_id in self.spec.list_instrument_ids():
             location_id = self.spec.get_initial_location(instrument_id) or "unknown"
             location_type = self.spec.get_initial_location_type(instrument_id) or "unknown"
-            self.instrument_states[instrument_id] = InstrumentBelief(
-                instrument_id=instrument_id,
-                home_location_type=location_type,
-                home_location_id=location_id,
-                location_type=location_type,
-                location_id=location_id,
-                owner="none",
-                status="available",
-                confidence=0.9,
-                lifecycle_stage=LIFECYCLE_HOME_RACK,
-                visual_anchor_id=location_id,
+            inventory_count = max(
+                1, int(self.spec.get_inventory_count(instrument_id))
             )
+            for instance_index in range(1, inventory_count + 1):
+                instance_id = f"{instrument_id}#{instance_index}"
+                self.instrument_states[instance_id] = InstrumentBelief(
+                    instrument_id=instrument_id,
+                    instance_id=instance_id,
+                    home_location_type=location_type,
+                    home_location_id=location_id,
+                    location_type=location_type,
+                    location_id=location_id,
+                    owner="none",
+                    status="available",
+                    confidence=0.9,
+                    lifecycle_stage=LIFECYCLE_HOME_RACK,
+                    visual_anchor_id=location_id,
+                )
+        for initial_state in self.spec.get_initial_instrument_states():
+            state = self.instrument_states.get(initial_state.instance_id)
+            if state is None:
+                continue
+            self._set_lifecycle(
+                state,
+                initial_state.lifecycle_stage,
+                location_type=self.spec.get_location_type(
+                    initial_state.location_id
+                ),
+                location_id=initial_state.location_id,
+                confidence=initial_state.confidence,
+                last_update_sec=self._monotonic_sec(),
+            )
+            self._update_visual_anchor(state)
         if seed_from_perception:
             self._seed_from_initial_perception()
         self._recompute_transient_state()
+
+    def _normal_phase_index(self, phase_id: str) -> int:
+        try:
+            return self.spec.normal_phase_ids.index(phase_id)
+        except ValueError:
+            return -1
+
+    def remaining_procedure_use_instruments(self) -> set[str]:
+        """Tools still mentioned by current/future authored sequence or roles."""
+
+        if self.state.execution_state in {"finishing", "completed"}:
+            return set()
+        phase_id = self.state.filtered_phase or self.spec.default_phase_id
+        if self.spec.is_interrupt_phase(phase_id):
+            phase_id = (
+                self._last_normal_phase_before_interrupt
+                or self.spec.default_phase_id
+            )
+        return set(
+            self.spec.get_remaining_expected_instruments(
+                phase_id,
+                include_current=True,
+            )
+        )
+
+    def procedure_future_use_expected(
+        self,
+        instrument_or_instance_id: str,
+    ) -> bool:
+        state = self._state_by_instance(instrument_or_instance_id)
+        instrument_id = (
+            state.instrument_id
+            if state is not None
+            else self.spec.resolve_instrument_alias(
+                str(instrument_or_instance_id or "")
+            )
+            or str(instrument_or_instance_id or "")
+        )
+        return bool(
+            instrument_id
+            and instrument_id in self.remaining_procedure_use_instruments()
+        )
+
+    def _instances_for_type(self, instrument_id: str) -> list[InstrumentBelief]:
+        return sorted(
+            (
+                state
+                for state in self.instrument_states.values()
+                if state.instrument_id == instrument_id
+            ),
+            key=lambda state: state.instance_id,
+        )
+
+    def _state_by_instance(self, instance_id: str) -> InstrumentBelief | None:
+        return self.instrument_states.get(str(instance_id or ""))
+
+    def _select_instance(
+        self,
+        instrument_id: str,
+        *,
+        preferred_instance_id: str = "",
+        allowed_lifecycles: set[str] | None = None,
+        exclude_reserved: bool = False,
+    ) -> InstrumentBelief | None:
+        if preferred_instance_id:
+            state = self._state_by_instance(preferred_instance_id)
+            if state is not None and state.instrument_id == instrument_id:
+                if allowed_lifecycles is None or state.lifecycle_stage in allowed_lifecycles:
+                    return state
+        candidates = self._instances_for_type(instrument_id)
+        if allowed_lifecycles is not None:
+            candidates = [
+                state
+                for state in candidates
+                if state.lifecycle_stage in allowed_lifecycles
+            ]
+        if exclude_reserved:
+            reserved_instances = {
+                cue.instance_id
+                for cue in self.state.surgeon_request_queue
+                if cue.instance_id
+            }
+            candidates = [
+                state
+                for state in candidates
+                if state.instance_id not in reserved_instances
+            ]
+        return min(
+            candidates,
+            key=lambda state: (
+                state.lifecycle_stage
+                not in {LIFECYCLE_HOME_RACK, LIFECYCLE_RETURNED_HOME},
+                float(state.last_update_sec or 0.0),
+                state.instance_id,
+            ),
+            default=None,
+        )
+
+    def get_instrument_state(
+        self,
+        instrument_or_instance_id: str,
+        *,
+        allowed_lifecycles: set[str] | None = None,
+    ) -> InstrumentBelief | None:
+        direct = self._state_by_instance(instrument_or_instance_id)
+        if direct is not None:
+            if allowed_lifecycles is None or direct.lifecycle_stage in allowed_lifecycles:
+                return direct
+            return None
+        resolved = (
+            self.spec.resolve_instrument_alias(instrument_or_instance_id)
+            or instrument_or_instance_id
+        )
+        return self._select_instance(
+            resolved,
+            allowed_lifecycles=allowed_lifecycles,
+        )
 
     def update_bed_robot_arm_group_request(self, request: BedRobotArmGroupRequest) -> None:
         """Record an accepted public request without inventing physical arm state."""
@@ -293,13 +599,49 @@ class ORDigitalTwin:
             },
         )
 
-    def update_bed_robot_arm_group_status(self, status: BedRobotArmGroupStatus) -> None:
-        """Reduce group-controller feedback into the authoritative twin state."""
+    @staticmethod
+    def _bed_robot_arm_group_status_signature(
+        status: BedRobotArmGroupStatus,
+    ) -> tuple[Any, ...]:
+        progress = max(0.0, min(1.0, float(status.progress)))
+        progress_milestone = min(4, int(progress * 4))
+        return (
+            str(status.request_id),
+            str(status.command_id),
+            str(status.group_id).strip().lower(),
+            str(status.operation),
+            str(status.state),
+            str(status.outcome),
+            bool(status.terminal),
+            bool(status.success),
+            str(status.direction),
+            round(float(status.distance_mm), 6),
+            str(status.distance_origin),
+            str(status.raw_distance_text),
+            str(status.end_effector_profile),
+            progress_milestone,
+            str(status.error_code),
+            str(status.rejection_reason),
+        )
+
+    def update_bed_robot_arm_group_status(
+        self, status: BedRobotArmGroupStatus
+    ) -> bool | None:
+        """Reduce group feedback and report whether semantic state changed."""
 
         group_id = str(status.group_id or "").strip().lower()
         belief = self.state.bed_robot_arm_groups.get(group_id)
         if belief is None:
-            return
+            return None
+        is_health = not str(status.operation or "").strip() and str(
+            status.request_id or ""
+        ).startswith("health-")
+        status_signature = self._bed_robot_arm_group_status_signature(status)
+        signature: tuple[Any, ...] | None = None
+        if not is_health:
+            signature = status_signature
+            if self._bed_robot_arm_group_status_signatures.get(group_id) == signature:
+                return False
         status_ns = int(status.stamp.sec) * 1_000_000_000 + int(
             status.stamp.nanosec
         )
@@ -307,6 +649,17 @@ class ORDigitalTwin:
             belief.last_update_stamp_nanosec
         )
         if current_ns and status_ns < current_ns:
+            ignored_key = (group_id, "status_older_than_current_group_state")
+            if (
+                self._bed_robot_arm_group_ignored_status_signatures.get(
+                    ignored_key
+                )
+                == status_signature
+            ):
+                return False
+            self._bed_robot_arm_group_ignored_status_signatures[
+                ignored_key
+            ] = status_signature
             self._record_event(
                 "BedRobotArmGroupStatusIgnored",
                 {
@@ -319,13 +672,27 @@ class ORDigitalTwin:
                     "reason": "status_older_than_current_group_state",
                 },
             )
-            return
+            return None
         mismatched_active_request = bool(
             belief.active_request_id
             and status.request_id
             and status.request_id != belief.active_request_id
         )
         if mismatched_active_request:
+            ignored_key = (
+                group_id,
+                "status_request_does_not_match_active_group_request",
+            )
+            if (
+                self._bed_robot_arm_group_ignored_status_signatures.get(
+                    ignored_key
+                )
+                == status_signature
+            ):
+                return False
+            self._bed_robot_arm_group_ignored_status_signatures[
+                ignored_key
+            ] = status_signature
             self._record_event(
                 "BedRobotArmGroupCommandRejected" if status.terminal else "BedRobotArmGroupStatusIgnored",
                 {
@@ -343,10 +710,17 @@ class ORDigitalTwin:
                     "active_request_id": belief.active_request_id,
                 },
             )
-            return
-        is_health = not str(status.operation or "").strip() and str(
-            status.request_id or ""
-        ).startswith("health-")
+            return None
+        for ignored_key in [
+            key
+            for key in self._bed_robot_arm_group_ignored_status_signatures
+            if key[0] == group_id
+        ]:
+            self._bed_robot_arm_group_ignored_status_signatures.pop(
+                ignored_key, None
+            )
+        if signature is not None:
+            self._bed_robot_arm_group_status_signatures[group_id] = signature
         if is_health:
             available = (
                 str(status.error_code) != "server_unavailable"
@@ -375,18 +749,19 @@ class ORDigitalTwin:
             if changed:
                 belief.last_update_stamp_sec = int(status.stamp.sec)
                 belief.last_update_stamp_nanosec = int(status.stamp.nanosec)
-            self._record_event(
-                "BedRobotArmGroupAvailabilityChanged",
-                {
-                    "request_id": status.request_id,
-                    "group_id": group_id,
-                    "state": next_state,
-                    "outcome": status.outcome,
-                    "available": available,
-                    "changed": changed,
-                },
-            )
-            return
+            if changed:
+                self._record_event(
+                    "BedRobotArmGroupAvailabilityChanged",
+                    {
+                        "request_id": status.request_id,
+                        "group_id": group_id,
+                        "state": next_state,
+                        "outcome": status.outcome,
+                        "available": available,
+                        "changed": True,
+                    },
+                )
+            return changed
         belief.last_update_stamp_sec = int(status.stamp.sec)
         belief.last_update_stamp_nanosec = int(status.stamp.nanosec)
         next_state = str(status.state or belief.state or "standby")
@@ -445,6 +820,7 @@ class ORDigitalTwin:
                 "rejection_reason": status.rejection_reason,
             },
         )
+        return True
 
     def bed_robot_arm_group_payload(self) -> list[dict[str, Any]]:
         return [
@@ -456,25 +832,42 @@ class ORDigitalTwin:
     def reset_runtime(self) -> None:
         self.reset_spec(self.spec, seed_from_perception=False)
 
+    def clear_perception_evidence(self) -> None:
+        """Drop uncommitted visual evidence while retaining accepted history."""
+        self._observation_candidates.clear()
+        self._phase_evidence_history.clear()
+        self.state.phase_confidence = 0.0
+        self.state.phase_uncertain = True
+        self.state.phase_stability = 0.0
+
     def set_initial_phase(self, phase_id: str) -> str:
         requested_phase = str(phase_id or "").strip()
         resolved_phase = requested_phase if requested_phase in self.spec.phase_ids else self.spec.default_phase_id
         if requested_phase and requested_phase != resolved_phase:
             self._record_invariant_violation(
                 reason="start_phase_out_of_bundle_scope",
-                phase_id=requested_phase,
-                active_procedure=self.spec.procedure_id,
+                event_type="InitialPhaseSelected",
+                instrument_id="",
+                proposed_stage=requested_phase,
             )
         self.state.filtered_phase = resolved_phase
         self.state.phase_confidence = 1.0
         self.state.phase_uncertain = False
         self.state.phase_stability = 1.0
+        self._relocate_phase_field_deployed_tools(
+            resolved_phase,
+            reason="initial_phase_selected",
+        )
         self._phase_entered_sec = self._monotonic_sec()
         self._phase_evidence_history.clear()
         self._pending_phase_cues.clear()
         self._phase_decision_cooldowns.clear()
         self._last_normal_phase_before_interrupt = ""
         self._clear_active_interrupt_context()
+        self._phase_bootstrap_open = False
+        self._initial_phase_floor_index = self._normal_phase_index(
+            resolved_phase
+        )
         self._recompute_transient_state()
         self._record_event(
             "InitialPhaseSelected",
@@ -484,6 +877,10 @@ class ORDigitalTwin:
             },
         )
         return resolved_phase
+
+    @property
+    def phase_bootstrap_open(self) -> bool:
+        return bool(self._phase_bootstrap_open)
 
     def set_execution_state(self, running: bool, execution_state: str) -> None:
         self.state.running = running
@@ -514,6 +911,86 @@ class ORDigitalTwin:
             if anchor.id.startswith("field_region"):
                 return anchor.id
         return "field_region"
+
+    def _is_field_deployed_for_phase(
+        self,
+        instrument_or_instance_id: str,
+        phase_id: str | None = None,
+    ) -> bool:
+        resolved_phase = str(
+            phase_id or self.state.filtered_phase or self.spec.default_phase_id
+        )
+        if resolved_phase not in self.spec.phase_ids:
+            return False
+        candidate_phases = [resolved_phase]
+        next_phase = self.spec.get_next_normal_phase(resolved_phase)
+        if next_phase:
+            candidate_phases.append(next_phase)
+        return any(
+            self.spec.is_field_deployed_instrument(
+                candidate_phase,
+                instrument_or_instance_id,
+            )
+            for candidate_phase in candidate_phases
+        )
+
+    def _phase_field_deployment_ready(self, phase_id: str) -> bool:
+        required_types = set(
+            self.spec.get_field_deployed_instruments(phase_id)
+        )
+        if not required_types:
+            return True
+        return any(
+            state.instrument_id in required_types
+            and state.lifecycle_stage == LIFECYCLE_SURGEON_OWNED
+            and state.location_type in {"surgical_field", "bed_fixed_tool"}
+            for state in self.instrument_states.values()
+        )
+
+    def _relocate_phase_field_deployed_tools(
+        self,
+        phase_id: str,
+        *,
+        reason: str,
+    ) -> list[str]:
+        if phase_id not in self.spec.phase_ids:
+            return []
+        field_tool_ids = set(
+            self.spec.get_field_deployed_instruments(phase_id)
+        )
+        if not field_tool_ids:
+            return []
+
+        field_anchor_id = self._field_anchor_id()
+        relocated: list[str] = []
+        for state in self._surgeon_owned_hand_states():
+            if state.instrument_id not in field_tool_ids:
+                continue
+            previous_location_type = state.location_type
+            previous_location_id = state.location_id
+            state.location_type = "surgical_field"
+            state.location_id = field_anchor_id
+            state.owner = _owner_for_lifecycle(state)
+            state.status = _status_for_lifecycle(state)
+            state.reserved_for = ""
+            state.mayo_placement_evidence = ""
+            self._clear_observation_candidate(state.instance_id)
+            self._update_visual_anchor(state)
+            relocated.append(state.instance_id)
+            self._record_event(
+                "ToolFieldDeploymentInferred",
+                {
+                    "phase_id": phase_id,
+                    "instrument_id": state.instrument_id,
+                    "instance_id": state.instance_id,
+                    "previous_location_type": previous_location_type,
+                    "previous_location_id": previous_location_id,
+                    "location_type": state.location_type,
+                    "location_id": state.location_id,
+                    "reason": reason,
+                },
+            )
+        return relocated
 
     def _resolve_visual_anchor(
         self,
@@ -566,6 +1043,9 @@ class ORDigitalTwin:
         self.state.surgeon_request_queue.clear()
         self.state.explicit_request_tool = ""
         self.state.surgeon_request_tool = ""
+        self.state.surgeon_request_instance_id = ""
+        self.state.surgeon_request_generation = 0
+        self.state.surgeon_request_additional_instance_assumed = False
         self.state.surgeon_ready_for_handover = False
         self.state.surgeon_ready_for_retrieval = False
 
@@ -575,7 +1055,7 @@ class ORDigitalTwin:
     def _interrupt_priority_tool(self, phase_id: str) -> str:
         for candidate in self.spec.get_expected_instruments(phase_id):
             resolved = self.spec.resolve_instrument_alias(candidate) or candidate
-            if resolved in self.instrument_states:
+            if self._instances_for_type(resolved):
                 return resolved
         return ""
 
@@ -616,7 +1096,7 @@ class ORDigitalTwin:
             )
         else:
             resolved_priority_tool = self._interrupt_priority_tool(target_phase)
-        if resolved_priority_tool in self.instrument_states:
+        if self._instances_for_type(resolved_priority_tool):
             display_name = next(
                 (
                     instrument.display_name
@@ -654,8 +1134,17 @@ class ORDigitalTwin:
     def _active_requested_tool_id(self) -> str:
         return self.state.surgeon_request_tool or self.state.explicit_request_tool or ""
 
+    def _active_requested_instance_id(self) -> str:
+        return self.state.surgeon_request_instance_id or ""
+
     def _is_active_requested_tool(self, instrument_id: str) -> bool:
-        return bool(instrument_id) and instrument_id == self._active_requested_tool_id()
+        if not instrument_id:
+            return False
+        if instrument_id == self._active_requested_instance_id():
+            return True
+        state = self._state_by_instance(instrument_id)
+        tool_type = state.instrument_id if state is not None else instrument_id
+        return tool_type == self._active_requested_tool_id()
 
     def _surgeon_owned_hand_states(self) -> list[InstrumentBelief]:
         return [
@@ -678,16 +1167,133 @@ class ORDigitalTwin:
                 self.state.surgeon_intent = "idle"
             self.state.explicit_request_tool = ""
             self.state.surgeon_request_tool = ""
+            self.state.surgeon_request_instance_id = ""
+            self.state.surgeon_request_generation = 0
+            self.state.surgeon_request_additional_instance_assumed = False
             self.state.surgeon_ready_for_handover = False
             self.state.surgeon_ready_for_retrieval = False
             return
 
         self.state.surgeon_intent = cue.event_type
         self.state.surgeon_request_tool = cue.instrument_id
+        self.state.surgeon_request_instance_id = cue.instance_id
+        self.state.surgeon_request_generation = int(cue.generation)
+        self.state.surgeon_request_additional_instance_assumed = bool(
+            cue.shadow_additional_instance_assumed
+        )
         self.state.surgeon_ready_for_handover = bool(cue.ready_for_handover)
         self.state.surgeon_ready_for_retrieval = bool(cue.ready_for_retrieval)
         if cue.event_type in ACTIVE_REQUEST_INTENTS:
             self.state.explicit_request_tool = cue.instrument_id
+
+    def _resolve_request_instance(
+        self,
+        *,
+        instrument_id: str,
+        event_type: str,
+        additional_instance_requested: bool,
+    ) -> InstrumentBelief | None:
+        if event_type in ACTIVE_RETURN_INTENTS:
+            return self._select_instance(
+                instrument_id,
+                allowed_lifecycles={
+                    LIFECYCLE_SURGEON_OWNED,
+                    LIFECYCLE_MAYO_REUSE,
+                    LIFECYCLE_MAYO_RECOVERY,
+                    LIFECYCLE_RECOVERING_LEFT,
+                    LIFECYCLE_CLEANING_LEFT,
+                    LIFECYCLE_CLEANED_LEFT,
+                },
+            )
+
+        if not additional_instance_requested:
+            same_type_prepositioned = self._select_instance(
+                instrument_id,
+                allowed_lifecycles={LIFECYCLE_PREPOSITIONED_RIGHT},
+            )
+            if same_type_prepositioned is not None:
+                return same_type_prepositioned
+
+        same_type_surgeon_owned = self._select_instance(
+            instrument_id,
+            allowed_lifecycles={LIFECYCLE_SURGEON_OWNED},
+        )
+        if same_type_surgeon_owned is not None and not additional_instance_requested:
+            if same_type_surgeon_owned.location_type not in {
+                "surgical_field",
+                "bed_fixed_tool",
+            }:
+                return same_type_surgeon_owned
+            available_instance = self._select_instance(
+                instrument_id,
+                allowed_lifecycles={
+                    LIFECYCLE_HOME_RACK,
+                    LIFECYCLE_RETURNED_HOME,
+                    LIFECYCLE_MAYO_REUSE,
+                    LIFECYCLE_MAYO_RECOVERY,
+                },
+                exclude_reserved=True,
+            )
+            if available_instance is not None:
+                return available_instance
+            return same_type_surgeon_owned
+
+        return self._select_instance(
+            instrument_id,
+            allowed_lifecycles={
+                LIFECYCLE_HOME_RACK,
+                LIFECYCLE_RETURNED_HOME,
+                LIFECYCLE_PREPOSITIONED_RIGHT,
+                LIFECYCLE_MAYO_REUSE,
+                LIFECYCLE_MAYO_RECOVERY,
+            },
+            exclude_reserved=True,
+        )
+
+    def _request_cue_committed(self, cue: SurgeonRequestCue) -> bool:
+        task = self.state.active_robot_task
+        if (
+            task is not None
+            and cue.instance_id
+            and task.instrument_instance_id == cue.instance_id
+        ):
+            return True
+        state = self._state_by_instance(cue.instance_id)
+        return bool(
+            state is not None
+            and state.lifecycle_stage
+            in {LIFECYCLE_PREPOSITIONED_RIGHT, LIFECYCLE_SURGEON_OWNED}
+        )
+
+    def _supersede_blocked_active_voice_request(
+        self,
+        *,
+        incoming_instrument_id: str,
+    ) -> bool:
+        cue = self._active_request_cue()
+        if (
+            cue is None
+            or cue.event_type != "voice_request"
+            or cue.instrument_id == incoming_instrument_id
+            or self._request_cue_committed(cue)
+            or self.handover_allowed()
+        ):
+            return False
+
+        superseded = self.state.surgeon_request_queue.popleft()
+        self._sync_active_request_from_queue()
+        self._record_event(
+            "SurgeonRequestSuperseded",
+            {
+                "superseded_tool": superseded.instrument_id,
+                "superseded_instance_id": superseded.instance_id,
+                "superseded_generation": superseded.generation,
+                "incoming_tool": incoming_instrument_id,
+                "reason": "newer_public_voice_request_replaced_uncommitted_blocked_request",
+                "queue_length": len(self.state.surgeon_request_queue),
+            },
+        )
+        return True
 
     def _enqueue_surgeon_request(
         self,
@@ -699,17 +1305,71 @@ class ORDigitalTwin:
         ready_for_handover: bool = True,
         ready_for_retrieval: bool = False,
         override: bool = False,
-    ) -> None:
+        force_shadow_additional_instance_assumption: bool = False,
+    ) -> bool:
         if not instrument_id:
-            return
+            return False
+        additional_instance_requested = bool(
+            force_shadow_additional_instance_assumption
+            or _requests_additional_instance(voice_text)
+        )
+        if event_type in ACTIVE_REQUEST_INTENTS and not additional_instance_requested:
+            for existing in self.state.surgeon_request_queue:
+                if (
+                    existing.instrument_id == instrument_id
+                    and existing.event_type in ACTIVE_REQUEST_INTENTS
+                ):
+                    if voice_text and not existing.voice_text:
+                        existing.voice_text = voice_text
+                    existing.ready_for_handover = bool(
+                        existing.ready_for_handover or ready_for_handover
+                    )
+                    existing.override = bool(existing.override or override)
+                    self._sync_active_request_from_queue()
+                    self._record_event(
+                        "SurgeonRequestCoalesced",
+                        {
+                            "queued_tool": instrument_id,
+                            "event_type": event_type,
+                            "queue_length": len(self.state.surgeon_request_queue),
+                            "active_request_tool": self.state.surgeon_request_tool,
+                        },
+                    )
+                    return bool(existing.shadow_additional_instance_assumed)
+
+        if event_type == "voice_request" and not additional_instance_requested:
+            self._supersede_blocked_active_voice_request(
+                incoming_instrument_id=instrument_id,
+            )
+            self._reconcile_shadow_capacity_for_public_request(
+                instrument_id=instrument_id,
+                voice_text=voice_text,
+            )
+
+        selected_instance = self._resolve_request_instance(
+            instrument_id=instrument_id,
+            event_type=event_type,
+            additional_instance_requested=additional_instance_requested,
+        )
+        if selected_instance is None:
+            self._record_invariant_violation(
+                reason="requested_tool_inventory_exhausted",
+                event_type=event_type,
+                instrument_id=instrument_id,
+            )
+            return False
+        self._request_generation_counter += 1
         cue = SurgeonRequestCue(
             event_type=event_type,
             instrument_id=instrument_id,
+            instance_id=selected_instance.instance_id,
+            generation=self._request_generation_counter,
             voice_text=voice_text,
             note=note,
             ready_for_handover=ready_for_handover,
             ready_for_retrieval=ready_for_retrieval,
             override=override,
+            shadow_additional_instance_assumed=additional_instance_requested,
         )
         self.state.surgeon_request_queue.append(cue)
         self._sync_active_request_from_queue()
@@ -717,12 +1377,70 @@ class ORDigitalTwin:
             "SurgeonRequestQueued",
             {
                 "queued_tool": instrument_id,
+                "queued_instance_id": cue.instance_id,
                 "event_type": event_type,
                 "voice_text": voice_text,
                 "queue_length": len(self.state.surgeon_request_queue),
                 "active_request_tool": self.state.surgeon_request_tool,
+                "request_generation": cue.generation,
             },
         )
+        return additional_instance_requested
+
+    def _reconcile_shadow_capacity_for_public_request(
+        self,
+        *,
+        instrument_id: str,
+        voice_text: str,
+    ) -> bool:
+        if not self._allow_shadow_request_capacity_reconciliation:
+            return False
+        additional_instance = (
+            self._allow_shadow_type_instance_requests
+            and _requests_additional_instance(voice_text)
+        )
+        hand_states = self._surgeon_owned_hand_states()
+        if len(hand_states) < 2:
+            return False
+        if (
+            not additional_instance
+            and any(state.instrument_id == instrument_id for state in hand_states)
+        ):
+            return False
+        if self._is_field_deployed_for_phase(instrument_id):
+            return False
+
+        released = min(
+            hand_states,
+            key=lambda state: (
+                float(state.last_update_sec or 0.0),
+                state.instance_id,
+            ),
+        )
+        previous_location_type = released.location_type
+        previous_location_id = released.location_id
+        released.location_type = "surgical_field"
+        released.location_id = self._field_anchor_id()
+        released.owner = _owner_for_lifecycle(released)
+        released.status = _status_for_lifecycle(released)
+        self._update_visual_anchor(released)
+        self._record_shadow_assumption(
+            "ShadowPublicRequestHandCapacityReconciled",
+            {
+                "instrument_id": released.instrument_id,
+                "instance_id": released.instance_id,
+                "incoming_request_tool": instrument_id,
+                "previous_location_type": previous_location_type,
+                "previous_location_id": previous_location_id,
+                "location_type": released.location_type,
+                "location_id": released.location_id,
+                "reason": (
+                    "public_voice_request_implies_one_active_handover_slot;"
+                    "exact_non_hand_location_remains_unobserved"
+                ),
+            },
+        )
+        return True
 
     def _dequeue_active_request(self, reason: str) -> None:
         cue = self._active_request_cue()
@@ -730,12 +1448,14 @@ class ORDigitalTwin:
             self._sync_active_request_from_queue()
             return
         completed_tool = cue.instrument_id
+        completed_instance_id = cue.instance_id
         self.state.surgeon_request_queue.popleft()
         self._sync_active_request_from_queue()
         self._record_event(
             "SurgeonRequestDequeued",
             {
                 "completed_tool": completed_tool,
+                "completed_instance_id": completed_instance_id,
                 "reason": reason,
                 "queue_length": len(self.state.surgeon_request_queue),
                 "active_request_tool": self.state.surgeon_request_tool,
@@ -746,7 +1466,20 @@ class ORDigitalTwin:
         return {
             "queue_length": len(self.state.surgeon_request_queue),
             "active_request_tool": self.state.surgeon_request_tool,
+            "active_request_instance_id": self.state.surgeon_request_instance_id,
+            "active_request_generation": self.state.surgeon_request_generation,
+            "active_request_additional_instance_assumed": (
+                self.state.surgeon_request_additional_instance_assumed
+            ),
             "queued_tools": [cue.instrument_id for cue in self.state.surgeon_request_queue],
+            "queued_instance_ids": [
+                cue.instance_id for cue in self.state.surgeon_request_queue
+            ],
+            "queued_generations": [cue.generation for cue in self.state.surgeon_request_queue],
+            "queued_additional_instance_assumptions": [
+                cue.shadow_additional_instance_assumed
+                for cue in self.state.surgeon_request_queue
+            ],
         }
 
     def _cleanup_still_pending(self) -> bool:
@@ -764,97 +1497,12 @@ class ORDigitalTwin:
                 return True
         return False
 
-    def _queue_mayo_reuse_for_completion_cleanup(self, reason: str) -> None:
-        if self.state.execution_state != "finishing":
-            return
-        for state in list(self.instrument_states.values()):
-            if state.lifecycle_stage == LIFECYCLE_MAYO_REUSE:
-                self._open_recovery_transaction(state.instrument_id, reason)
-
-    def _place_surgeon_owned_on_mayo_for_completion_cleanup(self, reason: str) -> None:
-        if self.state.execution_state != "finishing":
-            return
-        for state in list(self.instrument_states.values()):
-            if state.lifecycle_stage != LIFECYCLE_SURGEON_OWNED:
-                continue
-            if not self._apply_event_transition(
-                state=state,
-                next_stage=LIFECYCLE_MAYO_RECOVERY,
-                event_type="CompletionHeldToolPlacedOnMayo",
-                location_type="mayo_recovery_zone",
-                location_id="mayo_recovery_zone",
-                confidence=max(state.confidence, 0.86),
-            ):
-                continue
-            self._open_recovery_transaction(state.instrument_id, reason)
-            self._record_event(
-                "CompletionHeldToolPlacedOnMayo",
-                {
-                    "instrument_id": state.instrument_id,
-                    "reason": reason,
-                },
-            )
-
-    def _queue_mayo_capacity_recovery(self) -> None:
-        if self.state.execution_state not in {"running", "finishing"}:
-            return
-        if (
-            self.state.active_recovery_tools
-            or self.state.active_robot_task is not None
-            or self.state.left_hand_tool
-            or self.state.cleaner_busy
-        ):
-            return
-        reusable_states = [
-            state
-            for state in self.instrument_states.values()
-            if state.lifecycle_stage == LIFECYCLE_MAYO_REUSE
-        ]
-        if len(reusable_states) <= MAYO_REUSE_SOFT_LIMIT:
-            return
-        protected_tools = {
-            tool_id
-            for tool_id in {
-                self.state.surgeon_request_tool,
-                self.state.explicit_request_tool,
-                self.state.predicted_tool,
-            }
-            if tool_id
-        }
-        candidates = [state for state in reusable_states if state.instrument_id not in protected_tools]
-        if not candidates:
-            return
-        selected = min(candidates, key=lambda state: state.last_update_sec or 0.0)
-        if not self._apply_event_transition(
-            state=selected,
-            next_stage=LIFECYCLE_MAYO_RECOVERY,
-            event_type="MayoCapacityRecoveryQueued",
-            location_type="mayo_recovery_zone",
-            location_id="mayo_recovery_zone",
-            confidence=max(selected.confidence, 0.82),
-        ):
-            return
-        self._open_recovery_transaction(selected.instrument_id, "mayo_capacity_soft_limit")
-        self._record_event(
-            "MayoCapacityRecoveryQueued",
-            {
-                "instrument_id": selected.instrument_id,
-                "mayo_reuse_count": len(reusable_states),
-                "soft_limit": MAYO_REUSE_SOFT_LIMIT,
-                "protected_tools": sorted(protected_tools),
-            },
-        )
-
     def _begin_completion_cleanup(self) -> None:
         self._clear_surgeon_request_state()
         self.state.surgeon_intent = "procedure_finishing"
         if self.state.execution_state != "completed":
             self.state.running = True
             self.state.execution_state = "finishing"
-            self._place_surgeon_owned_on_mayo_for_completion_cleanup(
-                "completion_cleanup_place_held_on_mayo"
-            )
-            self._queue_mayo_reuse_for_completion_cleanup("completion_cleanup_queue_mayo_reuse")
 
     def _mark_completed(self) -> None:
         was_completed = self.state.execution_state == "completed"
@@ -863,14 +1511,18 @@ class ORDigitalTwin:
         self.state.cleaner_busy = False
         self.state.cleaner_remaining_sec = 0.0
         self.state.left_hand_tool = ""
+        self.state.left_hand_tool_instance_id = ""
         self.state.right_hand_tool = ""
+        self.state.right_hand_tool_instance_id = ""
         self.state.prepositioned_tool = ""
+        self.state.prepositioned_tool_instance_id = ""
         self.state.robot_state = "idle"
         self.state.running = False
         self.state.execution_state = "completed"
         self.state.surgeon_intent = "procedure_complete"
         self.state.pending_transition_tools = []
         self.state.active_recovery_tools = []
+        self.state.active_recovery_tool_instances = []
         if not was_completed:
             self._record_event(
                 "ProcedureCompleted",
@@ -894,11 +1546,13 @@ class ORDigitalTwin:
         source_anchor_id: str,
         target_anchor_id: str,
         duration_sec: float,
+        instrument_instance_id: str = "",
     ) -> None:
         self.state.active_robot_task = ActiveRobotTask(
             task_id=task_id,
             task_type=task_type,
             instrument_id=instrument_id,
+            instrument_instance_id=instrument_instance_id,
             arm=arm,
             source_anchor_id=source_anchor_id,
             target_anchor_id=target_anchor_id,
@@ -932,7 +1586,7 @@ class ORDigitalTwin:
         for observation in stage.observations:
             if not observation.visible:
                 continue
-            state = self.instrument_states.get(observation.instrument_id)
+            state = self.get_instrument_state(observation.instrument_id)
             if state is None:
                 continue
             self._apply_observation_rebase(
@@ -942,10 +1596,32 @@ class ORDigitalTwin:
                 confidence=float(observation.confidence),
                 stamp_sec=0.0,
             )
+        self._relocate_phase_field_deployed_tools(
+            self.state.filtered_phase,
+            reason="initial_perception_phase",
+        )
 
     def _record_event(self, event_type: str, payload: dict[str, Any]) -> None:
         self.event_history.append({"event_type": event_type, **payload})
         self.state.recent_event_types.appendleft(event_type)
+
+    def _record_shadow_assumption(
+        self,
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> None:
+        audit_payload = {
+            "event_type": event_type,
+            **payload,
+            "ground_truth_used": False,
+        }
+        self._shadow_assumption_audit.append(dict(audit_payload))
+        self._record_event(event_type, audit_payload)
+
+    def drain_shadow_assumption_audit(self) -> list[dict[str, Any]]:
+        assumptions = list(self._shadow_assumption_audit)
+        self._shadow_assumption_audit.clear()
+        return assumptions
 
     def _phase_evidence_summary(self, phase_id: str) -> tuple[float, float, int]:
         if not phase_id or not self._phase_evidence_history:
@@ -963,27 +1639,86 @@ class ORDigitalTwin:
             return (0.0, 1.0, 0)
         return (sum(scores) / len(scores), sum(uncertainties) / max(len(uncertainties), 1), len(scores))
 
-    def _phase_interaction_complete(self, phase_id: str) -> bool:
-        expected = list(self.spec.get_expected_instruments(phase_id))
+    def _phase_evidence_summary_at_or_after(
+        self, phase_id: str
+    ) -> tuple[float, float, int]:
+        """Treat a stable later normal phase as evidence that earlier steps passed."""
+
+        floor_index = self._normal_phase_index(phase_id)
+        if floor_index < 0 or not self._phase_evidence_history:
+            return (0.0, 1.0, 0)
+        recent = list(self._phase_evidence_history)[
+            -max(1, int(self.spec.bundle.phase_guard.smoothing_window)) :
+        ]
+        scores: list[float] = []
+        uncertainties: list[float] = []
+        for sample in recent:
+            phase_scores = sample.get("scores", {})
+            if not isinstance(phase_scores, dict):
+                continue
+            downstream_score = max(
+                (
+                    float(score)
+                    for candidate, score in phase_scores.items()
+                    if self._normal_phase_index(str(candidate)) >= floor_index
+                ),
+                default=0.0,
+            )
+            scores.append(downstream_score)
+            uncertainties.append(float(sample.get("uncertainty", 1.0)))
+        if not scores:
+            return (0.0, 1.0, 0)
+        return (
+            sum(scores) / len(scores),
+            sum(uncertainties) / max(len(uncertainties), 1),
+            len(scores),
+        )
+
+    def _phase_transition_required_counts(
+        self, current_phase: str, target_phase: str
+    ) -> dict[str, int]:
+        configured = self._configured_phase_transition_required_counts.get(
+            (current_phase, target_phase)
+        )
+        return dict(configured) if configured is not None else {}
+
+    def _phase_interaction_complete(
+        self, current_phase: str, target_phase: str
+    ) -> bool:
+        required_counts = self._phase_transition_required_counts(
+            current_phase, target_phase
+        )
+        if required_counts:
+            observed = self._phase_instance_interactions.get(
+                current_phase, {}
+            )
+            return all(
+                len(observed.get(tool_id, set())) >= required_count
+                for tool_id, required_count in required_counts.items()
+            )
+
+        expected = list(self.spec.get_expected_instruments(current_phase))
         if not expected:
             return True
         completed_count = 0
         for tool_id in expected:
-            state = self.instrument_states.get(tool_id)
-            if state is None:
-                continue
-            if state.ever_surgeon_owned:
+            instances = self._instances_for_type(tool_id)
+            if any(state.ever_surgeon_owned for state in instances):
                 completed_count += 1
                 continue
-            if state.lifecycle_stage in {
-                LIFECYCLE_SURGEON_OWNED,
-                LIFECYCLE_MAYO_REUSE,
-                LIFECYCLE_MAYO_RECOVERY,
-                LIFECYCLE_RECOVERING_LEFT,
-                LIFECYCLE_CLEANING_LEFT,
-                LIFECYCLE_CLEANED_LEFT,
-                LIFECYCLE_RETURNED_HOME,
-            }:
+            if any(
+                state.lifecycle_stage
+                in {
+                    LIFECYCLE_SURGEON_OWNED,
+                    LIFECYCLE_MAYO_REUSE,
+                    LIFECYCLE_MAYO_RECOVERY,
+                    LIFECYCLE_RECOVERING_LEFT,
+                    LIFECYCLE_CLEANING_LEFT,
+                    LIFECYCLE_CLEANED_LEFT,
+                    LIFECYCLE_RETURNED_HOME,
+                }
+                for state in instances
+            ):
                 completed_count += 1
         required_count = max(1, math.ceil(len(expected) * PHASE_INTERACTION_MIN_FRACTION))
         return completed_count >= required_count
@@ -1083,9 +1818,22 @@ class ORDigitalTwin:
         self.state.recent_event_types.appendleft(f"{event_type}:{target_phase}")
         return {"event_type": event_type, **payload}
 
-    def _phase_evidence_stable_enough(self, target_phase: str, *, require_full_window: bool = True) -> tuple[bool, float, int]:
+    def _phase_evidence_stable_enough(
+        self,
+        target_phase: str,
+        *,
+        require_full_window: bool = True,
+        include_later_normal_phases: bool = False,
+    ) -> tuple[bool, float, int]:
         guard = self.spec.bundle.phase_guard
-        average_confidence, average_uncertainty, sample_count = self._phase_evidence_summary(target_phase)
+        if include_later_normal_phases:
+            average_confidence, average_uncertainty, sample_count = (
+                self._phase_evidence_summary_at_or_after(target_phase)
+            )
+        else:
+            average_confidence, average_uncertainty, sample_count = (
+                self._phase_evidence_summary(target_phase)
+            )
         required_samples = max(2, int(guard.smoothing_window)) if require_full_window else 1
         stable = (
             sample_count >= required_samples
@@ -1095,6 +1843,16 @@ class ORDigitalTwin:
         return stable, average_confidence, sample_count
 
     def _static_or_dynamic_transition_allowed(self, current_phase: str, target_phase: str) -> bool:
+        current_index = self._normal_phase_index(current_phase)
+        target_index = self._normal_phase_index(target_phase)
+        if (
+            target_index >= 0
+            and (
+                target_index < self._initial_phase_floor_index
+                or (current_index >= 0 and target_index < current_index)
+            )
+        ):
+            return False
         if self.spec.is_transition_allowed(current_phase, target_phase):
             return True
         if self.spec.is_interrupt_phase(current_phase):
@@ -1110,6 +1868,23 @@ class ORDigitalTwin:
         cue_id: str = "",
     ) -> dict[str, Any]:
         current_phase = self.state.filtered_phase or self.spec.default_phase_id
+        target_index = self._normal_phase_index(target_phase)
+        current_index = self._normal_phase_index(current_phase)
+        if (
+            target_index >= 0
+            and (
+                target_index < self._initial_phase_floor_index
+                or (current_index >= 0 and target_index < current_index)
+            )
+        ):
+            return self._record_phase_decision(
+                target_phase=target_phase,
+                accepted=False,
+                reason="phase_regression_below_start_floor",
+                confidence=confidence,
+                cue_id=cue_id,
+                current_phase=current_phase,
+            )
         if self.spec.is_interrupt_phase(target_phase) and self.spec.is_normal_phase(current_phase):
             self._last_normal_phase_before_interrupt = current_phase
             self._set_active_interrupt_context(target_phase, reason)
@@ -1124,6 +1899,11 @@ class ORDigitalTwin:
         self.state.phase_confidence = float(confidence)
         self.state.phase_uncertain = False
         self.state.phase_stability = min(1.0, float(confidence))
+        self._relocate_phase_field_deployed_tools(
+            target_phase,
+            reason="phase_transition_approved",
+        )
+        self._phase_bootstrap_open = False
         self._phase_entered_sec = self._monotonic_sec()
         self._pending_phase_cues.clear()
         self._phase_decision_cooldowns.clear()
@@ -1139,7 +1919,13 @@ class ORDigitalTwin:
             current_phase=current_phase,
         )
 
-    def _try_approve_phase_transition(self, target_phase: str, *, cue_id: str = "") -> dict[str, Any]:
+    def _try_approve_phase_transition(
+        self,
+        target_phase: str,
+        *,
+        cue_id: str = "",
+        allow_downstream_evidence: bool = False,
+    ) -> dict[str, Any]:
         current_phase = self.state.filtered_phase or self.spec.default_phase_id
         guard = self.spec.bundle.phase_guard
         if self.state.execution_state in {"finishing", "completed"}:
@@ -1160,11 +1946,62 @@ class ORDigitalTwin:
                 confidence=0.0,
                 cue_id=cue_id,
             )
+        target_index = self._normal_phase_index(target_phase)
+        current_index = self._normal_phase_index(current_phase)
+        if (
+            target_index >= 0
+            and (
+                target_index < self._initial_phase_floor_index
+                or (current_index >= 0 and target_index < current_index)
+            )
+        ):
+            return self._record_phase_decision(
+                target_phase=target_phase,
+                accepted=False,
+                reason="phase_regression_below_start_floor",
+                confidence=0.0,
+                cue_id=cue_id,
+            )
+        if (
+            self._phase_bootstrap_open
+            and current_phase == self.spec.default_phase_id
+            and self.spec.is_normal_phase(target_phase)
+            and target_phase != current_phase
+            and target_phase not in self._pending_phase_cues
+        ):
+            stable, average_confidence, _ = self._phase_evidence_stable_enough(
+                target_phase
+            )
+            if stable:
+                return self._approve_phase_transition(
+                    target_phase,
+                    reason="stable_vlm_phase_bootstrap",
+                    confidence=average_confidence,
+                    cue_id=cue_id,
+                )
+            return self._record_phase_decision(
+                target_phase=target_phase,
+                accepted=False,
+                reason="phase_bootstrap_evidence_not_stable",
+                confidence=average_confidence,
+                cue_id=cue_id,
+            )
         if not self._static_or_dynamic_transition_allowed(current_phase, target_phase):
             return self._record_phase_decision(
                 target_phase=target_phase,
                 accepted=False,
                 reason="phase_transition_not_allowed_by_spec",
+                confidence=0.0,
+                cue_id=cue_id,
+            )
+        if (
+            not self._phase_bootstrap_open
+            and not self._phase_field_deployment_ready(target_phase)
+        ):
+            return self._record_phase_decision(
+                target_phase=target_phase,
+                accepted=False,
+                reason="phase_field_deployment_not_observed",
                 confidence=0.0,
                 cue_id=cue_id,
             )
@@ -1269,14 +2106,28 @@ class ORDigitalTwin:
                 confidence=average_confidence,
                 cue_id=cue_id,
             )
+        evidence_stable = False
+        evidence_confidence = 0.0
         if cue is None:
-            return self._record_phase_decision(
-                target_phase=target_phase,
-                accepted=False,
-                reason="missing_surgeon_advance_cue",
-                confidence=0.0,
-                cue_id=cue_id,
+            evidence_stable, evidence_confidence, _ = (
+                self._phase_evidence_stable_enough(
+                    target_phase,
+                    include_later_normal_phases=allow_downstream_evidence,
+                )
             )
+            if not evidence_stable:
+                return self._record_phase_decision(
+                    target_phase=target_phase,
+                    accepted=False,
+                    reason="phase_evidence_not_stable",
+                    confidence=evidence_confidence,
+                    cue_id=cue_id,
+                )
+        resolved_cue_id = (
+            str(cue.get("cue_id", cue_id))
+            if cue is not None
+            else cue_id
+        )
         dwell_elapsed = self._monotonic_sec() - self._phase_entered_sec
         min_dwell = max(float(guard.min_dwell_time_sec), float(self.spec.get_phase_min_duration(current_phase)))
         if dwell_elapsed < min_dwell:
@@ -1285,7 +2136,7 @@ class ORDigitalTwin:
                 accepted=False,
                 reason="phase_min_dwell_not_satisfied",
                 confidence=0.0,
-                cue_id=str(cue.get("cue_id", cue_id)),
+                cue_id=resolved_cue_id,
             )
         blocking_reason = self._phase_blocking_reason()
         if blocking_reason:
@@ -1294,24 +2145,47 @@ class ORDigitalTwin:
                 accepted=False,
                 reason=blocking_reason,
                 confidence=0.0,
-                cue_id=str(cue.get("cue_id", cue_id)),
+                cue_id=resolved_cue_id,
             )
-        if not self._phase_interaction_complete(current_phase):
+        required_counts = self._phase_transition_required_counts(
+            current_phase, target_phase
+        )
+        if required_counts and not self._phase_interaction_complete(
+            current_phase, target_phase
+        ):
             return self._record_phase_decision(
                 target_phase=target_phase,
                 accepted=False,
-                reason="required_tool_interaction_incomplete",
+                reason="required_transition_evidence_incomplete",
                 confidence=0.0,
-                cue_id=str(cue.get("cue_id", cue_id)),
+                cue_id=resolved_cue_id,
             )
 
-        average_confidence, average_uncertainty, sample_count = self._phase_evidence_summary(target_phase)
+        if allow_downstream_evidence:
+            average_confidence, average_uncertainty, sample_count = (
+                self._phase_evidence_summary_at_or_after(target_phase)
+            )
+        else:
+            average_confidence, average_uncertainty, sample_count = (
+                self._phase_evidence_summary(target_phase)
+            )
+        if cue is None:
+            return self._approve_phase_transition(
+                target_phase,
+                reason=(
+                    "stable_downstream_vlm_evidence"
+                    if allow_downstream_evidence
+                    else "stable_vlm_phase_evidence"
+                ),
+                confidence=max(evidence_confidence, average_confidence),
+                cue_id=cue_id,
+            )
         cue_confidence = max(float(cue.get("confidence", 0.0)), average_confidence)
         return self._approve_phase_transition(
             target_phase,
             reason="surgeon_cue_accepted",
             confidence=cue_confidence,
-            cue_id=str(cue.get("cue_id", cue_id)),
+            cue_id=resolved_cue_id,
         )
 
     def apply_phase_transition_cue(self, cue: PhaseTransitionCue) -> dict[str, Any]:
@@ -1383,6 +2257,33 @@ class ORDigitalTwin:
             top_phase = ranked[0][0]
             if top_phase != current_phase and self.spec.is_interrupt_phase(current_phase):
                 decisions.append(self._try_approve_phase_transition(top_phase))
+            elif (
+                top_phase != current_phase
+                and self.spec.is_normal_phase(current_phase)
+                and self.spec.is_normal_phase(top_phase)
+            ):
+                current_index = self._normal_phase_index(current_phase)
+                top_index = self._normal_phase_index(top_phase)
+                if self._phase_bootstrap_open:
+                    decisions.append(
+                        self._try_approve_phase_transition(top_phase)
+                    )
+                elif self._static_or_dynamic_transition_allowed(
+                    current_phase, top_phase
+                ):
+                    decisions.append(
+                        self._try_approve_phase_transition(top_phase)
+                    )
+                elif top_index > current_index:
+                    next_phase = self.spec.get_next_normal_phase(current_phase)
+                    next_index = self._normal_phase_index(next_phase)
+                    if next_phase and current_index < next_index <= top_index:
+                        decisions.append(
+                            self._try_approve_phase_transition(
+                                next_phase,
+                                allow_downstream_evidence=True,
+                            )
+                        )
             if self.spec.is_normal_phase(current_phase):
                 for phase_id, confidence in ranked:
                     if phase_id == current_phase or not self.spec.is_interrupt_phase(phase_id):
@@ -1395,15 +2296,30 @@ class ORDigitalTwin:
             decisions.append(self._try_approve_phase_transition(target_phase))
         return [decision for decision in decisions if decision]
 
-    def _open_recovery_transaction(self, instrument_id: str, reason: str) -> None:
-        if not instrument_id or instrument_id not in self.instrument_states:
+    def _open_recovery_transaction(
+        self, instrument_or_instance_id: str, reason: str
+    ) -> None:
+        state = self.get_instrument_state(
+            instrument_or_instance_id,
+            allowed_lifecycles={
+                LIFECYCLE_SURGEON_OWNED,
+                LIFECYCLE_MAYO_REUSE,
+                LIFECYCLE_MAYO_RECOVERY,
+                LIFECYCLE_RECOVERING_LEFT,
+                LIFECYCLE_CLEANING_LEFT,
+                LIFECYCLE_CLEANED_LEFT,
+            },
+        )
+        if state is None:
             return
-        state = self.instrument_states[instrument_id]
-        if self._is_active_requested_tool(instrument_id) and self.state.surgeon_intent in ACTIVE_REQUEST_INTENTS:
+        instrument_id = state.instrument_id
+        instance_id = state.instance_id
+        if self._is_active_requested_tool(instance_id) and self.state.surgeon_intent in ACTIVE_REQUEST_INTENTS:
             self._record_event(
                 "RecoveryBlockedForActiveRequest",
                 {
                     "instrument_id": instrument_id,
+                    "instance_id": instance_id,
                     "reason": reason,
                     "active_request_tool": self._active_requested_tool_id(),
                     "surgeon_intent": self.state.surgeon_intent,
@@ -1419,6 +2335,7 @@ class ORDigitalTwin:
                 "RecoveryTransactionMarkedMayoReuse",
                 {
                     "instrument_id": instrument_id,
+                    "instance_id": instance_id,
                     "reason": reason,
                     "location_id": state.location_id,
                     "location_type": state.location_type,
@@ -1436,38 +2353,82 @@ class ORDigitalTwin:
                 "RecoveryTransactionIgnored",
                 {
                     "instrument_id": instrument_id,
+                    "instance_id": instance_id,
                     "reason": reason,
                     "lifecycle_stage": state.lifecycle_stage,
                 },
             )
             return
-        if instrument_id in self.state.active_recovery_tools:
+        if instance_id in self.state.active_recovery_tool_instances:
             return
-        self.state.active_recovery_tools.append(instrument_id)
+        self.state.active_recovery_tool_instances.append(instance_id)
+        if instrument_id not in self.state.active_recovery_tools:
+            self.state.active_recovery_tools.append(instrument_id)
         self._record_event(
             "RecoveryTransactionOpened",
             {
                 "instrument_id": instrument_id,
+                "instance_id": instance_id,
                 "reason": reason,
             },
         )
 
-    def _close_recovery_transaction(self, instrument_id: str, reason: str) -> None:
-        if not instrument_id or instrument_id not in self.state.active_recovery_tools:
+    def _close_recovery_transaction(
+        self, instrument_or_instance_id: str, reason: str
+    ) -> None:
+        state = self.get_instrument_state(instrument_or_instance_id)
+        instance_id = (
+            state.instance_id if state is not None else instrument_or_instance_id
+        )
+        if (
+            not instance_id
+            or instance_id not in self.state.active_recovery_tool_instances
+        ):
             return
-        self.state.active_recovery_tools = [
-            tool_id for tool_id in self.state.active_recovery_tools if tool_id != instrument_id
+        self.state.active_recovery_tool_instances = [
+            candidate
+            for candidate in self.state.active_recovery_tool_instances
+            if candidate != instance_id
         ]
+        instrument_id = (
+            state.instrument_id
+            if state is not None
+            else instance_id.partition("#")[0]
+        )
+        remaining_types = {
+            candidate.partition("#")[0]
+            for candidate in self.state.active_recovery_tool_instances
+        }
+        self.state.active_recovery_tools = sorted(remaining_types)
         self._record_event(
             "RecoveryTransactionClosed",
             {
                 "instrument_id": instrument_id,
+                "instance_id": instance_id,
                 "reason": reason,
             },
         )
 
-    def _recovery_transaction_active(self, instrument_id: str) -> bool:
-        return bool(instrument_id and instrument_id in self.state.active_recovery_tools)
+    def _recovery_transaction_active(
+        self, instrument_or_instance_id: str
+    ) -> bool:
+        if not instrument_or_instance_id:
+            return False
+        if (
+            instrument_or_instance_id
+            in self.state.active_recovery_tool_instances
+        ):
+            return True
+        state = self._state_by_instance(instrument_or_instance_id)
+        instrument_id = (
+            state.instrument_id
+            if state is not None
+            else instrument_or_instance_id
+        )
+        return any(
+            candidate.partition("#")[0] == instrument_id
+            for candidate in self.state.active_recovery_tool_instances
+        )
 
     def _set_flag(self, flag: str, enabled: bool) -> None:
         if enabled:
@@ -1508,6 +2469,7 @@ class ORDigitalTwin:
         location_type: str,
         location_id: str,
         confidence: float,
+        instance_id: str = "",
     ) -> dict[str, Any]:
         event_type = {
             "accepted": "VLMProposalAccepted",
@@ -1518,6 +2480,7 @@ class ORDigitalTwin:
             "source": source,
             "proposal_id": proposal_id,
             "instrument_id": instrument_id,
+            "instance_id": instance_id,
             "current_lifecycle": current_stage,
             "proposed_lifecycle": observed_stage,
             "proposed_transition": f"{current_stage}->{observed_stage}",
@@ -1543,8 +2506,14 @@ class ORDigitalTwin:
         location_id: str,
         confidence: float,
         stamp_sec: float,
+        instance_id: str = "",
     ) -> dict[str, Any] | None:
-        key = (instrument_id, current_stage, observed_stage, location_type)
+        key = (
+            instance_id or instrument_id,
+            current_stage,
+            observed_stage,
+            location_type,
+        )
         last_seen = self._observation_violation_cooldowns.get(key, -9999.0)
         if stamp_sec - last_seen < 1.0:
             return None
@@ -1560,76 +2529,140 @@ class ORDigitalTwin:
             location_type=location_type,
             location_id=location_id,
             confidence=confidence,
+            instance_id=instance_id,
         )
 
-    def promote_mayo_recovery_from_vlm(
+    def record_mayo_policy_evidence(
         self,
         *,
         instrument_id: str,
+        evidence_type: str,
         confidence: float,
+        stability_sec: float,
         source: str,
         proposal_id: str,
         stamp_sec: float,
     ) -> dict[str, Any] | None:
-        resolved = self.spec.resolve_instrument_alias(instrument_id) or instrument_id
-        state = self.instrument_states.get(resolved)
+        direct_state = self._state_by_instance(instrument_id)
+        resolved = (
+            direct_state.instrument_id
+            if direct_state is not None
+            else self.spec.resolve_instrument_alias(instrument_id)
+            or instrument_id
+        )
+        state = self._select_instance(
+            resolved,
+            preferred_instance_id=(
+                direct_state.instance_id if direct_state is not None else ""
+            ),
+            allowed_lifecycles={
+                LIFECYCLE_MAYO_REUSE,
+                LIFECYCLE_MAYO_RECOVERY,
+            },
+        )
         if state is None:
-            return None
+            return self._record_vlm_proposal_decision(
+                reducer_result="rejected",
+                reducer_reason="mayo_policy_tool_not_on_mayo",
+                source=source,
+                proposal_id=proposal_id,
+                instrument_id=resolved,
+                current_stage="not_on_mayo",
+                observed_stage="not_on_mayo",
+                location_type="mayo_stand",
+                location_id="mayo_stand",
+                confidence=confidence,
+            )
         current_stage = state.lifecycle_stage
         if current_stage not in {LIFECYCLE_MAYO_REUSE, LIFECYCLE_MAYO_RECOVERY}:
             return self._record_vlm_proposal_decision(
                 reducer_result="rejected",
-                reducer_reason="mayo_retrieve_tool_not_on_mayo",
+                reducer_reason="mayo_policy_tool_not_on_mayo",
                 source=source,
                 proposal_id=proposal_id,
                 instrument_id=resolved,
                 current_stage=current_stage,
-                observed_stage=LIFECYCLE_MAYO_RECOVERY,
-                location_type="mayo_recovery_zone",
-                location_id="mayo_recovery_zone",
+                observed_stage=current_stage,
+                location_type=state.location_type,
+                location_id=state.location_id,
                 confidence=confidence,
+                instance_id=state.instance_id,
+            )
+        if evidence_type not in {"recover", "reuse"}:
+            return self._record_vlm_proposal_decision(
+                reducer_result="rejected",
+                reducer_reason="unknown_mayo_policy_evidence",
+                source=source,
+                proposal_id=proposal_id,
+                instrument_id=resolved,
+                current_stage=current_stage,
+                observed_stage=current_stage,
+                location_type=state.location_type,
+                location_id=state.location_id,
+                confidence=confidence,
+                instance_id=state.instance_id,
             )
 
-        self.state.surgeon_intent = "return_tool"
-        self.state.surgeon_request_tool = resolved
-        self.state.surgeon_ready_for_handover = False
-        self.state.surgeon_ready_for_retrieval = True
-        self._open_recovery_transaction(resolved, "vlm_mayo_retrieve_stable")
-        if current_stage != LIFECYCLE_MAYO_RECOVERY:
-            self._current_event_stamp_sec = stamp_sec
-            if not self._apply_event_transition(
-                state=state,
-                next_stage=LIFECYCLE_MAYO_RECOVERY,
-                event_type="VLMStableMayoRetrieve",
-                location_type="mayo_recovery_zone",
-                location_id="mayo_recovery_zone",
-                confidence=confidence,
-            ):
-                return self._record_vlm_proposal_decision(
-                    reducer_result="rejected",
-                    reducer_reason="illegal_mayo_recovery_promotion",
-                    source=source,
-                    proposal_id=proposal_id,
-                    instrument_id=resolved,
-                    current_stage=current_stage,
-                    observed_stage=LIFECYCLE_MAYO_RECOVERY,
-                    location_type="mayo_recovery_zone",
-                    location_id="mayo_recovery_zone",
-                    confidence=confidence,
-                )
-        self._recompute_transient_state()
-        return self._record_vlm_proposal_decision(
+        bounded_confidence = max(0.0, min(1.0, float(confidence)))
+        bounded_stability = max(0.0, float(stability_sec))
+        if evidence_type == "recover":
+            state.mayo_recovery_confidence = bounded_confidence
+            state.mayo_recovery_stability_sec = bounded_stability
+            state.mayo_reuse_confidence = 0.0
+            state.mayo_reuse_stability_sec = 0.0
+        else:
+            state.mayo_reuse_confidence = bounded_confidence
+            state.mayo_reuse_stability_sec = bounded_stability
+            state.mayo_recovery_confidence = 0.0
+            state.mayo_recovery_stability_sec = 0.0
+        state.mayo_evidence_source = source
+        state.last_update_sec = max(float(state.last_update_sec), float(stamp_sec))
+        result = self._record_vlm_proposal_decision(
             reducer_result="accepted",
-            reducer_reason="stable_mayo_retrieve",
+            reducer_reason=f"verified_mayo_{evidence_type}_evidence",
             source=source,
             proposal_id=proposal_id,
             instrument_id=resolved,
             current_stage=current_stage,
-            observed_stage=LIFECYCLE_MAYO_RECOVERY,
-            location_type="mayo_recovery_zone",
-            location_id="mayo_recovery_zone",
-            confidence=confidence,
+            observed_stage=current_stage,
+            location_type=state.location_type,
+            location_id=state.location_id,
+            confidence=bounded_confidence,
+            instance_id=state.instance_id,
         )
+        result["evidence_type"] = evidence_type
+        result["stability_sec"] = bounded_stability
+        result["procedure_future_use_expected"] = self.procedure_future_use_expected(
+            state.instance_id
+        )
+        return result
+
+    def clear_mayo_policy_evidence(self, instrument_id: str) -> bool:
+        direct_state = self._state_by_instance(instrument_id)
+        resolved = (
+            direct_state.instrument_id
+            if direct_state is not None
+            else self.spec.resolve_instrument_alias(instrument_id)
+            or instrument_id
+        )
+        state = self._select_instance(
+            resolved,
+            preferred_instance_id=(
+                direct_state.instance_id if direct_state is not None else ""
+            ),
+            allowed_lifecycles={
+                LIFECYCLE_MAYO_REUSE,
+                LIFECYCLE_MAYO_RECOVERY,
+            },
+        )
+        if state is None:
+            return False
+        state.mayo_reuse_confidence = 0.0
+        state.mayo_reuse_stability_sec = 0.0
+        state.mayo_recovery_confidence = 0.0
+        state.mayo_recovery_stability_sec = 0.0
+        state.mayo_evidence_source = ""
+        return True
 
     def _set_lifecycle(
         self,
@@ -1641,10 +2674,17 @@ class ORDigitalTwin:
         confidence: float | None = None,
         reserved_for: str | None = None,
         last_update_sec: float | None = None,
+        placement_evidence: str | None = None,
     ) -> None:
+        previous_stage = state.lifecycle_stage
         state.lifecycle_stage = lifecycle_stage
         if lifecycle_stage in {LIFECYCLE_SURGEON_OWNED, LIFECYCLE_MAYO_REUSE, LIFECYCLE_MAYO_RECOVERY}:
             state.ever_surgeon_owned = True
+        if lifecycle_stage == LIFECYCLE_SURGEON_OWNED:
+            phase_id = self.state.filtered_phase or self.spec.default_phase_id
+            self._phase_instance_interactions[phase_id][
+                state.instrument_id
+            ].add(state.instance_id)
         if lifecycle_stage in {LIFECYCLE_RECOVERING_LEFT, LIFECYCLE_CLEANING_LEFT, LIFECYCLE_CLEANED_LEFT} and state.last_holder == "surgeon":
             state.ever_surgeon_owned = True
 
@@ -1657,6 +2697,22 @@ class ORDigitalTwin:
             state.confidence = confidence
         if last_update_sec is not None:
             state.last_update_sec = last_update_sec
+        if lifecycle_stage in {LIFECYCLE_MAYO_REUSE, LIFECYCLE_MAYO_RECOVERY}:
+            if previous_stage not in {LIFECYCLE_MAYO_REUSE, LIFECYCLE_MAYO_RECOVERY}:
+                state.mayo_reuse_confidence = 0.0
+                state.mayo_reuse_stability_sec = 0.0
+                state.mayo_recovery_confidence = 0.0
+                state.mayo_recovery_stability_sec = 0.0
+                state.mayo_evidence_source = ""
+            if placement_evidence is not None:
+                state.mayo_placement_evidence = placement_evidence
+        else:
+            state.mayo_placement_evidence = ""
+            state.mayo_reuse_confidence = 0.0
+            state.mayo_reuse_stability_sec = 0.0
+            state.mayo_recovery_confidence = 0.0
+            state.mayo_recovery_stability_sec = 0.0
+            state.mayo_evidence_source = ""
 
         if lifecycle_stage in {LIFECYCLE_HOME_RACK, LIFECYCLE_PREPOSITIONED_RIGHT}:
             state.cleanliness_state = "sterile"
@@ -1695,13 +2751,33 @@ class ORDigitalTwin:
         allowed_targets = ALLOWED_EVENT_TRANSITIONS.get(state.lifecycle_stage, set())
         return next_stage in allowed_targets
 
-    def _has_strong_return_context(self, instrument_id: str) -> bool:
-        if self._recovery_transaction_active(instrument_id):
+    def _has_strong_return_context(
+        self, instrument_or_instance_id: str
+    ) -> bool:
+        if self._recovery_transaction_active(instrument_or_instance_id):
             return True
-        if self.state.surgeon_request_tool == instrument_id and self.state.surgeon_intent in ACTIVE_RETURN_INTENTS:
+        state = self.get_instrument_state(instrument_or_instance_id)
+        instrument_id = (
+            state.instrument_id if state is not None else instrument_or_instance_id
+        )
+        instance_id = state.instance_id if state is not None else ""
+        request_matches = bool(
+            (
+                instance_id
+                and self.state.surgeon_request_instance_id == instance_id
+            )
+            or (
+                not self.state.surgeon_request_instance_id
+                and self.state.surgeon_request_tool == instrument_id
+            )
+        )
+        if (
+            request_matches
+            and self.state.surgeon_intent in ACTIVE_RETURN_INTENTS
+        ):
             return True
         if self.state.surgeon_ready_for_retrieval and (
-            not self.state.surgeon_request_tool or self.state.surgeon_request_tool == instrument_id
+            not self.state.surgeon_request_tool or request_matches
         ):
             return True
         return False
@@ -1711,20 +2787,50 @@ class ORDigitalTwin:
         *,
         state: InstrumentBelief,
         observed_stage: str,
+        source: str,
+        confidence: float,
     ) -> tuple[bool, str]:
         current_stage = state.lifecycle_stage
         if observed_stage == current_stage:
             return (True, "")
         if (current_stage, observed_stage) in OBSERVATION_STICKY_DIRECT_BLOCKS:
             return (False, "observation_direct_rebase_forbidden")
-        if not self._transition_allowed(state, observed_stage):
+        corroborated_mayo_rebase = bool(
+            source in CAM4_MAYO_OBSERVATION_SOURCES
+            and current_stage
+            in {LIFECYCLE_HOME_RACK, LIFECYCLE_RETURNED_HOME}
+            and observed_stage == LIFECYCLE_MAYO_REUSE
+        )
+        if (
+            not self._transition_allowed(state, observed_stage)
+            and not corroborated_mayo_rebase
+        ):
             return (False, "illegal_observation_transition")
         if observed_stage == LIFECYCLE_MAYO_RECOVERY and current_stage in {
             LIFECYCLE_SURGEON_OWNED,
             LIFECYCLE_MAYO_REUSE,
         }:
-            if not self._has_strong_return_context(state.instrument_id):
+            if not self._has_strong_return_context(state.instance_id):
                 return (False, "observation_recovery_without_return_context")
+        if (
+            current_stage == LIFECYCLE_SURGEON_OWNED
+            and state.location_type in {"surgical_field", "bed_fixed_tool"}
+            and observed_stage in {
+                LIFECYCLE_MAYO_REUSE,
+                LIFECYCLE_MAYO_RECOVERY,
+            }
+            and not self._has_strong_return_context(state.instance_id)
+        ):
+            stable_cam4_mayo_return = bool(
+                source in CAM4_MAYO_OBSERVATION_SOURCES
+                and observed_stage == LIFECYCLE_MAYO_REUSE
+                and confidence >= CAM4_MAYO_TRANSITION_MIN_CONFIDENCE
+            )
+            if not stable_cam4_mayo_return:
+                return (
+                    False,
+                    "field_deployed_tool_requires_explicit_return_context",
+                )
         if observed_stage == LIFECYCLE_RETURNED_HOME and current_stage == LIFECYCLE_SURGEON_OWNED:
             return (False, "observation_direct_home_snap_forbidden")
         return (True, "")
@@ -1735,8 +2841,14 @@ class ORDigitalTwin:
         state: InstrumentBelief,
         observed_stage: str,
         confidence: float,
+        source: str,
     ) -> int:
         if observed_stage == state.lifecycle_stage:
+            return 1
+        if (
+            source in CAM4_MAYO_OBSERVATION_SOURCES
+            and observed_stage == LIFECYCLE_MAYO_REUSE
+        ):
             return 1
         if confidence >= 0.97:
             return 1
@@ -1744,8 +2856,8 @@ class ORDigitalTwin:
             return 2
         return 1
 
-    def _clear_observation_candidate(self, instrument_id: str) -> None:
-        self._observation_candidates.pop(instrument_id, None)
+    def _clear_observation_candidate(self, instance_id: str) -> None:
+        self._observation_candidates.pop(instance_id, None)
 
     def _observation_candidate_ready(
         self,
@@ -1756,15 +2868,17 @@ class ORDigitalTwin:
         location_id: str,
         confidence: float,
         stamp_sec: float,
+        source: str,
     ) -> bool:
         required = self._required_observation_streak(
             state=state,
             observed_stage=observed_stage,
             confidence=confidence,
+            source=source,
         )
         if required <= 1:
             return True
-        candidate = self._observation_candidates.get(state.instrument_id)
+        candidate = self._observation_candidates.get(state.instance_id)
         if (
             candidate
             and candidate["stage"] == observed_stage
@@ -1775,7 +2889,7 @@ class ORDigitalTwin:
             candidate["count"] = int(candidate["count"]) + 1
             candidate["last_seen"] = stamp_sec
         else:
-            self._observation_candidates[state.instrument_id] = {
+            self._observation_candidates[state.instance_id] = {
                 "stage": observed_stage,
                 "location_type": location_type,
                 "location_id": location_id,
@@ -1796,6 +2910,7 @@ class ORDigitalTwin:
         location_id: str | None = None,
         confidence: float | None = None,
         reserved_for: str | None = None,
+        placement_evidence: str | None = None,
     ) -> bool:
         if not self._transition_allowed(state, next_stage):
             self._record_invariant_violation(
@@ -1813,8 +2928,9 @@ class ORDigitalTwin:
             confidence=confidence,
             reserved_for=reserved_for,
             last_update_sec=getattr(self, "_current_event_stamp_sec", None),
+            placement_evidence=placement_evidence,
         )
-        self._clear_observation_candidate(state.instrument_id)
+        self._clear_observation_candidate(state.instance_id)
         return True
 
     def _apply_observation_rebase(
@@ -1833,22 +2949,31 @@ class ORDigitalTwin:
             location_type=location_type,
             location_id=location_id,
             confidence=confidence,
+            placement_evidence=(
+                "public_visual_observation"
+                if observed_stage
+                in {LIFECYCLE_MAYO_REUSE, LIFECYCLE_MAYO_RECOVERY}
+                else None
+            ),
         )
         state.last_update_sec = stamp_sec
-        self._clear_observation_candidate(state.instrument_id)
+        self._clear_observation_candidate(state.instance_id)
 
     def _clear_satisfied_request(self) -> None:
         self._sync_active_request_from_queue()
         requested_tool = self.state.surgeon_request_tool or self.state.explicit_request_tool
         if not requested_tool:
             return
-        requested_state = self.instrument_states.get(requested_tool)
+        requested_state = self.get_instrument_state(
+            self.state.surgeon_request_instance_id or requested_tool
+        )
         if requested_state is None:
             return
 
-        if self.state.surgeon_intent in ACTIVE_REQUEST_INTENTS and requested_state.lifecycle_stage in {
-            LIFECYCLE_SURGEON_OWNED,
-        }:
+        if (
+            self.state.surgeon_intent in ACTIVE_REQUEST_INTENTS
+            and requested_state.lifecycle_stage == LIFECYCLE_SURGEON_OWNED
+        ):
             self._dequeue_active_request("requested_tool_handed_over")
             return
 
@@ -1862,10 +2987,10 @@ class ORDigitalTwin:
 
     def _derive_next_required_transition(self, state: InstrumentBelief) -> str:
         if (
-            self._is_active_requested_tool(state.instrument_id)
+            self._is_active_requested_tool(state.instance_id)
             and self.state.surgeon_intent in ACTIVE_REQUEST_INTENTS
             and state.lifecycle_stage in {LIFECYCLE_MAYO_REUSE, LIFECYCLE_MAYO_RECOVERY}
-            and not self._recovery_transaction_active(state.instrument_id)
+            and not self._recovery_transaction_active(state.instance_id)
         ):
             return ""
         if state.lifecycle_stage == LIFECYCLE_PREPOSITIONED_RIGHT:
@@ -1882,18 +3007,23 @@ class ORDigitalTwin:
         if state.lifecycle_stage == LIFECYCLE_SURGEON_OWNED:
             if self.state.execution_state == "finishing":
                 return "recover_left"
-            if self._recovery_transaction_active(state.instrument_id):
+            if self._recovery_transaction_active(state.instance_id):
                 return "recover_left"
             if (
                 self.state.surgeon_intent in ACTIVE_RETURN_INTENTS
-                and self.state.surgeon_request_tool == state.instrument_id
+                and (
+                    self.state.surgeon_request_instance_id == state.instance_id
+                    or (
+                        not self.state.surgeon_request_instance_id
+                        and self.state.surgeon_request_tool
+                        == state.instrument_id
+                    )
+                )
             ):
                 return "recover_left"
             return ""
         if state.lifecycle_stage == LIFECYCLE_MAYO_REUSE:
-            if self.state.execution_state == "finishing":
-                return "recover_left"
-            if self._recovery_transaction_active(state.instrument_id):
+            if self._recovery_transaction_active(state.instance_id):
                 return "recover_left"
             return ""
         if state.lifecycle_stage == LIFECYCLE_MAYO_RECOVERY:
@@ -1912,12 +3042,14 @@ class ORDigitalTwin:
         self._refresh_active_robot_task()
         self._normalize_surgeon_hand_conflicts()
         self._normalize_cleaner_conflicts()
-        self._place_surgeon_owned_on_mayo_for_completion_cleanup("completion_cleanup_recompute_place_held")
-        self._queue_mayo_reuse_for_completion_cleanup("completion_cleanup_recompute")
-        for tool_id in list(self.state.active_recovery_tools):
-            state = self.instrument_states.get(tool_id)
+        for instance_id in list(
+            self.state.active_recovery_tool_instances
+        ):
+            state = self._state_by_instance(instance_id)
             if state is None or state.lifecycle_stage in {LIFECYCLE_HOME_RACK, LIFECYCLE_RETURNED_HOME}:
-                self._close_recovery_transaction(tool_id, "terminal_lifecycle_observed")
+                self._close_recovery_transaction(
+                    instance_id, "terminal_lifecycle_observed"
+                )
         right_candidates = [
             state
             for state in self.instrument_states.values()
@@ -1929,13 +3061,28 @@ class ORDigitalTwin:
             if state.lifecycle_stage in LEFT_HAND_LIFECYCLES
         ]
 
-        self.state.right_hand_tool = max(
+        right_state = max(
             right_candidates, key=lambda state: state.last_update_sec or 0.0, default=None
-        ).instrument_id if right_candidates else ""
-        self.state.left_hand_tool = max(
+        )
+        left_state = max(
             left_candidates, key=lambda state: state.last_update_sec or 0.0, default=None
-        ).instrument_id if left_candidates else ""
+        )
+        self.state.right_hand_tool = (
+            right_state.instrument_id if right_state else ""
+        )
+        self.state.right_hand_tool_instance_id = (
+            right_state.instance_id if right_state else ""
+        )
+        self.state.left_hand_tool = (
+            left_state.instrument_id if left_state else ""
+        )
+        self.state.left_hand_tool_instance_id = (
+            left_state.instance_id if left_state else ""
+        )
         self.state.prepositioned_tool = self.state.right_hand_tool if right_candidates else ""
+        self.state.prepositioned_tool_instance_id = (
+            self.state.right_hand_tool_instance_id if right_candidates else ""
+        )
         self.state.cleaner_busy = any(
             state.lifecycle_stage == LIFECYCLE_CLEANING_LEFT for state in self.instrument_states.values()
         )
@@ -1947,8 +3094,6 @@ class ORDigitalTwin:
             if state.lifecycle_stage == LIFECYCLE_DROPPED_FLOOR
         ]
         self._set_flag("dropped_tool_requires_human", bool(dropped_floor_tools))
-        self._queue_mayo_capacity_recovery()
-
         pending_tools: list[str] = []
         for state in self.instrument_states.values():
             state.next_required_transition = self._derive_next_required_transition(state)
@@ -1956,13 +3101,11 @@ class ORDigitalTwin:
                 pending_tools.append(state.instrument_id)
         self.state.pending_transition_tools = pending_tools
 
-        right_conflict = len({state.instrument_id for state in right_candidates}) > 1
-        left_conflict = len({state.instrument_id for state in left_candidates}) > 1
+        right_conflict = len(right_candidates) > 1
+        left_conflict = len(left_candidates) > 1
         self._set_flag("right_arm_overloaded", right_conflict)
         self._set_flag("left_arm_overloaded", left_conflict)
-        surgeon_owned_count = sum(
-            1 for state in self.instrument_states.values() if state.lifecycle_stage == LIFECYCLE_SURGEON_OWNED
-        )
+        surgeon_owned_count = len(self._surgeon_owned_hand_states())
         surgeon_owned_overloaded = surgeon_owned_count > 2
         was_surgeon_overloaded = "surgeon_owned_overloaded" in self.state.safety_flags
         self._set_flag("surgeon_owned_overloaded", surgeon_owned_overloaded)
@@ -1975,6 +3118,7 @@ class ORDigitalTwin:
                 },
             )
         self._clear_satisfied_request()
+        self._validate_inventory_invariants()
         self._normalize_robot_state()
         self._complete_if_cleanup_finished()
 
@@ -1982,57 +3126,90 @@ class ORDigitalTwin:
         hand_states = self._surgeon_owned_hand_states()
         if len(hand_states) <= 2:
             return
-
-        requested_tool = self._active_requested_tool_id()
-        hand_states.sort(
-            key=lambda state: (
-                0 if state.instrument_id == requested_tool else 1,
-                -(state.last_update_sec or 0.0),
-                state.instrument_id,
-            )
+        already_reported = (
+            "surgeon_owned_overloaded" in self.state.safety_flags
         )
-        kept_tools = [state.instrument_id for state in hand_states[:2]]
+        self._set_flag("surgeon_owned_overloaded", True)
+        if already_reported:
+            return
 
         self._record_event(
             "StateInvariantViolation",
             {
                 "reason": "surgeon_hand_capacity_exceeded",
-                "surgeon_hand_tools": [state.instrument_id for state in hand_states],
-                "kept_tools": kept_tools,
-                "active_request_tool": requested_tool,
-                "policy": "max_two_surgeon_hand_tools_requested_tool_protected",
+                "surgeon_hand_tools": [
+                    state.instrument_id for state in hand_states
+                ],
+                "surgeon_hand_instances": [
+                    state.instance_id for state in hand_states
+                ],
+                "active_request_tool": self._active_requested_tool_id(),
+                "active_request_instance_id": (
+                    self._active_requested_instance_id()
+                ),
+                "policy": "fail_closed_without_invented_mayo_placement",
             },
         )
 
-        for stale_state in hand_states[2:]:
-            if stale_state.instrument_id == requested_tool:
-                self._record_event(
-                    "RecoveryBlockedForActiveRequest",
-                    {
-                        "instrument_id": stale_state.instrument_id,
-                        "reason": "surgeon_hand_conflict_requested_tool_protected",
-                        "active_request_tool": requested_tool,
-                    },
-                )
-                continue
-
-            self._set_lifecycle(
-                stale_state,
-                LIFECYCLE_MAYO_RECOVERY,
-                location_type="mayo_recovery_zone",
-                location_id="mayo_recovery_zone",
-                confidence=max(stale_state.confidence, 0.9),
+    def _validate_inventory_invariants(self) -> None:
+        expected_counts = self.spec.get_tool_inventory()
+        actual_counts = Counter(
+            state.instrument_id
+            for state in self.instrument_states.values()
+        )
+        instance_ids = [
+            state.instance_id for state in self.instrument_states.values()
+        ]
+        duplicate_instance_ids = sorted(
+            instance_id
+            for instance_id, count in Counter(instance_ids).items()
+            if count > 1
+        )
+        key_mismatches = sorted(
+            key
+            for key, state in self.instrument_states.items()
+            if key != state.instance_id
+        )
+        count_mismatches = {
+            tool_id: {
+                "expected": int(expected_counts.get(tool_id, 0)),
+                "actual": int(actual_counts.get(tool_id, 0)),
+            }
+            for tool_id in sorted(
+                set(expected_counts) | set(actual_counts)
             )
+            if int(expected_counts.get(tool_id, 0))
+            != int(actual_counts.get(tool_id, 0))
+        }
+        violation = bool(
+            duplicate_instance_ids or key_mismatches or count_mismatches
+        )
+        self._set_flag("duplicate_tool_holder", violation)
+        signature = (
+            tuple(duplicate_instance_ids),
+            tuple(key_mismatches),
+            tuple(
+                (
+                    tool_id,
+                    values["expected"],
+                    values["actual"],
+                )
+                for tool_id, values in count_mismatches.items()
+            ),
+        )
+        if violation and signature != self._inventory_violation_signature:
+            self._inventory_violation_signature = signature
             self._record_event(
-                "SurgeonHandConflictNormalized",
+                "StateInvariantViolation",
                 {
-                    "instrument_id": stale_state.instrument_id,
-                    "kept_tools": kept_tools,
-                    "target_stage": LIFECYCLE_MAYO_RECOVERY,
-                    "active_request_tool": requested_tool,
+                    "reason": "instrument_inventory_invariant_failed",
+                    "duplicate_instance_ids": duplicate_instance_ids,
+                    "key_mismatches": key_mismatches,
+                    "count_mismatches": count_mismatches,
                 },
             )
-            self._open_recovery_transaction(stale_state.instrument_id, "surgeon_hand_conflict_normalized")
+        elif not violation:
+            self._inventory_violation_signature = None
 
     def _normalize_cleaner_conflicts(self) -> None:
         cleaner_states = [
@@ -2042,12 +3219,16 @@ class ORDigitalTwin:
         ]
         if len(cleaner_states) <= 1:
             return
-        active_task_tool = self.state.active_robot_task.instrument_id if self.state.active_robot_task is not None else ""
+        active_task_instance = (
+            self.state.active_robot_task.instrument_instance_id
+            if self.state.active_robot_task is not None
+            else ""
+        )
         cleaner_states.sort(
             key=lambda state: (
-                0 if state.instrument_id == active_task_tool else 1,
+                0 if state.instance_id == active_task_instance else 1,
                 state.last_update_sec or 0.0,
-                state.instrument_id,
+                state.instance_id,
             )
         )
         kept_state = cleaner_states[0]
@@ -2063,11 +3244,16 @@ class ORDigitalTwin:
                 "CleanerConflictQueued",
                 {
                     "instrument_id": queued_state.instrument_id,
+                    "instance_id": queued_state.instance_id,
                     "kept_tool": kept_state.instrument_id,
+                    "kept_instance_id": kept_state.instance_id,
                     "reason": "cleaner_single_tool_invariant",
                 },
             )
-            self._open_recovery_transaction(queued_state.instrument_id, "cleaner_single_tool_invariant")
+            self._open_recovery_transaction(
+                queued_state.instance_id,
+                "cleaner_single_tool_invariant",
+            )
 
     def _normalize_robot_state(self) -> None:
         if self.state.robot_state == "fault":
@@ -2090,14 +3276,18 @@ class ORDigitalTwin:
         if self.state.cleaner_busy:
             self.state.robot_state = "cleaning"
             return
-        left_state = self.instrument_states.get(self.state.left_hand_tool) if self.state.left_hand_tool else None
+        left_state = self._state_by_instance(
+            self.state.left_hand_tool_instance_id
+        )
         if left_state is not None:
             self.state.robot_state = "busy"
             return
         if any(state.lifecycle_stage == LIFECYCLE_CLEANED_LEFT for state in self.instrument_states.values()):
             self.state.robot_state = "ready_to_return"
             return
-        right_state = self.instrument_states.get(self.state.right_hand_tool) if self.state.right_hand_tool else None
+        right_state = self._state_by_instance(
+            self.state.right_hand_tool_instance_id
+        )
         if right_state is not None:
             self.state.robot_state = "handover_ready"
             return
@@ -2105,26 +3295,32 @@ class ORDigitalTwin:
             return
         self.state.robot_state = "idle"
 
-    def _right_arm_conflict(self, instrument_id: str) -> bool:
+    def _right_arm_conflict(self, instance_id: str) -> bool:
         self._recompute_transient_state()
-        return bool(self.state.right_hand_tool and self.state.right_hand_tool != instrument_id)
+        return bool(
+            self.state.right_hand_tool_instance_id
+            and self.state.right_hand_tool_instance_id != instance_id
+        )
 
-    def _left_arm_conflict(self, instrument_id: str) -> bool:
+    def _left_arm_conflict(self, instance_id: str) -> bool:
         self._recompute_transient_state()
-        return bool(self.state.left_hand_tool and self.state.left_hand_tool != instrument_id)
+        return bool(
+            self.state.left_hand_tool_instance_id
+            and self.state.left_hand_tool_instance_id != instance_id
+        )
 
-    def _surgeon_hand_conflict(self, instrument_id: str) -> str:
+    def _surgeon_hand_conflict(self, instance_id: str) -> str:
         hand_states = [
             state
-            for tool_id, state in self.instrument_states.items()
-            if tool_id != instrument_id
+            for candidate_id, state in self.instrument_states.items()
+            if candidate_id != instance_id
             and state.lifecycle_stage == LIFECYCLE_SURGEON_OWNED
             and (state.location_type == "surgeon_hand" or state.status == "handed_over")
         ]
         if len(hand_states) < 2:
             return ""
         hand_states.sort(key=lambda state: state.last_update_sec or 0.0)
-        return hand_states[0].instrument_id
+        return hand_states[0].instance_id
 
     def update_explicit_request(self, request_text: str) -> str:
         if not request_text.strip():
@@ -2136,16 +3332,111 @@ class ORDigitalTwin:
             if resolved:
                 break
         if resolved:
-            self._enqueue_surgeon_request(
+            first_request_is_additional = self._enqueue_surgeon_request(
                 event_type="voice_request",
                 instrument_id=resolved,
                 voice_text=request_text,
                 note="explicit voice text resolved to request cue",
                 ready_for_handover=True,
             )
+            if (
+                not first_request_is_additional
+                and self._allow_shadow_type_instance_requests
+                and _requests_additional_instance(request_text)
+                and _instrument_mention_count(
+                    self.spec,
+                    resolved,
+                    request_text,
+                )
+                >= 2
+            ):
+                self._enqueue_surgeon_request(
+                    event_type="voice_request",
+                    instrument_id=resolved,
+                    voice_text=request_text,
+                    note=(
+                        "repeated public tool mention with additional-instance cue"
+                    ),
+                    ready_for_handover=True,
+                    force_shadow_additional_instance_assumption=True,
+                )
         self._recompute_transient_state()
         self._record_event("ExplicitRequestUpdated", {"text": request_text, "resolved_tool": resolved})
         return resolved
+
+    def explicit_request_voice_backed(self) -> bool:
+        cue = self._active_request_cue()
+        if cue is None or cue.event_type not in ACTIVE_REQUEST_INTENTS:
+            return False
+        return bool(cue.event_type == "voice_request" or cue.voice_text.strip())
+
+    def is_explicit_procedure_completion_request(self, request_text: str) -> bool:
+        text = re.sub(
+            r"\s+",
+            " ",
+            str(request_text or "").strip().lower(),
+        )
+        text = re.sub(r"[.!?]+$", "", text).strip()
+        if not text:
+            return False
+        return bool(
+            re.fullmatch(
+                r"(?:네\s+)?(?:수술\s+)?"
+                r"(?:마치겠습니다|마칩니다|마무리하겠습니다|"
+                r"끝났습니다|종료하겠습니다)",
+                text,
+            )
+            or re.fullmatch(
+                r"(?:(?:okay|ok|yes|all right)\s+)?"
+                r"(?:(?:the\s+)?(?:procedure|surgery)\s+)?"
+                r"(?:(?:is|has been)\s+)?"
+                r"(?:complete|completed|finished|done)(?:\s+now)?",
+                text,
+            )
+        )
+
+    def is_explicit_voice_tool_request(self, request_text: str) -> bool:
+        text = str(request_text or "").strip()
+        if not text:
+            return False
+
+        signature = re.sub(r"[^0-9a-z가-힣]+", "", text.lower())
+        group_specs = [
+            *self.spec.get_bed_robot_arm_group_cues(),
+            *self.spec.get_bed_robot_arm_end_effector_transitions(),
+        ]
+        for group_spec in group_specs:
+            for utterance in group_spec.utterances:
+                candidate = re.sub(r"[^0-9a-z가-힣]+", "", str(utterance).lower())
+                if signature and signature == candidate:
+                    return False
+
+        lowered = text.lower()
+        request_markers = (
+            "please",
+            "pass ",
+            "hand ",
+            "give ",
+            "get me",
+            "i need",
+            "i want",
+            "can i have",
+            "줘",
+            "주세요",
+            "건네",
+            "달라",
+            "부탁",
+            "필요",
+        )
+        if any(marker in lowered for marker in request_markers):
+            return True
+
+        candidates = _normalize_request_text(text)
+        word_count = len(re.findall(r"[0-9a-z_가-힣]+", lowered))
+        return bool(
+            0 < word_count <= 6
+            and any(self.spec.resolve_instrument_alias(candidate) for candidate in candidates)
+        )
 
     def update_surgeon_request(self, request: SurgeonRequest) -> str:
         resolved = self.spec.resolve_instrument_alias(request.requested_tool) or request.requested_tool
@@ -2210,9 +3501,43 @@ class ORDigitalTwin:
 
     def apply_surgeon_actor_event(self, event: SurgeonActorEvent) -> None:
         event_type = (event.event_type or "").strip()
-        tool_id = self.spec.resolve_instrument_alias(event.tool_id) or event.tool_id
+        direct_state = self._state_by_instance(event.tool_id)
+        tool_id = (
+            direct_state.instrument_id
+            if direct_state is not None
+            else self.spec.resolve_instrument_alias(event.tool_id)
+            or event.tool_id
+        )
         phase_id = event.phase_id or self.state.filtered_phase
-        state = self.instrument_states.get(tool_id) if tool_id else None
+        allowed_lifecycles = (
+            {
+                LIFECYCLE_SURGEON_OWNED,
+                LIFECYCLE_MAYO_REUSE,
+                LIFECYCLE_MAYO_RECOVERY,
+            }
+            if event_type
+            in {
+                "return_tool",
+                "place_on_mayo",
+                "place_on_mayo_reuse",
+                "place_on_mayo_recovery",
+                "continue_using",
+            }
+            else None
+        )
+        state = (
+            self._select_instance(
+                tool_id,
+                preferred_instance_id=(
+                    direct_state.instance_id
+                    if direct_state is not None
+                    else self.state.surgeon_request_instance_id
+                ),
+                allowed_lifecycles=allowed_lifecycles,
+            )
+            if tool_id
+            else None
+        )
 
         if event_type in {"request_tool", "voice_request"}:
             # /surgeon/request is the canonical cue source. Actor events are kept
@@ -2221,9 +3546,15 @@ class ORDigitalTwin:
         elif event_type == "return_tool":
             self.state.surgeon_intent = event_type
             self.state.surgeon_request_tool = tool_id
+            self.state.surgeon_request_instance_id = (
+                state.instance_id if state is not None else ""
+            )
             self.state.surgeon_ready_for_handover = False
             self.state.surgeon_ready_for_retrieval = bool(event.ready_for_retrieval or tool_id)
-            self._open_recovery_transaction(tool_id, "surgeon_actor_return_tool")
+            if state is not None:
+                self._open_recovery_transaction(
+                    state.instance_id, "surgeon_actor_return_tool"
+                )
         elif event_type == "cancel_request":
             self._record_event(
                 "LegacyCancelActorEventIgnored",
@@ -2298,7 +3629,10 @@ class ORDigitalTwin:
                 self.state.surgeon_intent = "return_tool"
                 self.state.surgeon_ready_for_handover = False
                 self.state.surgeon_ready_for_retrieval = True
-                self._open_recovery_transaction(tool_id, "surgeon_actor_place_on_mayo_recovery")
+                self._open_recovery_transaction(
+                    state.instance_id,
+                    "surgeon_actor_place_on_mayo_recovery",
+                )
             else:
                 if not self._apply_event_transition(
                     state=state,
@@ -2307,6 +3641,15 @@ class ORDigitalTwin:
                     location_type=location_type,
                     location_id=location_id,
                     confidence=max(state.confidence, 0.96),
+                    placement_evidence=(
+                        "public_surgeon_event"
+                        if next_stage
+                        in {
+                            LIFECYCLE_MAYO_REUSE,
+                            LIFECYCLE_MAYO_RECOVERY,
+                        }
+                        else None
+                    ),
                 ):
                     return
                 if event_type == "continue_using":
@@ -2327,7 +3670,10 @@ class ORDigitalTwin:
                     self.state.surgeon_intent = "return_tool"
                     self.state.surgeon_ready_for_handover = False
                     self.state.surgeon_ready_for_retrieval = True
-                    self._open_recovery_transaction(tool_id, "surgeon_actor_place_on_mayo_recovery")
+                    self._open_recovery_transaction(
+                        state.instance_id,
+                        "surgeon_actor_place_on_mayo_recovery",
+                    )
 
         self._recompute_transient_state()
         self._record_event(
@@ -2335,6 +3681,9 @@ class ORDigitalTwin:
             {
                 "event_type": event_type,
                 "instrument_id": tool_id,
+                "instance_id": (
+                    state.instance_id if state is not None else ""
+                ),
                 "phase_id": phase_id,
                 "override": bool(event.override),
                 "voice_text": event.voice_text,
@@ -2347,14 +3696,41 @@ class ORDigitalTwin:
         if phase_id not in self.spec.phase_ids:
             self._record_invariant_violation(
                 reason="phase_out_of_bundle_scope",
-                phase_id=phase_id,
-                active_procedure=self.spec.procedure_id,
+                event_type="PhaseUpdated",
+                instrument_id="",
+                proposed_stage=phase_id,
             )
             phase_id = self.state.filtered_phase if self.state.filtered_phase in self.spec.phase_ids else self.spec.default_phase_id
+        current_phase = (
+            self.state.filtered_phase
+            if self.state.filtered_phase in self.spec.phase_ids
+            else self.spec.default_phase_id
+        )
+        target_index = self._normal_phase_index(phase_id)
+        current_index = self._normal_phase_index(current_phase)
+        if (
+            target_index >= 0
+            and (
+                target_index < self._initial_phase_floor_index
+                or (current_index >= 0 and target_index < current_index)
+            )
+        ):
+            self._record_phase_decision(
+                target_phase=phase_id,
+                accepted=False,
+                reason="phase_regression_below_start_floor",
+                confidence=float(filtered_phase.confidence),
+                current_phase=current_phase,
+            )
+            return
         self.state.filtered_phase = phase_id
         self.state.phase_confidence = float(filtered_phase.confidence)
         self.state.phase_uncertain = bool(filtered_phase.uncertain)
         self.state.phase_stability = float(filtered_phase.stability)
+        self._relocate_phase_field_deployed_tools(
+            phase_id,
+            reason="filtered_phase_updated",
+        )
         if not self.state.phase_uncertain and self.state.robot_state == "retracted":
             self.state.robot_state = "idle"
         self._record_event(
@@ -2376,20 +3752,86 @@ class ORDigitalTwin:
     ) -> dict[str, Any] | None:
         if not observation.visible:
             return None
-        instrument_id = self.spec.resolve_instrument_alias(observation.instrument_id) or observation.instrument_id
-        if instrument_id not in self.instrument_states:
+        direct_state = self._state_by_instance(observation.instrument_id)
+        instrument_id = (
+            direct_state.instrument_id
+            if direct_state is not None
+            else self.spec.resolve_instrument_alias(
+                observation.instrument_id
+            )
+            or observation.instrument_id
+        )
+        location_type = observation.location_type
+        preferred_lifecycles: set[str] | None = None
+        if location_type in {
+            "mayo_stand",
+            "mayo_reuse_zone",
+            "mayo_recovery_zone",
+        }:
+            preferred_lifecycles = {
+                LIFECYCLE_MAYO_REUSE,
+                LIFECYCLE_MAYO_RECOVERY,
+            }
+        elif location_type in SURGEON_OWNED_LOCATION_TYPES:
+            preferred_lifecycles = {
+                LIFECYCLE_SURGEON_OWNED,
+                LIFECYCLE_PREPOSITIONED_RIGHT,
+            }
+        current = (
+            direct_state
+            if direct_state is not None
+            else self._select_instance(
+                instrument_id,
+                allowed_lifecycles=preferred_lifecycles,
+            )
+        )
+        if current is None and preferred_lifecycles is not None:
+            current = self._select_instance(instrument_id)
+        if current is None:
             return None
-        current = self.instrument_states[instrument_id]
         location_type = observation.location_type or current.location_type
         location_id = observation.location_id or current.location_id
         confidence = float(observation.confidence)
         stamp_sec = _stamp_to_sec(observation.stamp)
-        proposal_id = proposal_id or f"{source}:{instrument_id}:{location_type}:{location_id}:{stamp_sec:.3f}"
+        proposal_id = proposal_id or (
+            f"{source}:{current.instance_id}:{location_type}:"
+            f"{location_id}:{stamp_sec:.3f}"
+        )
         observed_stage = _observed_lifecycle_for_location(current, location_type, location_id)
+
+        shadow_locked_instances = {
+            instance_id
+            for instance_id in self._shadow_counterfactual_locked_instances
+            if (
+                (locked_state := self._state_by_instance(instance_id))
+                is not None
+                and locked_state.instrument_id == instrument_id
+            )
+        }
+        if (
+            source in CAM4_MAYO_OBSERVATION_SOURCES
+            and shadow_locked_instances
+        ):
+            self._clear_observation_candidate(current.instance_id)
+            return self._record_vlm_proposal_decision(
+                reducer_result="quarantined",
+                reducer_reason="shadow_counterfactual_branch_conflict",
+                source=source,
+                proposal_id=proposal_id,
+                instrument_id=instrument_id,
+                current_stage=current.lifecycle_stage,
+                observed_stage=observed_stage,
+                location_type=location_type,
+                location_id=location_id,
+                confidence=confidence,
+                instance_id=current.instance_id,
+            )
 
         allowed, violation_reason = self._observation_transition_allowed(
             state=current,
             observed_stage=observed_stage,
+            source=source,
+            confidence=confidence,
         )
         if not allowed:
             result = self._record_observation_violation(
@@ -2403,8 +3845,9 @@ class ORDigitalTwin:
                 location_id=location_id,
                 confidence=confidence,
                 stamp_sec=stamp_sec,
+                instance_id=current.instance_id,
             )
-            self._clear_observation_candidate(instrument_id)
+            self._clear_observation_candidate(current.instance_id)
             return result
 
         if not self._observation_candidate_ready(
@@ -2414,6 +3857,7 @@ class ORDigitalTwin:
             location_id=location_id,
             confidence=confidence,
             stamp_sec=stamp_sec,
+            source=source,
         ):
             return self._record_vlm_proposal_decision(
                 reducer_result="quarantined",
@@ -2426,6 +3870,7 @@ class ORDigitalTwin:
                 location_type=location_type,
                 location_id=location_id,
                 confidence=confidence,
+                instance_id=current.instance_id,
             )
 
         previous_stage = current.lifecycle_stage
@@ -2448,12 +3893,130 @@ class ORDigitalTwin:
             location_type=current.location_type,
             location_id=current.location_id,
             confidence=confidence,
+            instance_id=current.instance_id,
         )
 
+    def _resolve_event_state(
+        self, event: TwinEvent, detail: dict[str, Any]
+    ) -> InstrumentBelief | None:
+        raw_instrument_id = str(event.instrument_id or "")
+        direct_instance_id = str(
+            getattr(event, "instance_id", "")
+            or detail.get("instrument_instance_id", "")
+            or detail.get("instance_id", "")
+        )
+        direct = self._state_by_instance(direct_instance_id)
+        if direct is not None:
+            if not raw_instrument_id or direct.instrument_id == raw_instrument_id:
+                return direct
+
+        resolved_type = (
+            self.spec.resolve_instrument_alias(raw_instrument_id)
+            or raw_instrument_id.partition("#")[0]
+        )
+        if not resolved_type:
+            return None
+
+        task = self.state.active_robot_task
+        if (
+            task is not None
+            and task.instrument_instance_id
+            and task.instrument_id == resolved_type
+        ):
+            task_state = self._state_by_instance(task.instrument_instance_id)
+            if task_state is not None:
+                return task_state
+
+        request_instance_id = self.state.surgeon_request_instance_id
+        if (
+            request_instance_id
+            and self.state.surgeon_request_tool == resolved_type
+            and event.event_type
+            in {
+                "RobotTaskStarted",
+                "RobotGraspedTool",
+                "ToolPrepared",
+                "ToolHandoverCompleted",
+                "ShadowAdditionalToolHandoverCompleted",
+            }
+        ):
+            request_state = self._state_by_instance(request_instance_id)
+            if request_state is not None:
+                return request_state
+
+        if event.event_type in {
+            "ToolReceivedFromSurgeon",
+            "ToolSentToCleaner",
+            "ToolCleaningProgress",
+            "ToolCleaningCompleted",
+            "ToolReturnedToTray",
+        }:
+            for instance_id in self.state.active_recovery_tool_instances:
+                recovery_state = self._state_by_instance(instance_id)
+                if recovery_state is not None and recovery_state.instrument_id == resolved_type:
+                    return recovery_state
+
+        preferred_instance_id = ""
+        preferred_lifecycles: set[str] | None = None
+        if event.event_type in {"RobotGraspedTool", "ToolPrepared", "ToolHandoverCompleted"}:
+            preferred_instance_id = self.state.right_hand_tool_instance_id
+            preferred_lifecycles = {
+                LIFECYCLE_HOME_RACK,
+                LIFECYCLE_RETURNED_HOME,
+                LIFECYCLE_PREPOSITIONED_RIGHT,
+                LIFECYCLE_MAYO_REUSE,
+                LIFECYCLE_MAYO_RECOVERY,
+            }
+        elif event.event_type == "ToolReceivedFromSurgeon":
+            preferred_lifecycles = {
+                LIFECYCLE_MAYO_RECOVERY,
+                LIFECYCLE_MAYO_REUSE,
+                LIFECYCLE_SURGEON_OWNED,
+            }
+        elif event.event_type in {"ToolSentToCleaner", "ToolCleaningProgress"}:
+            preferred_instance_id = self.state.left_hand_tool_instance_id
+            preferred_lifecycles = {
+                LIFECYCLE_RECOVERING_LEFT,
+                LIFECYCLE_CLEANING_LEFT,
+            }
+        elif event.event_type == "ToolCleaningCompleted":
+            preferred_lifecycles = {LIFECYCLE_CLEANING_LEFT}
+        elif event.event_type == "ToolReturnedToTray":
+            preferred_lifecycles = {
+                LIFECYCLE_CLEANED_LEFT,
+                LIFECYCLE_RECOVERING_LEFT,
+            }
+        elif event.event_type == "PredictedToolReturnedToRack":
+            preferred_instance_id = self.state.right_hand_tool_instance_id
+            preferred_lifecycles = {LIFECYCLE_PREPOSITIONED_RIGHT}
+
+        selected = self._select_instance(
+            resolved_type,
+            preferred_instance_id=preferred_instance_id,
+            allowed_lifecycles=preferred_lifecycles,
+        )
+        if selected is not None:
+            return selected
+        return self._select_instance(resolved_type)
+
     def apply_event(self, event: TwinEvent) -> None:
-        instrument_id = event.instrument_id
-        state = self.instrument_states.get(instrument_id) if instrument_id else None
         detail = json.loads(event.detail_json) if event.detail_json else {}
+        if not isinstance(detail, dict):
+            detail = {}
+        if event.event_type == "ShadowAdditionalToolHandoverCompleted":
+            detail.setdefault(
+                "compatibility_event_type",
+                "ShadowAdditionalToolHandoverCompleted",
+            )
+            event.event_type = "ToolHandoverCompleted"
+        state = self._resolve_event_state(event, detail)
+        instrument_id = (
+            state.instrument_id
+            if state is not None
+            else self.spec.resolve_instrument_alias(event.instrument_id)
+            or event.instrument_id
+        )
+        instance_id = state.instance_id if state is not None else ""
         self._current_event_stamp_sec = _stamp_to_sec(event.stamp)
         self._recompute_transient_state()
 
@@ -2462,6 +4025,7 @@ class ORDigitalTwin:
                 task_id=str(detail.get("task_id", detail.get("command_id", instrument_id))),
                 task_type=str(detail.get("task_type", event.mode or event.event_type)),
                 instrument_id=instrument_id,
+                instrument_instance_id=instance_id,
                 arm=event.arm or str(detail.get("arm", "")),
                 source_anchor_id=event.source_location_id or str(detail.get("source_anchor_id", "")),
                 target_anchor_id=event.target_location_id or str(detail.get("target_anchor_id", "")),
@@ -2471,6 +4035,7 @@ class ORDigitalTwin:
                 event.event_type,
                 {
                     "instrument_id": instrument_id,
+                    "instance_id": instance_id,
                     **detail,
                 },
             )
@@ -2483,6 +4048,7 @@ class ORDigitalTwin:
                 event.event_type,
                 {
                     "instrument_id": instrument_id,
+                    "instance_id": instance_id,
                     **detail,
                 },
             )
@@ -2495,12 +4061,12 @@ class ORDigitalTwin:
             "ToolHandoverCompleted",
             "PredictedToolReturnedToRack",
         }:
-            if self._right_arm_conflict(instrument_id):
+            if self._right_arm_conflict(instance_id):
                 self._record_invariant_violation(
                     reason="right_arm_busy",
                     event_type=event.event_type,
                     instrument_id=instrument_id,
-                    active_tool=self.state.right_hand_tool,
+                    active_tool=self.state.right_hand_tool_instance_id,
                 )
                 return
 
@@ -2511,16 +4077,21 @@ class ORDigitalTwin:
             "ToolCleaningCompleted",
             "ToolReturnedToTray",
         }:
-            if self._left_arm_conflict(instrument_id):
+            if self._left_arm_conflict(instance_id):
                 self._record_invariant_violation(
                     reason="left_arm_busy",
                     event_type=event.event_type,
                     instrument_id=instrument_id,
-                    active_tool=self.state.left_hand_tool,
+                    active_tool=self.state.left_hand_tool_instance_id,
                 )
                 return
 
         if event.event_type == "RobotGraspedTool" and state:
+            picked_from_mayo = (
+                state.lifecycle_stage in {LIFECYCLE_MAYO_REUSE, LIFECYCLE_MAYO_RECOVERY}
+                or event.source_location_type in {"mayo_stand", "mayo_reuse_zone", "mayo_recovery_zone"}
+                or event.source_location_id in {"mayo_stand", "mayo_reuse_zone", "mayo_recovery_zone"}
+            )
             if not self._apply_event_transition(
                 state=state,
                 next_stage=LIFECYCLE_PREPOSITIONED_RIGHT,
@@ -2530,6 +4101,11 @@ class ORDigitalTwin:
                 confidence=max(float(event.confidence), 0.95),
             ):
                 return
+            if picked_from_mayo:
+                self._close_recovery_transaction(
+                    state.instance_id,
+                    "mayo_tool_reused_for_handover",
+                )
             self.state.robot_state = "busy"
         elif event.event_type == "ToolPrepared" and state:
             if not self._apply_event_transition(
@@ -2544,43 +4120,68 @@ class ORDigitalTwin:
                 return
             self.state.robot_state = "prepared"
         elif event.event_type == "ToolHandoverCompleted" and state:
-            active_surgeon_hand_tool = self._surgeon_hand_conflict(instrument_id)
+            handed_over_from_mayo = state.lifecycle_stage in {
+                LIFECYCLE_MAYO_REUSE,
+                LIFECYCLE_MAYO_RECOVERY,
+            }
+            field_deployed = self._is_field_deployed_for_phase(
+                state.instance_id
+            )
+            active_surgeon_hand_tool = (
+                ""
+                if field_deployed
+                else self._surgeon_hand_conflict(state.instance_id)
+            )
             if active_surgeon_hand_tool:
-                previous_state = self.instrument_states.get(active_surgeon_hand_tool)
-                if previous_state is not None:
-                    self._record_event(
-                        "SurgeonHandConflictNormalized",
-                        {
-                            "instrument_id": active_surgeon_hand_tool,
-                            "incoming_tool": instrument_id,
-                            "target_stage": LIFECYCLE_MAYO_RECOVERY,
-                        },
-                    )
-                    self._apply_event_transition(
-                        state=previous_state,
-                        next_stage=LIFECYCLE_MAYO_RECOVERY,
-                        event_type="SurgeonHandConflictNormalized",
-                        location_type="mayo_recovery_zone",
-                        location_id="mayo_recovery_zone",
-                        confidence=max(previous_state.confidence, 0.9),
-                    )
-                    self._open_recovery_transaction(active_surgeon_hand_tool, "surgeon_hand_conflict_normalized")
+                self._record_invariant_violation(
+                    reason="surgeon_hand_capacity_exceeded",
+                    event_type=event.event_type,
+                    instrument_id=instrument_id,
+                    active_tool=active_surgeon_hand_tool,
+                )
+                self._record_event(
+                    "ToolHandoverBlocked",
+                    {
+                        "instrument_id": instrument_id,
+                        "instance_id": state.instance_id,
+                        "reason": "surgeon_hand_capacity_exceeded",
+                        "policy": (
+                            "public_mayo_placement_or_completion_cleanup_required"
+                        ),
+                    },
+                )
+                return
             if not self._apply_event_transition(
                 state=state,
                 next_stage=LIFECYCLE_SURGEON_OWNED,
                 event_type=event.event_type,
-                location_type="surgeon_hand",
-                location_id="surgeon_hand",
+                location_type=(
+                    "surgical_field"
+                    if field_deployed
+                    else "surgeon_hand"
+                ),
+                location_id=(
+                    self._field_anchor_id()
+                    if field_deployed
+                    else "surgeon_hand"
+                ),
                 confidence=max(float(event.confidence), 0.95),
             ):
                 return
+            if handed_over_from_mayo:
+                self._close_recovery_transaction(
+                    state.instance_id,
+                    "mayo_tool_handover_completed",
+                )
             self.state.robot_state = "idle"
-            if self.state.surgeon_request_tool == instrument_id:
+            if self._is_active_requested_tool(state.instance_id):
                 self._dequeue_active_request("handover_completed")
             else:
                 self._sync_active_request_from_queue()
         elif event.event_type == "ToolReceivedFromSurgeon" and state:
-            self._open_recovery_transaction(instrument_id, "robot_received_returned_tool")
+            self._open_recovery_transaction(
+                state.instance_id, "robot_received_returned_tool"
+            )
             if not self._apply_event_transition(
                 state=state,
                 next_stage=LIFECYCLE_RECOVERING_LEFT,
@@ -2590,16 +4191,18 @@ class ORDigitalTwin:
                 confidence=max(float(event.confidence), 0.95),
             ):
                 return
-            if self.state.surgeon_request_tool == instrument_id:
+            if self._is_active_requested_tool(state.instance_id):
                 self._dequeue_active_request("retrieval_started")
             else:
                 self._sync_active_request_from_queue()
         elif event.event_type == "ToolSentToCleaner" and state:
             active_cleaner_tool = next(
                 (
-                    tool_id
-                    for tool_id, cleaner_state in self.instrument_states.items()
-                    if tool_id != instrument_id and cleaner_state.lifecycle_stage == LIFECYCLE_CLEANING_LEFT
+                    candidate_id
+                    for candidate_id, cleaner_state in self.instrument_states.items()
+                    if candidate_id != state.instance_id
+                    and cleaner_state.lifecycle_stage
+                    == LIFECYCLE_CLEANING_LEFT
                 ),
                 "",
             )
@@ -2613,11 +4216,14 @@ class ORDigitalTwin:
                 )
                 self.state.cleaner_busy = True
                 self.state.robot_state = "busy"
-                self._open_recovery_transaction(instrument_id, "cleaner_busy_queued")
+                self._open_recovery_transaction(
+                    state.instance_id, "cleaner_busy_queued"
+                )
                 self._record_event(
                     "CleanerBusyToolQueued",
                     {
                         "instrument_id": instrument_id,
+                        "instance_id": state.instance_id,
                         "active_cleaner_tool": active_cleaner_tool,
                         "reason": "cleaner_allows_one_tool",
                     },
@@ -2671,11 +4277,17 @@ class ORDigitalTwin:
                 confidence=max(float(event.confidence), 0.95),
             ):
                 return
+            if event.mode == "shadow_counterfactual":
+                self._shadow_counterfactual_locked_instances.add(
+                    state.instance_id
+                )
             self.state.robot_state = "idle"
             if event.event_type == "ToolReturnedToTray":
                 self.state.cleaner_busy = False
                 self.state.cleaner_remaining_sec = 0.0
-                self._close_recovery_transaction(instrument_id, "tool_returned_home")
+                self._close_recovery_transaction(
+                    state.instance_id, "tool_returned_home"
+                )
         elif event.event_type == "SafetyRetract":
             if self.state.left_hand_tool or self.state.right_hand_tool or self.state.cleaner_busy:
                 self._record_invariant_violation(
@@ -2694,6 +4306,7 @@ class ORDigitalTwin:
             event.event_type,
             {
                 "instrument_id": instrument_id,
+                "instance_id": instance_id,
                 "lifecycle_stage": state.lifecycle_stage if state is not None else "",
                 **detail,
             },
@@ -2706,19 +4319,27 @@ class ORDigitalTwin:
         return self.spec.get_expected_instruments(phase_id)
 
     def get_available_instruments(self) -> list[str]:
-        return [
-            instrument_id
-            for instrument_id, state in self.instrument_states.items()
-            if _is_available_for_handover(state)
-        ]
+        return sorted(
+            {
+                state.instrument_id
+                for state in self.instrument_states.values()
+                if _is_available_for_handover(state)
+            }
+        )
 
     def handover_allowed(self) -> bool:
-        if any(flag in BLOCKING_SAFETY_FLAGS for flag in self.state.safety_flags):
+        voice_backed_request = self.explicit_request_voice_backed()
+        if any(
+            flag in BLOCKING_SAFETY_FLAGS
+            and not (voice_backed_request and flag == "vlm_unhealthy")
+            for flag in self.state.safety_flags
+        ):
             return False
         if (
             self.spec.bundle.action_guard
             and self.spec.bundle.action_guard.block_handover_when_phase_uncertain
             and self.state.phase_uncertain
+            and not voice_backed_request
         ):
             return False
         if self.state.active_robot_task is not None:
@@ -2728,14 +4349,20 @@ class ORDigitalTwin:
         requested_tool = self.state.surgeon_request_tool or self.state.explicit_request_tool
         if not requested_tool:
             return True
-        requested_state = self.instrument_states.get(requested_tool)
+        requested_state = self.get_instrument_state(
+            self.state.surgeon_request_instance_id or requested_tool
+        )
         if requested_state is None:
             return False
         if self.state.surgeon_intent in ACTIVE_REQUEST_INTENTS and not self.state.surgeon_ready_for_handover:
             return False
-        if requested_state.contaminated:
+        requested_on_mayo = requested_state.lifecycle_stage in {
+            LIFECYCLE_MAYO_REUSE,
+            LIFECYCLE_MAYO_RECOVERY,
+        }
+        if requested_state.contaminated and not requested_on_mayo:
             return False
-        if requested_state.lifecycle_stage in {LIFECYCLE_SURGEON_OWNED, LIFECYCLE_MAYO_REUSE}:
+        if requested_state.lifecycle_stage == LIFECYCLE_SURGEON_OWNED:
             return False
         surgeon_owned_count = sum(
             1
@@ -2743,9 +4370,18 @@ class ORDigitalTwin:
             if state.lifecycle_stage == LIFECYCLE_SURGEON_OWNED
             and (state.location_type == "surgeon_hand" or state.status == "handed_over")
         )
-        if surgeon_owned_count >= 2:
+        field_deployed = self._is_field_deployed_for_phase(
+            requested_state.instance_id
+        )
+        if surgeon_owned_count >= 2 and not field_deployed:
             return False
-        if requested_state.lifecycle_stage not in {LIFECYCLE_HOME_RACK, LIFECYCLE_RETURNED_HOME, LIFECYCLE_PREPOSITIONED_RIGHT}:
+        if requested_state.lifecycle_stage not in {
+            LIFECYCLE_HOME_RACK,
+            LIFECYCLE_RETURNED_HOME,
+            LIFECYCLE_PREPOSITIONED_RIGHT,
+            LIFECYCLE_MAYO_REUSE,
+            LIFECYCLE_MAYO_RECOVERY,
+        }:
             return False
         if requested_state.owner not in {"", "none", "robot_right_hand"}:
             return False
@@ -2770,15 +4406,30 @@ class ORDigitalTwin:
             "robot_state": self.state.robot_state,
             "surgeon_intent": self.state.surgeon_intent,
             "surgeon_request_tool": self.state.surgeon_request_tool,
+            "surgeon_request_instance_id": (
+                self.state.surgeon_request_instance_id
+            ),
             "surgeon_ready_for_handover": self.state.surgeon_ready_for_handover,
             "surgeon_ready_for_retrieval": self.state.surgeon_ready_for_retrieval,
             "cleaner_busy": self.state.cleaner_busy,
             "cleaner_remaining_sec": self.state.cleaner_remaining_sec,
             "pending_transition_tools": list(self.state.pending_transition_tools),
             "active_recovery_tools": list(self.state.active_recovery_tools),
+            "active_recovery_tool_instances": list(
+                self.state.active_recovery_tool_instances
+            ),
             "right_hand_tool": self.state.right_hand_tool,
+            "right_hand_tool_instance_id": (
+                self.state.right_hand_tool_instance_id
+            ),
             "left_hand_tool": self.state.left_hand_tool,
+            "left_hand_tool_instance_id": (
+                self.state.left_hand_tool_instance_id
+            ),
             "prepositioned_tool": self.state.prepositioned_tool,
+            "prepositioned_tool_instance_id": (
+                self.state.prepositioned_tool_instance_id
+            ),
             "active_robot_task": asdict(self.state.active_robot_task) if self.state.active_robot_task else {},
             "recent_events": list(self.state.recent_event_types),
             "instrument_states": self.instrument_payload(),

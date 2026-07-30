@@ -1,0 +1,8 @@
+string command
+string mode
+float32 playback_rate
+float32 seek_sec
+---
+bool success
+string message
+string state_json

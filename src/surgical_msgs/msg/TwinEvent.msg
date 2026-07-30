@@ -1,6 +1,7 @@
 builtin_interfaces/Time stamp
 string event_type
 string instrument_id
+string instance_id
 string phase_id
 string location_id
 string location_type

@@ -15,10 +15,10 @@ jobs:
     runs-on: ubuntu-latest
     env:
       BTOPS_REPOSITORY: ${{ vars.BTOPS_REPOSITORY || 'Radon213/btops_ws' }}
-      BTOPS_REF: ${{ vars.BTOPS_REF || 'main' }}
+      BTOPS_REF: ${{ vars.BTOPS_REF || 'cda8abb706d1c5c4132f7661d83a33c4c5b65e9c' }}
       BTOPS_LOCAL_CONTEXT: ./btops_ws
       AUTO_APMS_REPO_URL: ${{ vars.AUTO_APMS_REPO_URL || 'https://github.com/AutoAPMS/auto-apms.git' }}
-      AUTO_APMS_REF: ${{ vars.AUTO_APMS_REF || '1.5.1' }}
+      AUTO_APMS_REF: ${{ vars.AUTO_APMS_REF || '19ac8d558e35f657b8464694c5ddc524c6c31861' }}
     steps:
       - name: Checkout taskplanner
         uses: actions/checkout@v4

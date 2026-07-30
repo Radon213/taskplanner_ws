@@ -1,0 +1,169 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "taskplanner.observable_interaction_interval.v1",
+  "title": "Human-adjudicated observable implicit tool-request interval",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "case_id",
+    "event_id",
+    "event_type",
+    "source_frame_idx",
+    "time_sec",
+    "start_source_frame_idx",
+    "end_source_frame_idx",
+    "start_sec",
+    "end_sec",
+    "source_views",
+    "review_status",
+    "label_origin"
+  ],
+  "properties": {
+    "schema": {
+      "const": "taskplanner.observable_interaction_interval.v1"
+    },
+    "case_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]+$"
+    },
+    "event_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]+-R[0-9]{4,}$"
+    },
+    "event_type": {
+      "const": "implicit_tool_request"
+    },
+    "source_frame_idx": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Compatibility alias for start_source_frame_idx."
+    },
+    "time_sec": {
+      "type": "number",
+      "minimum": 0,
+      "description": "Compatibility alias for start_sec."
+    },
+    "start_source_frame_idx": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "end_source_frame_idx": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "start_sec": {
+      "type": "number",
+      "minimum": 0
+    },
+    "end_sec": {
+      "type": "number",
+      "minimum": 0
+    },
+    "source_views": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "enum": ["cam1", "cam2", "cam3", "cam4", "flir"]
+      }
+    },
+    "review_status": {
+      "enum": ["confirmed", "ambiguous", "rejected"]
+    },
+    "label_origin": {
+      "enum": [
+        "human_video_review",
+        "assistant_video_adjudication"
+      ]
+    },
+    "review": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "reviewer_kind",
+        "reviewer_id",
+        "reviewed_at"
+      ],
+      "properties": {
+        "reviewer_kind": {
+          "enum": ["human", "ai_assistant"]
+        },
+        "reviewer_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reviewed_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "notes": {
+          "type": "string"
+        },
+        "authorized_by": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "review_status": {
+            "const": "confirmed"
+          }
+        },
+        "required": ["review_status"]
+      },
+      "then": {
+        "required": ["review"]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "label_origin": {
+            "const": "human_video_review"
+          }
+        },
+        "required": ["label_origin"]
+      },
+      "then": {
+        "properties": {
+          "review": {
+            "properties": {
+              "reviewer_kind": {
+                "const": "human"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "label_origin": {
+            "const": "assistant_video_adjudication"
+          }
+        },
+        "required": ["label_origin"]
+      },
+      "then": {
+        "required": ["review"],
+        "properties": {
+          "review": {
+            "required": ["authorized_by"],
+            "properties": {
+              "reviewer_kind": {
+                "const": "ai_assistant"
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

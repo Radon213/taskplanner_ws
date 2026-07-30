@@ -1,0 +1,46 @@
+schema: taskplanner.observable_tool_vocabulary.v1
+event_types:
+  - initial_state
+  - tool_transfer
+  - place_on_mayo
+  - pickup_from_mayo
+holders:
+  - surgeon
+  - scrub_nurse
+  - assistant
+  - circulating_nurse
+  - none
+  - unknown
+locations:
+  - left_hand
+  - right_hand
+  - both_hands
+  - mayo_stand
+  - instrument_table
+  - surgical_field
+  - off_screen
+  - unknown
+visibility:
+  - clear
+  - partial
+  - occluded
+review_status:
+  - proposed
+  - confirmed
+  - ambiguous
+  - rejected
+derived_actions:
+  - initial_state
+  - handover
+  - observed_direct_return
+  - place_on_mayo
+  - pickup_from_mayo
+  - relocate
+evaluation_policy:
+  included_by_default:
+    - confirmed
+  retained_but_excluded_by_default:
+    - ambiguous
+  never_ground_truth:
+    - proposed
+    - rejected

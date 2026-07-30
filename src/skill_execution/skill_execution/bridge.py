@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 from typing import Tuple
 import uuid
@@ -17,6 +18,7 @@ from surgical_msgs.msg import SkillCommand, SkillStatus
 ALLOWED_ACTIONS = {
     "direct_handover",
     "pick_up_and_handover",
+    "pick_up_from_mayo_and_handover",
     "put_down_and_handover",
     "retrieve_from_hand",
     "retrieve_from_mayo",
@@ -35,6 +37,8 @@ class CommandEnvelope:
     command_id: str
     action: str
     instrument_id: str
+    instrument_instance_id: str
+    request_generation: int
     target_location_id: str
     target_location_type: str
     rationale: str
@@ -44,6 +48,31 @@ class CommandEnvelope:
     target_owner: str
     cleaning_required: bool
     mode: str
+
+
+class RequestDispatchLedger:
+    """Bounded at-most-once ledger for explicit surgeon request generations."""
+
+    def __init__(self, max_entries: int = 512) -> None:
+        self._max_entries = max(1, int(max_entries))
+        self._seen: set[int] = set()
+        self._order: deque[int] = deque()
+
+    def consume(self, request_generation: int) -> bool:
+        generation = int(request_generation)
+        if generation <= 0:
+            return True
+        if generation in self._seen:
+            return False
+        self._seen.add(generation)
+        self._order.append(generation)
+        while len(self._order) > self._max_entries:
+            self._seen.discard(self._order.popleft())
+        return True
+
+    def clear(self) -> None:
+        self._seen.clear()
+        self._order.clear()
 
 
 class SkillActionBridge(Node):
@@ -56,9 +85,14 @@ class SkillActionBridge(Node):
         self._server_wait_timeout_sec = float(
             self.declare_parameter("server_wait_timeout_sec", 3.0).value
         )
-        self._last_signature: Tuple[str, str, str, str, str, str, str, str, str, bool] | None = None
+        self._last_signature: (
+            Tuple[str, str, str, int, str, str, str, str, str, str, str, bool] | None
+        ) = None
         self._last_signature_time = self.get_clock().now()
-        self._active_signature: Tuple[str, str, str, str, str, str, str, str, str, bool] | None = None
+        self._active_signature: (
+            Tuple[str, str, str, int, str, str, str, str, str, str, str, bool] | None
+        ) = None
+        self._request_dispatch_ledger = RequestDispatchLedger()
         self._active_command_id = ""
         self._active_command: CommandEnvelope | None = None
         self._active_goal_handle = None
@@ -72,10 +106,14 @@ class SkillActionBridge(Node):
     def _stamp(self):
         return self.get_clock().now().to_msg()
 
-    def _signature(self, command: CommandEnvelope) -> Tuple[str, str, str, str, str, str, str, str, str, bool]:
+    def _signature(
+        self, command: CommandEnvelope
+    ) -> Tuple[str, str, str, int, str, str, str, str, str, str, str, bool]:
         return (
             command.action,
             command.instrument_id,
+            command.instrument_instance_id,
+            int(command.request_generation),
             command.target_location_id,
             command.target_location_type,
             command.arm,
@@ -87,6 +125,11 @@ class SkillActionBridge(Node):
         )
 
     def _is_duplicate(self, command: CommandEnvelope) -> bool:
+        if (
+            command.mode == "explicit_request"
+            and not self._request_dispatch_ledger.consume(command.request_generation)
+        ):
+            return True
         signature = self._signature(command)
         now = self.get_clock().now()
         elapsed = (now - self._last_signature_time).nanoseconds / 1_000_000_000.0
@@ -101,6 +144,8 @@ class SkillActionBridge(Node):
             command_id=msg.command_id or uuid.uuid4().hex,
             action=msg.action,
             instrument_id=msg.instrument_id,
+            instrument_instance_id=msg.instrument_instance_id,
+            request_generation=int(msg.request_generation),
             target_location_id=msg.target_location_id,
             target_location_type=msg.target_location_type,
             rationale=msg.rationale,
@@ -150,6 +195,7 @@ class SkillActionBridge(Node):
         action = {
             "predict_tool": "tool_predict",
             "pick_up_and_handover": "tool_handover",
+            "pick_up_from_mayo_and_handover": "mayo_handover",
             "direct_handover": "predicted_tool_handover",
             "put_down_and_handover": "replace_and_handover",
             "retrieve_from_mayo": "tool_retrieve",
@@ -160,6 +206,8 @@ class SkillActionBridge(Node):
             return 3.2
         if action == "tool_handover":
             return 3.2
+        if action == "mayo_handover":
+            return 4.2
         if action == "predicted_tool_handover":
             return 1.0
         if action == "replace_and_handover":
@@ -334,6 +382,8 @@ class SkillActionBridge(Node):
         command = msg.data.strip().lower()
         if command in {"stop", "reset"}:
             self._cancel_active_goal(command)
+        if command == "reset":
+            self._request_dispatch_ledger.clear()
 
     def _on_command(self, msg: SkillCommand) -> None:
         command = self._coerce_command(msg)

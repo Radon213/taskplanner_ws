@@ -18,6 +18,7 @@ from surgical_msgs.msg import TwinEvent, WorldState
 ALLOWED_ACTIONS = {
     "direct_handover",
     "pick_up_and_handover",
+    "pick_up_from_mayo_and_handover",
     "put_down_and_handover",
     "retrieve_from_hand",
     "retrieve_from_mayo",
@@ -33,6 +34,7 @@ ALLOWED_ACTIONS = {
 ACTION_ALIASES = {
     "predict_tool": "tool_predict",
     "pick_up_and_handover": "tool_handover",
+    "pick_up_from_mayo_and_handover": "mayo_handover",
     "direct_handover": "predicted_tool_handover",
     "put_down_and_handover": "replace_and_handover",
     "retrieve_from_mayo": "tool_retrieve",
@@ -403,6 +405,87 @@ class MockSkillActionServer(Node):
                 detail={"reserved_for": self._world.filtered_phase if self._world is not None else ""},
             )
             message = "tool prepositioned in the right hand"
+        elif action == "mayo_handover":
+            current_tool = self._world.right_hand_tool if self._world is not None else ""
+            replacing_tool = bool(current_tool and current_tool != goal.instrument_id)
+            source_location_id = goal.source_location_id or "mayo_stand"
+            source_location_type = goal.source_location_type or "mayo_stand"
+            duration_sec = (
+                self._mayo_recovery_pickup_sec
+                + self._rack_to_handover_sec
+                + self._surgeon_handover_sec
+                + (self._cleaner_to_rack_sec if replacing_tool else 0.0)
+            )
+            self._publish_task_state(
+                goal,
+                task_event_type="RobotTaskStarted",
+                task_type=goal.action,
+                source_anchor_id=source_location_id,
+                target_anchor_id=goal.target_location_id or "surgeon_receive_zone",
+                duration_sec=duration_sec,
+            )
+            pick_start = 0.02
+            if replacing_tool:
+                self._step_sleep(
+                    goal_handle,
+                    "returning_prediction_to_rack",
+                    f"returning predicted {current_tool} to the rack",
+                    0.02,
+                    0.24,
+                    self._cleaner_to_rack_sec,
+                    4,
+                    generation,
+                )
+                self._maybe_return_prepositioned_tool(goal)
+                pick_start = 0.26
+            self._step_sleep(
+                goal_handle,
+                "picking_from_mayo_for_handover",
+                f"picking requested {goal.instrument_id} from Mayo stand",
+                pick_start,
+                0.50,
+                self._mayo_recovery_pickup_sec,
+                4,
+                generation,
+            )
+            self._publish_pick_if_needed(goal)
+            self._step_sleep(
+                goal_handle,
+                "moving_to_handover",
+                f"moving {goal.instrument_id} from Mayo toward the handover zone",
+                0.50,
+                0.76,
+                self._rack_to_handover_sec,
+                4,
+                generation,
+            )
+            self._step_sleep(
+                goal_handle,
+                "handover_to_surgeon",
+                f"handing Mayo tool {goal.instrument_id} to the surgeon",
+                0.76,
+                0.96,
+                self._surgeon_handover_sec,
+                4,
+                generation,
+            )
+            event = self._make_event(
+                goal,
+                "ToolHandoverCompleted",
+                location_id="surgeon_hand",
+                location_type="surgeon_hand",
+                owner="surgeon",
+                status="handed_over",
+                source_location_id="robot_right_hand",
+                source_location_type="robot_right_hand",
+                target_location_id=goal.target_location_id or "surgeon_receive_zone",
+                target_location_type=goal.target_location_type or "handover_zone",
+                target_owner=goal.target_owner or "surgeon",
+                arm=goal.arm or "right",
+                cleaning_required=False,
+                detail={"pickup_source": "mayo_stand"},
+            )
+            message = "Mayo tool handed over to surgeon"
         elif action == "tool_handover":
             duration_sec = self._handover_duration_sec(goal)
             self._publish_task_state(

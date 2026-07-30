@@ -1,0 +1,105 @@
+{
+  "schema": "taskplanner.phase_ontology_migration.v1",
+  "authority": "user_authorized_ai_assistant_cross_case_phase_reaudit",
+  "source_catalog": {
+    "file": "procedure_phases.cross_case_provisional.v2.yaml",
+    "sha256": "a8ebaa724b3aa2b031c7c39b4f652db1188f9322df2544a56174104edec5561c"
+  },
+  "target_catalog": {
+    "file": "procedure_phases.cross_case_provisional.v3.yaml",
+    "sha256": "8b40063d0aa4b371c53c1f3e5e395e8202a3c6c11927051a5cbc1f8da531510d"
+  },
+  "scope": {
+    "calibration_cases": [
+      "0704_6",
+      "0704_7",
+      "0704_8",
+      "0704_9",
+      "0704_10",
+      "0704_11",
+      "0704_12",
+      "0704_13",
+      "0704_14",
+      "0704_15",
+      "0704_16",
+      "0704_17"
+    ],
+    "held_out_eligible": false
+  },
+  "id_mapping": [
+    {
+      "source_phase_id": "P01",
+      "target_phase_id": "P01",
+      "change_kind": "definition_preserved"
+    },
+    {
+      "source_phase_id": "P02",
+      "target_phase_id": "P02",
+      "change_kind": "definition_preserved"
+    },
+    {
+      "source_phase_id": "P03",
+      "target_phase_id": "P03",
+      "change_kind": "definition_refined",
+      "summary": "Fixed-retraction absence replaces an exact Adson/Bovie/bipolar pattern."
+    },
+    {
+      "source_phase_id": "P04",
+      "target_phase_id": "P04",
+      "change_kind": "definition_refined",
+      "summary": "First persistent fixed-retractor seating replaces named Army-Navy sequence dependence."
+    },
+    {
+      "source_phase_id": "P05",
+      "target_phase_id": "P05",
+      "change_kind": "definition_refined",
+      "summary": "Sustained target manipulation is defined independently of Adson or Allis identity."
+    },
+    {
+      "source_phase_id": "P06",
+      "target_phase_id": "P06",
+      "change_kind": "boundary_semantics_refined",
+      "summary": "First persistent focal control is causal; later energy is a subevent, not a boundary prerequisite."
+    },
+    {
+      "source_phase_id": "P07",
+      "target_phase_id": "P07",
+      "change_kind": "definition_preserved"
+    },
+    {
+      "source_phase_id": "P08",
+      "target_phase_id": "P08",
+      "change_kind": "definition_preserved"
+    },
+    {
+      "source_phase_id": "P09",
+      "target_phase_id": "P09",
+      "change_kind": "definition_preserved"
+    }
+  ],
+  "coarse_groups_added": [
+    {
+      "group_id": "M01",
+      "members": ["P03"]
+    },
+    {
+      "group_id": "M02",
+      "members": ["P04", "P05"],
+      "reason": "Voice and tool events without a usable surgical-field image cannot reliably separate these adjacent visual states."
+    },
+    {
+      "group_id": "M03",
+      "members": ["P06"]
+    }
+  ],
+  "nonclinical_workflow_state": {
+    "phase_id": "P10",
+    "target_role": "runtime_workflow_terminal_only",
+    "clinical_phase_reference_allowed": false,
+    "reason": "Instrument clearance is cleanup, not a distinct clinical resection Phase."
+  },
+  "scoring_policy": {
+    "phase_accuracy_enabled": false,
+    "reason": "The ontology and calibration boundaries remain provisional pending human review and held-out collection."
+  }
+}

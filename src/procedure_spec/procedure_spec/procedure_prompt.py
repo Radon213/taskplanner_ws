@@ -33,6 +33,7 @@ def compact_procedure_prompt(bundle_dir: str | Path) -> dict[str, Any]:
         return {}
 
     tools = payload.get("tools", {})
+    tool_inventory = payload.get("tool_inventory", {})
     phase_labels = payload.get("phase_labels", {})
     normal_phases = phase_labels.get("normal", {}) if isinstance(phase_labels, dict) else {}
     interrupt_phases = phase_labels.get("interrupt", {}) if isinstance(phase_labels, dict) else {}
@@ -53,18 +54,54 @@ def compact_procedure_prompt(bundle_dir: str | Path) -> dict[str, Any]:
             )
         interrupt = phase_flow.get("interrupt_transition", {}) or {}
         if isinstance(interrupt, dict):
-            flow.append(
-                [
-                    "*",
-                    str(interrupt.get("phase", "")),
-                    str((interrupt.get("enter_when", {}) or {}).get("tool_cue", "")),
-                ]
-            )
+            interrupt_phase = str(interrupt.get("phase", ""))
+            if interrupt_phase:
+                flow.append(
+                    [
+                        "*",
+                        interrupt_phase,
+                        str((interrupt.get("enter_when", {}) or {}).get("tool_cue", "")),
+                    ]
+                )
 
     phase_sequences: dict[str, list[list[str]]] = {}
+    phase_cues: dict[str, list[str]] = {}
+    phase_exclusions: dict[str, list[str]] = {}
+    phase_tool_roles: dict[str, dict[str, list[str]]] = {}
     for phase_id, detail in (payload.get("phase_details", {}) or {}).items():
         if not isinstance(detail, dict):
             continue
+        cues = [
+            str(cue).strip()
+            for cue in detail.get("visual_cues", []) or []
+            if str(cue).strip()
+        ]
+        if cues:
+            # Two short cues are enough to preserve the discriminative visual
+            # contract without rebuilding the full authoring document.
+            phase_cues[str(phase_id)] = cues[:2]
+        exclusions = [
+            str(cue).strip()
+            for cue in detail.get("exclusion_cues", []) or []
+            if str(cue).strip()
+        ]
+        if exclusions:
+            phase_exclusions[str(phase_id)] = exclusions[:2]
+        raw_tool_roles = detail.get("tool_roles", {}) or {}
+        if isinstance(raw_tool_roles, dict):
+            compact_roles: dict[str, list[str]] = {}
+            for role, tool_ids in raw_tool_roles.items():
+                if not isinstance(tool_ids, list):
+                    continue
+                normalized_ids = [
+                    str(tool_id).strip()
+                    for tool_id in tool_ids
+                    if str(tool_id).strip()
+                ]
+                if normalized_ids:
+                    compact_roles[str(role)] = normalized_ids
+            if compact_roles:
+                phase_tool_roles[str(phase_id)] = compact_roles
         rows: list[list[str]] = []
         for item in detail.get("expected_tool_sequence", []) or []:
             if not isinstance(item, dict):
@@ -85,6 +122,27 @@ def compact_procedure_prompt(bundle_dir: str | Path) -> dict[str, Any]:
     if not isinstance(bed_robot_arm_groups, dict):
         bed_robot_arm_groups = {}
 
+    raw_inference_policy = payload.get("phase_inference_policy", {}) or {}
+    phase_inference_policy = (
+        {
+            str(key): value
+            for key, value in raw_inference_policy.items()
+            if isinstance(value, (str, int, float, bool, list, dict))
+        }
+        if isinstance(raw_inference_policy, dict)
+        else {}
+    )
+    raw_phase_groups = payload.get("phase_groups", {}) or {}
+    phase_groups = (
+        {
+            str(group_id): group
+            for group_id, group in raw_phase_groups.items()
+            if isinstance(group, dict)
+        }
+        if isinstance(raw_phase_groups, dict)
+        else {}
+    )
+
     return {
         "id": str(payload.get("id", "thyroidectomy_procedure_prompt")),
         "procedure": str((payload.get("procedure", {}) or {}).get("name", "")),
@@ -94,11 +152,21 @@ def compact_procedure_prompt(bundle_dir: str | Path) -> dict[str, Any]:
             str(tool_id): {
                 "n": str(name),
                 "rt": str(tool_id),
+                "q": int(
+                    tool_inventory.get(tool_id, 1)
+                    if isinstance(tool_inventory, dict)
+                    else 1
+                ),
             }
             for tool_id, name in (tools if isinstance(tools, dict) else {}).items()
         },
         "flow": flow,
+        "cues": phase_cues,
+        "exclude": phase_exclusions,
+        "roles": phase_tool_roles,
         "seq": phase_sequences,
+        "phase_policy": phase_inference_policy,
+        "phase_groups": phase_groups,
         # Preserve the group-level scenario contract.  This intentionally has
         # no physical arm identifiers or arm-count assumptions.
         "bed_robot_arm_groups": bed_robot_arm_groups,

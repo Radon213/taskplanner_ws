@@ -4,10 +4,18 @@ import ROSLIB from "roslib";
 import type {
   BedRobotArmGroupState,
   BTDecision,
+  Cam4ToolRequestObservation,
   CompressedImageFrame,
+  ModelCatalogEntry,
+  ModelProviderStatus,
+  ModelRuntimeCommand,
+  ModelSelection,
+  ShadowGroundTruthState,
+  ShadowReplayState,
   SimulationEvent,
   SimulationState,
   SkillStatus,
+  SpeechUtterance,
   SurgeonLLMDecision,
   SurgeonState,
   VLMHealth,
@@ -15,6 +23,10 @@ import type {
   VLMResult,
   WorldState,
 } from "../types";
+import {
+  runtimeBridgeUrl,
+  type TaskplannerRuntimeMode,
+} from "../runtimeModes";
 
 const DEFAULT_STATE: SimulationState = {
   procedure_id: "",
@@ -138,6 +150,36 @@ const DEFAULT_VLM_RESULT: VLMResult = {
   uncertainty: 0,
 };
 
+const DEFAULT_CAM4_TOOL_REQUEST: Cam4ToolRequestObservation = {
+  available: false,
+  state: "uncertain",
+  requested: null,
+  confidence: 0,
+  sourceStampSec: 0,
+  receivedAt: 0,
+  onsetSourceStampSec: 0,
+  onsetReceivedAt: 0,
+};
+
+const DEFAULT_SHADOW_GROUND_TRUTH: ShadowGroundTruthState = {
+  available: false,
+  runId: "",
+  caseId: "",
+  sourceTimeSec: 0,
+  phase: {
+    phaseId: "",
+    startSec: 0,
+    endSec: 0,
+    active: false,
+  },
+  eventId: "",
+  active: false,
+  startSec: 0,
+  endSec: 0,
+  receivedAt: 0,
+  eventStartReceivedAt: 0,
+};
+
 const DEFAULT_WORLD_STATE: WorldState = {
   procedure_id: "",
   running: false,
@@ -155,7 +197,34 @@ const DEFAULT_WORLD_STATE: WorldState = {
   predicted_tool_confidence: 0,
   predicted_tool_stability_sec: 0,
   surgeon_request_tool: "",
+  explicit_request_voice_backed: false,
   bed_robot_arm_groups: [],
+};
+
+const DEFAULT_SHADOW_REPLAY_STATE: ShadowReplayState = {
+  stamp: { sec: 0, nanosec: 0 },
+  run_id: "",
+  case_id: "",
+  procedure_id: "",
+  state: "unavailable",
+  mode: "elastic_demo",
+  loaded: false,
+  running: false,
+  paused: false,
+  completed: false,
+  source_time_sec: 0,
+  duration_sec: 0,
+  image_duration_sec: 0,
+  wall_elapsed_sec: 0,
+  playback_rate: 1,
+  elastic_hold_sec: 0,
+  hold_reason: "",
+  last_error: "",
+  published_image_count: 0,
+  published_transcript_count: 0,
+  completed_vlm_count: 0,
+  pending_vlm_count: 0,
+  active_skill_count: 0,
 };
 
 type RosCompressedImage = {
@@ -165,6 +234,247 @@ type RosCompressedImage = {
   format?: string;
   data?: string | number[];
 };
+
+type RosString = {
+  data?: string;
+};
+
+const CAM4_TOOL_REQUEST_STATES = new Set<
+  Cam4ToolRequestObservation["state"]
+>(["request", "not_request", "hand_with_tool", "uncertain"]);
+
+export function normalizeCam4ToolRequest(
+  message: unknown,
+  receivedAt = Date.now(),
+): Cam4ToolRequestObservation {
+  const raw = String((message as RosString | null)?.data ?? "");
+  try {
+    const payload = JSON.parse(raw) as Record<string, unknown>;
+    if (payload.schema !== "taskplanner.cam4_semantics.v1") {
+      return DEFAULT_CAM4_TOOL_REQUEST;
+    }
+    const sourceStampSec = Number(payload.source_stamp_sec);
+    const request =
+      payload.tool_request && typeof payload.tool_request === "object"
+        ? (payload.tool_request as Record<string, unknown>)
+        : {};
+    const candidateState = String(request.state ?? "uncertain") as
+      Cam4ToolRequestObservation["state"];
+    const state = CAM4_TOOL_REQUEST_STATES.has(candidateState)
+      ? candidateState
+      : "uncertain";
+    const rawConfidence = Number(request.confidence);
+    const confidence = Number.isFinite(rawConfidence)
+      ? Math.max(0, Math.min(1, rawConfidence))
+      : 0;
+    return {
+      available: Number.isFinite(sourceStampSec),
+      state,
+      requested:
+        state === "request"
+          ? true
+          : state === "not_request"
+            ? false
+            : null,
+      confidence,
+      sourceStampSec: Number.isFinite(sourceStampSec) ? sourceStampSec : 0,
+      receivedAt,
+      onsetSourceStampSec: 0,
+      onsetReceivedAt: 0,
+    };
+  } catch {
+    return DEFAULT_CAM4_TOOL_REQUEST;
+  }
+}
+
+function normalizeShadowGroundTruth(
+  message: unknown,
+  receivedAt = Date.now(),
+): ShadowGroundTruthState {
+  const raw = String((message as RosString | null)?.data ?? "");
+  try {
+    const payload = JSON.parse(raw) as Record<string, unknown>;
+    if (
+      payload.schema !== "taskplanner.shadow_ground_truth.v1" &&
+      payload.schema !== "taskplanner.shadow_ground_truth.v2"
+    ) {
+      return DEFAULT_SHADOW_GROUND_TRUTH;
+    }
+    const request =
+      payload.implicit_tool_request &&
+      typeof payload.implicit_tool_request === "object"
+        ? (payload.implicit_tool_request as Record<string, unknown>)
+        : {};
+    const phase =
+      payload.phase && typeof payload.phase === "object"
+        ? (payload.phase as Record<string, unknown>)
+        : {};
+    const finite = (value: unknown) => {
+      const number = Number(value);
+      return Number.isFinite(number) ? number : 0;
+    };
+    return {
+      available: Boolean(payload.available),
+      runId: String(payload.run_id ?? ""),
+      caseId: String(payload.case_id ?? ""),
+      sourceTimeSec: finite(payload.source_time_sec),
+      phase: {
+        phaseId: String(phase.phase_id ?? ""),
+        startSec: finite(phase.start_sec),
+        endSec: finite(phase.end_sec),
+        active: Boolean(phase.active ?? phase.phase_id),
+      },
+      eventId: String(request.event_id ?? ""),
+      active: Boolean(request.active),
+      startSec: finite(request.start_sec),
+      endSec: finite(request.end_sec),
+      receivedAt,
+      eventStartReceivedAt: 0,
+    };
+  } catch {
+    return DEFAULT_SHADOW_GROUND_TRUTH;
+  }
+}
+
+// Preserve the recorded camera cadence. A millisecond throttle drops frames
+// when nominal 15 FPS input arrives with normal 59-81 ms scheduling jitter.
+const CAMERA_FRAME_THROTTLE_MS = 0;
+
+export type PerceptionLayerHealth = {
+  received: boolean;
+  enabled: boolean;
+  connected: boolean;
+  status: string;
+  latencyMs: number;
+  lastError: string;
+};
+
+const DEFAULT_PERCEPTION_HEALTH: PerceptionLayerHealth = {
+  received: false,
+  enabled: false,
+  connected: false,
+  status: "unavailable",
+  latencyMs: 0,
+  lastError: "",
+};
+
+function normalizePerceptionHealth(
+  message: unknown,
+): PerceptionLayerHealth {
+  const raw = (message as RosString | null)?.data;
+  if (!raw) return DEFAULT_PERCEPTION_HEALTH;
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    if (parsed.schema !== "taskplanner.rfdetr_health.v1") {
+      return DEFAULT_PERCEPTION_HEALTH;
+    }
+    return {
+      received: true,
+      enabled: Boolean(parsed.enabled),
+      connected: Boolean(parsed.connected),
+      status: String(parsed.status || "unknown"),
+      latencyMs: Number.isFinite(Number(parsed.latency_ms))
+        ? Number(parsed.latency_ms)
+        : 0,
+      lastError: String(parsed.last_error || ""),
+    };
+  } catch {
+    return DEFAULT_PERCEPTION_HEALTH;
+  }
+}
+
+type ShadowTranscriptHistory = {
+  runId: string;
+  utterances: SpeechUtterance[];
+};
+
+function speechSourceTime(utterance: SpeechUtterance): number {
+  return (
+    Number(utterance.start_stamp?.sec ?? 0) +
+    Number(utterance.start_stamp?.nanosec ?? 0) / 1_000_000_000
+  );
+}
+
+function mergeShadowTranscripts(
+  current: SpeechUtterance[],
+  incoming: SpeechUtterance[],
+): SpeechUtterance[] {
+  const byId = new Map<string, SpeechUtterance>();
+  for (const utterance of [...current, ...incoming]) {
+    if (
+      !utterance.utterance_id ||
+      !utterance.is_final ||
+      !utterance.text?.trim()
+    ) {
+      continue;
+    }
+    byId.set(utterance.utterance_id, utterance);
+  }
+  return [...byId.values()]
+    .sort((left, right) => {
+      const timeDifference =
+        speechSourceTime(right) - speechSourceTime(left);
+      return (
+        timeDifference ||
+        right.utterance_id.localeCompare(left.utterance_id)
+      );
+    })
+    .slice(0, 48);
+}
+
+function transcriptRunId(source: string): string {
+  const parts = source.split(":");
+  return parts.length >= 3 && parts[0] === "recorded_transcript"
+    ? parts.slice(2).join(":")
+    : "";
+}
+
+function normalizeShadowTranscriptHistory(
+  message: unknown,
+): ShadowTranscriptHistory {
+  const raw = (message as RosString | null)?.data;
+  if (!raw) return { runId: "", utterances: [] };
+  try {
+    const parsed = JSON.parse(raw) as {
+      schema?: string;
+      run_id?: string;
+      utterances?: Partial<SpeechUtterance>[];
+    };
+    if (
+      parsed.schema !== "taskplanner.shadow_transcript_history.v1" ||
+      !Array.isArray(parsed.utterances)
+    ) {
+      return { runId: "", utterances: [] };
+    }
+    const utterances = parsed.utterances
+      .filter(
+        (item) =>
+          Boolean(item?.utterance_id) &&
+          Boolean(item?.is_final) &&
+          Boolean(item?.text?.trim()),
+      )
+      .map((item) => ({
+        stamp: item.stamp ?? { sec: 0, nanosec: 0 },
+        start_stamp: item.start_stamp ?? { sec: 0, nanosec: 0 },
+        end_stamp: item.end_stamp ?? { sec: 0, nanosec: 0 },
+        utterance_id: String(item.utterance_id),
+        text: String(item.text),
+        is_final: true,
+        has_confidence: Boolean(item.has_confidence),
+        confidence: Number(item.confidence ?? 0),
+        speaker_role: String(item.speaker_role || "surgeon"),
+        language: String(item.language || ""),
+        source: String(item.source || ""),
+      }))
+      .slice(0, 48);
+    return {
+      runId: String(parsed.run_id || ""),
+      utterances,
+    };
+  } catch {
+    return { runId: "", utterances: [] };
+  }
+}
 
 type RosServiceResponseMessage = {
   result?: boolean;
@@ -247,6 +557,7 @@ export type OverridePayload = {
 };
 
 export type ControlCommand = "start" | "pause" | "resume" | "stop" | "reset";
+export type ShadowReplayMode = "realtime_1x" | "elastic_demo";
 
 const ROS_PARAM_BOOL = 1;
 const ROS_PARAM_STRING = 4;
@@ -301,8 +612,82 @@ function runtimeStatusMessage(state: SimulationState): string {
   return "";
 }
 
-export function useRosBridge() {
-  const [url, setUrl] = useState("ws://127.0.0.1:9090");
+function normalizeProviderStatus(value: unknown): ModelProviderStatus | null {
+  if (!value || typeof value !== "object") return null;
+  const row = value as Record<string, unknown>;
+  const providerId = String(row.provider_id || "").trim();
+  if (!providerId) return null;
+  return {
+    provider_id: providerId,
+    provider_name: String(row.provider_name || providerId),
+    endpoint: String(row.endpoint || ""),
+    reachable: Boolean(row.reachable),
+    status: String(row.status || ""),
+    detail: String(row.detail || ""),
+    latency_sec: Number(row.latency_sec || 0),
+    model_count: Number(row.model_count || 0),
+  };
+}
+
+function normalizeModelEntry(value: unknown): ModelCatalogEntry | null {
+  if (!value || typeof value !== "object") return null;
+  const row = value as Record<string, unknown>;
+  const providerId = String(row.provider_id || "").trim();
+  const modelId = String(row.model_id || "").trim();
+  if (!providerId || !modelId) return null;
+  const availableActions = Array.isArray(row.available_actions)
+    ? row.available_actions
+        .map((command) => String(command))
+        .filter(
+          (command): command is ModelRuntimeCommand =>
+            command === "load" ||
+            command === "unload" ||
+            command === "sleep" ||
+            command === "wake",
+        )
+    : [];
+  return {
+    provider_id: providerId,
+    provider_name: String(row.provider_name || providerId),
+    model_id: modelId,
+    display_name: String(row.display_name || modelId),
+    capability: String(row.capability || "unknown"),
+    load_state: String(row.load_state || "unknown"),
+    selectable: row.selectable === undefined ? true : Boolean(row.selectable),
+    detail: String(row.detail || ""),
+    runtime_managed: Boolean(row.runtime_managed),
+    available_actions: availableActions,
+  };
+}
+
+function legacyCatalog(modelIds: string[], providerName: string) {
+  const provider: ModelProviderStatus = {
+    provider_id: "legacy",
+    provider_name: providerName,
+    endpoint: "",
+    reachable: true,
+    status: "online",
+    detail: "Legacy single-provider catalog",
+    latency_sec: 0,
+    model_count: modelIds.length,
+  };
+  const models: ModelCatalogEntry[] = modelIds.map((modelId) => ({
+    provider_id: provider.provider_id,
+    provider_name: provider.provider_name,
+    model_id: modelId,
+    display_name: modelId,
+    capability: "unknown",
+    load_state: "unknown",
+    selectable: true,
+    detail: "",
+    runtime_managed: false,
+    available_actions: [],
+  }));
+  return { provider, models };
+}
+
+export function useRosBridge(runtimeMode: TaskplannerRuntimeMode) {
+  const [url, setUrl] = useState(() => runtimeBridgeUrl(runtimeMode));
   const [connected, setConnected] = useState(false);
   const [bundle, setBundle] = useState("");
   const [startPhase, setStartPhase] = useState("");
@@ -314,28 +699,76 @@ export function useRosBridge() {
   const [skillStatus, setSkillStatus] = useState<SkillStatus>(DEFAULT_SKILL_STATUS);
   const [vlmHealth, setVlmHealth] = useState<VLMHealth>(DEFAULT_VLM_HEALTH);
   const [vlmResult, setVlmResult] = useState<VLMResult>(DEFAULT_VLM_RESULT);
+  const [cam4ToolRequest, setCam4ToolRequest] =
+    useState<Cam4ToolRequestObservation>(DEFAULT_CAM4_TOOL_REQUEST);
   const [vlmReducerDecisions, setVlmReducerDecisions] = useState<VLMReducerDecision[]>([]);
   const [vlmImage, setVlmImage] = useState<CompressedImageFrame | null>(null);
+  const [vlmCompositeImage, setVlmCompositeImage] =
+    useState<CompressedImageFrame | null>(null);
+  const [cam1Image, setCam1Image] = useState<CompressedImageFrame | null>(null);
+  const [cam2Image, setCam2Image] = useState<CompressedImageFrame | null>(null);
+  const [cam3Image, setCam3Image] = useState<CompressedImageFrame | null>(null);
+  const [cam4Image, setCam4Image] = useState<CompressedImageFrame | null>(null);
+  const [flirImage, setFlirImage] = useState<CompressedImageFrame | null>(null);
+  const [cam4PerceptionImage, setCam4PerceptionImage] =
+    useState<CompressedImageFrame | null>(null);
+  const [flirPerceptionImage, setFlirPerceptionImage] =
+    useState<CompressedImageFrame | null>(null);
+  const [cam4PerceptionOverlay, setCam4PerceptionOverlay] =
+    useState<CompressedImageFrame | null>(null);
+  const [flirPerceptionOverlay, setFlirPerceptionOverlay] =
+    useState<CompressedImageFrame | null>(null);
+  const [perceptionHealth, setPerceptionHealth] =
+    useState<PerceptionLayerHealth>(DEFAULT_PERCEPTION_HEALTH);
   const [vlmHealthReceivedAt, setVlmHealthReceivedAt] = useState<number | null>(null);
   const [vlmResultReceivedAt, setVlmResultReceivedAt] = useState<number | null>(null);
-  const [vlmModelOptions, setVlmModelOptions] = useState<string[]>([]);
+  const [vlmModelOptions, setVlmModelOptions] = useState<ModelCatalogEntry[]>([]);
+  const [vlmProviderStatuses, setVlmProviderStatuses] = useState<ModelProviderStatus[]>([]);
+  const [vlmModelSelection, setVlmModelSelection] = useState<ModelSelection | null>(null);
   const [vlmModelCatalogStatus, setVlmModelCatalogStatus] = useState("loading");
-  const [actorModelOptions, setActorModelOptions] = useState<string[]>([]);
+  const [actorModelOptions, setActorModelOptions] = useState<ModelCatalogEntry[]>([]);
+  const [actorProviderStatuses, setActorProviderStatuses] = useState<ModelProviderStatus[]>([]);
+  const [actorModelSelection, setActorModelSelection] = useState<ModelSelection | null>(null);
   const [actorModelCatalogStatus, setActorModelCatalogStatus] = useState("loading");
   const [events, setEvents] = useState<SimulationEvent[]>([]);
   const [actionPending, setActionPending] = useState("");
   const [actionMessage, setActionMessage] = useState("Ready.");
   const [overrideAck, setOverrideAck] = useState<OverrideAck | null>(null);
   const [actorEnabled, setActorEnabledState] = useState(true);
+  const [shadowReplayState, setShadowReplayState] = useState<ShadowReplayState>(
+    DEFAULT_SHADOW_REPLAY_STATE,
+  );
+  const [shadowTranscript, setShadowTranscript] = useState<SpeechUtterance[]>([]);
+  const [shadowGroundTruth, setShadowGroundTruth] =
+    useState<ShadowGroundTruthState>(DEFAULT_SHADOW_GROUND_TRUTH);
 
   const rosRef = useRef<unknown>(null);
   const simulationStateRef = useRef<SimulationState>(DEFAULT_STATE);
+  const shadowReplayStateRef = useRef<ShadowReplayState>(
+    DEFAULT_SHADOW_REPLAY_STATE,
+  );
+  const perceptionHealthReceivedRef = useRef(false);
+  const perceptionEnabledRef = useRef(false);
+  const cam4ToolRequestRef = useRef<Cam4ToolRequestObservation>(
+    DEFAULT_CAM4_TOOL_REQUEST,
+  );
+  const shadowGroundTruthRef = useRef<ShadowGroundTruthState>(
+    DEFAULT_SHADOW_GROUND_TRUTH,
+  );
   const reconnectTimerRef = useRef<number | null>(null);
   const bundleDirtyRef = useRef(false);
   const eventSequenceRef = useRef(0);
   const suppressEventsUntilRef = useRef(0);
   const actionRunIdRef = useRef(0);
+  const controlRunIdRef = useRef(0);
   const bundleApplyRunIdRef = useRef(0);
+  const pendingCameraFramesRef = useRef(
+    new Map<
+      (frame: CompressedImageFrame | null) => void,
+      CompressedImageFrame
+    >(),
+  );
+  const cameraFlushFrameRef = useRef<number | null>(null);
 
   const activeBundle = bundle || simulationState.active_bundle;
 
@@ -362,11 +795,33 @@ export function useRosBridge() {
     });
     ros.on("close", () => {
       setConnected(false);
+      perceptionHealthReceivedRef.current = false;
+      perceptionEnabledRef.current = false;
+      setPerceptionHealth(DEFAULT_PERCEPTION_HEALTH);
+      setCam4PerceptionImage(null);
+      setFlirPerceptionImage(null);
+      setCam4PerceptionOverlay(null);
+      setFlirPerceptionOverlay(null);
+      setCam4ToolRequest(DEFAULT_CAM4_TOOL_REQUEST);
+      cam4ToolRequestRef.current = DEFAULT_CAM4_TOOL_REQUEST;
+      setShadowGroundTruth(DEFAULT_SHADOW_GROUND_TRUTH);
+      shadowGroundTruthRef.current = DEFAULT_SHADOW_GROUND_TRUTH;
       setActionMessage("ROS bridge disconnected. Reconnecting...");
       scheduleReconnect();
     });
     ros.on("error", () => {
       setConnected(false);
+      perceptionHealthReceivedRef.current = false;
+      perceptionEnabledRef.current = false;
+      setPerceptionHealth(DEFAULT_PERCEPTION_HEALTH);
+      setCam4PerceptionImage(null);
+      setFlirPerceptionImage(null);
+      setCam4PerceptionOverlay(null);
+      setFlirPerceptionOverlay(null);
+      setCam4ToolRequest(DEFAULT_CAM4_TOOL_REQUEST);
+      cam4ToolRequestRef.current = DEFAULT_CAM4_TOOL_REQUEST;
+      setShadowGroundTruth(DEFAULT_SHADOW_GROUND_TRUTH);
+      shadowGroundTruthRef.current = DEFAULT_SHADOW_GROUND_TRUTH;
       setActionMessage("ROS bridge error. Retrying connection...");
       scheduleReconnect();
     });
@@ -427,6 +882,118 @@ export function useRosBridge() {
       messageType: "sensor_msgs/msg/CompressedImage",
       throttle_rate: 100,
     });
+    const cameraTopics = [
+      {
+        name: "/surgery/images/cam1/compressed",
+        setter: setCam1Image,
+      },
+      {
+        name: "/surgery/images/cam2/compressed",
+        setter: setCam2Image,
+      },
+      {
+        name: "/surgery/images/cam3/compressed",
+        setter: setCam3Image,
+      },
+      {
+        name: "/surgery/images/cam4/compressed",
+        setter: setCam4Image,
+      },
+      {
+        name: "/surgery/images/flir/compressed",
+        setter: setFlirImage,
+      },
+      {
+        name: "/surgery/images/cam4/detected/compressed",
+        setter: setCam4PerceptionImage,
+      },
+      {
+        name: "/surgery/images/flir/segmented/compressed",
+        setter: setFlirPerceptionImage,
+      },
+      {
+        name: "/surgery/images/cam4/detection_overlay/compressed",
+        setter: setCam4PerceptionOverlay,
+      },
+      {
+        name: "/surgery/images/flir/segmentation_overlay/compressed",
+        setter: setFlirPerceptionOverlay,
+      },
+      {
+        name: "/surgery/images/vlm/composite/compressed",
+        setter: setVlmCompositeImage,
+      },
+    ].map(({ name, setter }) => {
+      const topic = new ROSLIB.Topic({
+        ros,
+        name,
+        messageType: "sensor_msgs/msg/CompressedImage",
+        throttle_rate: CAMERA_FRAME_THROTTLE_MS,
+      });
+      topic.subscribe((message: unknown) => {
+        if (
+          (name === "/surgery/images/cam4/detected/compressed" ||
+            name === "/surgery/images/flir/segmented/compressed" ||
+            name ===
+              "/surgery/images/cam4/detection_overlay/compressed" ||
+            name ===
+              "/surgery/images/flir/segmentation_overlay/compressed") &&
+          perceptionHealthReceivedRef.current &&
+          !perceptionEnabledRef.current
+        ) {
+          return;
+        }
+        const frame = compressedImageToFrame(
+          message as RosCompressedImage,
+          name,
+        );
+        if (!frame) return;
+        pendingCameraFramesRef.current.set(setter, frame);
+        if (cameraFlushFrameRef.current === null) {
+          cameraFlushFrameRef.current = window.requestAnimationFrame(() => {
+            cameraFlushFrameRef.current = null;
+            const pending = Array.from(
+              pendingCameraFramesRef.current.entries(),
+            );
+            pendingCameraFramesRef.current.clear();
+            for (const [applyFrame, nextFrame] of pending) {
+              applyFrame(nextFrame);
+            }
+          });
+        }
+      });
+      return topic;
+    });
+    const shadowReplayStateTopic = new ROSLIB.Topic({
+      ros,
+      name: "/shadow/replay_state",
+      messageType: "surgical_msgs/msg/ShadowReplayState",
+    });
+    const perceptionHealthTopic = new ROSLIB.Topic({
+      ros,
+      name: "/surgery/perception/rfdetr/health",
+      messageType: "std_msgs/msg/String",
+    });
+    const cam4SemanticsTopic = new ROSLIB.Topic({
+      ros,
+      name: "/surgery/perception/cam4/semantics/json",
+      messageType: "std_msgs/msg/String",
+    });
+    const shadowTranscriptTopic = new ROSLIB.Topic({
+      ros,
+      name: "/shadow/speech/utterance",
+      messageType: "surgical_msgs/msg/SpeechUtterance",
+    });
+    const shadowTranscriptHistoryTopic = new ROSLIB.Topic({
+      ros,
+      name: "/shadow/speech/history",
+      messageType: "std_msgs/msg/String",
+    });
+    const shadowGroundTruthTopic = new ROSLIB.Topic({
+      ros,
+      name: "/shadow/ground_truth/state",
+      messageType: "std_msgs/msg/String",
+    });
 
     simulationTopic.subscribe((message: unknown) => {
       const receivedState = normalizeSimulationState(message);
@@ -481,10 +1048,8 @@ export function useRosBridge() {
       });
     });
     vlmHealthTopic.subscribe((message: unknown) => {
-      startTransition(() => {
-        setVlmHealth(message as VLMHealth);
-        setVlmHealthReceivedAt(Date.now());
-      });
+      setVlmHealth(message as VLMHealth);
+      setVlmHealthReceivedAt(Date.now());
     });
     vlmResultTopic.subscribe((message: unknown) => {
       startTransition(() => {
@@ -498,10 +1063,169 @@ export function useRosBridge() {
       });
     });
     vlmFieldImageTopic.subscribe((message: unknown) => {
+      if (
+        perceptionHealthReceivedRef.current &&
+        !perceptionEnabledRef.current
+      ) {
+        return;
+      }
       const frame = compressedImageToFrame(message as RosCompressedImage, "/surgery/images/field/compressed");
       if (!frame) return;
       startTransition(() => {
         setVlmImage(frame);
+      });
+    });
+    shadowReplayStateTopic.subscribe((message: unknown) => {
+      const next = {
+        ...DEFAULT_SHADOW_REPLAY_STATE,
+        ...(message as Partial<ShadowReplayState>),
+      };
+      const previous = shadowReplayStateRef.current;
+      const runChanged =
+        Boolean(next.run_id) &&
+        Boolean(previous.run_id) &&
+        next.run_id !== previous.run_id;
+      const replayRewound =
+        previous.loaded &&
+        next.loaded &&
+        next.source_time_sec + 0.25 < previous.source_time_sec;
+      shadowReplayStateRef.current = next;
+      startTransition(() => {
+        if (runChanged || replayRewound) {
+          setShadowTranscript([]);
+          setEvents([]);
+          setVlmReducerDecisions([]);
+          setVlmResult(DEFAULT_VLM_RESULT);
+          setVlmResultReceivedAt(0);
+          setVlmImage(null);
+          setVlmCompositeImage(null);
+          setCam1Image(null);
+          setCam3Image(null);
+          setCam4Image(null);
+          setCam4PerceptionImage(null);
+          setFlirPerceptionImage(null);
+          setCam4PerceptionOverlay(null);
+          setFlirPerceptionOverlay(null);
+          setCam4ToolRequest(DEFAULT_CAM4_TOOL_REQUEST);
+          cam4ToolRequestRef.current = DEFAULT_CAM4_TOOL_REQUEST;
+          setShadowGroundTruth(DEFAULT_SHADOW_GROUND_TRUTH);
+          shadowGroundTruthRef.current = DEFAULT_SHADOW_GROUND_TRUTH;
+        }
+        setShadowReplayState(next);
+        if (next.loaded && next.procedure_id) {
+          bundleDirtyRef.current = false;
+          setBundle(next.procedure_id);
+        }
+      });
+    });
+    perceptionHealthTopic.subscribe((message: unknown) => {
+      const health = normalizePerceptionHealth(message);
+      const wasEnabled = perceptionEnabledRef.current;
+      perceptionHealthReceivedRef.current = health.received;
+      perceptionEnabledRef.current = health.received && health.enabled;
+      setPerceptionHealth(health);
+      if (!health.received) return;
+      if (!health.enabled) {
+        setCam4PerceptionImage(null);
+        setFlirPerceptionImage(null);
+        setCam4PerceptionOverlay(null);
+        setFlirPerceptionOverlay(null);
+        setCam4ToolRequest(DEFAULT_CAM4_TOOL_REQUEST);
+        cam4ToolRequestRef.current = DEFAULT_CAM4_TOOL_REQUEST;
+        return;
+      }
+      if (health.status !== "ready" && !wasEnabled) {
+        setVlmHealth((current) => ({
+          ...current,
+          healthy: false,
+          image_source: "",
+          latency_sec: 0,
+          last_error: health.lastError || "waiting for fresh RF-DETR frame",
+          last_mode: "waiting_for_perception",
+        }));
+        setVlmHealthReceivedAt(Date.now());
+      }
+    });
+    cam4SemanticsTopic.subscribe((message: unknown) => {
+      const parsed = normalizeCam4ToolRequest(message);
+      const previous = cam4ToolRequestRef.current;
+      const startsRequest =
+        parsed.available &&
+        parsed.state === "request" &&
+        previous.state !== "request";
+      const observation = {
+        ...parsed,
+        onsetSourceStampSec:
+          parsed.state === "request"
+            ? startsRequest
+              ? parsed.sourceStampSec
+              : previous.onsetSourceStampSec
+            : previous.onsetSourceStampSec,
+        onsetReceivedAt:
+          parsed.state === "request"
+            ? startsRequest
+              ? parsed.receivedAt
+              : previous.onsetReceivedAt
+            : previous.onsetReceivedAt,
+      };
+      cam4ToolRequestRef.current = observation;
+      startTransition(() => {
+        setCam4ToolRequest(observation);
+      });
+    });
+    shadowGroundTruthTopic.subscribe((message: unknown) => {
+      const parsed = normalizeShadowGroundTruth(message);
+      const previous = shadowGroundTruthRef.current;
+      const sameEvent =
+        Boolean(parsed.eventId) && parsed.eventId === previous.eventId;
+      const observation = {
+        ...parsed,
+        eventStartReceivedAt:
+          sameEvent && previous.eventStartReceivedAt > 0
+            ? previous.eventStartReceivedAt
+            : parsed.active
+              ? parsed.receivedAt
+              : 0,
+      };
+      shadowGroundTruthRef.current = observation;
+      startTransition(() => {
+        setShadowGroundTruth(observation);
+      });
+    });
+    shadowTranscriptTopic.subscribe((message: unknown) => {
+      const utterance = message as SpeechUtterance;
+      if (!utterance.is_final || !utterance.text?.trim()) return;
+      const messageRunId = transcriptRunId(utterance.source || "");
+      const activeRunId = shadowReplayStateRef.current.run_id;
+      if (
+        messageRunId &&
+        activeRunId &&
+        messageRunId !== activeRunId
+      ) {
+        return;
+      }
+      startTransition(() => {
+        setShadowTranscript((current) =>
+          mergeShadowTranscripts(current, [utterance]),
+        );
+      });
+    });
+    shadowTranscriptHistoryTopic.subscribe((message: unknown) => {
+      const history = normalizeShadowTranscriptHistory(message);
+      const activeRunId = shadowReplayStateRef.current.run_id;
+      if (
+        history.runId &&
+        activeRunId &&
+        history.runId !== activeRunId
+      ) {
+        return;
+      }
+      startTransition(() => {
+        setShadowTranscript((current) =>
+          history.utterances.length === 0
+            ? []
+            : mergeShadowTranscripts(current, history.utterances),
+        );
       });
     });
 
@@ -520,6 +1244,18 @@ export function useRosBridge() {
       vlmResultTopic.unsubscribe();
       vlmReducerTopic.unsubscribe();
       vlmFieldImageTopic.unsubscribe();
+      cameraTopics.forEach((topic) => topic.unsubscribe());
+      pendingCameraFramesRef.current.clear();
+      if (cameraFlushFrameRef.current !== null) {
+        window.cancelAnimationFrame(cameraFlushFrameRef.current);
+        cameraFlushFrameRef.current = null;
+      }
+      shadowReplayStateTopic.unsubscribe();
+      perceptionHealthTopic.unsubscribe();
+      cam4SemanticsTopic.unsubscribe();
+      shadowTranscriptTopic.unsubscribe();
+      shadowTranscriptHistoryTopic.unsubscribe();
+      shadowGroundTruthTopic.unsubscribe();
       if (reconnectTimerRef.current !== null) {
         window.clearTimeout(reconnectTimerRef.current);
         reconnectTimerRef.current = null;
@@ -532,6 +1268,10 @@ export function useRosBridge() {
   useEffect(() => {
     simulationStateRef.current = simulationState;
   }, [simulationState]);
+
+  useEffect(() => {
+    shadowReplayStateRef.current = shadowReplayState;
+  }, [shadowReplayState]);
 
   useEffect(() => {
     if (!bundleDirtyRef.current && simulationState.active_bundle && bundle !== simulationState.active_bundle) {
@@ -613,24 +1353,64 @@ export function useRosBridge() {
       if (!connected || refreshing) return;
       refreshing = true;
       try {
-        const response = await callService(
-          "/real_vlm_node/list_models",
-          "surgical_msgs/srv/ListModels",
-          {},
-          10000,
-        );
-        if (!Boolean(response.success)) {
-          throw new Error(String(response.message || "VLM model catalog unavailable."));
+        let response: Record<string, unknown>;
+        try {
+          response = await callService(
+            "/real_vlm_node/list_model_catalog",
+            "surgical_msgs/srv/ListModelCatalog",
+            {},
+            10000,
+          );
+        } catch {
+          const legacyResponse = await callService(
+            "/real_vlm_node/list_models",
+            "surgical_msgs/srv/ListModels",
+            {},
+            10000,
+          );
+          if (!Boolean(legacyResponse.success)) {
+            throw new Error(String(legacyResponse.message || "VLM model catalog unavailable."));
+          }
+          const modelIds = Array.isArray(legacyResponse.model_ids)
+            ? legacyResponse.model_ids.map((modelId) => String(modelId)).filter(Boolean)
+            : [];
+          const fallback = legacyCatalog(modelIds, "OpenAI compatible");
+          if (disposed) return;
+          setVlmModelOptions(fallback.models);
+          setVlmProviderStatuses([fallback.provider]);
+          setVlmModelSelection(
+            modelIds[0] ? { provider_id: "legacy", model_id: modelIds[0] } : null,
+          );
+          setVlmModelCatalogStatus(
+            String(legacyResponse.message || (modelIds.length ? "connected" : "empty")),
+          );
+          return;
         }
-        const modelIds = Array.isArray(response.model_ids)
-          ? response.model_ids.map((modelId) => String(modelId)).filter(Boolean)
+        const providers = Array.isArray(response.providers)
+          ? response.providers
+              .map(normalizeProviderStatus)
+              .filter((row): row is ModelProviderStatus => row !== null)
           : [];
+        const models = Array.isArray(response.models)
+          ? response.models
+              .map(normalizeModelEntry)
+              .filter((row): row is ModelCatalogEntry => row !== null)
+          : [];
+        const activeProviderId = String(response.active_provider_id || "").trim();
+        const activeModelId = String(response.active_model_id || "").trim();
         if (disposed) return;
-        setVlmModelOptions(modelIds);
-        setVlmModelCatalogStatus(String(response.message || (modelIds.length ? "connected" : "empty")));
+        setVlmModelOptions(models);
+        setVlmProviderStatuses(providers);
+        setVlmModelSelection(
+          activeProviderId && activeModelId
+            ? { provider_id: activeProviderId, model_id: activeModelId }
+            : null,
+        );
+        setVlmModelCatalogStatus(
+          String(response.message || (models.length ? "connected" : "empty")),
+        );
       } catch (error) {
         if (disposed) return;
-        setVlmModelOptions([]);
         setVlmModelCatalogStatus(error instanceof Error ? error.message : "VLM model catalog unavailable.");
       } finally {
         refreshing = false;
@@ -639,6 +1419,8 @@ export function useRosBridge() {
 
     if (!connected) {
       setVlmModelOptions([]);
+      setVlmProviderStatuses([]);
+      setVlmModelSelection(null);
       setVlmModelCatalogStatus("ROS bridge offline");
       return () => {
         disposed = true;
@@ -662,33 +1444,79 @@ export function useRosBridge() {
       if (!connected || refreshing) return;
       refreshing = true;
       try {
-        const response = await callService(
-          "/surgeon_actor/list_models",
-          "surgical_msgs/srv/ListModels",
-          {},
-          10000,
-        );
-        if (!Boolean(response.success)) {
-          throw new Error(String(response.message || "Actor model catalog unavailable."));
+        let response: Record<string, unknown>;
+        try {
+          response = await callService(
+            "/surgeon_actor/list_model_catalog",
+            "surgical_msgs/srv/ListModelCatalog",
+            {},
+            10000,
+          );
+        } catch {
+          const legacyResponse = await callService(
+            "/surgeon_actor/list_models",
+            "surgical_msgs/srv/ListModels",
+            {},
+            10000,
+          );
+          if (!Boolean(legacyResponse.success)) {
+            throw new Error(String(legacyResponse.message || "Actor model catalog unavailable."));
+          }
+          const modelIds = Array.isArray(legacyResponse.model_ids)
+            ? legacyResponse.model_ids.map((modelId) => String(modelId)).filter(Boolean)
+            : [];
+          const fallback = legacyCatalog(modelIds, "OpenAI compatible");
+          if (disposed) return;
+          setActorModelOptions(fallback.models);
+          setActorProviderStatuses([fallback.provider]);
+          setActorModelSelection(
+            modelIds[0] ? { provider_id: "legacy", model_id: modelIds[0] } : null,
+          );
+          setActorModelCatalogStatus(
+            String(legacyResponse.message || (modelIds.length ? "connected" : "empty")),
+          );
+          return;
         }
-        const modelIds = Array.isArray(response.model_ids)
-          ? response.model_ids.map((modelId) => String(modelId)).filter(Boolean)
+        const providers = Array.isArray(response.providers)
+          ? response.providers
+              .map(normalizeProviderStatus)
+              .filter((row): row is ModelProviderStatus => row !== null)
           : [];
+        const models = Array.isArray(response.models)
+          ? response.models
+              .map(normalizeModelEntry)
+              .filter((row): row is ModelCatalogEntry => row !== null)
+          : [];
+        const activeProviderId = String(response.active_provider_id || "").trim();
+        const activeModelId = String(response.active_model_id || "").trim();
         if (disposed) return;
-        setActorModelOptions(modelIds);
-        setActorModelCatalogStatus(String(response.message || (modelIds.length ? "connected" : "empty")));
+        setActorModelOptions(models);
+        setActorProviderStatuses(providers);
+        setActorModelSelection(
+          activeProviderId && activeModelId
+            ? { provider_id: activeProviderId, model_id: activeModelId }
+            : null,
+        );
+        setActorModelCatalogStatus(
+          String(response.message || (models.length ? "connected" : "empty")),
+        );
       } catch (error) {
         if (disposed) return;
-        setActorModelOptions([]);
         setActorModelCatalogStatus(error instanceof Error ? error.message : "Actor model catalog unavailable.");
       } finally {
         refreshing = false;
       }
     }
 
-    if (!connected) {
+    if (!connected || runtimeMode !== "llm") {
       setActorModelOptions([]);
-      setActorModelCatalogStatus("ROS bridge offline");
+      setActorProviderStatuses([]);
+      setActorModelSelection(null);
+      setActorModelCatalogStatus(
+        runtimeMode !== "llm"
+          ? "disabled in this runtime mode"
+          : "ROS bridge offline",
+      );
       return () => {
         disposed = true;
       };
@@ -701,7 +1529,7 @@ export function useRosBridge() {
       disposed = true;
       window.clearInterval(timer);
     };
-  }, [connected, url]);
+  }, [connected, url, runtimeMode]);
 
   function stringParameter(name: string, value: string) {
     return {
@@ -801,6 +1629,141 @@ export function useRosBridge() {
     );
   }
 
+  function applyShadowReplayStateJson(
+    value: unknown,
+    fallbackCaseId = "",
+  ): ShadowReplayState | null {
+    const stateJson = String(value ?? "").trim();
+    if (!stateJson) return null;
+    try {
+      const parsed = JSON.parse(stateJson) as Partial<ShadowReplayState>;
+      if (!parsed || typeof parsed !== "object") return null;
+      const next: ShadowReplayState = {
+        ...DEFAULT_SHADOW_REPLAY_STATE,
+        ...parsed,
+        case_id: String(
+          parsed.case_id ||
+            fallbackCaseId ||
+            shadowReplayStateRef.current.case_id,
+        ),
+      };
+      shadowReplayStateRef.current = next;
+      setShadowReplayState(next);
+      if (next.loaded && next.procedure_id) {
+        bundleDirtyRef.current = false;
+        setBundle(next.procedure_id);
+      }
+      return next;
+    } catch {
+      return null;
+    }
+  }
+
+  async function callShadowReplayControl(
+    command: "start" | "pause" | "resume" | "restart" | "stop" | "status",
+    options: {
+      mode?: ShadowReplayMode;
+      playbackRate?: number;
+    } = {},
+  ) {
+    const response = await callService(
+      "/shadow/control_replay",
+      "surgical_msgs/srv/ControlShadowReplay",
+      {
+        command,
+        mode: options.mode ?? "",
+        playback_rate: options.playbackRate ?? 0,
+        seek_sec: 0,
+      },
+      10000,
+    );
+    if (!Boolean(response.success)) {
+      throw new Error(
+        String(response.message || `Shadow replay ${command} failed.`),
+      );
+    }
+    applyShadowReplayStateJson(response.state_json);
+    return response;
+  }
+
+  async function configureShadowReplay(
+    mode: ShadowReplayMode,
+    playbackRate: number,
+  ) {
+    await runAction("Updating shadow replay", async () => {
+      const response = await callShadowReplayControl("status", {
+        mode,
+        playbackRate,
+      });
+      setActionMessage(String(response.message || "Shadow replay updated."));
+    });
+  }
+
+  async function selectShadowCase(caseId: string) {
+    const normalizedCaseId = caseId.trim();
+    if (!normalizedCaseId) return;
+    await runAction("Selecting shadow case", async () => {
+      const response = await callService(
+        "/shadow/select_case",
+        "surgical_msgs/srv/SelectShadowCase",
+        { case_id: normalizedCaseId },
+        15000,
+      );
+      if (!Boolean(response.success)) {
+        throw new Error(
+          String(response.message || `Unable to select ${normalizedCaseId}.`),
+        );
+      }
+
+      applyShadowReplayStateJson(response.state_json, normalizedCaseId);
+
+      setShadowTranscript([]);
+      setEvents([]);
+      setVlmReducerDecisions([]);
+      setVlmResult(DEFAULT_VLM_RESULT);
+      setVlmResultReceivedAt(0);
+      setVlmImage(null);
+      setVlmCompositeImage(null);
+      setCam1Image(null);
+      setCam2Image(null);
+      setCam3Image(null);
+      setCam4Image(null);
+      setFlirImage(null);
+      setCam4PerceptionImage(null);
+      setFlirPerceptionImage(null);
+      setCam4PerceptionOverlay(null);
+      setFlirPerceptionOverlay(null);
+      setCam4ToolRequest(DEFAULT_CAM4_TOOL_REQUEST);
+      cam4ToolRequestRef.current = DEFAULT_CAM4_TOOL_REQUEST;
+      setActionMessage(
+        String(response.message || `Shadow case ${normalizedCaseId} selected.`),
+      );
+    });
+  }
+
+  async function prepareShadowControl(command: ControlCommand) {
+    if (!shadowReplayStateRef.current.loaded) return;
+    if (command === "pause") {
+      await callShadowReplayControl("pause");
+    } else if (command === "reset") {
+      await callShadowReplayControl("restart");
+      setShadowTranscript([]);
+    } else if (command === "stop") {
+      await callShadowReplayControl("stop");
+    }
+  }
+
+  async function finalizeShadowControl(command: ControlCommand) {
+    if (!shadowReplayStateRef.current.loaded) return;
+    if (command === "start") {
+      await waitForControlTarget("start", 45000);
+      await callShadowReplayControl("start");
+      setShadowTranscript([]);
+    } else if (command === "resume") {
+      await callShadowReplayControl("resume");
+    }
+  }
+
   async function applyBundle(targetBundle = bundle) {
     const selectedBundle = targetBundle || bundle;
     if (!selectedBundle) return;
@@ -842,6 +1805,8 @@ export function useRosBridge() {
   }
 
   async function control(command: ControlCommand) {
+    const controlRunId = controlRunIdRef.current + 1;
+    controlRunIdRef.current = controlRunId;
     const label =
       command === "start"
         ? "Starting simulation"
@@ -860,6 +1825,7 @@ export function useRosBridge() {
       if (command === "reset") {
         clearEventLog({ suppressMs: 1200 });
       }
+      await prepareShadowControl(command);
       try {
         const response = await callService(
           "/simulation/control",
@@ -897,10 +1863,15 @@ export function useRosBridge() {
             command,
             command === "reset" ? 30000 : 20000,
           );
+          if (controlRunIdRef.current !== controlRunId) return;
+          await finalizeShadowControl(command);
           if (stableMessage) {
             setActionMessage(stableMessage);
           }
+          return;
         }
+        if (controlRunIdRef.current !== controlRunId) return;
+        await finalizeShadowControl(command);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         if (
@@ -923,6 +1894,8 @@ export function useRosBridge() {
               });
             }
             if (stableMessage) {
+              if (controlRunIdRef.current !== controlRunId) return;
+              await finalizeShadowControl(command);
               setActionMessage(stableMessage);
               return;
             }
@@ -970,20 +1943,183 @@ export function useRosBridge() {
     });
   }
 
-  async function setVlmModel(modelId: string) {
+  async function setVlmModel(selection: ModelSelection) {
     await runAction("Updating VLM model", async () => {
-      await setNodeParameters("real_vlm_node", [stringParameter("model_id", modelId)]);
-      setVlmHealth((current) => ({ ...current, model_id: modelId }));
-      setActionMessage(`VLM model set to ${modelId}.`);
+      const selectedEntry = vlmModelOptions.find(
+        (entry) =>
+          entry.provider_id === selection.provider_id &&
+          entry.model_id === selection.model_id,
+      );
+      const transitionState =
+        selectedEntry?.runtime_managed &&
+        ["unloaded", "error", "configured", "unknown"].includes(
+          selectedEntry.load_state,
+        )
+          ? "loading"
+          : selectedEntry?.load_state === "sleeping"
+            ? "waking"
+            : "";
+      if (transitionState) {
+        updateSharedModelRuntimeState(selection, transitionState);
+      }
+      try {
+        if (selection.provider_id === "legacy") {
+          await setNodeParameters("real_vlm_node", [
+            stringParameter("model_id", selection.model_id),
+          ]);
+        } else {
+          const response = await callService(
+            "/real_vlm_node/select_model_provider",
+            "surgical_msgs/srv/SelectModelProvider",
+            selection,
+            900000,
+          );
+          if (!Boolean(response.success)) {
+            throw new Error(
+              String(response.message || "VLM provider selection failed."),
+            );
+          }
+        }
+      } catch (error) {
+        if (transitionState) {
+          updateSharedModelRuntimeState(selection, "error");
+        }
+        throw error;
+      }
+      setVlmModelSelection(selection);
+      setVlmHealth((current) => ({ ...current, model_id: selection.model_id }));
+      setActionMessage(`VLM set to ${selection.provider_id} / ${selection.model_id}.`);
     });
   }
 
-  async function setActorModel(modelId: string) {
+  async function setActorModel(selection: ModelSelection) {
     await runAction("Updating LLM surgeon model", async () => {
-      await setNodeParameters("surgeon_actor", [stringParameter("model_id", modelId)]);
-      setSurgeonLlmDecision((current) => ({ ...current, model_id: modelId }));
-      setActionMessage(`LLM surgeon model set to ${modelId}.`);
+      const selectedEntry = actorModelOptions.find(
+        (entry) =>
+          entry.provider_id === selection.provider_id &&
+          entry.model_id === selection.model_id,
+      );
+      const transitionState =
+        selectedEntry?.runtime_managed &&
+        ["unloaded", "error", "configured", "unknown"].includes(
+          selectedEntry.load_state,
+        )
+          ? "loading"
+          : selectedEntry?.load_state === "sleeping"
+            ? "waking"
+            : "";
+      if (transitionState) {
+        updateSharedModelRuntimeState(selection, transitionState);
+      }
+      try {
+        if (selection.provider_id === "legacy") {
+          await setNodeParameters("surgeon_actor", [
+            stringParameter("model_id", selection.model_id),
+          ]);
+        } else {
+          const response = await callService(
+            "/surgeon_actor/select_model_provider",
+            "surgical_msgs/srv/SelectModelProvider",
+            selection,
+            900000,
+          );
+          if (!Boolean(response.success)) {
+            throw new Error(
+              String(
+                response.message ||
+                  "LLM surgeon provider selection failed.",
+              ),
+            );
+          }
+        }
+      } catch (error) {
+        if (transitionState) {
+          updateSharedModelRuntimeState(selection, "error");
+        }
+        throw error;
+      }
+      setActorModelSelection(selection);
+      setSurgeonLlmDecision((current) => ({
+        ...current,
+        model_id: selection.model_id,
+      }));
+      setActionMessage(`LLM surgeon set to ${selection.provider_id} / ${selection.model_id}.`);
     });
+  }
+
+  function updateSharedModelRuntimeState(
+    selection: ModelSelection,
+    state: string,
+  ) {
+    const update = (entries: ModelCatalogEntry[]) =>
+      entries.map((entry) =>
+        entry.provider_id === selection.provider_id &&
+        entry.model_id === selection.model_id
+          ? {
+              ...entry,
+              load_state: state,
+              available_actions: ["loading", "suspending", "waking", "unloading"].includes(
+                state,
+              )
+                ? []
+                : entry.available_actions,
+            }
+          : entry,
+      );
+    setVlmModelOptions(update);
+    setActorModelOptions(update);
+  }
+
+  async function controlModelRuntime(
+    nodeName: "real_vlm_node" | "surgeon_actor",
+    roleLabel: "VLM" | "actor",
+    selection: ModelSelection,
+    command: ModelRuntimeCommand,
+  ) {
+    await runAction(`Updating ${roleLabel} runtime: ${command}`, async () => {
+      const response = await callService(
+        `/${nodeName}/control_model_runtime`,
+        "surgical_msgs/srv/ControlModelRuntime",
+        {
+          provider_id: selection.provider_id,
+          model_id: selection.model_id,
+          command,
+        },
+        900000,
+      );
+      if (!Boolean(response.success)) {
+        throw new Error(String(response.message || `${roleLabel} runtime command failed.`));
+      }
+      const state = String(response.state || "unknown");
+      updateSharedModelRuntimeState(selection, state);
+      setActionMessage(
+        `${selection.provider_id} / ${selection.model_id}: ${command} accepted (${state}).`,
+      );
+    });
+  }
+
+  async function controlVlmModelRuntime(
+    selection: ModelSelection,
+    command: ModelRuntimeCommand,
+  ) {
+    await controlModelRuntime(
+      "real_vlm_node",
+      "VLM",
+      selection,
+      command,
+    );
+  }
+
+  async function controlActorModelRuntime(
+    selection: ModelSelection,
+    command: ModelRuntimeCommand,
+  ) {
+    await controlModelRuntime(
+      "surgeon_actor",
+      "actor",
+      selection,
+      command,
+    );
   }
 
   async function setActorEnabled(enabled: boolean) {
@@ -992,6 +2128,48 @@ export function useRosBridge() {
       setActorEnabledState(enabled);
       setActionMessage(enabled ? "LLM surgeon enabled." : "LLM surgeon disabled.");
     });
+  }
+
+  async function setPerceptionEnabled(enabled: boolean) {
+    await runAction(
+      enabled ? "Enabling object recognition" : "Disabling object recognition",
+      async () => {
+        setCam4PerceptionImage(null);
+        setFlirPerceptionImage(null);
+        setCam4PerceptionOverlay(null);
+        setFlirPerceptionOverlay(null);
+        const response = await callService(
+          "/rfdetr_perception_bridge/set_enabled",
+          "std_srvs/srv/SetBool",
+          { data: enabled },
+          10000,
+        );
+        if (!Boolean(response.success)) {
+          throw new Error(
+            String(
+              response.message ||
+                "Object recognition control request was rejected.",
+            ),
+          );
+        }
+        setPerceptionHealth((current) => ({
+          ...current,
+          received: true,
+          enabled,
+          connected: false,
+          status: enabled ? "waiting_for_frame" : "disabled",
+          lastError: "",
+        }));
+        setActionMessage(
+          String(
+            response.message ||
+              (enabled
+                ? "Object recognition enabled."
+                : "Object recognition disabled."),
+          ),
+        );
+      },
+    );
   }
 
   const runtimeMessage = runtimeStatusMessage(simulationState);
@@ -1017,13 +2195,29 @@ export function useRosBridge() {
     skillStatus,
     vlmHealth,
     vlmResult,
+    cam4ToolRequest,
     vlmReducerDecisions,
-    vlmImage,
+    vlmImage: vlmCompositeImage ?? vlmImage,
+    vlmCompositeImage,
+    cam1Image,
+    cam2Image,
+    cam3Image,
+    cam4Image,
+    flirImage,
+    cam4PerceptionImage,
+    flirPerceptionImage,
+    cam4PerceptionOverlay,
+    flirPerceptionOverlay,
+    perceptionHealth,
     vlmHealthReceivedAt,
     vlmResultReceivedAt,
     vlmModelOptions,
+    vlmProviderStatuses,
+    vlmModelSelection,
     vlmModelCatalogStatus,
     actorModelOptions,
+    actorProviderStatuses,
+    actorModelSelection,
     actorModelCatalogStatus,
     events,
     actionPending,
@@ -1032,11 +2226,19 @@ export function useRosBridge() {
     simulationReady,
     overrideAck,
     actorEnabled,
+    shadowReplayState,
+    shadowTranscript,
+    shadowGroundTruth,
     applyBundle,
     control,
     sendOverride,
     setVlmModel,
     setActorModel,
+    controlVlmModelRuntime,
+    controlActorModelRuntime,
     setActorEnabled,
+    setPerceptionEnabled,
+    selectShadowCase,
+    configureShadowReplay,
   };
 }

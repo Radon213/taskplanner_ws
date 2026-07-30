@@ -1,0 +1,577 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+COMPOSE_FILE="${ROOT_DIR}/docker-compose.yml"
+WAIT_TIMEOUT_SEC="${TASKPLANNER_COMPOSE_WAIT_SEC:-300}"
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}/taskplanner"
+NINFER_MANAGER_PID_FILE="${RUNTIME_DIR}/ninfer-manager.pid"
+NINFER_MANAGER_LOG_FILE="${RUNTIME_DIR}/ninfer-manager.log"
+NINFER_MANAGER_UNIT="taskplanner-ninfer-manager.service"
+LMSTUDIO_STARTED_FILE="${RUNTIME_DIR}/lmstudio.started"
+UNSLOTH_CONTROL_UNIT="taskplanner-unsloth-control.service"
+
+usage() {
+  cat <<'EOF'
+Taskplanner deployment launcher
+
+Usage:
+  scripts/taskplanner up <live|llm-surgeon|replay> [--dry-run] [--build]
+  scripts/taskplanner down [--dry-run]
+  scripts/taskplanner status
+  scripts/taskplanner config <live|llm-surgeon|replay>
+  scripts/taskplanner help
+
+Commands:
+  up       Start the selected runtime plus webapp, ROS bridge/model registry,
+           and unloaded vLLM/NInfer control planes. Live/replay also start RF-DETR.
+           Reuses install/ and node_modules unless --build is supplied.
+  down     Stop and remove every Taskplanner Compose profile.
+  status   Show containers from every Taskplanner profile.
+  config   Render the fully resolved Compose configuration for one mode.
+
+Environment:
+  .env.example is always loaded first. A local .env overrides deployment
+  paths and credentials. Mode-owned values are loaded last; exported shell
+  variables have highest precedence.
+
+Examples:
+  cp .env.example .env
+  scripts/taskplanner up live
+  scripts/taskplanner up live --build
+  scripts/taskplanner up replay --dry-run
+  SHADOW_CASE_ID=0704_12 scripts/taskplanner up replay
+  scripts/taskplanner down
+EOF
+}
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 2
+}
+
+validate_mode() {
+  case "${1:-}" in
+    live|llm-surgeon|replay) ;;
+    *) die "mode must be live, llm-surgeon, or replay" ;;
+  esac
+}
+
+compose_env_args() {
+  local mode="${1:-}"
+  ENV_FILES=("${ROOT_DIR}/.env.example")
+  ENV_ARGS=(--env-file "${ROOT_DIR}/.env.example")
+  if [[ -f "${ROOT_DIR}/.env" ]]; then
+    ENV_FILES+=("${ROOT_DIR}/.env")
+    ENV_ARGS+=(--env-file "${ROOT_DIR}/.env")
+  fi
+  if [[ -n "${mode}" ]]; then
+    ENV_FILES+=("${ROOT_DIR}/docker/orchestration/${mode}.env")
+    ENV_ARGS+=(--env-file "${ROOT_DIR}/docker/orchestration/${mode}.env")
+  fi
+}
+
+print_command() {
+  printf '+'
+  printf ' %q' "$@"
+  printf '\n'
+}
+
+run_or_print() {
+  if [[ "${DRY_RUN}" == "true" ]]; then
+    print_command "$@"
+  else
+    "$@"
+  fi
+}
+
+run_best_effort() {
+  local warning_message="$1"
+  shift
+  if [[ "${DRY_RUN}" == "true" ]]; then
+    print_command "$@"
+    return 0
+  fi
+  if ! "$@"; then
+    printf 'warning: %s\n' "${warning_message}" >&2
+  fi
+}
+
+ninfer_manager_command() {
+  NINFER_MANAGER_COMMAND=(
+    python3
+    "${ROOT_DIR}/scripts/ninfer_runtime_manager.py"
+  )
+  local env_file
+  for env_file in "${ENV_FILES[@]}"; do
+    NINFER_MANAGER_COMMAND+=(--env-file "${env_file}")
+  done
+}
+
+ninfer_manager_url() {
+  ninfer_manager_command
+  "${NINFER_MANAGER_COMMAND[@]}" --print-base-url
+}
+
+ninfer_manager_ready() {
+  local base_url="$1"
+  python3 - "${base_url}" <<'PY'
+import json
+import sys
+from urllib.error import URLError
+from urllib.request import urlopen
+
+try:
+    with urlopen(f"{sys.argv[1]}/health", timeout=1.0) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+except (OSError, URLError, ValueError):
+    raise SystemExit(1)
+raise SystemExit(
+    0
+    if payload.get("service") == "taskplanner-ninfer-manager"
+    else 1
+)
+PY
+}
+
+user_systemd_available() {
+  command -v systemd-run >/dev/null 2>&1 &&
+    systemctl --user show-environment >/dev/null 2>&1
+}
+
+compose_environment_value() {
+  local profile="$1"
+  local service="$2"
+  local key="$3"
+  local fallback="$4"
+  "${COMPOSE[@]}" --profile "${profile}" config --format json |
+    python3 -c '
+import json
+import sys
+
+profile, service, key, fallback = sys.argv[1:]
+config = json.load(sys.stdin)
+print(
+    config.get("services", {})
+    .get(service, {})
+    .get("environment", {})
+    .get(key, fallback)
+)
+' "${profile}" "${service}" "${key}" "${fallback}"
+}
+
+endpoint_host_port() {
+  python3 - "$1" "$2" <<'PY'
+import sys
+from urllib.parse import urlparse
+
+parsed = urlparse(sys.argv[1])
+host = parsed.hostname or "127.0.0.1"
+port = parsed.port or int(sys.argv[2])
+if host not in {"127.0.0.1", "localhost", "::1"}:
+    raise SystemExit(1)
+print(host, port)
+PY
+}
+
+start_lmstudio_control_plane() {
+  local mode="$1"
+  local service="$2"
+  local endpoint
+  endpoint="$(
+    compose_environment_value \
+      "${mode}" "${service}" LMSTUDIO_BASE_URL http://127.0.0.1:1234
+  )"
+  local host_port
+  host_port="$(endpoint_host_port "${endpoint}" 1234)" || return 0
+  local host="${host_port% *}"
+  local port="${host_port##* }"
+  if curl -fsS --max-time 1 "${endpoint%/}/v1/models" >/dev/null 2>&1; then
+    return 0
+  fi
+  command -v lms >/dev/null 2>&1 || return 1
+  mkdir -p "${RUNTIME_DIR}"
+  lms server start --port "${port}" --bind "${host}" >/dev/null
+  local attempt
+  for attempt in $(seq 1 100); do
+    if curl -fsS --max-time 1 "${endpoint%/}/v1/models" >/dev/null 2>&1; then
+      printf '%s\n' "${endpoint}" >"${LMSTUDIO_STARTED_FILE}"
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
+stop_lmstudio_control_plane() {
+  [[ -f "${LMSTUDIO_STARTED_FILE}" ]] || return 0
+  if command -v lms >/dev/null 2>&1; then
+    lms server stop >/dev/null 2>&1 || true
+  fi
+  rm -f "${LMSTUDIO_STARTED_FILE}"
+}
+
+start_unsloth_control_plane() {
+  local mode="$1"
+  local service="$2"
+  local endpoint
+  endpoint="$(
+    compose_environment_value \
+      "${mode}" "${service}" UNSLOTH_BASE_URL http://127.0.0.1:8888
+  )"
+  local host_port
+  host_port="$(endpoint_host_port "${endpoint}" 8888)" || return 0
+  local port="${host_port##* }"
+  if curl -fsS --max-time 1 "${endpoint%/}/api/health" >/dev/null 2>&1; then
+    return 0
+  fi
+  user_systemd_available || return 1
+  local executable="${UNSLOTH_STUDIO_EXE:-${HOME}/.unsloth/studio/unsloth_studio/bin/unsloth}"
+  [[ -x "${executable}" ]] || return 1
+  systemctl --user stop "${UNSLOTH_CONTROL_UNIT}" >/dev/null 2>&1 || true
+  systemd-run --user \
+    --unit="${UNSLOTH_CONTROL_UNIT%.service}" \
+    --collect \
+    --property=Restart=no \
+    "${executable}" studio -p "${port}" >/dev/null
+  local attempt
+  for attempt in $(seq 1 600); do
+    if curl -fsS --max-time 1 "${endpoint%/}/api/health" >/dev/null 2>&1; then
+      return 0
+    fi
+    if ! systemctl --user is-active --quiet "${UNSLOTH_CONTROL_UNIT}"; then
+      break
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
+stop_unsloth_control_plane() {
+  if user_systemd_available &&
+      systemctl --user is-active --quiet "${UNSLOTH_CONTROL_UNIT}"; then
+    systemctl --user stop "${UNSLOTH_CONTROL_UNIT}"
+  fi
+}
+
+start_ninfer_manager() {
+  ninfer_manager_command
+  local base_url
+  base_url="$(ninfer_manager_url)"
+  if [[ "${DRY_RUN}" == "true" ]]; then
+    print_command \
+      nohup "${NINFER_MANAGER_COMMAND[@]}" \
+      ">" "${NINFER_MANAGER_LOG_FILE}" "2>&1" "&"
+    return 0
+  fi
+  if ninfer_manager_ready "${base_url}"; then
+    return 0
+  fi
+  mkdir -p "${RUNTIME_DIR}"
+  if user_systemd_available; then
+    systemctl --user stop "${NINFER_MANAGER_UNIT}" >/dev/null 2>&1 || true
+    systemd-run --user \
+      --unit="${NINFER_MANAGER_UNIT%.service}" \
+      --collect \
+      --property=Restart=no \
+      "${NINFER_MANAGER_COMMAND[@]}" >/dev/null
+    local attempt
+    for attempt in $(seq 1 50); do
+      if ninfer_manager_ready "${base_url}"; then
+        systemctl --user show \
+          --property=MainPID \
+          --value \
+          "${NINFER_MANAGER_UNIT}" >"${NINFER_MANAGER_PID_FILE}"
+        return 0
+      fi
+      if ! systemctl --user is-active --quiet "${NINFER_MANAGER_UNIT}"; then
+        break
+      fi
+      sleep 0.1
+    done
+    printf 'NInfer manager failed to start; inspect: journalctl --user -u %s\n' \
+      "${NINFER_MANAGER_UNIT}" >&2
+    return 1
+  fi
+  if [[ -f "${NINFER_MANAGER_PID_FILE}" ]]; then
+    local stale_pid
+    stale_pid="$(cat "${NINFER_MANAGER_PID_FILE}")"
+    if kill -0 "${stale_pid}" 2>/dev/null; then
+      kill "${stale_pid}" 2>/dev/null || true
+      wait "${stale_pid}" 2>/dev/null || true
+    fi
+    rm -f "${NINFER_MANAGER_PID_FILE}"
+  fi
+  nohup "${NINFER_MANAGER_COMMAND[@]}" \
+    >"${NINFER_MANAGER_LOG_FILE}" 2>&1 &
+  local manager_pid=$!
+  printf '%s\n' "${manager_pid}" >"${NINFER_MANAGER_PID_FILE}"
+  local attempt
+  for attempt in $(seq 1 50); do
+    if ninfer_manager_ready "${base_url}"; then
+      return 0
+    fi
+    if ! kill -0 "${manager_pid}" 2>/dev/null; then
+      break
+    fi
+    sleep 0.1
+  done
+  printf 'NInfer manager failed to start; see %s\n' \
+    "${NINFER_MANAGER_LOG_FILE}" >&2
+  return 1
+}
+
+stop_ninfer_manager() {
+  if [[ "${DRY_RUN}" == "true" ]]; then
+    print_command systemctl --user stop "${NINFER_MANAGER_UNIT}"
+    print_command rm -f "${NINFER_MANAGER_PID_FILE}"
+    return 0
+  fi
+  if user_systemd_available &&
+      systemctl --user is-active --quiet "${NINFER_MANAGER_UNIT}"; then
+    systemctl --user stop "${NINFER_MANAGER_UNIT}"
+  fi
+  if [[ ! -f "${NINFER_MANAGER_PID_FILE}" ]]; then
+    return 0
+  fi
+  local manager_pid
+  manager_pid="$(cat "${NINFER_MANAGER_PID_FILE}")"
+  if kill -0 "${manager_pid}" 2>/dev/null; then
+    kill "${manager_pid}" 2>/dev/null || true
+    local attempt
+    for attempt in $(seq 1 100); do
+      if ! kill -0 "${manager_pid}" 2>/dev/null; then
+        break
+      fi
+      sleep 0.1
+    done
+  fi
+  rm -f "${NINFER_MANAGER_PID_FILE}"
+}
+
+prepare_replay_run_root() {
+  local run_root
+  run_root="$(
+    "${COMPOSE[@]}" --profile replay config --format json |
+      python3 -c '
+import json
+import sys
+
+config = json.load(sys.stdin)
+for volume in config["services"]["shadow-runner"].get("volumes", []):
+    if volume.get("type") == "bind" and volume.get("target") == "/taskplanner-runs":
+        print(volume["source"])
+        break
+else:
+    raise SystemExit("shadow-runner /taskplanner-runs bind mount is missing")
+'
+  )"
+
+  if [[ "${DRY_RUN}" == "true" ]]; then
+    print_command mkdir -p "${run_root}/shadow"
+    return 0
+  fi
+
+  if mkdir -p "${run_root}/shadow" 2>/dev/null &&
+      [[ -w "${run_root}/shadow" ]]; then
+    return 0
+  fi
+
+  # Docker creates a missing bind source as root. Repair that one-time
+  # bootstrap case without requiring sudo on a fresh deployment host.
+  docker run --rm \
+    --entrypoint bash \
+    -v "${run_root}:/target" \
+    taskplanner-ws:dev \
+    -lc "mkdir -p /target/shadow && chown -R $(id -u):$(id -g) /target"
+
+  [[ -w "${run_root}/shadow" ]] ||
+    die "replay result directory is not writable: ${run_root}/shadow"
+}
+
+compose_base() {
+  COMPOSE=(docker compose --project-directory "${ROOT_DIR}")
+  COMPOSE+=(-f "${COMPOSE_FILE}")
+  COMPOSE+=("${ENV_ARGS[@]}")
+}
+
+all_profiles() {
+  ALL_PROFILE_ARGS=(
+    --profile live
+    --profile llm-surgeon
+    --profile replay
+    --profile shadow
+    --profile dev
+  )
+}
+
+action="${1:-help}"
+shift || true
+DRY_RUN=false
+BUILD_ARGS=()
+
+case "${action}" in
+  help|-h|--help)
+    usage
+    ;;
+
+  up)
+    mode="${1:-}"
+    validate_mode "${mode}"
+    shift
+    while (($#)); do
+      case "$1" in
+        --dry-run) DRY_RUN=true ;;
+        --build)
+          BUILD_ARGS=(--build)
+          export TASKPLANNER_REBUILD_ON_START=true
+          export WEBAPP_INSTALL_ON_START=true
+          ;;
+        --no-build)
+          BUILD_ARGS=()
+          export TASKPLANNER_REBUILD_ON_START=false
+          export WEBAPP_INSTALL_ON_START=false
+          ;;
+        -h|--help)
+          usage
+          exit 0
+          ;;
+        *) die "unknown up option: $1" ;;
+      esac
+      shift
+    done
+
+    compose_env_args "${mode}"
+    compose_base
+    all_profiles
+
+    if [[ "${DRY_RUN}" != "true" ]]; then
+      command -v docker >/dev/null 2>&1 || die "docker is not installed"
+      "${COMPOSE[@]}" --profile "${mode}" config --quiet
+    fi
+
+    if [[ "${mode}" == "replay" ]]; then
+      prepare_replay_run_root
+    fi
+
+    run_or_print \
+      "${COMPOSE[@]}" "${ALL_PROFILE_ARGS[@]}" \
+      stop taskplanner-runtime shadow-runner object-perception
+    run_or_print \
+      "${COMPOSE[@]}" "${ALL_PROFILE_ARGS[@]}" \
+      rm -f taskplanner-runtime shadow-runner object-perception
+
+    run_best_effort \
+      "NInfer control plane did not start; other providers remain usable" \
+      start_ninfer_manager
+
+    runtime_service="taskplanner-runtime"
+    if [[ "${mode}" == "replay" ]]; then
+      runtime_service="shadow-runner"
+    fi
+    run_best_effort \
+      "LM Studio control plane is unavailable; provider remains offline" \
+      start_lmstudio_control_plane "${mode}" "${runtime_service}"
+    run_best_effort \
+      "Unsloth Studio control plane is unavailable; provider remains offline" \
+      start_unsloth_control_plane "${mode}" "${runtime_service}"
+
+    run_or_print \
+      "${COMPOSE[@]}" --profile "${mode}" \
+      up -d "${BUILD_ARGS[@]}" --force-recreate \
+      --remove-orphans \
+      --wait --wait-timeout "${WAIT_TIMEOUT_SEC}" \
+      vllm-manager webapp
+
+    if [[ "${mode}" == "live" || "${mode}" == "replay" ]]; then
+      run_best_effort \
+        "optional object perception did not start; continuing with ROS and voice inputs" \
+        "${COMPOSE[@]}" --profile "${mode}" \
+        up -d "${BUILD_ARGS[@]}" --force-recreate \
+        --wait --wait-timeout "${WAIT_TIMEOUT_SEC}" \
+        object-perception
+    fi
+
+    if [[ "${mode}" == "replay" ]]; then
+      run_or_print \
+        "${COMPOSE[@]}" --profile replay \
+        up -d "${BUILD_ARGS[@]}" --force-recreate shadow-runner
+    else
+      run_or_print \
+        "${COMPOSE[@]}" --profile "${mode}" \
+        up -d "${BUILD_ARGS[@]}" --force-recreate taskplanner-runtime
+    fi
+
+    if [[ "${DRY_RUN}" != "true" ]]; then
+      "${COMPOSE[@]}" --profile "${mode}" ps
+    fi
+    ;;
+
+  down)
+    while (($#)); do
+      case "$1" in
+        --dry-run) DRY_RUN=true ;;
+        -h|--help)
+          usage
+          exit 0
+          ;;
+        *) die "unknown down option: $1" ;;
+      esac
+      shift
+    done
+    compose_env_args
+    compose_base
+    all_profiles
+    run_or_print \
+      "${COMPOSE[@]}" "${ALL_PROFILE_ARGS[@]}" \
+      down --remove-orphans
+    stop_ninfer_manager
+    stop_lmstudio_control_plane
+    stop_unsloth_control_plane
+    ;;
+
+  status)
+    (($# == 0)) || die "status takes no arguments"
+    compose_env_args
+    compose_base
+    all_profiles
+    "${COMPOSE[@]}" "${ALL_PROFILE_ARGS[@]}" ps -a
+    if user_systemd_available &&
+        systemctl --user is-active --quiet "${NINFER_MANAGER_UNIT}"; then
+      printf 'NInfer manager: active transient user service (PID %s)\n' \
+        "$(systemctl --user show --property=MainPID --value "${NINFER_MANAGER_UNIT}")"
+    elif [[ -f "${NINFER_MANAGER_PID_FILE}" ]] &&
+        kill -0 "$(cat "${NINFER_MANAGER_PID_FILE}")" 2>/dev/null; then
+      printf 'NInfer manager PID: %s\n' \
+        "$(cat "${NINFER_MANAGER_PID_FILE}")"
+    else
+      rm -f "${NINFER_MANAGER_PID_FILE}"
+      printf 'NInfer manager: stopped\n'
+    fi
+    if command -v lms >/dev/null 2>&1 &&
+        lms server status 2>&1 | grep -q '^The server is running'; then
+      printf 'LM Studio catalog server: active\n'
+    else
+      printf 'LM Studio catalog server: stopped\n'
+    fi
+    if user_systemd_available &&
+        systemctl --user is-active --quiet "${UNSLOTH_CONTROL_UNIT}"; then
+      printf 'Unsloth Studio catalog server: active transient user service\n'
+    else
+      printf 'Unsloth Studio catalog server: external or stopped\n'
+    fi
+    ;;
+
+  config)
+    mode="${1:-}"
+    validate_mode "${mode}"
+    (($# == 1)) || die "config takes exactly one mode"
+    compose_env_args "${mode}"
+    compose_base
+    "${COMPOSE[@]}" --profile "${mode}" config
+    ;;
+
+  *)
+    die "unknown command: ${action}"
+    ;;
+esac

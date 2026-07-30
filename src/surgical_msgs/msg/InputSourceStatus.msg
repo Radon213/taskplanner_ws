@@ -1,0 +1,11 @@
+builtin_interfaces/Time stamp
+string source_id
+string modality
+string state
+bool healthy
+builtin_interfaces/Time last_observation_stamp
+float32 age_sec
+uint64 received_count
+uint64 accepted_count
+uint64 rejected_count
+string detail

@@ -1,4 +1,4 @@
-"""Bring up the taskplanner v1 mock runtime."""
+"""Bring up the configurable Taskplanner runtime."""
 
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, ExecuteProcess
@@ -15,12 +15,21 @@ def generate_launch_description() -> LaunchDescription:
     rosbridge_port = LaunchConfiguration("rosbridge_port")
     rosbridge_address = LaunchConfiguration("rosbridge_address")
     rosbridge_service_timeout = LaunchConfiguration("rosbridge_service_timeout")
+    input_profile = LaunchConfiguration("input_profile")
+    execution_backend = LaunchConfiguration("execution_backend")
+    speech_input_mode = LaunchConfiguration("speech_input_mode")
+    sentence_input_topic = LaunchConfiguration("sentence_input_topic")
+    speech_min_confidence = LaunchConfiguration("speech_min_confidence")
+    speech_max_age_sec = LaunchConfiguration("speech_max_age_sec")
+    speech_source_timeout_sec = LaunchConfiguration("speech_source_timeout_sec")
     vlm_mode = LaunchConfiguration("vlm_mode")
     vlm_base_url = LaunchConfiguration("vlm_base_url")
+    vlm_provider_id = LaunchConfiguration("vlm_provider_id")
     vlm_model_id = LaunchConfiguration("vlm_model_id")
     vlm_api_mode = LaunchConfiguration("vlm_api_mode")
     vlm_publish_period_sec = LaunchConfiguration("vlm_publish_period_sec")
     vlm_max_output_tokens = LaunchConfiguration("vlm_max_output_tokens")
+    vlm_generation_seed = LaunchConfiguration("vlm_generation_seed")
     vlm_response_format = LaunchConfiguration("vlm_response_format")
     vlm_reasoning_effort = LaunchConfiguration("vlm_reasoning_effort")
     vlm_response_mode = LaunchConfiguration("vlm_response_mode")
@@ -28,6 +37,7 @@ def generate_launch_description() -> LaunchDescription:
     vlm_image_stale_sec = LaunchConfiguration("vlm_image_stale_sec")
     surgeon_actor_mode = LaunchConfiguration("surgeon_actor_mode")
     actor_base_url = LaunchConfiguration("actor_base_url")
+    actor_provider_id = LaunchConfiguration("actor_provider_id")
     actor_model_id = LaunchConfiguration("actor_model_id")
     actor_response_format = LaunchConfiguration("actor_response_format")
     actor_reasoning_effort = LaunchConfiguration("actor_reasoning_effort")
@@ -35,17 +45,75 @@ def generate_launch_description() -> LaunchDescription:
     enable_no_image_camera = LaunchConfiguration("enable_no_image_camera")
     enable_synthetic_scene_camera = LaunchConfiguration("enable_synthetic_scene_camera")
     field_snapshot_url = LaunchConfiguration("field_snapshot_url")
+    enable_rfdetr_perception = LaunchConfiguration("enable_rfdetr_perception")
+    rfdetr_service_url = LaunchConfiguration("rfdetr_service_url")
+    flir_input_topic = LaunchConfiguration("flir_input_topic")
+    cam4_input_topic = LaunchConfiguration("cam4_input_topic")
+    field_image_topic = LaunchConfiguration("field_image_topic")
+    cam4_semantics_topic = LaunchConfiguration("cam4_semantics_topic")
+    require_field_image = LaunchConfiguration("require_field_image")
+    require_integration_preflight = LaunchConfiguration(
+        "require_integration_preflight"
+    )
+    preflight_require_perception = LaunchConfiguration(
+        "preflight_require_perception"
+    )
     spec_default = PathJoinSubstitution(
         [FindPackageShare("procedure_spec"), "specs", "thyroidectomy"]
     )
     mock_vlm_enabled = PythonExpression(
-        ["'", vlm_mode, "' == 'mock' or '", vlm_mode, "' == 'dual'"]
+        [
+            "'",
+            input_profile,
+            "' == 'simulation' and ('",
+            vlm_mode,
+            "' == 'mock' or '",
+            vlm_mode,
+            "' == 'dual')",
+        ]
     )
     real_vlm_enabled = PythonExpression(
         ["'", vlm_mode, "' == 'real' or '", vlm_mode, "' == 'dual'"]
     )
-    rule_surgeon_actor_enabled = PythonExpression(["'", surgeon_actor_mode, "' == 'rule'"])
-    llm_surgeon_actor_enabled = PythonExpression(["'", surgeon_actor_mode, "' == 'llm'"])
+    rule_surgeon_actor_enabled = PythonExpression(
+        [
+            "'",
+            input_profile,
+            "' == 'simulation' and '",
+            surgeon_actor_mode,
+            "' == 'rule'",
+        ]
+    )
+    llm_surgeon_actor_enabled = PythonExpression(
+        [
+            "'",
+            input_profile,
+            "' == 'simulation' and '",
+            surgeon_actor_mode,
+            "' == 'llm'",
+        ]
+    )
+    no_image_camera_enabled = PythonExpression(
+        [
+            "'",
+            input_profile,
+            "' == 'simulation' and '",
+            enable_no_image_camera,
+            "'.lower() in ('true', '1', 'yes')",
+        ]
+    )
+    synthetic_scene_camera_enabled = PythonExpression(
+        [
+            "'",
+            input_profile,
+            "' == 'simulation' and '",
+            enable_synthetic_scene_camera,
+            "'.lower() in ('true', '1', 'yes')",
+        ]
+    )
+    mock_execution_enabled = PythonExpression(
+        ["'", execution_backend, "' == 'mock'"]
+    )
 
     rosbridge_process = ExecuteProcess(
         condition=IfCondition(enable_rosbridge),
@@ -75,12 +143,24 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("rosbridge_port", default_value="9090"),
             DeclareLaunchArgument("rosbridge_address", default_value="127.0.0.1"),
             DeclareLaunchArgument("rosbridge_service_timeout", default_value="30.0"),
+            DeclareLaunchArgument("input_profile", default_value="simulation"),
+            DeclareLaunchArgument("execution_backend", default_value="mock"),
+            DeclareLaunchArgument("speech_input_mode", default_value="utterance"),
+            DeclareLaunchArgument(
+                "sentence_input_topic",
+                default_value="/sensors/surgeon/sentence",
+            ),
+            DeclareLaunchArgument("speech_min_confidence", default_value="0.55"),
+            DeclareLaunchArgument("speech_max_age_sec", default_value="3.0"),
+            DeclareLaunchArgument("speech_source_timeout_sec", default_value="5.0"),
             DeclareLaunchArgument("vlm_mode", default_value="real"),
-            DeclareLaunchArgument("vlm_base_url", default_value="http://127.0.0.1:1234"),
-            DeclareLaunchArgument("vlm_model_id", default_value="qwen3.6-35b-a3b-mtp@q2_k_xl"),
+            DeclareLaunchArgument("vlm_base_url", default_value="http://127.0.0.1:8001"),
+            DeclareLaunchArgument("vlm_provider_id", default_value="vllm"),
+            DeclareLaunchArgument("vlm_model_id", default_value="unsloth/gemma-4-E4B-it-NVFP4"),
             DeclareLaunchArgument("vlm_api_mode", default_value="openai_compat"),
             DeclareLaunchArgument("vlm_publish_period_sec", default_value="1.0"),
             DeclareLaunchArgument("vlm_max_output_tokens", default_value="320"),
+            DeclareLaunchArgument("vlm_generation_seed", default_value="0"),
             DeclareLaunchArgument("vlm_response_format", default_value="json_schema"),
             DeclareLaunchArgument("vlm_reasoning_effort", default_value="none"),
             DeclareLaunchArgument("vlm_response_mode", default_value="live"),
@@ -88,6 +168,7 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("vlm_image_stale_sec", default_value="3.0"),
             DeclareLaunchArgument("surgeon_actor_mode", default_value="llm"),
             DeclareLaunchArgument("actor_base_url", default_value="http://127.0.0.1:1234"),
+            DeclareLaunchArgument("actor_provider_id", default_value="auto"),
             DeclareLaunchArgument("actor_model_id", default_value="google/gemma-4-12b-qat"),
             DeclareLaunchArgument("actor_response_format", default_value="json_schema"),
             DeclareLaunchArgument("actor_reasoning_effort", default_value="none"),
@@ -95,6 +176,36 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("enable_no_image_camera", default_value="true"),
             DeclareLaunchArgument("enable_synthetic_scene_camera", default_value="false"),
             DeclareLaunchArgument("field_snapshot_url", default_value=""),
+            DeclareLaunchArgument("enable_rfdetr_perception", default_value="false"),
+            DeclareLaunchArgument(
+                "rfdetr_service_url",
+                default_value="http://127.0.0.1:8010",
+            ),
+            DeclareLaunchArgument(
+                "flir_input_topic",
+                default_value="/surgery/images/flir/compressed",
+            ),
+            DeclareLaunchArgument(
+                "cam4_input_topic",
+                default_value="/surgery/images/cam4/compressed",
+            ),
+            DeclareLaunchArgument(
+                "field_image_topic",
+                default_value="/surgery/images/field/compressed",
+            ),
+            DeclareLaunchArgument(
+                "cam4_semantics_topic",
+                default_value="",
+            ),
+            DeclareLaunchArgument("require_field_image", default_value="false"),
+            DeclareLaunchArgument(
+                "require_integration_preflight",
+                default_value="false",
+            ),
+            DeclareLaunchArgument(
+                "preflight_require_perception",
+                default_value="false",
+            ),
             Node(
                 package="btops_gateway",
                 executable="btops_gateway",
@@ -106,6 +217,39 @@ def generate_launch_description() -> LaunchDescription:
                 executable="tree_executor",
                 name="tree_executor",
                 parameters=[{"tick_rate": 0.1, "groot2_port": 0, "state_change_logger": True}],
+                output="screen",
+            ),
+            Node(
+                package="simulation_runtime",
+                executable="speech_input_adapter",
+                name="speech_input_adapter",
+                parameters=[
+                    {
+                        "input_mode": speech_input_mode,
+                        "sentence_input_topic": sentence_input_topic,
+                        "min_confidence": speech_min_confidence,
+                        "max_age_sec": speech_max_age_sec,
+                        "source_timeout_sec": speech_source_timeout_sec,
+                    }
+                ],
+                output="screen",
+            ),
+            Node(
+                package="vlm_node",
+                executable="rfdetr_perception_bridge",
+                name="rfdetr_perception_bridge",
+                condition=IfCondition(enable_rfdetr_perception),
+                parameters=[
+                    {
+                        "service_url": rfdetr_service_url,
+                        "flir_input_topic": flir_input_topic,
+                        "cam4_input_topic": cam4_input_topic,
+                        "flir_output_topic": field_image_topic,
+                        "cam4_semantics_topic": cam4_semantics_topic,
+                        "max_rate_hz": 15.0,
+                        "segmented_output_rate_hz": 2.0,
+                    }
+                ],
                 output="screen",
             ),
             Node(
@@ -130,14 +274,14 @@ def generate_launch_description() -> LaunchDescription:
                 package="vlm_node",
                 executable="synthetic_scene_camera",
                 name="synthetic_scene_camera",
-                condition=IfCondition(enable_synthetic_scene_camera),
+                condition=IfCondition(synthetic_scene_camera_enabled),
                 output="screen",
             ),
             Node(
                 package="vlm_node",
                 executable="no_image_camera",
                 name="no_image_camera",
-                condition=IfCondition(enable_no_image_camera),
+                condition=IfCondition(no_image_camera_enabled),
                 parameters=[
                     {
                         "image_topic": "/surgery/images/field/compressed",
@@ -172,15 +316,28 @@ def generate_launch_description() -> LaunchDescription:
                     {
                         "spec_dir": spec_dir,
                         "base_url": vlm_base_url,
+                        "provider_id": vlm_provider_id,
                         "model_id": vlm_model_id,
                         "api_mode": vlm_api_mode,
                         "publish_period_sec": vlm_publish_period_sec,
                         "max_output_tokens": vlm_max_output_tokens,
+                        "generation_seed": ParameterValue(
+                            vlm_generation_seed,
+                            value_type=int,
+                        ),
                         "response_format": vlm_response_format,
                         "reasoning_effort": vlm_reasoning_effort,
                         "response_mode": vlm_response_mode,
                         "context_mode": vlm_context_mode,
                         "image_stale_sec": vlm_image_stale_sec,
+                        "field_image_topic": field_image_topic,
+                        "raw_field_image_topic": flir_input_topic,
+                        "cam4_image_topic": cam4_input_topic,
+                        "cam4_semantics_topic": cam4_semantics_topic,
+                        "require_field_image": ParameterValue(
+                            require_field_image,
+                            value_type=bool,
+                        ),
                         "output_prefix": PythonExpression(
                             ["'/vlm' if '", vlm_mode, "' == 'real' else '/vlm_real'"]
                         ),
@@ -214,10 +371,15 @@ def generate_launch_description() -> LaunchDescription:
                     {
                         "spec_dir": spec_dir,
                         "base_url": actor_base_url,
+                        "provider_id": actor_provider_id,
                         "model_id": actor_model_id,
                         "response_format": actor_response_format,
                         "reasoning_effort": actor_reasoning_effort,
                         "decision_period_sec": 0.25,
+                        "require_voice_for_tool_requests": ParameterValue(
+                            PythonExpression(["'", vlm_mode, "' == 'voice_only'"]),
+                            value_type=bool,
+                        ),
                     }
                 ],
                 output="screen",
@@ -242,6 +404,10 @@ def generate_launch_description() -> LaunchDescription:
                         "validation_mode": validation_mode,
                         "vlm_mode": vlm_mode,
                         "tool_predict_stability_sec": 3.0,
+                        "vlm_implicit_request_confidence_threshold": 0.8,
+                        "vlm_implicit_request_stability_sec": 0.7,
+                        "vlm_implicit_request_release_sec": 1.5,
+                        "accept_validation_actor_events": False,
                         "phase_authority": PythonExpression(
                             ["'legacy_estimator' if '", validation_mode, "' == 'demo' else 'reducer'"]
                         ),
@@ -253,6 +419,7 @@ def generate_launch_description() -> LaunchDescription:
                 package="skill_execution",
                 executable="mock_skill_server",
                 name="mock_skill_server",
+                condition=IfCondition(mock_execution_enabled),
                 parameters=[
                     {
                         "action_name": "/skill/execute",
@@ -272,6 +439,7 @@ def generate_launch_description() -> LaunchDescription:
                 package="skill_execution",
                 executable="mock_bed_robot_arm_group_server",
                 name="mock_bed_robot_arm_group_server",
+                condition=IfCondition(mock_execution_enabled),
                 parameters=[
                     {
                         "spec_dir": spec_dir,
@@ -334,6 +502,23 @@ def generate_launch_description() -> LaunchDescription:
             ),
             Node(
                 package="simulation_runtime",
+                executable="integration_preflight",
+                name="integration_preflight",
+                condition=IfCondition(require_integration_preflight),
+                parameters=[
+                    {
+                        "sentence_topic": sentence_input_topic,
+                        "require_sentence_publisher": True,
+                        "require_perception": ParameterValue(
+                            preflight_require_perception,
+                            value_type=bool,
+                        ),
+                    }
+                ],
+                output="screen",
+            ),
+            Node(
+                package="simulation_runtime",
                 executable="simulation_manager",
                 name="simulation_manager",
                 parameters=[
@@ -341,6 +526,11 @@ def generate_launch_description() -> LaunchDescription:
                         "default_bundle": "thyroidectomy",
                         "surgeon_actor_mode": surgeon_actor_mode,
                         "manual_override_actor_mute_sec": 8.0,
+                        "execution_backend": execution_backend,
+                        "require_integration_preflight": ParameterValue(
+                            require_integration_preflight,
+                            value_type=bool,
+                        ),
                     }
                 ],
                 output="screen",

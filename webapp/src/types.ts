@@ -1,5 +1,6 @@
 export type InstrumentState = {
   instrument_id: string;
+  instance_id?: string;
   home_location_type: string;
   home_location_id: string;
   location_type: string;
@@ -86,12 +87,17 @@ export type SimulationState = {
   cleaner_remaining_sec: number;
   pending_transition_tools: string[];
   active_recovery_tools: string[];
+  active_recovery_tool_instances?: string[];
   right_hand_tool: string;
+  right_hand_tool_instance_id?: string;
   left_hand_tool: string;
+  left_hand_tool_instance_id?: string;
   prepositioned_tool: string;
+  prepositioned_tool_instance_id?: string;
   active_robot_task_id: string;
   active_robot_task_type: string;
   active_robot_task_tool_id: string;
+  active_robot_task_tool_instance_id?: string;
   active_robot_task_arm: string;
   active_robot_task_source_anchor: string;
   active_robot_task_target_anchor: string;
@@ -114,12 +120,19 @@ export type WorldState = {
   expected_instruments: string[];
   available_instruments: string[];
   right_hand_tool: string;
+  right_hand_tool_instance_id?: string;
   left_hand_tool: string;
+  left_hand_tool_instance_id?: string;
   prepositioned_tool: string;
+  prepositioned_tool_instance_id?: string;
   predicted_tool: string;
   predicted_tool_confidence: number;
   predicted_tool_stability_sec: number;
   surgeon_request_tool: string;
+  surgeon_request_instance_id?: string;
+  surgeon_request_generation?: number;
+  surgeon_request_additional_instance_assumed?: boolean;
+  explicit_request_voice_backed: boolean;
   bed_robot_arm_groups: BedRobotArmGroupState[];
 };
 
@@ -161,9 +174,82 @@ export type SurgeonLLMDecision = {
   overlay_json: string;
 };
 
+export type SpeechUtterance = {
+  stamp: RosTime;
+  start_stamp: RosTime;
+  end_stamp: RosTime;
+  utterance_id: string;
+  text: string;
+  is_final: boolean;
+  has_confidence: boolean;
+  confidence: number;
+  speaker_role: string;
+  language: string;
+  source: string;
+};
+
+export type ShadowReplayState = {
+  stamp: RosTime;
+  run_id: string;
+  case_id: string;
+  procedure_id: string;
+  state: string;
+  mode: "realtime_1x" | "elastic_demo" | string;
+  loaded: boolean;
+  running: boolean;
+  paused: boolean;
+  completed: boolean;
+  source_time_sec: number;
+  duration_sec: number;
+  image_duration_sec: number;
+  wall_elapsed_sec: number;
+  playback_rate: number;
+  elastic_hold_sec: number;
+  hold_reason: string;
+  last_error: string;
+  published_image_count: number;
+  published_transcript_count: number;
+  completed_vlm_count: number;
+  pending_vlm_count: number;
+  active_skill_count: number;
+};
+
+export type ModelProviderStatus = {
+  provider_id: string;
+  provider_name: string;
+  endpoint: string;
+  reachable: boolean;
+  status: string;
+  detail: string;
+  latency_sec: number;
+  model_count: number;
+};
+
+export type ModelCatalogEntry = {
+  provider_id: string;
+  provider_name: string;
+  model_id: string;
+  display_name: string;
+  capability: string;
+  load_state: string;
+  selectable: boolean;
+  detail: string;
+  runtime_managed: boolean;
+  available_actions: ModelRuntimeCommand[];
+};
+
+export type ModelSelection = {
+  provider_id: string;
+  model_id: string;
+};
+
+export type ModelRuntimeCommand = "load" | "unload" | "sleep" | "wake";
+
 export type BTDecision = {
   decision: string;
   selected_tool: string;
+  selected_tool_instance_id?: string;
+  request_generation?: number;
   selected_tool_lifecycle: string;
   next_required_transition: string;
   action: string;
@@ -177,6 +263,8 @@ export type SkillStatus = {
   command_id: string;
   action: string;
   instrument_id: string;
+  instrument_instance_id?: string;
+  request_generation?: number;
   state: string;
   success: boolean;
   message: string;
@@ -207,6 +295,7 @@ export type VLMHealth = {
 };
 
 export type VLMResult = {
+  stamp?: RosTime;
   source: string;
   schema_version: string;
   raw_json: string;
@@ -222,6 +311,36 @@ export type VLMResult = {
   gesture_hand_pose: string;
   gesture_confidence: number;
   uncertainty: number;
+};
+
+export type Cam4ToolRequestObservation = {
+  available: boolean;
+  state: "request" | "not_request" | "hand_with_tool" | "uncertain";
+  requested: boolean | null;
+  confidence: number;
+  sourceStampSec: number;
+  receivedAt: number;
+  onsetSourceStampSec: number;
+  onsetReceivedAt: number;
+};
+
+export type ShadowGroundTruthState = {
+  available: boolean;
+  runId: string;
+  caseId: string;
+  sourceTimeSec: number;
+  phase: {
+    phaseId: string;
+    startSec: number;
+    endSec: number;
+    active: boolean;
+  };
+  eventId: string;
+  active: boolean;
+  startSec: number;
+  endSec: number;
+  receivedAt: number;
+  eventStartReceivedAt: number;
 };
 
 export type VLMReducerDecision = {
@@ -293,6 +412,7 @@ export type LayoutDisplayMetadata = {
     display_name?: string;
     display_name_ko?: string;
   };
+  default_phase_id?: string;
   phases?: Array<{
     id: string;
     display_name?: string;
@@ -306,6 +426,7 @@ export type LayoutDisplayMetadata = {
     display_name_ko?: string;
     aliases?: string[];
     category?: string;
+    inventory_count?: number;
     role?: string;
     handover_profile?: string;
     requestable?: boolean;
@@ -316,6 +437,7 @@ export type LayoutDisplayMetadata = {
     id: string;
     display_name?: string;
     display_name_ko?: string;
+    default_phase_id?: string;
     requestable_instruments?: string[];
     phases?: Array<{
       id: string;
@@ -330,6 +452,7 @@ export type LayoutDisplayMetadata = {
       display_name_ko?: string;
       aliases?: string[];
       category?: string;
+      inventory_count?: number;
       role?: string;
       handover_profile?: string;
       requestable?: boolean;

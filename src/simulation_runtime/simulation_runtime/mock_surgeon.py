@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 import random
+import uuid
 
 from procedure_spec import get_default_spec_dir, load_bundle
 import rclpy
@@ -13,6 +14,7 @@ from std_msgs.msg import String
 from surgical_msgs.msg import (
     FilteredPhase,
     SimulationState,
+    SpeechUtterance,
     SurgeonGestureEvidence,
     SurgeonRequest,
     SurgeonState,
@@ -43,7 +45,11 @@ class MockSurgeonNode(Node):
         self._random_voice_enabled = bool(self.get_parameter("random_voice_enabled").value)
         self._state_pub = self.create_publisher(SurgeonState, "/surgeon/state", 20)
         self._request_pub = self.create_publisher(SurgeonRequest, "/surgeon/request", 20)
-        self._voice_pub = self.create_publisher(String, "/surgery/audio/request_text", 10)
+        self._speech_pub = self.create_publisher(
+            SpeechUtterance,
+            "/sensors/speech/utterance",
+            20,
+        )
         self._rng = random.Random(42)
         self._active = False
         self._tick = 0
@@ -123,10 +129,29 @@ class MockSurgeonNode(Node):
 
     def _publish_request(self, request: SurgeonRequest) -> None:
         request.stamp = self.get_clock().now().to_msg()
-        self._request_pub.publish(request)
-        voice = String()
-        voice.data = request.voice_text if request.event_type == "voice_request" else ""
-        self._voice_pub.publish(voice)
+        if request.override:
+            self._request_pub.publish(request)
+            return
+        text = (
+            str(request.voice_text or "").strip()
+            if request.event_type in {"voice_request", "request_tool"}
+            else ""
+        )
+        if not text:
+            return
+        utterance = SpeechUtterance()
+        utterance.stamp = request.stamp
+        utterance.start_stamp = request.stamp
+        utterance.end_stamp = request.stamp
+        utterance.utterance_id = f"mock-surgeon-{uuid.uuid4().hex}"
+        utterance.text = text
+        utterance.is_final = True
+        utterance.has_confidence = True
+        utterance.confidence = 1.0
+        utterance.speaker_role = "surgeon"
+        utterance.language = "und"
+        utterance.source = "mock_surgeon"
+        self._speech_pub.publish(utterance)
 
     def _publish_state(self, *, phase_id: str, intent: str, requested_tool: str, ready_for_handover: bool, ready_for_retrieval: bool, scripted: bool, scene_note: str, voice_text: str = "") -> None:
         state = SurgeonState()

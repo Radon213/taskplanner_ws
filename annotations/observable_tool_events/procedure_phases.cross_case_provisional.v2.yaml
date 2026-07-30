@@ -1,0 +1,241 @@
+schema: taskplanner.demo_procedure_phase_catalog.v2
+procedure_id: thyroidectomy_taskplanner_demonstration_v4
+phase_namespace: thyroidectomy_demo_v4_cross_case_provisional
+authority: user_authorized_ai_assistant_cross_case_video_synthesis
+reviewer_model: codex-gpt-5.6-sol
+runtime_status: evaluation_only_provisional_not_frozen
+
+development_scope:
+  calibration_cases:
+    - "0704_6"
+    - "0704_7"
+    - "0704_8"
+    - "0704_9"
+    - "0704_10"
+    - "0704_11"
+    - "0704_12"
+    - "0704_13"
+    - "0704_14"
+    - "0704_15"
+    - "0704_16"
+    - "0704_17"
+  held_out_eligible: false
+  reason: >
+    These videos are used to create and revise the Phase ontology, prompt,
+    boundaries, and evaluation reference. A future video collected after the
+    ontology and runtime prompt are frozen is required for held-out scoring.
+  case_timestamps_in_this_catalog: false
+  case_phase_accuracy_enabled: false
+  interaction_review_complete_through_case: "0704_17"
+  phase_boundary_review_complete_through_case: "0704_17"
+
+optimization_objective:
+  primary: >
+    Produce phases that a Taskplanner VLM can distinguish from externally
+    visible operative-field configuration and sustained tool-use patterns.
+  clinical_constraint: >
+    Keep clinically meaningful ordering and names, but do not assign a phase
+    solely from an inferred hidden anatomy or a spoken phase/tool name.
+  temporal_constraint: >
+    A boundary requires a sustained field or action-pattern change. A single
+    request, handover, correction, or cleanup action is insufficient.
+  current_status: >
+    P03-P06 have been compared across the complete 0704_6-0704_17 calibration
+    set, but remain cross-case hypotheses rather than frozen ground truth.
+    Per-case Phase starts remain ambiguous context and phase_accuracy remains
+    disabled.
+
+information_boundary:
+  ground_truth_runtime_input_allowed: false
+  case_specific_phase_events_runtime_input_allowed: false
+  catalog_runtime_input_allowed: false
+  future_runtime_publication_rule: >
+    After ontology freeze, publish a separately reviewed case-agnostic prompt.
+    Do not expose any calibration-case timestamp, adjudication, evaluation
+    mask, or future label to the VLM, reducer, DT reducer, or behavior tree.
+
+assignment_rules:
+  persistence_confirmation: >
+    Mark the first frame of a new observable state only after subsequent
+    multiview evidence shows that the field/tool pattern persists for roughly
+    1-2 seconds. The confirmation horizon is evidence for the boundary, not
+    the boundary timestamp itself.
+  evidence_required:
+    - observable operative-field configuration
+    - sustained action or tool-use pattern
+  evidence_allowed_as_context_only:
+    - causally available public voice transcript
+    - confirmed tool-request and tool-transfer chronology
+  insufficient_alone:
+    - one spoken tool or phase name
+    - one tool handover
+    - one Marlin temporal proposal
+    - an event inferred across a camera gap or occlusion
+    - post-completion instrument cleanup
+  left_censoring: >
+    Current clips begin in an already open operative field. Record P03 at frame
+    0 only as the visible active state; do not claim that the true P03
+    transition was observed.
+  gaps: >
+    Never place a transition inside a declared visual gap. If the before/after
+    state differs, retain an interval uncertainty or mask instead of inventing
+    an exact boundary.
+  cleanup: >
+    Procedure completion and instrument clearance do not form a separate
+    clinical Phase in this demonstration catalog. Continue the last active
+    operative phase through the scorable endpoint and mask cleanup afterward.
+  simultaneous_observations: >
+    Separate concurrent observable facts. Scrub-side Mayo organization does
+    not become a transfer merely because a surgeon request begins at the same
+    frame, while a directly visible return and a new open-palm request may
+    legitimately share one timestamp.
+  repeated_request_linkage: >
+    If the open-palm pose clearly ends and restarts before one completed
+    handover, retain the visually separate request intervals but link them to
+    one eventual handover context. Never duplicate the transfer to force a
+    one-to-one request/arrival count.
+  transition_evidence_examples:
+    P04: seated persistent retraction, not retractor approach or handover
+    P05: sustained target grasp and manipulation, not forceps arrival
+    P06: settled focal control followed by an energy pattern, not an isolated energy-tool exchange
+
+phase_order:
+  - P01
+  - P02
+  - P03
+  - P04
+  - P05
+  - P06
+  - P07
+  - P08
+  - P09
+
+phases:
+  - phase_id: P01
+    name: patient_positioning_and_field_preparation
+    name_ko: 환자 체위 및 수술부위 준비
+    definition_source: demo_authored_unobserved_placeholder
+    observed_in_current_calibration_clips: false
+    observable_definition: >
+      Positioning, skin preparation, sterile draping, and operative instrument
+      setup occur before active tissue access.
+    expected_pattern: preparation and counting rather than operative handovers
+    annotation_rule: do_not_create_case_event_without_visible_evidence
+
+  - phase_id: P02
+    name: skin_incision_and_flap_elevation
+    name_ko: 피부 절개 및 피판 거상
+    definition_source: demo_authored_unobserved_placeholder
+    observed_in_current_calibration_clips: false
+    observable_definition: >
+      Skin and superficial tissue layers are opened to establish the central
+      neck operative field.
+    expected_pattern: cutting and broad superficial dissection dominate
+    annotation_rule: do_not_create_case_event_without_visible_evidence
+
+  - phase_id: P03
+    name: central_field_dissection_before_stable_retraction
+    name_ko: 안정적 견인 전 중앙 수술야 박리
+    definition_source: cross_case_video_observed
+    observed_in_current_calibration_clips: true
+    observable_definition: >
+      The clip shows an already open central neck field undergoing dissection
+      before stable bilateral deep retraction has been established.
+    sustained_pattern:
+      - Adson-led tissue handling
+      - alternating Bovie, bipolar, and suction work
+      - no stable bilateral Army-Navy exposure
+    boundary_rule: frame_0_left_censored_active_state_only
+
+  - phase_id: P04
+    name: retractor_deployment_and_field_exposure
+    name_ko: 견인기 배치 및 수술야 노출
+    definition_source: cross_case_video_observed
+    observed_in_current_calibration_clips: true
+    observable_definition: >
+      Army-Navy retractors become seated at the wound edge and create a
+      sustained wider/deeper operative field, progressing toward stable
+      bilateral exposure.
+    sustained_pattern:
+      - one then two Army-Navy retractors are deployed
+      - retraction persists after the handover
+      - operative-field geometry visibly changes
+    boundary_rule: >
+      Use the first frame where the first Army-Navy is visibly seated and the
+      new retraction state persists for the confirmation horizon; do not use
+      the request or handover frame.
+
+  - phase_id: P05
+    name: retraction_supported_target_dissection
+    name_ko: 견인 유지 하 표적 조직 박리
+    definition_source: cross_case_video_observed
+    observed_in_current_calibration_clips: true
+    observable_definition: >
+      With stable retraction maintained, central target tissue is directly
+      grasped and manipulated for finer dissection.
+    sustained_pattern:
+      - stable retraction remains in place
+      - Adson or Allis engages central/deeper target tissue
+      - fine manipulation persists beyond a single handover
+    boundary_rule: >
+      Use the first sustained target-grasp/manipulation state after exposure,
+      retrospectively confirmed by the following 1-2 seconds, not the Adson or
+      Allis transfer timestamp by itself.
+
+  - phase_id: P06
+    name: focal_control_and_hemostatic_energy
+    name_ko: 국소 조직 제어 및 에너지 지혈
+    definition_source: cross_case_video_observed
+    observed_in_current_calibration_clips: true
+    observable_definition: >
+      A focal tissue point is clamped or otherwise controlled and then treated
+      with precise or broader energy while exposure remains stable.
+    sustained_pattern:
+      - mosquito, Allis, or another visibly equivalent clamp/grasp control becomes engaged
+      - bipolar and/or Bovie treatment follows or persists
+      - the pattern is not merely an early isolated energy-tool exchange
+    boundary_rule: >
+      Use the first stable focal-control state only when the following bounded
+      horizon confirms an energy-treatment pattern. Resolve spoken corrections
+      before using tool identity, and do not create a boundary from a request,
+      correction, or one Bovie/bipolar handover alone.
+
+  - phase_id: P07
+    name: thyroid_resection_and_specimen_extraction
+    name_ko: 갑상선 절제 및 검체 적출
+    definition_source: demo_authored_unobserved_placeholder
+    observed_in_current_calibration_clips: false
+    observable_definition: >
+      The target is visibly freed from remaining attachments and removed from
+      the field as a specimen.
+    expected_pattern: final division followed by specimen handling
+    annotation_rule: do_not_create_case_event_without_visible_evidence
+
+  - phase_id: P08
+    name: final_hemostasis_and_field_inspection
+    name_ko: 최종 지혈 및 수술야 확인
+    definition_source: demo_authored_unobserved_placeholder
+    observed_in_current_calibration_clips: false
+    observable_definition: >
+      Active dissection pauses while the exposed field is inspected, cleared,
+      and treated for remaining bleeding.
+    expected_pattern: inspection with suction and focal hemostasis as needed
+    annotation_rule: do_not_create_case_event_without_visible_evidence
+
+  - phase_id: P09
+    name: wound_closure
+    name_ko: 창상 봉합
+    definition_source: demo_authored_unobserved_placeholder
+    observed_in_current_calibration_clips: false
+    observable_definition: >
+      Open tissue layers are approximated and the skin is closed and dressed.
+    expected_pattern: suturing and dressing replace dissection instruments
+    annotation_rule: do_not_create_case_event_without_visible_evidence
+
+freeze_gates:
+  - review all calibration cases with interaction labels already finalized
+  - compare P03-P06 boundary evidence and uncertainty across cases
+  - test whether the Taskplanner VLM separates the proposed states without labels
+  - revise or merge phases that are not visually and temporally separable
+  - freeze the case-agnostic definitions and runtime prompt before held-out data
+  - keep all calibration timestamps and evaluation references offline

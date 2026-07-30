@@ -43,6 +43,20 @@ def test_suction_stop_tokens_take_priority_over_short_scenario_start_cue():
         )
 
 
+def test_english_air_suction_routes_through_public_voice_lane():
+    router = _router_at_thyroid_phase("P04")
+    assert router._classify_voice("air suction") == (
+        "suction",
+        "suction_start",
+        "suction",
+    )
+    assert router._classify_voice("suction off") == (
+        "suction",
+        "suction_stop",
+        "suction",
+    )
+
+
 def test_army_name_inside_retraction_does_not_trigger_profile_change():
     router = _router_at_thyroid_phase("P04")
     assert router._classify_voice("아미를 위로 조금 당겨줘") == (

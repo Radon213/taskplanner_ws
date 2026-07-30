@@ -21,7 +21,7 @@
             />
             <ForceSuccess>
               <Sequence name="RightHandHandover">
-                <ShouldDispatchDecision cooldown_sec="2.0" />
+                <ShouldDispatchDecision />
                 <EmitBTDecision />
                 <PublishSkillCommand />
               </Sequence>
@@ -42,8 +42,32 @@
             />
             <ForceSuccess>
               <Sequence name="SafetyDecision">
-                <ShouldDispatchDecision cooldown_sec="2.0" />
+                <ShouldDispatchDecision />
                 <EmitBTDecision />
+              </Sequence>
+            </ForceSuccess>
+          </Sequence>
+
+          <Sequence name="VisualImplicitRequest">
+            <IsPhaseCertain />
+            <Inverter>
+              <HasExplicitRequest />
+            </Inverter>
+            <HasImplicitRequest />
+            <SelectImplicitTool />
+            <IsToolAvailable />
+            <ApplyActionGuard />
+            <CanHandover />
+            <ConfigureHumanoidCommand
+              decision="implicit_request"
+              mode="implicit_request"
+              rationale="BT accepted stable visual open-palm evidence"
+            />
+            <ForceSuccess>
+              <Sequence name="ImplicitHandover">
+                <ShouldDispatchDecision />
+                <EmitBTDecision />
+                <PublishSkillCommand />
               </Sequence>
             </ForceSuccess>
           </Sequence>
@@ -54,11 +78,11 @@
             <ConfigureHumanoidCommand
               decision="recovery"
               mode="recovery"
-              rationale="world state requested recovery"
+              rationale="BT recovery policy selected a verified Mayo tool"
             />
             <ForceSuccess>
               <Sequence name="LeftHandRecovery">
-                <ShouldDispatchDecision cooldown_sec="1.5" />
+                <ShouldDispatchDecision />
                 <EmitBTDecision />
                 <PublishSkillCommand />
               </Sequence>
@@ -84,7 +108,7 @@
             />
             <ForceSuccess>
               <Sequence name="AnticipatoryHold">
-                <ShouldDispatchDecision cooldown_sec="2.0" />
+                <ShouldDispatchDecision />
                 <EmitBTDecision />
                 <PublishSkillCommand />
               </Sequence>
@@ -99,7 +123,7 @@
             />
             <ForceSuccess>
               <Sequence name="IdleDecision">
-                <ShouldDispatchDecision cooldown_sec="2.0" />
+                <ShouldDispatchDecision />
                 <EmitBTDecision />
               </Sequence>
             </ForceSuccess>

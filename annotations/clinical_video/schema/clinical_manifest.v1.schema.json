@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "taskplanner.clinical_video_manifest.v1",
+  "title": "Clinical video AI-draft and review artifact manifest",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema",
+    "case_id",
+    "authority",
+    "candidate_file",
+    "candidate_sha256",
+    "candidate_count",
+    "review_actions_file",
+    "final_reference_file"
+  ],
+  "properties": {
+    "schema": {
+      "const": "taskplanner.clinical_video_manifest.v1"
+    },
+    "case_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]+$"
+    },
+    "authority": {
+      "const": "ai_draft"
+    },
+    "candidate_file": {
+      "const": "clinical_candidates.codex_5_6_sol.v1.jsonl"
+    },
+    "candidate_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "candidate_count": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "review_actions_file": {
+      "const": "clinical_review_actions.v1.jsonl"
+    },
+    "final_reference_file": {
+      "const": "clinical_reference.final.v1.jsonl"
+    },
+    "source_timeline": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "file",
+        "sha256"
+      ],
+      "properties": {
+        "file": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": true
+    }
+  }
+}

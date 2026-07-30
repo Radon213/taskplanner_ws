@@ -18,6 +18,86 @@ class SchemaValidationError(ValueError):
     """Raised when the compact VLM schema is invalid."""
 
 
+def _mayo_confidence(value: Any) -> float:
+    confidence = float(value)
+    if not math.isfinite(confidence) or confidence < 0.0 or confidence > 1.0:
+        raise SchemaValidationError("mayo confidence must be between 0 and 1")
+    return confidence
+
+
+def _uncertainty(value: Any) -> float:
+    """Normalize malformed uncertainty conservatively without enabling actions."""
+
+    try:
+        uncertainty = float(value)
+    except (TypeError, ValueError):
+        return 1.0
+    if not math.isfinite(uncertainty) or uncertainty < 0.0 or uncertainty > 1.0:
+        return 1.0
+    return uncertainty
+
+
+def normalize_mayo_semantics(
+    mayo: Any,
+    mayo_retrieve: Any,
+) -> tuple[list[list[Any]], list[Any]]:
+    """Make per-tool Mayo votes and the selected recovery candidate consistent."""
+
+    if not isinstance(mayo, list):
+        raise SchemaValidationError("'mayo' must be a list")
+    if not isinstance(mayo_retrieve, list) or len(mayo_retrieve) != 2:
+        raise SchemaValidationError("'mayo_retrieve' must be [tool_id, confidence]")
+    _mayo_confidence(mayo_retrieve[1])
+
+    decisions: dict[str, tuple[str, float, int]] = {}
+    for index, item in enumerate(mayo):
+        if not isinstance(item, list) or len(item) != 3:
+            raise SchemaValidationError(
+                "each mayo item must be [tool_id, recover_or_reuse, confidence]"
+            )
+        tool_id = str(item[0]).strip()
+        decision = str(item[1]).strip().lower()
+        if decision not in {"recover", "reuse"}:
+            raise SchemaValidationError("mayo decision must be recover or reuse")
+        confidence = _mayo_confidence(item[2])
+        if not tool_id:
+            continue
+
+        previous = decisions.get(tool_id)
+        should_replace = previous is None or confidence > previous[1]
+        if (
+            previous is not None
+            and math.isclose(confidence, previous[1])
+            and decision == "reuse"
+            and previous[0] == "recover"
+        ):
+            # Equal-confidence disagreement must fail closed against recovery.
+            should_replace = True
+        if should_replace:
+            decisions[tool_id] = (decision, confidence, index)
+
+    normalized_mayo = [
+        [tool_id, decision, confidence]
+        for tool_id, (decision, confidence, _index) in sorted(
+            decisions.items(),
+            key=lambda item: item[1][2],
+        )
+    ]
+    recover_candidates = [
+        (tool_id, confidence, index)
+        for tool_id, (decision, confidence, index) in decisions.items()
+        if decision == "recover"
+    ]
+    if not recover_candidates:
+        return normalized_mayo, ["", 0.0]
+
+    recover_tool, recover_confidence, _index = min(
+        recover_candidates,
+        key=lambda item: (-item[1], item[2], item[0]),
+    )
+    return normalized_mayo, [recover_tool, recover_confidence]
+
+
 def _strip_markdown_fence(raw_text: str) -> str:
     text = raw_text.strip()
     if not text.startswith("```"):
@@ -108,7 +188,7 @@ def _validate_v1_payload(payload: dict[str, Any]) -> dict[str, Any]:
         raise SchemaValidationError("'sg' must be [event_type, requested_tool, hand_pose, confidence]")
     normalized_gesture = [str(gesture[0]), str(gesture[1]), str(gesture[2]), float(gesture[3])]
 
-    uncertainty = float(payload.get("u", 0.0))
+    uncertainty = _uncertainty(payload.get("u", 0.0))
     summary = str(payload.get("sum", ""))
 
     return {
@@ -140,22 +220,10 @@ def _validate_v2_payload(payload: dict[str, Any]) -> dict[str, Any]:
         raise SchemaValidationError("'intent' must be [intent_type, tool_id, confidence]")
     normalized_intent = [str(intent[0]), str(intent[1]), float(intent[2])]
 
-    mayo = payload.get("mayo", [])
-    if not isinstance(mayo, list):
-        raise SchemaValidationError("'mayo' must be a list")
-    normalized_mayo: list[list[Any]] = []
-    for item in mayo:
-        if not isinstance(item, list) or len(item) != 3:
-            raise SchemaValidationError("each mayo item must be [tool_id, recover_or_reuse, confidence]")
-        decision = str(item[1])
-        if decision not in {"recover", "reuse"}:
-            raise SchemaValidationError("mayo decision must be recover or reuse")
-        normalized_mayo.append([str(item[0]), decision, float(item[2])])
-
-    mayo_retrieve = payload.get("mayo_retrieve", ["", 0.0])
-    if not isinstance(mayo_retrieve, list) or len(mayo_retrieve) != 2:
-        raise SchemaValidationError("'mayo_retrieve' must be [tool_id, confidence]")
-    normalized_mayo_retrieve = [str(mayo_retrieve[0]), float(mayo_retrieve[1])]
+    normalized_mayo, normalized_mayo_retrieve = normalize_mayo_semantics(
+        payload.get("mayo", []),
+        payload.get("mayo_retrieve", ["", 0.0]),
+    )
 
     return {
         "v": "2",
@@ -164,7 +232,7 @@ def _validate_v2_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "intent": normalized_intent,
         "mayo": normalized_mayo,
         "mayo_retrieve": normalized_mayo_retrieve,
-        "u": float(payload.get("u", 0.0)),
+        "u": _uncertainty(payload.get("u", 0.0)),
         "sum": str(payload.get("sum", payload.get("summary", ""))),
     }
 
@@ -192,22 +260,10 @@ def _validate_v3_payload(payload: dict[str, Any]) -> dict[str, Any]:
         raise SchemaValidationError("'intent' must be [intent_type, tool_id, confidence]")
     normalized_intent = [str(intent[0]), str(intent[1]), float(intent[2])]
 
-    mayo = payload.get("mayo", [])
-    if not isinstance(mayo, list):
-        raise SchemaValidationError("'mayo' must be a list")
-    normalized_mayo: list[list[Any]] = []
-    for item in mayo:
-        if not isinstance(item, list) or len(item) != 3:
-            raise SchemaValidationError("each mayo item must be [tool_id, recover_or_reuse, confidence]")
-        decision = str(item[1])
-        if decision not in {"recover", "reuse"}:
-            raise SchemaValidationError("mayo decision must be recover or reuse")
-        normalized_mayo.append([str(item[0]), decision, float(item[2])])
-
-    mayo_retrieve = payload.get("mayo_retrieve", ["", 0.0])
-    if not isinstance(mayo_retrieve, list) or len(mayo_retrieve) != 2:
-        raise SchemaValidationError("'mayo_retrieve' must be [tool_id, confidence]")
-    normalized_mayo_retrieve = [str(mayo_retrieve[0]), float(mayo_retrieve[1])]
+    normalized_mayo, normalized_mayo_retrieve = normalize_mayo_semantics(
+        payload.get("mayo", []),
+        payload.get("mayo_retrieve", ["", 0.0]),
+    )
 
     return {
         "v": "3",
@@ -216,7 +272,7 @@ def _validate_v3_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "intent": normalized_intent,
         "mayo": normalized_mayo,
         "mayo_retrieve": normalized_mayo_retrieve,
-        "u": float(payload.get("u", 0.0)),
+        "u": _uncertainty(payload.get("u", 0.0)),
         "sum": str(payload.get("sum", payload.get("summary", ""))),
     }
 
@@ -313,6 +369,24 @@ def _validate_v4_payload(payload: dict[str, Any]) -> dict[str, Any]:
     v3_payload.pop("bed_robot_arm_group", None)
     normalized = _validate_v3_payload(v3_payload)
     normalized["v"] = "4"
+    gesture = payload.get("gesture", ["", "", "", 0.0])
+    if not isinstance(gesture, list) or len(gesture) != 4:
+        raise SchemaValidationError(
+            "'gesture' must be [event_type, tool_id, hand_pose, confidence]"
+        )
+    gesture_confidence = float(gesture[3])
+    if (
+        not math.isfinite(gesture_confidence)
+        or gesture_confidence < 0.0
+        or gesture_confidence > 1.0
+    ):
+        raise SchemaValidationError("gesture confidence must be between 0 and 1")
+    normalized["gesture"] = [
+        str(gesture[0]),
+        str(gesture[1]),
+        str(gesture[2]),
+        gesture_confidence,
+    ]
     normalized["bed_robot_arm_group"] = _validate_v4_bed_robot_arm_group(
         payload.get("bed_robot_arm_group")
     )
@@ -342,6 +416,21 @@ def compact_vlm_json_schema(version: str = "1") -> dict[str, Any]:
         schema = compact_vlm_json_schema("3")
         schema["properties"] = dict(schema["properties"])
         schema["properties"]["v"] = {"type": "string", "enum": ["4"]}
+        schema["properties"]["gesture"] = {
+            "type": "array",
+            "prefixItems": [
+                {"type": "string", "enum": ["", "request_tool"]},
+                {"type": "string"},
+                {"type": "string", "enum": ["", "open_receive"]},
+                {
+                    "type": "number",
+                    "minimum": 0.0,
+                    "maximum": 1.0,
+                },
+            ],
+            "minItems": 4,
+            "maxItems": 4,
+        }
         schema["properties"]["bed_robot_arm_group"] = {
             "anyOf": [
                 {"type": "null"},
@@ -441,7 +530,7 @@ def compact_vlm_json_schema(version: str = "1") -> dict[str, Any]:
                     "maxItems": 2,
                 },
                 "u": {"type": "number", "minimum": 0.0, "maximum": 1.0},
-                "sum": {"type": "string"},
+                "sum": {"type": "string", "maxLength": 320},
             },
             "required": ["v", "phase", "tool", "intent", "mayo", "mayo_retrieve", "u", "sum"],
             "additionalProperties": False,

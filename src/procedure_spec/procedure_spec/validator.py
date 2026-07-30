@@ -73,6 +73,7 @@ REQUIRED_LIFECYCLE_DISPLAY_KEYS = {
 REQUIRED_ACTION_DISPLAY_KEYS = {
     "direct_handover",
     "pick_up_and_handover",
+    "pick_up_from_mayo_and_handover",
     "put_down_and_handover",
     "retrieve_from_hand",
     "retrieve_from_mayo",
@@ -392,11 +393,21 @@ def validate_raw_bundle(raw_bundle: dict[str, object]) -> None:
         phase_ids.add(phase_id)
         _require_list(phase_map.get("possible_next"), f"phase '{phase_id}' possible_next")
         _require_list(phase_map.get("expected_instruments"), f"phase '{phase_id}' expected_instruments")
+        _require_list(
+            phase_map.get("field_deployed_instruments", []),
+            f"phase '{phase_id}' field_deployed_instruments",
+        )
+    default_phase_id = str(procedure.get("default_phase_id", "") or "").strip()
+    if default_phase_id and default_phase_id not in phase_ids:
+        raise SpecValidationError(
+            f"procedure default_phase_id references unknown phase '{default_phase_id}'."
+        )
 
     instrument_entries = _require_list(instruments.get("instruments"), "instruments.yaml instruments")
     if not instrument_entries:
         raise SpecValidationError("instruments.yaml must define at least one instrument.")
     instrument_ids: set[str] = set()
+    inventory_counts: dict[str, int] = {}
     for instrument in instrument_entries:
         instrument_map = _require_mapping(instrument, "instrument entry")
         instrument_id = str(instrument_map.get("id", "")).strip()
@@ -406,6 +417,16 @@ def validate_raw_bundle(raw_bundle: dict[str, object]) -> None:
             raise SpecValidationError(f"Duplicate instrument id '{instrument_id}'.")
         instrument_ids.add(instrument_id)
         _require_list(instrument_map.get("aliases", []), f"instrument '{instrument_id}' aliases")
+        inventory_count = instrument_map.get("inventory_count", 1)
+        if (
+            isinstance(inventory_count, bool)
+            or not isinstance(inventory_count, int)
+            or inventory_count <= 0
+        ):
+            raise SpecValidationError(
+                f"instrument '{instrument_id}' inventory_count must be a positive integer."
+            )
+        inventory_counts[instrument_id] = inventory_count
         if "requestable" in instrument_map and not isinstance(instrument_map["requestable"], bool):
             raise SpecValidationError(f"instrument '{instrument_id}' requestable must be boolean.")
         if not instrument_map.get("category"):
@@ -425,6 +446,12 @@ def validate_raw_bundle(raw_bundle: dict[str, object]) -> None:
             if str(instrument_id) not in instrument_ids:
                 raise SpecValidationError(
                     f"phase '{phase_id}' references unknown instrument '{instrument_id}'."
+                )
+        for instrument_id in phase_map.get("field_deployed_instruments", []):
+            if str(instrument_id) not in instrument_ids:
+                raise SpecValidationError(
+                    f"phase '{phase_id}' references unknown field-deployed "
+                    f"instrument '{instrument_id}'."
                 )
 
     _validate_bed_robot_arm_groups(raw_bundle.get("bed_robot_arm_groups"), phase_ids)
@@ -474,6 +501,83 @@ def validate_raw_bundle(raw_bundle: dict[str, object]) -> None:
             "scene_layout.yaml must provide an initial placement for every instrument: "
             + ", ".join(missing_placements)
         )
+
+    initial_states = _require_list(
+        scene_layout.get("initial_instrument_states", []),
+        "scene_layout.yaml initial_instrument_states",
+    )
+    initial_state_instances: set[str] = set()
+    supported_initial_lifecycles = {
+        "home_rack",
+        "returned_home",
+        "surgeon_owned",
+        "mayo_reuse",
+        "mayo_recovery",
+        "prepositioned_right",
+        "recovering_left",
+        "cleaning_left",
+        "cleaned_left",
+    }
+    for raw_state in initial_states:
+        state = _require_mapping(raw_state, "initial instrument state")
+        instrument_id = str(state.get("instrument_id", "")).strip()
+        instance_id = str(state.get("instance_id", "")).strip()
+        location_id = str(state.get("location_id", "")).strip()
+        lifecycle_stage = str(state.get("lifecycle_stage", "")).strip()
+        if instrument_id not in instrument_ids:
+            raise SpecValidationError(
+                f"Initial instrument state references unknown instrument '{instrument_id}'."
+            )
+        expected_prefix = f"{instrument_id}#"
+        if not instance_id.startswith(expected_prefix):
+            raise SpecValidationError(
+                f"Initial instrument state instance '{instance_id}' must start with "
+                f"'{expected_prefix}'."
+            )
+        try:
+            instance_index = int(instance_id.removeprefix(expected_prefix))
+        except ValueError as exc:
+            raise SpecValidationError(
+                f"Initial instrument state instance '{instance_id}' has an invalid index."
+            ) from exc
+        if not 1 <= instance_index <= inventory_counts[instrument_id]:
+            raise SpecValidationError(
+                f"Initial instrument state instance '{instance_id}' exceeds inventory "
+                f"count {inventory_counts[instrument_id]}."
+            )
+        if instance_id in initial_state_instances:
+            raise SpecValidationError(
+                f"Duplicate initial instrument state for '{instance_id}'."
+            )
+        initial_state_instances.add(instance_id)
+        if location_id not in location_ids:
+            raise SpecValidationError(
+                f"Initial instrument state references unknown location '{location_id}'."
+            )
+        if lifecycle_stage not in supported_initial_lifecycles:
+            raise SpecValidationError(
+                f"Initial instrument state for '{instance_id}' has unsupported lifecycle "
+                f"'{lifecycle_stage}'."
+            )
+        try:
+            confidence = float(state.get("confidence", 1.0))
+        except (TypeError, ValueError) as exc:
+            raise SpecValidationError(
+                f"Initial instrument state for '{instance_id}' confidence must be numeric."
+            ) from exc
+        if not 0.0 <= confidence <= 1.0:
+            raise SpecValidationError(
+                f"Initial instrument state for '{instance_id}' confidence must be between 0 and 1."
+            )
+        if (
+            lifecycle_stage == "surgeon_owned"
+            and location_types[location_id]
+            not in {"surgeon_hand", "surgical_field", "bed_fixed_tool", "return_zone"}
+        ):
+            raise SpecValidationError(
+                f"Initial surgeon-owned instrument '{instance_id}' must use a surgeon "
+                "or surgical-field location."
+            )
 
     phase_guard = _require_mapping(policy.get("phase_guard"), "policy.yaml phase_guard")
     action_guard = _require_mapping(policy.get("action_guard"), "policy.yaml action_guard")

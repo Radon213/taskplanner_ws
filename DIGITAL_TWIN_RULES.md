@@ -50,6 +50,9 @@ These rules are the source of truth for debugging runtime behavior.
 8. A floor-dropped tool is not a robot recovery target. Robot dispatch must hold
    until a human recovery event removes the contaminated tool from the field and
    either starts cleaning or provides a sterile replacement.
+9. A valid explicit voice request or implicit handover cue may request a tool
+   already on Mayo. The right arm then executes
+   `pick_up_from_mayo_and_handover` instead of treating the tool as unavailable.
 
 ## VLM Retrieval Inference Rules
 
@@ -80,6 +83,31 @@ These rules are the source of truth for debugging runtime behavior.
    BT may dispatch `predict_tool`.
 9. Stabilization must suppress one-frame noise; transient raw cues must not directly
    become BT-visible intent.
+10. Schema v4 keeps semantic `intent` separate from visual-only `gesture`.
+    `gesture=["request_tool", tool_id, "open_receive", confidence]` is valid only
+    when the current raw CAM4 pixels clearly show an empty open palm extended
+    toward the assistant. Speech, procedure order, detector text, prior output,
+    and next-tool candidates must not fabricate this field.
+11. RF-DETR remains advisory. With object recognition disabled, raw CAM4 pixels
+    may still establish visual gesture evidence, but the reducer accepts one
+    request per gesture episode only after confidence and temporal stability
+    checks and agreement with an independently stabilized or prepositioned next
+    tool. Ambiguous tool identity remains observation-only.
+
+## Sentence-only Degraded Operation
+
+1. `/surgery/audio/request_text` is admitted public sentence evidence and may
+   directly create a canonical explicit tool request when the sentence contains an active
+   procedure instrument and command intent.
+2. Procedure-defined suction/retraction utterances are reserved for their bed
+   robot-arm group and must not also become tool-handover requests.
+3. A sentence-backed explicit request may bypass only `vlm_unhealthy` and phase
+   uncertainty. Every physical-state, contamination, ownership, capacity,
+   readiness, and active-task guard remains mandatory.
+4. VLM absence must disable autonomous phase inference, next-tool prediction,
+   and probabilistic Mayo recovery. It must not stop explicit voice handover.
+5. Duplicate transcript and structured request messages for the same pending
+   tool are coalesced into one request.
 
 ## Contamination and Cleaning Rules
 
@@ -113,6 +141,12 @@ These rules are the source of truth for debugging runtime behavior.
    judgments, not visual ground truth.
 5. A tool on Mayo becomes a valid recovery candidate only after stable VLM
    `mayo_retrieve` evidence or procedure-completion cleanup.
+6. The internal reuse/recovery distinction does not create separate physical or
+   GUI zones. The dashboard renders one Mayo stand and shows the latest VLM-derived
+   reuse probability on each tool tag.
+7. A handover request for a Mayo tool takes priority over a pending recovery
+   candidate when no recovery action has started. Grasping the tool with the right
+   hand closes its pending recovery transaction.
 
 ## Rack and Home-Slot Rules
 
@@ -130,12 +164,14 @@ These rules are the source of truth for debugging runtime behavior.
    is active for a valid tool.
 5. `recovery` in normal flow dispatches `retrieve_from_mayo` only. Direct hand
    retrieval is reserved for legacy/manual test paths.
-6. `anticipatory_handover` may only fire when explicit and pending recovery conditions
+6. A requested Mayo tool dispatches `pick_up_from_mayo_and_handover` with the
+   Mayo location as source, the right arm, and the surgeon receive zone as target.
+7. `anticipatory_handover` may only fire when explicit and pending recovery conditions
    are absent and the selected tool comes from stable VLM next-tool prediction
-   (`confidence >= 0.8` for at least 5 seconds).
-7. Reset returns the simulation to idle and clears transient execution state.
-8. Reset must not auto-start the BT.
-9. Switching bundles while stopped must not require relaunching the workspace.
+   (`confidence >= 0.8` for at least 3 seconds).
+8. Reset returns the simulation to idle and clears transient execution state.
+9. Reset must not auto-start the BT.
+10. Switching bundles while stopped must not require relaunching the workspace.
 
 ## UI Consistency Rules
 
@@ -145,6 +181,9 @@ These rules are the source of truth for debugging runtime behavior.
 3. The current phase must always be visible in the UI.
 4. The active spoken request must be visible in the UI when present.
 5. The cleaner countdown must be visible whenever cleaning is in progress.
+6. Mayo tools must share one panel; recovery/reuse columns must not be rendered.
+7. Each Mayo tool tag must show its latest VLM-derived reuse probability, or `--`
+   when no current Mayo assessment exists.
 
 ## Debugging Acceptance Checks
 

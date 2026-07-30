@@ -66,7 +66,7 @@ export function getUiCopy(language: Language) {
         instrumentRack: "도구 랙",
         humanoid: "휴머노이드",
         surgeon: "집도의",
-        surgicalBed: "수술대",
+        surgicalBed: "수술베드",
         cleanerStation: "클리너",
         mayoStand: "메이요 스탠드",
         recovery: "회수",

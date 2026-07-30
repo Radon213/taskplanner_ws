@@ -1,0 +1,281 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "taskplanner.evaluation_masks.v2",
+  "title": "Evaluation masks with conservative re-audit roles",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "case_id",
+    "evaluation_scope",
+    "default_metric_eligibility",
+    "event_roles",
+    "interval_masks",
+    "cutoffs",
+    "tool_metric_scopes",
+    "voice_context_roles"
+  ],
+  "$defs": {
+    "metricEligibility": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "action",
+        "latency",
+        "state",
+        "physical",
+        "reuse",
+        "gesture_presence",
+        "gesture_onset",
+        "phase_accuracy",
+        "actor_identity"
+      ],
+      "properties": {
+        "action": {
+          "type": "boolean"
+        },
+        "latency": {
+          "type": "boolean"
+        },
+        "state": {
+          "type": "boolean"
+        },
+        "physical": {
+          "type": "boolean"
+        },
+        "reuse": {
+          "type": "boolean"
+        },
+        "gesture_presence": {
+          "type": "boolean"
+        },
+        "gesture_onset": {
+          "type": "boolean"
+        },
+        "phase_accuracy": {
+          "type": "boolean"
+        },
+        "actor_identity": {
+          "type": "boolean"
+        }
+      }
+    }
+  },
+  "properties": {
+    "schema": {
+      "const": "taskplanner.evaluation_masks.v2"
+    },
+    "case_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]+$"
+    },
+    "evaluation_scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "classification",
+        "held_out_eligible",
+        "reason"
+      ],
+      "properties": {
+        "classification": {
+          "enum": [
+            "development_calibration",
+            "held_out"
+          ]
+        },
+        "held_out_eligible": {
+          "type": "boolean"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "default_metric_eligibility": {
+      "$ref": "#/$defs/metricEligibility"
+    },
+    "event_roles": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "event_id",
+          "role",
+          "metric_eligibility",
+          "reason"
+        ],
+        "properties": {
+          "event_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "role": {
+            "enum": [
+              "action_target",
+              "compound_action_substep",
+              "state_observation_only",
+              "gesture_target",
+              "context_only_not_ground_truth",
+              "not_scorable"
+            ]
+          },
+          "metric_eligibility": {
+            "$ref": "#/$defs/metricEligibility"
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "interval_masks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "mask_id",
+          "start_sec",
+          "end_sec",
+          "metric_eligibility",
+          "reason"
+        ],
+        "properties": {
+          "mask_id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]+$"
+          },
+          "start_sec": {
+            "type": "number",
+            "minimum": 0
+          },
+          "end_sec": {
+            "type": "number",
+            "minimum": 0
+          },
+          "metric_eligibility": {
+            "$ref": "#/$defs/metricEligibility"
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "cutoffs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "action_and_next_tool_end_sec",
+        "state_audit_end_sec",
+        "visual_end_sec",
+        "voice_context_end_sec"
+      ],
+      "properties": {
+        "action_and_next_tool_end_sec": {
+          "type": "number",
+          "minimum": 0
+        },
+        "state_audit_end_sec": {
+          "type": "number",
+          "minimum": 0
+        },
+        "visual_end_sec": {
+          "type": "number",
+          "minimum": 0
+        },
+        "voice_context_end_sec": {
+          "type": "number",
+          "minimum": 0
+        }
+      }
+    },
+    "tool_metric_scopes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "tool",
+          "instance_resolution",
+          "state",
+          "physical",
+          "reuse",
+          "reason"
+        ],
+        "properties": {
+          "tool": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]*$"
+          },
+          "instance_resolution": {
+            "enum": [
+              "unresolved_multiple_instances",
+              "initial_inventory_unavailable",
+              "resolved"
+            ]
+          },
+          "state": {
+            "type": "boolean"
+          },
+          "physical": {
+            "type": "boolean"
+          },
+          "reuse": {
+            "type": "boolean"
+          },
+          "mask_after_sec": {
+            "type": "number",
+            "minimum": 0
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "voice_context_roles": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "event_id",
+          "role",
+          "handover_target",
+          "reason"
+        ],
+        "properties": {
+          "event_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "role": {
+            "enum": [
+              "procedure_context",
+              "tool_request_context",
+              "use_existing_tool_context",
+              "gap_context",
+              "correction_context",
+              "procedure_completion_context",
+              "offscreen_context"
+            ]
+          },
+          "handover_target": {
+            "type": "boolean"
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    }
+  }
+}

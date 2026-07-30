@@ -1,6 +1,8 @@
 builtin_interfaces/Time stamp
 string decision
 string selected_tool
+string selected_tool_instance_id
+uint64 request_generation
 string selected_tool_lifecycle
 string next_required_transition
 string action

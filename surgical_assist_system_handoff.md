@@ -40,8 +40,9 @@ docker compose up taskplanner-runtime webapp
 기본값:
 
 - VLM: `real`
-- VLM endpoint: `http://127.0.0.1:1234`
-- VLM model: `qwen3.6-35b-a3b-mtp@q2_k_xl`
+- VLM provider: `vllm`
+- VLM endpoint: `http://127.0.0.1:8001`
+- VLM model: `unsloth/gemma-4-E4B-it-NVFP4`
 - LLM surgeon actor: `llm`
 - Actor model: `google/gemma-4-12b-qat`
 - VLM input image: `no_image_camera`
@@ -147,6 +148,19 @@ reducer가 회수를 승격한다. 정상 BT recovery branch는 `retrieve_from_m
 사용한다.
 
 `retrieve_from_hand`는 legacy/manual-only이다.
+
+메이요 위 도구가 다시 필요해진 경우에는 별도 회수/재사용 구역을 옮기는
+것이 아니라, 집도의의 명시적 음성 요청 또는 암묵적 손 내밈 요청을
+그대로 처리한다.
+
+```text
+Mayo stand -> robot right hand -> surgeon receive zone
+```
+
+이때 BT는 `pick_up_from_mayo_and_handover`를 발행한다. GUI는 내부
+`mayo_reuse`/`mayo_recovery` lifecycle을 두 칸으로 나누지 않고 하나의
+Mayo stand에 합쳐 표시하며, 각 도구 태그에는 VLM의 최신 판단을
+`재사용 확률 NN%`로 표시한다.
 
 ## 8. BT 의사결정
 

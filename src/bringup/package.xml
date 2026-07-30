@@ -20,9 +20,12 @@
   <exec_depend>rcl_interfaces</exec_depend>
   <exec_depend>rclpy</exec_depend>
   <exec_depend>simulation_runtime</exec_depend>
+  <exec_depend>shadow_evaluation</exec_depend>
   <exec_depend>skill_execution</exec_depend>
   <exec_depend>surgical_msgs</exec_depend>
   <exec_depend>vlm_node</exec_depend>
+
+  <test_depend>python3-pytest</test_depend>
 
   <export>
     <build_type>ament_python</build_type>

@@ -14,6 +14,7 @@ from .models import (
     BedRobotArmGroupSpec,
     BedRobotArmProcedureSpec,
     HumanoidPolicy,
+    InitialInstrumentState,
     InitialPlacement,
     InstrumentSpec,
     MockObservation,
@@ -131,6 +132,7 @@ def load_bundle(bundle_dir: str | Path | None = None) -> ProcedureSpec:
         procedure_display_name_ko=str(
             procedure.get("procedure_display_name_ko", procedure.get("procedure_display_name", procedure["procedure_id"]))
         ),
+        default_phase_id=str(procedure.get("default_phase_id", "")),
         normal_phase_ids=[str(item) for item in procedure.get("normal_phase_ids", [])],
         interrupt_phase_ids=[str(item) for item in procedure.get("interrupt_phase_ids", [])],
         phases=[
@@ -140,6 +142,10 @@ def load_bundle(bundle_dir: str | Path | None = None) -> ProcedureSpec:
                 display_name_ko=str(phase.get("display_name_ko", phase.get("display_name", phase["id"]))),
                 possible_next=[str(item) for item in phase["possible_next"]],
                 expected_instruments=[str(item) for item in phase["expected_instruments"]],
+                field_deployed_instruments=[
+                    str(item)
+                    for item in phase.get("field_deployed_instruments", [])
+                ],
                 min_duration_sec=float(phase.get("min_duration_sec", 0.0)),
             )
             for phase in procedure["phases"]
@@ -151,6 +157,7 @@ def load_bundle(bundle_dir: str | Path | None = None) -> ProcedureSpec:
                 display_name_ko=str(instrument.get("display_name_ko", instrument.get("display_name", instrument["id"]))),
                 aliases=[str(alias) for alias in instrument.get("aliases", [])],
                 category=str(instrument["category"]),
+                inventory_count=int(instrument.get("inventory_count", 1)),
                 requestable=_instrument_requestable(instrument),
                 role=str(instrument.get("role", "")),
                 handover_profile=str(instrument["handover_profile"]),
@@ -168,6 +175,16 @@ def load_bundle(bundle_dir: str | Path | None = None) -> ProcedureSpec:
                 location_id=str(placement["location_id"]),
             )
             for placement in scene_layout["initial_instrument_placement"]
+        ],
+        initial_instrument_states=[
+            InitialInstrumentState(
+                instrument_id=str(state["instrument_id"]),
+                instance_id=str(state["instance_id"]),
+                location_id=str(state["location_id"]),
+                lifecycle_stage=str(state["lifecycle_stage"]),
+                confidence=float(state.get("confidence", 1.0)),
+            )
+            for state in scene_layout.get("initial_instrument_states", [])
         ],
         phase_guard=PhaseGuardPolicy(
             min_confidence_to_keep=float(policy["phase_guard"]["min_confidence_to_keep"]),

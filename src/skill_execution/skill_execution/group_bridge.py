@@ -50,6 +50,8 @@ class ActiveGroupGoal:
     signature: tuple[Any, ...]
     goal_handle: Any | None = None
     last_activity_ns: int = 0
+    last_feedback_state: str = ""
+    last_feedback_milestone: int = -1
 
 
 class BedRobotArmGroupActionBridge(Node):
@@ -58,6 +60,8 @@ class BedRobotArmGroupActionBridge(Node):
     Suction and retraction have independent action clients and active-goal
     slots, so either group can run while the other is still executing.
     """
+
+    _FEEDBACK_PROGRESS_MILESTONES = 4
 
     def __init__(self) -> None:
         super().__init__("bed_robot_arm_group_action_bridge")
@@ -314,6 +318,14 @@ class BedRobotArmGroupActionBridge(Node):
                 self._active.pop(command.group_id, None)
             self._command_started_ns.pop(command.command_id, None)
 
+    @classmethod
+    def _feedback_milestone(cls, progress: float) -> int:
+        normalized = max(0.0, min(1.0, float(progress)))
+        return min(
+            cls._FEEDBACK_PROGRESS_MILESTONES,
+            int(normalized * cls._FEEDBACK_PROGRESS_MILESTONES),
+        )
+
     def _on_feedback(self, command: GroupCommandEnvelope, feedback_message) -> None:
         feedback = feedback_message.feedback
         with self._lock:
@@ -326,12 +338,26 @@ class BedRobotArmGroupActionBridge(Node):
             if active is None or active.command.command_id != command.command_id:
                 return
             active.last_activity_ns = self.get_clock().now().nanoseconds
+            feedback_state = str(feedback.state or "executing")
+            milestone = self._feedback_milestone(float(feedback.progress))
+            should_publish = bool(
+                active.last_feedback_milestone < 0
+                or feedback_state != active.last_feedback_state
+                or milestone > active.last_feedback_milestone
+            )
+            if not should_publish:
+                return
+            active.last_feedback_state = feedback_state
+            active.last_feedback_milestone = max(
+                active.last_feedback_milestone,
+                milestone,
+            )
             # Publish while holding the re-entrant state lock so reset cannot
             # emit a terminal cancellation and then be followed by stale
             # feedback from this command.
             self._publish_status(
                 command,
-                state=feedback.state or "executing",
+                state=feedback_state,
                 outcome="executing",
                 terminal=False,
                 success=True,
@@ -704,7 +730,7 @@ class BedRobotArmGroupActionBridge(Node):
             confidence=1.0,
         )
 
-    def _watch_action_health(self) -> None:
+    def _watch_action_health(self, *, force_availability: bool = False) -> None:
         now_ns = self.get_clock().now().nanoseconds
         for group_id, client in self._action_clients.items():
             ready = bool(client.server_is_ready())
@@ -721,6 +747,9 @@ class BedRobotArmGroupActionBridge(Node):
                         # A controller that disappeared while dispatching has
                         # no trustworthy held pose after reconnection.
                         self._group_states[group_id] = "standby"
+                    availability_changed = previous is None or ready != previous
+                    if not availability_changed and not force_availability:
+                        continue
                     command = self._availability_envelope(group_id)
                     health_state = (
                         self._group_states.get(group_id, "standby")
@@ -802,7 +831,7 @@ class BedRobotArmGroupActionBridge(Node):
         if command in {"start", "start_actors"}:
             with self._lock:
                 self._runtime_accepting_commands = True
-            self._watch_action_health()
+            self._watch_action_health(force_availability=True)
             return
         if command == "start_runtime":
             # Runtime state may be reset to optimistic defaults by the twin,
@@ -810,7 +839,7 @@ class BedRobotArmGroupActionBridge(Node):
             # actual controller readiness immediately and via the heartbeat.
             with self._lock:
                 self._runtime_accepting_commands = False
-            self._watch_action_health()
+            self._watch_action_health(force_availability=True)
             return
         if command in {"stop", "reset"}:
             with self._lock:
@@ -820,7 +849,10 @@ class BedRobotArmGroupActionBridge(Node):
                 self._group_states[GROUP_SUCTION] = "standby"
                 self._group_states[GROUP_RETRACTION] = "standby"
                 self._last_signatures.clear()
-            self._watch_action_health()
+            # The twin also resets its group beliefs at this boundary. Re-emit
+            # one authoritative availability snapshot without restoring a
+            # periodic unchanged heartbeat.
+            self._watch_action_health(force_availability=True)
 
 
 def main() -> None:

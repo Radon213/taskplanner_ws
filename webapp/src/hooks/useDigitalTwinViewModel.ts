@@ -48,6 +48,10 @@ export type StageTool = {
   compact: boolean;
 };
 
+function instrumentInstanceKey(instrument: InstrumentState): string {
+  return instrument.instance_id?.trim() || instrument.instrument_id;
+}
+
 export type StageRoute = {
   source: LayoutAnchor;
   target: LayoutAnchor;
@@ -62,8 +66,7 @@ export type StageHolderId =
   | "humanoid_right"
   | "surgeon"
   | "cleaner"
-  | "mayo_recovery"
-  | "mayo_reuse";
+  | "mayo";
 
 export type StageHolderRect = {
   left: number;
@@ -161,7 +164,7 @@ export type StageToolDisplayState = "waiting" | "handover" | "using" | "recovery
 
 export type StageToolChipBadge = {
   label: string;
-  tone: "neutral" | "active" | "warning" | "danger" | "predicted";
+  tone: "neutral" | "active" | "warning" | "danger" | "predicted" | "reuse";
 };
 
 export type StageToolChipDensity = "comfortable" | "regular" | "dense" | "micro";
@@ -447,8 +450,7 @@ const BOARD_HOLDER_ORDER: StageHolderId[] = [
   "humanoid_right",
   "surgeon",
   "cleaner",
-  "mayo_recovery",
-  "mayo_reuse",
+  "mayo",
 ];
 
 const TERMINAL_SKILL_STATES = new Set([
@@ -459,13 +461,13 @@ const TERMINAL_SKILL_STATES = new Set([
   "rejected",
 ]);
 
-const STAGE_TOP = 9;
-const STAGE_BOTTOM = 94;
+const STAGE_TOP = 3;
+const STAGE_BOTTOM = 98;
 const STAGE_HEIGHT = STAGE_BOTTOM - STAGE_TOP;
 const STAGE_GAP = 3;
+const STAGE_COLUMN_GAP = 2.5;
 const DEFAULT_STAGE_ASPECT_RATIO = 1.55;
-const STAGE_RIGHT = 99;
-const RACK_LEFT = 3;
+const STAGE_LEFT = 1;
 const RACK_WIDTH = 30;
 const RACK_PADDING_X = 1;
 const RACK_SLOT_GAP_X = 0.8;
@@ -500,29 +502,38 @@ const SINGLE_TOOL_HOLDER_H = HOLDER_LABEL_SPACE + TOOL_CARD_H + HOLDER_PAD_BOTTO
 const BADGED_TOOL_HOLDER_H =
   HOLDER_LABEL_SPACE + HOLDER_BADGE_SPACE + HOLDER_BADGE_GAP + TOOL_CARD_H + HOLDER_PAD_BOTTOM;
 const HUMANOID_GROUP_PAD = 1;
+const HUMANOID_GROUP_WIDTH = HUMANOID_HOLDER_W + HUMANOID_GROUP_PAD * 2;
 const HUMANOID_GROUP_TITLE_SPACE = HOLDER_LABEL_SPACE + 1;
 const HUMANOID_ACTION_GAP = 1;
 const HUMANOID_GROUP_BOTTOM_PAD = 1.4;
-const HUMANOID_GROUP_LEFT = RACK_LEFT + RACK_WIDTH + STAGE_GAP;
-const HUMANOID_LEFT = HUMANOID_GROUP_LEFT + HUMANOID_GROUP_PAD;
-const BED_LEFT = HUMANOID_GROUP_LEFT + HUMANOID_HOLDER_W + HUMANOID_GROUP_PAD * 2 + STAGE_GAP;
+const SURGEON_LEFT = STAGE_LEFT;
+const SURGEON_WIDTH = HUMANOID_GROUP_WIDTH;
+const BED_LEFT = SURGEON_LEFT + SURGEON_WIDTH + STAGE_COLUMN_GAP;
 const BED_WIDTH = 25;
+const HUMANOID_GROUP_LEFT = BED_LEFT + BED_WIDTH + STAGE_COLUMN_GAP;
+const HUMANOID_LEFT = HUMANOID_GROUP_LEFT + HUMANOID_GROUP_PAD;
+const RACK_LEFT =
+  HUMANOID_GROUP_LEFT +
+  HUMANOID_GROUP_WIDTH +
+  STAGE_COLUMN_GAP;
 const MAYO_LABEL_SPACE = 4.4;
 const MAYO_PAD_X = 1;
 const MAYO_PAD_BOTTOM = 0.9;
-const MAYO_LANE_GAP = 1;
-const SURGEON_LEFT = BED_LEFT + BED_WIDTH + STAGE_GAP;
-const SURGEON_WIDTH = STAGE_RIGHT - SURGEON_LEFT;
 const CLEANER_HOLDER_H = SINGLE_TOOL_HOLDER_H + 1.1;
 const HAND_HOLDER_H = SINGLE_TOOL_HOLDER_H;
 const CLEANER_TOP = STAGE_BOTTOM - RACK_PADDING_Y - CLEANER_HOLDER_H;
 const MAYO_STAND_TOP = CLEANER_TOP - MAYO_LABEL_SPACE;
-const BED_BOTTOM = MAYO_STAND_TOP - STAGE_GAP * DEFAULT_STAGE_ASPECT_RATIO;
-const MAYO_STAND_LEFT = HUMANOID_GROUP_LEFT;
-const MAYO_STAND_RIGHT = SURGEON_LEFT + SURGEON_WIDTH;
+const BED_BOTTOM =
+  MAYO_STAND_TOP - STAGE_GAP * DEFAULT_STAGE_ASPECT_RATIO;
+const MAYO_STAND_LEFT = BED_LEFT;
+const MAYO_STAND_RIGHT = BED_LEFT + BED_WIDTH;
 const HUMANOID_PANEL_TOP = STAGE_TOP + HUMANOID_GROUP_TITLE_SPACE;
 const HUMANOID_PANEL_H =
-  (BED_BOTTOM - HUMANOID_PANEL_TOP - HUMANOID_ACTION_GAP * 2 - HUMANOID_GROUP_BOTTOM_PAD) / 3;
+  (BED_BOTTOM -
+    HUMANOID_PANEL_TOP -
+    HUMANOID_ACTION_GAP * 2 -
+    HUMANOID_GROUP_BOTTOM_PAD) /
+  3;
 const HUMANOID_LEFT_TOP = HUMANOID_PANEL_TOP;
 const HUMANOID_ACTION_TOP = HUMANOID_LEFT_TOP + HUMANOID_PANEL_H + HUMANOID_ACTION_GAP;
 const HUMANOID_RIGHT_TOP = HUMANOID_ACTION_TOP + HUMANOID_PANEL_H + HUMANOID_ACTION_GAP;
@@ -531,15 +542,19 @@ const BASE_HOLDER_RECTS: Record<StageHolderId, StageHolderRect> = {
   rack: { left: RACK_LEFT, top: STAGE_TOP, width: RACK_WIDTH, height: STAGE_HEIGHT },
   humanoid_left: { left: HUMANOID_LEFT, top: HUMANOID_LEFT_TOP, width: HUMANOID_HOLDER_W, height: HUMANOID_PANEL_H },
   humanoid_right: { left: HUMANOID_LEFT, top: HUMANOID_RIGHT_TOP, width: HUMANOID_HOLDER_W, height: HUMANOID_PANEL_H },
-  surgeon: { left: SURGEON_LEFT, top: STAGE_TOP, width: SURGEON_WIDTH, height: BED_BOTTOM - STAGE_TOP },
+  surgeon: {
+    left: SURGEON_LEFT,
+    top: STAGE_TOP,
+    width: SURGEON_WIDTH,
+    height: BED_BOTTOM - STAGE_TOP,
+  },
   cleaner: {
     left: RACK_LEFT + RACK_PADDING_X,
     top: CLEANER_TOP,
     width: RACK_WIDTH - RACK_PADDING_X * 2,
     height: CLEANER_HOLDER_H,
   },
-  mayo_recovery: { left: 0, top: 0, width: 0, height: 0 },
-  mayo_reuse: { left: 0, top: 0, width: 0, height: 0 },
+  mayo: { left: 0, top: 0, width: 0, height: 0 },
 };
 
 const BOARD_SURGICAL_BED_RECT: StageHolderRect = {
@@ -551,7 +566,7 @@ const BOARD_SURGICAL_BED_RECT: StageHolderRect = {
 const BOARD_HUMANOID_GROUP_RECT: StageHolderRect = {
   left: HUMANOID_GROUP_LEFT,
   top: STAGE_TOP,
-  width: HUMANOID_HOLDER_W + HUMANOID_GROUP_PAD * 2,
+  width: HUMANOID_GROUP_WIDTH,
   height: BED_BOTTOM - STAGE_TOP,
 };
 const BOARD_MAYO_STAND_RECT: StageHolderRect = {
@@ -560,6 +575,20 @@ const BOARD_MAYO_STAND_RECT: StageHolderRect = {
   width: MAYO_STAND_RIGHT - MAYO_STAND_LEFT,
   height: STAGE_BOTTOM - MAYO_STAND_TOP,
 };
+const BOARD_CAMERA_RECTS = {
+  cam1: {
+    left: SURGEON_LEFT,
+    top: MAYO_STAND_TOP,
+    width: SURGEON_WIDTH,
+    height: STAGE_BOTTOM - MAYO_STAND_TOP,
+  },
+  cam3: {
+    left: HUMANOID_GROUP_LEFT,
+    top: MAYO_STAND_TOP,
+    width: HUMANOID_GROUP_WIDTH,
+    height: STAGE_BOTTOM - MAYO_STAND_TOP,
+  },
+} satisfies Record<"cam1" | "cam3", StageHolderRect>;
 
 function holderTone(holderId: StageHolderId): StageHolder["tone"] {
   if (holderId === "rack") return "rack";
@@ -600,9 +629,15 @@ function holderIdForAnchor(anchorId: string, lifecycleStage = "", locationType =
     return "surgeon";
   }
   if (anchorId === "cleaner_slot" || locationType === "cleaner_slot") return "cleaner";
-  if (anchorId === "mayo_recovery_zone" || locationType === "mayo_recovery_zone") return "mayo_recovery";
-  if (anchorId === "mayo_reuse_zone" || anchorId === "mayo_stand" || locationType === "mayo_reuse_zone" || locationType === "mayo_stand") {
-    return "mayo_reuse";
+  if (
+    anchorId === "mayo_recovery_zone" ||
+    anchorId === "mayo_reuse_zone" ||
+    anchorId === "mayo_stand" ||
+    locationType === "mayo_recovery_zone" ||
+    locationType === "mayo_reuse_zone" ||
+    locationType === "mayo_stand"
+  ) {
+    return "mayo";
   }
   return "rack";
 }
@@ -626,11 +661,12 @@ function holderUsesBadgeStrip(holderId: StageHolderId): boolean {
 function contentRectForHolder(holderId: StageHolderId, rect: StageHolderRect): StageHolderRect {
   const badgeSpace = holderUsesBadgeStrip(holderId) ? HOLDER_BADGE_SPACE : 0;
   const badgeGap = holderUsesBadgeStrip(holderId) ? HOLDER_BADGE_GAP : 0;
+  const labelSpace = holderId === "mayo" ? 0.8 : HOLDER_LABEL_SPACE;
   return {
     left: rect.left + HOLDER_PAD_X,
-    top: rect.top + HOLDER_LABEL_SPACE + badgeSpace + badgeGap,
+    top: rect.top + labelSpace + badgeSpace + badgeGap,
     width: Math.max(0.1, rect.width - HOLDER_PAD_X * 2),
-    height: Math.max(0.1, rect.height - HOLDER_LABEL_SPACE - badgeSpace - badgeGap - HOLDER_PAD_BOTTOM),
+    height: Math.max(0.1, rect.height - labelSpace - badgeSpace - badgeGap - HOLDER_PAD_BOTTOM),
   };
 }
 
@@ -645,7 +681,7 @@ function gridRectForHolder(
   const maxColumns =
     holderId === "cleaner"
       ? 1
-      : holderId === "mayo_recovery" || holderId === "mayo_reuse"
+      : holderId === "mayo"
       ? 2
       : holderId === "surgeon"
         ? 1
@@ -693,13 +729,22 @@ function mayoListRectForHolder(
   holderRects: Record<StageHolderId, StageHolderRect>,
 ): StageHolderRect & { scale: number; compact: boolean; gridIndex: number } {
   const contentRect = contentRectForHolder(holderId, holderRects[holderId]);
-  const rowCount = Math.max(1, count);
+  const columnCount = count <= 1 ? 1 : 2;
+  const rowCount = Math.max(1, Math.ceil(count / columnCount));
   const rowGap = rowCount > 1 ? 0.45 : 0;
+  const columnGap = columnCount > 1 ? 0.8 : 0;
   const rowHeight = Math.max(1.9, (contentRect.height - rowGap * (rowCount - 1)) / rowCount);
-  const rowWidth = contentRect.width * 0.5;
+  const rowWidth =
+    columnCount === 1
+      ? contentRect.width * 0.5
+      : (contentRect.width - columnGap) / columnCount;
+  const gridWidth = rowWidth * columnCount + columnGap * (columnCount - 1);
+  const startLeft = contentRect.left + (contentRect.width - gridWidth) / 2;
+  const column = index % columnCount;
+  const row = Math.floor(index / columnCount);
   return {
-    left: contentRect.left + contentRect.width / 2,
-    top: contentRect.top + rowHeight / 2 + index * (rowHeight + rowGap),
+    left: startLeft + column * (rowWidth + columnGap) + rowWidth / 2,
+    top: contentRect.top + rowHeight / 2 + row * (rowHeight + rowGap),
     width: rowWidth,
     height: rowHeight,
     scale: Math.min(1, rowHeight / TOOL_CARD_H),
@@ -709,7 +754,7 @@ function mayoListRectForHolder(
 }
 
 function toolChipDensityForHolder(holderId: StageHolderId, count: number, compact: boolean): StageToolChipDensity {
-  if (holderId !== "mayo_recovery" && holderId !== "mayo_reuse") return compact ? "dense" : "regular";
+  if (holderId !== "mayo") return compact ? "dense" : "regular";
   if (count <= 1) return "comfortable";
   if (count <= 3) return "regular";
   if (count <= 4) return "dense";
@@ -725,7 +770,7 @@ function chipRectForHolder(
   if (holderId === "rack") {
     return { ...rackSlotRect(index), scale: 1, compact: false, gridIndex: index };
   }
-  if (holderId === "mayo_recovery" || holderId === "mayo_reuse") {
+  if (holderId === "mayo") {
     return mayoListRectForHolder(holderId, index, holderCount, holderRects);
   }
   return gridRectForHolder(holderId, index, holderCount, holderRects);
@@ -733,12 +778,22 @@ function chipRectForHolder(
 
 const RECOVERY_BADGE_LIFECYCLES = new Set(["surgeon_owned", "mayo_reuse", "mayo_recovery"]);
 
+function isActiveRecoveryInstrument(
+  instrument: InstrumentState,
+  activeRecoveryToolIds: Set<string>,
+): boolean {
+  return (
+    activeRecoveryToolIds.has(instrumentInstanceKey(instrument)) ||
+    activeRecoveryToolIds.has(instrument.instrument_id)
+  );
+}
+
 function displayLifecycleForInstrument(
   instrument: InstrumentState,
   activeRecoveryToolIds: Set<string>,
 ): string {
   const recoveryPending =
-    (activeRecoveryToolIds.has(instrument.instrument_id) ||
+    (isActiveRecoveryInstrument(instrument, activeRecoveryToolIds) ||
       instrument.next_required_transition === "recover_left") &&
     RECOVERY_BADGE_LIFECYCLES.has(instrument.lifecycle_stage);
   return recoveryPending ? "mayo_recovery" : instrument.lifecycle_stage;
@@ -758,7 +813,48 @@ function footerBadgesForInstrument(
   language: Language,
   ui: ReturnType<typeof getUiCopy>,
   activeRecoveryToolIds: Set<string>,
+  holderId: StageHolderId,
+  mayoAssessment: MayoVlmAssessment | undefined,
 ): StageToolChipBadge[] {
+  if (holderId === "mayo") {
+    const rawDecisionLabel =
+      mayoAssessment === undefined
+        ? language === "ko"
+          ? "VLM 판단 --"
+          : "VLM decision --"
+        : mayoAssessment.decision === "reuse"
+          ? language === "ko"
+            ? `VLM 재사용 ${Math.round(mayoAssessment.confidence * 100)}%`
+            : `VLM reuse ${Math.round(mayoAssessment.confidence * 100)}%`
+          : language === "ko"
+            ? `VLM ${mayoAssessment.selectedForRetrieve ? "회수 후보" : "회수"} ${Math.round(mayoAssessment.confidence * 100)}%`
+            : `VLM ${mayoAssessment.selectedForRetrieve ? "recovery candidate" : "recover"} ${Math.round(mayoAssessment.confidence * 100)}%`;
+    const finalRecovery =
+      isActiveRecoveryInstrument(instrument, activeRecoveryToolIds) ||
+      instrument.lifecycle_stage === "mayo_recovery" ||
+      instrument.next_required_transition === "recover_left";
+    const finalDecisionLabel = finalRecovery
+      ? language === "ko"
+        ? "DT 회수 확정"
+        : "DT recovery"
+      : language === "ko"
+        ? "DT 재사용 유지"
+        : "DT keep for reuse";
+    const badges: StageToolChipBadge[] = [
+      {
+        label: rawDecisionLabel,
+        tone: mayoAssessment?.decision === "recover" ? "warning" : "reuse",
+      },
+      {
+        label: finalDecisionLabel,
+        tone: finalRecovery ? "warning" : "neutral",
+      },
+    ];
+    if (instrument.contaminated) {
+      badges.push({ label: ui.contaminated, tone: "danger" });
+    }
+    return badges;
+  }
   const lifecycleEntry = catalogEntry(catalog, "lifecycle", displayLifecycleForInstrument(instrument, activeRecoveryToolIds));
   const stateBadge = {
     label: localizedDisplayName(lifecycleEntry, language, ui.waitingState),
@@ -769,6 +865,52 @@ function footerBadgesForInstrument(
     badges.push({ label: ui.contaminated, tone: "danger" });
   }
   return badges;
+}
+
+type MayoVlmAssessment = {
+  decision: "recover" | "reuse";
+  confidence: number;
+  selectedForRetrieve: boolean;
+};
+
+function mayoVlmAssessments(
+  vlmResult: VLMResult,
+  resolveToolId: (rawToolId: string) => string,
+): Map<string, MayoVlmAssessment> {
+  const assessments = new Map<string, MayoVlmAssessment>();
+  if (!vlmResult.raw_json) return assessments;
+  try {
+    const payload = JSON.parse(vlmResult.raw_json) as {
+      mayo?: unknown;
+      mayo_retrieve?: unknown;
+    };
+    const retrieveToolId =
+      Array.isArray(payload.mayo_retrieve) && payload.mayo_retrieve.length >= 2
+        ? resolveToolId(String(payload.mayo_retrieve[0] ?? "").trim())
+        : "";
+    if (!Array.isArray(payload.mayo)) return assessments;
+    for (const row of payload.mayo) {
+      if (!Array.isArray(row) || row.length < 3) continue;
+      const toolId = resolveToolId(String(row[0] ?? "").trim());
+      const decision = String(row[1] ?? "").trim().toLowerCase();
+      const confidence = Number(row[2]);
+      if (
+        !toolId ||
+        !Number.isFinite(confidence) ||
+        (decision !== "reuse" && decision !== "recover" && decision !== "recovery")
+      ) {
+        continue;
+      }
+      assessments.set(toolId, {
+        decision: decision === "reuse" ? "reuse" : "recover",
+        confidence: Math.max(0, Math.min(1, confidence)),
+        selectedForRetrieve: toolId === retrieveToolId,
+      });
+    }
+  } catch {
+    return assessments;
+  }
+  return assessments;
 }
 
 function isLayoutBundle(value: unknown): value is LayoutBundle {
@@ -802,6 +944,7 @@ function selectedBundleMetadata(
       display_name: selected.display_name,
       display_name_ko: selected.display_name_ko,
     },
+    default_phase_id: selected.default_phase_id,
     phases: selected.phases ?? [],
     normal_phase_ids: selected.normal_phase_ids ?? [],
     interrupt_phase_ids: selected.interrupt_phase_ids ?? [],
@@ -1217,7 +1360,7 @@ function normalizeCleanerBoardGroup(
 
   const [visibleCleanerTool, ...queuedTools] = normalized.cleaner;
   normalized.cleaner = visibleCleanerTool ? [visibleCleanerTool] : [];
-  normalized.mayo_recovery = [...(normalized.mayo_recovery ?? []), ...queuedTools];
+  normalized.mayo = [...(normalized.mayo ?? []), ...queuedTools];
   return normalized;
 }
 
@@ -1227,8 +1370,7 @@ function holderShortLabel(holderId: StageHolderId, language: Language): string {
   if (holderId === "surgeon") return language === "ko" ? "집도의" : "Surgeon";
   if (holderId === "humanoid_left") return language === "ko" ? "왼손" : "Left";
   if (holderId === "humanoid_right") return language === "ko" ? "오른손" : "Right";
-  if (holderId === "mayo_recovery") return language === "ko" ? "회수" : "Recovery";
-  return language === "ko" ? "재사용" : "Reuse";
+  return language === "ko" ? "메이요" : "Mayo";
 }
 
 function buildHolderRects(stageAspectRatio = DEFAULT_STAGE_ASPECT_RATIO): {
@@ -1237,12 +1379,15 @@ function buildHolderRects(stageAspectRatio = DEFAULT_STAGE_ASPECT_RATIO): {
   humanoidGroupRect: StageHolderRect;
   surgicalBedRect: StageHolderRect;
   mayoStandRect: StageHolderRect;
+  cameraRects: typeof BOARD_CAMERA_RECTS;
 } {
   const bedBottom = MAYO_STAND_TOP - STAGE_GAP * stageAspectRatio;
   const mayoStandRect = BOARD_MAYO_STAND_RECT;
-  const mayoLaneTop = BASE_HOLDER_RECTS.cleaner.top;
-  const laneWidth = (mayoStandRect.width - MAYO_PAD_X * 2 - MAYO_LANE_GAP) / 2;
-  const mayoLaneHeight = SINGLE_TOOL_HOLDER_H;
+  const mayoContentTop = mayoStandRect.top + MAYO_LABEL_SPACE;
+  const mayoContentHeight = Math.max(
+    0.1,
+    mayoStandRect.top + mayoStandRect.height - mayoContentTop - MAYO_PAD_BOTTOM,
+  );
   const humanoidGroupRect = {
     ...BOARD_HUMANOID_GROUP_RECT,
     height: bedBottom - BOARD_HUMANOID_GROUP_RECT.top,
@@ -1271,19 +1416,18 @@ function buildHolderRects(stageAspectRatio = DEFAULT_STAGE_ASPECT_RATIO): {
     rack: BASE_HOLDER_RECTS.rack,
     humanoid_left: humanoidLeftRect,
     humanoid_right: humanoidRightRect,
-    surgeon: { left: SURGEON_LEFT, top: STAGE_TOP, width: SURGEON_WIDTH, height: bedBottom - STAGE_TOP },
-    cleaner: BASE_HOLDER_RECTS.cleaner,
-    mayo_recovery: {
-      left: mayoStandRect.left + MAYO_PAD_X,
-      top: mayoLaneTop,
-      width: laneWidth,
-      height: mayoLaneHeight,
+    surgeon: {
+      left: SURGEON_LEFT,
+      top: STAGE_TOP,
+      width: SURGEON_WIDTH,
+      height: bedBottom - STAGE_TOP,
     },
-    mayo_reuse: {
-      left: mayoStandRect.left + MAYO_PAD_X + laneWidth + MAYO_LANE_GAP,
-      top: mayoLaneTop,
-      width: laneWidth,
-      height: mayoLaneHeight,
+    cleaner: BASE_HOLDER_RECTS.cleaner,
+    mayo: {
+      left: mayoStandRect.left + MAYO_PAD_X,
+      top: mayoContentTop,
+      width: mayoStandRect.width - MAYO_PAD_X * 2,
+      height: mayoContentHeight,
     },
   };
   return {
@@ -1300,6 +1444,7 @@ function buildHolderRects(stageAspectRatio = DEFAULT_STAGE_ASPECT_RATIO): {
       height: bedBottom - BOARD_SURGICAL_BED_RECT.top,
     },
     mayoStandRect,
+    cameraRects: BOARD_CAMERA_RECTS,
   };
 }
 
@@ -1846,6 +1991,18 @@ export function useDigitalTwinViewModel({
     const bundleDisplayById = new Map((metadata?.bundles ?? []).map((bundle) => [bundle.id, bundle]));
     const localizedToolName = (instrumentId: string) =>
       localizedDisplayName(toolDisplayById.get(instrumentId), language, displayToolName(instrumentId, language));
+    const toolAliasToId = new Map<string, string>();
+    for (const instrument of metadata?.instruments ?? []) {
+      for (const candidate of [instrument.id, instrument.display_name, instrument.display_name_ko, ...(instrument.aliases ?? [])]) {
+        const normalized = String(candidate ?? "").trim().toLowerCase();
+        if (normalized) toolAliasToId.set(normalized, instrument.id);
+      }
+    }
+    const resolveVlmToolId = (rawToolId: string) => {
+      const normalized = rawToolId.trim().toLowerCase();
+      return toolAliasToId.get(normalized) ?? (toolDisplayById.has(rawToolId) ? rawToolId : "");
+    };
+    const mayoAssessmentByTool = mayoVlmAssessments(vlmResult, resolveVlmToolId);
     const localizedPhaseName = (phaseId: string) =>
       localizedDisplayName(phaseDisplayById.get(phaseId), language, displayPhaseName(phaseId, language));
     const localizedBundleName = (bundleName: string) =>
@@ -1904,8 +2061,7 @@ export function useDigitalTwinViewModel({
       humanoid_right: language === "ko" ? "오른손" : "Right Hand",
       surgeon: ui.surgeon,
       cleaner: ui.cleanerStation,
-      mayo_recovery: ui.recovery,
-      mayo_reuse: ui.reuse,
+      mayo: ui.mayoStand,
     };
     const labelForHolder = (holderId: StageHolderId) => holderLabels[holderId];
     const runtimeBundleId = simulationState.active_bundle || simulationState.procedure_id || "";
@@ -1925,28 +2081,41 @@ export function useDigitalTwinViewModel({
 
     const surgeonOwnedInstruments = displayInstrumentStates.filter(
       (instrument) =>
-        instrument.lifecycle_stage === "surgeon_owned" ||
-        instrument.lifecycle_stage === "mayo_reuse",
+        instrument.lifecycle_stage === "surgeon_owned",
     );
     const requestedSurgeonToolId = simulationState.surgeon_request_tool || surgeonState.requested_tool || "";
-    const retrievalTargetToolId =
+    const retrievalTargetInstrument =
       surgeonState.ready_for_retrieval && requestedSurgeonToolId
-        ? surgeonOwnedInstruments.find((instrument) => instrument.instrument_id === requestedSurgeonToolId)?.instrument_id ?? ""
+        ? surgeonOwnedInstruments.find((instrument) => instrument.instrument_id === requestedSurgeonToolId)
+        : undefined;
+    const retrievalTargetInstrumentKey = retrievalTargetInstrument
+      ? instrumentInstanceKey(retrievalTargetInstrument)
+      : "";
+    const surgeonLeftInstrumentKey = surgeonState.ready_for_retrieval
+      ? retrievalTargetInstrumentKey ||
+        (surgeonOwnedInstruments[0]
+          ? instrumentInstanceKey(surgeonOwnedInstruments[0])
+          : "")
+      : surgeonOwnedInstruments[1]
+        ? instrumentInstanceKey(surgeonOwnedInstruments[1])
         : "";
-    const surgeonLeftInstrumentId = surgeonState.ready_for_retrieval
-      ? retrievalTargetToolId || surgeonOwnedInstruments[0]?.instrument_id || ""
-      : surgeonOwnedInstruments[1]?.instrument_id || "";
-    const surgeonRightInstrumentId =
-      surgeonOwnedInstruments.find((instrument) => instrument.instrument_id !== surgeonLeftInstrumentId)?.instrument_id ?? "";
+    const surgeonRightInstrument = surgeonOwnedInstruments.find(
+      (instrument) =>
+        instrumentInstanceKey(instrument) !== surgeonLeftInstrumentKey,
+    );
+    const surgeonRightInstrumentKey = surgeonRightInstrument
+      ? instrumentInstanceKey(surgeonRightInstrument)
+      : "";
 
     function anchorForInstrument(instrument: InstrumentState): LayoutAnchor | undefined {
+      const instanceKey = instrumentInstanceKey(instrument);
       if (instrument.visual_anchor_id && anchorMap[instrument.visual_anchor_id]) {
         return anchorMap[instrument.visual_anchor_id];
       }
-      if (instrument.instrument_id === surgeonRightInstrumentId && anchorMap.surgeon_right_hand) {
+      if (instanceKey === surgeonRightInstrumentKey && anchorMap.surgeon_right_hand) {
         return anchorMap.surgeon_right_hand;
       }
-      if (instrument.instrument_id === surgeonLeftInstrumentId && anchorMap.surgeon_left_hand) {
+      if (instanceKey === surgeonLeftInstrumentKey && anchorMap.surgeon_left_hand) {
         return anchorMap.surgeon_left_hand;
       }
       if (instrument.lifecycle_stage === "prepositioned_right" && anchorMap.robot_right_hand) return anchorMap.robot_right_hand;
@@ -1983,6 +2152,13 @@ export function useDigitalTwinViewModel({
       {} as Record<string, { anchor: LayoutAnchor; instruments: InstrumentState[] }>,
     );
 
+    const activeToolInstanceId = runtimeAllowsActiveTask
+      ? simulationState.active_robot_task_tool_instance_id ||
+        simulationState.right_hand_tool_instance_id ||
+        simulationState.left_hand_tool_instance_id ||
+        simulationState.prepositioned_tool_instance_id ||
+        ""
+      : "";
     const activeToolId = runtimeAllowsActiveTask
       ? simulationState.active_robot_task_tool_id ||
         simulationState.right_hand_tool ||
@@ -1995,12 +2171,14 @@ export function useDigitalTwinViewModel({
 
     const tools: StageTool[] = Object.values(grouped).flatMap(({ anchor, instruments }) =>
       [...instruments]
-        .sort((left, right) => left.instrument_id.localeCompare(right.instrument_id))
+        .sort((left, right) =>
+          instrumentInstanceKey(left).localeCompare(instrumentInstanceKey(right)),
+        )
         .map((instrument, index) => {
           const label = localizedToolName(instrument.instrument_id);
           const compact = anchor.id.startsWith("main_tray_slot") || instrument.lifecycle_stage === "home";
           return {
-            id: instrument.instrument_id,
+            id: instrumentInstanceKey(instrument),
             label,
             shortLabel: toolShortLabel(label),
             anchorId: anchor.id,
@@ -2008,14 +2186,25 @@ export function useDigitalTwinViewModel({
             lifecycle: catalogLabel(catalog, "lifecycle", instrument.lifecycle_stage, language, titleize(instrument.lifecycle_stage)).toUpperCase(),
             tone: catalogToolTone(catalogEntry(catalog, "lifecycle", instrument.lifecycle_stage)),
             contaminated: instrument.contaminated,
-            active: instrument.instrument_id === activeToolId,
+            active: activeToolInstanceId
+              ? instrumentInstanceKey(instrument) === activeToolInstanceId
+              : instrument.instrument_id === activeToolId,
             compact,
           };
         }),
     );
 
-    const leftHandInstrument = simulationState.left_hand_tool
-      ? displayInstrumentStates.find((instrument) => instrument.instrument_id === simulationState.left_hand_tool)
+    const leftHandInstrument = simulationState.left_hand_tool_instance_id
+      ? displayInstrumentStates.find(
+          (instrument) =>
+            instrumentInstanceKey(instrument) ===
+            simulationState.left_hand_tool_instance_id,
+        )
+      : simulationState.left_hand_tool
+        ? displayInstrumentStates.find(
+            (instrument) =>
+              instrument.instrument_id === simulationState.left_hand_tool,
+          )
       : undefined;
     const returnAnchorId = leftHandInstrument?.home_location_id || "main_tray_slot_1";
     const routes: StageRoute[] = [];
@@ -2066,7 +2255,14 @@ export function useDigitalTwinViewModel({
       {} as Record<StageHolderId, InstrumentState[]>,
     );
     const boardGrouped = normalizeCleanerBoardGroup(rawBoardGrouped, activeToolId);
-    const { holderRects, holderContentRects, humanoidGroupRect, surgicalBedRect, mayoStandRect } = buildHolderRects(stageAspectRatio);
+    const {
+      holderRects,
+      holderContentRects,
+      humanoidGroupRect,
+      surgicalBedRect,
+      mayoStandRect,
+      cameraRects,
+    } = buildHolderRects(stageAspectRatio);
     const rackSlotIds = Array.from({ length: RACK_SLOT_COUNT }).map((_, index) => `main_tray_slot_${index + 1}`);
     const boardRackSlotCount = rackSlotIds.length;
     const rackSlotIndexById = new Map(rackSlotIds.map((slotId, index) => [slotId, index]));
@@ -2094,7 +2290,13 @@ export function useDigitalTwinViewModel({
         (intent) => intent === "request_tool" || intent === "voice_request" || intent === "extend_hand_for_handover",
       );
     const requestedHighlightToolId = activeRequestIntent ? overrideAck?.toolId || requestedSurgeonToolId : "";
-    const activeRecoveryToolIds = new Set(runtimeFrameMatchesActiveBundle ? simulationState.active_recovery_tools ?? [] : []);
+    const activeRecoveryToolIds = new Set(
+      runtimeFrameMatchesActiveBundle
+        ? simulationState.active_recovery_tool_instances?.length
+          ? simulationState.active_recovery_tool_instances
+          : simulationState.active_recovery_tools ?? []
+        : [],
+    );
     const toolChipPlacements: StageToolChipPlacement[] = BOARD_HOLDER_ORDER.flatMap((holderId) => {
       const instruments = [...(boardGrouped[holderId] ?? [])].sort((left, right) => {
         if (holderId === "rack") {
@@ -2102,21 +2304,23 @@ export function useDigitalTwinViewModel({
           const rightIndex = rackSlotIndexById.get(right.home_location_id) ?? Number.MAX_SAFE_INTEGER;
           return leftIndex - rightIndex || left.instrument_id.localeCompare(right.instrument_id);
         }
-        const leftKey = `${left.home_location_id}-${left.location_id}-${left.instrument_id}`;
-        const rightKey = `${right.home_location_id}-${right.location_id}-${right.instrument_id}`;
+        const leftKey = `${left.home_location_id}-${left.location_id}-${instrumentInstanceKey(left)}`;
+        const rightKey = `${right.home_location_id}-${right.location_id}-${instrumentInstanceKey(right)}`;
         return leftKey.localeCompare(rightKey);
       });
       return instruments.map((instrument, index) => {
         const label = localizedToolName(instrument.instrument_id);
         const placementIndex = holderId === "rack" ? rackSlotIndexById.get(instrument.home_location_id) ?? index : index;
-          const rect = chipRectForHolder(
-            holderId,
-            placementIndex,
-            holderId === "rack" ? boardRackSlotCount : instruments.length,
-            holderRects,
-          );
-          const active = instrument.instrument_id === activeToolId;
-          const displayState = displayStateForInstrument(instrument, catalog, activeRecoveryToolIds);
+        const rect = chipRectForHolder(
+          holderId,
+          placementIndex,
+          holderId === "rack" ? boardRackSlotCount : instruments.length,
+          holderRects,
+        );
+        const active = activeToolInstanceId
+          ? instrumentInstanceKey(instrument) === activeToolInstanceId
+          : instrument.instrument_id === activeToolId;
+        const displayState = displayStateForInstrument(instrument, catalog, activeRecoveryToolIds);
         const requested =
           holderId === "humanoid_right" &&
           displayState === "handover" &&
@@ -2126,10 +2330,24 @@ export function useDigitalTwinViewModel({
           holderId === "humanoid_right" &&
           displayState === "handover";
         const predicted =
-          !requested && predictionEligible && (active || instrument.instrument_id === simulationState.prepositioned_tool);
-        const footerBadges = footerBadgesForInstrument(instrument, catalog, language, ui, activeRecoveryToolIds);
+          !requested &&
+          predictionEligible &&
+          (active ||
+            (simulationState.prepositioned_tool_instance_id
+              ? instrumentInstanceKey(instrument) ===
+                simulationState.prepositioned_tool_instance_id
+              : instrument.instrument_id === simulationState.prepositioned_tool));
+        const footerBadges = footerBadgesForInstrument(
+          instrument,
+          catalog,
+          language,
+          ui,
+          activeRecoveryToolIds,
+          holderId,
+          mayoAssessmentByTool.get(instrument.instrument_id),
+        );
         return {
-          id: instrument.instrument_id,
+          id: instrumentInstanceKey(instrument),
           label,
           shortLabel: toolShortLabel(label),
           holderId,
@@ -2154,7 +2372,7 @@ export function useDigitalTwinViewModel({
           footerBadges,
           contaminated: instrument.contaminated,
           active,
-          layoutVariant: holderId === "mayo_recovery" || holderId === "mayo_reuse" ? "mayoList" : "card",
+          layoutVariant: holderId === "mayo" ? "mayoList" : "card",
         };
       });
     });
@@ -2363,7 +2581,7 @@ export function useDigitalTwinViewModel({
     const boardMayoStand: StageMayoStand = {
       label: ui.mayoStand,
       rect: mayoStandRect,
-      active: activeHolderIds.has("mayo_recovery") || activeHolderIds.has("mayo_reuse"),
+      active: activeHolderIds.has("mayo"),
     };
     const boardBedRobotArmGroups = buildBedRobotArmGroups(
       runtimeFrameMatchesActiveBundle ? simulationState.bed_robot_arm_groups : [],
@@ -2527,22 +2745,38 @@ export function useDigitalTwinViewModel({
           : language === "ko"
             ? "끊김"
             : "disconnected";
+    const vlmWaitingForImage =
+      vlmShouldRun &&
+      hasVlmHealth &&
+      vlmHealth.connected &&
+      !vlmHealth.healthy &&
+      (vlmHealth.last_mode === "no_fresh_image" ||
+        vlmHealth.last_error.trim().toLowerCase() === "no fresh field image");
+    const vlmFallbackActive =
+      vlmShouldRun &&
+      !vlmWaitingForImage &&
+      (!hasVlmHealth || !vlmHealth.connected || !vlmHealth.healthy);
     const vlmHealthLabel = !vlmShouldRun
       ? language === "ko"
         ? "대기"
         : "idle"
-      : !hasVlmHealth
+      : vlmWaitingForImage
         ? language === "ko"
-          ? "확인 중"
-          : "checking"
-        : vlmHealth.healthy
-          ? language === "ko"
-            ? "정상"
-            : "healthy"
-          : language === "ko"
-            ? "주의"
-            : "degraded";
-    const vlmClassName = !vlmShouldRun || !hasVlmHealth ? "idle" : vlmHealth.connected && vlmHealth.healthy ? "ok" : "warn";
+          ? "영상 입력 대기"
+          : "waiting for image"
+      : vlmFallbackActive
+        ? language === "ko"
+          ? "음성 전용"
+          : "voice only"
+        : language === "ko"
+          ? "정상"
+          : "healthy";
+    const vlmClassName =
+      !vlmShouldRun || !hasVlmHealth || vlmWaitingForImage
+        ? "idle"
+        : vlmHealth.connected && vlmHealth.healthy
+          ? "ok"
+          : "warn";
     const vlmStatus = {
       kind: "VLM",
       connection: vlmConnectionLabel,
@@ -2550,6 +2784,15 @@ export function useDigitalTwinViewModel({
       className: vlmClassName,
       healthAge: elapsedLabel(vlmHealthReceivedAt, language),
       resultAge: elapsedLabel(vlmResultReceivedAt, language),
+      detail: vlmWaitingForImage
+        ? language === "ko"
+          ? "카메라 프레임이 다시 들어오면 VLM 추론을 자동으로 재개합니다."
+          : "VLM inference resumes automatically when the next camera frame arrives."
+        : vlmFallbackActive
+        ? language === "ko"
+          ? "VLM 기능은 일시 중지되지만 명시적 음성 도구 요청은 계속 처리됩니다."
+          : "VLM features are paused; explicit voice tool requests remain available."
+        : "",
     };
 
     return {
@@ -2559,6 +2802,10 @@ export function useDigitalTwinViewModel({
       anchorMap,
       entityMap,
       activeBundle,
+      defaultStartPhaseId:
+        metadata?.default_phase_id ||
+        normalPhaseIdsFromMetadata(metadata, new Set(interruptPhaseIdsFromMetadata(metadata)))[0] ||
+        "",
       bundleOptions,
       requestableTools,
       fieldAnchor,
@@ -2568,6 +2815,7 @@ export function useDigitalTwinViewModel({
       boardHumanoidGroup,
       boardSurgicalBed,
       boardMayoStand,
+      boardCameraRects: cameraRects,
       boardBedRobotArmGroups,
       boardRackSlotCount,
       boardRackSlots,

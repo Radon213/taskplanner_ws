@@ -2,8 +2,19 @@ import { useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { BrainCircuit, Clock3, MessageSquareText, Power, PowerOff, UserRound } from "lucide-react";
 
+import { ProviderModelSelect } from "./ProviderModelSelect";
+import {
+  PublicSurgeonGestureStatus,
+  type PublicSurgeonGesture,
+} from "./PublicSurgeonGestureStatus";
 import type { useDigitalTwinViewModel } from "../../hooks/useDigitalTwinViewModel";
-import type { SurgeonLLMDecision } from "../../types";
+import type {
+  ModelCatalogEntry,
+  ModelProviderStatus,
+  ModelRuntimeCommand,
+  ModelSelection,
+  SurgeonLLMDecision,
+} from "../../types";
 import { type Language } from "../../utils/display";
 
 type ViewModel = ReturnType<typeof useDigitalTwinViewModel>;
@@ -59,24 +70,33 @@ export function SurgeonIntentDock({
   llmDecision,
   actorEnabled,
   modelOptions,
+  providerStatuses,
   modelCatalogStatus,
-  actorModel,
+  modelSelection,
   connected,
   actionPending,
+  publicSurgeonGesture,
   onActorEnabledChange,
   onActorModelChange,
+  onActorRuntimeAction,
 }: {
   vm: ViewModel;
   language: Language;
   llmDecision: SurgeonLLMDecision;
   actorEnabled: boolean;
-  modelOptions: string[];
+  modelOptions: ModelCatalogEntry[];
+  providerStatuses: ModelProviderStatus[];
   modelCatalogStatus: string;
-  actorModel: string;
+  modelSelection: ModelSelection | null;
   connected: boolean;
   actionPending: string;
+  publicSurgeonGesture: PublicSurgeonGesture;
   onActorEnabledChange: (enabled: boolean) => void;
-  onActorModelChange: (modelId: string) => void;
+  onActorModelChange: (selection: ModelSelection) => void;
+  onActorRuntimeAction: (
+    selection: ModelSelection,
+    command: ModelRuntimeCommand,
+  ) => void;
 }) {
   const [speechLog, setSpeechLog] = useState<SpeechLogItem[]>([]);
   const [nowMs, setNowMs] = useState(Date.now());
@@ -84,13 +104,16 @@ export function SurgeonIntentDock({
   const speechLogListRef = useRef<HTMLDivElement>(null);
   const payload = parseActorPayload(llmDecision.raw_json);
   const overlay = parseOverlay(llmDecision.overlay_json);
-  const selectedActorModel = actorModel || llmDecision.model_id || modelOptions[0] || "";
   const controlsDisabled = !connected || Boolean(actionPending);
-  const modelDisabled = controlsDisabled || !modelOptions.length;
+  const modelDisabled =
+    controlsDisabled || !modelOptions.some((entry) => entry.selectable);
   const phaseLabel = llmDecision.hidden_phase ? vm.displayPhaseName(llmDecision.hidden_phase) : vm.ui.none;
   const toolLabel = llmDecision.tool ? vm.displayToolName(llmDecision.tool) : vm.ui.none;
   const heldToolLabel = overlay.heldTool ? vm.displayToolName(overlay.heldTool) : vm.ui.none;
   const mayoLabel = overlay.mayoTools.length ? overlay.mayoTools.map(vm.displayToolName).join(", ") : vm.ui.none;
+  const gestureToolLabel = publicSurgeonGesture.requestedTool
+    ? vm.displayToolName(publicSurgeonGesture.requestedTool)
+    : "";
   const nextDwellLabel =
     payload.nextDwellSec === null
       ? vm.ui.none
@@ -156,22 +179,18 @@ export function SurgeonIntentDock({
         </button>
         <label className="field compact model-select-field">
           <span>{vm.ui.model}</span>
-          <select
-            value={selectedActorModel}
+          <ProviderModelSelect
+            ariaLabel="LLM surgeon model provider and model"
+            language={language}
+            models={modelOptions}
+            providers={providerStatuses}
+            selection={modelSelection}
             disabled={modelDisabled}
             title={modelCatalogStatus}
-            onChange={(event) => onActorModelChange(event.target.value)}
-          >
-            {modelOptions.length ? (
-              modelOptions.map((modelId) => (
-                <option value={modelId} key={modelId}>
-                  {modelId}
-                </option>
-              ))
-            ) : (
-              <option value="">{modelCatalogStatus || vm.ui.none}</option>
-            )}
-          </select>
+            onChange={onActorModelChange}
+            runtimePending={actionPending.startsWith("Updating actor runtime")}
+            onRuntimeAction={onActorRuntimeAction}
+          />
         </label>
       </div>
 
@@ -209,6 +228,12 @@ export function SurgeonIntentDock({
           <strong>{mayoLabel}</strong>
         </article>
       </div>
+
+      <PublicSurgeonGestureStatus
+        evidence={publicSurgeonGesture}
+        language={language}
+        toolLabel={gestureToolLabel}
+      />
 
       <div className="llm-speech-log">
         <div className="llm-speech-log-header">
@@ -256,7 +281,7 @@ export function SurgeonIntentDock({
       <div className="llm-meta-row">
         <span>
           <BrainCircuit size={14} />
-          {llmDecision.model_id || selectedActorModel || vm.ui.none}
+          {llmDecision.model_id || modelSelection?.model_id || vm.ui.none}
         </span>
         <span>
           <Clock3 size={14} />

@@ -1,6 +1,13 @@
 import { Languages, Radio } from "lucide-react";
+import { ProviderModelSelect } from "./ProviderModelSelect";
 import type { Language } from "../../utils/display";
 import type { useDigitalTwinViewModel } from "../../hooks/useDigitalTwinViewModel";
+import type {
+  ModelCatalogEntry,
+  ModelProviderStatus,
+  ModelRuntimeCommand,
+  ModelSelection,
+} from "../../types";
 
 type ViewModel = ReturnType<typeof useDigitalTwinViewModel>;
 
@@ -18,23 +25,30 @@ export function StatusRibbon({
   language,
   onLanguageChange,
   modelOptions,
+  providerStatuses,
   modelCatalogStatus,
-  vlmModel,
+  modelSelection,
   actionPending,
   onVlmModelChange,
+  onVlmRuntimeAction,
 }: {
   vm: ViewModel;
   connected: boolean;
   language: Language;
   onLanguageChange: (language: Language) => void;
-  modelOptions: string[];
+  modelOptions: ModelCatalogEntry[];
+  providerStatuses: ModelProviderStatus[];
   modelCatalogStatus: string;
-  vlmModel: string;
+  modelSelection: ModelSelection | null;
   actionPending: string;
-  onVlmModelChange: (modelId: string) => void;
+  onVlmModelChange: (selection: ModelSelection) => void;
+  onVlmRuntimeAction: (
+    selection: ModelSelection,
+    command: ModelRuntimeCommand,
+  ) => void;
 }) {
-  const vlmSelectDisabled = !connected || Boolean(actionPending) || !modelOptions.length;
-  const selectedVlmModel = vlmModel || modelOptions[0] || "";
+  const vlmSelectDisabled =
+    !connected || Boolean(actionPending) || !modelOptions.some((entry) => entry.selectable);
 
   return (
     <header className="top-ribbon">
@@ -53,25 +67,23 @@ export function StatusRibbon({
           <Radio size={16} />
           <span>{connected ? vm.ui.rosOnline : vm.ui.rosOffline}</span>
         </div>
-        <div className={`ribbon-model-control ${vm.vlmStatus.className}`}>
+        <div
+          className={`ribbon-model-control ${vm.vlmStatus.className}`}
+          title={vm.vlmStatus.detail || modelCatalogStatus}
+        >
           <span className="ribbon-model-label">VLM</span>
-          <select
-            value={selectedVlmModel}
+          <ProviderModelSelect
+            ariaLabel="VLM model provider and model"
+            language={language}
+            models={modelOptions}
+            providers={providerStatuses}
+            selection={modelSelection}
             disabled={vlmSelectDisabled}
-            aria-label="VLM model"
             title={modelCatalogStatus}
-            onChange={(event) => onVlmModelChange(event.target.value)}
-          >
-            {modelOptions.length ? (
-              modelOptions.map((modelId) => (
-                <option value={modelId} key={modelId}>
-                  {modelId}
-                </option>
-              ))
-            ) : (
-              <option value="">{modelCatalogStatus || vm.ui.none}</option>
-            )}
-          </select>
+            onChange={onVlmModelChange}
+            runtimePending={actionPending.startsWith("Updating VLM runtime")}
+            onRuntimeAction={onVlmRuntimeAction}
+          />
           <strong>{vm.vlmStatus.health}</strong>
         </div>
         <div className="language-control" aria-label={vm.ui.language}>

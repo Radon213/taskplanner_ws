@@ -6,6 +6,7 @@ import base64
 from dataclasses import dataclass
 from typing import Any
 
+from model_provider_registry import force_disable_thinking
 import requests
 
 
@@ -17,15 +18,36 @@ class LMStudioResponse:
 
 
 class LMStudioClient:
-    def __init__(self, *, base_url: str, timeout_sec: float, api_key: str = "") -> None:
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        timeout_sec: float,
+        api_key: str = "",
+        provider_id: str = "lmstudio",
+    ) -> None:
         self._base_url = base_url.rstrip("/")
         self._timeout_sec = timeout_sec
         self._api_key = api_key.strip()
+        self._provider_id = provider_id.strip().lower()
 
     def _headers(self) -> dict[str, str]:
         if not self._api_key:
             return {}
         return {"Authorization": f"Bearer {self._api_key}"}
+
+    @staticmethod
+    def _raise_for_status(response: requests.Response) -> None:
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            detail = response.text.strip().replace("\n", " ")[:2000]
+            suffix = f"; provider response: {detail}" if detail else ""
+            raise requests.HTTPError(
+                f"{exc}{suffix}",
+                response=response,
+                request=response.request,
+            ) from exc
 
     def _openai_compat_url(self) -> str:
         if self._base_url.endswith("/v1"):
@@ -43,7 +65,7 @@ class LMStudioClient:
             headers=self._headers(),
             timeout=self._timeout_sec,
         )
-        response.raise_for_status()
+        self._raise_for_status(response)
         payload = response.json()
         rows: Any = payload.get("data", payload.get("models", [])) if isinstance(payload, dict) else payload
         if not isinstance(rows, list):
@@ -76,6 +98,7 @@ class LMStudioClient:
         response_format: str = "",
         json_schema: dict[str, Any] | None = None,
         reasoning_effort: str = "",
+        generation_seed: int | None = None,
     ) -> LMStudioResponse:
         if api_mode == "openai_compat":
             return self._request_openai_compat(
@@ -90,6 +113,7 @@ class LMStudioClient:
                 response_format=response_format,
                 json_schema=json_schema,
                 reasoning_effort=reasoning_effort,
+                generation_seed=generation_seed,
             )
         try:
             return self._request_native(
@@ -101,6 +125,7 @@ class LMStudioClient:
                 temperature=temperature,
                 top_p=top_p,
                 max_output_tokens=max_output_tokens,
+                generation_seed=generation_seed,
             )
         except Exception:
             return self._request_openai_compat(
@@ -115,6 +140,7 @@ class LMStudioClient:
                 response_format=response_format,
                 json_schema=json_schema,
                 reasoning_effort=reasoning_effort,
+                generation_seed=generation_seed,
             )
 
     def _request_native(
@@ -128,6 +154,7 @@ class LMStudioClient:
         temperature: float,
         top_p: float,
         max_output_tokens: int,
+        generation_seed: int | None,
     ) -> LMStudioResponse:
         url = f"{self._base_url}/api/v1/chat"
         body = {
@@ -135,6 +162,7 @@ class LMStudioClient:
             "temperature": temperature,
             "top_p": top_p,
             "max_tokens": max_output_tokens,
+            "reasoning": "off",
             "messages": self._build_messages(
                 system_prompt=system_prompt,
                 developer_prompt=developer_prompt,
@@ -142,13 +170,15 @@ class LMStudioClient:
                 images=images,
             ),
         }
+        if generation_seed is not None:
+            body["seed"] = generation_seed
         response = requests.post(
             url,
             json=body,
             headers=self._headers(),
             timeout=self._timeout_sec,
         )
-        response.raise_for_status()
+        self._raise_for_status(response)
         raw = self._extract_text(response.json())
         return LMStudioResponse(raw_text=raw, latency_sec=response.elapsed.total_seconds(), mode="native")
 
@@ -166,6 +196,7 @@ class LMStudioClient:
         response_format: str,
         json_schema: dict[str, Any] | None,
         reasoning_effort: str,
+        generation_seed: int | None,
     ) -> LMStudioResponse:
         url = self._openai_compat_url()
         body = {
@@ -180,7 +211,16 @@ class LMStudioClient:
                 images=images,
             ),
         }
-        if response_format == "json_schema" and json_schema is not None:
+        if generation_seed is not None:
+            body["seed"] = generation_seed
+        # NInfer intentionally does not implement constrained JSON decoding;
+        # its OpenAI endpoint accepts only response_format={type:text}. The
+        # Taskplanner prompts still require and validate one compact JSON
+        # object, so omit unsupported structured-output fields for this backend.
+        effective_response_format = (
+            "none" if self._provider_id == "ninfer" else response_format
+        )
+        if effective_response_format == "json_schema" and json_schema is not None:
             body["response_format"] = {
                 "type": "json_schema",
                 "json_schema": {
@@ -189,19 +229,20 @@ class LMStudioClient:
                     "schema": json_schema,
                 },
             }
-        elif response_format == "json_object":
+        elif effective_response_format == "json_object":
             body["response_format"] = {"type": "json_object"}
-        elif response_format == "text":
+        elif effective_response_format == "text":
             body["response_format"] = {"type": "text"}
         if reasoning_effort:
             body["reasoning_effort"] = reasoning_effort
+        force_disable_thinking(body, provider_id=self._provider_id)
         response = requests.post(
             url,
             json=body,
             headers=self._headers(),
             timeout=self._timeout_sec,
         )
-        response.raise_for_status()
+        self._raise_for_status(response)
         raw = self._extract_text(response.json())
         return LMStudioResponse(
             raw_text=raw,

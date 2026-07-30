@@ -210,8 +210,18 @@ class BedRobotArmGroupOrchestrator(Node):
 
     def _classify_voice(self, raw_text: str) -> tuple[str, str, str] | None:
         text = raw_text.strip().lower()
-        if "석션" in text:
-            stop_tokens = ("빼", "빠져", "스탑", "정지", "중지", "멈춰", "꺼")
+        if "석션" in text or "suction" in text:
+            stop_tokens = (
+                "빼",
+                "빠져",
+                "스탑",
+                "정지",
+                "중지",
+                "멈춰",
+                "꺼",
+                "stop",
+                "off",
+            )
             operation = OP_SUCTION_STOP if any(token in text for token in stop_tokens) else OP_SUCTION_START
             return GROUP_SUCTION, operation, "suction"
         if any(token in text for token in ("견인 해제", "리트랙션 해제", "당김 풀", "견인 풀")):

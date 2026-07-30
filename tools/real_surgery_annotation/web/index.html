@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>0704 Observable Tool Event Review</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">EVALUATION GROUND TRUTH</p>
+        <h1>수술도구 상태 변화 검토</h1>
+      </div>
+      <div class="topbar__actions">
+        <label for="reviewer">검토자 ID</label>
+        <input id="reviewer" autocomplete="username" placeholder="예: reviewer-01" />
+      </div>
+    </header>
+
+    <main class="workspace" aria-busy="true">
+      <aside class="card queue-card" aria-labelledby="queue-title">
+        <div class="card__header">
+          <div>
+            <p class="eyebrow">REVIEW QUEUE</p>
+            <h2 id="queue-title">후보 이벤트</h2>
+          </div>
+          <span id="queue-count" class="metric">0<span>건</span></span>
+        </div>
+        <div id="queue-loading" class="skeleton-list" aria-label="후보를 불러오는 중">
+          <div class="skeleton-row"></div>
+          <div class="skeleton-row"></div>
+          <div class="skeleton-row"></div>
+        </div>
+        <div id="queue-empty" class="empty-state" hidden>
+          <strong>검토할 후보가 없습니다</strong>
+          <p>현재 시각에서 새 이벤트를 추가할 수 있습니다.</p>
+          <button id="empty-add" type="button" class="button button--quiet">새 이벤트</button>
+        </div>
+        <ol id="queue" class="queue" aria-label="검토 후보 목록"></ol>
+        <button id="add-event" type="button" class="button button--quiet button--wide">
+          현재 시각 새 이벤트
+        </button>
+      </aside>
+
+      <section class="viewer-stack" aria-label="동기화 영상 검토">
+        <article class="card viewer-card">
+          <div class="card__header">
+            <div>
+              <p class="eyebrow">SYNCHRONIZED RGB</p>
+              <h2>CAM4 · FLIR</h2>
+            </div>
+            <output id="time-output" class="time-output" for="timeline">0.000 s</output>
+          </div>
+          <div class="video-grid">
+            <figure>
+              <figcaption>CAM4 <span id="cam4-stamp">—</span></figcaption>
+              <div class="canvas-shell">
+                <canvas id="cam4-canvas" width="1280" height="720" aria-label="CAM4 프레임"></canvas>
+              </div>
+            </figure>
+            <figure>
+              <figcaption>FLIR <span id="flir-stamp">—</span></figcaption>
+              <div class="canvas-shell">
+                <canvas id="flir-canvas" width="1280" height="720" aria-label="FLIR 프레임"></canvas>
+              </div>
+            </figure>
+          </div>
+          <div class="timeline-controls">
+            <label for="timeline">Bag timeline</label>
+            <input id="timeline" type="range" min="0" max="163.1" step="0.001" value="0" />
+            <div class="step-controls" aria-label="프레임 이동">
+              <button type="button" data-step="-1">−1 s</button>
+              <button type="button" data-step="-0.07043">◀ 1 frame</button>
+              <button type="button" data-step="0.07043">1 frame ▶</button>
+              <button type="button" data-step="1">+1 s</button>
+            </div>
+          </div>
+          <div id="viewer-error" class="inline-error" hidden>
+            <strong>프레임을 불러오지 못했습니다.</strong>
+            <button id="retry-frame" type="button">다시 시도</button>
+          </div>
+        </article>
+
+        <article class="card policy-card">
+          <div>
+            <p class="eyebrow">INFORMATION BOUNDARY</p>
+            <h2>정답은 evaluator 전용입니다</h2>
+          </div>
+          <p>
+            proposed 후보는 정답으로 사용되지 않습니다. confirmed/ambiguous만 파생
+            MCAP의 <code>/evaluation/ground_truth/*</code> 토픽 대상이며 VLM·reducer·BT에는
+            입력하지 않습니다.
+          </p>
+        </article>
+      </section>
+
+      <aside class="card inspector-card" aria-labelledby="inspector-title">
+        <div class="card__header">
+          <div>
+            <p class="eyebrow">EVENT INSPECTOR</p>
+            <h2 id="inspector-title">관측 내용</h2>
+          </div>
+          <span id="status-badge" class="status-badge">proposed</span>
+        </div>
+        <form id="event-form">
+          <label>이벤트 유형<select id="event-type" name="event_type"></select></label>
+          <label>완료 시각 (s)<input id="event-time" name="time_sec" type="number" min="0" step="0.001" required /></label>
+          <label>도구<select id="tool-id" name="tool_id"></select></label>
+          <label>물리 인스턴스 ID<input id="instance-id" name="instance_id" required /></label>
+
+          <fieldset>
+            <legend>이전 상태</legend>
+            <label>사람<select id="from-holder"></select></label>
+            <label>위치<select id="from-location"></select></label>
+          </fieldset>
+          <fieldset>
+            <legend>변화 후 상태</legend>
+            <label>사람<select id="to-holder"></select></label>
+            <label>위치<select id="to-location"></select></label>
+          </fieldset>
+
+          <label>가시성<select id="visibility"></select></label>
+          <fieldset>
+            <legend>근거 view</legend>
+            <div class="check-grid">
+              <label><input id="view-cam4" type="checkbox" value="cam4" /> CAM4</label>
+              <label><input id="view-flir" type="checkbox" value="flir" /> FLIR</label>
+            </div>
+          </fieldset>
+          <label>검토 메모<textarea id="review-notes" rows="3" placeholder="애매한 지점이나 판정 근거"></textarea></label>
+
+          <div class="action-stack">
+            <button id="confirm" type="button" class="button button--primary">확정 · Enter</button>
+            <div class="action-row">
+              <button id="ambiguous" type="button" class="button button--quiet">애매함 · A</button>
+              <button id="reject" type="button" class="button button--quiet">기각 · R</button>
+            </div>
+          </div>
+          <p id="form-help" class="form-help">
+            unknown이 남으면 confirmed가 아닌 ambiguous로 저장하세요.
+          </p>
+        </form>
+      </aside>
+    </main>
+
+    <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+    <script src="/app.js" defer></script>
+  </body>
+</html>

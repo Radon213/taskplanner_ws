@@ -1,0 +1,106 @@
+{
+  "version": "1",
+  "default_model_id": "unsloth/gemma-4-E4B-it-NVFP4",
+  "models": [
+    {
+      "source_model_id": "unsloth/gemma-4-E4B-it-NVFP4",
+      "served_model_name": "unsloth/gemma-4-E4B-it-NVFP4",
+      "display_name": "Gemma 4 E4B NVFP4 (optimized)",
+      "capabilities": ["text", "image"],
+      "max_model_len": 8192,
+      "max_num_seqs": 1,
+      "gpu_memory_utilization": 0.55,
+      "generation_config": "vllm",
+      "reasoning_parser": "gemma4",
+      "local_only": true,
+      "extra_args": [
+        "--enable-prefix-caching",
+        "--enable-chunked-prefill",
+        "--max-num-batched-tokens",
+        "8192",
+        "--limit-mm-per-prompt",
+        "{\"image\":3}",
+        "--no-enable-log-requests"
+      ]
+    },
+    {
+      "source_model_id": "unsloth/Qwen3.6-35B-A3B-NVFP4-Fast",
+      "served_model_name": "unsloth/Qwen3.6-35B-A3B-NVFP4-Fast",
+      "display_name": "Qwen3.6 35B A3B NVFP4 Fast",
+      "capabilities": ["text", "image"],
+      "max_model_len": 8192,
+      "max_num_seqs": 1,
+      "gpu_memory_utilization": 0.76,
+      "generation_config": "vllm",
+      "reasoning_parser": "",
+      "local_only": true,
+      "extra_args": [
+        "--enforce-eager",
+        "--enable-prefix-caching",
+        "--enable-chunked-prefill",
+        "--max-num-batched-tokens",
+        "2176",
+        "--limit-mm-per-prompt",
+        "{\"image\":1}",
+        "--no-enable-log-requests"
+      ]
+    },
+    {
+      "source_model_id": "AxionML/Qwen3.5-9B-NVFP4",
+      "served_model_name": "AxionML/Qwen3.5-9B-NVFP4",
+      "display_name": "Qwen3.5 9B NVFP4",
+      "capabilities": ["text", "image"],
+      "max_model_len": 8192,
+      "max_num_seqs": 1,
+      "gpu_memory_utilization": 0.58,
+      "generation_config": "vllm",
+      "reasoning_parser": "",
+      "local_only": true
+    },
+    {
+      "source_model_id": "AxionML/Qwen3.5-4B-NVFP4",
+      "served_model_name": "AxionML/Qwen3.5-4B-NVFP4",
+      "display_name": "Qwen3.5 4B NVFP4",
+      "capabilities": ["text", "image"],
+      "max_model_len": 8192,
+      "max_num_seqs": 1,
+      "gpu_memory_utilization": 0.28,
+      "generation_config": "vllm",
+      "reasoning_parser": "",
+      "local_only": true,
+      "extra_args": [
+        "--enable-prefix-caching",
+        "--enable-chunked-prefill",
+        "--max-num-batched-tokens",
+        "8192",
+        "--limit-mm-per-prompt",
+        "{\"image\":1}",
+        "--no-enable-log-requests"
+      ]
+    },
+    {
+      "source_model_id": "Qwen/Qwen2.5-VL-7B-Instruct",
+      "served_model_name": "Qwen/Qwen2.5-VL-7B-Instruct",
+      "display_name": "Qwen2.5-VL 7B Instruct",
+      "capabilities": ["text", "image"],
+      "max_model_len": 8192,
+      "max_num_seqs": 1,
+      "gpu_memory_utilization": 0.56,
+      "generation_config": "vllm",
+      "reasoning_parser": "",
+      "local_only": true
+    },
+    {
+      "source_model_id": "Qwen/Qwen2.5-VL-3B-Instruct",
+      "served_model_name": "Qwen/Qwen2.5-VL-3B-Instruct",
+      "display_name": "Qwen2.5-VL 3B Instruct",
+      "capabilities": ["text", "image"],
+      "max_model_len": 8192,
+      "max_num_seqs": 1,
+      "gpu_memory_utilization": 0.45,
+      "generation_config": "vllm",
+      "reasoning_parser": "",
+      "local_only": true
+    }
+  ]
+}

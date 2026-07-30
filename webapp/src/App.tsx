@@ -1,28 +1,55 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { motion } from "framer-motion";
 
 import { ProcedureDock } from "./components/command/ProcedureDock";
+import {
+  type PublicSurgeonGesture,
+} from "./components/command/PublicSurgeonGestureStatus";
 import { StatusRibbon } from "./components/command/StatusRibbon";
+import { ShadowReplayDock } from "./components/command/ShadowReplayDock";
 import { SurgeonIntentDock } from "./components/command/SurgeonIntentDock";
 import { ObservabilityPanel } from "./components/observability/ObservabilityPanel";
 import { OperatingRoomStage } from "./components/stage/OperatingRoomStage";
 import { useDigitalTwinViewModel } from "./hooks/useDigitalTwinViewModel";
 import { useRosBridge } from "./hooks/useRosBridge";
+import {
+  initialRuntimeMode,
+  persistRuntimeMode,
+  runtimeBridgeUrl,
+  type TaskplannerRuntimeMode,
+} from "./runtimeModes";
 import { type Language } from "./utils/display";
 
 export default function App() {
-  const ros = useRosBridge();
+  const [runtimeMode, setRuntimeMode] =
+    useState<TaskplannerRuntimeMode>(initialRuntimeMode);
+  const ros = useRosBridge(runtimeMode);
   const [language, setLanguage] = useState<Language>(() => {
     if (typeof window === "undefined") return "ko";
     return window.localStorage.getItem("taskplanner.language") === "en" ? "en" : "ko";
   });
   const [stageAspectRatio, setStageAspectRatio] = useState(1.55);
-  const [vlmModelSelection, setVlmModelSelection] = useState("");
-  const [actorModelSelection, setActorModelSelection] = useState("");
+  const actorPolicyKeyRef = useRef("");
 
   useEffect(() => {
     window.localStorage.setItem("taskplanner.language", language);
   }, [language]);
+
+  useEffect(() => {
+    persistRuntimeMode(runtimeMode);
+    const nextUrl = runtimeBridgeUrl(runtimeMode);
+    if (ros.url !== nextUrl) {
+      ros.setUrl(nextUrl);
+    }
+  }, [runtimeMode, ros.url]);
+
+  useEffect(() => {
+    if (!ros.connected || runtimeMode === "shadow") return;
+    const policyKey = `${runtimeMode}:${ros.url}`;
+    if (actorPolicyKeyRef.current === policyKey) return;
+    actorPolicyKeyRef.current = policyKey;
+    void ros.setActorEnabled(runtimeMode === "llm");
+  }, [ros.connected, ros.url, runtimeMode]);
 
   const vm = useDigitalTwinViewModel({
     language,
@@ -38,32 +65,60 @@ export default function App() {
     vlmResultReceivedAt: ros.vlmResultReceivedAt,
     stageAspectRatio,
   });
+  const vlmSurgeonGesture = useMemo<PublicSurgeonGesture>(
+    () => ({
+      eventType: ros.vlmResult.gesture_event_type,
+      handPose: ros.vlmResult.gesture_hand_pose,
+      confidence: ros.vlmResult.gesture_confidence,
+      requestedTool: ros.vlmResult.gesture_requested_tool,
+    }),
+    [ros.vlmResult],
+  );
+  const fusedSurgeonRequest = useMemo(
+    () => ({
+      confirmed:
+        ros.worldState.running &&
+        Boolean(ros.worldState.surgeon_request_tool),
+      requestedTool: ros.worldState.surgeon_request_tool,
+    }),
+    [
+      ros.worldState.running,
+      ros.worldState.surgeon_request_tool,
+    ],
+  );
 
   useEffect(() => {
-    if (ros.vlmHealth.model_id) {
-      setVlmModelSelection(ros.vlmHealth.model_id);
+    const runtimeBusy =
+      ros.simulationState.running ||
+      ["starting", "running", "finishing"].includes(
+        ros.simulationState.execution_state,
+      );
+    if (!runtimeBusy && !ros.actionPending && vm.defaultStartPhaseId) {
+      ros.setStartPhase(vm.defaultStartPhaseId);
     }
-  }, [ros.vlmHealth.model_id]);
+  }, [
+    ros.actionPending,
+    ros.activeBundle,
+    ros.simulationState.execution_state,
+    ros.simulationState.running,
+    vm.defaultStartPhaseId,
+  ]);
 
-  useEffect(() => {
-    if (ros.surgeonLlmDecision.model_id) {
-      setActorModelSelection(ros.surgeonLlmDecision.model_id);
-    }
-  }, [ros.surgeonLlmDecision.model_id]);
-
-  useEffect(() => {
-    if (!ros.vlmModelOptions.length) return;
-    setVlmModelSelection(
-      (current) => current || ros.vlmModelOptions.find((id) => id.toLowerCase().includes("qwen")) || ros.vlmModelOptions[0],
-    );
-  }, [ros.vlmModelOptions]);
-
-  useEffect(() => {
-    if (!ros.actorModelOptions.length) return;
-    setActorModelSelection(
-      (current) => current || ros.actorModelOptions.find((id) => id.toLowerCase().includes("gemma")) || ros.actorModelOptions[0],
-    );
-  }, [ros.actorModelOptions]);
+  const shadowTransportActive =
+    ros.shadowReplayState.running || ros.shadowReplayState.paused;
+  const controlIsRunning =
+    runtimeMode === "shadow"
+      ? shadowTransportActive || ros.simulationState.running
+      : ros.simulationState.running;
+  const controlIsPaused =
+    runtimeMode === "shadow"
+      ? ros.shadowReplayState.paused
+      : ros.simulationState.execution_state === "paused";
+  const controlCanPauseResume =
+    runtimeMode === "shadow"
+      ? shadowTransportActive
+      : ros.simulationState.running ||
+        ros.simulationState.execution_state === "paused";
 
   return (
     <div className="app-shell">
@@ -73,13 +128,14 @@ export default function App() {
         language={language}
         onLanguageChange={setLanguage}
         modelOptions={ros.vlmModelOptions}
+        providerStatuses={ros.vlmProviderStatuses}
         modelCatalogStatus={ros.vlmModelCatalogStatus}
-        vlmModel={vlmModelSelection}
+        modelSelection={ros.vlmModelSelection}
         actionPending={ros.actionPending}
-        onVlmModelChange={(modelId) => {
-          setVlmModelSelection(modelId);
-          void ros.setVlmModel(modelId);
-        }}
+        onVlmModelChange={(selection) => void ros.setVlmModel(selection)}
+        onVlmRuntimeAction={(selection, command) =>
+          void ros.controlVlmModelRuntime(selection, command)
+        }
       />
 
       <motion.main
@@ -91,7 +147,29 @@ export default function App() {
         <div className="stage-area">
           <OperatingRoomStage
             vm={vm}
-            vlmImage={ros.vlmImage}
+            cameraFrames={{
+              cam1: ros.cam1Image,
+              cam2: ros.cam2Image,
+              cam3: ros.cam3Image,
+              cam4: ros.cam4Image,
+              flir: ros.flirImage,
+            }}
+            perceptionCameraFrames={{
+              cam4: ros.cam4PerceptionImage,
+              flir: ros.flirPerceptionImage,
+            }}
+            perceptionOverlayFrames={{
+              cam4: ros.cam4PerceptionOverlay,
+              flir: ros.flirPerceptionOverlay,
+            }}
+            perceptionHealth={ros.perceptionHealth}
+            perceptionControlPending={ros.actionPending.includes(
+              "object recognition",
+            )}
+            onPerceptionEnabledChange={(enabled) =>
+              void ros.setPerceptionEnabled(enabled)
+            }
+            systemSurgeonRequest={fusedSurgeonRequest}
             onStageAspectChange={(ratio) => {
               setStageAspectRatio((current) => (Math.abs(current - ratio) > 0.01 ? ratio : current));
             }}
@@ -99,29 +177,48 @@ export default function App() {
         </div>
 
         <div className="surgeon-area">
-          <SurgeonIntentDock
-            vm={vm}
-            language={language}
-            llmDecision={ros.surgeonLlmDecision}
-            actorEnabled={ros.actorEnabled}
-            modelOptions={ros.actorModelOptions}
-            modelCatalogStatus={ros.actorModelCatalogStatus}
-            actorModel={actorModelSelection}
-            connected={ros.connected}
-            actionPending={ros.actionPending}
-            onActorEnabledChange={(enabled) => void ros.setActorEnabled(enabled)}
-            onActorModelChange={(modelId) => {
-              setActorModelSelection(modelId);
-              void ros.setActorModel(modelId);
-            }}
-          />
+          {runtimeMode === "shadow" ? (
+            <ShadowReplayDock
+              vm={vm}
+              language={language}
+              state={ros.shadowReplayState}
+              transcript={ros.shadowTranscript}
+              connected={ros.connected}
+              actionPending={ros.actionPending}
+              groundTruth={ros.shadowGroundTruth}
+              onCaseChange={(caseId) => void ros.selectShadowCase(caseId)}
+              onConfigure={(mode, playbackRate) =>
+                void ros.configureShadowReplay(mode, playbackRate)
+              }
+            />
+          ) : (
+            <SurgeonIntentDock
+              vm={vm}
+              language={language}
+              llmDecision={ros.surgeonLlmDecision}
+              actorEnabled={ros.actorEnabled}
+              modelOptions={ros.actorModelOptions}
+              providerStatuses={ros.actorProviderStatuses}
+              modelCatalogStatus={ros.actorModelCatalogStatus}
+              modelSelection={ros.actorModelSelection}
+              connected={ros.connected}
+              actionPending={ros.actionPending}
+              publicSurgeonGesture={vlmSurgeonGesture}
+              onActorEnabledChange={(enabled) => void ros.setActorEnabled(enabled)}
+              onActorModelChange={(selection) => void ros.setActorModel(selection)}
+              onActorRuntimeAction={(selection, command) =>
+                void ros.controlActorModelRuntime(selection, command)
+              }
+            />
+          )}
         </div>
 
         <div className="runtime-area">
           <ProcedureDock
             vm={vm}
             url={ros.url}
-            setUrl={ros.setUrl}
+            runtimeMode={runtimeMode}
+            onRuntimeModeChange={setRuntimeMode}
             bundle={ros.bundle}
             onBundleChange={(nextBundle) => {
               ros.setBundleSelection(nextBundle);
@@ -135,8 +232,9 @@ export default function App() {
             runtimeMessage={ros.runtimeMessage}
             runtimeReady={ros.simulationReady}
             executionState={ros.simulationState.execution_state}
-            isRunning={ros.simulationState.running}
-            isPaused={ros.simulationState.execution_state === "paused"}
+            isRunning={controlIsRunning}
+            isPaused={controlIsPaused}
+            canPauseResume={controlCanPauseResume}
             onControl={(command) => void ros.control(command)}
           />
           <ObservabilityPanel

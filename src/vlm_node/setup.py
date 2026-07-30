@@ -11,6 +11,7 @@ setup(
         (f"share/{package_name}", ["package.xml"]),
     ],
     install_requires=["setuptools", "requests", "Pillow"],
+    tests_require=["pytest"],
     zip_safe=True,
     maintainer="Codex",
     maintainer_email="codex@example.com",
@@ -23,6 +24,8 @@ setup(
             "synthetic_scene_camera = vlm_node.synthetic_scene_camera:main",
             "no_image_camera = vlm_node.no_image_camera:main",
             "snapshot_bridge = vlm_node.snapshot_bridge:main",
+            "rfdetr_perception_bridge = vlm_node.rfdetr_bridge:main",
+            "rfdetr_perception_service = vlm_node.rfdetr_service:main",
         ],
     },
 )

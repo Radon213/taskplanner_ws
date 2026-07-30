@@ -1,0 +1,330 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "taskplanner.observable_tool_event.v1",
+  "title": "Directly observable surgical tool state transition",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "case_id",
+    "event_id",
+    "event_type",
+    "time_sec",
+    "tool",
+    "from",
+    "to",
+    "derived_action",
+    "source_views",
+    "visibility",
+    "review_status",
+    "label_origin"
+  ],
+  "properties": {
+    "schema": {
+      "const": "taskplanner.observable_tool_event.v1"
+    },
+    "case_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]+$"
+    },
+    "event_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]+-(?:E|I|P)[0-9]{4,}$"
+    },
+    "event_type": {
+      "enum": [
+        "initial_state",
+        "tool_transfer",
+        "place_on_mayo",
+        "pickup_from_mayo"
+      ]
+    },
+    "time_sec": {
+      "type": "number",
+      "minimum": 0
+    },
+    "candidate_start_sec": {
+      "type": "number",
+      "minimum": 0
+    },
+    "candidate_end_sec": {
+      "type": "number",
+      "minimum": 0
+    },
+    "tool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "name", "instance_id"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^(?:[a-z][a-z0-9_]*|unknown_tool_[0-9]{2,})$"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "instance_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]+-tool-[A-Za-z0-9_-]+$"
+        }
+      }
+    },
+    "from": {
+      "oneOf": [
+        {"type": "null"},
+        {"$ref": "#/$defs/state"}
+      ]
+    },
+    "to": {
+      "$ref": "#/$defs/state"
+    },
+    "derived_action": {
+      "enum": [
+        "initial_state",
+        "handover",
+        "observed_direct_return",
+        "place_on_mayo",
+        "pickup_from_mayo",
+        "relocate"
+      ]
+    },
+    "source_views": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "enum": ["cam1", "cam2", "cam3", "cam4", "flir"]
+      }
+    },
+    "visibility": {
+      "enum": ["clear", "partial", "occluded"]
+    },
+    "review_status": {
+      "enum": ["proposed", "confirmed", "ambiguous", "rejected"]
+    },
+    "label_origin": {
+      "enum": [
+        "human_video_review",
+        "assistant_video_adjudication",
+        "assistant_visual_proposal",
+        "temporal_grounding_model",
+        "legacy_perception_seed"
+      ]
+    },
+    "proposal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["generator"],
+      "properties": {
+        "generator": {"type": "string", "minLength": 1},
+        "source_topic": {"type": "string"},
+        "source_frame_idx": {"type": "integer", "minimum": 0},
+        "legacy_track_segment_id": {"type": "string"},
+        "bbox_xywh_px": {
+          "type": "array",
+          "minItems": 4,
+          "maxItems": 4,
+          "items": {"type": "number", "minimum": 0}
+        },
+        "query": {"type": "string"},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "model_version": {"type": "string"}
+      }
+    },
+    "review": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reviewer_kind", "reviewer_id", "reviewed_at"],
+      "properties": {
+        "reviewer_kind": {"enum": ["human", "ai_assistant"]},
+        "reviewer_id": {"type": "string", "minLength": 1},
+        "authorized_by": {"type": "string", "minLength": 1},
+        "reviewed_at": {"type": "string", "format": "date-time"},
+        "notes": {"type": "string"}
+      }
+    },
+    "notes": {
+      "type": "string"
+    }
+  },
+  "$defs": {
+    "state": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["holder", "location"],
+      "properties": {
+        "holder": {
+          "enum": [
+            "surgeon",
+            "operative_recipient",
+            "scrub_nurse",
+            "assistant",
+            "circulating_nurse",
+            "none",
+            "unknown"
+          ]
+        },
+        "location": {
+          "enum": [
+            "left_hand",
+            "right_hand",
+            "both_hands",
+            "hand_unspecified",
+            "mayo_stand",
+            "instrument_table",
+            "surgical_field",
+            "off_screen",
+            "unknown"
+          ]
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {"event_type": {"const": "initial_state"}},
+        "required": ["event_type"]
+      },
+      "then": {
+        "properties": {
+          "from": {"type": "null"},
+          "derived_action": {"const": "initial_state"}
+        }
+      },
+      "else": {
+        "properties": {
+          "from": {"$ref": "#/$defs/state"}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "review_status": {
+            "enum": ["confirmed", "ambiguous", "rejected"]
+          }
+        },
+        "required": ["review_status"]
+      },
+      "then": {
+        "required": ["review"]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "review_status": {"const": "confirmed"},
+          "review": {
+            "properties": {"reviewer_kind": {"const": "human"}},
+            "required": ["reviewer_kind"]
+          }
+        },
+        "required": ["review_status", "review"]
+      },
+      "then": {
+        "properties": {
+          "label_origin": {"const": "human_video_review"}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "review_status": {"const": "confirmed"},
+          "review": {
+            "properties": {"reviewer_kind": {"const": "ai_assistant"}},
+            "required": ["reviewer_kind"]
+          }
+        },
+        "required": ["review_status", "review"]
+      },
+      "then": {
+        "properties": {
+          "label_origin": {"const": "assistant_video_adjudication"}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "label_origin": {"const": "human_video_review"}
+        },
+        "required": ["label_origin"]
+      },
+      "then": {
+        "properties": {
+          "review": {
+            "properties": {"reviewer_kind": {"const": "human"}},
+            "required": ["reviewer_kind"]
+          }
+        },
+        "required": ["review"]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "label_origin": {"const": "assistant_video_adjudication"}
+        },
+        "required": ["label_origin"]
+      },
+      "then": {
+        "properties": {
+          "review_status": {"enum": ["confirmed", "ambiguous"]},
+          "review": {
+            "properties": {
+              "reviewer_kind": {"const": "ai_assistant"}
+            },
+            "required": [
+              "reviewer_kind",
+              "authorized_by"
+            ]
+          }
+        },
+        "required": ["review"]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "label_origin": {"const": "assistant_visual_proposal"},
+          "review_status": {"const": "confirmed"}
+        },
+        "required": ["label_origin", "review_status"]
+      },
+      "then": {
+        "not": {}
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "review_status": {"const": "confirmed"},
+          "review": {
+            "properties": {"reviewer_kind": {"const": "ai_assistant"}},
+            "required": ["reviewer_kind"]
+          }
+        },
+        "required": ["review_status", "review"]
+      },
+      "then": {
+        "properties": {
+          "review": {
+            "required": ["authorized_by"]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"review_status": {"const": "proposed"}},
+        "required": ["review_status"]
+      },
+      "then": {
+        "required": ["proposal"]
+      }
+    }
+  ]
+}

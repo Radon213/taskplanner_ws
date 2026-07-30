@@ -8,6 +8,7 @@ import time
 import requests
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import CompressedImage
 
 
@@ -42,7 +43,11 @@ class SnapshotBridgeNode(Node):
         self._output_topic = str(
             self.declare_parameter("output_topic", "/surgery/images/field/compressed").value
         )
-        self._publisher = self.create_publisher(CompressedImage, self._output_topic, 10)
+        self._publisher = self.create_publisher(
+            CompressedImage,
+            self._output_topic,
+            qos_profile_sensor_data,
+        )
         self._session = requests.Session()
         self._last_success_sec = 0.0
         self._sequence_gate = SnapshotSequenceGate()

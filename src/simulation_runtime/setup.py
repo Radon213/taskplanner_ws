@@ -11,6 +11,7 @@ setup(
         (f"share/{package_name}", ["package.xml"]),
     ],
     install_requires=["setuptools", "requests"],
+    tests_require=["pytest"],
     zip_safe=True,
     maintainer="Codex",
     maintainer_email="codex@example.com",
@@ -22,6 +23,9 @@ setup(
             "mock_surgeon = simulation_runtime.mock_surgeon:main",
             "surgeon_actor = simulation_runtime.surgeon_actor:main",
             "llm_surgeon_actor = simulation_runtime.llm_surgeon_actor:main",
+            "speech_input_adapter = simulation_runtime.speech_input_adapter:main",
+            "sentence_input_adapter = simulation_runtime.speech_input_adapter:main",
+            "integration_preflight = simulation_runtime.integration_preflight:main",
         ],
     },
 )

@@ -1,0 +1,933 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>수술 영상 이벤트 검토 편집기</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#editor">검수 본문으로 이동</a>
+    <header class="app-bar">
+      <div class="app-identity">
+        <p id="workspace-kicker" class="eyebrow">EVALUATION REFERENCE · HUMAN GATE</p>
+        <div class="app-identity-row">
+          <h1>수술 영상 라벨링</h1>
+          <label class="case-picker" for="case-selector">
+            <span class="sr-only">검수 영상 선택</span>
+            <select
+              id="case-selector"
+              aria-label="검수 영상 선택"
+              disabled
+            >
+              <option>불러오는 중</option>
+            </select>
+          </label>
+        </div>
+      </div>
+
+      <div
+        id="interaction-review-mode-control"
+        class="review-mode-control"
+        role="group"
+        aria-label="수술 이벤트 검수 모드"
+      >
+        <button
+          type="button"
+          data-review-mode="final_observed"
+          aria-pressed="false"
+          disabled
+        >
+          원시 관측 참고
+        </button>
+        <button type="button" data-review-mode="edit" aria-pressed="true">
+          편집 검수
+        </button>
+        <button
+          type="button"
+          data-review-mode="final_dt"
+          aria-pressed="false"
+          disabled
+        >
+          최종 DT
+        </button>
+      </div>
+
+      <div class="review-progress" aria-label="검토 진행률">
+        <div>
+          <span id="review-progress-label">불러오는 중</span>
+          <strong id="review-progress-count">0 / 0</strong>
+        </div>
+        <div
+          class="progress-track"
+          role="progressbar"
+          aria-valuemin="0"
+          aria-valuemax="0"
+          aria-valuenow="0"
+          aria-labelledby="review-progress-label"
+        >
+          <span id="review-progress-fill"></span>
+        </div>
+      </div>
+
+      <div class="session-controls">
+        <label id="auto-pause-control" class="toggle-control">
+          <input id="auto-pause" type="checkbox" checked />
+          <span>미검토 후보 자동 정지</span>
+        </label>
+        <label
+          class="toggle-control"
+          title="수술 단계, 음성, 도구 요청, 도구 이동, 임상 근거 오버레이를 함께 표시합니다."
+        >
+          <input id="event-overlay-enabled" type="checkbox" checked />
+          <span>오버레이 표시</span>
+        </label>
+        <label
+          id="recognition-overlay-control"
+          class="toggle-control recognition-toggle"
+          title="CAM4·FLIR의 RF-DETR 도구·손 요청 인식 결과를 표시합니다. AI 추론 참고용이며 정답 라벨이 아닙니다."
+          hidden
+        >
+          <input
+            id="recognition-overlay-enabled"
+            type="checkbox"
+            aria-controls="cam4-recognition-overlay flir-recognition-overlay"
+            aria-describedby="recognition-overlay-description"
+            disabled
+          />
+          <span>AI 인식</span>
+        </label>
+        <span id="recognition-overlay-description" class="sr-only">
+          RF-DETR AI 추론 참고용이며 사람 검수 정답이 아닙니다.
+        </span>
+        <label id="reviewer-control" class="reviewer-control" for="reviewer-id">
+          <span>검토자 ID</span>
+          <input
+            id="reviewer-id"
+            autocomplete="username"
+            placeholder="예: reviewer-01"
+          />
+        </label>
+      </div>
+    </header>
+
+    <main id="editor" class="editor" aria-busy="true">
+      <section class="upper-workspace">
+        <aside class="panel navigator-panel" aria-label="어노테이션 탐색">
+          <div class="panel-header compact">
+            <div>
+              <p class="eyebrow">EVENT NAVIGATOR</p>
+              <h2 id="navigator-title">이벤트 · 임상 탐색</h2>
+            </div>
+            <output id="remaining-count" class="count-badge">0 미검토</output>
+          </div>
+
+          <div class="status-summary" aria-label="판정 현황">
+            <span><b id="confirmed-count">0</b>확정</span>
+            <span><b id="ambiguous-count">0</b>애매</span>
+            <span><b id="rejected-count">0</b>기각</span>
+          </div>
+
+          <fieldset class="filter-group">
+            <legend>표시할 Track</legend>
+            <label><input data-track-filter="request" type="checkbox" checked /> 도구 요청</label>
+            <label><input data-track-filter="transfer" type="checkbox" checked /> 이동</label>
+            <label><input data-track-filter="phase" type="checkbox" checked /> 수술 단계</label>
+            <label id="speech-track-filter" hidden>
+              <input data-track-filter="speech" type="checkbox" checked />
+              음성 문맥 <small id="speech-event-count">0</small>
+            </label>
+            <label id="clinical-track-filter">
+              <input data-track-filter="clinical" type="checkbox" checked />
+              임상 <small id="clinical-event-count">0</small>
+            </label>
+          </fieldset>
+
+          <div id="event-list-loading" class="skeleton-list" aria-label="이벤트 불러오는 중">
+            <div class="skeleton-row"></div>
+            <div class="skeleton-row"></div>
+            <div class="skeleton-row"></div>
+          </div>
+          <div id="event-list-empty" class="empty-state" hidden>
+            <strong id="event-list-empty-title">표시할 이벤트가 없습니다</strong>
+            <p id="event-list-empty-detail">후보 파일을 확인한 뒤 다시 불러와 주세요.</p>
+            <button
+              id="reset-filters"
+              type="button"
+              class="button button-secondary"
+              hidden
+            >
+              모든 Track 다시 표시
+            </button>
+            <button id="reload-state" type="button" class="button button-quiet">
+              다시 불러오기
+            </button>
+          </div>
+          <ol
+            id="event-list"
+            class="event-list"
+            aria-label="시간순 수술 이벤트와 임상 어노테이션 목록"
+          ></ol>
+        </aside>
+
+        <section class="panel stage-panel" aria-labelledby="viewer-title">
+          <div class="panel-header compact stage-heading">
+            <div>
+              <p class="eyebrow">CONTINUOUS SOURCE REVIEW</p>
+              <h2 id="viewer-title">CAM4 · FLIR / CAM2 · CAM3</h2>
+            </div>
+            <div class="frame-readout" aria-live="off">
+              <output id="frame-output">frame —</output>
+              <output id="time-output">—</output>
+            </div>
+          </div>
+
+          <div class="monitor-grid">
+            <div
+              id="event-overlay-stack"
+              class="event-overlay-grid"
+              role="group"
+              aria-label="동기화 수술 영상과 주변 오버레이 알림"
+            >
+              <div class="event-overlay-rail event-overlay-rail-left">
+                <section
+                  id="phase-event-overlay"
+                  class="event-overlay-region phase-overlay-region"
+                  aria-label="현재 수술 단계 문맥"
+                ></section>
+                <section
+                  id="clinical-event-overlay"
+                  class="event-overlay-region clinical-overlay-region"
+                  aria-label="현재 임상 어노테이션 근거"
+                  hidden
+                ></section>
+                <section
+                  id="request-event-overlay"
+                  class="event-overlay-region request-overlay-region"
+                  aria-label="현재 요청 구간"
+                ></section>
+              </div>
+
+              <div
+                id="video-shell"
+                class="video-shell"
+                role="group"
+                aria-label="동기화된 네 개의 독립 수술 영상. 위 왼쪽 CAM4, 위 오른쪽 FLIR, 아래 왼쪽 CAM2, 아래 오른쪽 CAM3"
+              >
+              <figure class="camera-tile" data-camera-view="cam4" data-stream-state="loading">
+                <video
+                  id="cam4-video"
+                  preload="metadata"
+                  playsinline
+                  aria-label="CAM4 기준 연속 영상과 음성"
+                ></video>
+                <img
+                  id="cam4-fallback"
+                  alt="현재 source frame의 CAM4 정밀 프레임"
+                  decoding="async"
+                  hidden
+                />
+                <canvas
+                  id="cam4-recognition-overlay"
+                  class="recognition-overlay"
+                  aria-hidden="true"
+                  hidden
+                ></canvas>
+                <figcaption class="camera-tile-label">
+                  <strong>CAM4</strong>
+                  <small id="cam4-stream-status">기준 · 음성</small>
+                </figcaption>
+              </figure>
+
+              <figure class="camera-tile" data-camera-view="flir" data-stream-state="loading">
+                <video
+                  id="flir-video"
+                  preload="metadata"
+                  playsinline
+                  muted
+                  aria-label="FLIR 동기 연속 영상, 음소거"
+                ></video>
+                <img
+                  id="flir-fallback"
+                  alt="현재 source frame의 FLIR 정밀 프레임"
+                  decoding="async"
+                  hidden
+                />
+                <canvas
+                  id="flir-recognition-overlay"
+                  class="recognition-overlay"
+                  aria-hidden="true"
+                  hidden
+                ></canvas>
+                <figcaption class="camera-tile-label">
+                  <strong>FLIR</strong>
+                  <small id="flir-stream-status">동기화 대기</small>
+                </figcaption>
+              </figure>
+
+              <figure class="camera-tile" data-camera-view="cam2" data-stream-state="loading">
+                <video
+                  id="cam2-video"
+                  preload="metadata"
+                  playsinline
+                  muted
+                  aria-label="CAM2 동기 연속 영상, 음소거"
+                ></video>
+                <img
+                  id="cam2-fallback"
+                  alt="현재 source frame의 CAM2 정밀 프레임"
+                  decoding="async"
+                  hidden
+                />
+                <figcaption class="camera-tile-label">
+                  <strong>CAM2</strong>
+                  <small id="cam2-stream-status">동기화 대기</small>
+                </figcaption>
+              </figure>
+
+              <figure class="camera-tile" data-camera-view="cam3" data-stream-state="loading">
+                <video
+                  id="cam3-video"
+                  preload="metadata"
+                  playsinline
+                  muted
+                  aria-label="CAM3 동기 연속 영상, 음소거"
+                ></video>
+                <img
+                  id="cam3-fallback"
+                  alt="현재 source frame의 CAM3 정밀 프레임"
+                  decoding="async"
+                  hidden
+                />
+                <figcaption class="camera-tile-label">
+                  <strong>CAM3</strong>
+                  <small id="cam3-stream-status">동기화 대기</small>
+                </figcaption>
+              </figure>
+
+              <div
+                id="video-loading"
+                class="viewer-state"
+                role="status"
+                aria-live="polite"
+                aria-atomic="true"
+              >
+                <span class="loading-bar" aria-hidden="true"></span>
+                <strong id="video-loading-message">
+                  독립 4-view 검토 영상을 준비하고 있습니다
+                </strong>
+              </div>
+              <div id="video-error" class="viewer-state error-state" role="alert" hidden>
+                <strong>연속 영상을 재생할 수 없습니다</strong>
+                <p>네 카메라의 정확 프레임 모드로 전환합니다.</p>
+                <button id="retry-video" type="button" class="button button-quiet">
+                  영상 다시 시도
+                </button>
+              </div>
+
+              <div id="visual-blocker" class="visual-blocker" role="status" hidden>
+                <p id="visual-blocker-code">CAMERA GAP</p>
+                <strong id="visual-blocker-message">평가 불가</strong>
+              </div>
+
+              <div id="candidate-alert" class="candidate-alert" role="status" aria-live="polite" hidden>
+                <div>
+                  <p class="eyebrow">AI CANDIDATE</p>
+                  <strong id="candidate-alert-title">후보에 도달했습니다</strong>
+                  <p id="candidate-alert-detail">
+                    요청 구간은 영상을 확인해 시작과 종료를 각각 지정하세요.
+                  </p>
+                </div>
+                <button id="dismiss-alert" type="button" aria-label="후보 알림 닫기">×</button>
+              </div>
+
+                <span id="playback-mode-badge" class="viewer-badge">영상 준비 중</span>
+              </div>
+
+              <div class="event-overlay-rail event-overlay-rail-right">
+                <section
+                  id="speech-event-overlay"
+                  class="event-overlay-region speech-overlay-region"
+                  aria-label="현재 음성 발화 문맥"
+                ></section>
+                <section
+                  id="transfer-event-overlay"
+                  class="event-overlay-region transfer-overlay-region"
+                  aria-label="현재 도구 이동"
+                ></section>
+              </div>
+
+              <div
+                id="event-overlay-announcer"
+                class="sr-only"
+                role="status"
+                aria-live="polite"
+                aria-atomic="true"
+              ></div>
+            </div>
+          </div>
+
+          <div class="transport" aria-label="영상 재생 조작">
+            <button type="button" data-frame-step="-5" aria-label="5프레임 뒤로">−5</button>
+            <button type="button" data-frame-step="-1" aria-label="1프레임 뒤로">−1</button>
+            <button id="play-toggle" type="button" class="play-button" aria-label="재생">
+              ▶
+            </button>
+            <button type="button" data-frame-step="1" aria-label="1프레임 앞으로">+1</button>
+            <button type="button" data-frame-step="5" aria-label="5프레임 앞으로">+5</button>
+            <label class="speed-control" for="playback-rate">
+              <span>속도</span>
+              <select id="playback-rate">
+                <option value="0.5">0.5×</option>
+                <option value="0.75">0.75×</option>
+                <option value="1" selected>1×</option>
+                <option value="1.25">1.25×</option>
+                <option value="1.5">1.5×</option>
+                <option value="2">2×</option>
+              </select>
+            </label>
+            <button
+              id="mute-toggle"
+              type="button"
+              class="audio-toggle"
+              aria-label="음소거"
+              aria-pressed="false"
+            >
+              소리
+            </button>
+            <label class="volume-control" for="volume-range">
+              <span>음량</span>
+              <input
+                id="volume-range"
+                type="range"
+                min="0"
+                max="1"
+                step="0.05"
+                value="1"
+              />
+            </label>
+            <details class="shortcut-menu">
+              <summary aria-label="키보드 단축키 보기">?</summary>
+              <div>
+                <strong>키보드 단축키</strong>
+                <span>Space 재생·일시정지</span>
+                <span>←/→ 1 frame · Shift+←/→ 5 frame</span>
+                <span>N/P 후보 이동 · M 현재 프레임으로 이동</span>
+                <span>Enter 확정 · A 애매 · Shift+R 후보 기각 · Esc 취소</span>
+              </div>
+            </details>
+          </div>
+          <p class="keyboard-help">
+            Space 재생 · ←/→ 1 frame · Shift+←/→ 5 frame · N/P 후보 이동 ·
+            M 현재 시각으로 이동 · Enter 확정 · A 애매 · Shift+R 후보만 기각
+          </p>
+        </section>
+
+        <aside class="panel inspector-panel" aria-label="어노테이션 상세 검수">
+          <section id="interaction-inspector" class="workspace-pane">
+          <div class="panel-header compact">
+            <div>
+              <p class="eyebrow">EVENT INSPECTOR</p>
+              <h2 id="inspector-title">이벤트 판정</h2>
+            </div>
+            <span
+              id="selection-status"
+              class="status-badge status-neutral"
+              tabindex="-1"
+              aria-live="polite"
+            >선택 없음</span>
+          </div>
+
+          <div id="inspector-empty" class="empty-state inspector-empty">
+            <strong>타임라인 마커를 선택하세요</strong>
+            <p id="inspector-empty-detail">영상을 재생하면 미검토 AI 후보에서 자동으로 멈춥니다.</p>
+            <button id="new-event-empty" type="button" class="button button-quiet">
+              현재 위치에 새 이벤트
+            </button>
+          </div>
+
+          <section id="final-inspector" class="final-inspector" hidden>
+            <div class="read-only-banner">
+              <strong id="final-mode-banner-title">읽기 전용 참조</strong>
+              <span id="final-mode-banner-detail">이 화면에서는 최종 참조 파일을 수정할 수 없습니다.</span>
+            </div>
+            <dl class="final-event-details">
+              <div><dt>이벤트 ID</dt><dd id="final-event-id">—</dd></div>
+              <div><dt>이벤트</dt><dd id="final-event-type">—</dd></div>
+              <div><dt>시각</dt><dd id="final-event-time">—</dd></div>
+              <div><dt>관측 내용</dt><dd id="final-event-observation">—</dd></div>
+              <div><dt>해석</dt><dd id="final-event-interpretation">—</dd></div>
+              <div><dt>라벨 출처</dt><dd id="final-event-origin">—</dd></div>
+              <div><dt id="final-event-disposition-label">DT 처리</dt><dd id="final-event-disposition">—</dd></div>
+            </dl>
+            <section class="final-review-note">
+              <p class="field-kicker">최종 검수 메모</p>
+              <p id="final-event-note">—</p>
+            </section>
+            <section class="final-projection-note">
+              <p id="final-projection-kicker" class="field-kicker">평가 투영 근거</p>
+              <p id="final-projection-reason">—</p>
+              <p id="final-projection-sources" class="source-event-ids">—</p>
+            </section>
+          </section>
+
+          <section id="speech-inspector" class="speech-inspector" hidden>
+            <div class="read-only-banner speech-context-banner">
+              <strong>음성 문맥 · 평가 정답 아님</strong>
+              <span>원본 transcript의 시각과 발화를 그대로 확인하는 읽기 전용 레이어입니다.</span>
+            </div>
+            <blockquote id="speech-event-text" class="speech-transcript">—</blockquote>
+            <dl class="final-event-details speech-event-details">
+              <div><dt>음성 ID</dt><dd id="speech-event-id">—</dd></div>
+              <div><dt>발화 시각</dt><dd id="speech-event-time">—</dd></div>
+              <div><dt>발화 종료</dt><dd id="speech-event-end">—</dd></div>
+              <div><dt>텍스트 이용 가능</dt><dd id="speech-event-available">—</dd></div>
+              <div><dt>의미 분류</dt><dd id="speech-event-semantic">—</dd></div>
+              <div><dt>도구 분류</dt><dd id="speech-event-tools">—</dd></div>
+              <div><dt>출처 권한</dt><dd id="speech-event-authority">—</dd></div>
+            </dl>
+            <section class="speech-context-note">
+              <p class="field-kicker">평가 경계</p>
+              <p id="speech-event-scoring-role">
+                이 발화는 검수 문맥이며, 도구 이동이나 요청의 정답 이벤트로 집계되지 않습니다.
+              </p>
+            </section>
+          </section>
+
+          <form id="review-form" aria-describedby="form-error review-scope-help" hidden>
+            <section id="candidate-origin" class="origin-card">
+              <p id="origin-kicker" class="field-kicker">AI 원래 후보</p>
+              <div class="time-comparison">
+                <span><b id="original-frame">frame —</b><small id="original-time">—</small></span>
+                <span aria-hidden="true">→</span>
+                <span><b id="draft-frame">frame —</b><small id="draft-time">—</small></span>
+              </div>
+              <p id="time-offset" class="time-offset">원래 시각과 같습니다.</p>
+              <output id="request-range-summary" class="request-range-summary" hidden>
+                요청 구간 —
+              </output>
+            </section>
+
+            <fieldset class="event-type-field">
+              <legend>이벤트 유형</legend>
+              <div id="event-type-options" class="segmented-options"></div>
+            </fieldset>
+
+            <div id="transfer-fields" class="field-group" hidden>
+              <label>
+                도구 ID
+                <input
+                  id="tool-id"
+                  list="tool-id-options"
+                  placeholder="예: bipolar_forceps"
+                  pattern="[a-z][a-z0-9_]*"
+                />
+                <datalist id="tool-id-options"></datalist>
+              </label>
+              <label>
+                From
+                <select id="from-location"></select>
+              </label>
+              <label>
+                To
+                <select id="to-location"></select>
+              </label>
+            </div>
+
+            <div id="phase-fields" class="field-group" hidden>
+              <label>
+                수술 단계 ID
+                <input id="phase-id" placeholder="예: P13" pattern="P[0-9]{2,}" />
+              </label>
+            </div>
+
+            <p id="request-help" class="inline-help" hidden>
+              빈손을 도구 수령 위치에 내밀어 유지하는 관측 가능한 구간만 표시합니다.
+              AI point 원안은 시작=종료로 두고, 확인한 종료만 직접 지정합니다.
+            </p>
+
+            <div id="request-timing-actions" class="request-timing-actions" hidden>
+              <button id="set-request-start" type="button" class="button button-secondary">
+                현재 프레임을 시작으로
+              </button>
+              <button id="set-request-end" type="button" class="button button-secondary">
+                현재 프레임을 종료로
+              </button>
+            </div>
+
+            <div id="timing-actions" class="timing-actions">
+              <button id="move-to-playhead" type="button" class="button button-secondary">
+                현재 프레임으로 이동 · M
+              </button>
+              <button id="discard-draft" type="button" class="button button-quiet">
+                변경 취소
+              </button>
+            </div>
+
+            <label>
+              사람 검토 메모
+              <textarea
+                id="review-notes"
+                rows="3"
+                placeholder="시각 조정이나 판정 근거를 남겨 주세요."
+              ></textarea>
+            </label>
+
+            <details id="ai-context" class="context-details">
+              <summary id="context-summary">AI 근거와 판정 이력</summary>
+              <dl>
+                <div><dt>모델</dt><dd id="ai-model">—</dd></div>
+                <div><dt>근거</dt><dd id="ai-evidence">—</dd></div>
+                <div><dt>원시 query</dt><dd id="proposal-query">—</dd></div>
+              </dl>
+              <ol id="action-history" class="action-history"></ol>
+            </details>
+
+            <div id="form-error" class="inline-error" role="alert" hidden></div>
+            <div class="review-actions">
+              <button id="confirm" type="button" class="button button-primary">
+                확정 · Enter
+              </button>
+              <button id="ambiguous" type="button" class="button button-warning">
+                애매함 · A
+              </button>
+              <button id="reject" type="button" class="button button-danger">
+                이 후보만 기각 · Shift+R
+              </button>
+              <button id="withdraw" type="button" class="button button-danger" hidden>
+                이 이벤트 철회
+              </button>
+            </div>
+            <p id="review-scope-help" class="scope-help">
+              기각은 선택한 AI 후보 하나에만 적용됩니다. 주변 구간을
+              ‘이벤트 없음’으로 판정하지 않습니다.
+            </p>
+          </form>
+          </section>
+
+          <section id="clinical-inspector" class="workspace-pane clinical-inspector" hidden>
+            <div class="panel-header compact">
+              <div>
+                <p class="eyebrow">CLINICAL LABEL INSPECTOR</p>
+                <h2 id="clinical-inspector-title">임상 라벨 검수</h2>
+              </div>
+              <output
+                id="clinical-selection-status"
+                class="status-badge status-neutral"
+                aria-live="polite"
+              >선택 없음</output>
+            </div>
+
+            <div
+              id="clinical-inspector-empty"
+              class="empty-state inspector-empty"
+            >
+              <strong>임상 후보를 선택하세요</strong>
+              <p>왼쪽 목록이나 아래 한 줄 타임라인에서 선택할 수 있습니다.</p>
+            </div>
+
+            <div id="clinical-final-read-only" class="read-only-banner" hidden>
+              <strong>임상 최종본 · 읽기 전용</strong>
+              <span>초안과 append-only 사람 검수 이력에서 파생된 결과입니다.</span>
+            </div>
+
+            <form
+              id="clinical-form"
+              class="clinical-form"
+              aria-describedby="clinical-form-error clinical-review-scope-help"
+              hidden
+            >
+              <label class="clinical-reviewer-role-control">
+                검토 역할
+                <select id="clinical-reviewer-role">
+                  <option value="clinical_reviewer">임상 검토자</option>
+                  <option value="clinician">임상의</option>
+                  <option value="surgeon">집도의</option>
+                </select>
+              </label>
+
+              <section class="origin-card clinical-origin-card" aria-label="읽기 전용 영상 근거">
+                <div>
+                  <p class="field-kicker">근거 시각</p>
+                  <strong id="clinical-anchor-summary">anchor —</strong>
+                </div>
+                <div>
+                  <p class="field-kicker">근거 클립</p>
+                  <strong id="clinical-evidence-summary">—</strong>
+                </div>
+                <p class="origin-help">
+                  Anchor와 evidence는 canonical timeline 기준이며 읽기 전용입니다.
+                </p>
+              </section>
+
+              <fieldset class="form-section clinical-label-fields">
+                <legend>임상 라벨</legend>
+                <p class="clinical-field-intro">
+                  사람이 작성하고 검토하는 내용 필드는 관찰과 해석 두 개뿐입니다.
+                </p>
+                <label for="clinical-observation">
+                  관찰
+                  <textarea
+                    id="clinical-observation"
+                    rows="6"
+                    maxlength="600"
+                    aria-describedby="clinical-observation-help clinical-observation-count"
+                    placeholder="영상에서 직접 확인되는 도구, 움직임, 대상, 시야 상태와 판독 제한을 1–2문장으로 적어 주세요."
+                  ></textarea>
+                  <small id="clinical-observation-help">
+                    영상에서 직접 보이는 사실만 씁니다. 가림이나 공백은 “판독 불가”라고 문장 안에 기록합니다.
+                  </small>
+                  <small id="clinical-observation-count" class="clinical-field-count" aria-live="polite">
+                    0/2문장 · 0/600자
+                  </small>
+                </label>
+                <label for="clinical-interpretation">
+                  해석
+                  <textarea
+                    id="clinical-interpretation"
+                    rows="5"
+                    maxlength="600"
+                    aria-describedby="clinical-interpretation-help clinical-interpretation-count"
+                    placeholder="관찰과 전후 흐름에서 가장 가능성 높은 조직·행위·반응을 1–2문장으로 적어 주세요."
+                  ></textarea>
+                  <small id="clinical-interpretation-help">
+                    관찰과 전후 흐름을 바탕으로 가장 가능성 높은 임상 의미를 적어 주세요. AI 초안은 집도의 확인 전 정답이 아닙니다.
+                  </small>
+                  <small id="clinical-interpretation-count" class="clinical-field-count" aria-live="polite">
+                    0/2문장 · 0/600자
+                  </small>
+                </label>
+              </fieldset>
+
+              <label>
+                검수 메모
+                <textarea
+                  id="clinical-review-notes"
+                  rows="3"
+                  placeholder="수정 근거와 남은 불확실성을 기록해 주세요."
+                ></textarea>
+              </label>
+
+              <details class="context-details">
+                <summary>출처 · 신뢰도 · 검수 이력</summary>
+                <dl>
+                  <div><dt>생성기</dt><dd id="clinical-provenance-generator">—</dd></div>
+                  <div><dt>모델</dt><dd id="clinical-provenance-model">—</dd></div>
+                  <div><dt>권한</dt><dd id="clinical-provenance-authority">—</dd></div>
+                  <div><dt>Source views</dt><dd id="clinical-source-views">—</dd></div>
+                  <div><dt>관찰 신뢰도</dt><dd id="clinical-observation-confidence">—</dd></div>
+                  <div><dt>해석 신뢰도</dt><dd id="clinical-interpretation-confidence">—</dd></div>
+                </dl>
+                <ol id="clinical-action-history" class="action-history"></ol>
+              </details>
+
+              <div
+                id="clinical-form-error"
+                class="inline-error"
+                role="alert"
+                hidden
+              ></div>
+
+              <div class="clinical-draft-actions">
+                <button
+                  id="clinical-discard-draft"
+                  type="button"
+                  class="button button-quiet"
+                >
+                  변경 취소
+                </button>
+                <span id="clinical-dirty-indicator" role="status">저장된 상태</span>
+              </div>
+
+              <div class="review-actions" role="group" aria-label="임상 후보 판정 저장">
+                <button id="clinical-confirm" type="button" class="button button-primary">
+                  확정 · Enter
+                </button>
+                <button id="clinical-ambiguous" type="button" class="button button-warning">
+                  애매 · A
+                </button>
+                <button id="clinical-reject" type="button" class="button button-danger">
+                  기각 · Shift+R
+                </button>
+              </div>
+              <p id="clinical-review-scope-help" class="scope-help">
+                AI 초안은 자동으로 ground truth가 되지 않습니다. 기각은 선택한
+                후보에만 적용됩니다.
+              </p>
+            </form>
+          </section>
+        </aside>
+      </section>
+
+      <section class="panel timeline-panel" aria-labelledby="timeline-title">
+        <div class="timeline-toolbar">
+          <div>
+            <p class="eyebrow">ANNOTATION TIMELINE</p>
+            <h2 id="timeline-title">관측 이벤트</h2>
+          </div>
+          <div class="timeline-actions">
+            <button
+              id="new-event"
+              type="button"
+              class="button button-secondary interaction-workspace"
+            >
+              + 현재 위치에 새 이벤트
+            </button>
+            <button id="previous-candidate" type="button" aria-label="이전 항목">이전 항목</button>
+            <button id="next-candidate" type="button" aria-label="다음 항목">다음 항목</button>
+            <button id="zoom-out" type="button" aria-label="타임라인 축소">−</button>
+            <button id="zoom-fit" type="button">전체</button>
+            <button id="zoom-in" type="button" aria-label="타임라인 확대">+</button>
+          </div>
+        </div>
+
+        <details
+          id="phase-catalog-panel"
+          class="phase-catalog-panel"
+          open
+          hidden
+        >
+          <summary class="phase-catalog-summary">
+            <span class="phase-catalog-heading">전체 수술 단계 구성</span>
+            <strong id="phase-catalog-current">
+              현재 영상 구간에 지정된 수술 단계 없음
+            </strong>
+            <small id="phase-catalog-count">0단계</small>
+          </summary>
+          <ol
+            id="phase-catalog-list"
+            class="phase-catalog-list"
+            aria-label="전체 수술 단계 순서"
+          ></ol>
+          <p id="phase-catalog-note" class="phase-catalog-note"></p>
+        </details>
+
+        <div
+          id="timeline-scroll"
+          class="timeline-scroll"
+          tabindex="0"
+          aria-label="수술 이벤트와 임상 어노테이션 타임라인. 마우스 휠로 시간축 확대와 축소, Shift와 휠로 가로 이동, Home과 End로 처음과 끝 이동"
+        >
+          <div id="timeline-content" class="timeline-content">
+            <div class="timeline-ruler-row" aria-hidden="true">
+              <div class="timeline-ruler-gutter"></div>
+              <div id="time-ruler" class="time-ruler"></div>
+            </div>
+            <div id="gap-overlay" class="gap-overlay" aria-hidden="true"></div>
+
+            <div class="timeline-track speech-track interaction-timeline-track" data-track="speech" hidden>
+              <div class="track-label">
+                <span class="track-symbol speech-symbol" aria-hidden="true">
+                  <svg class="timeline-semantic-icon" data-icon="speaker" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" focusable="false">
+                    <path d="M11 5 6 9H2v6h4l5 4V5Z"></path>
+                    <path d="M15.54 8.46a5 5 0 0 1 0 7.07"></path>
+                    <path d="M19.07 4.93a10 10 0 0 1 0 14.14"></path>
+                  </svg>
+                </span>
+                음성
+              </div>
+              <div id="speech-track" class="track-canvas"></div>
+            </div>
+            <div class="timeline-track interaction-timeline-track" data-track="request">
+              <div class="track-label"><span class="track-symbol point-symbol">○</span> 도구 요청</div>
+              <div id="request-track" class="track-canvas"></div>
+            </div>
+            <div class="timeline-track interaction-timeline-track" data-track="transfer">
+              <div class="track-label"><span class="track-symbol diamond-symbol">◆</span> 도구 이동</div>
+              <div id="transfer-track" class="track-canvas"></div>
+            </div>
+            <div class="timeline-track interaction-timeline-track" data-track="phase">
+              <div class="track-label">
+                <span class="track-symbol bar-symbol">▬</span>
+                수술 단계
+              </div>
+              <div id="phase-track" class="track-canvas"></div>
+            </div>
+            <div
+              class="timeline-track clinical-timeline-track"
+              data-track="clinical"
+              hidden
+            >
+              <div class="track-label">
+                <span class="track-symbol clinical-symbol" aria-hidden="true">
+                  <svg class="timeline-semantic-icon" data-icon="stethoscope" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" focusable="false">
+                    <path d="M11 2v2"></path>
+                    <path d="M5 2v2"></path>
+                    <path d="M5 3H4a2 2 0 0 0-2 2v3a6 6 0 0 0 12 0V5a2 2 0 0 0-2-2h-1"></path>
+                    <path d="M8 14a6 6 0 0 0 12 0v-2"></path>
+                    <circle cx="20" cy="10" r="2"></circle>
+                  </svg>
+                </span>
+                임상
+                <small>관찰 · 해석</small>
+              </div>
+              <div
+                id="clinical-track"
+                class="track-canvas"
+                role="group"
+                aria-label="모든 임상 항목이 함께 표시되는 단일 타임라인"
+              ></div>
+            </div>
+            <div class="timeline-track gap-track interaction-timeline-track" data-track="gap">
+              <div class="track-label"><span class="track-symbol gap-symbol">▧</span> 영상 공백</div>
+              <div id="gap-track" class="track-canvas"></div>
+            </div>
+
+            <button
+              id="playhead"
+              class="playhead"
+              type="button"
+              role="slider"
+              aria-label="현재 재생 위치"
+              aria-valuemin="0"
+              aria-valuemax="0"
+              aria-valuenow="0"
+            >
+              <span></span>
+            </button>
+          </div>
+        </div>
+
+        <div class="timeline-legend" aria-label="마커 범례">
+          <span data-edit-legend><i class="legend-marker candidate"></i>AI 원안</span>
+          <span data-edit-legend><i class="legend-marker confirmed">✓</i>사람 확정</span>
+          <span data-edit-legend><i class="legend-marker ambiguous">?</i>애매</span>
+          <span data-edit-legend><i class="legend-marker rejected">×</i>기각</span>
+          <span data-edit-legend><i class="legend-marker draft"></i>현재 수정</span>
+          <span id="final-legend" hidden><i class="legend-marker confirmed">✓</i>확정된 읽기 전용 이벤트</span>
+          <span id="speech-legend" hidden>
+            <i class="legend-marker speech" aria-hidden="true">
+              <svg class="timeline-semantic-icon" data-icon="speaker" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" focusable="false">
+                <path d="M11 5 6 9H2v6h4l5 4V5Z"></path>
+                <path d="M15.54 8.46a5 5 0 0 1 0 7.07"></path>
+                <path d="M19.07 4.93a10 10 0 0 1 0 14.14"></path>
+              </svg>
+            </i>
+            음성 문맥 · 정답 집계 제외
+          </span>
+          <span id="phase-context-legend" hidden><i class="legend-marker ambiguous">?</i>임시 수술 단계 · 애매 · 정답 집계 제외</span>
+          <span class="clinical-legend" hidden>
+            <i class="clinical-kind-key" aria-hidden="true">
+              <svg class="timeline-semantic-icon" data-icon="stethoscope" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" focusable="false">
+                <path d="M11 2v2"></path>
+                <path d="M5 2v2"></path>
+                <path d="M5 3H4a2 2 0 0 0-2 2v3a6 6 0 0 0 12 0V5a2 2 0 0 0-2-2h-1"></path>
+                <path d="M8 14a6 6 0 0 0 12 0v-2"></path>
+                <circle cx="20" cy="10" r="2"></circle>
+              </svg>
+            </i>
+            임상 · AI 초안
+          </span>
+          <span class="clinical-legend" hidden><i class="legend-marker confirmed">✓</i>사람 확정</span>
+          <span class="clinical-legend" hidden><i class="legend-marker ambiguous">?</i>애매</span>
+          <span class="clinical-legend" hidden><i class="legend-marker rejected">×</i>기각</span>
+          <span class="timeline-pan-hint">휠 확대·축소 · Shift+휠 가로 이동 · Home/End 처음/끝</span>
+        </div>
+      </section>
+    </main>
+
+    <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+    <script src="/app.js" defer></script>
+  </body>
+</html>

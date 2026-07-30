@@ -307,7 +307,7 @@ class BTAuditHarness(SmokeHarness):
                     detail=f"selected_tool={decision.selected_tool} but active request was {explicit_tool}.",
                 )
             if selected_state is not None:
-                if selected_state.lifecycle_stage in {"surgeon_owned", "mayo_reuse"}:
+                if selected_state.lifecycle_stage == "surgeon_owned":
                     if decision.action not in {"go_idle_pose", "retract_arm"}:
                         self._push_finding(
                             severity="blocker",
@@ -316,8 +316,24 @@ class BTAuditHarness(SmokeHarness):
                             world=world,
                             detail=f"{decision.selected_tool} was already surgeon-side but action was {decision.action}.",
                         )
+                if selected_state.lifecycle_stage in {"mayo_reuse", "mayo_recovery"}:
+                    if decision.action != "pick_up_from_mayo_and_handover":
+                        self._push_finding(
+                            severity="blocker",
+                            code="mayo_request_wrong_action",
+                            decision=decision,
+                            world=world,
+                            detail=(
+                                f"{decision.selected_tool} was on Mayo but action was "
+                                f"{decision.action or 'none'}."
+                            ),
+                        )
                 if selected_state.contaminated:
-                    if selected_state.lifecycle_stage not in {"surgeon_owned", "mayo_reuse"}:
+                    if selected_state.lifecycle_stage not in {
+                        "surgeon_owned",
+                        "mayo_reuse",
+                        "mayo_recovery",
+                    }:
                         self._push_finding(
                             severity="blocker",
                             code="explicit_contaminated_tool",
@@ -325,7 +341,18 @@ class BTAuditHarness(SmokeHarness):
                             world=world,
                             detail=f"{decision.selected_tool} was contaminated during explicit handover.",
                         )
-                if selected_state.lifecycle_stage not in {"home_rack", "returned_home", "prepositioned_right", "surgeon_owned", "mayo_reuse"} and world.right_hand_tool != decision.selected_tool:
+                if (
+                    selected_state.lifecycle_stage
+                    not in {
+                        "home_rack",
+                        "returned_home",
+                        "prepositioned_right",
+                        "surgeon_owned",
+                        "mayo_reuse",
+                        "mayo_recovery",
+                    }
+                    and world.right_hand_tool != decision.selected_tool
+                ):
                     self._push_finding(
                         severity="blocker",
                         code="explicit_unavailable_tool",
@@ -334,22 +361,22 @@ class BTAuditHarness(SmokeHarness):
                         detail=f"{decision.selected_tool} was not in an explicit-requestable lifecycle ({selected_state.lifecycle_stage}).",
                     )
                 if selected_state.owner == "surgeon" or selected_state.status in {"handed_over", "in_use"}:
-                    if selected_state.lifecycle_stage not in {"surgeon_owned", "mayo_reuse"}:
+                    if selected_state.lifecycle_stage != "surgeon_owned":
                         self._push_finding(
-                        severity="blocker",
-                        code="explicit_tool_already_with_surgeon",
-                        decision=decision,
-                        world=world,
-                        detail=f"{decision.selected_tool} was already with the surgeon.",
+                            severity="blocker",
+                            code="explicit_tool_already_with_surgeon",
+                            decision=decision,
+                            world=world,
+                            detail=f"{decision.selected_tool} was already with the surgeon.",
                         )
             if not world.handover_allowed and not bool(decision.handover_allowed):
-                if selected_state is None or selected_state.lifecycle_stage not in {"surgeon_owned", "mayo_reuse"}:
+                if selected_state is None or selected_state.lifecycle_stage != "surgeon_owned":
                     self._push_finding(
-                    severity="blocker",
-                    code="explicit_when_guard_blocked",
-                    decision=decision,
-                    world=world,
-                    detail="explicit_request executed while handover was disallowed.",
+                        severity="blocker",
+                        code="explicit_when_guard_blocked",
+                        decision=decision,
+                        world=world,
+                        detail="explicit_request executed while handover was disallowed.",
                     )
         elif decision.decision == "recovery":
             recovery_context_present = bool(pending_recovery or pipeline_active or recoverable)
@@ -553,8 +580,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("--vlm-mode", default="mock", choices=["mock", "real", "dual"])
     parser.add_argument("--vlm-response-mode", default="live")
-    parser.add_argument("--vlm-base-url", default="http://192.168.0.122:1234")
-    parser.add_argument("--vlm-model-id", default="gemma-4-26b-a4b-it")
+    parser.add_argument("--vlm-base-url", default="http://127.0.0.1:8001")
+    parser.add_argument("--vlm-model-id", default="unsloth/gemma-4-E4B-it-NVFP4")
     parser.add_argument(
         "--spec-name",
         default="all",

@@ -41,7 +41,36 @@ def _retraction_proposal(**overrides) -> dict:
 def test_v4_accepts_null_optional_group_proposal() -> None:
     normalized = validate_payload(_base_v4())
     assert normalized["v"] == "4"
+    assert normalized["gesture"] == ["", "", "", 0.0]
     assert normalized["bed_robot_arm_group"] is None
+
+
+def test_v4_preserves_visual_only_open_palm_evidence() -> None:
+    payload = _base_v4()
+    payload["gesture"] = ["request_tool", "T05", "open_receive", 0.86]
+
+    normalized = validate_payload(payload)
+
+    assert normalized["gesture"] == [
+        "request_tool",
+        "T05",
+        "open_receive",
+        0.86,
+    ]
+
+
+def test_v4_allows_visual_request_before_tool_identity_is_resolved() -> None:
+    payload = _base_v4()
+    payload["gesture"] = ["request_tool", "", "open_receive", 0.79]
+
+    normalized = validate_payload(payload)
+
+    assert normalized["gesture"] == [
+        "request_tool",
+        "",
+        "open_receive",
+        0.79,
+    ]
 
 
 def test_v4_tolerates_omitted_proposal_and_normalizes_it_to_null() -> None:
@@ -164,3 +193,60 @@ def test_v4_json_schema_has_nullable_single_group_proposal_and_six_directions() 
         "UP_DOWN",
     ]
     assert proposal_schema["properties"]["distance_mm"]["exclusiveMinimum"] == 0.0
+
+
+def test_v4_non_numeric_uncertainty_fails_closed() -> None:
+    payload = _base_v4()
+    payload["u"] = "Insufficient visual evidence; explanation belongs in sum."
+
+    normalized = validate_payload(payload)
+
+    assert normalized["u"] == 1.0
+
+
+def test_mayo_retrieve_is_derived_from_highest_recover_vote() -> None:
+    payload = _base_v4()
+    payload["mayo"] = [
+        ["T02", "recover", 0.61],
+        ["T03", "recover", 0.82],
+        ["T04", "reuse", 0.93],
+    ]
+    payload["mayo_retrieve"] = ["T04", 0.99]
+
+    normalized = validate_payload(payload)
+
+    assert normalized["mayo_retrieve"] == ["T03", 0.82]
+
+
+def test_mayo_reuse_cannot_also_be_retrieved() -> None:
+    payload = _base_v4()
+    payload["mayo"] = [["T02", "reuse", 0.95]]
+    payload["mayo_retrieve"] = ["T02", 0.95]
+
+    normalized = validate_payload(payload)
+
+    assert normalized["mayo"] == [["T02", "reuse", 0.95]]
+    assert normalized["mayo_retrieve"] == ["", 0.0]
+
+
+def test_conflicting_duplicate_mayo_vote_fails_closed_on_equal_confidence() -> None:
+    payload = _base_v4()
+    payload["mayo"] = [
+        ["T02", "recover", 0.8],
+        ["T02", "reuse", 0.8],
+    ]
+    payload["mayo_retrieve"] = ["T02", 0.8]
+
+    normalized = validate_payload(payload)
+
+    assert normalized["mayo"] == [["T02", "reuse", 0.8]]
+    assert normalized["mayo_retrieve"] == ["", 0.0]
+
+
+@pytest.mark.parametrize("confidence", [-0.01, 1.01, float("inf")])
+def test_mayo_confidence_must_be_bounded(confidence: float) -> None:
+    payload = _base_v4()
+    payload["mayo"] = [["T02", "reuse", confidence]]
+
+    with pytest.raises(SchemaValidationError, match="between 0 and 1"):
+        validate_payload(payload)

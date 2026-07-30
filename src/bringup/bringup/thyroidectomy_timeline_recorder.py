@@ -576,7 +576,7 @@ class ThyroidectomyTimelineRecorder(Node):
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--spec-name", default="thyroidectomy")
-    parser.add_argument("--vlm-model-id", default="qwen3.6-35b-a3b-mtp@q2_k_xl")
+    parser.add_argument("--vlm-model-id", default="unsloth/gemma-4-E4B-it-NVFP4")
     parser.add_argument("--actor-model-id", default="google/gemma-4-12b-qat")
     parser.add_argument("--timeout-sec", type=float, default=900.0)
     parser.add_argument("--visual-interval-sec", type=float, default=8.0)

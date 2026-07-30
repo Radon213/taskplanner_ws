@@ -127,7 +127,7 @@ prepare_simulation() {
 import os
 import urllib.request
 
-base_url = os.environ.get('VLM_BASE_URL', 'http://127.0.0.1:1234').rstrip('/')
+base_url = os.environ.get('VLM_BASE_URL', 'http://127.0.0.1:8001').rstrip('/')
 print(urllib.request.urlopen(f'{base_url}/v1/models', timeout=5).read().decode()[:500])
 PY"
 

@@ -1,0 +1,399 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "taskplanner.observable_interaction_point.v2",
+  "title": "Observable request, tool-transfer, or phase-start point with conservative actor and review presentation",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "case_id",
+    "event_id",
+    "event_type",
+    "time_sec",
+    "source_frame_idx",
+    "source_views",
+    "review_status",
+    "label_origin"
+  ],
+  "properties": {
+    "schema": {
+      "const": "taskplanner.observable_interaction_point.v2"
+    },
+    "case_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]+$"
+    },
+    "event_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]+-(?:R|T|PH)[0-9]{4,}$"
+    },
+    "event_type": {
+      "enum": [
+        "implicit_tool_request",
+        "tool_transfer",
+        "phase_start"
+      ]
+    },
+    "time_sec": {
+      "type": "number",
+      "minimum": 0
+    },
+    "source_frame_idx": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "source_views": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "enum": ["cam1", "cam2", "cam3", "cam4", "flir"]
+      }
+    },
+    "tool": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*$"
+    },
+    "from": {
+      "enum": [
+        "mayo_stand",
+        "scrub_nurse",
+        "surgeon",
+        "operative_person_role_unresolved"
+      ]
+    },
+    "to": {
+      "enum": [
+        "mayo_stand",
+        "scrub_nurse",
+        "surgeon",
+        "operative_person_role_unresolved"
+      ]
+    },
+    "phase_id": {
+      "type": "string",
+      "pattern": "^P[0-9]{2,}$"
+    },
+    "phase_boundary_kind": {
+      "enum": [
+        "clip_initial_state",
+        "observed_transition",
+        "uncertain_transition"
+      ]
+    },
+    "review_status": {
+      "enum": ["proposed", "confirmed", "ambiguous", "rejected"]
+    },
+    "label_origin": {
+      "enum": [
+        "temporal_grounding_model",
+        "assistant_visual_proposal",
+        "assistant_video_adjudication",
+        "human_video_review"
+      ]
+    },
+    "proposal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["generator"],
+      "properties": {
+        "generator": {
+          "type": "string",
+          "minLength": 1
+        },
+        "model_revision": {
+          "type": "string",
+          "minLength": 1
+        },
+        "anchor_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "raw_evidence_file": {
+          "type": "string",
+          "minLength": 1
+        },
+        "query": {
+          "type": "string",
+          "minLength": 1
+        },
+        "candidate_start_sec": {
+          "type": "number",
+          "minimum": 0
+        },
+        "candidate_end_sec": {
+          "type": "number",
+          "minimum": 0
+        }
+      }
+    },
+    "ai_review": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "reviewer_model",
+        "decision",
+        "reviewed_at",
+        "evidence"
+      ],
+      "properties": {
+        "reviewer_model": {
+          "const": "gpt-5.6-sol"
+        },
+        "decision": {
+          "enum": ["recommend", "uncertain", "reject"]
+        },
+        "reviewed_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "evidence": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "review": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "reviewer_kind",
+        "reviewer_id",
+        "reviewed_at"
+      ],
+      "properties": {
+        "reviewer_kind": {
+          "enum": ["human", "ai_assistant"]
+        },
+        "reviewer_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reviewed_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "notes": {
+          "type": "string"
+        },
+        "authorized_by": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "review_presentation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "observation_ko",
+        "interpretation_ko",
+        "evidence_start_source_frame_idx",
+        "evidence_end_source_frame_idx",
+        "source_views"
+      ],
+      "properties": {
+        "observation_ko": {
+          "type": "string",
+          "minLength": 1
+        },
+        "interpretation_ko": {
+          "type": "string",
+          "minLength": 1
+        },
+        "evidence_start_source_frame_idx": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "evidence_end_source_frame_idx": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "source_views": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": ["cam1", "cam2", "cam3", "cam4", "flir"]
+          }
+        },
+        "dt_observation_ko": {
+          "type": "string",
+          "minLength": 1
+        },
+        "dt_interpretation_ko": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "event_type": {
+            "const": "implicit_tool_request"
+          }
+        },
+        "required": ["event_type"]
+      },
+      "then": {
+        "not": {
+          "anyOf": [
+            {"required": ["tool"]},
+            {"required": ["from"]},
+            {"required": ["to"]},
+            {"required": ["phase_id"]}
+          ]
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event_type": {
+            "const": "tool_transfer"
+          }
+        },
+        "required": ["event_type"]
+      },
+      "then": {
+        "required": ["tool", "from", "to"],
+        "not": {
+          "required": ["phase_id"]
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event_type": {
+            "const": "phase_start"
+          }
+        },
+        "required": ["event_type"]
+      },
+      "then": {
+        "required": ["phase_id", "phase_boundary_kind"],
+        "not": {
+          "anyOf": [
+            {"required": ["tool"]},
+            {"required": ["from"]},
+            {"required": ["to"]},
+            {"required": ["review_presentation"]}
+          ]
+        }
+      },
+      "else": {
+        "not": {
+          "required": ["phase_boundary_kind"]
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "review_status": {
+            "const": "confirmed"
+          }
+        },
+        "required": ["review_status"]
+      },
+      "then": {
+        "required": ["review"],
+        "properties": {
+          "label_origin": {
+            "enum": [
+              "human_video_review",
+              "assistant_video_adjudication"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "label_origin": {
+            "const": "temporal_grounding_model"
+          }
+        },
+        "required": ["label_origin"]
+      },
+      "then": {
+        "required": ["proposal"],
+        "properties": {
+          "review_status": {
+            "const": "proposed"
+          },
+          "proposal": {
+            "required": [
+              "generator",
+              "model_revision",
+              "raw_evidence_file"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "label_origin": {
+            "const": "assistant_visual_proposal"
+          }
+        },
+        "required": ["label_origin"]
+      },
+      "then": {
+        "required": ["ai_review"]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "label_origin": {
+            "const": "human_video_review"
+          }
+        },
+        "required": ["label_origin"]
+      },
+      "then": {
+        "required": ["review"],
+        "properties": {
+          "review": {
+            "properties": {
+              "reviewer_kind": {
+                "const": "human"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "label_origin": {
+            "const": "assistant_video_adjudication"
+          }
+        },
+        "required": ["label_origin"]
+      },
+      "then": {
+        "required": ["review"],
+        "properties": {
+          "review": {
+            "required": ["authorized_by"],
+            "properties": {
+              "reviewer_kind": {
+                "const": "ai_assistant"
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

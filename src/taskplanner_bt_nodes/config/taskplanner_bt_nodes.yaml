@@ -46,6 +46,18 @@ HasExplicitRequest:
   allow_unreachable: true
   logger_level: ""
   extra: ~
+HasImplicitRequest:
+  class_name: taskplanner_bt_nodes::HasImplicitRequest
+  description: Apply BT confidence, duration, pose, and tool-consistency policy to verified visual request evidence.
+  topic: ""
+  port_alias: {}
+  port_default: {}
+  hidden_ports: []
+  wait_timeout: 1
+  request_timeout: 2
+  allow_unreachable: true
+  logger_level: ""
+  extra: ~
 NeedsRecovery:
   class_name: taskplanner_bt_nodes::NeedsRecovery
   description: Return SUCCESS when the mirrored world state requests recovery.
@@ -85,6 +97,18 @@ CanHandover:
 SelectExplicitTool:
   class_name: taskplanner_bt_nodes::SelectExplicitTool
   description: Select the explicitly requested tool and mirror it to selected.tool.
+  topic: ""
+  port_alias: {}
+  port_default: {}
+  hidden_ports: []
+  wait_timeout: 1
+  request_timeout: 2
+  allow_unreachable: true
+  logger_level: ""
+  extra: ~
+SelectImplicitTool:
+  class_name: taskplanner_bt_nodes::SelectImplicitTool
+  description: Select an active tool instance after the BT accepts verified implicit-request evidence.
   topic: ""
   port_alias: {}
   port_default: {}

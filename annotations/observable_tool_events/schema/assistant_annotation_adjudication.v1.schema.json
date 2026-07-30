@@ -1,0 +1,112 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "taskplanner.assistant_annotation_adjudication.v1",
+  "title": "Authorized assistant correction of a reviewed timeline annotation",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "case_id",
+    "correction_id",
+    "annotation_id",
+    "supersedes_action_id",
+    "source_action_sha256",
+    "review_status",
+    "resulting_label_origin",
+    "adjudicated_fields",
+    "review"
+  ],
+  "properties": {
+    "schema": {
+      "const": "taskplanner.assistant_annotation_adjudication.v1"
+    },
+    "case_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]+$"
+    },
+    "correction_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]+-C[0-9]{4,}$"
+    },
+    "annotation_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]+-(?:R|T|PH)[0-9]{4,}$"
+    },
+    "supersedes_action_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "source_action_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "review_status": {
+      "enum": ["confirmed", "ambiguous", "rejected"]
+    },
+    "resulting_label_origin": {
+      "type": ["string", "null"],
+      "enum": ["assistant_video_adjudication", null]
+    },
+    "adjudicated_fields": {
+      "type": "object"
+    },
+    "review": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "reviewer_kind",
+        "reviewer_id",
+        "authorized_by",
+        "reviewed_at",
+        "notes"
+      ],
+      "properties": {
+        "reviewer_kind": {
+          "const": "ai_assistant"
+        },
+        "reviewer_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "authorized_by": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reviewed_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "notes": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "review_status": {
+            "const": "confirmed"
+          }
+        },
+        "required": ["review_status"]
+      },
+      "then": {
+        "properties": {
+          "resulting_label_origin": {
+            "const": "assistant_video_adjudication"
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "resulting_label_origin": {
+            "type": "null"
+          }
+        }
+      }
+    }
+  ]
+}

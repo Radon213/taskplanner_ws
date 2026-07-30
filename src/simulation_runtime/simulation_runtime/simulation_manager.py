@@ -17,6 +17,7 @@ from rclpy.node import Node
 from rclpy.parameter import Parameter
 from rclpy.parameter_client import AsyncParameterClient
 from std_msgs.msg import String
+from std_srvs.srv import Trigger
 from surgical_msgs.msg import SimulationState, SurgeonRequest
 from surgical_msgs.srv import ControlSimulation, InjectSurgeonOverride, SelectSimulationBundle
 
@@ -24,6 +25,14 @@ from surgical_msgs.srv import ControlSimulation, InjectSurgeonOverride, SelectSi
 RESOURCE_ID = "tree/taskplanner_bt_trees::surgical_assist_v1::TaskplannerAssistDemo"
 ENTRY_POINT = "TaskplannerAssistDemo"
 NODE_MANIFESTS = ["taskplanner_bt_nodes::taskplanner_bt_nodes"]
+RETRYABLE_START_ERROR_MARKERS = (
+    "/tree_executor/set_parameters",
+    "address already in use",
+    "previous one is still busy",
+    "currently executing",
+    "parameter is not allowed to change while tree executor is running",
+    "node_manifest_identities is empty",
+)
 ALLOWED_OVERRIDE_EVENTS = {"request_tool", "voice_request", "return_tool", "cancel_request"}
 TOOL_REQUIRED_OVERRIDE_EVENTS = {"request_tool", "voice_request", "return_tool"}
 
@@ -39,6 +48,12 @@ class SimulationManagerNode(Node):
         self.declare_parameter("groot2_port", 0)
         self.declare_parameter("surgeon_actor_mode", "llm")
         self.declare_parameter("manual_override_actor_mute_sec", 8.0)
+        self.declare_parameter("execution_backend", "mock")
+        self.declare_parameter("require_integration_preflight", False)
+        self.declare_parameter(
+            "integration_preflight_service",
+            "/integration/check_readiness",
+        )
 
         self._spec_root = Path(str(self.get_parameter("spec_root").value))
         self._active_bundle = str(self.get_parameter("default_bundle").value)
@@ -52,6 +67,12 @@ class SimulationManagerNode(Node):
         self._manual_override_actor_mute_sec = float(
             self.get_parameter("manual_override_actor_mute_sec").value
         )
+        self._execution_backend = str(
+            self.get_parameter("execution_backend").value
+        ).strip().lower()
+        self._require_integration_preflight = bool(
+            self.get_parameter("require_integration_preflight").value
+        )
         self._running = False
         self._execution_state = "idle"
         self._bundle_dirty = False
@@ -60,6 +81,7 @@ class SimulationManagerNode(Node):
         self._operation_lock = threading.Lock()
         self._completion_terminate_started = False
         self._latest_state: SimulationState | None = None
+        self._latest_state_generation = 0
         self._latest_state_lock = threading.Lock()
         self._callback_group = ReentrantCallbackGroup()
 
@@ -89,6 +111,11 @@ class SimulationManagerNode(Node):
             "/btops/get_runtime_state",
             callback_group=self._callback_group,
         )
+        self._integration_preflight_client = self.create_client(
+            Trigger,
+            str(self.get_parameter("integration_preflight_service").value),
+            callback_group=self._callback_group,
+        )
         self._parameter_clients = {
             "/mock_vlm_node": AsyncParameterClient(
                 self, "/mock_vlm_node", callback_group=self._callback_group
@@ -113,12 +140,15 @@ class SimulationManagerNode(Node):
                 "/bed_robot_arm_group_orchestrator",
                 callback_group=self._callback_group,
             ),
-            "/mock_bed_robot_arm_group_server": AsyncParameterClient(
+        }
+        if self._execution_backend == "mock":
+            self._parameter_clients[
+                "/mock_bed_robot_arm_group_server"
+            ] = AsyncParameterClient(
                 self,
                 "/mock_bed_robot_arm_group_server",
                 callback_group=self._callback_group,
-            ),
-        }
+            )
 
         self.create_service(
             SelectSimulationBundle,
@@ -184,6 +214,7 @@ class SimulationManagerNode(Node):
     def _on_simulation_state(self, msg: SimulationState) -> None:
         with self._latest_state_lock:
             self._latest_state = msg
+            self._latest_state_generation += 1
         if msg.execution_state == "completed":
             should_terminate = self._running or self._execution_state != "completed"
             self._running = False
@@ -215,12 +246,14 @@ class SimulationManagerNode(Node):
         description: str,
         *,
         warn: bool = True,
+        after_generation: int = -1,
     ) -> bool:
         deadline = time.time() + timeout_sec
         while time.time() < deadline:
             with self._latest_state_lock:
                 state = self._latest_state
-            if state is not None:
+                generation = self._latest_state_generation
+            if state is not None and generation > after_generation:
                 try:
                     if predicate(state):
                         return True
@@ -235,12 +268,6 @@ class SimulationManagerNode(Node):
         if self._operation_cancel.is_set():
             raise RuntimeError("operation interrupted by newer control command")
 
-    @staticmethod
-    def _state_stamp_key(state: SimulationState | None) -> tuple[int, int] | None:
-        if state is None:
-            return None
-        return (int(state.stamp.sec), int(state.stamp.nanosec))
-
     def _publish_control_until(self, command: str, predicate, timeout_sec: float, description: str) -> bool:
         deadline = time.time() + timeout_sec
         attempts = 3
@@ -248,34 +275,52 @@ class SimulationManagerNode(Node):
             if self._operation_cancel.is_set():
                 return False
             with self._latest_state_lock:
-                previous_stamp = self._state_stamp_key(self._latest_state)
+                previous_generation = self._latest_state_generation
             self._publish_control(command, repeat_count=2)
             remaining = deadline - time.time()
             if remaining <= 0:
                 break
             wait_slice = max(0.5, remaining / max(1, attempts - attempt))
             if self._wait_for_simulation_state(
-                lambda state: self._state_stamp_key(state) != previous_stamp and predicate(state),
+                predicate,
                 timeout_sec=min(wait_slice, remaining),
                 description=description,
                 warn=False,
+                after_generation=previous_generation,
             ):
                 return True
         self.get_logger().warn(f"Timed out waiting for {description}.")
         return False
 
-    @staticmethod
-    def _all_instruments_home(state: SimulationState) -> bool:
+    def _all_instruments_at_initial_layout(self, state: SimulationState) -> bool:
         if not state.instrument_states:
             return False
+        configured_states = {
+            str(initial_state.instance_id): initial_state
+            for initial_state in self._active_spec.get_initial_instrument_states()
+        }
+        observed_configured_instances: set[str] = set()
         for instrument in state.instrument_states:
+            instance_id = str(instrument.instance_id)
+            configured_state = configured_states.get(instance_id)
+            if configured_state is not None:
+                observed_configured_instances.add(instance_id)
+                if str(instrument.location_id) != str(configured_state.location_id):
+                    return False
+                if (
+                    configured_state.lifecycle_stage
+                    and str(instrument.lifecycle_stage)
+                    != str(configured_state.lifecycle_stage)
+                ):
+                    return False
+                continue
             home_location_id = str(instrument.home_location_id)
             home_location_type = str(instrument.home_location_type)
             if home_location_id and str(instrument.location_id) != home_location_id:
                 return False
             if home_location_type and str(instrument.location_type) != home_location_type:
                 return False
-        return True
+        return observed_configured_instances == set(configured_states)
 
     def _set_spec_dir_on_runtime(self, spec_dir: Path) -> None:
         optional_clients = {
@@ -338,12 +383,6 @@ class SimulationManagerNode(Node):
         if not self._start_client.wait_for_service(timeout_sec=5.0):
             return False, "btops start_behavior service is unavailable"
         last_message = "btops start_behavior returned no response"
-        retryable_markers = (
-            "/tree_executor/set_parameters",
-            "previous one is still busy",
-            "currently executing",
-            "parameter is not allowed to change while tree executor is running",
-        )
         for attempt in range(5):
             self._raise_if_operation_cancelled()
             self._wait_for_executor_idle(timeout_sec=3.0)
@@ -382,7 +421,15 @@ class SimulationManagerNode(Node):
                 return True, str(response.message)
             last_message = str(response.message)
             lowered_message = last_message.lower()
-            if any(marker in lowered_message for marker in retryable_markers):
+            if any(
+                marker in lowered_message
+                for marker in RETRYABLE_START_ERROR_MARKERS
+            ):
+                self.get_logger().warn(
+                    "retrying BT start after transient executor failure "
+                    f"(attempt={attempt + 1}, groot2_port={requested_groot2_port}): "
+                    f"{last_message}"
+                )
                 if self._wait_for_executor_running(timeout_sec=4.0):
                     return True, last_message
                 self._command_executor("terminate")
@@ -477,7 +524,7 @@ class SimulationManagerNode(Node):
                 (not bundle or state.active_bundle == bundle)
                 and (not state.running)
                 and state.execution_state == "idle"
-                and self._all_instruments_home(state)
+                and self._all_instruments_at_initial_layout(state)
             ),
             timeout_sec=8.0,
             description="idle digital twin frame after reset",
@@ -571,6 +618,7 @@ class SimulationManagerNode(Node):
         self._running = False
         self._execution_state = "starting"
         self._completion_terminate_started = False
+        self._check_integration_preflight()
         if prepare_executor:
             self._prepare_executor_for_restart()
         self._raise_if_operation_cancelled()
@@ -580,7 +628,7 @@ class SimulationManagerNode(Node):
                 state.active_bundle == self._active_bundle
                 and (not state.running)
                 and state.execution_state == "idle"
-                and self._all_instruments_home(state)
+                and self._all_instruments_at_initial_layout(state)
             ),
             timeout_sec=8.0,
             description="initial idle digital twin frame",
@@ -595,7 +643,7 @@ class SimulationManagerNode(Node):
                 and state.running
                 and state.execution_state == "running"
                 and state.filtered_phase == target_phase_id
-                and self._all_instruments_home(state)
+                and self._all_instruments_at_initial_layout(state)
             ),
             timeout_sec=8.0,
             description=f"initial home running digital twin frame at {target_phase_id}",
@@ -620,6 +668,20 @@ class SimulationManagerNode(Node):
         self._publish_control("stop")
         self._set_idle_state()
         raise RuntimeError(message or "failed to start simulation")
+
+    def _check_integration_preflight(self) -> None:
+        if not bool(getattr(self, "_require_integration_preflight", False)):
+            return
+        client = getattr(self, "_integration_preflight_client", None)
+        if client is None or not client.wait_for_service(timeout_sec=2.0):
+            raise RuntimeError("integration preflight service is unavailable")
+        response = self._wait_future(
+            client.call_async(Trigger.Request()),
+            timeout_sec=5.0,
+        )
+        if response is None or not bool(response.success):
+            detail = str(getattr(response, "message", "") or "readiness check failed")
+            raise RuntimeError(detail)
 
     def _commit_start_actors(self, start_phase_id: str = "") -> None:
         """Atomically commit the final start gate against stop/reset.
@@ -817,6 +879,17 @@ class SimulationManagerNode(Node):
                     response.running = self._running
                     response.execution_state = self._execution_state
                     return response
+            elif command == self._operation_name and command in {
+                "pause",
+                "resume",
+                "reset",
+                "stop",
+            }:
+                response.success = True
+                response.message = f"{command} already in progress"
+                response.running = self._running
+                response.execution_state = self._execution_state
+                return response
 
             if command == "start":
                 try:

@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "taskplanner.shadow_trace.v1",
+  "title": "Taskplanner shadow replay trace record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "run_id",
+    "sequence",
+    "mode",
+    "layer",
+    "topic",
+    "message_type",
+    "ros_time_sec",
+    "wall_time_sec",
+    "payload",
+    "payload_sha256"
+  ],
+  "properties": {
+    "schema": {
+      "const": "taskplanner.shadow_trace.v1"
+    },
+    "run_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "sequence": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "mode": {
+      "enum": [
+        "strict",
+        "reconciled",
+        "oracle"
+      ]
+    },
+    "layer": {
+      "enum": [
+        "input_image",
+        "input_transcript",
+        "runtime_control",
+        "runtime_state",
+        "vlm_request",
+        "vlm_health",
+        "vlm_raw",
+        "vlm_proposal",
+        "vlm_reducer_decision",
+        "reducer_event",
+        "reducer_fused",
+        "bt_decision",
+        "skill_command",
+        "skill_status",
+        "skill_event",
+        "shadow_sink",
+        "evaluation_observation"
+      ]
+    },
+    "topic": {
+      "type": "string",
+      "pattern": "^/"
+    },
+    "message_type": {
+      "type": "string",
+      "minLength": 1
+    },
+    "ros_time_sec": {
+      "type": "number",
+      "minimum": 0
+    },
+    "source_stamp_sec": {
+      "type": "number",
+      "minimum": 0
+    },
+    "wall_time_sec": {
+      "type": "number",
+      "minimum": 0
+    },
+    "correlation_id": {
+      "type": "string"
+    },
+    "payload": {
+      "type": "object"
+    },
+    "payload_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  }
+}

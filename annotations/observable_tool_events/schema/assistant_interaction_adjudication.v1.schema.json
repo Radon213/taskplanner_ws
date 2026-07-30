@@ -1,0 +1,348 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "taskplanner.assistant_interaction_adjudication.v1",
+  "title": "Authorized assistant-primary adjudication of an observable interaction",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "case_id",
+    "adjudication_id",
+    "review_status",
+    "adjudicated_fields",
+    "proposal_refs",
+    "evidence_refs",
+    "review"
+  ],
+  "properties": {
+    "schema": {
+      "const": "taskplanner.assistant_interaction_adjudication.v1"
+    },
+    "case_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]+$"
+    },
+    "adjudication_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]+-AJ[0-9]{4,}$"
+    },
+    "review_status": {
+      "enum": [
+        "confirmed",
+        "ambiguous",
+        "rejected"
+      ]
+    },
+    "adjudicated_fields": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/request_interval_fields"
+        },
+        {
+          "$ref": "#/$defs/tool_transfer_fields"
+        }
+      ]
+    },
+    "proposal_refs": {
+      "type": "array",
+      "description": "Zero or more model/search proposals. The array may be empty when exact-frame review discovers an event that the proposal model missed.",
+      "items": {
+        "$ref": "#/$defs/proposal_ref"
+      }
+    },
+    "evidence_refs": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/evidence_ref"
+      }
+    },
+    "review": {
+      "$ref": "#/$defs/assistant_review"
+    }
+  },
+  "$defs": {
+    "source_views": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "cam1",
+          "cam2",
+          "cam3",
+          "cam4",
+          "flir"
+        ]
+      }
+    },
+    "request_interval_fields": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "event_id",
+        "event_type",
+        "source_frame_idx",
+        "time_sec",
+        "start_source_frame_idx",
+        "end_source_frame_idx",
+        "start_sec",
+        "end_sec",
+        "source_views"
+      ],
+      "properties": {
+        "event_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]+-R[0-9]{4,}$"
+        },
+        "event_type": {
+          "const": "implicit_tool_request"
+        },
+        "source_frame_idx": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "time_sec": {
+          "type": "number",
+          "minimum": 0
+        },
+        "start_source_frame_idx": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "end_source_frame_idx": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "start_sec": {
+          "type": "number",
+          "minimum": 0
+        },
+        "end_sec": {
+          "type": "number",
+          "minimum": 0
+        },
+        "source_views": {
+          "$ref": "#/$defs/source_views"
+        }
+      }
+    },
+    "tool_transfer_fields": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "event_id",
+        "event_type",
+        "source_frame_idx",
+        "time_sec",
+        "source_views",
+        "tool",
+        "from",
+        "to"
+      ],
+      "properties": {
+        "event_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]+-T[0-9]{4,}$"
+        },
+        "event_type": {
+          "const": "tool_transfer"
+        },
+        "source_frame_idx": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "time_sec": {
+          "type": "number",
+          "minimum": 0
+        },
+        "source_views": {
+          "$ref": "#/$defs/source_views"
+        },
+        "tool": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]*$"
+        },
+        "from": {
+          "enum": [
+            "mayo_stand",
+            "scrub_nurse",
+            "surgeon"
+          ]
+        },
+        "to": {
+          "enum": [
+            "mayo_stand",
+            "scrub_nurse",
+            "surgeon"
+          ]
+        }
+      }
+    },
+    "proposal_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "generator",
+        "raw_evidence_file",
+        "raw_evidence_sha256"
+      ],
+      "properties": {
+        "generator": {
+          "type": "string",
+          "minLength": 1
+        },
+        "model_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "model_revision": {
+          "type": "string",
+          "minLength": 1
+        },
+        "raw_evidence_file": {
+          "type": "string",
+          "minLength": 1
+        },
+        "raw_evidence_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "anchor_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "query": {
+          "type": "string",
+          "minLength": 1
+        },
+        "candidate_start_sec": {
+          "type": "number",
+          "minimum": 0
+        },
+        "candidate_end_sec": {
+          "type": "number",
+          "minimum": 0
+        }
+      }
+    },
+    "evidence_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_kind",
+        "source_views",
+        "start_source_frame_idx",
+        "end_source_frame_idx",
+        "timeline_file",
+        "timeline_sha256",
+        "notes"
+      ],
+      "properties": {
+        "evidence_kind": {
+          "enum": [
+            "video_frames",
+            "video_and_voice"
+          ]
+        },
+        "source_views": {
+          "$ref": "#/$defs/source_views"
+        },
+        "start_source_frame_idx": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "end_source_frame_idx": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "timeline_file": {
+          "type": "string",
+          "minLength": 1
+        },
+        "timeline_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "voice_event_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "voice_file": {
+          "type": "string",
+          "minLength": 1
+        },
+        "voice_file_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "notes": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "evidence_kind": {
+                "const": "video_and_voice"
+              }
+            },
+            "required": [
+              "evidence_kind"
+            ]
+          },
+          "then": {
+            "required": [
+              "voice_event_ids",
+              "voice_file",
+              "voice_file_sha256"
+            ],
+            "properties": {
+              "voice_event_ids": {
+                "minItems": 1
+              }
+            }
+          }
+        }
+      ]
+    },
+    "assistant_review": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "reviewer_kind",
+        "reviewer_id",
+        "authorized_by",
+        "reviewed_at",
+        "notes"
+      ],
+      "properties": {
+        "reviewer_kind": {
+          "const": "ai_assistant"
+        },
+        "reviewer_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "authorized_by": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reviewed_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "notes": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  }
+}

@@ -25,10 +25,12 @@ auto_apms_behavior_tree_register_nodes(${PROJECT_NAME}
   taskplanner_bt_nodes::IsProcedureActive
   taskplanner_bt_nodes::IsPhaseCertain
   taskplanner_bt_nodes::HasExplicitRequest
+  taskplanner_bt_nodes::HasImplicitRequest
   taskplanner_bt_nodes::NeedsRecovery
   taskplanner_bt_nodes::IsToolAvailable
   taskplanner_bt_nodes::CanHandover
   taskplanner_bt_nodes::SelectExplicitTool
+  taskplanner_bt_nodes::SelectImplicitTool
   taskplanner_bt_nodes::SelectExpectedTool
   taskplanner_bt_nodes::SelectRecoveryTool
   taskplanner_bt_nodes::SetIdleDecision
@@ -46,5 +48,13 @@ install(TARGETS ${PROJECT_NAME}
 install(DIRECTORY config/
   DESTINATION share/${PROJECT_NAME}/config
 )
+
+if(BUILD_TESTING)
+  find_package(ament_cmake_pytest REQUIRED)
+  ament_add_pytest_test(
+    test_decision_boundary
+    test/test_decision_boundary.py
+  )
+endif()
 
 ament_package()
