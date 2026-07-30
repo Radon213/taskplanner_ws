@@ -202,6 +202,7 @@ services:
     volumes:
       - .:/workspaces/taskplanner_ws
       - ${SHADOW_DATASET_ROOT:-${HOME}/.local/share/taskplanner/datasets/shadow}:/datasets/shadow:ro
+      - ${TASKPLANNER_ANNOTATION_ROOT:-./annotations/observable_tool_events}:/datasets/annotations/observable_tool_events:ro
       - ${TASKPLANNER_RUN_ROOT:-${HOME}/.local/share/taskplanner/runs}:/taskplanner-runs
     environment:
       HOME: /tmp/taskplanner-shadow
@@ -263,6 +264,7 @@ services:
       exec ros2 launch bringup taskplanner_shadow.launch.py
       case_id:=$${SHADOW_CASE_ID}
       source_bag_path:=/datasets/shadow/$${SHADOW_CASE_ID}
+      annotation_cases_root:=/datasets/annotations/observable_tool_events/cases
       default_bundle:=$${SHADOW_BUNDLE_ID}
       interactive_replay:=true
       require_vlm:=$${SHADOW_REQUIRE_VLM}

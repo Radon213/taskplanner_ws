@@ -53,6 +53,11 @@ ${SHADOW_DATASET_ROOT}/
   0704_7/metadata.yaml
   ...
 
+${TASKPLANNER_ANNOTATION_ROOT}/
+  cases/0704_6/annotation_manifest.json
+  catalogs/
+  schema/
+
 ${RFDETR_MODEL_ROOT}/
   flir/checkpoint_best_total.pth
   cam4/checkpoint_best_total.pth
@@ -216,6 +221,15 @@ annotations, annotation reports, derived bags, and perception assets under
 LLM/VLM downloads, credentials, caches, and transient runtime traces remain
 external. The data companion is restricted clinical research data and must not
 be redistributed without explicit authorization.
+
+For the attached companion, set:
+
+```text
+SHADOW_DATASET_ROOT=<release>/data/shadow_dataset/bags
+TASKPLANNER_ANNOTATION_ROOT=<release>/data/annotations/observable_tool_events
+TASKPLANNER_ANNOTATION_CACHE=<release>/data/review_media
+RFDETR_MODEL_ROOT=<release>/data/perception/rfdetr/models
+```
 
 ## Diagnostics
 

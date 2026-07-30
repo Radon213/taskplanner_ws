@@ -92,17 +92,11 @@ review_case_ids=(
 )
 
 copy_tree \
-  "${ROOT_DIR}/annotations/clinical_video/cases" \
-  "${STAGING_DIR}/annotations/clinical_video/cases"
+  "${ROOT_DIR}/annotations/clinical_video" \
+  "${STAGING_DIR}/annotations/clinical_video"
 copy_tree \
-  "${ROOT_DIR}/annotations/observable_tool_events/cases" \
-  "${STAGING_DIR}/annotations/observable_tool_events/cases"
-copy_tree \
-  "${ROOT_DIR}/annotations/observable_tool_events/proposals" \
-  "${STAGING_DIR}/annotations/observable_tool_events/proposals"
-copy_tree \
-  "${ROOT_DIR}/annotations/observable_tool_events/reports" \
-  "${STAGING_DIR}/annotations/observable_tool_events/reports"
+  "${ROOT_DIR}/annotations/observable_tool_events" \
+  "${STAGING_DIR}/annotations/observable_tool_events"
 copy_tree "${ROOT_DIR}/reports" "${STAGING_DIR}/evaluation_reports"
 copy_tree "${ROOT_DIR}/annotated_bags" "${STAGING_DIR}/derived_bags"
 
@@ -211,6 +205,7 @@ For replay, set:
 
 ```text
 SHADOW_DATASET_ROOT=<release>/data/shadow_dataset/bags
+TASKPLANNER_ANNOTATION_ROOT=<release>/data/annotations/observable_tool_events
 TASKPLANNER_ANNOTATION_CACHE=<release>/data/review_media
 RFDETR_MODEL_ROOT=<release>/data/perception/rfdetr/models
 ```
