@@ -212,6 +212,7 @@ TASKPLANNER_PERCEPTION_ASSET_ROOT=/path/to/0704_RFDETR \
 TASKPLANNER_AUDIO_SOURCE_ROOT=/path/to/0704_audio \
 TASKPLANNER_KEYFRAME_ROOT=/path/to/0704_keyframes \
 TASKPLANNER_LEGACY_PERCEPTION_ROOT=/path/to/0704_YOLO \
+TASKPLANNER_LEGACY_DETECTION_ROOT=/path/to/0704_legacy_cam4_detection \
 scripts/package_replay_data.sh /path/to/taskplanner-backup/releases/<release>
 ```
 

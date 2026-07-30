@@ -21,6 +21,7 @@ Optional inputs:
   TASKPLANNER_AUDIO_SOURCE_ROOT
   TASKPLANNER_KEYFRAME_ROOT
   TASKPLANNER_LEGACY_PERCEPTION_ROOT
+  TASKPLANNER_LEGACY_DETECTION_ROOT
 
 The script also includes the repository-local case annotations, proposals,
 reports, and derived annotated bags. Model-provider downloads, credentials,
@@ -47,6 +48,7 @@ PERCEPTION_ASSET_ROOT="${TASKPLANNER_PERCEPTION_ASSET_ROOT:-}"
 AUDIO_SOURCE_ROOT="${TASKPLANNER_AUDIO_SOURCE_ROOT:-}"
 KEYFRAME_ROOT="${TASKPLANNER_KEYFRAME_ROOT:-}"
 LEGACY_PERCEPTION_ROOT="${TASKPLANNER_LEGACY_PERCEPTION_ROOT:-}"
+LEGACY_DETECTION_ROOT="${TASKPLANNER_LEGACY_DETECTION_ROOT:-}"
 
 require_directory() {
   local path="$1"
@@ -146,6 +148,13 @@ if [[ -n "${LEGACY_PERCEPTION_ROOT}" ]]; then
   copy_tree \
     "${LEGACY_PERCEPTION_ROOT}" \
     "${STAGING_DIR}/perception/legacy"
+fi
+if [[ -n "${LEGACY_DETECTION_ROOT}" ]]; then
+  require_directory "${LEGACY_DETECTION_ROOT}" \
+    "legacy CAM4 detection assets"
+  copy_tree \
+    "${LEGACY_DETECTION_ROOT}" \
+    "${STAGING_DIR}/perception/legacy_cam4_detection"
 fi
 
 TASKPLANNER_SHA="$(git -C "${ROOT_DIR}" rev-parse HEAD)"
