@@ -7,9 +7,9 @@ It never edits source annotations.
 ## Build
 
 ```bash
-cd /home/arl/Documents/ARPA-H/taskplanner_ws
+cd /path/to/taskplanner_ws
 python3 -m tools.vlm_finetuning.build_causal_sft_dataset \
-  --output-dir /home/arl/Documents/ARPA-H/taskplanner_ws/output/vlm_finetuning/qwen35_4b_causal_v1 \
+  --output-dir ./output/vlm_finetuning/qwen35_4b_causal_v1 \
   --seed 20260729 \
   --fold-count 4 \
   --held-out-fold 0

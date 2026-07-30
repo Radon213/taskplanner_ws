@@ -26,6 +26,7 @@ import bisect
 import hashlib
 import json
 import math
+import os
 import random
 import re
 import shutil
@@ -1946,7 +1947,13 @@ def build_folds_document(
 def _load_multiview_media(
     sources: CaseSources,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
-    cache_dir = Path("/home/arl/.cache/taskplanner_annotation") / sources.case_id
+    cache_root = Path(
+        os.environ.get(
+            "TASKPLANNER_ANNOTATION_CACHE",
+            str(Path.home() / ".cache/taskplanner_annotation"),
+        )
+    ).expanduser()
+    cache_dir = cache_root / sources.case_id
     manifest_path = cache_dir / "review_multiview.manifest.json"
     if not manifest_path.is_file():
         raise BuildError(

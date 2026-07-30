@@ -11,6 +11,7 @@ import argparse
 import importlib.metadata
 import json
 import math
+import os
 import platform
 import re
 import subprocess
@@ -22,7 +23,12 @@ from typing import Any, Sequence
 from .event_model import canonical_json, sha256_file
 
 
-DEFAULT_MAGE_REPO = Path("/home/arl/.cache/codex/mage")
+DEFAULT_MAGE_REPO = Path(
+    os.environ.get(
+        "MAGE_REPO",
+        str(Path.home() / ".cache/taskplanner/mage"),
+    )
+).expanduser()
 MAGE_CHECKPOINT = "microsoft/Mage-VL"
 
 _NUMBER = r"[+-]?(?:(?:\d+(?:\.\d*)?)|(?:\.\d+))(?:[eE][+-]?\d+)?"

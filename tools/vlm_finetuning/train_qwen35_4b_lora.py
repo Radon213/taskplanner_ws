@@ -22,9 +22,9 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-DEFAULT_MODEL = (
-    "/home/arl/.cache/huggingface/hub/models--unsloth--Qwen3.5-4B/"
-    "snapshots/3764fa359b9082ea5a1e4a5e3ac3aaf6e9671636"
+DEFAULT_MODEL = os.environ.get(
+    "TASKPLANNER_VLM_TRAINING_MODEL",
+    "unsloth/Qwen3.5-4B",
 )
 
 

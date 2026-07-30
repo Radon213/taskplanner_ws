@@ -25,8 +25,11 @@ from typing import Any
 
 
 DEFAULT_RFDETR_ROOT = Path(
-    "/mnt/arl/NAS관리/백업/업무/ARPA-H/SurgeryData/갑상샘/0704_RFDETR"
-)
+    os.environ.get(
+        "TASKPLANNER_RFDETR_ARTIFACT_ROOT",
+        str(Path(__file__).resolve().parents[2] / "external_data/rfdetr"),
+    )
+).expanduser()
 WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_TIMELINE_ROOT = (
     WORKSPACE_ROOT / "annotations/observable_tool_events/cases"

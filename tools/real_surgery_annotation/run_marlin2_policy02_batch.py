@@ -36,15 +36,25 @@ from tools.real_surgery_annotation.run_marlin2_proposals import (
 
 ANNOTATION_ROOT = WORKSPACE_ROOT / "annotations/observable_tool_events"
 DEFAULT_VIDEO_ROOT = Path(
-    "/mnt/arl/NAS관리/백업/업무/ARPA-H/SurgeryData/"
-    "갑상샘/0704_갑상선절제술_원본영상"
-)
+    os.environ.get(
+        "TASKPLANNER_SURGERY_VIDEO_ROOT",
+        str(WORKSPACE_ROOT / "external_data/surgery_videos"),
+    )
+).expanduser()
 DEFAULT_MODEL = Path(
-    "/home/arl/.cache/huggingface/hub/models--NemoStation--Marlin-2B/"
-    "snapshots/fd111fca4fc7897876fb0d7e9df22ca5ac8ab965"
-)
+    os.environ.get(
+        "MARLIN_MODEL_PATH",
+        str(
+            Path.home()
+            / ".cache/huggingface/hub/models--NemoStation--Marlin-2B/"
+            "snapshots/fd111fca4fc7897876fb0d7e9df22ca5ac8ab965"
+        ),
+    )
+).expanduser()
 DEFAULT_MODEL_REVISION = "fd111fca4fc7897876fb0d7e9df22ca5ac8ab965"
-DEFAULT_PYTHON = Path("/home/arl/.cache/codex/venvs/marlin-2b/bin/python")
+DEFAULT_PYTHON = Path(
+    os.environ.get("MARLIN_PYTHON", sys.executable)
+).expanduser()
 RUNNER = Path(__file__).resolve().with_name("run_marlin2_proposals.py")
 POLICY_VERSION = "policy02.v1"
 TARGET_CASE_IDS = tuple(f"0704_{index}" for index in range(7, 18))

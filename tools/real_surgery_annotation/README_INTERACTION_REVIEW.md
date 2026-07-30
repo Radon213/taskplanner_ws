@@ -33,7 +33,7 @@ python3 -B -m tools.real_surgery_annotation.interaction_review_gui \
   --case-id 0704_9 --case-id 0704_10 --case-id 0704_11 \
   --case-id 0704_12 --case-id 0704_13 --case-id 0704_14 \
   --case-id 0704_15 --case-id 0704_16 --case-id 0704_17 \
-  --review-media-root /home/arl/.cache/taskplanner_annotation \
+  --review-media-root "${TASKPLANNER_ANNOTATION_CACHE:-$HOME/.cache/taskplanner_annotation}" \
   --default-case 0704_17 \
   --default-review-mode final_dt \
   --host 127.0.0.1 \
@@ -60,7 +60,7 @@ python3 -m tools.real_surgery_annotation.interaction_review_gui \
   --candidates annotations/observable_tool_events/cases/0704_6/phase_candidates.ai_review.v1.jsonl \
   --decisions annotations/observable_tool_events/cases/0704_6/phase_human_review_decisions.v1.jsonl \
   --stream-kind phase \
-  --source-bag /mnt/arl/NAS관리/백업/업무/ARPA-H/SurgeryData/갑상샘/0704_멀티모달_ROS2_MCAP_v1.0.0/bags/0704_6 \
+  --source-bag /path/to/0704_멀티모달_ROS2_MCAP_v1.0.0/bags/0704_6 \
   --port 8879
 ```
 

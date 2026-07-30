@@ -813,8 +813,7 @@ def _parse_args() -> argparse.Namespace:
         default=Path(
             os.environ.get(
                 "RFDETR_FLIR_CHECKPOINT",
-                "/home/arl/Documents/ARPA-H/rfdetr_0704_20260729/"
-                "outputs/surg_full/checkpoint_best_total.pth",
+                "/models/rfdetr/flir/checkpoint_best_total.pth",
             )
         ),
     )
@@ -824,8 +823,7 @@ def _parse_args() -> argparse.Namespace:
         default=Path(
             os.environ.get(
                 "RFDETR_CAM4_CHECKPOINT",
-                "/home/arl/Documents/ARPA-H/rfdetr_0704_20260729/"
-                "outputs/mayo_full/checkpoint_best_total.pth",
+                "/models/rfdetr/cam4/checkpoint_best_total.pth",
             )
         ),
     )

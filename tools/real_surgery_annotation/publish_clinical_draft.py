@@ -28,6 +28,12 @@ CLINICAL_MANIFEST_NAME = "clinical_manifest.v2.json"
 CLINICAL_ACTIONS_NAME = "clinical_review_actions.v2.jsonl"
 CLINICAL_REFERENCE_NAME = "clinical_reference.final.v2.jsonl"
 RFDETR_AUTHORITY = "ai_inference_reference_not_ground_truth"
+DEFAULT_REVIEW_MEDIA_ROOT = Path(
+    os.environ.get(
+        "TASKPLANNER_ANNOTATION_CACHE",
+        str(Path.home() / ".cache/taskplanner_annotation"),
+    )
+).expanduser()
 
 
 class ClinicalDraftPublishError(ValueError):
@@ -125,9 +131,7 @@ def build_manifest(
     case_id: str,
     generated_at: str,
     model: str = "Codex 5.6 sol",
-    review_media_root: Path = Path(
-        "/home/arl/.cache/taskplanner_annotation"
-    ),
+    review_media_root: Path = DEFAULT_REVIEW_MEDIA_ROOT,
 ) -> dict[str, Any]:
     """Derive a clinical manifest from current canonical case descriptors."""
 
@@ -391,9 +395,7 @@ def publish_case(
     case_id: str,
     generated_at: str,
     model: str = "Codex 5.6 sol",
-    review_media_root: Path = Path(
-        "/home/arl/.cache/taskplanner_annotation"
-    ),
+    review_media_root: Path = DEFAULT_REVIEW_MEDIA_ROOT,
 ) -> dict[str, Any]:
     """Create a manifest once, then load all candidates fail-closed."""
 
@@ -480,7 +482,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--review-media-root",
         type=Path,
-        default=Path("/home/arl/.cache/taskplanner_annotation"),
+        default=DEFAULT_REVIEW_MEDIA_ROOT,
     )
     parser.add_argument(
         "--generated-at",

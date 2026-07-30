@@ -575,7 +575,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument(
         "--report-dir",
-        default="/home/arl/taskplanner_ws/reports",
+        default=str(Path.cwd() / "reports"),
         help="Directory where JSON audit reports should be written.",
     )
     parser.add_argument("--vlm-mode", default="mock", choices=["mock", "real", "dual"])

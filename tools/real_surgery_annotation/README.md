@@ -42,7 +42,7 @@ python3 -m tools.real_surgery_annotation.validate_annotations \
 
 source /opt/ros/jazzy/setup.bash
 python3 -m tools.real_surgery_annotation.inject_annotations \
-  --source-bag /mnt/arl/NAS관리/백업/업무/ARPA-H/SurgeryData/갑상샘/0704_멀티모달_ROS2_MCAP_v1.0.0/bags/0704_5 \
+  --source-bag /path/to/0704_멀티모달_ROS2_MCAP_v1.0.0/bags/0704_5 \
   --case-dir annotations/observable_tool_events/cases/0704_5 \
   --schema annotations/observable_tool_events/schema/observable_tool_event.v1.schema.json \
   --tools annotations/observable_tool_events/catalogs/tools.yaml \
@@ -100,7 +100,7 @@ time and cannot be published as ground truth.
 python3 -m tools.real_surgery_annotation.run_mage_vl_streaming \
   --video /path/to/proxy.mp4 \
   --case 0704_5 \
-  --mage-repo /home/arl/.cache/codex/mage \
+  --mage-repo "${MAGE_REPO:-$HOME/.cache/taskplanner/mage}" \
   --threshold 0.5 \
   --segment-sec 8 \
   --max-segments 4 \
