@@ -201,14 +201,15 @@ SHA-256 checksums. External datasets, annotations, model weights, caches, and
 runtime traces are deliberately excluded.
 
 For an authorized internal release that must reproduce Shadow Replay and its
-evaluation, attach the restricted data companion after creating the source
-package:
+evaluation, attach a validated restricted-data asset map after creating the
+source package:
 
 ```bash
 TASKPLANNER_SOURCE_MEDIA_ROOT=/path/to/0704_original_media \
 TASKPLANNER_SHADOW_PACKAGE_ROOT=/path/to/0704_rosbag2 \
 TASKPLANNER_REVIEW_MEDIA_ROOT=/path/to/review_media \
 TASKPLANNER_PERCEPTION_ASSET_ROOT=/path/to/0704_RFDETR \
+TASKPLANNER_DERIVED_BAGS_ROOT=/path/to/derived_annotated_bags \
 TASKPLANNER_AUDIO_SOURCE_ROOT=/path/to/0704_audio \
 TASKPLANNER_KEYFRAME_ROOT=/path/to/0704_keyframes \
 TASKPLANNER_LEGACY_PERCEPTION_ROOT=/path/to/0704_YOLO \
@@ -216,21 +217,35 @@ TASKPLANNER_LEGACY_DETECTION_ROOT=/path/to/0704_legacy_cam4_detection \
 scripts/package_replay_data.sh /path/to/taskplanner-backup/releases/<release>
 ```
 
-This adds original media, replay bags, synchronized review proxies, canonical
-annotations, annotation reports, derived bags, and perception assets under
-`data/`, with an independent `DATA_CHECKSUMS.sha256`. Provider-managed
-LLM/VLM downloads, credentials, caches, and transient runtime traces remain
-external. The data companion is restricted clinical research data and must not
-be redistributed without explicit authorization.
+The default `reference` mode writes `data/DATA_PACKAGE.json` and validates all
+required case media without duplicating large files. It records both absolute
+paths and paths relative to the release, so assets already stored beside the
+release on the same NAS remain a single source of truth. This avoids filling a
+local rclone VFS cache during NAS-to-NAS copies.
 
-For the attached companion, set:
+Provider-managed LLM/VLM downloads, credentials, caches, and transient runtime
+traces remain external. The mapped assets are restricted clinical research
+data and must not be redistributed without explicit authorization.
+
+Configure runtime paths from the generated asset map:
 
 ```text
-SHADOW_DATASET_ROOT=<release>/data/shadow_dataset/bags
-TASKPLANNER_ANNOTATION_ROOT=<release>/data/annotations/observable_tool_events
-TASKPLANNER_ANNOTATION_CACHE=<release>/data/review_media
-RFDETR_MODEL_ROOT=<release>/data/perception/rfdetr/models
+SHADOW_DATASET_ROOT=<shadow_dataset path>/bags
+TASKPLANNER_ANNOTATION_ROOT=<release>/source/taskplanner_ws/annotations/observable_tool_events
+TASKPLANNER_ANNOTATION_CACHE=<review_media path>
+RFDETR_MODEL_ROOT=<rfdetr_assets path>/models
 ```
+
+Physical materialization is an explicit exceptional operation:
+
+```bash
+TASKPLANNER_DATA_MODE=copy \
+TASKPLANNER_ALLOW_FULL_COPY=true \
+scripts/package_replay_data.sh /local-or-direct-remote/release
+```
+
+The script refuses copy mode on a FUSE/rclone destination by default. Use a
+direct remote transfer or a NAS-side copy job instead of overriding that guard.
 
 ## Diagnostics
 

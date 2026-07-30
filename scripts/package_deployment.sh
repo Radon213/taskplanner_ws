@@ -18,8 +18,8 @@ Creates a versioned, checksummed deployment source package containing:
 
 Datasets, annotations, model weights, caches, and runtime output are external
 assets and are intentionally not included by this source-packaging step.
-Use `scripts/package_replay_data.sh` to attach an authorized, checksummed
-replay/evaluation data companion to the resulting release.
+Use `scripts/package_replay_data.sh` to attach an authorized, validated
+single-source replay/evaluation asset map to the resulting release.
 EOF
 }
 
@@ -261,8 +261,9 @@ Start with \`docs/DEPLOYMENT.md\`. Copy
 Video datasets, annotations, model weights, caches, and runtime traces are not
 included by the source-packaging step. Their required locations are documented
 in the deployment guide and \`manifests/EXTERNAL_ASSETS.example.json\`.
-An authorized replay/evaluation data companion can be attached with
-\`scripts/package_replay_data.sh\`.
+An authorized replay/evaluation asset map can be attached with
+\`scripts/package_replay_data.sh\`. The default mode references canonical
+storage and does not duplicate large media through a VFS mount.
 
 The expanded \`source/\` tree materializes repository symlinks for NAS/FUSE
 compatibility. The exact Git object and file-mode representation is preserved

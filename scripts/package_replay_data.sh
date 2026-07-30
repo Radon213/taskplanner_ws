@@ -7,17 +7,27 @@ RELEASE_DIR="${1:-}"
 usage() {
   cat <<'EOF'
 Usage:
+  # Safe default: record validated references without duplicating NAS data.
   TASKPLANNER_SOURCE_MEDIA_ROOT=/path/to/0704_original_media \
   TASKPLANNER_SHADOW_PACKAGE_ROOT=/path/to/0704_rosbag2 \
   TASKPLANNER_REVIEW_MEDIA_ROOT=/path/to/review_media \
   TASKPLANNER_PERCEPTION_ASSET_ROOT=/path/to/0704_RFDETR \
   scripts/package_replay_data.sh <deployment-release-dir>
 
-Attaches a checksummed replay/evaluation data package to an existing
-Taskplanner deployment release. Required inputs are the original media,
-multimodal rosbag package, synchronized review media, and RF-DETR assets.
+Attaches a validated replay/evaluation asset map to an existing Taskplanner
+deployment release. Large assets remain in their canonical storage locations
+and are referenced by absolute and release-relative paths.
+
+To create a physically materialized copy, set both:
+  TASKPLANNER_DATA_MODE=copy
+  TASKPLANNER_ALLOW_FULL_COPY=true
+
+Copy mode is rejected on rclone/FUSE destinations unless
+TASKPLANNER_ALLOW_VFS_COPY=true is also set. Use direct rclone transfer instead
+of a VFS mount for large remote packages.
 
 Optional inputs:
+  TASKPLANNER_DERIVED_BAGS_ROOT
   TASKPLANNER_AUDIO_SOURCE_ROOT
   TASKPLANNER_KEYFRAME_ROOT
   TASKPLANNER_LEGACY_PERCEPTION_ROOT
@@ -49,6 +59,8 @@ AUDIO_SOURCE_ROOT="${TASKPLANNER_AUDIO_SOURCE_ROOT:-}"
 KEYFRAME_ROOT="${TASKPLANNER_KEYFRAME_ROOT:-}"
 LEGACY_PERCEPTION_ROOT="${TASKPLANNER_LEGACY_PERCEPTION_ROOT:-}"
 LEGACY_DETECTION_ROOT="${TASKPLANNER_LEGACY_DETECTION_ROOT:-}"
+DERIVED_BAGS_ROOT="${TASKPLANNER_DERIVED_BAGS_ROOT:-${ROOT_DIR}/annotated_bags}"
+DATA_MODE="${TASKPLANNER_DATA_MODE:-reference}"
 
 require_directory() {
   local path="$1"
@@ -67,7 +79,7 @@ require_directory "${ROOT_DIR}/annotations/clinical_video/cases" \
   "clinical annotations"
 require_directory "${ROOT_DIR}/annotations/observable_tool_events/cases" \
   "observable annotations"
-require_directory "${ROOT_DIR}/annotated_bags" "derived annotated bags"
+require_directory "${DERIVED_BAGS_ROOT}" "derived annotated bags"
 
 FINAL_DATA_DIR="${RELEASE_DIR}/data"
 STAGING_DIR="${RELEASE_DIR}/.data-staging"
@@ -75,13 +87,104 @@ STAGING_DIR="${RELEASE_DIR}/.data-staging"
   printf 'error: data package already exists: %s\n' "${FINAL_DATA_DIR}" >&2
   exit 2
 }
+
+if [[ "${DATA_MODE}" == "reference" ]]; then
+  asset_args=(--derived-bags "${DERIVED_BAGS_ROOT}")
+  if [[ -n "${AUDIO_SOURCE_ROOT}" ]]; then
+    require_directory "${AUDIO_SOURCE_ROOT}" "source audio"
+    asset_args+=(--audio "${AUDIO_SOURCE_ROOT}")
+  fi
+  if [[ -n "${KEYFRAME_ROOT}" ]]; then
+    require_directory "${KEYFRAME_ROOT}" "keyframes"
+    asset_args+=(--keyframes "${KEYFRAME_ROOT}")
+  fi
+  if [[ -n "${LEGACY_PERCEPTION_ROOT}" ]]; then
+    require_directory "${LEGACY_PERCEPTION_ROOT}" "legacy perception assets"
+    asset_args+=(--legacy-perception "${LEGACY_PERCEPTION_ROOT}")
+  fi
+  if [[ -n "${LEGACY_DETECTION_ROOT}" ]]; then
+    require_directory "${LEGACY_DETECTION_ROOT}" \
+      "legacy CAM4 detection assets"
+    asset_args+=(--legacy-detection "${LEGACY_DETECTION_ROOT}")
+  fi
+
+  TASKPLANNER_SHA="$(
+    python3 - "${RELEASE_DIR}/manifests/SOURCE_VERSIONS.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+print(payload["repositories"]["taskplanner_ws"]["commit"])
+PY
+  )"
+  python3 "${ROOT_DIR}/scripts/create_replay_asset_map.py" \
+    "${RELEASE_DIR}" \
+    --taskplanner-commit "${TASKPLANNER_SHA}" \
+    --original-media "${SOURCE_MEDIA_ROOT}" \
+    --shadow-dataset "${SHADOW_PACKAGE_ROOT}" \
+    --review-media "${REVIEW_MEDIA_ROOT}" \
+    --rfdetr "${PERCEPTION_ASSET_ROOT}" \
+    --annotations "${RELEASE_DIR}/source/taskplanner_ws/annotations" \
+    --reports "${RELEASE_DIR}/source/taskplanner_ws/reports" \
+    "${asset_args[@]}"
+
+  cat >> "${RELEASE_DIR}/README.md" <<'EOF'
+
+## Replay and evaluation data map
+
+The `data/` directory contains a validated single-source asset map. Large
+clinical media are not duplicated; see `data/DATA_PACKAGE.json` for canonical
+absolute and release-relative paths.
+EOF
+
+  (
+    cd "${RELEASE_DIR}"
+    find . -type f ! -name CHECKSUMS.sha256 -print0 \
+      | sort -z \
+      | xargs -0 sha256sum > CHECKSUMS.sha256
+  )
+
+  DEST_ROOT="$(dirname "$(dirname "${RELEASE_DIR}")")"
+  if [[ -f "${DEST_ROOT}/LATEST.txt" ]] && \
+    [[ "$(cat "${DEST_ROOT}/LATEST.txt")" == "releases/$(basename "${RELEASE_DIR}")" ]]; then
+    cp "${RELEASE_DIR}/README.md" "${DEST_ROOT}/README.md"
+  fi
+
+  printf 'replay asset map: %s\n' "${FINAL_DATA_DIR}"
+  exit 0
+fi
+
+if [[ "${DATA_MODE}" != "copy" ]]; then
+  printf 'error: unsupported TASKPLANNER_DATA_MODE=%s\n' "${DATA_MODE}" >&2
+  exit 2
+fi
+if [[ "${TASKPLANNER_ALLOW_FULL_COPY:-false}" != "true" ]]; then
+  printf '%s\n' \
+    'error: copy mode requires TASKPLANNER_ALLOW_FULL_COPY=true' >&2
+  exit 2
+fi
+
+TARGET_FSTYPE="$(
+  findmnt -n -o FSTYPE --target "${RELEASE_DIR}" 2>/dev/null || true
+)"
+if [[ "${TARGET_FSTYPE}" == fuse.* ]] && \
+  [[ "${TASKPLANNER_ALLOW_VFS_COPY:-false}" != "true" ]]; then
+  printf '%s\n' \
+    "error: refusing full copy through ${TARGET_FSTYPE}; use reference mode or direct rclone transfer" >&2
+  exit 2
+fi
+
 mkdir -p "${STAGING_DIR}"
 
 copy_tree() {
   local source="$1"
   local destination="$2"
   mkdir -p "${destination}"
-  rsync -aL --partial --inplace --human-readable \
+  # rclone VFS mounts can reject post-upload chmod/mtime updates. Package
+  # integrity is enforced with SHA-256, so copy bytes recursively and resume
+  # completed files by size without relying on remote filesystem metadata.
+  rsync -rL --size-only --partial --inplace --human-readable \
     "${source}/" "${destination}/"
 }
 
@@ -101,7 +204,7 @@ copy_tree \
   "${ROOT_DIR}/annotations/observable_tool_events" \
   "${STAGING_DIR}/annotations/observable_tool_events"
 copy_tree "${ROOT_DIR}/reports" "${STAGING_DIR}/evaluation_reports"
-copy_tree "${ROOT_DIR}/annotated_bags" "${STAGING_DIR}/derived_bags"
+copy_tree "${DERIVED_BAGS_ROOT}" "${STAGING_DIR}/derived_bags"
 
 for case_id in "${case_ids[@]}"; do
   require_directory "${SOURCE_MEDIA_ROOT}/${case_id}" \
