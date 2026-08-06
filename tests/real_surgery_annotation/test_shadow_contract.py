@@ -34,6 +34,21 @@ class ShadowContractTest(unittest.TestCase):
     def test_trace_contract_includes_fault_injection_observability(self) -> None:
         self.assertIn("fault_injection_status", TRACE_LAYERS)
 
+    def test_trace_contract_includes_bt_context_ingress(self) -> None:
+        record = TraceRecord(
+            run_id="run-1",
+            sequence=0,
+            mode="strict",
+            layer="bt_context_ingress",
+            topic="/bt/context_ingress",
+            message_type="surgical_msgs/msg/WorldState",
+            ros_time_sec=1.0,
+            wall_time_sec=100.0,
+            payload={"surgeon_request_generation": 3},
+        ).as_dict()
+
+        self.assertEqual([], validate_trace_records([record]))
+
     def test_fault_injection_status_is_topic_and_schema_bound(self) -> None:
         record = TraceRecord(
             run_id="run-1",

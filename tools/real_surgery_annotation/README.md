@@ -150,6 +150,21 @@ still suppressing duplicate ticks from one request. A missing per-instance
 inventory may be reconciled only in shadow mode, is marked
 `additional_instance_assumed`, and is counted in the report.
 
+The BT bridge republishes each WorldState after it has queued the matching
+blackboard update on the internal `/bt/context_ingress` topic. Shadow traces use
+that boundary to keep three latency meanings separate:
+
+- `DT fact -> BT context ingress` measures reducer-to-BT transport and callback
+  latency. This is the software latency gate.
+- `DT fact -> first BT decision publication` includes time until the active tree
+  can publish a decision, including a currently running skill branch.
+- `DT fact -> BT action acceptance` additionally includes policy, availability,
+  and fail-closed safety waiting before a handover action is admitted.
+
+Explicit request links require the same `request_generation`; visual implicit
+request links require the same public request source and tool. Tool name and a
+broad time window alone are not sufficient correlation evidence.
+
 ### Deterministic fixture
 
 Generate the fixture once, run it twice in isolated ROS domains, then compare

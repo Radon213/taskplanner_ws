@@ -3467,13 +3467,10 @@ def _runtime_tool_matches(
     return False
 
 
-def _reducer_request_fact_signatures(
-    record: dict[str, Any],
+def _world_request_fact_signatures(
+    payload: dict[str, Any],
     identity_map: dict[str, str],
 ) -> set[tuple[str, str, int]]:
-    if record.get("layer") != "reducer_fused":
-        return set()
-    payload = _payload(record)
     signatures: set[tuple[str, str, int]] = set()
 
     explicit_tool = normalize_tool_id(
@@ -3516,6 +3513,15 @@ def _reducer_request_fact_signatures(
             )
         )
     return signatures
+
+
+def _reducer_request_fact_signatures(
+    record: dict[str, Any],
+    identity_map: dict[str, str],
+) -> set[tuple[str, str, int]]:
+    if record.get("layer") != "reducer_fused":
+        return set()
+    return _world_request_fact_signatures(_payload(record), identity_map)
 
 
 def _request_pipeline_activations(
@@ -3562,6 +3568,31 @@ def _request_pipeline_activations(
             )
         active_fact_signatures = signatures
 
+    bt_ingress_episodes: list[dict[str, Any]] = []
+    for record in ordered_records:
+        if record.get("layer") != "bt_context_ingress":
+            continue
+        for source, tool_id, generation in sorted(
+            _world_request_fact_signatures(
+                _payload(record),
+                identity_map,
+            )
+        ):
+            bt_ingress_episodes.append(
+                {
+                    "record_id": (
+                        "bt-ingress:"
+                        + str(record.get("sequence", len(bt_ingress_episodes)))
+                        + f":{source}:{generation}"
+                    ),
+                    "source": source,
+                    "tool_id": tool_id,
+                    "generation": generation,
+                    "source_time_sec": _trace_time(record),
+                    "wall_time_sec": _wall_time(record),
+                }
+            )
+
     bt_episodes: list[dict[str, Any]] = []
     for record in ordered_records:
         if record.get("layer") != "bt_decision":
@@ -3569,13 +3600,17 @@ def _request_pipeline_activations(
         payload = _payload(record)
         action = _clean(payload.get("action")).lower()
         decision = _clean(payload.get("decision")).lower()
-        if (
-            action not in HANDOVER_ACTIONS - PREPARATION_ACTIONS
-            or (
-                decision not in {"explicit_request", "implicit_request"}
-                and int(payload.get("request_generation", 0) or 0) <= 0
+        request_generation = int(
+            payload.get("request_generation", 0) or 0
+        )
+        is_acceptance = (
+            action in HANDOVER_ACTIONS - PREPARATION_ACTIONS
+            and (
+                decision in {"explicit_request", "implicit_request"}
+                or request_generation > 0
             )
-        ):
+        )
+        if request_generation <= 0 and decision != "implicit_request":
             continue
         bt_episodes.append(
             {
@@ -3584,6 +3619,10 @@ def _request_pipeline_activations(
                     + str(record.get("sequence", len(bt_episodes)))
                 ),
                 "source": decision or "request_backed",
+                "decision": decision,
+                "action": action,
+                "generation": request_generation,
+                "is_acceptance": is_acceptance,
                 "tool_id": normalize_tool_id(
                     payload.get("selected_tool")
                     or payload.get("instrument_id"),
@@ -3596,7 +3635,9 @@ def _request_pipeline_activations(
 
     results: dict[str, dict[str, dict[str, Any] | None]] = {}
     used_fact_ids: set[str] = set()
-    used_bt_ids: set[str] = set()
+    used_bt_ingress_ids: set[str] = set()
+    used_bt_evaluation_ids: set[str] = set()
+    used_bt_acceptance_ids: set[str] = set()
     for index, pair in enumerate(requested_pairs):
         event_id = _clean(pair.get("request_event_id"))
         if not event_id:
@@ -3635,24 +3676,91 @@ def _request_pipeline_activations(
         if fact is not None:
             used_fact_ids.add(fact["record_id"])
 
+        def bt_matches_fact(row: dict[str, Any]) -> bool:
+            if fact is None:
+                return False
+            if row["source_time_sec"] < fact["source_time_sec"]:
+                return False
+            if fact["source"] == "explicit_request":
+                generation = int(fact.get("generation", 0) or 0)
+                if generation > 0:
+                    return row["generation"] == generation
+                return (
+                    row["source"] == "explicit_request"
+                    and _runtime_tool_matches(
+                        row["tool_id"],
+                        fact["tool_id"],
+                        identity_map,
+                    )
+                )
+            return (
+                row["source"] == "implicit_request"
+                and _runtime_tool_matches(
+                    row["tool_id"],
+                    fact["tool_id"],
+                    identity_map,
+                )
+            )
+
+        def ingress_matches_fact(row: dict[str, Any]) -> bool:
+            if fact is None:
+                return False
+            if row["source_time_sec"] < fact["source_time_sec"]:
+                return False
+            if row["source"] != fact["source"]:
+                return False
+            if not _runtime_tool_matches(
+                row["tool_id"],
+                fact["tool_id"],
+                identity_map,
+            ):
+                return False
+            generation = int(fact.get("generation", 0) or 0)
+            return generation <= 0 or row["generation"] == generation
+
+        bt_ingress = next(
+            (
+                row
+                for row in bt_ingress_episodes
+                if row["record_id"] not in used_bt_ingress_ids
+                and row["source_time_sec"] < next_request_time
+                and ingress_matches_fact(row)
+            ),
+            None,
+        )
+        if bt_ingress is not None:
+            used_bt_ingress_ids.add(bt_ingress["record_id"])
+
+        bt_evaluation = next(
+            (
+                row
+                for row in bt_episodes
+                if row["record_id"] not in used_bt_evaluation_ids
+                and row["source_time_sec"] < next_request_time
+                and bt_matches_fact(row)
+            ),
+            None,
+        )
+        if bt_evaluation is not None:
+            used_bt_evaluation_ids.add(bt_evaluation["record_id"])
+
         bt_acceptance = next(
             (
                 row
                 for row in bt_episodes
-                if row["record_id"] not in used_bt_ids
-                and earliest <= row["source_time_sec"] < next_request_time
-                and _runtime_tool_matches(
-                    row["tool_id"],
-                    pair["tool_id"],
-                    identity_map,
-                )
+                if row["record_id"] not in used_bt_acceptance_ids
+                and row["is_acceptance"]
+                and row["source_time_sec"] < next_request_time
+                and bt_matches_fact(row)
             ),
             None,
         )
         if bt_acceptance is not None:
-            used_bt_ids.add(bt_acceptance["record_id"])
+            used_bt_acceptance_ids.add(bt_acceptance["record_id"])
         results[event_id] = {
             "dt_request_fact": fact,
+            "bt_context_ingress": bt_ingress,
+            "bt_request_evaluation": bt_evaluation,
             "bt_request_acceptance": bt_acceptance,
         }
     return results
@@ -4477,6 +4585,8 @@ def _evaluate_behavior_quality(
             {},
         )
         dt_fact = pipeline.get("dt_request_fact")
+        bt_ingress = pipeline.get("bt_context_ingress")
+        bt_evaluation = pipeline.get("bt_request_evaluation")
         bt_acceptance = pipeline.get("bt_request_acceptance")
         dt_fact_time = (
             float(dt_fact["source_time_sec"])
@@ -4486,6 +4596,26 @@ def _evaluate_behavior_quality(
         dt_fact_wall_time = (
             dt_fact.get("wall_time_sec")
             if isinstance(dt_fact, dict)
+            else None
+        )
+        bt_ingress_time = (
+            float(bt_ingress["source_time_sec"])
+            if isinstance(bt_ingress, dict)
+            else None
+        )
+        bt_ingress_wall_time = (
+            bt_ingress.get("wall_time_sec")
+            if isinstance(bt_ingress, dict)
+            else None
+        )
+        bt_evaluation_time = (
+            float(bt_evaluation["source_time_sec"])
+            if isinstance(bt_evaluation, dict)
+            else None
+        )
+        bt_evaluation_wall_time = (
+            bt_evaluation.get("wall_time_sec")
+            if isinstance(bt_evaluation, dict)
             else None
         )
         bt_acceptance_time = (
@@ -4565,6 +4695,46 @@ def _evaluate_behavior_quality(
                     max(0.0, gt_to_dt_wall_offset)
                     if gt_to_dt_wall_offset is not None
                     else None
+                ),
+                "bt_context_ingress_time_sec": bt_ingress_time,
+                "bt_context_ingress_wall_time_sec": bt_ingress_wall_time,
+                "dt_request_fact_to_bt_ingress_latency_sec": (
+                    _non_negative_elapsed(
+                        start_sec=dt_fact_time,
+                        end_sec=bt_ingress_time,
+                    )
+                ),
+                "dt_request_fact_to_bt_ingress_wall_clock_latency_sec": (
+                    _non_negative_elapsed(
+                        start_sec=dt_fact_wall_time,
+                        end_sec=bt_ingress_wall_time,
+                    )
+                ),
+                "bt_request_evaluation_source": (
+                    bt_evaluation.get("source")
+                    if isinstance(bt_evaluation, dict)
+                    else None
+                ),
+                "bt_request_evaluation_decision": (
+                    bt_evaluation.get("decision")
+                    if isinstance(bt_evaluation, dict)
+                    else None
+                ),
+                "bt_request_evaluation_time_sec": bt_evaluation_time,
+                "bt_request_evaluation_wall_time_sec": (
+                    bt_evaluation_wall_time
+                ),
+                "dt_request_fact_to_bt_evaluation_latency_sec": (
+                    _non_negative_elapsed(
+                        start_sec=dt_fact_time,
+                        end_sec=bt_evaluation_time,
+                    )
+                ),
+                "dt_request_fact_to_bt_evaluation_wall_clock_latency_sec": (
+                    _non_negative_elapsed(
+                        start_sec=dt_fact_wall_time,
+                        end_sec=bt_evaluation_wall_time,
+                    )
                 ),
                 "bt_request_acceptance_source": (
                     bt_acceptance.get("source")
@@ -4649,6 +4819,40 @@ def _evaluate_behavior_quality(
                 for row in request_rows
                 if row[
                     "dt_request_fact_to_bt_acceptance_wall_clock_latency_sec"
+                ]
+                is not None
+            )
+        ),
+        "dt_request_fact_to_bt_ingress_latency_sec": _distribution(
+            row["dt_request_fact_to_bt_ingress_latency_sec"]
+            for row in request_rows
+            if row["dt_request_fact_to_bt_ingress_latency_sec"]
+            is not None
+        ),
+        "dt_request_fact_to_bt_ingress_wall_clock_latency_sec": (
+            _distribution(
+                row["dt_request_fact_to_bt_ingress_wall_clock_latency_sec"]
+                for row in request_rows
+                if row[
+                    "dt_request_fact_to_bt_ingress_wall_clock_latency_sec"
+                ]
+                is not None
+            )
+        ),
+        "dt_request_fact_to_bt_evaluation_latency_sec": _distribution(
+            row["dt_request_fact_to_bt_evaluation_latency_sec"]
+            for row in request_rows
+            if row["dt_request_fact_to_bt_evaluation_latency_sec"]
+            is not None
+        ),
+        "dt_request_fact_to_bt_evaluation_wall_clock_latency_sec": (
+            _distribution(
+                row[
+                    "dt_request_fact_to_bt_evaluation_wall_clock_latency_sec"
+                ]
+                for row in request_rows
+                if row[
+                    "dt_request_fact_to_bt_evaluation_wall_clock_latency_sec"
                 ]
                 is not None
             )
@@ -6198,6 +6402,18 @@ def write_scorecard_csv(report: dict[str, Any], path: Path) -> None:
                         "source_seconds",
                     ),
                     (
+                        "dt_request_fact_to_bt_ingress_latency",
+                        "bt_decision",
+                        "dt_request_fact_to_bt_ingress_latency_sec",
+                        "source_seconds",
+                    ),
+                    (
+                        "dt_request_fact_to_bt_evaluation_latency",
+                        "bt_decision",
+                        "dt_request_fact_to_bt_evaluation_latency_sec",
+                        "source_seconds",
+                    ),
+                    (
                         "dt_request_fact_to_bt_acceptance_latency",
                         "bt_decision",
                         "dt_request_fact_to_bt_acceptance_latency_sec",
@@ -6214,6 +6430,24 @@ def write_scorecard_csv(report: dict[str, Any], path: Path) -> None:
                         "reducer_fused",
                         (
                             "ground_truth_to_dt_request_fact_"
+                            "wall_clock_latency_sec"
+                        ),
+                        "wall_clock_seconds",
+                    ),
+                    (
+                        "dt_request_fact_to_bt_ingress_wall_clock_latency",
+                        "bt_decision",
+                        (
+                            "dt_request_fact_to_bt_ingress_"
+                            "wall_clock_latency_sec"
+                        ),
+                        "wall_clock_seconds",
+                    ),
+                    (
+                        "dt_request_fact_to_bt_evaluation_wall_clock_latency",
+                        "bt_decision",
+                        (
+                            "dt_request_fact_to_bt_evaluation_"
                             "wall_clock_latency_sec"
                         ),
                         "wall_clock_seconds",

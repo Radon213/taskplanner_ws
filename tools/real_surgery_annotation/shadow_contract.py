@@ -53,6 +53,7 @@ TRACE_LAYERS = {
     "vlm_reducer_decision",
     "reducer_event",
     "reducer_fused",
+    "bt_context_ingress",
     "bt_decision",
     "skill_command",
     "skill_status",
@@ -69,11 +70,13 @@ TRACE_LAYER_TOPIC_CONTRACTS = {
     "evaluation_ground_truth": {"/shadow/ground_truth/state"},
     "fault_injection_status": {"/test/fault/status"},
     "vlm_tool_observation": {"/vlm/tool_observations"},
+    "bt_context_ingress": {"/bt/context_ingress"},
 }
 TRACE_LAYER_MESSAGE_TYPE_CONTRACTS = {
     "evaluation_ground_truth": {"std_msgs/msg/String"},
     "fault_injection_status": {"std_msgs/msg/String"},
     "vlm_tool_observation": {"surgical_msgs/msg/ToolObservation"},
+    "bt_context_ingress": {"surgical_msgs/msg/WorldState"},
 }
 
 

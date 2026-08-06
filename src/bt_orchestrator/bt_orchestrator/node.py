@@ -90,6 +90,11 @@ class DecisionBridgeNode(Node):
         target_node_name = self.declare_parameter("target_node_name", "/tree_executor").value
         mirror_period_sec = float(self.declare_parameter("mirror_period_sec", 0.2).value)
         self._summary_pub = self.create_publisher(String, "/bt/decision_summary", 10)
+        self._context_ingress_pub = self.create_publisher(
+            WorldState,
+            "/bt/context_ingress",
+            20,
+        )
         self._latest_world: WorldState | None = None
         self._last_summary_by_channel: dict[str, str] = {}
         self._seen_tool_ids: set[str] = set()
@@ -177,6 +182,7 @@ class DecisionBridgeNode(Node):
             force_keys.update(mirrored)
         self._seen_tool_ids.update(active_tool_ids)
         self._mirror.queue_many(mirrored, force_keys=force_keys)
+        self._context_ingress_pub.publish(msg)
         suggestion = select_expected_tool(msg)
         self._publish_summary(
             "world",

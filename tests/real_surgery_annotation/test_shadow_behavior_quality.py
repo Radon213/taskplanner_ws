@@ -382,6 +382,30 @@ class ShadowBehaviorQualityTest(unittest.TestCase):
                 wall_time_sec=102.0,
             ),
             self._record(
+                "bt_context_ingress",
+                10.21,
+                {
+                    "explicit_request_tool": "tool_alpha",
+                    "surgeon_request_tool": "tool_alpha",
+                    "surgeon_request_generation": 1,
+                },
+                2,
+                wall_time_sec=102.1,
+            ),
+            self._record(
+                "bt_decision",
+                10.25,
+                {
+                    "decision": "hold",
+                    "action": "",
+                    "selected_tool": "",
+                    "request_generation": 1,
+                    "blocking_guard": "pending_transition",
+                },
+                3,
+                wall_time_sec=103.0,
+            ),
+            self._record(
                 "bt_decision",
                 10.3,
                 {
@@ -390,11 +414,11 @@ class ShadowBehaviorQualityTest(unittest.TestCase):
                     "selected_tool": "tool_alpha",
                     "request_generation": 1,
                 },
-                2,
+                4,
                 wall_time_sec=104.0,
             ),
             *self._completed_command(
-                sequence=3,
+                sequence=5,
                 command_id="handover-a",
                 action="pick_up_and_handover",
                 tool_id="tool_alpha",
@@ -447,6 +471,30 @@ class ShadowBehaviorQualityTest(unittest.TestCase):
             ]["mean"],
         )
         self.assertEqual(
+            0.01,
+            pipeline[
+                "dt_request_fact_to_bt_ingress_latency_sec"
+            ]["mean"],
+        )
+        self.assertEqual(
+            0.1,
+            pipeline[
+                "dt_request_fact_to_bt_ingress_wall_clock_latency_sec"
+            ]["mean"],
+        )
+        self.assertEqual(
+            0.05,
+            pipeline[
+                "dt_request_fact_to_bt_evaluation_latency_sec"
+            ]["mean"],
+        )
+        self.assertEqual(
+            1.0,
+            pipeline[
+                "dt_request_fact_to_bt_evaluation_wall_clock_latency_sec"
+            ]["mean"],
+        )
+        self.assertEqual(
             0.1,
             pipeline[
                 "dt_request_fact_to_bt_acceptance_latency_sec"
@@ -474,6 +522,107 @@ class ShadowBehaviorQualityTest(unittest.TestCase):
         self.assertEqual(
             "explicit_request",
             episode["bt_request_acceptance_source"],
+        )
+        self.assertEqual("hold", episode["bt_request_evaluation_decision"])
+
+    def test_pipeline_links_bt_by_request_generation(self) -> None:
+        trace = [
+            self._active_request_record(
+                sequence=0,
+                event_id="request-a",
+                source_time_sec=10.0,
+                wall_time_sec=100.0,
+            ),
+            self._record(
+                "reducer_fused",
+                10.2,
+                {
+                    "explicit_request_tool": "tool_alpha",
+                    "surgeon_request_generation": 7,
+                },
+                1,
+                wall_time_sec=102.0,
+            ),
+            self._record(
+                "bt_context_ingress",
+                10.21,
+                {
+                    "explicit_request_tool": "tool_alpha",
+                    "surgeon_request_generation": 7,
+                },
+                2,
+                wall_time_sec=102.1,
+            ),
+            self._record(
+                "bt_decision",
+                10.25,
+                {
+                    "decision": "explicit_request",
+                    "action": "direct_handover",
+                    "selected_tool": "tool_alpha",
+                    "request_generation": 8,
+                },
+                3,
+                wall_time_sec=102.5,
+            ),
+            self._record(
+                "bt_decision",
+                10.3,
+                {
+                    "decision": "hold",
+                    "action": "",
+                    "selected_tool": "",
+                    "request_generation": 7,
+                },
+                4,
+                wall_time_sec=103.0,
+            ),
+            self._record(
+                "bt_decision",
+                10.4,
+                {
+                    "decision": "explicit_request",
+                    "action": "direct_handover",
+                    "selected_tool": "tool_alpha",
+                    "request_generation": 7,
+                },
+                5,
+                wall_time_sec=104.0,
+            ),
+            *self._completed_command(
+                sequence=6,
+                command_id="handover-a",
+                action="direct_handover",
+                tool_id="tool_alpha",
+                command_time_sec=10.4,
+                completion_time_sec=10.6,
+                command_wall_time_sec=104.0,
+                completion_wall_time_sec=105.0,
+                event_type="ToolHandoverCompleted",
+            ),
+        ]
+        report = evaluate_shadow(
+            ground_truth=[
+                self._request("request-a", 10.0),
+                self._handover("handover-a", 11.0, "tool_alpha"),
+            ],
+            decisions=trace,
+            lead_window_sec=10.0,
+        )
+        episode = report["behavior_quality"]["request_to_handover"][
+            "episodes"
+        ][0]
+
+        self.assertEqual(10.3, episode["bt_request_evaluation_time_sec"])
+        self.assertEqual(10.4, episode["bt_request_acceptance_time_sec"])
+        self.assertEqual(10.21, episode["bt_context_ingress_time_sec"])
+        self.assertEqual(
+            0.1,
+            episode["dt_request_fact_to_bt_evaluation_latency_sec"],
+        )
+        self.assertEqual(
+            0.2,
+            episode["dt_request_fact_to_bt_acceptance_latency_sec"],
         )
 
     def test_pipeline_latency_preserves_early_visual_fact_as_zero_delay(

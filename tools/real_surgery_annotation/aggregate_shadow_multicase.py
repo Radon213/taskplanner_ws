@@ -93,6 +93,10 @@ def _percent(value: float | None) -> str:
     return "N/A" if value is None else f"{100.0 * value:.1f}%"
 
 
+def _seconds(value: float | None) -> str:
+    return "N/A" if value is None else f"{value:.3f}s"
+
+
 def _ratio(correct: int | None, total: int | None) -> str:
     if correct is None or total is None or total <= 0:
         return "N/A"
@@ -221,6 +225,12 @@ def validate_cases(cases: list[CaseRun], expected_case_ids: list[str]) -> dict[s
         for key, value in first_runtime["code_artifacts"].items()
     }
     expected_commit = first_runtime["git"]["commit"]
+    expected_replay_mode = first_runtime.get("replay_mode", "unknown")
+    expected_replay_rate = float(first_runtime.get("rate", 1.0) or 1.0)
+    expected_fault_injection = first_runtime.get(
+        "fault_injection",
+        {"enabled": False, "scenario": None},
+    )
     for case in cases:
         runtime = case.manifest["runtime"]
         if case.manifest.get("status") != "complete":
@@ -249,6 +259,12 @@ def validate_cases(cases: list[CaseRun], expected_case_ids: list[str]) -> dict[s
             errors.append(f"{case.case_id}: code artifact hashes differ")
         if runtime["git"]["commit"] != expected_commit:
             errors.append(f"{case.case_id}: git commit differs")
+        if runtime.get("replay_mode", "unknown") != expected_replay_mode:
+            errors.append(f"{case.case_id}: replay mode differs")
+        if float(runtime.get("rate", 1.0) or 1.0) != expected_replay_rate:
+            errors.append(f"{case.case_id}: replay rate differs")
+        if runtime.get("fault_injection") != expected_fault_injection:
+            errors.append(f"{case.case_id}: fault-injection setup differs")
 
     return {
         "ok": not errors,
@@ -258,6 +274,11 @@ def validate_cases(cases: list[CaseRun], expected_case_ids: list[str]) -> dict[s
         "model": expected_vlm,
         "git_commit": expected_commit,
         "code_artifacts": expected_hashes,
+        "replay": {
+            "mode": expected_replay_mode,
+            "rate": expected_replay_rate,
+        },
+        "fault_injection": expected_fault_injection,
     }
 
 
@@ -370,6 +391,9 @@ def _behavior_latencies(cases: list[CaseRun]) -> dict[str, dict[str, Any]]:
         "latency_sec",
         "wall_clock_latency_sec",
         "ground_truth_to_dt_request_fact_latency_sec",
+        "dt_request_fact_to_bt_ingress_latency_sec",
+        "dt_request_fact_to_bt_ingress_wall_clock_latency_sec",
+        "dt_request_fact_to_bt_evaluation_latency_sec",
         "dt_request_fact_to_bt_acceptance_latency_sec",
         "bt_acceptance_to_handover_wall_clock_latency_sec",
     )
@@ -631,6 +655,24 @@ def _report(
         else f"`{first_case}`부터 `{last_case}`까지"
     )
     complete_ratio = f"{case_count}/{case_count}"
+    replay = validation["replay"]
+    fault_injection = validation["fault_injection"]
+    if fault_injection.get("enabled"):
+        scenario = fault_injection.get("scenario") or {}
+        fault_description = (
+            f"enabled (`{Path(str(scenario.get('path', 'unknown'))).name}`, "
+            f"SHA-256 `{scenario.get('sha256', 'unknown')}`)"
+        )
+    else:
+        fault_description = "disabled"
+    bt_ingress_wall_p95 = behavior_latency[
+        "dt_request_fact_to_bt_ingress_wall_clock_latency_sec"
+    ]["p95"]
+    bt_ingress_gate = (
+        "PASS"
+        if bt_ingress_wall_p95 is not None and bt_ingress_wall_p95 <= 0.250
+        else "FAIL"
+    )
 
     return f"""# Taskplanner {case_count}-case Shadow Replay 성능 보고서
 
@@ -650,7 +692,7 @@ def _report(
 
 - Procedure bundle: `thyroidectomy_demo`
 - Mode: `strict`, ground-truth label은 런타임 입력에 노출하지 않고 오프라인 평가에서만 사용
-- Replay: `elastic_demo`, 1.0x source rate, VLM backpressure와 counterfactual skill completion 반영
+- Replay: `{replay['mode']}`, {replay['rate']:.1f}x source rate; fault injection {fault_description}
 - VLM 입력 주기: 1.0s, max output 320 tokens, thinking/reasoning `none`
 - Object perception: RF-DETR FLIR segmentation + CAM4 detection service 사용
 - Git commit: `{validation['git_commit']}`; dirty 작업 트리는 각 핵심 코드 파일 SHA-256을 고정해 동일성을 검증
@@ -720,7 +762,10 @@ def _report(
 - Request→handover source-clock latency: n={behavior_latency['latency_sec']['count']}, median={behavior_latency['latency_sec']['median']:.3f}s, p95={behavior_latency['latency_sec']['p95']:.3f}s
 - Request→handover wall-clock latency: n={behavior_latency['wall_clock_latency_sec']['count']}, median={behavior_latency['wall_clock_latency_sec']['median']:.3f}s, p95={behavior_latency['wall_clock_latency_sec']['p95']:.3f}s
 - GT request→DT fact source latency: median={behavior_latency['ground_truth_to_dt_request_fact_latency_sec']['median']:.3f}s
-- DT fact→BT acceptance source latency: median={behavior_latency['dt_request_fact_to_bt_acceptance_latency_sec']['median']:.3f}s
+- DT fact→BT context ingress wall latency: median/p95={_seconds(behavior_latency['dt_request_fact_to_bt_ingress_wall_clock_latency_sec']['median'])}/{_seconds(bt_ingress_wall_p95)}
+- DT→BT ingress p95 ≤ 0.250s software gate: **{bt_ingress_gate}**
+- DT fact→BT first decision publication source latency: median/p95={_seconds(behavior_latency['dt_request_fact_to_bt_evaluation_latency_sec']['median'])}/{_seconds(behavior_latency['dt_request_fact_to_bt_evaluation_latency_sec']['p95'])}
+- DT fact→BT action acceptance source latency: median/p95={_seconds(behavior_latency['dt_request_fact_to_bt_acceptance_latency_sec']['median'])}/{_seconds(behavior_latency['dt_request_fact_to_bt_acceptance_latency_sec']['p95'])} (정책·가용성 대기 포함)
 - BT acceptance→handover wall latency: median={behavior_latency['bt_acceptance_to_handover_wall_clock_latency_sec']['median']:.3f}s
 
 ![Latency by case](latency_by_case.png)

@@ -240,6 +240,30 @@ def render_markdown(
                         "dt_request_fact_to_bt_acceptance_latency_sec"
                     )
                 )
+                + " s (includes policy and availability waiting)",
+                "- DT request fact -> BT context ingress, source clock "
+                "(median / p95 / max): "
+                + _latency_distribution(
+                    pipeline_latency.get(
+                        "dt_request_fact_to_bt_ingress_latency_sec"
+                    )
+                )
+                + " s",
+                "- DT request fact -> BT context ingress, wall clock "
+                "(median / p95 / max): "
+                + _latency_distribution(
+                    pipeline_latency.get(
+                        "dt_request_fact_to_bt_ingress_wall_clock_latency_sec"
+                    )
+                )
+                + " s",
+                "- DT request fact -> BT first evaluation, source clock "
+                "(median / p95 / max): "
+                + _latency_distribution(
+                    pipeline_latency.get(
+                        "dt_request_fact_to_bt_evaluation_latency_sec"
+                    )
+                )
                 + " s",
                 "- BT acceptance -> handover, wall clock "
                 "(median / p95 / max): "

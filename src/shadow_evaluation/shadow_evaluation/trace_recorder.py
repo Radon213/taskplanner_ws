@@ -352,6 +352,12 @@ class ShadowTraceRecorderNode(Node):
             "surgical_msgs/msg/WorldState",
         )
         self._subscribe(
+            WorldState,
+            "/bt/context_ingress",
+            "bt_context_ingress",
+            "surgical_msgs/msg/WorldState",
+        )
+        self._subscribe(
             BTDecision,
             "/bt/decision",
             "bt_decision",
