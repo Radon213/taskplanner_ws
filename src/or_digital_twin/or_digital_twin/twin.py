@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict, deque
 from dataclasses import asdict
+from difflib import SequenceMatcher
 from typing import Any
 import json
 import math
@@ -221,6 +222,60 @@ _NON_HANDOVER_TOOL_ACTION_PATTERN = re.compile(
     r"(?:닦|세척|소독|정리|치워|버려|제거|회수|빼|멈춰|정지|꺼)",
     re.IGNORECASE,
 )
+_ASR_REQUEST_STOP_TOKENS = frozenset(
+    {
+        "a",
+        "an",
+        "another",
+        "can",
+        "get",
+        "give",
+        "hand",
+        "have",
+        "i",
+        "me",
+        "more",
+        "need",
+        "one",
+        "pass",
+        "please",
+        "the",
+        "want",
+        "건네",
+        "달라",
+        "부탁",
+        "주세요",
+        "줘",
+    }
+)
+_ASR_GENERIC_TOOL_TOKENS = frozenset(
+    {
+        "blade",
+        "cautery",
+        "clamp",
+        "device",
+        "dissector",
+        "forceps",
+        "hemostat",
+        "holder",
+        "instrument",
+        "needle",
+        "retractor",
+        "scalpel",
+        "scissors",
+        "shear",
+        "suction",
+        "tool",
+        "가위",
+        "겸자",
+        "기구",
+        "리트랙터",
+        "메스",
+        "석션",
+        "전기소작기",
+        "포셉",
+    }
+)
 
 
 def _lexical_tokens(raw_text: str) -> list[str]:
@@ -240,6 +295,120 @@ def _has_handover_request_marker(raw_text: str) -> bool:
 
 def _has_non_handover_tool_action(raw_text: str) -> bool:
     return bool(_NON_HANDOVER_TOOL_ACTION_PATTERN.search(str(raw_text or "")))
+
+
+def _latin_soundex(raw_text: str) -> str:
+    letters = re.sub(r"[^a-z]", "", str(raw_text or "").lower())
+    if not letters:
+        return ""
+    codes = {
+        **dict.fromkeys("bfpv", "1"),
+        **dict.fromkeys("cgjkqsxz", "2"),
+        **dict.fromkeys("dt", "3"),
+        "l": "4",
+        **dict.fromkeys("mn", "5"),
+        "r": "6",
+    }
+    result = letters[0].upper()
+    previous = codes.get(letters[0], "")
+    for letter in letters[1:]:
+        code = codes.get(letter, "")
+        if code and code != previous:
+            result += code
+            if len(result) == 4:
+                break
+        previous = code
+    return result.ljust(4, "0")
+
+
+def _asr_name_match_score(left: str, right: str) -> float:
+    if not left or not right or min(len(left), len(right)) < 4:
+        return 0.0
+    ratio = SequenceMatcher(None, left, right).ratio()
+    if ratio >= 0.78:
+        return ratio
+    left_soundex = _latin_soundex(left)
+    right_soundex = _latin_soundex(right)
+    if left_soundex and left_soundex == right_soundex and ratio >= 0.60:
+        return ratio
+    return 0.0
+
+
+def _resolve_asr_fuzzy_request_tool(
+    spec: ProcedureSpec,
+    raw_text: str,
+) -> str:
+    """Resolve one unambiguous spoken tool name inside an explicit request."""
+
+    if (
+        not _has_handover_request_marker(raw_text)
+        or _has_non_handover_tool_action(raw_text)
+        or _has_procedure_reference(spec, raw_text)
+    ):
+        return ""
+    text_tokens = _lexical_tokens(raw_text)
+    spoken_classes = set(text_tokens) & _ASR_GENERIC_TOOL_TOKENS
+    distinctive = [
+        token
+        for token in text_tokens
+        if token not in _ASR_REQUEST_STOP_TOKENS
+        and token not in _ASR_GENERIC_TOOL_TOKENS
+    ]
+    spoken_names = {
+        "".join(distinctive[start : start + width])
+        for width in (1, 2)
+        for start in range(0, len(distinctive) - width + 1)
+    }
+    if not spoken_names:
+        return ""
+
+    scores: dict[str, float] = {}
+    for instrument in spec.bundle.instruments:
+        best = 0.0
+        for alias in {
+            instrument.display_name,
+            instrument.display_name_ko,
+            *instrument.aliases,
+        }:
+            alias_tokens = _lexical_tokens(alias)
+            alias_classes = set(alias_tokens) & _ASR_GENERIC_TOOL_TOKENS
+            if spoken_classes and not (spoken_classes & alias_classes):
+                continue
+            alias_name = "".join(
+                token
+                for token in alias_tokens
+                if token not in _ASR_GENERIC_TOOL_TOKENS
+            )
+            for spoken_name in spoken_names:
+                best = max(
+                    best,
+                    _asr_name_match_score(spoken_name, alias_name),
+                )
+        if best:
+            scores[instrument.id] = best
+
+    ranked = sorted(scores.items(), key=lambda item: (-item[1], item[0]))
+    if not ranked:
+        return ""
+    if len(ranked) > 1 and ranked[0][1] - ranked[1][1] < 0.08:
+        return ""
+    return ranked[0][0]
+
+
+def _resolve_request_tool_with_asr_fallback(
+    spec: ProcedureSpec,
+    raw_text: str,
+    *,
+    reject_procedure_modifiers: bool = False,
+) -> str:
+    resolved = _resolve_request_tool(
+        spec,
+        raw_text,
+        reject_procedure_modifiers=reject_procedure_modifiers,
+    )
+    if resolved:
+        return resolved
+    return _resolve_asr_fuzzy_request_tool(spec, raw_text)
 
 
 def _resolve_compound_handover_tool(
@@ -3872,7 +4041,7 @@ class ORDigitalTwin:
             # a terse instrument request. Only the text outside the procedure
             # clause can name the requested tool.
             suffix = text[control_match.end() :].strip()
-            resolved = _resolve_request_tool(
+            resolved = _resolve_request_tool_with_asr_fallback(
                 self.spec,
                 suffix,
                 reject_procedure_modifiers=True,
@@ -3889,7 +4058,7 @@ class ORDigitalTwin:
                 )
             return ""
 
-        resolved = _resolve_request_tool(self.spec, text)
+        resolved = _resolve_request_tool_with_asr_fallback(self.spec, text)
         if not resolved:
             return ""
         if _has_non_handover_tool_action(text):

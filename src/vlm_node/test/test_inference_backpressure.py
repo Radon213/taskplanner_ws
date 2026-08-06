@@ -17,6 +17,8 @@ from vlm_node.real_vlm import (
     InferenceBackpressure,
     ModelImage,
     RealVLMNode,
+    actor_log_request_context,
+    compact_prompt_json,
     model_input_signature,
 )
 
@@ -439,11 +441,20 @@ def test_failed_live_tick_records_health_but_publishes_no_stale_result() -> None
     failure = node._inference_failures[0]
     assert failure.trigger == INFERENCE_TRIGGER_PERIODIC_LIVE
     assert failure.mode == "last_good"
+    static_prompt_chars = len(node._system_prompt) + len(
+        node._developer_instruction
+    )
+    request_context_json = compact_prompt_json(
+        actor_log_request_context(
+            {},
+            static_prompt_chars=static_prompt_chars,
+        )
+    )
     assert health_calls == [
         {
             "image_source": "flir_rfdetr_segmented",
             "latency_sec": 0.25,
-            "prompt_chars": len("system") + len("developer") + len("{}"),
+            "prompt_chars": static_prompt_chars + len(request_context_json),
             "output_chars": len(node._last_good_raw),
             "parse_retry_count": 2,
             "last_error": "provider timeout",

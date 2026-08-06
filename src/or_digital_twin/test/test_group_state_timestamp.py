@@ -494,6 +494,39 @@ def test_voice_transcript_resolves_short_distinctive_tool_names():
     assert twin.update_explicit_request("bipolar") == "T07"
 
 
+@pytest.mark.parametrize(
+    ("text", "expected_tool"),
+    [
+        ("Adsen forceps please", "T02"),
+        ("alice forceps please", "T03"),
+        ("add some forceps please", "T02"),
+        ("procedure start; Alice forceps please", "T03"),
+    ],
+)
+def test_explicit_voice_request_tolerates_unambiguous_asr_name_errors(
+    text: str,
+    expected_tool: str,
+):
+    twin = ORDigitalTwin(_thyroid_demo_spec())
+
+    assert twin.resolve_explicit_voice_tool_request(text) == expected_tool
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "some forceps please",
+        "please start thyroid surgery",
+    ],
+)
+def test_asr_fallback_does_not_guess_ambiguous_or_procedure_requests(text: str):
+    twin = ORDigitalTwin(_thyroid_demo_spec())
+
+    assert twin.resolve_explicit_voice_tool_request(text) == ""
+    assert twin.update_explicit_request(text) == ""
+    assert twin.state.surgeon_request_tool == ""
+
+
 def test_voice_correction_prefers_the_last_named_tool():
     twin = ORDigitalTwin(_thyroid_spec())
 

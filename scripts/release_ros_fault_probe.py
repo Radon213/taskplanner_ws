@@ -393,6 +393,27 @@ def _states(history: list[dict[str, Any]]) -> set[str]:
     return {str(row["state"]).upper() for row in history}
 
 
+def _wait_for_speech_relay_path(
+    node: ReleaseProbeNode,
+    *,
+    timeout_sec: float = 5.0,
+) -> None:
+    """Wait until both sides of the one-shot sentence relay are discovered."""
+
+    deadline = time.monotonic() + max(0.1, float(timeout_sec))
+    while time.monotonic() < deadline:
+        raw_relay_ready = node.raw_sentence_pub.get_subscription_count() > 0
+        public_adapter_ready = bool(
+            node.get_subscriptions_info_by_topic("/sensors/surgeon/sentence")
+        )
+        if raw_relay_ready and public_adapter_ready:
+            return
+        time.sleep(0.05)
+    raise RuntimeError(
+        "speech fault relay did not discover both raw input and public adapter"
+    )
+
+
 def _assertions(
     node: ReleaseProbeNode,
     action_rows: list[dict[str, Any]],
@@ -727,30 +748,28 @@ def main() -> int:
                     environment=environment,
                     logs_dir=logs_dir,
                 ),
+                _launch(
+                    "fault_injector",
+                    [
+                        "ros2",
+                        "run",
+                        "simulation_runtime",
+                        "fault_injector",
+                        "--ros-args",
+                        "-p",
+                        "enabled:=true",
+                        "-p",
+                        f"scenario_path:={SCENARIO}",
+                    ],
+                    environment=environment,
+                    logs_dir=logs_dir,
+                ),
             ]
         )
-        time.sleep(1.0)
+        _wait_for_speech_relay_path(node)
         node.publish_control("start_runtime:P03")
         time.sleep(0.3)
         injector_started = time.monotonic()
-        children.append(
-            _launch(
-                "fault_injector",
-                [
-                    "ros2",
-                    "run",
-                    "simulation_runtime",
-                    "fault_injector",
-                    "--ros-args",
-                    "-p",
-                    "enabled:=true",
-                    "-p",
-                    f"scenario_path:={SCENARIO}",
-                ],
-                environment=environment,
-                logs_dir=logs_dir,
-            )
-        )
 
         while time.monotonic() - injector_started < args.duration_sec:
             fault_elapsed = time.monotonic() - injector_started
