@@ -2751,6 +2751,83 @@ button {
   gap: 8px;
 }
 
+.source-health-row {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.source-health-item {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: baseline;
+  gap: 2px 6px;
+  padding: 7px 8px;
+  border: 1px solid rgba(143, 164, 191, 0.2);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.035);
+}
+
+.source-health-item span,
+.source-health-item strong,
+.source-health-item small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.source-health-item span {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.source-health-item strong {
+  color: #9fb4cb;
+  font-size: 11px;
+}
+
+.source-health-item small {
+  grid-column: 1 / -1;
+  color: var(--muted);
+  font-size: 9px;
+}
+
+.source-health-item.state-ready {
+  border-color: rgba(72, 193, 150, 0.34);
+}
+
+.source-health-item.state-ready strong {
+  color: #70d8b4;
+}
+
+.source-health-item.state-recovering,
+.source-health-item.state-stale {
+  border-color: rgba(230, 174, 73, 0.4);
+}
+
+.source-health-item.state-recovering strong,
+.source-health-item.state-stale strong {
+  color: #f1c46e;
+}
+
+.source-health-item.state-error {
+  border-color: rgba(232, 91, 103, 0.48);
+}
+
+.source-health-item.state-error strong {
+  color: #ff8993;
+}
+
+@media (max-width: 1200px) {
+  .source-health-row {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
 .decision-scroll {
   min-height: 0;
   overflow-x: hidden;
@@ -6418,5 +6495,76 @@ textarea {
   .stage-area .stage-header h2 {
     font-size: 24px;
     white-space: normal;
+  }
+}
+
+/* Keep observer-facing surgeon evidence above the physical tool layer. The
+   surgeon-owned tool grid reserves space below this compact cue region. */
+.surgeon-evidence-overlay {
+  position: absolute;
+  z-index: 40;
+  box-sizing: border-box;
+  display: grid;
+  align-content: start;
+  min-width: 0;
+  padding: 34px 7px 0;
+  pointer-events: none;
+}
+
+.surgeon-evidence-stack {
+  display: grid;
+  min-width: 0;
+  max-height: calc(100% - 40px);
+  gap: 5px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+}
+
+.surgeon-evidence-stack .surgeon-hand-status,
+.surgeon-evidence-stack .holder-alert-stack {
+  position: relative;
+  top: auto;
+  right: auto;
+  bottom: auto;
+  left: auto;
+  z-index: auto;
+}
+
+.surgeon-evidence-stack .surgeon-hand-status {
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.surgeon-evidence-stack .holder-alert-stack {
+  display: grid;
+  gap: 5px;
+}
+
+.tool-chip-footer-badges > span.recovery {
+  border-color: rgba(105, 193, 255, 0.5);
+  background: rgba(31, 92, 140, 0.56);
+  color: #d9eeff;
+}
+
+.mission-layout.live-stage-expanded {
+  grid-template-areas:
+    "stage"
+    "runtime"
+    "timeline";
+}
+
+@media (min-width: 1280px) {
+  .mission-layout.live-stage-expanded {
+    grid-template-columns: minmax(0, 1fr) minmax(300px, 0.56fr);
+    grid-template-areas:
+      "stage runtime"
+      "timeline timeline";
+  }
+}
+
+@media (min-width: 1920px) and (min-height: 1000px) {
+  .mission-layout.live-stage-expanded {
+    grid-template-columns: minmax(0, 2.18fr) minmax(400px, 0.62fr);
   }
 }

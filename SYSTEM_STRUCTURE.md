@@ -279,7 +279,18 @@ Main responsibilities:
 Default Docker runtime:
 
 ```bash
-docker compose up taskplanner-runtime webapp
+scripts/taskplanner up live
+```
+
+For a profile-aware Compose-only startup, bring up the selected profile rather
+than individual services so that its shared provider control planes are present:
+
+```bash
+docker compose \
+  --env-file .env.example \
+  --env-file .env \
+  --env-file docker/orchestration/live.env \
+  --profile live up -d taskplanner-runtime webapp
 ```
 
 Default launch values:
@@ -341,17 +352,21 @@ React model selector
      -> vLLM manager :8001 /v1/models
         -> lifecycle API
         -> on-demand vLLM worker :8002
+     -> NInfer manager :8080 /v1/models
+        -> lifecycle API
+        -> on-demand NInfer worker :8082
 ```
 
-The vLLM manager is a control plane, catalog, and proxy rather than a loaded
-model server. Its worker is started only on demand. Lifecycle commands return
-immediately and state changes are observed through the normal five-second
-catalog refresh. Native LM Studio and Unsloth requests run on background
-threads so a long model load never blocks a ROS service callback. Their
-provider-native catalogs remain the final source of truth after an optimistic
-`loading` or `unloading` state. Taskplanner exposes only the actions supported
-by each provider: LM Studio and Unsloth provide load/unload, while managed vLLM
-also provides sleep/wake.
+The vLLM and NInfer managers are control planes, catalogs, and proxies rather
+than loaded model servers. Their workers are started only on demand and are not
+enabled as host boot services. Lifecycle commands return immediately and state
+changes are observed through the normal five-second catalog refresh. Native LM
+Studio and Unsloth requests run on background threads so a long model load never
+blocks a ROS service callback. Their provider-native catalogs remain the final
+source of truth after an optimistic `loading` or `unloading` state. Taskplanner
+exposes only the actions supported by each provider: LM Studio and Unsloth
+provide load/unload, managed vLLM also provides sleep/wake, and managed NInfer
+provides load/unload.
 
 Selecting an unloaded managed model invokes its load operation automatically.
 The same controls are available explicitly beside both the VLM and LLM surgeon
@@ -433,6 +448,14 @@ Change frontend operator view:
 - `webapp/src/styles.css`
 
 ## 7. Validation
+
+Release-level validation is orchestrated by `scripts/taskplanner
+verify-release`. It records build, contract, deterministic fault, ROS Action,
+Playwright, supply-chain, optional recorded-surgery metric, restart, and soak
+results in one report bundle. The detailed thresholds and software-versus-site
+release boundary are defined in `docs/RELEASE_VERIFICATION.md`.
+
+The commands below are focused developer probes rather than the release gate.
 
 ```bash
 source /opt/ros/jazzy/setup.bash

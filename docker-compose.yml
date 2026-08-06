@@ -47,6 +47,57 @@ services:
       retries: 3
       start_period: 5s
 
+  ninfer-manager:
+    profiles:
+      - live
+      - llm-surgeon
+      - replay
+      - shadow
+    build:
+      context: .
+      dockerfile: docker/ninfer-manager/Dockerfile
+      args:
+        NINFER_BASE_IMAGE: ${NINFER_BASE_IMAGE:-ubuntu:26.04@sha256:3131b4cc82a783df6c9df078f86e01819a13594b865c2cad47bd1bca2b7063bb}
+    image: taskplanner-ninfer-manager:0.1.0
+    restart: "no"
+    user: "${TASKPLANNER_UID:-1000}:${TASKPLANNER_GID:-1000}"
+    network_mode: host
+    ipc: host
+    gpus: all
+    stop_grace_period: 60s
+    volumes:
+      # The NInfer source build and .ninfer artifacts remain external to the
+      # repository. An unset path maps the workspace only, so the catalog is
+      # simply empty instead of creating a host directory or loading a model.
+      - ${NINFER_RUNTIME_ROOT:-.}:/opt/taskplanner/ninfer:ro
+      - ${NINFER_CUDA_ROOT:-.}:/opt/taskplanner/cuda:ro
+    environment:
+      NINFER_API_KEY: ${NINFER_API_KEY:-}
+      NINFER_MANAGER_HOST: ${NINFER_MANAGER_HOST:-127.0.0.1}
+      NINFER_MANAGER_PORT: ${NINFER_MANAGER_PORT:-8080}
+      NINFER_MANAGER_WORKER_HOST: ${NINFER_MANAGER_WORKER_HOST:-127.0.0.1}
+      NINFER_MANAGER_WORKER_PORT: ${NINFER_MANAGER_WORKER_PORT:-8082}
+      NINFER_MANAGER_STARTUP_TIMEOUT_SEC: ${NINFER_MANAGER_STARTUP_TIMEOUT_SEC:-600}
+      NINFER_MANAGER_SHUTDOWN_TIMEOUT_SEC: ${NINFER_MANAGER_SHUTDOWN_TIMEOUT_SEC:-45}
+      NINFER_RUNTIME_ROOT: /opt/taskplanner/ninfer
+      NINFER_SERVER_BINARY: /opt/taskplanner/ninfer/build/apps/ninfer-serve
+      NINFER_CUDA_LIBRARY_PATH: /opt/taskplanner/cuda/targets/x86_64-linux/lib
+      NINFER_LOG_ROOT: /tmp/taskplanner-ninfer
+      NINFER_35B_ARTIFACT_REL: ${NINFER_35B_ARTIFACT_REL:-models/qwen3_6_35b_a3b.ninfer}
+      NINFER_35B_MAX_CONTEXT: ${NINFER_35B_MAX_CONTEXT:-8192}
+      NINFER_27B_ARTIFACT_REL: ${NINFER_27B_ARTIFACT_REL:-models/qwen3_6_27b.ninfer}
+      NINFER_27B_MAX_CONTEXT: ${NINFER_27B_MAX_CONTEXT:-8192}
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:${NINFER_MANAGER_PORT:-8080}/health', timeout=2)"
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 5s
+
   taskplanner-dev:
     profiles:
       - dev
@@ -249,6 +300,8 @@ services:
     depends_on:
       vllm-manager:
         condition: service_healthy
+      ninfer-manager:
+        condition: service_healthy
       webapp:
         condition: service_started
     command: >
@@ -372,8 +425,13 @@ services:
       SEGMENTED_FLIR_TOPIC: ${SEGMENTED_FLIR_TOPIC:-/surgery/images/flir/segmented/compressed}
       CAM4_SEMANTICS_TOPIC: ${CAM4_SEMANTICS_TOPIC:-/surgery/perception/cam4/semantics/json}
       TASKPLANNER_REBUILD_ON_START: ${TASKPLANNER_REBUILD_ON_START:-false}
+      # Default remains false: shared state is explicitly enabled only for a
+      # reviewed cross-institution deployment.
+      PUBLISH_SHARED_STATE: ${PUBLISH_SHARED_STATE:-false}
     depends_on:
       vllm-manager:
+        condition: service_healthy
+      ninfer-manager:
         condition: service_healthy
       webapp:
         condition: service_started
@@ -386,7 +444,7 @@ services:
       fi &&
       source install/setup.bash &&
       if [ '${INPUT_PROFILE:-simulation}' = 'external' ]; then
-        exec ros2 launch bringup taskplanner_live.launch.py;
+        exec ros2 launch bringup taskplanner_live.launch.py publish_shared_state:=$${PUBLISH_SHARED_STATE:-false};
       else
         exec ros2 launch bringup taskplanner_mock.launch.py enable_rosbridge:=true rosbridge_port:=${ROSBRIDGE_PORT:-9090} rosbridge_address:=${ROSBRIDGE_ADDRESS:-127.0.0.1} input_profile:=${INPUT_PROFILE:-simulation} execution_backend:=${EXECUTION_BACKEND:-mock} speech_input_mode:=${SPEECH_INPUT_MODE:-utterance} sentence_input_topic:=${SENTENCE_INPUT_TOPIC:-/sensors/surgeon/sentence} speech_min_confidence:=${SPEECH_MIN_CONFIDENCE:-0.55} speech_max_age_sec:=${SPEECH_MAX_AGE_SEC:-3.0} speech_source_timeout_sec:=${SPEECH_SOURCE_TIMEOUT_SEC:-5.0} vlm_mode:=${VLM_MODE:-real} vlm_base_url:=${VLM_BASE_URL:-http://127.0.0.1:8001} vlm_provider_id:=${VLM_PROVIDER_ID:-vllm} vlm_model_id:=${VLM_MODEL_ID:-unsloth/gemma-4-E4B-it-NVFP4} vlm_api_mode:=${VLM_API_MODE:-openai_compat} vlm_publish_period_sec:=${VLM_PUBLISH_PERIOD_SEC:-1.0} vlm_image_stale_sec:=${VLM_IMAGE_STALE_SEC:-3.0} vlm_max_output_tokens:=${VLM_MAX_OUTPUT_TOKENS:-320} vlm_generation_seed:=${VLM_GENERATION_SEED:-0} vlm_response_format:=${VLM_RESPONSE_FORMAT:-json_schema} vlm_reasoning_effort:=${VLM_REASONING_EFFORT:-none} vlm_context_mode:=${VLM_CONTEXT_MODE:-actor_log} surgeon_actor_mode:=${SURGEON_ACTOR_MODE:-llm} actor_base_url:=${ACTOR_BASE_URL:-http://127.0.0.1:1234} actor_provider_id:=${ACTOR_PROVIDER_ID:-auto} actor_model_id:=${ACTOR_MODEL_ID:-google/gemma-4-12b-qat} actor_response_format:=${ACTOR_RESPONSE_FORMAT:-json_schema} actor_reasoning_effort:=${ACTOR_REASONING_EFFORT:-none} enable_rfdetr_perception:=${ENABLE_RFDETR_PERCEPTION:-true} rfdetr_service_url:=${RFDETR_SERVICE_URL:-http://127.0.0.1:8010} flir_input_topic:=${FLIR_INPUT_TOPIC:-/surgery/images/flir/compressed} cam4_input_topic:=${CAM4_INPUT_TOPIC:-/surgery/images/cam4/compressed} field_image_topic:=${SEGMENTED_FLIR_TOPIC:-/surgery/images/flir/segmented/compressed} cam4_semantics_topic:=${CAM4_SEMANTICS_TOPIC:-/surgery/perception/cam4/semantics/json} enable_no_image_camera:=${ENABLE_NO_IMAGE_CAMERA:-true} enable_synthetic_scene_camera:=${ENABLE_SYNTHETIC_SCENE_CAMERA:-false} $${FIELD_SNAPSHOT_URL:+field_snapshot_url:=$${FIELD_SNAPSHOT_URL}};
       fi"

@@ -1,0 +1,25 @@
+schema: taskplanner.fault_scenario.v1
+scenario_id: compound-recovery
+seed: 2718281
+events:
+  - id: cam4-reorder
+    source: cam4
+    kind: reorder
+    start_sec: 5.0
+    duration_sec: 4.0
+  - id: flir-delay
+    source: flir
+    kind: delay
+    start_sec: 8.0
+    duration_sec: 5.0
+    params: {delay_sec: 0.8}
+  - id: speech-duplicate
+    source: speech
+    kind: duplicate
+    start_sec: 10.0
+    duration_sec: 6.0
+  - id: vlm-invalid
+    source: vlm_result
+    kind: vlm_invalid_schema
+    start_sec: 14.0
+    duration_sec: 4.0

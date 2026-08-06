@@ -240,6 +240,20 @@ def _validate_v2_payload(payload: dict[str, Any]) -> dict[str, Any]:
 def _normalize_pair_rows(value: Any, label: str) -> list[list[Any]]:
     if not isinstance(value, list):
         raise SchemaValidationError(f"'{label}' must be a list")
+    # Some unconstrained OpenAI-compatible backends collapse a one-candidate
+    # array from [["T01", 0.8]] to ["T01", 0.8]. The meaning is unique, so
+    # restore only this exact shape; malformed or ambiguous rows still fail.
+    if (
+        len(value) == 2
+        and isinstance(value[0], str)
+        and not isinstance(value[1], (list, dict, bool))
+    ):
+        try:
+            float(value[1])
+        except (TypeError, ValueError):
+            pass
+        else:
+            value = [value]
     rows: list[list[Any]] = []
     for item in value:
         if not isinstance(item, list) or len(item) != 2:

@@ -57,6 +57,7 @@ class PhaseGuardPolicy:
     smoothing_window: int
     min_dwell_time_sec: float
     allow_unknown_phase: bool
+    min_evidence_duration_sec: float = 1.0
 
 
 @dataclass(slots=True)

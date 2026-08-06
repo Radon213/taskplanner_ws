@@ -22,6 +22,9 @@
   <exec_depend>simulation_runtime</exec_depend>
   <exec_depend>shadow_evaluation</exec_depend>
   <exec_depend>skill_execution</exec_depend>
+  <exec_depend>surgical_interop_execution</exec_depend>
+  <exec_depend>surgical_interop_gateway</exec_depend>
+  <exec_depend>surgical_interop_msgs</exec_depend>
   <exec_depend>surgical_msgs</exec_depend>
   <exec_depend>vlm_node</exec_depend>
 

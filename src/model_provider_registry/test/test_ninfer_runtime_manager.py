@@ -76,6 +76,34 @@ def test_catalog_starts_unloaded_and_does_not_spawn(tmp_path):
     assert manager._processes == {}
 
 
+def test_catalog_expands_environment_in_worker_settings(monkeypatch, tmp_path):
+    artifact = tmp_path / "model.ninfer"
+    artifact.write_bytes(b"ninfer")
+    monkeypatch.setenv("NINFER_TEST_CONTEXT", "8192")
+    catalog = tmp_path / "models.json"
+    catalog.write_text(
+        json.dumps(
+            {
+                "models": [
+                    {
+                        "id": "qwen-vlm",
+                        "artifact_path": str(artifact),
+                        "start_command": ["ninfer-serve", "{artifact}"],
+                        "environment": {
+                            "NINFER_MAX_CONTEXT": "${NINFER_TEST_CONTEXT}"
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    model = manager_module._load_catalog(str(catalog))[0]
+
+    assert model.environment["NINFER_MAX_CONTEXT"] == "8192"
+
+
 def test_explicit_load_starts_worker_and_explicit_unload_stops_it(
     monkeypatch,
     tmp_path,

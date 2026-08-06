@@ -14,11 +14,10 @@ Taskplanner.
 | `replay` | model control planes, webapp, RF-DETR attempt, shadow replay/ROS bridge | External rosbag dataset and timestamped annotations |
 
 The vLLM manager starts with `VLLM_MANAGER_AUTO_START=false`, so its catalog is
-available while no vLLM worker model is loaded. The launcher also starts a
-small transient NInfer control plane on the host. It advertises configured
-`.ninfer` artifacts but starts no worker until a dashboard/API load request.
-The manager and its worker stop with `scripts/taskplanner down` and never
-install a boot service.
+available while no vLLM worker model is loaded. The Compose-managed
+`ninfer-manager` provides the same unloaded catalog behavior for local
+`.ninfer` artifacts. Neither manager installs a host boot service, and neither
+starts a model worker until an explicit dashboard/API load request.
 
 When locally installed, the launcher starts the LM Studio catalog server and
 the Unsloth Studio backend without loading a model. It then queries all four
@@ -72,22 +71,18 @@ run traces are bind-mounted and are not part of the application image. Local
 LM Studio, Unsloth Studio, vLLM, and NInfer model downloads are also managed
 outside this repository.
 
-For NInfer, copy the catalog template and set absolute local paths:
-
-```bash
-mkdir -p "${HOME}/.config/taskplanner"
-cp config/model_providers/ninfer_models.example.json \
-  "${HOME}/.config/taskplanner/ninfer-models.json"
-```
-
-Then edit the copied file and set this in `.env`:
+For NInfer, point `.env` at the host-managed runtime and CUDA toolkit:
 
 ```text
-NINFER_MODEL_CATALOG_PATH=/home/user/.config/taskplanner/ninfer-models.json
+NINFER_RUNTIME_ROOT=/absolute/path/to/ninfer
+NINFER_CUDA_ROOT=/usr/local/cuda-13.1
+NINFER_35B_ARTIFACT_REL=models/qwen3_6_35b_a3b.ninfer
 ```
 
-The NInfer server binary and `.ninfer` artifact remain outside the application
-repository and deployment image.
+The Compose-managed control plane discovers supported artifacts beneath
+`NINFER_RUNTIME_ROOT` and exposes only files that exist. The NInfer server
+binary, `.ninfer` artifacts, and CUDA libraries remain outside the application
+repository and deployment image; the manager bind-mounts them read-only.
 
 ## Start and stop
 
@@ -144,8 +139,10 @@ docker compose \
 
 Use the matching environment file and profile for `llm-surgeon` or `replay`.
 Use `scripts/taskplanner up ...` for normal operation because the launcher also
-handles profile switching, local provider control planes, writable replay
-output directories, and best-effort perception startup.
+handles profile switching, writable replay output directories, and best-effort
+perception startup. The same Compose profile also starts the vLLM and NInfer
+control planes, so direct profile-aware Compose startup retains model catalog
+and lifecycle support.
 
 ## Model loading
 
@@ -253,12 +250,38 @@ scripts/package_replay_data.sh /local-or-direct-remote/release
 The script refuses copy mode on a FUSE/rclone destination by default. Use a
 direct remote transfer or a NAS-side copy job instead of overriding that guard.
 
+## Release verification
+
+Before packaging a software release candidate, run:
+
+```bash
+scripts/taskplanner verify-release --tier rc
+```
+
+For the final software-stage evidence, run the configured 100-restart,
+24-hour campaign:
+
+```bash
+scripts/taskplanner verify-release --tier full
+```
+
+The command creates an auditable result bundle under `reports/release/` and
+does not load a VLM or copy restricted datasets. Pass explicit read-only data,
+annotation, baseline-report, provider, and model arguments to add the 12-case
+Shadow Replay accuracy and latency gate. See
+[`docs/RELEASE_VERIFICATION.md`](docs/RELEASE_VERIFICATION.md) for the complete
+command and acceptance criteria.
+
+This is the software release boundary. Real robot calibration, trajectories,
+grasp and release behavior, collision avoidance, E-stop behavior, and the site
+network remain a separate physical acceptance gate.
+
 ## Diagnostics
 
 ```bash
 scripts/taskplanner status
 docker compose logs --tail=100 vllm-manager
-journalctl --user -u taskplanner-ninfer-manager.service -n 100 --no-pager
+docker compose logs --tail=100 ninfer-manager
 docker compose --profile live logs --tail=100 object-perception
 docker compose --profile live logs --tail=100 taskplanner-runtime
 docker compose --profile replay logs --tail=100 shadow-runner

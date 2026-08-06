@@ -16,7 +16,6 @@ from surgical_msgs.msg import (
     FilteredPhase,
     SpeechUtterance,
     SurgeonActorEvent,
-    SurgeonGestureEvidence,
     SurgeonRequest,
     SurgeonState,
     WorldState,
@@ -79,9 +78,6 @@ class SurgeonActorNode(Node):
         self._active = False
         self._world: WorldState | None = None
         self._phase_hint: FilteredPhase | None = None
-        self._gesture_history: deque[dict[str, object]] = deque(maxlen=6)
-        self._latched_vlm_state: dict[str, object] | None = None
-        self._latched_vlm_ticks = 0
         self._active_override: SurgeonRequest | None = None
         self._override_queue: deque[SurgeonRequest] = deque(maxlen=10)
         self._published_request_signature = ""
@@ -112,7 +108,6 @@ class SurgeonActorNode(Node):
         self.create_subscription(SurgeonRequest, "/simulation/surgeon_override", self._on_override, 20)
         self.create_subscription(WorldState, "/twin/world_state", self._on_world, 20)
         self.create_subscription(FilteredPhase, "/phase/filtered", self._on_phase_hint, 20)
-        self.create_subscription(SurgeonGestureEvidence, "/vlm/surgeon_gesture_evidence", self._on_gesture_evidence, 20)
 
         self._timer = self.create_timer(self._decision_period_sec, self._tick)
 
@@ -432,119 +427,6 @@ class SurgeonActorNode(Node):
         # autonomous surgeon policy should stop at the end of the script.
         return ""
 
-    def _prune_gesture_history(self, now_sec: float) -> None:
-        while self._gesture_history and (now_sec - float(self._gesture_history[0]["stamp_sec"])) > 3.5:
-            self._gesture_history.popleft()
-
-    def _stable_gesture_request(self) -> dict[str, object] | None:
-        now_sec = self._current_time_sec()
-        self._prune_gesture_history(now_sec)
-        candidates: dict[tuple[str, str], dict[str, object]] = {}
-        for sample in self._gesture_history:
-            event_type = str(sample["event_type"])
-            requested_tool = str(sample["requested_tool"])
-            confidence = float(sample["confidence"])
-            if not event_type or confidence < 0.18:
-                continue
-            age_sec = max(now_sec - float(sample["stamp_sec"]), 0.0)
-            weight = confidence * max(0.22, 1.0 - age_sec / 3.0)
-            signature = (event_type, requested_tool)
-            bucket = candidates.setdefault(signature, {"score": 0.0, "count": 0, "latest": sample})
-            bucket["score"] = float(bucket["score"]) + weight
-            bucket["count"] = int(bucket["count"]) + 1
-            if float(sample["stamp_sec"]) >= float(bucket["latest"]["stamp_sec"]):
-                bucket["latest"] = sample
-        if not candidates:
-            return None
-        ranked = sorted(
-            candidates.items(),
-            key=lambda item: (float(item[1]["score"]), float(item[1]["latest"]["confidence"])),
-            reverse=True,
-        )
-        for (event_type, requested_tool), best in ranked:
-            latest = best["latest"]
-            score = float(best["score"])
-            count = int(best["count"])
-            latest_confidence = float(latest["confidence"])
-            latest_pose = str(latest.get("hand_pose", ""))
-            fast_path = latest_confidence >= 0.84 and not latest_pose.startswith(("uncertain", "occluded"))
-            if fast_path:
-                if score < 0.72:
-                    continue
-            elif score < 1.02 or count < 2:
-                continue
-
-            if event_type == "request_tool":
-                if not requested_tool or self._tool_is_with_surgeon(requested_tool) or self._tool_is_temporarily_unavailable(requested_tool):
-                    continue
-                return {
-                    "phase_id": latest["phase_id"] or (self._world.filtered_phase if self._world else self._current_phase_id),
-                    "intent": "request_tool",
-                    "requested_tool": requested_tool,
-                    "ready_for_handover": True,
-                    "ready_for_retrieval": False,
-                    "scene_note": latest["note"] or "VLM inferred an open hand requesting a tool.",
-                }
-            if event_type == "return_tool":
-                if not requested_tool or not self._tool_is_with_surgeon(requested_tool):
-                    continue
-                return {
-                    "phase_id": latest["phase_id"] or (self._world.filtered_phase if self._world else self._current_phase_id),
-                    "intent": "return_tool",
-                    "requested_tool": requested_tool,
-                    "ready_for_handover": False,
-                    "ready_for_retrieval": True,
-                    "scene_note": latest["note"] or "VLM inferred a used tool being presented for retrieval.",
-                }
-            if event_type == "request_procedure_completion":
-                if self._world is None or not self._is_terminal_phase(self._world.filtered_phase):
-                    continue
-                return {
-                    "phase_id": latest["phase_id"] or (self._world.filtered_phase if self._world else self._current_phase_id),
-                    "intent": "request_procedure_completion",
-                    "requested_tool": "",
-                    "ready_for_handover": False,
-                    "ready_for_retrieval": False,
-                    "scene_note": latest["note"] or "VLM detected the surgeon requesting procedure completion.",
-                }
-            if event_type == "complete_procedure":
-                if self._world is None or self._cleanup_still_pending():
-                    continue
-                return {
-                    "phase_id": latest["phase_id"] or (self._world.filtered_phase if self._world else self._current_phase_id),
-                    "intent": "complete_procedure",
-                    "requested_tool": "",
-                    "ready_for_handover": False,
-                    "ready_for_retrieval": False,
-                    "scene_note": latest["note"] or "VLM detected the surgeon confirming procedure completion.",
-                }
-        return None
-
-    def _request_state_still_relevant(self, state: dict[str, object] | None) -> bool:
-        if state is None:
-            return False
-        intent = str(state.get("intent", ""))
-        requested_tool = str(state.get("requested_tool", ""))
-        if not requested_tool:
-            return False
-        if intent == "request_tool":
-            return not self._tool_is_with_surgeon(requested_tool) and not self._tool_is_temporarily_unavailable(requested_tool)
-        if intent == "return_tool":
-            return self._tool_is_with_surgeon(requested_tool)
-        return False
-
-    def _effective_vlm_state(self, stable_state: dict[str, object] | None) -> dict[str, object] | None:
-        if stable_state is not None:
-            self._latched_vlm_state = dict(stable_state)
-            self._latched_vlm_ticks = 3
-            return stable_state
-        if self._latched_vlm_ticks > 0 and self._request_state_still_relevant(self._latched_vlm_state):
-            self._latched_vlm_ticks -= 1
-            return self._latched_vlm_state
-        self._latched_vlm_state = None
-        self._latched_vlm_ticks = 0
-        return None
-
     def _publish_request(self, request: SurgeonRequest) -> None:
         request.stamp = self.get_clock().now().to_msg()
         if request.override:
@@ -660,33 +542,6 @@ class SurgeonActorNode(Node):
         phase_id = self._coerce_phase_id(self._world.filtered_phase or self._spec.default_phase_id)
         expected_tools = list(self._spec.get_expected_instruments(phase_id))
         current_tool = self._current_surgeon_tool()
-
-        effective_vlm_state = self._effective_vlm_state(self._stable_gesture_request())
-        if effective_vlm_state is not None:
-            tool_id = str(effective_vlm_state["requested_tool"])
-            voice_text = ""
-            actor_event_type = str(effective_vlm_state["intent"])
-            if str(effective_vlm_state["intent"]) == "request_tool":
-                voice_text, _ = self._choose_voice_text(phase_id, tool_id)
-                self._set_active_voice(voice_text)
-            elif str(effective_vlm_state["intent"]) == "return_tool":
-                actor_event_type = "place_on_mayo_recovery"
-            elif str(effective_vlm_state["intent"]) in {
-                "request_procedure_completion",
-                "complete_procedure",
-            }:
-                actor_event_type = ""
-            return ActorDecision(
-                intent=str(effective_vlm_state["intent"]),
-                requested_tool=tool_id,
-                voice_text=voice_text,
-                ready_for_handover=bool(effective_vlm_state["ready_for_handover"]),
-                ready_for_retrieval=bool(effective_vlm_state["ready_for_retrieval"]),
-                scene_note=str(effective_vlm_state["scene_note"]),
-                phase_id=str(effective_vlm_state["phase_id"]) or phase_id,
-                actor_event_type=actor_event_type,
-                actor_tool_id=tool_id,
-            )
 
         if (
             self._world.cleaner_busy
@@ -923,9 +778,6 @@ class SurgeonActorNode(Node):
             self._phase_entered_sec = self._current_time_sec()
             self._active_voice_text = ""
             self._voice_hold_ticks = 0
-            self._gesture_history.clear()
-            self._latched_vlm_state = None
-            self._latched_vlm_ticks = 0
             self._override_queue.clear()
             self._clear_active_override()
             self._published_request_signature = ""
@@ -973,21 +825,6 @@ class SurgeonActorNode(Node):
 
     def _on_phase_hint(self, msg: FilteredPhase) -> None:
         self._phase_hint = msg
-
-    def _on_gesture_evidence(self, msg: SurgeonGestureEvidence) -> None:
-        stamp_sec = float(msg.stamp.sec) + float(msg.stamp.nanosec) / 1_000_000_000.0
-        self._gesture_history.append(
-            {
-                "stamp_sec": stamp_sec,
-                "phase_id": msg.phase_id,
-                "event_type": msg.event_type,
-                "requested_tool": msg.requested_tool,
-                "hand_pose": msg.hand_pose,
-                "confidence": float(msg.confidence),
-                "note": msg.note,
-            }
-        )
-
 
 def main() -> None:
     rclpy.init()

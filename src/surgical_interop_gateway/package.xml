@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>surgical_interop_gateway</name>
+  <version>0.1.0</version>
+  <description>Read-only gateway that projects vetted Taskplanner state to shared surgical ROS topics.</description>
+  <maintainer email="codex@example.com">Codex</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>surgical_msgs</exec_depend>
+  <exec_depend>surgical_interop_msgs</exec_depend>
+
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

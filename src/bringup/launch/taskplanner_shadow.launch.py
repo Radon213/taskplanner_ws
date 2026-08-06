@@ -73,6 +73,7 @@ def validate_shadow_routes(routes: dict[str, str]) -> None:
         "flir_image_topic",
         "cam4_image_topic",
         "segmented_flir_image_topic",
+        "cam4_overlay_image_topic",
         "cam4_semantics_topic",
     }
     missing = sorted(required.difference(routes))
@@ -138,6 +139,7 @@ def validate_shadow_routes(routes: dict[str, str]) -> None:
             "flir_image_topic",
             "cam4_image_topic",
             "segmented_flir_image_topic",
+            "cam4_overlay_image_topic",
             "cam4_semantics_topic",
         )
     }
@@ -401,6 +403,7 @@ def _shadow_preflight(context: Any) -> list[Any]:
             "flir_image_topic",
             "cam4_image_topic",
             "segmented_flir_image_topic",
+            "cam4_overlay_image_topic",
             "cam4_semantics_topic",
         )
     }
@@ -514,6 +517,9 @@ def generate_launch_description() -> LaunchDescription:
     segmented_flir_image_topic = LaunchConfiguration(
         "segmented_flir_image_topic"
     )
+    cam4_overlay_image_topic = LaunchConfiguration(
+        "cam4_overlay_image_topic"
+    )
     composite_image_topic = LaunchConfiguration("composite_image_topic")
     cam4_semantics_topic = LaunchConfiguration("cam4_semantics_topic")
     rfdetr_service_url = LaunchConfiguration("rfdetr_service_url")
@@ -567,6 +573,7 @@ def generate_launch_description() -> LaunchDescription:
     replay_drain_settle_sec = LaunchConfiguration(
         "replay_drain_settle_sec"
     )
+    fault_scenario_path = LaunchConfiguration("fault_scenario_path")
     vlm_base_url = LaunchConfiguration("vlm_base_url")
     vlm_provider_id = LaunchConfiguration("vlm_provider_id")
     vlm_model_id = LaunchConfiguration("vlm_model_id")
@@ -606,6 +613,66 @@ def generate_launch_description() -> LaunchDescription:
     default_bundle = LaunchConfiguration("default_bundle")
     use_sim_time = {"use_sim_time": True}
     non_strict = PythonExpression(["'", mode, "' != 'strict'"])
+    fault_enabled = PythonExpression(
+        [
+            "'",
+            fault_scenario_path,
+            "' != '' and '",
+            interactive_replay,
+            "'.lower() == 'true'",
+        ]
+    )
+    replay_flir_output_topic = PythonExpression(
+        [
+            "'/test/fault/raw/flir/compressed' if '",
+            fault_scenario_path,
+            "' != '' and '",
+            interactive_replay,
+            "'.lower() == 'true' else '",
+            flir_image_topic,
+            "'",
+        ]
+    )
+    replay_cam4_output_topic = PythonExpression(
+        [
+            "'/test/fault/raw/cam4/compressed' if '",
+            fault_scenario_path,
+            "' != '' and '",
+            interactive_replay,
+            "'.lower() == 'true' else '",
+            cam4_image_topic,
+            "'",
+        ]
+    )
+    replay_transcript_output_topic = PythonExpression(
+        [
+            "'/test/fault/raw/speech/sentence' if '",
+            fault_scenario_path,
+            "' != '' and '",
+            interactive_replay,
+            "'.lower() == 'true' else '",
+            source_transcript_topic,
+            "'",
+        ]
+    )
+    replay_vlm_result_output_topic = PythonExpression(
+        [
+            "'/test/fault/raw/vlm/result' if '",
+            fault_scenario_path,
+            "' != '' and '",
+            interactive_replay,
+            "'.lower() == 'true' else '/vlm/result'",
+        ]
+    )
+    replay_vlm_health_output_topic = PythonExpression(
+        [
+            "'/test/fault/raw/vlm/health' if '",
+            fault_scenario_path,
+            "' != '' and '",
+            interactive_replay,
+            "'.lower() == 'true' else '/vlm/health'",
+        ]
+    )
     evaluation_observation_topic = PythonExpression(
         [
             "'/shadow/evaluation_observation' if '",
@@ -629,6 +696,14 @@ def generate_launch_description() -> LaunchDescription:
             "-p",
             "address:=127.0.0.1",
         ],
+        output="screen",
+    )
+    rosapi_node = Node(
+        package="rosapi",
+        executable="rosapi_node",
+        name="rosapi",
+        condition=IfCondition(enable_rosbridge),
+        parameters=[{"use_sim_time": False}],
         output="screen",
     )
 
@@ -664,6 +739,10 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument(
                 "segmented_flir_image_topic",
                 default_value="/surgery/images/flir/segmented/compressed",
+            ),
+            DeclareLaunchArgument(
+                "cam4_overlay_image_topic",
+                default_value="/surgery/images/cam4/detection_overlay/compressed",
             ),
             DeclareLaunchArgument(
                 "composite_image_topic",
@@ -794,6 +873,15 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument(
                 "replay_drain_settle_sec",
                 default_value="1.25",
+            ),
+            DeclareLaunchArgument(
+                "fault_scenario_path",
+                default_value="",
+                description=(
+                    "Optional deterministic fault timeline. When set, only "
+                    "the replay controller's public FLIR, CAM4, and transcript "
+                    "outputs are relayed through the fault injector."
+                ),
             ),
             DeclareLaunchArgument(
                 "vlm_base_url",
@@ -935,6 +1023,48 @@ def generate_launch_description() -> LaunchDescription:
                         "auto_start": False,
                     }
                 ],
+                remappings=[
+                    (flir_image_topic, replay_flir_output_topic),
+                    (cam4_image_topic, replay_cam4_output_topic),
+                    (
+                        source_transcript_topic,
+                        replay_transcript_output_topic,
+                    ),
+                ],
+                output="screen",
+            ),
+            Node(
+                package="simulation_runtime",
+                executable="fault_injector",
+                name="shadow_fault_injector",
+                condition=IfCondition(fault_enabled),
+                parameters=[
+                    {
+                        "use_sim_time": False,
+                        "enabled": True,
+                        "start_on_first_image": True,
+                        "scenario_path": ParameterValue(
+                            fault_scenario_path,
+                            value_type=str,
+                        ),
+                        "raw_flir_topic": "/test/fault/raw/flir/compressed",
+                        "raw_cam4_topic": "/test/fault/raw/cam4/compressed",
+                        "raw_sentence_topic": (
+                            "/test/fault/raw/speech/sentence"
+                        ),
+                        "flir_topic": flir_image_topic,
+                        "cam4_topic": cam4_image_topic,
+                        "sentence_topic": source_transcript_topic,
+                        "raw_vlm_result_topic": (
+                            "/test/fault/raw/vlm/result"
+                        ),
+                        "raw_vlm_health_topic": (
+                            "/test/fault/raw/vlm/health"
+                        ),
+                        "vlm_result_topic": "/vlm/result",
+                        "vlm_health_topic": "/vlm/health",
+                    }
+                ],
                 output="screen",
             ),
             Node(
@@ -994,6 +1124,21 @@ def generate_launch_description() -> LaunchDescription:
                 output="screen",
             ),
             Node(
+                package="simulation_runtime",
+                executable="source_health_monitor",
+                name="source_health_monitor",
+                parameters=[
+                    {
+                        "use_sim_time": False,
+                        "flir_topic": flir_image_topic,
+                        "cam4_topic": cam4_image_topic,
+                        "camera_stale_after_sec": 1.0,
+                        "vlm_stale_after_sec": 3.0,
+                    }
+                ],
+                output="screen",
+            ),
+            Node(
                 package="vlm_node",
                 executable="rfdetr_perception_bridge",
                 name="rfdetr_perception_bridge",
@@ -1006,6 +1151,7 @@ def generate_launch_description() -> LaunchDescription:
                         "flir_input_topic": flir_image_topic,
                         "cam4_input_topic": cam4_image_topic,
                         "flir_output_topic": segmented_flir_image_topic,
+                        "cam4_overlay_topic": cam4_overlay_image_topic,
                         "cam4_semantics_topic": cam4_semantics_topic,
                         "max_source_skew_sec": ParameterValue(
                             vlm_multiview_max_skew_sec,
@@ -1064,6 +1210,7 @@ def generate_launch_description() -> LaunchDescription:
                         "field_image_topic": segmented_flir_image_topic,
                         "raw_field_image_topic": flir_image_topic,
                         "cam4_image_topic": cam4_image_topic,
+                        "cam4_overlay_image_topic": cam4_overlay_image_topic,
                         "composite_image_topic": composite_image_topic,
                         "require_cam4_image": False,
                         "multiview_max_skew_sec": ParameterValue(
@@ -1102,6 +1249,10 @@ def generate_launch_description() -> LaunchDescription:
                         "context_prefix": "/context",
                     }
                 ],
+                remappings=[
+                    ("/vlm/result", replay_vlm_result_output_topic),
+                    ("/vlm/health", replay_vlm_health_output_topic),
+                ],
                 output="screen",
             ),
             Node(
@@ -1115,6 +1266,7 @@ def generate_launch_description() -> LaunchDescription:
                         "validation_mode": "bt_twin",
                         "vlm_mode": "real",
                         "phase_authority": "reducer",
+                        "tool_predict_evidence_confidence_threshold": 0.5,
                         "tool_predict_stability_sec": 3.0,
                         "vlm_implicit_request_confidence_threshold": 0.8,
                         "vlm_implicit_request_stability_sec": 0.7,
@@ -1188,7 +1340,10 @@ def generate_launch_description() -> LaunchDescription:
                     {
                         **use_sim_time,
                         "output_path": trace_path,
-                        "run_id": run_id,
+                        # Launch's YAML parameter normalization can interpret
+                        # IDs such as ``0704_6`` as an integer. Preserve the
+                        # public run identifier exactly as supplied.
+                        "run_id": ParameterValue(run_id, value_type=str),
                         "mode": mode,
                         "field_image_topic": field_image_topic,
                         "flir_image_topic": flir_image_topic,
@@ -1201,6 +1356,7 @@ def generate_launch_description() -> LaunchDescription:
                         "cam4_semantics_topic": cam4_semantics_topic,
                         "tray_image_topic": tray_image_topic,
                         "source_transcript_topic": source_transcript_topic,
+                        "fault_status_topic": "/test/fault/status",
                     }
                 ],
                 output="screen",
@@ -1239,5 +1395,6 @@ def generate_launch_description() -> LaunchDescription:
                 output="screen",
             ),
             rosbridge_process,
+            rosapi_node,
         ]
     )

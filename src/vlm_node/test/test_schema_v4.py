@@ -73,6 +73,25 @@ def test_v4_allows_visual_request_before_tool_identity_is_resolved() -> None:
     ]
 
 
+def test_v4_deterministically_restores_flat_single_candidate_pairs() -> None:
+    payload = _base_v4()
+    payload["phase"] = ["P04", 0.91]
+    payload["tool"] = ["T05", 0.84]
+
+    normalized = validate_payload(payload)
+
+    assert normalized["phase"] == [["P04", 0.91]]
+    assert normalized["tool"] == [["T05", 0.84]]
+
+
+def test_v4_still_rejects_ambiguous_candidate_rows() -> None:
+    payload = _base_v4()
+    payload["tool"] = ["T05", "T02"]
+
+    with pytest.raises(SchemaValidationError, match="each tool item"):
+        validate_payload(payload)
+
+
 def test_v4_tolerates_omitted_proposal_and_normalizes_it_to_null() -> None:
     payload = _base_v4()
     payload.pop("bed_robot_arm_group")

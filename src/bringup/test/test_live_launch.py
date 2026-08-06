@@ -25,6 +25,7 @@ def test_base_launch_conditions_mock_execution_servers() -> None:
     }
     assert {
         "execution_backend",
+        "default_bundle",
         "speech_input_mode",
         "sentence_input_topic",
         "enable_rfdetr_perception",
@@ -40,6 +41,16 @@ def test_base_launch_conditions_mock_execution_servers() -> None:
     ]
     assert len(mock_nodes) == 2
     assert all(node.condition is not None for node in mock_nodes)
+
+    rosapi_nodes = [
+        entity
+        for entity in description.entities
+        if isinstance(entity, Node)
+        and entity.node_package == "rosapi"
+        and entity.node_executable == "rosapi_node"
+    ]
+    assert len(rosapi_nodes) == 1
+    assert rosapi_nodes[0].condition is not None
 
 
 def test_live_launch_wraps_external_runtime_contract() -> None:

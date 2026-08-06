@@ -82,6 +82,18 @@ class CandidateAndShadowTest(unittest.TestCase):
                 "reducer_fused": "/twin/world_state",
                 "bt_decision": "/bt/decision",
                 "skill_command": "/bt/skill_command",
+                "bed_robot_arm_group_request": (
+                    "/bed_robot_arm_group/request"
+                ),
+                "bed_robot_arm_group_command": (
+                    "/bed_robot_arm_group/command"
+                ),
+                "bed_robot_arm_group_status": (
+                    "/bed_robot_arm_group/status"
+                ),
+                "shadow_bed_robot_arm_group_sink": (
+                    "/shadow/bed_robot_arm_group_sink"
+                ),
             }[layer],
             message_type="fixture/msg/Test",
             ros_time_sec=time_sec,
@@ -178,6 +190,267 @@ class CandidateAndShadowTest(unittest.TestCase):
         )
         event_result = report["layers"]["vlm_raw"]["events"][0]
         self.assertEqual("T01", event_result["predicted_raw_tool_id"])
+
+    def test_bed_robot_group_action_is_scored_outside_ordinary_handover(
+        self,
+    ) -> None:
+        report = evaluate_shadow(
+            ground_truth=[
+                self._event(
+                    event_id="fixture-suction",
+                    time_sec=10.0,
+                    tool_id="yankauer_suction",
+                ),
+                self._event(
+                    event_id="fixture-scalpel",
+                    time_sec=20.0,
+                    tool_id="scalpel",
+                ),
+            ],
+            decisions=[
+                self._trace(
+                    sequence=0,
+                    time_sec=0.0,
+                    layer="bed_robot_arm_group_status",
+                    payload={
+                        "group_id": "suction",
+                        "end_effector_profile": "suction",
+                        "state": "standby",
+                    },
+                ),
+                self._trace(
+                    sequence=1,
+                    time_sec=8.0,
+                    layer="bed_robot_arm_group_command",
+                    payload={
+                        "command_id": "group-command-1",
+                        "request_id": "group-request-1",
+                        "group_id": "suction",
+                        "end_effector_profile": "suction",
+                        "operation": "suction_start",
+                    },
+                ),
+                self._trace(
+                    sequence=2,
+                    time_sec=8.1,
+                    layer="shadow_bed_robot_arm_group_sink",
+                    payload={
+                        "command_id": "group-command-1",
+                        "request_id": "group-request-1",
+                        "group_id": "suction",
+                        "operation": "suction_start",
+                    },
+                ),
+                self._trace(
+                    sequence=3,
+                    time_sec=8.5,
+                    layer="bed_robot_arm_group_status",
+                    payload={
+                        "command_id": "group-command-1",
+                        "request_id": "group-request-1",
+                        "group_id": "suction",
+                        "end_effector_profile": "suction",
+                        "operation": "suction_start",
+                        "terminal": True,
+                        "success": True,
+                        "state": "suctioning",
+                        "outcome": "succeeded",
+                    },
+                ),
+                self._trace(
+                    sequence=4,
+                    time_sec=12.0,
+                    layer="bed_robot_arm_group_command",
+                    payload={
+                        "command_id": "group-command-2",
+                        "request_id": "group-request-2",
+                        "group_id": "suction",
+                        "end_effector_profile": "suction",
+                        "operation": "suction_stop",
+                    },
+                ),
+                self._trace(
+                    sequence=5,
+                    time_sec=18.0,
+                    layer="bt_decision",
+                    payload={
+                        "selected_tool": "scalpel",
+                        "action": "handover",
+                        "confidence": 1.0,
+                    },
+                ),
+            ],
+            lead_window_sec=10.0,
+        )
+
+        self.assertEqual(2, report["confirmed_handover_count"])
+        self.assertEqual(1, report["confirmed_ordinary_handover_count"])
+        self.assertEqual(
+            1,
+            report["confirmed_specialized_group_action_count"],
+        )
+        bt_layer = report["layers"]["bt_decision"]
+        self.assertEqual(1, bt_layer["target_count"])
+        self.assertEqual(1, bt_layer["outcomes"]["exact_match"])
+        self.assertEqual(0, bt_layer["outcomes"]["missed_opportunity"])
+
+        specialized = report["specialized_group_actions"]
+        self.assertEqual("complete", specialized["status"])
+        self.assertEqual(1, specialized["target_count"])
+        self.assertEqual(1, specialized["exact_match_count"])
+        self.assertEqual(1.0, specialized["command_recall"])
+        self.assertEqual(0, specialized["false_positive_command_count"])
+        self.assertEqual(1, specialized["non_activation_command_count"])
+        self.assertEqual(1, specialized["terminal_success_count"])
+        self.assertEqual(1.0, specialized["execution_fulfillment_rate"])
+        self.assertTrue(specialized["events"][0]["sink_observed"])
+        self.assertEqual(
+            1.0,
+            report["scorecard"]["specialized_group_action"]["accuracy"],
+        )
+
+    def test_ambiguous_group_profile_does_not_reclassify_targets(self) -> None:
+        report = evaluate_shadow(
+            ground_truth=[
+                self._event(
+                    event_id="fixture-yankauer",
+                    time_sec=10.0,
+                    tool_id="yankauer_suction",
+                ),
+                self._event(
+                    event_id="fixture-poole",
+                    time_sec=20.0,
+                    tool_id="poole_suction",
+                ),
+            ],
+            decisions=[
+                self._trace(
+                    sequence=0,
+                    time_sec=0.0,
+                    layer="bed_robot_arm_group_status",
+                    payload={
+                        "group_id": "suction",
+                        "end_effector_profile": "suction",
+                        "state": "standby",
+                    },
+                ),
+                self._trace(
+                    sequence=1,
+                    time_sec=8.0,
+                    layer="bed_robot_arm_group_command",
+                    payload={
+                        "command_id": "group-command-1",
+                        "group_id": "suction",
+                        "end_effector_profile": "suction",
+                        "operation": "suction_start",
+                    },
+                ),
+            ],
+            lead_window_sec=10.0,
+        )
+
+        self.assertEqual(2, report["confirmed_ordinary_handover_count"])
+        self.assertEqual(
+            0,
+            report["confirmed_specialized_group_action_count"],
+        )
+        self.assertEqual(
+            2,
+            report["layers"]["bt_decision"]["target_count"],
+        )
+        specialized = report["specialized_group_actions"]
+        self.assertEqual("ambiguous_capabilities", specialized["status"])
+        self.assertEqual(1, len(specialized["capabilities"]["ambiguous"]))
+
+    def test_declared_group_target_remains_specialized_when_command_missing(
+        self,
+    ) -> None:
+        report = evaluate_shadow(
+            ground_truth=[
+                self._event(
+                    event_id="fixture-suction",
+                    time_sec=10.0,
+                    tool_id="yankauer_suction",
+                )
+            ],
+            decisions=[
+                self._trace(
+                    sequence=0,
+                    time_sec=0.0,
+                    layer="bed_robot_arm_group_status",
+                    payload={
+                        "group_id": "suction",
+                        "end_effector_profile": "suction",
+                        "state": "standby",
+                    },
+                )
+            ],
+            lead_window_sec=10.0,
+        )
+
+        self.assertEqual(0, report["confirmed_ordinary_handover_count"])
+        self.assertEqual(0, report["layers"]["bt_decision"]["target_count"])
+        specialized = report["specialized_group_actions"]
+        self.assertEqual(1, specialized["target_count"])
+        self.assertEqual(0, specialized["exact_match_count"])
+        self.assertEqual(1, specialized["missed_opportunity_count"])
+        self.assertEqual(0.0, specialized["command_recall"])
+
+    def test_group_activation_without_reference_target_is_unscorable(
+        self,
+    ) -> None:
+        report = evaluate_shadow(
+            ground_truth=[
+                self._event(
+                    event_id="fixture-scalpel",
+                    time_sec=20.0,
+                    tool_id="scalpel",
+                )
+            ],
+            decisions=[
+                self._trace(
+                    sequence=0,
+                    time_sec=0.0,
+                    layer="bed_robot_arm_group_status",
+                    payload={
+                        "group_id": "suction",
+                        "end_effector_profile": "suction",
+                        "state": "standby",
+                    },
+                ),
+                self._trace(
+                    sequence=1,
+                    time_sec=8.0,
+                    layer="bed_robot_arm_group_command",
+                    payload={
+                        "command_id": "group-command-1",
+                        "group_id": "suction",
+                        "end_effector_profile": "suction",
+                        "operation": "suction_start",
+                    },
+                ),
+            ],
+            lead_window_sec=10.0,
+            tool_identity_map={"suction": "yankauer_suction"},
+        )
+
+        specialized = report["specialized_group_actions"]
+        self.assertEqual(
+            "unscorable_reference_gap",
+            specialized["status"],
+        )
+        self.assertEqual(0, specialized["target_count"])
+        self.assertEqual(0, specialized["false_positive_command_count"])
+        self.assertEqual(
+            1,
+            specialized["unscorable_activation_command_count"],
+        )
+        self.assertEqual(
+            1,
+            report["scorecard"]["specialized_group_action"][
+                "unscorable_command_count"
+            ],
+        )
 
     def test_model_raw_scores_frozen_input_time_not_publication_time(
         self,
@@ -342,6 +615,12 @@ class CandidateAndShadowTest(unittest.TestCase):
         self.assertEqual(1, layer["outcomes"]["exact_match"])
         self.assertEqual(1, layer["request_backed_exact_count"])
         self.assertEqual(0, layer["anticipatory_exact_count"])
+        score = report["scorecard"]["next_tool_prediction"]["layers"][
+            "reducer_fused"
+        ]
+        self.assertEqual(1.0, score["combined_action_selection_accuracy"])
+        self.assertEqual(0.0, score["anticipatory_target_recall"])
+        self.assertEqual(1.0, score["request_backed_target_recall"])
 
     def test_interval_parser_accepts_fenced_json_and_multiple_spans(self) -> None:
         self.assertEqual(
@@ -540,6 +819,110 @@ class CandidateAndShadowTest(unittest.TestCase):
         )
         self.assertEqual(0, report["metrics"]["exact_match_count"])
         self.assertEqual(1, report["metrics"]["missed_opportunity_count"])
+
+    def test_request_backed_action_uses_bounded_reaction_lag(self) -> None:
+        event = self._event(
+            event_id="fixture-E0001",
+            time_sec=20.0,
+            tool_id="scalpel",
+        )
+        trace = [
+            self._trace(
+                sequence=0,
+                time_sec=20.4,
+                layer="skill_command",
+                payload={
+                    "instrument_id": "scalpel",
+                    "action": "pick_up_and_handover",
+                    "request_generation": 1,
+                },
+            )
+        ]
+
+        report = evaluate_shadow(
+            ground_truth=[event],
+            decisions=trace,
+            lead_window_sec=10.0,
+            request_reaction_window_sec=1.0,
+        )
+
+        layer = report["layers"]["skill_command"]
+        scored = layer["events"][0]
+        self.assertEqual(1, layer["outcomes"]["exact_match"])
+        self.assertEqual(1, layer["request_backed_exact_count"])
+        self.assertEqual(1, layer["request_reactive_exact_count"])
+        self.assertEqual("request_reactive", scored["match_timing"])
+        self.assertEqual(0.4, scored["request_reaction_lag_sec"])
+        self.assertIsNone(scored["lead_time_sec"])
+
+    def test_request_reaction_window_does_not_admit_stale_action(self) -> None:
+        event = self._event(
+            event_id="fixture-E0001",
+            time_sec=20.0,
+            tool_id="scalpel",
+        )
+        trace = [
+            self._trace(
+                sequence=0,
+                time_sec=22.1,
+                layer="skill_command",
+                payload={
+                    "instrument_id": "scalpel",
+                    "action": "pick_up_and_handover",
+                    "request_generation": 1,
+                },
+            )
+        ]
+
+        report = evaluate_shadow(
+            ground_truth=[event],
+            decisions=trace,
+            lead_window_sec=10.0,
+            request_reaction_window_sec=2.0,
+        )
+
+        layer = report["layers"]["skill_command"]
+        self.assertEqual(0, layer["outcomes"]["exact_match"])
+        self.assertEqual(1, layer["outcomes"]["missed_opportunity"])
+        self.assertEqual(1, layer["false_positive_count"])
+
+    def test_reactive_wrong_tool_is_left_for_later_matching_target(self) -> None:
+        events = [
+            self._event(
+                event_id="fixture-E0001",
+                time_sec=20.0,
+                tool_id="scalpel",
+            ),
+            self._event(
+                event_id="fixture-E0002",
+                time_sec=21.5,
+                tool_id="bovie",
+            ),
+        ]
+        trace = [
+            self._trace(
+                sequence=0,
+                time_sec=20.5,
+                layer="skill_command",
+                payload={
+                    "instrument_id": "bovie",
+                    "action": "pick_up_and_handover",
+                    "request_generation": 1,
+                },
+            )
+        ]
+
+        report = evaluate_shadow(
+            ground_truth=events,
+            decisions=trace,
+            lead_window_sec=10.0,
+            request_reaction_window_sec=2.0,
+        )
+
+        layer = report["layers"]["skill_command"]
+        self.assertEqual("missed_opportunity", layer["events"][0]["outcome"])
+        self.assertEqual("exact_match", layer["events"][1]["outcome"])
+        self.assertEqual("bovie", layer["events"][1]["predicted_tool_id"])
 
     def test_trace_reports_each_decision_layer_separately(self) -> None:
         event = self._event(

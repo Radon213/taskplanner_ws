@@ -31,9 +31,38 @@ class ShadowContractTest(unittest.TestCase):
     def test_trace_contract_includes_replay_clock_observability(self) -> None:
         self.assertIn("shadow_replay_state", TRACE_LAYERS)
 
+    def test_trace_contract_includes_fault_injection_observability(self) -> None:
+        self.assertIn("fault_injection_status", TRACE_LAYERS)
+
+    def test_fault_injection_status_is_topic_and_schema_bound(self) -> None:
+        record = TraceRecord(
+            run_id="run-1",
+            sequence=0,
+            mode="strict",
+            layer="fault_injection_status",
+            topic="/test/fault/status",
+            message_type="std_msgs/msg/String",
+            ros_time_sec=1.0,
+            wall_time_sec=100.0,
+            payload={
+                "schema": "taskplanner.fault_report.v1",
+                "scenario_id": "noise",
+                "seed": 7,
+                "counters": {"flir": {"dropped": 2}},
+            },
+        ).as_dict()
+
+        self.assertEqual([], validate_trace_records([record]))
+
     def test_trace_contract_separates_model_raw_from_operational_vlm(self) -> None:
         self.assertIn("vlm_model_raw", TRACE_LAYERS)
         self.assertIn("vlm_raw", TRACE_LAYERS)
+
+    def test_trace_contract_includes_evidence_and_evaluation_only_layers(
+        self,
+    ) -> None:
+        self.assertIn("vlm_tool_observation", TRACE_LAYERS)
+        self.assertIn("evaluation_ground_truth", TRACE_LAYERS)
 
     def test_trace_contract_includes_normalized_perception_pipeline(self) -> None:
         self.assertTrue(
@@ -95,6 +124,48 @@ class ShadowContractTest(unittest.TestCase):
                 for error in validate_trace_records([record])
             )
         )
+
+    def test_evaluation_ground_truth_layer_is_topic_and_payload_bound(
+        self,
+    ) -> None:
+        record = TraceRecord(
+            run_id="run-1",
+            sequence=0,
+            mode="strict",
+            layer="evaluation_ground_truth",
+            topic="/twin/world_state",
+            message_type="std_msgs/msg/String",
+            ros_time_sec=1.0,
+            wall_time_sec=100.0,
+            payload={
+                "schema": "taskplanner.shadow_ground_truth.v2",
+                "evaluation_only": False,
+            },
+        ).as_dict()
+
+        errors = validate_trace_records([record])
+
+        self.assertTrue(any("not valid for topic" in error for error in errors))
+        self.assertTrue(
+            any("evaluation_only=true" in error for error in errors)
+        )
+
+    def test_vlm_tool_observation_layer_rejects_wrong_topic(self) -> None:
+        record = TraceRecord(
+            run_id="run-1",
+            sequence=0,
+            mode="strict",
+            layer="vlm_tool_observation",
+            topic="/surgeon/request",
+            message_type="surgical_msgs/msg/ToolObservation",
+            ros_time_sec=1.0,
+            wall_time_sec=100.0,
+            payload={"instrument_id": "T04", "visible": True},
+        ).as_dict()
+
+        errors = validate_trace_records([record])
+
+        self.assertTrue(any("not valid for topic" in error for error in errors))
 
     def test_trace_sequence_and_time_must_be_monotonic(self) -> None:
         first = TraceRecord(

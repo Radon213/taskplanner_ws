@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from or_digital_twin.node import ORDigitalTwinNode
 from or_digital_twin.models import (
     LIFECYCLE_MAYO_REUSE,
@@ -750,3 +752,140 @@ def test_group_voice_cue_is_not_misclassified_as_tool_handover():
     assert twin.is_explicit_voice_tool_request(
         "현재 Bovie를 사용하고 있으며 다음 단계 준비를 계속합니다"
     ) is False
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "갑상선 절제술 시작하자",
+        "일곱 번째 갑상선 절제술 시작",
+        "네 자 열 번째 갑상선 절제술 시작하겠습니다.",
+        "start thyroid surgery",
+        "let us begin the thyroid procedure",
+        "수술을 계속 진행하겠습니다",
+    ],
+)
+def test_procedure_control_speech_is_not_a_tool_request(text: str):
+    twin = ORDigitalTwin(_thyroid_demo_spec())
+
+    assert twin.resolve_explicit_voice_tool_request(text) == ""
+    assert twin.is_explicit_voice_tool_request(text) is False
+    assert twin.update_explicit_request(text) == ""
+    assert twin.state.surgeon_request_tool == ""
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "thyroid",
+        "12th thyroid",
+        "갑상선",
+        "열두 번째 갑상선",
+    ],
+)
+def test_bare_procedure_name_fragment_is_not_a_tool_request(text: str):
+    twin = ORDigitalTwin(_thyroid_demo_spec())
+
+    assert twin.resolve_explicit_voice_tool_request(text) == ""
+    assert twin.update_explicit_request(text) == ""
+    assert twin.state.surgeon_request_tool == ""
+
+
+@pytest.mark.parametrize(
+    ("text", "expected_tool"),
+    [
+        ("thyroid retractor", "T11"),
+        ("thyroid please", "T11"),
+        ("갑상선 리트랙터", "T11"),
+        ("갑상선 주세요", "T11"),
+        ("Adson", "T02"),
+    ],
+)
+def test_procedure_name_tool_alias_requires_tool_class_or_request_marker(
+    text: str,
+    expected_tool: str,
+):
+    twin = ORDigitalTwin(_thyroid_demo_spec())
+
+    assert twin.resolve_explicit_voice_tool_request(text) == expected_tool
+
+
+def test_mixed_script_compact_additional_request_selects_second_instance():
+    twin = ORDigitalTwin(_thyroid_demo_spec())
+
+    assert twin.update_explicit_request("Adson") == "T02"
+    assert twin.update_explicit_request("Adson하나 더") == "T02"
+    assert [
+        cue.instance_id
+        for cue in twin.state.surgeon_request_queue
+    ] == ["T02#1", "T02#2"]
+
+
+@pytest.mark.parametrize(
+    ("text", "expected_tool"),
+    [
+        ("자 여섯 번째 갑상선 절제술 시작 Adson", "T02"),
+        ("수술 시작, Bovie 주세요", "T04"),
+        ("thyroid procedure start; Adson", "T02"),
+        ("갑상선 리트랙터 주세요", "T11"),
+        ("thyroid retractor", "T11"),
+    ],
+)
+def test_tool_request_after_procedure_control_clause_is_preserved(
+    text: str,
+    expected_tool: str,
+):
+    twin = ORDigitalTwin(_thyroid_demo_spec())
+
+    assert twin.resolve_explicit_voice_tool_request(text) == expected_tool
+    assert twin.is_explicit_voice_tool_request(text) is True
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "suction이랑 Bovie tip 좀 닦아줘 볼래요",
+        "Bovie를 세척해 주세요",
+        "please clean the Bovie tip",
+        "Bovie 정리해 주세요",
+        "Bovie 빼 주세요",
+    ],
+)
+def test_tool_management_speech_is_not_a_handover_request(text: str):
+    twin = ORDigitalTwin(_thyroid_demo_spec())
+
+    assert twin.resolve_explicit_voice_tool_request(text) == ""
+    assert twin.is_explicit_voice_tool_request(text) is False
+
+
+@pytest.mark.parametrize(
+    ("text", "expected_tool"),
+    [
+        ("Adson 받고 suction 빼", "T02"),
+        ("Bovie 빼고 bipolar 주세요", "T07"),
+        ("please clean Bovie, then pass Adson", "T02"),
+    ],
+)
+def test_compound_voice_routes_handover_clause_independently(
+    text: str,
+    expected_tool: str,
+):
+    twin = ORDigitalTwin(_thyroid_demo_spec())
+
+    assert twin.resolve_explicit_voice_tool_request(text) == expected_tool
+    assert twin.is_explicit_voice_tool_request(text) is True
+
+
+@pytest.mark.parametrize(
+    ("text", "expected_tool"),
+    [
+        ("Bovie 다시 줘", "T04"),
+        ("Bovie 주세요", "T04"),
+        ("please pass the Bovie", "T04"),
+        ("I need the Bovie", "T04"),
+    ],
+)
+def test_handover_verbs_remain_supported(text: str, expected_tool: str):
+    twin = ORDigitalTwin(_thyroid_demo_spec())
+
+    assert twin.resolve_explicit_voice_tool_request(text) == expected_tool

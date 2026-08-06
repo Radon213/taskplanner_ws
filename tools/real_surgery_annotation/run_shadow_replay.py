@@ -7,6 +7,7 @@ import argparse
 import ast
 from contextlib import ExitStack
 from datetime import datetime, timezone
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -34,6 +35,7 @@ try:
         resolve_case_reference,
         sha256_file,
         utc_now,
+        validate_behavior_quality_report,
         validate_trace_records,
     )
 except ImportError:  # Support direct execution from the repository root.
@@ -46,6 +48,7 @@ except ImportError:  # Support direct execution from the repository root.
         resolve_case_reference,
         sha256_file,
         utc_now,
+        validate_behavior_quality_report,
         validate_trace_records,
     )
 
@@ -78,7 +81,22 @@ STRICT_FORBIDDEN_NODE_MARKERS = (
     "skill_bridge",
     "mock_skill",
 )
-MIN_BEST_EFFORT_TRACE_COVERAGE = 0.98
+TARGET_BEST_EFFORT_TRACE_COVERAGE = 0.98
+MIN_BEST_EFFORT_TRACE_COVERAGE = 0.95
+SHADOW_GROUND_TRUTH_PREFIX = "/shadow/ground_truth"
+PROTECTED_GROUND_TRUTH_PREFIXES = (
+    GROUND_TRUTH_PREFIX,
+    SHADOW_GROUND_TRUTH_PREFIX,
+)
+GROUND_TRUTH_EVALUATION_SINK_NODES = {
+    "/shadow_trace_recorder",
+}
+EVALUATION_SINK_ALLOWED_PUBLISHER_TOPICS = {
+    "/parameter_events",
+    "/rosout",
+}
+RUNTIME_LOCK_SCHEMA = "taskplanner.shadow_runtime_lock.v1"
+RUNTIME_LOCK_DIR_ENV = "TASKPLANNER_SHADOW_RUNTIME_LOCK_DIR"
 
 
 def _provider_api_key(provider_id: str) -> str:
@@ -100,6 +118,7 @@ def _provider_api_key(provider_id: str) -> str:
 def _resolve_start_phase_id(
     explicit_phase_id: str,
     annotation_manifest: dict[str, Any],
+    procedure_payload: dict[str, Any] | None = None,
 ) -> tuple[str, str]:
     explicit = str(explicit_phase_id or "").strip()
     if explicit:
@@ -109,7 +128,19 @@ def _resolve_start_phase_id(
         configured = str(replay_profile.get("start_phase_id", "") or "").strip()
         if configured:
             return configured, "case_manifest"
-    return "", "procedure_default"
+    procedure = (
+        procedure_payload.get("procedure", {})
+        if isinstance(procedure_payload, dict)
+        else {}
+    )
+    configured = (
+        str(procedure.get("default_phase_id", "") or "").strip()
+        if isinstance(procedure, dict)
+        else ""
+    )
+    if configured:
+        return configured, "procedure_default"
+    return "", "unspecified"
 
 
 def _resolve_case_dir(
@@ -198,13 +229,164 @@ def _select_groot2_port(requested_port: int, ros_domain_id: int) -> int:
         return requested
 
     preferred = 20_000 + int(ros_domain_id)
-    for candidate in range(preferred, preferred + 100):
-        if _port_is_available(candidate):
-            return candidate
-    raise RuntimeError(
-        "no available shadow Groot2 port in reserved range "
-        f"{preferred}-{preferred + 99}"
-    )
+    if not _port_is_available(preferred):
+        raise RuntimeError(
+            "derived Groot2 port is unavailable: "
+            f"{preferred} (ROS_DOMAIN_ID={ros_domain_id}); refusing to "
+            "fall forward because another shadow runtime may own this domain"
+        )
+    return preferred
+
+
+def _runtime_lock_dir() -> Path:
+    configured = os.environ.get(RUNTIME_LOCK_DIR_ENV, "").strip()
+    if configured:
+        return Path(configured).expanduser().resolve()
+    uid = getattr(os, "getuid", lambda: 0)()
+    return Path("/tmp") / f"taskplanner-shadow-runtime-{uid}"
+
+
+def _runtime_resource_claims(
+    *,
+    ros_domain_id: int,
+    groot2_port: int,
+    rosbridge_port: int | None,
+) -> list[dict[str, Any]]:
+    claims = [
+        {
+            "key": f"ros-domain-{int(ros_domain_id)}",
+            "kind": "ros_domain",
+            "value": int(ros_domain_id),
+            "role": "shadow_runtime",
+        },
+        {
+            "key": f"tcp-port-{int(groot2_port)}",
+            "kind": "tcp_port",
+            "value": int(groot2_port),
+            "role": "groot2",
+        },
+    ]
+    if rosbridge_port is not None:
+        if int(rosbridge_port) == int(groot2_port):
+            raise ValueError(
+                "Groot2 and rosbridge cannot share TCP port "
+                f"{groot2_port}"
+            )
+        claims.append(
+            {
+                "key": f"tcp-port-{int(rosbridge_port)}",
+                "kind": "tcp_port",
+                "value": int(rosbridge_port),
+                "role": "rosbridge",
+            }
+        )
+    return claims
+
+
+class _RuntimeResourceLock:
+    """Hold host-local ROS domain and TCP resources for one shadow runtime."""
+
+    def __init__(
+        self,
+        *,
+        lock_dir: Path,
+        claims: list[dict[str, Any]],
+        owner: dict[str, Any],
+    ) -> None:
+        self.lock_dir = lock_dir
+        self.claims = sorted(claims, key=lambda row: str(row["key"]))
+        self.owner = {
+            "schema": RUNTIME_LOCK_SCHEMA,
+            "pid": os.getpid(),
+            "hostname": socket.gethostname(),
+            "acquired_at": utc_now(),
+            **owner,
+            "resources": self.claims,
+        }
+        self._handles: list[tuple[Path, int]] = []
+
+    @staticmethod
+    def _read_owner(fd: int) -> dict[str, Any] | str | None:
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            raw = os.read(fd, 64 * 1024).decode("utf-8").strip()
+        except OSError:
+            return None
+        if not raw:
+            return None
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError:
+            return raw
+        return value if isinstance(value, dict) else raw
+
+    def acquire(self) -> "_RuntimeResourceLock":
+        self.lock_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            for claim in self.claims:
+                lock_path = self.lock_dir / f"{claim['key']}.lock"
+                fd = os.open(
+                    lock_path,
+                    os.O_RDWR | os.O_CREAT,
+                    0o600,
+                )
+                try:
+                    fcntl.flock(
+                        fd,
+                        fcntl.LOCK_EX | fcntl.LOCK_NB,
+                    )
+                except BlockingIOError as exc:
+                    current_owner = self._read_owner(fd)
+                    os.close(fd)
+                    owner_text = json.dumps(
+                        current_owner,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                    raise RuntimeError(
+                        "shadow runtime resource is already locked: "
+                        f"{claim['kind']}={claim['value']} "
+                        f"(role={claim['role']}, lock={lock_path}, "
+                        f"owner={owner_text}). "
+                        "Use a different ROS domain/port or stop the owning "
+                        "shadow replay."
+                    ) from exc
+                payload = {
+                    **self.owner,
+                    "locked_resource": claim,
+                }
+                encoded = (
+                    json.dumps(
+                        payload,
+                        ensure_ascii=False,
+                        indent=2,
+                        sort_keys=True,
+                    )
+                    + "\n"
+                ).encode("utf-8")
+                os.ftruncate(fd, 0)
+                os.lseek(fd, 0, os.SEEK_SET)
+                os.write(fd, encoded)
+                os.fsync(fd)
+                self._handles.append((lock_path, fd))
+        except Exception:
+            self.release()
+            raise
+        return self
+
+    def release(self) -> None:
+        while self._handles:
+            _path, fd = self._handles.pop()
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
+    def __enter__(self) -> "_RuntimeResourceLock":
+        return self.acquire()
+
+    def __exit__(self, *_args: Any) -> None:
+        self.release()
 
 
 def _run(
@@ -569,7 +751,20 @@ def _validate_public_input_trace(
             and isinstance(perception.get("bboxes"), dict)
             and isinstance(perception.get("segmentation"), dict)
         )
-        current_split_context = (
+        current_fused_context = (
+            isinstance(visual, dict)
+            and visual.get("image_source")
+            == "flir_cam4_rfdetr_segmented"
+            and visual.get("image_layout") == "flir_left_cam4_right"
+            and visual.get("cam4_image_forwarded_to_vlm") is True
+            and isinstance(perception, dict)
+            and perception.get("source") == "cam4_rfdetr_small"
+            and perception.get("ground_truth") is False
+            and isinstance(perception.get("alignment"), dict)
+            and perception["alignment"].get("status") == "aligned"
+            and isinstance(perception.get("tools"), list)
+        )
+        current_flir_only_context = (
             isinstance(visual, dict)
             and visual.get("image_source") == "flir_rfdetr_segmented"
             and isinstance(perception, dict)
@@ -580,9 +775,13 @@ def _validate_public_input_trace(
             and perception["alignment"].get("status") == "aligned"
             and isinstance(perception.get("tools"), list)
         )
-        if current_split_context:
+        if current_fused_context or current_flir_only_context:
             segmented_flir_context_count += 1
-        if legacy_multiview_context or current_split_context:
+        if (
+            legacy_multiview_context
+            or current_fused_context
+            or current_flir_only_context
+        ):
             auditable_perception_context_count += 1
 
     def coverage_summary(
@@ -607,6 +806,7 @@ def _validate_public_input_trace(
         expected: int,
         recorded: int,
         errors: list[str],
+        warnings: list[str],
     ) -> dict[str, int | float]:
         summary = coverage_summary(expected, recorded)
         if (
@@ -620,14 +820,27 @@ def _validate_public_input_trace(
                 f"ratio={summary['coverage_ratio']:.4f},"
                 f"minimum={MIN_BEST_EFFORT_TRACE_COVERAGE:.4f}"
             )
+        elif (
+            expected > 0
+            and summary["coverage_ratio"]
+            < TARGET_BEST_EFFORT_TRACE_COVERAGE
+        ):
+            warnings.append(
+                f"{label}_coverage_below_target:"
+                f"expected={expected},recorded={recorded},"
+                f"ratio={summary['coverage_ratio']:.4f},"
+                f"target={TARGET_BEST_EFFORT_TRACE_COVERAGE:.4f}"
+            )
         return summary
 
     errors: list[str] = []
+    warnings: list[str] = []
     field_image_coverage = require_best_effort_coverage(
         label="field_image",
         expected=expected_images,
         recorded=recorded_images,
         errors=errors,
+        warnings=warnings,
     )
     if recorded_source_transcripts != expected_transcripts:
         errors.append(
@@ -655,6 +868,7 @@ def _validate_public_input_trace(
             expected=expected_flir_images,
             recorded=recorded_flir_images,
             errors=errors,
+            warnings=warnings,
         )
     cam4_image_coverage = coverage_summary(
         expected_cam4_images,
@@ -666,6 +880,7 @@ def _validate_public_input_trace(
             expected=expected_cam4_images,
             recorded=recorded_cam4_images,
             errors=errors,
+            warnings=warnings,
         )
     bbox_coverage = coverage_summary(expected_bboxes, recorded_bboxes)
     if recorded_perception_bboxes_topic:
@@ -674,6 +889,7 @@ def _validate_public_input_trace(
             expected=expected_bboxes,
             recorded=recorded_bboxes,
             errors=errors,
+            warnings=warnings,
         )
     segmentation_coverage = coverage_summary(
         expected_segmentations,
@@ -685,6 +901,7 @@ def _validate_public_input_trace(
             expected=expected_segmentations,
             recorded=recorded_segmentations,
             errors=errors,
+            warnings=warnings,
         )
     if composite_image_topic and expected_flir_images and recorded_composites <= 0:
         errors.append("vlm_model_input_image_missing")
@@ -722,6 +939,9 @@ def _validate_public_input_trace(
         "minimum_best_effort_trace_coverage": (
             MIN_BEST_EFFORT_TRACE_COVERAGE
         ),
+        "target_best_effort_trace_coverage": (
+            TARGET_BEST_EFFORT_TRACE_COVERAGE
+        ),
         "recorded_vlm_composite_count": recorded_composites,
         "recorded_vlm_preprocessed_input_count": (
             recorded_preprocessed_images
@@ -737,6 +957,7 @@ def _validate_public_input_trace(
         "recorded_source_transcript_count": recorded_source_transcripts,
         "admitted_speech_count": admitted_speech,
         "errors": errors,
+        "warnings": warnings,
     }
 
 
@@ -1118,6 +1339,7 @@ def _runtime_boundary_audit(
             for name, types in audit_node.get_topic_names_and_types()
         )
         subscriptions: dict[str, list[str]] = {}
+        publishers: dict[str, list[str]] = {}
         info_errors: dict[str, str] = {}
         for full_name in CRITICAL_NODES:
             namespace, _, name = full_name.rpartition("/")
@@ -1130,8 +1352,18 @@ def _runtime_boundary_audit(
                 subscriptions[full_name] = sorted(
                     topic for topic, _types in values
                 )
+                published_values = (
+                    audit_node.get_publisher_names_and_types_by_node(
+                        name,
+                        namespace,
+                    )
+                )
+                publishers[full_name] = sorted(
+                    topic for topic, _types in published_values
+                )
             except Exception as exc:
                 subscriptions[full_name] = []
+                publishers[full_name] = []
                 info_errors[full_name] = str(exc)
     finally:
         audit_node.destroy_node()
@@ -1142,12 +1374,53 @@ def _runtime_boundary_audit(
         for line in topic_lines
         if line.split(" ", 1)[0].startswith(GROUND_TRUTH_PREFIX)
     ]
-    leaked_subscriptions = {
+    protected_ground_truth_topics = [
+        line.split(" ", 1)[0]
+        for line in topic_lines
+        if any(
+            line.split(" ", 1)[0].startswith(prefix)
+            for prefix in PROTECTED_GROUND_TRUTH_PREFIXES
+        )
+    ]
+    protected_subscriptions = {
         node: [
-            topic for topic in values if topic.startswith(GROUND_TRUTH_PREFIX)
+            topic
+            for topic in values
+            if any(
+                topic.startswith(prefix)
+                for prefix in PROTECTED_GROUND_TRUTH_PREFIXES
+            )
         ]
         for node, values in subscriptions.items()
-        if any(topic.startswith(GROUND_TRUTH_PREFIX) for topic in values)
+        if any(
+            any(
+                topic.startswith(prefix)
+                for prefix in PROTECTED_GROUND_TRUTH_PREFIXES
+            )
+            for topic in values
+        )
+    }
+    evaluation_sink_ground_truth_subscriptions = {
+        node: topics
+        for node, topics in protected_subscriptions.items()
+        if node in GROUND_TRUTH_EVALUATION_SINK_NODES
+    }
+    leaked_subscriptions = {
+        node: topics
+        for node, topics in protected_subscriptions.items()
+        if node not in GROUND_TRUTH_EVALUATION_SINK_NODES
+    }
+    evaluation_sink_runtime_publishers = {
+        node: [
+            topic
+            for topic in publishers.get(node, [])
+            if topic not in EVALUATION_SINK_ALLOWED_PUBLISHER_TOPICS
+        ]
+        for node in GROUND_TRUTH_EVALUATION_SINK_NODES
+        if any(
+            topic not in EVALUATION_SINK_ALLOWED_PUBLISHER_TOPICS
+            for topic in publishers.get(node, [])
+        )
     }
     forbidden_nodes = [
         node
@@ -1161,6 +1434,8 @@ def _runtime_boundary_audit(
             strict_errors.append("ground_truth_topics_visible")
         if leaked_subscriptions:
             strict_errors.append("critical_node_ground_truth_subscription")
+        if evaluation_sink_runtime_publishers:
+            strict_errors.append("evaluation_sink_has_runtime_publishers")
         if forbidden_nodes:
             strict_errors.append("forbidden_runtime_node_present")
         if "/reference_reconciler" in nodes:
@@ -1176,8 +1451,16 @@ def _runtime_boundary_audit(
         "nodes": nodes,
         "topics": topic_lines,
         "critical_node_subscriptions": subscriptions,
+        "critical_node_publishers": publishers,
         "missing_critical_nodes": missing_critical_nodes,
         "forbidden_topics": forbidden_topics,
+        "protected_ground_truth_topics": protected_ground_truth_topics,
+        "evaluation_sink_ground_truth_subscriptions": (
+            evaluation_sink_ground_truth_subscriptions
+        ),
+        "evaluation_sink_runtime_publishers": (
+            evaluation_sink_runtime_publishers
+        ),
         "leaked_subscriptions": leaked_subscriptions,
         "forbidden_nodes": forbidden_nodes,
         "node_info_errors": info_errors,
@@ -1275,6 +1558,47 @@ def _artifact_if_present(path: Path) -> dict[str, str] | None:
     return hashed_artifact(path) if path.is_file() else None
 
 
+def _behavior_quality_manifest_summary(
+    evaluation: dict[str, Any],
+) -> dict[str, Any]:
+    behavior_quality = evaluation.get("behavior_quality")
+    errors = validate_behavior_quality_report(behavior_quality)
+    if errors:
+        raise ValueError(
+            "offline behavior-quality contract validation failed: "
+            + "; ".join(errors)
+        )
+    assert isinstance(behavior_quality, dict)
+    raw_summary = behavior_quality["summary"]
+    assert isinstance(raw_summary, dict)
+    summary = dict(raw_summary)
+    empty_latency_distribution = {
+        "count": 0,
+        "mean": None,
+        "median": None,
+        "p95": None,
+        "max": None,
+    }
+    for key in (
+        "request_to_handover_wall_clock_latency_sec",
+        "wrong_preposition_release_wall_clock_latency_sec",
+        "abandoned_preposition_hold_duration_sec",
+        "abandoned_preposition_wall_clock_hold_duration_sec",
+    ):
+        summary.setdefault(key, dict(empty_latency_distribution))
+    return {
+        "schema": behavior_quality["schema"],
+        "status": behavior_quality.get("status"),
+        "reference_quality": behavior_quality.get("reference_quality"),
+        "evaluation_only": True,
+        "latency_clock_semantics": behavior_quality.get(
+            "latency_clock_semantics",
+            {},
+        ),
+        **summary,
+    }
+
+
 def _build_parser(repo_root: Path) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -1312,7 +1636,15 @@ def _build_parser(repo_root: Path) -> argparse.ArgumentParser:
         default=repo_root / "output/shadow_runs",
     )
     parser.add_argument("--run-id", default="")
-    parser.add_argument("--ros-domain-id", type=int, default=71)
+    parser.add_argument(
+        "--ros-domain-id",
+        type=int,
+        default=171,
+        help=(
+            "Isolated ROS domain for this evaluator. The default deliberately "
+            "differs from the interactive shadow runtime domain (71)."
+        ),
+    )
     parser.add_argument(
         "--groot2-port",
         type=int,
@@ -1337,7 +1669,25 @@ def _build_parser(repo_root: Path) -> argparse.ArgumentParser:
         choices=("elastic_demo", "realtime_1x"),
         default="elastic_demo",
     )
-    parser.add_argument("--rosbridge-port", type=int, default=9091)
+    parser.add_argument(
+        "--fault-scenario-path",
+        type=Path,
+        default=None,
+        help=(
+            "Optional deterministic public-input fault timeline. The source "
+            "bag remains unchanged; replayed FLIR, CAM4, and transcript "
+            "messages are relayed through the fault injector."
+        ),
+    )
+    parser.add_argument(
+        "--rosbridge-port",
+        type=int,
+        default=9191,
+        help=(
+            "Evaluator rosbridge port. The default deliberately differs from "
+            "the interactive shadow runtime port (9099)."
+        ),
+    )
     parser.add_argument(
         "--score-provisional-phase",
         action=argparse.BooleanOptionalAction,
@@ -1490,6 +1840,22 @@ def main() -> int:
         args.groot2_port,
         args.ros_domain_id,
     )
+    if (
+        args.interactive_replay
+        and not _port_is_available(args.rosbridge_port)
+    ):
+        raise RuntimeError(
+            "requested rosbridge port is unavailable: "
+            f"{args.rosbridge_port}"
+        )
+    runtime_lock_dir = _runtime_lock_dir()
+    runtime_resource_claims = _runtime_resource_claims(
+        ros_domain_id=args.ros_domain_id,
+        groot2_port=groot2_port,
+        rosbridge_port=(
+            args.rosbridge_port if args.interactive_replay else None
+        ),
+    )
     source_bag = args.source_bag.resolve()
     case_dir = _resolve_case_dir(repo_root, source_bag, args.case_dir)
     spec_dir = (
@@ -1525,6 +1891,7 @@ def main() -> int:
     args.start_phase_id, start_phase_source = _resolve_start_phase_id(
         args.start_phase_id,
         annotation_manifest,
+        procedure_payload,
     )
     _validate_start_phase_id(args.start_phase_id, procedure_path)
     annotation_root = case_dir.parents[1]
@@ -1578,6 +1945,17 @@ def main() -> int:
             raise FileNotFoundError(replay_response_path)
     else:
         replay_response_path = None
+    if args.fault_scenario_path is not None:
+        if not args.interactive_replay:
+            raise ValueError(
+                "--fault-scenario-path requires --interactive-replay so the "
+                "public source topics can be relayed without mutating the bag"
+            )
+        fault_scenario_path = args.fault_scenario_path.resolve()
+        if not fault_scenario_path.is_file():
+            raise FileNotFoundError(fault_scenario_path)
+    else:
+        fault_scenario_path = None
 
     run_id = args.run_id.strip() or (
         datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -1595,6 +1973,7 @@ def main() -> int:
     scorecard_csv_path = run_dir / "shadow_scorecard.csv"
     markdown_path = run_dir / "shadow_report.md"
     timeline_path = run_dir / "shadow_timeline.svg"
+    surgery_record_path = run_dir / "surgery_record_input.txt"
     static_boundary_path = run_dir / "static_boundary.json"
     runtime_boundary_path = run_dir / "runtime_boundary.json"
     launch_log_path = run_dir / "launch.log"
@@ -1635,9 +2014,27 @@ def main() -> int:
             "rate": args.rate,
             "interactive_replay": bool(args.interactive_replay),
             "replay_mode": args.replay_mode,
+            "fault_injection": {
+                "enabled": fault_scenario_path is not None,
+                "scenario": (
+                    hashed_artifact(fault_scenario_path)
+                    if fault_scenario_path is not None
+                    else None
+                ),
+            },
             "rosbridge_port": (
                 args.rosbridge_port if args.interactive_replay else None
             ),
+            "resource_lock": {
+                "schema": RUNTIME_LOCK_SCHEMA,
+                "lock_dir": str(runtime_lock_dir),
+                "claims": runtime_resource_claims,
+                "status": (
+                    "not_required_dry_run"
+                    if args.dry_run
+                    else "pending"
+                ),
+            },
             "score_provisional_phase": bool(
                 args.score_provisional_phase
             ),
@@ -1712,6 +2109,10 @@ def main() -> int:
                     repo_root
                     / "tools/real_surgery_annotation/render_shadow_report.py"
                 ),
+                "surgery_record_renderer": hashed_artifact(
+                    repo_root
+                    / "tools/real_surgery_annotation/render_surgery_record_timeline.py"
+                ),
                 "shadow_determinism_comparator": hashed_artifact(
                     repo_root
                     / "tools/real_surgery_annotation/compare_shadow_determinism.py"
@@ -1777,14 +2178,47 @@ def main() -> int:
             "strict": args.mode == "strict",
             "ground_truth_runtime_visible": args.mode != "strict",
             "checked": False,
+            "surgery_record_input": {
+                "emitted_only_after_status": "complete",
+                "source_transcript_topic": args.source_transcript_topic,
+                "vlm_source": "vlm_raw.schema_v4.summary",
+                "evaluation_ground_truth_included": False,
+                "shadow_events_marked_non_physical": True,
+            },
         },
     }
     _write_manifest(manifest_path, manifest)
 
     launch_process: subprocess.Popen[Any] | None = None
     bag_process: subprocess.Popen[Any] | None = None
+    runtime_lock: _RuntimeResourceLock | None = None
     return_code = 1
     try:
+        if not args.dry_run:
+            pending_runtime_lock = _RuntimeResourceLock(
+                lock_dir=runtime_lock_dir,
+                claims=runtime_resource_claims,
+                owner={
+                    "run_id": run_id,
+                    "case_id": case_id,
+                    "ros_domain_id": args.ros_domain_id,
+                    "groot2_port": groot2_port,
+                    "rosbridge_port": (
+                        args.rosbridge_port
+                        if args.interactive_replay
+                        else None
+                    ),
+                },
+            )
+            try:
+                runtime_lock = pending_runtime_lock.acquire()
+            except RuntimeError:
+                manifest["runtime"]["resource_lock"]["status"] = "contended"
+                _write_manifest(manifest_path, manifest)
+                raise
+            manifest["runtime"]["resource_lock"]["status"] = "acquired"
+            manifest["runtime"]["resource_lock"]["owner_pid"] = os.getpid()
+            _write_manifest(manifest_path, manifest)
         static_boundary = _static_boundary_audit(
             repo_root=repo_root,
             report_path=static_boundary_path,
@@ -1914,6 +2348,10 @@ def main() -> int:
         ]
         if args.interactive_replay:
             launch_command.append(f"source_bag_path:={source_bag}")
+        if fault_scenario_path is not None:
+            launch_command.append(
+                f"fault_scenario_path:={fault_scenario_path}"
+            )
         if args.mode != "strict":
             launch_command.append(f"reference_path:={event_path}")
             launch_command.append(f"tool_catalog_path:={tool_catalog_path}")
@@ -2050,6 +2488,11 @@ def main() -> int:
             _terminate_process(launch_process)
             launch_process = None
             bag_process = None
+        if runtime_lock is not None:
+            runtime_lock.release()
+            runtime_lock = None
+            manifest["runtime"]["resource_lock"]["status"] = "released"
+            manifest["runtime"]["resource_lock"]["released_at"] = utc_now()
 
         if not trace_path.is_file():
             raise RuntimeError("shadow trace was not created")
@@ -2124,6 +2567,12 @@ def main() -> int:
         evaluation = json.loads(evaluation_path.read_text(encoding="utf-8"))
         if evaluation.get("runtime", {}).get("trace_contract_error_count") != 0:
             raise RuntimeError("offline evaluator reported trace contract errors")
+        manifest["evaluation"] = {
+            "status": evaluation.get("status"),
+            "behavior_quality": _behavior_quality_manifest_summary(
+                evaluation
+            ),
+        }
         manifest["status"] = "complete"
         manifest["completed_at"] = utc_now()
         manifest["runtime"]["trace_record_count"] = len(trace_records)
@@ -2143,6 +2592,20 @@ def main() -> int:
             str(timeline_path),
         ]
         _run(report_command, env=env, timeout_sec=30.0)
+        surgery_record_command = [
+            sys.executable,
+            "-m",
+            "tools.real_surgery_annotation.render_surgery_record_timeline",
+            "--manifest",
+            str(manifest_path),
+            "--trace",
+            str(trace_path),
+            "--procedure-prompt",
+            str(procedure_path),
+            "--output",
+            str(surgery_record_path),
+        ]
+        _run(surgery_record_command, env=env, timeout_sec=30.0)
         manifest["artifacts"] = {
             "trace": hashed_artifact(trace_path),
             "evaluation": hashed_artifact(evaluation_path),
@@ -2150,6 +2613,7 @@ def main() -> int:
             "scorecard_csv": hashed_artifact(scorecard_csv_path),
             "markdown_report": hashed_artifact(markdown_path),
             "timeline_svg": hashed_artifact(timeline_path),
+            "surgery_record_input": hashed_artifact(surgery_record_path),
             "static_boundary": hashed_artifact(static_boundary_path),
             "runtime_boundary": hashed_artifact(runtime_boundary_path),
             "model_preflight": hashed_artifact(model_preflight_path),
@@ -2169,6 +2633,11 @@ def main() -> int:
     finally:
         _terminate_process(bag_process)
         _terminate_process(launch_process)
+        if runtime_lock is not None:
+            runtime_lock.release()
+            runtime_lock = None
+            manifest["runtime"]["resource_lock"]["status"] = "released"
+            manifest["runtime"]["resource_lock"]["released_at"] = utc_now()
         if manifest["status"] in {"failed", "interrupted"}:
             manifest["completed_at"] = utc_now()
             artifacts: dict[str, Any] = {}

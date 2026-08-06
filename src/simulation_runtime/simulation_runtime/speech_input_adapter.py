@@ -181,6 +181,7 @@ class SpeechInputAdapterNode(Node):
         self._received_count = 0
         self._accepted_count = 0
         self._rejected_count = 0
+        self._epoch = 1
         self._last_source = ""
         self._last_detail = self._waiting_detail()
         self._last_observation_stamp = None
@@ -304,6 +305,7 @@ class SpeechInputAdapterNode(Node):
         self._recent_ids.clear()
         self._recent_sentences.clear()
         if command == "reset":
+            self._epoch += 1
             self._received_count = 0
             self._accepted_count = 0
             self._rejected_count = 0
@@ -322,13 +324,13 @@ class SpeechInputAdapterNode(Node):
         )
         healthy = 0.0 <= age_sec <= self._source_timeout_sec
         if self._received_count == 0:
-            state = "waiting"
+            state = "MISSING"
         elif healthy:
-            state = "healthy"
+            state = "READY"
         elif self._accepted_count == 0:
-            state = "rejecting"
+            state = "ERROR"
         else:
-            state = "stale"
+            state = "STALE"
 
         status = InputSourceStatus()
         status.stamp = self.get_clock().now().to_msg()
@@ -344,6 +346,13 @@ class SpeechInputAdapterNode(Node):
         status.received_count = int(self._received_count)
         status.accepted_count = int(self._accepted_count)
         status.rejected_count = int(self._rejected_count)
+        status.epoch = int(self._epoch)
+        status.dropped_count = 0
+        status.error_code = (
+            self._last_detail
+            if state in {"ERROR", "STALE"}
+            else ""
+        )
         status.detail = self._last_detail
         self._status_pub.publish(status)
 

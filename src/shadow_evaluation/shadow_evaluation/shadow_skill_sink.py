@@ -173,6 +173,103 @@ class SemanticCommandLedger:
         self._admissions.clear()
         self._reported_deadlocks.clear()
 
+    def forget_preparations(
+        self,
+        instrument_id: str,
+        instance_id: str = "",
+    ) -> None:
+        """Start a new episode after a preparation is consumed or released."""
+        tool_id = str(instrument_id or "").strip()
+        tool_instance = str(instance_id or "").strip()
+        if not tool_id:
+            return
+
+        forgotten_keys = {
+            key
+            for key in self._admissions
+            if _semantic_key_matches_preparation(
+                key,
+                tool_id,
+                tool_instance,
+            )
+        }
+        if not forgotten_keys:
+            return
+        for key in forgotten_keys:
+            self._admissions.pop(key, None)
+        self._reported_deadlocks = {
+            key: observed_at
+            for key, observed_at in self._reported_deadlocks.items()
+            if not any(
+                key.startswith(f"{semantic_key}\n")
+                for semantic_key in forgotten_keys
+            )
+        }
+
+    def forget_returns(
+        self,
+        instrument_id: str,
+        instance_id: str = "",
+    ) -> None:
+        """Allow one return in a newly observed preparation episode."""
+        tool_id = str(instrument_id or "").strip()
+        tool_instance = str(instance_id or "").strip()
+        if not tool_id:
+            return
+
+        forgotten_keys = {
+            key
+            for key in self._admissions
+            if _semantic_key_matches_return(
+                key,
+                tool_id,
+                tool_instance,
+            )
+        }
+        if not forgotten_keys:
+            return
+        for key in forgotten_keys:
+            self._admissions.pop(key, None)
+        self._reported_deadlocks = {
+            key: observed_at
+            for key, observed_at in self._reported_deadlocks.items()
+            if not any(
+                key.startswith(f"{semantic_key}\n")
+                for semantic_key in forgotten_keys
+            )
+        }
+
+    def begin_preparation_episode(
+        self,
+        instrument_id: str,
+        instance_id: str = "",
+    ) -> None:
+        """Allow one return command for a newly admitted preparation."""
+
+        tool_id = str(instrument_id or "").strip()
+        tool_instance = str(instance_id or "").strip()
+        if not tool_id:
+            return
+        forgotten_keys = {
+            key
+            for key in self._admissions
+            if _semantic_key_matches_unused_return(
+                key,
+                tool_id,
+                tool_instance,
+            )
+        }
+        for key in forgotten_keys:
+            self._admissions.pop(key, None)
+        self._reported_deadlocks = {
+            key: observed_at
+            for key, observed_at in self._reported_deadlocks.items()
+            if not any(
+                key.startswith(f"{semantic_key}\n")
+                for semantic_key in forgotten_keys
+            )
+        }
+
     def previous_fingerprint(self, semantic_key: str) -> str:
         previous = self._admissions.get(semantic_key)
         return previous[0] if previous else ""
@@ -214,6 +311,130 @@ def _instance_id(payload: dict[str, Any]) -> str:
         or payload.get("instance_id")
         or ""
     ).strip()
+
+
+def _semantic_key_matches_preparation(
+    semantic_key: str,
+    instrument_id: str,
+    instance_id: str,
+) -> bool:
+    fields = str(semantic_key or "").split("|")
+    if len(fields) < 3 or fields[0] not in PREPARE_ACTIONS:
+        return False
+    if fields[1] != instrument_id:
+        return False
+    return not instance_id or fields[2] in {"", instance_id}
+
+
+def _semantic_key_matches_return(
+    semantic_key: str,
+    instrument_id: str,
+    instance_id: str,
+) -> bool:
+    fields = str(semantic_key or "").split("|")
+    if (
+        len(fields) < 3
+        or fields[0] != "return_unused_preposition"
+    ):
+        return False
+    if fields[1] != instrument_id:
+        return False
+    return not instance_id or fields[2] in {"", instance_id}
+
+
+def _semantic_key_matches_unused_return(
+    semantic_key: str,
+    instrument_id: str,
+    instance_id: str,
+) -> bool:
+    fields = str(semantic_key or "").split("|")
+    if len(fields) < 3 or fields[0] != "return_unused_preposition":
+        return False
+    if fields[1] != instrument_id:
+        return False
+    return not instance_id or fields[2] in {"", instance_id}
+
+
+def _instrument_lifecycle_index(
+    world: dict[str, Any] | None,
+) -> dict[tuple[str, str], str]:
+    if world is None:
+        return {}
+    result: dict[tuple[str, str], str] = {}
+    for state in world.get("instrument_states", []):
+        if not isinstance(state, dict):
+            continue
+        tool_id = str(state.get("instrument_id", "") or "").strip()
+        instance_id = str(state.get("instance_id", "") or "").strip()
+        if not tool_id:
+            continue
+        result[(tool_id, instance_id)] = str(
+            state.get("lifecycle_stage", "") or ""
+        ).strip()
+    return result
+
+
+def returned_home_instrument_instances(
+    previous_world: dict[str, Any] | None,
+    current_world: dict[str, Any] | None,
+) -> set[tuple[str, str]]:
+    previous = _instrument_lifecycle_index(previous_world)
+    current = _instrument_lifecycle_index(current_world)
+    home_stages = {"home_rack", "returned_home"}
+    return {
+        identity
+        for identity, lifecycle in current.items()
+        if lifecycle in home_stages
+        and identity in previous
+        and previous[identity] not in home_stages
+    }
+
+
+def completed_preposition_instrument_instances(
+    previous_world: dict[str, Any] | None,
+    current_world: dict[str, Any] | None,
+) -> set[tuple[str, str]]:
+    """Find preparations consumed by handover or released to a source."""
+
+    previous = _instrument_lifecycle_index(previous_world)
+    current = _instrument_lifecycle_index(current_world)
+    return {
+        identity
+        for identity, lifecycle in current.items()
+        if identity in previous
+        and previous[identity] == "prepositioned_right"
+        and lifecycle != "prepositioned_right"
+    }
+
+
+def newly_prepositioned_instrument_instances(
+    previous_world: dict[str, Any] | None,
+    current_world: dict[str, Any] | None,
+) -> set[tuple[str, str]]:
+    previous = _instrument_lifecycle_index(previous_world)
+    current = _instrument_lifecycle_index(current_world)
+    return {
+        identity
+        for identity, lifecycle in current.items()
+        if lifecycle == "prepositioned_right"
+        and identity in previous
+        and previous[identity] != "prepositioned_right"
+    }
+
+
+def departed_prepositioned_instrument_instances(
+    previous_world: dict[str, Any] | None,
+    current_world: dict[str, Any] | None,
+) -> set[tuple[str, str]]:
+    previous = _instrument_lifecycle_index(previous_world)
+    current = _instrument_lifecycle_index(current_world)
+    return {
+        identity
+        for identity, lifecycle in current.items()
+        if identity in previous
+        and previous[identity] == "prepositioned_right"
+        and lifecycle != "prepositioned_right"
+    }
 
 
 def _world_instrument_state(
@@ -350,8 +571,14 @@ def classify_shadow_command(
                 "blocked",
                 f"right_hand_tool_not_prepositioned:{right_lifecycle or 'unknown'}",
             )
-        if not str(right_hand.get("home_location_id", "") or "").strip():
-            return ("blocked", "right_hand_tool_home_location_unknown")
+        if not (
+            str(
+                right_hand.get("preposition_origin_location_id", "")
+                or right_hand.get("home_location_id", "")
+                or ""
+            ).strip()
+        ):
+            return ("blocked", "right_hand_tool_return_location_unknown")
     elif (
         action in HANDOVER_ACTIONS
         and right_hand_tool
@@ -387,10 +614,25 @@ def classify_shadow_command(
     elif action == "return_unused_preposition":
         if lifecycle != "prepositioned_right":
             return ("physically_impossible", "instrument_not_prepositioned")
-        if bool(state.get("contaminated")):
+        return_location_type = str(
+            command.get("target_location_type", "") or ""
+        ).strip()
+        if (
+            bool(state.get("contaminated"))
+            and return_location_type
+            not in {"mayo_stand", "mayo_reuse_zone"}
+        ):
             return ("unsafe", "instrument_contaminated")
-    elif action in PREPARE_ACTIONS and bool(state.get("contaminated")):
-        return ("unsafe", "instrument_contaminated")
+    elif action in PREPARE_ACTIONS:
+        if (
+            lifecycle not in {"home_rack", "returned_home", "mayo_reuse"}
+        ):
+            return (
+                "physically_impossible",
+                f"instrument_not_preparable_from_{lifecycle or 'unknown'}",
+            )
+        if bool(state.get("contaminated")) and lifecycle != "mayo_reuse":
+            return ("unsafe", "instrument_contaminated")
     return ("admissible", "shadow_only_no_execution")
 
 
@@ -611,30 +853,40 @@ def counterfactual_event_payloads(
             displaced_instance_id = str(
                 displaced_state.get("instance_id", "") or ""
             ).strip()
-            displaced_home_id = str(
-                displaced_state.get("home_location_id", "") or ""
+            displaced_return_id = str(
+                displaced_state.get("preposition_origin_location_id", "")
+                or displaced_state.get("home_location_id", "")
+                or ""
             ).strip()
-            displaced_home_type = str(
-                displaced_state.get("home_location_type", "") or "tray_slot"
+            displaced_return_type = str(
+                displaced_state.get("preposition_origin_location_type", "")
+                or displaced_state.get("home_location_type", "")
+                or "tray_slot"
             ).strip()
-            if not displaced_tool_id or not displaced_home_id:
+            displaced_return_lifecycle = str(
+                displaced_state.get(
+                    "preposition_origin_lifecycle_stage", ""
+                )
+                or "returned_home"
+            ).strip()
+            if not displaced_tool_id or not displaced_return_id:
                 return []
             events.append(
                 {
-                    "event_type": "PredictedToolReturnedToRack",
+                    "event_type": "UnusedPrepositionReturned",
                     "instrument_id": displaced_tool_id,
                     "instance_id": displaced_instance_id,
                     "confidence": 1.0,
                     "mode": "shadow_counterfactual",
-                    "location_id": displaced_home_id,
-                    "location_type": displaced_home_type,
+                    "location_id": displaced_return_id,
+                    "location_type": displaced_return_type,
                     "owner": "none",
                     "status": "available",
                     "arm": arm or "right",
                     "source_location_id": "robot_right_hand",
                     "source_location_type": "robot_right_hand",
-                    "target_location_id": displaced_home_id,
-                    "target_location_type": displaced_home_type,
+                    "target_location_id": displaced_return_id,
+                    "target_location_type": displaced_return_type,
                     "target_owner": "none",
                     "detail": {
                         **common["detail"],
@@ -644,6 +896,9 @@ def counterfactual_event_payloads(
                         "incoming_instrument_id": tool_id,
                         "incoming_instance_id": _instance_id(command),
                         "semantic_step": "put_down_existing_right_hand_tool",
+                        "target_lifecycle_stage": (
+                            displaced_return_lifecycle
+                        ),
                     },
                 }
             )
@@ -756,12 +1011,33 @@ def counterfactual_event_payloads(
         ]
 
     if action == "return_unused_preposition":
+        return_location_id = str(
+            command.get("target_location_id")
+            or state.get("preposition_origin_location_id")
+            or home_location_id
+            or ""
+        )
+        return_location_type = str(
+            command.get("target_location_type")
+            or state.get("preposition_origin_location_type")
+            or home_location_type
+            or ""
+        )
+        return_lifecycle = str(
+            state.get("preposition_origin_lifecycle_stage")
+            or (
+                "mayo_reuse"
+                if return_location_type
+                in {"mayo_stand", "mayo_reuse_zone"}
+                else "returned_home"
+            )
+        )
         return [
             {
                 **common,
-                "event_type": "PredictedToolReturnedToRack",
-                "location_id": home_location_id,
-                "location_type": home_location_type,
+                "event_type": "UnusedPrepositionReturned",
+                "location_id": return_location_id,
+                "location_type": return_location_type,
                 "owner": "none",
                 "status": "available",
                 "arm": arm or "right",
@@ -769,9 +1045,13 @@ def counterfactual_event_payloads(
                 "source_location_type": (
                     source_location_type or "robot_right_hand"
                 ),
-                "target_location_id": home_location_id,
-                "target_location_type": home_location_type,
+                "target_location_id": return_location_id,
+                "target_location_type": return_location_type,
                 "target_owner": "none",
+                "detail": {
+                    **common["detail"],
+                    "target_lifecycle_stage": return_lifecycle,
+                },
             }
         ]
     return []
@@ -830,9 +1110,24 @@ def counterfactual_event_matches_world(
         )
     if event_type == "ToolHandoverCompleted":
         return lifecycle == "surgeon_owned" and owner == "surgeon"
-    if event_type in {"PredictedToolReturnedToRack", "ToolReturnedToTray"}:
+    if event_type in {
+        "PredictedToolReturnedToRack",
+        "UnusedPrepositionReturned",
+        "ToolReturnedToTray",
+    }:
+        expected_lifecycles = {"home_rack", "returned_home"}
+        if (
+            event_type == "UnusedPrepositionReturned"
+            and str(
+                event.get("target_location_type", "")
+                or event.get("location_type", "")
+                or ""
+            ).strip()
+            in {"mayo_stand", "mayo_reuse_zone"}
+        ):
+            expected_lifecycles = {"mayo_reuse"}
         return (
-            lifecycle in {"home_rack", "returned_home"}
+            lifecycle in expected_lifecycles
             and owner in {"", "none"}
             and (not expected_location or location_id == expected_location)
             and str(world.get("right_hand_tool", "") or "").strip() != tool_id
@@ -1095,7 +1390,23 @@ class ShadowSkillSinkNode(Node):
         )
 
     def _on_world(self, msg: WorldState) -> None:
-        self._world = message_payload(msg)
+        current_world = message_payload(msg)
+        for tool_id, instance_id in departed_prepositioned_instrument_instances(
+            self._world,
+            current_world,
+        ):
+            self._semantic_ledger.forget_preparations(tool_id, instance_id)
+        for tool_id, instance_id in completed_preposition_instrument_instances(
+            self._world,
+            current_world,
+        ):
+            self._semantic_ledger.forget_preparations(tool_id, instance_id)
+        for tool_id, instance_id in newly_prepositioned_instrument_instances(
+            self._world,
+            current_world,
+        ):
+            self._semantic_ledger.forget_returns(tool_id, instance_id)
+        self._world = current_world
 
     def _reset_replay_runtime(self, run_id: str) -> None:
         self._replay_run_id = str(run_id or "")
@@ -1182,6 +1493,14 @@ class ShadowSkillSinkNode(Node):
         ):
             return
         if status in FEEDBACK_ELIGIBLE_STATUSES:
+            if (
+                str(payload.get("action", "") or "").strip().lower()
+                in PREPARE_ACTIONS
+            ):
+                self._semantic_ledger.begin_preparation_episode(
+                    str(payload.get("instrument_id", "") or ""),
+                    _instance_id(payload),
+                )
             self._semantic_ledger.record_admission(
                 semantic_key,
                 fingerprint,

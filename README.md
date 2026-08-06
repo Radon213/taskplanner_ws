@@ -144,11 +144,14 @@ inside the ROS runtime and are never returned by the model-catalog services or
 sent to the browser. On a VRAM-constrained host, both roles may select the same
 provider and model to share one loaded set of weights.
 
-NInfer is exposed through a lightweight host control plane. Its configured
-catalog remains visible while no worker is loaded; selecting a valid `.ninfer`
-artifact starts the worker on demand. Taskplanner maps its no-reasoning policy
-to NInfer's `enable_thinking=false` extension and relies on prompt-level JSON
-instructions because NInfer does not enforce client JSON Schema.
+NInfer is exposed through the Compose-managed `ninfer-manager` control plane.
+Its local artifact catalog remains visible while no worker is loaded; selecting
+a valid `.ninfer` artifact starts the compatible NInfer worker on demand.
+Taskplanner maps its no-reasoning policy to NInfer's `enable_thinking=false`
+extension and relies on prompt-level JSON instructions because NInfer does not
+enforce client JSON Schema. The control plane is a normal runtime dependency,
+not a host user service, so it is available from both `scripts/taskplanner up`
+and profile-aware `docker compose up` commands without loading model weights.
 
 The web UI refreshes both provider-aware model selectors every five seconds.
 `/real_vlm_node/list_model_catalog` and
@@ -207,6 +210,33 @@ before loading a vLLM worker. Catalog entries marked `local_only` remain visible
 but cannot be selected until their weights exist in the mounted Hugging Face
 cache. `VLLM_CACHE_DIR` is mounted separately so compiled kernels and autotuning
 results survive manager-container recreation.
+
+### NInfer manager
+
+The common `ninfer-manager` service keeps its catalog and lifecycle API online
+at `127.0.0.1:8080` while every NInfer worker is stopped. Configure the
+host-managed NInfer installation and CUDA toolkit in `.env`:
+
+```text
+NINFER_RUNTIME_ROOT=/absolute/path/to/ninfer
+NINFER_CUDA_ROOT=/usr/local/cuda-13.1
+NINFER_35B_ARTIFACT_REL=models/qwen3_6_35b_a3b.ninfer
+```
+
+The manager only advertises artifact files that actually exist beneath
+`NINFER_RUNTIME_ROOT`; it never downloads them and it never auto-loads a model.
+Selecting an available model from either dashboard selector calls its lifecycle
+API and starts a single worker on `127.0.0.1:8082`. The worker is configured
+with thinking disabled. Starting or switching a Taskplanner profile recreates
+the manager with no worker, returning GPU memory to the host until an operator
+explicitly selects a model.
+
+Start the control plane directly, without loading model weights:
+
+```bash
+docker compose --profile live up -d ninfer-manager
+curl http://127.0.0.1:8080/health
+```
 
 For the default real-mode demo, LM Studio should expose an OpenAI-compatible
 server at `http://127.0.0.1:1234`.
@@ -334,6 +364,24 @@ Important launch arguments:
 
 ## Validation Commands
 
+The supported release entry point is:
+
+```bash
+scripts/taskplanner verify-release --tier quick
+scripts/taskplanner verify-release --tier rc
+scripts/taskplanner verify-release --tier full
+```
+
+The command always writes an auditable JSON/CSV/Markdown/SVG report bundle.
+The `full` defaults are 100 restart cycles and a 24-hour soak. Recorded-surgery
+evaluation can be attached to the same command with explicit, read-only
+dataset and annotation roots; models are never loaded automatically. See
+[`docs/RELEASE_VERIFICATION.md`](docs/RELEASE_VERIFICATION.md) for the gates,
+thresholds, external-asset handling, and the separate physical-site approval
+boundary.
+
+Focused developer probes remain available after sourcing the workspace:
+
 ```bash
 source /opt/ros/jazzy/setup.bash
 source /opt/btops_ws/install/setup.bash
@@ -346,13 +394,16 @@ ros2 run bringup taskplanner_smoke_test --spec-name inguinal_hernia_repair
 ros2 run bringup taskplanner_multi_bundle_runtime_probe --duration-sec 60
 ```
 
-The release candidate for `0.1.0` was validated with:
+The historical `0.1.0` candidate was validated with:
 
 - ROS workspace build for modified packages.
 - `webapp` production build.
 - 60-second runtime probe across thyroidectomy, nephrectomy, and inguinal
   hernia repair.
 - Overlay leak check confirming hidden event-tool hints are not shown to VLM.
+
+Those checks are retained as a historical baseline; they do not replace the
+current release harness.
 
 ## Release
 

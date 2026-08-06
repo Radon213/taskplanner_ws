@@ -69,7 +69,12 @@ BLOCKING_SAFETY_FLAGS = {
 ALLOWED_EVENT_TRANSITIONS = {
     LIFECYCLE_HOME_RACK: {LIFECYCLE_PREPOSITIONED_RIGHT, LIFECYCLE_RETURNED_HOME},
     LIFECYCLE_RETURNED_HOME: {LIFECYCLE_PREPOSITIONED_RIGHT, LIFECYCLE_SURGEON_OWNED},
-    LIFECYCLE_PREPOSITIONED_RIGHT: {LIFECYCLE_PREPOSITIONED_RIGHT, LIFECYCLE_SURGEON_OWNED, LIFECYCLE_RETURNED_HOME, LIFECYCLE_DROPPED_FLOOR},
+    LIFECYCLE_PREPOSITIONED_RIGHT: {
+        LIFECYCLE_PREPOSITIONED_RIGHT,
+        LIFECYCLE_SURGEON_OWNED,
+        LIFECYCLE_RETURNED_HOME,
+        LIFECYCLE_DROPPED_FLOOR,
+    },
     LIFECYCLE_SURGEON_OWNED: {LIFECYCLE_SURGEON_OWNED, LIFECYCLE_MAYO_REUSE, LIFECYCLE_MAYO_RECOVERY, LIFECYCLE_RECOVERING_LEFT, LIFECYCLE_DROPPED_FLOOR},
     LIFECYCLE_MAYO_REUSE: {LIFECYCLE_MAYO_REUSE, LIFECYCLE_PREPOSITIONED_RIGHT, LIFECYCLE_SURGEON_OWNED, LIFECYCLE_MAYO_RECOVERY, LIFECYCLE_RECOVERING_LEFT, LIFECYCLE_DROPPED_FLOOR},
     LIFECYCLE_MAYO_RECOVERY: {LIFECYCLE_MAYO_RECOVERY, LIFECYCLE_PREPOSITIONED_RIGHT, LIFECYCLE_SURGEON_OWNED, LIFECYCLE_RECOVERING_LEFT, LIFECYCLE_DROPPED_FLOOR},
@@ -98,6 +103,15 @@ SURGEON_ACTOR_LOCATION_EVENTS = {
 }
 
 
+def _separate_latin_hangul_boundaries(raw_text: str) -> str:
+    return re.sub(
+        r"(?<=[0-9a-z_])(?=[가-힣])|(?<=[가-힣])(?=[0-9a-z_])",
+        " ",
+        str(raw_text or ""),
+        flags=re.IGNORECASE,
+    )
+
+
 def _stamp_to_sec(stamp) -> float:
     return float(stamp.sec) + float(stamp.nanosec) / 1_000_000_000.0
 
@@ -121,7 +135,11 @@ def _normalize_request_text(raw_text: str) -> list[str]:
     }
 
     def tokens_for(text: str) -> list[str]:
-        cleaned = re.sub(r"[^a-z0-9_가-힣\s]", " ", text)
+        cleaned = re.sub(
+            r"[^a-z0-9_가-힣\s]",
+            " ",
+            _separate_latin_hangul_boundaries(text),
+        )
         return [
             token
             for token in cleaned.split()
@@ -154,6 +172,253 @@ def _normalize_request_text(raw_text: str) -> list[str]:
         if candidate not in candidates:
             candidates.append(candidate)
     return candidates
+
+
+_PROCEDURE_CONTROL_PATTERN = re.compile(
+    r"\b(?:start|begin|commence|resume|continue)(?:s|d|ing)?\b|"
+    r"(?:시작|개시|재개|진행|계속)\s*"
+    r"(?:하겠습니다|하겠어요|하죠|하자|합니다|합시다|해요|해서|해|할게요|할게)?",
+    re.IGNORECASE,
+)
+_PROCEDURE_CONTEXT_TOKENS = frozenset(
+    {
+        "operation",
+        "phase",
+        "procedure",
+        "stage",
+        "surgery",
+        "단계",
+        "수술",
+        "시술",
+        "절제술",
+    }
+)
+_PROCEDURE_NAME_STOP_TOKENS = frozenset(
+    {
+        "a",
+        "an",
+        "demonstration",
+        "demo",
+        "open",
+        "procedure",
+        "repair",
+        "surgery",
+        "the",
+        "시연",
+    }
+)
+_HANDOVER_REQUEST_PATTERN = re.compile(
+    r"\b(?:please|pass|hand|give|get\s+me|i\s+need|i\s+want|"
+    r"can\s+i\s+have)\b|"
+    r"(?<![가-힣])(?:줘(?:요|보세요)?|주(?:세요|시고|십시오)|"
+    r"건네(?:줘|주세요)?|달라|부탁(?:해|합니다)?|받고)"
+    r"(?=$|[\s,.!?])",
+    re.IGNORECASE,
+)
+_NON_HANDOVER_TOOL_ACTION_PATTERN = re.compile(
+    r"\b(?:clean|wipe|wash|remove|discard|stop|turn\s+off|put\s+down|"
+    r"take\s+away)\b|"
+    r"(?:닦|세척|소독|정리|치워|버려|제거|회수|빼|멈춰|정지|꺼)",
+    re.IGNORECASE,
+)
+
+
+def _lexical_tokens(raw_text: str) -> list[str]:
+    return re.findall(
+        r"[0-9a-z_가-힣]+",
+        _separate_latin_hangul_boundaries(raw_text).lower(),
+    )
+
+
+def _compact_lexical_text(raw_text: str) -> str:
+    return "".join(_lexical_tokens(raw_text))
+
+
+def _has_handover_request_marker(raw_text: str) -> bool:
+    return bool(_HANDOVER_REQUEST_PATTERN.search(str(raw_text or "")))
+
+
+def _has_non_handover_tool_action(raw_text: str) -> bool:
+    return bool(_NON_HANDOVER_TOOL_ACTION_PATTERN.search(str(raw_text or "")))
+
+
+def _resolve_compound_handover_tool(
+    spec: ProcedureSpec,
+    raw_text: str,
+) -> str:
+    """Resolve the handover clause without swallowing adjacent tool commands."""
+
+    text = str(raw_text or "")
+    handover_matches = list(_HANDOVER_REQUEST_PATTERN.finditer(text))
+    non_handover_matches = list(
+        _NON_HANDOVER_TOOL_ACTION_PATTERN.finditer(text)
+    )
+    for handover in reversed(handover_matches):
+        left = max(
+            (
+                match.end()
+                for match in non_handover_matches
+                if match.end() <= handover.start()
+            ),
+            default=0,
+        )
+        right = min(
+            (
+                match.start()
+                for match in non_handover_matches
+                if match.start() >= handover.end()
+            ),
+            default=len(text),
+        )
+        segment = text[left:right].strip()
+        if not segment:
+            continue
+        marker_start = max(0, handover.start() - left)
+        marker_end = max(marker_start, handover.end() - left)
+        prefix = segment[:marker_start].strip()
+        suffix = segment[marker_end:].strip()
+        marker = handover.group(0)
+        parts = (
+            (suffix, prefix, segment)
+            if re.search(r"[a-z]", marker, re.IGNORECASE)
+            else (prefix, suffix, segment)
+        )
+        for part in parts:
+            resolved = _resolve_request_tool(spec, part)
+            if resolved:
+                return resolved
+    return ""
+
+
+def _procedure_name_tokens(spec: ProcedureSpec) -> set[str]:
+    result: set[str] = set()
+    names = (
+        spec.bundle.procedure_id.replace("_", " "),
+        spec.bundle.procedure_display_name,
+        spec.bundle.procedure_display_name_ko,
+    )
+    for name in names:
+        without_parenthetical = re.sub(r"[\(\[\{].*?[\)\]\}]", " ", str(name))
+        for token in _lexical_tokens(without_parenthetical):
+            if len(token) >= 3 and token not in _PROCEDURE_NAME_STOP_TOKENS:
+                result.add(token)
+    return result
+
+
+def _tokens_share_procedure_root(left: str, right: str) -> bool:
+    left_token = str(left or "").strip().lower()
+    right_token = str(right or "").strip().lower()
+    if min(len(left_token), len(right_token)) < 3:
+        return False
+    return left_token in right_token or right_token in left_token
+
+
+def _is_bare_procedure_name_tool_alias(
+    spec: ProcedureSpec,
+    raw_text: str,
+    instrument_id: str,
+) -> bool:
+    """Reject anatomy/procedure shorthand unless the tool class is also spoken."""
+
+    text_tokens = set(_lexical_tokens(raw_text))
+    procedure_tokens = _procedure_name_tokens(spec)
+    procedure_like = {
+        token
+        for token in text_tokens
+        if any(
+            _tokens_share_procedure_root(token, procedure_token)
+            for procedure_token in procedure_tokens
+        )
+    }
+    if not procedure_like:
+        return False
+
+    instrument = next(
+        (
+            item
+            for item in spec.bundle.instruments
+            if item.id == instrument_id
+        ),
+        None,
+    )
+    if instrument is None:
+        return True
+    instrument_tokens = set(
+        _lexical_tokens(
+            " ".join(
+                (
+                    instrument.display_name,
+                    instrument.display_name_ko,
+                    *instrument.aliases,
+                )
+            )
+        )
+    )
+    distinguishing_tool_tokens = {
+        token
+        for token in text_tokens & instrument_tokens
+        if token not in procedure_like
+        and not any(
+            _tokens_share_procedure_root(token, procedure_token)
+            for procedure_token in procedure_tokens
+        )
+    }
+    return not distinguishing_tool_tokens
+
+
+def _has_procedure_reference(spec: ProcedureSpec, raw_text: str) -> bool:
+    tokens = set(_lexical_tokens(raw_text))
+    if tokens & _PROCEDURE_CONTEXT_TOKENS:
+        return True
+    compact_text = _compact_lexical_text(raw_text)
+    for name in (
+        spec.bundle.procedure_id.replace("_", " "),
+        spec.bundle.procedure_display_name,
+        spec.bundle.procedure_display_name_ko,
+    ):
+        without_parenthetical = re.sub(r"[\(\[\{].*?[\)\]\}]", " ", str(name))
+        compact_name = _compact_lexical_text(without_parenthetical)
+        if len(compact_name) >= 4 and compact_name in compact_text:
+            return True
+    return bool(tokens & _procedure_name_tokens(spec))
+
+
+def _candidate_modifies_procedure(candidate: str, raw_text: str) -> bool:
+    candidate_tokens = _lexical_tokens(candidate)
+    text_tokens = _lexical_tokens(raw_text)
+    if not candidate_tokens or not text_tokens:
+        return False
+    width = len(candidate_tokens)
+    for index in range(0, len(text_tokens) - width + 1):
+        if text_tokens[index : index + width] != candidate_tokens:
+            continue
+        adjacent = set()
+        if index > 0:
+            adjacent.add(text_tokens[index - 1])
+        if index + width < len(text_tokens):
+            adjacent.add(text_tokens[index + width])
+        if adjacent & _PROCEDURE_CONTEXT_TOKENS:
+            return True
+    return False
+
+
+def _resolve_request_tool(
+    spec: ProcedureSpec,
+    raw_text: str,
+    *,
+    reject_procedure_modifiers: bool = False,
+) -> str:
+    for candidate in _normalize_request_text(raw_text):
+        resolved = spec.resolve_instrument_alias(candidate) or ""
+        if not resolved:
+            continue
+        if reject_procedure_modifiers and _candidate_modifies_procedure(
+            candidate,
+            raw_text,
+        ):
+            continue
+        return resolved
+    return ""
 
 
 def _requests_additional_instance(raw_text: str) -> bool:
@@ -352,7 +617,12 @@ class ORDigitalTwin:
         self._observation_candidates: dict[str, dict[str, Any]] = {}
         self._shadow_counterfactual_locked_instances: set[str] = set()
         self._observation_violation_cooldowns: dict[tuple[str, str, str, str], float] = {}
-        self._phase_evidence_history: deque[dict[str, Any]] = deque(maxlen=8)
+        self._phase_evidence_history: deque[dict[str, Any]] = deque(
+            maxlen=max(
+                8,
+                int(self.spec.bundle.phase_guard.smoothing_window) * 2,
+            )
+        )
         self._pending_phase_cues: dict[str, dict[str, Any]] = {}
         self._phase_decision_cooldowns: dict[tuple[str, str, str], float] = {}
         self._last_normal_phase_before_interrupt = ""
@@ -398,7 +668,16 @@ class ORDigitalTwin:
         self._observation_candidates.clear()
         self._shadow_counterfactual_locked_instances.clear()
         self._observation_violation_cooldowns.clear()
-        self._phase_evidence_history.clear()
+        phase_history_capacity = max(
+            8,
+            int(self.spec.bundle.phase_guard.smoothing_window) * 2,
+        )
+        if self._phase_evidence_history.maxlen != phase_history_capacity:
+            self._phase_evidence_history = deque(
+                maxlen=phase_history_capacity
+            )
+        else:
+            self._phase_evidence_history.clear()
         self._pending_phase_cues.clear()
         self._phase_decision_cooldowns.clear()
         self._shadow_assumption_audit.clear()
@@ -839,6 +1118,10 @@ class ORDigitalTwin:
         self.state.phase_confidence = 0.0
         self.state.phase_uncertain = True
         self.state.phase_stability = 0.0
+
+    def clear_object_detection_evidence(self) -> None:
+        """Drop advisory detector candidates without invalidating VLM evidence."""
+        self._observation_candidates.clear()
 
     def set_initial_phase(self, phase_id: str) -> str:
         requested_phase = str(phase_id or "").strip()
@@ -1623,56 +1906,118 @@ class ORDigitalTwin:
         self._shadow_assumption_audit.clear()
         return assumptions
 
-    def _phase_evidence_summary(self, phase_id: str) -> tuple[float, float, int]:
+    def _phase_evidence_rows(
+        self,
+        phase_id: str,
+        *,
+        include_later_normal_phases: bool = False,
+    ) -> list[dict[str, float]]:
+        """Classify bounded evidence as support, contradiction, or unknown."""
+
         if not phase_id or not self._phase_evidence_history:
-            return (0.0, 1.0, 0)
-        recent = list(self._phase_evidence_history)[-max(1, int(self.spec.bundle.phase_guard.smoothing_window)) :]
-        scores: list[float] = []
-        uncertainties: list[float] = []
-        for sample in recent:
+            return []
+        floor_index = self._normal_phase_index(phase_id)
+        minimum_clear_confidence = float(
+            self.spec.bundle.phase_guard.min_confidence_to_keep
+        )
+        rows: list[dict[str, float]] = []
+        for sample in self._phase_evidence_history:
             phase_scores = sample.get("scores", {})
-            if not isinstance(phase_scores, dict):
+            if not isinstance(phase_scores, dict) or not phase_scores:
                 continue
-            scores.append(float(phase_scores.get(phase_id, 0.0)))
-            uncertainties.append(float(sample.get("uncertainty", 1.0)))
-        if not scores:
+            uncertainty = float(sample.get("uncertainty", 1.0))
+            explicit_scores: list[float] = []
+            if include_later_normal_phases and floor_index >= 0:
+                explicit_scores = [
+                    float(score)
+                    for candidate, score in phase_scores.items()
+                    if self._normal_phase_index(str(candidate)) >= floor_index
+                ]
+            elif phase_id in phase_scores:
+                explicit_scores = [float(phase_scores[phase_id])]
+
+            if explicit_scores:
+                score = max(explicit_scores)
+            else:
+                strongest_alternative = max(
+                    (float(score) for score in phase_scores.values()),
+                    default=0.0,
+                )
+                if (
+                    uncertainty > 0.45
+                    or strongest_alternative < minimum_clear_confidence
+                ):
+                    # Occlusion, weak ranking, or a genuinely indeterminate
+                    # frame does not erase otherwise valid temporal evidence.
+                    continue
+                score = 0.0
+            rows.append(
+                {
+                    "score": score,
+                    "uncertainty": uncertainty,
+                    "stamp_sec": float(sample.get("stamp_sec", 0.0)),
+                }
+            )
+        return rows[
+            -max(
+                1,
+                int(self.spec.bundle.phase_guard.smoothing_window),
+            ) :
+        ]
+
+    def _phase_evidence_summary(self, phase_id: str) -> tuple[float, float, int]:
+        rows = self._phase_evidence_rows(phase_id)
+        if not rows:
             return (0.0, 1.0, 0)
-        return (sum(scores) / len(scores), sum(uncertainties) / max(len(uncertainties), 1), len(scores))
+        return (
+            sum(row["score"] for row in rows) / len(rows),
+            sum(row["uncertainty"] for row in rows) / len(rows),
+            len(rows),
+        )
 
     def _phase_evidence_summary_at_or_after(
         self, phase_id: str
     ) -> tuple[float, float, int]:
         """Treat a stable later normal phase as evidence that earlier steps passed."""
 
-        floor_index = self._normal_phase_index(phase_id)
-        if floor_index < 0 or not self._phase_evidence_history:
-            return (0.0, 1.0, 0)
-        recent = list(self._phase_evidence_history)[
-            -max(1, int(self.spec.bundle.phase_guard.smoothing_window)) :
-        ]
-        scores: list[float] = []
-        uncertainties: list[float] = []
-        for sample in recent:
-            phase_scores = sample.get("scores", {})
-            if not isinstance(phase_scores, dict):
-                continue
-            downstream_score = max(
-                (
-                    float(score)
-                    for candidate, score in phase_scores.items()
-                    if self._normal_phase_index(str(candidate)) >= floor_index
-                ),
-                default=0.0,
-            )
-            scores.append(downstream_score)
-            uncertainties.append(float(sample.get("uncertainty", 1.0)))
-        if not scores:
+        rows = self._phase_evidence_rows(
+            phase_id,
+            include_later_normal_phases=True,
+        )
+        if not rows:
             return (0.0, 1.0, 0)
         return (
-            sum(scores) / len(scores),
-            sum(uncertainties) / max(len(uncertainties), 1),
-            len(scores),
+            sum(row["score"] for row in rows) / len(rows),
+            sum(row["uncertainty"] for row in rows) / len(rows),
+            len(rows),
         )
+
+    def _phase_evidence_source_span_sec(
+        self,
+        phase_id: str,
+        *,
+        include_later_normal_phases: bool = False,
+    ) -> tuple[float, bool]:
+        rows = self._phase_evidence_rows(
+            phase_id,
+            include_later_normal_phases=include_later_normal_phases,
+        )
+        if not rows:
+            return (0.0, False)
+        stamps = sorted(
+            {
+                float(row["stamp_sec"])
+                for row in rows
+                if float(row["stamp_sec"]) > 0.0
+            }
+        )
+        if not stamps:
+            # Legacy/manual evidence without a source clock keeps the prior
+            # sample-count contract. Camera-backed evidence always carries one.
+            return (0.0, False)
+        if len(stamps) < 2:
+            return (0.0, True)
+        return (max(stamps) - min(stamps), True)
 
     def _phase_transition_required_counts(
         self, current_phase: str, target_phase: str
@@ -1834,11 +2179,34 @@ class ORDigitalTwin:
             average_confidence, average_uncertainty, sample_count = (
                 self._phase_evidence_summary(target_phase)
             )
-        required_samples = max(2, int(guard.smoothing_window)) if require_full_window else 1
+        source_span_sec, has_source_clock = (
+            self._phase_evidence_source_span_sec(
+                target_phase,
+                include_later_normal_phases=include_later_normal_phases,
+            )
+        )
+        required_samples = (
+            2
+            if require_full_window and has_source_clock
+            else (
+                max(2, int(guard.smoothing_window))
+                if require_full_window
+                else 1
+            )
+        )
+        minimum_source_span_sec = (
+            max(0.0, float(guard.min_evidence_duration_sec))
+            if require_full_window
+            else 0.0
+        )
         stable = (
             sample_count >= required_samples
             and average_confidence >= float(guard.min_confidence_to_switch)
             and average_uncertainty <= 0.45
+            and (
+                not has_source_clock
+                or source_span_sec >= minimum_source_span_sec
+            )
         )
         return stable, average_confidence, sample_count
 
@@ -1918,6 +2286,33 @@ class ORDigitalTwin:
             cue_id=cue_id,
             current_phase=current_phase,
         )
+
+    def _resolve_phase_bootstrap_at_current_phase(
+        self,
+        current_phase: str,
+        *,
+        confidence: float,
+    ) -> dict[str, Any]:
+        self._phase_bootstrap_open = False
+        current_index = self._normal_phase_index(current_phase)
+        if current_index >= 0:
+            self._initial_phase_floor_index = current_index
+        self._phase_entered_sec = self._monotonic_sec()
+        self._pending_phase_cues.clear()
+        self._phase_decision_cooldowns.clear()
+        self.state.phase_confidence = float(confidence)
+        self.state.phase_uncertain = False
+        self.state.phase_stability = min(1.0, float(confidence))
+        payload = {
+            "current_phase": current_phase,
+            "target_phase": current_phase,
+            "accepted": True,
+            "reason": "stable_vlm_phase_bootstrap_confirmed_current",
+            "confidence": float(confidence),
+            "cue_id": "",
+        }
+        self._record_event("PhaseBootstrapResolved", payload)
+        return {"event_type": "PhaseBootstrapResolved", **payload}
 
     def _try_approve_phase_transition(
         self,
@@ -2220,15 +2615,58 @@ class ORDigitalTwin:
         }
         if not scores:
             return []
-        self._phase_evidence_history.append(
-            {
-                "source": evidence.source,
-                "scores": scores,
-                "uncertainty": float(evidence.uncertainty),
-                "stamp_sec": _stamp_to_sec(evidence.stamp),
-                "summary": evidence.scene_summary,
-            }
-        )
+        stamp_sec = _stamp_to_sec(evidence.stamp)
+        sample = {
+            "source": evidence.source,
+            "scores": scores,
+            "uncertainty": float(evidence.uncertainty),
+            "stamp_sec": stamp_sec,
+            "summary": evidence.scene_summary,
+        }
+        correlated_index = None
+        if stamp_sec > 0.0:
+            for index in range(len(self._phase_evidence_history) - 1, -1, -1):
+                previous = self._phase_evidence_history[index]
+                if (
+                    str(previous.get("source", "")) == str(evidence.source)
+                    and abs(
+                        float(previous.get("stamp_sec", 0.0)) - stamp_sec
+                    )
+                    <= 1e-6
+                ):
+                    correlated_index = index
+                    break
+        if correlated_index is not None:
+            previous = self._phase_evidence_history[correlated_index]
+            if (
+                previous.get("scores") == sample["scores"]
+                and float(previous.get("uncertainty", 1.0))
+                == sample["uncertainty"]
+                and str(previous.get("summary", "")) == sample["summary"]
+            ):
+                self._record_event(
+                    "PhaseEvidenceDuplicateSuppressed",
+                    {
+                        "source": evidence.source,
+                        "stamp_sec": stamp_sec,
+                        "scores": scores,
+                        "uncertainty": float(evidence.uncertainty),
+                    },
+                )
+                return []
+            self._phase_evidence_history[correlated_index] = sample
+            self._record_event(
+                "PhaseEvidenceCorrelatedFrameUpdated",
+                {
+                    "source": evidence.source,
+                    "stamp_sec": stamp_sec,
+                    "previous_scores": previous.get("scores", {}),
+                    "scores": scores,
+                    "uncertainty": float(evidence.uncertainty),
+                },
+            )
+        else:
+            self._phase_evidence_history.append(sample)
         current_phase = self.state.filtered_phase or self.spec.default_phase_id
         current_confidence = float(scores.get(current_phase, 0.0))
         minimum_keep_confidence = (
@@ -2255,7 +2693,22 @@ class ORDigitalTwin:
         ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
         if ranked:
             top_phase = ranked[0][0]
-            if top_phase != current_phase and self.spec.is_interrupt_phase(current_phase):
+            if (
+                self._phase_bootstrap_open
+                and top_phase == current_phase
+                and self.spec.is_normal_phase(current_phase)
+            ):
+                stable, average_confidence, _ = self._phase_evidence_stable_enough(
+                    current_phase
+                )
+                if stable:
+                    decisions.append(
+                        self._resolve_phase_bootstrap_at_current_phase(
+                            current_phase,
+                            confidence=average_confidence,
+                        )
+                    )
+            elif top_phase != current_phase and self.spec.is_interrupt_phase(current_phase):
                 decisions.append(self._try_approve_phase_transition(top_phase))
             elif (
                 top_phase != current_phase
@@ -2996,8 +3449,6 @@ class ORDigitalTwin:
         if state.lifecycle_stage == LIFECYCLE_PREPOSITIONED_RIGHT:
             if self.state.execution_state in {"finishing", "completed"}:
                 return "return_unused_preposition"
-            if state.instrument_id not in self.get_expected_instruments():
-                return "return_unused_preposition"
             requested_tool = self.state.surgeon_request_tool or self.state.explicit_request_tool
             if requested_tool and requested_tool != state.instrument_id:
                 return "return_unused_preposition"
@@ -3326,11 +3777,7 @@ class ORDigitalTwin:
         if not request_text.strip():
             self._record_event("ExplicitRequestUpdated", {"text": request_text, "resolved_tool": ""})
             return ""
-        resolved = ""
-        for token in _normalize_request_text(request_text):
-            resolved = self.spec.resolve_instrument_alias(token) or ""
-            if resolved:
-                break
+        resolved = self.resolve_explicit_voice_tool_request(request_text)
         if resolved:
             first_request_is_additional = self._enqueue_surgeon_request(
                 event_type="voice_request",
@@ -3396,9 +3843,12 @@ class ORDigitalTwin:
         )
 
     def is_explicit_voice_tool_request(self, request_text: str) -> bool:
+        return bool(self.resolve_explicit_voice_tool_request(request_text))
+
+    def resolve_explicit_voice_tool_request(self, request_text: str) -> str:
         text = str(request_text or "").strip()
         if not text:
-            return False
+            return ""
 
         signature = re.sub(r"[^0-9a-z가-힣]+", "", text.lower())
         group_specs = [
@@ -3409,34 +3859,49 @@ class ORDigitalTwin:
             for utterance in group_spec.utterances:
                 candidate = re.sub(r"[^0-9a-z가-힣]+", "", str(utterance).lower())
                 if signature and signature == candidate:
-                    return False
+                    return ""
 
         lowered = text.lower()
-        request_markers = (
-            "please",
-            "pass ",
-            "hand ",
-            "give ",
-            "get me",
-            "i need",
-            "i want",
-            "can i have",
-            "줘",
-            "주세요",
-            "건네",
-            "달라",
-            "부탁",
-            "필요",
+        control_match = (
+            _PROCEDURE_CONTROL_PATTERN.search(text)
+            if _has_procedure_reference(self.spec, text)
+            else None
         )
-        if any(marker in lowered for marker in request_markers):
-            return True
+        if control_match is not None:
+            # A public sentence may contain both a procedure-control clause and
+            # a terse instrument request. Only the text outside the procedure
+            # clause can name the requested tool.
+            suffix = text[control_match.end() :].strip()
+            resolved = _resolve_request_tool(
+                self.spec,
+                suffix,
+                reject_procedure_modifiers=True,
+            )
+            if resolved:
+                return resolved
 
-        candidates = _normalize_request_text(text)
-        word_count = len(re.findall(r"[0-9a-z_가-힣]+", lowered))
-        return bool(
-            0 < word_count <= 6
-            and any(self.spec.resolve_instrument_alias(candidate) for candidate in candidates)
-        )
+            prefix = text[: control_match.start()].strip()
+            if _has_handover_request_marker(prefix):
+                return _resolve_request_tool(
+                    self.spec,
+                    prefix,
+                    reject_procedure_modifiers=True,
+                )
+            return ""
+
+        resolved = _resolve_request_tool(self.spec, text)
+        if not resolved:
+            return ""
+        if _has_non_handover_tool_action(text):
+            return _resolve_compound_handover_tool(self.spec, text)
+        if _has_handover_request_marker(text):
+            return resolved
+
+        if _is_bare_procedure_name_tool_alias(self.spec, text, resolved):
+            return ""
+
+        word_count = len(_lexical_tokens(lowered))
+        return resolved if 0 < word_count <= 6 else ""
 
     def update_surgeon_request(self, request: SurgeonRequest) -> str:
         resolved = self.spec.resolve_instrument_alias(request.requested_tool) or request.requested_tool
@@ -3946,6 +4411,7 @@ class ORDigitalTwin:
 
         if event.event_type in {
             "ToolReceivedFromSurgeon",
+            "ToolRetrievedFromMayo",
             "ToolSentToCleaner",
             "ToolCleaningProgress",
             "ToolCleaningCompleted",
@@ -3958,7 +4424,42 @@ class ORDigitalTwin:
 
         preferred_instance_id = ""
         preferred_lifecycles: set[str] | None = None
-        if event.event_type in {"RobotGraspedTool", "ToolPrepared", "ToolHandoverCompleted"}:
+        if event.event_type == "RobotTaskStarted":
+            task_type = str(
+                detail.get("task_type", detail.get("action", ""))
+            )
+            if task_type == "return_unused_preposition":
+                preferred_instance_id = (
+                    self.state.right_hand_tool_instance_id
+                )
+                preferred_lifecycles = {
+                    LIFECYCLE_PREPOSITIONED_RIGHT
+                }
+            elif task_type in {
+                "predict_tool",
+                "tool_predict",
+                "pick_up_and_handover",
+                "tool_handover",
+            }:
+                preferred_lifecycles = {
+                    LIFECYCLE_HOME_RACK,
+                    LIFECYCLE_RETURNED_HOME,
+                    LIFECYCLE_PREPOSITIONED_RIGHT,
+                    LIFECYCLE_MAYO_REUSE,
+                    LIFECYCLE_MAYO_RECOVERY,
+                }
+            elif task_type in {
+                "retrieve_from_mayo",
+                "retrieve_from_hand",
+                "tool_retrieve",
+            }:
+                preferred_lifecycles = {
+                    LIFECYCLE_MAYO_RECOVERY,
+                    LIFECYCLE_MAYO_REUSE,
+                    LIFECYCLE_SURGEON_OWNED,
+                    LIFECYCLE_RECOVERING_LEFT,
+                }
+        elif event.event_type in {"RobotGraspedTool", "ToolPrepared", "ToolHandoverCompleted"}:
             preferred_instance_id = self.state.right_hand_tool_instance_id
             preferred_lifecycles = {
                 LIFECYCLE_HOME_RACK,
@@ -3967,7 +4468,10 @@ class ORDigitalTwin:
                 LIFECYCLE_MAYO_REUSE,
                 LIFECYCLE_MAYO_RECOVERY,
             }
-        elif event.event_type == "ToolReceivedFromSurgeon":
+        elif event.event_type in {
+            "ToolReceivedFromSurgeon",
+            "ToolRetrievedFromMayo",
+        }:
             preferred_lifecycles = {
                 LIFECYCLE_MAYO_RECOVERY,
                 LIFECYCLE_MAYO_REUSE,
@@ -3986,7 +4490,10 @@ class ORDigitalTwin:
                 LIFECYCLE_CLEANED_LEFT,
                 LIFECYCLE_RECOVERING_LEFT,
             }
-        elif event.event_type == "PredictedToolReturnedToRack":
+        elif event.event_type in {
+            "PredictedToolReturnedToRack",
+            "UnusedPrepositionReturned",
+        }:
             preferred_instance_id = self.state.right_hand_tool_instance_id
             preferred_lifecycles = {LIFECYCLE_PREPOSITIONED_RIGHT}
 
@@ -4060,6 +4567,7 @@ class ORDigitalTwin:
             "ToolPrepared",
             "ToolHandoverCompleted",
             "PredictedToolReturnedToRack",
+            "UnusedPrepositionReturned",
         }:
             if self._right_arm_conflict(instance_id):
                 self._record_invariant_violation(
@@ -4072,6 +4580,7 @@ class ORDigitalTwin:
 
         if state and event.event_type in {
             "ToolReceivedFromSurgeon",
+            "ToolRetrievedFromMayo",
             "ToolSentToCleaner",
             "ToolCleaningProgress",
             "ToolCleaningCompleted",
@@ -4087,6 +4596,11 @@ class ORDigitalTwin:
                 return
 
         if event.event_type == "RobotGraspedTool" and state:
+            origin_lifecycle = state.lifecycle_stage
+            origin_location_type = (
+                event.source_location_type or state.location_type
+            )
+            origin_location_id = event.source_location_id or state.location_id
             picked_from_mayo = (
                 state.lifecycle_stage in {LIFECYCLE_MAYO_REUSE, LIFECYCLE_MAYO_RECOVERY}
                 or event.source_location_type in {"mayo_stand", "mayo_reuse_zone", "mayo_recovery_zone"}
@@ -4101,6 +4615,9 @@ class ORDigitalTwin:
                 confidence=max(float(event.confidence), 0.95),
             ):
                 return
+            state.preposition_origin_location_type = origin_location_type
+            state.preposition_origin_location_id = origin_location_id
+            state.preposition_origin_lifecycle_stage = origin_lifecycle
             if picked_from_mayo:
                 self._close_recovery_transaction(
                     state.instance_id,
@@ -4108,6 +4625,20 @@ class ORDigitalTwin:
                 )
             self.state.robot_state = "busy"
         elif event.event_type == "ToolPrepared" and state:
+            origin_lifecycle = (
+                state.preposition_origin_lifecycle_stage
+                or state.lifecycle_stage
+            )
+            origin_location_type = (
+                state.preposition_origin_location_type
+                or event.source_location_type
+                or state.location_type
+            )
+            origin_location_id = (
+                state.preposition_origin_location_id
+                or event.source_location_id
+                or state.location_id
+            )
             if not self._apply_event_transition(
                 state=state,
                 next_stage=LIFECYCLE_PREPOSITIONED_RIGHT,
@@ -4118,6 +4649,9 @@ class ORDigitalTwin:
                 reserved_for=detail.get("reserved_for", self.state.filtered_phase),
             ):
                 return
+            state.preposition_origin_location_type = origin_location_type
+            state.preposition_origin_location_id = origin_location_id
+            state.preposition_origin_lifecycle_stage = origin_lifecycle
             self.state.robot_state = "prepared"
         elif event.event_type == "ToolHandoverCompleted" and state:
             handed_over_from_mayo = state.lifecycle_stage in {
@@ -4173,12 +4707,18 @@ class ORDigitalTwin:
                     state.instance_id,
                     "mayo_tool_handover_completed",
                 )
+            state.preposition_origin_location_type = ""
+            state.preposition_origin_location_id = ""
+            state.preposition_origin_lifecycle_stage = ""
             self.state.robot_state = "idle"
             if self._is_active_requested_tool(state.instance_id):
                 self._dequeue_active_request("handover_completed")
             else:
                 self._sync_active_request_from_queue()
-        elif event.event_type == "ToolReceivedFromSurgeon" and state:
+        elif event.event_type in {
+            "ToolReceivedFromSurgeon",
+            "ToolRetrievedFromMayo",
+        } and state:
             self._open_recovery_transaction(
                 state.instance_id, "robot_received_returned_tool"
             )
@@ -4267,16 +4807,66 @@ class ORDigitalTwin:
             self.state.cleaner_busy = False
             self.state.cleaner_remaining_sec = 0.0
             self.state.robot_state = "ready_to_return"
-        elif event.event_type in {"ToolReturnedToTray", "PredictedToolReturnedToRack"} and state:
-            if not self._apply_event_transition(
+        elif event.event_type in {
+            "ToolReturnedToTray",
+            "PredictedToolReturnedToRack",
+            "UnusedPrepositionReturned",
+        } and state:
+            return_to_mayo = (
+                event.event_type == "UnusedPrepositionReturned"
+                and (
+                    str(detail.get("target_lifecycle_stage", ""))
+                    == LIFECYCLE_MAYO_REUSE
+                    or event.target_location_type
+                    in {"mayo_stand", "mayo_reuse_zone"}
+                    or event.target_location_id
+                    in {"mayo_stand", "mayo_reuse_zone"}
+                )
+            )
+            if return_to_mayo:
+                if state.lifecycle_stage != LIFECYCLE_PREPOSITIONED_RIGHT:
+                    self._record_invariant_violation(
+                        reason="unused_preposition_return_requires_right_hand",
+                        event_type=event.event_type,
+                        instrument_id=instrument_id,
+                        proposed_stage=LIFECYCLE_MAYO_REUSE,
+                    )
+                    return
+                self._set_lifecycle(
+                    state,
+                    LIFECYCLE_MAYO_REUSE,
+                    location_type=(
+                        event.target_location_type or "mayo_reuse_zone"
+                    ),
+                    location_id=(
+                        event.target_location_id or "mayo_reuse_zone"
+                    ),
+                    confidence=max(float(event.confidence), 0.95),
+                    last_update_sec=getattr(
+                        self, "_current_event_stamp_sec", None
+                    ),
+                    placement_evidence=(
+                        "robot_returned_unused_preposition"
+                    ),
+                )
+                self._clear_observation_candidate(state.instance_id)
+            elif not self._apply_event_transition(
                 state=state,
                 next_stage=LIFECYCLE_RETURNED_HOME,
                 event_type=event.event_type,
-                location_type=event.target_location_type or state.home_location_type,
-                location_id=event.target_location_id or state.home_location_id,
+                location_type=(
+                    event.target_location_type
+                    or state.home_location_type
+                ),
+                location_id=(
+                    event.target_location_id or state.home_location_id
+                ),
                 confidence=max(float(event.confidence), 0.95),
             ):
                 return
+            state.preposition_origin_location_type = ""
+            state.preposition_origin_location_id = ""
+            state.preposition_origin_lifecycle_stage = ""
             if event.mode == "shadow_counterfactual":
                 self._shadow_counterfactual_locked_instances.add(
                     state.instance_id

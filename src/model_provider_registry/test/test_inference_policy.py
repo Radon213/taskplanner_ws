@@ -31,12 +31,15 @@ def test_vllm_thinking_is_disabled_at_chat_template_boundary():
     assert "enable_thinking" not in body
 
 
-def test_lmstudio_uses_supported_reasoning_effort_without_unknown_fields():
+def test_lmstudio_disables_thinking_at_chat_template_boundary():
     body = {}
 
     force_disable_thinking(body, provider_id="lmstudio")
 
-    assert body == {"reasoning_effort": "none"}
+    assert body == {
+        "reasoning_effort": "none",
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
 
 
 def test_ninfer_uses_typed_thinking_switch():

@@ -1,8 +1,19 @@
-# External Input Contract
+# 기관 간 ROS 2 계약
 
-This document defines the Taskplanner input boundary for multi-computer
-integration. External systems publish observations. They do not publish actor
-ground truth, fused phase state, or robot decisions.
+This document defines the implementation target for multi-computer integration.
+It is not a claim that an external controller already exists. Until each
+provider implements and validates its endpoint, Taskplanner uses its internal
+or mock execution path.
+
+The contract has two directions:
+
+- **기관 → Taskplanner:** camera, speech, and robot-controller endpoints that a
+  provider is asked to implement.
+- **Taskplanner → 기관:** a small, read-only set of shared surgical context,
+  instrument, robot, event, and VLM-observation topics.
+
+External systems never publish surgeon-actor ground truth, fused digital-twin
+state, or robot decisions into the Taskplanner authority topics.
 
 ## Runtime Profiles
 
@@ -19,8 +30,8 @@ ground truth, fused phase state, or robot decisions.
 - Uses `execution_backend=external`, so no mock robot Action server is started.
 - Keeps the sentence adapter, digital twin, BT, action bridges, and dashboard.
 - Expects final sentence text and camera publishers from external computers.
-- Requires the external robot Action servers and sentence publisher to pass
-  `/integration/check_readiness` before a scenario can start.
+- Is used only after the requested external endpoints have been implemented and
+  passed `/integration/check_readiness`.
 
 For the first wired-LAN integration, start with:
 
@@ -31,7 +42,8 @@ docker compose --env-file config/integration.env.example \
 
 This profile uses `VLM_MODE=voice_only`, so explicit surgeon sentences can
 exercise the full logical handover path before vision is connected. Robot
-execution still requires external Action servers.
+execution still requires implemented external endpoints. The contract below is
+the request to the controller teams; it is not evidence of a running server.
 
 ## Sentence Text Input
 
@@ -110,30 +122,149 @@ Taskplanner's VLM subscribers and built-in camera publishers use the same QoS.
 Populate `header.stamp` with the frame acquisition time and `format` with
 `jpeg` or `png`.
 
-## Robot Action Servers
+## Requested Robot Endpoints
 
-The external robot/controller side must provide these servers before a scenario
-can start:
+The following are the new, direct implementation requests. Their names say what
+the robot must do; the old generic `/skill/execute` and
+`/bed_robot_arm_group/*/execute` contracts remain internal/legacy compatibility
+interfaces and are not the requested cross-institution API.
 
 ```text
-/skill/execute                              surgical_msgs/action/ExecuteSkill
-/bed_robot_arm_group/suction/execute       surgical_msgs/action/ExecuteBedRobotArmGroup
-/bed_robot_arm_group/retraction/execute    surgical_msgs/action/ExecuteBedRobotArmGroup
+/surgery/tool_handover   surgical_interop_msgs/action/ExecuteToolHandover
+/surgery/retraction      surgical_interop_msgs/action/ExecuteRetraction
+/surgery/suction/set     surgical_interop_msgs/srv/SetSuction
 ```
 
-`taskplanner_live.launch.py` never starts the deterministic mock servers.
-Controller rejection, cancellation, and failure must be returned through the
-Action result instead of publishing synthetic digital-twin state. The Taskplanner
-bridges translate results into `/skill/status` and
-`/bed_robot_arm_group/status`; the digital twin updates only from those public
-execution events.
+`ExecuteToolHandover` is the single tool-transfer Action. It accepts exactly
+five transitions: `tray -> robot`, `tray -> surgeon`, `robot -> surgeon`,
+`robot -> tray`, and `mayo -> tray`. `tray -> robot` means that the robot picks
+up the next tool already selected by Taskplanner and holds it ready; it is not
+a robot-side prediction request. Success means stable holding has been reached,
+and holding persists until a later handover or return Goal. The only location
+values are `tray`, `mayo`, `robot`, and `surgeon`; every other pair is invalid.
+`instrument_id` carries the shared real name (for example
+`Bovie surgical cautery`), never an internal catalog code such as `T04`.
+Taskplanner also converts an internal instance such as `T04#1` to
+`Bovie surgical cautery#1`. The Goal has no arm field: the receiving robot
+controller chooses the arm. It also excludes planner rationale, detailed
+internal anchors, target-owner, cleaning policy, and execution mode.
+
+`ExecuteRetraction` carries a correlation ID plus only the fields required by
+the selected operation: `MOVE` needs direction and distance, while
+`CHANGE_END_EFFECTOR` needs the requested end-effector profile. `RELEASE` has
+no extra motion parameters. It does not carry a group ID, confidence, raw
+surgeon text, or planner rationale. `SetSuction` carries a correlation ID and
+`enabled`. A simple ON/OFF operation is a service; it becomes an Action only if
+the controller later needs a long-running, cancellable workflow.
+
+Controllers return a machine-readable final state/reason code, and Actions
+provide only state/progress feedback. They must enforce their own homing,
+E-stop, collision, force, and protective-stop policy. A controller must not
+publish synthetic digital-twin state; Taskplanner converts observed execution
+results into its internal status and event streams.
+
+### Tool handover state and interrupt contract
+
+KAIST does not need to add a separate integration-state topic for the initial
+handover integration. `/surgery/tool_handover` Action feedback is the
+goal-scoped robot-state report, and Taskplanner owns the public
+`/surgery/robots` projection.
+
+`ExecuteToolHandover.Feedback.state` accepts only the following values:
+
+| State | Meaning |
+| --- | --- |
+| `moving_to_source` | Moving toward the Goal's source location. |
+| `grasping` | Acquiring and verifying a stable grasp. |
+| `moving_to_target` | Moving the secured tool toward the Goal's target. |
+| `waiting_for_takeover` | Holding at the surgeon handover pose until takeover is confirmed. |
+| `placing` | Placing and releasing the tool on the tray. |
+| `holding` | Holding the selected tool stably on the robot (`tray -> robot`). |
+| `stopping` | A cancel was accepted and safe stopping is in progress. |
+| `retreating` | No grasp was confirmed; the robot is retreating while the tool remains at the source. |
+| `recovering_to_tray` | A grasp was confirmed; the robot is returning the held tool to its configured tray recovery pose. |
+
+States that do not apply to a location pair are skipped. `progress` is a
+monotonic Action-lifecycle value in `[0.0, 1.0]`, including cancel recovery. It
+reaches `1.0` at any terminal Result; consumers must use `success` rather than
+progress to determine the outcome and must not infer a physical pose or a
+deadline. The only Result `final_state` values are `completed`, `canceled`, and
+`failed`. `completed` requires `success=true`; the other two require
+`success=false`.
+
+Interrupt uses the standard ROS 2 Action cancel request, not a custom message
+or topic. It is a compensating recovery protocol rather than an instantaneous
+terminal transition:
+
+1. Taskplanner requests Cancel for the active Goal and does not send the next
+   tool Goal yet.
+2. The server reports `stopping` while arresting the current trajectory.
+3. If grasp was not confirmed, the server reports `retreating`, moves to a safe
+   non-contact pose, leaves the instrument at `source_location`, and returns
+   `final_state=canceled`, `reason_code=canceled_source_unchanged`.
+4. If grasp was confirmed, or the Goal started with `source_location=robot`,
+   the server reports `recovering_to_tray`, places the instrument at its
+   preconfigured semantic `tray` recovery pose, and returns
+   `final_state=canceled`, `reason_code=canceled_recovered_to_tray`.
+5. Only after one of those terminal Results may Taskplanner send the next Goal.
+
+The controller must serialize tool Goals and must not execute or queue a new
+tool Goal while normal motion or cancel recovery is active. The recovery tray
+pose is controller configuration, not a Goal field. Because the public contract
+contains no exact slot or trajectory, it guarantees semantic recovery to
+`tray`, not reversal to the exact original pose or slot.
+
+Confirmed release to the surgeon is the physical commit point. Once it has
+occurred, the Goal finishes `completed`; the server must not attempt to retrieve
+the tool from the surgeon as a rollback. If grasp state is uncertain, the tray
+pose is unavailable, or recovery cannot be verified, the server returns
+`final_state=failed`, `reason_code=cancel_recovery_failed`. Taskplanner then
+blocks the next ordinary command until an operator or a separately defined
+recovery procedure resolves the state. A hardware E-stop or protective stop
+remains controller-local and also aborts the Goal as `failed`.
+
+Cancel is never retroactive. If `tray -> robot` has already completed and the
+robot is holding the prepared tool, Taskplanner sends a new `robot -> tray`
+Goal to put it down; it does not attempt to Cancel the completed Goal.
+
+## Shared Surgical State Published by Taskplanner
+
+When the `surgical_interop_gateway` is explicitly enabled, Taskplanner publishes
+the following read-only, human-readable topics:
+
+```text
+/surgery/context                surgical_interop_msgs/msg/SurgeryContext
+/surgery/instruments            surgical_interop_msgs/msg/InstrumentStateArray
+/surgery/robots                 surgical_interop_msgs/msg/RobotStateArray
+/surgery/events                 surgical_interop_msgs/msg/SurgeryEvent
+/surgery/clinical_observations  surgical_interop_msgs/msg/ClinicalObservationArray
+/surgery/health                 surgical_interop_msgs/msg/SurgeryHealth
+```
+
+These are projections of DT and VLM data, not aliases of the internal topics.
+The gateway never publishes `raw_json`, `detail_json`, planner rationale,
+predicted next tool, hidden actor state, or an unvalidated clinical conclusion.
+Instrument locations are semantic anchors such as `mayo`, `right_hand`, or
+`field`; they are not 3D poses unless a separately calibrated pose contract is
+added.
+
+Every public state, event, and observation carries an `evidence_status`:
+
+- `DT_ACCEPTED`: accepted by the deterministic digital-twin reducer as current
+  operational state.
+- `MODEL_OBSERVED`: a VLM observation or hypothesis, not a clinical fact.
+- `CLINICIAN_CONFIRMED`: available only after a clinician confirmation workflow
+  supplies it.
+- `UNKNOWN` or `REJECTED`: insufficient or rejected evidence.
 
 ## Start Preflight
 
-`/integration/check_readiness` uses `std_srvs/srv/Trigger`. It fails closed when:
+`/integration/check_readiness` uses `std_srvs/srv/Trigger`. It is enabled for a
+real external integration only after the relevant provider has agreed to the
+contract. It fails closed when:
 
 - the sentence topic has no publisher;
-- any required robot Action server is absent;
+- required tool-handover/retraction Action 또는 suction Service가 없을 때;
 - real VLM mode is selected but RF-DETR has no fresh, aligned FLIR/CAM4 result.
 
 The current preflight verifies transport and perception readiness. Physical
@@ -181,8 +312,8 @@ prediction, and Mayo recovery remain unavailable until VLM evidence is healthy.
 6. Verify `ros2 topic info -v` before starting a scenario.
 7. Start the sentence publisher and verify
    `ros2 topic info -v /sensors/surgeon/sentence`.
-8. Start the three external robot Action servers and verify
-   `/integration/check_readiness`.
+8. Implement and validate only the requested controller endpoints applicable to
+   the scenario, then verify `/integration/check_readiness`.
 9. Validate sentence-only operation with `VLM_MODE=voice_only`.
 10. Add FLIR and CAM4, then verify fresh RF-DETR readiness.
 11. Enable the real VLM only after the perception gate is stable.

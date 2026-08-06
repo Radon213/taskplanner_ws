@@ -220,6 +220,13 @@ const SIMULATION_STATE = {
   layout_json: "",
 };
 
+const INPUT_SOURCE_STATUS = {
+  flir: { state: "READY", healthy: true, age_sec: 0.1, dropped_count: 0 },
+  cam4: { state: "STALE", healthy: false, age_sec: 1.8, dropped_count: 3 },
+  vlm: { state: "RECOVERING", healthy: false, age_sec: 0.2, dropped_count: 1 },
+  speech: { state: "READY", healthy: true, age_sec: 0.0, dropped_count: 0 },
+} as const;
+
 async function installRosbridgeFixture(page: Page) {
   await page.routeWebSocket(/ws:\/\/127\.0\.0\.1:9090\/?$/, (socket) => {
     const publishedTopics = new Set<string>();
@@ -238,6 +245,29 @@ async function installRosbridgeFixture(page: Page) {
               socket.send(JSON.stringify({ op: "publish", topic: message.topic, msg: event }));
             }, 20 + index * 20);
           });
+        }
+        const sourceMatch = message.topic.match(/^\/input\/(flir|cam4|vlm|speech)\/status$/);
+        if (sourceMatch) {
+          const sourceId = sourceMatch[1] as keyof typeof INPUT_SOURCE_STATUS;
+          socket.send(
+            JSON.stringify({
+              op: "publish",
+              topic: message.topic,
+              msg: {
+                stamp: { sec: 1, nanosec: 0 },
+                source_id: sourceId,
+                modality: sourceId === "speech" ? "speech" : "image",
+                last_observation_stamp: { sec: 1, nanosec: 0 },
+                received_count: 10,
+                accepted_count: 9,
+                rejected_count: 1,
+                epoch: 2,
+                error_code: "",
+                detail: "fixture",
+                ...INPUT_SOURCE_STATUS[sourceId],
+              },
+            }),
+          );
         }
       }
 
@@ -301,7 +331,9 @@ test("renders two logical groups and links request, VLM, BT, Action, and status 
   );
   await expect(retractionTrace).toHaveClass(/tone-danger/);
 
-  await expect(page.locator(`[data-holder-id="surgeon"] .holder-embedded-bubble`)).toContainText("석션 시작");
+  await expect(
+    page.getByLabel("집도의 evidence").locator(".holder-embedded-bubble"),
+  ).toContainText("석션 시작");
   const explicitDistanceEvent = page
     .locator(`.timeline-item[data-bed-group-request-id="${RETRACTION_REQUEST_ID}"]`)
     .filter({ hasText: "거리: 50 mm" })
@@ -317,6 +349,12 @@ test("renders two logical groups and links request, VLM, BT, Action, and status 
   await expect(vlmTab).toHaveAttribute("aria-selected", "true");
   await expect(vlmTab).toBeFocused();
   await expect(page.getByRole("tabpanel", { name: "VLM" })).toBeAttached();
+  const sourceHealth = page.getByRole("region", { name: "입력원 상태" });
+  await expect(sourceHealth).toContainText("FLIR");
+  await expect(sourceHealth).toContainText("CAM4");
+  await expect(sourceHealth.locator(".state-stale")).toContainText("지연");
+  await expect(sourceHealth.locator(".state-recovering")).toContainText("복구 중");
+  await expect(sourceHealth).toContainText("누락 3");
 });
 
 test("keeps group cards and request traces responsive with accessible touch targets", async ({ page }) => {

@@ -126,6 +126,10 @@ cp "${ROOT_DIR}/DEPLOYMENT.md" "${STAGING_DIR}/docs/DEPLOYMENT.md"
 cp "${ROOT_DIR}/DISTRIBUTION_NOTICE.md" \
   "${STAGING_DIR}/docs/DISTRIBUTION_NOTICE.md"
 
+python3 "${ROOT_DIR}/scripts/generate_sbom.py" \
+  --image "${TASKPLANNER_IMAGE_NAME:-taskplanner-ws:dev}" \
+  --output "${STAGING_DIR}/manifests/SBOM.spdx.json"
+
 python3 - \
   "${STAGING_DIR}/manifests/SOURCE_VERSIONS.json" \
   "${TIMESTAMP}" \

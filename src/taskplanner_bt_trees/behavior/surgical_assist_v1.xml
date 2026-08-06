@@ -28,26 +28,6 @@
             </ForceSuccess>
           </Sequence>
 
-          <Sequence name="Safety">
-            <Inverter>
-              <IsPhaseCertain />
-            </Inverter>
-            <Inverter>
-              <NeedsRecovery />
-            </Inverter>
-            <SetIdleDecision
-              decision="hold"
-              action=""
-              rationale="phase uncertain; observing without robot motion"
-            />
-            <ForceSuccess>
-              <Sequence name="SafetyDecision">
-                <ShouldDispatchDecision />
-                <EmitBTDecision />
-              </Sequence>
-            </ForceSuccess>
-          </Sequence>
-
           <Sequence name="VisualImplicitRequest">
             <IsPhaseCertain />
             <Inverter>
@@ -89,8 +69,7 @@
             </ForceSuccess>
           </Sequence>
 
-          <Sequence name="AnticipatoryHandover">
-            <IsPhaseCertain />
+          <Sequence name="AnticipatoryPreparation">
             <Inverter>
               <HasExplicitRequest />
             </Inverter>
@@ -99,18 +78,37 @@
             </Inverter>
             <SelectExpectedTool />
             <IsToolAvailable />
-            <ApplyActionGuard />
-            <CanHandover />
+            <CanPreposition />
             <ConfigureHumanoidCommand
               decision="anticipatory_handover"
               mode="anticipatory"
-              rationale="stable VLM next-tool prediction"
+              rationale="stable next-tool evidence selected for reversible preparation"
             />
             <ForceSuccess>
               <Sequence name="AnticipatoryHold">
                 <ShouldDispatchDecision />
                 <EmitBTDecision />
                 <PublishSkillCommand />
+              </Sequence>
+            </ForceSuccess>
+          </Sequence>
+
+          <Sequence name="Safety">
+            <Inverter>
+              <IsPhaseCertain />
+            </Inverter>
+            <Inverter>
+              <NeedsRecovery />
+            </Inverter>
+            <SetIdleDecision
+              decision="hold"
+              action=""
+              rationale="phase uncertain; observing without robot motion"
+            />
+            <ForceSuccess>
+              <Sequence name="SafetyDecision">
+                <ShouldDispatchDecision />
+                <EmitBTDecision />
               </Sequence>
             </ForceSuccess>
           </Sequence>

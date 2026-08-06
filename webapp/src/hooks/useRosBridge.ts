@@ -6,6 +6,7 @@ import type {
   BTDecision,
   Cam4ToolRequestObservation,
   CompressedImageFrame,
+  InputSourceStatus,
   ModelCatalogEntry,
   ModelProviderStatus,
   ModelRuntimeCommand,
@@ -698,6 +699,9 @@ export function useRosBridge(runtimeMode: TaskplannerRuntimeMode) {
   const [btDecision, setBtDecision] = useState<BTDecision>(DEFAULT_BT_DECISION);
   const [skillStatus, setSkillStatus] = useState<SkillStatus>(DEFAULT_SKILL_STATUS);
   const [vlmHealth, setVlmHealth] = useState<VLMHealth>(DEFAULT_VLM_HEALTH);
+  const [inputSourceStatuses, setInputSourceStatuses] = useState<
+    Record<string, InputSourceStatus>
+  >({});
   const [vlmResult, setVlmResult] = useState<VLMResult>(DEFAULT_VLM_RESULT);
   const [cam4ToolRequest, setCam4ToolRequest] =
     useState<Cam4ToolRequestObservation>(DEFAULT_CAM4_TOOL_REQUEST);
@@ -871,6 +875,14 @@ export function useRosBridge(runtimeMode: TaskplannerRuntimeMode) {
       name: "/vlm/result",
       messageType: "surgical_msgs/msg/VLMResult",
     });
+    const inputSourceStatusTopics = ["flir", "cam4", "vlm", "speech"].map(
+      (sourceId) =>
+        new ROSLIB.Topic({
+          ros,
+          name: `/input/${sourceId}/status`,
+          messageType: "surgical_msgs/msg/InputSourceStatus",
+        }),
+    );
     const vlmReducerTopic = new ROSLIB.Topic({
       ros,
       name: "/vlm/reducer_decisions",
@@ -1055,6 +1067,19 @@ export function useRosBridge(runtimeMode: TaskplannerRuntimeMode) {
       startTransition(() => {
         setVlmResult(message as VLMResult);
         setVlmResultReceivedAt(Date.now());
+      });
+    });
+    inputSourceStatusTopics.forEach((topic) => {
+      topic.subscribe((message: unknown) => {
+        const status = message as InputSourceStatus;
+        const sourceId = String(status.source_id || "").trim().toLowerCase();
+        if (!sourceId) return;
+        startTransition(() => {
+          setInputSourceStatuses((current) => ({
+            ...current,
+            [sourceId]: status,
+          }));
+        });
       });
     });
     vlmReducerTopic.subscribe((message: unknown) => {
@@ -1242,6 +1267,7 @@ export function useRosBridge(runtimeMode: TaskplannerRuntimeMode) {
       skillStatusTopic.unsubscribe();
       vlmHealthTopic.unsubscribe();
       vlmResultTopic.unsubscribe();
+      inputSourceStatusTopics.forEach((topic) => topic.unsubscribe());
       vlmReducerTopic.unsubscribe();
       vlmFieldImageTopic.unsubscribe();
       cameraTopics.forEach((topic) => topic.unsubscribe());
@@ -2194,6 +2220,7 @@ export function useRosBridge(runtimeMode: TaskplannerRuntimeMode) {
     btDecision,
     skillStatus,
     vlmHealth,
+    inputSourceStatuses,
     vlmResult,
     cam4ToolRequest,
     vlmReducerDecisions,

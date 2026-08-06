@@ -1,0 +1,23 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>surgical_interop_execution</name>
+  <version>0.1.0</version>
+  <description>Adapter from Taskplanner internal commands to focused public robot capability endpoints.</description>
+  <maintainer email="Radon213@users.noreply.github.com">Radon213</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
+  <exec_depend>procedure_spec</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>surgical_interop_msgs</exec_depend>
+  <exec_depend>surgical_msgs</exec_depend>
+
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

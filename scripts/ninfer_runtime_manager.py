@@ -103,7 +103,9 @@ def _load_catalog(path: str) -> tuple[ModelSpec, ...]:
                 start_command=_command_parts(row.get("start_command")),
                 stop_command=_command_parts(row.get("stop_command")),
                 environment={
-                    str(key): str(value)
+                    str(key): os.path.expandvars(
+                        os.path.expanduser(str(value))
+                    )
                     for key, value in (
                         environment.items()
                         if isinstance(environment, dict)

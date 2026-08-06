@@ -317,7 +317,10 @@ class SubscriberManager:
 
     def __init__(self) -> None:
         self._lock = Lock()
-        self._subscribers: dict[str, MultiSubscriber] = {}
+        # A raw (CBOR-RAW) rclpy subscription delivers serialized bytes while a
+        # normal subscription delivers ROS message instances.  They cannot be
+        # shared safely even when the ROS topic is the same.
+        self._subscribers: dict[str, dict[bool, MultiSubscriber]] = {}
 
     def subscribe(
         self,
@@ -337,15 +340,16 @@ class SubscriberManager:
         :param msg_type: (optional) The type of the topic
         """
         with self._lock:
-            if topic not in self._subscribers:
-                self._subscribers[topic] = MultiSubscriber(
+            topic_subscribers = self._subscribers.setdefault(topic, {})
+            if raw not in topic_subscribers:
+                topic_subscribers[raw] = MultiSubscriber(
                     topic, client_id, callback, node_handle, msg_type=msg_type, raw=raw
                 )
             else:
-                self._subscribers[topic].subscribe(client_id, callback)
+                topic_subscribers[raw].subscribe(client_id, callback)
 
             if msg_type is not None and not raw:
-                self._subscribers[topic].verify_type(msg_type)
+                topic_subscribers[raw].verify_type(msg_type)
 
     def unsubscribe(self, client_id: str, topic: str) -> None:
         """
@@ -358,10 +362,18 @@ class SubscriberManager:
             if topic not in self._subscribers:
                 return
 
-            self._subscribers[topic].unsubscribe(client_id)
+            topic_subscribers = self._subscribers[topic]
+            empty_modes = []
+            for raw, subscriber in topic_subscribers.items():
+                subscriber.unsubscribe(client_id)
+                if not subscriber.has_subscribers():
+                    subscriber.unregister()
+                    empty_modes.append(raw)
 
-            if not self._subscribers[topic].has_subscribers():
-                self._subscribers[topic].unregister()
+            for raw in empty_modes:
+                del topic_subscribers[raw]
+
+            if not topic_subscribers:
                 del self._subscribers[topic]
 
 

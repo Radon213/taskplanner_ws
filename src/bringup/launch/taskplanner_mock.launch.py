@@ -11,12 +11,14 @@ from launch_ros.substitutions import FindPackageShare
 
 def generate_launch_description() -> LaunchDescription:
     spec_dir = LaunchConfiguration("spec_dir")
+    default_bundle = LaunchConfiguration("default_bundle")
     enable_rosbridge = LaunchConfiguration("enable_rosbridge")
     rosbridge_port = LaunchConfiguration("rosbridge_port")
     rosbridge_address = LaunchConfiguration("rosbridge_address")
     rosbridge_service_timeout = LaunchConfiguration("rosbridge_service_timeout")
     input_profile = LaunchConfiguration("input_profile")
     execution_backend = LaunchConfiguration("execution_backend")
+    execution_contract = LaunchConfiguration("execution_contract")
     speech_input_mode = LaunchConfiguration("speech_input_mode")
     sentence_input_topic = LaunchConfiguration("sentence_input_topic")
     speech_min_confidence = LaunchConfiguration("speech_min_confidence")
@@ -50,6 +52,7 @@ def generate_launch_description() -> LaunchDescription:
     flir_input_topic = LaunchConfiguration("flir_input_topic")
     cam4_input_topic = LaunchConfiguration("cam4_input_topic")
     field_image_topic = LaunchConfiguration("field_image_topic")
+    cam4_overlay_image_topic = LaunchConfiguration("cam4_overlay_image_topic")
     cam4_semantics_topic = LaunchConfiguration("cam4_semantics_topic")
     require_field_image = LaunchConfiguration("require_field_image")
     require_integration_preflight = LaunchConfiguration(
@@ -114,6 +117,12 @@ def generate_launch_description() -> LaunchDescription:
     mock_execution_enabled = PythonExpression(
         ["'", execution_backend, "' == 'mock'"]
     )
+    legacy_execution_bridge_enabled = PythonExpression(
+        ["'", execution_contract, "' == 'legacy'"]
+    )
+    direct_execution_bridge_enabled = PythonExpression(
+        ["'", execution_contract, "' == 'direct'"]
+    )
 
     rosbridge_process = ExecuteProcess(
         condition=IfCondition(enable_rosbridge),
@@ -135,16 +144,33 @@ def generate_launch_description() -> LaunchDescription:
         ],
         output="screen",
     )
+    rosapi_node = Node(
+        package="rosapi",
+        executable="rosapi_node",
+        name="rosapi",
+        condition=IfCondition(enable_rosbridge),
+        parameters=[{"use_sim_time": False}],
+        output="screen",
+    )
 
     return LaunchDescription(
         [
             DeclareLaunchArgument("spec_dir", default_value=spec_default),
+            DeclareLaunchArgument("default_bundle", default_value="thyroidectomy"),
             DeclareLaunchArgument("enable_rosbridge", default_value="true"),
             DeclareLaunchArgument("rosbridge_port", default_value="9090"),
             DeclareLaunchArgument("rosbridge_address", default_value="127.0.0.1"),
             DeclareLaunchArgument("rosbridge_service_timeout", default_value="30.0"),
             DeclareLaunchArgument("input_profile", default_value="simulation"),
             DeclareLaunchArgument("execution_backend", default_value="mock"),
+            DeclareLaunchArgument(
+                "execution_contract",
+                default_value="legacy",
+                description=(
+                    "legacy uses internal generic action bridges; direct uses "
+                    "the focused /surgery robot contracts."
+                ),
+            ),
             DeclareLaunchArgument("speech_input_mode", default_value="utterance"),
             DeclareLaunchArgument(
                 "sentence_input_topic",
@@ -194,6 +220,10 @@ def generate_launch_description() -> LaunchDescription:
                 default_value="/surgery/images/field/compressed",
             ),
             DeclareLaunchArgument(
+                "cam4_overlay_image_topic",
+                default_value="/surgery/images/cam4/detection_overlay/compressed",
+            ),
+            DeclareLaunchArgument(
                 "cam4_semantics_topic",
                 default_value="",
             ),
@@ -235,6 +265,38 @@ def generate_launch_description() -> LaunchDescription:
                 output="screen",
             ),
             Node(
+                package="simulation_runtime",
+                executable="source_health_monitor",
+                name="source_health_monitor",
+                parameters=[
+                    {
+                        "flir_topic": flir_input_topic,
+                        "cam4_topic": cam4_input_topic,
+                        "vlm_result_topic": PythonExpression(
+                            [
+                                "'/vlm_real/result' if '",
+                                vlm_mode,
+                                "' == 'dual' else '/vlm/result'",
+                            ]
+                        ),
+                        "vlm_health_topic": PythonExpression(
+                            [
+                                "'/vlm_real/health' if '",
+                                vlm_mode,
+                                "' == 'dual' else '/vlm/health'",
+                            ]
+                        ),
+                        "enable_vlm": ParameterValue(
+                            PythonExpression(
+                                ["'", vlm_mode, "' in ('real', 'dual')"]
+                            ),
+                            value_type=bool,
+                        ),
+                    }
+                ],
+                output="screen",
+            ),
+            Node(
                 package="vlm_node",
                 executable="rfdetr_perception_bridge",
                 name="rfdetr_perception_bridge",
@@ -245,6 +307,7 @@ def generate_launch_description() -> LaunchDescription:
                         "flir_input_topic": flir_input_topic,
                         "cam4_input_topic": cam4_input_topic,
                         "flir_output_topic": field_image_topic,
+                        "cam4_overlay_topic": cam4_overlay_image_topic,
                         "cam4_semantics_topic": cam4_semantics_topic,
                         "max_rate_hz": 15.0,
                         "segmented_output_rate_hz": 2.0,
@@ -333,6 +396,7 @@ def generate_launch_description() -> LaunchDescription:
                         "field_image_topic": field_image_topic,
                         "raw_field_image_topic": flir_input_topic,
                         "cam4_image_topic": cam4_input_topic,
+                        "cam4_overlay_image_topic": cam4_overlay_image_topic,
                         "cam4_semantics_topic": cam4_semantics_topic,
                         "require_field_image": ParameterValue(
                             require_field_image,
@@ -403,6 +467,7 @@ def generate_launch_description() -> LaunchDescription:
                         "spec_dir": spec_dir,
                         "validation_mode": validation_mode,
                         "vlm_mode": vlm_mode,
+                        "tool_predict_evidence_confidence_threshold": 0.5,
                         "tool_predict_stability_sec": 3.0,
                         "vlm_implicit_request_confidence_threshold": 0.8,
                         "vlm_implicit_request_stability_sec": 0.7,
@@ -457,6 +522,7 @@ def generate_launch_description() -> LaunchDescription:
                 package="skill_execution",
                 executable="skill_action_bridge",
                 name="skill_action_bridge",
+                condition=IfCondition(legacy_execution_bridge_enabled),
                 parameters=[
                     {
                         "action_name": "/skill/execute",
@@ -470,9 +536,26 @@ def generate_launch_description() -> LaunchDescription:
                 package="skill_execution",
                 executable="bed_robot_arm_group_action_bridge",
                 name="bed_robot_arm_group_action_bridge",
+                condition=IfCondition(legacy_execution_bridge_enabled),
                 parameters=[
                     {
                         "min_repeat_interval_sec": 2.0,
+                        "server_wait_timeout_sec": 3.0,
+                    }
+                ],
+                output="screen",
+            ),
+            Node(
+                package="surgical_interop_execution",
+                executable="surgical_interop_execution_bridge",
+                name="surgical_interop_execution_bridge",
+                condition=IfCondition(direct_execution_bridge_enabled),
+                parameters=[
+                    {
+                        "spec_dir": spec_dir,
+                        "tool_handover_endpoint": "/surgery/tool_handover",
+                        "retraction_endpoint": "/surgery/retraction",
+                        "suction_service": "/surgery/suction/set",
                         "server_wait_timeout_sec": 3.0,
                     }
                 ],
@@ -508,6 +591,7 @@ def generate_launch_description() -> LaunchDescription:
                 parameters=[
                     {
                         "sentence_topic": sentence_input_topic,
+                        "tool_handover_action_name": "/surgery/tool_handover",
                         "require_sentence_publisher": True,
                         "require_perception": ParameterValue(
                             preflight_require_perception,
@@ -523,7 +607,7 @@ def generate_launch_description() -> LaunchDescription:
                 name="simulation_manager",
                 parameters=[
                     {
-                        "default_bundle": "thyroidectomy",
+                        "default_bundle": default_bundle,
                         "surgeon_actor_mode": surgeon_actor_mode,
                         "manual_override_actor_mute_sec": 8.0,
                         "execution_backend": execution_backend,
@@ -536,5 +620,6 @@ def generate_launch_description() -> LaunchDescription:
                 output="screen",
             ),
             rosbridge_process,
+            rosapi_node,
         ]
     )

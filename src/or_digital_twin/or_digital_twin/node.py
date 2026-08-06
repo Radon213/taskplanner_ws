@@ -27,6 +27,7 @@ from surgical_msgs.msg import (
     BedRobotArmGroupStatus,
     FilteredPhase,
     InstrumentState,
+    InputSourceStatus,
     BTContextSnapshot,
     EventDigest,
     PerceptionScene,
@@ -80,9 +81,11 @@ class ORDigitalTwinNode(Node):
         self.declare_parameter("phase_authority", "reducer")
         self.declare_parameter("vlm_mode", "mock")
         self.declare_parameter("vlm_health_timeout_sec", 6.0)
+        self.declare_parameter("vlm_evidence_max_gap_sec", 2.5)
         self.declare_parameter("mayo_retrieve_confidence_threshold", 0.5)
         self.declare_parameter("mayo_reuse_suppress_threshold", 0.5)
         self.declare_parameter("mayo_stability_sec", 5.0)
+        self.declare_parameter("tool_predict_evidence_confidence_threshold", 0.5)
         self.declare_parameter("tool_predict_confidence_threshold", 0.8)
         self.declare_parameter("tool_predict_stability_sec", 3.0)
         self.declare_parameter("vlm_implicit_request_confidence_threshold", 0.8)
@@ -103,9 +106,16 @@ class ORDigitalTwinNode(Node):
         self._phase_authority = str(self.get_parameter("phase_authority").value)
         self._vlm_mode = str(self.get_parameter("vlm_mode").value)
         self._vlm_health_timeout_sec = max(0.5, float(self.get_parameter("vlm_health_timeout_sec").value))
+        self._vlm_evidence_max_gap_sec = max(
+            0.5,
+            float(self.get_parameter("vlm_evidence_max_gap_sec").value),
+        )
         self._mayo_retrieve_threshold = float(self.get_parameter("mayo_retrieve_confidence_threshold").value)
         self._mayo_reuse_threshold = float(self.get_parameter("mayo_reuse_suppress_threshold").value)
         self._mayo_stability_sec = max(0.1, float(self.get_parameter("mayo_stability_sec").value))
+        self._tool_predict_evidence_threshold = float(
+            self.get_parameter("tool_predict_evidence_confidence_threshold").value
+        )
         self._tool_predict_threshold = float(self.get_parameter("tool_predict_confidence_threshold").value)
         self._tool_predict_stability_sec = max(0.1, float(self.get_parameter("tool_predict_stability_sec").value))
         self._vlm_implicit_request_threshold = float(
@@ -147,11 +157,20 @@ class ORDigitalTwinNode(Node):
         self._important_events: deque[SimulationEvent] = deque(maxlen=self._vlm_recent_event_count)
         self._latest_outward_signal: SurgeonOutwardSignal | None = None
         self._vlm_health_by_topic: dict[str, tuple[VLMHealth, float]] = {}
+        self._input_source_status_by_id: dict[str, InputSourceStatus] = {}
+        self._visual_admission_by_channel: dict[
+            str, tuple[int, int, float]
+        ] = {}
+        self._visual_runtime_epoch_floor = 0
+        self._vlm_evidence_blocked = False
         self._perception_health_seen = False
         self._perception_enabled = True
         self._mayo_retrieve_stability: dict[str, dict] = {}
         self._mayo_reuse_stability: dict[str, dict] = {}
         self._tool_predict_stability: dict[str, dict] = {}
+        self._tool_prediction_last_sample_by_source: dict[
+            str, tuple[float, str]
+        ] = {}
         self._vlm_implicit_request_stability: dict[str, dict] = {}
         self._vlm_implicit_request_episode_tool = ""
         self._vlm_implicit_request_release_since: float | None = None
@@ -195,6 +214,24 @@ class ORDigitalTwinNode(Node):
             )
         self.create_subscription(VLMResult, "/vlm/result", self._on_vlm_result, 20)
         self.create_subscription(VLMResult, "/vlm_real/result", self._on_vlm_result, 20)
+        self.create_subscription(
+            InputSourceStatus,
+            "/input/flir/status",
+            self._on_input_source_status,
+            10,
+        )
+        self.create_subscription(
+            InputSourceStatus,
+            "/input/cam4/status",
+            self._on_input_source_status,
+            10,
+        )
+        self.create_subscription(
+            InputSourceStatus,
+            "/input/vlm/status",
+            self._on_input_source_status,
+            10,
+        )
         self.create_subscription(VLMHealth, "/vlm/health", lambda msg: self._on_vlm_health("/vlm/health", msg), 10)
         self.create_subscription(
             VLMHealth,
@@ -260,7 +297,9 @@ class ORDigitalTwinNode(Node):
                     self._mayo_retrieve_stability.clear()
                     self._mayo_reuse_stability.clear()
                     self._tool_predict_stability.clear()
+                    self._tool_prediction_last_sample_by_source.clear()
                     self._clear_vlm_implicit_request_state()
+                    self._advance_visual_runtime_epoch()
                     self._pending_bed_robot_arm_group_requests.clear()
                     self._phase_entered_ros_sec = self._stamp_sec(self._stamp())
                     self._publish_world_state()
@@ -286,10 +325,17 @@ class ORDigitalTwinNode(Node):
                 self._mayo_reuse_threshold = float(parameter.value)
             elif parameter.name == "mayo_stability_sec":
                 self._mayo_stability_sec = max(0.1, float(parameter.value))
+            elif parameter.name == "tool_predict_evidence_confidence_threshold":
+                self._tool_predict_evidence_threshold = float(parameter.value)
             elif parameter.name == "tool_predict_confidence_threshold":
                 self._tool_predict_threshold = float(parameter.value)
             elif parameter.name == "tool_predict_stability_sec":
                 self._tool_predict_stability_sec = max(0.1, float(parameter.value))
+            elif parameter.name == "vlm_evidence_max_gap_sec":
+                self._vlm_evidence_max_gap_sec = max(
+                    0.5,
+                    float(parameter.value),
+                )
             elif parameter.name == "vlm_implicit_request_confidence_threshold":
                 self._vlm_implicit_request_threshold = float(parameter.value)
             elif parameter.name == "vlm_implicit_request_stability_sec":
@@ -312,9 +358,10 @@ class ORDigitalTwinNode(Node):
         return self.get_clock().now().to_msg()
 
     def _required_vlm_health_topics(self) -> list[str]:
-        if self._vlm_mode == "real":
+        vlm_mode = str(getattr(self, "_vlm_mode", "mock"))
+        if vlm_mode == "real":
             return ["/vlm/health"]
-        if self._vlm_mode == "dual":
+        if vlm_mode == "dual":
             return ["/vlm_real/health"]
         return []
 
@@ -322,10 +369,158 @@ class ORDigitalTwinNode(Node):
         self._vlm_health_by_topic[topic] = (msg, time.monotonic())
         self._refresh_vlm_safety_flags()
 
+    def _on_input_source_status(self, msg: InputSourceStatus) -> None:
+        source_id = str(msg.source_id or "").strip().lower()
+        if not source_id:
+            return
+        self._input_source_status_by_id[source_id] = msg
+        if source_id == "vlm":
+            self._refresh_vlm_safety_flags()
+
+    def _source_is_ready(self, source_id: str) -> bool:
+        status = getattr(self, "_input_source_status_by_id", {}).get(source_id)
+        if status is None:
+            return True
+        return bool(status.healthy and str(status.state).upper() == "READY")
+
     def _perception_gate_active(self) -> bool:
-        # RF-DETR is advisory. A healthy VLM may continue from synchronized
-        # raw FLIR/CAM4 pixels when object recognition is disabled.
-        return False
+        # RF-DETR remains advisory. This gate concerns the VLM evidence stream
+        # itself, so raw pixels may still be used when detection is disabled.
+        self._refresh_vlm_safety_flags()
+        return bool(
+            "vlm_unhealthy"
+            in getattr(getattr(self._twin, "state", None), "safety_flags", [])
+        )
+
+    def _camera_gate_active(self, source_id: str) -> bool:
+        status = getattr(self, "_input_source_status_by_id", {}).get(source_id)
+        return bool(status is not None and not self._source_is_ready(source_id))
+
+    def _advance_visual_runtime_epoch(self) -> None:
+        self._visual_runtime_epoch_floor = max(
+            0,
+            int(getattr(self, "_visual_runtime_epoch_floor", 0)),
+        ) + 1
+        getattr(self, "_visual_admission_by_channel", {}).clear()
+
+    def _reject_visual_evidence(
+        self,
+        *,
+        channel: str,
+        source: str,
+        reason: str,
+        message,
+    ) -> None:
+        publisher = getattr(self, "_reducer_decision_pub", None)
+        if publisher is None:
+            return
+        correlation_id = str(getattr(message, "correlation_id", ""))
+        source_epoch = int(getattr(message, "source_epoch", 0))
+        source_sequence = int(getattr(message, "source_sequence", 0))
+        self._publish_reducer_decision_event(
+            input_type="visual_evidence_admission",
+            input_id=correlation_id or channel,
+            input_source=source or "unknown",
+            accepted=False,
+            reason=reason,
+            detail={
+                "channel": channel,
+                "source_epoch": source_epoch,
+                "source_sequence": source_sequence,
+                "correlation_id": correlation_id,
+                "runtime_epoch_floor": int(
+                    getattr(self, "_visual_runtime_epoch_floor", 0)
+                ),
+            },
+        )
+
+    def _admit_visual_evidence(
+        self,
+        message,
+        *,
+        channel: str,
+        source: str,
+        require_epoch: bool,
+    ) -> bool:
+        source_epoch = max(0, int(getattr(message, "source_epoch", 0)))
+        source_sequence = max(
+            0,
+            int(getattr(message, "source_sequence", 0)),
+        )
+        stamp_sec = self._stamp_sec(getattr(message, "stamp", None))
+        epoch_floor = max(
+            0,
+            int(getattr(self, "_visual_runtime_epoch_floor", 0)),
+        )
+        if require_epoch and source_epoch <= 0:
+            self._reject_visual_evidence(
+                channel=channel,
+                source=source,
+                reason="missing_visual_source_epoch",
+                message=message,
+            )
+            return False
+        if source_epoch and source_epoch < epoch_floor:
+            self._reject_visual_evidence(
+                channel=channel,
+                source=source,
+                reason="stale_visual_source_epoch",
+                message=message,
+            )
+            return False
+        if source_epoch > epoch_floor:
+            self._visual_runtime_epoch_floor = source_epoch
+            getattr(self, "_visual_admission_by_channel", {}).clear()
+
+        tracker = getattr(self, "_visual_admission_by_channel", None)
+        if tracker is None:
+            tracker = {}
+            self._visual_admission_by_channel = tracker
+        previous = tracker.get(channel)
+        if previous is not None:
+            previous_epoch, previous_sequence, previous_stamp = previous
+            if source_epoch and source_epoch < previous_epoch:
+                reason = "stale_visual_source_epoch"
+            elif (
+                source_epoch
+                and source_epoch == previous_epoch
+                and source_sequence > 0
+                and previous_sequence > 0
+                and source_sequence <= previous_sequence
+            ):
+                reason = (
+                    "duplicate_visual_source_sequence"
+                    if source_sequence == previous_sequence
+                    else "out_of_order_visual_source_sequence"
+                )
+            elif (
+                source_sequence == 0
+                and stamp_sec > 0.0
+                and previous_stamp > 0.0
+                and stamp_sec <= previous_stamp
+            ):
+                reason = (
+                    "duplicate_visual_source_stamp"
+                    if abs(stamp_sec - previous_stamp) <= 1e-9
+                    else "out_of_order_visual_source_stamp"
+                )
+            else:
+                reason = ""
+            if reason:
+                self._reject_visual_evidence(
+                    channel=channel,
+                    source=source,
+                    reason=reason,
+                    message=message,
+                )
+                return False
+
+        tracker[channel] = (
+            source_epoch,
+            source_sequence,
+            stamp_sec,
+        )
+        return True
 
     def _on_perception_health(self, msg: String) -> None:
         try:
@@ -340,33 +535,47 @@ class ORDigitalTwinNode(Node):
         self._perception_health_seen = True
         self._perception_enabled = bool(payload.get("enabled"))
         if not self._perception_enabled:
-            self._twin.clear_perception_evidence()
+            self._twin.clear_object_detection_evidence()
         self._refresh_vlm_safety_flags()
         self._publish_world_state()
 
     def _refresh_vlm_safety_flags(self) -> None:
         required_topics = self._required_vlm_health_topics()
         if not required_topics:
-            self._twin.set_safety_flag("vlm_unhealthy", False)
+            if hasattr(self._twin, "set_safety_flag"):
+                self._twin.set_safety_flag("vlm_unhealthy", False)
+            self._vlm_evidence_blocked = False
             return
         now = time.monotonic()
         unhealthy = False
         for topic in required_topics:
-            sample = self._vlm_health_by_topic.get(topic)
+            sample = getattr(self, "_vlm_health_by_topic", {}).get(topic)
             if sample is None:
                 unhealthy = True
                 continue
             health, received_at = sample
-            if now - received_at > self._vlm_health_timeout_sec:
+            if now - received_at > float(
+                getattr(self, "_vlm_health_timeout_sec", 6.0)
+            ):
                 unhealthy = True
                 continue
             if not bool(health.connected and health.healthy) or bool(health.last_error):
                 unhealthy = True
+        if not self._source_is_ready("vlm"):
+            unhealthy = True
         if unhealthy:
             self._clear_tool_prediction_state()
             self._mayo_retrieve_stability.clear()
             self._mayo_reuse_stability.clear()
-        self._twin.set_safety_flag("vlm_unhealthy", unhealthy)
+            self._clear_vlm_implicit_request_state()
+            if (
+                not getattr(self, "_vlm_evidence_blocked", False)
+                and hasattr(self._twin, "clear_perception_evidence")
+            ):
+                self._twin.clear_perception_evidence()
+        self._vlm_evidence_blocked = unhealthy
+        if hasattr(self._twin, "set_safety_flag"):
+            self._twin.set_safety_flag("vlm_unhealthy", unhealthy)
 
     def _bundle_metadata_payload(self, spec) -> dict:
         requestable_instruments = [
@@ -450,6 +659,9 @@ class ORDigitalTwinNode(Node):
         return augmented
 
     def _publish_world_state(self) -> None:
+        self._expire_stale_vlm_evidence(
+            self._stamp_sec(self._stamp()),
+        )
         self._refresh_vlm_safety_flags()
         self._twin.normalize_for_publish()
         world = WorldState()
@@ -557,6 +769,15 @@ class ORDigitalTwinNode(Node):
             msg.lifecycle_stage = payload["lifecycle_stage"]
             msg.next_required_transition = payload["next_required_transition"]
             msg.visual_anchor_id = payload["visual_anchor_id"]
+            msg.preposition_origin_location_type = payload[
+                "preposition_origin_location_type"
+            ]
+            msg.preposition_origin_location_id = payload[
+                "preposition_origin_location_id"
+            ]
+            msg.preposition_origin_lifecycle_stage = payload[
+                "preposition_origin_lifecycle_stage"
+            ]
             msg.procedure_future_use_expected = bool(
                 self._twin.procedure_future_use_expected(payload["instance_id"])
             )
@@ -1082,7 +1303,24 @@ class ORDigitalTwinNode(Node):
         self._publish_world_state()
 
     def _on_phase_evidence(self, msg: PhaseEvidence) -> None:
+        source = str(msg.source or "mock_vlm")
         if self._perception_gate_active():
+            self._reject_visual_evidence(
+                channel="phase",
+                source=source,
+                reason="vlm_source_not_ready",
+                message=msg,
+            )
+            return
+        if not self._admit_visual_evidence(
+            msg,
+            channel="phase",
+            source=source,
+            require_epoch=(
+                str(getattr(self, "_vlm_mode", "mock")) in {"real", "dual"}
+                and "real_vlm" in source
+            ),
+        ):
             return
         fused = self._fuse_phase_evidence(msg)
         decisions = self._twin.apply_phase_evidence(fused)
@@ -1366,24 +1604,55 @@ class ORDigitalTwinNode(Node):
         threshold: float,
         stability_sec: float,
         now_sec: float,
+        received_sec: float | None = None,
     ) -> tuple[bool, float]:
+        received_at = now_sec if received_sec is None else received_sec
+        max_gap_sec = getattr(self, "_vlm_evidence_max_gap_sec", 2.5)
         if not tool_id or confidence < threshold:
             if tool_id:
                 tracker.pop(tool_id, None)
             return (False, 0.0)
         entry = tracker.get(tool_id)
-        if entry is None or now_sec - float(entry.get("last_seen", now_sec)) > 2.5:
-            entry = {"first_seen": now_sec, "last_seen": now_sec, "confidence": confidence}
+        if (
+            entry is None
+            or now_sec - float(entry.get("last_seen", now_sec))
+            > max_gap_sec
+        ):
+            entry = {
+                "first_seen": now_sec,
+                "last_seen": now_sec,
+                "last_received": received_at,
+                "confidence": confidence,
+            }
             tracker[tool_id] = entry
         else:
+            last_seen = float(entry.get("last_seen", now_sec))
+            entry["last_received"] = max(
+                received_at,
+                float(entry.get("last_received", received_at)),
+            )
+            if now_sec < last_seen:
+                duration = max(
+                    0.0,
+                    last_seen - float(entry.get("first_seen", last_seen)),
+                )
+                return (duration >= stability_sec, duration)
             entry["last_seen"] = now_sec
             entry["confidence"] = confidence
-        duration = now_sec - float(entry["first_seen"])
+        duration = max(0.0, now_sec - float(entry["first_seen"]))
         return (duration >= stability_sec, duration)
 
     def _clear_stale_tool_prediction(self, now_sec: float) -> None:
+        max_gap_sec = getattr(self, "_vlm_evidence_max_gap_sec", 2.5)
         for tool_id, entry in list(self._tool_predict_stability.items()):
-            if now_sec - float(entry.get("last_seen", now_sec)) > 2.5:
+            last_received = float(
+                entry.get("last_received", entry.get("last_seen", now_sec))
+            )
+            if (
+                now_sec >= last_received
+                and now_sec - last_received
+                > max_gap_sec
+            ):
                 self._tool_predict_stability.pop(tool_id, None)
         if not self._twin.state.predicted_tool:
             return
@@ -1393,11 +1662,76 @@ class ORDigitalTwinNode(Node):
             self._twin.state.predicted_tool_confidence = 0.0
             self._twin.state.predicted_tool_stability_sec = 0.0
 
+    def _expire_stale_vlm_evidence(self, now_sec: float) -> None:
+        """Withdraw visual facts even when the VLM stops publishing."""
+
+        self._clear_stale_tool_prediction(now_sec)
+        state = self._twin.state
+        if not state.implicit_request_visible:
+            if self._vlm_implicit_request_release_since is not None:
+                self._release_vlm_implicit_request_episode(now_sec)
+            return
+
+        tracking_key = state.implicit_request_tool or "__unresolved__"
+        entry = self._vlm_implicit_request_stability.get(tracking_key)
+        max_gap_sec = getattr(self, "_vlm_evidence_max_gap_sec", 2.5)
+        last_received = (
+            float(entry.get("last_received", entry.get("last_seen", now_sec)))
+            if entry is not None
+            else None
+        )
+        if (
+            last_received is None
+            or (
+                now_sec >= last_received
+                and now_sec - last_received > max_gap_sec
+            )
+        ):
+            self._release_vlm_implicit_request_episode(now_sec)
+
     def _clear_tool_prediction_state(self) -> None:
         self._tool_predict_stability.clear()
+        getattr(
+            self,
+            "_tool_prediction_last_sample_by_source",
+            {},
+        ).clear()
         self._twin.state.predicted_tool = ""
         self._twin.state.predicted_tool_confidence = 0.0
         self._twin.state.predicted_tool_stability_sec = 0.0
+
+    def _tool_prediction_sample_status(
+        self,
+        *,
+        source: str,
+        now_sec: float,
+        payload: dict,
+    ) -> str:
+        """Admit at most one temporal sample per source observation."""
+
+        tracker = getattr(
+            self,
+            "_tool_prediction_last_sample_by_source",
+            None,
+        )
+        if tracker is None:
+            tracker = {}
+            self._tool_prediction_last_sample_by_source = tracker
+        source_key = source or "unknown"
+        signature = json.dumps(
+            self._vlm_tool_rows(payload),
+            ensure_ascii=True,
+            separators=(",", ":"),
+        )
+        previous = tracker.get(source_key)
+        if previous is not None:
+            previous_stamp, _previous_signature = previous
+            if now_sec < previous_stamp - 1e-6:
+                return "stale_out_of_order_tool_prediction"
+            if abs(now_sec - previous_stamp) <= 1e-6:
+                return "duplicate_tool_prediction_observation"
+        tracker[source_key] = (now_sec, signature)
+        return "accepted"
 
     def _clear_vlm_implicit_request_state(self) -> None:
         self._vlm_implicit_request_stability.clear()
@@ -1443,6 +1777,7 @@ class ORDigitalTwinNode(Node):
         payload: dict,
         msg: VLMResult,
         now_sec: float,
+        received_sec: float | None = None,
     ) -> None:
         """Validate visual gesture evidence without creating a surgeon request."""
 
@@ -1507,6 +1842,7 @@ class ORDigitalTwinNode(Node):
             threshold=0.01,
             stability_sec=0.0,
             now_sec=now_sec,
+            received_sec=received_sec,
         )
 
         if self._vlm_implicit_request_episode_tool != tracking_key:
@@ -1550,14 +1886,6 @@ class ORDigitalTwinNode(Node):
             mode="evidence_only",
         )
 
-    def _tool_available_for_prediction(self, tool_id: str) -> bool:
-        return bool(
-            self._twin.get_instrument_state(
-                tool_id,
-                allowed_lifecycles={"home_rack", "returned_home"},
-            )
-        )
-
     def _vlm_tool_rows(self, payload: dict) -> list[list]:
         raw = payload.get("tool", [])
         if str(payload.get("v", "")) in {"3", "4"}:
@@ -1570,7 +1898,12 @@ class ORDigitalTwinNode(Node):
             return [[str(raw[0]), float(raw[1])]]
         return []
 
-    def _fused_tool_prediction(self, payload: dict, now_sec: float) -> tuple[str, float, dict]:
+    def _fused_tool_prediction(
+        self,
+        payload: dict,
+        now_sec: float,
+        received_sec: float | None = None,
+    ) -> tuple[str, float, dict]:
         vlm_rows = self._vlm_tool_rows(payload)
         vlm_scores = {
             self._twin.spec.resolve_instrument_alias(str(tool_id)) or str(tool_id): float(confidence)
@@ -1583,54 +1916,132 @@ class ORDigitalTwinNode(Node):
             for item in prior
             if isinstance(item, list) and len(item) == 2 and str(item[0])
         }
-        candidates = sorted(set(vlm_scores) | set(prior_scores))
+        # Procedure priors may nudge observed VLM candidates, but must never
+        # invent an action candidate that the current perception result did not
+        # propose.
+        candidates = sorted(vlm_scores)
         fused_scores: dict[str, float] = {}
-        unavailable: dict[str, str] = {}
+        candidate_lifecycles: dict[str, list[str]] = {}
         for tool_id in candidates:
-            if not self._twin._instances_for_type(tool_id):
+            instances = self._twin._instances_for_type(tool_id)
+            if not instances:
                 continue
-            if not self._tool_available_for_prediction(tool_id):
-                state = self._twin.get_instrument_state(tool_id)
-                unavailable[tool_id] = state.lifecycle_stage if state is not None else "missing"
-                continue
-            vlm_score = float(vlm_scores.get(tool_id, 0.0))
-            prior_score = float(prior_scores.get(tool_id, 0.0))
-            agreement = 0.15 if vlm_score >= 0.35 and prior_score >= 0.35 else 0.0
-            fused_scores[tool_id] = min(1.0, 0.15 + 0.62 * vlm_score + 0.28 * prior_score + agreement)
+            candidate_lifecycles[tool_id] = sorted(
+                {
+                    str(getattr(state, "lifecycle_stage", "") or "")
+                    for state in instances
+                }
+            )
+            vlm_score = max(0.0, min(1.0, float(vlm_scores.get(tool_id, 0.0))))
+            prior_score = max(0.0, min(1.0, float(prior_scores.get(tool_id, 0.0))))
+            remaining = 1.0 - vlm_score
+            prior_nudge = 0.15 * prior_score * remaining
+            agreement_nudge = (
+                0.05 * remaining
+                if vlm_score >= 0.35 and prior_score >= 0.35
+                else 0.0
+            )
+            fused_scores[tool_id] = min(
+                1.0,
+                vlm_score + prior_nudge + agreement_nudge,
+            )
         if not fused_scores:
-            return "", 0.0, {"vlm": vlm_scores, "prior": prior_scores, "unavailable": unavailable, "fused": {}}
-        best_tool, best_confidence = max(fused_scores.items(), key=lambda item: item[1])
-        selected_tool = best_tool
-        selected_confidence = best_confidence
+            return "", 0.0, {
+                "vlm": vlm_scores,
+                "prior": prior_scores,
+                "candidate_lifecycles": candidate_lifecycles,
+                "fused": {},
+            }
+
+        eligible_scores: dict[str, float] = {}
+        for tool_id, confidence in fused_scores.items():
+            if confidence >= self._tool_predict_evidence_threshold:
+                eligible_scores[tool_id] = confidence
+        if not eligible_scores:
+            self._tool_predict_stability.clear()
+            return "", 0.0, {
+                "vlm": vlm_scores,
+                "prior": prior_scores,
+                "candidate_lifecycles": candidate_lifecycles,
+                "fused": fused_scores,
+                "durations_sec": {
+                    tool_id: 0.0 for tool_id in fused_scores
+                },
+            }
+
+        selected_tool, selected_confidence = max(
+            eligible_scores.items(),
+            key=lambda item: item[1],
+        )
+        # Readiness measures continuity of the current top candidate. A
+        # different winner invalidates the previous candidate's preparation
+        # clock instead of letting intermittent ranked appearances accumulate.
+        for tracked_tool in list(self._tool_predict_stability):
+            if tracked_tool != selected_tool:
+                self._tool_predict_stability.pop(tracked_tool, None)
+        _, selected_duration = self._update_stability(
+            self._tool_predict_stability,
+            tool_id=selected_tool,
+            confidence=selected_confidence,
+            threshold=self._tool_predict_evidence_threshold,
+            stability_sec=self._tool_predict_stability_sec,
+            now_sec=now_sec,
+            received_sec=received_sec,
+        )
+        durations = {
+            tool_id: (
+                selected_duration if tool_id == selected_tool else 0.0
+            )
+            for tool_id in fused_scores
+        }
         vlm_top = max(vlm_scores.items(), key=lambda item: item[1])[0] if vlm_scores else ""
         prior_top = max(prior_scores.items(), key=lambda item: item[1])[0] if prior_scores else ""
-        strong_new_consensus = bool(best_tool and best_tool == vlm_top and best_tool == prior_top)
-        sticky_margin = 0.06 if strong_new_consensus else 0.12
-        for tracked_tool, entry in self._tool_predict_stability.items():
-            if tracked_tool != best_tool and strong_new_consensus:
-                continue
-            if now_sec - float(entry.get("last_seen", now_sec)) > 2.5:
-                continue
-            tracked_score = fused_scores.get(tracked_tool)
-            if tracked_score is None:
-                continue
-            if tracked_score >= best_confidence - sticky_margin:
-                selected_tool = tracked_tool
-                selected_confidence = tracked_score
-                break
+        strong_new_consensus = bool(
+            selected_tool
+            and selected_tool == vlm_top
+            and selected_tool == prior_top
+        )
         return selected_tool, selected_confidence, {
             "vlm": vlm_scores,
             "prior": prior_scores,
-            "unavailable": unavailable,
+            "candidate_lifecycles": candidate_lifecycles,
             "fused": fused_scores,
+            "durations_sec": durations,
             "selected": selected_tool,
+            "selected_duration_sec": durations.get(selected_tool, 0.0),
             "vlm_top": vlm_top,
             "prior_top": prior_top,
             "strong_new_consensus": strong_new_consensus,
         }
 
-    def _handle_vlm_tool_prediction(self, payload: dict, msg: VLMResult, now_sec: float) -> None:
-        if str(payload.get("v", "")) == "2" and "real_vlm" not in str(msg.source):
+    def _handle_vlm_tool_prediction(
+        self,
+        payload: dict,
+        msg: VLMResult,
+        now_sec: float,
+        received_sec: float | None = None,
+    ) -> None:
+        sample_status = self._tool_prediction_sample_status(
+            source=str(msg.source),
+            now_sec=now_sec,
+            payload=payload,
+        )
+        if sample_status != "accepted":
+            self._publish_reducer_decision_event(
+                input_type="vlm_tool_prediction",
+                input_id=f"tool_prediction_ignored:{now_sec:.3f}",
+                input_source=msg.source,
+                accepted=False,
+                reason=sample_status,
+                detail={"tool_rows": self._vlm_tool_rows(payload)},
+            )
+            return
+
+        legacy_v2 = bool(
+            str(payload.get("v", "")) == "2"
+            and "real_vlm" not in str(msg.source)
+        )
+        if legacy_v2:
             raw_tool = payload.get("tool", ["", 0.0])
             if not isinstance(raw_tool, list) or len(raw_tool) != 2:
                 self._clear_stale_tool_prediction(now_sec)
@@ -1643,77 +2054,33 @@ class ORDigitalTwinNode(Node):
                 return
             fusion_detail = {"legacy_v2": True, "tool": tool_id, "confidence": confidence}
         else:
-            tool_id, confidence, fusion_detail = self._fused_tool_prediction(payload, now_sec)
+            tool_id, confidence, fusion_detail = self._fused_tool_prediction(
+                payload,
+                now_sec,
+                received_sec,
+            )
         if not tool_id:
             self._clear_stale_tool_prediction(now_sec)
-            if fusion_detail.get("unavailable"):
-                self._publish_reducer_decision_event(
-                    input_type="vlm_tool_prediction",
-                    input_id=f"tool_prediction:none:{now_sec:.3f}",
-                    input_source=msg.source,
-                    accepted=False,
-                    reason="no_available_fused_tool_prediction",
-                    detail=fusion_detail,
-                )
             return
-        current_prediction = self._twin.state.predicted_tool
-        if (
-            current_prediction
-            and current_prediction != tool_id
-            and (
-                bool(fusion_detail.get("strong_new_consensus"))
-                or confidence >= self._tool_predict_threshold
+        if legacy_v2:
+            _, duration = self._update_stability(
+                self._tool_predict_stability,
+                tool_id=tool_id,
+                confidence=confidence,
+                threshold=self._tool_predict_evidence_threshold,
+                stability_sec=self._tool_predict_stability_sec,
+                now_sec=now_sec,
+                received_sec=received_sec,
             )
-        ):
-            self._tool_predict_stability.pop(current_prediction, None)
-            self._twin.state.predicted_tool = ""
-            self._twin.state.predicted_tool_confidence = 0.0
-            self._twin.state.predicted_tool_stability_sec = 0.0
-            self._publish_reducer_decision_event(
-                input_type="vlm_tool_prediction",
-                input_id=f"tool_prediction_clear:{current_prediction}:{now_sec:.3f}",
-                input_source=msg.source,
-                accepted=False,
-                reason="cleared_stale_tool_prediction_for_new_consensus",
-                affected_tool=current_prediction,
-                detail={
-                    "replacement_candidate": tool_id,
-                    "confidence": confidence,
-                    "fusion": fusion_detail,
-                },
+        else:
+            duration = float(
+                fusion_detail.get("selected_duration_sec", 0.0)
             )
-        stable, duration = self._update_stability(
-            self._tool_predict_stability,
-            tool_id=tool_id,
-            confidence=confidence,
-            threshold=self._tool_predict_threshold,
-            stability_sec=self._tool_predict_stability_sec,
-            now_sec=now_sec,
+        policy_ready = bool(
+            confidence >= self._tool_predict_threshold
+            and duration >= self._tool_predict_stability_sec
         )
         self._clear_stale_tool_prediction(now_sec)
-        current_state = self._twin.get_instrument_state(
-            tool_id,
-            allowed_lifecycles={"home_rack", "returned_home"},
-        )
-        if current_state is None or current_state.contaminated or current_state.lifecycle_stage not in {"home_rack", "returned_home"}:
-            self._publish_reducer_decision_event(
-                input_type="vlm_tool_prediction",
-                input_id=f"tool_prediction:{tool_id}:{now_sec:.3f}",
-                input_source=msg.source,
-                accepted=False,
-                reason="predicted_tool_not_available_for_preposition",
-                affected_tool=tool_id,
-                detail={
-                    "confidence": confidence,
-                    "lifecycle": current_state.lifecycle_stage if current_state else "",
-                    "fusion": fusion_detail,
-                },
-            )
-            if self._twin.state.predicted_tool == tool_id:
-                self._twin.state.predicted_tool = ""
-                self._twin.state.predicted_tool_confidence = 0.0
-                self._twin.state.predicted_tool_stability_sec = 0.0
-            return
         changed = self._twin.state.predicted_tool != tool_id
         self._twin.state.predicted_tool = tool_id
         self._twin.state.predicted_tool_confidence = confidence
@@ -1728,8 +2095,10 @@ class ORDigitalTwinNode(Node):
             detail={
                 "confidence": confidence,
                 "duration_sec": round(duration, 3),
+                "evidence_confidence_threshold": self._tool_predict_evidence_threshold,
+                "policy_confidence_threshold": self._tool_predict_threshold,
                 "threshold_sec": self._tool_predict_stability_sec,
-                "policy_ready": stable,
+                "policy_ready": policy_ready,
                 "fusion": fusion_detail,
             },
         )
@@ -1741,13 +2110,34 @@ class ORDigitalTwinNode(Node):
                 detail={
                     "source": msg.source,
                     "duration_sec": round(duration, 3),
+                    "evidence_confidence_threshold": self._tool_predict_evidence_threshold,
+                    "policy_confidence_threshold": self._tool_predict_threshold,
                     "threshold_sec": self._tool_predict_stability_sec,
-                    "policy_ready": stable,
+                    "policy_ready": policy_ready,
                 },
                 mode="evidence_only",
             )
 
     def _on_vlm_result(self, msg: VLMResult) -> None:
+        source = str(msg.source or "unknown_vlm")
+        if self._perception_gate_active():
+            self._reject_visual_evidence(
+                channel="vlm_result",
+                source=source,
+                reason="vlm_source_not_ready",
+                message=msg,
+            )
+            return
+        if not self._admit_visual_evidence(
+            msg,
+            channel="vlm_result",
+            source=source,
+            require_epoch=(
+                str(getattr(self, "_vlm_mode", "mock")) in {"real", "dual"}
+                and "real_vlm" in source
+            ),
+        ):
+            return
         if str(msg.schema_version) not in {"2", "3", "4"}:
             return
         try:
@@ -1757,19 +2147,19 @@ class ORDigitalTwinNode(Node):
         if not isinstance(payload, dict) or str(payload.get("v", "")) not in {"2", "3", "4"}:
             return
         now_sec = self._stamp_sec(msg.stamp)
-        interrupt_visible = any(
-            self._twin.spec.is_interrupt_phase(self._twin.spec.resolve_phase_id(str(phase_id)) or str(phase_id))
-            and float(confidence) >= 0.5
-            for phase_id, confidence in zip(msg.phase_ids, msg.phase_confidences)
+        received_sec = self._stamp_sec(self._stamp())
+        self._handle_vlm_tool_prediction(
+            payload,
+            msg,
+            now_sec,
+            received_sec,
         )
-        if interrupt_visible:
-            self._tool_predict_stability.clear()
-            if self._twin.state.predicted_tool:
-                self._twin.state.predicted_tool = ""
-                self._twin.state.predicted_tool_confidence = 0.0
-                self._twin.state.predicted_tool_stability_sec = 0.0
-        self._handle_vlm_tool_prediction(payload, msg, now_sec)
-        self._handle_vlm_implicit_request(payload, msg, now_sec)
+        self._handle_vlm_implicit_request(
+            payload,
+            msg,
+            now_sec,
+            received_sec,
+        )
         mayo_rows: dict[str, tuple[str, float]] = {}
         for item in payload.get("mayo", []):
             if not isinstance(item, list) or len(item) != 3:
@@ -1814,6 +2204,7 @@ class ORDigitalTwinNode(Node):
                 threshold=threshold,
                 stability_sec=self._mayo_stability_sec,
                 now_sec=now_sec,
+                received_sec=received_sec,
             )
             current_state = self._twin.get_instrument_state(
                 tool_id,
@@ -1863,7 +2254,8 @@ class ORDigitalTwinNode(Node):
 
     def _on_observation(self, msg: ToolObservation) -> None:
         source = (
-            "vlm_cam4_mayo_observation"
+            str(getattr(msg, "source", ""))
+            or "vlm_cam4_mayo_observation"
             if msg.location_type == "mayo_stand"
             else "legacy_tool_observation"
         )
@@ -1884,7 +2276,41 @@ class ORDigitalTwinNode(Node):
         *,
         source: str,
     ) -> None:
-        if self._perception_gate_active():
+        resolved_source = str(getattr(msg, "source", "")) or source
+        is_cam4_detector = source == "cam4_rfdetr_mayo_observation"
+        if is_cam4_detector:
+            if self._camera_gate_active("cam4"):
+                self._reject_visual_evidence(
+                    channel="cam4_tool_observation",
+                    source=resolved_source,
+                    reason="cam4_source_not_ready",
+                    message=msg,
+                )
+                return
+        elif self._perception_gate_active():
+            self._reject_visual_evidence(
+                channel="vlm_tool_observation",
+                source=resolved_source,
+                reason="vlm_source_not_ready",
+                message=msg,
+            )
+            return
+        resolved_tool = self._twin.spec.resolve_instrument_alias(msg.instrument_id) or msg.instrument_id
+        admission_channel = (
+            f"{'cam4' if is_cam4_detector else 'vlm'}_tool:"
+            f"{resolved_tool}:{msg.location_type}:{msg.location_id}"
+        )
+        if not self._admit_visual_evidence(
+            msg,
+            channel=admission_channel,
+            source=resolved_source,
+            require_epoch=(
+                not is_cam4_detector
+                and str(getattr(self, "_vlm_mode", "mock"))
+                in {"real", "dual"}
+                and "real_vlm" in resolved_source
+            ),
+        ):
             return
         stamp_sec = float(msg.stamp.sec) + float(msg.stamp.nanosec) / 1_000_000_000.0
         proposal_id = (
@@ -1893,13 +2319,12 @@ class ORDigitalTwinNode(Node):
         )
         current_lifecycle = ""
         proposed_lifecycle = ""
-        resolved_tool = self._twin.spec.resolve_instrument_alias(msg.instrument_id) or msg.instrument_id
         current_state = self._twin.get_instrument_state(resolved_tool)
         if current_state is not None:
             current_lifecycle = current_state.lifecycle_stage
         result = self._twin.reconcile_observation(
             msg,
-            source=source,
+            source=resolved_source,
             proposal_id=proposal_id,
         )
         if result:
@@ -1982,7 +2407,25 @@ class ORDigitalTwinNode(Node):
         self._publish_world_state()
 
     def _on_bed_robot_arm_group_proposal(self, msg: BedRobotArmGroupActionProposal) -> None:
+        source = str(getattr(msg, "source", "")) or "vlm_bed_robot_arm_group"
         if self._perception_gate_active():
+            self._reject_visual_evidence(
+                channel="bed_robot_arm_group_proposal",
+                source=source,
+                reason="vlm_source_not_ready",
+                message=msg,
+            )
+            return
+        request_id = str(msg.command.request_id or "unresolved")
+        if not self._admit_visual_evidence(
+            msg,
+            channel=f"bed_robot_arm_group_proposal:{request_id}",
+            source=source,
+            require_epoch=(
+                str(getattr(self, "_vlm_mode", "mock")) in {"real", "dual"}
+                and "real_vlm" in source
+            ),
+        ):
             return
         command = msg.command
         self._publish_event(
@@ -2230,6 +2673,15 @@ class ORDigitalTwinNode(Node):
         command, _, start_phase_id = raw_command.partition(":")
         command = command.strip().lower()
         start_phase_id = start_phase_id.strip()
+        if command in {
+            "start",
+            "start_runtime",
+            "pause",
+            "resume",
+            "stop",
+            "reset",
+        }:
+            self._advance_visual_runtime_epoch()
         if command in {"start", "start_runtime"}:
             self._pending_bed_robot_arm_group_requests.clear()
             self._clear_vlm_implicit_request_state()

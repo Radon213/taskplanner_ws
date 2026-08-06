@@ -1,0 +1,31 @@
+schema: taskplanner.fault_scenario.v1
+scenario_id: noisy-operating-room
+seed: 1618033
+events:
+  - id: flir-motion
+    source: flir
+    kind: shake
+    start_sec: 3.0
+    duration_sec: 4.0
+    params: {max_px: 8}
+  - id: flir-smoke-occlusion
+    source: flir
+    kind: occlusion
+    start_sec: 12.0
+    duration_sec: 2.0
+    params: {width_ratio: 0.18, height_ratio: 0.15}
+  - id: cam4-dark
+    source: cam4
+    kind: exposure
+    start_sec: 7.0
+    duration_sec: 4.0
+    params: {factor: 0.7}
+  - id: asr-alias
+    source: speech
+    kind: speech_replace
+    start_sec: 4.0
+    duration_sec: 20.0
+    params:
+      replacements:
+        Allis: alice
+        Adson: add some

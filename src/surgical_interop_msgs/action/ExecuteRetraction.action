@@ -1,0 +1,14 @@
+# Execute a focused retraction capability. The endpoint identifies the robot
+# capability, so no group identifier or planning rationale is required.
+string command_id
+string operation
+string direction
+float32 distance_mm
+string end_effector_profile
+---
+bool success
+string final_state
+string reason_code
+---
+string state
+float32 progress

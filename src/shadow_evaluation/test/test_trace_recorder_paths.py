@@ -71,6 +71,7 @@ def test_error_policy_retains_legacy_collision_behavior(tmp_path):
 
 def test_image_trace_qos_accepts_best_effort_camera_publishers():
     assert IMAGE_TRACE_QOS.reliability == ReliabilityPolicy.BEST_EFFORT
+    assert IMAGE_TRACE_QOS.depth == 256
 
 
 def test_open_writer_keeps_synchronous_default(tmp_path):

@@ -1,0 +1,28 @@
+schema: taskplanner.fault_scenario.v1
+scenario_id: media-corruption
+seed: 32452843
+events:
+  - id: cam4-corrupt-jpeg
+    source: cam4
+    kind: corrupt
+    start_sec: 2.0
+    duration_sec: 2.0
+    params: {keep_ratio: 0.18}
+  - id: flir-resolution-change
+    source: flir
+    kind: resize
+    start_sec: 5.0
+    duration_sec: 3.0
+    params: {width: 320, height: 240}
+  - id: flir-defocus
+    source: flir
+    kind: blur
+    start_sec: 5.0
+    duration_sec: 3.0
+    params: {radius: 5.0}
+  - id: partial-asr-result
+    source: speech
+    kind: speech_partial
+    start_sec: 7.0
+    duration_sec: 3.0
+    params: {keep_words: 2}

@@ -164,7 +164,7 @@ export type StageToolDisplayState = "waiting" | "handover" | "using" | "recovery
 
 export type StageToolChipBadge = {
   label: string;
-  tone: "neutral" | "active" | "warning" | "danger" | "predicted" | "reuse";
+  tone: "neutral" | "active" | "warning" | "danger" | "predicted" | "reuse" | "recovery";
 };
 
 export type StageToolChipDensity = "comfortable" | "regular" | "dense" | "micro";
@@ -173,6 +173,10 @@ export type StageToolChipPlacement = {
   id: string;
   label: string;
   shortLabel: string;
+  /** Physical instances represented by this visual card. */
+  instanceIds?: string[];
+  /** Visual-only inventory count; the digital-twin instances remain separate. */
+  quantity?: number;
   holderId: StageHolderId;
   holderLabel: string;
   left: number;
@@ -482,6 +486,7 @@ const TOOL_CARD_W = (RACK_WIDTH - RACK_PADDING_X * 2 - RACK_SLOT_GAP_X) / RACK_S
 const HOLDER_LABEL_SPACE = 4.4;
 const HOLDER_BADGE_SPACE = 3.2;
 const HOLDER_BADGE_GAP = 1.1;
+const SURGEON_EVIDENCE_EXTRA_SPACE = 7.2;
 const HOLDER_PAD_X = 1.2;
 const HOLDER_PAD_BOTTOM = 0.8;
 const TOOL_CARD_MIN_SCALE = 0.46;
@@ -661,12 +666,16 @@ function holderUsesBadgeStrip(holderId: StageHolderId): boolean {
 function contentRectForHolder(holderId: StageHolderId, rect: StageHolderRect): StageHolderRect {
   const badgeSpace = holderUsesBadgeStrip(holderId) ? HOLDER_BADGE_SPACE : 0;
   const badgeGap = holderUsesBadgeStrip(holderId) ? HOLDER_BADGE_GAP : 0;
+  const surgeonEvidenceSpace = holderId === "surgeon" ? SURGEON_EVIDENCE_EXTRA_SPACE : 0;
   const labelSpace = holderId === "mayo" ? 0.8 : HOLDER_LABEL_SPACE;
   return {
     left: rect.left + HOLDER_PAD_X,
-    top: rect.top + labelSpace + badgeSpace + badgeGap,
+    top: rect.top + labelSpace + badgeSpace + badgeGap + surgeonEvidenceSpace,
     width: Math.max(0.1, rect.width - HOLDER_PAD_X * 2),
-    height: Math.max(0.1, rect.height - labelSpace - badgeSpace - badgeGap - HOLDER_PAD_BOTTOM),
+    height: Math.max(
+      0.1,
+      rect.height - labelSpace - badgeSpace - badgeGap - surgeonEvidenceSpace - HOLDER_PAD_BOTTOM,
+    ),
   };
 }
 
@@ -776,6 +785,65 @@ function chipRectForHolder(
   return gridRectForHolder(holderId, index, holderCount, holderRects);
 }
 
+type HolderInstrumentDisplayGroup = {
+  id: string;
+  instruments: InstrumentState[];
+};
+
+function groupHolderInstrumentsForDisplay(
+  holderId: StageHolderId,
+  instruments: InstrumentState[],
+): HolderInstrumentDisplayGroup[] {
+  // Rack inventory has its own slot-aware aggregation in OperatingRoomStage.
+  // The surgeon and Mayo surfaces instead use one visual card per tool type so
+  // multiple physical instances do not consume a vertical slot each.
+  if (holderId !== "surgeon" && holderId !== "mayo") {
+    return instruments.map((instrument) => ({
+      id: instrumentInstanceKey(instrument),
+      instruments: [instrument],
+    }));
+  }
+
+  const groups = new Map<string, HolderInstrumentDisplayGroup>();
+  for (const instrument of instruments) {
+    const key = instrument.instrument_id;
+    const group = groups.get(key);
+    if (group) {
+      group.instruments.push(instrument);
+    } else {
+      groups.set(key, { id: key, instruments: [instrument] });
+    }
+  }
+  return [...groups.values()];
+}
+
+function representativeInstrumentForDisplayGroup(
+  instruments: InstrumentState[],
+  activeToolId: string,
+  activeToolInstanceId: string,
+  activeRecoveryToolIds: Set<string>,
+): InstrumentState {
+  return [...instruments].sort((left, right) => {
+    const priority = (instrument: InstrumentState): number => {
+      const instanceId = instrumentInstanceKey(instrument);
+      let score = 0;
+      if (activeToolInstanceId ? instanceId === activeToolInstanceId : instrument.instrument_id === activeToolId) {
+        score += 100;
+      }
+      if (
+        isActiveRecoveryInstrument(instrument, activeRecoveryToolIds) ||
+        instrument.lifecycle_stage === "mayo_recovery" ||
+        instrument.next_required_transition === "recover_left"
+      ) {
+        score += 50;
+      }
+      if (instrument.contaminated) score += 5;
+      return score;
+    };
+    return priority(right) - priority(left) || instrumentInstanceKey(left).localeCompare(instrumentInstanceKey(right));
+  })[0];
+}
+
 const RECOVERY_BADGE_LIFECYCLES = new Set(["surgeon_owned", "mayo_reuse", "mayo_recovery"]);
 
 function isActiveRecoveryInstrument(
@@ -817,39 +885,34 @@ function footerBadgesForInstrument(
   mayoAssessment: MayoVlmAssessment | undefined,
 ): StageToolChipBadge[] {
   if (holderId === "mayo") {
-    const rawDecisionLabel =
-      mayoAssessment === undefined
-        ? language === "ko"
-          ? "VLM 판단 --"
-          : "VLM decision --"
-        : mayoAssessment.decision === "reuse"
-          ? language === "ko"
-            ? `VLM 재사용 ${Math.round(mayoAssessment.confidence * 100)}%`
-            : `VLM reuse ${Math.round(mayoAssessment.confidence * 100)}%`
-          : language === "ko"
-            ? `VLM ${mayoAssessment.selectedForRetrieve ? "회수 후보" : "회수"} ${Math.round(mayoAssessment.confidence * 100)}%`
-            : `VLM ${mayoAssessment.selectedForRetrieve ? "recovery candidate" : "recover"} ${Math.round(mayoAssessment.confidence * 100)}%`;
     const finalRecovery =
       isActiveRecoveryInstrument(instrument, activeRecoveryToolIds) ||
       instrument.lifecycle_stage === "mayo_recovery" ||
       instrument.next_required_transition === "recover_left";
-    const finalDecisionLabel = finalRecovery
-      ? language === "ko"
-        ? "DT 회수 확정"
-        : "DT recovery"
-      : language === "ko"
-        ? "DT 재사용 유지"
-        : "DT keep for reuse";
-    const badges: StageToolChipBadge[] = [
-      {
-        label: rawDecisionLabel,
-        tone: mayoAssessment?.decision === "recover" ? "warning" : "reuse",
-      },
-      {
-        label: finalDecisionLabel,
-        tone: finalRecovery ? "warning" : "neutral",
-      },
-    ];
+    const confidence = Math.round((mayoAssessment?.confidence ?? 0) * 100);
+    const decisionBadge: StageToolChipBadge = finalRecovery
+      ? {
+          label: language === "ko" ? "회수 예정" : "Recovery scheduled",
+          tone: "recovery",
+        }
+      : mayoAssessment?.decision === "reuse"
+        ? {
+            label: language === "ko" ? `재사용 ${confidence}%` : `Reuse ${confidence}%`,
+            tone: "reuse",
+          }
+        : mayoAssessment?.decision === "recover"
+          ? {
+              label:
+                language === "ko"
+                  ? `${mayoAssessment.selectedForRetrieve ? "회수 후보" : "회수 판단"} ${confidence}%`
+                  : `${mayoAssessment.selectedForRetrieve ? "Recovery candidate" : "Recover"} ${confidence}%`,
+              tone: "warning",
+            }
+          : {
+              label: language === "ko" ? "판단 대기" : "Decision pending",
+              tone: "neutral",
+            };
+    const badges: StageToolChipBadge[] = [decisionBadge];
     if (instrument.contaminated) {
       badges.push({ label: ui.contaminated, tone: "danger" });
     }
@@ -2308,18 +2371,27 @@ export function useDigitalTwinViewModel({
         const rightKey = `${right.home_location_id}-${right.location_id}-${instrumentInstanceKey(right)}`;
         return leftKey.localeCompare(rightKey);
       });
-      return instruments.map((instrument, index) => {
+      const displayGroups = groupHolderInstrumentsForDisplay(holderId, instruments);
+      return displayGroups.map((group, index) => {
+        const instrument = representativeInstrumentForDisplayGroup(
+          group.instruments,
+          activeToolId,
+          activeToolInstanceId,
+          activeRecoveryToolIds,
+        );
         const label = localizedToolName(instrument.instrument_id);
         const placementIndex = holderId === "rack" ? rackSlotIndexById.get(instrument.home_location_id) ?? index : index;
         const rect = chipRectForHolder(
           holderId,
           placementIndex,
-          holderId === "rack" ? boardRackSlotCount : instruments.length,
+          holderId === "rack" ? boardRackSlotCount : displayGroups.length,
           holderRects,
         );
-        const active = activeToolInstanceId
-          ? instrumentInstanceKey(instrument) === activeToolInstanceId
-          : instrument.instrument_id === activeToolId;
+        const active = group.instruments.some((candidate) =>
+          activeToolInstanceId
+            ? instrumentInstanceKey(candidate) === activeToolInstanceId
+            : candidate.instrument_id === activeToolId,
+        );
         const displayState = displayStateForInstrument(instrument, catalog, activeRecoveryToolIds);
         const requested =
           holderId === "humanoid_right" &&
@@ -2337,7 +2409,8 @@ export function useDigitalTwinViewModel({
               ? instrumentInstanceKey(instrument) ===
                 simulationState.prepositioned_tool_instance_id
               : instrument.instrument_id === simulationState.prepositioned_tool));
-        const footerBadges = footerBadgesForInstrument(
+        const contaminated = group.instruments.some((candidate) => candidate.contaminated);
+        const representativeBadges = footerBadgesForInstrument(
           instrument,
           catalog,
           language,
@@ -2346,10 +2419,20 @@ export function useDigitalTwinViewModel({
           holderId,
           mayoAssessmentByTool.get(instrument.instrument_id),
         );
+        const footerBadges =
+          contaminated && !representativeBadges.some((badge) => badge.tone === "danger")
+            ? [...representativeBadges, { label: ui.contaminated, tone: "danger" as const }]
+            : representativeBadges;
+        const visualId =
+          group.instruments.length > 1
+            ? `${holderId}:${group.id}`
+            : instrumentInstanceKey(instrument);
         return {
-          id: instrumentInstanceKey(instrument),
+          id: visualId,
           label,
           shortLabel: toolShortLabel(label),
+          instanceIds: group.instruments.map(instrumentInstanceKey),
+          quantity: group.instruments.length,
           holderId,
           holderLabel: holderShortLabel(holderId, language),
           left: rect.left,
@@ -2359,7 +2442,7 @@ export function useDigitalTwinViewModel({
           scale: rect.scale,
           compact: rect.compact,
           gridIndex: rect.gridIndex,
-          density: toolChipDensityForHolder(holderId, instruments.length, rect.compact),
+          density: toolChipDensityForHolder(holderId, displayGroups.length, rect.compact),
           displayState,
           highlight: requested ? "requested" : predicted ? "predicted" : "normal",
           lifecycle: catalogLabel(
@@ -2370,7 +2453,7 @@ export function useDigitalTwinViewModel({
             titleize(displayLifecycleForInstrument(instrument, activeRecoveryToolIds)),
           ),
           footerBadges,
-          contaminated: instrument.contaminated,
+          contaminated,
           active,
           layoutVariant: holderId === "mayo" ? "mayoList" : "card",
         };

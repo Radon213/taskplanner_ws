@@ -12,6 +12,21 @@ from typing import Any, Iterable
 
 TRACE_SCHEMA = "taskplanner.shadow_trace.v1"
 RUN_MANIFEST_SCHEMA = "taskplanner.shadow_run_manifest.v1"
+BEHAVIOR_QUALITY_SCHEMA_V1 = "taskplanner.shadow_behavior_quality.v1"
+BEHAVIOR_QUALITY_SCHEMA = "taskplanner.shadow_behavior_quality.v2"
+BEHAVIOR_QUALITY_SOURCE_SUMMARY_KEYS = (
+    "preparation_coverage",
+    "request_to_handover_latency_sec",
+    "wrong_preposition_release_latency_sec",
+    "unnecessary_preparation_count",
+    "unnecessary_preparation_rate",
+    "invariant_violation_count",
+)
+BEHAVIOR_QUALITY_SUMMARY_KEYS = (
+    *BEHAVIOR_QUALITY_SOURCE_SUMMARY_KEYS,
+    "request_to_handover_wall_clock_latency_sec",
+    "wrong_preposition_release_wall_clock_latency_sec",
+)
 RUN_MODES = {"strict", "reconciled", "oracle"}
 GROUND_TRUTH_PREFIX = "/evaluation/ground_truth"
 
@@ -25,6 +40,7 @@ TRACE_LAYERS = {
     "cam4_semantic_perception",
     "rfdetr_health",
     "rfdetr_diagnostics",
+    "fault_injection_status",
     "shadow_replay_state",
     "runtime_control",
     "runtime_state",
@@ -33,6 +49,7 @@ TRACE_LAYERS = {
     "vlm_model_raw",
     "vlm_raw",
     "vlm_proposal",
+    "vlm_tool_observation",
     "vlm_reducer_decision",
     "reducer_event",
     "reducer_fused",
@@ -46,7 +63,166 @@ TRACE_LAYERS = {
     "bed_robot_arm_group_status",
     "shadow_bed_robot_arm_group_sink",
     "evaluation_observation",
+    "evaluation_ground_truth",
 }
+TRACE_LAYER_TOPIC_CONTRACTS = {
+    "evaluation_ground_truth": {"/shadow/ground_truth/state"},
+    "fault_injection_status": {"/test/fault/status"},
+    "vlm_tool_observation": {"/vlm/tool_observations"},
+}
+TRACE_LAYER_MESSAGE_TYPE_CONTRACTS = {
+    "evaluation_ground_truth": {"std_msgs/msg/String"},
+    "fault_injection_status": {"std_msgs/msg/String"},
+    "vlm_tool_observation": {"surgical_msgs/msg/ToolObservation"},
+}
+
+
+def _is_non_negative_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _validate_optional_rate(
+    value: Any,
+    *,
+    location: str,
+    errors: list[str],
+) -> None:
+    if value is None:
+        return
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not 0.0 <= float(value) <= 1.0
+    ):
+        errors.append(f"{location} must be null or a number in [0, 1]")
+
+
+def _validate_latency_distribution(
+    value: Any,
+    *,
+    location: str,
+    errors: list[str],
+) -> None:
+    if not isinstance(value, dict):
+        errors.append(f"{location} must be an object")
+        return
+    if not _is_non_negative_int(value.get("count")):
+        errors.append(f"{location}.count must be a non-negative integer")
+    for key in ("mean", "median", "p95", "max"):
+        metric = value.get(key)
+        if metric is None:
+            continue
+        if (
+            isinstance(metric, bool)
+            or not isinstance(metric, (int, float))
+            or float(metric) < 0.0
+        ):
+            errors.append(
+                f"{location}.{key} must be null or a non-negative number"
+            )
+
+
+def validate_behavior_quality_report(payload: Any) -> list[str]:
+    """Validate the stable, evaluation-only behavior-quality result shape."""
+
+    errors: list[str] = []
+    if not isinstance(payload, dict):
+        return ["behavior_quality must be an object"]
+    schema = payload.get("schema")
+    if schema not in {
+        BEHAVIOR_QUALITY_SCHEMA_V1,
+        BEHAVIOR_QUALITY_SCHEMA,
+    }:
+        errors.append("behavior_quality.schema is invalid")
+    summary = payload.get("summary")
+    if not isinstance(summary, dict):
+        return [*errors, "behavior_quality.summary must be an object"]
+    required_summary_keys = (
+        BEHAVIOR_QUALITY_SOURCE_SUMMARY_KEYS
+        if schema == BEHAVIOR_QUALITY_SCHEMA_V1
+        else BEHAVIOR_QUALITY_SUMMARY_KEYS
+    )
+    missing = [
+        key for key in required_summary_keys if key not in summary
+    ]
+    if missing:
+        errors.append(
+            "behavior_quality.summary is missing keys: "
+            + ", ".join(missing)
+        )
+        return errors
+
+    _validate_optional_rate(
+        summary["preparation_coverage"],
+        location="behavior_quality.summary.preparation_coverage",
+        errors=errors,
+    )
+    _validate_latency_distribution(
+        summary["request_to_handover_latency_sec"],
+        location=(
+            "behavior_quality.summary.request_to_handover_latency_sec"
+        ),
+        errors=errors,
+    )
+    _validate_latency_distribution(
+        summary["wrong_preposition_release_latency_sec"],
+        location=(
+            "behavior_quality.summary."
+            "wrong_preposition_release_latency_sec"
+        ),
+        errors=errors,
+    )
+    if schema == BEHAVIOR_QUALITY_SCHEMA:
+        _validate_latency_distribution(
+            summary["request_to_handover_wall_clock_latency_sec"],
+            location=(
+                "behavior_quality.summary."
+                "request_to_handover_wall_clock_latency_sec"
+            ),
+            errors=errors,
+        )
+        _validate_latency_distribution(
+            summary[
+                "wrong_preposition_release_wall_clock_latency_sec"
+            ],
+            location=(
+                "behavior_quality.summary."
+                "wrong_preposition_release_wall_clock_latency_sec"
+            ),
+            errors=errors,
+        )
+    for key in (
+        "abandoned_preposition_hold_duration_sec",
+        "abandoned_preposition_wall_clock_hold_duration_sec",
+    ):
+        if key in summary:
+            _validate_latency_distribution(
+                summary[key],
+                location=f"behavior_quality.summary.{key}",
+                errors=errors,
+            )
+    for key in (
+        "unnecessary_preparation_count",
+        "invariant_violation_count",
+    ):
+        if not _is_non_negative_int(summary[key]):
+            errors.append(
+                f"behavior_quality.summary.{key} must be a non-negative integer"
+            )
+    if (
+        "abandoned_preposition_count" in summary
+        and not _is_non_negative_int(summary["abandoned_preposition_count"])
+    ):
+        errors.append(
+            "behavior_quality.summary.abandoned_preposition_count "
+            "must be a non-negative integer"
+        )
+    _validate_optional_rate(
+        summary["unnecessary_preparation_rate"],
+        location="behavior_quality.summary.unnecessary_preparation_rate",
+        errors=errors,
+    )
+    return errors
 
 
 def utc_now() -> str:
@@ -368,11 +544,56 @@ def validate_trace_records(records: Iterable[dict[str, Any]]) -> list[str]:
         topic = str(record.get("topic", ""))
         if not topic.startswith("/"):
             errors.append(f"{prefix}: topic must be absolute")
+        allowed_topics = TRACE_LAYER_TOPIC_CONTRACTS.get(layer)
+        if allowed_topics is not None and topic not in allowed_topics:
+            errors.append(
+                f"{prefix}: layer {layer!r} is not valid for topic {topic!r}"
+            )
+        message_type = str(record.get("message_type", ""))
+        allowed_message_types = TRACE_LAYER_MESSAGE_TYPE_CONTRACTS.get(layer)
+        if (
+            allowed_message_types is not None
+            and message_type not in allowed_message_types
+        ):
+            errors.append(
+                f"{prefix}: layer {layer!r} has invalid message type "
+                f"{message_type!r}"
+            )
         payload = record.get("payload")
         if not isinstance(payload, dict):
             errors.append(f"{prefix}: payload must be an object")
         elif record.get("payload_sha256") != payload_sha256(payload):
             errors.append(f"{prefix}: payload_sha256 mismatch")
+        if layer == "evaluation_ground_truth" and isinstance(payload, dict):
+            if payload.get("evaluation_only") is not True:
+                errors.append(
+                    f"{prefix}: evaluation ground truth must be marked "
+                    "evaluation_only=true"
+                )
+            if payload.get("schema") not in {
+                "taskplanner.shadow_ground_truth.v1",
+                "taskplanner.shadow_ground_truth.v2",
+            }:
+                errors.append(
+                    f"{prefix}: invalid evaluation ground-truth payload schema"
+                )
+        if layer == "fault_injection_status" and isinstance(payload, dict):
+            if payload.get("schema") != "taskplanner.fault_report.v1":
+                errors.append(
+                    f"{prefix}: invalid fault-injection payload schema"
+                )
+            if not str(payload.get("scenario_id", "")).strip():
+                errors.append(
+                    f"{prefix}: fault-injection scenario_id is required"
+                )
+            if not isinstance(payload.get("seed"), int) or isinstance(
+                payload.get("seed"), bool
+            ):
+                errors.append(f"{prefix}: fault-injection seed must be an integer")
+            if not isinstance(payload.get("counters"), dict):
+                errors.append(
+                    f"{prefix}: fault-injection counters must be an object"
+                )
         try:
             ros_time = float(record["ros_time_sec"])
             wall_time = float(record["wall_time_sec"])

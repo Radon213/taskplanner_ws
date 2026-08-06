@@ -592,6 +592,19 @@ def validate_raw_bundle(raw_bundle: dict[str, object]) -> None:
     ):
         if key not in phase_guard:
             raise SpecValidationError(f"policy.yaml phase_guard requires '{key}'.")
+    if "min_evidence_duration_sec" in phase_guard:
+        try:
+            min_evidence_duration_sec = float(
+                phase_guard["min_evidence_duration_sec"]
+            )
+        except (TypeError, ValueError) as exc:
+            raise SpecValidationError(
+                "policy.yaml phase_guard min_evidence_duration_sec must be numeric."
+            ) from exc
+        if min_evidence_duration_sec < 0.0:
+            raise SpecValidationError(
+                "policy.yaml phase_guard min_evidence_duration_sec must be non-negative."
+            )
 
     for key in (
         "block_handover_when_phase_uncertain",

@@ -51,7 +51,7 @@ from .trace_io import AsyncTraceWriter, TraceWriter
 
 IMAGE_TRACE_QOS = QoSProfile(
     history=HistoryPolicy.KEEP_LAST,
-    depth=64,
+    depth=256,
     reliability=ReliabilityPolicy.BEST_EFFORT,
     durability=DurabilityPolicy.VOLATILE,
 )
@@ -157,6 +157,7 @@ class ShadowTraceRecorderNode(Node):
             "/surgery/perception/rfdetr/diagnostics/json",
         )
         self.declare_parameter("source_transcript_topic", "/surgery/transcript")
+        self.declare_parameter("fault_status_topic", "/test/fault/status")
         output_path = Path(str(self.get_parameter("output_path").value))
         run_id = str(self.get_parameter("run_id").value).strip()
         mode = str(self.get_parameter("mode").value).strip()
@@ -251,6 +252,13 @@ class ShadowTraceRecorderNode(Node):
             str(self.get_parameter("source_transcript_topic").value),
             "input_transcript",
             "std_msgs/msg/String",
+        )
+        self._subscribe(
+            String,
+            str(self.get_parameter("fault_status_topic").value),
+            "fault_injection_status",
+            "std_msgs/msg/String",
+            payload_transform=self._json_string_payload,
         )
         self._subscribe(
             String,

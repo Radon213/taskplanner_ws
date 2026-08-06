@@ -17,25 +17,36 @@ ENV ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
 ENV TASKPLANNER_WS=/workspaces/taskplanner_ws
 ENV BTOPS_WS=/opt/btops_ws
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN set -e; \
+    for attempt in 1 2 3 4; do \
+      rm -rf /var/lib/apt/lists/*; \
+      if apt-get -o Acquire::Retries=5 update; then break; fi; \
+      if [ "${attempt}" -eq 4 ]; then exit 1; fi; \
+      sleep "$((attempt * 5))"; \
+    done; \
+    apt-get install -y --no-install-recommends \
     bash-completion \
     build-essential \
     ca-certificates \
     curl \
     git \
     npm \
+    python3-matplotlib \
+    python3-opencv \
     openssh-client \
     python3-colcon-common-extensions \
     python3-jsonschema \
     python3-pil \
     python3-pip \
+    python3-pytest \
     python3-requests \
     python3-rosdep \
+    python3-twisted \
     python3-yaml \
     python3-zmq \
     ros-jazzy-ament-cmake-mypy \
-    ros-jazzy-rosbridge-suite \
-    && rm -rf /var/lib/apt/lists/*
+    ros-jazzy-rosbridge-suite; \
+    rm -rf /var/lib/apt/lists/*
 
 RUN mkdir -p "${BTOPS_WS}/src" \
     && git clone --filter=blob:none --no-checkout "${AUTO_APMS_REPO_URL}" "${BTOPS_WS}/src/auto_apms" \

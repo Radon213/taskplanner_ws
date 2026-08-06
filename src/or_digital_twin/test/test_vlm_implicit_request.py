@@ -24,6 +24,7 @@ def _node() -> tuple[ORDigitalTwinNode, list[dict]]:
     node._vlm_implicit_request_threshold = 0.8
     node._vlm_implicit_request_stability_sec = 0.7
     node._vlm_implicit_request_release_sec = 1.5
+    node._vlm_evidence_max_gap_sec = 2.5
     node._vlm_implicit_request_stability = {}
     node._vlm_implicit_request_episode_tool = ""
     node._vlm_implicit_request_release_since = None
@@ -123,3 +124,57 @@ def test_handover_intent_without_visual_gesture_does_not_queue_request() -> None
 
     assert node._twin.request_queue_summary()["queue_length"] == 0
     assert decisions == []
+
+
+def test_prediction_evidence_expires_without_another_vlm_message() -> None:
+    node, _decisions = _node()
+    node._twin.state.predicted_tool = "T02"
+    node._twin.state.predicted_tool_confidence = 0.91
+    node._twin.state.predicted_tool_stability_sec = 3.2
+    node._tool_predict_stability["T02"] = {
+        "first_seen": 6.8,
+        "last_seen": 10.0,
+        "confidence": 0.91,
+    }
+
+    node._expire_stale_vlm_evidence(12.4)
+    assert node._twin.state.predicted_tool == "T02"
+
+    node._expire_stale_vlm_evidence(12.6)
+    assert node._twin.state.predicted_tool == ""
+    assert node._twin.state.predicted_tool_confidence == 0.0
+    assert node._twin.state.predicted_tool_stability_sec == 0.0
+
+
+def test_visual_request_evidence_expires_without_another_vlm_message() -> None:
+    node, _decisions = _node()
+    msg = _result()
+
+    node._handle_vlm_implicit_request({"v": "4", "tool": []}, msg, 10.0)
+    assert node._twin.state.implicit_request_visible is True
+
+    node._expire_stale_vlm_evidence(12.4)
+    assert node._twin.state.implicit_request_visible is True
+
+    node._expire_stale_vlm_evidence(12.6)
+    assert node._twin.state.implicit_request_visible is False
+    assert node._twin.state.implicit_request_tool == ""
+    assert node._twin.request_queue_summary()["queue_length"] == 0
+
+
+def test_delayed_visual_result_expires_from_receipt_not_capture_time() -> None:
+    node, _decisions = _node()
+    msg = _result()
+
+    node._handle_vlm_implicit_request(
+        {"v": "4", "tool": []},
+        msg,
+        10.0,
+        received_sec=13.0,
+    )
+
+    node._expire_stale_vlm_evidence(13.2)
+    assert node._twin.state.implicit_request_visible is True
+
+    node._expire_stale_vlm_evidence(15.6)
+    assert node._twin.state.implicit_request_visible is False

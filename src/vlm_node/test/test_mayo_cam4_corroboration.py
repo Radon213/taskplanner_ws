@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 from builtin_interfaces.msg import Time
 import pytest
-from procedure_spec import load_bundle
+from procedure_spec import compact_procedure_prompt, load_bundle
 from vlm_node.real_vlm import RealVLMNode
 
 
@@ -35,6 +35,7 @@ def _demo_node() -> RealVLMNode:
     )
     node = RealVLMNode.__new__(RealVLMNode)
     node._spec = load_bundle(spec_dir)
+    node._procedure_prompt = compact_procedure_prompt(spec_dir)
     node._perception_image_max_skew_sec = 0.2
     return node
 
@@ -389,52 +390,23 @@ def test_detector_independent_prompt_separates_pose_and_tool_identity() -> None:
         RealVLMNode
     )._actor_log_developer_instruction()
 
-    assert "Mandatory CAM4 visual pass" in instruction
-    assert "Tool identity is a separate question" in instruction
-    assert "empty tool_id" in instruction
-    assert "tool-unknown gesture" in instruction
-    assert 'intent must be exactly ["none","",0.0]' in instruction
-    assert "request_tool is a gesture event, not an intent value" in instruction
-    assert "visually compare all visible hands" in instruction
-    assert "inspect each independently" in instruction
-    assert "Ignore bare patient hands" in instruction
-    assert "Use the supplied CAM4 crop as-is" in instruction
-    assert "center-right interior request zone" in instruction
-    assert "covered-patient region to the right of the blue Mayo work surface" in instruction
-    assert "search prior only" in instruction
-    assert "one flat four-item array" in instruction
-    assert "Trace each candidate wrist to its source" in instruction
-    assert "elastic cuff into a blue or green sterile gown sleeve" in instruction
-    assert "common positive appearance is that skin-toned staff glove" in instruction
-    assert "do not require spread fingers" in instruction
-    assert "sterile drape" in instruction
-    assert "broad complete palmar surface and several relaxed uncurled fingers" in instruction
-    assert "palm/thenar-pad and finger-pad geometry" in instruction
-    assert "Medical gloves may be beige, pink, white, or blue" in instruction
-    assert "dorsal-only hand" in instruction
-    assert "Mayo placement/pickup requires visible hand contact or grip on a tool" in instruction
-    assert "Use 0.45-0.79 only when the complete empty palm" in instruction
-    assert "wearer role, wrist orientation, or cuff visibility remains uncertain" in instruction
-    assert "If the palm, several fingers, or open-versus-gripping state is not directly visible" in instruction
-    assert "Mere contact with the body is not stabilization" in instruction
-    assert "visible pressure, bracing, tissue traction, or active manipulation" in instruction
-    assert "a palm or multiple fingers clipped at the bottom or side frame edge" in instruction
-    assert "fingertips or knuckles without a complete visible palm" in instruction
-    assert "A nearby tool or cable is not placement/pickup" in instruction
-    assert "require visible hand contact or grip" in instruction
-    assert "Never copy a tool from Mayo" in instruction
-    assert "An open palm alone never names a tool" in instruction
-    assert "a nearby or Mayo tool is not a directed cue" in instruction
-    assert "Final CAM4 audit immediately before JSON" in instruction
-    assert "inspect only CAM4 for gesture and Mayo" in instruction
-    assert "expected request appearance" in instruction
-    assert "Mandatory positive rule" in instruction
-    assert "gesture MUST be request_tool" in instruction
-    assert "stationary, touching the body, or another hand is operating" in instruction
-    assert "One positive candidate overrides unrelated negative hands" in instruction
-    assert "With no named request" in instruction
-    assert "No speech or transfer is required" in instruction
-    assert "Detector absence must not erase" in instruction
+    assert "inspect every visible hand" in instruction
+    assert "substantially visible empty receiving palm" in instruction
+    assert "Orientation, motion, glove color, and exact image position are irrelevant" in instruction
+    assert "operating hand does not cancel a separate requesting hand" in instruction
+    assert "cropped fragments" in instruction
+    assert "dorsal-only hands" in instruction
+    assert "patient/bystander hands" in instruction
+    assert 'emit ["request_tool","","open_receive",confidence]' in instruction
+    assert "Never infer its tool id" in instruction
+    assert 'intent ["none","",0.0]' in instruction
+    assert "gesture always has exactly four values" in instruction
+    assert 'no request is exactly ["","","",0.0]' in instruction
+    assert "Never emit [\"open_receive\",\"\",0.85]" in instruction
+    assert "center-right interior request zone" not in instruction
+    assert "blue Mayo work surface" not in instruction
+    assert "skin-toned staff glove" not in instruction
+    assert "blue or green sterile gown" not in instruction
 
 
 def test_detector_independent_prompt_requires_full_mayo_inventory() -> None:
@@ -442,23 +414,20 @@ def test_detector_independent_prompt_requires_full_mayo_inventory() -> None:
         RealVLMNode
     )._actor_log_developer_instruction()
 
-    assert "sweep the fixed stand left-to-right and top-to-bottom" in instruction
-    assert "one mayo row per visible instance" in instruction
-    assert "Identify by morphology before procedure likelihood" in instruction
-    assert "thumb forceps have no finger rings" in instruction
-    assert "a ring-handled tool can never be Adson" in instruction
-    assert (
-        "A small slim ring-handled clamp with long narrow straight jaws "
-        "is a Mosquito hemostat"
-    ) in instruction
-    assert "Allis is bulkier and requires directly visible short broad toothed grasping jaws" in instruction
-    assert "ring handles alone are insufficient for Allis" in instruction
-    assert "prefer Mosquito at lower confidence over inventing Allis" in instruction
-    assert "freeze this geometry-based inventory" in instruction
-    assert "object recognition is disabled" in instruction
-    assert "Every mayo row requires a distinct tool silhouette directly visible in CAM4" in instruction
-    assert "Never copy a tool from FLIR" in instruction
-    assert "perceptual evidence only" in instruction
+    assert "scan the complete hand/Mayo image" in instruction
+    assert "one row per distinct visible instrument instance" in instruction
+    assert "preserve duplicates" in instruction
+    assert "rings, hinge, shaft, jaws, blade, insulation/cable, or lumen" in instruction
+    assert "omit unidentifiable silhouettes" in instruction
+    assert "Detector rows may support a match" in instruction
+    assert "absence does not erase clear pixels" in instruction
+    assert "Never copy instruments from the surgical-field image" in instruction
+    assert "advisory observation" in instruction
+    assert "mayo is always an array of three-value rows" in instruction
+    assert 'never ["Txx"], ["tool name"]' in instruction
+    assert "Pxx/Txx are shape placeholders only" in instruction
+    assert '[["P03",0.80]]' not in instruction
+    assert '[["T02",0.70]]' not in instruction
 
 
 def test_cam4_observations_precede_procedure_priors_in_prompt() -> None:
@@ -466,9 +435,84 @@ def test_cam4_observations_precede_procedure_priors_in_prompt() -> None:
         RealVLMNode
     )._actor_log_developer_instruction()
 
-    assert "Populate gesture and mayo from CAM4 pixels first" in instruction
-    assert "must not overwrite a directly visible CAM4 observation" in instruction
-    assert instruction.index('"gesture"') < instruction.index('"phase"')
+    assert instruction.index("GESTURE:") < instruction.index("MAYO:")
+    assert instruction.index("MAYO:") < instruction.index("PHASE/NEXT TOOL:")
+    assert "gesture and mayo must come only from the hand/Mayo pixels" in instruction
+
+
+def test_next_tool_prompt_encourages_calibrated_proactive_forecast() -> None:
+    instruction = RealVLMNode.__new__(
+        RealVLMNode
+    )._actor_log_developer_instruction()
+
+    assert "calibrated 2-8 second forecast" in instruction
+    assert "forecast of a new handover" in instruction
+    assert "not a label for the tool currently in use" in instruction
+    assert "which additional instrument the assistant should prepare next" in instruction
+    assert "does not inventory visible instruments" in instruction
+    assert "do not wait for a hand gesture or spoken request" in instruction
+    assert "most plausible near-term additional tool" in instruction
+    assert "visible task trajectory" in instruction
+    assert "broad procedure-role transitions" in instruction
+    assert "distinguish instruments already held" in instruction
+    assert "public evidence specifically supports another instance" in instruction
+    assert "an already active type must stay below 0.65" in instruction
+    assert "forecast a plausible unused tool instead" in instruction
+    assert "digital_twin.forecast_inventory.available" in instruction
+    assert "rack_available unused stock" in instruction
+    assert "mayo_reuse surgeon-used tools expected later" in instruction
+    assert "trajectory supports imminent reuse" in instruction
+    assert "A tool type may appear in available and unavailable" in instruction
+    assert "must have available count >0" in instruction
+    assert "never authorizes action" in instruction
+    assert "Do not memorize case timing" in instruction
+    assert "keep every weak candidate below 0.65" in instruction
+    assert "not a confirmed request" in instruction
+
+
+def test_phase_start_floor_prompt_is_runtime_constraint_not_ground_truth() -> None:
+    instruction = RealVLMNode.__new__(
+        RealVLMNode
+    )._actor_log_developer_instruction()
+
+    assert "phase_start_floor" in instruction
+    assert "limits phase only, never tool/intent" in instruction
+    assert "Not ground truth" in instruction
+    assert "allowed_normal_phase_ids, never earlier" in instruction
+    assert "Interrupts need visible evidence" in instruction
+
+
+def test_actor_log_prompt_requires_frame_specific_uncertainty() -> None:
+    instruction = RealVLMNode.__new__(
+        RealVLMNode
+    )._actor_log_developer_instruction()
+
+    assert '"u":1.0' not in instruction
+    assert "calculate u independently on every frame" in instruction
+    assert "0.26-0.45 for usable adjacent-phase ambiguity" in instruction
+    assert "0.80-1.00 only when the relevant view is unusable" in instruction
+    assert "Do not copy the structural 0.50 value" in instruction
+
+
+def test_actor_log_prompt_is_camera_agnostic_and_token_bounded() -> None:
+    node = _demo_node()
+
+    system_prompt = node._actor_log_system_prompt()
+    developer_prompt = node._actor_log_developer_instruction()
+
+    assert "do not assume a fixed pixel position" in system_prompt
+    assert "ground truth" in system_prompt
+    assert "Procedure context:" in system_prompt
+    assert "temporal_prior favors current/next" in system_prompt
+    assert '"policy":' not in system_prompt
+    assert '"flow":' not in system_prompt
+    assert '"groups":' in system_prompt
+    assert '"roles":' in system_prompt
+    assert "central dissection continues without a persistently widened" in system_prompt
+    assert "stable exposure is already followed by sustained central target" in system_prompt
+    assert "temporal_prior is a preference, not a candidate filter" in developer_prompt
+    assert "ASR near-homophones" in developer_prompt
+    assert len(system_prompt) + len(developer_prompt) < 16_000
 
 
 def test_handover_intent_does_not_fabricate_visual_gesture() -> None:

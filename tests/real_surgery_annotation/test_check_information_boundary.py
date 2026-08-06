@@ -83,3 +83,75 @@ def test_multiple_references_on_one_line_are_all_reported(
         match["reference_kind"]
         for match in report["violations"][0]["matches"]
     ] == ["flat_case_root", "evaluation_masks"]
+
+
+def test_runtime_test_files_are_not_scanned_as_deployed_consumers(
+    tmp_path: Path,
+) -> None:
+    test_file = (
+        tmp_path
+        / "src"
+        / "shadow_evaluation"
+        / "test"
+        / "test_ground_truth_timeline.py"
+    )
+    test_file.parent.mkdir(parents=True)
+    test_file.write_text(
+        'REFERENCE = "interaction_events.observed.final.v2.jsonl"\n',
+        encoding="utf-8",
+    )
+
+    report = check_boundary(tmp_path)
+
+    assert report["ok"] is True
+    assert report["checked_file_count"] == 0
+    assert report["violations"] == []
+
+
+def test_shadow_display_adapter_has_narrow_reference_allowlist(
+    tmp_path: Path,
+) -> None:
+    adapter = (
+        tmp_path
+        / "src"
+        / "shadow_evaluation"
+        / "shadow_evaluation"
+        / "interactive_replay_controller.py"
+    )
+    adapter.parent.mkdir(parents=True)
+    adapter.write_text(
+        'REFERENCE = "interaction_events.observed.final.v2.jsonl"\n',
+        encoding="utf-8",
+    )
+
+    report = check_boundary(tmp_path)
+
+    assert report["ok"] is True
+    assert report["violations"] == []
+    assert report["evaluation_display_references"][0]["matches"][0][
+        "reference_kind"
+    ] == "observed_final"
+
+
+def test_shadow_display_allowlist_does_not_apply_to_other_runtime_nodes(
+    tmp_path: Path,
+) -> None:
+    consumer = (
+        tmp_path
+        / "src"
+        / "or_digital_twin"
+        / "or_digital_twin"
+        / "node.py"
+    )
+    consumer.parent.mkdir(parents=True)
+    consumer.write_text(
+        'REFERENCE = "interaction_events.observed.final.v2.jsonl"\n',
+        encoding="utf-8",
+    )
+
+    report = check_boundary(tmp_path)
+
+    assert report["ok"] is False
+    assert report["violations"][0]["path"].endswith(
+        "or_digital_twin/or_digital_twin/node.py"
+    )

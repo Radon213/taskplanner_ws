@@ -1,0 +1,73 @@
+{
+  "schema": "taskplanner.release_verification.v1",
+  "cases": [
+    "0704_6",
+    "0704_7",
+    "0704_8",
+    "0704_9",
+    "0704_10",
+    "0704_11",
+    "0704_12",
+    "0704_13",
+    "0704_14",
+    "0704_15",
+    "0704_16",
+    "0704_17"
+  ],
+  "product_packages": [
+    "bringup",
+    "bt_orchestrator",
+    "model_provider_registry",
+    "or_digital_twin",
+    "phase_estimator",
+    "procedure_spec",
+    "shadow_evaluation",
+    "simulation_runtime",
+    "skill_execution",
+    "surgical_interop_execution",
+    "surgical_interop_gateway",
+    "surgical_interop_msgs",
+    "surgical_msgs",
+    "taskplanner_bt_nodes",
+    "taskplanner_bt_trees",
+    "vlm_node"
+  ],
+  "top_level_contract_tests": [
+    "tests/test_replay_asset_map.py",
+    "tests/test_release_runtime_campaign.py",
+    "tests/test_release_shadow_campaign.py",
+    "tests/test_evaluate_release_metrics.py",
+    "tests/test_verify_release.py",
+    "tests/real_surgery_annotation/test_check_information_boundary.py",
+    "tests/real_surgery_annotation/test_shadow_contract.py",
+    "tests/real_surgery_annotation/test_shadow_runner.py",
+    "tests/real_surgery_annotation/test_shadow_behavior_quality.py",
+    "tests/real_surgery_annotation/test_aggregate_shadow_multicase.py",
+    "tests/real_surgery_annotation/test_surgery_record_timeline.py"
+  ],
+  "thresholds": {
+    "prompt_chars_max": 16000,
+    "vlm_fresh_frame_p95_ms": 1000,
+    "voice_to_dt_p95_ms": 250,
+    "dt_to_bt_p95_ms": 250,
+    "bt_to_action_goal_p95_ms": 100,
+    "ui_state_delay_p95_ms": 500,
+    "clock_drift_max_ms": 100,
+    "memory_growth_max_percent": 10,
+    "clean_accuracy_regression_max_percentage_points": 2,
+    "mild_noise_drop_max_percentage_points": 10,
+    "false_direct_handover_max": 0,
+    "post_terminal_commands_max": 0,
+    "duplicate_actions_max": 0,
+    "procedure_start_false_tool_actions_max": 0
+  },
+  "viewports": [
+    [3840, 2160],
+    [2560, 1440],
+    [1920, 1080]
+  ],
+  "full_gate": {
+    "restart_iterations": 100,
+    "soak_hours": 24
+  }
+}

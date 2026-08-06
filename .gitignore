@@ -27,6 +27,10 @@ reports/*.jpeg
 reports/taskplanner_validation_assets/
 reports/*_surgery_timeline.txt
 reports/*_timeline_recorder*.exit
+/reports/release/
+/reports/shadow_multicase/
+/reports/surgery_records/
+/reports/*_surgery_record*.txt
 test_outputs/
 .playwright-cli/
 *.bag

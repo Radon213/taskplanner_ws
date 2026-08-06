@@ -185,6 +185,13 @@ def semantic_evaluation_signature(report: dict[str, Any]) -> dict[str, Any]:
             "request_backed_exact_count": payload.get(
                 "request_backed_exact_count"
             ),
+            "proactive_exact_count": payload.get(
+                "proactive_exact_count",
+                payload.get("anticipatory_exact_count"),
+            ),
+            "post_request_visual_exact_count": payload.get(
+                "post_request_visual_exact_count"
+            ),
             "anticipatory_exact_count": payload.get(
                 "anticipatory_exact_count"
             ),

@@ -69,7 +69,59 @@ class ShadowReportTest(unittest.TestCase):
                 "skill_command_after_completion_count": 0,
             },
             "phase": {"status": "not_available"},
+            "behavior_quality": {
+                "summary": {
+                    "preparation_coverage": 0.5,
+                    "request_to_handover_latency_sec": {
+                        "count": 2,
+                        "mean": 0.6,
+                        "median": 0.5,
+                        "p95": 0.8,
+                        "max": 0.8,
+                    },
+                    "request_to_handover_wall_clock_latency_sec": {
+                        "count": 2,
+                        "mean": 3.5,
+                        "median": 3.0,
+                        "p95": 5.0,
+                        "max": 5.0,
+                    },
+                    "wrong_preposition_release_latency_sec": {
+                        "count": 1,
+                        "mean": 0.2,
+                        "median": 0.2,
+                        "p95": 0.2,
+                        "max": 0.2,
+                    },
+                    "wrong_preposition_release_wall_clock_latency_sec": {
+                        "count": 1,
+                        "mean": 2.0,
+                        "median": 2.0,
+                        "p95": 2.0,
+                        "max": 2.0,
+                    },
+                },
+                "preparation_coverage": {
+                    "prepared_before_request_count": 1,
+                    "eligible_handover_count": 2,
+                },
+            },
             "scorecard": {
+                "next_tool_prediction": {
+                    "reference_quality": "confirmed handover targets",
+                    "layers": {
+                        "vlm_raw": {
+                            "correct_count": 1,
+                            "evaluated_count": 2,
+                            "accuracy": 0.5,
+                            "combined_action_selection_accuracy": 0.5,
+                            "anticipatory_correct_count": 1,
+                            "anticipatory_target_recall": 0.5,
+                            "request_backed_correct_count": 0,
+                            "request_backed_target_recall": 0.0,
+                        }
+                    },
+                },
                 "dt_tool_management": {
                     "correct_count": 0,
                     "evaluated_count": 0,
@@ -132,6 +184,18 @@ class ShadowReportTest(unittest.TestCase):
         self.assertIn("Shadow state reconciliations from public requests: 2", output)
         self.assertIn("Replay source / wall time: 10.000 / 13.000 s", output)
         self.assertIn("Elastic hold total / breakdown: 3.000 s", output)
+        self.assertIn("Behavior Quality", output)
+        self.assertIn(
+            "Request-to-handover latency, source clock "
+            "(median / p95 / max): 0.500 / 0.800 / 0.800 (n=2) s",
+            output,
+        )
+        self.assertIn(
+            "Request-to-handover latency, wall clock "
+            "(median / p95 / max): 3.000 / 5.000 / 5.000 (n=2) s",
+            output,
+        )
+        self.assertIn("Wall-clock distributions include elastic replay holds", output)
         self.assertIn(
             "Trace input coverage (field / FLIR / CAM4 / bbox / segmentation): "
             "99.0% (1 dropped) / 100.0% (0 dropped) / "
@@ -140,6 +204,17 @@ class ShadowReportTest(unittest.TestCase):
         )
         self.assertIn(
             "DT inventory conservation | Reducer fused | 12 / 12 | 100.0%",
+            output,
+        )
+        self.assertIn("Tool Decision Timing", output)
+        self.assertIn(
+            "VLM operational (publish time) | 1 / 2 | 50.0% | "
+            "0 | 0 / 2 | 0.0% | 50.0%",
+            output,
+        )
+        self.assertIn(
+            "Combined tool action selection | "
+            "VLM operational (publish time) | 1 / 2 | 50.0%",
             output,
         )
 

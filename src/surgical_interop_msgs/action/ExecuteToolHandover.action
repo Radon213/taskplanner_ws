@@ -1,0 +1,60 @@
+# Request one concrete single-tool transfer through the shared public endpoint.
+#
+# instrument_id is the shared, human-readable instrument name (for example,
+# "Bovie surgical cautery"), never an internal catalog code such as "T04".
+# source_location and target_location allow only: tray, mayo, robot, surgeon.
+# The only valid transitions are:
+#   tray  -> robot    (pick up the planner-selected next tool and hold it ready)
+#   tray  -> surgeon  (pick up and hand over)
+#   robot -> surgeon  (hand over a held tool)
+#   robot -> tray     (return an unused held tool)
+#   mayo  -> tray     (retrieve a used tool)
+# The server selects its own arm and must reject every other transition.
+#
+# Operational Cancel requires compensating recovery, not an instantaneous stop:
+# - before a grasp is confirmed: stop, retreat safely, and leave the tool at
+#   source_location;
+# - after a grasp is confirmed or when source_location is robot: move the tool
+#   to the controller-configured tray recovery pose and release it;
+# - after transfer/release to the surgeon is confirmed, the commit point has
+#   passed and the Goal completes normally instead of attempting a rollback.
+# The server must not execute another Goal until this Goal is terminal.
+string command_id
+string instrument_id
+string instrument_instance_id
+string source_location
+string target_location
+---
+# Terminal application state. This must agree with the ROS 2 Action terminal
+# status: COMPLETED/SUCCEEDED, CANCELED/CANCELED, or FAILED/ABORTED.
+string FINAL_COMPLETED=completed
+string FINAL_CANCELED=canceled
+string FINAL_FAILED=failed
+# Required cancellation outcomes. They let Taskplanner reconcile the tool
+# location without exposing a private trajectory or exact tray slot.
+string REASON_COMPLETED=completed
+string REASON_CANCELED_SOURCE_UNCHANGED=canceled_source_unchanged
+string REASON_CANCELED_RECOVERED_TO_TRAY=canceled_recovered_to_tray
+string REASON_CANCEL_RECOVERY_FAILED=cancel_recovery_failed
+bool success
+string final_state
+# A short machine-readable code. Keep it empty or "completed" on success.
+string reason_code
+---
+# Goal-scoped execution phase. Stages that do not apply to a source/target pair
+# may be skipped. A cancel request transitions through STOPPING and exactly one
+# recovery branch. CANCELED is returned only after recovery is verified.
+string STATE_MOVING_TO_SOURCE=moving_to_source
+string STATE_GRASPING=grasping
+string STATE_MOVING_TO_TARGET=moving_to_target
+string STATE_WAITING_FOR_TAKEOVER=waiting_for_takeover
+string STATE_PLACING=placing
+string STATE_HOLDING=holding
+string STATE_STOPPING=stopping
+string STATE_RETREATING=retreating
+string STATE_RECOVERING_TO_TRAY=recovering_to_tray
+string state
+# Monotonic Action-lifecycle completion estimate in [0.0, 1.0], including
+# compensating recovery. It reaches 1.0 at any terminal Result; success is
+# reported separately. Consumers must not infer a physical pose from it.
+float32 progress

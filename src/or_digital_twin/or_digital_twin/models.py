@@ -35,6 +35,9 @@ class InstrumentBelief:
     lifecycle_stage: str = LIFECYCLE_HOME_RACK
     next_required_transition: str = ""
     visual_anchor_id: str = ""
+    preposition_origin_location_type: str = ""
+    preposition_origin_location_id: str = ""
+    preposition_origin_lifecycle_stage: str = ""
     ever_surgeon_owned: bool = False
     last_update_sec: float = 0.0
     mayo_placement_evidence: str = ""

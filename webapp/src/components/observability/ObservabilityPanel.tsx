@@ -6,6 +6,7 @@ import type { BedRobotArmGroupTrace, useDigitalTwinViewModel } from "../../hooks
 import type {
   BTDecision,
   CompressedImageFrame,
+  InputSourceStatus,
   SimulationState,
   SkillStatus,
   SurgeonState,
@@ -58,6 +59,33 @@ function TimelineMeta({ value }: { value: string }) {
 function compactIdentifier(value: string): string {
   if (value.length <= 24) return value;
   return `${value.slice(0, 14)}…${value.slice(-6)}`;
+}
+
+function vlmInputImageLabel(
+  imageSource: string,
+  sizeBytes: number,
+  language: Language,
+): string {
+  const source = String(imageSource || "");
+  const sizeLabel = `${Math.max(1, Math.round(sizeBytes / 1024))} KB`;
+  const isComposite = source.startsWith("flir_cam4_");
+  const isRawFallback = source.endsWith("raw_fallback");
+
+  if (language === "ko") {
+    const viewLabel = isComposite
+      ? "FLIR + CAM4 합성 입력"
+      : isRawFallback
+        ? "원본 FLIR 폴백"
+        : "RF-DETR 분할 FLIR";
+    return `${viewLabel} · ${sizeLabel}`;
+  }
+
+  const viewLabel = isComposite
+    ? "FLIR + CAM4 composite"
+    : isRawFallback
+      ? "Raw FLIR fallback"
+      : "RF-DETR segmented FLIR";
+  return `${viewLabel} · ${sizeLabel}`;
 }
 
 function BedRobotArmGroupTraceCard({
@@ -171,6 +199,7 @@ export function ObservabilityPanel({
   worldState,
   surgeonState,
   vlmHealth,
+  inputSourceStatuses,
   vlmResult,
   vlmReducerDecisions,
   vlmImage,
@@ -184,6 +213,7 @@ export function ObservabilityPanel({
   worldState: WorldState;
   surgeonState: SurgeonState;
   vlmHealth: VLMHealth;
+  inputSourceStatuses: Record<string, InputSourceStatus>;
   vlmResult: VLMResult;
   vlmReducerDecisions: VLMReducerDecision[];
   vlmImage: CompressedImageFrame | null;
@@ -195,6 +225,43 @@ export function ObservabilityPanel({
   const followLatestRef = useRef(true);
   const [followLatest, setFollowLatest] = useState(true);
   const prefersReducedMotion = useReducedMotion();
+  const sourceHealthRows = useMemo(
+    () =>
+      [
+        ["flir", "FLIR"],
+        ["cam4", "CAM4"],
+        ["vlm", "VLM"],
+        ["speech", language === "ko" ? "음성" : "Speech"],
+      ].map(([sourceId, label]) => {
+        const status = inputSourceStatuses[sourceId];
+        const state = String(status?.state || "MISSING").toUpperCase();
+        const localizedState =
+          language === "ko"
+            ? ({
+                READY: "정상",
+                STALE: "지연",
+                MISSING: "없음",
+                RECOVERING: "복구 중",
+                ERROR: "오류",
+                DISABLED: "꺼짐",
+              }[state] ?? state)
+            : state;
+        const age = Number(status?.age_sec ?? -1);
+        const dropped = Number(status?.dropped_count ?? 0);
+        return {
+          sourceId,
+          label,
+          state,
+          localizedState,
+          detail: [
+            age >= 0 ? `${age.toFixed(1)}s` : "-",
+            language === "ko" ? `누락 ${dropped}` : `drops ${dropped}`,
+          ].join(" · "),
+          title: status?.error_code || status?.detail || localizedState,
+        };
+      }),
+    [inputSourceStatuses, language],
+  );
   const newestFirstTimeline = useMemo(() => vm.timeline, [vm.timeline]);
   const timelineCounts = useMemo(
     () => ({
@@ -522,13 +589,31 @@ export function ObservabilityPanel({
                 exit={prefersReducedMotion ? undefined : { opacity: 0, y: -8 }}
                 transition={{ duration: prefersReducedMotion ? 0 : 0.18 }}
               >
+                <section
+                  className="source-health-row"
+                  aria-label={language === "ko" ? "입력원 상태" : "Input source health"}
+                >
+                  {sourceHealthRows.map((source) => (
+                    <div
+                      className={`source-health-item state-${source.state.toLowerCase()}`}
+                      key={source.sourceId}
+                      title={source.title}
+                    >
+                      <span>{source.label}</span>
+                      <strong>{source.localizedState}</strong>
+                      <small>{source.detail}</small>
+                    </div>
+                  ))}
+                </section>
                 <DetailCard
                   label={language === "ko" ? "VLM 입력 영상" : "VLM input image"}
                   value={
                     vlmImage
-                      ? language === "ko"
-                        ? `${vlmHealth.image_source === "flir_raw_fallback" ? "원본 FLIR 폴백" : "RF-DETR 분할 FLIR"} · ${Math.max(1, Math.round(vlmImage.sizeBytes / 1024))} KB`
-                        : `${vlmHealth.image_source === "flir_raw_fallback" ? "Raw FLIR fallback" : "RF-DETR segmented FLIR"} · ${Math.max(1, Math.round(vlmImage.sizeBytes / 1024))} KB`
+                      ? vlmInputImageLabel(
+                          vlmHealth.image_source,
+                          vlmImage.sizeBytes,
+                          language,
+                        )
                       : language === "ko"
                         ? "frame 없음"
                         : "no frame"

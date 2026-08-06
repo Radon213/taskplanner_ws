@@ -212,7 +212,9 @@ def test_clinical_analysis_removes_internal_stabilizer_markers() -> None:
     assert analysis == "Fine dissection continues around the thyroid"
 
 
-def test_live_visual_boundary_accepts_segmented_or_raw_flir() -> None:
+def test_live_visual_boundary_accepts_fused_and_flir_only_visual_inputs() -> None:
+    assert is_model_ready_visual_source("flir_cam4_rfdetr_segmented")
+    assert is_model_ready_visual_source("flir_cam4_raw_fallback")
     assert is_model_ready_visual_source("flir_rfdetr_segmented")
     assert is_model_ready_visual_source("flir_raw_fallback")
     assert not is_model_ready_visual_source("field")

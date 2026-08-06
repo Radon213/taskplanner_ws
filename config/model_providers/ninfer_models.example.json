@@ -1,4 +1,5 @@
 {
+  "_deprecated": "Legacy direct-host catalog example. Normal Compose deployments discover artifacts from NINFER_RUNTIME_ROOT; do not use this file for new installations.",
   "models": [
     {
       "id": "qwen3.6-35b-a3b",

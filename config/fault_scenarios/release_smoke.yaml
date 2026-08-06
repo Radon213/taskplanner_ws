@@ -1,0 +1,27 @@
+schema: taskplanner.fault_scenario.v1
+scenario_id: live-release-smoke
+seed: 424242
+events:
+  - id: cam4-freeze-smoke
+    source: cam4
+    kind: freeze
+    start_sec: 1.0
+    duration_sec: 0.7
+  - id: flir-drop-smoke
+    source: flir
+    kind: drop
+    start_sec: 1.1
+    duration_sec: 0.7
+  - id: vlm-health-smoke
+    source: vlm_health
+    kind: vlm_unhealthy
+    start_sec: 2.0
+    duration_sec: 1.0
+  - id: sentence-asr-smoke
+    source: sentence
+    kind: speech_replace
+    start_sec: 2.2
+    duration_sec: 0.4
+    params:
+      replacements:
+        Adsen: Adson

@@ -16,6 +16,7 @@ from vlm_node.real_vlm import (
     compose_flir_cam4_for_model,
     crop_cam4_for_model,
     dynamic_cam4_crop_xywh,
+    explicit_phase_start_floor_context,
     image_samples_are_aligned,
     should_run_periodic_live_frame,
     should_trigger_replay_frame,
@@ -69,6 +70,35 @@ def test_explicit_start_phase_disables_open_set_bootstrap() -> None:
     assert not should_use_open_set_phase_bootstrap(0, 0, False)
 
 
+def test_explicit_start_phase_is_persistent_normal_phase_floor() -> None:
+    floor = explicit_phase_start_floor_context(
+        "P03",
+        explicit_start_phase=True,
+        normal_phase_ids=["P01", "P02", "P03", "P04"],
+        interrupt_phase_ids=["I01"],
+    )
+    assert floor == {
+        "id": "P03",
+        "source": "operator_or_procedure_selected_start",
+        "ground_truth": False,
+        "policy": "normal_phase_floor",
+        "allowed_normal_phase_ids": ["P03", "P04"],
+        "interrupt_phase_ids": ["I01"],
+    }
+    assert explicit_phase_start_floor_context(
+        "P03",
+        explicit_start_phase=False,
+        normal_phase_ids=["P01", "P02", "P03"],
+        interrupt_phase_ids=[],
+    ) is None
+    assert explicit_phase_start_floor_context(
+        "I01",
+        explicit_start_phase=True,
+        normal_phase_ids=["P01", "P02", "P03"],
+        interrupt_phase_ids=["I01"],
+    ) is None
+
+
 def test_model_image_is_bounded_without_changing_aspect_ratio() -> None:
     source = BytesIO()
     Image.new("RGB", (1840, 1280), color=(64, 96, 128)).save(
@@ -109,6 +139,35 @@ def _jpeg(size: tuple[int, int], color: tuple[int, int, int]) -> bytes:
     output = BytesIO()
     Image.new("RGB", size, color=color).save(output, format="JPEG")
     return output.getvalue()
+
+
+def _transparent_webp(
+    size: tuple[int, int],
+    color: tuple[int, int, int, int],
+) -> bytes:
+    output = BytesIO()
+    Image.new("RGBA", size, color=color).save(
+        output,
+        format="WEBP",
+        lossless=True,
+    )
+    return output.getvalue()
+
+
+def _overlay_sample(
+    *,
+    stamp_sec: int,
+    stamp_nanosec: int,
+    color: tuple[int, int, int, int],
+) -> ImageSample:
+    return ImageSample(
+        received_monotonic=time.time(),
+        stamp_sec=stamp_sec,
+        stamp_nanosec=stamp_nanosec,
+        frame_id="camera|rfdetr_bbox_overlay",
+        data=_transparent_webp((1280, 720), color),
+        mime_type="image/webp",
+    )
 
 
 def _sample(
@@ -186,6 +245,50 @@ def test_composite_is_one_bounded_labeled_image() -> None:
         assert image.width > image.height
     assert first == second
     assert mime_type == "image/jpeg"
+
+
+def test_composite_uses_the_same_visible_height_for_flir_and_cam4() -> None:
+    composite, _ = compose_flir_cam4_for_model(
+        _jpeg((1920, 1080), (180, 20, 20)),
+        "image/jpeg",
+        _jpeg((1280, 720), (20, 180, 20)),
+        "image/jpeg",
+        cam4_crop_xywh_norm=(0.3, 0.2, 0.6, 0.7),
+        max_side_px=1024,
+    )
+
+    with Image.open(BytesIO(composite)) as image:
+        # The header is dark, but both panes must fill the complete image row
+        # immediately below it.  This rejects the former CAM4 letterbox.
+        content_y = 60
+        right_pixel = image.getpixel((image.width - 8, content_y))
+        lower_right_pixel = image.getpixel((image.width - 8, image.height - 8))
+
+    assert right_pixel[1] > right_pixel[0] * 2
+    assert lower_right_pixel[1] > lower_right_pixel[0] * 2
+
+
+def test_composite_blends_the_cam4_detector_overlay() -> None:
+    composite, _ = compose_flir_cam4_for_model(
+        _jpeg((1920, 1080), (180, 20, 20)),
+        "image/jpeg",
+        _jpeg((1280, 720), (20, 180, 20)),
+        "image/jpeg",
+        cam4_crop_xywh_norm=(0.3, 0.2, 0.6, 0.7),
+        max_side_px=1024,
+        cam4_overlay_bytes=_transparent_webp(
+            (1280, 720),
+            (200, 20, 220, 255),
+        ),
+        cam4_overlay_mime_type="image/webp",
+    )
+
+    with Image.open(BytesIO(composite)) as image:
+        right_pixel = image.getpixel((image.width - 8, 60))
+
+    # An opaque detector overlay turns the raw green CAM4 panel magenta.
+    assert right_pixel[0] > right_pixel[1] * 2
+    assert right_pixel[2] > right_pixel[1] * 2
 
 
 def test_dynamic_cam4_crop_frames_union_with_padding_and_minimum_size() -> None:
@@ -381,6 +484,9 @@ def _segmented_flir_node() -> RealVLMNode:
     )
     node._raw_field_image_topic = "/surgery/images/flir/compressed"
     node._cam4_image_topic = "/surgery/images/cam4/compressed"
+    node._cam4_overlay_image_topic = (
+        "/surgery/images/cam4/detection_overlay/compressed"
+    )
     node._composite_image_topic = (
         "/surgery/images/vlm/composite/compressed"
     )
@@ -400,28 +506,36 @@ def _segmented_flir_node() -> RealVLMNode:
     return node
 
 
-def test_model_selection_uses_segmented_flir_and_raw_cam4() -> None:
+def test_model_selection_fuses_segmented_flir_and_cam4_overlay_into_one_image() -> None:
     node = _segmented_flir_node()
     node._latest_images["cam4"] = _sample(
         stamp_sec=44,
         stamp_nanosec=80_000_000,
         color=(0, 100, 0),
     )
+    node._latest_images["cam4_overlay"] = _overlay_sample(
+        stamp_sec=44,
+        stamp_nanosec=80_000_000,
+        color=(190, 10, 210, 255),
+    )
 
     images, image_source, model_image = node._select_images()
 
-    assert image_source == "flir_rfdetr_segmented"
-    assert len(images) == 2
-    assert images[0][0] == "RFDETR-segmented FLIR surgical field"
-    assert images[1][0].startswith("CAM4 context crop")
+    assert image_source == "flir_cam4_rfdetr_segmented"
+    assert len(images) == 1
+    assert images[0][0] == (
+        "Synchronized FLIR surgical field + CAM4 Mayo/surgeon-hand context"
+    )
     for _label, image_bytes, _mime_type in images:
         with Image.open(BytesIO(image_bytes)) as image:
-            assert max(image.size) <= 512
+            assert max(image.size) <= 1024
+            assert image.width > image.height
     assert model_image is not None
     assert model_image.stamp_sec == 44
     assert model_image.stamp_nanosec == 50_000_000
+    assert model_image.data == images[0][1]
     assert node._current_visual_input == {
-        "image_source": "flir_rfdetr_segmented",
+        "image_source": "flir_cam4_rfdetr_segmented",
         "model_ready_topic": "/surgery/images/vlm/composite/compressed",
         "perception_image_max_skew_sec": 0.2,
         "sources": [
@@ -432,20 +546,33 @@ def test_model_selection_uses_segmented_flir_and_raw_cam4() -> None:
                 "frame_id": "camera",
             },
             {
-                "role": "cam4_context_crop",
+                "role": "cam4_mayo_hand_crop",
                 "topic": "/surgery/images/cam4/compressed",
                 "stamp_sec": 44.08,
                 "frame_id": "camera",
                 "offset_sec": 0.03,
             },
+            {
+                "role": "cam4_rfdetr_small_overlay",
+                "topic": "/surgery/images/cam4/detection_overlay/compressed",
+                "stamp_sec": 44.08,
+                "frame_id": "camera|rfdetr_bbox_overlay",
+                "offset_sec": 0.03,
+                "cam4_offset_sec": 0.0,
+            },
         ],
         "preprocessing": (
-            "RFDETRSegSmall overlay; "
-            "CAM4 context crop inspected independently"
+            "single side-by-side composite: RFDETRSegSmall FLIR + "
+            "RFDETRSmall CAM4 bbox/hand overlay"
         ),
+        "image_layout": "flir_left_cam4_right",
         "cam4_image_forwarded_to_vlm": True,
         "cam4_alignment_skew_sec": 0.03,
+        "cam4_detector_overlay_forwarded_to_vlm": True,
+        "cam4_detector_overlay_alignment_skew_sec": 0.0,
         "detector_advisory": True,
+        "cam4_fallback_reason": "",
+        "cam4_overlay_fallback_reason": "",
         "input_error": "",
     }
 
@@ -468,11 +595,18 @@ def test_model_selection_falls_back_to_raw_flir_when_detector_is_off() -> None:
 
     images, image_source, model_image = node._select_images()
 
-    assert image_source == "flir_raw_fallback"
-    assert len(images) == 2
+    assert image_source == "flir_cam4_raw_fallback"
+    assert len(images) == 1
     assert model_image is not None
-    assert images[0][0].startswith("Raw FLIR")
+    assert images[0][0].startswith("Synchronized FLIR")
     assert node._current_visual_input["cam4_image_forwarded_to_vlm"] is True
+    assert (
+        node._current_visual_input["cam4_detector_overlay_forwarded_to_vlm"]
+        is False
+    )
+    assert "perception is disabled" in node._current_visual_input[
+        "cam4_overlay_fallback_reason"
+    ]
     assert node._current_visual_input["detector_advisory"] is False
 
 
@@ -588,6 +722,7 @@ def test_shadow_launch_uses_rfdetr_input_contract() -> None:
         "/surgery/images/flir/compressed",
         "/surgery/images/cam4/compressed",
         "/surgery/images/flir/segmented/compressed",
+        "/surgery/images/cam4/detection_overlay/compressed",
         "/surgery/images/vlm/composite/compressed",
         "/surgery/perception/cam4/semantics/json",
     ):

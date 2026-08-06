@@ -8,4 +8,7 @@ float32 age_sec
 uint64 received_count
 uint64 accepted_count
 uint64 rejected_count
+uint64 epoch
+uint64 dropped_count
+string error_code
 string detail

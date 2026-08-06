@@ -26,6 +26,7 @@ from .event_model import (
     strip_internal_fields,
 )
 from .shadow_contract import (
+    BEHAVIOR_QUALITY_SCHEMA,
     RUN_MODES,
     load_jsonl as load_trace_jsonl,
     resolve_case_evaluation_mask,
@@ -33,6 +34,7 @@ from .shadow_contract import (
     resolve_case_reference,
     resolve_case_tool_catalog,
     sha256_file as shadow_sha256_file,
+    validate_behavior_quality_report,
     validate_trace_records,
 )
 
@@ -56,6 +58,46 @@ HANDOVER_ACTIONS = {
     "prepare_tool",
 }
 RECOVERY_ACTIONS = {"retrieve_from_mayo", "recover", "recovery"}
+PREPARATION_ACTIONS = {"predict_tool", "prepare_tool"}
+UNUSED_PREPOSITION_RETURN_ACTIONS = {"return_unused_preposition"}
+# Confirmed request boundaries come from a different observer than runtime
+# speech/vision evidence. Admit only a narrow early match so a response at the
+# boundary is not mislabeled as missed, while preserving the signed offset.
+REQUEST_HANDOVER_EARLY_MATCH_TOLERANCE_SEC = 1.5
+REQUEST_EVENT_TYPES = {
+    "explicit_tool_request",
+    "implicit_tool_request",
+    "request_tool",
+    "surgeon_tool_request",
+    "tool_request",
+    "voice_tool_request",
+}
+BED_ROBOT_GROUP_LAYERS = {
+    "bed_robot_arm_group_status",
+    "bed_robot_arm_group_request",
+    "bed_robot_arm_group_command",
+}
+BED_ROBOT_ACTIVATION_TOKENS = {
+    "activate",
+    "deploy",
+    "enable",
+    "engage",
+    "extend",
+    "handover",
+    "present",
+    "start",
+}
+BED_ROBOT_DEACTIVATION_TOKENS = {
+    "cancel",
+    "disable",
+    "home",
+    "off",
+    "pause",
+    "release",
+    "standby",
+    "stop",
+    "withdraw",
+}
 EVALUATION_MASK_SCHEMAS = {
     "taskplanner.evaluation_masks.v1",
     "taskplanner.evaluation_masks.v2",
@@ -607,6 +649,19 @@ def _distribution(values: Iterable[float]) -> dict[str, float | int | None]:
 
 def _trace_time(record: dict[str, Any]) -> float:
     return _float(record.get("ros_time_sec", record.get("time_sec", 0.0)))
+
+
+def _wall_time(record: dict[str, Any]) -> float | None:
+    value = record.get("wall_time_sec")
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(result) or result < 0.0:
+        return None
+    return result
 
 
 def _prediction_time(record: dict[str, Any], layer: str) -> float:
@@ -1242,6 +1297,470 @@ def _target_handovers(
     return targets, excluded, reference
 
 
+def _semantic_identifier_tokens(value: Any) -> frozenset[str]:
+    normalized = unicodedata.normalize("NFKC", _clean(value)).casefold()
+    characters = [
+        character if character.isalnum() else " "
+        for character in normalized
+    ]
+    return frozenset("".join(characters).split())
+
+
+def _capability_match_rank(
+    capability_name: str,
+    tool_id: str,
+    *,
+    tool_identity_map: dict[str, str],
+) -> int:
+    normalized_capability = normalize_tool_id(
+        capability_name,
+        tool_identity_map,
+    )
+    if normalized_capability == tool_id:
+        return 3
+    capability_tokens = _semantic_identifier_tokens(normalized_capability)
+    tool_tokens = _semantic_identifier_tokens(tool_id)
+    if not capability_tokens or not tool_tokens:
+        return 0
+    if capability_tokens < tool_tokens:
+        return 2
+    if tool_tokens < capability_tokens:
+        return 1
+    return 0
+
+
+def _discover_bed_robot_group_capabilities(
+    records: list[dict[str, Any]],
+    *,
+    canonical_tool_ids: set[str],
+    tool_identity_map: dict[str, str],
+) -> dict[str, Any]:
+    descriptors: dict[tuple[str, str], dict[str, Any]] = {}
+    for record in records:
+        if _clean(record.get("layer")) not in BED_ROBOT_GROUP_LAYERS:
+            continue
+        payload = _payload(record)
+        group_id = _clean(payload.get("group_id"))
+        profile = _clean(payload.get("end_effector_profile"))
+        if not group_id or not profile:
+            continue
+        descriptor = descriptors.setdefault(
+            (group_id, profile),
+            {
+                "group_id": group_id,
+                "end_effector_profile": profile,
+                "source_layers": set(),
+                "record_count": 0,
+            },
+        )
+        descriptor["source_layers"].add(_clean(record.get("layer")))
+        descriptor["record_count"] += 1
+
+    resolved: list[dict[str, Any]] = []
+    ambiguous: list[dict[str, Any]] = []
+    unresolved: list[dict[str, Any]] = []
+    for descriptor in descriptors.values():
+        ranked = [
+            (
+                _capability_match_rank(
+                    descriptor["end_effector_profile"],
+                    tool_id,
+                    tool_identity_map=tool_identity_map,
+                ),
+                tool_id,
+            )
+            for tool_id in sorted(canonical_tool_ids)
+        ]
+        best_rank = max((rank for rank, _tool_id in ranked), default=0)
+        candidates = [
+            tool_id
+            for rank, tool_id in ranked
+            if rank == best_rank and rank > 0
+        ]
+        row = {
+            **descriptor,
+            "source_layers": sorted(descriptor["source_layers"]),
+            "match_rank": best_rank,
+        }
+        if len(candidates) == 1:
+            row["tool_id"] = candidates[0]
+            resolved.append(row)
+        elif candidates:
+            row["candidate_tool_ids"] = candidates
+            ambiguous.append(row)
+        else:
+            unresolved.append(row)
+
+    resolved.sort(
+        key=lambda row: (
+            row["group_id"],
+            row["end_effector_profile"],
+        )
+    )
+    ambiguous.sort(
+        key=lambda row: (
+            row["group_id"],
+            row["end_effector_profile"],
+        )
+    )
+    unresolved.sort(
+        key=lambda row: (
+            row["group_id"],
+            row["end_effector_profile"],
+        )
+    )
+    return {
+        "resolved": resolved,
+        "ambiguous": ambiguous,
+        "unresolved": unresolved,
+    }
+
+
+def _is_bed_robot_activation(
+    *,
+    operation: str,
+    group_id: str,
+    end_effector_profile: str,
+) -> bool:
+    operation_tokens = _semantic_identifier_tokens(operation)
+    if not operation_tokens:
+        return False
+    if operation_tokens & BED_ROBOT_DEACTIVATION_TOKENS:
+        return False
+    if operation_tokens & BED_ROBOT_ACTIVATION_TOKENS:
+        return True
+    semantic_tokens = (
+        _semantic_identifier_tokens(group_id)
+        | _semantic_identifier_tokens(end_effector_profile)
+    )
+    return bool(operation_tokens & semantic_tokens)
+
+
+def _bed_robot_command_id(record: dict[str, Any]) -> str:
+    payload = _payload(record)
+    return _clean(
+        payload.get("command_id")
+        or record.get("correlation_id")
+    )
+
+
+def _evaluate_specialized_group_actions(
+    *,
+    records: list[dict[str, Any]],
+    targets: list[dict[str, Any]],
+    timeline: ReferenceTimeline,
+    lead_window_sec: float,
+    tool_identity_map: dict[str, str],
+) -> tuple[dict[str, Any], set[str]]:
+    capabilities = _discover_bed_robot_group_capabilities(
+        records,
+        canonical_tool_ids=timeline.canonical_tools,
+        tool_identity_map=tool_identity_map,
+    )
+    capabilities_by_descriptor = {
+        (
+            row["group_id"],
+            row["end_effector_profile"],
+        ): row
+        for row in capabilities["resolved"]
+    }
+    capabilities_by_group: dict[str, list[dict[str, Any]]] = {}
+    for row in capabilities["resolved"]:
+        capabilities_by_group.setdefault(row["group_id"], []).append(row)
+
+    target_capabilities: dict[str, list[dict[str, Any]]] = {}
+    for row in capabilities["resolved"]:
+        target_capabilities.setdefault(row["tool_id"], []).append(row)
+
+    specialized_targets = [
+        target
+        for target in targets
+        if event_tool_id(target) in target_capabilities
+    ]
+    specialized_target_ids = {
+        _clean(target.get("event_id"))
+        for target in specialized_targets
+    }
+
+    commands: list[dict[str, Any]] = []
+    non_activation_commands: list[dict[str, Any]] = []
+    unmapped_commands: list[dict[str, Any]] = []
+    for record in records:
+        if _clean(record.get("layer")) != "bed_robot_arm_group_command":
+            continue
+        payload = _payload(record)
+        group_id = _clean(payload.get("group_id"))
+        profile = _clean(payload.get("end_effector_profile"))
+        operation = _clean(payload.get("operation"))
+        sequence = int(
+            record.get("sequence", record.get("_jsonl_line", 0))
+        )
+        capability = capabilities_by_descriptor.get((group_id, profile))
+        if capability is None:
+            group_capabilities = capabilities_by_group.get(group_id, [])
+            if len(group_capabilities) == 1:
+                capability = group_capabilities[0]
+        command = {
+            "command_id": (
+                _bed_robot_command_id(record)
+                or f"bed-group-command:{sequence}"
+            ),
+            "request_id": _clean(payload.get("request_id")),
+            "sequence": sequence,
+            "time_sec": _trace_time(record),
+            "group_id": group_id,
+            "end_effector_profile": profile,
+            "operation": operation,
+            "tool_id": (
+                capability["tool_id"] if capability is not None else ""
+            ),
+        }
+        if capability is None:
+            unmapped_commands.append(command)
+            continue
+        if _is_bed_robot_activation(
+            operation=operation,
+            group_id=group_id,
+            end_effector_profile=profile,
+        ):
+            commands.append(command)
+        else:
+            non_activation_commands.append(command)
+
+    commands.sort(key=lambda row: (row["time_sec"], row["sequence"]))
+    terminal_status_by_command: dict[str, list[dict[str, Any]]] = {}
+    for record in records:
+        if _clean(record.get("layer")) != "bed_robot_arm_group_status":
+            continue
+        payload = _payload(record)
+        command_id = _bed_robot_command_id(record)
+        if not command_id or not bool(payload.get("terminal")):
+            continue
+        terminal_status_by_command.setdefault(command_id, []).append(
+            {
+                "time_sec": _trace_time(record),
+                "success": bool(payload.get("success")),
+                "state": _clean(payload.get("state")),
+                "outcome": _clean(payload.get("outcome")),
+            }
+        )
+
+    sink_command_ids = {
+        _bed_robot_command_id(record)
+        for record in records
+        if _clean(record.get("layer"))
+        == "shadow_bed_robot_arm_group_sink"
+        and _bed_robot_command_id(record)
+    }
+
+    consumed_commands: set[str] = set()
+    event_results: list[dict[str, Any]] = []
+    for target in specialized_targets:
+        target_time = float(target["time_sec"])
+        target_tool_id = event_tool_id(target)
+        target_policy = timeline.evaluation_mask.event_policy(target)
+        candidates = [
+            command
+            for command in commands
+            if command["command_id"] not in consumed_commands
+            and command["tool_id"] == target_tool_id
+            and target_time - lead_window_sec
+            <= float(command["time_sec"])
+            < target_time
+            and timeline.evaluation_mask.metric_enabled_at(
+                "action",
+                float(command["time_sec"]),
+            )
+        ]
+        selected = max(
+            candidates,
+            key=lambda row: (row["time_sec"], row["sequence"]),
+            default=None,
+        )
+        if selected is not None:
+            consumed_commands.add(selected["command_id"])
+        terminal_rows = (
+            terminal_status_by_command.get(selected["command_id"], [])
+            if selected is not None
+            else []
+        )
+        terminal = max(
+            terminal_rows,
+            key=lambda row: row["time_sec"],
+            default=None,
+        )
+        if terminal is not None and terminal["success"]:
+            execution_outcome = "terminal_success"
+        elif terminal is not None:
+            execution_outcome = "terminal_failure"
+        elif (
+            selected is not None
+            and selected["command_id"] in sink_command_ids
+        ):
+            execution_outcome = "dispatched_without_terminal_status"
+        elif selected is not None:
+            execution_outcome = "no_execution_evidence"
+        else:
+            execution_outcome = "not_commanded"
+        event_results.append(
+            {
+                "event_id": _clean(target.get("event_id")),
+                "time_sec": target_time,
+                "target_tool_id": target_tool_id,
+                "target_label_origin": target.get("label_origin"),
+                "target_scoring_role": target_policy["role"],
+                "outcome": (
+                    "exact_match"
+                    if selected is not None
+                    else "missed_opportunity"
+                ),
+                "selected_command_id": (
+                    selected["command_id"]
+                    if selected is not None
+                    else None
+                ),
+                "group_id": (
+                    selected["group_id"]
+                    if selected is not None
+                    else target_capabilities[target_tool_id][0]["group_id"]
+                ),
+                "end_effector_profile": (
+                    selected["end_effector_profile"]
+                    if selected is not None
+                    else target_capabilities[target_tool_id][0][
+                        "end_effector_profile"
+                    ]
+                ),
+                "operation": (
+                    selected["operation"] if selected is not None else None
+                ),
+                "lead_time_sec": (
+                    round(target_time - float(selected["time_sec"]), 6)
+                    if selected is not None
+                    and target_policy["metric_eligibility"]["latency"]
+                    else None
+                ),
+                "sink_observed": bool(
+                    selected is not None
+                    and selected["command_id"] in sink_command_ids
+                ),
+                "execution_outcome": execution_outcome,
+                "terminal_state": (
+                    terminal["state"] if terminal is not None else None
+                ),
+                "terminal_outcome": (
+                    terminal["outcome"] if terminal is not None else None
+                ),
+            }
+        )
+
+    unmatched_commands = [
+        command
+        for command in commands
+        if command["command_id"] not in consumed_commands
+    ]
+    exact_count = sum(
+        row["outcome"] == "exact_match" for row in event_results
+    )
+    terminal_success_count = sum(
+        row["execution_outcome"] == "terminal_success"
+        for row in event_results
+    )
+    target_count = len(event_results)
+    reference_gap_commands = (
+        unmatched_commands
+        if commands and not target_count and capabilities["resolved"]
+        else []
+    )
+    false_positive_commands = (
+        []
+        if reference_gap_commands
+        else unmatched_commands
+    )
+    return (
+        {
+            "schema": "taskplanner.specialized_group_action_evaluation.v1",
+            "status": (
+                "complete"
+                if target_count
+                else (
+                    "ambiguous_capabilities"
+                    if capabilities["ambiguous"]
+                    else (
+                        "unscorable_reference_gap"
+                        if reference_gap_commands
+                        else (
+                            "no_mapped_targets"
+                            if capabilities["resolved"]
+                            else "no_declared_capabilities"
+                        )
+                    )
+                )
+            ),
+            "reference_quality": (
+                (
+                    "no confirmed specialized-action reference targets; "
+                    "activation commands are audited but not classified"
+                )
+                if reference_gap_commands
+                else (
+                    "confirmed handover targets mapped to uniquely declared "
+                    "bed-robot end-effector capabilities"
+                )
+            ),
+            "capabilities": capabilities,
+            "target_count": target_count,
+            "exact_match_count": exact_count,
+            "missed_opportunity_count": target_count - exact_count,
+            "command_recall": (
+                exact_count / target_count if target_count else None
+            ),
+            "activation_command_count": len(commands),
+            "false_positive_command_count": len(false_positive_commands),
+            "unscorable_activation_command_count": len(
+                reference_gap_commands
+            ),
+            "non_activation_command_count": len(non_activation_commands),
+            "unmapped_command_count": len(unmapped_commands),
+            "terminal_success_count": terminal_success_count,
+            "terminal_failure_count": sum(
+                row["execution_outcome"] == "terminal_failure"
+                for row in event_results
+            ),
+            "execution_fulfillment_rate": (
+                terminal_success_count / exact_count if exact_count else None
+            ),
+            "events": event_results,
+            "unmatched_activation_commands": false_positive_commands,
+            "unscorable_activation_commands": reference_gap_commands,
+            "non_activation_commands": non_activation_commands,
+            "unmapped_commands": unmapped_commands,
+            "notes": [
+                (
+                    "Capability-to-tool mapping is derived offline from "
+                    "declared end-effector profiles and confirmed tool "
+                    "identities; ambiguous mappings remain ordinary "
+                    "handover targets."
+                ),
+                (
+                    "Reference labels are never emitted to VLM, reducer, "
+                    "BT, or runtime command topics."
+                ),
+                (
+                    "Lifecycle stop/release commands are reported but "
+                    "excluded from activation false-positive counts."
+                ),
+                (
+                    "When no confirmed specialized-action target exists, "
+                    "activation commands are marked unscorable instead of "
+                    "being inferred as false positives."
+                ),
+            ],
+        },
+        specialized_target_ids,
+    )
+
+
 def _eligible_episode_view(
     episode: dict[str, Any],
     *,
@@ -1249,15 +1768,36 @@ def _eligible_episode_view(
     lead_window_sec: float,
     max_prediction_age_sec: float,
     evaluation_mask: EvaluationMask,
+    allow_request_reaction: bool = False,
+    request_reaction_window_sec: float = 0.0,
 ) -> dict[str, Any] | None:
-    prior_times = [
+    eligible_times = [
         float(value)
         for value in episode.get("record_times_sec", [])
-        if float(value) < target_time
-        and evaluation_mask.metric_enabled_at("action", float(value))
+        if evaluation_mask.metric_enabled_at("action", float(value))
+    ]
+    prior_times = [
+        value for value in eligible_times if value < target_time
     ]
     if not prior_times:
-        return None
+        if not allow_request_reaction:
+            return None
+        reaction_times = [
+            value
+            for value in eligible_times
+            if target_time <= value <= target_time + request_reaction_window_sec
+        ]
+        if not reaction_times:
+            return None
+        first_time = min(reaction_times)
+        last_time = max(reaction_times)
+        view = dict(episode)
+        view["first_time_sec"] = first_time
+        view["last_time_sec"] = last_time
+        view["record_times_sec"] = reaction_times
+        view["match_timing"] = "request_reactive"
+        view["reaction_lag_sec"] = first_time - target_time
+        return view
     first_time = min(prior_times)
     last_time = max(prior_times)
     if first_time < target_time - lead_window_sec:
@@ -1279,6 +1819,8 @@ def _eligible_episode_view(
     view["first_time_sec"] = first_time
     view["last_time_sec"] = last_time
     view["record_times_sec"] = prior_times
+    view["match_timing"] = "pre_event"
+    view["reaction_lag_sec"] = None
     return view
 
 
@@ -1308,10 +1850,12 @@ def _evaluate_layer(
     layer: str,
     episodes: list[dict[str, Any]],
     targets: list[dict[str, Any]],
+    request_time_by_target_id: dict[str, float],
     timeline: ReferenceTimeline,
     lead_window_sec: float,
     stable_sec: float,
     max_prediction_age_sec: float,
+    request_reaction_window_sec: float,
 ) -> dict[str, Any]:
     evaluation_mask = timeline.evaluation_mask
     handover_episodes = [
@@ -1346,6 +1890,10 @@ def _evaluate_layer(
 
     for target in targets:
         target_time = float(target["time_sec"])
+        target_event_id = _clean(target.get("event_id"))
+        confirmed_request_time = request_time_by_target_id.get(
+            target_event_id
+        )
         target_tool = event_tool_id(target)
         target_policy = evaluation_mask.event_policy(target)
         eligible = []
@@ -1361,6 +1909,17 @@ def _evaluate_layer(
                     episode.get("last_prediction", {}),
                 )
             }
+            request_backed = (
+                layer in {
+                    "reducer_fused",
+                    "bt_decision",
+                    "skill_command",
+                }
+                and (
+                    int(episode.get("request_generation", 0)) > 0
+                    or "explicit_request" in prediction_sources
+                )
+            )
             discrete_request = (
                 layer == "reducer_fused"
                 and "explicit_request" in prediction_sources
@@ -1377,28 +1936,53 @@ def _evaluate_layer(
                 lead_window_sec=lead_window_sec,
                 max_prediction_age_sec=effective_max_age_sec,
                 evaluation_mask=evaluation_mask,
+                allow_request_reaction=request_backed,
+                request_reaction_window_sec=request_reaction_window_sec,
             )
             if view is not None:
                 eligible.append(view)
         exact_candidates = [
             episode for episode in eligible if episode["tool_id"] == target_tool
         ]
+        pre_event_candidates = [
+            episode
+            for episode in eligible
+            if episode.get("match_timing") == "pre_event"
+        ]
         selected: dict[str, Any] | None
         if exact_candidates:
             selected = max(
                 exact_candidates,
                 key=lambda item: (
-                    float(item["last_time_sec"]),
-                    float(item["first_time_sec"]),
+                    item.get("match_timing") == "pre_event",
+                    (
+                        float(item["last_time_sec"])
+                        if item.get("match_timing") == "pre_event"
+                        else -float(item["first_time_sec"])
+                    ),
+                    (
+                        float(item["first_time_sec"])
+                        if item.get("match_timing") == "pre_event"
+                        else -float(item["last_time_sec"])
+                    ),
                 ),
             )
             outcome = "exact_match"
-        elif eligible:
+        elif pre_event_candidates:
             selected = max(
-                eligible,
+                pre_event_candidates,
                 key=lambda item: (
-                    float(item["last_time_sec"]),
-                    float(item["first_time_sec"]),
+                    item.get("match_timing") == "pre_event",
+                    (
+                        float(item["last_time_sec"])
+                        if item.get("match_timing") == "pre_event"
+                        else -float(item["first_time_sec"])
+                    ),
+                    (
+                        float(item["first_time_sec"])
+                        if item.get("match_timing") == "pre_event"
+                        else -float(item["last_time_sec"])
+                    ),
                 ),
             )
             feasibility, _reason = timeline.feasibility(selected)
@@ -1415,10 +1999,14 @@ def _evaluate_layer(
         first_lead = None
         stable_lead = None
         last_lead = None
+        reaction_lag = None
         feasibility = "not_applicable"
         feasibility_reason = ""
+        first_prediction_time = None
+        decision_timing = None
         if selected is not None:
             consumed.add(selected["episode_id"])
+            first_prediction_time = float(selected["first_time_sec"])
             latency_times = [
                 float(value)
                 for value in selected.get("record_times_sec", [])
@@ -1430,24 +2018,53 @@ def _evaluate_layer(
             ):
                 latency_first = min(latency_times)
                 latency_last = max(latency_times)
-                first_lead = target_time - latency_first
-                last_lead = target_time - latency_last
-                if (
-                    selected["tool_id"] == target_tool
-                    and target_time - latency_first >= stable_sec
-                    and latency_last >= latency_first + stable_sec
-                ):
-                    stable_lead = (
-                        target_time
-                        - latency_first
-                        - stable_sec
-                    )
+                if selected.get("match_timing") == "request_reactive":
+                    reaction_lag = latency_first - target_time
+                else:
+                    first_lead = target_time - latency_first
+                    last_lead = target_time - latency_last
+                    if (
+                        selected["tool_id"] == target_tool
+                        and target_time - latency_first >= stable_sec
+                        and latency_last >= latency_first + stable_sec
+                    ):
+                        stable_lead = (
+                            target_time
+                            - latency_first
+                            - stable_sec
+                        )
             feasibility, feasibility_reason = timeline.feasibility(selected)
+            prediction_source = _clean(
+                selected.get("first_prediction", {}).get(
+                    "prediction_source"
+                )
+            )
+            request_backed = (
+                prediction_source == "explicit_request"
+                or int(selected.get("request_generation", 0)) > 0
+            )
+            if outcome == "exact_match" and request_backed:
+                decision_timing = "request_backed"
+            elif (
+                outcome == "exact_match"
+                and prediction_source == "predicted_tool"
+            ):
+                if confirmed_request_time is None:
+                    decision_timing = "unrequested_pre_handover"
+                elif first_prediction_time < confirmed_request_time:
+                    decision_timing = "pre_request_proactive"
+                else:
+                    decision_timing = "post_request_visual"
 
         results.append(
             {
                 "event_id": target["event_id"],
                 "time_sec": target_time,
+                "confirmed_request_time_sec": (
+                    round(confirmed_request_time, 6)
+                    if confirmed_request_time is not None
+                    else None
+                ),
                 "target_tool_id": target_tool,
                 "target_label_origin": target.get("label_origin"),
                 "target_visibility": target.get("visibility"),
@@ -1482,6 +2099,17 @@ def _evaluate_layer(
                     if selected is not None
                     else 0
                 ),
+                "match_timing": (
+                    selected.get("match_timing")
+                    if selected is not None
+                    else None
+                ),
+                "first_prediction_time_sec": (
+                    round(first_prediction_time, 6)
+                    if first_prediction_time is not None
+                    else None
+                ),
+                "decision_timing": decision_timing,
                 "first_correct_lead_sec": (
                     round(first_lead, 6)
                     if outcome == "exact_match" and first_lead is not None
@@ -1500,6 +2128,11 @@ def _evaluate_layer(
                 "last_prediction_lead_sec": (
                     round(last_lead, 6) if last_lead is not None else None
                 ),
+                "request_reaction_lag_sec": (
+                    round(reaction_lag, 6)
+                    if outcome == "exact_match" and reaction_lag is not None
+                    else None
+                ),
                 "feasibility": feasibility,
                 "feasibility_reason": feasibility_reason,
             }
@@ -1517,15 +2150,31 @@ def _evaluate_layer(
     exact = counts["exact_match"]
     request_backed_exact = sum(
         result["outcome"] == "exact_match"
-        and (
-            result.get("prediction_source") == "explicit_request"
-            or int(result.get("request_generation", 0)) > 0
-        )
+        and result.get("decision_timing") == "request_backed"
         for result in results
     )
-    anticipatory_exact = sum(
+    pre_request_proactive_exact = sum(
         result["outcome"] == "exact_match"
-        and result.get("prediction_source") == "predicted_tool"
+        and result.get("decision_timing") == "pre_request_proactive"
+        for result in results
+    )
+    unrequested_pre_handover_exact = sum(
+        result["outcome"] == "exact_match"
+        and result.get("decision_timing") == "unrequested_pre_handover"
+        for result in results
+    )
+    proactive_exact = (
+        pre_request_proactive_exact
+        + unrequested_pre_handover_exact
+    )
+    post_request_visual_exact = sum(
+        result["outcome"] == "exact_match"
+        and result.get("decision_timing") == "post_request_visual"
+        for result in results
+    )
+    request_reactive_exact = sum(
+        result["outcome"] == "exact_match"
+        and result.get("match_timing") == "request_reactive"
         for result in results
     )
     target_count = len(results)
@@ -1538,6 +2187,11 @@ def _evaluate_layer(
         float(result["stable_correct_lead_sec"])
         for result in results
         if result["stable_correct_lead_sec"] is not None
+    ]
+    request_reaction_lags = [
+        float(result["request_reaction_lag_sec"])
+        for result in results
+        if result["request_reaction_lag_sec"] is not None
     ]
     precision_denominator = (
         exact
@@ -1570,7 +2224,19 @@ def _evaluate_layer(
         "top1_exact_rate": exact / target_count if target_count else None,
         "stable_exact_count": len(stable_leads),
         "request_backed_exact_count": request_backed_exact,
-        "anticipatory_exact_count": anticipatory_exact,
+        "request_reactive_exact_count": request_reactive_exact,
+        "proactive_exact_count": proactive_exact,
+        "pre_request_proactive_exact_count": (
+            pre_request_proactive_exact
+        ),
+        "unrequested_pre_handover_exact_count": (
+            unrequested_pre_handover_exact
+        ),
+        "post_request_visual_exact_count": post_request_visual_exact,
+        # Compatibility alias. Unlike the previous implementation, this now
+        # excludes visual predictions that first appeared after a confirmed
+        # request.
+        "anticipatory_exact_count": proactive_exact,
         "stable_exact_rate": len(stable_leads) / target_count if target_count else None,
         "precision_including_false_positives": (
             exact / precision_denominator if precision_denominator else None
@@ -1580,6 +2246,7 @@ def _evaluate_layer(
         "physical_feasibility_counts": dict(feasibility_counts),
         "first_correct_lead_sec": _distribution(first_leads),
         "stable_correct_lead_sec": _distribution(stable_leads),
+        "request_reaction_lag_sec": _distribution(request_reaction_lags),
         "events": results,
         "unmatched_prediction_episodes": [
             {
@@ -2682,7 +3349,7 @@ def _evaluate_dt_tool_endpoints(
 
 
 def _expected_terminal_skill_events(action: str) -> set[str]:
-    if action in {"predict_tool", "prepare_tool"}:
+    if action in PREPARATION_ACTIONS:
         return {"ToolPrepared"}
     if action in HANDOVER_ACTIONS:
         return {
@@ -2692,8 +3359,1840 @@ def _expected_terminal_skill_events(action: str) -> set[str]:
     if action in RECOVERY_ACTIONS:
         return {"ToolReturnedToTray"}
     if action == "return_unused_preposition":
-        return {"PredictedToolReturnedToRack"}
+        return {
+            "PredictedToolReturnedToRack",
+            "UnusedPrepositionReturned",
+        }
     return set()
+
+
+def _reference_event_time(
+    event: dict[str, Any],
+    *,
+    prefer_start: bool = False,
+) -> float:
+    if prefer_start and event.get("start_sec") is not None:
+        return _float(event.get("start_sec"))
+    return _float(event.get("time_sec", event.get("start_sec", 0.0)))
+
+
+def _is_request_reference(event: dict[str, Any]) -> bool:
+    event_type = _clean(event.get("event_type")).lower()
+    return (
+        event_type in REQUEST_EVENT_TYPES
+        or event_type.endswith("_tool_request")
+    )
+
+
+def _request_tool_id(
+    event: dict[str, Any],
+    identity_map: dict[str, str],
+) -> str:
+    candidate = (
+        event.get("requested_tool")
+        or event.get("instrument_id")
+        or event_tool_id(event)
+    )
+    if isinstance(candidate, dict):
+        candidate = candidate.get("id") or candidate.get("tool_id")
+    return normalize_tool_id(candidate, identity_map)
+
+
+def _linked_reference_ids(event: dict[str, Any]) -> set[str]:
+    values: list[Any] = [
+        event.get("handover_event_id"),
+        event.get("target_event_id"),
+        event.get("linked_event_id"),
+        event.get("related_event_id"),
+    ]
+    links = event.get("links")
+    if isinstance(links, dict):
+        values.extend(links.values())
+    elif isinstance(links, list):
+        values.extend(links)
+    return {_clean(value) for value in values if _clean(value)}
+
+
+def _request_activation_wall_times(
+    trace_records: list[dict[str, Any]],
+) -> dict[str, dict[str, float]]:
+    activations: dict[str, dict[str, float]] = {}
+    for record in sorted(
+        trace_records,
+        key=lambda row: (
+            _wall_time(row)
+            if _wall_time(row) is not None
+            else math.inf,
+            int(row.get("sequence", 0) or 0),
+        ),
+    ):
+        if record.get("layer") != "evaluation_ground_truth":
+            continue
+        payload = _payload(record)
+        if payload.get("evaluation_only") is not True:
+            continue
+        request = payload.get("implicit_tool_request")
+        if not isinstance(request, dict) or request.get("active") is not True:
+            continue
+        event_id = _clean(request.get("event_id"))
+        wall_time = _wall_time(record)
+        if not event_id or wall_time is None:
+            continue
+        activations.setdefault(
+            event_id,
+            {
+                "wall_time_sec": wall_time,
+                "source_time_sec": _float(
+                    payload.get("source_time_sec"),
+                    default=_trace_time(record),
+                ),
+            },
+        )
+    return activations
+
+
+def _runtime_tool_matches(
+    value: Any,
+    target_tool_id: str,
+    identity_map: dict[str, str],
+) -> bool:
+    candidate = normalize_tool_id(value, identity_map)
+    if candidate == target_tool_id:
+        return True
+    if "#" in candidate:
+        return (
+            normalize_tool_id(candidate.split("#", 1)[0], identity_map)
+            == target_tool_id
+        )
+    return False
+
+
+def _reducer_request_fact_signatures(
+    record: dict[str, Any],
+    identity_map: dict[str, str],
+) -> set[tuple[str, str, int]]:
+    if record.get("layer") != "reducer_fused":
+        return set()
+    payload = _payload(record)
+    signatures: set[tuple[str, str, int]] = set()
+
+    explicit_tool = normalize_tool_id(
+        payload.get("explicit_request_tool")
+        or payload.get("surgeon_request_tool"),
+        identity_map,
+    )
+    if explicit_tool:
+        signatures.add(
+            (
+                "explicit_request",
+                explicit_tool,
+                int(payload.get("surgeon_request_generation", 0) or 0),
+            )
+        )
+
+    if payload.get("implicit_request_visible") is not True:
+        return signatures
+    hand_pose = _clean(payload.get("implicit_request_hand_pose")).lower()
+    if hand_pose and hand_pose != "open_receive":
+        return signatures
+    implicit_tool = normalize_tool_id(
+        payload.get("implicit_request_tool"),
+        identity_map,
+    )
+    predicted_tool = normalize_tool_id(
+        payload.get("predicted_tool")
+        or payload.get("predicted_tool_id"),
+        identity_map,
+    )
+    if implicit_tool and predicted_tool and implicit_tool != predicted_tool:
+        return signatures
+    visual_target = implicit_tool or predicted_tool
+    if visual_target:
+        signatures.add(
+            (
+                "visual_implicit_request",
+                visual_target,
+                int(payload.get("implicit_request_generation", 0) or 0),
+            )
+        )
+    return signatures
+
+
+def _request_pipeline_activations(
+    *,
+    trace_records: list[dict[str, Any]],
+    requested_pairs: list[dict[str, Any]],
+    identity_map: dict[str, str],
+) -> dict[str, dict[str, dict[str, Any] | None]]:
+    ordered_records = sorted(
+        trace_records,
+        key=lambda row: (
+            _trace_time(row),
+            _wall_time(row)
+            if _wall_time(row) is not None
+            else math.inf,
+            int(row.get("sequence", 0) or 0),
+        ),
+    )
+
+    fact_episodes: list[dict[str, Any]] = []
+    active_fact_signatures: set[tuple[str, str, int]] = set()
+    for record in ordered_records:
+        if record.get("layer") != "reducer_fused":
+            continue
+        signatures = _reducer_request_fact_signatures(
+            record,
+            identity_map,
+        )
+        for source, tool_id, generation in sorted(
+            signatures - active_fact_signatures
+        ):
+            fact_episodes.append(
+                {
+                    "record_id": (
+                        "reducer:"
+                        + str(record.get("sequence", len(fact_episodes)))
+                    ),
+                    "source": source,
+                    "tool_id": tool_id,
+                    "generation": generation,
+                    "source_time_sec": _trace_time(record),
+                    "wall_time_sec": _wall_time(record),
+                }
+            )
+        active_fact_signatures = signatures
+
+    bt_episodes: list[dict[str, Any]] = []
+    for record in ordered_records:
+        if record.get("layer") != "bt_decision":
+            continue
+        payload = _payload(record)
+        action = _clean(payload.get("action")).lower()
+        decision = _clean(payload.get("decision")).lower()
+        if (
+            action not in HANDOVER_ACTIONS - PREPARATION_ACTIONS
+            or (
+                decision not in {"explicit_request", "implicit_request"}
+                and int(payload.get("request_generation", 0) or 0) <= 0
+            )
+        ):
+            continue
+        bt_episodes.append(
+            {
+                "record_id": (
+                    "bt:"
+                    + str(record.get("sequence", len(bt_episodes)))
+                ),
+                "source": decision or "request_backed",
+                "tool_id": normalize_tool_id(
+                    payload.get("selected_tool")
+                    or payload.get("instrument_id"),
+                    identity_map,
+                ),
+                "source_time_sec": _trace_time(record),
+                "wall_time_sec": _wall_time(record),
+            }
+        )
+
+    results: dict[str, dict[str, dict[str, Any] | None]] = {}
+    used_fact_ids: set[str] = set()
+    used_bt_ids: set[str] = set()
+    for index, pair in enumerate(requested_pairs):
+        event_id = _clean(pair.get("request_event_id"))
+        if not event_id:
+            continue
+        request_time = float(pair["request_time_sec"])
+        previous_request_time = (
+            float(requested_pairs[index - 1]["request_time_sec"])
+            if index > 0
+            else None
+        )
+        next_request_time = (
+            float(requested_pairs[index + 1]["request_time_sec"])
+            if index + 1 < len(requested_pairs)
+            else math.inf
+        )
+        earliest = (
+            request_time - REQUEST_HANDOVER_EARLY_MATCH_TOLERANCE_SEC
+        )
+        if previous_request_time is not None:
+            earliest = max(earliest, previous_request_time)
+
+        fact = next(
+            (
+                row
+                for row in fact_episodes
+                if row["record_id"] not in used_fact_ids
+                and earliest <= row["source_time_sec"] < next_request_time
+                and _runtime_tool_matches(
+                    row["tool_id"],
+                    pair["tool_id"],
+                    identity_map,
+                )
+            ),
+            None,
+        )
+        if fact is not None:
+            used_fact_ids.add(fact["record_id"])
+
+        bt_acceptance = next(
+            (
+                row
+                for row in bt_episodes
+                if row["record_id"] not in used_bt_ids
+                and earliest <= row["source_time_sec"] < next_request_time
+                and _runtime_tool_matches(
+                    row["tool_id"],
+                    pair["tool_id"],
+                    identity_map,
+                )
+            ),
+            None,
+        )
+        if bt_acceptance is not None:
+            used_bt_ids.add(bt_acceptance["record_id"])
+        results[event_id] = {
+            "dt_request_fact": fact,
+            "bt_request_acceptance": bt_acceptance,
+        }
+    return results
+
+
+def _non_negative_elapsed(
+    *,
+    start_sec: float | None,
+    end_sec: float | None,
+) -> float | None:
+    if start_sec is None or end_sec is None:
+        return None
+    elapsed = end_sec - start_sec
+    if elapsed < -1e-6:
+        return None
+    return round(max(0.0, elapsed), 6)
+
+
+def _pair_requests_to_handovers(
+    *,
+    ground_truth: list[dict[str, Any]],
+    targets: list[dict[str, Any]],
+    identity_map: dict[str, str],
+    evaluation_mask: EvaluationMask,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    requests: list[dict[str, Any]] = []
+    for event in ground_truth:
+        if (
+            event.get("review_status") != "confirmed"
+            or not _is_request_reference(event)
+        ):
+            continue
+        request_time = _reference_event_time(event, prefer_start=True)
+        if not evaluation_mask.metric_enabled_at("latency", request_time):
+            continue
+        requests.append(
+            {
+                "event": strip_internal_fields(event),
+                "event_id": _clean(event.get("event_id")),
+                "time_sec": request_time,
+                "end_sec": _float(
+                    event.get("end_sec"),
+                    default=request_time,
+                ),
+                "tool_id": _request_tool_id(event, identity_map),
+                "linked_ids": _linked_reference_ids(event),
+            }
+        )
+    requests.sort(key=lambda row: (row["time_sec"], row["event_id"]))
+
+    used_request_indices: set[int] = set()
+    pairs: list[dict[str, Any]] = []
+    for target in sorted(
+        targets,
+        key=lambda row: (
+            _reference_event_time(row),
+            _clean(row.get("event_id")),
+        ),
+    ):
+        target_time = _reference_event_time(target)
+        target_id = _clean(target.get("event_id"))
+        target_tool = normalize_tool_id(
+            event_tool_id(target),
+            identity_map,
+        )
+        candidates: list[tuple[int, dict[str, Any]]] = []
+        for index, request in enumerate(requests):
+            if index in used_request_indices:
+                continue
+            if request["time_sec"] > target_time:
+                continue
+            if request["tool_id"] and request["tool_id"] != target_tool:
+                continue
+            candidates.append((index, request))
+
+        linked = [
+            candidate
+            for candidate in candidates
+            if target_id in candidate[1]["linked_ids"]
+        ]
+        selected = max(
+            linked or candidates,
+            key=lambda candidate: (
+                candidate[1]["time_sec"],
+                candidate[1]["event_id"],
+            ),
+            default=None,
+        )
+        request: dict[str, Any] | None = None
+        if selected is not None:
+            used_request_indices.add(selected[0])
+            request = selected[1]
+        pairs.append(
+            {
+                "target": target,
+                "target_event_id": target_id,
+                "target_time_sec": target_time,
+                "tool_id": target_tool,
+                "request": request,
+                "request_event_id": (
+                    request["event_id"] if request is not None else None
+                ),
+                "request_time_sec": (
+                    request["time_sec"] if request is not None else None
+                ),
+            }
+        )
+    unmatched_requests = [
+        request
+        for index, request in enumerate(requests)
+        if index not in used_request_indices
+    ]
+    return pairs, unmatched_requests
+
+
+def _skill_action_outcomes(
+    trace_records: list[dict[str, Any]],
+    *,
+    identity_map: dict[str, str],
+) -> dict[str, list[dict[str, Any]]]:
+    commands: dict[str, dict[str, Any]] = {}
+    for record in trace_records:
+        if record.get("layer") != "skill_command":
+            continue
+        payload = _payload(record)
+        command_id = _clean(payload.get("command_id"))
+        if not command_id:
+            command_id = f"skill-command:{record.get('sequence', 0)}"
+        commands.setdefault(
+            command_id,
+            {
+                "command_id": command_id,
+                "action": _clean(payload.get("action")).lower(),
+                "tool_id": normalize_tool_id(
+                    payload.get("instrument_id"),
+                    identity_map,
+                ),
+                "instance_id": _clean(
+                    payload.get("instrument_instance_id")
+                ),
+                "arm": _clean(payload.get("arm")).lower(),
+                "command_time_sec": _trace_time(record),
+                "command_wall_time_sec": _wall_time(record),
+                "command_sequence": int(
+                    record.get("sequence", 0) or 0
+                ),
+            },
+        )
+
+    completed_status: dict[str, dict[str, Any]] = {}
+    for record in trace_records:
+        if record.get("layer") != "skill_status":
+            continue
+        payload = _payload(record)
+        command_id = _clean(payload.get("command_id"))
+        if (
+            command_id
+            and _clean(payload.get("state")).lower() == "completed"
+            and bool(payload.get("success"))
+        ):
+            completed_status.setdefault(
+                command_id,
+                {
+                    "time_sec": _trace_time(record),
+                    "wall_time_sec": _wall_time(record),
+                    "sequence": int(record.get("sequence", 0) or 0),
+                    "payload": payload,
+                },
+            )
+
+    events_by_command: dict[str, list[dict[str, Any]]] = {}
+    event_only: list[dict[str, Any]] = []
+    for record in trace_records:
+        if record.get("layer") != "skill_event":
+            continue
+        payload = _payload(record)
+        detail = _parse_json_object(payload.get("detail_json"))
+        command_id = _clean(
+            payload.get("command_id") or detail.get("command_id")
+        )
+        row = {
+            "command_id": command_id,
+            "event_type": _clean(payload.get("event_type")),
+            "tool_id": normalize_tool_id(
+                payload.get("instrument_id")
+                or detail.get("instrument_id"),
+                identity_map,
+            ),
+            "instance_id": _clean(
+                payload.get("instance_id")
+                or payload.get("instrument_instance_id")
+                or detail.get("instrument_instance_id")
+                or detail.get("instance_id")
+            ),
+            "arm": _clean(
+                payload.get("arm") or detail.get("arm")
+            ).lower(),
+            "time_sec": _trace_time(record),
+            "wall_time_sec": _wall_time(record),
+            "sequence": int(record.get("sequence", 0) or 0),
+        }
+        if command_id:
+            events_by_command.setdefault(command_id, []).append(row)
+        else:
+            event_only.append(row)
+
+    outcomes: dict[str, list[dict[str, Any]]] = {
+        "preparations": [],
+        "handovers": [],
+        "returns": [],
+    }
+    observed_keys: set[tuple[str, str]] = set()
+
+    def append_outcome(
+        kind: str,
+        *,
+        command_id: str,
+        action: str,
+        tool_id: str,
+        instance_id: str,
+        arm: str,
+        command_time_sec: float,
+        completion_time_sec: float,
+        command_wall_time_sec: float | None,
+        completion_wall_time_sec: float | None,
+        completion_sequence: int,
+        source: str,
+    ) -> None:
+        key = (kind, command_id)
+        if key in observed_keys or not tool_id:
+            return
+        observed_keys.add(key)
+        outcomes[kind].append(
+            {
+                "outcome_id": f"{kind}:{command_id}",
+                "command_id": command_id,
+                "action": action,
+                "tool_id": tool_id,
+                "instance_id": instance_id or None,
+                "arm": arm or None,
+                "command_time_sec": command_time_sec,
+                "completion_time_sec": completion_time_sec,
+                "command_wall_time_sec": command_wall_time_sec,
+                "completion_wall_time_sec": completion_wall_time_sec,
+                "completion_sequence": completion_sequence,
+                "source": source,
+            }
+        )
+
+    handover_events = {
+        "ToolHandoverCompleted",
+        "ShadowAdditionalToolHandoverCompleted",
+    }
+    for command_id, command in commands.items():
+        event_rows = events_by_command.get(command_id, [])
+        action = command["action"]
+        tool_id = command["tool_id"]
+        status = completed_status.get(command_id)
+        if not tool_id and status is not None:
+            tool_id = normalize_tool_id(
+                status["payload"].get("instrument_id"),
+                identity_map,
+            )
+
+        prepared = next(
+            (
+                row
+                for row in event_rows
+                if row["event_type"] == "ToolPrepared"
+            ),
+            None,
+        )
+        if action in PREPARATION_ACTIONS and (prepared or status):
+            append_outcome(
+                "preparations",
+                command_id=command_id,
+                action=action,
+                tool_id=tool_id or (prepared or {}).get("tool_id", ""),
+                instance_id=(
+                    (prepared or {}).get("instance_id")
+                    or command["instance_id"]
+                ),
+                arm=(
+                    (prepared or {}).get("arm")
+                    or command["arm"]
+                ),
+                command_time_sec=command["command_time_sec"],
+                completion_time_sec=(
+                    prepared["time_sec"]
+                    if prepared is not None
+                    else status["time_sec"]
+                ),
+                command_wall_time_sec=command["command_wall_time_sec"],
+                completion_wall_time_sec=(
+                    prepared["wall_time_sec"]
+                    if prepared is not None
+                    else status["wall_time_sec"]
+                ),
+                completion_sequence=(
+                    prepared["sequence"]
+                    if prepared is not None
+                    else status["sequence"]
+                ),
+                source=(
+                    "ToolPrepared"
+                    if prepared is not None
+                    else "successful_skill_status"
+                ),
+            )
+
+        handed_over = next(
+            (
+                row
+                for row in event_rows
+                if row["event_type"] in handover_events
+            ),
+            None,
+        )
+        if (
+            action in HANDOVER_ACTIONS - PREPARATION_ACTIONS
+            and (handed_over or status)
+        ):
+            append_outcome(
+                "handovers",
+                command_id=command_id,
+                action=action,
+                tool_id=tool_id or (handed_over or {}).get("tool_id", ""),
+                instance_id=(
+                    (handed_over or {}).get("instance_id")
+                    or command["instance_id"]
+                ),
+                arm=(
+                    (handed_over or {}).get("arm")
+                    or command["arm"]
+                ),
+                command_time_sec=command["command_time_sec"],
+                completion_time_sec=(
+                    handed_over["time_sec"]
+                    if handed_over is not None
+                    else status["time_sec"]
+                ),
+                command_wall_time_sec=command["command_wall_time_sec"],
+                completion_wall_time_sec=(
+                    handed_over["wall_time_sec"]
+                    if handed_over is not None
+                    else status["wall_time_sec"]
+                ),
+                completion_sequence=(
+                    handed_over["sequence"]
+                    if handed_over is not None
+                    else status["sequence"]
+                ),
+                source=(
+                    handed_over["event_type"]
+                    if handed_over is not None
+                    else "successful_skill_status"
+                ),
+            )
+
+        returned = next(
+            (
+                row
+                for row in event_rows
+                if row["event_type"]
+                in {
+                    "PredictedToolReturnedToRack",
+                    "UnusedPrepositionReturned",
+                }
+            ),
+            None,
+        )
+        if returned is not None or (
+            action in UNUSED_PREPOSITION_RETURN_ACTIONS
+            and status is not None
+        ):
+            append_outcome(
+                "returns",
+                command_id=command_id,
+                action=action,
+                tool_id=(
+                    returned.get("tool_id", "")
+                    if returned is not None
+                    else tool_id
+                ),
+                instance_id=(
+                    returned.get("instance_id")
+                    if returned is not None
+                    else command["instance_id"]
+                ),
+                arm=(
+                    returned.get("arm")
+                    if returned is not None
+                    else command["arm"]
+                ),
+                command_time_sec=command["command_time_sec"],
+                completion_time_sec=(
+                    returned["time_sec"]
+                    if returned is not None
+                    else status["time_sec"]
+                ),
+                command_wall_time_sec=command["command_wall_time_sec"],
+                completion_wall_time_sec=(
+                    returned["wall_time_sec"]
+                    if returned is not None
+                    else status["wall_time_sec"]
+                ),
+                completion_sequence=(
+                    returned["sequence"]
+                    if returned is not None
+                    else status["sequence"]
+                ),
+                source=(
+                    returned["event_type"]
+                    if returned is not None
+                    else "successful_skill_status"
+                ),
+            )
+
+    event_kind = {
+        "ToolPrepared": "preparations",
+        "ToolHandoverCompleted": "handovers",
+        "ShadowAdditionalToolHandoverCompleted": "handovers",
+        "PredictedToolReturnedToRack": "returns",
+        "UnusedPrepositionReturned": "returns",
+    }
+    for command_id, rows in events_by_command.items():
+        if command_id not in commands:
+            event_only.extend(rows)
+    for row in event_only:
+        kind = event_kind.get(row["event_type"])
+        if not kind:
+            continue
+        append_outcome(
+            kind,
+            command_id=f"event:{row['sequence']}",
+            action={
+                "preparations": "prepare_tool",
+                "handovers": "handover",
+                "returns": "return_unused_preposition",
+            }[kind],
+            tool_id=row["tool_id"],
+            instance_id=row["instance_id"],
+            arm=row["arm"],
+            command_time_sec=row["time_sec"],
+            completion_time_sec=row["time_sec"],
+            command_wall_time_sec=row["wall_time_sec"],
+            completion_wall_time_sec=row["wall_time_sec"],
+            completion_sequence=row["sequence"],
+            source=row["event_type"],
+        )
+
+    for rows in outcomes.values():
+        rows.sort(
+            key=lambda row: (
+                row["completion_time_sec"],
+                row["outcome_id"],
+            )
+        )
+    return outcomes
+
+
+def _same_physical_outcome(
+    left: dict[str, Any],
+    right: dict[str, Any],
+) -> bool:
+    if left.get("tool_id") != right.get("tool_id"):
+        return False
+    left_instance = _clean(left.get("instance_id"))
+    right_instance = _clean(right.get("instance_id"))
+    if left_instance and right_instance:
+        return left_instance == right_instance
+    return True
+
+
+def _outcome_order_key(
+    outcome: dict[str, Any],
+) -> tuple[float, int]:
+    return (
+        _float(outcome.get("completion_time_sec")),
+        int(outcome.get("completion_sequence", 0) or 0),
+    )
+
+
+def _same_robot_arm(
+    left: dict[str, Any],
+    right: dict[str, Any],
+) -> bool:
+    left_arm = _clean(left.get("arm")).lower()
+    right_arm = _clean(right.get("arm")).lower()
+    return bool(left_arm and right_arm and left_arm == right_arm)
+
+
+def _preparation_invalidation_at_cutoff(
+    preparation: dict[str, Any],
+    *,
+    cutoff_sec: float,
+    preparations: list[dict[str, Any]],
+    handovers: list[dict[str, Any]],
+    returns: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    prepared_order = _outcome_order_key(preparation)
+    invalidations: list[dict[str, Any]] = []
+
+    def add_if_after(
+        outcome: dict[str, Any],
+        reason: str,
+    ) -> None:
+        outcome_order = _outcome_order_key(outcome)
+        if (
+            outcome_order <= prepared_order
+            or outcome_order[0] > cutoff_sec
+        ):
+            return
+        invalidations.append(
+            {
+                "reason": reason,
+                "outcome_id": outcome["outcome_id"],
+                "time_sec": outcome_order[0],
+                "sequence": outcome_order[1],
+            }
+        )
+
+    for outcome in returns:
+        if _same_physical_outcome(outcome, preparation):
+            add_if_after(outcome, "returned")
+    for outcome in handovers:
+        if _same_physical_outcome(outcome, preparation):
+            add_if_after(outcome, "consumed")
+        elif _same_robot_arm(outcome, preparation):
+            add_if_after(outcome, "displaced")
+    for outcome in preparations:
+        if (
+            outcome["outcome_id"] != preparation["outcome_id"]
+            and _same_robot_arm(outcome, preparation)
+        ):
+            add_if_after(outcome, "superseded")
+
+    return min(
+        invalidations,
+        key=lambda row: (row["time_sec"], row["sequence"]),
+        default=None,
+    )
+
+
+def _invariant_violation_audit(
+    trace_records: list[dict[str, Any]],
+) -> dict[str, Any]:
+    rows: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    active_bt_signature = ""
+    for record in sorted(
+        trace_records,
+        key=lambda row: (
+            _trace_time(row),
+            int(row.get("sequence", 0) or 0),
+        ),
+    ):
+        layer = _clean(record.get("layer"))
+        if layer not in {
+            "bt_decision",
+            "reducer_event",
+            "shadow_sink",
+            "skill_event",
+        }:
+            continue
+        payload = _payload(record)
+        direct_values = {
+            "event_type": _clean(payload.get("event_type")),
+            "input_type": _clean(payload.get("input_type")),
+            "reason": _clean(
+                payload.get("reason")
+                or payload.get("decision_reason")
+            ),
+            "guard": _clean(
+                payload.get("blocking_guard")
+                or payload.get("safety_status")
+            ),
+        }
+        signature = "|".join(
+            value.casefold() for value in direct_values.values() if value
+        )
+        is_violation = (
+            "invariant" in signature
+            or "blocked_invariant" in signature
+        )
+        if layer == "bt_decision":
+            if not is_violation:
+                active_bt_signature = ""
+                continue
+            if signature == active_bt_signature:
+                continue
+            active_bt_signature = signature
+        elif not is_violation:
+            continue
+
+        event_id = _clean(
+            payload.get("event_id")
+            or payload.get("input_id")
+            or payload.get("command_id")
+            or record.get("correlation_id")
+        )
+        dedupe_id = (
+            f"{layer}:{event_id}"
+            if event_id
+            else f"{layer}:{record.get('sequence', len(rows))}"
+        )
+        if dedupe_id in seen_ids:
+            continue
+        seen_ids.add(dedupe_id)
+        rows.append(
+            {
+                "source_layer": layer,
+                "time_sec": _trace_time(record),
+                "event_id": event_id or None,
+                **direct_values,
+            }
+        )
+    return {
+        "count": len(rows),
+        "by_source_layer": dict(
+            Counter(row["source_layer"] for row in rows)
+        ),
+        "events": rows,
+    }
+
+
+def _evaluate_behavior_quality(
+    *,
+    trace_records: list[dict[str, Any]],
+    ground_truth: list[dict[str, Any]],
+    targets: list[dict[str, Any]],
+    identity_map: dict[str, str],
+    evaluation_mask: EvaluationMask,
+) -> dict[str, Any]:
+    pairs, unmatched_requests = _pair_requests_to_handovers(
+        ground_truth=ground_truth,
+        targets=targets,
+        identity_map=identity_map,
+        evaluation_mask=evaluation_mask,
+    )
+    outcomes = _skill_action_outcomes(
+        trace_records,
+        identity_map=identity_map,
+    )
+    preparations = outcomes["preparations"]
+    handovers = outcomes["handovers"]
+    returns = outcomes["returns"]
+    request_wall_activations = _request_activation_wall_times(
+        trace_records
+    )
+
+    used_preparations: set[str] = set()
+    coverage_rows: list[dict[str, Any]] = []
+    for pair in pairs:
+        cutoff = (
+            pair["request_time_sec"]
+            if pair["request_time_sec"] is not None
+            else pair["target_time_sec"]
+        )
+        candidates: list[dict[str, Any]] = []
+        stale_preparations: list[dict[str, Any]] = []
+        for preparation in preparations:
+            if (
+                preparation["outcome_id"] in used_preparations
+                or preparation["tool_id"] != pair["tool_id"]
+                or preparation["completion_time_sec"] > cutoff
+            ):
+                continue
+            invalidation = _preparation_invalidation_at_cutoff(
+                preparation,
+                cutoff_sec=cutoff,
+                preparations=preparations,
+                handovers=handovers,
+                returns=returns,
+            )
+            if invalidation is None:
+                candidates.append(preparation)
+            else:
+                stale_preparations.append(
+                    {
+                        "preparation_outcome_id": preparation[
+                            "outcome_id"
+                        ],
+                        "instance_id": preparation.get("instance_id"),
+                        "invalidated_by_outcome_id": invalidation[
+                            "outcome_id"
+                        ],
+                        "invalidation_reason": invalidation["reason"],
+                        "invalidation_time_sec": invalidation["time_sec"],
+                    }
+                )
+        selected = max(
+            candidates,
+            key=_outcome_order_key,
+            default=None,
+        )
+        if selected is not None:
+            used_preparations.add(selected["outcome_id"])
+        coverage_rows.append(
+            {
+                "target_event_id": pair["target_event_id"],
+                "request_event_id": pair["request_event_id"],
+                "tool_id": pair["tool_id"],
+                "readiness_cutoff_sec": cutoff,
+                "cutoff_basis": (
+                    "confirmed_request"
+                    if pair["request_time_sec"] is not None
+                    else "confirmed_handover"
+                ),
+                "prepared": selected is not None,
+                "preparation_outcome_id": (
+                    selected["outcome_id"]
+                    if selected is not None
+                    else None
+                ),
+                "preparation_instance_id": (
+                    selected.get("instance_id")
+                    if selected is not None
+                    else None
+                ),
+                "preparation_lead_sec": (
+                    round(
+                        cutoff - selected["completion_time_sec"],
+                        6,
+                    )
+                    if selected is not None
+                    else None
+                ),
+                "stale_preparation_count": len(stale_preparations),
+                "stale_preparations": stale_preparations,
+            }
+        )
+    prepared_target_count = sum(row["prepared"] for row in coverage_rows)
+    preparation_coverage = (
+        prepared_target_count / len(coverage_rows)
+        if coverage_rows
+        else None
+    )
+
+    used_handover_outcomes: set[str] = set()
+    request_rows: list[dict[str, Any]] = []
+    requested_pairs = [
+        pair for pair in pairs if pair["request_time_sec"] is not None
+    ]
+    requested_pairs.sort(
+        key=lambda row: (
+            row["request_time_sec"],
+            row["target_event_id"],
+        )
+    )
+    request_pipeline_activations = _request_pipeline_activations(
+        trace_records=trace_records,
+        requested_pairs=requested_pairs,
+        identity_map=identity_map,
+    )
+    for index, pair in enumerate(requested_pairs):
+        previous_request_time = (
+            requested_pairs[index - 1]["request_time_sec"]
+            if index > 0
+            else None
+        )
+        next_request_time = (
+            requested_pairs[index + 1]["request_time_sec"]
+            if index + 1 < len(requested_pairs)
+            else None
+        )
+        earliest_match_time = (
+            pair["request_time_sec"]
+            - REQUEST_HANDOVER_EARLY_MATCH_TOLERANCE_SEC
+        )
+        if previous_request_time is not None:
+            earliest_match_time = max(
+                earliest_match_time,
+                previous_request_time,
+            )
+        candidates = [
+            outcome
+            for outcome in handovers
+            if outcome["outcome_id"] not in used_handover_outcomes
+            and outcome["tool_id"] == pair["tool_id"]
+            and outcome["completion_time_sec"] >= earliest_match_time
+            and (
+                next_request_time is None
+                or outcome["completion_time_sec"] < next_request_time
+            )
+        ]
+        selected = min(
+            candidates,
+            key=lambda row: row["completion_time_sec"],
+            default=None,
+        )
+        if selected is not None:
+            used_handover_outcomes.add(selected["outcome_id"])
+        request_activation = request_wall_activations.get(
+            _clean(pair["request_event_id"])
+        )
+        request_wall_time = (
+            request_activation["wall_time_sec"]
+            if request_activation is not None
+            else None
+        )
+        handover_wall_time = (
+            selected.get("completion_wall_time_sec")
+            if selected is not None
+            else None
+        )
+        wall_clock_latency = _non_negative_elapsed(
+            start_sec=request_wall_time,
+            end_sec=handover_wall_time,
+        )
+        source_offset = (
+            round(
+                selected["completion_time_sec"]
+                - pair["request_time_sec"],
+                6,
+            )
+            if selected is not None
+            else None
+        )
+        pipeline = request_pipeline_activations.get(
+            _clean(pair["request_event_id"]),
+            {},
+        )
+        dt_fact = pipeline.get("dt_request_fact")
+        bt_acceptance = pipeline.get("bt_request_acceptance")
+        dt_fact_time = (
+            float(dt_fact["source_time_sec"])
+            if isinstance(dt_fact, dict)
+            else None
+        )
+        dt_fact_wall_time = (
+            dt_fact.get("wall_time_sec")
+            if isinstance(dt_fact, dict)
+            else None
+        )
+        bt_acceptance_time = (
+            float(bt_acceptance["source_time_sec"])
+            if isinstance(bt_acceptance, dict)
+            else None
+        )
+        bt_acceptance_wall_time = (
+            bt_acceptance.get("wall_time_sec")
+            if isinstance(bt_acceptance, dict)
+            else None
+        )
+        gt_to_dt_offset = (
+            round(dt_fact_time - pair["request_time_sec"], 6)
+            if dt_fact_time is not None
+            else None
+        )
+        gt_to_dt_wall_offset = (
+            round(dt_fact_wall_time - request_wall_time, 6)
+            if dt_fact_wall_time is not None
+            and request_wall_time is not None
+            else None
+        )
+        request_rows.append(
+            {
+                "request_event_id": pair["request_event_id"],
+                "target_event_id": pair["target_event_id"],
+                "tool_id": pair["tool_id"],
+                "request_time_sec": pair["request_time_sec"],
+                "reference_handover_time_sec": pair["target_time_sec"],
+                "system_handover_outcome_id": (
+                    selected["outcome_id"]
+                    if selected is not None
+                    else None
+                ),
+                "system_handover_time_sec": (
+                    selected["completion_time_sec"]
+                    if selected is not None
+                    else None
+                ),
+                "latency_sec": (
+                    max(0.0, source_offset)
+                    if selected is not None
+                    else None
+                ),
+                "response_offset_sec": source_offset,
+                "early_match": bool(
+                    source_offset is not None and source_offset < 0.0
+                ),
+                "early_lead_sec": (
+                    round(-source_offset, 6)
+                    if source_offset is not None and source_offset < 0.0
+                    else None
+                ),
+                "request_wall_time_sec": request_wall_time,
+                "system_handover_wall_time_sec": handover_wall_time,
+                "wall_clock_latency_sec": wall_clock_latency,
+                "dt_request_fact_source": (
+                    dt_fact.get("source")
+                    if isinstance(dt_fact, dict)
+                    else None
+                ),
+                "dt_request_fact_time_sec": dt_fact_time,
+                "dt_request_fact_wall_time_sec": dt_fact_wall_time,
+                "ground_truth_to_dt_request_fact_offset_sec": (
+                    gt_to_dt_offset
+                ),
+                "ground_truth_to_dt_request_fact_latency_sec": (
+                    max(0.0, gt_to_dt_offset)
+                    if gt_to_dt_offset is not None
+                    else None
+                ),
+                "ground_truth_to_dt_request_fact_wall_clock_offset_sec": (
+                    gt_to_dt_wall_offset
+                ),
+                "ground_truth_to_dt_request_fact_wall_clock_latency_sec": (
+                    max(0.0, gt_to_dt_wall_offset)
+                    if gt_to_dt_wall_offset is not None
+                    else None
+                ),
+                "bt_request_acceptance_source": (
+                    bt_acceptance.get("source")
+                    if isinstance(bt_acceptance, dict)
+                    else None
+                ),
+                "bt_request_acceptance_time_sec": bt_acceptance_time,
+                "bt_request_acceptance_wall_time_sec": (
+                    bt_acceptance_wall_time
+                ),
+                "dt_request_fact_to_bt_acceptance_latency_sec": (
+                    _non_negative_elapsed(
+                        start_sec=dt_fact_time,
+                        end_sec=bt_acceptance_time,
+                    )
+                ),
+                "dt_request_fact_to_bt_acceptance_wall_clock_latency_sec": (
+                    _non_negative_elapsed(
+                        start_sec=dt_fact_wall_time,
+                        end_sec=bt_acceptance_wall_time,
+                    )
+                ),
+                "bt_acceptance_to_handover_latency_sec": (
+                    _non_negative_elapsed(
+                        start_sec=bt_acceptance_time,
+                        end_sec=(
+                            selected["completion_time_sec"]
+                            if selected is not None
+                            else None
+                        ),
+                    )
+                ),
+                "bt_acceptance_to_handover_wall_clock_latency_sec": (
+                    _non_negative_elapsed(
+                        start_sec=bt_acceptance_wall_time,
+                        end_sec=handover_wall_time,
+                    )
+                ),
+                "completed": selected is not None,
+            }
+        )
+    request_latencies = [
+        row["latency_sec"]
+        for row in request_rows
+        if row["latency_sec"] is not None
+    ]
+    request_wall_clock_latencies = [
+        row["wall_clock_latency_sec"]
+        for row in request_rows
+        if row["wall_clock_latency_sec"] is not None
+    ]
+    request_pipeline_latency = {
+        "ground_truth_to_dt_request_fact_latency_sec": _distribution(
+            row["ground_truth_to_dt_request_fact_latency_sec"]
+            for row in request_rows
+            if row["ground_truth_to_dt_request_fact_latency_sec"]
+            is not None
+        ),
+        "ground_truth_to_dt_request_fact_wall_clock_latency_sec": (
+            _distribution(
+                row[
+                    "ground_truth_to_dt_request_fact_wall_clock_latency_sec"
+                ]
+                for row in request_rows
+                if row[
+                    "ground_truth_to_dt_request_fact_wall_clock_latency_sec"
+                ]
+                is not None
+            )
+        ),
+        "dt_request_fact_to_bt_acceptance_latency_sec": _distribution(
+            row["dt_request_fact_to_bt_acceptance_latency_sec"]
+            for row in request_rows
+            if row["dt_request_fact_to_bt_acceptance_latency_sec"]
+            is not None
+        ),
+        "dt_request_fact_to_bt_acceptance_wall_clock_latency_sec": (
+            _distribution(
+                row[
+                    "dt_request_fact_to_bt_acceptance_wall_clock_latency_sec"
+                ]
+                for row in request_rows
+                if row[
+                    "dt_request_fact_to_bt_acceptance_wall_clock_latency_sec"
+                ]
+                is not None
+            )
+        ),
+        "bt_acceptance_to_handover_latency_sec": _distribution(
+            row["bt_acceptance_to_handover_latency_sec"]
+            for row in request_rows
+            if row["bt_acceptance_to_handover_latency_sec"] is not None
+        ),
+        "bt_acceptance_to_handover_wall_clock_latency_sec": (
+            _distribution(
+                row[
+                    "bt_acceptance_to_handover_wall_clock_latency_sec"
+                ]
+                for row in request_rows
+                if row[
+                    "bt_acceptance_to_handover_wall_clock_latency_sec"
+                ]
+                is not None
+            )
+        ),
+        "dt_request_fact_observed_count": sum(
+            row["dt_request_fact_time_sec"] is not None
+            for row in request_rows
+        ),
+        "bt_request_acceptance_count": sum(
+            row["bt_request_acceptance_time_sec"] is not None
+            for row in request_rows
+        ),
+        "early_dt_request_fact_count": sum(
+            (
+                row["ground_truth_to_dt_request_fact_offset_sec"]
+                is not None
+                and row["ground_truth_to_dt_request_fact_offset_sec"] < 0.0
+            )
+            for row in request_rows
+        ),
+    }
+
+    coverage_by_target = {
+        row["target_event_id"]: row for row in coverage_rows
+    }
+    request_readiness_rows: list[dict[str, Any]] = []
+    for request_row in request_rows:
+        coverage_row = coverage_by_target.get(
+            request_row["target_event_id"],
+            {},
+        )
+        prepared_at_request = bool(coverage_row.get("prepared"))
+        early_handover = bool(request_row.get("early_match"))
+        request_readiness_rows.append(
+            {
+                "request_event_id": request_row["request_event_id"],
+                "target_event_id": request_row["target_event_id"],
+                "tool_id": request_row["tool_id"],
+                "ready": prepared_at_request or early_handover,
+                "readiness_mode": (
+                    "prepared"
+                    if prepared_at_request
+                    else "early_handover"
+                    if early_handover
+                    else None
+                ),
+                "prepared_at_request": prepared_at_request,
+                "preparation_outcome_id": coverage_row.get(
+                    "preparation_outcome_id"
+                ),
+                "preparation_lead_sec": coverage_row.get(
+                    "preparation_lead_sec"
+                ),
+                "early_handover": early_handover,
+                "early_handover_lead_sec": request_row.get(
+                    "early_lead_sec"
+                ),
+                "handover_outcome_id": request_row.get(
+                    "system_handover_outcome_id"
+                ),
+            }
+        )
+    request_ready_count = sum(
+        row["ready"] for row in request_readiness_rows
+    )
+    request_readiness_coverage = (
+        request_ready_count / len(request_readiness_rows)
+        if request_readiness_rows
+        else None
+    )
+
+    unnecessary_rows: list[dict[str, Any]] = []
+    wrong_rows: list[dict[str, Any]] = []
+    used_returns: set[str] = set()
+    for preparation in preparations:
+        prepared_time = preparation["completion_time_sec"]
+        next_pair = next(
+            (
+                pair
+                for pair in pairs
+                if pair["target_time_sec"] >= prepared_time
+            ),
+            None,
+        )
+        cutoff = (
+            (
+                next_pair["request_time_sec"]
+                if next_pair["request_time_sec"] is not None
+                else next_pair["target_time_sec"]
+            )
+            if next_pair is not None
+            else None
+        )
+        first_return = next(
+            (
+                row
+                for row in returns
+                if _same_physical_outcome(row, preparation)
+                and row["completion_time_sec"] >= prepared_time
+            ),
+            None,
+        )
+        useful = bool(
+            next_pair is not None
+            and next_pair["tool_id"] == preparation["tool_id"]
+            and (
+                first_return is None
+                or first_return["completion_time_sec"] > cutoff
+            )
+        )
+        unnecessary_rows.append(
+            {
+                "preparation_outcome_id": preparation["outcome_id"],
+                "tool_id": preparation["tool_id"],
+                "instance_id": preparation.get("instance_id"),
+                "prepared_time_sec": prepared_time,
+                "next_target_event_id": (
+                    next_pair["target_event_id"]
+                    if next_pair is not None
+                    else None
+                ),
+                "next_target_tool_id": (
+                    next_pair["tool_id"]
+                    if next_pair is not None
+                    else None
+                ),
+                "classification": "useful" if useful else "unnecessary",
+                "returned_before_use": bool(
+                    first_return is not None
+                    and (
+                        cutoff is None
+                        or first_return["completion_time_sec"] <= cutoff
+                    )
+                ),
+            }
+        )
+
+        if (
+            next_pair is None
+            or next_pair["tool_id"] == preparation["tool_id"]
+        ):
+            continue
+        next_request_activation = request_wall_activations.get(
+            _clean(next_pair["request_event_id"])
+        )
+        contradiction_time = max(
+            prepared_time,
+            (
+                next_pair["request_time_sec"]
+                if next_pair["request_time_sec"] is not None
+                else next_pair["target_time_sec"]
+            ),
+        )
+        if (
+            first_return is not None
+            and first_return["completion_time_sec"] < contradiction_time
+        ):
+            continue
+        consumed_before_contradiction = any(
+            _same_physical_outcome(outcome, preparation)
+            and prepared_time
+            <= outcome["completion_time_sec"]
+            < contradiction_time
+            for outcome in handovers
+        )
+        if consumed_before_contradiction:
+            continue
+        release = next(
+            (
+                row
+                for row in returns
+                if row["outcome_id"] not in used_returns
+                and _same_physical_outcome(row, preparation)
+                and row["completion_time_sec"] >= contradiction_time
+            ),
+            None,
+        )
+        if release is not None:
+            used_returns.add(release["outcome_id"])
+        preparation_wall_time = preparation.get(
+            "completion_wall_time_sec"
+        )
+        request_wall_time = (
+            next_request_activation["wall_time_sec"]
+            if next_request_activation is not None
+            else None
+        )
+        contradiction_wall_time = (
+            max(preparation_wall_time, request_wall_time)
+            if preparation_wall_time is not None
+            and request_wall_time is not None
+            else None
+        )
+        release_wall_time = (
+            release.get("completion_wall_time_sec")
+            if release is not None
+            else None
+        )
+        wall_clock_release_latency = _non_negative_elapsed(
+            start_sec=contradiction_wall_time,
+            end_sec=release_wall_time,
+        )
+        wrong_rows.append(
+            {
+                "preparation_outcome_id": preparation["outcome_id"],
+                "prepared_tool_id": preparation["tool_id"],
+                "prepared_instance_id": preparation.get("instance_id"),
+                "contradicting_target_event_id": next_pair[
+                    "target_event_id"
+                ],
+                "requested_tool_id": next_pair["tool_id"],
+                "contradiction_time_sec": contradiction_time,
+                "release_outcome_id": (
+                    release["outcome_id"] if release is not None else None
+                ),
+                "release_time_sec": (
+                    release["completion_time_sec"]
+                    if release is not None
+                    else None
+                ),
+                "release_latency_sec": (
+                    round(
+                        release["completion_time_sec"]
+                        - contradiction_time,
+                        6,
+                    )
+                    if release is not None
+                    else None
+                ),
+                "contradiction_wall_time_sec": contradiction_wall_time,
+                "release_wall_time_sec": release_wall_time,
+                "wall_clock_release_latency_sec": (
+                    wall_clock_release_latency
+                ),
+                "released": release is not None,
+            }
+        )
+
+    abandoned_rows: list[dict[str, Any]] = []
+    paired_abandoned_preparations: set[str] = set()
+    for release in returns:
+        candidates = []
+        for preparation in preparations:
+            if (
+                preparation["outcome_id"] in paired_abandoned_preparations
+                or preparation["completion_time_sec"]
+                > release["completion_time_sec"]
+                or not _same_physical_outcome(release, preparation)
+            ):
+                continue
+            consumed_before_release = any(
+                _same_physical_outcome(outcome, preparation)
+                and preparation["completion_time_sec"]
+                <= outcome["completion_time_sec"]
+                <= release["completion_time_sec"]
+                for outcome in handovers
+            )
+            if not consumed_before_release:
+                candidates.append(preparation)
+        preparation = max(
+            candidates,
+            key=_outcome_order_key,
+            default=None,
+        )
+        if preparation is None:
+            continue
+        paired_abandoned_preparations.add(preparation["outcome_id"])
+        source_hold_duration = max(
+            0.0,
+            release["completion_time_sec"]
+            - preparation["completion_time_sec"],
+        )
+        wall_hold_duration = _non_negative_elapsed(
+            start_sec=preparation.get("completion_wall_time_sec"),
+            end_sec=release.get("completion_wall_time_sec"),
+        )
+        abandoned_rows.append(
+            {
+                "preparation_outcome_id": preparation["outcome_id"],
+                "prepared_tool_id": preparation["tool_id"],
+                "prepared_instance_id": preparation.get("instance_id"),
+                "preparation_time_sec": preparation["completion_time_sec"],
+                "release_outcome_id": release["outcome_id"],
+                "release_time_sec": release["completion_time_sec"],
+                "hold_duration_sec": round(source_hold_duration, 6),
+                "preparation_wall_time_sec": preparation.get(
+                    "completion_wall_time_sec"
+                ),
+                "release_wall_time_sec": release.get(
+                    "completion_wall_time_sec"
+                ),
+                "wall_clock_hold_duration_sec": wall_hold_duration,
+                "instance_identity_assumed": not bool(
+                    _clean(preparation.get("instance_id"))
+                    and _clean(release.get("instance_id"))
+                ),
+            }
+        )
+
+    wrong_release_latencies = [
+        row["release_latency_sec"]
+        for row in wrong_rows
+        if row["release_latency_sec"] is not None
+    ]
+    wrong_release_wall_clock_latencies = [
+        row["wall_clock_release_latency_sec"]
+        for row in wrong_rows
+        if row["wall_clock_release_latency_sec"] is not None
+    ]
+    abandoned_hold_durations = [
+        row["hold_duration_sec"] for row in abandoned_rows
+    ]
+    abandoned_wall_clock_hold_durations = [
+        row["wall_clock_hold_duration_sec"]
+        for row in abandoned_rows
+        if row["wall_clock_hold_duration_sec"] is not None
+    ]
+    unnecessary_count = sum(
+        row["classification"] == "unnecessary"
+        for row in unnecessary_rows
+    )
+    invariant_audit = _invariant_violation_audit(trace_records)
+    summary = {
+        "preparation_coverage": preparation_coverage,
+        "request_readiness_coverage": request_readiness_coverage,
+        "request_to_handover_latency_sec": _distribution(
+            request_latencies
+        ),
+        "request_to_handover_wall_clock_latency_sec": _distribution(
+            request_wall_clock_latencies
+        ),
+        "wrong_preposition_release_latency_sec": _distribution(
+            wrong_release_latencies
+        ),
+        "wrong_preposition_release_wall_clock_latency_sec": _distribution(
+            wrong_release_wall_clock_latencies
+        ),
+        "abandoned_preposition_hold_duration_sec": _distribution(
+            abandoned_hold_durations
+        ),
+        "abandoned_preposition_wall_clock_hold_duration_sec": _distribution(
+            abandoned_wall_clock_hold_durations
+        ),
+        "abandoned_preposition_count": len(abandoned_rows),
+        "request_pipeline_latency": request_pipeline_latency,
+        "unnecessary_preparation_count": unnecessary_count,
+        "unnecessary_preparation_rate": (
+            unnecessary_count / len(preparations)
+            if preparations
+            else None
+        ),
+        "invariant_violation_count": invariant_audit["count"],
+    }
+    report = {
+        "schema": BEHAVIOR_QUALITY_SCHEMA,
+        "status": (
+            "complete"
+            if targets or preparations or trace_records
+            else "not_available"
+        ),
+        "reference_quality": (
+            "confirmed evaluation-only request and handover events"
+        ),
+        "latency_clock_semantics": {
+            "source_clock": (
+                "Replay source time; elastic skill holds can pause this clock."
+            ),
+            "wall_clock": (
+                "Elapsed trace wall time from the first active confirmed "
+                "request record to the observed skill completion."
+            ),
+            "pipeline": (
+                "Offline-only decomposition: confirmed reference request to "
+                "the first matching DT request fact, DT fact to BT request "
+                "acceptance, and BT acceptance to observed handover "
+                "completion."
+            ),
+        },
+        "summary": summary,
+        "preparation_coverage": {
+            "eligible_handover_count": len(coverage_rows),
+            "prepared_before_request_count": prepared_target_count,
+            "missed_preparation_count": (
+                len(coverage_rows) - prepared_target_count
+            ),
+            "coverage": preparation_coverage,
+            "targets": coverage_rows,
+        },
+        "request_readiness": {
+            "evaluable_request_count": len(request_readiness_rows),
+            "ready_before_request_count": request_ready_count,
+            "prepared_at_request_count": sum(
+                row["prepared_at_request"]
+                for row in request_readiness_rows
+            ),
+            "early_handover_count": sum(
+                row["early_handover"] for row in request_readiness_rows
+            ),
+            "coverage": request_readiness_coverage,
+            "requests": request_readiness_rows,
+        },
+        "request_to_handover": {
+            "paired_request_count": len(request_rows),
+            "completed_count": sum(row["completed"] for row in request_rows),
+            "missed_count": sum(
+                not row["completed"] for row in request_rows
+            ),
+            "unmatched_confirmed_request_count": len(unmatched_requests),
+            "latency_sec": summary[
+                "request_to_handover_latency_sec"
+            ],
+            "wall_clock_latency_sec": summary[
+                "request_to_handover_wall_clock_latency_sec"
+            ],
+            "episodes": request_rows,
+        },
+        "request_pipeline_latency": request_pipeline_latency,
+        "wrong_preposition_release": {
+            "wrong_preposition_count": len(wrong_rows),
+            "released_count": sum(row["released"] for row in wrong_rows),
+            "unreleased_count": sum(
+                not row["released"] for row in wrong_rows
+            ),
+            "latency_sec": summary[
+                "wrong_preposition_release_latency_sec"
+            ],
+            "wall_clock_latency_sec": summary[
+                "wrong_preposition_release_wall_clock_latency_sec"
+            ],
+            "episodes": wrong_rows,
+        },
+        "abandoned_preposition": {
+            "returned_before_use_count": len(abandoned_rows),
+            "hold_duration_sec": summary[
+                "abandoned_preposition_hold_duration_sec"
+            ],
+            "wall_clock_hold_duration_sec": summary[
+                "abandoned_preposition_wall_clock_hold_duration_sec"
+            ],
+            "episodes": abandoned_rows,
+        },
+        "unnecessary_preparation": {
+            "completed_preparation_count": len(preparations),
+            "useful_preparation_count": (
+                len(preparations) - unnecessary_count
+            ),
+            "unnecessary_preparation_count": unnecessary_count,
+            "unnecessary_preparation_rate": summary[
+                "unnecessary_preparation_rate"
+            ],
+            "preparations": unnecessary_rows,
+        },
+        "invariant_violations": invariant_audit,
+        "notes": [
+            (
+                "Reference labels are read only by this offline evaluator and "
+                "are never emitted as runtime VLM, reducer, or BT inputs."
+            ),
+            (
+                "Preparation coverage requires a completed preparation before "
+                "the paired confirmed request that remains active at the "
+                "cutoff; consumed, returned, displaced, or superseded "
+                "preparations are stale. When no request label exists, the "
+                "confirmed handover time is the conservative cutoff."
+            ),
+            (
+                "Request readiness counts a requested tool as ready when a "
+                "matching preparation is still held at the request boundary "
+                "or when a matching handover completed within the explicit "
+                "early-match tolerance. It measures operational readiness, "
+                "not forecast-label accuracy."
+            ),
+            (
+                "A preparation is useful only for the next confirmed ordinary "
+                "handover target; a later same-tool target does not "
+                "retroactively justify blocking the robot hand."
+            ),
+            (
+                "Wrong-preposition release latency starts when the next "
+                "confirmed request or handover establishes a different "
+                "immediate tool target."
+            ),
+            (
+                "Abandoned-preposition hold duration measures every completed "
+                "preparation that is returned before a matching handover, from "
+                "preparation completion to source-return completion. It captures "
+                "evidence withdrawal and prediction churn even when the next "
+                "confirmed target is the same tool or is not yet labelled."
+            ),
+            (
+                "Source-clock latency preserves replay-video timing. "
+                "Wall-clock latency starts at the first evaluation-only "
+                "ground-truth request activation and ends at the observed "
+                "skill event or successful terminal status, so elastic replay "
+                "holds remain visible."
+            ),
+            (
+                "Wall-clock latency is unavailable when a confirmed request "
+                "has no matching active evaluation-ground-truth trace record; "
+                "the evaluator does not infer wall time from source time."
+            ),
+            (
+                "Pipeline latency uses only emitted reducer and BT records. "
+                "The runtime never receives the reference request; reference "
+                "timestamps are joined only in this offline evaluator."
+            ),
+            (
+                "A same-tool handover up to "
+                f"{REQUEST_HANDOVER_EARLY_MATCH_TOLERANCE_SEC:.1f}s before a "
+                "confirmed request boundary is retained as an explicit "
+                "early_match. Source latency is floored at zero and the "
+                "signed response_offset_sec remains available for audit."
+            ),
+            (
+                "Invariant counts use explicit reducer, BT guard, shadow "
+                "admission, or skill event markers and ignore repeated "
+                "runtime-state snapshots."
+            ),
+        ],
+    }
+    errors = validate_behavior_quality_report(report)
+    if errors:
+        raise ValueError(
+            "internal behavior-quality contract failure: "
+            + "; ".join(errors)
+        )
+    return report
 
 
 def _evaluate_command_fulfillment(
@@ -2825,6 +5324,7 @@ def _build_scorecard(
     identity_map: dict[str, str],
     evaluation_mask: EvaluationMask,
     tool_inventory: dict[str, int],
+    specialized_group_actions: dict[str, Any],
 ) -> dict[str, Any]:
     phase_rows = {
         layer: {
@@ -2848,11 +5348,71 @@ def _build_scorecard(
         ):
             continue
         outcomes = payload.get("outcomes", {})
+        target_count = int(payload.get("target_count", 0) or 0)
+        combined_correct = int(outcomes.get("exact_match", 0) or 0)
+        proactive_correct = int(
+            payload.get(
+                "proactive_exact_count",
+                payload.get("anticipatory_exact_count", 0),
+            )
+            or 0
+        )
+        pre_request_correct = int(
+            payload.get("pre_request_proactive_exact_count", 0) or 0
+        )
+        unrequested_forecast_correct = int(
+            payload.get(
+                "unrequested_pre_handover_exact_count",
+                0,
+            )
+            or 0
+        )
+        post_request_visual_correct = int(
+            payload.get("post_request_visual_exact_count", 0) or 0
+        )
+        request_backed_correct = int(
+            payload.get("request_backed_exact_count", 0) or 0
+        )
         tool_rows[layer] = {
-            "correct_count": outcomes.get("exact_match", 0),
-            "evaluated_count": payload.get("target_count", 0),
+            "correct_count": combined_correct,
+            "evaluated_count": target_count,
             "accuracy": payload.get("top1_exact_rate"),
             "false_positive_count": payload.get("false_positive_count", 0),
+            "combined_action_selection_correct_count": combined_correct,
+            "combined_action_selection_accuracy": payload.get(
+                "top1_exact_rate"
+            ),
+            "proactive_correct_count": proactive_correct,
+            "proactive_target_recall": (
+                proactive_correct / target_count
+                if target_count
+                else None
+            ),
+            # Compatibility aliases for existing scorecard consumers.
+            "anticipatory_correct_count": proactive_correct,
+            "anticipatory_target_recall": (
+                proactive_correct / target_count
+                if target_count
+                else None
+            ),
+            "pre_request_proactive_correct_count": pre_request_correct,
+            "unrequested_pre_handover_correct_count": (
+                unrequested_forecast_correct
+            ),
+            "post_request_visual_correct_count": (
+                post_request_visual_correct
+            ),
+            "post_request_visual_target_recall": (
+                post_request_visual_correct / target_count
+                if target_count
+                else None
+            ),
+            "request_backed_correct_count": request_backed_correct,
+            "request_backed_target_recall": (
+                request_backed_correct / target_count
+                if target_count
+                else None
+            ),
         }
     return {
         "schema": "taskplanner.shadow_scorecard.v1",
@@ -2864,6 +5424,24 @@ def _build_scorecard(
         },
         "next_tool_prediction": {
             "reference_quality": "confirmed handover targets",
+            "metric_semantics": {
+                "proactive_target_recall": (
+                    "Targets correctly forecast before the paired confirmed "
+                    "request; targets without a request label must be "
+                    "forecast before handover."
+                ),
+                "post_request_visual_target_recall": (
+                    "Targets first recognized visually after the paired "
+                    "confirmed request but before handover."
+                ),
+                "request_backed_target_recall": (
+                    "Targets correctly selected after public request evidence."
+                ),
+                "combined_action_selection_accuracy": (
+                    "Legacy combined exact rate; not anticipatory forecast "
+                    "accuracy."
+                ),
+            },
             "layers": tool_rows,
         },
         "intent_recognition": _evaluate_vlm_intent(
@@ -2888,9 +5466,39 @@ def _build_scorecard(
             tool_inventory=tool_inventory,
         ),
         "command_fulfillment": _evaluate_command_fulfillment(trace_records),
+        "specialized_group_action": {
+            "status": specialized_group_actions.get("status"),
+            "reference_quality": specialized_group_actions.get(
+                "reference_quality"
+            ),
+            "correct_count": specialized_group_actions.get(
+                "exact_match_count",
+                0,
+            ),
+            "evaluated_count": specialized_group_actions.get(
+                "target_count",
+                0,
+            ),
+            "accuracy": specialized_group_actions.get("command_recall"),
+            "false_positive_count": specialized_group_actions.get(
+                "false_positive_command_count",
+                0,
+            ),
+            "unscorable_command_count": specialized_group_actions.get(
+                "unscorable_activation_command_count",
+                0,
+            ),
+            "terminal_success_count": specialized_group_actions.get(
+                "terminal_success_count",
+                0,
+            ),
+            "execution_fulfillment_rate": specialized_group_actions.get(
+                "execution_fulfillment_rate"
+            ),
+        },
         "bt_decision": tool_rows.get("bt_decision", {}),
         "notes": [
-            "0704_6 is a development/calibration case, not a held-out generalization result.",
+            "Replay cases used during iteration are development/calibration data, not held-out generalization results.",
             "Provisional Phase scores must be revised if later label adjudication changes the boundaries.",
             "Top-1 tool accuracy combines anticipatory forecasts and public request-backed tool identification; report both source counts.",
         ],
@@ -2905,6 +5513,7 @@ def evaluate_shadow(
     mode: str = "strict",
     stable_sec: float = 3.0,
     max_prediction_age_sec: float = 3.0,
+    request_reaction_window_sec: float = 2.0,
     episode_gap_sec: float = 2.5,
     recovery_reuse_warning_sec: float = 15.0,
     phase_ground_truth: list[dict[str, Any]] | None = None,
@@ -2943,6 +5552,45 @@ def evaluate_shadow(
         tool_identity_map=identity_map,
         evaluation_mask=mask,
     )
+    (
+        specialized_group_actions,
+        specialized_target_ids,
+    ) = _evaluate_specialized_group_actions(
+        records=decisions,
+        targets=targets,
+        timeline=timeline,
+        lead_window_sec=lead_window_sec,
+        tool_identity_map=identity_map,
+    )
+    ordinary_targets = [
+        target
+        for target in targets
+        if _clean(target.get("event_id")) not in specialized_target_ids
+    ]
+    request_pairs, _unmatched_requests = _pair_requests_to_handovers(
+        ground_truth=ground_truth,
+        targets=ordinary_targets,
+        identity_map=identity_map,
+        evaluation_mask=mask,
+    )
+    request_time_by_target_id = {
+        _clean(pair["target_event_id"]): float(pair["request_time_sec"])
+        for pair in request_pairs
+        if pair.get("request_time_sec") is not None
+    }
+    behavior_quality = _evaluate_behavior_quality(
+        trace_records=decisions,
+        ground_truth=ground_truth,
+        targets=ordinary_targets,
+        identity_map=identity_map,
+        evaluation_mask=mask,
+    )
+    reference["confirmed_ordinary_handover_count"] = len(
+        ordinary_targets
+    )
+    reference["confirmed_specialized_group_action_count"] = len(
+        specialized_target_ids
+    )
     predictions_by_layer = extract_predictions(
         decisions,
         tool_identity_map=identity_map,
@@ -2973,6 +5621,7 @@ def evaluate_shadow(
                 "lead_window_sec": lead_window_sec,
                 "stable_sec": stable_sec,
                 "max_prediction_age_sec": max_prediction_age_sec,
+                "request_reaction_window_sec": request_reaction_window_sec,
                 "episode_gap_sec": episode_gap_sec,
                 "recovery_reuse_warning_sec": recovery_reuse_warning_sec,
             },
@@ -2982,6 +5631,8 @@ def evaluate_shadow(
             "evaluation_mask": mask.report(),
             "state_audit": timeline.state_audit(),
             "phase": phase_report,
+            "specialized_group_actions": specialized_group_actions,
+            "behavior_quality": behavior_quality,
             "runtime": _runtime_metrics(decisions, trace_errors=trace_errors),
             "notes": [
                 "No metric was computed because there are no confirmed reference events.",
@@ -2992,13 +5643,15 @@ def evaluate_shadow(
             phase=phase_report,
             layers={},
             trace_records=decisions,
-            targets=targets,
+            targets=ordinary_targets,
             ground_truth=ground_truth,
             lead_window_sec=lead_window_sec,
             identity_map=identity_map,
             evaluation_mask=mask,
             tool_inventory=inventory,
+            specialized_group_actions=specialized_group_actions,
         )
+        report["scorecard"]["behavior_quality"] = behavior_quality
         return report
     if not targets:
         action_targets_masked = (
@@ -3017,6 +5670,7 @@ def evaluate_shadow(
                 "lead_window_sec": lead_window_sec,
                 "stable_sec": stable_sec,
                 "max_prediction_age_sec": max_prediction_age_sec,
+                "request_reaction_window_sec": request_reaction_window_sec,
                 "episode_gap_sec": episode_gap_sec,
                 "recovery_reuse_warning_sec": recovery_reuse_warning_sec,
             },
@@ -3026,6 +5680,8 @@ def evaluate_shadow(
             "evaluation_mask": mask.report(),
             "state_audit": timeline.state_audit(),
             "phase": phase_report,
+            "specialized_group_actions": specialized_group_actions,
+            "behavior_quality": behavior_quality,
             "runtime": _runtime_metrics(decisions, trace_errors=trace_errors),
             "notes": [
                 (
@@ -3040,13 +5696,15 @@ def evaluate_shadow(
             phase=phase_report,
             layers={},
             trace_records=decisions,
-            targets=targets,
+            targets=ordinary_targets,
             ground_truth=ground_truth,
             lead_window_sec=lead_window_sec,
             identity_map=identity_map,
             evaluation_mask=mask,
             tool_inventory=inventory,
+            specialized_group_actions=specialized_group_actions,
         )
+        report["scorecard"]["behavior_quality"] = behavior_quality
         return report
 
     layers: dict[str, Any] = {}
@@ -3058,11 +5716,13 @@ def evaluate_shadow(
         layers[layer] = _evaluate_layer(
             layer=layer,
             episodes=episodes,
-            targets=targets,
+            targets=ordinary_targets,
+            request_time_by_target_id=request_time_by_target_id,
             timeline=timeline,
             lead_window_sec=lead_window_sec,
             stable_sec=stable_sec,
             max_prediction_age_sec=max_prediction_age_sec,
+            request_reaction_window_sec=request_reaction_window_sec,
         )
     skill_episodes = collapse_prediction_episodes(
         predictions_by_layer["skill_command"],
@@ -3119,9 +5779,20 @@ def evaluate_shadow(
             else "Oracle mode is a downstream upper-bound baseline and is not end-to-end performance."
         ),
         "A prediction episode can match at most one reference handover.",
+        (
+            "Only public-request-backed reducer, BT, and skill episodes may "
+            "match shortly after a reference handover; their delay is "
+            "reported as request reaction lag, never as prediction lead."
+        ),
         "Recovery actions are excluded from handover false-positive counts and audited separately.",
         "Clinically acceptable alternatives remain human-adjudication items unless physical impossibility is provable.",
     ]
+    if specialized_target_ids:
+        notes.append(
+            "Targets uniquely served by declared bed-robot end-effectors are "
+            "excluded from ordinary handover denominators and scored under "
+            "specialized_group_actions."
+        )
     if reference["reference_authority"] == "mixed":
         notes.append(
             "Reference labels mix human review and authorized assistant video adjudication."
@@ -3147,6 +5818,7 @@ def evaluate_shadow(
             "lead_window_sec": lead_window_sec,
             "stable_sec": stable_sec,
             "max_prediction_age_sec": max_prediction_age_sec,
+            "request_reaction_window_sec": request_reaction_window_sec,
             "episode_gap_sec": episode_gap_sec,
             "recovery_reuse_warning_sec": recovery_reuse_warning_sec,
         },
@@ -3158,6 +5830,8 @@ def evaluate_shadow(
         "evaluation_mask": mask.report(),
         "state_audit": timeline.state_audit(),
         "phase": phase_report,
+        "specialized_group_actions": specialized_group_actions,
+        "behavior_quality": behavior_quality,
         "runtime": _runtime_metrics(decisions, trace_errors=trace_errors),
         "notes": notes,
     }
@@ -3165,13 +5839,15 @@ def evaluate_shadow(
         phase=phase_report,
         layers=layers,
         trace_records=decisions,
-        targets=targets,
+        targets=ordinary_targets,
         ground_truth=ground_truth,
         lead_window_sec=lead_window_sec,
         identity_map=identity_map,
         evaluation_mask=mask,
         tool_inventory=inventory,
+        specialized_group_actions=specialized_group_actions,
     )
+    report["scorecard"]["behavior_quality"] = behavior_quality
     return report
 
 
@@ -3191,6 +5867,10 @@ def write_layer_csv(report: dict[str, Any], path: Path) -> None:
         "top1_exact_rate",
         "stable_exact_rate",
         "request_backed_exact_count",
+        "proactive_exact_count",
+        "pre_request_proactive_exact_count",
+        "unrequested_pre_handover_exact_count",
+        "post_request_visual_exact_count",
         "anticipatory_exact_count",
         "first_correct_lead_median_sec",
         "first_correct_lead_p95_sec",
@@ -3223,6 +5903,22 @@ def write_layer_csv(report: dict[str, Any], path: Path) -> None:
                     "request_backed_exact_count": payload[
                         "request_backed_exact_count"
                     ],
+                    "proactive_exact_count": payload.get(
+                        "proactive_exact_count",
+                        payload.get("anticipatory_exact_count", 0),
+                    ),
+                    "pre_request_proactive_exact_count": payload.get(
+                        "pre_request_proactive_exact_count",
+                        0,
+                    ),
+                    "unrequested_pre_handover_exact_count": payload.get(
+                        "unrequested_pre_handover_exact_count",
+                        0,
+                    ),
+                    "post_request_visual_exact_count": payload.get(
+                        "post_request_visual_exact_count",
+                        0,
+                    ),
                     "anticipatory_exact_count": payload[
                         "anticipatory_exact_count"
                     ],
@@ -3266,19 +5962,63 @@ def write_scorecard_csv(report: dict[str, Any], path: Path) -> None:
         "next_tool_prediction",
         {},
     ).get("layers", {}).items():
-        rows.append(
-            {
-                "metric": "next_tool_prediction",
-                "layer": layer,
-                "correct_count": metric.get("correct_count"),
-                "evaluated_count": metric.get("evaluated_count"),
-                "accuracy": metric.get("accuracy"),
-                "status": "complete",
-                "reference_quality": scorecard.get(
-                    "next_tool_prediction",
-                    {},
-                ).get("reference_quality"),
-            }
+        reference_quality = scorecard.get(
+            "next_tool_prediction",
+            {},
+        ).get("reference_quality")
+        rows.extend(
+            [
+                {
+                    "metric": "combined_tool_action_selection",
+                    "layer": layer,
+                    "correct_count": metric.get("correct_count"),
+                    "evaluated_count": metric.get("evaluated_count"),
+                    "accuracy": metric.get("accuracy"),
+                    "status": "complete",
+                    "reference_quality": reference_quality,
+                },
+                {
+                    "metric": "proactive_next_tool",
+                    "layer": layer,
+                    "correct_count": metric.get(
+                        "proactive_correct_count",
+                        metric.get("anticipatory_correct_count"),
+                    ),
+                    "evaluated_count": metric.get("evaluated_count"),
+                    "accuracy": metric.get(
+                        "proactive_target_recall",
+                        metric.get("anticipatory_target_recall"),
+                    ),
+                    "status": "complete",
+                    "reference_quality": reference_quality,
+                },
+                {
+                    "metric": "post_request_visual_tool",
+                    "layer": layer,
+                    "correct_count": metric.get(
+                        "post_request_visual_correct_count"
+                    ),
+                    "evaluated_count": metric.get("evaluated_count"),
+                    "accuracy": metric.get(
+                        "post_request_visual_target_recall"
+                    ),
+                    "status": "complete",
+                    "reference_quality": reference_quality,
+                },
+                {
+                    "metric": "request_backed_tool_selection",
+                    "layer": layer,
+                    "correct_count": metric.get(
+                        "request_backed_correct_count"
+                    ),
+                    "evaluated_count": metric.get("evaluated_count"),
+                    "accuracy": metric.get(
+                        "request_backed_target_recall"
+                    ),
+                    "status": "complete",
+                    "reference_quality": reference_quality,
+                },
+            ]
         )
     for metric_name, payload, accuracy_key in (
         (
@@ -3328,6 +6068,212 @@ def write_scorecard_csv(report: dict[str, Any], path: Path) -> None:
             }
         )
 
+    specialized = scorecard.get("specialized_group_action", {})
+    rows.append(
+        {
+            "metric": "specialized_group_action",
+            "layer": "bed_robot_arm_group_command",
+            "correct_count": specialized.get("correct_count"),
+            "evaluated_count": specialized.get("evaluated_count"),
+            "accuracy": specialized.get("accuracy"),
+            "status": specialized.get("status"),
+            "reference_quality": specialized.get("reference_quality"),
+        }
+    )
+    rows.append(
+        {
+            "metric": "specialized_group_execution",
+            "layer": "bed_robot_arm_group_status",
+            "correct_count": specialized.get("terminal_success_count"),
+            "evaluated_count": specialized.get("correct_count"),
+            "accuracy": specialized.get("execution_fulfillment_rate"),
+            "status": specialized.get("status"),
+            "reference_quality": specialized.get("reference_quality"),
+        }
+    )
+
+    behavior = scorecard.get("behavior_quality", {})
+    behavior_summary = behavior.get("summary", {})
+    preparation = behavior.get("preparation_coverage", {})
+    request_latency = behavior_summary.get(
+        "request_to_handover_latency_sec",
+        {},
+    )
+    request_wall_clock_latency = behavior_summary.get(
+        "request_to_handover_wall_clock_latency_sec",
+        {},
+    )
+    release_latency = behavior_summary.get(
+        "wrong_preposition_release_latency_sec",
+        {},
+    )
+    release_wall_clock_latency = behavior_summary.get(
+        "wrong_preposition_release_wall_clock_latency_sec",
+        {},
+    )
+    pipeline_latency = behavior_summary.get(
+        "request_pipeline_latency",
+        {},
+    )
+    rows.extend(
+        [
+            {
+                "metric": "preparation_coverage",
+                "layer": "skill_execution",
+                "correct_count": preparation.get(
+                    "prepared_before_request_count"
+                ),
+                "evaluated_count": preparation.get(
+                    "eligible_handover_count"
+                ),
+                "accuracy": behavior_summary.get(
+                    "preparation_coverage"
+                ),
+                "status": behavior.get("status"),
+                "reference_quality": behavior.get("reference_quality"),
+            },
+            {
+                "metric": "request_to_handover_latency",
+                "layer": "skill_execution",
+                "evaluated_count": request_latency.get("count"),
+                "value": request_latency.get("mean"),
+                "p95": request_latency.get("p95"),
+                "max": request_latency.get("max"),
+                "unit": "seconds",
+                "status": behavior.get("status"),
+                "reference_quality": behavior.get("reference_quality"),
+            },
+            {
+                "metric": "request_to_handover_wall_clock_latency",
+                "layer": "skill_execution",
+                "evaluated_count": request_wall_clock_latency.get("count"),
+                "value": request_wall_clock_latency.get("mean"),
+                "p95": request_wall_clock_latency.get("p95"),
+                "max": request_wall_clock_latency.get("max"),
+                "unit": "wall_clock_seconds",
+                "status": behavior.get("status"),
+                "reference_quality": behavior.get("reference_quality"),
+            },
+            {
+                "metric": "wrong_preposition_release_latency",
+                "layer": "skill_execution",
+                "evaluated_count": release_latency.get("count"),
+                "value": release_latency.get("mean"),
+                "p95": release_latency.get("p95"),
+                "max": release_latency.get("max"),
+                "unit": "seconds",
+                "status": behavior.get("status"),
+                "reference_quality": behavior.get("reference_quality"),
+            },
+            {
+                "metric": "wrong_preposition_release_wall_clock_latency",
+                "layer": "skill_execution",
+                "evaluated_count": release_wall_clock_latency.get("count"),
+                "value": release_wall_clock_latency.get("mean"),
+                "p95": release_wall_clock_latency.get("p95"),
+                "max": release_wall_clock_latency.get("max"),
+                "unit": "wall_clock_seconds",
+                "status": behavior.get("status"),
+                "reference_quality": behavior.get("reference_quality"),
+            },
+            *[
+                {
+                    "metric": metric_name,
+                    "layer": layer,
+                    "evaluated_count": distribution.get("count"),
+                    "value": distribution.get("mean"),
+                    "p95": distribution.get("p95"),
+                    "max": distribution.get("max"),
+                    "unit": unit,
+                    "status": behavior.get("status"),
+                    "reference_quality": behavior.get(
+                        "reference_quality"
+                    ),
+                }
+                for metric_name, layer, key, unit in (
+                    (
+                        "ground_truth_to_dt_request_fact_latency",
+                        "reducer_fused",
+                        "ground_truth_to_dt_request_fact_latency_sec",
+                        "source_seconds",
+                    ),
+                    (
+                        "dt_request_fact_to_bt_acceptance_latency",
+                        "bt_decision",
+                        "dt_request_fact_to_bt_acceptance_latency_sec",
+                        "source_seconds",
+                    ),
+                    (
+                        "bt_acceptance_to_handover_latency",
+                        "skill_execution",
+                        "bt_acceptance_to_handover_latency_sec",
+                        "source_seconds",
+                    ),
+                    (
+                        "ground_truth_to_dt_request_fact_wall_clock_latency",
+                        "reducer_fused",
+                        (
+                            "ground_truth_to_dt_request_fact_"
+                            "wall_clock_latency_sec"
+                        ),
+                        "wall_clock_seconds",
+                    ),
+                    (
+                        "dt_request_fact_to_bt_acceptance_wall_clock_latency",
+                        "bt_decision",
+                        (
+                            "dt_request_fact_to_bt_acceptance_"
+                            "wall_clock_latency_sec"
+                        ),
+                        "wall_clock_seconds",
+                    ),
+                    (
+                        "bt_acceptance_to_handover_wall_clock_latency",
+                        "skill_execution",
+                        (
+                            "bt_acceptance_to_handover_"
+                            "wall_clock_latency_sec"
+                        ),
+                        "wall_clock_seconds",
+                    ),
+                )
+                for distribution in [pipeline_latency.get(key, {})]
+            ],
+            {
+                "metric": "unnecessary_preparation",
+                "layer": "skill_execution",
+                "correct_count": behavior_summary.get(
+                    "unnecessary_preparation_count"
+                ),
+                "evaluated_count": behavior.get(
+                    "unnecessary_preparation",
+                    {},
+                ).get("completed_preparation_count"),
+                "value": behavior_summary.get(
+                    "unnecessary_preparation_count"
+                ),
+                "accuracy": behavior_summary.get(
+                    "unnecessary_preparation_rate"
+                ),
+                "unit": "count_and_rate",
+                "status": behavior.get("status"),
+                "reference_quality": behavior.get("reference_quality"),
+            },
+            {
+                "metric": "invariant_violation",
+                "layer": "runtime_safety",
+                "value": behavior_summary.get(
+                    "invariant_violation_count"
+                ),
+                "unit": "count",
+                "status": behavior.get("status"),
+                "reference_quality": (
+                    "explicit runtime invariant markers"
+                ),
+            },
+        ]
+    )
+
     fields = (
         "metric",
         "layer",
@@ -3339,6 +6285,10 @@ def write_scorecard_csv(report: dict[str, Any], path: Path) -> None:
         "f1",
         "status",
         "reference_quality",
+        "value",
+        "unit",
+        "p95",
+        "max",
     )
     with path.open("w", encoding="utf-8", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=fields)
@@ -3358,6 +6308,15 @@ def main() -> int:
     parser.add_argument("--lead-window-sec", type=float, default=10.0)
     parser.add_argument("--stable-sec", type=float, default=3.0)
     parser.add_argument("--max-prediction-age-sec", type=float, default=3.0)
+    parser.add_argument(
+        "--request-reaction-window-sec",
+        type=float,
+        default=2.0,
+        help=(
+            "Maximum post-reference delay for public-request-backed reducer, "
+            "BT, or skill decisions. VLM predictions remain pre-event only."
+        ),
+    )
     parser.add_argument("--episode-gap-sec", type=float, default=2.5)
     parser.add_argument(
         "--recovery-reuse-warning-sec",
@@ -3435,6 +6394,7 @@ def main() -> int:
         mode=args.mode,
         stable_sec=args.stable_sec,
         max_prediction_age_sec=args.max_prediction_age_sec,
+        request_reaction_window_sec=args.request_reaction_window_sec,
         episode_gap_sec=args.episode_gap_sec,
         recovery_reuse_warning_sec=args.recovery_reuse_warning_sec,
         phase_ground_truth=phase_ground_truth,

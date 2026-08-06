@@ -11,15 +11,19 @@ from rclpy.action import ActionClient
 from rclpy.node import Node
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
-from surgical_msgs.action import ExecuteBedRobotArmGroup, ExecuteSkill
+from surgical_interop_msgs.action import (
+    ExecuteRetraction,
+    ExecuteToolHandover,
+)
+from surgical_interop_msgs.srv import SetSuction
 
 
 def evaluate_readiness(
     *,
     sentence_publisher_count: int,
     require_sentence_publisher: bool,
-    skill_server_ready: bool,
-    suction_server_ready: bool,
+    tool_handover_server_ready: bool,
+    suction_service_ready: bool,
     retraction_server_ready: bool,
     require_perception: bool,
     rfdetr_health: dict[str, Any] | None,
@@ -27,13 +31,13 @@ def evaluate_readiness(
     perception_max_age_sec: float,
 ) -> dict[str, Any]:
     checks = {
-        "sentence_topic": (
+        "surgeon_sentence_publisher": (
             not require_sentence_publisher or sentence_publisher_count > 0
         ),
-        "skill_action_server": bool(skill_server_ready),
-        "suction_action_server": bool(suction_server_ready),
+        "tool_handover_action_server": bool(tool_handover_server_ready),
+        "suction_control_service": bool(suction_service_ready),
         "retraction_action_server": bool(retraction_server_ready),
-        "perception": True,
+        "perception_input": True,
     }
     details: dict[str, Any] = {
         "sentence_publisher_count": max(0, int(sentence_publisher_count)),
@@ -50,7 +54,7 @@ def evaluate_readiness(
             and bool(health.get("cam4_aligned"))
             and 0.0 <= float(rfdetr_age_sec) <= float(perception_max_age_sec)
         )
-        checks["perception"] = perception_ready
+        checks["perception_input"] = perception_ready
         details["rfdetr_status"] = str(health.get("status", "missing"))
         details["cam4_aligned"] = bool(health.get("cam4_aligned"))
 
@@ -80,14 +84,17 @@ class IntegrationPreflightNode(Node):
         self.declare_parameter("require_sentence_publisher", True)
         self.declare_parameter("require_perception", False)
         self.declare_parameter("perception_max_age_sec", 3.0)
-        self.declare_parameter("skill_action_name", "/skill/execute")
         self.declare_parameter(
-            "suction_action_name",
-            "/bed_robot_arm_group/suction/execute",
+            "tool_handover_action_name",
+            "/surgery/tool_handover",
+        )
+        self.declare_parameter(
+            "suction_service_name",
+            "/surgery/suction/set",
         )
         self.declare_parameter(
             "retraction_action_name",
-            "/bed_robot_arm_group/retraction/execute",
+            "/surgery/retraction",
         )
 
         self._sentence_topic = str(self.get_parameter("sentence_topic").value)
@@ -104,19 +111,18 @@ class IntegrationPreflightNode(Node):
         self._latest_rfdetr_health: dict[str, Any] | None = None
         self._latest_rfdetr_monotonic = 0.0
 
-        self._skill_client = ActionClient(
+        self._tool_handover_client = ActionClient(
             self,
-            ExecuteSkill,
-            str(self.get_parameter("skill_action_name").value),
+            ExecuteToolHandover,
+            str(self.get_parameter("tool_handover_action_name").value),
         )
-        self._suction_client = ActionClient(
-            self,
-            ExecuteBedRobotArmGroup,
-            str(self.get_parameter("suction_action_name").value),
+        self._suction_client = self.create_client(
+            SetSuction,
+            str(self.get_parameter("suction_service_name").value),
         )
         self._retraction_client = ActionClient(
             self,
-            ExecuteBedRobotArmGroup,
+            ExecuteRetraction,
             str(self.get_parameter("retraction_action_name").value),
         )
         self._readiness_pub = self.create_publisher(
@@ -158,8 +164,8 @@ class IntegrationPreflightNode(Node):
         snapshot = evaluate_readiness(
             sentence_publisher_count=self.count_publishers(self._sentence_topic),
             require_sentence_publisher=self._require_sentence_publisher,
-            skill_server_ready=self._skill_client.server_is_ready(),
-            suction_server_ready=self._suction_client.server_is_ready(),
+            tool_handover_server_ready=self._tool_handover_client.server_is_ready(),
+            suction_service_ready=self._suction_client.service_is_ready(),
             retraction_server_ready=self._retraction_client.server_is_ready(),
             require_perception=self._require_perception,
             rfdetr_health=self._latest_rfdetr_health,

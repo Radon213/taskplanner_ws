@@ -33,6 +33,9 @@ from shadow_evaluation.reference_reconciler import (
 )
 from shadow_evaluation.shadow_skill_sink import classify_shadow_command
 from shadow_evaluation.shadow_skill_sink import classify_shadow_command_attempt
+from shadow_evaluation.shadow_skill_sink import (
+    completed_preposition_instrument_instances,
+)
 from shadow_evaluation.shadow_skill_sink import counterfactual_event_matches_world
 from shadow_evaluation.shadow_skill_sink import (
     counterfactual_event_world_fingerprint,
@@ -44,7 +47,14 @@ from shadow_evaluation.shadow_skill_sink import (
 from shadow_evaluation.shadow_skill_sink import (
     counterfactual_task_boundary_payload,
 )
+from shadow_evaluation.shadow_skill_sink import (
+    departed_prepositioned_instrument_instances,
+)
 from shadow_evaluation.shadow_skill_sink import PendingShadowAction
+from shadow_evaluation.shadow_skill_sink import (
+    newly_prepositioned_instrument_instances,
+)
+from shadow_evaluation.shadow_skill_sink import returned_home_instrument_instances
 from shadow_evaluation.shadow_skill_sink import semantic_command_key
 from shadow_evaluation.shadow_skill_sink import SemanticCommandLedger
 from shadow_evaluation.shadow_skill_sink import shadow_group_terminal_state
@@ -395,7 +405,7 @@ def test_elastic_replay_gate_observes_backlog_without_clock_coupling():
         active_skill_count=1,
         vlm_ready=False,
         vlm_grace_elapsed=True,
-    ) == "skill_execution"
+    ) == ""
 
 
 def test_elastic_replay_gate_does_not_require_vlm_after_images_end():
@@ -467,6 +477,253 @@ def test_semantic_command_ledger_reset_removes_prior_run_state():
     )
 
 
+def test_rack_return_starts_new_preparation_episode_only_for_returned_instance():
+    ledger = SemanticCommandLedger()
+    returned_prepare = semantic_command_key(
+        {
+            "action": "predict_tool",
+            "instrument_id": "T02",
+            "instance_id": "T02#1",
+            "request_generation": 0,
+        }
+    )
+    other_prepare = semantic_command_key(
+        {
+            "action": "predict_tool",
+            "instrument_id": "T02",
+            "instance_id": "T02#2",
+            "request_generation": 0,
+        }
+    )
+    handover = semantic_command_key(
+        {
+            "action": "pick_up_and_handover",
+            "instrument_id": "T02",
+            "instance_id": "T02#1",
+            "request_generation": 1,
+        }
+    )
+    for key in (returned_prepare, other_prepare, handover):
+        ledger.record_admission(key, "world-a", 10.0)
+        assert ledger.should_report_deadlock(key, "world-a", 11.0)
+
+    ledger.forget_preparations("T02", "T02#1")
+
+    assert ledger.previous_fingerprint(returned_prepare) == ""
+    assert ledger.previous_fingerprint(other_prepare) == "world-a"
+    assert ledger.previous_fingerprint(handover) == "world-a"
+    assert ledger.should_report_deadlock(
+        returned_prepare,
+        "world-a",
+        12.0,
+    )
+
+
+def test_new_preparation_episode_readmits_unused_return_for_same_instance():
+    ledger = SemanticCommandLedger()
+    returned = semantic_command_key(
+        {
+            "action": "return_unused_preposition",
+            "instrument_id": "T01",
+            "instance_id": "T01#1",
+            "request_generation": 0,
+        }
+    )
+    other_return = semantic_command_key(
+        {
+            "action": "return_unused_preposition",
+            "instrument_id": "T01",
+            "instance_id": "T01#2",
+            "request_generation": 0,
+        }
+    )
+    ledger.record_admission(returned, "prepositioned-world", 10.0)
+    ledger.record_admission(other_return, "other-world", 10.0)
+
+    ledger.begin_preparation_episode("T01", "T01#1")
+
+    assert ledger.previous_fingerprint(returned) == ""
+    assert ledger.previous_fingerprint(other_return) == "other-world"
+
+
+def test_returned_home_transition_is_instance_specific_and_edge_triggered():
+    before = {
+        "instrument_states": [
+            {
+                "instrument_id": "T02",
+                "instance_id": "T02#1",
+                "lifecycle_stage": "prepositioned_right",
+            },
+            {
+                "instrument_id": "T02",
+                "instance_id": "T02#2",
+                "lifecycle_stage": "home_rack",
+            },
+        ]
+    }
+    after = {
+        "instrument_states": [
+            {
+                "instrument_id": "T02",
+                "instance_id": "T02#1",
+                "lifecycle_stage": "returned_home",
+            },
+            {
+                "instrument_id": "T02",
+                "instance_id": "T02#2",
+                "lifecycle_stage": "home_rack",
+            },
+        ]
+    }
+
+    assert returned_home_instrument_instances(before, after) == {
+        ("T02", "T02#1")
+    }
+    assert returned_home_instrument_instances(after, after) == set()
+
+
+def test_consumed_preposition_starts_a_new_prediction_episode():
+    before = {
+        "instrument_states": [
+            {
+                "instrument_id": "T04",
+                "instance_id": "T04#1",
+                "lifecycle_stage": "prepositioned_right",
+            },
+            {
+                "instrument_id": "T07",
+                "instance_id": "T07#1",
+                "lifecycle_stage": "mayo_reuse",
+            },
+        ]
+    }
+    after_handover = {
+        "instrument_states": [
+            {
+                "instrument_id": "T04",
+                "instance_id": "T04#1",
+                "lifecycle_stage": "surgeon_owned",
+            },
+            {
+                "instrument_id": "T07",
+                "instance_id": "T07#1",
+                "lifecycle_stage": "mayo_reuse",
+            },
+        ]
+    }
+
+    assert completed_preposition_instrument_instances(
+        before,
+        after_handover,
+    ) == {("T04", "T04#1")}
+    assert completed_preposition_instrument_instances(
+        after_handover,
+        after_handover,
+    ) == set()
+
+
+def test_new_preparation_episode_rearms_return_for_only_that_instance():
+    ledger = SemanticCommandLedger()
+    returned = semantic_command_key(
+        {
+            "action": "return_unused_preposition",
+            "instrument_id": "T01",
+            "instance_id": "T01#1",
+            "request_generation": 0,
+        }
+    )
+    other_return = semantic_command_key(
+        {
+            "action": "return_unused_preposition",
+            "instrument_id": "T01",
+            "instance_id": "T01#2",
+            "request_generation": 0,
+        }
+    )
+    for key in (returned, other_return):
+        ledger.record_admission(key, "prepositioned-world", 10.0)
+
+    ledger.forget_returns("T01", "T01#1")
+
+    assert ledger.previous_fingerprint(returned) == ""
+    assert (
+        ledger.previous_fingerprint(other_return)
+        == "prepositioned-world"
+    )
+
+
+def test_newly_prepositioned_transition_is_instance_specific_and_edge_triggered():
+    before = {
+        "instrument_states": [
+            {
+                "instrument_id": "T01",
+                "instance_id": "T01#1",
+                "lifecycle_stage": "returned_home",
+            },
+            {
+                "instrument_id": "T01",
+                "instance_id": "T01#2",
+                "lifecycle_stage": "prepositioned_right",
+            },
+        ]
+    }
+    after = {
+        "instrument_states": [
+            {
+                "instrument_id": "T01",
+                "instance_id": "T01#1",
+                "lifecycle_stage": "prepositioned_right",
+            },
+            {
+                "instrument_id": "T01",
+                "instance_id": "T01#2",
+                "lifecycle_stage": "prepositioned_right",
+            },
+        ]
+    }
+
+    assert newly_prepositioned_instrument_instances(before, after) == {
+        ("T01", "T01#1")
+    }
+    assert newly_prepositioned_instrument_instances(after, after) == set()
+
+
+def test_departed_preposition_starts_a_new_preparation_episode():
+    before = {
+        "instrument_states": [
+            {
+                "instrument_id": "T04",
+                "instance_id": "T04#1",
+                "lifecycle_stage": "prepositioned_right",
+            },
+            {
+                "instrument_id": "T02",
+                "instance_id": "T02#1",
+                "lifecycle_stage": "home_rack",
+            },
+        ]
+    }
+    after = {
+        "instrument_states": [
+            {
+                "instrument_id": "T04",
+                "instance_id": "T04#1",
+                "lifecycle_stage": "surgeon_owned",
+            },
+            {
+                "instrument_id": "T02",
+                "instance_id": "T02#1",
+                "lifecycle_stage": "home_rack",
+            },
+        ]
+    }
+
+    assert departed_prepositioned_instrument_instances(before, after) == {
+        ("T04", "T04#1")
+    }
+    assert departed_prepositioned_instrument_instances(after, after) == set()
+
+
 def test_shadow_sink_applies_physical_handover_guards():
     command = {"instrument_id": "bovie", "action": "pick_up_and_handover"}
     assert classify_shadow_command(command, _world())[0] == "admissible"
@@ -482,6 +739,74 @@ def test_shadow_sink_applies_physical_handover_guards():
         command,
         _world(lifecycle="mayo_reuse", contaminated=True),
     )[0] == "admissible"
+
+
+def test_shadow_sink_allows_reversible_preparation_from_mayo_reuse():
+    world = _world(lifecycle="mayo_reuse", contaminated=True)
+    state = world["instrument_states"][0]
+    state.update(
+        instance_id="bovie#1",
+        location_id="mayo_reuse_zone",
+        location_type="mayo_reuse_zone",
+    )
+    prepare = {
+        "command_id": "prepare-mayo-bovie",
+        "action": "predict_tool",
+        "instrument_id": "bovie",
+        "instance_id": "bovie#1",
+        "source_location_id": "mayo_reuse_zone",
+        "source_location_type": "mayo_reuse_zone",
+        "target_location_id": "robot_right_hand",
+        "target_location_type": "robot_right_hand",
+    }
+
+    assert classify_shadow_command(prepare, world) == (
+        "admissible",
+        "shadow_only_no_execution",
+    )
+    prepared_event = counterfactual_event_payloads(prepare, world)[0]
+    assert prepared_event["event_type"] == "ToolPrepared"
+    assert prepared_event["source_location_id"] == "mayo_reuse_zone"
+
+    prepared_world = deepcopy(world)
+    prepared_state = prepared_world["instrument_states"][0]
+    prepared_state.update(
+        lifecycle_stage="prepositioned_right",
+        owner="robot_right_hand",
+        location_id="robot_right_hand",
+        location_type="robot_right_hand",
+        contaminated=False,
+        preposition_origin_location_id="mayo_reuse_zone",
+        preposition_origin_location_type="mayo_reuse_zone",
+        preposition_origin_lifecycle_stage="mayo_reuse",
+    )
+    prepared_world["right_hand_tool"] = "bovie"
+    prepared_world["right_hand_instance_id"] = "bovie#1"
+    release = {
+        "command_id": "release-mayo-bovie",
+        "action": "return_unused_preposition",
+        "instrument_id": "bovie",
+        "instance_id": "bovie#1",
+        "source_location_id": "robot_right_hand",
+        "source_location_type": "robot_right_hand",
+        "target_location_id": "mayo_reuse_zone",
+        "target_location_type": "mayo_reuse_zone",
+    }
+
+    assert classify_shadow_command(release, prepared_world) == (
+        "admissible",
+        "shadow_only_no_execution",
+    )
+    returned_event = counterfactual_event_payloads(
+        release,
+        prepared_world,
+    )[0]
+    assert returned_event["event_type"] == "UnusedPrepositionReturned"
+    assert returned_event["target_location_id"] == "mayo_reuse_zone"
+    assert (
+        returned_event["detail"]["target_lifecycle_stage"]
+        == "mayo_reuse"
+    )
 
 
 def test_shadow_sink_can_label_type_level_instance_assumption_without_weakening_default_guard():
@@ -701,7 +1026,7 @@ def test_put_down_and_handover_returns_t02_before_grasping_t07():
     events = counterfactual_event_payloads(command, world)
 
     assert [event["event_type"] for event in events] == [
-        "PredictedToolReturnedToRack",
+        "UnusedPrepositionReturned",
         "RobotGraspedTool",
         "ToolHandoverCompleted",
     ]

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,6 +10,7 @@ from unittest.mock import patch
 
 from tools.real_surgery_annotation.run_shadow_replay import (
     CRITICAL_NODES,
+    _RuntimeResourceLock,
     _build_parser,
     _model_preflight,
     _parse_shadow_state_json,
@@ -15,6 +18,7 @@ from tools.real_surgery_annotation.run_shadow_replay import (
     _reference_authority,
     _resolve_case_dir,
     _resolve_start_phase_id,
+    _runtime_resource_claims,
     _select_groot2_port,
     _validate_public_input_trace,
     _validate_shadow_feedback_trace,
@@ -36,6 +40,38 @@ class _Response:
 
 
 class ShadowRunnerPreflightTest(unittest.TestCase):
+    @staticmethod
+    def _probe_runtime_lock(
+        lock_dir: Path,
+        claims: list[dict],
+    ) -> subprocess.CompletedProcess[str]:
+        script = f"""
+import json
+from pathlib import Path
+from tools.real_surgery_annotation.run_shadow_replay import _RuntimeResourceLock
+
+claims = json.loads({json.dumps(json.dumps(claims))})
+try:
+    with _RuntimeResourceLock(
+        lock_dir=Path({str(lock_dir)!r}),
+        claims=claims,
+        owner={{"run_id": "child-run", "case_id": "child-case"}},
+    ):
+        print("acquired")
+except RuntimeError as exc:
+    print(str(exc))
+    raise SystemExit(23)
+"""
+        return subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=Path(__file__).resolve().parents[2],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+            timeout=10.0,
+        )
+
     def test_generation_seed_is_explicit_and_overridable(self) -> None:
         parser = _build_parser(Path("/tmp/taskplanner"))
 
@@ -51,6 +87,14 @@ class ShadowRunnerPreflightTest(unittest.TestCase):
 
         self.assertEqual(default_args.vlm_generation_seed, 0)
         self.assertEqual(disabled_args.vlm_generation_seed, -1)
+
+    def test_default_runtime_resources_do_not_overlap_interactive_shadow(self) -> None:
+        parser = _build_parser(Path("/tmp/taskplanner"))
+
+        args = parser.parse_args(["--source-bag", "/tmp/source"])
+
+        self.assertEqual(args.ros_domain_id, 171)
+        self.assertEqual(args.rosbridge_port, 9191)
 
     def test_case_dir_default_is_inferred_instead_of_pinned_to_old_case(self) -> None:
         parser = _build_parser(Path("/tmp/taskplanner"))
@@ -190,9 +234,28 @@ class ShadowRunnerPreflightTest(unittest.TestCase):
         phase_id, source = _resolve_start_phase_id(
             "P04",
             {"shadow_replay": {"start_phase_id": "P03"}},
+            {"procedure": {"default_phase_id": "P02"}},
         )
         self.assertEqual(phase_id, "P04")
         self.assertEqual(source, "cli")
+
+    def test_procedure_default_phase_is_used_when_case_has_no_override(
+        self,
+    ) -> None:
+        phase_id, source = _resolve_start_phase_id(
+            "",
+            {},
+            {"procedure": {"default_phase_id": "P03"}},
+        )
+
+        self.assertEqual(phase_id, "P03")
+        self.assertEqual(source, "procedure_default")
+
+    def test_missing_start_phase_is_reported_as_unspecified(self) -> None:
+        phase_id, source = _resolve_start_phase_id("", {}, {})
+
+        self.assertEqual(phase_id, "")
+        self.assertEqual(source, "unspecified")
 
     def test_groot2_port_is_domain_derived_outside_ephemeral_range(self) -> None:
         with patch(
@@ -201,12 +264,16 @@ class ShadowRunnerPreflightTest(unittest.TestCase):
         ):
             self.assertEqual(_select_groot2_port(0, 71), 20071)
 
-    def test_groot2_port_falls_forward_when_preferred_port_is_busy(self) -> None:
+    def test_groot2_port_fails_when_derived_port_is_busy(self) -> None:
         with patch(
             "tools.real_surgery_annotation.run_shadow_replay._port_is_available",
             side_effect=lambda port: port == 20072,
         ):
-            self.assertEqual(_select_groot2_port(0, 71), 20072)
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "derived Groot2 port is unavailable: 20071",
+            ):
+                _select_groot2_port(0, 71)
 
     def test_explicit_unavailable_groot2_port_fails_closed(self) -> None:
         with patch(
@@ -215,6 +282,101 @@ class ShadowRunnerPreflightTest(unittest.TestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, "unavailable"):
                 _select_groot2_port(20123, 71)
+
+    def test_runtime_lock_rejects_same_ros_domain_cross_process(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            lock_dir = Path(temporary)
+            first_claims = _runtime_resource_claims(
+                ros_domain_id=124,
+                groot2_port=20124,
+                rosbridge_port=None,
+            )
+            second_claims = _runtime_resource_claims(
+                ros_domain_id=124,
+                groot2_port=20125,
+                rosbridge_port=None,
+            )
+            with _RuntimeResourceLock(
+                lock_dir=lock_dir,
+                claims=first_claims,
+                owner={
+                    "run_id": "owner-run",
+                    "case_id": "0704_9",
+                },
+            ):
+                result = self._probe_runtime_lock(
+                    lock_dir,
+                    second_claims,
+                )
+
+        self.assertEqual(result.returncode, 23, result.stdout)
+        self.assertIn("ros_domain=124", result.stdout)
+        self.assertIn("owner-run", result.stdout)
+
+    def test_runtime_lock_rejects_same_tcp_port_cross_process(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            lock_dir = Path(temporary)
+            first_claims = _runtime_resource_claims(
+                ros_domain_id=124,
+                groot2_port=20124,
+                rosbridge_port=None,
+            )
+            second_claims = _runtime_resource_claims(
+                ros_domain_id=125,
+                groot2_port=20124,
+                rosbridge_port=None,
+            )
+            with _RuntimeResourceLock(
+                lock_dir=lock_dir,
+                claims=first_claims,
+                owner={
+                    "run_id": "owner-run",
+                    "case_id": "0704_9",
+                },
+            ):
+                result = self._probe_runtime_lock(
+                    lock_dir,
+                    second_claims,
+                )
+
+        self.assertEqual(result.returncode, 23, result.stdout)
+        self.assertIn("tcp_port=20124", result.stdout)
+        self.assertIn("role=groot2", result.stdout)
+
+    def test_runtime_lock_allows_disjoint_resources_cross_process(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            lock_dir = Path(temporary)
+            first_claims = _runtime_resource_claims(
+                ros_domain_id=124,
+                groot2_port=20124,
+                rosbridge_port=9124,
+            )
+            second_claims = _runtime_resource_claims(
+                ros_domain_id=125,
+                groot2_port=20125,
+                rosbridge_port=9125,
+            )
+            with _RuntimeResourceLock(
+                lock_dir=lock_dir,
+                claims=first_claims,
+                owner={
+                    "run_id": "owner-run",
+                    "case_id": "0704_9",
+                },
+            ):
+                result = self._probe_runtime_lock(
+                    lock_dir,
+                    second_claims,
+                )
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("acquired", result.stdout)
 
     def test_public_speech_nodes_are_runtime_critical(self) -> None:
         self.assertIn("/recorded_transcript_adapter", CRITICAL_NODES)
@@ -408,8 +570,9 @@ class ShadowRunnerPreflightTest(unittest.TestCase):
             result["field_image_coverage"]["coverage_ratio"],
             0.98,
         )
+        self.assertEqual(result["warnings"], [])
 
-    def test_public_input_integrity_rejects_material_best_effort_loss(
+    def test_public_input_integrity_warns_on_degraded_best_effort_loss(
         self,
     ) -> None:
         bag_info = {
@@ -430,10 +593,39 @@ class ShadowRunnerPreflightTest(unittest.TestCase):
             source_transcript_topic="/transcript",
         )
 
+        self.assertTrue(result["ok"])
+        self.assertIn(
+            "field_image_coverage_below_target:"
+            "expected=100,recorded=97,ratio=0.9700,target=0.9800",
+            result["warnings"],
+        )
+        self.assertEqual(result["errors"], [])
+
+    def test_public_input_integrity_rejects_material_best_effort_loss(
+        self,
+    ) -> None:
+        bag_info = {
+            "topics": {
+                "/cam": {"message_count": 100},
+                "/transcript": {"message_count": 0},
+            }
+        }
+        records = [
+            {"layer": "input_image", "topic": "/cam"}
+            for _ in range(94)
+        ]
+
+        result = _validate_public_input_trace(
+            records,
+            bag_info=bag_info,
+            field_image_topic="/cam",
+            source_transcript_topic="/transcript",
+        )
+
         self.assertFalse(result["ok"])
         self.assertIn(
             "field_image_coverage_below_minimum:"
-            "expected=100,recorded=97,ratio=0.9700,minimum=0.9800",
+            "expected=100,recorded=94,ratio=0.9400,minimum=0.9500",
             result["errors"],
         )
 
@@ -451,14 +643,16 @@ class ShadowRunnerPreflightTest(unittest.TestCase):
         }
         context = {
             "visual_input": {
-                "image_source": "flir_rfdetr_segmented",
+                "image_source": "flir_cam4_rfdetr_segmented",
+                "image_layout": "flir_left_cam4_right",
+                "cam4_image_forwarded_to_vlm": True,
                 "sources": [
                     {"role": "flir", "stamp_sec": 44.05},
+                    {"role": "cam4_mayo_hand_crop", "stamp_sec": 44.08},
                 ],
             },
             "observable_perception": {
                 "source": "cam4_rfdetr_small",
-                "cam4_image_forwarded_to_vlm": False,
                 "ground_truth": False,
                 "alignment": {"status": "aligned"},
                 "tools": [

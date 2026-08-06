@@ -15,6 +15,9 @@ export type InstrumentState = {
   lifecycle_stage: string;
   next_required_transition: string;
   visual_anchor_id: string;
+  preposition_origin_location_type?: string;
+  preposition_origin_location_id?: string;
+  preposition_origin_lifecycle_stage?: string;
 };
 
 export type RosTime = {
@@ -294,9 +297,29 @@ export type VLMHealth = {
   last_mode: string;
 };
 
+export type InputSourceStatus = {
+  stamp?: RosTime;
+  source_id: string;
+  modality: string;
+  state: "READY" | "STALE" | "MISSING" | "RECOVERING" | "ERROR" | "DISABLED" | string;
+  healthy: boolean;
+  last_observation_stamp?: RosTime;
+  age_sec: number;
+  received_count: number;
+  accepted_count: number;
+  rejected_count: number;
+  epoch: number;
+  dropped_count: number;
+  error_code: string;
+  detail: string;
+};
+
 export type VLMResult = {
   stamp?: RosTime;
   source: string;
+  source_epoch?: number;
+  source_sequence?: number;
+  correlation_id?: string;
   schema_version: string;
   raw_json: string;
   summary: string;

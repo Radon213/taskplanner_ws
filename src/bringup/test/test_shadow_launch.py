@@ -47,6 +47,7 @@ def test_shadow_launch_exposes_strict_replay_controls():
     assert arguments["require_vlm"][0].text == "false"
     assert "rfdetr_preflight_timeout_sec" in arguments
     assert "trace_root" in arguments
+    assert "fault_scenario_path" in arguments
     assert arguments["source_cam4_topic"][0].text == (
         "/surgery/cam4/color/image/compressed"
     )
@@ -59,6 +60,40 @@ def test_shadow_launch_exposes_strict_replay_controls():
     ]
     assert len(bridges) == 1
     assert bridges[0].condition is None
+
+    fault_injectors = [
+        entity
+        for entity in description.entities
+        if isinstance(entity, Node)
+        and entity.node_executable == "fault_injector"
+    ]
+    assert len(fault_injectors) == 1
+    assert fault_injectors[0].condition is not None
+
+    rosapi_nodes = [
+        entity
+        for entity in description.entities
+        if isinstance(entity, Node)
+        and entity.node_package == "rosapi"
+        and entity.node_executable == "rosapi_node"
+    ]
+    assert len(rosapi_nodes) == 1
+    assert rosapi_nodes[0].condition is not None
+
+    trace_recorders = [
+        entity
+        for entity in description.entities
+        if isinstance(entity, Node)
+        and entity.node_executable == "shadow_trace_recorder"
+    ]
+    assert len(trace_recorders) == 1
+    trace_parameters = trace_recorders[0]._Node__parameters[0]
+    run_id_parameter = next(
+        value
+        for key, value in trace_parameters.items()
+        if "".join(part.text for part in key) == "run_id"
+    )
+    assert run_id_parameter._ParameterValue__value_type is str
 
 
 def test_shadow_spec_dir_follows_default_bundle(monkeypatch):
@@ -99,6 +134,7 @@ def _valid_routes() -> dict[str, str]:
         "flir_image_topic": "/normalized/flir",
         "cam4_image_topic": "/normalized/cam4",
         "segmented_flir_image_topic": "/normalized/flir/segmented",
+        "cam4_overlay_image_topic": "/normalized/cam4/overlay",
         "cam4_semantics_topic": "/normalized/cam4/semantics",
     }
 

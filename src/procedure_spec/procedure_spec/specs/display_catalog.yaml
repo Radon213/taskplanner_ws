@@ -285,6 +285,11 @@ events:
     display_name_ko: 예측 도구 랙 복귀
     severity: normal
     tone: robot
+  UnusedPrepositionReturned:
+    display_name: Unused prepared tool returned
+    display_name_ko: 미사용 준비 도구 원위치 복귀
+    severity: normal
+    tone: robot
   ToolHandoverCompleted:
     display_name: Tool handover completed
     display_name_ko: 도구 전달 완료

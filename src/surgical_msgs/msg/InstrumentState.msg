@@ -15,6 +15,9 @@ string last_holder
 string lifecycle_stage
 string next_required_transition
 string visual_anchor_id
+string preposition_origin_location_type
+string preposition_origin_location_id
+string preposition_origin_lifecycle_stage
 bool procedure_future_use_expected
 string mayo_placement_evidence
 float64 last_observed_sec

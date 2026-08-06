@@ -15,7 +15,6 @@ from surgical_msgs.msg import (
     FilteredPhase,
     SimulationState,
     SpeechUtterance,
-    SurgeonGestureEvidence,
     SurgeonRequest,
     SurgeonState,
 )
@@ -62,10 +61,6 @@ class MockSurgeonNode(Node):
         self._active_override: SurgeonRequest | None = None
         self._override_queue: deque[SurgeonRequest] = deque(maxlen=10)
         self._instrument_states: dict[str, object] = {}
-        self._gesture_history: deque[dict[str, object]] = deque(maxlen=6)
-        self._published_vlm_signature = ""
-        self._latched_vlm_state: dict[str, object] | None = None
-        self._latched_vlm_ticks = 0
         self._timer = None
         self._load_spec(self._spec_dir)
         self.add_on_set_parameters_callback(self._on_parameters_changed)
@@ -73,12 +68,6 @@ class MockSurgeonNode(Node):
         self.create_subscription(SurgeonRequest, "/simulation/surgeon_override", self._on_override, 20)
         self.create_subscription(FilteredPhase, "/phase/filtered", self._on_phase, 20)
         self.create_subscription(SimulationState, "/simulation/state", self._on_simulation_state, 20)
-        self.create_subscription(
-            SurgeonGestureEvidence,
-            "/vlm/surgeon_gesture_evidence",
-            self._on_gesture_evidence,
-            20,
-        )
 
     def _load_spec(self, spec_dir: str) -> None:
         self._spec = load_bundle(spec_dir)
@@ -225,144 +214,6 @@ class MockSurgeonNode(Node):
             or getattr(instrument, "location_type", "") == "mayo_recovery_zone"
         )
 
-    def _prune_gesture_history(self, now_sec: float) -> None:
-        while self._gesture_history and (now_sec - float(self._gesture_history[0]["stamp_sec"])) > 3.5:
-            self._gesture_history.popleft()
-
-    def _current_time_sec(self) -> float:
-        now = self.get_clock().now().to_msg()
-        return float(now.sec) + float(now.nanosec) / 1_000_000_000.0
-
-    def _stable_gesture_request(self) -> dict[str, object] | None:
-        now_sec = self._current_time_sec()
-        self._prune_gesture_history(now_sec)
-        candidates: dict[tuple[str, str], dict[str, object]] = {}
-
-        for sample in self._gesture_history:
-            event_type = str(sample["event_type"])
-            requested_tool = str(sample["requested_tool"])
-            confidence = float(sample["confidence"])
-            if not event_type or confidence < 0.18:
-                continue
-            age_sec = max(now_sec - float(sample["stamp_sec"]), 0.0)
-            weight = confidence * max(0.22, 1.0 - age_sec / 3.0)
-            signature = (event_type, requested_tool)
-            bucket = candidates.setdefault(
-                signature,
-                {"score": 0.0, "count": 0, "latest": sample},
-            )
-            bucket["score"] = float(bucket["score"]) + weight
-            bucket["count"] = int(bucket["count"]) + 1
-            if float(sample["stamp_sec"]) >= float(bucket["latest"]["stamp_sec"]):
-                bucket["latest"] = sample
-
-        if not candidates:
-            return None
-
-        ranked_candidates = sorted(
-            candidates.items(),
-            key=lambda item: (
-                float(item[1]["score"]),
-                float(item[1]["latest"]["confidence"]),
-            ),
-            reverse=True,
-        )
-
-        for (event_type, requested_tool), best in ranked_candidates:
-            latest = best["latest"]
-            score = float(best["score"])
-            count = int(best["count"])
-            latest_confidence = float(latest["confidence"])
-            latest_pose = str(latest.get("hand_pose", ""))
-            fast_path = latest_confidence >= 0.84 and not latest_pose.startswith(("uncertain", "occluded"))
-            if fast_path:
-                if score < 0.72:
-                    continue
-            elif score < 1.02 or count < 2:
-                continue
-
-            if event_type == "request_tool":
-                if (
-                    not requested_tool
-                    or self._tool_is_with_surgeon(requested_tool)
-                    or self._tool_is_temporarily_unavailable(requested_tool)
-                ):
-                    continue
-                return {
-                    "phase_id": latest["phase_id"] or self._current_phase_id,
-                    "intent": "request_tool",
-                    "requested_tool": requested_tool,
-                    "ready_for_handover": True,
-                    "ready_for_retrieval": False,
-                    "scene_note": latest["note"] or "VLM inferred an open hand requesting a tool.",
-                }
-            if event_type == "return_tool":
-                if not requested_tool or not (
-                    self._tool_is_with_surgeon(requested_tool) or self._tool_is_in_field(requested_tool)
-                ):
-                    continue
-                return {
-                    "phase_id": latest["phase_id"] or self._current_phase_id,
-                    "intent": "return_tool",
-                    "requested_tool": requested_tool,
-                    "ready_for_handover": False,
-                    "ready_for_retrieval": True,
-                    "scene_note": latest["note"] or "VLM inferred a used tool being presented for retrieval.",
-                }
-        return None
-
-    def _publish_vlm_request_transition(self, stable_state: dict[str, object] | None, voice_active: bool) -> None:
-        signature = (
-            f"{stable_state['intent']}:{stable_state['requested_tool']}"
-            if stable_state is not None
-            else ""
-        )
-        if signature == self._published_vlm_signature:
-            return
-        if stable_state is not None:
-            request = SurgeonRequest()
-            request.event_type = str(stable_state["intent"])
-            request.requested_tool = str(stable_state["requested_tool"])
-            request.ready_for_handover = bool(stable_state["ready_for_handover"])
-            request.ready_for_retrieval = bool(stable_state["ready_for_retrieval"])
-            request.override = False
-            request.note = str(stable_state["scene_note"])
-            self._publish_request(request)
-            self._published_vlm_signature = signature
-            return
-        if self._published_vlm_signature and not voice_active:
-            request = SurgeonRequest()
-            request.event_type = "cancel_request"
-            request.override = False
-            request.note = "VLM hand cue is no longer stable."
-            self._publish_request(request)
-        self._published_vlm_signature = ""
-
-    def _request_state_still_relevant(self, state: dict[str, object] | None) -> bool:
-        if state is None:
-            return False
-        intent = str(state.get("intent", ""))
-        requested_tool = str(state.get("requested_tool", ""))
-        if not requested_tool:
-            return False
-        if intent == "request_tool":
-            return not self._tool_is_with_surgeon(requested_tool) and not self._tool_is_temporarily_unavailable(requested_tool)
-        if intent == "return_tool":
-            return self._tool_is_with_surgeon(requested_tool) or self._tool_is_in_field(requested_tool)
-        return False
-
-    def _effective_vlm_state(self, stable_state: dict[str, object] | None) -> dict[str, object] | None:
-        if stable_state is not None:
-            self._latched_vlm_state = dict(stable_state)
-            self._latched_vlm_ticks = 3
-            return stable_state
-        if self._latched_vlm_ticks > 0 and self._request_state_still_relevant(self._latched_vlm_state):
-            self._latched_vlm_ticks -= 1
-            return self._latched_vlm_state
-        self._latched_vlm_state = None
-        self._latched_vlm_ticks = 0
-        return None
-
     def _select_requestable_tool(
         self,
         phase_id: str,
@@ -496,22 +347,19 @@ class MockSurgeonNode(Node):
         stage = self._stage_for_tick(self._tick)
         self._current_phase_id = stage.phase_id or self._current_phase_id
         phase_id = stage.phase_id or self._current_phase_id or self._spec.default_phase_id
-        stable_vlm_state = self._stable_gesture_request()
-        effective_vlm_state = self._effective_vlm_state(stable_vlm_state)
-        if effective_vlm_state:
-            state_intent = str(effective_vlm_state["intent"])
-            state_requested_tool = str(effective_vlm_state["requested_tool"])
-            state_handover = bool(effective_vlm_state["ready_for_handover"])
-            state_retrieval = bool(effective_vlm_state["ready_for_retrieval"])
-            state_scene_note = str(effective_vlm_state["scene_note"])
-            state_phase_id = str(effective_vlm_state["phase_id"])
-        else:
-            state_intent = stage.event_type or "idle"
-            state_requested_tool = stage.requested_tool or ""
-            state_handover = bool(stage.ready_for_handover or stage.event_type in {"request_tool", "voice_request", "extend_hand_for_handover"})
-            state_retrieval = bool(stage.ready_for_retrieval or stage.event_type in {"return_tool", "extend_hand_for_retrieval"})
-            state_scene_note = stage.scene_note or ""
-            state_phase_id = stage.phase_id or phase_id
+        state_intent = stage.event_type or "idle"
+        state_requested_tool = stage.requested_tool or ""
+        state_handover = bool(
+            stage.ready_for_handover
+            or stage.event_type
+            in {"request_tool", "voice_request", "extend_hand_for_handover"}
+        )
+        state_retrieval = bool(
+            stage.ready_for_retrieval
+            or stage.event_type in {"return_tool", "extend_hand_for_retrieval"}
+        )
+        state_scene_note = stage.scene_note or ""
+        state_phase_id = stage.phase_id or phase_id
 
         if (
             self._random_voice_enabled
@@ -532,9 +380,6 @@ class MockSurgeonNode(Node):
 
         if self._last_stage_name != stage.name:
             self._last_stage_name = stage.name
-
-        voice_active = bool(self._active_voice_text)
-        self._publish_vlm_request_transition(None if voice_active else effective_vlm_state, voice_active)
 
         self._publish_state(
             phase_id=state_phase_id,
@@ -575,11 +420,6 @@ class MockSurgeonNode(Node):
             self._clear_active_override()
             self._schedule_next_random_voice()
             self._override_queue.clear()
-            self._gesture_history.clear()
-            self._published_vlm_signature = ""
-            self._latched_vlm_state = None
-            self._latched_vlm_ticks = 0
-
     def _on_override(self, msg: SurgeonRequest) -> None:
         if msg.event_type == "cancel_request":
             self._override_queue.clear()
@@ -592,26 +432,6 @@ class MockSurgeonNode(Node):
     def _on_phase(self, msg: FilteredPhase) -> None:
         if msg.phase_id:
             self._current_phase_id = msg.phase_id
-
-    def _on_gesture_evidence(self, msg: SurgeonGestureEvidence) -> None:
-        stamp_sec = float(msg.stamp.sec) + float(msg.stamp.nanosec) / 1_000_000_000.0
-        self._gesture_history.append(
-            {
-                "stamp_sec": stamp_sec,
-                "phase_id": msg.phase_id,
-                "event_type": msg.event_type,
-                "requested_tool": msg.requested_tool,
-                "hand_pose": msg.hand_pose,
-                "confidence": float(msg.confidence),
-                "note": msg.note,
-            }
-        )
-        if not self._active:
-            return
-        stable_vlm_state = self._stable_gesture_request()
-        effective_vlm_state = self._effective_vlm_state(stable_vlm_state)
-        voice_active = bool(self._active_voice_text)
-        self._publish_vlm_request_transition(None if voice_active else effective_vlm_state, voice_active)
 
     def _on_simulation_state(self, msg: SimulationState) -> None:
         self._instrument_states = {instrument.instrument_id: instrument for instrument in msg.instrument_states}

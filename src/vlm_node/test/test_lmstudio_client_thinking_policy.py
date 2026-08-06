@@ -82,6 +82,38 @@ def test_ninfer_request_uses_typed_thinking_switch_and_prompt_json(monkeypatch):
     assert "chat_template_kwargs" not in captured
 
 
+def test_lmstudio_openai_request_disables_template_thinking(monkeypatch):
+    captured: dict[str, Any] = {}
+
+    def fake_post(url, *, json, headers, timeout):
+        captured.update(json)
+        return _Response()
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    client = LMStudioClient(
+        base_url="http://127.0.0.1:1234",
+        timeout_sec=1.0,
+        provider_id="lmstudio",
+    )
+
+    client.request_json(
+        system_prompt="system",
+        developer_prompt="developer",
+        user_context_json="{}",
+        images=[],
+        model_id="qwen/qwen3.5-4b",
+        temperature=0.0,
+        top_p=1.0,
+        max_output_tokens=32,
+        api_mode="openai_compat",
+        reasoning_effort="high",
+    )
+
+    assert captured["reasoning_effort"] == "none"
+    assert captured["chat_template_kwargs"] == {"enable_thinking": False}
+    assert "enable_thinking" not in captured
+
+
 def test_openai_request_includes_explicit_generation_seed(monkeypatch):
     captured: dict[str, Any] = {}
 

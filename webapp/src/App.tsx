@@ -139,7 +139,7 @@ export default function App() {
       />
 
       <motion.main
-        className="mission-layout"
+        className={`mission-layout ${runtimeMode === "live" ? "live-stage-expanded" : ""}`}
         initial={{ opacity: 0, y: 16 }}
         animate={{ opacity: 1, y: 0 }}
         transition={{ duration: 0.38, ease: [0.22, 1, 0.36, 1] }}
@@ -176,42 +176,44 @@ export default function App() {
           />
         </div>
 
-        <div className="surgeon-area">
-          {runtimeMode === "shadow" ? (
-            <ShadowReplayDock
-              vm={vm}
-              language={language}
-              state={ros.shadowReplayState}
-              transcript={ros.shadowTranscript}
-              connected={ros.connected}
-              actionPending={ros.actionPending}
-              groundTruth={ros.shadowGroundTruth}
-              onCaseChange={(caseId) => void ros.selectShadowCase(caseId)}
-              onConfigure={(mode, playbackRate) =>
-                void ros.configureShadowReplay(mode, playbackRate)
-              }
-            />
-          ) : (
-            <SurgeonIntentDock
-              vm={vm}
-              language={language}
-              llmDecision={ros.surgeonLlmDecision}
-              actorEnabled={ros.actorEnabled}
-              modelOptions={ros.actorModelOptions}
-              providerStatuses={ros.actorProviderStatuses}
-              modelCatalogStatus={ros.actorModelCatalogStatus}
-              modelSelection={ros.actorModelSelection}
-              connected={ros.connected}
-              actionPending={ros.actionPending}
-              publicSurgeonGesture={vlmSurgeonGesture}
-              onActorEnabledChange={(enabled) => void ros.setActorEnabled(enabled)}
-              onActorModelChange={(selection) => void ros.setActorModel(selection)}
-              onActorRuntimeAction={(selection, command) =>
-                void ros.controlActorModelRuntime(selection, command)
-              }
-            />
-          )}
-        </div>
+        {runtimeMode !== "live" ? (
+          <div className="surgeon-area">
+            {runtimeMode === "shadow" ? (
+              <ShadowReplayDock
+                vm={vm}
+                language={language}
+                state={ros.shadowReplayState}
+                transcript={ros.shadowTranscript}
+                connected={ros.connected}
+                actionPending={ros.actionPending}
+                groundTruth={ros.shadowGroundTruth}
+                onCaseChange={(caseId) => void ros.selectShadowCase(caseId)}
+                onConfigure={(mode, playbackRate) =>
+                  void ros.configureShadowReplay(mode, playbackRate)
+                }
+              />
+            ) : (
+              <SurgeonIntentDock
+                vm={vm}
+                language={language}
+                llmDecision={ros.surgeonLlmDecision}
+                actorEnabled={ros.actorEnabled}
+                modelOptions={ros.actorModelOptions}
+                providerStatuses={ros.actorProviderStatuses}
+                modelCatalogStatus={ros.actorModelCatalogStatus}
+                modelSelection={ros.actorModelSelection}
+                connected={ros.connected}
+                actionPending={ros.actionPending}
+                publicSurgeonGesture={vlmSurgeonGesture}
+                onActorEnabledChange={(enabled) => void ros.setActorEnabled(enabled)}
+                onActorModelChange={(selection) => void ros.setActorModel(selection)}
+                onActorRuntimeAction={(selection, command) =>
+                  void ros.controlActorModelRuntime(selection, command)
+                }
+              />
+            )}
+          </div>
+        ) : null}
 
         <div className="runtime-area">
           <ProcedureDock
@@ -246,6 +248,7 @@ export default function App() {
             worldState={ros.worldState}
             surgeonState={ros.surgeonState}
             vlmHealth={ros.vlmHealth}
+            inputSourceStatuses={ros.inputSourceStatuses}
             vlmResult={ros.vlmResult}
             vlmReducerDecisions={ros.vlmReducerDecisions}
             vlmImage={ros.vlmImage}
@@ -263,6 +266,7 @@ export default function App() {
             worldState={ros.worldState}
             surgeonState={ros.surgeonState}
             vlmHealth={ros.vlmHealth}
+            inputSourceStatuses={ros.inputSourceStatuses}
             vlmResult={ros.vlmResult}
             vlmReducerDecisions={ros.vlmReducerDecisions}
             vlmImage={ros.vlmImage}

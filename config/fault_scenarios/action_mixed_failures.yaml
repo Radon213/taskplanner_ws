@@ -1,0 +1,18 @@
+schema: taskplanner.action_emulator.v1
+profile_id: mixed-action-failures
+routes:
+  tool_handover:
+    sequence:
+      - {outcome: success, duration_sec: 0.25}
+      - {outcome: partial_failure, duration_sec: 0.4, fail_progress: 0.45}
+      - {outcome: cancel_recovery_failed, duration_sec: 2.0}
+    default: {outcome: success, duration_sec: 0.3}
+  retraction:
+    sequence:
+      - {outcome: reject}
+      - {outcome: success, duration_sec: 0.5}
+    default: {outcome: success, duration_sec: 0.4}
+  suction:
+    sequence:
+      - {outcome: abort, reason_code: suction_controller_unavailable}
+    default: {outcome: success}

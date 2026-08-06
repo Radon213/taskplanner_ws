@@ -92,6 +92,43 @@ class TestSubscriberManager(unittest.TestCase):
         self.assertFalse(topic in manager._subscribers)
         self.assert_topic_not_subscribed(topic)
 
+    def test_register_json_and_raw_subscribers_on_same_topic(self) -> None:
+        """Keep decoded and CDR subscriptions isolated for mixed clients."""
+        topic = "/test_register_json_and_raw_subscribers_on_same_topic"
+        msg_type = "std_msgs/String"
+        json_client = "client_test_mixed_json"
+        raw_client = "client_test_mixed_raw"
+        received: dict[str, Any] = {"json": None, "raw": None}
+
+        publisher_qos = QoSProfile(
+            depth=10,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        pub = self.node.create_publisher(String, topic, publisher_qos)
+
+        def json_cb(msg: OutgoingMessage[String]) -> None:
+            received["json"] = msg.get_json_values()["data"]
+
+        def raw_cb(msg: OutgoingMessage) -> None:
+            received["raw"] = msg.message
+
+        manager.subscribe(json_client, topic, json_cb, self.node, msg_type, raw=False)
+        manager.subscribe(raw_client, topic, raw_cb, self.node, msg_type, raw=True)
+        self.assertEqual(set(manager._subscribers[topic]), {False, True})
+
+        time.sleep(0.1)
+        pub.publish(String(data="mixed transport"))
+        time.sleep(0.1)
+
+        self.assertEqual(received["json"], "mixed transport")
+        self.assertIsInstance(received["raw"], bytes)
+
+        manager.unsubscribe(json_client, topic)
+        self.assertIn(topic, manager._subscribers)
+        manager.unsubscribe(raw_client, topic)
+        self.assertNotIn(topic, manager._subscribers)
+        self.node.destroy_publisher(pub)
+
     def test_register_publisher_conflicting_types(self) -> None:
         topic = "/test_register_publisher_conflicting_types"
         msg_type = "std_msgs/String"

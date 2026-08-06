@@ -192,6 +192,9 @@ def load_bundle(bundle_dir: str | Path | None = None) -> ProcedureSpec:
             smoothing_window=int(policy["phase_guard"]["smoothing_window"]),
             min_dwell_time_sec=float(policy["phase_guard"]["min_dwell_time_sec"]),
             allow_unknown_phase=bool(policy["phase_guard"]["allow_unknown_phase"]),
+            min_evidence_duration_sec=float(
+                policy["phase_guard"].get("min_evidence_duration_sec", 1.0)
+            ),
         ),
         action_guard=ActionGuardPolicy(
             block_handover_when_phase_uncertain=bool(

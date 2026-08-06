@@ -1,4 +1,8 @@
 builtin_interfaces/Time stamp
+string source
+uint64 source_epoch
+uint64 source_sequence
+string correlation_id
 string procedure_id
 string phase_id
 string event_type

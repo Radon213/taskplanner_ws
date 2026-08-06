@@ -99,9 +99,16 @@ class MockSkillActionServer(Node):
         if command in {"stop", "reset"}:
             self._control_generation += 1
 
-    def _find_instrument(self, instrument_id: str):
+    def _find_instrument(self, instrument_id: str, instance_id: str = ""):
         if self._world is None:
             return None
+        if instance_id:
+            for instrument in self._world.instrument_states:
+                if (
+                    instrument.instance_id == instance_id
+                    and instrument.instrument_id == instrument_id
+                ):
+                    return instrument
         for instrument in self._world.instrument_states:
             if instrument.instrument_id == instrument_id:
                 return instrument
@@ -228,6 +235,9 @@ class MockSkillActionServer(Node):
         event.stamp = self._stamp()
         event.event_type = event_type
         event.instrument_id = kwargs.get("instrument_id", goal.instrument_id)
+        event.instance_id = kwargs.get(
+            "instance_id", goal.instrument_instance_id
+        )
         event.phase_id = self._world.filtered_phase if self._world is not None else ""
         event.location_id = kwargs.get("location_id", "")
         event.location_type = kwargs.get("location_type", "")
@@ -244,6 +254,8 @@ class MockSkillActionServer(Node):
         event.mode = kwargs.get("mode", goal.mode)
         detail = dict(kwargs.get("detail", {}))
         detail.setdefault("command_id", goal.command_id)
+        if event.instance_id:
+            detail.setdefault("instrument_instance_id", event.instance_id)
         detail.setdefault("transport", "ros2_action")
         detail.setdefault("rationale", goal.rationale)
         event.detail_json = json.dumps(detail, sort_keys=True)
@@ -253,35 +265,59 @@ class MockSkillActionServer(Node):
         self._event_pub.publish(event)
 
     def _maybe_return_prepositioned_tool(
-        self, goal: ExecuteSkill.Goal, event_type: str = "PredictedToolReturnedToRack"
+        self,
+        goal: ExecuteSkill.Goal,
+        event_type: str = "UnusedPrepositionReturned",
     ) -> bool:
         if self._world is None:
             return False
         current_tool = self._world.right_hand_tool or self._world.prepositioned_tool
         if not current_tool or current_tool == goal.instrument_id:
             return False
-        instrument = self._find_instrument(current_tool)
+        current_instance_id = (
+            self._world.right_hand_tool_instance_id
+            or self._world.prepositioned_tool_instance_id
+        )
+        instrument = self._find_instrument(
+            current_tool, current_instance_id
+        )
         if instrument is None:
             return False
         if instrument.location_type != "robot_right_hand" or instrument.status not in {"prepared", "held"}:
             return False
+        return_location_id = (
+            getattr(instrument, "preposition_origin_location_id", "")
+            or instrument.home_location_id
+        )
+        return_location_type = (
+            getattr(instrument, "preposition_origin_location_type", "")
+            or instrument.home_location_type
+        )
+        return_lifecycle = (
+            getattr(instrument, "preposition_origin_lifecycle_stage", "")
+            or "returned_home"
+        )
         self._publish_event(
             self._make_event(
                 goal,
                 event_type,
                 instrument_id=current_tool,
+                instance_id=instrument.instance_id,
                 source_location_id="robot_right_hand",
                 source_location_type="robot_right_hand",
-                target_location_id=instrument.home_location_id,
-                target_location_type=instrument.home_location_type,
+                target_location_id=return_location_id,
+                target_location_type=return_location_type,
                 target_owner="none",
-                location_id=instrument.home_location_id,
-                location_type=instrument.home_location_type,
+                location_id=return_location_id,
+                location_type=return_location_type,
                 owner="none",
                 status="available",
                 cleaning_required=False,
                 mode="override_replace",
-                detail={"reason": "prepositioned tool replaced before handover"},
+                detail={
+                    "reason": "prepositioned tool replaced before handover",
+                    "target_lifecycle_stage": return_lifecycle,
+                },
             )
         )
         return True
@@ -289,7 +325,9 @@ class MockSkillActionServer(Node):
     def _publish_pick_if_needed(self, goal: ExecuteSkill.Goal) -> None:
         if self._world is not None and self._world.right_hand_tool == goal.instrument_id:
             return
-        instrument = self._find_instrument(goal.instrument_id)
+        instrument = self._find_instrument(
+            goal.instrument_id, goal.instrument_instance_id
+        )
         source_location_id = goal.source_location_id or (
             instrument.location_id if instrument is not None else "main_tray_slot_1"
         )
@@ -345,7 +383,18 @@ class MockSkillActionServer(Node):
         if action == "tool_predict":
             current_tool = self._world.right_hand_tool if self._world is not None else ""
             replacing_tool = bool(current_tool and current_tool != goal.instrument_id)
-            duration_sec = self._rack_pick_sec + self._rack_to_handover_sec
+            source_is_mayo = (
+                goal.source_location_type
+                in {"mayo_stand", "mayo_reuse_zone"}
+                or goal.source_location_id
+                in {"mayo_stand", "mayo_reuse_zone"}
+            )
+            pickup_sec = (
+                self._mayo_recovery_pickup_sec
+                if source_is_mayo
+                else self._rack_pick_sec
+            )
+            duration_sec = pickup_sec + self._rack_to_handover_sec
             if replacing_tool:
                 duration_sec += self._cleaner_to_rack_sec
             self._publish_task_state(
@@ -372,11 +421,11 @@ class MockSkillActionServer(Node):
                 pick_start = 0.30
             self._step_sleep(
                 goal_handle,
-                "picking_from_rack",
-                f"picking {goal.instrument_id} from rack",
+                "picking_for_preposition",
+                f"picking {goal.instrument_id} for reversible preparation",
                 pick_start,
                 0.60,
-                self._rack_pick_sec,
+                pickup_sec,
                 4,
                 generation,
             )
@@ -587,26 +636,53 @@ class MockSkillActionServer(Node):
             )
             message = "predicted tool replaced and requested tool handed over"
         elif action == "return_unused_preposition":
-            instrument = self._find_instrument(goal.instrument_id)
-            home_location_id = goal.target_location_id or (
+            instrument = self._find_instrument(
+                goal.instrument_id, goal.instrument_instance_id
+            )
+            return_location_id = goal.target_location_id or (
+                getattr(
+                    instrument,
+                    "preposition_origin_location_id",
+                    "",
+                )
+                if instrument is not None
+                else ""
+            ) or (
                 instrument.home_location_id if instrument is not None else "main_tray_slot_1"
             )
-            home_location_type = goal.target_location_type or (
+            return_location_type = goal.target_location_type or (
+                getattr(
+                    instrument,
+                    "preposition_origin_location_type",
+                    "",
+                )
+                if instrument is not None
+                else ""
+            ) or (
                 instrument.home_location_type if instrument is not None else "tray_slot"
             )
+            return_lifecycle = (
+                getattr(
+                    instrument,
+                    "preposition_origin_lifecycle_stage",
+                    "",
+                )
+                if instrument is not None
+                else ""
+            ) or "returned_home"
             duration_sec = self._cleaner_to_rack_sec
             self._publish_task_state(
                 goal,
                 task_event_type="RobotTaskStarted",
                 task_type=goal.action,
                 source_anchor_id=goal.source_location_id or "robot_right_hand",
-                target_anchor_id=home_location_id,
+                target_anchor_id=return_location_id,
                 duration_sec=duration_sec,
             )
             self._step_sleep(
                 goal_handle,
-                "returning_prediction_to_rack",
-                f"returning unused predicted {goal.instrument_id} to the rack",
+                "returning_prediction_to_source",
+                f"returning unused predicted {goal.instrument_id} to its source",
                 0.05,
                 0.96,
                 duration_sec,
@@ -615,23 +691,28 @@ class MockSkillActionServer(Node):
             )
             event = self._make_event(
                 goal,
-                "PredictedToolReturnedToRack",
-                location_id=home_location_id,
-                location_type=home_location_type,
+                "UnusedPrepositionReturned",
+                location_id=return_location_id,
+                location_type=return_location_type,
                 owner="none",
                 status="available",
                 source_location_id=goal.source_location_id or "robot_right_hand",
                 source_location_type=goal.source_location_type or "robot_right_hand",
-                target_location_id=home_location_id,
-                target_location_type=home_location_type,
+                target_location_id=return_location_id,
+                target_location_type=return_location_type,
                 target_owner="none",
                 arm=goal.arm or "right",
                 cleaning_required=False,
-                detail={"reason": "unused prepositioned tool returned during cleanup"},
+                detail={
+                    "reason": "unused prepositioned tool returned during cleanup",
+                    "target_lifecycle_stage": return_lifecycle,
+                },
             )
-            message = "unused predicted tool returned to rack"
+            message = "unused predicted tool returned to its source"
         elif action == "tool_retrieve":
-            instrument = self._find_instrument(goal.instrument_id)
+            instrument = self._find_instrument(
+                goal.instrument_id, goal.instrument_instance_id
+            )
             home_location_id = goal.target_location_id or (
                 instrument.home_location_id if instrument is not None else "main_tray_slot_1"
             )

@@ -495,6 +495,7 @@ def main(argv: list[str] | None = None) -> int:
             "bringup",
             "taskplanner_mock.launch.py",
             f"spec_dir:={spec_dir}",
+            f"default_bundle:={args.spec_name}",
             "enable_rosbridge:=false",
             "vlm_mode:=real",
             f"vlm_base_url:={args.vlm_base_url}",

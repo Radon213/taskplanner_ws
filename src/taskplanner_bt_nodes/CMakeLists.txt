@@ -29,6 +29,7 @@ auto_apms_behavior_tree_register_nodes(${PROJECT_NAME}
   taskplanner_bt_nodes::NeedsRecovery
   taskplanner_bt_nodes::IsToolAvailable
   taskplanner_bt_nodes::CanHandover
+  taskplanner_bt_nodes::CanPreposition
   taskplanner_bt_nodes::SelectExplicitTool
   taskplanner_bt_nodes::SelectImplicitTool
   taskplanner_bt_nodes::SelectExpectedTool

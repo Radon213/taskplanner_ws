@@ -94,6 +94,18 @@ CanHandover:
   allow_unreachable: true
   logger_level: ""
   extra: ~
+CanPreposition:
+  class_name: taskplanner_bt_nodes::CanPreposition
+  description: Apply low-risk right-hand preparation guards without treating preparation as a surgeon handover.
+  topic: ""
+  port_alias: {}
+  port_default: {}
+  hidden_ports: []
+  wait_timeout: 1
+  request_timeout: 2
+  allow_unreachable: true
+  logger_level: ""
+  extra: ~
 SelectExplicitTool:
   class_name: taskplanner_bt_nodes::SelectExplicitTool
   description: Select the explicitly requested tool and mirror it to selected.tool.

@@ -1,0 +1,19 @@
+schema: taskplanner.fault_scenario.v1
+scenario_id: camera-vlm-outage
+seed: 104729
+events:
+  - id: cam4-freeze
+    source: cam4
+    kind: freeze
+    start_sec: 8.0
+    duration_sec: 4.0
+  - id: flir-drop
+    source: flir
+    kind: drop
+    start_sec: 15.0
+    duration_sec: 3.0
+  - id: vlm-disconnect
+    source: vlm_health
+    kind: vlm_unhealthy
+    start_sec: 20.0
+    duration_sec: 5.0

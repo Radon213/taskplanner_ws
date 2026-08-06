@@ -338,6 +338,7 @@ class SkillActionBridge(Node):
         goal.command_id = command.command_id
         goal.action = command.action
         goal.instrument_id = command.instrument_id
+        goal.instrument_instance_id = command.instrument_instance_id
         goal.target_location_id = command.target_location_id
         goal.target_location_type = command.target_location_type
         goal.rationale = command.rationale

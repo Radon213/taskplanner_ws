@@ -6,7 +6,6 @@ COMPOSE_FILE="${ROOT_DIR}/docker-compose.yml"
 WAIT_TIMEOUT_SEC="${TASKPLANNER_COMPOSE_WAIT_SEC:-300}"
 RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}/taskplanner"
 NINFER_MANAGER_PID_FILE="${RUNTIME_DIR}/ninfer-manager.pid"
-NINFER_MANAGER_LOG_FILE="${RUNTIME_DIR}/ninfer-manager.log"
 NINFER_MANAGER_UNIT="taskplanner-ninfer-manager.service"
 LMSTUDIO_STARTED_FILE="${RUNTIME_DIR}/lmstudio.started"
 UNSLOTH_CONTROL_UNIT="taskplanner-unsloth-control.service"
@@ -20,6 +19,7 @@ Usage:
   scripts/taskplanner down [--dry-run]
   scripts/taskplanner status
   scripts/taskplanner config <live|llm-surgeon|replay>
+  scripts/taskplanner verify-release [--tier quick|rc|full]
   scripts/taskplanner help
 
 Commands:
@@ -29,6 +29,8 @@ Commands:
   down     Stop and remove every Taskplanner Compose profile.
   status   Show containers from every Taskplanner profile.
   config   Render the fully resolved Compose configuration for one mode.
+  verify-release
+           Run reproducible software release gates and write JSON/CSV/Markdown/SVG reports.
 
 Environment:
   .env.example is always loaded first. A local .env overrides deployment
@@ -42,6 +44,7 @@ Examples:
   scripts/taskplanner up replay --dry-run
   SHADOW_CASE_ID=0704_12 scripts/taskplanner up replay
   scripts/taskplanner down
+  scripts/taskplanner verify-release --tier rc
 EOF
 }
 
@@ -254,74 +257,7 @@ stop_unsloth_control_plane() {
   fi
 }
 
-start_ninfer_manager() {
-  ninfer_manager_command
-  local base_url
-  base_url="$(ninfer_manager_url)"
-  if [[ "${DRY_RUN}" == "true" ]]; then
-    print_command \
-      nohup "${NINFER_MANAGER_COMMAND[@]}" \
-      ">" "${NINFER_MANAGER_LOG_FILE}" "2>&1" "&"
-    return 0
-  fi
-  if ninfer_manager_ready "${base_url}"; then
-    return 0
-  fi
-  mkdir -p "${RUNTIME_DIR}"
-  if user_systemd_available; then
-    systemctl --user stop "${NINFER_MANAGER_UNIT}" >/dev/null 2>&1 || true
-    systemd-run --user \
-      --unit="${NINFER_MANAGER_UNIT%.service}" \
-      --collect \
-      --property=Restart=no \
-      "${NINFER_MANAGER_COMMAND[@]}" >/dev/null
-    local attempt
-    for attempt in $(seq 1 50); do
-      if ninfer_manager_ready "${base_url}"; then
-        systemctl --user show \
-          --property=MainPID \
-          --value \
-          "${NINFER_MANAGER_UNIT}" >"${NINFER_MANAGER_PID_FILE}"
-        return 0
-      fi
-      if ! systemctl --user is-active --quiet "${NINFER_MANAGER_UNIT}"; then
-        break
-      fi
-      sleep 0.1
-    done
-    printf 'NInfer manager failed to start; inspect: journalctl --user -u %s\n' \
-      "${NINFER_MANAGER_UNIT}" >&2
-    return 1
-  fi
-  if [[ -f "${NINFER_MANAGER_PID_FILE}" ]]; then
-    local stale_pid
-    stale_pid="$(cat "${NINFER_MANAGER_PID_FILE}")"
-    if kill -0 "${stale_pid}" 2>/dev/null; then
-      kill "${stale_pid}" 2>/dev/null || true
-      wait "${stale_pid}" 2>/dev/null || true
-    fi
-    rm -f "${NINFER_MANAGER_PID_FILE}"
-  fi
-  nohup "${NINFER_MANAGER_COMMAND[@]}" \
-    >"${NINFER_MANAGER_LOG_FILE}" 2>&1 &
-  local manager_pid=$!
-  printf '%s\n' "${manager_pid}" >"${NINFER_MANAGER_PID_FILE}"
-  local attempt
-  for attempt in $(seq 1 50); do
-    if ninfer_manager_ready "${base_url}"; then
-      return 0
-    fi
-    if ! kill -0 "${manager_pid}" 2>/dev/null; then
-      break
-    fi
-    sleep 0.1
-  done
-  printf 'NInfer manager failed to start; see %s\n' \
-    "${NINFER_MANAGER_LOG_FILE}" >&2
-  return 1
-}
-
-stop_ninfer_manager() {
+stop_legacy_ninfer_manager() {
   if [[ "${DRY_RUN}" == "true" ]]; then
     print_command systemctl --user stop "${NINFER_MANAGER_UNIT}"
     print_command rm -f "${NINFER_MANAGER_PID_FILE}"
@@ -461,9 +397,9 @@ case "${action}" in
       "${COMPOSE[@]}" "${ALL_PROFILE_ARGS[@]}" \
       rm -f taskplanner-runtime shadow-runner object-perception
 
-    run_best_effort \
-      "NInfer control plane did not start; other providers remain usable" \
-      start_ninfer_manager
+    # Releases before the Compose control plane used a host transient service.
+    # Stop only that legacy process so it cannot occupy the manager port.
+    run_or_print stop_legacy_ninfer_manager
 
     runtime_service="taskplanner-runtime"
     if [[ "${mode}" == "replay" ]]; then
@@ -481,7 +417,7 @@ case "${action}" in
       up -d "${BUILD_ARGS[@]}" --force-recreate \
       --remove-orphans \
       --wait --wait-timeout "${WAIT_TIMEOUT_SEC}" \
-      vllm-manager webapp
+      vllm-manager ninfer-manager webapp
 
     if [[ "${mode}" == "live" || "${mode}" == "replay" ]]; then
       run_best_effort \
@@ -525,7 +461,7 @@ case "${action}" in
     run_or_print \
       "${COMPOSE[@]}" "${ALL_PROFILE_ARGS[@]}" \
       down --remove-orphans
-    stop_ninfer_manager
+    stop_legacy_ninfer_manager
     stop_lmstudio_control_plane
     stop_unsloth_control_plane
     ;;
@@ -536,17 +472,10 @@ case "${action}" in
     compose_base
     all_profiles
     "${COMPOSE[@]}" "${ALL_PROFILE_ARGS[@]}" ps -a
-    if user_systemd_available &&
-        systemctl --user is-active --quiet "${NINFER_MANAGER_UNIT}"; then
-      printf 'NInfer manager: active transient user service (PID %s)\n' \
-        "$(systemctl --user show --property=MainPID --value "${NINFER_MANAGER_UNIT}")"
-    elif [[ -f "${NINFER_MANAGER_PID_FILE}" ]] &&
-        kill -0 "$(cat "${NINFER_MANAGER_PID_FILE}")" 2>/dev/null; then
-      printf 'NInfer manager PID: %s\n' \
-        "$(cat "${NINFER_MANAGER_PID_FILE}")"
+    if ninfer_manager_ready "$(ninfer_manager_url)"; then
+      printf 'NInfer manager: Compose control plane ready\n'
     else
-      rm -f "${NINFER_MANAGER_PID_FILE}"
-      printf 'NInfer manager: stopped\n'
+      printf 'NInfer manager: unavailable\n'
     fi
     if command -v lms >/dev/null 2>&1 &&
         lms server status 2>&1 | grep -q '^The server is running'; then
@@ -569,6 +498,10 @@ case "${action}" in
     compose_env_args "${mode}"
     compose_base
     "${COMPOSE[@]}" --profile "${mode}" config
+    ;;
+
+  verify-release)
+    exec python3 "${ROOT_DIR}/scripts/verify_release.py" "$@"
     ;;
 
   *)

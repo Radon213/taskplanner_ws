@@ -15,6 +15,25 @@ FORBIDDEN_RUNTIME_REFERENCES = {
     "evaluation_masks": "evaluation_masks.v1",
 }
 DEFAULT_RUNTIME_ROOTS = ("src", "webapp", "config", "docker")
+RUNTIME_SCAN_EXCLUDED_PARTS = {
+    "test",
+    "tests",
+    "__pycache__",
+    "node_modules",
+    "build",
+    "install",
+    "dist",
+}
+# This node is the evaluation display adapter: it may read reviewed timelines
+# only to publish the operator-facing shadow ground-truth panel. Production
+# decision nodes remain covered by the normal deny rule and runtime graph audit.
+EVALUATION_DISPLAY_REFERENCE_ALLOWLIST = {
+    "src/shadow_evaluation/shadow_evaluation/interactive_replay_controller.py": {
+        "flat_case_root",
+        "observed_final",
+        "phase_reference_final",
+    },
+}
 TEXT_SUFFIXES = {
     ".py",
     ".cpp",
@@ -37,6 +56,7 @@ TEXT_SUFFIXES = {
 def check_boundary(repo_root: Path) -> dict:
     checked = 0
     violations: list[dict[str, object]] = []
+    evaluation_display_references: list[dict[str, object]] = []
     for relative_root in DEFAULT_RUNTIME_ROOTS:
         root = repo_root / relative_root
         if not root.exists():
@@ -44,7 +64,11 @@ def check_boundary(repo_root: Path) -> dict:
         for path in root.rglob("*"):
             if not path.is_file() or path.suffix.lower() not in TEXT_SUFFIXES:
                 continue
-            if any(part in {"node_modules", "build", "install", "dist"} for part in path.parts):
+            relative_path = path.relative_to(repo_root)
+            if any(
+                part in RUNTIME_SCAN_EXCLUDED_PARTS
+                for part in relative_path.parts
+            ):
                 continue
             checked += 1
             try:
@@ -63,9 +87,37 @@ def check_boundary(repo_root: Path) -> dict:
                     if reference in line
                 ]
                 if matches:
+                    allowed_reference_kinds = (
+                        EVALUATION_DISPLAY_REFERENCE_ALLOWLIST.get(
+                            str(relative_path),
+                            set(),
+                        )
+                    )
+                    allowed_matches = [
+                        match
+                        for match in matches
+                        if match["reference_kind"] in allowed_reference_kinds
+                    ]
+                    matches = [
+                        match
+                        for match in matches
+                        if match["reference_kind"]
+                        not in allowed_reference_kinds
+                    ]
+                    if allowed_matches:
+                        evaluation_display_references.append(
+                            {
+                                "path": str(relative_path),
+                                "line": line_number,
+                                "text": line.strip(),
+                                "matches": allowed_matches,
+                            }
+                        )
+                    if not matches:
+                        continue
                     violations.append(
                         {
-                            "path": str(path.relative_to(repo_root)),
+                            "path": str(relative_path),
                             "line": line_number,
                             "text": line.strip(),
                             "matches": matches,
@@ -77,11 +129,21 @@ def check_boundary(repo_root: Path) -> dict:
         "runtime_roots": list(DEFAULT_RUNTIME_ROOTS),
         "checked_file_count": checked,
         "forbidden_runtime_references": FORBIDDEN_RUNTIME_REFERENCES,
+        "evaluation_display_reference_allowlist": {
+            path: sorted(reference_kinds)
+            for path, reference_kinds in (
+                EVALUATION_DISPLAY_REFERENCE_ALLOWLIST.items()
+            )
+        },
+        "evaluation_display_references": evaluation_display_references,
         "violations": violations,
         "policy": (
             "No VLM, reducer, BT, skill, runtime config, or production UI "
             "consumer may resolve evaluation-only references. Offline "
-            "evaluation and annotation tools live outside these runtime roots."
+            "evaluation and annotation tools live outside these runtime roots. "
+            "The allow-listed shadow display adapter may read reviewed "
+            "timelines only for the operator-facing ground-truth panel; "
+            "runtime graph auditing protects that topic from decision nodes."
         ),
     }
 

@@ -394,7 +394,11 @@ export function OperatingRoomStage({
     previousToolRectsRef.current = nextRects;
   }, [displayToolPlacements]);
 
-  const surgeonAlertBubbles = vm.boardActionBubbles.filter((bubble) => bubble.id.startsWith("surgeon-"));
+  const surgeonAlertBubbles = vm.boardActionBubbles
+    .filter((bubble) => bubble.id.startsWith("surgeon-"))
+    .slice(0, 1);
+  const displayedSurgeonAlerts = surgeonRequestConfirmed ? [] : surgeonAlertBubbles;
+  const surgeonHolder = vm.boardHolders.find((holder) => holder.id === "surgeon");
   const surgeonAlertClockKey = surgeonAlertBubbles
     .map((bubble) => `${bubble.id}:${bubble.occurredAt ?? 0}`)
     .join("|");
@@ -617,14 +621,15 @@ export function OperatingRoomStage({
         </div>
 
         {vm.boardHolders.map((holder) => {
-          const holderSurgeonAlerts = holder.id === "surgeon" ? surgeonAlertBubbles : [];
           const inlineBadges = holder.id === "cleaner" ? holder.badges : undefined;
           const floatingBadges = holder.id === "cleaner" ? undefined : holder.badges;
           return (
             <div
               key={holder.id}
               className={`holder-zone ${holder.tone} ${holder.active ? "active" : ""} ${
-                holderSurgeonAlerts.length ? "has-alerts" : ""
+                holder.id === "surgeon" && (surgeonRequestConfirmed || displayedSurgeonAlerts.length)
+                  ? "has-evidence"
+                  : ""
               }`}
               data-holder-id={holder.id}
               style={{
@@ -648,51 +653,6 @@ export function OperatingRoomStage({
                   ) : holder.meta ? (
                     <span>{holder.meta}</span>
                   ) : null}
-                </div>
-              ) : null}
-              {holder.id === "surgeon" && surgeonRequestConfirmed ? (
-                <div
-                  className="surgeon-hand-status active"
-                  role="status"
-                  aria-live="polite"
-                  data-system-source="reducer-world-state"
-                  data-system-event="tool-request-confirmed"
-                >
-                  <Hand aria-hidden="true" size={14} strokeWidth={2.2} />
-                  <span>
-                    {vm.language === "ko"
-                      ? "도구 요청 확정"
-                      : "Tool request confirmed"}
-                  </span>
-                  <strong>{confirmedRequestTool}</strong>
-                </div>
-              ) : null}
-              {holderSurgeonAlerts.length ? (
-                <div className="holder-alert-stack" aria-label={`${holder.label} alerts`}>
-                  <AnimatePresence initial={false}>
-                    {holderSurgeonAlerts.map((bubble) => (
-                      <motion.div
-                        key={bubble.id}
-                        layout
-                        className="holder-embedded-bubble"
-                        initial={{ opacity: 0, y: reduceMotion ? 0 : -6, scale: reduceMotion ? 1 : 0.98 }}
-                        animate={{ opacity: 1, y: 0 }}
-                        exit={{ opacity: 0, y: reduceMotion ? 0 : -4, scale: reduceMotion ? 1 : 0.98 }}
-                        transition={{
-                          layout: { duration: reduceMotion ? 0.1 : 0.22, ease: [0.22, 1, 0.36, 1] },
-                          opacity: { duration: reduceMotion ? 0.1 : 0.16 },
-                          y: { duration: reduceMotion ? 0.1 : 0.18 },
-                          scale: { duration: reduceMotion ? 0.1 : 0.18 },
-                        }}
-                      >
-                        <span>
-                          <b>{bubble.title}</b>
-                          {bubble.occurredAt ? <time>{voiceAgeLabel(bubble.occurredAt, nowMs, vm.language)}</time> : null}
-                        </span>
-                        <strong>{bubble.text}</strong>
-                      </motion.div>
-                    ))}
-                  </AnimatePresence>
                 </div>
               ) : null}
               {floatingBadges?.length ? (
@@ -868,6 +828,67 @@ export function OperatingRoomStage({
             );
           })}
         </div>
+
+        {surgeonHolder && (surgeonRequestConfirmed || displayedSurgeonAlerts.length) ? (
+          <div
+            className="surgeon-evidence-overlay"
+            aria-label={`${surgeonHolder.label} evidence`}
+            style={{
+              left: `${surgeonHolder.rect.left}%`,
+              top: `${surgeonHolder.rect.top}%`,
+              width: `${surgeonHolder.rect.width}%`,
+              height: `${surgeonHolder.rect.height}%`,
+            }}
+          >
+            <div className="surgeon-evidence-stack">
+              {surgeonRequestConfirmed ? (
+                <div
+                  className="surgeon-hand-status active"
+                  role="status"
+                  aria-live="polite"
+                  data-system-source="reducer-world-state"
+                  data-system-event="tool-request-confirmed"
+                >
+                  <Hand aria-hidden="true" size={14} strokeWidth={2.2} />
+                  <span>
+                    {vm.language === "ko"
+                      ? "도구 요청 확정"
+                      : "Tool request confirmed"}
+                  </span>
+                  <strong>{confirmedRequestTool}</strong>
+                </div>
+              ) : null}
+              {displayedSurgeonAlerts.length ? (
+                <div className="holder-alert-stack" aria-label={`${surgeonHolder.label} alerts`}>
+                  <AnimatePresence initial={false}>
+                    {displayedSurgeonAlerts.map((bubble) => (
+                      <motion.div
+                        key={bubble.id}
+                        layout
+                        className="holder-embedded-bubble"
+                        initial={{ opacity: 0, y: reduceMotion ? 0 : -6, scale: reduceMotion ? 1 : 0.98 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        exit={{ opacity: 0, y: reduceMotion ? 0 : -4, scale: reduceMotion ? 1 : 0.98 }}
+                        transition={{
+                          layout: { duration: reduceMotion ? 0.1 : 0.22, ease: [0.22, 1, 0.36, 1] },
+                          opacity: { duration: reduceMotion ? 0.1 : 0.16 },
+                          y: { duration: reduceMotion ? 0.1 : 0.18 },
+                          scale: { duration: reduceMotion ? 0.1 : 0.18 },
+                        }}
+                      >
+                        <span>
+                          <b>{bubble.title}</b>
+                          {bubble.occurredAt ? <time>{voiceAgeLabel(bubble.occurredAt, nowMs, vm.language)}</time> : null}
+                        </span>
+                        <strong>{bubble.text}</strong>
+                      </motion.div>
+                    ))}
+                  </AnimatePresence>
+                </div>
+              ) : null}
+            </div>
+          </div>
+        ) : null}
       </div>
     </section>
   );

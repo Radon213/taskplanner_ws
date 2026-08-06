@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
+import json
 import threading
 from types import SimpleNamespace
 
@@ -16,6 +17,7 @@ from vlm_node.real_vlm import (
     InferenceBackpressure,
     ModelImage,
     RealVLMNode,
+    model_input_signature,
 )
 
 
@@ -25,6 +27,65 @@ class _Publisher:
 
     def publish(self, message) -> None:
         self.messages.append(message)
+
+
+def _model_input_key(
+    *,
+    context: str = '{"speech":[]}',
+    source_stamp: float = 10.0,
+    image_bytes: bytes = b"frame",
+    runtime_epoch: int = 1,
+) -> str:
+    return model_input_signature(
+        runtime_epoch=runtime_epoch,
+        request_config={
+            "provider_id": "provider",
+            "model_id": "vision-model",
+            "temperature": 0.0,
+        },
+        system_prompt="public evidence observer",
+        developer_instruction="json only",
+        request_context_json=context,
+        observation_metadata=[
+            {
+                "role": "flir",
+                "stamp_sec": source_stamp,
+                "frame_id": "camera",
+            }
+        ],
+        images=[("FLIR", image_bytes, "image/jpeg")],
+    )
+
+
+def test_model_input_signature_suppresses_only_exact_public_duplicates() -> None:
+    assert _model_input_key() == _model_input_key()
+
+
+def test_model_input_signature_preserves_new_public_context_on_same_frame() -> None:
+    baseline = _model_input_key(context='{"speech":[]}')
+    with_speech = _model_input_key(
+        context='{"speech":[{"text":"scalpel please"}]}'
+    )
+
+    assert baseline != with_speech
+
+
+def test_model_input_signature_preserves_changed_pixels_at_same_source_time() -> None:
+    assert _model_input_key(image_bytes=b"frame-a") != _model_input_key(
+        image_bytes=b"frame-b"
+    )
+
+
+def test_model_input_signature_preserves_later_source_time_for_stability() -> None:
+    assert _model_input_key(source_stamp=10.0) != _model_input_key(
+        source_stamp=10.5
+    )
+
+
+def test_model_input_signature_epoch_allows_explicit_runtime_retry() -> None:
+    assert _model_input_key(runtime_epoch=1) != _model_input_key(
+        runtime_epoch=2
+    )
 
 
 def test_in_flight_frames_coalesce_to_latest_and_run_immediately_afterward() -> None:
@@ -209,6 +270,106 @@ def test_live_model_failure_never_returns_last_good_as_fresh_payload() -> None:
     assert "provider timeout" in error
 
 
+def test_invalid_model_response_is_preserved_for_bounded_diagnostics() -> None:
+    node = RealVLMNode.__new__(RealVLMNode)
+    node._response_mode = "live"
+    node._retry_count = 0
+    node._developer_instruction = "json only"
+    node._system_prompt = "system"
+    node._model_id = "test-model"
+    node._temperature = 0.0
+    node._top_p = 1.0
+    node._generation_seed = 0
+    node._max_output_tokens = 64
+    node._api_mode = "openai_compat"
+    node._response_format = "none"
+    node._json_schema = {}
+    node._reasoning_effort = ""
+    invalid_payload = {
+        "v": "4",
+        "phase": [["P04", 0.8]],
+        "tool": ["T05", "T02"],
+        "intent": ["none", "", 0.0],
+        "gesture": ["", "", "", 0.0],
+        "mayo": [],
+        "mayo_retrieve": ["", 0.0],
+        "u": 0.2,
+        "sum": "visible field",
+        "bed_robot_arm_group": None,
+    }
+    raw_response = json.dumps(invalid_payload)
+    node._client = SimpleNamespace(
+        request_json=lambda **_kwargs: SimpleNamespace(
+            raw_text=raw_response,
+            latency_sec=0.2,
+            mode="openai_compat",
+        )
+    )
+
+    raw, payload, _latency, mode, retries, error = node._run_model("{}", [])
+
+    assert raw == raw_response
+    assert payload is None
+    assert mode == "inference_response_failed"
+    assert retries == 1
+    assert f"raw_response_chars={len(raw_response)}" in error
+    assert "raw_response_excerpt=" in error
+
+
+def test_schema_retry_receives_bounded_validation_error_and_recovers() -> None:
+    node = RealVLMNode.__new__(RealVLMNode)
+    node._response_mode = "live"
+    node._retry_count = 1
+    node._developer_instruction = "schema contract"
+    node._system_prompt = "system"
+    node._model_id = "test-model"
+    node._temperature = 0.0
+    node._top_p = 1.0
+    node._generation_seed = 0
+    node._max_output_tokens = 64
+    node._api_mode = "openai_compat"
+    node._response_format = "none"
+    node._json_schema = {}
+    node._reasoning_effort = ""
+    invalid = {
+        "v": "4",
+        "phase": [["P04", 0.8]],
+        "tool": [["T05", 0.8]],
+        "intent": ["none", "", 0.0],
+        "gesture": ["none", "", 0.0],
+        "mayo": [],
+        "mayo_retrieve": ["", 0.0],
+        "u": 0.2,
+        "sum": "visible field",
+        "bed_robot_arm_group": None,
+    }
+    valid = dict(invalid)
+    valid["gesture"] = ["", "", "", 0.0]
+    raw_responses = [json.dumps(invalid), json.dumps(valid)]
+    developer_prompts: list[str] = []
+
+    def request_json(**kwargs):
+        developer_prompts.append(kwargs["developer_prompt"])
+        return SimpleNamespace(
+            raw_text=raw_responses[len(developer_prompts) - 1],
+            latency_sec=0.2,
+            mode="openai_compat",
+        )
+
+    node._client = SimpleNamespace(request_json=request_json)
+
+    _raw, payload, _latency, mode, retries, error = node._run_model("{}", [])
+
+    assert payload is not None
+    assert mode == "openai_compat"
+    assert retries == 1
+    assert error == ""
+    assert len(developer_prompts) == 2
+    assert "failed schema validation" in developer_prompts[1]
+    assert "'gesture' must be" in developer_prompts[1]
+    assert "do not simplify any array shape" in developer_prompts[1]
+
+
 def test_failed_live_tick_records_health_but_publishes_no_stale_result() -> None:
     node = RealVLMNode.__new__(RealVLMNode)
     node._active = True
@@ -283,7 +444,7 @@ def test_failed_live_tick_records_health_but_publishes_no_stale_result() -> None
             "image_source": "flir_rfdetr_segmented",
             "latency_sec": 0.25,
             "prompt_chars": len("system") + len("developer") + len("{}"),
-            "output_chars": 0,
+            "output_chars": len(node._last_good_raw),
             "parse_retry_count": 2,
             "last_error": "provider timeout",
             "mode": (
@@ -321,3 +482,20 @@ def test_failure_history_is_bounded_and_keeps_latest_sequence() -> None:
     assert node._inference_failures[-1].sequence == (
         INFERENCE_FAILURE_HISTORY_LENGTH + 5
     )
+
+
+def test_visual_evidence_metadata_is_monotonic_within_runtime_epoch() -> None:
+    node = RealVLMNode.__new__(RealVLMNode)
+    node._model_input_epoch = 9001
+    node._vlm_result_sequence = 0
+    node._last_submitted_model_input_key = ""
+
+    first = node._next_visual_evidence_metadata("abcdef0123456789")
+    second = node._next_visual_evidence_metadata("fedcba9876543210")
+
+    assert first == (9001, 1, "vlm-9001-1-abcdef012345")
+    assert second == (9001, 2, "vlm-9001-2-fedcba987654")
+
+    node._reset_model_input_dedupe(advance_epoch=True)
+    assert node._model_input_epoch == 9002
+    assert node._vlm_result_sequence == 0

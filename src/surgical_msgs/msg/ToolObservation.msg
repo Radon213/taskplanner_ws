@@ -1,4 +1,8 @@
 builtin_interfaces/Time stamp
+string source
+uint64 source_epoch
+uint64 source_sequence
+string correlation_id
 string instrument_id
 string location_id
 string location_type

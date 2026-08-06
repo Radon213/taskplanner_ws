@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from or_digital_twin.models import (
@@ -7,6 +8,7 @@ from or_digital_twin.models import (
     LIFECYCLE_MAYO_RECOVERY,
     LIFECYCLE_MAYO_REUSE,
     LIFECYCLE_PREPOSITIONED_RIGHT,
+    LIFECYCLE_RECOVERING_LEFT,
     LIFECYCLE_RETURNED_HOME,
     LIFECYCLE_SURGEON_OWNED,
 )
@@ -114,6 +116,91 @@ def test_requested_mayo_reuse_tool_can_be_handed_over_again() -> None:
     )
     assert state.lifecycle_stage == LIFECYCLE_SURGEON_OWNED
     assert twin.state.surgeon_request_tool == ""
+
+
+def test_confirmed_public_retrieve_moves_mayo_tool_back_to_tray() -> None:
+    twin = _thyroid_twin()
+    state = _state(twin, "T04")
+    twin._set_lifecycle(
+        state,
+        LIFECYCLE_MAYO_RECOVERY,
+        location_type="mayo_recovery_zone",
+        location_id="mayo_recovery_zone",
+        confidence=1.0,
+    )
+
+    retrieved = _event(
+        "ToolRetrievedFromMayo",
+        "T04",
+        source="mayo_recovery_zone",
+        source_type="mayo_recovery_zone",
+        target="robot_left_hand",
+        target_type="robot_left_hand",
+    )
+    retrieved.instance_id = state.instance_id
+    twin.apply_event(retrieved)
+    assert state.lifecycle_stage == LIFECYCLE_RECOVERING_LEFT
+
+    returned = _event(
+        "ToolReturnedToTray",
+        "T04",
+        source="robot_left_hand",
+        source_type="robot_left_hand",
+        target=state.home_location_id,
+        target_type=state.home_location_type,
+    )
+    returned.instance_id = state.instance_id
+    twin.apply_event(returned)
+    assert state.lifecycle_stage == LIFECYCLE_RETURNED_HOME
+    assert state.location_id == state.home_location_id
+
+
+def test_unused_mayo_preposition_returns_to_mayo_instead_of_rack() -> None:
+    twin = _thyroid_twin()
+    tool_id = "T01"
+    state = _state(twin, tool_id)
+    twin._set_lifecycle(
+        state,
+        LIFECYCLE_MAYO_REUSE,
+        location_type="mayo_reuse_zone",
+        location_id="mayo_reuse_zone",
+        confidence=1.0,
+        placement_evidence="public_visual_observation",
+    )
+
+    twin.apply_event(
+        _event(
+            "RobotGraspedTool",
+            tool_id,
+            source="mayo_reuse_zone",
+            source_type="mayo_reuse_zone",
+            target="robot_right_hand",
+            target_type="robot_right_hand",
+        )
+    )
+
+    assert state.lifecycle_stage == LIFECYCLE_PREPOSITIONED_RIGHT
+    assert state.preposition_origin_location_id == "mayo_reuse_zone"
+    assert state.preposition_origin_lifecycle_stage == LIFECYCLE_MAYO_REUSE
+
+    returned = _event(
+        "UnusedPrepositionReturned",
+        tool_id,
+        source="robot_right_hand",
+        source_type="robot_right_hand",
+        target="mayo_reuse_zone",
+        target_type="mayo_reuse_zone",
+    )
+    returned.detail_json = json.dumps(
+        {"target_lifecycle_stage": LIFECYCLE_MAYO_REUSE}
+    )
+    twin.apply_event(returned)
+
+    assert state.lifecycle_stage == LIFECYCLE_MAYO_REUSE
+    assert state.location_id == "mayo_reuse_zone"
+    assert state.contaminated is True
+    assert state.preposition_origin_location_id == ""
+    assert twin.state.right_hand_tool == ""
 
 
 def test_active_mayo_recovery_is_canceled_when_tool_is_requested_for_reuse() -> None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import asdict, dataclass
+import hashlib
 from io import BytesIO
 import json
 import math
@@ -92,7 +93,9 @@ PUBLIC_DIGITAL_TWIN_EVENT_TYPES = {
     "InvariantViolation",
     "InvariantViolationIgnored",
 }
-ACTOR_LOG_CONTEXT_MAX_CHARS = 3200
+VLM_PROMPT_MAX_CHARS = 16_000
+ACTOR_LOG_CONTEXT_MAX_CHARS = 2800
+ACTOR_LOG_MIN_RUNTIME_CHARS = 512
 ACTOR_LOG_EVIDENCE_LIMITS = {
     "speech": 4,
     "observed_signals": 6,
@@ -106,6 +109,209 @@ HANDOVER_SKILL_ACTIONS = {
     "pick_up_from_mayo_and_handover",
     "put_down_and_handover",
 }
+
+
+def compact_prompt_json(data: dict[str, Any]) -> str:
+    """Serialize model context without expanding Korean speech into escapes."""
+
+    return json.dumps(
+        data,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def compact_actor_log_procedure_context(
+    spec,
+    procedure_prompt: dict[str, Any],
+) -> dict[str, Any]:
+    """Build a non-redundant VLM ontology from any procedure bundle."""
+    phase_labels = procedure_prompt.get("phase_labels", {})
+    phase_cues = procedure_prompt.get("cues", {})
+    phase_exclusions = procedure_prompt.get("exclude", {})
+    phase_sequences = procedure_prompt.get("seq", {})
+    phase_roles = procedure_prompt.get("roles", {})
+
+    phases: list[dict[str, Any]] = []
+    for phase in spec.bundle.phases:
+        phase_id = str(phase.id)
+        item: dict[str, Any] = {
+            "id": phase_id,
+            "name": str(phase_labels.get(phase_id, phase_id)),
+            "next": list(phase.possible_next),
+            "tools": list(phase.expected_instruments),
+        }
+        cues = list(phase_cues.get(phase_id, []))
+        if cues:
+            # Adjacent phases are often separated by the second authored cue
+            # (for example, stable exposure versus target manipulation).
+            # Preserve the complete compact cue list across every procedure;
+            # case timestamps and evaluation labels remain excluded.
+            item["cue"] = cues
+        exclusions = list(phase_exclusions.get(phase_id, []))
+        if exclusions:
+            item["not"] = exclusions
+        sequences = list(phase_sequences.get(phase_id, []))
+        if sequences:
+            # The free-text rationale repeats phase cues and consumes a large
+            # fraction of every request. The ordered tool transition is the
+            # only part the visual observer needs; policy remains in the BT.
+            item["sequence"] = [
+                [str(row[0]), str(row[1])]
+                for row in sequences
+                if isinstance(row, (list, tuple)) and len(row) >= 2
+            ]
+        roles = phase_roles.get(phase_id, {})
+        if roles:
+            item["roles"] = roles
+        phases.append(item)
+
+    tools = [
+        {
+            "id": instrument.id,
+            "name": instrument.display_name,
+            "role": instrument.role,
+        }
+        for instrument in spec.bundle.instruments
+    ]
+    context = {
+        "procedure": str(procedure_prompt.get("procedure", "")),
+        "phases": phases,
+        "tools": tools,
+    }
+    # Flow and phase-policy prose repeat the per-phase cue/exclusion rows and
+    # consume a large immutable prefix on every request. The generic policy is
+    # expressed once in the developer instruction; coarse groups remain useful
+    # when adjacent visual states cannot be distinguished.
+    phase_groups = procedure_prompt.get("phase_groups")
+    if phase_groups:
+        context["groups"] = phase_groups
+    return context
+
+
+def actor_log_model_context(context: dict[str, Any]) -> dict[str, Any]:
+    """Remove prediction-shaped feedback from the context sent to the model."""
+    model_context = dict(context)
+    # Procedure priors and previous VLM hypotheses are consumed by the
+    # reducer/stabilizer. Sending their ranked pairs back to the model creates
+    # a self-reinforcing loop and makes model-raw output cease to be an
+    # independent observation.
+    model_context.pop("candidates", None)
+    model_context.pop("previous", None)
+    model_context.pop("procedure_prompt_id", None)
+
+    visual = model_context.get("visual_input")
+    if isinstance(visual, dict):
+        compact_visual = {
+            key: visual[key]
+            for key in (
+                "image_source",
+                "image_layout",
+                "sources",
+                "cam4_image_forwarded_to_vlm",
+                "cam4_detector_overlay_forwarded_to_vlm",
+                "detector_advisory",
+                "input_error",
+            )
+            if key in visual and visual[key] is not None and visual[key] != ""
+        }
+        sources = visual.get("sources")
+        if isinstance(sources, list):
+            compact_sources = []
+            for source in sources[-3:]:
+                if not isinstance(source, dict):
+                    continue
+                compact_source = {
+                    key: source[key]
+                    for key in ("role", "stamp_sec", "offset_sec")
+                    if key in source and source[key] is not None
+                }
+                if compact_source:
+                    compact_sources.append(compact_source)
+            if compact_sources:
+                compact_visual["sources"] = compact_sources
+        model_context["visual_input"] = compact_visual
+
+    perception = model_context.get("observable_perception")
+    if isinstance(perception, dict):
+        compact_perception = {
+            key: perception[key]
+            for key in ("source", "ground_truth", "tool_request", "tools")
+            if key in perception
+        }
+        alignment = perception.get("alignment")
+        if isinstance(alignment, dict) and alignment.get("status"):
+            compact_perception["alignment"] = {
+                "status": alignment["status"],
+            }
+        tool_rows = perception.get("tools")
+        if isinstance(tool_rows, list):
+            compact_tools = []
+            for row in tool_rows[:12]:
+                if not isinstance(row, dict):
+                    continue
+                compact_row = {
+                    key: row[key]
+                    for key in (
+                        "name",
+                        "id",
+                        "count",
+                        "max_confidence",
+                        "confidence",
+                        "stable_sample_count",
+                        "stable_duration_sec",
+                    )
+                    if key in row and row[key] is not None
+                }
+                if compact_row:
+                    compact_tools.append(compact_row)
+            compact_perception["tools"] = compact_tools
+        model_context["observable_perception"] = compact_perception
+
+    digital_twin = model_context.get("digital_twin")
+    if isinstance(digital_twin, dict):
+        compact_twin = dict(digital_twin)
+        # The same rows are exposed at the top level when they are actionable.
+        compact_twin.pop("bed_robot_arm_groups", None)
+        model_context["digital_twin"] = compact_twin
+
+    groups = model_context.get("bed_robot_arm_groups")
+    if isinstance(groups, list):
+        actionable_groups = [
+            row
+            for row in groups
+            if isinstance(row, dict)
+            and (
+                not bool(row.get("connected", True))
+                or bool(row.get("active_request_id"))
+                or bool(row.get("error_code"))
+                or bool(row.get("rejection_reason"))
+                or str(row.get("state", "")).lower()
+                not in {"", "standby", "idle", "ready"}
+            )
+        ]
+        if actionable_groups:
+            model_context["bed_robot_arm_groups"] = actionable_groups
+        else:
+            model_context.pop("bed_robot_arm_groups", None)
+
+    if model_context.get("pending_bed_robot_arm_group_request") is None:
+        model_context.pop("pending_bed_robot_arm_group_request", None)
+
+    phase_floor = model_context.get("phase_start_floor")
+    if isinstance(phase_floor, dict):
+        model_context["phase_start_floor"] = {
+            key: phase_floor[key]
+            for key in (
+                "id",
+                "allowed_normal_phase_ids",
+                "interrupt_phase_ids",
+                "ground_truth",
+            )
+            if key in phase_floor
+        }
+    return model_context
 
 
 def bound_actor_log_context(
@@ -133,13 +339,16 @@ def bound_actor_log_context(
         digital_twin["events"] = events[-ACTOR_LOG_EVENT_LIMIT:]
     bounded["digital_twin"] = digital_twin
 
+    # Preserve the newest externally observable request cue until the end.
+    # Old skill/event rows are less useful to the visual observer than current
+    # speech and hand-request evidence.
     shrink_order = (
-        (evidence, "observed_signals"),
         (evidence, "skill_status"),
-        (evidence, "speech"),
         (digital_twin, "events"),
+        (evidence, "observed_signals"),
+        (evidence, "speech"),
     )
-    while len(compact_json(bounded)) > max_chars:
+    while len(compact_prompt_json(actor_log_model_context(bounded))) > max_chars:
         removed = False
         for owner, key in shrink_order:
             rows = owner.get(key, [])
@@ -150,9 +359,172 @@ def bound_actor_log_context(
         if not removed:
             break
     return bounded
+
+
+def actor_log_request_context(
+    context: dict[str, Any],
+    *,
+    static_prompt_chars: int,
+    total_prompt_chars_max: int = VLM_PROMPT_MAX_CHARS,
+) -> dict[str, Any]:
+    """Build a valid request context under the complete prompt budget."""
+
+    available_chars = int(total_prompt_chars_max) - int(static_prompt_chars)
+    if available_chars < ACTOR_LOG_MIN_RUNTIME_CHARS:
+        raise RuntimeError(
+            "static VLM prompt does not reserve enough runtime evidence space"
+        )
+    bounded = bound_actor_log_context(context, max_chars=available_chars)
+    model_context = actor_log_model_context(bounded)
+    if len(compact_prompt_json(model_context)) <= available_chars:
+        return model_context
+
+    # A very large inventory can exceed the budget even after history rows are
+    # reduced to one. Keep current public request evidence and the smallest
+    # state needed to interpret it, instead of truncating JSON or dropping the
+    # latest speech cue.
+    evidence = model_context.get("evidence_window", {})
+    if not isinstance(evidence, dict):
+        evidence = {}
+    minimal: dict[str, Any] = {
+        "proc": model_context.get("proc", ""),
+        "phase_search_mode": model_context.get("phase_search_mode", ""),
+        "evidence_window": {
+            key: rows[-1:]
+            for key in ("speech", "observed_signals", "skill_status")
+            if isinstance((rows := evidence.get(key)), list) and rows
+        },
+    }
+    for key in (
+        "phase_start_floor",
+        "visual_input",
+        "observable_perception",
+        "pending_bed_robot_arm_group_request",
+    ):
+        if key in model_context:
+            minimal[key] = model_context[key]
+    digital_twin = model_context.get("digital_twin")
+    if isinstance(digital_twin, dict):
+        minimal["digital_twin"] = {
+            key: digital_twin[key]
+            for key in ("hands", "forecast_inventory", "tools")
+            if key in digital_twin
+        }
+
+    optional_removal_order = (
+        "digital_twin",
+        "pending_bed_robot_arm_group_request",
+        "phase_start_floor",
+    )
+    for key in optional_removal_order:
+        if len(compact_prompt_json(minimal)) <= available_chars:
+            break
+        minimal.pop(key, None)
+
+    # Detector rows are advisory and can expand abruptly when many instances
+    # enter CAM4. Preserve the pixels, newest speech/request evidence, and
+    # detector provenance while reducing optional rows instead of failing the
+    # latest-frame loop for every incoming frame.
+    evidence = minimal.get("evidence_window", {})
+    if not isinstance(evidence, dict):
+        evidence = {}
+        minimal["evidence_window"] = evidence
+    perception = minimal.get("observable_perception", {})
+    if not isinstance(perception, dict):
+        perception = {}
+    visual = minimal.get("visual_input", {})
+    if not isinstance(visual, dict):
+        visual = {}
+
+    if len(compact_prompt_json(minimal)) > available_chars:
+        evidence.pop("skill_status", None)
+
+    tools = perception.get("tools")
+    if isinstance(tools, list):
+        while tools and len(compact_prompt_json(minimal)) > available_chars:
+            tools.pop()
+
+    if len(compact_prompt_json(minimal)) > available_chars:
+        visual.pop("sources", None)
+
+    if len(compact_prompt_json(minimal)) > available_chars and perception:
+        request = perception.get("tool_request")
+        alignment = perception.get("alignment")
+        reduced_perception = {
+            key: perception[key]
+            for key in ("source", "ground_truth")
+            if key in perception
+        }
+        if isinstance(alignment, dict) and alignment.get("status"):
+            reduced_perception["alignment"] = {
+                "status": alignment["status"]
+            }
+        if isinstance(request, dict):
+            reduced_request = {
+                key: request[key]
+                for key in ("state", "requested", "confidence")
+                if key in request and request[key] is not None
+            }
+            if reduced_request:
+                reduced_perception["tool_request"] = reduced_request
+        minimal["observable_perception"] = reduced_perception
+
+    if len(compact_prompt_json(minimal)) > available_chars and visual:
+        minimal["visual_input"] = {
+            key: visual[key]
+            for key in (
+                "image_source",
+                "image_layout",
+                "cam4_image_forwarded_to_vlm",
+                "cam4_detector_overlay_forwarded_to_vlm",
+                "detector_advisory",
+                "input_error",
+            )
+            if key in visual and visual[key] is not None and visual[key] != ""
+        }
+
+    # Keep the newest public cue but bound free-form ASR and status text. Exact
+    # transcripts remain on their ROS topic and in trace logs for auditing.
+    for key, text_keys in (
+        ("speech", ("text",)),
+        ("observed_signals", ("speech_text", "detail", "text")),
+    ):
+        rows = evidence.get(key)
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            for text_key in text_keys:
+                if text_key in row:
+                    row[text_key] = str(row[text_key])[:160]
+
+    for key in ("phase_search_mode", "proc"):
+        if len(compact_prompt_json(minimal)) <= available_chars:
+            break
+        minimal.pop(key, None)
+
+    if len(compact_prompt_json(minimal)) > available_chars:
+        # This final form still preserves the newest externally visible cue and
+        # is valid JSON rather than a lossy string slice.
+        latest_evidence = {
+            key: rows[-1:]
+            for key in ("speech", "observed_signals")
+            if isinstance((rows := evidence.get(key)), list) and rows
+        }
+        minimal = {"evidence_window": latest_evidence}
+        for rows in latest_evidence.values():
+            for row in rows:
+                if isinstance(row, dict) and "text" in row:
+                    row["text"] = str(row["text"])[:80]
+    if len(compact_prompt_json(minimal)) > available_chars:
+        minimal = {"evidence_window": {}}
+    return minimal
 PUBLIC_REQUEST_MAX_AGE_SEC = 6.0
 DEFAULT_CAM4_CROP_XYWH_NORM = (0.32, 0.18, 0.62, 0.78)
-DEFAULT_MULTIVIEW_IMAGE_MAX_SIDE_PX = 512
+# A side-by-side FLIR + CAM4 frame needs enough pixels for the Mayo/hand
+# context to remain useful.  This stays bounded below the single-view limit.
+DEFAULT_MULTIVIEW_IMAGE_MAX_SIDE_PX = 1024
 MAX_PUBLIC_PERCEPTION_INSTANCES = 24
 IMAGE_PAIR_BUFFER_LENGTH = 32
 PERCEPTION_PAIR_BUFFER_LENGTH = 64
@@ -202,9 +574,11 @@ def normalize_clinical_analysis(value: Any) -> str:
 
 
 def is_model_ready_visual_source(image_source: str) -> bool:
-    """Accept detector-assisted or detector-independent FLIR input."""
+    """Accept the fused visual contract and its FLIR-only fallback."""
 
     return str(image_source).strip() in {
+        "flir_cam4_rfdetr_segmented",
+        "flir_cam4_raw_fallback",
         "flir_rfdetr_segmented",
         "flir_raw_fallback",
     }
@@ -228,6 +602,57 @@ class ModelImage:
     stamp_sec: int
     stamp_nanosec: int
     frame_id: str
+
+
+def model_input_signature(
+    *,
+    runtime_epoch: int,
+    request_config: dict[str, Any],
+    system_prompt: str,
+    developer_instruction: str,
+    request_context_json: str,
+    observation_metadata: Any,
+    images: list[tuple[str, bytes, str]],
+) -> str:
+    """Hash the exact public model request while preserving source-time evidence."""
+
+    digest = hashlib.sha256()
+
+    def update_segment(name: str, value: bytes | str) -> None:
+        name_bytes = name.encode("utf-8")
+        value_bytes = value if isinstance(value, bytes) else value.encode("utf-8")
+        digest.update(len(name_bytes).to_bytes(4, "big"))
+        digest.update(name_bytes)
+        digest.update(len(value_bytes).to_bytes(8, "big"))
+        digest.update(value_bytes)
+
+    update_segment("runtime_epoch", str(max(0, int(runtime_epoch))))
+    update_segment(
+        "request_config",
+        json.dumps(
+            request_config,
+            separators=(",", ":"),
+            sort_keys=True,
+            default=str,
+        ),
+    )
+    update_segment("system_prompt", system_prompt)
+    update_segment("developer_instruction", developer_instruction)
+    update_segment("request_context_json", request_context_json)
+    update_segment(
+        "observation_metadata",
+        json.dumps(
+            observation_metadata,
+            separators=(",", ":"),
+            sort_keys=True,
+            default=str,
+        ),
+    )
+    for index, (label, image_bytes, mime_type) in enumerate(images):
+        update_segment(f"image[{index}].label", str(label))
+        update_segment(f"image[{index}].mime_type", str(mime_type))
+        update_segment(f"image[{index}].bytes", bytes(image_bytes))
+    return digest.hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -418,6 +843,38 @@ def should_use_open_set_phase_bootstrap(
     )
 
 
+def explicit_phase_start_floor_context(
+    phase_id: str,
+    *,
+    explicit_start_phase: bool,
+    normal_phase_ids: list[str],
+    interrupt_phase_ids: list[str],
+) -> dict[str, Any] | None:
+    """Expose the selected normal-phase floor without feeding back VLM output."""
+
+    normalized_phase = str(phase_id or "").strip()
+    normal_ids = [
+        str(item or "").strip()
+        for item in normal_phase_ids
+        if str(item or "").strip()
+    ]
+    if not explicit_start_phase or normalized_phase not in normal_ids:
+        return None
+    start_index = normal_ids.index(normalized_phase)
+    return {
+        "id": normalized_phase,
+        "source": "operator_or_procedure_selected_start",
+        "ground_truth": False,
+        "policy": "normal_phase_floor",
+        "allowed_normal_phase_ids": normal_ids[start_index:],
+        "interrupt_phase_ids": [
+            str(item or "").strip()
+            for item in interrupt_phase_ids
+            if str(item or "").strip()
+        ],
+    }
+
+
 def bound_image_for_model(
     image_bytes: bytes,
     mime_type: str,
@@ -540,17 +997,18 @@ def dynamic_cam4_crop_xywh(
     return normalize_crop_xywh((left, top, width, height))
 
 
-def _fit_panel(source: Image.Image, size: tuple[int, int]) -> Image.Image:
-    contained = ImageOps.contain(source.convert("RGB"), size, Image.Resampling.LANCZOS)
-    panel = Image.new("RGB", size, "black")
-    panel.paste(
-        contained,
-        (
-            (size[0] - contained.width) // 2,
-            (size[1] - contained.height) // 2,
-        ),
+def _resize_panel_to_shared_height(
+    source: Image.Image,
+    *,
+    width: int,
+    height: int,
+) -> Image.Image:
+    """Resize a panel whose width was derived from its native aspect ratio."""
+
+    return source.convert("RGB").resize(
+        (max(1, int(width)), max(1, int(height))),
+        Image.Resampling.LANCZOS,
     )
-    return panel
 
 
 def compose_flir_cam4_for_model(
@@ -561,28 +1019,61 @@ def compose_flir_cam4_for_model(
     *,
     cam4_crop_xywh_norm: tuple[float, float, float, float] | list[float],
     max_side_px: int,
+    cam4_overlay_bytes: bytes | None = None,
+    cam4_overlay_mime_type: str = "",
 ) -> tuple[bytes, str]:
-    """Build one bounded, labeled image from FLIR and a configured CAM4 crop."""
+    """Build one bounded, labeled FLIR-left/CAM4-right model image."""
 
-    del flir_mime_type, cam4_mime_type
+    del flir_mime_type, cam4_mime_type, cam4_overlay_mime_type
     limit = max(320, int(max_side_px or 0))
     with (
         Image.open(BytesIO(flir_bytes)) as flir_source,
         Image.open(BytesIO(cam4_bytes)) as cam4_source,
     ):
         flir = flir_source.convert("RGB")
+        cam4 = cam4_source.convert("RGBA")
+        if cam4_overlay_bytes:
+            # RF-DETR publishes a transparent CAM4 overlay so the browser can
+            # compose it cheaply. Reuse the exact same observed overlay in the
+            # model image rather than silently dropping detector evidence.
+            with Image.open(BytesIO(cam4_overlay_bytes)) as overlay_source:
+                cam4_overlay = overlay_source.convert("RGBA")
+            if cam4_overlay.size != cam4.size:
+                cam4_overlay = cam4_overlay.resize(
+                    cam4.size,
+                    Image.Resampling.NEAREST,
+                )
+            cam4 = Image.alpha_composite(cam4, cam4_overlay)
         cam4_crop = crop_image_normalized(
-            cam4_source.convert("RGB"),
+            cam4.convert("RGB"),
             cam4_crop_xywh_norm,
         )
         canvas_width = limit
         label_height = max(24, min(42, canvas_width // 32))
-        flir_width = max(1, round(canvas_width * 0.68))
+        # Both observed views use their native aspect ratio at one shared
+        # height.  The former fixed-width split letterboxed CAM4 below its
+        # frame, reducing the Mayo/hand evidence that reaches the VLM.
+        flir_aspect = flir.width / max(flir.height, 1)
+        cam4_aspect = cam4_crop.width / max(cam4_crop.height, 1)
+        content_height = max(
+            1,
+            round(canvas_width / max(flir_aspect + cam4_aspect, 1.0e-6)),
+        )
+        flir_width = min(
+            canvas_width - 1,
+            max(1, round(content_height * flir_aspect)),
+        )
         cam4_width = canvas_width - flir_width
-        flir_aspect = flir.height / max(flir.width, 1)
-        content_height = max(180, round(flir_width * flir_aspect))
-        flir_panel = _fit_panel(flir, (flir_width, content_height))
-        cam4_panel = _fit_panel(cam4_crop, (cam4_width, content_height))
+        flir_panel = _resize_panel_to_shared_height(
+            flir,
+            width=flir_width,
+            height=content_height,
+        )
+        cam4_panel = _resize_panel_to_shared_height(
+            cam4_crop,
+            width=cam4_width,
+            height=content_height,
+        )
         canvas = Image.new(
             "RGB",
             (canvas_width, label_height + content_height),
@@ -601,7 +1092,11 @@ def compose_flir_cam4_for_model(
         draw.text((10, 5), "FLIR surgical field", fill="white", font=font)
         draw.text(
             (flir_width + 10, 5),
-            "CAM4 context crop",
+            (
+                "CAM4 Mayo / hand + RFDETR"
+                if cam4_overlay_bytes
+                else "CAM4 Mayo / surgeon hand"
+            ),
             fill="white",
             font=font,
         )
@@ -812,6 +1307,7 @@ class RealVLMNode(Node):
         self.declare_parameter("field_image_topic", "/surgery/images/field/compressed")
         self.declare_parameter("raw_field_image_topic", "")
         self.declare_parameter("cam4_image_topic", "")
+        self.declare_parameter("cam4_overlay_image_topic", "")
         self.declare_parameter("tray_image_topic", "/surgery/images/tray/compressed")
         self.declare_parameter("synthetic_image_topic", "/surgery/images/synthetic/compressed")
         self.declare_parameter(
@@ -888,6 +1384,12 @@ class RealVLMNode(Node):
         self._source_live_trigger_lock = threading.Lock()
         self._visual_frame_generation = 0
         self._last_submitted_visual_generation = -1
+        # A wall-clock boot epoch keeps observations from a restarted VLM
+        # strictly newer than delayed results from its previous process.
+        self._model_input_epoch = max(1, time.time_ns())
+        self._vlm_result_sequence = 0
+        self._last_submitted_model_input_key = ""
+        self._exact_duplicate_suppressed_count = 0
         self._fast_cam4_mayo_published_tools: set[str] = set()
         self._fast_cam4_mayo_last_seen_stamp_sec: dict[str, float] = {}
         self._oracle_scenario = []
@@ -1032,6 +1534,14 @@ class RealVLMNode(Node):
                 qos_profile_sensor_data,
                 callback_group=visual_group,
             )
+        if self._cam4_overlay_image_topic:
+            self.create_subscription(
+                CompressedImage,
+                self._cam4_overlay_image_topic,
+                self._make_image_cb("cam4_overlay"),
+                qos_profile_sensor_data,
+                callback_group=visual_group,
+            )
         self.create_subscription(
             CompressedImage,
             self._tray_image_topic,
@@ -1147,6 +1657,9 @@ class RealVLMNode(Node):
             param_value("raw_field_image_topic")
         ).strip()
         self._cam4_image_topic = str(param_value("cam4_image_topic")).strip()
+        self._cam4_overlay_image_topic = str(
+            param_value("cam4_overlay_image_topic")
+        ).strip()
         self._tray_image_topic = str(param_value("tray_image_topic"))
         self._synthetic_image_topic = str(param_value("synthetic_image_topic"))
         self._composite_image_topic = str(param_value("composite_image_topic"))
@@ -1267,71 +1780,46 @@ class RealVLMNode(Node):
         )
 
     def _actor_log_system_prompt(self) -> str:
-        phases = [
-            {
-                "id": phase.id,
-                "next": list(phase.possible_next),
-                "tools": list(phase.expected_instruments),
-            }
-            for phase in self._spec.bundle.phases
-        ]
-        tools = [
-            {
-                "id": instrument.id,
-                "name": instrument.display_name,
-                "role": instrument.role,
-                "requestable": bool(getattr(instrument, "requestable", True)),
-            }
-            for instrument in self._spec.bundle.instruments
-        ]
+        procedure_context = compact_actor_log_procedure_context(
+            self._spec,
+            self._procedure_prompt,
+        )
         return (
-            "You are the visual evidence interpreter for a surgical task planner. "
-            "Inputs are a FLIR surgical-field view plus a synchronized overhead CAM4 crop for surgeon-hand and Mayo observation. Object recognition may be absent. "
-            "Evidence order is mandatory: inspect CAM4 pixels first, freeze gesture and Mayo observations, then use public speech, signals, skill/twin events, FLIR, and procedure candidates to infer phase and next tool. observable_perception is optional advice, never a prerequisite or ground truth. "
-            "For CAM4, inspect the center-right interior request zone and then the whole crop. Judge each hand independently and inventory every distinct Mayo silhouette. Visible geometry can outweigh missing detector rows; a search zone alone is not evidence. "
-            "Use only externally observable evidence. Never assume hidden surgeon-actor phase, plans, timers, or private logs. Previous predictions are weak temporal context, not facts. "
-            "Outputs are observations with confidence only. They never authorize handover, recovery, cleanup, ownership, lifecycle, or robot action; the digital twin validates facts and the Behavior Tree applies policy. "
-            "Separate a currently used/held tool from the next tool likely to be requested. An open-palm request may be tool-unknown. "
-            "For phase, open_set means compare all phases because replay may start mid-procedure; temporal_prior means current phase plus allowed next phases. Prefer visible anatomy and persistent operative activity. Procedure order is a prior, neither required nor sufficient. If evidence is weak, retain low-confidence candidates instead of inventing unseen progress. "
-            "Field-event text is an intermittent event overlay, not the phase. Shared tool use alone does not prove a phase; honor each doctor-prompt cue and exclusion. "
-            "For next tool, use context.candidates as a weak prior and reorder only with public evidence. "
-            "Mayo recover/reuse is advisory: reuse means visible/public evidence supports near-term reuse; otherwise recover remains low confidence. Ambiguity favors low-confidence reuse. mayo_retrieve names at most the strongest advisory recover candidate. "
-            "The doctor prompt may use Pxx/Txx ids. Apply runtime_phase and tools[*].rt crosswalks and emit only runtime ids; never emit an empty-runtime-id tool. "
-            "For a pending logical retraction-group request, emit a direction only with supporting speech or visual evidence. Never infer physical arm identity/count, and never emit suction. Otherwise bed_robot_arm_group is null. "
+            "You interpret public, externally observable evidence for a surgical task planner. "
+            "Each model image is one labeled side-by-side composite: the left FLIR panel is the surgical field and the right CAM4 panel is the Mayo/surgeon-hand context. Read each panel independently before combining their evidence; do not transfer a tool seen in one panel into the other; do not assume a fixed pixel position, gown color, skin tone, camera crop, or procedure start phase. "
+            "Object detections are optional suggestions. Inspect pixels independently and let clear visual evidence outweigh missing or conflicting detector rows. "
+            "First inspect the left surgical field for visible anatomy, target tissue, instrument-to-tissue interaction, manipulation, and immediate tissue or field response. Independently inspect hand gestures and Mayo contents in the right panel. Then infer phase and next-request tool from visible anatomy/activity, public speech, public skill/twin events, and the procedure context. "
+            "Use no hidden actor state, private plans, ground truth, or replay annotation. Previous predictions and procedure order are weak temporal priors, not facts. "
+            "Your output is evidence with confidence only. It never authorizes handover, recovery, cleanup, ownership, lifecycle changes, or robot action; the digital twin validates facts and the Behavior Tree applies policy. "
+            "Compare all phases: open_set is unanchored; temporal_prior favors current/next but never excludes strong later visual evidence. "
+            "A currently held, visible, or Mayo tool is not automatically the next requested tool. A visible open-hand request may have unknown tool identity. "
             "Return exactly one schema-v4 JSON object and no other text. "
-            f"Runtime ontology: {json.dumps({'phases': phases, 'tools': tools}, separators=(',', ':'))}. "
-            f"Doctor procedure prompt: {json.dumps(self._procedure_prompt, separators=(',', ':'))}"
+            "Procedure context keys: phases contain id/name/allowed next/tools, one positive cue, one exclusion cue, optional tool roles, and compact current-to-next sequences; groups describe coarse adjacent states; tools contain runtime id/name/role. "
+            f"Procedure context: {json.dumps(procedure_context, separators=(',', ':'))}"
         )
 
     def _actor_log_developer_instruction(self) -> str:
         return (
-            "Return schema v4 only: "
-            "{\"v\":\"4\",\"gesture\":[event_type,tool_id,hand_pose,confidence],"
-            "\"mayo\":[[tool_id,\"recover|reuse\",confidence]],\"mayo_retrieve\":[tool_id,confidence],"
-            "\"phase\":[[phase_id,confidence]],\"tool\":[[tool_id,confidence]],"
-            "\"intent\":[intent_type,tool_id,confidence],\"u\":uncertainty,\"sum\":\"brief clinical analysis\","
-            "\"bed_robot_arm_group\":null_or_retraction_object}. "
-            "Use exact runtime ids. Confidence and u are numeric 0.0-1.0. "
-            "Populate gesture and mayo from CAM4 pixels first; then infer phase, next tool, and intent. Priors must not overwrite a directly visible CAM4 observation. "
-            "Mandatory CAM4 visual pass, independent of observable_perception: "
-            "(1) Gesture. Use the supplied CAM4 crop as-is. In this fixed view the request area is the covered-patient region to the right of the blue Mayo work surface. Inspect that center-right interior zone, then the full crop. The zone is a search prior only; visually compare all visible hands and inspect each independently. One operating hand never cancels another open hand. "
-            "Trace each candidate wrist to its source. A skin-toned hand continuing through an elastic cuff into a blue or green sterile gown sleeve is a staff glove; an extreme-edge hand connected to an exposed forearm or patient wristband is a patient hand. Ignore bare patient hands at table edges and bottom-border-clipped scrub hands. "
-            "The common positive appearance is that skin-toned staff glove lying open on the covered patient or sterile drape inside the center-right interior request zone. Positive geometry is a broad complete palmar surface and several relaxed uncurled fingers, empty and not gripping. Confirm the receiving surface from palm/thenar-pad and finger-pad geometry; visible knuckles or a dorsal-only hand are insufficient. Fingers may point in any direction; do not require spread fingers, motion, speech, transfer, or known wearer. Medical gloves may be beige, pink, white, or blue. "
-            "Mere contact with the body is not stabilization; require visible pressure, bracing, tissue traction, or active manipulation. Use 0.80-1.00 for a clear complete palm. Use 0.45-0.79 only when the complete empty palm is clear but wearer role, wrist orientation, or cuff visibility remains uncertain. If the palm, several fingers, or open-versus-gripping state is not directly visible, emit no gesture. "
-            "gesture is one flat four-item array: strongest positive is [\"request_tool\",tool_id_or_empty,\"open_receive\",confidence], otherwise [\"\",\"\",\"\",0.0]. "
-            "Tool identity is a separate question. With no public named request, use empty tool_id and intent must be exactly [\"none\",\"\",0.0]; request_tool is a gesture event, not an intent value. An open palm alone never names a tool; a nearby or Mayo tool is not a directed cue. Never copy a tool from Mayo, held/active tools, procedure candidates, or next-tool prediction into gesture or intent. "
-            "Hard negatives: bare patient hand; a palm or multiple fingers clipped at the bottom or side frame edge; fingertips or knuckles without a complete visible palm; dorsal-only hand; gripping; active manipulation; blur; severe occlusion. Mayo placement/pickup requires visible hand contact or grip on a tool, so require visible hand contact or grip rather than proximity alone. A nearby tool or cable is not placement/pickup by itself and must not cancel an otherwise qualifying request palm. Detector absence must not erase clear pixel evidence. "
-            "(2) Mayo. First sweep the fixed stand left-to-right and top-to-bottom, including edges and occlusion. Split touching items by handles, rings, shafts, tips, and cables; emit one mayo row per visible instance, preserving duplicates. "
-            "Identify by morphology before procedure likelihood: tweezer-shaped thumb forceps have no finger rings, so a ring-handled tool can never be Adson; clamps and scissors have paired rings and a hinge. A small slim ring-handled clamp with long narrow straight jaws is a Mosquito hemostat, not Allis. Allis is bulkier and requires directly visible short broad toothed grasping jaws; ring handles alone are insufficient for Allis. If broad teeth are not resolved, prefer Mosquito at lower confidence over inventing Allis. Retractors have broad or hooked blades; energy instruments often have insulation or a cable; suction instruments have a hollow tube. "
-            "Complete and freeze this geometry-based inventory before phase/next-tool priors. Confidence: 0.80-1.00 clear shape; 0.45-0.79 partial but distinctive. Match only runtime ontology and omit unidentifiable silhouettes. Scan even when object recognition is disabled or empty. "
-            "Every mayo row requires a distinct tool silhouette directly visible in CAM4. Never copy a tool from FLIR, procedure order, candidates, memory, or a field-manipulated instrument. Mayo rows are perceptual evidence only, never a robot command or lifecycle transition. "
-            "Exclude tools publicly located in robot hands, cleaner, rack/tray, prepositioning, recovery, or cleaning. Label visible tools reuse only with public near-term reuse evidence; otherwise recover at low confidence. mayo_retrieve is the strongest advisory recover candidate or [\"\",0.0]. "
-            "(3) Phase/tool/intent. Emit 1-4 phase and 1-4 next-request tool rows. Visibility alone does not make a held, Mayo, or cleaning tool the next tool. For open_set compare all phases; for temporal_prior use current_phase and allowed_next. Procedure-start speech does not prove phase one. A tool-unknown gesture is valid, but handover intent requires a direct public cue naming the tool. "
-            "(4) Bed group. Without a supported pending retraction request and direction evidence, bed_robot_arm_group is null. Otherwise copy request_id/end_effector_profile, set group_id=operation=retraction, and never name a physical arm. "
-            "Direction is one of UP, DOWN, LEFT, RIGHT, LEFT_RIGHT, UP_DOWN. Korean aliases include 위/위쪽/상방, 아래/아래쪽/하방, 왼쪽/좌측, 오른쪽/우측, 좌우/양쪽, 상하/위와 아래. "
-            "Distance: explicit mm/cm wins (cm x10); unitless number means mm; 미세하게=1, 살짝=5, 조금=10, 많이=20, 최대한=30, absent=10 mm. Preserve explicit value, raw phrase, and distance_origin. "
-            "Final CAM4 audit immediately before JSON: inspect only CAM4 for gesture and Mayo. The expected request appearance is a complete empty staff palm over the covered-patient area to the right of the blue Mayo surface. Mandatory positive rule: when its palmar surface and several uncurled fingers are visible, gesture MUST be request_tool; never reject it because it is stationary, touching the body, or another hand is operating. Being near a tool is also not disqualifying. One positive candidate overrides unrelated negative hands. No speech or transfer is required. With no named request, tool_id stays empty and intent none. Emit Mayo rows only for separate CAM4-visible silhouettes, never FLIR or priors. "
-            "sum is one or two concise factual clinical sentences describing visible field, likely phase, active manipulation, and change; no internal logic, invented findings, markdown, or extra text."
+            "Emit exactly this JSON shape, with nested candidate pairs: "
+            "{\"v\":\"4\",\"phase\":[[\"Pxx\",0.0]],\"tool\":[[\"Txx\",0.0]],"
+            "\"intent\":[\"none\",\"\",0.0],\"gesture\":[\"\",\"\",\"\",0.0],"
+            "\"mayo\":[],\"mayo_retrieve\":[\"\",0.0],\"u\":0.50,"
+            "\"sum\":\"one compact English clinical observation\",\"bed_robot_arm_group\":null}. "
+            "All numbers in that shape are structural placeholders, not defaults to copy. Use exact runtime ids and numeric confidence 0.0-1.0. phase and tool must each be arrays of 1-4 [id,confidence] pairs, never one flat pair. "
+            "Perform these independent passes before combining evidence: "
+            "GESTURE: inspect every visible hand in the right CAM4 Mayo/surgeon-hand panel. request_tool requires a substantially visible empty receiving palm with several relaxed, uncurled fingers, extended or held available toward the working team. Orientation, motion, glove color, and exact image position are irrelevant. An operating hand does not cancel a separate requesting hand. Reject cropped fragments, dorsal-only hands, gripping, tissue manipulation, bracing/traction, severe blur, and patient/bystander hands. If the visual request is clear, emit [\"request_tool\",\"\",\"open_receive\",confidence] even without speech. Never infer its tool id from a nearby, held, Mayo, predicted, or procedure-prior tool. "
+            "MAYO: scan the complete hand/Mayo image in the right CAM4 panel, including edges and occlusions. Emit one row per distinct visible instrument instance and preserve duplicates. Identify by visible morphology such as rings, hinge, shaft, jaws, blade, insulation/cable, or lumen; omit unidentifiable silhouettes instead of guessing from procedure likelihood. Detector rows may support a match but their absence does not erase clear pixels. Never copy instruments from the surgical-field image in the left FLIR panel, speech, candidates, memory, or procedure order into mayo. recover/reuse is only an advisory observation: use reuse when public evidence supports near-term reuse; otherwise keep recover confidence low. mayo_retrieve is at most the strongest advisory candidate. "
+            "CLINICAL SUMMARY: write sum as exactly one compact English sentence focused on the left surgical field. When visible, state the instrument, the specific target anatomy or tissue, how it is being manipulated, and the immediate observable tissue response or effect on exposure. Prefer evidence-supported terms such as wound edge, strap muscle, connective-tissue plane, thyroid tissue, vessel, or surgical bed over generic tissue. Include a clinically important negative finding such as no active bleeding, smoke, pooled fluid, or visible tissue division only when the relevant area is clearly visible. If anatomy or contact is obscured, state that limitation instead of guessing. Use 'consistent with' or 'likely' for a maneuver or clinical purpose that is interpreted rather than directly seen. Never claim injury, preserved anatomy, completed hemostasis, or procedural completion without direct visible evidence. Do not spend sum on FLIR/CAM4 panel names, Mayo inventory, hand-request state, phase names or ids, next-tool forecasts, or internal reasoning. "
+            "PHASE/NEXT TOOL: compare the left FLIR surgical-field panel with every phase cue, exclusion, group, and role before ranking candidates. temporal_prior is a preference, not a candidate filter; include a non-adjacent later phase when its persistent visual state is genuinely stronger, because the reducer separately enforces legal adjacent transitions. Use visible anatomy and persistent operative activity first, then public speech/events and procedure priors. A tool exchange or transient event alone does not prove a phase. "
+            "phase_start_floor limits phase only, never tool/intent. Not ground truth; use allowed_normal_phase_ids, never earlier. Interrupts need visible evidence. "
+            "NEXT-TOOL FORECAST: make a calibrated 2-8 second forecast of a new handover, not a label for the tool currently in use and not a confirmed request. tool answers which additional instrument the assistant should prepare next; it does not inventory visible instruments. digital_twin.forecast_inventory.available combines rack_available unused stock and mayo_reuse surgeon-used tools expected later; unavailable is the rest. All are [tool_id,count]. A tool type may appear in available and unavailable when a spare exists. Confidence >=0.65 must have available count >0; inventory never authorizes action. When usable, do not wait for a hand gesture or spoken request: rank the most plausible near-term additional tool from visible task trajectory and broad procedure-role transitions. Rank mayo_reuse high only when that trajectory supports imminent reuse. First distinguish instruments already held, in field, on Mayo, cleaning, or merely visible. Do not rank an active type first unless public evidence specifically supports another instance. Otherwise an already active type must stay below 0.65; forecast a plausible unused tool instead, or keep every weak candidate below 0.65. Do not memorize case timing. Procedure start/continue/finish speech is neither phase proof nor a tool request. "
+            "INTENT: only current public speech or an observed request signal naming a runtime instrument may produce [\"handover\",tool_id,confidence]. Match obvious ASR near-homophones and Korean/English transliterations to the listed runtime tool names, but do not turn procedure-start, continue, phase, anatomy, or completion speech into a tool request. A visual open hand without a named tool remains gesture evidence with intent [\"none\",\"\",0.0]. "
+            "BED GROUP: emit null unless a pending public retraction request has supported direction evidence. If supported, copy its request_id/end_effector_profile, use group_id=operation=\"retraction\", and never infer physical arm identity/count or suction. Direction is UP, DOWN, LEFT, RIGHT, LEFT_RIGHT, or UP_DOWN. Explicit mm/cm wins; otherwise map qualitative magnitude conservatively and preserve raw text and origin. "
+            "UNCERTAINTY: calculate u independently on every frame; it is epistemic uncertainty, where 0.0 means clear evidence and 1.0 means unusable evidence. Use 0.00-0.25 for a clear dominant interpretation, 0.26-0.45 for usable adjacent-phase ambiguity, 0.46-0.79 for weak, occluded, or conflicting evidence, and 0.80-1.00 only when the relevant view is unusable or the observation is genuinely indeterminate. Do not copy the structural 0.50 value. "
+            "STRICT STRUCTURE CHECK: gesture always has exactly four values. A positive is [\"request_tool\",\"\",\"open_receive\",0.85]; no request is exactly [\"\",\"\",\"\",0.0]. Never emit [\"open_receive\",\"\",0.85], [\"none\",\"\",0.0], or any three-value gesture. "
+            "mayo is always an array of three-value rows: [[\"Txx\",\"reuse\",0.80]], never [\"Txx\"], [\"tool name\"], or [\"tool name (Txx)\"]. Empty Mayo is []. "
+            "phase and tool are always arrays of two-value rows, including a single candidate: [[\"Pxx\",0.80]] and [[\"Txx\",0.70]], never flat pairs. Pxx/Txx are shape placeholders only; replace them with exact ids from Procedure context and never emit the letters xx. "
+            "Final audit: gesture and mayo must come only from the hand/Mayo pixels; phase/tool may combine public evidence; output no markdown or explanation outside JSON. sum must be exactly one compact English clinical sentence grounded in visible field evidence, with no invented findings, operational handover commentary, phase names or ids, or internal reasoning."
         )
 
     def _on_parameters_changed(self, params):
@@ -1383,6 +1871,7 @@ class RealVLMNode(Node):
         if reload_required:
             try:
                 self._load_parameters(overrides)
+                self._reset_model_input_dedupe(advance_epoch=True)
                 if spec_changed:
                     self._recent_events.clear()
                     self._last_good_raw = ""
@@ -1617,16 +2106,19 @@ class RealVLMNode(Node):
         response.model_id = result.model_id
         response.state = result.state
         response.message = result.message
+        if result.success:
+            self._reset_model_input_dedupe(advance_epoch=True)
         return response
 
     def _make_image_cb(self, label: str):
         def _cb(msg: CompressedImage) -> None:
             image_format = str(msg.format or "").lower()
-            mime_type = (
-                "image/jpeg"
-                if "jpeg" in image_format or "jpg" in image_format
-                else "image/png"
-            )
+            if "webp" in image_format:
+                mime_type = "image/webp"
+            elif "png" in image_format:
+                mime_type = "image/png"
+            else:
+                mime_type = "image/jpeg"
             sample = ImageSample(
                 received_monotonic=self._causal_now_sec(),
                 stamp_sec=int(msg.header.stamp.sec),
@@ -1640,7 +2132,7 @@ class RealVLMNode(Node):
                 label,
                 deque(maxlen=IMAGE_PAIR_BUFFER_LENGTH),
             ).append(sample)
-            if label in {"field", "raw_field", "cam4"}:
+            if label in {"field", "raw_field", "cam4", "cam4_overlay"}:
                 self._visual_frame_generation += 1
                 if self._response_mode == "replay":
                     self._maybe_trigger_replay_image_tick()
@@ -1879,6 +2371,8 @@ class RealVLMNode(Node):
             return
         self._latest_images.pop("field", None)
         self._image_buffers.pop("field", None)
+        self._latest_images.pop("cam4_overlay", None)
+        self._image_buffers.pop("cam4_overlay", None)
         self._latest_perception.clear()
         getattr(self, "_perception_buffers", {}).clear()
         self._current_visual_input = {}
@@ -2130,6 +2624,7 @@ class RealVLMNode(Node):
         command = command.strip().lower()
         start_phase_id = start_phase_id.strip()
         if command in {"start", "start_actors"}:
+            self._reset_model_input_dedupe(advance_epoch=True)
             self._reset_public_evidence()
             self._last_replay_image_stamp_sec = None
             self._last_periodic_live_image_stamp_sec = None
@@ -2148,12 +2643,15 @@ class RealVLMNode(Node):
             self._last_authoritative_phase = self._phase_bootstrap_id
             self._active = True
         elif command == "pause":
+            self._reset_model_input_dedupe(advance_epoch=True)
             self._active = False
             self._inference_backpressure.clear_pending()
             self._reset_source_time_live_trigger(reset_stamp=False)
         elif command == "resume":
+            self._reset_model_input_dedupe(advance_epoch=True)
             self._active = True
         elif command == "stop":
+            self._reset_model_input_dedupe(advance_epoch=True)
             self._active = False
             self._inference_backpressure.clear_pending()
             self._last_replay_image_stamp_sec = None
@@ -2162,6 +2660,7 @@ class RealVLMNode(Node):
             self._reset_source_time_live_trigger(reset_stamp=True)
             self._reset_fast_cam4_mayo_observations()
         elif command == "reset":
+            self._reset_model_input_dedupe(advance_epoch=True)
             self._active = False
             self._inference_backpressure.clear_pending()
             self._world = None
@@ -2181,6 +2680,79 @@ class RealVLMNode(Node):
             self._last_submitted_live_image_stamp_sec = None
             self._reset_source_time_live_trigger(reset_stamp=True)
             self._reset_fast_cam4_mayo_observations()
+
+    def _reset_model_input_dedupe(self, *, advance_epoch: bool) -> None:
+        if advance_epoch:
+            self._model_input_epoch = (
+                max(0, int(getattr(self, "_model_input_epoch", 0))) + 1
+            )
+            self._vlm_result_sequence = 0
+        self._last_submitted_model_input_key = ""
+
+    def _next_visual_evidence_metadata(
+        self,
+        model_input_key: str,
+    ) -> tuple[int, int, str]:
+        epoch = max(0, int(getattr(self, "_model_input_epoch", 0)))
+        sequence = max(0, int(getattr(self, "_vlm_result_sequence", 0))) + 1
+        self._vlm_result_sequence = sequence
+        correlation_id = f"vlm-{epoch}-{sequence}-{model_input_key[:12]}"
+        return epoch, sequence, correlation_id
+
+    @staticmethod
+    def _set_visual_evidence_metadata(
+        message,
+        *,
+        source_epoch: int,
+        source_sequence: int,
+        correlation_id: str,
+        source: str = "",
+    ) -> None:
+        if hasattr(message, "source") and source:
+            message.source = source
+        message.source_epoch = max(0, int(source_epoch))
+        message.source_sequence = max(0, int(source_sequence))
+        message.correlation_id = str(correlation_id)
+
+    def _current_model_input_signature(
+        self,
+        request_context_json: str,
+        images: list[tuple[str, bytes, str]],
+    ) -> str:
+        return model_input_signature(
+            runtime_epoch=int(getattr(self, "_model_input_epoch", 0)),
+            request_config={
+                "provider_id": str(getattr(self, "_provider_id", "")),
+                "model_id": str(getattr(self, "_model_id", "")),
+                "api_mode": str(getattr(self, "_api_mode", "")),
+                "response_format": str(
+                    getattr(self, "_response_format", "")
+                ),
+                "reasoning_effort": str(
+                    getattr(self, "_reasoning_effort", "")
+                ),
+                "temperature": float(getattr(self, "_temperature", 0.0)),
+                "top_p": float(getattr(self, "_top_p", 1.0)),
+                "max_output_tokens": int(
+                    getattr(self, "_max_output_tokens", 0)
+                ),
+                "generation_seed": getattr(
+                    self,
+                    "_generation_seed",
+                    None,
+                ),
+                "json_schema": getattr(self, "_json_schema", {}),
+            },
+            system_prompt=str(getattr(self, "_system_prompt", "")),
+            developer_instruction=str(
+                getattr(self, "_developer_instruction", "")
+            ),
+            request_context_json=request_context_json,
+            observation_metadata=dict(
+                getattr(self, "_current_visual_input", {})
+            ).get("sources", []),
+            images=images,
+        )
 
     def _reset_public_evidence(self) -> None:
         self._recent_events.clear()
@@ -2395,9 +2967,99 @@ class RealVLMNode(Node):
         return {
             "hands": world_context.get("hands", {}),
             "tools": world_context.get("tools", []),
+            "forecast_inventory": self._public_forecast_inventory_context(),
             "bed_robot_arm_groups": self._bed_robot_arm_group_state_rows(),
             "events": public_events[-6:],
         }
+
+    def _public_forecast_inventory_context(self) -> dict[str, list[list[Any]]]:
+        """Summarize which public DT instances could support a new handover."""
+
+        if self._world is None:
+            return {
+                "available": [],
+                "rack_available": [],
+                "mayo_reuse": [],
+                "unavailable": [],
+            }
+        requestable = {
+            str(instrument.id)
+            for instrument in self._spec.bundle.instruments
+            if bool(getattr(instrument, "requestable", True))
+        }
+        counts = {
+            tool_id: {
+                "rack_available": 0,
+                "mayo_reuse": 0,
+                "unavailable": 0,
+            }
+            for tool_id in requestable
+        }
+        for instrument in getattr(self._world, "instrument_states", []):
+            tool_id = str(getattr(instrument, "instrument_id", "") or "")
+            if tool_id not in counts:
+                continue
+            lifecycle = str(
+                getattr(instrument, "lifecycle_stage", "") or ""
+            )
+            owner = str(getattr(instrument, "owner", "") or "")
+            contaminated = bool(
+                getattr(instrument, "contaminated", False)
+            )
+            future_use_expected = bool(
+                getattr(
+                    instrument,
+                    "procedure_future_use_expected",
+                    False,
+                )
+            )
+            if (
+                lifecycle in {"home_rack", "returned_home"}
+                and owner in {"", "none"}
+                and not contaminated
+            ):
+                bucket = "rack_available"
+            elif (
+                lifecycle == "mayo_reuse"
+                and owner in {"", "none"}
+                and future_use_expected
+            ):
+                bucket = "mayo_reuse"
+            else:
+                bucket = "unavailable"
+            counts[tool_id][bucket] += 1
+
+        ordered_ids = [
+            str(instrument.id)
+            for instrument in self._spec.bundle.instruments
+            if str(instrument.id) in counts
+        ]
+        by_source = {
+            bucket: [
+                [tool_id, counts[tool_id][bucket]]
+                for tool_id in ordered_ids
+                if counts[tool_id][bucket] > 0
+            ]
+            for bucket in (
+                "rack_available",
+                "mayo_reuse",
+                "unavailable",
+            )
+        }
+        by_source["available"] = [
+            [
+                tool_id,
+                counts[tool_id]["rack_available"]
+                + counts[tool_id]["mayo_reuse"],
+            ]
+            for tool_id in ordered_ids
+            if (
+                counts[tool_id]["rack_available"]
+                + counts[tool_id]["mayo_reuse"]
+            )
+            > 0
+        ]
+        return by_source
 
     def _perception_samples(
         self,
@@ -2689,11 +3351,15 @@ class RealVLMNode(Node):
         msg.stamp = observation_stamp
         msg.procedure_id = self._spec.procedure_id
         if self._world is not None:
+            msg.filtered_phase = self._authoritative_runtime_phase()
+            msg.phase_confidence = float(self._world.phase_confidence)
+            msg.phase_uncertain = bool(self._world.phase_uncertain)
             msg.right_hand_tool = self._world.right_hand_tool
             msg.left_hand_tool = self._world.left_hand_tool
             msg.prepositioned_tool = self._world.prepositioned_tool
             msg.cleaner_busy = bool(self._world.cleaner_busy)
             msg.cleaner_remaining_sec = float(self._world.cleaner_remaining_sec)
+            msg.phase_expected_tools = list(self._world.expected_instruments)
             msg.active_tool_ids = [str(row.get("id", "")) for row in context.get("digital_twin", {}).get("tools", []) if row.get("id")]
             msg.recent_events = self._public_event_digests()
             msg.bed_robot_arm_groups = list(
@@ -3097,6 +3763,16 @@ class RealVLMNode(Node):
             "candidates": candidates,
             "previous": previous,
         }
+        phase_start_floor = explicit_phase_start_floor_context(
+            getattr(self, "_phase_bootstrap_id", ""),
+            explicit_start_phase=bool(
+                getattr(self, "_phase_bootstrap_explicit", False)
+            ),
+            normal_phase_ids=list(self._spec.normal_phase_ids),
+            interrupt_phase_ids=list(self._spec.interrupt_phase_ids),
+        )
+        if phase_start_floor is not None:
+            context["phase_start_floor"] = phase_start_floor
         return bound_actor_log_context(context)
 
     def _assemble_actor_log_context(self) -> str:
@@ -3229,6 +3905,7 @@ class RealVLMNode(Node):
                 "sources": [],
                 "preprocessing": "unavailable",
                 "cam4_image_forwarded_to_vlm": False,
+                "cam4_detector_overlay_forwarded_to_vlm": False,
                 "detector_advisory": perception_enabled,
                 "input_error": self._current_image_input_error,
             }
@@ -3252,6 +3929,51 @@ class RealVLMNode(Node):
             if cam4_skew_sec <= self._multiview_max_skew_sec + 1.0e-9:
                 cam4 = nearest_cam4
 
+        # The transparent RF-DETRSmall overlay carries the rendered CAM4
+        # instrument and hand-request evidence. It must refer to the selected
+        # raw CAM4 source frame; otherwise the model sees the raw pixels and
+        # the metadata explicitly records the fallback.
+        cam4_overlay: ImageSample | None = None
+        cam4_overlay_skew_sec: float | None = None
+        cam4_overlay_fallback_reason = ""
+        if cam4 is not None:
+            if not perception_enabled:
+                cam4_overlay_fallback_reason = (
+                    "RF-DETR perception is disabled; raw CAM4 pixels forwarded"
+                )
+            elif not self._cam4_overlay_image_topic:
+                cam4_overlay_fallback_reason = (
+                    "CAM4 RF-DETR overlay topic is not configured"
+                )
+            else:
+                cam4_overlay_samples = self._fresh_images("cam4_overlay", now)
+                if not cam4_overlay_samples:
+                    cam4_overlay_fallback_reason = (
+                        "fresh CAM4 RF-DETR overlay is unavailable"
+                    )
+                else:
+                    nearest_overlay = min(
+                        cam4_overlay_samples,
+                        key=lambda sample: abs(
+                            image_sample_stamp_sec(sample)
+                            - image_sample_stamp_sec(cam4)
+                        ),
+                    )
+                    cam4_overlay_skew_sec = abs(
+                        image_sample_stamp_sec(nearest_overlay)
+                        - image_sample_stamp_sec(cam4)
+                    )
+                    if (
+                        cam4_overlay_skew_sec
+                        <= self._perception_image_max_skew_sec + 1.0e-9
+                    ):
+                        cam4_overlay = nearest_overlay
+                    else:
+                        cam4_overlay_fallback_reason = (
+                            "CAM4 RF-DETR overlay is outside the perception "
+                            "alignment window"
+                        )
+
         image_max_side_px = self._image_max_side_px
         if cam4 is not None:
             multiview_limit = getattr(
@@ -3265,39 +3987,10 @@ class RealVLMNode(Node):
                 else multiview_limit
             )
 
-        field_bytes, field_mime = bound_image_for_model(
-            field.data,
-            field.mime_type,
-            image_max_side_px,
-        )
         using_segmented_field = field is segmented_field
-        model_image = ModelImage(
-            label=(
-                "RFDETR-segmented FLIR surgical field"
-                if using_segmented_field
-                else "Raw FLIR surgical field (detector-independent fallback)"
-            ),
-            data=field_bytes,
-            mime_type=field_mime,
-            stamp_sec=field.stamp_sec,
-            stamp_nanosec=field.stamp_nanosec,
-            frame_id=field.frame_id,
-        )
-        image_source = (
-            "flir_rfdetr_segmented"
-            if using_segmented_field
-            else "flir_raw_fallback"
-        )
         self._current_perception_reference_stamp_sec = image_sample_stamp_sec(
             field
         )
-        images: list[tuple[str, bytes, str]] = [
-            (
-                model_image.label,
-                model_image.data,
-                model_image.mime_type,
-            )
-        ]
         sources = [
             {
                 "role": (
@@ -3321,39 +4014,152 @@ class RealVLMNode(Node):
             }
         ]
         cam4_forwarded = False
+        cam4_overlay_forwarded = cam4_overlay is not None
+        cam4_fallback_reason = ""
+        image_layout = "flir_only"
+        model_image: ModelImage | None = None
+        image_source = ""
         if cam4 is not None:
-            cam4_bytes, cam4_mime = crop_cam4_for_model(
-                cam4.data,
-                cam4_crop_xywh_norm=self._current_cam4_crop(cam4),
-                max_side_px=image_max_side_px,
-            )
-            images.append(
-                (
-                    "CAM4 context crop for Mayo and surgeon-hand observation; inspect pixels directly",
-                    cam4_bytes,
-                    cam4_mime,
+            try:
+                composite_bytes, composite_mime = compose_flir_cam4_for_model(
+                    field.data,
+                    field.mime_type,
+                    cam4.data,
+                    cam4.mime_type,
+                    cam4_crop_xywh_norm=self._current_cam4_crop(cam4),
+                    max_side_px=image_max_side_px,
+                    cam4_overlay_bytes=(
+                        cam4_overlay.data if cam4_overlay is not None else None
+                    ),
+                    cam4_overlay_mime_type=(
+                        cam4_overlay.mime_type
+                        if cam4_overlay is not None
+                        else ""
+                    ),
                 )
-            )
-            sources.append(
-                {
-                    "role": "cam4_context_crop",
-                    "topic": self._cam4_image_topic,
-                    "stamp_sec": round(
-                        image_sample_stamp_sec(cam4),
-                        9,
+            except (OSError, ValueError) as exc:
+                cam4_fallback_reason = (
+                    "CAM4 composite unavailable; using FLIR-only fallback "
+                    f"({type(exc).__name__})"
+                )
+            else:
+                model_image = ModelImage(
+                    label=(
+                        "Synchronized FLIR surgical field + CAM4 Mayo/"
+                        "surgeon-hand context"
                     ),
-                    "frame_id": cam4.frame_id,
-                    "offset_sec": round(
-                        image_sample_stamp_sec(cam4)
-                        - image_sample_stamp_sec(field),
-                        9,
-                    ),
-                }
+                    data=composite_bytes,
+                    mime_type=composite_mime,
+                    stamp_sec=field.stamp_sec,
+                    stamp_nanosec=field.stamp_nanosec,
+                    frame_id=field.frame_id or cam4.frame_id,
+                )
+                image_source = (
+                    "flir_cam4_rfdetr_segmented"
+                    if using_segmented_field
+                    else "flir_cam4_raw_fallback"
+                )
+                sources.append(
+                    {
+                        "role": "cam4_mayo_hand_crop",
+                        "topic": self._cam4_image_topic,
+                        "stamp_sec": round(
+                            image_sample_stamp_sec(cam4),
+                            9,
+                        ),
+                        "frame_id": cam4.frame_id,
+                        "offset_sec": round(
+                            image_sample_stamp_sec(cam4)
+                            - image_sample_stamp_sec(field),
+                            9,
+                        ),
+                    }
+                )
+                if cam4_overlay is not None:
+                    sources.append(
+                        {
+                            "role": "cam4_rfdetr_small_overlay",
+                            "topic": self._cam4_overlay_image_topic,
+                            "stamp_sec": round(
+                                image_sample_stamp_sec(cam4_overlay),
+                                9,
+                            ),
+                            "frame_id": cam4_overlay.frame_id,
+                            "offset_sec": round(
+                                image_sample_stamp_sec(cam4_overlay)
+                                - image_sample_stamp_sec(field),
+                                9,
+                            ),
+                            "cam4_offset_sec": round(
+                                image_sample_stamp_sec(cam4_overlay)
+                                - image_sample_stamp_sec(cam4),
+                                9,
+                            ),
+                        }
+                    )
+                cam4_forwarded = True
+                image_layout = "flir_left_cam4_right"
+        elif cam4_skew_sec is not None:
+            cam4_fallback_reason = (
+                "CAM4 frame is outside the multiview synchronization window"
             )
-            cam4_forwarded = True
+        else:
+            cam4_fallback_reason = "CAM4 frame is unavailable"
+
+        if model_image is None:
+            field_bytes, field_mime = bound_image_for_model(
+                field.data,
+                field.mime_type,
+                image_max_side_px,
+            )
+            model_image = ModelImage(
+                label=(
+                    "RFDETR-segmented FLIR surgical field"
+                    if using_segmented_field
+                    else "Raw FLIR surgical field (detector-independent fallback)"
+                ),
+                data=field_bytes,
+                mime_type=field_mime,
+                stamp_sec=field.stamp_sec,
+                stamp_nanosec=field.stamp_nanosec,
+                frame_id=field.frame_id,
+            )
+            image_source = (
+                "flir_rfdetr_segmented"
+                if using_segmented_field
+                else "flir_raw_fallback"
+            )
+        images: list[tuple[str, bytes, str]] = [
+            (
+                model_image.label,
+                model_image.data,
+                model_image.mime_type,
+            )
+        ]
         if self._require_cam4_image and not cam4_forwarded:
             self._current_image_input_error = (
                 "missing synchronized raw CAM4 Mayo/hand image"
+            )
+        if cam4_forwarded:
+            flir_preprocessing = (
+                "RFDETRSegSmall FLIR"
+                if using_segmented_field
+                else "raw FLIR fallback"
+            )
+            cam4_preprocessing = (
+                "RFDETRSmall CAM4 bbox/hand overlay"
+                if cam4_overlay_forwarded
+                else "raw CAM4 Mayo/hand fallback"
+            )
+            preprocessing = (
+                "single side-by-side composite: "
+                f"{flir_preprocessing} + {cam4_preprocessing}"
+            )
+        else:
+            preprocessing = (
+                "RFDETRSegSmall FLIR-only fallback"
+                if using_segmented_field
+                else "raw FLIR-only fallback"
             )
         self._current_visual_input = {
             "image_source": image_source,
@@ -3362,18 +4168,25 @@ class RealVLMNode(Node):
                 self._perception_image_max_skew_sec
             ),
             "sources": sources,
-            "preprocessing": (
-                "RFDETRSegSmall overlay; CAM4 context crop inspected independently"
-                if using_segmented_field
-                else "raw FLIR fallback; CAM4 context crop inspected independently"
-            ),
+            "preprocessing": preprocessing,
+            "image_layout": image_layout,
             "cam4_image_forwarded_to_vlm": cam4_forwarded,
             "cam4_alignment_skew_sec": (
                 round(cam4_skew_sec, 9)
                 if cam4_skew_sec is not None
                 else None
             ),
+            "cam4_detector_overlay_forwarded_to_vlm": (
+                cam4_overlay_forwarded
+            ),
+            "cam4_detector_overlay_alignment_skew_sec": (
+                round(cam4_overlay_skew_sec, 9)
+                if cam4_overlay_skew_sec is not None
+                else None
+            ),
             "detector_advisory": perception_enabled,
+            "cam4_fallback_reason": cam4_fallback_reason,
+            "cam4_overlay_fallback_reason": cam4_overlay_fallback_reason,
             "input_error": self._current_image_input_error,
         }
         return images, image_source, model_image
@@ -3668,134 +4481,29 @@ class RealVLMNode(Node):
             "voice_request",
         }
 
-        phase_candidates = self._candidate_rows(context_dict, "phase")
-        candidate_evidence = context_dict.get("candidates", {}).get("evidence", {}) if isinstance(context_dict, dict) else {}
-        fallback_phase = str(candidate_evidence.get("current_phase", "") if isinstance(candidate_evidence, dict) else "")
         model_phase_rows = [
             [str(row[0]), float(row[1])]
             for row in stabilized.get("phase", [])
             if isinstance(row, list) and len(row) >= 2 and str(row[0])
         ]
-        phase_search_mode = str(
-            context_dict.get(
-                "phase_search_mode",
-                candidate_evidence.get("phase_search_mode", ""),
-            )
-        )
-        tool_sequence_open_set_anchor_allowed = bool(
-            candidate_evidence.get(
-                "tool_sequence_open_set_anchor_allowed",
-                True,
-            )
-        )
-        public_sequence_anchor = ""
-        if (
-            phase_search_mode == "open_set"
-            and tool_sequence_open_set_anchor_allowed
-            and phase_candidates
-        ):
-            top_prior_phase = str(phase_candidates[0][0])
-            alignment = candidate_evidence.get("sequence_alignment", {})
-            top_alignment = (
-                alignment.get(top_prior_phase, {})
-                if isinstance(alignment, dict)
-                else {}
-            )
-            try:
-                matches = int(top_alignment.get("matches", 0))
-                adjacent = int(top_alignment.get("adjacent", 0))
-            except (TypeError, ValueError):
-                matches = 0
-                adjacent = 0
-            if matches >= 2 and (adjacent >= 1 or matches >= 3):
-                public_sequence_anchor = top_prior_phase
-                anchor_confidence = min(
-                    0.99,
-                    0.80 + matches * 0.05 + adjacent * 0.03,
-                )
-                model_phase_rows = [
-                    [top_prior_phase, anchor_confidence],
-                    *[
-                        row
-                        for row in model_phase_rows
-                        if str(row[0]) != top_prior_phase
-                    ],
-                ]
-        if phase_search_mode == "temporal_prior":
-            valid_temporal_phases = {
-                str(candidate_evidence.get("current_phase", "")),
-                *(
-                    str(phase_id)
-                    for phase_id in candidate_evidence.get(
-                        "allowed_next",
-                        [],
-                    )
-                ),
-            }
-            valid_temporal_phases.discard("")
-            if valid_temporal_phases:
-                model_phase_rows = [
-                    row
-                    for row in model_phase_rows
-                    if str(row[0]) in valid_temporal_phases
-                ]
-        if (
-            phase_search_mode == "open_set"
-            and not tool_sequence_open_set_anchor_allowed
-        ):
-            # This procedure defines Phase from visible functional state.
-            # Tool-order candidates may inform interpretation and next-tool
-            # prediction, but they cannot bootstrap a detailed Phase. Trust
-            # only the current image-backed model rows here.
-            stabilized["phase"] = self._normal_phase_rows(
-                model_phase_rows,
-            )[:4]
-        elif phase_search_mode == "open_set" and not public_sequence_anchor:
-            # The default runtime phase is only a placeholder during open-set
-            # startup. A close-up image can resemble several later phases, so
-            # do not irreversibly bootstrap the reducer until public tool
-            # sequence evidence supplies a stable procedure-local anchor.
-            stabilized["phase"] = []
-        elif phase_candidates:
-            stabilized["phase"] = self._normal_phase_rows(
-                self._merge_ranked_rows(model_phase_rows, phase_candidates, limit=4),
-                fallback_phase=fallback_phase,
-            )[:4]
-        elif model_phase_rows:
-            stabilized["phase"] = self._normal_phase_rows(
-                self._merge_ranked_rows(model_phase_rows, [], limit=4),
-                fallback_phase=fallback_phase,
-            )[:4]
+        # Preserve the model's observation ranking. Temporal legality,
+        # persistence, and procedure priors are reducer responsibilities.
+        stabilized["phase"] = self._normal_phase_rows(
+            self._merge_ranked_rows(model_phase_rows, [], limit=4)
+        )[:4]
 
-        tool_candidates = self._candidate_rows(context_dict, "tool")
         model_tool_rows = [
             [str(row[0]), float(row[1])]
             for row in stabilized.get("tool", [])
             if isinstance(row, list) and len(row) >= 2 and str(row[0])
         ]
-        public_tool_anchor = ""
-        if requested_tool:
-            public_tool_anchor = requested_tool
-            model_tool_rows = [
-                [requested_tool, 1.0],
-                *[
-                    row
-                    for row in model_tool_rows
-                    if str(row[0]) != requested_tool
-                ],
-            ]
-        if tool_candidates:
-            stabilized["tool"] = self._merge_ranked_rows(
-                model_tool_rows,
-                tool_candidates,
-                limit=4,
-            )
-        elif model_tool_rows:
-            stabilized["tool"] = self._merge_ranked_rows(
-                model_tool_rows,
-                [],
-                limit=4,
-            )
+        # An explicit request is handled independently by the speech/intent
+        # path. It is not a next-tool forecast and must not overwrite one.
+        stabilized["tool"] = self._merge_ranked_rows(
+            model_tool_rows,
+            [],
+            limit=4,
+        )
 
         visual_input = (
             context_dict.get("visual_input", {})
@@ -4261,12 +4969,18 @@ class RealVLMNode(Node):
             return normalized_raw, payload, 0.0, "oracle", retries_used, ""
 
         last_error = ""
+        last_raw_text = ""
         transport_failed = False
         started_monotonic = time.monotonic()
         for attempt in range(self._retry_count + 1):
             developer_prompt = self._developer_instruction
             if attempt > 0:
-                developer_prompt += " Previous response was invalid. Re-emit schema only."
+                validation_error = last_error.split(";", 1)[0].strip()[:180]
+                developer_prompt += (
+                    " Previous response failed schema validation: "
+                    f"{validation_error}. Correct that field and re-emit the complete "
+                    "schema-v4 JSON object only; do not simplify any array shape."
+                )
             try:
                 response = self._client.request_json(
                     system_prompt=self._system_prompt,
@@ -4283,10 +4997,17 @@ class RealVLMNode(Node):
                     reasoning_effort=self._reasoning_effort,
                     generation_seed=self._generation_seed,
                 )
+                last_raw_text = response.raw_text
                 normalized_raw, payload = normalize_raw_text(response.raw_text)
                 return normalized_raw, payload, response.latency_sec, response.mode, attempt, ""
             except (requests.RequestException, SchemaValidationError, json.JSONDecodeError, RuntimeError, ValueError) as exc:  # type: ignore[name-defined]
                 last_error = str(exc)
+                if last_raw_text and not isinstance(exc, requests.RequestException):
+                    excerpt = re.sub(r"\s+", " ", last_raw_text).strip()[:320]
+                    last_error = (
+                        f"{last_error}; raw_response_chars={len(last_raw_text)}; "
+                        f"raw_response_excerpt={excerpt!r}"
+                    )
                 transport_failed = transport_failed or isinstance(
                     exc,
                     requests.RequestException,
@@ -4298,7 +5019,7 @@ class RealVLMNode(Node):
             else "inference_response_failed"
         )
         return (
-            "",
+            last_raw_text,
             None,
             max(0.0, time.monotonic() - started_monotonic),
             failure_mode,
@@ -4392,11 +5113,6 @@ class RealVLMNode(Node):
             "_perception_generation",
             0,
         )
-        visual_generation = getattr(
-            self,
-            "_visual_frame_generation",
-            0,
-        )
         images, image_source, model_image = self._select_images()
         model_image_stamp_sec: float | None = None
         if model_image is not None:
@@ -4404,20 +5120,21 @@ class RealVLMNode(Node):
                 float(model_image.stamp_sec)
                 + float(model_image.stamp_nanosec) / 1_000_000_000.0
             )
-        if (
-            model_image is not None
-            and visual_generation > 0
-            and visual_generation
-            == getattr(self, "_last_submitted_visual_generation", -1)
-        ):
-            return
         context_stamp = self.get_clock().now().to_msg()
         if model_image is not None:
             context_stamp.sec = int(model_image.stamp_sec)
             context_stamp.nanosec = int(model_image.stamp_nanosec)
         if self._context_mode == "actor_log":
             context_dict = self._assemble_actor_log_context_dict()
-            request_context_json = compact_json(context_dict)
+            static_prompt_chars = len(self._system_prompt) + len(
+                self._developer_instruction
+            )
+            request_context_json = compact_prompt_json(
+                actor_log_request_context(
+                    context_dict,
+                    static_prompt_chars=static_prompt_chars,
+                )
+            )
             request_context_msg = self._actor_log_request_context_msg(
                 context_dict,
                 request_context_json,
@@ -4473,10 +5190,37 @@ class RealVLMNode(Node):
                 connected=True,
             )
             return
+        model_input_key = self._current_model_input_signature(
+            request_context_json,
+            images,
+        )
+        if model_input_key == getattr(
+            self,
+            "_last_submitted_model_input_key",
+            "",
+        ):
+            self._exact_duplicate_suppressed_count = (
+                max(
+                    0,
+                    int(
+                        getattr(
+                            self,
+                            "_exact_duplicate_suppressed_count",
+                            0,
+                        )
+                    ),
+                )
+                + 1
+            )
+            return
+        self._last_submitted_model_input_key = model_input_key
+        (
+            source_epoch,
+            source_sequence,
+            correlation_id,
+        ) = self._next_visual_evidence_metadata(model_input_key)
         if model_image_stamp_sec is not None:
             self._last_submitted_live_image_stamp_sec = model_image_stamp_sec
-        if visual_generation > 0:
-            self._last_submitted_visual_generation = visual_generation
         self._publish_model_ready_image(model_image)
         try:
             raw_json, payload, latency_sec, mode, parse_retry_count, last_error = self._run_model(
@@ -4509,6 +5253,22 @@ class RealVLMNode(Node):
                 connected=connected,
             )
             return
+        if source_epoch != max(
+            0,
+            int(getattr(self, "_model_input_epoch", 0)),
+        ):
+            self._publish_health(
+                image_source=image_source,
+                latency_sec=latency_sec,
+                prompt_chars=prompt_chars,
+                output_chars=0,
+                parse_retry_count=parse_retry_count,
+                last_error="inference completed after runtime epoch changed",
+                mode="stale_epoch_result_discarded",
+                healthy=False,
+                connected=connected,
+            )
+            return
         if self._response_mode == "live" and (
             payload is None
             or not healthy
@@ -4524,6 +5284,7 @@ class RealVLMNode(Node):
                 prompt_chars=prompt_chars,
                 retry_count=parse_retry_count,
                 connected=connected,
+                output_chars=len(raw_json),
             )
             return
         if payload is None:
@@ -4545,6 +5306,9 @@ class RealVLMNode(Node):
                 model_raw_json,
                 observation_stamp=context_stamp,
                 mode=published_mode,
+                source_epoch=source_epoch,
+                source_sequence=source_sequence,
+                correlation_id=correlation_id,
             )
         raw_json = model_raw_json
         if self._context_mode == "actor_log":
@@ -4575,6 +5339,9 @@ class RealVLMNode(Node):
             mode=published_mode,
             healthy=healthy,
             connected=connected,
+            source_epoch=source_epoch,
+            source_sequence=source_sequence,
+            correlation_id=correlation_id,
         )
         if model_image_stamp_sec is not None:
             self._last_periodic_live_image_stamp_sec = model_image_stamp_sec
@@ -4648,6 +5415,11 @@ class RealVLMNode(Node):
         payload: dict[str, Any],
         raw_json: str,
         stamp,
+        *,
+        source: str = "",
+        source_epoch: int = 0,
+        source_sequence: int = 0,
+        correlation_id: str = "",
     ) -> None:
         if str(payload.get("v", "")) != "4":
             return
@@ -4661,6 +5433,13 @@ class RealVLMNode(Node):
         group_payload = payload.get("bed_robot_arm_group")
         message = BedRobotArmGroupActionProposal()
         message.stamp = stamp
+        self._set_visual_evidence_metadata(
+            message,
+            source=source,
+            source_epoch=source_epoch,
+            source_sequence=source_sequence,
+            correlation_id=correlation_id,
+        )
         message.schema_version = "4"
         message.raw_json = raw_json
         command = BedRobotArmGroupCommand()
@@ -4738,6 +5517,7 @@ class RealVLMNode(Node):
         prompt_chars: int,
         retry_count: int,
         connected: bool,
+        output_chars: int = 0,
     ) -> None:
         self._inference_failure_count += 1
         failure = InferenceFailure(
@@ -4759,7 +5539,7 @@ class RealVLMNode(Node):
             image_source=failure.image_source,
             latency_sec=failure.latency_sec,
             prompt_chars=max(0, int(prompt_chars)),
-            output_chars=0,
+            output_chars=max(0, int(output_chars)),
             parse_retry_count=failure.retry_count,
             last_error=failure.error,
             mode=(
@@ -4776,6 +5556,9 @@ class RealVLMNode(Node):
         *,
         observation_stamp,
         mode: str,
+        source_epoch: int = 0,
+        source_sequence: int = 0,
+        correlation_id: str = "",
     ) -> None:
         """Publish the parsed model response before runtime stabilization.
 
@@ -4870,7 +5653,13 @@ class RealVLMNode(Node):
         procedure_id = str(
             getattr(getattr(self, "_spec", None), "procedure_id", "unknown")
         )
-        result.source = f"real_vlm_model_raw:{procedure_id}:{mode}"
+        self._set_visual_evidence_metadata(
+            result,
+            source=f"real_vlm_model_raw:{procedure_id}:{mode}",
+            source_epoch=source_epoch,
+            source_sequence=source_sequence,
+            correlation_id=correlation_id,
+        )
         result.schema_version = schema_version
         result.raw_json = raw_json
         result.summary = str(payload.get("sum", ""))
@@ -4911,6 +5700,9 @@ class RealVLMNode(Node):
         mode: str,
         healthy: bool,
         connected: bool,
+        source_epoch: int = 0,
+        source_sequence: int = 0,
+        correlation_id: str = "",
     ) -> None:
         stamp = observation_stamp
         schema_version = str(payload.get("v", "1"))
@@ -4973,7 +5765,14 @@ class RealVLMNode(Node):
 
         phase_evidence = PhaseEvidence()
         phase_evidence.stamp = stamp
-        phase_evidence.source = f"real_vlm:{self._spec.procedure_id}:{mode}"
+        evidence_source = f"real_vlm:{self._spec.procedure_id}:{mode}"
+        self._set_visual_evidence_metadata(
+            phase_evidence,
+            source=evidence_source,
+            source_epoch=source_epoch,
+            source_sequence=source_sequence,
+            correlation_id=correlation_id,
+        )
         phase_evidence.phase_ids = [item[0] for item in phase_rows]
         phase_evidence.phase_confidences = [float(item[1]) for item in phase_rows]
         phase_evidence.visible_instrument_ids = [item[0] for item in observed_rows]
@@ -4989,6 +5788,13 @@ class RealVLMNode(Node):
         for tool_id, location_id, location_type, confidence in observed_rows:
             observation = ToolObservation()
             observation.stamp = stamp
+            self._set_visual_evidence_metadata(
+                observation,
+                source=evidence_source,
+                source_epoch=source_epoch,
+                source_sequence=source_sequence,
+                correlation_id=correlation_id,
+            )
             observation.instrument_id = tool_id
             observation.location_id = location_id
             observation.location_type = location_type
@@ -4998,6 +5804,13 @@ class RealVLMNode(Node):
 
         gesture = SurgeonGestureEvidence()
         gesture.stamp = stamp
+        self._set_visual_evidence_metadata(
+            gesture,
+            source=evidence_source,
+            source_epoch=source_epoch,
+            source_sequence=source_sequence,
+            correlation_id=correlation_id,
+        )
         gesture.procedure_id = self._spec.procedure_id
         gesture.phase_id = phase_evidence.phase_ids[0] if phase_evidence.phase_ids else ""
         gesture.event_type = str(gesture_row[0])
@@ -5009,7 +5822,13 @@ class RealVLMNode(Node):
 
         result = VLMResult()
         result.stamp = stamp
-        result.source = phase_evidence.source
+        self._set_visual_evidence_metadata(
+            result,
+            source=phase_evidence.source,
+            source_epoch=source_epoch,
+            source_sequence=source_sequence,
+            correlation_id=correlation_id,
+        )
         result.schema_version = schema_version
         result.raw_json = raw_json
         result.summary = summary
@@ -5030,6 +5849,10 @@ class RealVLMNode(Node):
             payload,
             raw_json,
             stamp,
+            source=evidence_source,
+            source_epoch=source_epoch,
+            source_sequence=source_sequence,
+            correlation_id=correlation_id,
         )
 
         self._publish_health(

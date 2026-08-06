@@ -46,6 +46,16 @@ def _number(value: Any) -> str:
     return f"{float(value):.3f}"
 
 
+def _latency_distribution(value: Any) -> str:
+    payload = value if isinstance(value, dict) else {}
+    return (
+        f"{_number(payload.get('median'))} / "
+        f"{_number(payload.get('p95'))} / "
+        f"{_number(payload.get('max'))} "
+        f"(n={int(payload.get('count', 0) or 0)})"
+    )
+
+
 def render_markdown(
     *,
     manifest: dict[str, Any],
@@ -104,6 +114,8 @@ def render_markdown(
         f"{trace_coverage('cam4_image')} / "
         f"{trace_coverage('bbox')} / "
         f"{trace_coverage('segmentation')}",
+        f"- Trace input coverage warnings: "
+        f"{input_integrity.get('warnings', [])}",
         f"- Skill commands / semantic admissions / duplicate-suppressed: "
         f"{runtime.get('skill_command_count', 0)} / "
         f"{runtime.get('skill_command_semantic_admission_count', 0)} / "
@@ -122,12 +134,132 @@ def render_markdown(
         f"(GT-independent, no physical execution)",
         f"- Commands after completion: "
         f"{runtime.get('skill_command_after_completion_count', 0)}",
-        "",
-        "## Tool Decision Layers",
-        "",
-        "| Layer | Exact / target | Top-1 | Stable | Request-backed | Anticipatory | Wrong | Missed | Unsafe | Unmatched predictions | Other actions | Median lead (s) |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
+    behavior = evaluation.get("behavior_quality", {})
+    if isinstance(behavior, dict) and isinstance(
+        behavior.get("summary"),
+        dict,
+    ):
+        behavior_summary = behavior["summary"]
+        preparation = behavior.get("preparation_coverage", {})
+        request_readiness = behavior.get("request_readiness", {})
+        unnecessary_preparation = behavior.get(
+            "unnecessary_preparation",
+            {},
+        )
+        pipeline_latency = behavior_summary.get(
+            "request_pipeline_latency",
+            {},
+        )
+        lines.extend(
+            [
+                "",
+                "## Behavior Quality",
+                "",
+                f"- Preparation coverage: "
+                f"{preparation.get('prepared_before_request_count', 0)} / "
+                f"{preparation.get('eligible_handover_count', 0)} "
+                f"({_percent(behavior_summary.get('preparation_coverage'))})",
+                f"- Request readiness at request boundary: "
+                f"{request_readiness.get('ready_before_request_count', 0)} / "
+                f"{request_readiness.get('evaluable_request_count', 0)} "
+                f"({_percent(request_readiness.get('coverage'))}); "
+                f"held preparation "
+                f"{request_readiness.get('prepared_at_request_count', 0)}, "
+                f"early handover "
+                f"{request_readiness.get('early_handover_count', 0)}",
+                f"- Useful speculative preparations: "
+                f"{unnecessary_preparation.get('useful_preparation_count', 0)} / "
+                f"{unnecessary_preparation.get('completed_preparation_count', 0)} "
+                f"({_percent(1.0 - unnecessary_preparation['unnecessary_preparation_rate']) if unnecessary_preparation.get('unnecessary_preparation_rate') is not None else 'N/A'})",
+                "- Request-to-handover latency, source clock "
+                "(median / p95 / max): "
+                + _latency_distribution(
+                    behavior_summary.get(
+                        "request_to_handover_latency_sec"
+                    )
+                )
+                + " s",
+                "- Request-to-handover latency, wall clock "
+                "(median / p95 / max): "
+                + _latency_distribution(
+                    behavior_summary.get(
+                        "request_to_handover_wall_clock_latency_sec"
+                    )
+                )
+                + " s",
+                "- Wrong-preposition release latency, source clock "
+                "(median / p95 / max): "
+                + _latency_distribution(
+                    behavior_summary.get(
+                        "wrong_preposition_release_latency_sec"
+                    )
+                )
+                + " s",
+                "- Wrong-preposition release latency, wall clock "
+                "(median / p95 / max): "
+                + _latency_distribution(
+                    behavior_summary.get(
+                        "wrong_preposition_release_wall_clock_latency_sec"
+                    )
+                )
+                + " s",
+                "- Abandoned-preposition hold duration, source clock "
+                "(median / p95 / max): "
+                + _latency_distribution(
+                    behavior_summary.get(
+                        "abandoned_preposition_hold_duration_sec"
+                    )
+                )
+                + " s",
+                "- Abandoned-preposition hold duration, wall clock "
+                "(median / p95 / max): "
+                + _latency_distribution(
+                    behavior_summary.get(
+                        "abandoned_preposition_wall_clock_hold_duration_sec"
+                    )
+                )
+                + " s",
+                (
+                    "- Wall-clock distributions include elastic replay holds; "
+                    "source-clock distributions preserve video-time "
+                    "comparability."
+                ),
+                "- GT request -> DT request fact, source clock "
+                "(median / p95 / max): "
+                + _latency_distribution(
+                    pipeline_latency.get(
+                        "ground_truth_to_dt_request_fact_latency_sec"
+                    )
+                )
+                + " s",
+                "- DT request fact -> BT acceptance, source clock "
+                "(median / p95 / max): "
+                + _latency_distribution(
+                    pipeline_latency.get(
+                        "dt_request_fact_to_bt_acceptance_latency_sec"
+                    )
+                )
+                + " s",
+                "- BT acceptance -> handover, wall clock "
+                "(median / p95 / max): "
+                + _latency_distribution(
+                    pipeline_latency.get(
+                        "bt_acceptance_to_handover_wall_clock_latency_sec"
+                    )
+                )
+                + " s",
+            ]
+        )
+    lines.extend(
+        [
+            "",
+            "## Tool Decision Layers",
+            "",
+            "| Layer | Exact / target | Top-1 | Stable | Request-backed | Reactive | Proactive | Post-request visual | Wrong | Missed | Unsafe | Unmatched predictions | Other actions | Median lead (s) | Median reaction lag (s) |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
     for layer in LAYER_ORDER:
         payload = evaluation.get("layers", {}).get(layer, {})
         if (
@@ -145,7 +277,14 @@ def render_markdown(
                     _percent(payload.get("top1_exact_rate")),
                     _percent(payload.get("stable_exact_rate")),
                     str(payload.get("request_backed_exact_count", 0)),
-                    str(payload.get("anticipatory_exact_count", 0)),
+                    str(payload.get("request_reactive_exact_count", 0)),
+                    str(
+                        payload.get(
+                            "proactive_exact_count",
+                            payload.get("anticipatory_exact_count", 0),
+                        )
+                    ),
+                    str(payload.get("post_request_visual_exact_count", 0)),
                     str(outcomes.get("wrong_prediction", 0)),
                     str(outcomes.get("missed_opportunity", 0)),
                     str(outcomes.get("unsafe_or_impossible", 0)),
@@ -153,6 +292,11 @@ def render_markdown(
                     str(payload.get("non_handover_action_episode_count", 0)),
                     _number(
                         payload.get("first_correct_lead_sec", {}).get("median")
+                    ),
+                    _number(
+                        payload.get("request_reaction_lag_sec", {}).get(
+                            "median"
+                        )
                     ),
                 )
             )
@@ -165,9 +309,11 @@ def render_markdown(
             "- VLM exact tool matches by evidence timing: "
             f"{vlm_tool_layer.get('request_backed_exact_count', 0)} "
             "request-backed, "
-            f"{vlm_tool_layer.get('anticipatory_exact_count', 0)} "
-            "anticipatory. Top-1 combines both and must not be read as "
-            "anticipatory accuracy alone.",
+            f"{vlm_tool_layer.get('proactive_exact_count', vlm_tool_layer.get('anticipatory_exact_count', 0))} "
+            "proactive, "
+            f"{vlm_tool_layer.get('post_request_visual_exact_count', 0)} "
+            "post-request visual. Top-1 combines timing classes and must not "
+            "be read as proactive forecast accuracy alone.",
         ]
     )
     scorecard = evaluation.get("scorecard", {})
@@ -186,12 +332,62 @@ def render_markdown(
     for layer, payload in tool_score.get("layers", {}).items():
         scorecard_rows.append(
             (
-                "Next-tool prediction",
+                "Combined tool action selection",
                 LAYER_LABELS.get(layer, layer),
                 payload,
                 "complete",
             )
         )
+    if tool_score.get("layers"):
+        lines.extend(
+            [
+                "",
+                "## Tool Decision Timing",
+                "",
+                "| Layer | Proactive correct / targets | "
+                "Proactive target recall | "
+                "Post-request visual | "
+                "Request-backed correct / targets | "
+                "Request-backed target recall | "
+                "Combined action selection |",
+                "|---|---:|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for layer, payload in tool_score["layers"].items():
+            target_count = payload.get("evaluated_count", 0)
+            lines.append(
+                "| "
+                + " | ".join(
+                    (
+                        LAYER_LABELS.get(layer, layer),
+                        f"{payload.get('proactive_correct_count', payload.get('anticipatory_correct_count', 0))} / "
+                        f"{target_count}",
+                        _percent(
+                            payload.get(
+                                "proactive_target_recall",
+                                payload.get("anticipatory_target_recall"),
+                            )
+                        ),
+                        str(
+                            payload.get(
+                                "post_request_visual_correct_count",
+                                0,
+                            )
+                        ),
+                        f"{payload.get('request_backed_correct_count', 0)} / "
+                        f"{target_count}",
+                        _percent(
+                            payload.get("request_backed_target_recall")
+                        ),
+                        _percent(
+                            payload.get(
+                                "combined_action_selection_accuracy"
+                            )
+                        ),
+                    )
+                )
+                + " |"
+            )
     model_raw_intent_score = scorecard.get(
         "model_raw_intent_recognition",
         {},

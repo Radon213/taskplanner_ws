@@ -15,7 +15,7 @@ def force_disable_thinking(
     normalized_provider = provider_id.strip().lower()
     body["reasoning_effort"] = "none"
 
-    if normalized_provider in {"unsloth", "vllm"}:
+    if normalized_provider in {"lmstudio", "unsloth", "vllm"}:
         raw_kwargs = body.get("chat_template_kwargs")
         template_kwargs = dict(raw_kwargs) if isinstance(raw_kwargs, dict) else {}
         template_kwargs["enable_thinking"] = False

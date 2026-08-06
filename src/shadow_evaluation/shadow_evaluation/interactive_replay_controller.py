@@ -1011,7 +1011,11 @@ class ElasticReplayGate:
                 observed_pending_vlm_count=observed_pending_vlm_count,
             )
         )
-        if active_cleanup_count > 0:
+        # Elastic playback keeps recorded media causally aligned with simulated
+        # physical actions. Realtime playback deliberately leaves the source
+        # clock independent so downstream skill/cleanup latency stays visible.
+        synchronize_actions = mode == "elastic_demo"
+        if synchronize_actions and active_cleanup_count > 0:
             self._hard_hold_active = False
             return ReplaySyncDecision(
                 hold_reason="cleanup_execution",
@@ -1020,7 +1024,7 @@ class ElasticReplayGate:
                 hard_hold_active=False,
                 degraded=not vlm_required or not vlm_ready,
             )
-        if active_skill_count > 0:
+        if synchronize_actions and active_skill_count > 0:
             self._hard_hold_active = False
             return ReplaySyncDecision(
                 hold_reason="skill_execution",
@@ -1031,9 +1035,9 @@ class ElasticReplayGate:
             )
         # VLM is asynchronous visual evidence. Its readiness, backlog, and
         # frame alignment remain visible in metadata but never alter the media
-        # clock. `mode` and the legacy thresholds remain accepted so existing
-        # launch files and callers do not break.
-        _ = mode, vlm_grace_elapsed, pending_count
+        # clock. Legacy thresholds remain accepted so existing launch files and
+        # callers do not break.
+        _ = vlm_grace_elapsed, pending_count
         self._hard_hold_active = False
         return ReplaySyncDecision(
             playback_rate_factor=1.0,
@@ -1733,7 +1737,7 @@ class InteractiveReplayControllerNode(Node):
             "last_control_command": self._last_control_command,
             "control_reason": self._control_reason,
             "degraded_mode": (
-                "speech_only"
+                "asynchronous_vlm"
                 if not self._vlm_required()
                 else (
                     "vlm_transient_failure"
@@ -1994,12 +1998,18 @@ class InteractiveReplayControllerNode(Node):
             self._vlm_health_received_at = now
             self._vlm_connected = bool(msg.connected)
             if not self._vlm_required():
-                self._vlm_healthy = False
-                self._last_vlm_health_error = (
-                    "object recognition disabled"
+                # Optional VLM means the media clock does not wait for visual
+                # inference. It does not mean that perception is disabled or
+                # that image/result observations should be discarded.
+                self._vlm_healthy = bool(
+                    msg.connected and msg.healthy and not msg.last_error
                 )
-                self._no_input_since_at = None
-                self._vlm_wait_started_at = None
+                self._vlm_health_source_sec = self._source_time_sec
+                self._last_vlm_health_error = str(msg.last_error or "")
+                if self._vlm_healthy:
+                    self._last_vlm_progress_at = now
+                    self._no_input_since_at = None
+                self._force_state_publish = True
                 return
             if _is_no_input_vlm_health(msg):
                 # Allow short source-video gaps to advance, but do not let a
@@ -2083,11 +2093,7 @@ class InteractiveReplayControllerNode(Node):
     def _on_vlm_input_image(self, msg: CompressedImage) -> None:
         stamp_sec = _seconds_from_stamp(msg.header.stamp)
         with self._lock:
-            if (
-                not self._vlm_required()
-                or self._state
-                not in {"running", "held", "paused", "draining"}
-            ):
+            if self._state not in {"running", "held", "paused", "draining"}:
                 return
             slot_id = record_vlm_input_obligation(
                 stamp_sec=stamp_sec,
@@ -2120,8 +2126,6 @@ class InteractiveReplayControllerNode(Node):
 
     def _on_vlm_result(self, msg: VLMResult) -> None:
         with self._lock:
-            if not self._vlm_required():
-                return
             if self._state not in {
                 "running",
                 "held",
@@ -2394,10 +2398,10 @@ class InteractiveReplayControllerNode(Node):
             return
         due_records, coalesced_count = coalesce_stateful_records(
             self._source.pop_due(self._source_time_sec),
-            stateful_topics={
-                *self._image_topic_routes,
-                *self._json_topic_routes,
-            },
+            # Camera frames are an ordered media stream, not state snapshots.
+            # Publish every due frame and let the independent VLM backpressure
+            # path choose which observations it can process.
+            stateful_topics=set(self._json_topic_routes),
         )
         self._coalesced_stateful_count += coalesced_count
         for topic, serialized, source_sec in due_records:

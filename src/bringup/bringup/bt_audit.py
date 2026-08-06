@@ -455,7 +455,11 @@ class BTAuditHarness(SmokeHarness):
                         f"{world.expected_instruments}."
                     ),
                 )
-            if selected_state is not None and selected_state.contaminated:
+            if (
+                selected_state is not None
+                and selected_state.contaminated
+                and selected_state.lifecycle_stage != "mayo_reuse"
+            ):
                 self._push_finding(
                     severity="blocker",
                     code="anticipatory_contaminated_tool",
@@ -463,7 +467,16 @@ class BTAuditHarness(SmokeHarness):
                     world=world,
                     detail=f"{decision.selected_tool} was contaminated during anticipatory selection.",
                 )
-            if selected_state is not None and selected_state.lifecycle_stage not in {"home_rack", "returned_home", "prepositioned_right"}:
+            if (
+                selected_state is not None
+                and selected_state.lifecycle_stage
+                not in {
+                    "home_rack",
+                    "returned_home",
+                    "prepositioned_right",
+                    "mayo_reuse",
+                }
+            ):
                 self._push_finding(
                     severity="blocker",
                     code="anticipatory_invalid_lifecycle",

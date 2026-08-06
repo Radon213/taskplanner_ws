@@ -486,6 +486,7 @@ def _build_policy() -> dict[str, Any]:
             "smoothing_window": 5,
             "min_dwell_time_sec": 5.0,
             "allow_unknown_phase": True,
+            "min_evidence_duration_sec": 1.0,
         },
         "action_guard": {
             "block_handover_when_phase_uncertain": True,

@@ -1,4 +1,8 @@
 builtin_interfaces/Time stamp
+string source
+uint64 source_epoch
+uint64 source_sequence
+string correlation_id
 string schema_version
 surgical_msgs/BedRobotArmGroupCommand command
 bool valid

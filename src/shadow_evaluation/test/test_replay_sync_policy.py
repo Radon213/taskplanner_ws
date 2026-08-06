@@ -1,9 +1,12 @@
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from builtin_interfaces.msg import Time
+from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
+from surgical_msgs.msg import VLMHealth, VLMResult
 
 import shadow_evaluation.interactive_replay_controller as replay_controller
 from shadow_evaluation.interactive_replay_controller import (
@@ -300,17 +303,31 @@ def test_hard_vlm_thresholds_are_observational_only():
     assert released.playback_rate_factor == 1.0
 
 
-def test_skill_and_cleanup_are_causal_holds_in_every_mode():
+def test_skill_and_cleanup_hold_only_elastic_playback():
     gate = ElasticReplayGate(require_vlm=False)
 
-    skill = _decision(
+    elastic_skill = _decision(
+        gate,
+        source_time_sec=4.0,
+        completed_vlm_count=0,
+        mode="elastic_demo",
+        active_skill_count=1,
+    )
+    elastic_cleanup = _decision(
+        gate,
+        source_time_sec=4.0,
+        completed_vlm_count=0,
+        mode="elastic_demo",
+        active_cleanup_count=1,
+    )
+    realtime_skill = _decision(
         gate,
         source_time_sec=4.0,
         completed_vlm_count=0,
         mode="realtime_1x",
         active_skill_count=1,
     )
-    cleanup = _decision(
+    realtime_cleanup = _decision(
         gate,
         source_time_sec=4.0,
         completed_vlm_count=0,
@@ -318,11 +335,15 @@ def test_skill_and_cleanup_are_causal_holds_in_every_mode():
         active_cleanup_count=1,
     )
 
-    assert skill.hold_reason == "skill_execution"
-    assert cleanup.hold_reason == "cleanup_execution"
+    assert elastic_skill.hold_reason == "skill_execution"
+    assert elastic_cleanup.hold_reason == "cleanup_execution"
+    assert realtime_skill.hold_reason == ""
+    assert realtime_cleanup.hold_reason == ""
+    assert realtime_skill.playback_rate_factor == 1.0
+    assert realtime_cleanup.playback_rate_factor == 1.0
 
 
-def test_require_vlm_false_runs_in_degraded_speech_only_mode():
+def test_require_vlm_false_runs_without_a_visual_timing_gate():
     gate = ElasticReplayGate(require_vlm=False)
 
     decision = _decision(
@@ -335,6 +356,53 @@ def test_require_vlm_false_runs_in_degraded_speech_only_mode():
     assert decision.hold_reason == ""
     assert decision.degraded
     assert decision.playback_rate_factor == 1.0
+
+
+def test_optional_vlm_events_remain_observable_without_gating_playback():
+    node = InteractiveReplayControllerNode.__new__(
+        InteractiveReplayControllerNode
+    )
+    node._lock = threading.RLock()
+    node._gate = ElasticReplayGate(require_vlm=False, vlm_period_sec=1.0)
+    node._state = "running"
+    node._source_time_sec = 12.0
+    node._image_duration_sec = 100.0
+    node._expected_vlm_slots = set()
+    node._expected_vlm_slot_times = {}
+    node._completed_vlm_slots = set()
+    node._failed_vlm_slots = set()
+    node._force_state_publish = False
+    node._vlm_health_received_at = -1.0
+    node._vlm_connected = False
+    node._vlm_healthy = False
+    node._vlm_health_source_sec = 0.0
+    node._last_vlm_health_error = ""
+    node._last_vlm_progress_at = 0.0
+    node._no_input_since_at = None
+    node._vlm_wait_started_at = None
+    node._consecutive_vlm_failures = 0
+    node._vlm_failure_grace_until = -1.0
+    node._last_vlm_failure_signature = ""
+
+    health = VLMHealth()
+    health.connected = True
+    health.healthy = True
+    node._on_vlm_health(health)
+
+    model_input = CompressedImage()
+    model_input.header.stamp = Time(sec=10, nanosec=500_000_000)
+    node._on_vlm_input_image(model_input)
+
+    result = VLMResult()
+    result.stamp = Time(sec=10, nanosec=500_000_000)
+    node._on_vlm_result(result)
+
+    observation_id = 10_500_000_000
+    assert node._vlm_healthy
+    assert node._last_vlm_health_error == ""
+    assert node._expected_vlm_slots == {observation_id}
+    assert node._completed_vlm_slots == {observation_id}
+    assert node._force_state_publish
 
 
 def test_replay_gate_defaults_to_optional_visual_evidence():
@@ -569,6 +637,19 @@ def test_stateful_records_coalesce_but_speech_events_are_lossless():
         ("/perception", b"new", 1.5),
     ]
     assert coalesced == 2
+
+
+def test_runtime_call_keeps_camera_topics_out_of_stateful_coalescing():
+    source = Path(
+        replay_controller.__file__
+    ).read_text(encoding="utf-8")
+    publish_due = source[
+        source.index("    def _publish_due_records(self) -> None:")
+        : source.index("    def _tick(self) -> None:")
+    ]
+
+    assert "stateful_topics=set(self._json_topic_routes)" in publish_due
+    assert "*self._image_topic_routes" not in publish_due
 
 
 def test_media_end_drain_waits_then_marks_timeout_explicitly():

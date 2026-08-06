@@ -1,9 +1,16 @@
 """Bring up the fail-closed external Taskplanner integration runtime."""
 
 from launch import LaunchDescription
-from launch.actions import IncludeLaunchDescription
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import EnvironmentVariable, PathJoinSubstitution, PythonExpression
+from launch.substitutions import (
+    EnvironmentVariable,
+    LaunchConfiguration,
+    PathJoinSubstitution,
+    PythonExpression,
+)
+from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 
 
@@ -13,6 +20,7 @@ def _env(name: str, default: str) -> EnvironmentVariable:
 
 def generate_launch_description() -> LaunchDescription:
     vlm_mode = _env("VLM_MODE", "real")
+    publish_shared_state = LaunchConfiguration("publish_shared_state")
     perception_enabled = PythonExpression(
         ["'", vlm_mode, "' in ('real', 'dual')"]
     )
@@ -23,6 +31,14 @@ def generate_launch_description() -> LaunchDescription:
     )
     return LaunchDescription(
         [
+            DeclareLaunchArgument(
+                "publish_shared_state",
+                default_value="false",
+                description=(
+                    "Publish the curated read-only shared surgical state on "
+                    "/surgery/* topics."
+                ),
+            ),
             IncludeLaunchDescription(
                 base_launch,
                 launch_arguments={
@@ -35,6 +51,7 @@ def generate_launch_description() -> LaunchDescription:
                     ),
                     "input_profile": "external",
                     "execution_backend": "external",
+                    "execution_contract": "direct",
                     "speech_input_mode": "sentence_text",
                     "sentence_input_topic": _env(
                         "SENTENCE_INPUT_TOPIC",
@@ -90,6 +107,10 @@ def generate_launch_description() -> LaunchDescription:
                         "SEGMENTED_FLIR_TOPIC",
                         "/surgery/images/flir/segmented/compressed",
                     ),
+                    "cam4_overlay_image_topic": _env(
+                        "CAM4_OVERLAY_TOPIC",
+                        "/surgery/images/cam4/detection_overlay/compressed",
+                    ),
                     "cam4_semantics_topic": _env(
                         "CAM4_SEMANTICS_TOPIC",
                         "/surgery/perception/cam4/semantics/json",
@@ -101,6 +122,13 @@ def generate_launch_description() -> LaunchDescription:
                         "false",
                     ),
                 }.items(),
-            )
+            ),
+            Node(
+                package="surgical_interop_gateway",
+                executable="surgical_interop_gateway",
+                name="surgical_interop_gateway",
+                condition=IfCondition(publish_shared_state),
+                output="screen",
+            ),
         ]
     )
