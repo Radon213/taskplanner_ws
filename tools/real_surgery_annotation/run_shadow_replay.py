@@ -1711,6 +1711,15 @@ def _build_parser(repo_root: Path) -> argparse.ArgumentParser:
     parser.add_argument("--publish-period-sec", type=float, default=1.0)
     parser.add_argument("--response-format", default="json_schema")
     parser.add_argument("--reasoning-effort", default="none")
+    parser.add_argument(
+        "--vlm-task-profile",
+        choices=("full", "tool_forecast_only"),
+        default="full",
+        help=(
+            "Use tool_forecast_only only for an isolated raw next-tool "
+            "prediction benchmark."
+        ),
+    )
     parser.add_argument("--max-output-tokens", type=int, default=320)
     parser.add_argument(
         "--vlm-generation-seed",
@@ -2065,6 +2074,7 @@ def main() -> int:
                 "publish_period_sec": args.publish_period_sec,
                 "response_format": args.response_format,
                 "reasoning_effort": args.reasoning_effort,
+                "task_profile": args.vlm_task_profile,
                 "max_output_tokens": args.max_output_tokens,
                 "generation_seed": args.vlm_generation_seed,
                 "request_timeout_sec": args.vlm_request_timeout_sec,
@@ -2322,6 +2332,7 @@ def main() -> int:
             f"vlm_publish_period_sec:={args.publish_period_sec}",
             f"vlm_response_format:={args.response_format}",
             f"vlm_reasoning_effort:={args.reasoning_effort}",
+            f"vlm_task_profile:={args.vlm_task_profile}",
             f"vlm_max_output_tokens:={args.max_output_tokens}",
             f"vlm_generation_seed:={args.vlm_generation_seed}",
             f"vlm_request_timeout_sec:={args.vlm_request_timeout_sec}",

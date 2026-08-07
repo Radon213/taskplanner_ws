@@ -139,6 +139,8 @@ def build_case_command(args: argparse.Namespace, case_id: str, index: int) -> li
         args.response_format,
         "--reasoning-effort",
         args.reasoning_effort,
+        "--vlm-task-profile",
+        getattr(args, "vlm_task_profile", "full"),
         "--max-output-tokens",
         str(args.max_output_tokens),
         "--vlm-generation-seed",
@@ -218,6 +220,11 @@ def main() -> int:
     parser.add_argument("--api-mode", default="openai_compat")
     parser.add_argument("--response-format", default="json_schema")
     parser.add_argument("--reasoning-effort", default="none")
+    parser.add_argument(
+        "--vlm-task-profile",
+        choices=("full", "tool_forecast_only"),
+        default="full",
+    )
     parser.add_argument("--publish-period-sec", type=float, default=1.0)
     parser.add_argument("--max-output-tokens", type=int, default=320)
     parser.add_argument("--seed", type=int, default=0)
@@ -326,6 +333,7 @@ def main() -> int:
             "base_url": args.base_url,
             "model_id": args.model_id,
             "seed": args.seed,
+            "task_profile": args.vlm_task_profile,
         },
         "fault_scenario_path": (
             str(args.fault_scenario_path)

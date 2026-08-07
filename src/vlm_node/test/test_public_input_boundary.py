@@ -19,6 +19,7 @@ from vlm_node.real_vlm import (
     actor_log_model_context,
     actor_log_request_context,
     bound_actor_log_context,
+    build_forecast_constraints,
     compact_prompt_json,
 )
 
@@ -171,6 +172,9 @@ def test_actor_log_context_is_bounded_without_repeating_static_ontology() -> Non
         "digital_twin": {
             "hands": {},
             "tools": [{"id": "T01", "lc": "mayo_reuse"}],
+            "completed_handovers": [
+                {"tool": "T02", "at": float(index)} for index in range(10)
+            ],
             "events": [
                 {"t": f"event-{index}", "detail": "x" * 180}
                 for index in range(6)
@@ -186,6 +190,9 @@ def test_actor_log_context_is_bounded_without_repeating_static_ontology() -> Non
     assert bounded["digital_twin"]["tools"] == [
         {"id": "T01", "lc": "mayo_reuse"}
     ]
+    assert [
+        row["tool"] for row in bounded["digital_twin"]["completed_handovers"]
+    ] == ["T02"] * 8
     assert len(
         json.dumps(
             bounded,
@@ -335,6 +342,10 @@ def test_actor_log_request_context_handles_dense_detector_rows_at_runtime_budget
         "digital_twin": {
             "hands": {"right": "", "left": ""},
             "forecast_inventory": {"available": [["T02", 1]]},
+            "completed_handovers": [
+                {"tool": "T02", "at": 10.0},
+                {"tool": "T04", "at": 20.0},
+            ],
             "tools": [
                 {"id": f"T{index:02d}", "lc": "home_rack"}
                 for index in range(30)
@@ -355,6 +366,12 @@ def test_actor_log_request_context_handles_dense_detector_rows_at_runtime_budget
     )
     assert request_context["visual_input"]["image_source"].startswith("flir_cam4")
     assert request_context["observable_perception"]["ground_truth"] is False
+    assert request_context["digital_twin"]["completed_handovers"][-1][
+        "tool"
+    ] == "T04"
+    assert request_context["digital_twin"]["forecast_inventory"][
+        "available"
+    ] == [["T02", 1]]
 
 
 def test_model_context_excludes_ranked_feedback_but_keeps_public_evidence() -> None:
@@ -369,7 +386,14 @@ def test_model_context_excludes_ranked_feedback_but_keeps_public_evidence() -> N
             "interrupt_phase_ids": [],
         },
         "evidence_window": {"speech": [{"text": "Bovie"}]},
-        "digital_twin": {"hands": {}, "tools": [{"id": "T04"}]},
+        "digital_twin": {
+            "hands": {},
+            "tools": [{"id": "T04"}],
+            "completed_handovers": [
+                {"tool": "T02", "at": 10.0},
+                {"tool": "T04", "at": 20.0},
+            ],
+        },
         "candidates": {
             "phase": [["P03", 1.0], ["P04", 0.92]],
             "tool": [["T02", 1.0]],
@@ -395,6 +419,43 @@ def test_model_context_excludes_ranked_feedback_but_keeps_public_evidence() -> N
         {"text": "Bovie"}
     ]
     assert model_context["digital_twin"]["tools"] == [{"id": "T04"}]
+    assert model_context["digital_twin"]["completed_handovers"][-1] == {
+        "tool": "T04",
+        "at": 20.0,
+    }
+    assert model_context["forecast_constraints"] == {
+        "currently_in_use": [],
+        "available_for_next_handover": [],
+        "prepositioned": [],
+        "mayo_reusable": [],
+        "unavailable_for_next_handover": [],
+    }
+
+
+def test_forecast_constraints_separate_current_tools_from_handover_supply() -> None:
+    constraints = build_forecast_constraints(
+        {
+            "hands": {"rh": "T05", "lh": "", "pre": "T07"},
+            "tools": [
+                {"id": "T03", "lc": "surgeon_owned", "own": "surgeon"},
+                {"id": "T03", "lc": "surgeon_owned", "own": "surgeon"},
+                {"id": "T04", "lc": "mayo_reuse", "own": "none"},
+            ],
+            "forecast_inventory": {
+                "available": [["T02", 2], ["T04", 1]],
+                "mayo_reuse": [["T04", 1]],
+                "unavailable": [["T03", 2], ["T05", 1]],
+            },
+        }
+    )
+
+    assert constraints == {
+        "currently_in_use": [["T03", 2]],
+        "available_for_next_handover": [["T02", 2], ["T04", 1]],
+        "prepositioned": [["T07", 1], ["T05", 1]],
+        "mayo_reusable": [["T04", 1]],
+        "unavailable_for_next_handover": [["T03", 2], ["T05", 1]],
+    }
 
 
 def test_public_forecast_inventory_exposes_spares_without_authorizing_action() -> None:

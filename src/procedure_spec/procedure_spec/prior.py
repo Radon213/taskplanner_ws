@@ -154,6 +154,30 @@ class ProcedurePriorScorer:
                 elif current_tool == primary[-1] and next_tool in self._requestable:
                     primary.append(next_tool)
 
+        self._handover_paths: list[tuple[str, int, list[str]]] = []
+        raw_handover_patterns = self.prompt.get("handover_patterns", {}) or {}
+        if isinstance(raw_handover_patterns, dict):
+            for source in ("primary", "alternatives"):
+                for path_index, raw_path in enumerate(
+                    raw_handover_patterns.get(source, []) or []
+                ):
+                    if not isinstance(raw_path, list):
+                        continue
+                    path = [
+                        tool_id
+                        for tool_id in (
+                            self._resolve_tool(raw_tool) for raw_tool in raw_path
+                        )
+                        if tool_id in self._requestable
+                    ]
+                    if len(path) >= 2:
+                        self._handover_paths.append((source, path_index, path))
+        if not any(source == "primary" for source, _, _ in self._handover_paths):
+            for phase_id in self.spec.normal_phase_ids:
+                path = list(self._primary_sequence_by_phase.get(phase_id, []))
+                if len(path) >= 2:
+                    self._handover_paths.append(("phase", len(self._handover_paths), path))
+
     def _resolve_tool(self, raw: Any) -> str:
         text = str(raw or "").strip()
         if not text:
@@ -386,21 +410,140 @@ class ProcedurePriorScorer:
             resolved = self._resolve_tool(status.get("tool", ""))
             if resolved:
                 recent_tools.append(resolved)
-        progress_event_types = {
-            "ToolHandoverCompleted",
-            "ToolReceivedFromSurgeon",
-        }
-        for event in evidence.get("events", []) or []:
-            if not isinstance(event, dict):
-                continue
-            if not self._row_after_phase_entry(event, phase_entered_sec):
-                continue
-            if str(event.get("t", "")) not in progress_event_types:
-                continue
-            resolved = self._resolve_tool(event.get("tool", ""))
-            if resolved:
-                recent_tools.append(resolved)
+        if not evidence.get("recent_tools") and not evidence.get(
+            "completed_handovers"
+        ):
+            progress_event_types = {
+                "ToolHandoverCompleted",
+                "ToolReceivedFromSurgeon",
+            }
+            for event in evidence.get("events", []) or []:
+                if not isinstance(event, dict):
+                    continue
+                if not self._row_after_phase_entry(event, phase_entered_sec):
+                    continue
+                if str(event.get("t", "")) not in progress_event_types:
+                    continue
+                resolved = self._resolve_tool(event.get("tool", ""))
+                if resolved:
+                    recent_tools.append(resolved)
         return speech_tools, recent_tools
+
+    def _history_tools(self, evidence: dict[str, Any], key: str) -> list[str]:
+        tools: list[str] = []
+        for row in evidence.get(key, []) or []:
+            raw_tool = row.get("tool", "") if isinstance(row, dict) else row
+            resolved = self._resolve_tool(raw_tool)
+            if resolved:
+                # Repeated requests are meaningful when the procedure owns
+                # multiple instances of the same instrument.
+                tools.append(resolved)
+        return tools
+
+    def _handover_forecast(
+        self,
+        histories: list[tuple[str, list[str], int]],
+    ) -> dict[str, Any]:
+        if not self._handover_paths:
+            return {}
+
+        non_empty = [row for row in histories if row[1]]
+        if non_empty:
+            history_source, history, _ = max(
+                non_empty,
+                # Validated requests are the earliest public progression fact.
+                # Completion history is a fallback because transport delays
+                # and duplicate lifecycle events can make it look longer.
+                key=lambda row: (row[2], len(row[1])),
+            )
+        else:
+            history_source, history = "entry", []
+
+        candidates: list[dict[str, Any]] = []
+        for source, path_index, path in self._handover_paths:
+            source_bonus = 0.05 if source == "primary" else 0.0
+            if not history:
+                if source != "primary" or path_index != 0:
+                    continue
+                candidates.append(
+                    {
+                        "tool": path[0],
+                        "confidence": 0.86,
+                        "match_length": 0,
+                        "path_start": 0,
+                        "source": source,
+                        "path_index": path_index,
+                    }
+                )
+                continue
+
+            max_match = min(len(history), len(path) - 1)
+            for match_length in range(max_match, 0, -1):
+                suffix = history[-match_length:]
+                positions = [
+                    start
+                    for start in range(0, len(path) - match_length)
+                    if path[start : start + match_length] == suffix
+                ]
+                if not positions:
+                    continue
+                expected_start = max(
+                    0,
+                    min(
+                        len(path) - match_length - 1,
+                        len(history) - match_length,
+                    ),
+                )
+                path_start = min(
+                    positions,
+                    key=lambda start: (abs(start - expected_start), start),
+                )
+                confidence = min(
+                    0.95,
+                    0.76
+                    + source_bonus
+                    + min(0.14, match_length * 0.06)
+                    + min(0.05, max(0, match_length - 3) * 0.015),
+                )
+                candidates.append(
+                    {
+                        "tool": path[path_start + match_length],
+                        "confidence": round(confidence, 3),
+                        "match_length": match_length,
+                        "path_start": path_start,
+                        "source": source,
+                        "path_index": path_index,
+                    }
+                )
+                break
+
+        if not candidates:
+            return {
+                "tool": "",
+                "confidence": 0.0,
+                "history": history[-12:],
+                "history_source": history_source,
+                "match_length": 0,
+                "source": "none",
+                "candidates": [],
+            }
+
+        candidates.sort(
+            key=lambda row: (
+                float(row["confidence"]),
+                int(row["match_length"]),
+                row["source"] == "primary",
+                -int(row["path_index"]),
+            ),
+            reverse=True,
+        )
+        selected = candidates[0]
+        return {
+            **selected,
+            "history": history[-12:],
+            "history_source": history_source,
+            "candidates": candidates[:4],
+        }
 
     def _sequence_alignment_score(
         self,
@@ -540,6 +683,19 @@ class ProcedurePriorScorer:
             phase_scores[phase_id] += 0.14
 
         speech_tools, recent_tools = self._evidence_tools(evidence)
+        request_tools = self._history_tools(evidence, "tool_requests")
+        completed_handover_tools = self._history_tools(
+            evidence,
+            "completed_handovers",
+        )
+        path_forecast = self._handover_forecast(
+            [
+                ("validated_requests", request_tools, 4),
+                ("public_speech", speech_tools, 3),
+                ("completed_handovers", completed_handover_tools, 2),
+                ("recent_tools", recent_tools, 1),
+            ]
+        )
         try:
             phase_entered_sec = float(evidence.get("phase_entered_sec", 0.0) or 0.0)
         except (TypeError, ValueError):
@@ -710,6 +866,14 @@ class ProcedurePriorScorer:
                     continue
                 phase_scores[phase_id] *= 0.55
 
+        if not field_event_text and path_forecast.get("tool"):
+            # This is a preparation prior only. The reducer exposes it as a
+            # hypothesis; inventory, ownership and handover authorization stay
+            # in the Behavior Tree.
+            tool_scores[str(path_forecast["tool"])] += (
+                2.4 * float(path_forecast.get("confidence", 0.0))
+            )
+
         for index, tool_id in enumerate(reversed(recent_tools[-6:])):
             weight = max(0.08, 0.28 - index * 0.035)
             for phase_id in self._phase_by_tool.get(tool_id, set()):
@@ -875,6 +1039,9 @@ class ProcedurePriorScorer:
                 "interrupt_event_active": bool(field_event_text),
                 "speech_tools": speech_tools[-4:],
                 "recent_tools": recent_tools[-8:],
+                "tool_requests": request_tools[-12:],
+                "completed_handovers": completed_handover_tools[-12:],
+                "procedure_path_forecast": path_forecast,
                 "allowed_next": sorted(regular_allowed_next),
                 "tool_only_detailed_phase_transition_allowed": (
                     self._tool_only_detailed_phase_transition_allowed

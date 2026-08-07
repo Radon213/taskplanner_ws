@@ -298,13 +298,17 @@ def _prediction_fusion_node(
     *,
     prior_rows: list[list],
     available: set[str],
+    prior_evidence: dict | None = None,
 ) -> ORDigitalTwinNode:
     node = ORDigitalTwinNode.__new__(ORDigitalTwinNode)
     node._tool_predict_stability = {}
     node._tool_predict_evidence_threshold = 0.5
     node._tool_predict_stability_sec = 3.0
     node._prior_scorer = SimpleNamespace(
-        score=lambda _evidence: {"tool": prior_rows}
+        score=lambda _evidence: {
+            "tool": prior_rows,
+            "evidence": prior_evidence or {},
+        }
     )
     node._runtime_prior_evidence = lambda: {}
     node._twin = SimpleNamespace(
@@ -348,6 +352,56 @@ def test_procedure_prior_only_nudges_vlm_candidates() -> None:
     assert tool_id == "T01"
     assert confidence == pytest.approx(0.8)
     assert "T02" not in detail["fused"]
+
+
+def test_validated_procedure_path_can_create_reversible_preparation_candidate() -> None:
+    node = _prediction_fusion_node(
+        prior_rows=[["T02", 1.0]],
+        available={"T01", "T02"},
+        prior_evidence={
+            "procedure_path_forecast": {
+                "tool": "T02",
+                "confidence": 0.86,
+                "history": ["T02", "T02"],
+                "history_source": "validated_requests",
+                "match_length": 2,
+            }
+        },
+    )
+
+    tool_id, confidence, detail = node._fused_tool_prediction(
+        {"v": "4", "tool": [["T01", 0.72]]},
+        10.0,
+    )
+
+    assert tool_id == "T02"
+    assert confidence == pytest.approx(0.86)
+    assert detail["path_available"] is True
+    assert detail["procedure_path_forecast"]["match_length"] == 2
+
+
+def test_strong_current_visual_forecast_can_override_procedure_path() -> None:
+    node = _prediction_fusion_node(
+        prior_rows=[["T02", 1.0]],
+        available={"T01", "T02"},
+        prior_evidence={
+            "procedure_path_forecast": {
+                "tool": "T02",
+                "confidence": 0.86,
+                "history": ["T02", "T02"],
+                "history_source": "validated_requests",
+                "match_length": 2,
+            }
+        },
+    )
+
+    tool_id, confidence, _ = node._fused_tool_prediction(
+        {"v": "4", "tool": [["T01", 0.97]]},
+        10.0,
+    )
+
+    assert tool_id == "T01"
+    assert confidence == pytest.approx(0.97)
 
 
 def test_unavailable_vlm_candidate_remains_evidence_without_prior_fallback() -> None:

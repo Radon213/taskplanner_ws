@@ -3,7 +3,7 @@
 # deliberately excluded. Authored phases absent from a source clip remain
 # procedure priors, not claims about that clip.
 
-id: thyroidectomy_demo_prompt_v3
+id: thyroidectomy_demo_prompt_v4
 
 procedure:
   id: "thyroidectomy_demo"
@@ -101,6 +101,19 @@ tool_inventory:
   T07: 1
   T08: 1
   T11: 2
+
+# Common request-order priors for anticipatory preparation. These paths carry
+# no case id or timestamp and are never sufficient to authorize a handover.
+# Alternatives encode local functional branches without asking the model to
+# choose among several nearly identical full-case templates. Visible activity,
+# validated requests, inventory, and BT guards remain authoritative.
+handover_patterns:
+  primary:
+    - [T02, T02, T04, T07, T04, T05, T05, T02, T07, T08, T07, T04]
+  alternatives:
+    - [T04, T02, T05]
+    - [T02, T08, T07, T04]
+    - [T05, T05, T02, T02, T07]
 
 # The demonstration begins inside an already-open field. Both Allis instances
 # are already deployed and in active surgeon use rather than waiting on the rack.
@@ -282,6 +295,7 @@ phase_details:
     expected_tool_sequence:
       - current: "T04"
         next: "T02"
+        strength: "medium"
         cue: "the superficial edge needs controlled grasping during flap elevation"
 
   P03:
@@ -292,24 +306,59 @@ phase_details:
       - "a fixed retractor is already seated and persistently widening the field"
       - "a small focal target is already under sustained localized control"
     tool_roles:
+      entry_handover: [T02]
       tissue_handling: [T02, T03]
       dissection_or_hemostasis: [T04, T07]
+      upcoming_fixed_retraction: [T05, T11]
     expected_tool_sequence:
       - current: "T02"
         next: "T02"
-        cue: "a second Adson is common for counter-traction but not required"
+        strength: "high"
+        cue: "paired fine forceps commonly establish counter-traction before energy dissection"
       - current: "T02"
         next: "T04"
-        cue: "one common option is energy dissection of tensioned tissue"
+        strength: "high"
+        cue: "broad energy dissection commonly follows fine tissue handling"
+      - current: "T04"
+        next: "T07"
+        strength: "high"
+        cue: "focal bipolar control commonly follows broader energy dissection"
+      - current: "T07"
+        next: "T04"
+        strength: "high"
+        cue: "broader dissection commonly resumes after focal bipolar control"
+      - current: "T04"
+        next: "T05"
+        strength: "high"
+        cue: "fixed retraction is commonly prepared as the central field becomes ready for sustained exposure"
+      - current: "T05"
+        next: "T05"
+        strength: "high"
+        cue: "a second fixed retractor commonly completes balanced exposure when another instance is available"
+      - current: "T02"
+        next: "T05"
+        strength: "medium"
+        cue: "fixed retraction may follow renewed tissue handling when the field is already sufficiently dissected"
+      - current: "T04"
+        next: "T11"
+        strength: "medium"
+        cue: "a visibly equivalent thyroid retractor may substitute for the fixed-retraction setup"
       - current: "T02"
         next: "T07"
-        cue: "precise bipolar work is an alternative within the same functional state"
+        strength: "medium"
+        cue: "precise bipolar work is an alternative after tissue handling"
       - current: "T04"
         next: "T02"
-        cue: "tissue handling may resume after energy work"
+        strength: "high"
+        cue: "fine handling may resume before fixed retraction"
+      - current: "T04"
+        next: "T04"
+        strength: "medium"
+        cue: "broad energy dissection may continue with the same tool"
       - current: "T07"
         next: "T02"
-        cue: "tissue handling may resume after focal energy work"
+        strength: "medium"
+        cue: "fine tissue handling may briefly resume after focal energy work"
 
   P04:
     visual_cues:
@@ -324,13 +373,24 @@ phase_details:
     expected_tool_sequence:
       - current: "T05"
         next: "T05"
+        strength: "high"
         cue: "a second fixed retractor is common but not required"
       - current: "T05"
         next: "T02"
+        strength: "high"
         cue: "fine target handling may follow once exposure is stable"
+      - current: "T02"
+        next: "T02"
+        strength: "medium"
+        cue: "a second fine forceps may reinforce traction after fixed exposure"
       - current: "T05"
         next: "T03"
+        strength: "medium"
         cue: "Allis can substitute when firmer target handling is needed"
+      - current: "T11"
+        next: "T02"
+        strength: "medium"
+        cue: "fine target handling may follow an equivalent fixed thyroid retractor"
 
   P05:
     visual_cues:
@@ -345,20 +405,33 @@ phase_details:
       possible_focal_control_preparation: [T08]
     expected_tool_sequence:
       - current: "T02"
+        next: "T07"
+        strength: "high"
+        cue: "focal bipolar treatment commonly follows target traction before clamp placement"
+      - current: "T07"
         next: "T08"
-        cue: "Mosquito is one option when a small focal point becomes ready for control"
+        strength: "high"
+        cue: "a small focal point commonly becomes ready for clamp control after bipolar work"
+      - current: "T02"
+        next: "T08"
+        strength: "medium"
+        cue: "Mosquito can follow directly when a small focal point is already isolated"
       - current: "T02"
         next: "T03"
+        strength: "medium"
         cue: "Allis is an alternative for firmer target manipulation"
       - current: "T03"
         next: "T08"
+        strength: "medium"
         cue: "focal control may follow firmer target exposure"
       - current: "T02"
-        next: "T07"
-        cue: "energy use can occur during target dissection and does not alone establish P06"
-      - current: "T02"
         next: "T04"
+        strength: "medium"
         cue: "Bovie use can occur during target dissection and does not alone establish P06"
+      - current: "T02"
+        next: "T02"
+        strength: "medium"
+        cue: "paired fine forceps may provide bilateral counter-traction"
 
   P06:
     visual_cues:
@@ -373,19 +446,24 @@ phase_details:
     expected_tool_sequence:
       - current: "T08"
         next: "T07"
+        strength: "high"
         cue: "bipolar is one treatment option for the controlled point"
+      - current: "T07"
+        next: "T04"
+        strength: "high"
+        cue: "broader treatment commonly follows precise energy when further division is needed"
       - current: "T08"
         next: "T04"
+        strength: "medium"
         cue: "Bovie is an alternative treatment option and may occur without prior bipolar"
       - current: "T03"
         next: "T07"
+        strength: "medium"
         cue: "a visibly equivalent focal control can be followed by bipolar"
       - current: "T03"
         next: "T04"
+        strength: "medium"
         cue: "a visibly equivalent focal control can be followed by Bovie"
-      - current: "T07"
-        next: "T04"
-        cue: "broader treatment may follow precise energy, but this order is not required"
 
   P07:
     visual_cues:
@@ -394,6 +472,7 @@ phase_details:
     expected_tool_sequence:
       - current: "T02"
         next: "T04"
+        strength: "medium"
         cue: "a remaining attachment is tensioned for final division"
 
   P08:
@@ -403,9 +482,11 @@ phase_details:
     expected_tool_sequence:
       - current: "T04"
         next: "T07"
+        strength: "medium"
         cue: "suction-group field clearance reveals a focal point requiring hemostasis"
       - current: "T07"
         next: "T04"
+        strength: "medium"
         cue: "broader touch-up is needed before closure"
 
   P09:

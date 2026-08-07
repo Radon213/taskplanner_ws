@@ -113,6 +113,7 @@ def compact_procedure_prompt(bundle_dir: str | Path) -> dict[str, Any]:
                     current_tool,
                     next_tool,
                     str(item.get("cue", "")),
+                    str(item.get("strength", "medium")),
                 ]
             )
         if rows:
@@ -143,6 +144,24 @@ def compact_procedure_prompt(bundle_dir: str | Path) -> dict[str, Any]:
         else {}
     )
 
+    raw_handover_patterns = payload.get("handover_patterns", {}) or {}
+    handover_patterns: dict[str, list[list[str]]] = {}
+    if isinstance(raw_handover_patterns, dict):
+        for strength in ("primary", "alternatives"):
+            normalized_paths: list[list[str]] = []
+            for path in raw_handover_patterns.get(strength, []) or []:
+                if not isinstance(path, list):
+                    continue
+                normalized = [
+                    str(tool_id).strip()
+                    for tool_id in path
+                    if str(tool_id).strip()
+                ]
+                if len(normalized) >= 2:
+                    normalized_paths.append(normalized)
+            if normalized_paths:
+                handover_patterns[strength] = normalized_paths
+
     return {
         "id": str(payload.get("id", "thyroidectomy_procedure_prompt")),
         "procedure": str((payload.get("procedure", {}) or {}).get("name", "")),
@@ -167,6 +186,7 @@ def compact_procedure_prompt(bundle_dir: str | Path) -> dict[str, Any]:
         "seq": phase_sequences,
         "phase_policy": phase_inference_policy,
         "phase_groups": phase_groups,
+        "handover_patterns": handover_patterns,
         # Preserve the group-level scenario contract.  This intentionally has
         # no physical arm identifiers or arm-count assumptions.
         "bed_robot_arm_groups": bed_robot_arm_groups,

@@ -30,6 +30,7 @@ def test_case_command_is_strict_reproducible_and_isolated(tmp_path):
         publish_period_sec=1.0,
         response_format="json_schema",
         reasoning_effort="none",
+        vlm_task_profile="tool_forecast_only",
         max_output_tokens=320,
         seed=0,
         request_timeout_sec=60.0,
@@ -50,6 +51,7 @@ def test_case_command_is_strict_reproducible_and_isolated(tmp_path):
     assert command[command.index("--groot2-port") + 1] == "20195"
     assert command[command.index("--rosbridge-port") + 1] == "9295"
     assert command[command.index("--vlm-generation-seed") + 1] == "0"
+    assert command[command.index("--vlm-task-profile") + 1] == "tool_forecast_only"
     assert command[command.index("--vlm-request-timeout-sec") + 1] == "60.0"
     assert command[command.index("--replay-vlm-health-timeout-sec") + 1] == "130.0"
     assert command[command.index("--replay-vlm-wait-timeout-sec") + 1] == "130.0"

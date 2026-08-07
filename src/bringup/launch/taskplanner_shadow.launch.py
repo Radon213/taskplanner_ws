@@ -597,6 +597,7 @@ def generate_launch_description() -> LaunchDescription:
     )
     vlm_response_format = LaunchConfiguration("vlm_response_format")
     vlm_reasoning_effort = LaunchConfiguration("vlm_reasoning_effort")
+    vlm_task_profile = LaunchConfiguration("vlm_task_profile")
     vlm_max_output_tokens = LaunchConfiguration("vlm_max_output_tokens")
     vlm_generation_seed = LaunchConfiguration("vlm_generation_seed")
     vlm_response_mode = LaunchConfiguration("vlm_response_mode")
@@ -918,6 +919,15 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument("vlm_response_format", default_value="json_schema"),
             DeclareLaunchArgument("vlm_reasoning_effort", default_value="none"),
+            DeclareLaunchArgument(
+                "vlm_task_profile",
+                default_value="full",
+                choices=("full", "tool_forecast_only"),
+                description=(
+                    "VLM task profile. tool_forecast_only is an isolated raw "
+                    "next-tool benchmark and does not replace the normal profile."
+                ),
+            ),
             DeclareLaunchArgument("vlm_max_output_tokens", default_value="320"),
             DeclareLaunchArgument("vlm_generation_seed", default_value="0"),
             DeclareLaunchArgument("vlm_response_mode", default_value="live"),
@@ -1204,6 +1214,7 @@ def generate_launch_description() -> LaunchDescription:
                         ),
                         "response_format": vlm_response_format,
                         "reasoning_effort": vlm_reasoning_effort,
+                        "task_profile": vlm_task_profile,
                         "response_mode": vlm_response_mode,
                         "replay_response_path": vlm_replay_response_path,
                         "context_mode": "actor_log",

@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from builtin_interfaces.msg import Time
 import pytest
 from procedure_spec import compact_procedure_prompt, load_bundle
-from vlm_node.real_vlm import RealVLMNode
+from vlm_node.real_vlm import RealVLMNode, compact_actor_log_procedure_context
 
 
 def _node() -> RealVLMNode:
@@ -468,6 +468,30 @@ def test_next_tool_prompt_encourages_calibrated_proactive_forecast() -> None:
     assert "Do not memorize case timing" in instruction
     assert "keep every weak candidate below 0.65" in instruction
     assert "not a confirmed request" in instruction
+    assert "match the longest suffix" in instruction
+    assert "against every procedure chain" in instruction
+    assert "Independently of your phase candidate" in instruction
+    assert "Do not choose the next tool solely from your phase output" in instruction
+
+
+def test_demo_procedure_context_exposes_recurring_chains_and_alternatives() -> None:
+    node = _demo_node()
+
+    context = compact_actor_log_procedure_context(
+        node._spec,
+        node._procedure_prompt,
+    )
+    phases = {phase["id"]: phase for phase in context["phases"]}
+
+    assert phases["P03"]["chain"] == [
+        ["T02", "T02", "T04", "T07", "T04", "T05", "T05"],
+        ["T04", "T02"],
+    ]
+    assert ["T04", "T04"] in phases["P03"]["alt"]
+    assert phases["P04"]["chain"] == [["T05", "T05", "T02"]]
+    assert phases["P05"]["chain"] == [["T02", "T07", "T08"]]
+    assert phases["P06"]["chain"] == [["T08", "T07", "T04"]]
+    assert "sequence" not in phases["P03"]
 
 
 def test_phase_start_floor_prompt_is_runtime_constraint_not_ground_truth() -> None:
@@ -494,6 +518,17 @@ def test_actor_log_prompt_requires_frame_specific_uncertainty() -> None:
     assert "Do not copy the structural 0.50 value" in instruction
 
 
+def test_actor_log_prompt_separates_current_tools_from_next_handover() -> None:
+    instruction = RealVLMNode.__new__(
+        RealVLMNode
+    )._actor_log_developer_instruction()
+
+    assert "currently_in_use lists surgeon-held tools and counts" in instruction
+    assert "tool is only a calibrated 2-8 second forecast" in instruction
+    assert "available_for_next_handover" in instruction
+    assert "the reducer and BT, not the VLM, validate availability" in instruction
+
+
 def test_actor_log_prompt_is_camera_agnostic_and_token_bounded() -> None:
     node = _demo_node()
 
@@ -512,7 +547,7 @@ def test_actor_log_prompt_is_camera_agnostic_and_token_bounded() -> None:
     assert "stable exposure is already followed by sustained central target" in system_prompt
     assert "temporal_prior is a preference, not a candidate filter" in developer_prompt
     assert "ASR near-homophones" in developer_prompt
-    assert len(system_prompt) + len(developer_prompt) < 16_000
+    assert len(system_prompt) + len(developer_prompt) < 14_000
 
 
 def test_handover_intent_does_not_fabricate_visual_gesture() -> None:

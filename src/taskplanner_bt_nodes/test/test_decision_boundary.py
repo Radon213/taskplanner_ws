@@ -35,9 +35,12 @@ def test_bt_owns_visual_request_policy_and_runtime_gate() -> None:
 
     assert 'execution_state == "running"' in runtime
     assert 'execution_state == "finishing"' in runtime
-    assert "confidence < 0.8" in implicit
-    assert "stability_sec < 0.7" in implicit
+    assert "confidence < kImplicitGestureMinConfidence" in implicit
+    assert "stability_sec < kImplicitGestureMinStabilitySec" in implicit
     assert '"open_receive"' in implicit
+    assert "kPreparationMinConfidence" in implicit
+    assert "kPreparationMinStabilitySec" in implicit
+    assert '"prepositioned_right"' in implicit
 
 
 def test_dt_handover_value_is_only_a_hint_to_bt() -> None:
@@ -112,6 +115,38 @@ def test_preparation_is_reversible_and_separate_from_handover_policy() -> None:
     assert "<CanHandover" not in anticipatory_xml
     assert "<IsPhaseCertain" not in anticipatory_xml
     assert 'name="AnticipatoryPreparation"' in xml
+
+
+def test_tool_unspecified_visual_request_prefers_prepositioned_prediction() -> None:
+    source = CPP_PATH.read_text(encoding="utf-8")
+    implicit_condition = _section(
+        source, "class HasImplicitRequest", "class NeedsRecovery"
+    )
+    implicit_selection = _section(
+        source, "class SelectImplicitTool", "class SelectExpectedTool"
+    )
+    action_guard = _section(
+        source, "class ApplyActionGuard", "class ConfigureHumanoidCommand"
+    )
+
+    assert "prepared_instance" in implicit_condition
+    assert (
+        'toolLifecycle(*this, prepared_instance) == "prepositioned_right"'
+        in implicit_condition
+    )
+    assert "prediction_confidence < kPreparationMinConfidence" in implicit_condition
+    assert "prediction_stability_sec < kPreparationMinStabilitySec" in implicit_condition
+
+    preposition_at = implicit_selection.index("robot.prepositioned_tool")
+    prediction_at = implicit_selection.index("prediction.tool")
+    assert preposition_at < prediction_at
+    assert '"implicit_visual_preposition_match"' in implicit_selection
+    assert '"implicit_visual_prediction_fallback"' in implicit_selection
+    assert '"surgeon_owned"' not in implicit_selection
+
+    assert "implicit_candidate_supported" in action_guard
+    assert "prediction_confidence >= kPreparationMinConfidence" in action_guard
+    assert "prediction_stability_sec >= kPreparationMinStabilitySec" in action_guard
 
 
 def test_reducer_records_evidence_without_creating_action_obligations() -> None:
@@ -244,6 +279,8 @@ def test_stale_prediction_releases_reversible_preposition_in_bt() -> None:
 
     assert "kPreparationUnsupportedGraceSec = 0.8" in source
     assert "kPreparationMaxDwellSec = 6.0" in source
+    assert "kPreparationStrongConfidence = 0.85" in source
+    assert "kPreparationStrongMaxDwellSec = 30.0" in source
     assert '"robot.prepositioned_instance"' in needs_recovery
     assert '"prediction.tool"' in needs_recovery
     assert '"policy.expired_preposition_instance"' in needs_recovery

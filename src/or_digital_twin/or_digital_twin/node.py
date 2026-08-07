@@ -155,6 +155,8 @@ class ORDigitalTwinNode(Node):
         self._prior_scorer = ProcedurePriorScorer(self._twin.spec, compact_procedure_prompt(self._spec_dir))
         self._bundle_metadata_cache = self._build_bundle_metadata()
         self._important_events: deque[SimulationEvent] = deque(maxlen=self._vlm_recent_event_count)
+        self._validated_tool_request_history: deque[dict] = deque(maxlen=12)
+        self._completed_handover_history: deque[dict] = deque(maxlen=12)
         self._latest_outward_signal: SurgeonOutwardSignal | None = None
         self._vlm_health_by_topic: dict[str, tuple[VLMHealth, float]] = {}
         self._input_source_status_by_id: dict[str, InputSourceStatus] = {}
@@ -294,6 +296,8 @@ class ORDigitalTwinNode(Node):
                     self._prior_scorer = ProcedurePriorScorer(self._twin.spec, compact_procedure_prompt(self._spec_dir))
                     self._bundle_metadata_cache = self._build_bundle_metadata()
                     self._important_events.clear()
+                    self._validated_tool_request_history.clear()
+                    self._completed_handover_history.clear()
                     self._mayo_retrieve_stability.clear()
                     self._mayo_reuse_stability.clear()
                     self._tool_predict_stability.clear()
@@ -1038,6 +1042,36 @@ class ORDigitalTwinNode(Node):
         self._important_events.append(event)
         self._important_event_pub.publish(event)
 
+    def _append_tool_history(
+        self,
+        history_name: str,
+        tool_id: str,
+        stamp,
+    ) -> None:
+        resolved = self._twin.spec.resolve_instrument_alias(str(tool_id)) or str(
+            tool_id
+        )
+        history = getattr(self, history_name, None)
+        if not resolved or history is None:
+            return
+        at = self._stamp_sec(stamp)
+        if history:
+            previous = history[-1]
+            if (
+                str(previous.get("tool", "")) == resolved
+                and abs(float(previous.get("at", 0.0)) - at) < 0.05
+            ):
+                return
+        history.append({"tool": resolved, "at": at})
+
+    def _clear_tool_histories(self) -> None:
+        request_history = getattr(self, "_validated_tool_request_history", None)
+        if request_history is not None:
+            request_history.clear()
+        handover_history = getattr(self, "_completed_handover_history", None)
+        if handover_history is not None:
+            handover_history.clear()
+
     def _context_tool_rows(self, world: WorldState) -> tuple[list[str], list[str], list[dict]]:
         active_tool_ids: list[str] = []
         non_home_tool_ids: list[str] = []
@@ -1370,15 +1404,18 @@ class ORDigitalTwinNode(Node):
                 "RobotTaskCompleted",
             }
         ]
-        recent_tools = [
-            {"tool": event["tool"], "at": event["stamp_sec"]}
-            for event in events
-            if event.get("tool")
-        ]
+        completed_handovers = list(
+            getattr(self, "_completed_handover_history", [])
+        )
+        tool_requests = list(
+            getattr(self, "_validated_tool_request_history", [])
+        )
         return {
             "current_phase": self._twin._active_context_phase_id(),
             "phase_entered_sec": self._phase_entered_ros_sec,
-            "recent_tools": recent_tools,
+            "recent_tools": completed_handovers,
+            "completed_handovers": completed_handovers,
+            "tool_requests": tool_requests,
             "mayo_tools": mayo_tools,
             "hand_tools": hand_tools,
             "events": events,
@@ -1910,7 +1947,14 @@ class ORDigitalTwinNode(Node):
             for tool_id, confidence in vlm_rows
             if str(tool_id)
         }
-        prior = self._prior_scorer.score(self._runtime_prior_evidence()).get("tool", [])
+        prior_result = self._prior_scorer.score(self._runtime_prior_evidence())
+        prior = prior_result.get("tool", [])
+        prior_evidence = prior_result.get("evidence", {})
+        path_forecast = (
+            prior_evidence.get("procedure_path_forecast", {})
+            if isinstance(prior_evidence, dict)
+            else {}
+        )
         prior_scores = {
             self._twin.spec.resolve_instrument_alias(str(item[0])) or str(item[0]): float(item[1])
             for item in prior
@@ -1919,10 +1963,33 @@ class ORDigitalTwinNode(Node):
         # Procedure priors may nudge observed VLM candidates, but must never
         # invent an action candidate that the current perception result did not
         # propose.
-        candidates = sorted(vlm_scores)
+        candidates = set(vlm_scores)
+        path_tool = self._twin.spec.resolve_instrument_alias(
+            str(path_forecast.get("tool", ""))
+        ) or str(path_forecast.get("tool", ""))
+        path_confidence = max(
+            0.0,
+            min(1.0, float(path_forecast.get("confidence", 0.0) or 0.0)),
+        )
+        path_instances = self._twin._instances_for_type(path_tool) if path_tool else []
+        path_lifecycles = {
+            str(getattr(state, "lifecycle_stage", "") or "")
+            for state in path_instances
+        }
+        path_available = bool(
+            path_lifecycles.intersection(
+                {"home_rack", "returned_home", "mayo_reuse", "prepositioned_right"}
+            )
+        )
+        if (
+            path_tool
+            and path_confidence >= self._tool_predict_evidence_threshold
+            and path_available
+        ):
+            candidates.add(path_tool)
         fused_scores: dict[str, float] = {}
         candidate_lifecycles: dict[str, list[str]] = {}
-        for tool_id in candidates:
+        for tool_id in sorted(candidates):
             instances = self._twin._instances_for_type(tool_id)
             if not instances:
                 continue
@@ -1945,12 +2012,19 @@ class ORDigitalTwinNode(Node):
                 1.0,
                 vlm_score + prior_nudge + agreement_nudge,
             )
+            if tool_id == path_tool and path_available:
+                fused_scores[tool_id] = max(
+                    fused_scores[tool_id],
+                    path_confidence,
+                )
         if not fused_scores:
             return "", 0.0, {
                 "vlm": vlm_scores,
                 "prior": prior_scores,
                 "candidate_lifecycles": candidate_lifecycles,
                 "fused": {},
+                "procedure_path_forecast": path_forecast,
+                "path_available": path_available,
             }
 
         eligible_scores: dict[str, float] = {}
@@ -1967,6 +2041,8 @@ class ORDigitalTwinNode(Node):
                 "durations_sec": {
                     tool_id: 0.0 for tool_id in fused_scores
                 },
+                "procedure_path_forecast": path_forecast,
+                "path_available": path_available,
             }
 
         selected_tool, selected_confidence = max(
@@ -2012,6 +2088,8 @@ class ORDigitalTwinNode(Node):
             "vlm_top": vlm_top,
             "prior_top": prior_top,
             "strong_new_consensus": strong_new_consensus,
+            "procedure_path_forecast": path_forecast,
+            "path_available": path_available,
         }
 
     def _handle_vlm_tool_prediction(
@@ -2349,6 +2427,12 @@ class ORDigitalTwinNode(Node):
 
     def _on_skill_event(self, msg: TwinEvent) -> None:
         self._twin.apply_event(msg)
+        if msg.event_type == "ToolHandoverCompleted" and msg.instrument_id:
+            self._append_tool_history(
+                "_completed_handover_history",
+                msg.instrument_id,
+                msg.stamp,
+            )
         try:
             detail = json.loads(msg.detail_json) if msg.detail_json else {}
             if not isinstance(detail, dict):
@@ -2571,6 +2655,11 @@ class ORDigitalTwinNode(Node):
             resolved = self._twin.update_explicit_request(msg.data)
             shadow_assumptions = self._twin.drain_shadow_assumption_audit()
             if resolved:
+                self._append_tool_history(
+                    "_validated_tool_request_history",
+                    resolved,
+                    self._stamp(),
+                )
                 self._clear_tool_prediction_state()
         for index, assumption in enumerate(shadow_assumptions):
             event_type = str(assumption.get("event_type", "shadow_assumption"))
@@ -2620,6 +2709,11 @@ class ORDigitalTwinNode(Node):
             return
         resolved = self._twin.update_surgeon_request(msg)
         if resolved and str(msg.event_type) in {"request_tool", "voice_request"}:
+            self._append_tool_history(
+                "_validated_tool_request_history",
+                resolved,
+                msg.stamp,
+            )
             self._clear_tool_prediction_state()
         queue_detail = self._twin.request_queue_summary()
         self._publish_event(
@@ -2685,6 +2779,7 @@ class ORDigitalTwinNode(Node):
         if command in {"start", "start_runtime"}:
             self._pending_bed_robot_arm_group_requests.clear()
             self._clear_vlm_implicit_request_state()
+            self._clear_tool_histories()
             self._twin.reset_spec(self._twin.spec, seed_from_perception=False)
             self._stamp_all_bed_robot_arm_groups()
             self._phase_entered_ros_sec = self._stamp_sec(self._stamp())
@@ -2704,6 +2799,7 @@ class ORDigitalTwinNode(Node):
         elif command == "reset":
             self._pending_bed_robot_arm_group_requests.clear()
             self._clear_vlm_implicit_request_state()
+            self._clear_tool_histories()
             self._twin.reset_runtime()
             self._stamp_all_bed_robot_arm_groups()
             self._phase_entered_ros_sec = self._stamp_sec(self._stamp())

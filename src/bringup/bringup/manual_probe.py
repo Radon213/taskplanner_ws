@@ -36,11 +36,13 @@ class ProbeResult:
     replacement_preposition_tool_id: str
     explicit_request_tool_id: str
     visual_evidence_did_not_create_explicit_request: bool
+    implicit_request_tool_was_unspecified: bool
     implicit_handover_completed: bool
     initial_preposition_completed: bool
     prediction_evidence_withdrawal_returned: bool
     wrong_preposition_returned: bool
     replacement_preposition_completed: bool
+    voice_correction_used_put_down_and_handover: bool
     explicit_handover_completed: bool
     implicit_request_to_handover_sec: float
     prediction_to_preposition_sec: float
@@ -482,20 +484,35 @@ def main(argv: list[str] | None = None) -> int:
         harness.emit_stable_phase_observation(phase_id=phase_id)
         harness.wait_for_handover_window(timeout_sec=12.0)
 
+        prediction_started_at = time.monotonic()
+        harness.emit_stable_tool_prediction(
+            phase_id=phase_id,
+            tool_id=tool_id,
+            duration_sec=1.4,
+        )
+        harness.wait_for_skill_command("predict_tool", tool_id)
+        harness.wait_until(
+            lambda: harness._latest_world is not None
+            and harness._latest_world.prepositioned_tool == tool_id,
+            16.0,
+            "stable VLM-predicted tool to become prepositioned",
+        )
+        prediction_to_preposition_sec = time.monotonic() - prediction_started_at
+
         request_log_start = len(harness._surgeon_request_log)
         implicit_started_at = time.monotonic()
         harness.emit_gesture_probe(
             phase_id=phase_id,
             event_type="request_tool",
-            tool_id=tool_id,
-            note=f"manual strong request cue for {tool_id}",
+            tool_id="",
+            note="manual open-palm request without a visible tool identity",
         )
         harness.wait_for_decision("implicit_request", tool_id)
         harness.wait_for_skill_event("ToolHandoverCompleted", tool_id)
         implicit_handover_sec = time.monotonic() - implicit_started_at
         leaked_visual_request = any(
             event_type in {"request_tool", "voice_request"}
-            and requested_tool == tool_id
+            or bool(requested_tool)
             for _, event_type, requested_tool in harness._surgeon_request_log[
                 request_log_start:
             ]
@@ -517,7 +534,6 @@ def main(argv: list[str] | None = None) -> int:
 
         prediction_tool = harness.choose_probe_tool()
         prediction_phase = harness._latest_world.filtered_phase if harness._latest_world else phase_id
-        prediction_started_at = time.monotonic()
         harness.emit_stable_tool_prediction(
             phase_id=prediction_phase,
             tool_id=prediction_tool,
@@ -530,7 +546,6 @@ def main(argv: list[str] | None = None) -> int:
             16.0,
             "stable VLM-predicted tool to become prepositioned",
         )
-        prediction_to_preposition_sec = time.monotonic() - prediction_started_at
         if harness._latest_world is None:
             raise RuntimeError("No world state available for replacement probe.")
         prepositioned_tool = harness._latest_world.prepositioned_tool
@@ -541,7 +556,7 @@ def main(argv: list[str] | None = None) -> int:
             duration_sec=2.0,
         )
         harness.wait_for_skill_event(
-            "PredictedToolReturnedToRack",
+            "UnusedPrepositionReturned",
             prepositioned_tool,
         )
         prediction_evidence_withdrawal_release_sec = (
@@ -572,23 +587,30 @@ def main(argv: list[str] | None = None) -> int:
             time.monotonic() - replacement_started_at
         )
 
-        harness.inject_voice_override(replacement_tool)
-        harness.wait_for_override_request(replacement_tool)
-        harness.wait_for_decision("explicit_request", replacement_tool)
-        harness.wait_for_skill_event("ToolHandoverCompleted", replacement_tool)
+        correction_tool = harness.choose_override_probe_tool(replacement_tool)
+        correction_started_at = time.monotonic()
+        harness.inject_voice_override(correction_tool)
+        harness.wait_for_override_request(correction_tool)
+        harness.wait_for_decision("explicit_request", correction_tool)
+        harness.wait_for_skill_command("put_down_and_handover", correction_tool)
+        harness.wait_for_skill_event("UnusedPrepositionReturned", replacement_tool)
+        wrong_preposition_release_sec = time.monotonic() - correction_started_at
+        harness.wait_for_skill_event("ToolHandoverCompleted", correction_tool)
 
         result = ProbeResult(
             bundle=args.spec_name,
             implicit_request_tool_id=tool_id,
-            initial_preposition_tool_id=prepositioned_tool,
+            initial_preposition_tool_id=tool_id,
             replacement_preposition_tool_id=replacement_tool,
-            explicit_request_tool_id=replacement_tool,
+            explicit_request_tool_id=correction_tool,
             visual_evidence_did_not_create_explicit_request=True,
+            implicit_request_tool_was_unspecified=True,
             implicit_handover_completed=True,
             initial_preposition_completed=True,
             prediction_evidence_withdrawal_returned=True,
             wrong_preposition_returned=True,
             replacement_preposition_completed=True,
+            voice_correction_used_put_down_and_handover=True,
             explicit_handover_completed=True,
             implicit_request_to_handover_sec=round(implicit_handover_sec, 3),
             prediction_to_preposition_sec=round(
@@ -600,7 +622,7 @@ def main(argv: list[str] | None = None) -> int:
                 3,
             ),
             wrong_preposition_release_sec=round(
-                prediction_evidence_withdrawal_release_sec,
+                wrong_preposition_release_sec,
                 3,
             ),
             replacement_prediction_to_preposition_sec=round(

@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from procedure_spec import (
     ProcedurePriorScorer,
     compact_procedure_prompt,
@@ -101,16 +103,49 @@ def test_demo_prompt_keeps_retractor_and_vessel_control_patterns() -> None:
     ] in compact["flow"]
     assert all(row[0] != "*" for row in compact["flow"])
     assert compact["seq"]["P04"] == [
-        ["T05", "T05", "a second fixed retractor is common but not required"],
-        ["T05", "T02", "fine target handling may follow once exposure is stable"],
-        ["T05", "T03", "Allis can substitute when firmer target handling is needed"],
+        [
+            "T05",
+            "T05",
+            "a second fixed retractor is common but not required",
+            "high",
+        ],
+        [
+            "T05",
+            "T02",
+            "fine target handling may follow once exposure is stable",
+            "high",
+        ],
+        [
+            "T02",
+            "T02",
+            "a second fine forceps may reinforce traction after fixed exposure",
+            "medium",
+        ],
+        [
+            "T05",
+            "T03",
+            "Allis can substitute when firmer target handling is needed",
+            "medium",
+        ],
+        [
+            "T11",
+            "T02",
+            "fine target handling may follow an equivalent fixed thyroid retractor",
+            "medium",
+        ],
     ]
     assert compact["seq"]["P06"][:2] == [
-        ["T08", "T07", "bipolar is one treatment option for the controlled point"],
         [
             "T08",
+            "T07",
+            "bipolar is one treatment option for the controlled point",
+            "high",
+        ],
+        [
+            "T07",
             "T04",
-            "Bovie is an alternative treatment option and may occur without prior bipolar",
+            "broader treatment commonly follows precise energy when further division is needed",
+            "high",
         ],
     ]
     assert compact["cues"]["P03"][0].startswith(
@@ -141,7 +176,7 @@ def test_demo_compact_prompt_is_case_agnostic_and_forbids_time_shortcuts() -> No
     compact = compact_procedure_prompt(_spec_root() / "thyroidectomy_demo")
     serialized = json.dumps(compact, ensure_ascii=False, sort_keys=True)
 
-    assert compact["id"] == "thyroidectomy_demo_prompt_v3"
+    assert compact["id"] == "thyroidectomy_demo_prompt_v4"
     assert compact["phase_policy"]["time_prior_role"] == "forbidden"
     assert compact["phase_policy"]["case_specific_timestamp_role"] == "forbidden"
     assert compact["phase_policy"]["degraded_mode_rule"].startswith(
@@ -156,6 +191,52 @@ def test_demo_compact_prompt_is_case_agnostic_and_forbids_time_shortcuts() -> No
     assert "0704_" not in serialized
     assert "source_frame_idx" not in serialized
     assert "time_sec" not in serialized
+
+
+def test_demo_prompt_encodes_cross_case_functional_handover_patterns() -> None:
+    compact = compact_procedure_prompt(_spec_root() / "thyroidectomy_demo")
+
+    assert [row[:2] for row in compact["seq"]["P03"][:7]] == [
+        ["T02", "T02"],
+        ["T02", "T04"],
+        ["T04", "T07"],
+        ["T07", "T04"],
+        ["T04", "T05"],
+        ["T05", "T05"],
+        ["T02", "T05"],
+    ]
+    assert [row[3] for row in compact["seq"]["P03"][:6]] == ["high"] * 6
+    assert [row[:2] for row in compact["seq"]["P05"][:3]] == [
+        ["T02", "T07"],
+        ["T07", "T08"],
+        ["T02", "T08"],
+    ]
+    assert compact["roles"]["P03"]["upcoming_fixed_retraction"] == [
+        "T05",
+        "T11",
+    ]
+    assert compact["roles"]["P03"]["entry_handover"] == ["T02"]
+    assert compact["handover_patterns"]["primary"] == [
+        [
+            "T02",
+            "T02",
+            "T04",
+            "T07",
+            "T04",
+            "T05",
+            "T05",
+            "T02",
+            "T07",
+            "T08",
+            "T07",
+            "T04",
+        ]
+    ]
+    assert compact["handover_patterns"]["alternatives"] == [
+        ["T04", "T02", "T05"],
+        ["T02", "T08", "T07", "T04"],
+        ["T05", "T05", "T02", "T02", "T07"],
+    ]
 
 
 def _demo_prior() -> ProcedurePriorScorer:
@@ -197,6 +278,54 @@ def test_demo_prior_preserves_repeated_same_tool_requests() -> None:
 
     assert _top_id(first, "tool") == "T02"
     assert _top_id(second, "tool") == "T04"
+
+
+@pytest.mark.parametrize(
+    ("history", "expected"),
+    [
+        ([], "T02"),
+        (["T02"], "T02"),
+        (["T02", "T02"], "T04"),
+        (["T02", "T02", "T04"], "T07"),
+        (["T02", "T02", "T04", "T07"], "T04"),
+        (["T02", "T02", "T04", "T07", "T04"], "T05"),
+    ],
+)
+def test_demo_prior_forecasts_next_handover_from_validated_request_suffix(
+    history: list[str],
+    expected: str,
+) -> None:
+    result = _demo_prior().score(
+        {
+            "current_phase": "P03",
+            "tool_requests": [
+                {"tool": tool_id, "at": float(index + 1)}
+                for index, tool_id in enumerate(history)
+            ],
+        }
+    )
+
+    forecast = result["evidence"]["procedure_path_forecast"]
+    assert forecast["tool"] == expected
+    assert forecast["history"] == history
+    assert forecast["confidence"] >= 0.85
+    assert _top_id(result, "tool") == expected
+
+
+def test_demo_prior_prefers_validated_requests_over_duplicate_completion_events() -> None:
+    result = _demo_prior().score(
+        {
+            "current_phase": "P03",
+            "tool_requests": ["T02", "T02", "T04"],
+            "completed_handovers": ["T02", "T02", "T04", "T04"],
+            "recent_tools": ["T02", "T02", "T04", "T04"],
+        }
+    )
+
+    forecast = result["evidence"]["procedure_path_forecast"]
+    assert forecast["history_source"] == "validated_requests"
+    assert forecast["history"] == ["T02", "T02", "T04"]
+    assert forecast["tool"] == "T07"
 
 
 def test_demo_prior_does_not_advance_detailed_phase_from_tool_names_alone() -> None:
