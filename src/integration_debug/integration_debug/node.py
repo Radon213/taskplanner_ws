@@ -1143,11 +1143,18 @@ class IntegrationDebugNode(Node):
             network = collect_network_status()
         except Exception as exc:
             network = {
+                "preferred_interface": os.environ.get(
+                    "TASKPLANNER_DEBUG_NETWORK_INTERFACE", ""
+                ),
                 "primary_interface": "",
                 "primary_ipv4": "",
                 "prefix_length": 0,
                 "gateway_ipv4": "",
                 "multicast_capable": False,
+                "interface_present": False,
+                "interface_kind": "unknown",
+                "link_up": False,
+                "selection_source": "inspection_error",
                 "addresses": [],
                 "error": str(exc),
             }

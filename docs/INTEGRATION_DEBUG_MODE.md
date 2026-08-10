@@ -29,6 +29,12 @@ DDS 설정은 이미 시작된 ROS 2 프로세스에서 안전하게 교체할 �
 
 설정은 `${TASKPLANNER_RUN_ROOT}/debug/network-settings.json`에 보존되어 다음 디버그 모드 시작에도 적용된다. 전체 Taskplanner 런타임이나 다른 Compose 프로젝트는 재시작하지 않는다. LAN 연결 확인에는 `SUBNET`, 동일 Domain ID, 양측 multicast 허용, 호스트 방화벽의 DDS/RTPS 트래픽 허용이 모두 필요하며, 핑 성공만으로 DDS discovery 성공을 의미하지는 않는다.
 
+`TASKPLANNER_DEBUG_NETWORK_INTERFACE`를 지정하면 Debug UI의 `LOCAL IP`는 해당
+인터페이스만 주 주소로 사용한다. 이 PC의 기본값은 유선 5GbE 포트
+`enp13s0`이다. 케이블이나 IPv4 주소가 없을 때 Wi-Fi 주소로 대체하지 않고
+`유선 IP 없음`을 표시하므로, 상대 기관 LAN을 연결한 뒤 유선 주소가 실제로
+할당됐는지 확인할 수 있다.
+
 ## 외부에서 들어오는 입력
 
 | 토픽 | 타입 | 기본 QoS | 화면에서 확인하는 값 |

@@ -35,6 +35,7 @@ import {
 import {
   type DebugCommandResponse,
   type DebugInputStatus,
+  type DebugNetworkStatus,
   type DebugOutputStatus,
   type IntegrationDebugStatus,
   useIntegrationDebugBridge,
@@ -68,6 +69,22 @@ interface DebugPingResult {
   reachable: boolean;
   error: string;
   rtt_ms: { min: number; avg: number; max: number } | null;
+}
+
+function wiredInterfaceSelected(network: DebugNetworkStatus): boolean {
+  return network.interface_kind === "ethernet" || Boolean(network.preferred_interface);
+}
+
+function localAddressLabel(network: DebugNetworkStatus): string {
+  if (network.primary_ipv4) return network.primary_ipv4;
+  return wiredInterfaceSelected(network) ? "유선 IP 없음" : "주소 없음";
+}
+
+function localLinkLabel(network: DebugNetworkStatus): string {
+  if (network.interface_present === false) return "인터페이스 없음";
+  if (network.link_up === false) return "케이블 미연결";
+  if (!network.primary_ipv4) return network.link_up === true ? "링크 연결 · IPv4 없음" : "IPv4 할당 대기";
+  return network.interface_kind === "ethernet" ? "유선 연결" : "연결됨";
 }
 
 interface SpeechRecognitionResultLike {
@@ -276,6 +293,24 @@ function NetworkPanel({
   notify: (notice: Notice) => void;
 }) {
   const network = status.runtime.network;
+  const wiredSelected = wiredInterfaceSelected(network);
+  const addressLabel = localAddressLabel(network);
+  const linkLabel = localLinkLabel(network);
+  const interfaceName = network.primary_interface || network.preferred_interface || "지정된 유선 인터페이스";
+  const missingAddressTitle = network.interface_present === false
+    ? "지정한 유선 인터페이스를 찾을 수 없습니다"
+    : network.link_up === false
+      ? "유선 케이블이 연결되지 않았습니다"
+      : network.link_up === true
+        ? "유선 링크는 연결됐지만 IPv4가 없습니다"
+        : "유선 LAN 주소를 기다리고 있습니다";
+  const missingAddressHint = network.interface_present === false
+    ? `${interfaceName} 이름과 장치 상태를 확인해 주세요. Wi-Fi 주소는 주 주소로 대체하지 않습니다.`
+    : network.link_up === false
+      ? `${interfaceName}에 케이블을 연결하고 IPv4를 할당해 주세요. Wi-Fi 주소는 주 주소로 대체하지 않습니다.`
+      : network.link_up === true
+        ? `${interfaceName}의 물리 링크는 연결됐습니다. 공유기 WAN이 아닌 상대 PC와 같은 LAN 포트에서 DHCP 주소를 받거나 고정 IPv4를 설정해 주세요.`
+        : `${interfaceName}의 링크 상태와 IPv4 설정을 확인해 주세요. Wi-Fi 주소는 주 주소로 대체하지 않습니다.`;
   const [domainId, setDomainId] = useState(status.runtime.ros_domain_id);
   const [discoveryRange, setDiscoveryRange] = useState(
     status.runtime.discovery_range === "SUBNET" ? "SUBNET" : "LOCALHOST",
@@ -308,6 +343,7 @@ function NetworkPanel({
       !row.interface.startsWith("br-") &&
       !row.interface.startsWith("veth"),
   );
+  const secondaryAddresses = activeAddresses.filter((row) => !row.primary);
 
   async function applyNetworkSettings(event: FormEvent) {
     event.preventDefault();
@@ -370,7 +406,7 @@ function NetworkPanel({
           <div><p>DDS NETWORK</p><h2>DDS·LAN 설정</h2></div>
         </div>
         <div className="debug-network-overview" aria-label="현재 네트워크 설정">
-          <span><small>LOCAL IP</small><strong>{network.primary_ipv4 || "확인 중"}</strong></span>
+          <span><small>LOCAL IP</small><strong title={network.primary_interface}>{addressLabel}</strong></span>
           <span><small>DOMAIN</small><strong>{status.runtime.ros_domain_id}</strong></span>
           <span><small>DISCOVERY</small><strong>{status.runtime.discovery_range || "미지정"}</strong></span>
         </div>
@@ -387,18 +423,27 @@ function NetworkPanel({
             <div><span>LOCAL INTERFACE</span><h3 id="debug-local-network-title">현재 로컬 주소</h3></div>
           </div>
           <div className="debug-primary-address">
-            <strong>{network.primary_ipv4 || "주소 확인 중"}<small>{network.prefix_length ? `/${network.prefix_length}` : ""}</small></strong>
-            <span>{network.primary_interface || "인터페이스 미확인"}</span>
+            <strong>{addressLabel}<small>{network.prefix_length ? `/${network.prefix_length}` : ""}</small></strong>
+            <span>{network.primary_interface || "인터페이스 미확인"} · {linkLabel}</span>
           </div>
+          {wiredSelected && !network.primary_ipv4 ? (
+            <div className="debug-interface-state" role="status">
+              <AlertTriangle size={18} aria-hidden="true" />
+              <div>
+                <strong>{missingAddressTitle}</strong>
+                <span>{missingAddressHint}</span>
+              </div>
+            </div>
+          ) : null}
           <dl className="debug-network-facts">
             <div><dt>Gateway</dt><dd>{network.gateway_ipv4 || "없음"}</dd></div>
             <div><dt>Multicast</dt><dd>{network.multicast_capable ? "지원" : "확인 필요"}</dd></div>
             <div><dt>RMW</dt><dd>{status.runtime.rmw_implementation || "미지정"}</dd></div>
           </dl>
-          {activeAddresses.length > 1 ? (
+          {secondaryAddresses.length ? (
             <details className="debug-address-details">
-              <summary>다른 활성 IPv4 주소 {activeAddresses.length - 1}개</summary>
-              <ul>{activeAddresses.filter((row) => !row.primary).map((row) => <li key={`${row.interface}-${row.address}`}><code>{row.address}/{row.prefix_length}</code><span>{row.interface}</span></li>)}</ul>
+              <summary>다른 활성 IPv4 주소 {secondaryAddresses.length}개</summary>
+              <ul>{secondaryAddresses.map((row) => <li key={`${row.interface}-${row.address}`}><code>{row.address}/{row.prefix_length}</code><span>{row.interface}{row.kind === "wifi" ? " · Wi-Fi" : ""}</span></li>)}</ul>
             </details>
           ) : null}
         </section>
@@ -513,7 +558,9 @@ function ConnectionPanel({
   const readyEndpoints = status.endpoints.filter((row) => row.ready).length;
   const enabledOutputs = status.outputs.filter((row) => row.enabled).length;
   const outputSubscribers = status.outputs.reduce((total, row) => total + row.subscriber_count, 0);
-  const networkReady = Boolean(status.runtime.network.primary_ipv4);
+  const network = status.runtime.network;
+  const wiredSelected = wiredInterfaceSelected(network);
+  const networkReady = Boolean(network.primary_ipv4) && network.link_up !== false;
   return (
     <section className="debug-panel-stack" data-slot="debug-connection-panel">
       <dl className="debug-health-strip" aria-label="통합 연결 요약">
@@ -527,7 +574,7 @@ function ConnectionPanel({
           <dt>출력 토픽</dt><dd><strong>{enabledOutputs}</strong><span> 발행 · {outputSubscribers} 구독</span></dd><small>총 {status.outputs.length}개 계약</small>
         </div>
         <div className={networkReady ? "ok debug-health-network" : "warn debug-health-network"}>
-          <dt>로컬 네트워크</dt><dd><strong>{status.runtime.network.primary_ipv4 || "주소 없음"}</strong></dd><small>{status.runtime.network.primary_interface || "interface 대기"} · D{status.runtime.ros_domain_id} · {status.runtime.discovery_range}</small>
+          <dt>{wiredSelected ? "유선 네트워크" : "로컬 네트워크"}</dt><dd><strong>{localAddressLabel(network)}</strong></dd><small>{network.primary_interface || "interface 대기"} · {localLinkLabel(network)} · D{status.runtime.ros_domain_id} · {status.runtime.discovery_range}</small>
         </div>
       </dl>
 

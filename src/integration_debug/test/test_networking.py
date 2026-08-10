@@ -5,6 +5,8 @@ import pytest
 from integration_debug.networking import (
     NETWORK_SETTINGS_SCHEMA,
     _default_ipv4_route,
+    _ipv4_default_routes,
+    _select_primary_interface,
     load_network_settings,
     validate_network_settings,
     validate_ping_target,
@@ -61,3 +63,55 @@ def test_default_route_parser_uses_little_endian_gateway_and_lowest_metric(
         encoding="utf-8",
     )
     assert _default_ipv4_route(route) == ("enp13s0", "10.125.185.1")
+    assert _ipv4_default_routes(route) == [
+        (100, "enp13s0", "10.125.185.1"),
+        (600, "wlan0", "192.168.0.1"),
+    ]
+
+
+def test_configured_wired_interface_wins_without_an_ipv4_address() -> None:
+    interfaces = [
+        {
+            "interface": "enp13s0",
+            "address": "",
+            "up": True,
+            "loopback": False,
+            "kind": "ethernet",
+        },
+        {
+            "interface": "wlan0",
+            "address": "10.228.39.105",
+            "up": True,
+            "loopback": False,
+            "kind": "wifi",
+        },
+    ]
+    assert _select_primary_interface(
+        interfaces,
+        default_interface="wlan0",
+        preferred_interface="enp13s0",
+    ) == ("enp13s0", "configured")
+
+
+def test_default_route_remains_primary_without_an_explicit_preference() -> None:
+    interfaces = [
+        {
+            "interface": "enp13s0",
+            "address": "10.125.185.90",
+            "up": True,
+            "loopback": False,
+            "kind": "ethernet",
+        },
+        {
+            "interface": "wlan0",
+            "address": "10.228.39.105",
+            "up": True,
+            "loopback": False,
+            "kind": "wifi",
+        },
+    ]
+    assert _select_primary_interface(
+        interfaces,
+        default_interface="wlan0",
+        preferred_interface="",
+    ) == ("wlan0", "default_route")

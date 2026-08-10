@@ -81,14 +81,22 @@ export interface DebugNetworkAddress {
   loopback: boolean;
   multicast: boolean;
   primary: boolean;
+  carrier?: boolean;
+  operstate?: string;
+  kind?: "ethernet" | "wifi" | "virtual";
 }
 
 export interface DebugNetworkStatus {
+  preferred_interface?: string;
   primary_interface: string;
   primary_ipv4: string;
   prefix_length: number;
   gateway_ipv4: string;
   multicast_capable: boolean;
+  interface_present?: boolean;
+  interface_kind?: "ethernet" | "wifi" | "virtual" | "unknown";
+  link_up?: boolean;
+  selection_source?: string;
   addresses: DebugNetworkAddress[];
   settings_path: string;
   restart_supported: boolean;

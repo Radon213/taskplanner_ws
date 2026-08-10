@@ -184,11 +184,59 @@ def _interface_ioctl(sock: socket.socket, name: str, operation: int) -> bytes:
     return fcntl.ioctl(sock.fileno(), operation, _interface_request(name))
 
 
-def _default_ipv4_route(path: str | Path = "/proc/net/route") -> tuple[str, str]:
+def _read_sysfs_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def _interface_kind(name: str, sys_class_net: Path) -> str:
+    interface_path = sys_class_net / name
+    if (interface_path / "wireless").exists():
+        return "wifi"
+    if (interface_path / "device").exists():
+        return "ethernet"
+    return "virtual"
+
+
+def _select_primary_interface(
+    interfaces: list[dict[str, Any]],
+    *,
+    default_interface: str,
+    preferred_interface: str,
+) -> tuple[str, str]:
+    names = {str(row["interface"]) for row in interfaces}
+    if preferred_interface:
+        if preferred_interface in names:
+            return preferred_interface, "configured"
+        return preferred_interface, "configured_missing"
+    if default_interface in names:
+        return default_interface, "default_route"
+    for kind in ("ethernet", "wifi", "virtual"):
+        candidate = next(
+            (
+                row
+                for row in interfaces
+                if row["up"]
+                and not row["loopback"]
+                and row["address"]
+                and row["kind"] == kind
+            ),
+            None,
+        )
+        if candidate is not None:
+            return str(candidate["interface"]), f"fallback_{kind}"
+    return "", "unavailable"
+
+
+def _ipv4_default_routes(
+    path: str | Path = "/proc/net/route",
+) -> list[tuple[int, str, str]]:
     try:
         lines = Path(path).read_text(encoding="utf-8").splitlines()[1:]
     except OSError:
-        return "", ""
+        return []
     candidates: list[tuple[int, str, str]] = []
     for line in lines:
         fields = line.split()
@@ -202,21 +250,45 @@ def _default_ipv4_route(path: str | Path = "/proc/net/route") -> tuple[str, str]
             continue
         if flags & 0x1:
             candidates.append((metric, fields[0], gateway))
+    return sorted(candidates)
+
+
+def _default_ipv4_route(path: str | Path = "/proc/net/route") -> tuple[str, str]:
+    candidates = _ipv4_default_routes(path)
     if candidates:
-        _metric, interface, gateway = min(candidates)
+        _metric, interface, gateway = candidates[0]
         return interface, gateway
     return "", ""
 
 
-def collect_network_status() -> dict[str, Any]:
-    default_interface, gateway = _default_ipv4_route()
-    addresses: list[dict[str, Any]] = []
+def collect_network_status(
+    *,
+    preferred_interface: str | None = None,
+    sys_class_net: str | Path = "/sys/class/net",
+) -> dict[str, Any]:
+    configured_interface = str(
+        os.environ.get("TASKPLANNER_DEBUG_NETWORK_INTERFACE", "")
+        if preferred_interface is None
+        else preferred_interface
+    ).strip()
+    sysfs_root = Path(sys_class_net)
+    default_routes = _ipv4_default_routes()
+    if default_routes:
+        _default_metric, default_interface, _default_gateway = default_routes[0]
+    else:
+        default_interface = ""
+    interfaces: list[dict[str, Any]] = []
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
         for _index, name in socket.if_nameindex():
             try:
                 flags = struct.unpack(
                     "H", _interface_ioctl(probe, name, _SIOCGIFFLAGS)[16:18]
                 )[0]
+            except (OSError, ValueError, struct.error):
+                continue
+            address = ""
+            prefix_length = 0
+            try:
                 address = socket.inet_ntoa(
                     _interface_ioctl(probe, name, _SIOCGIFADDR)[20:24]
                 )
@@ -227,24 +299,48 @@ def collect_network_status() -> dict[str, Any]:
                     f"0.0.0.0/{netmask}"
                 ).prefixlen
             except (OSError, ValueError, struct.error):
-                continue
-            mac_path = Path("/sys/class/net") / name / "address"
-            try:
-                mac_address = mac_path.read_text(encoding="utf-8").strip()
-            except OSError:
-                mac_address = ""
-            addresses.append(
+                address = ""
+                prefix_length = 0
+            interface_path = sysfs_root / name
+            kind = _interface_kind(name, sysfs_root)
+            carrier = _read_sysfs_text(interface_path / "carrier") == "1"
+            operstate = _read_sysfs_text(interface_path / "operstate")
+            interfaces.append(
                 {
                     "interface": name,
                     "address": address,
                     "prefix_length": prefix_length,
-                    "mac_address": mac_address,
+                    "mac_address": _read_sysfs_text(interface_path / "address"),
                     "up": bool(flags & _IFF_UP),
                     "loopback": bool(flags & _IFF_LOOPBACK),
                     "multicast": bool(flags & _IFF_MULTICAST),
-                    "primary": name == default_interface,
+                    "carrier": carrier,
+                    "operstate": operstate,
+                    "kind": kind,
                 }
             )
+
+    selected_interface, selection_source = _select_primary_interface(
+        interfaces,
+        default_interface=default_interface,
+        preferred_interface=configured_interface,
+    )
+    selected = next(
+        (
+            row
+            for row in interfaces
+            if str(row["interface"]) == selected_interface
+        ),
+        None,
+    )
+    addresses = [
+        {
+            **row,
+            "primary": str(row["interface"]) == selected_interface,
+        }
+        for row in interfaces
+        if row["address"]
+    ]
     addresses.sort(
         key=lambda row: (
             not bool(row["primary"]),
@@ -252,17 +348,32 @@ def collect_network_status() -> dict[str, Any]:
             str(row["interface"]),
         )
     )
-    primary = next((row for row in addresses if row["primary"]), None)
-    if primary is None:
-        primary = next(
-            (row for row in addresses if row["up"] and not row["loopback"]),
-            None,
+    link_up = bool(
+        selected
+        and (
+            selected["carrier"]
+            if selected["kind"] in {"ethernet", "wifi"}
+            else selected["operstate"] == "up"
         )
+    )
+    selected_gateway = next(
+        (
+            route_gateway
+            for _metric, route_interface, route_gateway in default_routes
+            if route_interface == selected_interface
+        ),
+        "",
+    )
     return {
-        "primary_interface": str(primary["interface"]) if primary else "",
-        "primary_ipv4": str(primary["address"]) if primary else "",
-        "prefix_length": int(primary["prefix_length"]) if primary else 0,
-        "gateway_ipv4": gateway,
-        "multicast_capable": bool(primary and primary["multicast"]),
+        "preferred_interface": configured_interface,
+        "primary_interface": selected_interface,
+        "primary_ipv4": str(selected["address"]) if selected else "",
+        "prefix_length": int(selected["prefix_length"]) if selected else 0,
+        "gateway_ipv4": selected_gateway,
+        "multicast_capable": bool(selected and selected["multicast"]),
+        "interface_present": selected is not None,
+        "interface_kind": str(selected["kind"]) if selected else "unknown",
+        "link_up": link_up,
+        "selection_source": selection_source,
         "addresses": addresses,
     }

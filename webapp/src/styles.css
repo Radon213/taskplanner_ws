@@ -5825,6 +5825,38 @@ body {
   font-size: 12px;
 }
 
+.debug-interface-state {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  padding: 10px;
+  border: 1px solid rgba(238, 178, 106, 0.3);
+  border-radius: var(--radius);
+  background: rgba(238, 178, 106, 0.07);
+  color: var(--surgeon-strong);
+}
+
+.debug-interface-state svg {
+  flex: 0 0 auto;
+  margin-top: 1px;
+}
+
+.debug-interface-state strong,
+.debug-interface-state span {
+  display: block;
+}
+
+.debug-interface-state strong {
+  font-size: 12px;
+}
+
+.debug-interface-state span {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
 .debug-network-facts {
   grid-template-columns: repeat(3, minmax(0, 1fr));
   margin: 0;
