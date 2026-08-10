@@ -50,6 +50,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/ControlSimulation.srv"
   "srv/ControlShadowReplay.srv"
   "srv/InjectSurgeonOverride.srv"
+  "srv/IntegrationDebugCommand.srv"
   "srv/ListModelCatalog.srv"
   "srv/ListModels.srv"
   "srv/SelectShadowCase.srv"

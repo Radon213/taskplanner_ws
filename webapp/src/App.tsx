@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { motion } from "framer-motion";
 
 import { ProcedureDock } from "./components/command/ProcedureDock";
+import { DebugWorkspace } from "./components/debug/DebugWorkspace";
 import {
   type PublicSurgeonGesture,
 } from "./components/command/PublicSurgeonGestureStatus";
@@ -21,22 +22,60 @@ import {
 import { type Language } from "./utils/display";
 
 export default function App() {
-  const [runtimeMode, setRuntimeMode] =
-    useState<TaskplannerRuntimeMode>(initialRuntimeMode);
-  const ros = useRosBridge(runtimeMode);
+  const [runtimeMode, setRuntimeMode] = useState<TaskplannerRuntimeMode>(initialRuntimeMode);
   const [language, setLanguage] = useState<Language>(() => {
     if (typeof window === "undefined") return "ko";
     return window.localStorage.getItem("taskplanner.language") === "en" ? "en" : "ko";
   });
-  const [stageAspectRatio, setStageAspectRatio] = useState(1.55);
-  const actorPolicyKeyRef = useRef("");
+  const [lastMissionMode, setLastMissionMode] = useState<Exclude<TaskplannerRuntimeMode, "debug">>(() => {
+    if (typeof window === "undefined") return "llm";
+    const stored = window.localStorage.getItem("taskplanner.lastMissionMode");
+    return stored === "live" || stored === "llm" || stored === "shadow" ? stored : "llm";
+  });
 
   useEffect(() => {
     window.localStorage.setItem("taskplanner.language", language);
+    document.documentElement.lang = language;
   }, [language]);
 
   useEffect(() => {
     persistRuntimeMode(runtimeMode);
+    if (runtimeMode !== "debug") {
+      setLastMissionMode(runtimeMode);
+      window.localStorage.setItem("taskplanner.lastMissionMode", runtimeMode);
+    }
+  }, [runtimeMode]);
+
+  if (runtimeMode === "debug") {
+    return <DebugWorkspace language={language} onExit={() => setRuntimeMode(lastMissionMode)} />;
+  }
+
+  return (
+    <MissionWorkspace
+      runtimeMode={runtimeMode}
+      onRuntimeModeChange={setRuntimeMode}
+      language={language}
+      onLanguageChange={setLanguage}
+    />
+  );
+}
+
+function MissionWorkspace({
+  runtimeMode,
+  onRuntimeModeChange,
+  language,
+  onLanguageChange,
+}: {
+  runtimeMode: Exclude<TaskplannerRuntimeMode, "debug">;
+  onRuntimeModeChange: (mode: TaskplannerRuntimeMode) => void;
+  language: Language;
+  onLanguageChange: (language: Language) => void;
+}) {
+  const ros = useRosBridge(runtimeMode);
+  const [stageAspectRatio, setStageAspectRatio] = useState(1.55);
+  const actorPolicyKeyRef = useRef("");
+
+  useEffect(() => {
     const nextUrl = runtimeBridgeUrl(runtimeMode);
     if (ros.url !== nextUrl) {
       ros.setUrl(nextUrl);
@@ -126,7 +165,7 @@ export default function App() {
         vm={vm}
         connected={ros.connected}
         language={language}
-        onLanguageChange={setLanguage}
+        onLanguageChange={onLanguageChange}
         modelOptions={ros.vlmModelOptions}
         providerStatuses={ros.vlmProviderStatuses}
         modelCatalogStatus={ros.vlmModelCatalogStatus}
@@ -136,6 +175,7 @@ export default function App() {
         onVlmRuntimeAction={(selection, command) =>
           void ros.controlVlmModelRuntime(selection, command)
         }
+        onDebugMode={() => onRuntimeModeChange("debug")}
       />
 
       <motion.main
@@ -220,7 +260,7 @@ export default function App() {
             vm={vm}
             url={ros.url}
             runtimeMode={runtimeMode}
-            onRuntimeModeChange={setRuntimeMode}
+            onRuntimeModeChange={onRuntimeModeChange}
             bundle={ros.bundle}
             onBundleChange={(nextBundle) => {
               ros.setBundleSelection(nextBundle);

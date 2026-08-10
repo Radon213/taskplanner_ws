@@ -1,0 +1,10 @@
+# Internal command envelope used only between the Taskplanner web UI and the
+# scenario-free integration Debug Mode runtime. Public robot and shared-state
+# contracts remain strongly typed in surgical_interop_msgs.
+string operation
+string payload_json
+---
+bool accepted
+string command_id
+string message
+string result_json

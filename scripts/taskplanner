@@ -15,10 +15,10 @@ usage() {
 Taskplanner deployment launcher
 
 Usage:
-  scripts/taskplanner up <live|llm-surgeon|replay> [--dry-run] [--build]
+  scripts/taskplanner up <live|llm-surgeon|replay|debug> [--dry-run] [--build]
   scripts/taskplanner down [--dry-run]
   scripts/taskplanner status
-  scripts/taskplanner config <live|llm-surgeon|replay>
+  scripts/taskplanner config <live|llm-surgeon|replay|debug>
   scripts/taskplanner verify-release [--tier quick|rc|full]
   scripts/taskplanner help
 
@@ -42,6 +42,7 @@ Examples:
   scripts/taskplanner up live
   scripts/taskplanner up live --build
   scripts/taskplanner up replay --dry-run
+  scripts/taskplanner up debug --build
   SHADOW_CASE_ID=0704_12 scripts/taskplanner up replay
   scripts/taskplanner down
   scripts/taskplanner verify-release --tier rc
@@ -55,8 +56,8 @@ die() {
 
 validate_mode() {
   case "${1:-}" in
-    live|llm-surgeon|replay) ;;
-    *) die "mode must be live, llm-surgeon, or replay" ;;
+    live|llm-surgeon|replay|debug) ;;
+    *) die "mode must be live, llm-surgeon, replay, or debug" ;;
   esac
 }
 
@@ -337,8 +338,19 @@ all_profiles() {
     --profile llm-surgeon
     --profile replay
     --profile shadow
+    --profile debug
     --profile dev
   )
+}
+
+assert_debug_runtime_is_exclusive() {
+  local active_services
+  active_services="$(
+    "${COMPOSE[@]}" "${ALL_PROFILE_ARGS[@]}" ps --status running --services
+  )"
+  if grep -Eq '^(taskplanner-runtime|shadow-runner)$' <<<"${active_services}"; then
+    die "a full Taskplanner runtime is active; stop it before starting Debug Mode"
+  fi
 }
 
 action="${1:-help}"
@@ -386,16 +398,30 @@ case "${action}" in
       "${COMPOSE[@]}" --profile "${mode}" config --quiet
     fi
 
+    if [[ "${mode}" == "debug" ]]; then
+      if [[ "${DRY_RUN}" != "true" ]]; then
+        assert_debug_runtime_is_exclusive
+      fi
+      run_or_print \
+        "${COMPOSE[@]}" --profile debug \
+        up -d "${BUILD_ARGS[@]}" --force-recreate \
+        webapp integration-debug
+      if [[ "${DRY_RUN}" != "true" ]]; then
+        "${COMPOSE[@]}" --profile debug ps
+      fi
+      exit 0
+    fi
+
     if [[ "${mode}" == "replay" ]]; then
       prepare_replay_run_root
     fi
 
     run_or_print \
       "${COMPOSE[@]}" "${ALL_PROFILE_ARGS[@]}" \
-      stop taskplanner-runtime shadow-runner object-perception
+      stop taskplanner-runtime shadow-runner object-perception integration-debug
     run_or_print \
       "${COMPOSE[@]}" "${ALL_PROFILE_ARGS[@]}" \
-      rm -f taskplanner-runtime shadow-runner object-perception
+      rm -f taskplanner-runtime shadow-runner object-perception integration-debug
 
     # Releases before the Compose control plane used a host transient service.
     # Stop only that legacy process so it cannot occupy the manager port.

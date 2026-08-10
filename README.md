@@ -250,6 +250,7 @@ cp .env.example .env
 scripts/taskplanner up live
 scripts/taskplanner up llm-surgeon
 SHADOW_CASE_ID=0704_6 scripts/taskplanner up replay
+scripts/taskplanner up debug --build
 ```
 
 Use `--build` for a first deployment or after dependency/interface changes:
@@ -270,6 +271,13 @@ Open:
 ```text
 http://127.0.0.1:4173
 ```
+
+외부 기관과 전체 플래너 없이 ROS 입출력, 수동 Action/Service, 리트랙터
+조그, 더미 공개 토픽, 텍스트·마이크 문장을 확인할 때는 통합 **디버그
+모드**를 사용한다. Debug UI는 기본적으로 `http://127.0.0.1:4174`, 전용
+ROSBridge는 `ws://127.0.0.1:9091`에서 열린다. 종단 목록, 안전 동작 및
+상대 기관 확인 절차는
+[`docs/INTEGRATION_DEBUG_MODE.md`](docs/INTEGRATION_DEBUG_MODE.md)를 따른다.
 
 When the dashboard is opened through another hostname, such as a Tailscale
 IPv4 address or MagicDNS name, it connects to rosbridge on that same hostname

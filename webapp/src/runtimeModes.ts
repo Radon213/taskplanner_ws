@@ -1,9 +1,9 @@
-export type TaskplannerRuntimeMode = "live" | "llm" | "shadow";
+export type TaskplannerRuntimeMode = "live" | "llm" | "shadow" | "debug";
 
 const STORAGE_KEY = "taskplanner.runtimeMode";
 
 function isRuntimeMode(value: string | null | undefined): value is TaskplannerRuntimeMode {
-  return value === "live" || value === "llm" || value === "shadow";
+  return value === "live" || value === "llm" || value === "shadow" || value === "debug";
 }
 
 function browserProtocol(): "ws:" | "wss:" {
@@ -17,6 +17,9 @@ function browserHostname(): string {
 }
 
 function configuredUrl(mode: TaskplannerRuntimeMode): string {
+  if (mode === "debug") {
+    return import.meta.env.VITE_ROSBRIDGE_DEBUG_URL?.trim() || "";
+  }
   if (mode === "live") {
     return import.meta.env.VITE_ROSBRIDGE_LIVE_URL?.trim() || "";
   }
@@ -28,6 +31,9 @@ function configuredUrl(mode: TaskplannerRuntimeMode): string {
 
 function configuredPort(mode: TaskplannerRuntimeMode): string {
   const sharedPort = import.meta.env.VITE_ROSBRIDGE_PORT?.trim() || "9090";
+  if (mode === "debug") {
+    return import.meta.env.VITE_ROSBRIDGE_DEBUG_PORT?.trim() || "9091";
+  }
   if (mode === "live") {
     return import.meta.env.VITE_ROSBRIDGE_LIVE_PORT?.trim() || sharedPort;
   }

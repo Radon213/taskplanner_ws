@@ -1,0 +1,73 @@
+schema: taskplanner.integration_debug.v1
+monitor_window_sec: 5.0
+status_period_sec: 1.0
+heartbeat_timeout_sec: 6.0
+
+inputs:
+  - name: surgeon_sentence
+    topic: /sensors/surgeon/sentence
+    type: std_msgs/msg/String
+    expected_hz: 0.0
+    stale_after_sec: 0.0
+    qos: reliable_volatile
+  - name: flir_camera
+    topic: /surgery/images/flir/compressed
+    type: sensor_msgs/msg/CompressedImage
+    expected_hz: 0.0
+    stale_after_sec: 3.0
+    qos: sensor_data
+  - name: cam4_camera
+    topic: /surgery/images/cam4/compressed
+    type: sensor_msgs/msg/CompressedImage
+    expected_hz: 0.0
+    stale_after_sec: 3.0
+    qos: sensor_data
+
+outputs:
+  - topic: /surgery/context
+    type: surgical_interop_msgs/msg/SurgeryContext
+    default_hz: 1.0
+    qos: snapshot
+  - topic: /surgery/instruments
+    type: surgical_interop_msgs/msg/InstrumentStateArray
+    default_hz: 1.0
+    qos: snapshot
+  - topic: /surgery/robots
+    type: surgical_interop_msgs/msg/RobotStateArray
+    default_hz: 1.0
+    qos: snapshot
+  - topic: /surgery/events
+    type: surgical_interop_msgs/msg/SurgeryEvent
+    default_hz: 1.0
+    qos: event
+  - topic: /surgery/clinical_observations
+    type: surgical_interop_msgs/msg/ClinicalObservationArray
+    default_hz: 1.0
+    qos: snapshot
+  - topic: /surgery/health
+    type: surgical_interop_msgs/msg/SurgeryHealth
+    default_hz: 1.0
+    qos: snapshot
+
+blocked_nodes:
+  - tree_executor
+  - simulation_manager
+  - surgical_interop_execution_bridge
+  - surgical_interop_gateway
+
+voice:
+  default_source_location: tray
+  default_target_location: surgeon
+  aliases:
+    "켈리": "Kelly forceps"
+    "kelly": "Kelly forceps"
+    "알리스": "Allis forceps"
+    "allis": "Allis forceps"
+    "보비": "Bovie surgical cautery"
+    "bovie": "Bovie surgical cautery"
+    "바이폴라": "Bipolar forceps"
+    "bipolar": "Bipolar forceps"
+    "모스키토": "Mosquito forceps"
+    "mosquito": "Mosquito forceps"
+    "메첸바움": "Metzenbaum scissors"
+    "metzenbaum": "Metzenbaum scissors"

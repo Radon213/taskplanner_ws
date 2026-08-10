@@ -77,11 +77,13 @@ export function ProcedureDock({
           { id: "live", label: "실제 통합 모드", detail: "실시간 로봇 · 영상 · 음성" },
           { id: "llm", label: "LLM 집도의 모드", detail: "LLM 기반 검증 시뮬레이션" },
           { id: "shadow", label: "리플레이 (Shadow) 모드", detail: "기록 영상 재생 및 평가" },
+          { id: "debug", label: "디버그 모드", detail: "시나리오 없이 입출력·조그 검증" },
         ]
       : [
           { id: "live", label: "Live integration", detail: "Live robot, vision, and speech" },
           { id: "llm", label: "LLM surgeon", detail: "LLM-driven validation simulation" },
           { id: "shadow", label: "Replay (Shadow)", detail: "Recorded replay and evaluation" },
+          { id: "debug", label: "Debug Mode", detail: "Scenario-free I/O and jog validation" },
         ];
   const selectedRuntimeMode =
     runtimeModeOptions.find((option) => option.id === runtimeMode) ??

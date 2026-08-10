@@ -1,4 +1,4 @@
-import { Languages, Radio } from "lucide-react";
+import { Bug, Languages, Radio } from "lucide-react";
 import { ProviderModelSelect } from "./ProviderModelSelect";
 import type { Language } from "../../utils/display";
 import type { useDigitalTwinViewModel } from "../../hooks/useDigitalTwinViewModel";
@@ -31,6 +31,7 @@ export function StatusRibbon({
   actionPending,
   onVlmModelChange,
   onVlmRuntimeAction,
+  onDebugMode,
 }: {
   vm: ViewModel;
   connected: boolean;
@@ -46,6 +47,7 @@ export function StatusRibbon({
     selection: ModelSelection,
     command: ModelRuntimeCommand,
   ) => void;
+  onDebugMode: () => void;
 }) {
   const vlmSelectDisabled =
     !connected || Boolean(actionPending) || !modelOptions.some((entry) => entry.selectable);
@@ -63,6 +65,10 @@ export function StatusRibbon({
         </div>
       </div>
       <div className="ribbon-cluster">
+        <button className="debug-mode-entry" onClick={onDebugMode} type="button">
+          <Bug size={16} aria-hidden="true" />
+          <span>{language === "ko" ? "디버그 모드" : "Debug Mode"}</span>
+        </button>
         <div className={`system-pill ${connected ? "ok" : "warn"}`}>
           <Radio size={16} />
           <span>{connected ? vm.ui.rosOnline : vm.ui.rosOffline}</span>
