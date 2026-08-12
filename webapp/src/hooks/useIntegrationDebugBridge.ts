@@ -34,9 +34,9 @@ export interface DebugInputStatus {
 }
 
 export interface DebugEndpointStatus {
-  name: "tool_handover" | "retraction" | "suction";
+  name: "tool_handover" | "retraction_adjustment" | "tool_change" | "bed_robot_arm_status";
   endpoint: string;
-  kind: "action" | "service";
+  kind: "action" | "service" | "topic";
   ready: boolean;
 }
 
@@ -151,9 +151,32 @@ function parseStatus(raw: unknown): IntegrationDebugStatus | null {
   if (typeof raw !== "string") return null;
   try {
     const value = JSON.parse(raw) as Partial<IntegrationDebugStatus>;
-    return value.schema === "taskplanner.integration_debug.status.v1"
-      ? (value as IntegrationDebugStatus)
-      : null;
+    if (value.schema !== "taskplanner.integration_debug.status.v1") return null;
+
+    const endpoints = Array.isArray(value.endpoints)
+      ? value.endpoints.filter((endpoint) => {
+          const name = String(endpoint?.name || "").toLowerCase();
+          const path = String(endpoint?.endpoint || "").toLowerCase();
+          return name !== "suction" && !path.includes("/suction");
+        })
+      : [];
+    const action = value.action?.route === "suction"
+      ? {
+          route: "",
+          command_id: "",
+          state: "idle",
+          progress: 0,
+          success: false,
+          terminal: true,
+          reason_code: "",
+        }
+      : value.action;
+
+    return {
+      ...value,
+      endpoints,
+      action,
+    } as IntegrationDebugStatus;
   } catch {
     return null;
   }

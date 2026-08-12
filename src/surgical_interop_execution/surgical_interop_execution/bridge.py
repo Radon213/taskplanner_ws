@@ -6,17 +6,20 @@ from dataclasses import dataclass
 from typing import Any
 import json
 import threading
+import time
 import uuid
 
 import rclpy
+from action_msgs.msg import GoalStatus
 from procedure_spec import load_bundle
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from surgical_interop_msgs.action import (
-    ExecuteRetraction,
+    ExecuteRetractionAdjustment,
     ExecuteToolHandover,
 )
-from surgical_interop_msgs.srv import SetSuction
+from surgical_interop_msgs.msg import BedRobotArmStateArray
+from surgical_interop_msgs.srv import RequestToolChange
 from surgical_msgs.msg import BedRobotArmGroupCommand, BedRobotArmGroupStatus
 from surgical_msgs.msg import SkillCommand, SkillStatus, TwinEvent
 from std_msgs.msg import String
@@ -29,8 +32,8 @@ from .mappings import (
     PREPARE_ALIASES,
     RETRIEVE_ALIASES,
     RETURN_TO_TRAY_ALIASES,
-    RetractionRequest,
-    SuctionRequest,
+    RetractionAdjustmentRequest,
+    ToolChangeRequest,
     ToolHandoverRequest,
     map_group_command,
     map_skill_to_tool_handover,
@@ -65,6 +68,33 @@ _TOOL_TRANSFER_FINAL_STATES = frozenset(
     }
 )
 
+_RETRACTION_FEEDBACK_STATES = frozenset({"adjusting", "recovering"})
+_RETRACTION_FINAL_STATES = frozenset(
+    {"completed", "canceled", "fault", "protective_stop", "unknown"}
+)
+_TOOL_CHANGE_RESULTS = frozenset(
+    {"completed", "failed", "canceled", "protective_stop", "unknown"}
+)
+_BED_ROBOT_ARM_STATES = frozenset(
+    {
+        "standby",
+        "direct_teach",
+        "retracting",
+        "changing_tool",
+        "moving_to_standby",
+        "fault",
+        "protective_stop",
+        "unknown",
+    }
+)
+_RETRACTOR_ROLE_INSTANCES = frozenset(
+    {"left_malleable", "right_malleable", "army_navy"}
+)
+_BED_ROBOT_PROCEDURE_LAYOUTS = {
+    "thyroidectomy": frozenset({"army_navy"}),
+    "nephrectomy": frozenset({"left_malleable", "right_malleable"}),
+}
+
 
 @dataclass(slots=True)
 class ActiveAction:
@@ -72,13 +102,18 @@ class ActiveAction:
     command: InternalSkillCommand | InternalGroupCommand
     goal_handle: Any | None = None
     cancelled: bool = False
+    dispatched: bool = False
 
 
 @dataclass(slots=True)
 class ActiveService:
     route: str
     command: InternalGroupCommand
+    # ROS services cannot be canceled after dispatch.  This flag means runtime
+    # stop/reset was requested while the blocking controller call is in flight.
     cancelled: bool = False
+    dispatched: bool = False
+    future: Any | None = None
 
 
 class SurgicalInteropExecutionBridge(Node):
@@ -102,10 +137,40 @@ class SurgicalInteropExecutionBridge(Node):
             for instrument in self._procedure_spec.bundle.instruments
         }
         self._retraction_endpoint = str(
-            self.declare_parameter("retraction_endpoint", "/surgery/retraction").value
+            self.declare_parameter(
+                "retraction_endpoint", "/surgery/retraction/adjust"
+            ).value
         )
-        self._suction_endpoint = str(
-            self.declare_parameter("suction_service", "/surgery/suction/set").value
+        self._tool_change_endpoint = str(
+            self.declare_parameter(
+                "tool_change_service", "/surgery/tool_change/request"
+            ).value
+        )
+        self._bed_robot_status_endpoint = str(
+            self.declare_parameter(
+                "bed_robot_status_endpoint", "/external/bed_robot_arms/status"
+            ).value
+        )
+        self._max_retraction_distance_mm = float(
+            self.declare_parameter("max_retraction_distance_mm", 30.0).value
+        )
+        self._require_bed_robot_status = bool(
+            self.declare_parameter("require_bed_robot_status", True).value
+        )
+        self._bed_robot_status_timeout_sec = float(
+            self.declare_parameter("bed_robot_status_timeout_sec", 2.0).value
+        )
+        self._bed_robot_source_max_age_sec = float(
+            self.declare_parameter(
+                "bed_robot_source_max_age_sec",
+                self._bed_robot_status_timeout_sec,
+            ).value
+        )
+        self._bed_robot_source_future_tolerance_sec = float(
+            self.declare_parameter(
+                "bed_robot_source_future_tolerance_sec",
+                0.5,
+            ).value
         )
         self._dispatch_lock = threading.RLock()
         self._runtime_accepting_commands = False
@@ -114,6 +179,13 @@ class SurgicalInteropExecutionBridge(Node):
         )
         self._active_actions: dict[tuple[str, str], ActiveAction] = {}
         self._active_services: dict[tuple[str, str], ActiveService] = {}
+        self._bed_robot_revision: int | None = None
+        self._bed_robot_source_stamp_ns: int | None = None
+        self._bed_robot_epoch = 0
+        self._bed_robot_signature: tuple[Any, ...] | None = None
+        self._bed_robot_procedure_type = ""
+        self._bed_robot_received_monotonic = 0.0
+        self._bed_robot_states: dict[str, Any] = {}
         self._skill_status_pub = self.create_publisher(SkillStatus, "/skill/status", 20)
         self._skill_event_pub = self.create_publisher(TwinEvent, "/skill/events", 20)
         self._group_status_pub = self.create_publisher(
@@ -125,9 +197,11 @@ class SurgicalInteropExecutionBridge(Node):
             self._tool_transfer_endpoint,
         )
         self._retraction_client = ActionClient(
-            self, ExecuteRetraction, self._retraction_endpoint
+            self, ExecuteRetractionAdjustment, self._retraction_endpoint
         )
-        self._suction_client = self.create_client(SetSuction, self._suction_endpoint)
+        self._tool_change_client = self.create_client(
+            RequestToolChange, self._tool_change_endpoint
+        )
         self.create_subscription(SkillCommand, "/bt/skill_command", self._on_skill, 20)
         self.create_subscription(
             BedRobotArmGroupCommand,
@@ -139,6 +213,12 @@ class SurgicalInteropExecutionBridge(Node):
             String,
             "/simulation/control_state",
             self._on_control,
+            20,
+        )
+        self.create_subscription(
+            BedRobotArmStateArray,
+            self._bed_robot_status_endpoint,
+            self._on_bed_robot_status,
             20,
         )
 
@@ -158,6 +238,209 @@ class SurgicalInteropExecutionBridge(Node):
     def _runtime_is_accepting(self) -> bool:
         with self._dispatch_lock:
             return self._runtime_accepting_commands
+
+    @staticmethod
+    def _source_stamp_ns(msg: BedRobotArmStateArray) -> int | None:
+        sec = int(msg.stamp.sec)
+        nanosec = int(msg.stamp.nanosec)
+        if sec < 0 or nanosec < 0 or nanosec >= 1_000_000_000:
+            return None
+        return sec * 1_000_000_000 + nanosec
+
+    @staticmethod
+    def _wall_time_ns() -> int:
+        # The external controller contract uses wall-clock ROS time even when
+        # Taskplanner itself is replaying against /clock.
+        return time.time_ns()
+
+    def _bed_robot_source_age_sec(self, source_stamp_ns: int) -> float:
+        return (self._wall_time_ns() - source_stamp_ns) / 1_000_000_000.0
+
+    @staticmethod
+    def _bed_robot_snapshot_signature(
+        procedure_type: str, states: dict[str, Any]
+    ) -> tuple[Any, ...]:
+        return (
+            procedure_type,
+            tuple(
+                sorted(
+                    (
+                        arm_id,
+                        arm.role.strip(),
+                        arm.role_instance_id.strip(),
+                        arm.state.strip(),
+                        bool(arm.direct_teach_active),
+                        arm.reason_code.strip(),
+                    )
+                    for arm_id, arm in states.items()
+                )
+            ),
+        )
+
+    def _on_bed_robot_status(self, msg: BedRobotArmStateArray) -> None:
+        revision = int(msg.revision)
+        source_stamp_ns = self._source_stamp_ns(msg)
+        if source_stamp_ns is None or source_stamp_ns <= 0:
+            self.get_logger().warning(
+                "ignored bed robot arm status with invalid source stamp"
+            )
+            return
+        source_age_sec = self._bed_robot_source_age_sec(source_stamp_ns)
+        if (
+            source_age_sec > self._bed_robot_source_max_age_sec
+            or source_age_sec < -self._bed_robot_source_future_tolerance_sec
+        ):
+            self.get_logger().warning(
+                "ignored stale or future-dated bed robot arm source stamp"
+            )
+            return
+        procedure_type = msg.procedure_type.strip().casefold()
+        expected_roles = _BED_ROBOT_PROCEDURE_LAYOUTS.get(procedure_type)
+        if expected_roles is None:
+            self.get_logger().warning(
+                "ignored bed robot arm status with unsupported procedure_type"
+            )
+            return
+        states: dict[str, Any] = {}
+        for arm in msg.arms:
+            arm_id = arm.arm_id.strip()
+            role = arm.role.strip()
+            role_instance_id = arm.role_instance_id.strip()
+            state = arm.state.strip()
+            if (
+                not arm_id
+                or arm_id not in {"arm_1", "arm_2"}
+                or role != "retraction"
+                or role_instance_id not in _RETRACTOR_ROLE_INSTANCES
+                or state not in _BED_ROBOT_ARM_STATES
+                or arm_id in states
+            ):
+                self.get_logger().warning(
+                    "ignored invalid bed robot arm status snapshot"
+                )
+                return
+            if bool(arm.direct_teach_active) != (state == "direct_teach"):
+                self.get_logger().warning(
+                    "ignored inconsistent direct-teach arm status"
+                )
+                return
+            states[arm_id] = arm
+
+        if not states:
+            self.get_logger().warning("ignored empty bed robot arm status snapshot")
+            return
+        reported_roles = frozenset(
+            arm.role_instance_id.strip() for arm in states.values()
+        )
+        if reported_roles != expected_roles or len(states) != len(expected_roles):
+            self.get_logger().warning(
+                "ignored bed robot arm status with invalid procedure layout"
+            )
+            return
+        signature = self._bed_robot_snapshot_signature(procedure_type, states)
+        restart_affected: list[ActiveAction | ActiveService] = []
+        with self._dispatch_lock:
+            previous_revision = self._bed_robot_revision
+            previous_stamp_ns = self._bed_robot_source_stamp_ns
+            if previous_stamp_ns is not None:
+                if source_stamp_ns <= previous_stamp_ns:
+                    self.get_logger().warning(
+                        "ignored stale bed robot arm source stamp"
+                    )
+                    return
+                if previous_revision is not None and revision == previous_revision:
+                    if signature != self._bed_robot_signature:
+                        self.get_logger().warning(
+                            "ignored changed bed robot arm state without revision advance"
+                        )
+                        return
+                    # A newer source stamp with an identical revision and payload
+                    # is a valid controller heartbeat.
+                elif previous_revision is not None and revision < previous_revision:
+                    # The public message has no epoch field.  A strictly newer
+                    # source stamp paired with a lower revision is the only
+                    # document-field evidence available for a controller restart.
+                    self._bed_robot_epoch += 1
+                    self.get_logger().warning(
+                        "accepted bed robot controller restart epoch from newer stamp"
+                    )
+                    restart_affected = [
+                        active
+                        for active in self._active_actions.values()
+                        if active.route == "retraction"
+                    ] + [
+                        active
+                        for active in self._active_services.values()
+                        if active.route == "tool_change"
+                    ]
+                    if restart_affected:
+                        self._runtime_accepting_commands = False
+            self._bed_robot_revision = revision
+            self._bed_robot_source_stamp_ns = source_stamp_ns
+            self._bed_robot_signature = signature
+            self._bed_robot_procedure_type = procedure_type
+            self._bed_robot_received_monotonic = time.monotonic()
+            self._bed_robot_states = states
+
+        for active in restart_affected:
+            self._publish_group_status(
+                active.command,
+                state="unknown",
+                outcome="remote_state_unknown",
+                terminal=False,
+                success=False,
+                reason_code="controller_restarted_during_command",
+            )
+
+    def _bed_robot_dispatch_guard(
+        self, request: RetractionAdjustmentRequest | ToolChangeRequest
+    ) -> str:
+        if not self._require_bed_robot_status:
+            return ""
+        with self._dispatch_lock:
+            age = time.monotonic() - self._bed_robot_received_monotonic
+            procedure_type = self._bed_robot_procedure_type
+            states = dict(self._bed_robot_states)
+            source_stamp_ns = self._bed_robot_source_stamp_ns
+        if not states:
+            return "bed_robot_status_missing"
+        if age > self._bed_robot_status_timeout_sec:
+            return "bed_robot_status_stale"
+        if source_stamp_ns is None:
+            return "bed_robot_source_stamp_missing"
+        source_age_sec = self._bed_robot_source_age_sec(source_stamp_ns)
+        if source_age_sec > self._bed_robot_source_max_age_sec:
+            return "bed_robot_source_stamp_stale"
+        if source_age_sec < -self._bed_robot_source_future_tolerance_sec:
+            return "bed_robot_source_stamp_future"
+
+        if isinstance(request, ToolChangeRequest):
+            if procedure_type != "thyroidectomy":
+                return "unsupported_procedure_operation"
+            targets = [states.get(request.arm_id)]
+            ready_states = {"standby"}
+        elif procedure_type != "nephrectomy":
+            return "unsupported_procedure_operation"
+        elif request.target_retractor_id == "both_malleable":
+            by_role = {arm.role_instance_id: arm for arm in states.values()}
+            targets = [by_role.get("left_malleable"), by_role.get("right_malleable")]
+            ready_states = {"standby", "retracting"}
+        else:
+            targets = [
+                arm
+                for arm in states.values()
+                if arm.role_instance_id == request.target_retractor_id
+            ]
+            ready_states = {"standby", "retracting"}
+
+        if not targets or any(target is None for target in targets):
+            return "target_retractor_unavailable"
+        for target in targets:
+            if bool(target.direct_teach_active) or target.state == "direct_teach":
+                return "direct_teach_active"
+            if target.state not in ready_states:
+                return f"arm_not_ready_{target.state}"
+        return ""
 
     def _block_runtime_dispatch(self) -> None:
         with self._dispatch_lock:
@@ -182,6 +465,16 @@ class SurgicalInteropExecutionBridge(Node):
                 for active in self._active_actions.values()
             ):
                 return "tool_transfer_busy"
+            if route == "retraction" and any(
+                active.route == "retraction"
+                for active in self._active_actions.values()
+            ):
+                return "retraction_busy"
+            if route == "retraction" and any(
+                active.route == "tool_change"
+                for active in self._active_services.values()
+            ):
+                return "bed_robot_arms_busy"
             if not self._dispatch_ledger.reserve(
                 command.command_id,
                 explicit_request_generation=self._explicit_request_generation(command),
@@ -205,6 +498,13 @@ class SurgicalInteropExecutionBridge(Node):
                 for active in self._active_services.values()
             ):
                 return "duplicate_command"
+            if any(active.route == route for active in self._active_services.values()):
+                return f"{route}_busy"
+            if route == "tool_change" and any(
+                active.route == "retraction"
+                for active in self._active_actions.values()
+            ):
+                return "bed_robot_arms_busy"
             if not self._dispatch_ledger.reserve(command.command_id):
                 return "duplicate_command"
             self._active_services[self._action_key(route, command.command_id)] = ActiveService(
@@ -243,22 +543,26 @@ class SurgicalInteropExecutionBridge(Node):
             active.goal_handle = goal_handle
             return True, bool(active.cancelled)
 
-    def _set_action_goal_handle(self, route: str, command_id: str, goal_handle: Any) -> bool:
+    def _action_state(self, route: str, command_id: str) -> tuple[bool, bool]:
         with self._dispatch_lock:
             active = self._active_actions.get(self._action_key(route, command_id))
-            if active is None or active.cancelled:
-                return False
+            if active is None:
+                return False, False
+            return True, bool(active.cancelled)
+
+    def _set_action_goal_handle(
+        self, route: str, command_id: str, goal_handle: Any
+    ) -> tuple[bool, bool]:
+        with self._dispatch_lock:
+            active = self._active_actions.get(self._action_key(route, command_id))
+            if active is None:
+                return False, False
             active.goal_handle = goal_handle
-            return True
+            return True, bool(active.cancelled)
 
     def _clear_action(self, route: str, command_id: str) -> None:
         with self._dispatch_lock:
             self._active_actions.pop(self._action_key(route, command_id), None)
-
-    def _service_is_cancelled(self, route: str, command_id: str) -> bool:
-        with self._dispatch_lock:
-            active = self._active_services.get(self._action_key(route, command_id))
-            return active is None or active.cancelled
 
     def _clear_service(self, route: str, command_id: str) -> None:
         with self._dispatch_lock:
@@ -295,6 +599,13 @@ class SurgicalInteropExecutionBridge(Node):
                 active.cancelled = True
             if control == "reset":
                 self._dispatch_ledger.clear()
+                self._bed_robot_revision = None
+                self._bed_robot_source_stamp_ns = None
+                self._bed_robot_epoch = 0
+                self._bed_robot_signature = None
+                self._bed_robot_procedure_type = ""
+                self._bed_robot_received_monotonic = 0.0
+                self._bed_robot_states = {}
 
         for active in actions:
             if isinstance(active.command, InternalSkillCommand):
@@ -307,11 +618,11 @@ class SurgicalInteropExecutionBridge(Node):
             else:
                 self._publish_group_status(
                     active.command,
-                    state="standby",
-                    outcome="cancelled_by_runtime_control",
-                    terminal=True,
+                    state="cancel_requested",
+                    outcome="cancel_requested",
+                    terminal=False,
                     success=False,
-                    reason_code="cancelled_by_runtime_control",
+                    reason_code="cancel_requested_by_runtime_control",
                 )
             if active.goal_handle is not None:
                 try:
@@ -321,16 +632,28 @@ class SurgicalInteropExecutionBridge(Node):
                         f"failed to cancel {active.route} command {active.command.command_id}"
                     )
 
-        # ROS services are not cancellable after dispatch.  Mark their future
-        # result as ignored and publish a terminal compatibility status now.
+        # ROS services are not cancellable after dispatch.  Keep each call
+        # tracked until its real response arrives.
         for active in services:
             self._publish_group_status(
                 active.command,
-                state="standby",
-                outcome="cancelled_by_runtime_control",
-                terminal=True,
+                state=(
+                    "changing_tool"
+                    if active.dispatched
+                    else "cancel_requested"
+                ),
+                outcome=(
+                    "awaiting_service_result_after_stop"
+                    if active.dispatched
+                    else "cancel_requested"
+                ),
+                terminal=False,
                 success=False,
-                reason_code="cancelled_by_runtime_control",
+                reason_code=(
+                    "service_not_cancellable_awaiting_response"
+                    if active.dispatched
+                    else "cancel_requested_before_service_dispatch"
+                ),
             )
 
     @staticmethod
@@ -360,7 +683,13 @@ class SurgicalInteropExecutionBridge(Node):
             command_id=command_id,
             group_id=msg.group_id.strip(),
             operation=msg.operation.strip(),
+            arm_id=msg.arm_id.strip(),
+            target_tool_id=msg.target_tool_id.strip(),
+            adjustment_mode=msg.adjustment_mode.strip(),
+            target_retractor_id=msg.target_retractor_id.strip(),
+            direction_frame=msg.direction_frame.strip(),
             direction=msg.direction.strip(),
+            axis=msg.axis.strip(),
             distance_mm=float(msg.distance_mm),
             end_effector_profile=msg.end_effector_profile.strip(),
             distance_origin=msg.distance_origin.strip(),
@@ -416,16 +745,29 @@ class SurgicalInteropExecutionBridge(Node):
         status.command_id = command.command_id
         status.group_id = command.group_id
         status.operation = command.operation
+        status.arm_id = command.arm_id
+        status.target_tool_id = command.target_tool_id
+        status.adjustment_mode = command.adjustment_mode
+        status.target_retractor_id = command.target_retractor_id
+        status.direction_frame = command.direction_frame
         status.state = state
         status.outcome = outcome
         status.terminal = bool(terminal)
         status.success = bool(success)
         status.message = reason_code
         status.direction = command.direction
+        status.axis = command.axis
         status.distance_mm = float(command.distance_mm)
         status.distance_origin = command.distance_origin
         status.raw_distance_text = command.raw_distance_text
-        status.end_effector_profile = command.end_effector_profile
+        # RequestToolChange.completed confirms sequence completion only.  The
+        # public contract does not verify physical attachment, so never expose
+        # the requested profile as a controller-confirmed state fact.
+        status.end_effector_profile = (
+            ""
+            if command.operation == "change_end_effector"
+            else command.end_effector_profile
+        )
         status.confidence = float(command.confidence)
         status.progress = max(0.0, min(1.0, float(progress)))
         status.elapsed_sec = 0.0
@@ -464,20 +806,25 @@ class SurgicalInteropExecutionBridge(Node):
         return instrument_name, instance_id
 
     @staticmethod
-    def _retraction_goal(request: RetractionRequest) -> ExecuteRetraction.Goal:
-        goal = ExecuteRetraction.Goal()
+    def _retraction_goal(
+        request: RetractionAdjustmentRequest,
+    ) -> ExecuteRetractionAdjustment.Goal:
+        goal = ExecuteRetractionAdjustment.Goal()
         goal.command_id = request.command_id
-        goal.operation = request.operation
+        goal.adjustment_mode = request.adjustment_mode
+        goal.target_retractor_id = request.target_retractor_id
+        goal.direction_frame = request.direction_frame
         goal.direction = request.direction
+        goal.axis = request.axis
         goal.distance_mm = float(request.distance_mm)
-        goal.end_effector_profile = request.end_effector_profile
         return goal
 
     @staticmethod
-    def _suction_request(request: SuctionRequest) -> SetSuction.Request:
-        service_request = SetSuction.Request()
+    def _tool_change_request(request: ToolChangeRequest) -> RequestToolChange.Request:
+        service_request = RequestToolChange.Request()
         service_request.command_id = request.command_id
-        service_request.enabled = bool(request.enabled)
+        service_request.arm_id = request.arm_id
+        service_request.target_tool_id = request.target_tool_id
         return service_request
 
     def _publish_tool_transfer_completed_events(
@@ -770,19 +1117,17 @@ class SurgicalInteropExecutionBridge(Node):
             )
             if not tracked:
                 return
-            if cancel_requested:
-                self._block_runtime_dispatch()
-            self._clear_action("tool_transfer", command.command_id)
+            self._block_runtime_dispatch()
             self._publish_skill_status(
                 command,
-                state=ExecuteToolHandover.Result.FINAL_FAILED,
+                state="unknown",
                 success=False,
                 reason_code=(
                     "cancel_result_unavailable"
                     if cancel_requested
-                    else "dispatch_failed"
+                    else "goal_response_unavailable"
                 ),
-                progress=1.0,
+                progress=0.0,
             )
             return
         if goal_handle is None or not goal_handle.accepted:
@@ -849,28 +1194,43 @@ class SurgicalInteropExecutionBridge(Node):
             return
         try:
             wrapped_result = future.result()
-            result = wrapped_result.result if wrapped_result is not None else None
         except Exception:  # pragma: no cover - ROS transport failure
-            result = None
-        if result is None:
-            if cancel_requested:
-                self._block_runtime_dispatch()
-            self._clear_action("tool_transfer", command.command_id)
+            wrapped_result = None
+        if wrapped_result is None:
+            self._block_runtime_dispatch()
             self._publish_skill_status(
                 command,
-                state=ExecuteToolHandover.Result.FINAL_FAILED,
+                state="unknown",
                 success=False,
                 reason_code=(
                     "cancel_result_unavailable"
                     if cancel_requested
                     else "result_failed"
                 ),
+                progress=0.0,
+            )
+            return
+        result = getattr(wrapped_result, "result", None)
+        ros_status = int(getattr(wrapped_result, "status", GoalStatus.STATUS_UNKNOWN))
+        if result is None:
+            self._block_runtime_dispatch()
+            self._clear_action("tool_transfer", command.command_id)
+            self._publish_skill_status(
+                command,
+                state=ExecuteToolHandover.Result.FINAL_FAILED,
+                success=False,
+                reason_code="invalid_controller_result",
                 progress=1.0,
             )
             return
         success = bool(result.success)
         final_state = str(result.final_state).strip()
         reason_code = str(result.reason_code).strip()
+        expected_ros_status = {
+            ExecuteToolHandover.Result.FINAL_COMPLETED: GoalStatus.STATUS_SUCCEEDED,
+            ExecuteToolHandover.Result.FINAL_CANCELED: GoalStatus.STATUS_CANCELED,
+            ExecuteToolHandover.Result.FINAL_FAILED: GoalStatus.STATUS_ABORTED,
+        }.get(final_state)
         result_is_consistent = final_state in _TOOL_TRANSFER_FINAL_STATES and (
             (success and final_state == ExecuteToolHandover.Result.FINAL_COMPLETED)
             or (
@@ -881,7 +1241,7 @@ class SurgicalInteropExecutionBridge(Node):
                     ExecuteToolHandover.Result.FINAL_FAILED,
                 }
             )
-        )
+        ) and ros_status == expected_ros_status
         if (
             result_is_consistent
             and final_state == ExecuteToolHandover.Result.FINAL_CANCELED
@@ -889,6 +1249,7 @@ class SurgicalInteropExecutionBridge(Node):
         ):
             result_is_consistent = False
         if not result_is_consistent:
+            self._block_runtime_dispatch()
             success = False
             final_state = ExecuteToolHandover.Result.FINAL_FAILED
             reason_code = "invalid_controller_result"
@@ -929,7 +1290,10 @@ class SurgicalInteropExecutionBridge(Node):
             )
             return
         try:
-            request = map_group_command(command)
+            request = map_group_command(
+                command,
+                max_retraction_distance_mm=self._max_retraction_distance_mm,
+            )
         except MappingFailure as exc:
             self._publish_group_status(
                 command,
@@ -940,13 +1304,26 @@ class SurgicalInteropExecutionBridge(Node):
                 reason_code=exc.code,
             )
             return
-        if isinstance(request, SuctionRequest):
-            self._dispatch_suction(command, request)
+        guard_error = self._bed_robot_dispatch_guard(request)
+        if guard_error:
+            self._publish_group_status(
+                command,
+                state="fault",
+                outcome="rejected",
+                terminal=True,
+                success=False,
+                reason_code=guard_error,
+            )
+            return
+        if isinstance(request, ToolChangeRequest):
+            self._dispatch_tool_change(command, request)
             return
         self._dispatch_retraction(command, request)
 
-    def _dispatch_suction(self, command: InternalGroupCommand, request: SuctionRequest) -> None:
-        if not self._suction_client.wait_for_service(
+    def _dispatch_tool_change(
+        self, command: InternalGroupCommand, request: ToolChangeRequest
+    ) -> None:
+        if not self._tool_change_client.wait_for_service(
             timeout_sec=self._server_wait_timeout_sec
         ):
             self._publish_group_status(
@@ -958,7 +1335,7 @@ class SurgicalInteropExecutionBridge(Node):
                 reason_code="service_unavailable",
             )
             return
-        dispatch_error = self._begin_service_dispatch("suction", command)
+        dispatch_error = self._begin_service_dispatch("tool_change", command)
         if dispatch_error:
             self._publish_group_status(
                 command,
@@ -979,19 +1356,29 @@ class SurgicalInteropExecutionBridge(Node):
             return
         self._publish_group_status(
             command,
-            state="dispatching",
+            state="changing_tool",
             outcome="dispatching",
             terminal=False,
             success=True,
             reason_code="dispatching",
         )
-        if self._service_is_cancelled("suction", command.command_id):
-            self._clear_service("suction", command.command_id)
-            return
+        canceled_before_dispatch = False
         try:
-            future = self._suction_client.call_async(self._suction_request(request))
+            with self._dispatch_lock:
+                active = self._active_services.get(
+                    self._action_key("tool_change", command.command_id)
+                )
+                if active is None or active.cancelled:
+                    canceled_before_dispatch = True
+                    future = None
+                else:
+                    active.dispatched = True
+                    future = self._tool_change_client.call_async(
+                        self._tool_change_request(request)
+                    )
+                    active.future = future
         except Exception:  # pragma: no cover - ROS transport failure
-            self._clear_service("suction", command.command_id)
+            self._clear_service("tool_change", command.command_id)
             self._publish_group_status(
                 command,
                 state="fault",
@@ -1001,43 +1388,83 @@ class SurgicalInteropExecutionBridge(Node):
                 reason_code="dispatch_failed",
             )
             return
+        if canceled_before_dispatch or future is None:
+            self._clear_service("tool_change", command.command_id)
+            self._publish_group_status(
+                command,
+                state="canceled",
+                outcome="canceled_before_dispatch",
+                terminal=True,
+                success=False,
+                reason_code="canceled_before_service_dispatch",
+            )
+            return
         future.add_done_callback(
-            lambda result, command=command: self._on_suction_result(command, result)
+            lambda result, command=command: self._on_tool_change_result(command, result)
         )
 
-    def _on_suction_result(self, command: InternalGroupCommand, future: Any) -> None:
-        if self._service_is_cancelled("suction", command.command_id):
-            self._clear_service("suction", command.command_id)
+    def _on_tool_change_result(
+        self, command: InternalGroupCommand, future: Any
+    ) -> None:
+        with self._dispatch_lock:
+            active = self._active_services.get(
+                self._action_key("tool_change", command.command_id)
+            )
+            cancel_requested = bool(active.cancelled) if active is not None else False
+        if active is None:
             return
         try:
             result = future.result()
         except Exception:  # pragma: no cover - ROS transport failure
             result = None
         if result is None:
-            self._clear_service("suction", command.command_id)
+            self._block_runtime_dispatch()
             self._publish_group_status(
                 command,
-                state="fault",
-                outcome="result_failed",
-                terminal=True,
+                state="unknown",
+                outcome="remote_state_unknown",
+                terminal=False,
                 success=False,
-                reason_code="result_failed",
+                reason_code=(
+                    "service_result_unavailable_after_stop"
+                    if cancel_requested
+                    else "service_result_unavailable"
+                ),
             )
             return
-        success = bool(result.success)
-        self._clear_service("suction", command.command_id)
+        result_state = str(result.result).strip()
+        success = bool(result.success) and result_state == "completed"
+        valid = result_state in _TOOL_CHANGE_RESULTS and (
+            bool(result.success) == (result_state == "completed")
+        )
+        if not valid:
+            self._block_runtime_dispatch()
+            success = False
+            result_state = "unknown"
+            reason_code = "invalid_controller_result"
+        else:
+            reason_code = str(result.reason_code).strip() or (
+                "ok" if success else result_state
+            )
+        self._clear_service("tool_change", command.command_id)
         self._publish_group_status(
             command,
-            state=result.state or ("completed" if success else "fault"),
-            outcome="completed" if success else "failed",
+            state=result_state,
+            outcome=(
+                "completed_after_stop"
+                if success and cancel_requested
+                else "completed"
+                if success
+                else result_state
+            ),
             terminal=True,
             success=success,
-            reason_code=result.reason_code or ("completed" if success else "execution_failed"),
+            reason_code=reason_code,
             progress=1.0 if success else 0.0,
         )
 
     def _dispatch_retraction(
-        self, command: InternalGroupCommand, request: RetractionRequest
+        self, command: InternalGroupCommand, request: RetractionAdjustmentRequest
     ) -> None:
         if not self._retraction_client.wait_for_server(
             timeout_sec=self._server_wait_timeout_sec
@@ -1078,16 +1505,22 @@ class SurgicalInteropExecutionBridge(Node):
             success=True,
             reason_code="dispatching",
         )
-        if self._action_is_cancelled("retraction", command.command_id):
-            self._clear_action("retraction", command.command_id)
-            return
+        canceled_before_dispatch = False
         try:
-            future = self._retraction_client.send_goal_async(
-                self._retraction_goal(request),
-                feedback_callback=lambda feedback, command=command: self._on_retraction_feedback(
-                    command, feedback
-                ),
-            )
+            with self._dispatch_lock:
+                active = self._active_actions.get(
+                    self._action_key("retraction", command.command_id)
+                )
+                if active is None or active.cancelled:
+                    canceled_before_dispatch = True
+                    future = None
+                else:
+                    future = self._retraction_client.send_goal_async(
+                        self._retraction_goal(request),
+                        feedback_callback=lambda feedback, command=command: self._on_retraction_feedback(
+                            command, feedback
+                        ),
+                    )
         except Exception:  # pragma: no cover - ROS transport failure
             self._clear_action("retraction", command.command_id)
             self._publish_group_status(
@@ -1097,6 +1530,17 @@ class SurgicalInteropExecutionBridge(Node):
                 terminal=True,
                 success=False,
                 reason_code="dispatch_failed",
+            )
+            return
+        if canceled_before_dispatch or future is None:
+            self._clear_action("retraction", command.command_id)
+            self._publish_group_status(
+                command,
+                state="canceled",
+                outcome="canceled_before_dispatch",
+                terminal=True,
+                success=False,
+                reason_code="canceled_before_dispatch",
             )
             return
         future.add_done_callback(
@@ -1104,105 +1548,180 @@ class SurgicalInteropExecutionBridge(Node):
         )
 
     def _on_retraction_feedback(self, command: InternalGroupCommand, feedback_message: Any) -> None:
-        if self._action_is_cancelled("retraction", command.command_id):
+        tracked, cancel_requested = self._action_state(
+            "retraction", command.command_id
+        )
+        if not tracked:
             return
         feedback = feedback_message.feedback
+        state = str(feedback.state).strip()
+        if state not in _RETRACTION_FEEDBACK_STATES:
+            self._publish_group_status(
+                command,
+                state="fault",
+                outcome="invalid_feedback",
+                terminal=False,
+                success=False,
+                reason_code="invalid_controller_feedback_state",
+            )
+            return
         self._publish_group_status(
             command,
-            state=feedback.state or "executing",
-            outcome="executing",
+            state=state,
+            outcome="cancel_recovery" if cancel_requested else "executing",
             terminal=False,
-            success=True,
-            reason_code="executing",
-            progress=float(feedback.progress),
+            success=not cancel_requested,
+            reason_code="cancel_recovery" if cancel_requested else "executing",
         )
 
     def _on_retraction_goal_response(self, command: InternalGroupCommand, future: Any) -> None:
         try:
             goal_handle = future.result()
         except Exception:  # pragma: no cover - ROS transport failure
-            if self._action_is_cancelled("retraction", command.command_id):
-                self._clear_action("retraction", command.command_id)
+            tracked, cancel_requested = self._action_state(
+                "retraction", command.command_id
+            )
+            if not tracked:
                 return
-            self._clear_action("retraction", command.command_id)
+            self._block_runtime_dispatch()
             self._publish_group_status(
                 command,
-                state="fault",
-                outcome="dispatch_failed",
-                terminal=True,
+                state="unknown",
+                outcome="remote_state_unknown",
+                terminal=False,
                 success=False,
-                reason_code="dispatch_failed",
+                reason_code=(
+                    "cancel_result_unavailable"
+                    if cancel_requested
+                    else "goal_response_unavailable"
+                ),
             )
             return
         if goal_handle is None or not goal_handle.accepted:
-            if self._action_is_cancelled("retraction", command.command_id):
-                self._clear_action("retraction", command.command_id)
+            tracked, cancel_requested = self._action_state(
+                "retraction", command.command_id
+            )
+            if not tracked:
                 return
             self._clear_action("retraction", command.command_id)
             self._publish_group_status(
                 command,
-                state="fault",
-                outcome="rejected",
+                state="canceled" if cancel_requested else "fault",
+                outcome="canceled" if cancel_requested else "rejected",
                 terminal=True,
                 success=False,
-                reason_code="goal_rejected",
+                reason_code=(
+                    "canceled_before_goal_acceptance"
+                    if cancel_requested
+                    else "goal_rejected"
+                ),
             )
             return
-        if not self._set_action_goal_handle("retraction", command.command_id, goal_handle):
-            try:
-                goal_handle.cancel_goal_async()
-            except Exception:  # pragma: no cover - ROS transport failure
-                pass
-            self._clear_action("retraction", command.command_id)
-            return
-        if self._action_is_cancelled("retraction", command.command_id):
-            try:
-                goal_handle.cancel_goal_async()
-            except Exception:  # pragma: no cover - ROS transport failure
-                pass
-            self._clear_action("retraction", command.command_id)
-            return
-        self._publish_group_status(
-            command,
-            state="accepted",
-            outcome="accepted",
-            terminal=False,
-            success=True,
-            reason_code="accepted",
+        tracked, cancel_requested = self._set_action_goal_handle(
+            "retraction", command.command_id, goal_handle
         )
+        if not tracked:
+            try:
+                goal_handle.cancel_goal_async()
+            except Exception:  # pragma: no cover - ROS transport failure
+                pass
+            return
+        if cancel_requested:
+            try:
+                goal_handle.cancel_goal_async()
+            except Exception:  # pragma: no cover - ROS transport failure
+                self.get_logger().warning(
+                    f"failed to cancel retraction command {command.command_id}"
+                )
+        else:
+            self._publish_group_status(
+                command,
+                state="accepted",
+                outcome="accepted",
+                terminal=False,
+                success=True,
+                reason_code="accepted",
+            )
         goal_handle.get_result_async().add_done_callback(
             lambda result, command=command: self._on_retraction_result(command, result)
         )
 
     def _on_retraction_result(self, command: InternalGroupCommand, future: Any) -> None:
-        if self._action_is_cancelled("retraction", command.command_id):
-            self._clear_action("retraction", command.command_id)
+        tracked, cancel_requested = self._action_state(
+            "retraction", command.command_id
+        )
+        if not tracked:
             return
         try:
             wrapped_result = future.result()
-            result = wrapped_result.result if wrapped_result is not None else None
         except Exception:  # pragma: no cover - ROS transport failure
-            result = None
+            wrapped_result = None
+        if wrapped_result is None:
+            self._block_runtime_dispatch()
+            self._publish_group_status(
+                command,
+                state="unknown",
+                outcome="remote_state_unknown",
+                terminal=False,
+                success=False,
+                reason_code=(
+                    "cancel_result_unavailable"
+                    if cancel_requested
+                    else "result_failed"
+                ),
+            )
+            return
+        result = getattr(wrapped_result, "result", None)
+        ros_status = int(getattr(wrapped_result, "status", GoalStatus.STATUS_UNKNOWN))
         if result is None:
+            self._block_runtime_dispatch()
             self._clear_action("retraction", command.command_id)
             self._publish_group_status(
                 command,
-                state="fault",
-                outcome="result_failed",
+                state="unknown",
+                outcome="unknown",
                 terminal=True,
                 success=False,
-                reason_code="result_failed",
+                reason_code="invalid_controller_result",
+                progress=0.0,
             )
             return
-        success = bool(result.success)
+        final_state = str(result.final_state).strip()
+        expected_ros_status = {
+            "completed": GoalStatus.STATUS_SUCCEEDED,
+            "canceled": GoalStatus.STATUS_CANCELED,
+            "fault": GoalStatus.STATUS_ABORTED,
+            "protective_stop": GoalStatus.STATUS_ABORTED,
+            "unknown": GoalStatus.STATUS_ABORTED,
+        }.get(final_state)
+        valid = (
+            final_state in _RETRACTION_FINAL_STATES
+            and bool(result.success) == (final_state == "completed")
+            and ros_status == expected_ros_status
+        )
+        success = bool(result.success) and valid
+        if not valid:
+            self._block_runtime_dispatch()
+            final_state = "unknown"
+            reason_code = "invalid_controller_result"
+        else:
+            reason_code = str(result.reason_code).strip() or (
+                "completed" if success else final_state
+            )
+        if final_state in {
+            "fault",
+            "protective_stop",
+            "unknown",
+        }:
+            self._block_runtime_dispatch()
         self._clear_action("retraction", command.command_id)
         self._publish_group_status(
             command,
-            state=result.final_state or ("completed" if success else "fault"),
-            outcome="completed" if success else "failed",
+            state=final_state,
+            outcome="completed" if success else final_state,
             terminal=True,
             success=success,
-            reason_code=result.reason_code or ("completed" if success else "execution_failed"),
+            reason_code=reason_code,
             progress=1.0 if success else 0.0,
         )
 

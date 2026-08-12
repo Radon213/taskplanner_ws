@@ -7,7 +7,6 @@ find_package(builtin_interfaces REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
-  "action/ExecuteBedRobotArmGroup.action"
   "action/ExecuteSkill.action"
   "msg/BTDecision.msg"
   "msg/BTContextSnapshot.msg"

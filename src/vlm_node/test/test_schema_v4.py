@@ -26,10 +26,14 @@ def _retraction_proposal(**overrides) -> dict:
         "request_id": "req-123",
         "group_id": "retraction",
         "operation": "retraction",
-        "direction": "LEFT_RIGHT",
+        "adjustment_mode": "multi",
+        "target_retractor_id": "both_malleable",
+        "direction_frame": "surgeon_view",
+        "direction": "none",
+        "axis": "left_right",
         "distance_mm": 10.0,
-        "distance_origin": "qualitative_inferred",
-        "raw_distance_text": "조금",
+        "distance_origin": "explicit_with_unit",
+        "raw_distance_text": "10 mm",
         "end_effector_profile": "army_navy",
         "rationale": "bilateral exposure is needed",
         "confidence": 0.91,
@@ -99,72 +103,125 @@ def test_v4_tolerates_omitted_proposal_and_normalizes_it_to_null() -> None:
 
 
 @pytest.mark.parametrize(
-    ("raw_text", "distance_mm", "origin"),
+    ("raw_text", "distance_mm"),
     [
-        ("1 cm", 10.0, "explicit_with_unit"),
-        ("10", 10.0, "explicit_unit_inferred"),
-        ("5 cm", 50.0, "explicit_with_unit"),
-        ("조금", 10.0, "qualitative_inferred"),
-        ("", 10.0, "defaulted"),
+        ("1 mm", 1.0),
+        ("0.1 cm", 1.0),
+        ("1 cm", 10.0),
+        ("30 mm", 30.0),
+        ("3 cm", 30.0),
     ],
 )
-def test_v4_parses_and_rechecks_retraction_distance(
+def test_v4_accepts_explicit_numeric_retraction_distance_within_limit(
     raw_text: str,
     distance_mm: float,
-    origin: str,
 ) -> None:
     payload = _base_v4()
     payload["bed_robot_arm_group"] = _retraction_proposal(
         raw_distance_text=raw_text,
         distance_mm=distance_mm,
-        distance_origin=origin,
+        distance_origin="explicit_with_unit",
     )
     normalized = validate_payload(payload)["bed_robot_arm_group"]
     assert normalized["distance_mm"] == distance_mm
-    assert normalized["distance_origin"] == origin
+    assert normalized["distance_origin"] == "explicit_with_unit"
     assert normalized["raw_distance_text"] == raw_text
+
+
+def test_v4_accepts_single_execute_retraction_adjustment_fields() -> None:
+    payload = _base_v4()
+    payload["bed_robot_arm_group"] = _retraction_proposal(
+        adjustment_mode="single",
+        target_retractor_id="right_malleable",
+        direction="up",
+        axis="none",
+    )
+
+    normalized = validate_payload(payload)["bed_robot_arm_group"]
+
+    assert normalized["adjustment_mode"] == "single"
+    assert normalized["target_retractor_id"] == "right_malleable"
+    assert normalized["direction_frame"] == "surgeon_view"
+    assert normalized["direction"] == "up"
+    assert normalized["axis"] == "none"
 
 
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
-        ("direction", "FORWARD", "direction"),
-        ("group_id", "suction", "group_id"),
-        ("operation", "suction_start", "operation"),
-        ("distance_mm", 31, "distance mismatch"),
+        ("direction", "forward", "multi adjustment"),
+        ("target_retractor_id", "left_malleable", "multi adjustment"),
+        ("axis", "none", "multi adjustment"),
+        ("direction_frame", "robot_base", "direction_frame"),
+        ("group_id", "legacy_lane", "group_id"),
+        ("operation", "unsupported_operation", "operation"),
+        ("distance_mm", 11, "distance mismatch"),
     ],
 )
 def test_v4_rejects_invalid_group_proposals(field: str, value: object, message: str) -> None:
     payload = _base_v4()
     proposal = _retraction_proposal()
-    if field == "distance_mm":
-        proposal["raw_distance_text"] = "조금"
     proposal[field] = value
     payload["bed_robot_arm_group"] = proposal
     with pytest.raises(SchemaValidationError, match=message):
         validate_payload(payload)
 
 
-def test_v4_rejects_qualitative_distance_outside_one_through_thirty() -> None:
-    payload = _base_v4()
-    payload["bed_robot_arm_group"] = _retraction_proposal(
-        raw_distance_text="중간 정도",
-        distance_mm=31,
-    )
-    with pytest.raises(SchemaValidationError, match="between 1 and 30"):
-        validate_payload(payload)
-
-
-@pytest.mark.parametrize("raw_text", ["", "당겨줘"])
-def test_v4_rejects_invented_qualitative_distance_without_intensity(
+@pytest.mark.parametrize(
+    ("raw_text", "distance_mm"),
+    [
+        ("31 mm", 31.0),
+        ("3.1 cm", 31.0),
+        ("5 cm", 50.0),
+    ],
+)
+def test_v4_rejects_explicit_distance_above_thirty_mm(
     raw_text: str,
+    distance_mm: float,
 ) -> None:
     payload = _base_v4()
     payload["bed_robot_arm_group"] = _retraction_proposal(
         raw_distance_text=raw_text,
-        distance_mm=15,
+        distance_mm=distance_mm,
     )
-    with pytest.raises(SchemaValidationError, match="intensity expression"):
+    with pytest.raises(SchemaValidationError, match="30 mm contract limit"):
+        validate_payload(payload)
+
+
+@pytest.mark.parametrize(
+    ("raw_text", "distance_origin", "message"),
+    [
+        ("10", "explicit_with_unit", "explicit numeric mm/cm"),
+        ("조금", "qualitative_inferred", "explicit_with_unit"),
+        ("", "defaulted", "explicit_with_unit"),
+    ],
+)
+def test_v4_rejects_unitless_qualitative_and_defaulted_distance(
+    raw_text: str,
+    distance_origin: str,
+    message: str,
+) -> None:
+    payload = _base_v4()
+    payload["bed_robot_arm_group"] = _retraction_proposal(
+        raw_distance_text=raw_text,
+        distance_mm=10.0,
+        distance_origin=distance_origin,
+    )
+    with pytest.raises(SchemaValidationError, match=message):
+        validate_payload(payload)
+
+
+@pytest.mark.parametrize(
+    ("raw_text", "distance_mm"),
+    [("0 mm", 0.0), ("-1 mm", -1.0)],
+)
+def test_v4_rejects_non_positive_distance(raw_text: str, distance_mm: float) -> None:
+    payload = _base_v4()
+    payload["bed_robot_arm_group"] = _retraction_proposal(
+        raw_distance_text=raw_text,
+        distance_mm=distance_mm,
+    )
+    with pytest.raises(SchemaValidationError, match="positive finite number"):
         validate_payload(payload)
 
 
@@ -199,17 +256,31 @@ def test_v1_through_v3_remain_supported() -> None:
     )["v"] == "1"
 
 
-def test_v4_json_schema_has_nullable_single_group_proposal_and_six_directions() -> None:
+def test_v4_json_schema_has_nullable_retraction_adjustment_contract() -> None:
     schema = compact_vlm_json_schema("4")
     assert "bed_robot_arm_group" in schema["required"]
     proposal_schema = schema["properties"]["bed_robot_arm_group"]["anyOf"][1]
     assert proposal_schema["properties"]["direction"]["enum"] == [
-        "UP",
-        "DOWN",
-        "LEFT",
-        "RIGHT",
-        "LEFT_RIGHT",
-        "UP_DOWN",
+        "up",
+        "down",
+        "left",
+        "right",
+        "none",
+    ]
+    assert proposal_schema["properties"]["axis"]["enum"] == [
+        "left_right",
+        "up_down",
+        "none",
+    ]
+    assert proposal_schema["properties"]["adjustment_mode"]["enum"] == [
+        "single",
+        "multi",
+    ]
+    assert proposal_schema["properties"]["direction_frame"]["enum"] == [
+        "surgeon_view",
+    ]
+    assert proposal_schema["properties"]["distance_origin"]["enum"] == [
+        "explicit_with_unit",
     ]
     assert proposal_schema["properties"]["distance_mm"]["exclusiveMinimum"] == 0.0
 

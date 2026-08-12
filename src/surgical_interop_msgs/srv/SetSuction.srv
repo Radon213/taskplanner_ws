@@ -1,8 +1,0 @@
-# Set suction on or off. command_id is supplied by the requester and is used for
-# correlation and idempotency.
-string command_id
-bool enabled
----
-bool success
-string state
-string reason_code

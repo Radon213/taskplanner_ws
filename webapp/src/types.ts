@@ -25,54 +25,29 @@ export type RosTime = {
   nanosec: number;
 };
 
-export type BedRobotArmGroupId = "suction" | "retraction";
+export type BedRobotArmState = {
+  arm_id: string;
+  role: "retraction" | string;
+  role_instance_id: string;
+  state:
+    | "standby"
+    | "direct_teach"
+    | "retracting"
+    | "changing_tool"
+    | "moving_to_standby"
+    | "fault"
+    | "protective_stop"
+    | "unknown"
+    | string;
+  direct_teach_active: boolean;
+  reason_code: string;
+};
 
-export type BedRobotArmGroupOperation =
-  | ""
-  | "suction_start"
-  | "suction_stop"
-  | "retraction"
-  | "release_retraction"
-  | "change_end_effector";
-
-export type BedRobotArmGroupDirection = "" | "UP" | "DOWN" | "LEFT" | "RIGHT" | "LEFT_RIGHT" | "UP_DOWN";
-
-export type BedRobotArmGroupDistanceOrigin =
-  | ""
-  | "explicit_with_unit"
-  | "explicit_unit_inferred"
-  | "qualitative_inferred"
-  | "defaulted";
-
-export type BedRobotArmGroupExecutionState =
-  | "offline"
-  | "standby"
-  | "suctioning"
-  | "stopping"
-  | "retracting"
-  | "holding"
-  | "releasing"
-  | "changing_end_effector"
-  | "approaching"
-  | "fault";
-
-export type BedRobotArmGroupState = {
+export type BedRobotArmStateArray = {
   stamp: RosTime;
-  group_id: BedRobotArmGroupId;
-  connected: boolean;
-  state: BedRobotArmGroupExecutionState;
-  operation: BedRobotArmGroupOperation;
-  direction: BedRobotArmGroupDirection;
-  distance_mm: number;
-  distance_origin: BedRobotArmGroupDistanceOrigin;
-  raw_distance_text: string;
-  end_effector_profile: string;
-  active_request_id: string;
-  active_command_id: string;
-  progress: number;
-  error_code: string;
-  error_message: string;
-  rejection_reason: string;
+  revision: number;
+  procedure_type: string;
+  arms: BedRobotArmState[];
 };
 
 export type SimulationState = {
@@ -106,7 +81,7 @@ export type SimulationState = {
   active_robot_task_target_anchor: string;
   active_robot_task_progress: number;
   active_robot_task_remaining_sec: number;
-  bed_robot_arm_groups: BedRobotArmGroupState[];
+  bed_robot_arms: BedRobotArmState[];
   instrument_states: InstrumentState[];
   recent_events: string[];
   layout_json?: string;
@@ -136,7 +111,7 @@ export type WorldState = {
   surgeon_request_generation?: number;
   surgeon_request_additional_instance_assumed?: boolean;
   explicit_request_voice_backed: boolean;
-  bed_robot_arm_groups: BedRobotArmGroupState[];
+  bed_robot_arms: BedRobotArmState[];
 };
 
 export type SimulationEvent = {

@@ -1,7 +1,8 @@
-"""Shared validation rules for bed robot-arm group commands.
+"""Shared validation rules for legacy retraction-arm command envelopes.
 
-The task planner deliberately addresses logical groups only.  No member count,
-physical arm identifier, or mount position belongs in this contract.
+The reviewed public contract is implemented in ``surgical_interop_execution``.
+This module only keeps the internal aggregate envelope strict and
+retraction-only while older launch profiles are migrated.
 """
 
 from __future__ import annotations
@@ -9,37 +10,28 @@ from __future__ import annotations
 import math
 
 
-GROUP_SUCTION = "suction"
 GROUP_RETRACTION = "retraction"
-GROUPS = frozenset({GROUP_SUCTION, GROUP_RETRACTION})
+GROUPS = frozenset({GROUP_RETRACTION})
 
 GROUP_STATES = frozenset(
     {
         "offline",
         "standby",
-        "suctioning",
-        "stopping",
         "retracting",
         "holding",
-        "releasing",
         "changing_end_effector",
         "approaching",
         "fault",
     }
 )
 
-OPERATION_SUCTION_START = "suction_start"
-OPERATION_SUCTION_STOP = "suction_stop"
 OPERATION_RETRACTION = "retraction"
-OPERATION_RELEASE_RETRACTION = "release_retraction"
 OPERATION_CHANGE_END_EFFECTOR = "change_end_effector"
 
 OPERATIONS_BY_GROUP = {
-    GROUP_SUCTION: frozenset({OPERATION_SUCTION_START, OPERATION_SUCTION_STOP}),
     GROUP_RETRACTION: frozenset(
         {
             OPERATION_RETRACTION,
-            OPERATION_RELEASE_RETRACTION,
             OPERATION_CHANGE_END_EFFECTOR,
         }
     ),

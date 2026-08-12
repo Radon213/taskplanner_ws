@@ -80,6 +80,8 @@ class HumanoidPolicy:
 
 @dataclass(slots=True)
 class BedRobotArmGroupSpec:
+    """Compatibility model for the single retraction controller lane."""
+
     id: str
     enabled: bool
     initial_end_effector_profile: str
@@ -93,6 +95,9 @@ class BedRobotArmGroupCueSpec:
     group_id: str
     operation: str
     utterances: list[str] = field(default_factory=list)
+    adjustment_mode: str = ""
+    target_retractor_id: str = ""
+    direction_frame: str = ""
     directions: list[str] = field(default_factory=list)
     default_distance_mm: float = 0.0
     end_effector_profile: str = ""
@@ -106,22 +111,22 @@ class BedRobotArmEndEffectorTransitionSpec:
     group_id: str
     from_profile: str
     to_profile: str
+    arm_id: str = ""
+    target_tool_id: str = ""
     utterances: list[str] = field(default_factory=list)
     feedback_text: str = ""
 
 
 @dataclass(slots=True)
 class BedRobotArmProcedureSpec:
+    """Procedure policy for retraction adjustment and tool-profile changes."""
+
     directions: list[str] = field(default_factory=list)
     distance_precedence: list[str] = field(default_factory=list)
-    default_distance_mm: float = 10.0
-    qualitative_min_mm: float = 1.0
-    qualitative_max_mm: float = 30.0
+    max_distance_mm: float = 30.0
     cm_to_mm_multiplier: float = 10.0
-    unitless_numeric_unit: str = "mm"
+    require_explicit_unit: bool = True
     clamp_explicit_values: bool = False
-    qualitative_integer_mm: bool = True
-    qualitative_anchors: dict[str, float] = field(default_factory=dict)
     groups: list[BedRobotArmGroupSpec] = field(default_factory=list)
     cues: list[BedRobotArmGroupCueSpec] = field(default_factory=list)
     end_effector_transitions: list[BedRobotArmEndEffectorTransitionSpec] = field(default_factory=list)

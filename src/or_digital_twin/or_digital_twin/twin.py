@@ -12,6 +12,7 @@ import re
 import time
 
 from procedure_spec import ProcedureSpec
+from surgical_interop_msgs.msg import BedRobotArmStateArray
 from surgical_msgs.msg import (
     BedRobotArmGroupRequest,
     BedRobotArmGroupStatus,
@@ -43,7 +44,23 @@ from .models import (
 )
 
 
-BED_ROBOT_ARM_GROUP_IDS = ("suction", "retraction")
+BED_ROBOT_ARM_GROUP_IDS = ("retraction",)
+BED_ROBOT_ARM_CONTROLLER_STATES = frozenset(
+    {
+        "standby",
+        "direct_teach",
+        "retracting",
+        "changing_tool",
+        "moving_to_standby",
+        "fault",
+        "protective_stop",
+        "unknown",
+    }
+)
+BED_ROBOT_ARM_PROCEDURE_ROLES = {
+    "thyroidectomy": frozenset({"army_navy"}),
+    "nephrectomy": frozenset({"left_malleable", "right_malleable"}),
+}
 
 
 SURGEON_OWNED_LOCATION_TYPES = {"surgeon_hand", "surgical_field", "bed_fixed_tool", "return_zone"}
@@ -782,6 +799,10 @@ class ORDigitalTwin:
         self._bed_robot_arm_group_ignored_status_signatures: dict[
             tuple[str, str], tuple[Any, ...]
         ] = {}
+        self._bed_robot_arm_controller_revision: int | None = None
+        self._bed_robot_arm_controller_source_stamp_ns: int | None = None
+        self._bed_robot_arm_controller_signature: tuple[Any, ...] | None = None
+        self._bed_robot_arm_controller_epoch = 0
         self.instrument_states: dict[str, InstrumentBelief] = {}
         self._observation_candidates: dict[str, dict[str, Any]] = {}
         self._shadow_counterfactual_locked_instances: set[str] = set()
@@ -816,17 +837,12 @@ class ORDigitalTwin:
             phase_uncertain=True,
             phase_stability=0.0,
         )
-        group_spec = self.spec.get_bed_robot_arm_group_spec()
-        profile_defaults = {
-            group.id: group.initial_end_effector_profile
-            for group in (group_spec.groups if group_spec is not None else [])
-        }
         self.state.bed_robot_arm_groups = {
             group_id: BedRobotArmGroupBelief(
                 group_id=group_id,
-                connected=True,
-                state="standby",
-                end_effector_profile=str(profile_defaults.get(group_id, "")),
+                connected=False,
+                state="unknown",
+                end_effector_profile="",
             )
             for group_id in BED_ROBOT_ARM_GROUP_IDS
         }
@@ -834,6 +850,10 @@ class ORDigitalTwin:
         self.event_history.clear()
         self._bed_robot_arm_group_status_signatures.clear()
         self._bed_robot_arm_group_ignored_status_signatures.clear()
+        self._bed_robot_arm_controller_revision = None
+        self._bed_robot_arm_controller_source_stamp_ns = None
+        self._bed_robot_arm_controller_signature = None
+        self._bed_robot_arm_controller_epoch = 0
         self._observation_candidates.clear()
         self._shadow_counterfactual_locked_instances.clear()
         self._observation_violation_cooldowns.clear()
@@ -1043,9 +1063,229 @@ class ORDigitalTwin:
                 "operation": request.operation,
                 "voice_text": request.voice_text,
                 "source": request.source,
+                "arm_id": request.arm_id,
+                "target_tool_id": request.target_tool_id,
+                "adjustment_mode": request.adjustment_mode,
+                "target_retractor_id": request.target_retractor_id,
+                "direction_frame": request.direction_frame,
                 "end_effector_profile": request.end_effector_profile,
             },
         )
+
+    @staticmethod
+    def _public_bed_robot_procedure_type(procedure_id: str) -> str:
+        normalized = str(procedure_id or "").strip().casefold()
+        if normalized in {"thyroidectomy", "thyroidectomy_demo"}:
+            return "thyroidectomy"
+        return normalized
+
+    @staticmethod
+    def _aggregate_bed_robot_controller_state(arms_by_role: dict[str, Any]) -> str:
+        states = {str(arm.state).strip() for arm in arms_by_role.values()}
+        for candidate in (
+            "protective_stop",
+            "fault",
+            "unknown",
+            "direct_teach",
+            "changing_tool",
+            "moving_to_standby",
+            "retracting",
+        ):
+            if candidate in states:
+                return candidate
+        return "standby"
+
+    @staticmethod
+    def _bed_robot_controller_source_stamp_ns(
+        status: BedRobotArmStateArray,
+    ) -> int | None:
+        sec = int(status.stamp.sec)
+        nanosec = int(status.stamp.nanosec)
+        if sec < 0 or nanosec < 0 or nanosec >= 1_000_000_000:
+            return None
+        return sec * 1_000_000_000 + nanosec
+
+    @staticmethod
+    def _bed_robot_controller_signature(
+        procedure_type: str, arms_by_role: dict[str, Any]
+    ) -> tuple[Any, ...]:
+        return (
+            procedure_type,
+            tuple(
+                sorted(
+                    (
+                        role_instance,
+                        str(arm.arm_id).strip(),
+                        str(arm.role).strip(),
+                        str(arm.state).strip(),
+                        bool(arm.direct_teach_active),
+                        str(arm.reason_code).strip(),
+                    )
+                    for role_instance, arm in arms_by_role.items()
+                )
+            ),
+        )
+
+    def update_bed_robot_arm_controller_status(
+        self, status: BedRobotArmStateArray
+    ) -> bool | None:
+        """Reduce only the controller-owned fields from the public status."""
+
+        procedure_type = self._public_bed_robot_procedure_type(status.procedure_type)
+        current_procedure = self._public_bed_robot_procedure_type(
+            self.state.procedure_id
+        )
+        expected_roles = BED_ROBOT_ARM_PROCEDURE_ROLES.get(procedure_type)
+        if expected_roles is None or procedure_type != current_procedure:
+            return None
+
+        arms_by_role: dict[str, Any] = {}
+        arm_ids: set[str] = set()
+        for arm in status.arms:
+            arm_id = str(arm.arm_id).strip()
+            role_instance = str(arm.role_instance_id).strip()
+            state = str(arm.state).strip()
+            if (
+                arm_id not in {"arm_1", "arm_2"}
+                or arm_id in arm_ids
+                or str(arm.role).strip() != "retraction"
+                or role_instance not in expected_roles
+                or role_instance in arms_by_role
+                or state not in BED_ROBOT_ARM_CONTROLLER_STATES
+                or bool(arm.direct_teach_active) != (state == "direct_teach")
+            ):
+                return None
+            arm_ids.add(arm_id)
+            arms_by_role[role_instance] = arm
+        if frozenset(arms_by_role) != expected_roles:
+            return None
+
+        revision = int(status.revision)
+        source_stamp_ns = self._bed_robot_controller_source_stamp_ns(status)
+        if source_stamp_ns is None:
+            return None
+        signature = self._bed_robot_controller_signature(
+            procedure_type, arms_by_role
+        )
+        previous_stamp_ns = self._bed_robot_arm_controller_source_stamp_ns
+        previous_revision = self._bed_robot_arm_controller_revision
+        controller_restarted = False
+        if previous_stamp_ns is not None:
+            # The source timestamp is the cross-epoch ordering fence. This also
+            # rejects delayed snapshots from the old epoch after a restart.
+            if source_stamp_ns <= previous_stamp_ns:
+                return False
+            if previous_revision is not None and revision == previous_revision:
+                if signature != self._bed_robot_arm_controller_signature:
+                    return False
+            elif previous_revision is not None and revision < previous_revision:
+                # BedRobotArmStateArray has no epoch field, so this exact pair
+                # is the only document-contract evidence of a controller restart.
+                controller_restarted = True
+
+        if controller_restarted:
+            self._bed_robot_arm_controller_epoch += 1
+        self._bed_robot_arm_controller_revision = revision
+        self._bed_robot_arm_controller_source_stamp_ns = source_stamp_ns
+        self._bed_robot_arm_controller_signature = signature
+
+        belief = self.state.bed_robot_arm_groups["retraction"]
+        if controller_restarted:
+            # Clear every controller-owned field before applying the complete
+            # new snapshot. Operation/result fields belong to the internal
+            # command lane and remain ordered independently.
+            belief.connected = False
+            belief.state = "unknown"
+            belief.arm_id = ""
+            belief.end_effector_profile = ""
+            belief.error_code = ""
+        next_state = self._aggregate_bed_robot_controller_state(arms_by_role)
+        next_arm_id = (
+            str(next(iter(arms_by_role.values())).arm_id).strip()
+            if len(arms_by_role) == 1
+            else ""
+        )
+        reason_codes = sorted(
+            {
+                str(arm.reason_code).strip()
+                for arm in arms_by_role.values()
+                if str(arm.reason_code).strip()
+            }
+        )
+        next_error_code = ";".join(reason_codes)
+        changed = bool(
+            not belief.connected
+            or belief.state != next_state
+            or belief.arm_id != next_arm_id
+            or belief.error_code != next_error_code
+        )
+        belief.connected = True
+        belief.state = next_state
+        belief.arm_id = next_arm_id
+        # The public status has no mounted-tool field. Keep that fact unknown
+        # even after a successful Tool Change sequence.
+        belief.end_effector_profile = ""
+        belief.error_code = next_error_code
+        belief.last_update_stamp_sec = int(status.stamp.sec)
+        belief.last_update_stamp_nanosec = int(status.stamp.nanosec)
+        if controller_restarted:
+            self._record_event(
+                "BedRobotArmControllerEpochRestarted",
+                {
+                    "controller_epoch": self._bed_robot_arm_controller_epoch,
+                    "previous_revision": previous_revision,
+                    "revision": revision,
+                    "previous_source_stamp_ns": previous_stamp_ns,
+                    "source_stamp_ns": source_stamp_ns,
+                    "procedure_type": procedure_type,
+                },
+            )
+        self._record_event(
+            "BedRobotArmControllerStateUpdated",
+            {
+                "controller_epoch": self._bed_robot_arm_controller_epoch,
+                "epoch_restarted": controller_restarted,
+                "revision": revision,
+                "procedure_type": procedure_type,
+                "state": next_state,
+                "arm_ids": sorted(arm_ids),
+                "role_instance_ids": sorted(arms_by_role),
+                "reason_codes": reason_codes,
+                "changed": changed,
+            },
+        )
+        return True
+
+    def expire_bed_robot_arm_controller_status(
+        self, reason_code: str = "controller_status_stale"
+    ) -> bool:
+        """Invalidate controller-owned state without inventing a replacement."""
+
+        belief = self.state.bed_robot_arm_groups["retraction"]
+        reason = str(reason_code or "controller_status_stale").strip()
+        if (
+            not belief.connected
+            and belief.state == "unknown"
+            and belief.arm_id == ""
+            and belief.end_effector_profile == ""
+            and belief.error_code == reason
+        ):
+            return False
+        belief.connected = False
+        belief.state = "unknown"
+        belief.arm_id = ""
+        belief.end_effector_profile = ""
+        belief.error_code = reason
+        self._record_event(
+            "BedRobotArmControllerStateExpired",
+            {
+                "reason_code": reason,
+                "controller_epoch": self._bed_robot_arm_controller_epoch,
+                "last_revision": self._bed_robot_arm_controller_revision,
+                "last_source_stamp_ns": self._bed_robot_arm_controller_source_stamp_ns,
+            },
+        )
+        return True
 
     @staticmethod
     def _bed_robot_arm_group_status_signature(
@@ -1062,11 +1302,16 @@ class ORDigitalTwin:
             str(status.outcome),
             bool(status.terminal),
             bool(status.success),
+            str(status.arm_id),
+            str(status.target_tool_id),
+            str(status.adjustment_mode),
+            str(status.target_retractor_id),
+            str(status.direction_frame),
             str(status.direction),
+            str(status.axis),
             round(float(status.distance_mm), 6),
             str(status.distance_origin),
             str(status.raw_distance_text),
-            str(status.end_effector_profile),
             progress_milestone,
             str(status.error_code),
             str(status.rejection_reason),
@@ -1093,8 +1338,8 @@ class ORDigitalTwin:
         status_ns = int(status.stamp.sec) * 1_000_000_000 + int(
             status.stamp.nanosec
         )
-        current_ns = int(belief.last_update_stamp_sec) * 1_000_000_000 + int(
-            belief.last_update_stamp_nanosec
+        current_ns = int(belief.last_operation_stamp_sec) * 1_000_000_000 + int(
+            belief.last_operation_stamp_nanosec
         )
         if current_ns and status_ns < current_ns:
             ignored_key = (group_id, "status_older_than_current_group_state")
@@ -1170,56 +1415,17 @@ class ORDigitalTwin:
         if signature is not None:
             self._bed_robot_arm_group_status_signatures[group_id] = signature
         if is_health:
-            available = (
-                str(status.error_code) != "server_unavailable"
-                and bool(status.success)
-            )
-            next_state = (
-                "offline"
-                if not available
-                else (
-                    str(status.state or "standby")
-                    if belief.state == "offline"
-                    else belief.state
-                )
-            )
-            changed = bool(
-                belief.connected != available
-                or belief.state != next_state
-            )
-            belief.connected = available
-            belief.state = next_state
-            # Health heartbeats report transport availability only.  Do not
-            # erase (or replace with ``server_unavailable``) the last
-            # operational error returned by the group controller: that
-            # rejection must remain inspectable in the twin and UI until a
-            # later operation supplies a new result.
-            if changed:
-                belief.last_update_stamp_sec = int(status.stamp.sec)
-                belief.last_update_stamp_nanosec = int(status.stamp.nanosec)
-            if changed:
-                self._record_event(
-                    "BedRobotArmGroupAvailabilityChanged",
-                    {
-                        "request_id": status.request_id,
-                        "group_id": group_id,
-                        "state": next_state,
-                        "outcome": status.outcome,
-                        "available": available,
-                        "changed": True,
-                    },
-                )
-            return changed
-        belief.last_update_stamp_sec = int(status.stamp.sec)
-        belief.last_update_stamp_nanosec = int(status.stamp.nanosec)
-        next_state = str(status.state or belief.state or "standby")
-        belief.connected = (
-            str(status.error_code) != "server_unavailable"
-            and next_state not in {"offline", "fault"}
-        )
-        belief.state = next_state
+            # Legacy endpoint health is not controller-owned arm state.
+            return False
+        belief.last_operation_stamp_sec = int(status.stamp.sec)
+        belief.last_operation_stamp_nanosec = int(status.stamp.nanosec)
         belief.operation = str(status.operation)
+        belief.target_tool_id = str(status.target_tool_id)
+        belief.adjustment_mode = str(status.adjustment_mode)
+        belief.target_retractor_id = str(status.target_retractor_id)
+        belief.direction_frame = str(status.direction_frame)
         belief.direction = str(status.direction)
+        belief.axis = str(status.axis)
         belief.distance_mm = float(status.distance_mm)
         belief.distance_origin = str(status.distance_origin)
         belief.raw_distance_text = str(status.raw_distance_text)
@@ -1236,8 +1442,6 @@ class ORDigitalTwin:
         belief.rejection_reason = (
             "" if control_cancelled else str(status.rejection_reason)
         )
-        if status.end_effector_profile and bool(status.terminal and status.success):
-            belief.end_effector_profile = str(status.end_effector_profile)
         if bool(status.terminal):
             belief.active_request_id = ""
             belief.active_command_id = ""
@@ -1260,10 +1464,15 @@ class ORDigitalTwin:
                 "outcome": status.outcome,
                 "success": bool(status.success),
                 "terminal": bool(status.terminal),
+                "arm_id": status.arm_id,
+                "target_tool_id": status.target_tool_id,
+                "adjustment_mode": status.adjustment_mode,
+                "target_retractor_id": status.target_retractor_id,
+                "direction_frame": status.direction_frame,
                 "direction": status.direction,
+                "axis": status.axis,
                 "distance_mm": float(status.distance_mm),
                 "distance_origin": status.distance_origin,
-                "end_effector_profile": status.end_effector_profile,
                 "error_code": status.error_code,
                 "rejection_reason": status.rejection_reason,
             },

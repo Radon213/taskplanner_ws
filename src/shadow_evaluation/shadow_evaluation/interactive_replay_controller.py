@@ -27,8 +27,8 @@ import rosbag2_py
 from rosgraph_msgs.msg import Clock
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
+from surgical_interop_msgs.msg import BedRobotArmStateArray
 from surgical_msgs.msg import (
-    BedRobotArmGroupStatus,
     ShadowReplayState,
     SkillStatus,
     VLMHealth,
@@ -54,6 +54,10 @@ TERMINAL_SKILL_STATES = {
     "failed",
     "rejected",
     "succeeded",
+}
+TRANSIENT_BED_ROBOT_ARM_STATES = {
+    "changing_tool",
+    "moving_to_standby",
 }
 VALID_MODES = {"realtime_1x", "elastic_demo"}
 NO_INPUT_VLM_ERRORS = {
@@ -1457,7 +1461,7 @@ class InteractiveReplayControllerNode(Node):
         self._failed_vlm_slots: set[int] = set()
         self._active_skills: set[str] = set()
         self._active_cleanup_skills: set[str] = set()
-        self._active_groups: set[str] = set()
+        self._active_bed_robot_arms: set[str] = set()
         self._vlm_healthy = False
         self._vlm_connected = False
         self._vlm_health_source_sec = -1.0
@@ -1522,6 +1526,11 @@ class InteractiveReplayControllerNode(Node):
             "/shadow/replay_state",
             state_qos,
         )
+        self._runtime_control_publisher = self.create_publisher(
+            String,
+            "/simulation/control_state",
+            state_qos,
+        )
         self._ground_truth_publisher = self.create_publisher(
             String,
             "/shadow/ground_truth/state",
@@ -1558,9 +1567,9 @@ class InteractiveReplayControllerNode(Node):
             50,
         )
         self.create_subscription(
-            BedRobotArmGroupStatus,
-            "/bed_robot_arm_group/status",
-            self._on_group_status,
+            BedRobotArmStateArray,
+            "/external/bed_robot_arms/status",
+            self._on_bed_robot_arm_status,
             50,
         )
         self.create_service(
@@ -1580,6 +1589,7 @@ class InteractiveReplayControllerNode(Node):
         self.create_timer(0.02, self._tick)
         self.create_timer(0.05, self._publish_ground_truth)
         self.create_timer(0.1, self._publish_state)
+        self.create_timer(0.5, self._publish_runtime_control_heartbeat)
         if bool(self.get_parameter("auto_start").value) and self._source:
             self._start(reset=True)
 
@@ -1609,7 +1619,22 @@ class InteractiveReplayControllerNode(Node):
             self._state = "error"
             self._last_error = str(exc)
             self._force_state_publish = True
+            self._publish_runtime_control("stop")
             self.get_logger().error(self._last_error)
+
+    def _publish_runtime_control(self, command: str) -> None:
+        message = String()
+        message.data = str(command).strip().lower()
+        self._runtime_control_publisher.publish(message)
+
+    def _publish_runtime_control_heartbeat(self) -> None:
+        with self._lock:
+            command = (
+                "start"
+                if self._state in {"running", "held", "draining"}
+                else "stop"
+            )
+        self._publish_runtime_control(command)
 
     def _reset_counters(
         self,
@@ -1647,7 +1672,7 @@ class InteractiveReplayControllerNode(Node):
         self._failed_vlm_slots.clear()
         self._active_skills.clear()
         self._active_cleanup_skills.clear()
-        self._active_groups.clear()
+        self._active_bed_robot_arms.clear()
         self._gate.reset()
         self._vlm_healthy = False
         self._vlm_connected = False
@@ -1688,6 +1713,7 @@ class InteractiveReplayControllerNode(Node):
         self._effective_playback_rate = self._playback_rate
         self._last_tick_at = time.monotonic()
         self._force_state_publish = True
+        self._publish_runtime_control("start")
         return True, f"shadow replay running in {self._mode}"
 
     def _capture_wall_elapsed(self, now: float | None = None) -> None:
@@ -1826,6 +1852,7 @@ class InteractiveReplayControllerNode(Node):
                         self._state = "paused"
                         self._hold_reason = self._control_reason
                         self._effective_playback_rate = 0.0
+                        self._publish_runtime_control("stop")
                         success = True
                         message = "shadow replay paused"
                     else:
@@ -1842,6 +1869,7 @@ class InteractiveReplayControllerNode(Node):
                         self._effective_playback_rate = self._playback_rate
                         self._last_tick_at = time.monotonic()
                         self._grant_vlm_resume_grace(self._last_tick_at)
+                        self._publish_runtime_control("start")
                         success = True
                         message = "shadow replay resumed"
                     elif self._state in {"running", "held", "draining"}:
@@ -1854,6 +1882,7 @@ class InteractiveReplayControllerNode(Node):
                     self._reset_counters()
                     self._state = "ready"
                     self._effective_playback_rate = 0.0
+                    self._publish_runtime_control("reset")
                     success = True
                     message = "shadow replay rewound; start when runtime is ready"
                 elif command == "stop":
@@ -1867,9 +1896,10 @@ class InteractiveReplayControllerNode(Node):
                     self._failed_vlm_slots.clear()
                     self._active_skills.clear()
                     self._active_cleanup_skills.clear()
-                    self._active_groups.clear()
+                    self._active_bed_robot_arms.clear()
                     self._vlm_wait_started_at = None
                     self._no_input_since_at = None
+                    self._publish_runtime_control("stop")
                     success = True
                     message = "shadow replay stopped"
                 elif command == "seek":
@@ -1887,6 +1917,7 @@ class InteractiveReplayControllerNode(Node):
                     self._state_before_manual_pause = "running"
                     self._hold_reason = self._control_reason
                     self._effective_playback_rate = 0.0
+                    self._publish_runtime_control("reset")
                     success = True
                     message = f"shadow replay seeked to {seek_sec:.2f}s"
                 elif command == "status":
@@ -1971,6 +2002,7 @@ class InteractiveReplayControllerNode(Node):
                 self._last_error = ""
                 self._force_state_publish = True
                 self._last_ground_truth_key = ""
+                self._publish_runtime_control("reset")
                 response.success = True
                 response.message = (
                     f"shadow case {asset.case_id} loaded and rewound"
@@ -2184,31 +2216,30 @@ class InteractiveReplayControllerNode(Node):
                     self._grant_vlm_resume_grace(time.monotonic())
                 self._force_state_publish = True
 
-    def _on_group_status(self, msg: BedRobotArmGroupStatus) -> None:
-        command_id = str(msg.command_id or msg.request_id or "").strip()
-        if not command_id or command_id.startswith("health-"):
-            return
+    def _on_bed_robot_arm_status(self, msg: BedRobotArmStateArray) -> None:
+        active = {
+            str(arm.arm_id).strip()
+            for arm in msg.arms
+            if str(arm.arm_id).strip()
+            and str(arm.state).strip().lower() in TRANSIENT_BED_ROBOT_ARM_STATES
+        }
         with self._lock:
-            was_active = command_id in self._active_groups
-            if bool(msg.terminal):
-                self._active_groups.discard(command_id)
-            else:
-                self._active_groups.add(command_id)
-            is_active = command_id in self._active_groups
-            if was_active != is_active:
-                if was_active and not is_active:
+            previous = self._active_bed_robot_arms
+            if previous != active:
+                if previous and not active:
                     self._grant_vlm_resume_grace(time.monotonic())
+                self._active_bed_robot_arms = active
                 self._force_state_publish = True
 
     def _active_skill_count(self) -> int:
         return (
             len(self._active_skills)
             + len(self._active_cleanup_skills)
-            + len(self._active_groups)
+            + len(self._active_bed_robot_arms)
         )
 
     def _active_non_cleanup_count(self) -> int:
-        return len(self._active_skills) + len(self._active_groups)
+        return len(self._active_skills) + len(self._active_bed_robot_arms)
 
     def _active_cleanup_count(self) -> int:
         return len(self._active_cleanup_skills)
@@ -2344,6 +2375,7 @@ class InteractiveReplayControllerNode(Node):
         self._last_error = message
         self._effective_playback_rate = 0.0
         self._force_state_publish = True
+        self._publish_runtime_control("stop")
         self.get_logger().error(message)
 
     def _enter_draining(self, now: float) -> None:
@@ -2381,6 +2413,7 @@ class InteractiveReplayControllerNode(Node):
                 f"{self._drain_timeout_sec:.1f}s; pending={pending}"
             )
             self._force_state_publish = True
+            self._publish_runtime_control("stop")
             return
         if self._drain_clear_since_at is None:
             self._drain_clear_since_at = now
@@ -2392,6 +2425,7 @@ class InteractiveReplayControllerNode(Node):
         self._state = "completed"
         self._hold_reason = ""
         self._force_state_publish = True
+        self._publish_runtime_control("stop")
 
     def _publish_due_records(self) -> None:
         if self._source is None:

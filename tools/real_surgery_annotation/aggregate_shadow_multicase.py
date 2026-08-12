@@ -778,7 +778,7 @@ def _report(
 - Command fulfillment: {_ratio(command['correct_count'], command['evaluated_count'])}. 이는 counterfactual mock execution 성공률이며 실제 로봇 물리 성공률이 아니다.
 - Invariant violation: {invariant_total}건, 완료 후 skill command: {after_complete}건.
 - Recovery command: {recovery_actions}건. 이번 reference에서는 recovery 동작의 충분한 정확도 표본이 확보되지 않았다.
-- Specialized bed-robot action reference target: {specialized_targets}건. 해당 항목은 현재 정답 라벨 공백으로 정확도를 산출할 수 없다.
+- Specialized retraction-arm action reference target: {specialized_targets}건. 해당 항목은 현재 정답 라벨 공백으로 정확도를 산출할 수 없다.
 
 ## DT 평가 범위
 
@@ -799,7 +799,7 @@ def _report(
 1. `{worst_phase[0]}` 등 phase reducer가 악화된 케이스의 transition evidence와 hysteresis를 분석한다.
 2. Proactive tool prediction은 정확도와 함께 unnecessary preparation, wrong-preposition release latency를 공동 최적화한다.
 3. DT 위치 정확도를 평가하려면 type-level 도구명을 physical instance ID로 분리한 initial inventory와 endpoint label을 보강한다.
-4. Recovery와 specialized group action은 confirmed target이 부족하므로 별도 평가 가능한 이벤트 라벨을 추가한다.
+4. Recovery와 specialized retraction action은 confirmed target이 부족하므로 별도 평가 가능한 이벤트 라벨을 추가한다.
 5. 외부 일반화 주장을 위해 다른 세션·집도의·시점의 untouched test set과 반복 seed 실험을 별도로 구성한다.
 
 ## 산출물

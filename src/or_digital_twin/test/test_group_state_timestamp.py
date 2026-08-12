@@ -13,6 +13,7 @@ from or_digital_twin.models import (
 from or_digital_twin.twin import ORDigitalTwin
 from procedure_spec import load_bundle
 from std_msgs.msg import String
+from surgical_interop_msgs.msg import BedRobotArmState, BedRobotArmStateArray
 from surgical_msgs.msg import (
     BedRobotArmGroupCommand,
     BedRobotArmGroupStatus,
@@ -41,31 +42,179 @@ def _thyroid_demo_spec():
     )
 
 
-def test_group_reducer_preserves_source_status_timestamp_in_payload():
+def _controller_status(
+    *,
+    revision: int = 1,
+    stamp: int = 10,
+    procedure_type: str = "thyroidectomy",
+    arm_id: str = "arm_2",
+    role_instance_id: str = "army_navy",
+    state: str = "standby",
+) -> BedRobotArmStateArray:
+    status = BedRobotArmStateArray()
+    status.stamp.sec = stamp
+    status.revision = revision
+    status.procedure_type = procedure_type
+    arm = BedRobotArmState()
+    arm.arm_id = arm_id
+    arm.role = "retraction"
+    arm.role_instance_id = role_instance_id
+    arm.state = state
+    arm.direct_teach_active = state == "direct_teach"
+    arm.reason_code = "ok"
+    status.arms.append(arm)
+    return status
+
+
+def test_group_reducer_separates_controller_state_from_operation_status():
     twin = ORDigitalTwin(_thyroid_spec())
+    assert twin.update_bed_robot_arm_controller_status(
+        _controller_status(stamp=123, state="retracting")
+    ) is True
+
     status = BedRobotArmGroupStatus()
-    status.stamp.sec = 123
+    status.stamp.sec = 124
     status.stamp.nanosec = 456
     status.request_id = "req-1"
     status.command_id = "cmd-1"
-    status.group_id = "suction"
-    status.operation = "suction_start"
-    status.state = "suctioning"
+    status.group_id = "retraction"
+    status.operation = "retraction"
+    status.arm_id = "arm_1"
+    status.adjustment_mode = "single"
+    status.target_retractor_id = "right_malleable"
+    status.direction_frame = "surgeon_view"
+    status.direction = "right"
+    status.state = "standby"
+    status.end_effector_profile = "army_navy_retractor"
     twin.update_bed_robot_arm_group_status(status)
 
     payload = next(
-        item for item in twin.bed_robot_arm_group_payload() if item["group_id"] == "suction"
+        item
+        for item in twin.bed_robot_arm_group_payload()
+        if item["group_id"] == "retraction"
     )
     assert payload["last_update_stamp_sec"] == 123
-    assert payload["last_update_stamp_nanosec"] == 456
+    assert payload["last_update_stamp_nanosec"] == 0
+    assert payload["last_operation_stamp_sec"] == 124
+    assert payload["last_operation_stamp_nanosec"] == 456
+    assert payload["connected"] is True
+    assert payload["state"] == "retracting"
+    assert payload["arm_id"] == "arm_2"
+    assert payload["end_effector_profile"] == ""
+    assert payload["adjustment_mode"] == "single"
+    assert payload["target_retractor_id"] == "right_malleable"
+    assert payload["direction_frame"] == "surgeon_view"
+    assert payload["direction"] == "right"
+
+
+def test_controller_status_rejects_stale_revision_and_wrong_role() -> None:
+    twin = ORDigitalTwin(_thyroid_spec())
+    assert twin.update_bed_robot_arm_controller_status(
+        _controller_status(revision=4, arm_id="arm_2", state="retracting")
+    ) is True
+
+    stale = _controller_status(
+        revision=4,
+        stamp=20,
+        arm_id="arm_1",
+        state="standby",
+    )
+    assert twin.update_bed_robot_arm_controller_status(stale) is False
+
+    wrong_role = _controller_status(
+        revision=5,
+        stamp=30,
+        arm_id="arm_1",
+        role_instance_id="left_malleable",
+        state="standby",
+    )
+    assert twin.update_bed_robot_arm_controller_status(wrong_role) is None
+
+    belief = twin.state.bed_robot_arm_groups["retraction"]
+    assert belief.arm_id == "arm_2"
+    assert belief.state == "retracting"
+    assert belief.last_update_stamp_sec == 10
+
+
+def test_controller_restart_accepts_lower_revision_with_newer_source_stamp() -> None:
+    twin = ORDigitalTwin(_thyroid_spec())
+    assert twin.update_bed_robot_arm_controller_status(
+        _controller_status(
+            revision=8,
+            stamp=20,
+            arm_id="arm_1",
+            state="retracting",
+        )
+    ) is True
+
+    restarted = _controller_status(
+        revision=1,
+        stamp=30,
+        arm_id="arm_2",
+        state="standby",
+    )
+    assert twin.update_bed_robot_arm_controller_status(restarted) is True
+
+    belief = twin.state.bed_robot_arm_groups["retraction"]
+    assert twin._bed_robot_arm_controller_epoch == 1
+    assert twin._bed_robot_arm_controller_revision == 1
+    assert twin._bed_robot_arm_controller_source_stamp_ns == 30_000_000_000
+    assert belief.connected is True
+    assert belief.state == "standby"
+    assert belief.arm_id == "arm_2"
+    assert belief.end_effector_profile == ""
+    assert belief.last_update_stamp_sec == 30
+    restart_event = next(
+        event
+        for event in twin.event_history
+        if event["event_type"] == "BedRobotArmControllerEpochRestarted"
+    )
+    assert restart_event["controller_epoch"] == 1
+    assert restart_event["previous_revision"] == 8
+    assert restart_event["revision"] == 1
+
+
+def test_controller_restart_rejects_delayed_old_epoch_and_changed_heartbeat() -> None:
+    twin = ORDigitalTwin(_thyroid_spec())
+    assert twin.update_bed_robot_arm_controller_status(
+        _controller_status(revision=9, stamp=20, arm_id="arm_1", state="retracting")
+    ) is True
+    assert twin.update_bed_robot_arm_controller_status(
+        _controller_status(revision=1, stamp=30, arm_id="arm_2", state="standby")
+    ) is True
+
+    # A delayed previous-epoch snapshot cannot win with its larger revision.
+    assert twin.update_bed_robot_arm_controller_status(
+        _controller_status(revision=10, stamp=25, arm_id="arm_1", state="fault")
+    ) is False
+    # Same revision may heartbeat, but cannot mutate controller state.
+    assert twin.update_bed_robot_arm_controller_status(
+        _controller_status(revision=1, stamp=31, arm_id="arm_2", state="fault")
+    ) is False
+
+    belief = twin.state.bed_robot_arm_groups["retraction"]
+    assert twin._bed_robot_arm_controller_epoch == 1
+    assert twin._bed_robot_arm_controller_revision == 1
+    assert twin._bed_robot_arm_controller_source_stamp_ns == 30_000_000_000
+    assert belief.state == "standby"
+    assert belief.arm_id == "arm_2"
+    assert belief.last_update_stamp_sec == 30
+
+    # An identical heartbeat refreshes source time without creating a new epoch.
+    assert twin.update_bed_robot_arm_controller_status(
+        _controller_status(revision=1, stamp=32, arm_id="arm_2", state="standby")
+    ) is True
+    assert twin._bed_robot_arm_controller_epoch == 1
+    assert twin._bed_robot_arm_controller_source_stamp_ns == 32_000_000_000
+    assert belief.last_update_stamp_sec == 32
 
 
 def test_periodic_world_serialization_does_not_retimestamp_unchanged_group():
     payload = {
         "group_id": "retraction",
         "connected": True,
-        "state": "holding",
-        "end_effector_profile": "army",
+        "state": "retracting",
+        "end_effector_profile": "",
         "last_update_stamp_sec": 12,
         "last_update_stamp_nanosec": 34,
     }
@@ -82,15 +231,69 @@ def test_periodic_world_serialization_does_not_retimestamp_unchanged_group():
     assert (second.stamp.sec, second.stamp.nanosec) == (12, 34)
 
 
+def test_node_rejects_stale_and_future_controller_source_time() -> None:
+    node = ORDigitalTwinNode.__new__(ORDigitalTwinNode)
+    node._twin = ORDigitalTwin(_thyroid_spec())
+    node._bed_robot_source_max_age_sec = 2.0
+    node._bed_robot_source_future_tolerance_sec = 0.5
+    node._bed_robot_status_timeout_sec = 2.0
+    node._bed_robot_status_received_monotonic = 0.0
+    node._bed_robot_status_source_stamp_ns = None
+    node._wall_time_ns = lambda: 10_000_000_000
+    node._monotonic_sec = lambda: 5.0
+    node._publish_event = lambda *args, **kwargs: None
+    node._publish_world_state = lambda: None
+
+    node._on_bed_robot_arm_controller_status(_controller_status(stamp=7))
+    node._on_bed_robot_arm_controller_status(_controller_status(stamp=11))
+    belief = node._twin.state.bed_robot_arm_groups["retraction"]
+    assert belief.connected is False
+
+    node._on_bed_robot_arm_controller_status(_controller_status(stamp=9))
+    assert belief.connected is True
+    assert node._bed_robot_status_source_stamp_ns == 9_000_000_000
+
+
+def test_node_expires_controller_state_when_source_becomes_stale() -> None:
+    node = ORDigitalTwinNode.__new__(ORDigitalTwinNode)
+    node._twin = ORDigitalTwin(_thyroid_spec())
+    node._bed_robot_source_max_age_sec = 2.0
+    node._bed_robot_source_future_tolerance_sec = 0.5
+    node._bed_robot_status_timeout_sec = 2.0
+    node._bed_robot_status_received_monotonic = 5.0
+    node._bed_robot_status_source_stamp_ns = 9_000_000_000
+    node._wall_time_ns = lambda: 12_000_000_000
+    node._monotonic_sec = lambda: 8.0
+    events = []
+    node._publish_event = lambda event_type, **kwargs: events.append(
+        (event_type, kwargs)
+    )
+    assert node._twin.update_bed_robot_arm_controller_status(
+        _controller_status(stamp=9)
+    ) is True
+
+    node._expire_bed_robot_controller_status()
+
+    belief = node._twin.state.bed_robot_arm_groups["retraction"]
+    assert belief.connected is False
+    assert belief.state == "unknown"
+    assert belief.arm_id == ""
+    assert belief.error_code == "controller_status_stale"
+    assert events[0][0] == "BedRobotArmControllerStateExpired"
+
+
 def test_late_command_callback_cannot_resurrect_terminal_group_state():
     twin = ORDigitalTwin(_thyroid_spec())
+    twin.update_bed_robot_arm_controller_status(
+        _controller_status(stamp=20, state="retracting")
+    )
     terminal = BedRobotArmGroupStatus()
-    terminal.stamp.sec = 20
+    terminal.stamp.sec = 30
     terminal.request_id = "req-complete"
     terminal.command_id = "cmd-complete"
     terminal.group_id = "retraction"
     terminal.operation = "retraction"
-    terminal.state = "holding"
+    terminal.state = "standby"
     terminal.terminal = True
     terminal.success = True
     terminal.end_effector_profile = "thyroid_retractor"
@@ -112,21 +315,26 @@ def test_late_command_callback_cannot_resurrect_terminal_group_state():
     node._on_bed_robot_arm_group_command(late_command)
 
     belief = twin.state.bed_robot_arm_groups["retraction"]
-    assert belief.state == "holding"
+    assert belief.state == "retracting"
     assert belief.active_request_id == ""
     assert belief.active_command_id == ""
     assert belief.last_update_stamp_sec == 20
+    assert belief.last_operation_stamp_sec == 30
+    assert belief.end_effector_profile == ""
 
 
 def test_older_terminal_status_cannot_rollback_newer_terminal_state():
     twin = ORDigitalTwin(_thyroid_spec())
+    twin.update_bed_robot_arm_controller_status(
+        _controller_status(stamp=5, state="retracting")
+    )
     completed = BedRobotArmGroupStatus()
     completed.stamp.sec = 20
     completed.request_id = "req-start"
     completed.command_id = "cmd-start"
-    completed.group_id = "suction"
-    completed.operation = "suction_start"
-    completed.state = "suctioning"
+    completed.group_id = "retraction"
+    completed.operation = "retraction"
+    completed.state = "retracting"
     completed.terminal = True
     completed.success = True
     twin.update_bed_robot_arm_group_status(completed)
@@ -134,82 +342,65 @@ def test_older_terminal_status_cannot_rollback_newer_terminal_state():
     delayed_rejection = BedRobotArmGroupStatus()
     delayed_rejection.stamp.sec = 10
     delayed_rejection.request_id = "req-stop"
-    delayed_rejection.group_id = "suction"
-    delayed_rejection.operation = "suction_stop"
+    delayed_rejection.group_id = "retraction"
+    delayed_rejection.operation = "retraction"
     delayed_rejection.state = "standby"
     delayed_rejection.terminal = True
     delayed_rejection.success = False
     delayed_rejection.error_code = "request_in_flight"
     twin.update_bed_robot_arm_group_status(delayed_rejection)
 
-    belief = twin.state.bed_robot_arm_groups["suction"]
-    assert belief.state == "suctioning"
-    assert belief.operation == "suction_start"
-    assert belief.last_update_stamp_sec == 20
+    belief = twin.state.bed_robot_arm_groups["retraction"]
+    assert belief.state == "retracting"
+    assert belief.operation == "retraction"
+    assert belief.last_update_stamp_sec == 5
+    assert belief.last_operation_stamp_sec == 20
 
 
-def test_health_heartbeat_preserves_operation_and_restores_state_after_reconnect():
+def test_legacy_health_cannot_initialize_or_override_controller_state():
     twin = ORDigitalTwin(_thyroid_spec())
-    completed = BedRobotArmGroupStatus()
-    completed.stamp.sec = 20
-    completed.request_id = "req-retract"
-    completed.command_id = "cmd-retract"
-    completed.group_id = "retraction"
-    completed.operation = "retraction"
-    completed.state = "holding"
-    completed.direction = "LEFT_RIGHT"
-    completed.distance_mm = 10.0
-    completed.distance_origin = "qualitative_inferred"
-    completed.end_effector_profile = "thyroid_retractor"
-    completed.terminal = True
-    completed.success = False
-    completed.error_code = "distance_limit_exceeded"
-    completed.rejection_reason = "50 mm exceeds the configured controller limit"
-    twin.update_bed_robot_arm_group_status(completed)
+    belief = twin.state.bed_robot_arm_groups["retraction"]
+    assert belief.connected is False
+    assert belief.state == "unknown"
+    assert belief.last_update_stamp_sec == 0
 
     ready = BedRobotArmGroupStatus()
-    ready.stamp.sec = 30
+    ready.stamp.sec = 10
     ready.request_id = "health-retraction"
     ready.group_id = "retraction"
-    ready.state = "holding"
+    ready.state = "standby"
     ready.terminal = True
     ready.success = True
     ready.outcome = "available"
-    twin.update_bed_robot_arm_group_status(ready)
-
-    belief = twin.state.bed_robot_arm_groups["retraction"]
-    assert belief.state == "holding"
-    assert belief.operation == "retraction"
-    assert belief.direction == "LEFT_RIGHT"
-    assert belief.distance_mm == 10.0
-    assert belief.end_effector_profile == "thyroid_retractor"
-    assert belief.error_code == "distance_limit_exceeded"
-    assert belief.rejection_reason == "50 mm exceeds the configured controller limit"
+    assert twin.update_bed_robot_arm_group_status(ready) is False
+    assert belief.connected is False
+    assert belief.state == "unknown"
 
     offline = BedRobotArmGroupStatus()
-    offline.stamp.sec = 40
+    offline.stamp.sec = 11
     offline.request_id = "health-retraction"
     offline.group_id = "retraction"
     offline.state = "offline"
     offline.terminal = True
     offline.success = False
     offline.error_code = "server_unavailable"
-    twin.update_bed_robot_arm_group_status(offline)
-    assert belief.state == "offline"
+    assert twin.update_bed_robot_arm_group_status(offline) is False
+    assert belief.state == "unknown"
     assert belief.connected is False
 
-    ready.stamp.sec = 50
-    twin.update_bed_robot_arm_group_status(ready)
-    assert belief.state == "holding"
+    assert twin.update_bed_robot_arm_controller_status(
+        _controller_status(revision=1, stamp=12, state="retracting")
+    ) is True
+    assert belief.state == "retracting"
     assert belief.connected is True
-    assert belief.operation == "retraction"
-    assert belief.direction == "LEFT_RIGHT"
-    assert belief.distance_mm == 10.0
-    assert belief.error_code == "distance_limit_exceeded"
-    assert belief.rejection_reason == "50 mm exceeds the configured controller limit"
+
+    offline.stamp.sec = 13
+    assert twin.update_bed_robot_arm_group_status(offline) is False
+    assert belief.state == "retracting"
+    assert belief.connected is True
 
 
-def test_repeated_health_heartbeat_only_records_availability_transitions():
+def test_repeated_health_heartbeat_records_no_controller_availability_transition():
     twin = ORDigitalTwin(_thyroid_spec())
     offline = BedRobotArmGroupStatus()
     offline.stamp.sec = 10
@@ -221,7 +412,7 @@ def test_repeated_health_heartbeat_only_records_availability_transitions():
     offline.error_code = "server_unavailable"
     offline.outcome = "server_unavailable"
 
-    assert twin.update_bed_robot_arm_group_status(offline) is True
+    assert twin.update_bed_robot_arm_group_status(offline) is False
     first_count = len(twin.event_history)
 
     offline.stamp.sec = 11
@@ -237,12 +428,12 @@ def test_repeated_health_heartbeat_only_records_availability_transitions():
     ready.success = True
     ready.outcome = "available"
 
-    assert twin.update_bed_robot_arm_group_status(ready) is True
-    assert len(twin.event_history) == first_count + 1
+    assert twin.update_bed_robot_arm_group_status(ready) is False
+    assert len(twin.event_history) == first_count
 
     ready.stamp.sec = 13
     assert twin.update_bed_robot_arm_group_status(ready) is False
-    assert len(twin.event_history) == first_count + 1
+    assert len(twin.event_history) == first_count
 
 
 def test_node_does_not_publish_unchanged_health_heartbeat_as_event():
@@ -282,10 +473,8 @@ def test_node_does_not_publish_unchanged_health_heartbeat_as_event():
 
     node._on_bed_robot_arm_group_status(offline)
 
-    assert [event_type for event_type, _ in published_events] == [
-        "BedRobotArmGroupAvailabilityChanged"
-    ]
-    assert published_world_states == [True]
+    assert published_events == []
+    assert published_world_states == []
 
 
 def test_group_reducer_suppresses_duplicate_progress_but_keeps_semantic_boundaries():
@@ -303,8 +492,8 @@ def test_group_reducer_suppresses_duplicate_progress_but_keeps_semantic_boundari
         msg.stamp.sec = stamp
         msg.request_id = "req-1"
         msg.command_id = "cmd-1"
-        msg.group_id = "suction"
-        msg.operation = "suction_start"
+        msg.group_id = "retraction"
+        msg.operation = "retraction"
         msg.state = state
         msg.outcome = outcome
         msg.progress = progress
@@ -313,25 +502,25 @@ def test_group_reducer_suppresses_duplicate_progress_but_keeps_semantic_boundari
         return msg
 
     assert twin.update_bed_robot_arm_group_status(
-        status(stamp=10, state="suctioning", outcome="executing", progress=0.05)
+        status(stamp=10, state="retracting", outcome="executing", progress=0.05)
     ) is True
     first_count = len(twin.event_history)
 
     assert twin.update_bed_robot_arm_group_status(
-        status(stamp=11, state="suctioning", outcome="executing", progress=0.20)
+        status(stamp=11, state="retracting", outcome="executing", progress=0.20)
     ) is False
     assert len(twin.event_history) == first_count
 
     assert twin.update_bed_robot_arm_group_status(
-        status(stamp=12, state="suctioning", outcome="executing", progress=0.25)
+        status(stamp=12, state="retracting", outcome="executing", progress=0.25)
     ) is True
     assert twin.update_bed_robot_arm_group_status(
-        status(stamp=13, state="stopping", outcome="executing", progress=0.25)
+        status(stamp=13, state="holding", outcome="executing", progress=0.25)
     ) is True
     assert twin.update_bed_robot_arm_group_status(
         status(
             stamp=14,
-            state="suctioning",
+            state="holding",
             outcome="completed",
             progress=1.0,
             terminal=True,
@@ -353,8 +542,8 @@ def test_ignored_stale_group_status_does_not_poison_duplicate_cache():
         msg.stamp.sec = stamp
         msg.request_id = "req-1"
         msg.command_id = "cmd-1"
-        msg.group_id = "suction"
-        msg.operation = "suction_start"
+        msg.group_id = "retraction"
+        msg.operation = "retraction"
         msg.state = state
         msg.outcome = "executing"
         msg.progress = 0.25
@@ -362,22 +551,22 @@ def test_ignored_stale_group_status_does_not_poison_duplicate_cache():
         return msg
 
     assert twin.update_bed_robot_arm_group_status(
-        status(stamp=20, state="suctioning")
+        status(stamp=20, state="retracting")
     ) is True
     assert twin.update_bed_robot_arm_group_status(
-        status(stamp=10, state="stopping")
+        status(stamp=10, state="holding")
     ) is None
     ignored_count = len(twin.event_history)
     assert twin.update_bed_robot_arm_group_status(
-        status(stamp=11, state="stopping")
+        status(stamp=11, state="holding")
     ) is False
     assert len(twin.event_history) == ignored_count
     assert twin.update_bed_robot_arm_group_status(
-        status(stamp=30, state="stopping")
+        status(stamp=30, state="holding")
     ) is True
 
 
-def test_node_does_not_publish_rejected_group_status_as_a_state_update():
+def test_node_ignores_removed_suction_group_status():
     node = ORDigitalTwinNode.__new__(ORDigitalTwinNode)
     node._twin = ORDigitalTwin(_thyroid_spec())
     node._pending_bed_robot_arm_group_requests = {}
@@ -410,10 +599,9 @@ def test_node_does_not_publish_rejected_group_status_as_a_state_update():
     stale.success = True
     node._on_bed_robot_arm_group_status(stale)
 
-    assert [event_type for event_type, _ in published_events] == [
-        "BedRobotArmGroupStatusUpdated"
-    ]
-    assert published_world_states == [True]
+    assert published_events == []
+    assert published_world_states == []
+    assert set(node._twin.state.bed_robot_arm_groups) == {"retraction"}
 
 
 def test_node_suppresses_duplicate_group_progress_event_and_world_publish():
@@ -431,9 +619,9 @@ def test_node_suppresses_duplicate_group_progress_event_and_world_publish():
     status.stamp.sec = 10
     status.request_id = "req-1"
     status.command_id = "cmd-1"
-    status.group_id = "suction"
-    status.operation = "suction_start"
-    status.state = "suctioning"
+    status.group_id = "retraction"
+    status.operation = "retraction"
+    status.state = "retracting"
     status.outcome = "executing"
     status.progress = 0.05
     status.success = True
@@ -725,6 +913,7 @@ def test_transcript_callback_creates_request_without_structured_actor_message():
         (event_type, kwargs)
     )
     node._publish_world_state = lambda: published_world_states.append(True)
+    node._stamp = lambda: SurgeonRequest().stamp
 
     transcript = String()
     transcript.data = "Bovie surgical cautery please"

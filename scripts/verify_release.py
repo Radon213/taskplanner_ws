@@ -435,7 +435,7 @@ def build_checks(
         CheckSpec(
             name="web_build",
             command=(
-                "rm -rf "
+                "npm --prefix webapp ci && rm -rf "
                 + shlex.quote(str(ROOT / "test_outputs" / "release-web" / run_id))
                 + " && npm --prefix webapp run build -- --outDir "
                 + shlex.quote(str(ROOT / "test_outputs" / "release-web" / run_id))
@@ -585,6 +585,10 @@ def run_check(spec: CheckSpec, logs_dir: Path) -> CheckResult:
     duration = time.monotonic() - started
     status = "passed" if return_code == 0 else "failed"
     print(f"[{spec.name}] {status} ({duration:.1f}s)", flush=True)
+    try:
+        recorded_log_path = str(log_path.relative_to(ROOT))
+    except ValueError:
+        recorded_log_path = str(log_path)
     return CheckResult(
         name=spec.name,
         classification=spec.classification,
@@ -593,7 +597,7 @@ def run_check(spec: CheckSpec, logs_dir: Path) -> CheckResult:
         return_code=return_code,
         duration_sec=round(duration, 3),
         command=spec.command,
-        log_path=str(log_path.relative_to(ROOT)),
+        log_path=recorded_log_path,
         detail=detail,
     )
 

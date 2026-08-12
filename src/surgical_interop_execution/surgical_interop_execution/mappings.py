@@ -57,22 +57,33 @@ ROBOT_HANDOVER_TRANSITION = (LOCATION_ROBOT, LOCATION_SURGEON)
 RETURN_TO_TRAY_TRANSITION = (LOCATION_ROBOT, LOCATION_TRAY)
 RETRIEVE_TRANSITION = (LOCATION_MAYO, LOCATION_TRAY)
 
-GROUP_SUCTION = "suction"
 GROUP_RETRACTION = "retraction"
 
-OPERATION_SUCTION_START = "suction_start"
-OPERATION_SUCTION_STOP = "suction_stop"
 OPERATION_RETRACTION = "retraction"
 OPERATION_RELEASE_RETRACTION = "release_retraction"
 OPERATION_CHANGE_END_EFFECTOR = "change_end_effector"
 
-PUBLIC_RETRACTION_OPERATIONS = {
-    OPERATION_RETRACTION: "MOVE",
-    OPERATION_RELEASE_RETRACTION: "RELEASE",
-    OPERATION_CHANGE_END_EFFECTOR: "CHANGE_END_EFFECTOR",
-}
-
 MAX_RETRACTION_DISTANCE_MM = 30.0
+
+ARM_IDS = frozenset({"arm_1", "arm_2"})
+TOOL_THYROID_RETRACTOR = "thyroid_retractor"
+TOOL_ARMY_NAVY_RETRACTOR = "army_navy_retractor"
+TARGET_LEFT_MALLEABLE = "left_malleable"
+TARGET_RIGHT_MALLEABLE = "right_malleable"
+TARGET_BOTH_MALLEABLE = "both_malleable"
+TARGET_RETRACTOR_IDS = frozenset(
+    {TARGET_LEFT_MALLEABLE, TARGET_RIGHT_MALLEABLE, TARGET_BOTH_MALLEABLE}
+)
+
+ADJUSTMENT_SINGLE = "single"
+ADJUSTMENT_MULTI = "multi"
+DIRECTION_FRAME_SURGEON_VIEW = "surgeon_view"
+CARDINAL_DIRECTIONS = frozenset({"up", "down", "left", "right"})
+ADJUSTMENT_AXES = frozenset({"left_right", "up_down"})
+
+TARGET_TOOL_IDS = frozenset(
+    {TOOL_THYROID_RETRACTOR, TOOL_ARMY_NAVY_RETRACTOR}
+)
 
 
 class MappingFailure(ValueError):
@@ -152,7 +163,13 @@ class InternalGroupCommand:
     command_id: str
     group_id: str
     operation: str
+    arm_id: str
+    target_tool_id: str
+    adjustment_mode: str
+    target_retractor_id: str
+    direction_frame: str
     direction: str
+    axis: str
     distance_mm: float
     end_effector_profile: str
     distance_origin: str = ""
@@ -171,18 +188,21 @@ class ToolHandoverRequest:
 
 
 @dataclass(frozen=True, slots=True)
-class RetractionRequest:
+class RetractionAdjustmentRequest:
     command_id: str
-    operation: str
+    adjustment_mode: str
+    target_retractor_id: str
+    direction_frame: str
     direction: str
+    axis: str
     distance_mm: float
-    end_effector_profile: str
 
 
 @dataclass(frozen=True, slots=True)
-class SuctionRequest:
+class ToolChangeRequest:
     command_id: str
-    enabled: bool
+    arm_id: str
+    target_tool_id: str
 
 
 def public_instrument_instance_id(
@@ -259,50 +279,75 @@ def map_skill_to_tool_handover(
 
 def map_group_command(
     command: InternalGroupCommand,
-) -> RetractionRequest | SuctionRequest:
-    """Map a group command to the one public capability it actually requests."""
+    *,
+    max_retraction_distance_mm: float = MAX_RETRACTION_DISTANCE_MM,
+) -> RetractionAdjustmentRequest | ToolChangeRequest:
+    """Validate and project the internal envelope onto the reviewed contract."""
 
     if not command.command_id.strip():
         raise MappingFailure("invalid_command_id")
 
-    if command.group_id == GROUP_SUCTION:
-        if command.operation == OPERATION_SUCTION_START:
-            return SuctionRequest(command_id=command.command_id, enabled=True)
-        if command.operation == OPERATION_SUCTION_STOP:
-            return SuctionRequest(command_id=command.command_id, enabled=False)
-        raise MappingFailure("unsupported_suction_operation")
-
     if command.group_id != GROUP_RETRACTION:
-        raise MappingFailure("unsupported_group")
+        raise MappingFailure(
+            "suction_arm_removed" if command.group_id == "suction" else "unsupported_group"
+        )
 
-    public_operation = PUBLIC_RETRACTION_OPERATIONS.get(command.operation)
-    if public_operation is None:
+    if command.operation == OPERATION_CHANGE_END_EFFECTOR:
+        arm_id = command.arm_id.strip().casefold()
+        if arm_id not in ARM_IDS:
+            raise MappingFailure("invalid_arm_id")
+        target_tool_id = command.target_tool_id.strip().casefold()
+        if target_tool_id not in TARGET_TOOL_IDS:
+            raise MappingFailure("invalid_target_tool")
+        return ToolChangeRequest(
+            command_id=command.command_id,
+            arm_id=arm_id,
+            target_tool_id=target_tool_id,
+        )
+
+    if command.operation != OPERATION_RETRACTION:
         raise MappingFailure("unsupported_retraction_operation")
 
-    direction = command.direction.strip().upper()
-    profile = command.end_effector_profile.strip()
+    adjustment_mode = command.adjustment_mode.strip().casefold()
+    target_retractor_id = command.target_retractor_id.strip().casefold()
+    direction_frame = command.direction_frame.strip().casefold()
+    direction = command.direction.strip().casefold()
+    axis = command.axis.strip().casefold()
+    if direction_frame != DIRECTION_FRAME_SURGEON_VIEW:
+        raise MappingFailure("invalid_direction_frame")
     distance_mm = float(command.distance_mm)
-    if public_operation == "MOVE":
-        if (
-            not direction
-            or not isfinite(distance_mm)
-            or distance_mm <= 0.0
-            or distance_mm > MAX_RETRACTION_DISTANCE_MM
-        ):
-            raise MappingFailure("invalid_retraction_command")
+    maximum = float(max_retraction_distance_mm)
+    if (
+        not isfinite(distance_mm)
+        or distance_mm <= 0.0
+        or not isfinite(maximum)
+        or maximum <= 0.0
+        or distance_mm > maximum
+    ):
+        raise MappingFailure("invalid_retraction_distance")
+
+    if adjustment_mode == ADJUSTMENT_SINGLE:
+        if target_retractor_id not in {
+            TARGET_LEFT_MALLEABLE,
+            TARGET_RIGHT_MALLEABLE,
+        }:
+            raise MappingFailure("invalid_target_retractor")
+        if direction not in CARDINAL_DIRECTIONS or axis != "none":
+            raise MappingFailure("invalid_single_adjustment")
+    elif adjustment_mode == ADJUSTMENT_MULTI:
+        if target_retractor_id != TARGET_BOTH_MALLEABLE:
+            raise MappingFailure("invalid_target_retractor")
+        if direction != "none" or axis not in ADJUSTMENT_AXES:
+            raise MappingFailure("invalid_multi_adjustment")
     else:
-        direction = ""
-        distance_mm = 0.0
+        raise MappingFailure("invalid_adjustment_mode")
 
-    if public_operation == "CHANGE_END_EFFECTOR" and not profile:
-        raise MappingFailure("missing_end_effector_profile")
-    if public_operation != "CHANGE_END_EFFECTOR":
-        profile = ""
-
-    return RetractionRequest(
+    return RetractionAdjustmentRequest(
         command_id=command.command_id,
-        operation=public_operation,
+        adjustment_mode=adjustment_mode,
+        target_retractor_id=target_retractor_id,
+        direction_frame=direction_frame,
         direction=direction,
+        axis=axis,
         distance_mm=distance_mm,
-        end_effector_profile=profile,
     )

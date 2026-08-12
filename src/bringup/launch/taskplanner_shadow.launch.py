@@ -40,6 +40,26 @@ BUILD_MARKER_PATH = Path("/etc/taskplanner-build.json")
 _SAFE_RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
+def _bed_robot_contract_configuration(context: Any) -> list[Any]:
+    bundle_id = LaunchConfiguration("default_bundle").perform(context).strip()
+    if bundle_id in {"thyroidectomy", "thyroidectomy_demo"}:
+        procedure_type = "thyroidectomy"
+    elif bundle_id == "nephrectomy":
+        procedure_type = "nephrectomy"
+    else:
+        procedure_type = ""
+    return [
+        SetLaunchConfiguration(
+            "bed_robot_contract_enabled",
+            "true" if procedure_type else "false",
+        ),
+        SetLaunchConfiguration(
+            "bed_robot_contract_procedure_type",
+            procedure_type,
+        ),
+    ]
+
+
 def _as_bool(value: str) -> bool:
     normalized = str(value).strip().lower()
     if normalized in {"1", "true", "yes", "on"}:
@@ -612,6 +632,12 @@ def generate_launch_description() -> LaunchDescription:
     rosbridge_port = LaunchConfiguration("rosbridge_port")
     groot2_port = LaunchConfiguration("groot2_port")
     default_bundle = LaunchConfiguration("default_bundle")
+    bed_robot_contract_enabled = LaunchConfiguration(
+        "bed_robot_contract_enabled"
+    )
+    bed_robot_contract_procedure_type = LaunchConfiguration(
+        "bed_robot_contract_procedure_type"
+    )
     use_sim_time = {"use_sim_time": True}
     non_strict = PythonExpression(["'", mode, "' != 'strict'"])
     fault_enabled = PythonExpression(
@@ -943,6 +969,7 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("enable_rosbridge", default_value="false"),
             DeclareLaunchArgument("rosbridge_port", default_value="9091"),
             DeclareLaunchArgument("groot2_port", default_value="0"),
+            OpaqueFunction(function=_bed_robot_contract_configuration),
             OpaqueFunction(function=_shadow_preflight),
             Node(
                 package="shadow_evaluation",
@@ -1315,11 +1342,64 @@ def generate_launch_description() -> LaunchDescription:
                 package="bt_orchestrator",
                 executable="bed_robot_arm_group_orchestrator",
                 name="bed_robot_arm_group_orchestrator",
+                condition=IfCondition(bed_robot_contract_enabled),
                 parameters=[
                     {
                         **use_sim_time,
                         "spec_dir": spec_dir,
                     }
+                ],
+                output="screen",
+            ),
+            Node(
+                package="surgical_interop_execution",
+                executable="fault_action_emulator",
+                name="shadow_robot_contract_emulator",
+                condition=IfCondition(bed_robot_contract_enabled),
+                parameters=[
+                    {
+                        # The external controller contract must remain observable
+                        # while replay source time is paused or held.
+                        "use_sim_time": False,
+                        "profile_path": PathJoinSubstitution(
+                            [
+                                FindPackageShare("bringup"),
+                                "config",
+                                "robot_contract_success.yaml",
+                            ]
+                        ),
+                        "procedure_type": ParameterValue(
+                            bed_robot_contract_procedure_type,
+                            value_type=str,
+                        ),
+                    }
+                ],
+                output="screen",
+            ),
+            Node(
+                package="surgical_interop_execution",
+                executable="surgical_interop_execution_bridge",
+                name="shadow_surgical_interop_execution_bridge",
+                condition=IfCondition(bed_robot_contract_enabled),
+                parameters=[
+                    {
+                        **use_sim_time,
+                        "spec_dir": spec_dir,
+                        "tool_handover_endpoint": "/surgery/tool_handover",
+                        "tool_change_service": "/surgery/tool_change/request",
+                        "retraction_endpoint": "/surgery/retraction/adjust",
+                        "bed_robot_status_endpoint": (
+                            "/external/bed_robot_arms/status"
+                        ),
+                        "server_wait_timeout_sec": 3.0,
+                        "require_bed_robot_status": True,
+                    }
+                ],
+                remappings=[
+                    (
+                        "/bt/skill_command",
+                        "/shadow/no_direct_skill_command",
+                    )
                 ],
                 output="screen",
             ),
@@ -1330,7 +1410,6 @@ def generate_launch_description() -> LaunchDescription:
                 parameters=[
                     {
                         **use_sim_time,
-                        "spec_dir": spec_dir,
                         "counterfactual_success_feedback": ParameterValue(
                             counterfactual_success_feedback,
                             value_type=bool,

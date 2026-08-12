@@ -31,3 +31,20 @@ task-planning baseline for surgical tool handover and Mayo-stand recovery.
 - Web dashboard production build.
 - Multi-bundle runtime probe across thyroidectomy, nephrectomy, and inguinal
   hernia repair.
+
+## Post-0.1.0 Integration Note
+
+The current development branch replaces the former generic bed-arm concept
+with the institution-agreed retraction-only contract:
+
+- thyroidectomy Tool Change uses the completion-waiting
+  `/surgery/tool_change/request` Service;
+- nephrectomy Malleable fine adjustment uses the cancellable
+  `/surgery/retraction/adjust` Action;
+- controller-owned retraction state arrives on
+  `/external/bed_robot_arms/status`;
+- bed-mounted suction-arm command and status paths are removed, while clinical
+  suction instruments and surgeon speech about suction remain supported.
+
+This note describes unreleased development after tag `v0.1.0`; it does not
+retroactively change the tagged artifact.

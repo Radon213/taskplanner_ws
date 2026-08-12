@@ -57,7 +57,6 @@ from shadow_evaluation.shadow_skill_sink import (
 from shadow_evaluation.shadow_skill_sink import returned_home_instrument_instances
 from shadow_evaluation.shadow_skill_sink import semantic_command_key
 from shadow_evaluation.shadow_skill_sink import SemanticCommandLedger
-from shadow_evaluation.shadow_skill_sink import shadow_group_terminal_state
 
 
 def _world(
@@ -448,13 +447,6 @@ def test_shadow_sink_never_admits_command_without_running_world():
     )
     assert status == "blocked"
     assert reason == "no_world_state"
-
-
-def test_shadow_group_feedback_models_state_without_execution():
-    assert shadow_group_terminal_state("suction_start") == "suctioning"
-    assert shadow_group_terminal_state("suction_stop") == "standby"
-    assert shadow_group_terminal_state("retraction") == "holding"
-    assert shadow_group_terminal_state("release_retraction") == "standby"
 
 
 def test_semantic_command_ledger_reset_removes_prior_run_state():

@@ -3982,14 +3982,14 @@ body {
   line-height: 1.25;
 }
 
-.bed-robot-group-rail {
+.bed-robot-arm-rail {
   display: grid;
   min-width: 0;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr));
   gap: 8px;
 }
 
-.bed-robot-group-card {
+.bed-robot-arm-card {
   position: relative;
   display: grid;
   min-width: 0;
@@ -4009,7 +4009,7 @@ body {
     box-shadow 180ms ease;
 }
 
-.bed-robot-group-card.tone-active {
+.bed-robot-arm-card.tone-active {
   border-color: rgba(105, 193, 255, 0.5);
   background:
     linear-gradient(135deg, rgba(105, 193, 255, 0.13), transparent 62%),
@@ -4019,12 +4019,12 @@ body {
     0 10px 22px rgba(0, 0, 0, 0.08);
 }
 
-.bed-robot-group-card.tone-warning {
+.bed-robot-arm-card.tone-warning {
   border-color: rgba(255, 159, 90, 0.46);
   box-shadow: inset 3px 0 0 var(--surgeon);
 }
 
-.bed-robot-group-card.tone-danger {
+.bed-robot-arm-card.tone-danger {
   border-color: rgba(255, 108, 122, 0.52);
   background:
     linear-gradient(135deg, rgba(255, 108, 122, 0.1), transparent 62%),
@@ -4032,37 +4032,35 @@ body {
   box-shadow: inset 3px 0 0 var(--warning);
 }
 
-.bed-robot-group-card.tone-offline {
+.bed-robot-arm-card.tone-offline {
   border-color: rgba(120, 146, 186, 0.16);
   background: rgba(12, 22, 35, 0.58);
   box-shadow: inset 3px 0 0 rgba(143, 163, 191, 0.2);
 }
 
-.bed-robot-group-header,
-.bed-robot-group-identity,
-.bed-robot-group-status,
-.bed-robot-group-progress > div,
-.bed-robot-distance {
+.bed-robot-arm-header,
+.bed-robot-arm-identity,
+.bed-robot-arm-status {
   display: flex;
   min-width: 0;
   align-items: center;
 }
 
-.bed-robot-group-header {
+.bed-robot-arm-header {
   justify-content: space-between;
   gap: 10px;
 }
 
-.bed-robot-group-identity {
+.bed-robot-arm-identity {
   flex: 1 1 auto;
   gap: 9px;
 }
 
-.bed-robot-group-identity > div {
+.bed-robot-arm-identity > div {
   min-width: 0;
 }
 
-.bed-robot-group-icon {
+.bed-robot-arm-icon {
   display: grid;
   width: 34px;
   height: 34px;
@@ -4074,8 +4072,8 @@ body {
   color: var(--robot-strong);
 }
 
-.bed-robot-group-identity small,
-.bed-robot-group-identity h3 {
+.bed-robot-arm-identity small,
+.bed-robot-arm-identity h3 {
   display: block;
   overflow: hidden;
   margin: 0;
@@ -4083,7 +4081,7 @@ body {
   white-space: nowrap;
 }
 
-.bed-robot-group-identity small {
+.bed-robot-arm-identity small {
   margin-bottom: 2px;
   color: var(--muted);
   font-size: 10px;
@@ -4091,14 +4089,14 @@ body {
   line-height: 1.1;
 }
 
-.bed-robot-group-identity h3 {
+.bed-robot-arm-identity h3 {
   color: var(--text);
   font-size: 14px;
   font-weight: 700;
   line-height: 1.16;
 }
 
-.bed-robot-group-status {
+.bed-robot-arm-status {
   max-width: 46%;
   flex: 0 1 auto;
   justify-content: flex-end;
@@ -4110,7 +4108,7 @@ body {
   text-align: end;
 }
 
-.bed-robot-group-status i {
+.bed-robot-arm-status i {
   width: 6px;
   height: 6px;
   flex: 0 0 6px;
@@ -4118,68 +4116,64 @@ body {
   background: var(--muted);
 }
 
-.bed-robot-group-status span {
+.bed-robot-arm-status span {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.bed-robot-group-status.tone-active {
+.bed-robot-arm-status.tone-active {
   color: var(--robot-strong);
 }
 
-.bed-robot-group-status.tone-active i {
+.bed-robot-arm-status.tone-active i {
   background: var(--robot);
   box-shadow: 0 0 8px rgba(105, 193, 255, 0.5);
 }
 
-.bed-robot-group-status.tone-warning {
+.bed-robot-arm-status.tone-warning {
   color: var(--surgeon-strong);
 }
 
-.bed-robot-group-status.tone-warning i {
+.bed-robot-arm-status.tone-warning i {
   background: var(--surgeon);
 }
 
-.bed-robot-group-status.tone-danger {
+.bed-robot-arm-status.tone-danger {
   color: var(--warning);
 }
 
-.bed-robot-group-status.tone-danger i {
+.bed-robot-arm-status.tone-danger i {
   background: var(--warning);
 }
 
-.bed-robot-group-status.tone-offline {
+.bed-robot-arm-status.tone-offline {
   color: var(--muted);
 }
 
-.bed-robot-group-facts {
+.bed-robot-arm-facts {
   display: grid;
   min-width: 0;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 6px;
   margin: 0;
 }
 
-.bed-robot-group-facts.retraction {
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-}
-
-.bed-robot-group-facts > div {
+.bed-robot-arm-facts > div {
   min-width: 0;
   padding-inline-start: 7px;
   border-inline-start: 1px solid rgba(120, 146, 186, 0.18);
 }
 
-.bed-robot-group-facts dt,
-.bed-robot-group-facts dd {
+.bed-robot-arm-facts dt,
+.bed-robot-arm-facts dd {
   overflow: hidden;
   margin: 0;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.bed-robot-group-facts dt {
+.bed-robot-arm-facts dt {
   margin-bottom: 2px;
   color: var(--muted);
   font-size: 10px;
@@ -4187,100 +4181,11 @@ body {
   line-height: 1.1;
 }
 
-.bed-robot-group-facts dd {
+.bed-robot-arm-facts dd {
   color: var(--text);
   font-size: 12px;
   font-weight: 700;
   line-height: 1.2;
-}
-
-.bed-robot-distance {
-  gap: 3px;
-  overflow: visible !important;
-}
-
-.bed-robot-distance strong {
-  color: var(--robot-strong);
-  font-size: 16px;
-  font-variant-numeric: tabular-nums;
-  line-height: 1;
-}
-
-.bed-robot-distance span {
-  color: var(--muted);
-  font-size: 8px;
-  font-weight: 700;
-}
-
-.bed-robot-group-progress {
-  display: grid;
-  min-width: 0;
-  gap: 3px;
-}
-
-.bed-robot-group-progress > div {
-  justify-content: space-between;
-  gap: 8px;
-  color: var(--muted);
-  font-size: 10px;
-  font-weight: 700;
-}
-
-.bed-robot-group-progress strong {
-  color: var(--soft);
-  font-variant-numeric: tabular-nums;
-}
-
-.bed-robot-group-progress progress {
-  width: 100%;
-  height: 4px;
-  overflow: hidden;
-  appearance: none;
-  border: 0;
-  border-radius: 999px;
-  background: rgba(120, 146, 186, 0.16);
-}
-
-.bed-robot-group-progress progress::-webkit-progress-bar {
-  border-radius: 999px;
-  background: rgba(120, 146, 186, 0.16);
-}
-
-.bed-robot-group-progress progress::-webkit-progress-value {
-  border-radius: 999px;
-  background: var(--robot);
-}
-
-.bed-robot-group-progress progress::-moz-progress-bar {
-  border-radius: 999px;
-  background: var(--robot);
-}
-
-.bed-robot-group-card.tone-danger progress::-webkit-progress-value {
-  background: var(--warning);
-}
-
-.bed-robot-group-card.tone-danger progress::-moz-progress-bar {
-  background: var(--warning);
-}
-
-.bed-robot-group-card.tone-warning progress::-webkit-progress-value {
-  background: var(--surgeon);
-}
-
-.bed-robot-group-card.tone-warning progress::-moz-progress-bar {
-  background: var(--surgeon);
-}
-
-.bed-robot-group-error {
-  margin: 0;
-  overflow: hidden;
-  color: var(--warning);
-  font-size: 11px;
-  font-weight: 700;
-  line-height: 1.2;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .holder-title {
@@ -5043,7 +4948,7 @@ body {
     text-align: left;
   }
 
-  .bed-robot-group-rail {
+  .bed-robot-arm-rail {
     display: flex;
     overflow-x: auto;
     overscroll-behavior-inline: contain;
@@ -5053,12 +4958,12 @@ body {
     -webkit-overflow-scrolling: touch;
   }
 
-  .bed-robot-group-card {
+  .bed-robot-arm-card {
     min-width: min(290px, 86vw);
     scroll-snap-align: start;
   }
 
-  .bed-robot-group-facts.retraction {
+  .bed-robot-arm-facts {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
@@ -5530,7 +5435,6 @@ body {
 .debug-arm-card > div,
 .debug-action-summary,
 .debug-inline-actions,
-.debug-suction-actions,
 .debug-row-actions {
   display: flex;
   align-items: center;
@@ -6320,14 +6224,12 @@ body {
 }
 
 .debug-inline-actions,
-.debug-suction-actions,
 .debug-row-actions {
   gap: 8px;
   flex-wrap: wrap;
 }
 
-.debug-inline-actions .button,
-.debug-suction-actions .button {
+.debug-inline-actions .button {
   flex: 1 1 144px;
   min-height: 44px;
 }
@@ -6717,7 +6619,7 @@ body {
 }
 
 /* Request-ID-linked bed robot group observability. */
-.bed-group-trace-section {
+.bed-arm-trace-section {
   display: grid;
   gap: 12px;
   margin-bottom: 12px;
@@ -6725,7 +6627,7 @@ body {
   border-bottom: 1px solid var(--line);
 }
 
-.bed-group-trace-title-row {
+.bed-arm-trace-title-row {
   display: flex;
   min-width: 0;
   align-items: flex-start;
@@ -6733,25 +6635,25 @@ body {
   gap: 12px;
 }
 
-.bed-group-trace-title-row > div {
+.bed-arm-trace-title-row > div {
   min-width: 0;
 }
 
-.bed-group-trace-title-row h3 {
+.bed-arm-trace-title-row h3 {
   margin: 0;
   color: var(--text);
   font-size: 13px;
   line-height: 1.3;
 }
 
-.bed-group-trace-title-row p {
+.bed-arm-trace-title-row p {
   margin: 4px 0 0;
   color: var(--muted);
   font-size: 11px;
   line-height: 1.4;
 }
 
-.bed-group-trace-title-row > span {
+.bed-arm-trace-title-row > span {
   display: inline-grid;
   flex: 0 0 auto;
   min-width: 28px;
@@ -6766,12 +6668,12 @@ body {
   font-weight: 700;
 }
 
-.bed-group-trace-list {
+.bed-arm-trace-list {
   display: grid;
   gap: 8px;
 }
 
-.bed-group-trace-card {
+.bed-arm-trace-card {
   min-width: 0;
   padding: 12px;
   border: 1px solid var(--line);
@@ -6779,19 +6681,19 @@ body {
   background: rgba(255, 255, 255, 0.035);
 }
 
-.bed-group-trace-card.tone-active {
+.bed-arm-trace-card.tone-active {
   border-color: rgba(117, 167, 255, 0.32);
 }
 
-.bed-group-trace-card.tone-success {
+.bed-arm-trace-card.tone-success {
   border-color: rgba(112, 221, 209, 0.34);
 }
 
-.bed-group-trace-card.tone-danger {
+.bed-arm-trace-card.tone-danger {
   border-color: rgba(255, 138, 116, 0.42);
 }
 
-.bed-group-trace-card-header {
+.bed-arm-trace-card-header {
   display: flex;
   min-width: 0;
   align-items: flex-start;
@@ -6799,19 +6701,19 @@ body {
   gap: 12px;
 }
 
-.bed-group-trace-card-header > div {
+.bed-arm-trace-card-header > div {
   display: grid;
   min-width: 0;
   gap: 4px;
 }
 
-.bed-group-trace-card-header strong {
+.bed-arm-trace-card-header strong {
   color: var(--text);
   font-size: 12px;
   line-height: 1.3;
 }
 
-.bed-group-trace-card-header span {
+.bed-arm-trace-card-header span {
   overflow: hidden;
   color: var(--muted);
   font-size: 11px;
@@ -6820,7 +6722,7 @@ body {
   white-space: nowrap;
 }
 
-.bed-group-trace-card-header > em {
+.bed-arm-trace-card-header > em {
   flex: 0 0 auto;
   max-width: 128px;
   padding: 4px 8px;
@@ -6836,17 +6738,17 @@ body {
   white-space: nowrap;
 }
 
-.bed-group-trace-card.tone-success .bed-group-trace-card-header > em {
+.bed-arm-trace-card.tone-success .bed-arm-trace-card-header > em {
   border-color: rgba(112, 221, 209, 0.3);
   color: var(--robot-strong);
 }
 
-.bed-group-trace-card.tone-danger .bed-group-trace-card-header > em {
+.bed-arm-trace-card.tone-danger .bed-arm-trace-card-header > em {
   border-color: rgba(255, 138, 116, 0.34);
   color: var(--warning);
 }
 
-.bed-group-trace-card > code {
+.bed-arm-trace-card > code {
   display: block;
   margin-top: 8px;
   overflow: hidden;
@@ -6857,7 +6759,7 @@ body {
   white-space: nowrap;
 }
 
-.bed-group-trace-card ol {
+.bed-arm-trace-card ol {
   display: grid;
   grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 4px;
@@ -6866,7 +6768,7 @@ body {
   list-style: none;
 }
 
-.bed-group-trace-card li {
+.bed-arm-trace-card li {
   position: relative;
   display: grid;
   min-width: 0;
@@ -6880,11 +6782,11 @@ body {
   text-align: center;
 }
 
-.bed-group-trace-card li + li {
+.bed-arm-trace-card li + li {
   border-left: 1px solid var(--line);
 }
 
-.bed-group-trace-card li > div {
+.bed-arm-trace-card li > div {
   display: grid;
   width: 100%;
   min-width: 0;
@@ -6892,7 +6794,7 @@ body {
   gap: 2px;
 }
 
-.bed-group-trace-marker {
+.bed-arm-trace-marker {
   position: relative;
   display: block;
   width: 8px;
@@ -6902,27 +6804,27 @@ body {
   background: var(--surface-2);
 }
 
-.bed-group-trace-card li.state-active .bed-group-trace-marker {
+.bed-arm-trace-card li.state-active .bed-arm-trace-marker {
   border-color: var(--clinical);
   background: var(--clinical);
 }
 
-.bed-group-trace-card li.state-complete .bed-group-trace-marker {
+.bed-arm-trace-card li.state-complete .bed-arm-trace-marker {
   border-color: var(--robot);
   background: var(--robot);
 }
 
-.bed-group-trace-card li.state-rejected .bed-group-trace-marker {
+.bed-arm-trace-card li.state-rejected .bed-arm-trace-marker {
   border-color: var(--warning);
   background: var(--warning);
 }
 
-.bed-group-trace-card li.state-skipped .bed-group-trace-marker {
+.bed-arm-trace-card li.state-skipped .bed-arm-trace-marker {
   border-color: var(--muted);
   background: transparent;
 }
 
-.bed-group-trace-card li strong {
+.bed-arm-trace-card li strong {
   min-width: 0;
   color: var(--soft);
   font-size: 10px;
@@ -6930,11 +6832,11 @@ body {
   overflow-wrap: anywhere;
 }
 
-.bed-group-trace-card li small {
+.bed-arm-trace-card li small {
   display: none;
 }
 
-.bed-group-trace-card li > em {
+.bed-arm-trace-card li > em {
   color: var(--muted);
   font-size: 10px;
   font-style: normal;
@@ -6942,19 +6844,19 @@ body {
   line-height: 1.2;
 }
 
-.bed-group-trace-card li.state-active > em {
+.bed-arm-trace-card li.state-active > em {
   color: var(--clinical);
 }
 
-.bed-group-trace-card li.state-complete > em {
+.bed-arm-trace-card li.state-complete > em {
   color: var(--robot-strong);
 }
 
-.bed-group-trace-card li.state-rejected > em {
+.bed-arm-trace-card li.state-rejected > em {
   color: var(--warning);
 }
 
-.bed-group-trace-empty {
+.bed-arm-trace-empty {
   min-height: 48px;
   margin: 0;
   padding: 12px;
@@ -7021,7 +6923,7 @@ body {
     display: none;
   }
 
-  .bed-group-trace-card-header {
+  .bed-arm-trace-card-header {
     display: grid;
     grid-template-columns: minmax(0, 1fr) auto;
     gap: 8px;
@@ -7366,7 +7268,7 @@ body {
 .stage-area .stage-chrome,
 .stage-area .stage-header,
 .stage-area .phase-stepper,
-.stage-area .bed-robot-group-rail,
+.stage-area .bed-robot-arm-rail,
 .stage-area .foxglove-board {
   min-width: 0;
   width: 100%;
@@ -7637,27 +7539,26 @@ textarea {
   line-height: 13px;
 }
 
-.bed-robot-group-identity small,
-.bed-robot-group-facts dt,
-.bed-robot-group-progress > div {
+.bed-robot-arm-identity small,
+.bed-robot-arm-facts dt {
   font-size: 11px;
   font-weight: 500;
   line-height: 1.25;
 }
 
-.bed-robot-group-identity h3 {
+.bed-robot-arm-identity h3 {
   font-size: 14px;
   font-weight: 700;
   line-height: 1.2;
 }
 
-.bed-robot-group-status {
+.bed-robot-arm-status {
   font-size: 11px;
   font-weight: 500;
   line-height: 1.25;
 }
 
-.bed-robot-group-facts dd {
+.bed-robot-arm-facts dd {
   font-size: 12px;
   font-weight: 700;
   line-height: 1.25;
@@ -8482,10 +8383,6 @@ textarea {
 
 .debug-action-meta span {
   padding: 6px;
-}
-
-.debug-suction-card .debug-card-description {
-  margin-block: 0;
 }
 
 .debug-info-banner {

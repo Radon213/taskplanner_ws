@@ -2108,7 +2108,7 @@ class RealVLMNode(Node):
             "phase_start_floor limits phase only, never tool/intent. Not ground truth; use allowed_normal_phase_ids, never earlier. Interrupts need visible evidence. "
             "NEXT-TOOL FORECAST: tool is only a calibrated 2-8 second forecast of a new handover, not a label for the tool currently in use; it answers which additional instrument the assistant should prepare next and does not inventory visible instruments. Predict early: do not wait for a hand gesture or spoken request. Choose the most plausible near-term additional tool from visible task trajectory, broad procedure-role transitions, and public histories. Explicitly distinguish instruments already held or prepositioned. Unless public evidence specifically supports another instance, an already active type must stay below 0.65; forecast a plausible unused tool instead. forecast_constraints restates public DT context, not ground truth: currently_in_use lists surgeon-held tools and counts, prepositioned lists robot-held tools, and available_for_next_handover lists separate supply. It is derived from digital_twin.forecast_inventory.available: rack_available unused stock plus mayo_reuse surgeon-used tools expected later when trajectory supports imminent reuse. A tool type may appear in available and unavailable when separate instances exist, but a forecast must have available count >0. This evidence never authorizes action. Do not suppress uncertain visual evidence because of DT context; the reducer and BT, not the VLM, validate availability and decide action. digital_twin.tool_requests and completed_handovers are oldest-to-newest public histories. Independently of your phase candidate, match the longest suffix against every procedure chain; prefer the next primary item when pixels agree and alternatives only with support. Do not choose the next tool solely from your phase output. With no history, entry_handover is a weak preparation prior, not a confirmed request; keep every weak candidate below 0.65. Speech naming a tool is the current request; forecast the following handover instead. Do not memorize case timing. Procedure start/continue/finish speech is not a request. "
             "INTENT: only current public speech or an observed request signal naming a runtime instrument may produce [\"handover\",tool_id,confidence]. Match obvious ASR near-homophones and Korean/English transliterations to the listed runtime tool names, but do not turn procedure-start, continue, phase, anatomy, or completion speech into a tool request. A visual open hand without a named tool remains gesture evidence with intent [\"none\",\"\",0.0]. "
-            "BED GROUP: null unless a pending public retraction request has direction evidence; then copy request_id/profile and preserve direction/distance text. "
+            "BED RETRACTION: null unless a pending public fine-adjustment request has direction evidence. Copy request_id, adjustment_mode, target_retractor_id, and surgeon_view exactly. For single, emit one of up/down/left/right with axis none. For multi, emit direction none with axis left_right or up_down. Preserve grounded distance text. Never propose tool change or any non-retraction operation. "
             "UNCERTAINTY: calculate u independently on every frame: 0.00-0.25 clear, 0.26-0.45 for usable adjacent-phase ambiguity, 0.46-0.79 weak/conflicting, and 0.80-1.00 only when the relevant view is unusable. Do not copy the structural 0.50 value. "
             "STRICT STRUCTURE CHECK: gesture always has exactly four values. A positive is [\"request_tool\",\"\",\"open_receive\",0.85]; no request is exactly [\"\",\"\",\"\",0.0]. Never emit [\"open_receive\",\"\",0.85], [\"none\",\"\",0.0], or any three-value gesture. "
             "mayo is always an array of three-value rows: [[\"Txx\",\"reuse\",0.80]], never [\"Txx\"], [\"tool name\"], or [\"tool name (Txx)\"]. Empty Mayo is []. "
@@ -2842,14 +2842,26 @@ class RealVLMNode(Node):
         self._queue_inference(INFERENCE_TRIGGER_SPEECH)
 
     def _on_bed_robot_arm_group_request(self, msg: BedRobotArmGroupRequest) -> None:
-        """Track only VLM-routed logical retraction requests.
-
-        Suction start/stop is intentionally absent here: the BT group lane
-        routes those operations deterministically without asking the VLM.
-        """
-        self._append_public_speech(msg.voice_text)
-        if str(msg.group_id) != "retraction" or str(msg.operation) != "retraction":
+        """Track only VLM-routed fine retraction-adjustment requests."""
+        if str(msg.group_id) != "retraction" or str(msg.operation) not in {
+            "retraction",
+            "retraction_adjustment",
+        }:
             return
+        if str(msg.direction_frame) != "surgeon_view":
+            return
+        if str(msg.adjustment_mode) == "single":
+            if str(msg.target_retractor_id) not in {
+                "left_malleable",
+                "right_malleable",
+            }:
+                return
+        elif str(msg.adjustment_mode) == "multi":
+            if str(msg.target_retractor_id) != "both_malleable":
+                return
+        else:
+            return
+        self._append_public_speech(msg.voice_text)
         request_id = str(msg.request_id).strip()
         if not request_id:
             self.get_logger().warning("Ignoring retraction request without request_id")
@@ -2872,27 +2884,42 @@ class RealVLMNode(Node):
         self._last_bed_robot_arm_group_proposal_request_id = ""
 
     def _on_bed_robot_arm_group_status(self, msg: BedRobotArmGroupStatus) -> None:
+        if str(msg.group_id) != "retraction":
+            return
         pending = self._latest_bed_robot_arm_group_request
         if pending is None or str(msg.request_id) != str(pending.request_id):
             return
         if bool(msg.terminal):
             self._latest_bed_robot_arm_group_request = None
 
-    def _bed_robot_arm_group_state_rows(self) -> list[dict[str, Any]]:
+    def _retraction_group_states(self) -> list[Any]:
         if self._world is None:
             return []
+        return [
+            state
+            for state in getattr(self._world, "bed_robot_arm_groups", [])
+            if str(getattr(state, "group_id", "")) == "retraction"
+        ]
+
+    def _bed_robot_arm_group_state_rows(self) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
-        for state in getattr(self._world, "bed_robot_arm_groups", []):
+        for state in self._retraction_group_states():
             group_id = str(getattr(state, "group_id", ""))
-            if group_id not in {"suction", "retraction"}:
-                continue
             rows.append(
                 {
                     "group_id": group_id,
                     "connected": bool(getattr(state, "connected", False)),
                     "state": str(getattr(state, "state", "")),
                     "operation": str(getattr(state, "operation", "")),
+                    "arm_id": str(getattr(state, "arm_id", "")),
+                    "target_tool_id": str(getattr(state, "target_tool_id", "")),
+                    "adjustment_mode": str(getattr(state, "adjustment_mode", "")),
+                    "target_retractor_id": str(
+                        getattr(state, "target_retractor_id", "")
+                    ),
+                    "direction_frame": str(getattr(state, "direction_frame", "")),
                     "direction": str(getattr(state, "direction", "")),
+                    "axis": str(getattr(state, "axis", "")),
                     "distance_mm": round(float(getattr(state, "distance_mm", 0.0)), 3),
                     "distance_origin": str(getattr(state, "distance_origin", "")),
                     "end_effector_profile": str(
@@ -2916,6 +2943,9 @@ class RealVLMNode(Node):
             "operation": str(request.operation),
             "voice_text": str(request.voice_text),
             "procedure_id": str(request.procedure_id),
+            "adjustment_mode": str(request.adjustment_mode),
+            "target_retractor_id": str(request.target_retractor_id),
+            "direction_frame": str(request.direction_frame),
             "end_effector_profile": str(request.end_effector_profile),
             "source": str(request.source),
         }
@@ -3259,9 +3289,7 @@ class RealVLMNode(Node):
         msg.pending_transition_tools = list(self._world.pending_transition_tools)
         msg.recent_events = recent_events
         msg.bt_snapshot = bt_snapshot
-        msg.bed_robot_arm_groups = list(
-            getattr(self._world, "bed_robot_arm_groups", [])
-        )
+        msg.bed_robot_arm_groups = self._retraction_group_states()
         pending_group_request = self._latest_bed_robot_arm_group_request
         msg.has_pending_bed_robot_arm_group_request = pending_group_request is not None
         if pending_group_request is not None:
@@ -3689,9 +3717,7 @@ class RealVLMNode(Node):
             msg.phase_expected_tools = list(self._world.expected_instruments)
             msg.active_tool_ids = [str(row.get("id", "")) for row in context.get("digital_twin", {}).get("tools", []) if row.get("id")]
             msg.recent_events = self._public_event_digests()
-            msg.bed_robot_arm_groups = list(
-                getattr(self._world, "bed_robot_arm_groups", [])
-            )
+            msg.bed_robot_arm_groups = self._retraction_group_states()
         pending_group_request = self._latest_bed_robot_arm_group_request
         msg.has_pending_bed_robot_arm_group_request = pending_group_request is not None
         if pending_group_request is not None:
@@ -4713,7 +4739,19 @@ class RealVLMNode(Node):
             "request_id": str(request.request_id),
             "group_id": "retraction",
             "operation": "retraction",
-            "direction": normalized.direction,
+            "adjustment_mode": str(request.adjustment_mode),
+            "target_retractor_id": str(request.target_retractor_id),
+            "direction_frame": str(request.direction_frame),
+            "direction": (
+                "none"
+                if str(request.adjustment_mode) == "multi"
+                else normalized.direction.lower()
+            ),
+            "axis": (
+                normalized.direction.lower()
+                if str(request.adjustment_mode) == "multi"
+                else "none"
+            ),
             "distance_mm": float(normalized.distance_mm),
             "distance_origin": normalized.distance_origin,
             "raw_distance_text": normalized.raw_distance_text,
@@ -5717,6 +5755,31 @@ class RealVLMNode(Node):
         if str(proposal.get("operation", "")) != "retraction":
             return "VLM proposal operation must be retraction"
 
+        adjustment_mode = str(proposal.get("adjustment_mode", ""))
+        if adjustment_mode != str(request.adjustment_mode):
+            return "adjustment_mode does not match the pending request"
+        if str(proposal.get("target_retractor_id", "")) != str(
+            request.target_retractor_id
+        ):
+            return "target_retractor_id does not match the pending request"
+        if str(proposal.get("direction_frame", "")) != str(
+            request.direction_frame
+        ) or str(request.direction_frame) != "surgeon_view":
+            return "direction_frame must match the surgeon_view request"
+        direction = str(proposal.get("direction", "")).lower()
+        axis = str(proposal.get("axis", "")).lower()
+        if adjustment_mode == "single":
+            if direction not in {"up", "down", "left", "right"} or axis != "none":
+                return "single adjustment requires a cardinal direction and axis none"
+        elif adjustment_mode == "multi":
+            if direction != "none" or axis not in {"left_right", "up_down"}:
+                return "multi adjustment requires direction none and a documented axis"
+        else:
+            return "unsupported adjustment_mode"
+        proposal_direction = (
+            axis.upper() if adjustment_mode == "multi" else direction.upper()
+        )
+
         requested_profile = str(request.end_effector_profile).strip()
         proposed_profile = str(proposal.get("end_effector_profile", "")).strip()
         if requested_profile and proposed_profile != requested_profile:
@@ -5737,7 +5800,7 @@ class RealVLMNode(Node):
             distance_mm = float(proposal.get("distance_mm", 0.0))
             normalized = normalize_retraction_request(
                 voice_text,
-                vlm_direction=str(proposal.get("direction", "")),
+                vlm_direction=proposal_direction,
                 qualitative_distance_mm=(
                     distance_mm if distance_origin == "qualitative_inferred" else None
                 ),
@@ -5745,7 +5808,7 @@ class RealVLMNode(Node):
         except (BedRobotArmGroupNormalizationError, TypeError, ValueError) as exc:
             return f"deterministic request normalization failed: {exc}"
 
-        if normalized.direction != str(proposal.get("direction", "")):
+        if normalized.direction != proposal_direction:
             return (
                 "direction contradicts the source request: "
                 f"expected {normalized.direction}"
@@ -5800,6 +5863,9 @@ class RealVLMNode(Node):
         command.command_id = f"vlm-{request_id}"
         command.group_id = "retraction"
         command.operation = "retraction"
+        command.adjustment_mode = str(request.adjustment_mode)
+        command.target_retractor_id = str(request.target_retractor_id)
+        command.direction_frame = str(request.direction_frame)
         command.end_effector_profile = str(request.end_effector_profile)
 
         if not isinstance(group_payload, dict):
@@ -5813,6 +5879,16 @@ class RealVLMNode(Node):
             command.group_id = str(group_payload.get("group_id", ""))
             command.operation = str(group_payload.get("operation", ""))
             command.direction = str(group_payload.get("direction", ""))
+            command.axis = str(group_payload.get("axis", ""))
+            command.adjustment_mode = str(
+                group_payload.get("adjustment_mode", "")
+            )
+            command.target_retractor_id = str(
+                group_payload.get("target_retractor_id", "")
+            )
+            command.direction_frame = str(
+                group_payload.get("direction_frame", "")
+            )
             command.distance_mm = float(group_payload.get("distance_mm", 0.0))
             command.distance_origin = str(group_payload.get("distance_origin", ""))
             command.raw_distance_text = str(group_payload.get("raw_distance_text", ""))

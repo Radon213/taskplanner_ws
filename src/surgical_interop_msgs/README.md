@@ -15,6 +15,7 @@ internal planner rationale, prompts, and diagnostic text.
 | `/surgery/events` | `SurgeryEvent` | Ordered public state changes; `sequence` establishes the event order. |
 | `/surgery/clinical_observations` | `ClinicalObservationArray` | Model observations, their confidence, and authority; not automatically confirmed clinical facts. |
 | `/surgery/health` | `SurgeryHealth` | Public freshness and availability summary for the integration. |
+| `/external/bed_robot_arms/status` | `BedRobotArmStateArray` | Controller-owned state of the bed-mounted retraction arms. |
 
 State snapshots carry a monotonically increasing `revision`. Events and clinical
 observations carry a `sequence`. All public state and observation messages carry
@@ -29,13 +30,37 @@ The recommended public endpoints are:
 | Endpoint | Type | Meaning |
 | --- | --- | --- |
 | `/surgery/tool_handover` | `ExecuteToolHandover` action | Use one Action for preparation, handover, unused-tool return, and Mayo retrieval. |
-| `/surgery/retraction` | `ExecuteRetraction` action | Perform one retraction operation. `operation` is `MOVE`, `RELEASE`, or `CHANGE_END_EFFECTOR`; only the fields applicable to that operation are populated. |
-| `/surgery/suction/set` | `SetSuction` service | Set suction on or off when long-running feedback or cancellation is not needed. |
+| `/surgery/tool_change/request` | `RequestToolChange` service | Request a tool change on one bed-mounted robot arm and wait for the controller response. |
+| `/surgery/retraction/adjust` | `ExecuteRetractionAdjustment` action | Adjust one or both configured retractors and support ROS 2 Action cancellation. |
 
 Every request has a caller-provided `command_id` for correlation and idempotency.
-Action results and service responses expose only `success`, final `state`, and a
-stable machine-readable `reason_code`. Action feedback is limited to current
-`state` and `progress`.
+Results and service responses expose `success`, their documented terminal state,
+and a stable machine-readable `reason_code`.
+
+`RequestToolChange.arm_id` accepts `arm_1` and `arm_2`.
+`target_tool_id` accepts `thyroid_retractor` and `army_navy_retractor`. Its
+`result` is `completed`, `failed`, `canceled`, `protective_stop`, or `unknown`.
+A `completed` response confirms completion of the controller's motion sequence;
+it does not independently verify physical tool attachment.
+
+`ExecuteRetractionAdjustment.adjustment_mode` is `single` or `multi`.
+`target_retractor_id` is `left_malleable`, `right_malleable`, or
+`both_malleable`; `direction_frame` is `surgeon_view`; `direction` is `up`,
+`down`, `left`, `right`, or `none`; and `axis` is `left_right`, `up_down`, or
+`none`. The controller owns Goal acceptance, motion planning, protective stop,
+and E-stop handling. Feedback `state` is `adjusting` or `recovering`.
+`ExecuteRetractionAdjustment` feedback contains no progress estimate.
+Its Result payload must agree with the ROS 2 Action terminal status: completed
+uses SUCCEEDED, canceled uses CANCELED, and fault/protective_stop/unknown use
+ABORTED. A missing or contradictory terminal result is not treated as success.
+
+`BedRobotArmState.role` is `retraction`. Its `role_instance_id` is
+`left_malleable`, `right_malleable`, or `army_navy`, and `state` is `standby`,
+`direct_teach`, `retracting`, `changing_tool`, `moving_to_standby`, `fault`,
+`protective_stop`, or `unknown`. The status intentionally contains no medical
+device control values.
+`BedRobotArmStateArray.stamp` is fresh wall-clock ROS time, independent of replay
+`/clock`; both source age and reception age are checked before dispatch.
 
 `ExecuteToolHandover` accepts only `tray`, `mayo`, `robot`, and `surgeon` as
 location values. The only valid transitions are `tray -> robot` (pick up the

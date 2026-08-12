@@ -3,21 +3,20 @@ from dataclasses import asdict
 import pytest
 
 from surgical_interop_execution.mappings import (
+    ADJUSTMENT_MULTI,
+    ADJUSTMENT_SINGLE,
     MAX_RETRACTION_DISTANCE_MM,
     DispatchLedger,
     GROUP_RETRACTION,
-    GROUP_SUCTION,
     OPERATION_CHANGE_END_EFFECTOR,
     OPERATION_RELEASE_RETRACTION,
     OPERATION_RETRACTION,
-    OPERATION_SUCTION_START,
-    OPERATION_SUCTION_STOP,
     PUBLIC_TOOL_LOCATIONS,
     InternalGroupCommand,
     InternalSkillCommand,
     MappingFailure,
-    RetractionRequest,
-    SuctionRequest,
+    RetractionAdjustmentRequest,
+    ToolChangeRequest,
     map_group_command,
     map_skill_to_tool_handover,
     public_instrument_instance_id,
@@ -203,7 +202,13 @@ def _group(operation: str, **overrides) -> InternalGroupCommand:
         "command_id": "group-1",
         "group_id": GROUP_RETRACTION,
         "operation": operation,
-        "direction": "LEFT",
+        "arm_id": "",
+        "target_tool_id": "",
+        "adjustment_mode": "single",
+        "target_retractor_id": "left_malleable",
+        "direction_frame": "surgeon_view",
+        "direction": "left",
+        "axis": "none",
         "distance_mm": 8.0,
         "end_effector_profile": "",
         "distance_origin": "private_origin",
@@ -216,84 +221,141 @@ def _group(operation: str, **overrides) -> InternalGroupCommand:
 
 
 def test_retraction_move_preserves_only_physical_motion_fields():
-    request = map_group_command(_group(OPERATION_RETRACTION))
-    assert request == RetractionRequest(
+    request = map_group_command(
+        _group(OPERATION_RETRACTION)
+    )
+    assert request == RetractionAdjustmentRequest(
         command_id="group-1",
-        operation="MOVE",
-        direction="LEFT",
+        adjustment_mode=ADJUSTMENT_SINGLE,
+        target_retractor_id="left_malleable",
+        direction_frame="surgeon_view",
+        direction="left",
+        axis="none",
         distance_mm=8.0,
-        end_effector_profile="",
     )
     assert asdict(request) == {
         "command_id": "group-1",
-        "operation": "MOVE",
-        "direction": "LEFT",
+        "adjustment_mode": "single",
+        "target_retractor_id": "left_malleable",
+        "direction_frame": "surgeon_view",
+        "direction": "left",
+        "axis": "none",
         "distance_mm": 8.0,
-        "end_effector_profile": "",
     }
 
 
-def test_release_and_end_effector_change_have_explicit_operations():
-    release = map_group_command(_group(OPERATION_RELEASE_RETRACTION))
-    assert release == RetractionRequest("group-1", "RELEASE", "", 0.0, "")
-    change = map_group_command(
+def test_multi_adjustment_maps_axis_without_guessing_direction():
+    request = map_group_command(
+        _group(
+            OPERATION_RETRACTION,
+            adjustment_mode="multi",
+            target_retractor_id="both_malleable",
+            direction="none",
+            axis="up_down",
+        )
+    )
+    assert request == RetractionAdjustmentRequest(
+        command_id="group-1",
+        adjustment_mode=ADJUSTMENT_MULTI,
+        target_retractor_id="both_malleable",
+        direction_frame="surgeon_view",
+        direction="none",
+        axis="up_down",
+        distance_mm=8.0,
+    )
+
+
+def test_end_effector_change_maps_to_document_tool_change_service():
+    request = map_group_command(
         _group(
             OPERATION_CHANGE_END_EFFECTOR,
-            direction="",
-            distance_mm=0.0,
-            end_effector_profile="wide_retractor",
-        )
-    )
-    assert change == RetractionRequest(
-        "group-1", "CHANGE_END_EFFECTOR", "", 0.0, "wide_retractor"
-    )
-
-
-def test_suction_start_and_stop_map_to_boolean_service_requests():
-    start = map_group_command(
-        _group(
-            OPERATION_SUCTION_START,
-            group_id=GROUP_SUCTION,
+            arm_id="arm_2",
+            target_tool_id="army_navy_retractor",
             direction="",
             distance_mm=0.0,
         )
     )
-    stop = map_group_command(
-        _group(
-            OPERATION_SUCTION_STOP,
-            group_id=GROUP_SUCTION,
-            direction="",
-            distance_mm=0.0,
-        )
+    assert request == ToolChangeRequest(
+        command_id="group-1",
+        arm_id="arm_2",
+        target_tool_id="army_navy_retractor",
     )
-    assert start == SuctionRequest("group-1", True)
-    assert stop == SuctionRequest("group-1", False)
 
 
-def test_retraction_requires_a_positive_finite_distance():
-    with pytest.raises(MappingFailure, match="invalid_retraction_command"):
-        map_group_command(_group(OPERATION_RETRACTION, distance_mm=0.0))
-
-
-def test_retraction_distance_is_bounded_by_the_public_safety_limit():
-    assert MAX_RETRACTION_DISTANCE_MM == 30.0
-    assert map_group_command(
-        _group(OPERATION_RETRACTION, distance_mm=MAX_RETRACTION_DISTANCE_MM)
-    ).distance_mm == 30.0
-    with pytest.raises(MappingFailure, match="invalid_retraction_command"):
+def test_suction_group_is_explicitly_rejected_at_public_boundary():
+    with pytest.raises(MappingFailure, match="suction_arm_removed"):
         map_group_command(
-            _group(OPERATION_RETRACTION, distance_mm=MAX_RETRACTION_DISTANCE_MM + 0.1)
+            _group(
+                OPERATION_RETRACTION,
+                group_id="suction",
+            )
         )
 
 
-def test_end_effector_change_requires_a_profile():
-    with pytest.raises(MappingFailure, match="missing_end_effector_profile"):
+def test_release_is_not_in_the_new_public_contract():
+    with pytest.raises(MappingFailure, match="unsupported_retraction_operation"):
+        map_group_command(
+            _group(
+                OPERATION_RELEASE_RETRACTION,
+                direction="",
+                distance_mm=0.0,
+            )
+        )
+
+
+def test_single_adjustment_requires_an_explicit_document_target():
+    with pytest.raises(MappingFailure, match="invalid_target_retractor"):
+        map_group_command(_group(OPERATION_RETRACTION, target_retractor_id=""))
+
+
+def test_tool_change_rejects_unknown_tool_and_arm_values():
+    with pytest.raises(MappingFailure, match="invalid_target_tool"):
         map_group_command(
             _group(
                 OPERATION_CHANGE_END_EFFECTOR,
+                arm_id="arm_1",
+                target_tool_id="wide_retractor",
                 direction="",
                 distance_mm=0.0,
-                end_effector_profile="",
+            )
+        )
+    with pytest.raises(MappingFailure, match="invalid_arm_id"):
+        map_group_command(
+            _group(
+                OPERATION_CHANGE_END_EFFECTOR,
+                arm_id="left_arm",
+                target_tool_id="thyroid_retractor",
+                direction="",
+                distance_mm=0.0,
+            )
+        )
+
+
+def test_retraction_requires_a_positive_finite_distance():
+    with pytest.raises(MappingFailure, match="invalid_retraction_distance"):
+        map_group_command(
+            _group(
+                OPERATION_RETRACTION,
+                distance_mm=0.0,
+            )
+        )
+
+
+def test_retraction_distance_is_bounded_by_configured_public_limit():
+    assert MAX_RETRACTION_DISTANCE_MM == 30.0
+    assert map_group_command(
+        _group(
+            OPERATION_RETRACTION,
+            distance_mm=MAX_RETRACTION_DISTANCE_MM,
+            target_retractor_id="right_malleable",
+        )
+    ).distance_mm == 30.0
+    with pytest.raises(MappingFailure, match="invalid_retraction_distance"):
+        map_group_command(
+            _group(
+                OPERATION_RETRACTION,
+                distance_mm=MAX_RETRACTION_DISTANCE_MM + 0.1,
+                target_retractor_id="right_malleable",
             )
         )
 

@@ -659,7 +659,11 @@ function ManualPanel({
   const [instance, setInstance] = useState("Kelly forceps#1");
   const [transition, setTransition] = useState("tray:surgeon");
   const [distance, setDistance] = useState(5);
-  const [profile, setProfile] = useState("wide_retractor");
+  const [adjustmentMode, setAdjustmentMode] = useState<"single" | "multi">("single");
+  const [targetRetractorId, setTargetRetractorId] = useState("left_malleable");
+  const [axis, setAxis] = useState<"left_right" | "up_down">("left_right");
+  const [toolChangeArmId, setToolChangeArmId] = useState("arm_1");
+  const [targetToolId, setTargetToolId] = useState("thyroid_retractor");
   const [pending, setPending] = useState("");
   const busy = !status.action.terminal;
   const armed = status.session.armed;
@@ -685,14 +689,40 @@ function ManualPanel({
     });
   }
 
-  async function move(direction: string) {
-    await invoke("retraction", { operation: "MOVE", direction, distance_mm: distance });
+  async function move(direction: "up" | "down" | "left" | "right") {
+    await invoke("retraction_adjustment", {
+      adjustment_mode: "single",
+      target_retractor_id: targetRetractorId,
+      direction_frame: "surgeon_view",
+      direction,
+      axis: "none",
+      distance_mm: distance,
+    });
+  }
+
+  async function moveBoth() {
+    await invoke("retraction_adjustment", {
+      adjustment_mode: "multi",
+      target_retractor_id: "both_malleable",
+      direction_frame: "surgeon_view",
+      direction: "none",
+      axis,
+      distance_mm: distance,
+    });
+  }
+
+  async function requestToolChange(event: FormEvent) {
+    event.preventDefault();
+    await invoke("tool_change", {
+      arm_id: toolChangeArmId,
+      target_tool_id: targetToolId,
+    });
   }
 
   const motionDisabled = !connected || !armed || busy || Boolean(pending);
   const moveDisabled =
     motionDisabled ||
-    !endpointReady("retraction") ||
+    !endpointReady("retraction_adjustment") ||
     !Number.isFinite(distance) ||
     distance <= 0 ||
     distance > 30;
@@ -732,40 +762,46 @@ function ManualPanel({
         </form>
 
         <article className="debug-section-card debug-control-card">
-          <div className="debug-section-heading"><div><p>STEP JOG</p><h2>리트랙터 조그</h2></div><StatusBadge state={endpointReady("retraction") ? "READY" : "WAITING"} label={endpointReady("retraction") ? "서버 발견" : "서버 대기"} /></div>
-          <label className="debug-field"><span>이동 스텝</span><input aria-invalid={!Number.isFinite(distance) || distance <= 0 || distance > 30} min="0.1" max="30" step="0.5" type="number" value={distance} onChange={(event) => setDistance(Number(event.target.value))} /><small>한 번 누를 때 하나의 MOVE Goal · 최대 30 mm</small></label>
-          <div className="debug-jog-pad" aria-label="리트랙터 방향 조그">
-            <button aria-label="위로 이동" disabled={moveDisabled} onClick={() => void move("UP")} type="button"><ArrowUp aria-hidden="true" /></button>
-            <button aria-label="왼쪽으로 이동" disabled={moveDisabled} onClick={() => void move("LEFT")} type="button"><ArrowLeft aria-hidden="true" /></button>
-            <span>{distance || 0}<small>mm</small></span>
-            <button aria-label="오른쪽으로 이동" disabled={moveDisabled} onClick={() => void move("RIGHT")} type="button"><ArrowRight aria-hidden="true" /></button>
-            <button aria-label="아래로 이동" disabled={moveDisabled} onClick={() => void move("DOWN")} type="button"><ArrowDown aria-hidden="true" /></button>
+          <div className="debug-section-heading"><div><p>ACTION</p><h2>리트랙션 조정</h2></div><StatusBadge state={endpointReady("retraction_adjustment") ? "READY" : "WAITING"} label={endpointReady("retraction_adjustment") ? "서버 발견" : "서버 대기"} /></div>
+          <div className="debug-segmented-control" aria-label="리트랙션 조정 모드">
+            <button aria-pressed={adjustmentMode === "single"} className={adjustmentMode === "single" ? "active" : ""} onClick={() => setAdjustmentMode("single")} type="button">단일 리트랙터<small>single</small></button>
+            <button aria-pressed={adjustmentMode === "multi"} className={adjustmentMode === "multi" ? "active" : ""} onClick={() => setAdjustmentMode("multi")} type="button">양측 동시<small>multi</small></button>
           </div>
-          <div className="debug-inline-actions">
-            <button className="button button-secondary" disabled={motionDisabled || !endpointReady("retraction")} onClick={() => void invoke("retraction", { operation: "RELEASE" })} type="button">견인 해제</button>
-            <button className="button button-quiet" disabled={motionDisabled || !endpointReady("retraction") || !profile.trim()} onClick={() => void invoke("retraction", { operation: "CHANGE_END_EFFECTOR", end_effector_profile: profile })} type="button">엔드이펙터 변경</button>
-          </div>
-          <label className="debug-field"><span>엔드이펙터 프로파일</span><input value={profile} onChange={(event) => setProfile(event.target.value)} /></label>
-          {!endpointReady("retraction") ? <p className="debug-inline-warning">Action 서버가 발견될 때까지 조그 명령을 전송하지 않습니다.</p> : null}
+          {adjustmentMode === "single" ? (
+            <label className="debug-field"><span>대상 리트랙터</span><select value={targetRetractorId} onChange={(event) => setTargetRetractorId(event.target.value)}><option value="left_malleable">left_malleable</option><option value="right_malleable">right_malleable</option></select></label>
+          ) : (
+            <label className="debug-field"><span>동시 조정 축</span><select value={axis} onChange={(event) => setAxis(event.target.value as "left_right" | "up_down")}><option value="left_right">left_right</option><option value="up_down">up_down</option></select></label>
+          )}
+          <label className="debug-field"><span>이동 스텝</span><input aria-invalid={!Number.isFinite(distance) || distance <= 0 || distance > 30} min="0.1" max="30" step="0.5" type="number" value={distance} onChange={(event) => setDistance(Number(event.target.value))} /><small>집도의 시점 기준 · 최대 30 mm</small></label>
+          {adjustmentMode === "single" ? (
+            <div className="debug-jog-pad" aria-label="리트랙터 방향 조그">
+              <button aria-label="위로 이동" disabled={moveDisabled} onClick={() => void move("up")} type="button"><ArrowUp aria-hidden="true" /></button>
+              <button aria-label="왼쪽으로 이동" disabled={moveDisabled} onClick={() => void move("left")} type="button"><ArrowLeft aria-hidden="true" /></button>
+              <span>{distance || 0}<small>mm</small></span>
+              <button aria-label="오른쪽으로 이동" disabled={moveDisabled} onClick={() => void move("right")} type="button"><ArrowRight aria-hidden="true" /></button>
+              <button aria-label="아래로 이동" disabled={moveDisabled} onClick={() => void move("down")} type="button"><ArrowDown aria-hidden="true" /></button>
+            </div>
+          ) : (
+            <button className="button button-primary full" disabled={moveDisabled} onClick={() => void moveBoth()} type="button"><ArrowLeft size={16} aria-hidden="true" />양측 리트랙터 동시 조정<ArrowRight size={16} aria-hidden="true" /></button>
+          )}
+          {!endpointReady("retraction_adjustment") ? <p className="debug-inline-warning">Action 서버가 발견될 때까지 조정 명령을 전송하지 않습니다.</p> : null}
         </article>
 
         <div className="debug-manual-side">
-          <article className="debug-section-card debug-control-card debug-suction-card">
-            <div className="debug-section-heading"><div><p>SERVICE</p><h2>석션 제어</h2></div><StatusBadge state={endpointReady("suction") ? "READY" : "WAITING"} label={endpointReady("suction") ? "서비스 발견" : "서비스 대기"} /></div>
-            <p className="debug-card-description">ON/OFF 응답을 추정 없이 그대로 확인합니다.</p>
-            <div className="debug-suction-actions">
-              <button className="button button-primary" disabled={motionDisabled || !endpointReady("suction")} onClick={() => void invoke("suction", { enabled: true })} type="button">석션 ON</button>
-              <button className="button button-secondary" disabled={motionDisabled || !endpointReady("suction")} onClick={() => void invoke("suction", { enabled: false })} type="button">석션 OFF</button>
-            </div>
-            {!endpointReady("suction") ? <p className="debug-inline-warning">Service 서버를 기다리고 있습니다.</p> : null}
-          </article>
+          <form className="debug-section-card debug-control-card" onSubmit={(event) => void requestToolChange(event)}>
+            <div className="debug-section-heading"><div><p>SERVICE</p><h2>리트랙션 도구 교환</h2></div><StatusBadge state={endpointReady("tool_change") ? "READY" : "WAITING"} label={endpointReady("tool_change") ? "서비스 발견" : "서비스 대기"} /></div>
+            <label className="debug-field"><span>로봇암</span><select value={toolChangeArmId} onChange={(event) => setToolChangeArmId(event.target.value)}><option value="arm_1">arm_1</option><option value="arm_2">arm_2</option></select></label>
+            <label className="debug-field"><span>대상 도구</span><select value={targetToolId} onChange={(event) => setTargetToolId(event.target.value)}><option value="thyroid_retractor">thyroid_retractor</option><option value="army_navy_retractor">army_navy_retractor</option></select></label>
+            <button className="button button-primary full" disabled={motionDisabled || !endpointReady("tool_change")} type="submit"><RefreshCw size={16} aria-hidden="true" />도구 교환 요청</button>
+            {!endpointReady("tool_change") ? <p className="debug-inline-warning">Service 서버를 기다리고 있습니다.</p> : null}
+          </form>
 
           <article className="debug-section-card debug-action-card" aria-live="polite">
             <div className="debug-section-heading"><div><p>ACTION FEEDBACK</p><h2>실행 상태</h2></div><Activity size={19} aria-hidden="true" /></div>
             <div className="debug-action-summary"><StatusBadge state={status.action.state} /><strong>{status.action.route || "대기"}</strong><code>{status.action.command_id || "활성 명령 없음"}</code></div>
             <div className="debug-progress-track" role="progressbar" aria-label="Action 진행률" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(status.action.progress * 100)} aria-valuetext={`${Math.round(status.action.progress * 100)}%, ${status.action.state}`}><span style={{ width: `${Math.round(status.action.progress * 100)}%` }} /></div>
             <div className="debug-action-meta"><span>{Math.round(status.action.progress * 100)}%</span><span>{(status.action.elapsed_sec ?? 0).toFixed(1)} s</span><span>{status.action.reason_code || "feedback 대기"}</span></div>
-            {busy && status.action.route !== "suction" ? <button className="button button-secondary full" disabled={!connected || Boolean(pending)} onClick={() => void invoke("cancel_active")} type="button"><Square size={15} aria-hidden="true" />현재 Action 취소</button> : null}
+            {busy ? <button className="button button-secondary full" disabled={!connected || Boolean(pending)} onClick={() => void invoke("cancel_active")} type="button"><Square size={15} aria-hidden="true" />현재 Action 취소</button> : null}
           </article>
         </div>
       </div>

@@ -7,7 +7,6 @@ import json
 import time
 from typing import Any
 
-from procedure_spec import get_default_spec_dir, load_bundle
 import rclpy
 from rclpy.clock import Clock, ClockType
 from rclpy.node import Node
@@ -19,8 +18,6 @@ from rclpy.qos import (
 )
 from std_msgs.msg import String
 from surgical_msgs.msg import (
-    BedRobotArmGroupCommand,
-    BedRobotArmGroupStatus,
     ShadowReplayState,
     SkillCommand,
     SkillStatus,
@@ -293,16 +290,6 @@ class SemanticCommandLedger:
             return False
         self._reported_deadlocks[key] = observed_at
         return True
-
-
-def shadow_group_terminal_state(operation: str) -> str:
-    return {
-        "suction_start": "suctioning",
-        "suction_stop": "standby",
-        "retraction": "holding",
-        "release_retraction": "standby",
-        "change_end_effector": "standby",
-    }.get(str(operation or "").strip(), "standby")
 
 
 def _instance_id(payload: dict[str, Any]) -> str:
@@ -1248,9 +1235,7 @@ class ShadowSkillSinkNode(Node):
         self.declare_parameter("handover_duration_sec", 2.6)
         self.declare_parameter("recovery_duration_sec", 6.0)
         self.declare_parameter("return_duration_sec", 1.8)
-        self.declare_parameter("group_action_duration_sec", 2.0)
         self.declare_parameter("feedback_confirmation_timeout_sec", 1.5)
-        self.declare_parameter("spec_dir", str(get_default_spec_dir()))
         self._retention_sec = max(
             1.0,
             float(self.get_parameter("dedupe_retention_sec").value),
@@ -1288,10 +1273,6 @@ class ShadowSkillSinkNode(Node):
                 float(self.get_parameter("return_duration_sec").value),
             ),
         }
-        self._group_action_duration_sec = max(
-            0.2,
-            float(self.get_parameter("group_action_duration_sec").value),
-        )
         self._feedback_confirmation_timeout_sec = max(
             0.2,
             float(
@@ -1305,23 +1286,8 @@ class ShadowSkillSinkNode(Node):
         self._replay_state = ""
         self._replay_paused_at: float | None = None
         self._seen_command_ids: dict[str, float] = {}
-        self._seen_group_command_ids: dict[str, float] = {}
         self._semantic_ledger = SemanticCommandLedger()
         self._pending_actions: dict[str, PendingShadowAction] = {}
-        self._pending_group_actions: dict[
-            str,
-            tuple[BedRobotArmGroupCommand, float],
-        ] = {}
-        spec = load_bundle(str(self.get_parameter("spec_dir").value))
-        group_spec = spec.get_bed_robot_arm_group_spec()
-        self._group_profiles = {
-            group.id: group.initial_end_effector_profile
-            for group in (group_spec.groups if group_spec is not None else [])
-            if group.enabled
-        }
-        self._group_states = {
-            group_id: "standby" for group_id in self._group_profiles
-        }
         self._publisher = self.create_publisher(
             String,
             "/shadow/skill_outcome",
@@ -1337,16 +1303,6 @@ class ShadowSkillSinkNode(Node):
             "/skill/events",
             50,
         )
-        self._group_outcome_publisher = self.create_publisher(
-            String,
-            "/shadow/bed_robot_arm_group_outcome",
-            50,
-        )
-        self._group_status_publisher = self.create_publisher(
-            BedRobotArmGroupStatus,
-            "/bed_robot_arm_group/status",
-            50,
-        )
         self.create_subscription(
             WorldState,
             "/twin/world_state",
@@ -1357,12 +1313,6 @@ class ShadowSkillSinkNode(Node):
             SkillCommand,
             "/bt/skill_command",
             self._on_command,
-            50,
-        )
-        self.create_subscription(
-            BedRobotArmGroupCommand,
-            "/bt/bed_robot_arm_group_command",
-            self._on_group_command,
             50,
         )
         replay_state_qos = QoSProfile(
@@ -1378,11 +1328,6 @@ class ShadowSkillSinkNode(Node):
             replay_state_qos,
         )
         steady_clock = Clock(clock_type=ClockType.STEADY_TIME)
-        self.create_timer(
-            1.0,
-            self._publish_group_health,
-            clock=steady_clock,
-        )
         self.create_timer(
             0.1,
             self._advance_pending_actions,
@@ -1413,12 +1358,8 @@ class ShadowSkillSinkNode(Node):
         self._replay_paused_at = None
         self._world = None
         self._seen_command_ids.clear()
-        self._seen_group_command_ids.clear()
         self._semantic_ledger.reset()
         self._pending_actions.clear()
-        self._pending_group_actions.clear()
-        for group_id in self._group_states:
-            self._group_states[group_id] = "standby"
 
     def _on_replay_state(self, msg: ShadowReplayState) -> None:
         run_id = str(msg.run_id or "")
@@ -1442,12 +1383,6 @@ class ShadowSkillSinkNode(Node):
                 paused_duration_sec = max(0.0, now - paused_at)
                 for action in self._pending_actions.values():
                     action.shift_clock(paused_duration_sec)
-                self._pending_group_actions = {
-                    command_id: (command, started_at + paused_duration_sec)
-                    for command_id, (command, started_at) in (
-                        self._pending_group_actions.items()
-                    )
-                }
             self._replay_paused_at = None
         self._replay_state = state
 
@@ -1556,137 +1491,6 @@ class ShadowSkillSinkNode(Node):
                     f"shadow command not executed: {terminal_reason}"
                 ),
             )
-
-    def _publish_group_health(self) -> None:
-        for group_id, profile in self._group_profiles.items():
-            status = BedRobotArmGroupStatus()
-            status.stamp = self.get_clock().now().to_msg()
-            status.request_id = f"health-shadow-{group_id}"
-            status.group_id = group_id
-            status.state = self._group_states.get(group_id, "standby")
-            status.outcome = "available"
-            status.terminal = True
-            status.success = True
-            status.message = "shadow counterfactual group controller available"
-            status.end_effector_profile = profile
-            status.confidence = 1.0
-            status.progress = 1.0
-            self._group_status_publisher.publish(status)
-
-    def _on_group_command(self, msg: BedRobotArmGroupCommand) -> None:
-        payload = message_payload(msg)
-        now = time.monotonic()
-        cutoff = now - self._retention_sec
-        self._seen_group_command_ids = {
-            key: observed_at
-            for key, observed_at in self._seen_group_command_ids.items()
-            if observed_at >= cutoff
-        }
-        command_id = str(payload.get("command_id", "") or "").strip()
-        duplicate = bool(
-            command_id and command_id in self._seen_group_command_ids
-        )
-        if command_id:
-            self._seen_group_command_ids[command_id] = now
-        enabled = str(payload.get("group_id", "")) in self._group_profiles
-        status_name = (
-            "duplicate_suppressed"
-            if duplicate
-            else ("admissible" if enabled else "blocked")
-        )
-        reason = (
-            "duplicate_command_id"
-            if duplicate
-            else (
-                "shadow_only_no_execution"
-                if enabled
-                else "group_not_enabled_in_procedure"
-            )
-        )
-        outcome = {
-            "request_id": str(payload.get("request_id", "")),
-            "command_id": command_id,
-            "group_id": str(payload.get("group_id", "")),
-            "operation": str(payload.get("operation", "")),
-            "status": status_name,
-            "reason": reason,
-            "execution_attempted": False,
-            "counterfactual_feedback_published": bool(
-                enabled
-                and not duplicate
-                and self._counterfactual_success_feedback
-            ),
-            "ground_truth_used": False,
-        }
-        result = String()
-        result.data = json.dumps(outcome, separators=(",", ":"), sort_keys=True)
-        self._group_outcome_publisher.publish(result)
-        if (
-            enabled
-            and not duplicate
-            and self._counterfactual_success_feedback
-        ):
-            self._schedule_group_completion(msg)
-
-    def _schedule_group_completion(
-        self,
-        command: BedRobotArmGroupCommand,
-    ) -> None:
-        command_id = str(command.command_id or command.request_id or "").strip()
-        if not command_id:
-            command_id = f"shadow-group-{time.monotonic_ns()}"
-        self._pending_group_actions[command_id] = (
-            command,
-            time.monotonic(),
-        )
-        self._publish_group_progress(
-            command,
-            progress=0.0,
-            terminal=False,
-        )
-
-    def _publish_group_progress(
-        self,
-        command: BedRobotArmGroupCommand,
-        *,
-        progress: float,
-        terminal: bool,
-    ) -> None:
-        state = shadow_group_terminal_state(command.operation)
-        if terminal:
-            self._group_states[command.group_id] = state
-        if terminal and command.end_effector_profile:
-            self._group_profiles[command.group_id] = (
-                command.end_effector_profile
-            )
-        status = BedRobotArmGroupStatus()
-        status.stamp = self.get_clock().now().to_msg()
-        status.request_id = command.request_id
-        status.command_id = command.command_id
-        status.group_id = command.group_id
-        status.operation = command.operation
-        status.state = state if terminal else "executing"
-        status.outcome = "succeeded" if terminal else "running"
-        status.terminal = terminal
-        status.success = terminal
-        status.message = (
-            "counterfactual shadow completion; no physical execution attempted"
-        )
-        status.direction = command.direction
-        status.distance_mm = float(command.distance_mm)
-        status.distance_origin = command.distance_origin
-        status.raw_distance_text = command.raw_distance_text
-        status.end_effector_profile = self._group_profiles.get(
-            command.group_id,
-            command.end_effector_profile,
-        )
-        status.confidence = float(command.confidence)
-        status.progress = float(progress)
-        status.elapsed_sec = float(progress * self._group_action_duration_sec)
-        status.remaining_sec = float(
-            max(0.0, (1.0 - progress) * self._group_action_duration_sec)
-        )
-        self._group_status_publisher.publish(status)
 
     def _schedule_counterfactual_feedback(
         self,
@@ -2004,25 +1808,6 @@ class ShadowSkillSinkNode(Node):
                     state="running",
                     success=False,
                 )
-
-        for command_id, (command, started_at) in list(
-            self._pending_group_actions.items()
-        ):
-            progress = min(
-                1.0,
-                max(
-                    0.0,
-                    (now - started_at) / self._group_action_duration_sec,
-                ),
-            )
-            self._publish_group_progress(
-                command,
-                progress=progress,
-                terminal=progress >= 1.0,
-            )
-            if progress >= 1.0:
-                self._pending_group_actions.pop(command_id, None)
-
 
 def main() -> None:
     rclpy.init()

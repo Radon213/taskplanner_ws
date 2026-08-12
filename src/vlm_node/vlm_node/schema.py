@@ -8,7 +8,6 @@ from typing import Any
 
 from procedure_spec import (
     DISTANCE_ORIGINS,
-    RETRACTION_DIRECTIONS,
     BedRobotArmGroupNormalizationError,
     validate_retraction_distance_proposal,
 )
@@ -301,7 +300,11 @@ def _validate_v4_bed_robot_arm_group(value: Any) -> dict[str, Any] | None:
         "request_id",
         "group_id",
         "operation",
+        "adjustment_mode",
+        "target_retractor_id",
+        "direction_frame",
         "direction",
+        "axis",
         "distance_mm",
         "distance_origin",
         "raw_distance_text",
@@ -323,7 +326,11 @@ def _validate_v4_bed_robot_arm_group(value: Any) -> dict[str, Any] | None:
     request_id = str(value["request_id"]).strip()
     group_id = str(value["group_id"]).strip()
     operation = str(value["operation"]).strip()
-    direction = str(value["direction"]).strip().upper()
+    adjustment_mode = str(value["adjustment_mode"]).strip().lower()
+    target_retractor_id = str(value["target_retractor_id"]).strip().lower()
+    direction_frame = str(value["direction_frame"]).strip().lower()
+    direction = str(value["direction"]).strip().lower()
+    axis = str(value["axis"]).strip().lower()
     distance_origin = str(value["distance_origin"]).strip()
     raw_distance_text = str(value["raw_distance_text"]).strip()
     confidence = float(value["confidence"])
@@ -331,16 +338,37 @@ def _validate_v4_bed_robot_arm_group(value: Any) -> dict[str, Any] | None:
 
     if not request_id:
         raise SchemaValidationError("bed_robot_arm_group request_id must be non-empty")
-    # Suction is routed deterministically and does not come from VLM.  Schema
-    # v4 therefore carries only a retraction proposal, still at group level.
+    # Schema v4 carries only fine retraction-adjustment evidence. Tool change
+    # remains a separate deterministic request path.
     if group_id != "retraction":
         raise SchemaValidationError("bed_robot_arm_group group_id must be retraction")
     if operation != "retraction":
         raise SchemaValidationError("bed_robot_arm_group operation must be retraction")
-    if direction not in RETRACTION_DIRECTIONS:
+    if adjustment_mode == "single":
+        if target_retractor_id not in {"left_malleable", "right_malleable"}:
+            raise SchemaValidationError(
+                "single adjustment requires left_malleable or right_malleable"
+            )
+        if direction not in {"up", "down", "left", "right"} or axis != "none":
+            raise SchemaValidationError(
+                "single adjustment requires a cardinal direction and axis none"
+            )
+    elif adjustment_mode == "multi":
+        if target_retractor_id != "both_malleable":
+            raise SchemaValidationError(
+                "multi adjustment requires both_malleable"
+            )
+        if direction != "none" or axis not in {"left_right", "up_down"}:
+            raise SchemaValidationError(
+                "multi adjustment requires direction none and one documented axis"
+            )
+    else:
         raise SchemaValidationError(
-            "bed_robot_arm_group direction must be one of "
-            + ", ".join(RETRACTION_DIRECTIONS)
+            "bed_robot_arm_group adjustment_mode must be single or multi"
+        )
+    if direction_frame != "surgeon_view":
+        raise SchemaValidationError(
+            "bed_robot_arm_group direction_frame must be surgeon_view"
         )
     if distance_origin not in DISTANCE_ORIGINS:
         raise SchemaValidationError(
@@ -365,7 +393,11 @@ def _validate_v4_bed_robot_arm_group(value: Any) -> dict[str, Any] | None:
         "request_id": request_id,
         "group_id": group_id,
         "operation": operation,
+        "adjustment_mode": adjustment_mode,
+        "target_retractor_id": target_retractor_id,
+        "direction_frame": direction_frame,
         "direction": direction,
+        "axis": axis,
         "distance_mm": normalized_distance.distance_mm,
         "distance_origin": normalized_distance.distance_origin,
         "raw_distance_text": raw_distance_text,
@@ -454,9 +486,29 @@ def compact_vlm_json_schema(version: str = "1") -> dict[str, Any]:
                         "request_id": {"type": "string", "minLength": 1},
                         "group_id": {"type": "string", "enum": ["retraction"]},
                         "operation": {"type": "string", "enum": ["retraction"]},
+                        "adjustment_mode": {
+                            "type": "string",
+                            "enum": ["single", "multi"],
+                        },
+                        "target_retractor_id": {
+                            "type": "string",
+                            "enum": [
+                                "left_malleable",
+                                "right_malleable",
+                                "both_malleable",
+                            ],
+                        },
+                        "direction_frame": {
+                            "type": "string",
+                            "enum": ["surgeon_view"],
+                        },
                         "direction": {
                             "type": "string",
-                            "enum": list(RETRACTION_DIRECTIONS),
+                            "enum": ["up", "down", "left", "right", "none"],
+                        },
+                        "axis": {
+                            "type": "string",
+                            "enum": ["left_right", "up_down", "none"],
                         },
                         "distance_mm": {"type": "number", "exclusiveMinimum": 0.0},
                         "distance_origin": {
@@ -476,7 +528,11 @@ def compact_vlm_json_schema(version: str = "1") -> dict[str, Any]:
                         "request_id",
                         "group_id",
                         "operation",
+                        "adjustment_mode",
+                        "target_retractor_id",
+                        "direction_frame",
                         "direction",
+                        "axis",
                         "distance_mm",
                         "distance_origin",
                         "raw_distance_text",

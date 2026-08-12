@@ -3,7 +3,13 @@ string group_id
 bool connected
 string state
 string operation
+string arm_id
+string target_tool_id
+string adjustment_mode
+string target_retractor_id
+string direction_frame
 string direction
+string axis
 float32 distance_mm
 string distance_origin
 string raw_distance_text

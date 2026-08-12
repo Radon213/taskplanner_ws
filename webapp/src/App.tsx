@@ -94,6 +94,7 @@ function MissionWorkspace({
     language,
     activeBundle: ros.activeBundle,
     simulationState: ros.simulationState,
+    bedRobotArms: ros.bedRobotArms,
     skillStatus: ros.skillStatus,
     surgeonState: ros.surgeonState,
     events: ros.events,

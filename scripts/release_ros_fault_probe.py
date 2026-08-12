@@ -27,7 +27,12 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
-from surgical_interop_msgs.action import ExecuteToolHandover
+from surgical_interop_msgs.action import (
+    ExecuteRetractionAdjustment,
+    ExecuteToolHandover,
+)
+from surgical_interop_msgs.msg import BedRobotArmStateArray
+from surgical_interop_msgs.srv import RequestToolChange
 from surgical_msgs.msg import (
     InputSourceStatus,
     ReducerDecisionEvent,
@@ -93,6 +98,7 @@ class ReleaseProbeNode(Node):
         self.world_history: list[dict[str, Any]] = []
         self.reducer_history: list[dict[str, Any]] = []
         self.fault_reports: list[dict[str, Any]] = []
+        self.bed_robot_status_history: list[dict[str, Any]] = []
         self._jpeg = _jpeg_bytes()
         self._sequence = 0
         self._procedure_start_sent = False
@@ -140,6 +146,21 @@ class ReleaseProbeNode(Node):
         )
         self.action_client = ActionClient(
             self, ExecuteToolHandover, "/surgery/tool_handover"
+        )
+        self.retraction_client = ActionClient(
+            self,
+            ExecuteRetractionAdjustment,
+            "/surgery/retraction/adjust",
+        )
+        self.tool_change_client = self.create_client(
+            RequestToolChange,
+            "/surgery/tool_change/request",
+        )
+        self.create_subscription(
+            BedRobotArmStateArray,
+            "/external/bed_robot_arms/status",
+            self._on_bed_robot_status,
+            20,
         )
 
     def elapsed(self) -> float:
@@ -198,6 +219,26 @@ class ReleaseProbeNode(Node):
         if isinstance(payload, dict):
             payload["at_sec"] = round(self.elapsed(), 4)
             self.fault_reports.append(payload)
+
+    def _on_bed_robot_status(self, message: BedRobotArmStateArray) -> None:
+        self.bed_robot_status_history.append(
+            {
+                "at_sec": round(self.elapsed(), 4),
+                "revision": int(message.revision),
+                "procedure_type": str(message.procedure_type),
+                "arms": [
+                    {
+                        "arm_id": str(arm.arm_id),
+                        "role": str(arm.role),
+                        "role_instance_id": str(arm.role_instance_id),
+                        "state": str(arm.state),
+                        "direct_teach_active": bool(arm.direct_teach_active),
+                        "reason_code": str(arm.reason_code),
+                    }
+                    for arm in message.arms
+                ],
+            }
+        )
 
     def publish_control(self, value: str) -> None:
         message = String()
@@ -338,6 +379,99 @@ class ReleaseProbeNode(Node):
         )
         return rows
 
+    def run_bed_robot_contract(self) -> dict[str, Any]:
+        if not self.retraction_client.wait_for_server(timeout_sec=8.0):
+            raise RuntimeError(
+                "/surgery/retraction/adjust Action server did not appear"
+            )
+        if not self.tool_change_client.wait_for_service(timeout_sec=8.0):
+            raise RuntimeError(
+                "/surgery/tool_change/request Service did not appear"
+            )
+        deadline = time.monotonic() + 3.0
+        while not self.bed_robot_status_history and time.monotonic() < deadline:
+            time.sleep(0.02)
+        if not self.bed_robot_status_history:
+            raise RuntimeError(
+                "/external/bed_robot_arms/status did not publish a snapshot"
+            )
+
+        def adjust(command_id: str) -> dict[str, Any]:
+            goal = ExecuteRetractionAdjustment.Goal()
+            goal.command_id = command_id
+            goal.adjustment_mode = "single"
+            goal.target_retractor_id = "left_malleable"
+            goal.direction_frame = "surgeon_view"
+            goal.direction = "up"
+            goal.axis = "none"
+            goal.distance_mm = 5.0
+            started = time.monotonic()
+            handle = _wait_future(
+                self.retraction_client.send_goal_async(goal), timeout_sec=5.0
+            )
+            row: dict[str, Any] = {
+                "command_id": command_id,
+                "accepted": bool(handle.accepted),
+                "goal_acceptance_latency_sec": round(
+                    time.monotonic() - started,
+                    6,
+                ),
+            }
+            if not handle.accepted:
+                row["duration_sec"] = round(time.monotonic() - started, 4)
+                return row
+            wrapped = _wait_future(handle.get_result_async(), timeout_sec=8.0)
+            row.update(
+                {
+                    "status": int(wrapped.status),
+                    "success": bool(wrapped.result.success),
+                    "final_state": str(wrapped.result.final_state),
+                    "reason_code": str(wrapped.result.reason_code),
+                    "duration_sec": round(time.monotonic() - started, 4),
+                }
+            )
+            return row
+
+        def change_tool(
+            command_id: str,
+            target_tool_id: str,
+        ) -> dict[str, Any]:
+            request = RequestToolChange.Request()
+            request.command_id = command_id
+            request.arm_id = "arm_1"
+            request.target_tool_id = target_tool_id
+            started = time.monotonic()
+            response = _wait_future(
+                self.tool_change_client.call_async(request), timeout_sec=5.0
+            )
+            return {
+                "command_id": command_id,
+                "arm_id": request.arm_id,
+                "target_tool_id": target_tool_id,
+                "success": bool(response.success),
+                "result": str(response.result),
+                "reason_code": str(response.reason_code),
+                "duration_sec": round(time.monotonic() - started, 4),
+            }
+
+        return {
+            "status_snapshot": self.bed_robot_status_history[-1],
+            "retraction_rejected": adjust("release-retraction-reject"),
+            "retraction_success": adjust("release-retraction-success"),
+            "tool_change_failed": change_tool(
+                "release-tool-change-failure",
+                "thyroid_retractor",
+            ),
+            "tool_change_success": change_tool(
+                "release-tool-change-success",
+                "army_navy_retractor",
+            ),
+            "tool_change_replay": change_tool(
+                "release-tool-change-success",
+                "army_navy_retractor",
+            ),
+        }
+
 
 def _launch(
     name: str,
@@ -417,6 +551,7 @@ def _wait_for_speech_relay_path(
 def _assertions(
     node: ReleaseProbeNode,
     action_rows: list[dict[str, Any]],
+    bed_robot_results: dict[str, Any],
     child_failures: list[str],
 ) -> list[AssertionResult]:
     checks: list[AssertionResult] = []
@@ -558,6 +693,55 @@ def _assertions(
         and cancel.get("reason_code") == "cancel_recovery_failed",
         json.dumps(cancel, sort_keys=True),
     )
+
+    status_snapshot = bed_robot_results.get("status_snapshot", {})
+    arms = status_snapshot.get("arms", [])
+    add(
+        "bed_robot_status_matches_nephrectomy_contract",
+        status_snapshot.get("procedure_type") == "nephrectomy"
+        and [row.get("arm_id") for row in arms] == ["arm_1", "arm_2"]
+        and {row.get("role_instance_id") for row in arms}
+        == {"left_malleable", "right_malleable"}
+        and all(row.get("role") == "retraction" for row in arms),
+        json.dumps(status_snapshot, sort_keys=True),
+    )
+    retraction_rejected = bed_robot_results.get("retraction_rejected", {})
+    retraction_success = bed_robot_results.get("retraction_success", {})
+    add(
+        "retraction_adjustment_profile_rejection",
+        retraction_rejected.get("accepted") is False,
+        json.dumps(retraction_rejected, sort_keys=True),
+    )
+    add(
+        "retraction_adjustment_success",
+        retraction_success.get("accepted") is True
+        and retraction_success.get("success") is True
+        and retraction_success.get("final_state") == "completed",
+        json.dumps(retraction_success, sort_keys=True),
+    )
+    tool_change_failed = bed_robot_results.get("tool_change_failed", {})
+    tool_change_success = bed_robot_results.get("tool_change_success", {})
+    tool_change_replay = bed_robot_results.get("tool_change_replay", {})
+    add(
+        "tool_change_service_reports_failure",
+        tool_change_failed.get("success") is False
+        and tool_change_failed.get("result") == "failed",
+        json.dumps(tool_change_failed, sort_keys=True),
+    )
+    add(
+        "tool_change_service_success",
+        tool_change_success.get("success") is True
+        and tool_change_success.get("result") == "completed",
+        json.dumps(tool_change_success, sort_keys=True),
+    )
+    add(
+        "tool_change_command_id_idempotent",
+        tool_change_replay.get("success") is True
+        and tool_change_replay.get("result") == tool_change_success.get("result")
+        and tool_change_replay.get("reason_code")
+        == tool_change_success.get("reason_code"),
+        json.dumps(tool_change_replay, sort_keys=True),
+    )
     add(
         "all_ros_children_survived_campaign",
         not child_failures,
@@ -571,6 +755,7 @@ def _write_reports(
     node: ReleaseProbeNode,
     assertions: list[AssertionResult],
     action_rows: list[dict[str, Any]],
+    bed_robot_results: dict[str, Any],
     child_failures: list[str],
     domain_id: int,
 ) -> None:
@@ -588,6 +773,8 @@ def _write_reports(
         "reducer_history": node.reducer_history,
         "fault_reports": node.fault_reports,
         "action_results": action_rows,
+        "bed_robot_contract_results": bed_robot_results,
+        "bed_robot_status_history": node.bed_robot_status_history,
         "unexpected_child_exits": child_failures,
         "procedure_start_false_tool_actions": sum(
             1
@@ -663,6 +850,7 @@ def main() -> int:
     executor: MultiThreadedExecutor | None = None
     spin_thread: threading.Thread | None = None
     action_rows: list[dict[str, Any]] = []
+    bed_robot_results: dict[str, Any] = {}
     child_failures: list[str] = []
     assertions: list[AssertionResult] = []
 
@@ -744,6 +932,8 @@ def main() -> int:
                         "--ros-args",
                         "-p",
                         f"profile_path:={ACTION_PROFILE}",
+                        "-p",
+                        "procedure_type:=nephrectomy",
                     ],
                     environment=environment,
                     logs_dir=logs_dir,
@@ -780,7 +970,13 @@ def main() -> int:
             time.sleep(0.05)
         time.sleep(0.7)
         action_rows = node.run_action_contract()
-        assertions = _assertions(node, action_rows, child_failures)
+        bed_robot_results = node.run_bed_robot_contract()
+        assertions = _assertions(
+            node,
+            action_rows,
+            bed_robot_results,
+            child_failures,
+        )
     except Exception as exc:
         assertions.append(
             AssertionResult("probe_completed_without_exception", False, repr(exc))
@@ -806,6 +1002,7 @@ def main() -> int:
         node,
         assertions,
         action_rows,
+        bed_robot_results,
         child_failures,
         args.ros_domain_id,
     )

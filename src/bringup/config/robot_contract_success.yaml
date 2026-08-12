@@ -1,5 +1,5 @@
 schema: taskplanner.action_emulator.v1
-profile_id: debug-demo-success
+profile_id: bringup-robot-contract-success
 routes:
   tool_handover:
     default: {outcome: success, duration_sec: 0.6}

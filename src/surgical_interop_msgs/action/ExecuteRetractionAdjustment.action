@@ -1,0 +1,13 @@
+string command_id
+string adjustment_mode
+string target_retractor_id
+string direction_frame
+string direction
+string axis
+float32 distance_mm
+---
+bool success
+string final_state
+string reason_code
+---
+string state

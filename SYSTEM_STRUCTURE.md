@@ -1,8 +1,8 @@
 # Taskplanner System Structure
 
-Last reviewed: 2026-06-23 KST
+Last reviewed: 2026-08-12 KST
 
-This document describes the `0.1.0` runtime structure of
+This document describes the current post-`0.1.0` runtime structure of
 `taskplanner_ws`.
 
 ## 1. Architectural Rule
@@ -35,6 +35,9 @@ Core ownership rules:
 - BT reads the digital twin through blackboard mirroring and emits skill
   commands. It does not mutate world state directly.
 - Skill execution reports action status and events back to the digital twin.
+- The external bed-mounted controller owns detailed arm motion and safety state.
+  Taskplanner consumes only the documented retraction-arm status fields and
+  sends only the documented tool-change Service or adjustment Action request.
 - The webapp is an operator/debug view, not a source of truth.
 
 ## 2. Packages
@@ -85,7 +88,7 @@ Real VLM public inputs include:
 - `/bt/decision`
 - `/skill/status`
 - admitted public voice transcript
-- bed robot arm requests/status derived from speech and controller feedback
+- retraction-arm requests derived from speech and controller-owned arm status
 
 The real VLM does not subscribe to validation-only `/surgeon/state`,
 `/surgeon/actor_event`, or `/surgeon/actor_overlay`. The system-fused phase is
@@ -210,6 +213,31 @@ The action interface remains wire-compatible and uses the `action` string
 `pick_up_from_mayo_and_handover` for the Mayo-to-surgeon path. The mock server
 always completes configured actions and emits public `/skill/status` plus
 `/skill/events`.
+
+Bed-mounted robot-arm integration is a separate, retraction-only lane. It maps
+internal validated requests onto `/surgery/tool_change/request` for
+thyroidectomy or `/surgery/retraction/adjust` for nephrectomy, and consumes
+controller-owned state from `/external/bed_robot_arms/status`. There is no
+bed-mounted suction-arm command or status path. Clinical suction instruments
+and surgeon speech about suction remain normal tool/evidence semantics.
+
+### `surgical_interop_msgs` and `surgical_interop_execution`
+
+The external retraction contract is intentionally smaller than the internal
+planner state:
+
+- `RequestToolChange`: request `command_id`, `arm_id`, `target_tool_id`; response
+  `success`, `result`, `reason_code`.
+- `ExecuteRetractionAdjustment`: Goal `command_id`, `adjustment_mode`,
+  `target_retractor_id`, `direction_frame`, `direction`, `axis`, `distance_mm`;
+  Result `success`, `final_state`, `reason_code`; Feedback `state`.
+- `BedRobotArmStateArray`: `stamp`, `revision`, `procedure_type`, `arms`, where
+  each arm has `arm_id`, `role`, `role_instance_id`, `state`,
+  `direct_teach_active`, and `reason_code`.
+
+The bridge does not synthesize controller poses, trajectories, progress, force,
+collision state, or attachment verification. Exact allowed values and endpoint
+semantics are defined in `docs/EXTERNAL_INPUT_CONTRACT.md`.
 
 ### `surgical_msgs`
 

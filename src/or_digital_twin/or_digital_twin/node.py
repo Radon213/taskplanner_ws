@@ -19,6 +19,7 @@ import rclpy
 from rcl_interfaces.msg import SetParametersResult
 from rclpy.node import Node
 from std_msgs.msg import String
+from surgical_interop_msgs.msg import BedRobotArmStateArray
 from surgical_msgs.msg import (
     BedRobotArmGroupActionProposal,
     BedRobotArmGroupCommand,
@@ -66,7 +67,9 @@ class ORDigitalTwinNode(Node):
         "RobotTaskStarted",
         "RobotTaskCompleted",
         "BedRobotArmGroupRequestObserved",
+        "BedRobotArmGroupRequestRejected",
         "BedRobotArmGroupProposalObserved",
+        "BedRobotArmGroupProposalRejected",
         "BedRobotArmGroupCommandApproved",
         "BedRobotArmGroupCommandCompleted",
         "BedRobotArmGroupCommandRejected",
@@ -100,6 +103,9 @@ class ORDigitalTwinNode(Node):
         )
         self.declare_parameter("allow_shadow_type_instance_requests", False)
         self.declare_parameter("allow_open_set_phase_bootstrap", False)
+        self.declare_parameter("bed_robot_status_timeout_sec", 2.0)
+        self.declare_parameter("bed_robot_source_max_age_sec", 2.0)
+        self.declare_parameter("bed_robot_source_future_tolerance_sec", 0.5)
         self._spec_dir = str(self.get_parameter("spec_dir").value)
         self._vlm_recent_event_count = max(1, int(self.get_parameter("vlm_recent_event_count").value))
         self._validation_mode = str(self.get_parameter("validation_mode").value)
@@ -134,6 +140,22 @@ class ORDigitalTwinNode(Node):
         )
         self._accept_non_override_structured_requests = bool(
             self.get_parameter("accept_non_override_structured_requests").value
+        )
+        self._bed_robot_status_timeout_sec = max(
+            0.1,
+            float(self.get_parameter("bed_robot_status_timeout_sec").value),
+        )
+        self._bed_robot_source_max_age_sec = max(
+            0.1,
+            float(self.get_parameter("bed_robot_source_max_age_sec").value),
+        )
+        self._bed_robot_source_future_tolerance_sec = max(
+            0.0,
+            float(
+                self.get_parameter(
+                    "bed_robot_source_future_tolerance_sec"
+                ).value
+            ),
         )
         self._twin = ORDigitalTwin(
             load_bundle(self._spec_dir),
@@ -177,6 +199,8 @@ class ORDigitalTwinNode(Node):
         self._vlm_implicit_request_episode_tool = ""
         self._vlm_implicit_request_release_since: float | None = None
         self._pending_bed_robot_arm_group_requests: dict[str, BedRobotArmGroupRequest] = {}
+        self._bed_robot_status_received_monotonic = 0.0
+        self._bed_robot_status_source_stamp_ns: int | None = None
         self._phase_entered_ros_sec = self._stamp_sec(self._stamp())
         self.add_on_set_parameters_callback(self._on_parameters_changed)
 
@@ -278,6 +302,12 @@ class ORDigitalTwinNode(Node):
             self._on_bed_robot_arm_group_status,
             50,
         )
+        self.create_subscription(
+            BedRobotArmStateArray,
+            "/external/bed_robot_arms/status",
+            self._on_bed_robot_arm_controller_status,
+            20,
+        )
         self.create_subscription(String, "/surgery/audio/request_text", self._on_request, 20)
         self.create_subscription(SurgeonRequest, "/surgeon/request", self._on_surgeon_request, 20)
         self.create_subscription(FilteredPhase, "/phase/filtered", self._on_phase, 20)
@@ -305,6 +335,7 @@ class ORDigitalTwinNode(Node):
                     self._clear_vlm_implicit_request_state()
                     self._advance_visual_runtime_epoch()
                     self._pending_bed_robot_arm_group_requests.clear()
+                    self._reset_bed_robot_controller_freshness()
                     self._phase_entered_ros_sec = self._stamp_sec(self._stamp())
                     self._publish_world_state()
                 except Exception as exc:
@@ -356,6 +387,18 @@ class ORDigitalTwinNode(Node):
                 self._accept_validation_actor_events = bool(parameter.value)
             elif parameter.name == "accept_non_override_structured_requests":
                 self._accept_non_override_structured_requests = bool(parameter.value)
+            elif parameter.name == "bed_robot_status_timeout_sec":
+                self._bed_robot_status_timeout_sec = max(
+                    0.1, float(parameter.value)
+                )
+            elif parameter.name == "bed_robot_source_max_age_sec":
+                self._bed_robot_source_max_age_sec = max(
+                    0.1, float(parameter.value)
+                )
+            elif parameter.name == "bed_robot_source_future_tolerance_sec":
+                self._bed_robot_source_future_tolerance_sec = max(
+                    0.0, float(parameter.value)
+                )
         return SetParametersResult(successful=True)
 
     def _stamp(self):
@@ -663,6 +706,7 @@ class ORDigitalTwinNode(Node):
         return augmented
 
     def _publish_world_state(self) -> None:
+        self._expire_bed_robot_controller_status()
         self._expire_stale_vlm_evidence(
             self._stamp_sec(self._stamp()),
         )
@@ -920,10 +964,12 @@ class ORDigitalTwinNode(Node):
         self._publish_vlm_context(world)
 
     def _stamp_all_bed_robot_arm_groups(self) -> None:
-        stamp = self._stamp()
         for belief in self._twin.state.bed_robot_arm_groups.values():
-            belief.last_update_stamp_sec = int(stamp.sec)
-            belief.last_update_stamp_nanosec = int(stamp.nanosec)
+            # Zero means that no controller-owned status has been observed.
+            belief.last_update_stamp_sec = 0
+            belief.last_update_stamp_nanosec = 0
+            belief.last_operation_stamp_sec = 0
+            belief.last_operation_stamp_nanosec = 0
 
     @staticmethod
     def _set_bed_robot_arm_group_stamp(belief, stamp) -> None:
@@ -939,15 +985,17 @@ class ORDigitalTwinNode(Node):
         if update_sec or update_nanosec:
             msg.stamp.sec = update_sec
             msg.stamp.nanosec = update_nanosec
-        else:
-            # This fallback is only for manually constructed test twins.  The
-            # runtime stamps all groups once at construction/reset.
-            msg.stamp = stamp
         msg.group_id = str(payload.get("group_id", ""))
         msg.connected = bool(payload.get("connected", False))
-        msg.state = str(payload.get("state", "standby"))
+        msg.state = str(payload.get("state", "unknown"))
         msg.operation = str(payload.get("operation", ""))
+        msg.arm_id = str(payload.get("arm_id", ""))
+        msg.target_tool_id = str(payload.get("target_tool_id", ""))
+        msg.adjustment_mode = str(payload.get("adjustment_mode", ""))
+        msg.target_retractor_id = str(payload.get("target_retractor_id", ""))
+        msg.direction_frame = str(payload.get("direction_frame", ""))
         msg.direction = str(payload.get("direction", ""))
+        msg.axis = str(payload.get("axis", ""))
         msg.distance_mm = float(payload.get("distance_mm", 0.0))
         msg.distance_origin = str(payload.get("distance_origin", ""))
         msg.raw_distance_text = str(payload.get("raw_distance_text", ""))
@@ -2469,7 +2517,23 @@ class ORDigitalTwinNode(Node):
 
     def _on_bed_robot_arm_group_request(self, msg: BedRobotArmGroupRequest) -> None:
         group_id = str(msg.group_id or "").strip().lower()
-        if group_id in {"suction", "retraction"} and msg.request_id:
+        if group_id != "retraction":
+            self._twin.update_bed_robot_arm_group_request(msg)
+            self._publish_event(
+                "BedRobotArmGroupRequestRejected",
+                phase_id=msg.phase_id,
+                status="rejected",
+                mode="bed_robot_arm_group_request",
+                detail={
+                    "request_id": msg.request_id,
+                    "group_id": group_id,
+                    "operation": msg.operation,
+                    "reason": "unsupported_group",
+                },
+            )
+            self._publish_world_state()
+            return
+        if msg.request_id:
             self._pending_bed_robot_arm_group_requests[msg.request_id] = msg
         self._twin.update_bed_robot_arm_group_request(msg)
         self._publish_event(
@@ -2484,6 +2548,11 @@ class ORDigitalTwinNode(Node):
                 "voice_text": msg.voice_text,
                 "procedure_id": msg.procedure_id,
                 "phase_id": msg.phase_id,
+                "arm_id": msg.arm_id,
+                "target_tool_id": msg.target_tool_id,
+                "adjustment_mode": msg.adjustment_mode,
+                "target_retractor_id": msg.target_retractor_id,
+                "direction_frame": msg.direction_frame,
                 "end_effector_profile": msg.end_effector_profile,
                 "source": msg.source,
             },
@@ -2512,6 +2581,23 @@ class ORDigitalTwinNode(Node):
         ):
             return
         command = msg.command
+        if str(command.group_id or "").strip().lower() != "retraction":
+            self._publish_event(
+                "BedRobotArmGroupProposalRejected",
+                phase_id=self._twin.state.filtered_phase,
+                status="rejected",
+                confidence=float(command.confidence),
+                mode="vlm_bed_robot_arm_group_proposal",
+                detail={
+                    "request_id": command.request_id,
+                    "command_id": command.command_id,
+                    "group_id": command.group_id,
+                    "operation": command.operation,
+                    "reason": "unsupported_group",
+                },
+            )
+            self._publish_world_state()
+            return
         self._publish_event(
             "BedRobotArmGroupProposalObserved",
             phase_id=self._twin.state.filtered_phase,
@@ -2526,7 +2612,13 @@ class ORDigitalTwinNode(Node):
                 "command_id": command.command_id,
                 "group_id": command.group_id,
                 "operation": command.operation,
+                "arm_id": command.arm_id,
+                "target_tool_id": command.target_tool_id,
+                "adjustment_mode": command.adjustment_mode,
+                "target_retractor_id": command.target_retractor_id,
+                "direction_frame": command.direction_frame,
                 "direction": command.direction,
+                "axis": command.axis,
                 "distance_mm": float(command.distance_mm),
                 "distance_origin": command.distance_origin,
                 "raw_distance_text": command.raw_distance_text,
@@ -2538,6 +2630,23 @@ class ORDigitalTwinNode(Node):
         self._publish_world_state()
 
     def _on_bed_robot_arm_group_command(self, msg: BedRobotArmGroupCommand) -> None:
+        if str(msg.group_id or "").strip().lower() != "retraction":
+            self._publish_event(
+                "BedRobotArmGroupCommandRejected",
+                phase_id=self._twin.state.filtered_phase,
+                status="rejected",
+                confidence=float(msg.confidence),
+                mode="bt_bed_robot_arm_group_guard",
+                detail={
+                    "request_id": msg.request_id,
+                    "command_id": msg.command_id,
+                    "group_id": msg.group_id,
+                    "operation": msg.operation,
+                    "reason": "unsupported_group",
+                },
+            )
+            self._publish_world_state()
+            return
         belief = self._twin.state.bed_robot_arm_groups.get(msg.group_id)
         state_update_ignored = False
         if belief is not None:
@@ -2547,16 +2656,22 @@ class ORDigitalTwinNode(Node):
             command_ns = int(command_stamp.sec) * 1_000_000_000 + int(
                 command_stamp.nanosec
             )
-            current_ns = int(belief.last_update_stamp_sec) * 1_000_000_000 + int(
-                belief.last_update_stamp_nanosec
+            current_ns = int(belief.last_operation_stamp_sec) * 1_000_000_000 + int(
+                belief.last_operation_stamp_nanosec
             )
             state_update_ignored = bool(current_ns and command_ns <= current_ns)
             if not state_update_ignored:
-                self._set_bed_robot_arm_group_stamp(belief, command_stamp)
+                belief.last_operation_stamp_sec = int(command_stamp.sec)
+                belief.last_operation_stamp_nanosec = int(command_stamp.nanosec)
                 belief.active_request_id = msg.request_id
                 belief.active_command_id = msg.command_id
                 belief.operation = msg.operation
+                belief.target_tool_id = msg.target_tool_id
+                belief.adjustment_mode = msg.adjustment_mode
+                belief.target_retractor_id = msg.target_retractor_id
+                belief.direction_frame = msg.direction_frame
                 belief.direction = msg.direction
+                belief.axis = msg.axis
                 belief.distance_mm = float(msg.distance_mm)
                 belief.distance_origin = msg.distance_origin
                 belief.raw_distance_text = msg.raw_distance_text
@@ -2575,7 +2690,13 @@ class ORDigitalTwinNode(Node):
                 "command_id": msg.command_id,
                 "group_id": msg.group_id,
                 "operation": msg.operation,
+                "arm_id": msg.arm_id,
+                "target_tool_id": msg.target_tool_id,
+                "adjustment_mode": msg.adjustment_mode,
+                "target_retractor_id": msg.target_retractor_id,
+                "direction_frame": msg.direction_frame,
                 "direction": msg.direction,
+                "axis": msg.axis,
                 "distance_mm": float(msg.distance_mm),
                 "distance_origin": msg.distance_origin,
                 "raw_distance_text": msg.raw_distance_text,
@@ -2587,11 +2708,104 @@ class ORDigitalTwinNode(Node):
         )
         self._publish_world_state()
 
+    def _on_bed_robot_arm_controller_status(
+        self, msg: BedRobotArmStateArray
+    ) -> None:
+        source_stamp_ns = self._bed_robot_controller_source_stamp_ns(msg)
+        if source_stamp_ns is None or source_stamp_ns <= 0:
+            return
+        source_age_sec = self._bed_robot_controller_source_age_sec(source_stamp_ns)
+        if (
+            source_age_sec > self._bed_robot_source_max_age_sec
+            or source_age_sec < -self._bed_robot_source_future_tolerance_sec
+        ):
+            return
+        if self._twin.update_bed_robot_arm_controller_status(msg) is not True:
+            return
+        self._bed_robot_status_received_monotonic = self._monotonic_sec()
+        self._bed_robot_status_source_stamp_ns = source_stamp_ns
+        self._publish_event(
+            "BedRobotArmControllerStateUpdated",
+            status=self._twin.state.bed_robot_arm_groups["retraction"].state,
+            mode="external_bed_robot_arm_status",
+            detail={
+                "revision": int(msg.revision),
+                "procedure_type": msg.procedure_type,
+                "arms": [
+                    {
+                        "arm_id": arm.arm_id,
+                        "role": arm.role,
+                        "role_instance_id": arm.role_instance_id,
+                        "state": arm.state,
+                        "direct_teach_active": bool(arm.direct_teach_active),
+                        "reason_code": arm.reason_code,
+                    }
+                    for arm in msg.arms
+                ],
+            },
+        )
+        self._publish_world_state()
+
+    @staticmethod
+    def _bed_robot_controller_source_stamp_ns(
+        msg: BedRobotArmStateArray,
+    ) -> int | None:
+        sec = int(msg.stamp.sec)
+        nanosec = int(msg.stamp.nanosec)
+        if sec < 0 or nanosec < 0 or nanosec >= 1_000_000_000:
+            return None
+        return sec * 1_000_000_000 + nanosec
+
+    @staticmethod
+    def _wall_time_ns() -> int:
+        return time.time_ns()
+
+    @staticmethod
+    def _monotonic_sec() -> float:
+        return time.monotonic()
+
+    def _bed_robot_controller_source_age_sec(self, source_stamp_ns: int) -> float:
+        return (self._wall_time_ns() - source_stamp_ns) / 1_000_000_000.0
+
+    def _reset_bed_robot_controller_freshness(self) -> None:
+        self._bed_robot_status_received_monotonic = 0.0
+        self._bed_robot_status_source_stamp_ns = None
+
+    def _expire_bed_robot_controller_status(self) -> None:
+        received_at = self._bed_robot_status_received_monotonic
+        source_stamp_ns = self._bed_robot_status_source_stamp_ns
+        if received_at <= 0.0 or source_stamp_ns is None:
+            return
+        receipt_age_sec = self._monotonic_sec() - received_at
+        source_age_sec = self._bed_robot_controller_source_age_sec(source_stamp_ns)
+        if (
+            receipt_age_sec <= self._bed_robot_status_timeout_sec
+            and source_age_sec <= self._bed_robot_source_max_age_sec
+            and source_age_sec >= -self._bed_robot_source_future_tolerance_sec
+        ):
+            return
+        self._reset_bed_robot_controller_freshness()
+        if self._twin.expire_bed_robot_arm_controller_status():
+            self._publish_event(
+                "BedRobotArmControllerStateExpired",
+                status="unknown",
+                mode="external_bed_robot_arm_status",
+                detail={
+                    "reason_code": "controller_status_stale",
+                    "receipt_age_sec": receipt_age_sec,
+                    "source_age_sec": source_age_sec,
+                },
+            )
+
     def _on_bed_robot_arm_group_status(self, msg: BedRobotArmGroupStatus) -> None:
         if not int(msg.stamp.sec) and not int(msg.stamp.nanosec):
             msg.stamp = self._stamp()
         status_changed = self._twin.update_bed_robot_arm_group_status(msg)
-        if bool(msg.terminal) and msg.request_id:
+        if (
+            str(msg.group_id or "").strip().lower() == "retraction"
+            and bool(msg.terminal)
+            and msg.request_id
+        ):
             self._pending_bed_robot_arm_group_requests.pop(msg.request_id, None)
         is_health = not msg.operation and msg.request_id.startswith("health-")
         if status_changed is not True:
@@ -2623,11 +2837,16 @@ class ORDigitalTwinNode(Node):
                 "terminal": bool(msg.terminal),
                 "success": bool(msg.success),
                 "message": msg.message,
+                "arm_id": msg.arm_id,
+                "target_tool_id": msg.target_tool_id,
+                "adjustment_mode": msg.adjustment_mode,
+                "target_retractor_id": msg.target_retractor_id,
+                "direction_frame": msg.direction_frame,
                 "direction": msg.direction,
+                "axis": msg.axis,
                 "distance_mm": float(msg.distance_mm),
                 "distance_origin": msg.distance_origin,
                 "raw_distance_text": msg.raw_distance_text,
-                "end_effector_profile": msg.end_effector_profile,
                 "progress": float(msg.progress),
                 "elapsed_sec": float(msg.elapsed_sec),
                 "remaining_sec": float(msg.remaining_sec),
@@ -2781,6 +3000,7 @@ class ORDigitalTwinNode(Node):
             self._clear_vlm_implicit_request_state()
             self._clear_tool_histories()
             self._twin.reset_spec(self._twin.spec, seed_from_perception=False)
+            self._reset_bed_robot_controller_freshness()
             self._stamp_all_bed_robot_arm_groups()
             self._phase_entered_ros_sec = self._stamp_sec(self._stamp())
             if start_phase_id:
@@ -2801,6 +3021,7 @@ class ORDigitalTwinNode(Node):
             self._clear_vlm_implicit_request_state()
             self._clear_tool_histories()
             self._twin.reset_runtime()
+            self._reset_bed_robot_controller_freshness()
             self._stamp_all_bed_robot_arm_groups()
             self._phase_entered_ros_sec = self._stamp_sec(self._stamp())
             self._twin.set_execution_state(False, "idle")

@@ -95,6 +95,21 @@ def test_shadow_launch_exposes_strict_replay_controls():
     )
     assert run_id_parameter._ParameterValue__value_type is str
 
+    contract_nodes = {
+        entity.node_executable
+        for entity in description.entities
+        if isinstance(entity, Node)
+        and entity.node_executable
+        in {
+            "fault_action_emulator",
+            "surgical_interop_execution_bridge",
+        }
+    }
+    assert contract_nodes == {
+        "fault_action_emulator",
+        "surgical_interop_execution_bridge",
+    }
+
 
 def test_shadow_spec_dir_follows_default_bundle(monkeypatch):
     module = _load_shadow_launch_module()
@@ -116,6 +131,64 @@ def test_shadow_spec_dir_follows_default_bundle(monkeypatch):
 
     assert spec_dir.endswith(
         "/procedure_spec/specs/thyroidectomy_demo"
+    )
+
+
+@pytest.mark.parametrize(
+    ("bundle_id", "enabled", "procedure_type"),
+    [
+        ("thyroidectomy", "true", "thyroidectomy"),
+        ("thyroidectomy_demo", "true", "thyroidectomy"),
+        ("nephrectomy", "true", "nephrectomy"),
+        ("inguinal_hernia_repair", "false", ""),
+    ],
+)
+def test_shadow_bed_robot_contract_bundle_mapping(
+    bundle_id,
+    enabled,
+    procedure_type,
+):
+    module = _load_shadow_launch_module()
+    context = LaunchContext()
+    context.launch_configurations["default_bundle"] = bundle_id
+
+    for action in module._bed_robot_contract_configuration(context):
+        action.visit(context)
+
+    assert context.launch_configurations["bed_robot_contract_enabled"] == enabled
+    assert (
+        context.launch_configurations["bed_robot_contract_procedure_type"]
+        == procedure_type
+    )
+
+
+def test_shadow_contract_nodes_are_disabled_for_inguinal_bundle():
+    module = _load_shadow_launch_module()
+    description = module.generate_launch_description()
+    nodes = {
+        entity.node_executable: entity
+        for entity in description.entities
+        if isinstance(entity, Node)
+        and entity.node_executable
+        in {
+            "fault_action_emulator",
+            "surgical_interop_execution_bridge",
+            "bed_robot_arm_group_orchestrator",
+        }
+    }
+    context = LaunchContext()
+    context.launch_configurations["default_bundle"] = "inguinal_hernia_repair"
+    for action in module._bed_robot_contract_configuration(context):
+        action.visit(context)
+
+    assert nodes.keys() == {
+        "fault_action_emulator",
+        "surgical_interop_execution_bridge",
+        "bed_robot_arm_group_orchestrator",
+    }
+    assert all(
+        node.condition is not None and not node.condition.evaluate(context)
+        for node in nodes.values()
     )
 
 

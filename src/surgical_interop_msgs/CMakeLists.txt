@@ -7,8 +7,10 @@ find_package(builtin_interfaces REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
-  "action/ExecuteRetraction.action"
+  "action/ExecuteRetractionAdjustment.action"
   "action/ExecuteToolHandover.action"
+  "msg/BedRobotArmState.msg"
+  "msg/BedRobotArmStateArray.msg"
   "msg/ClinicalObservation.msg"
   "msg/ClinicalObservationArray.msg"
   "msg/InstrumentState.msg"
@@ -18,7 +20,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/SurgeryContext.msg"
   "msg/SurgeryEvent.msg"
   "msg/SurgeryHealth.msg"
-  "srv/SetSuction.srv"
+  "srv/RequestToolChange.srv"
   DEPENDENCIES action_msgs builtin_interfaces
 )
 

@@ -17,7 +17,13 @@ setup(
                 "launch/taskplanner_shadow.launch.py",
             ],
         ),
-        (f"share/{package_name}/config", ["config/taskplanner.yaml"]),
+        (
+            f"share/{package_name}/config",
+            [
+                "config/taskplanner.yaml",
+                "config/robot_contract_success.yaml",
+            ],
+        ),
     ],
     install_requires=["setuptools"],
     tests_require=["pytest"],

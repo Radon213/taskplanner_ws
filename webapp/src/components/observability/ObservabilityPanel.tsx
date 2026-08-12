@@ -2,7 +2,7 @@ import { useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent } from "
 import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
 import { BrainCircuit, Code2, ListTree, RadioTower } from "lucide-react";
 
-import type { BedRobotArmGroupTrace, useDigitalTwinViewModel } from "../../hooks/useDigitalTwinViewModel";
+import type { BedRobotArmTrace, useDigitalTwinViewModel } from "../../hooks/useDigitalTwinViewModel";
 import type {
   BTDecision,
   CompressedImageFrame,
@@ -88,25 +88,25 @@ function vlmInputImageLabel(
   return `${viewLabel} · ${sizeLabel}`;
 }
 
-function BedRobotArmGroupTraceCard({
+function BedRobotArmTraceCard({
   trace,
   language,
 }: {
-  trace: BedRobotArmGroupTrace;
+  trace: BedRobotArmTrace;
   language: Language;
 }) {
   const requestLabel = language === "ko" ? "요청 ID" : "Request ID";
   return (
     <article
-      className={`bed-group-trace-card tone-${trace.tone}`}
-      data-slot="bed-robot-arm-group-trace"
-      data-bed-group-request-id={trace.requestId}
-      data-bed-group-id={trace.groupId}
-      aria-label={`${trace.groupLabel}, ${requestLabel} ${trace.requestId}`}
+      className={`bed-arm-trace-card tone-${trace.tone}`}
+      data-slot="bed-robot-arm-trace"
+      data-bed-arm-request-id={trace.requestId}
+      data-bed-arm-id={trace.armId}
+      aria-label={`${trace.armLabel}, ${requestLabel} ${trace.requestId}`}
     >
-      <div className="bed-group-trace-card-header">
+      <div className="bed-arm-trace-card-header">
         <div>
-          <strong>{trace.groupLabel}</strong>
+          <strong>{trace.armLabel}</strong>
           <span>{trace.summary}</span>
         </div>
         <em title={trace.outcomeLabel}>{trace.outcomeLabel}</em>
@@ -114,16 +114,16 @@ function BedRobotArmGroupTraceCard({
       <code title={trace.requestId}>
         {requestLabel}: {compactIdentifier(trace.requestId)}
       </code>
-      <ol aria-label={language === "ko" ? "그룹 요청 처리 단계" : "Group request processing stages"}>
+      <ol aria-label={language === "ko" ? "리트랙션 요청 처리 단계" : "Retraction request processing stages"}>
         {trace.steps.map((step) => (
           <li
             key={step.id}
             className={`state-${step.state}`}
-            data-bed-group-trace-step={step.id}
+            data-bed-arm-trace-step={step.id}
             title={step.detail}
             aria-label={`${step.label}: ${step.stateLabel}. ${step.detail}`}
           >
-            <span className="bed-group-trace-marker" aria-hidden="true" />
+            <span className="bed-arm-trace-marker" aria-hidden="true" />
             <div>
               <strong>{step.label}</strong>
               <small title={step.detail}>{step.detail}</small>
@@ -431,8 +431,8 @@ export function ObservabilityPanel({
                 data-timeline-index={index}
                 data-timeline-ui-id={item.uiId}
                 data-timeline-severity={item.severity}
-                data-bed-group-request-id={item.requestId}
-                data-bed-group-id={item.groupId}
+                data-bed-arm-request-id={item.requestId}
+                data-bed-arm-id={item.armId}
                 className={`timeline-item ${item.tone} severity-${item.severity}`}
                 initial={prefersReducedMotion ? false : { opacity: 0, x: -26 }}
                 animate={{ opacity: 1, x: 0 }}
@@ -516,31 +516,31 @@ export function ObservabilityPanel({
         </div>
 
         <div className="decision-scroll">
-          <section className="bed-group-trace-section" aria-labelledby="bed-group-trace-title">
-            <div className="bed-group-trace-title-row">
+          <section className="bed-arm-trace-section" aria-labelledby="bed-arm-trace-title">
+            <div className="bed-arm-trace-title-row">
               <div>
-                <h3 id="bed-group-trace-title">
-                  {language === "ko" ? "베드 로봇암 요청 추적" : "Bed robot request trace"}
+                <h3 id="bed-arm-trace-title">
+                  {language === "ko" ? "리트랙션 로봇암 요청 추적" : "Retraction robot request trace"}
                 </h3>
                 <p>
                   {language === "ko"
-                    ? "같은 요청 ID로 발화부터 그룹 상태까지 연결합니다."
-                    : "Links the utterance to group status with one request ID."}
+                    ? "같은 요청 ID로 발화부터 리트랙션 암 상태까지 연결합니다."
+                    : "Links the utterance to retraction arm status with one request ID."}
                 </p>
               </div>
               <span aria-label={language === "ko" ? "최근 요청 수" : "Recent request count"}>
-                {vm.bedRobotArmGroupTraces.length}
+                {vm.bedRobotArmTraces.length}
               </span>
             </div>
-            {vm.bedRobotArmGroupTraces.length ? (
-              <div className="bed-group-trace-list" aria-live="polite">
-                {vm.bedRobotArmGroupTraces.slice(0, 2).map((trace) => (
-                  <BedRobotArmGroupTraceCard key={trace.requestId} trace={trace} language={language} />
+            {vm.bedRobotArmTraces.length ? (
+              <div className="bed-arm-trace-list" aria-live="polite">
+                {vm.bedRobotArmTraces.slice(0, 2).map((trace) => (
+                  <BedRobotArmTraceCard key={trace.requestId} trace={trace} language={language} />
                 ))}
               </div>
             ) : (
-              <p className="bed-group-trace-empty">
-                {language === "ko" ? "아직 관측된 그룹 요청이 없습니다." : "No group request has been observed yet."}
+              <p className="bed-arm-trace-empty">
+                {language === "ko" ? "아직 관측된 리트랙션 요청이 없습니다." : "No retraction request has been observed yet."}
               </p>
             )}
           </section>

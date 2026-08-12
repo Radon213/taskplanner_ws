@@ -30,8 +30,12 @@ from rclpy.qos import (
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
-from surgical_interop_msgs.action import ExecuteRetraction, ExecuteToolHandover
+from surgical_interop_msgs.action import (
+    ExecuteRetractionAdjustment,
+    ExecuteToolHandover,
+)
 from surgical_interop_msgs.msg import (
+    BedRobotArmStateArray,
     ClinicalObservation,
     ClinicalObservationArray,
     InstrumentState,
@@ -42,7 +46,7 @@ from surgical_interop_msgs.msg import (
     SurgeryEvent,
     SurgeryHealth,
 )
-from surgical_interop_msgs.srv import SetSuction
+from surgical_interop_msgs.srv import RequestToolChange
 from surgical_msgs.srv import IntegrationDebugCommand
 
 from integration_debug.contracts import (
@@ -50,7 +54,9 @@ from integration_debug.contracts import (
     load_config,
     measured_rate,
     parse_voice_command,
-    validate_retraction,
+    validate_bed_robot_arm_status,
+    validate_retraction_adjustment,
+    validate_tool_change,
     validate_tool_handover,
 )
 from integration_debug.networking import (
@@ -208,6 +214,15 @@ class IntegrationDebugNode(Node):
 
         self._input_stats: dict[str, InputStats] = {}
         self._input_subscriptions: list[Any] = []
+        self._bed_robot_arm_status_received = False
+        self._bed_robot_arm_status_received_monotonic = 0.0
+        self._bed_robot_arm_status_source_stamp_sec = 0.0
+        self._bed_robot_arm_status_revision: int | None = None
+        self._bed_robot_arm_status_max_age_sec = max(
+            0.1,
+            float(self._config.get("bed_robot_arm_status_max_age_sec", 3.0)),
+        )
+        self._bed_robot_arm_status_summary: dict[str, Any] = {}
         for row in self._config["inputs"]:
             topic = str(row["topic"])
             message_type = str(row["type"])
@@ -249,13 +264,20 @@ class IntegrationDebugNode(Node):
         )
         self._retraction_client = ActionClient(
             self,
-            ExecuteRetraction,
-            "/surgery/retraction",
+            ExecuteRetractionAdjustment,
+            "/surgery/retraction/adjust",
             callback_group=self._callback_group,
         )
-        self._suction_client = self.create_client(
-            SetSuction,
-            "/surgery/suction/set",
+        self._tool_change_client = self.create_client(
+            RequestToolChange,
+            "/surgery/tool_change/request",
+            callback_group=self._callback_group,
+        )
+        self._bed_robot_arm_status_subscription = self.create_subscription(
+            BedRobotArmStateArray,
+            "/external/bed_robot_arms/status",
+            self._on_bed_robot_arm_status,
+            _event_qos(),
             callback_group=self._callback_group,
         )
 
@@ -404,6 +426,54 @@ class IntegrationDebugNode(Node):
             stats.last_sample = f"{msg.format or 'unknown'} · {len(msg.data)} bytes"
             stats.message_count += 1
 
+    def _on_bed_robot_arm_status(self, msg: BedRobotArmStateArray) -> None:
+        try:
+            arms = validate_bed_robot_arm_status(msg.procedure_type, msg.arms)
+        except ValueError as exc:
+            with self._lock:
+                self._bed_robot_arm_status_received = False
+                self._bed_robot_arm_status_summary = {"error": str(exc)}
+            self.get_logger().warning(f"ignored invalid bed robot arm status: {exc}")
+            return
+        source_stamp_sec = float(msg.stamp.sec) + float(msg.stamp.nanosec) / 1e9
+        revision = int(msg.revision)
+        current_stamp = self._bed_robot_arm_status_source_stamp_sec
+        current_revision = self._bed_robot_arm_status_revision
+        ordered = bool(
+            source_stamp_sec > 0.0
+            and (
+                source_stamp_sec > current_stamp
+                or (
+                    source_stamp_sec == current_stamp
+                    and current_revision is not None
+                    and revision > current_revision
+                )
+            )
+        )
+        if not ordered:
+            self.get_logger().warning(
+                "ignored stale bed robot arm status "
+                f"stamp={source_stamp_sec:.9f} revision={revision}"
+            )
+            return
+        with self._lock:
+            self._bed_robot_arm_status_received = True
+            self._bed_robot_arm_status_received_monotonic = time.monotonic()
+            self._bed_robot_arm_status_source_stamp_sec = source_stamp_sec
+            self._bed_robot_arm_status_revision = revision
+            self._bed_robot_arm_status_summary = {
+                "revision": revision,
+                "procedure_type": str(msg.procedure_type),
+                "arm_count": len(arms),
+                "arms": arms,
+            }
+
+    def _bed_robot_arm_status_ready(self) -> tuple[bool, float | None]:
+        if not self._bed_robot_arm_status_received:
+            return False, None
+        age_sec = time.monotonic() - self._bed_robot_arm_status_received_monotonic
+        return age_sec <= self._bed_robot_arm_status_max_age_sec, age_sec
+
     def _blocked_nodes(self) -> list[str]:
         expected = {str(value) for value in self._config.get("blocked_nodes", [])}
         try:
@@ -500,8 +570,12 @@ class IntegrationDebugNode(Node):
                 self._armed = False
                 self._voice_auto_execute = False
             if self._active_command_id:
-                self._request_cancel()
-                return True, self._active_command_id, "disarmed; active Action cancel requested"
+                accepted, command_id, message = self._request_cancel()
+                if accepted:
+                    return True, command_id, "disarmed; active Action cancel requested"
+                if self._active_route == "tool_change":
+                    return True, command_id, "disarmed; tool change Service remains in flight"
+                return False, command_id, message
             return True, "", "manual control disarmed"
         if operation == "reset_fault":
             with self._lock:
@@ -650,39 +724,45 @@ class IntegrationDebugNode(Node):
                 )
             )
             return True, command_id, "tool handover Goal submitted"
-        if operation == "retraction":
-            mapped = validate_retraction(payload)
+        if operation == "retraction_adjustment":
+            mapped = validate_retraction_adjustment(payload)
             if not self._retraction_client.server_is_ready():
-                return False, "", "/surgery/retraction Action server is unavailable"
-            goal = ExecuteRetraction.Goal()
+                return False, "", "/surgery/retraction/adjust Action server is unavailable"
+            goal = ExecuteRetractionAdjustment.Goal()
             goal.command_id = command_id
-            goal.operation = mapped["operation"]
+            goal.adjustment_mode = mapped["adjustment_mode"]
+            goal.target_retractor_id = mapped["target_retractor_id"]
+            goal.direction_frame = mapped["direction_frame"]
             goal.direction = mapped["direction"]
+            goal.axis = mapped["axis"]
             goal.distance_mm = mapped["distance_mm"]
-            goal.end_effector_profile = mapped["end_effector_profile"]
-            self._start_action("retraction", command_id, source)
+            self._start_action("retraction_adjustment", command_id, source)
             future = self._retraction_client.send_goal_async(
                 goal,
                 feedback_callback=lambda feedback: self._on_action_feedback(
-                    "retraction", command_id, feedback
+                    "retraction_adjustment", command_id, feedback
                 ),
             )
             future.add_done_callback(
-                lambda result: self._on_goal_response("retraction", command_id, result)
+                lambda result: self._on_goal_response(
+                    "retraction_adjustment", command_id, result
+                )
             )
-            return True, command_id, "retraction Goal submitted"
-        if operation == "suction":
-            if not self._suction_client.service_is_ready():
-                return False, "", "/surgery/suction/set Service is unavailable"
-            request = SetSuction.Request()
+            return True, command_id, "retraction adjustment Goal submitted"
+        if operation == "tool_change":
+            mapped = validate_tool_change(payload)
+            if not self._tool_change_client.service_is_ready():
+                return False, "", "/surgery/tool_change/request Service is unavailable"
+            request = RequestToolChange.Request()
             request.command_id = command_id
-            request.enabled = bool(payload.get("enabled", False))
-            self._start_action("suction", command_id, source)
-            future = self._suction_client.call_async(request)
+            request.arm_id = mapped["arm_id"]
+            request.target_tool_id = mapped["target_tool_id"]
+            self._start_action("tool_change", command_id, source)
+            future = self._tool_change_client.call_async(request)
             future.add_done_callback(
-                lambda result: self._on_suction_result(command_id, result)
+                lambda result: self._on_tool_change_result(command_id, result)
             )
-            return True, command_id, "suction request submitted"
+            return True, command_id, "tool change request submitted"
         return False, "", "unsupported integration debug operation"
 
     def _start_action(self, route: str, command_id: str, source: str) -> None:
@@ -733,9 +813,10 @@ class IntegrationDebugNode(Node):
             if self._active_command_id != command_id:
                 return
             self._action_status["state"] = str(feedback.state or "executing")
-            self._action_status["progress"] = min(
-                1.0, max(0.0, float(feedback.progress))
-            )
+            if hasattr(feedback, "progress"):
+                self._action_status["progress"] = min(
+                    1.0, max(0.0, float(feedback.progress))
+                )
 
     def _on_action_result(self, route: str, command_id: str, future: Any) -> None:
         try:
@@ -750,17 +831,17 @@ class IntegrationDebugNode(Node):
             reason_code = f"result_error:{exc}"
         self._finish_action(route, command_id, success, final_state, reason_code)
 
-    def _on_suction_result(self, command_id: str, future: Any) -> None:
+    def _on_tool_change_result(self, command_id: str, future: Any) -> None:
         try:
             result = future.result()
             success = bool(result.success)
-            final_state = str(result.state or ("completed" if success else "failed"))
+            final_state = str(result.result or ("completed" if success else "failed"))
             reason_code = str(result.reason_code or final_state)
         except Exception as exc:
             success = False
             final_state = "failed"
             reason_code = f"service_error:{exc}"
-        self._finish_action("suction", command_id, success, final_state, reason_code)
+        self._finish_action("tool_change", command_id, success, final_state, reason_code)
 
     def _finish_action(
         self,
@@ -809,8 +890,8 @@ class IntegrationDebugNode(Node):
             route = self._active_route
             if not command_id:
                 return False, "", "no active Action to cancel"
-            if route == "suction":
-                return False, command_id, "suction is a non-cancellable Service"
+            if route == "tool_change":
+                return False, command_id, "tool change is a non-cancellable Service"
             if goal_handle is None:
                 return False, command_id, "Action Goal has not been accepted yet"
             self._action_status["state"] = "cancel_requested"
@@ -1165,6 +1246,7 @@ class IntegrationDebugNode(Node):
                 "restart_scheduled": self._restart_scheduled,
             }
         )
+        bed_robot_ready, bed_robot_age_sec = self._bed_robot_arm_status_ready()
         endpoints = [
             {
                 "name": "tool_handover",
@@ -1173,16 +1255,28 @@ class IntegrationDebugNode(Node):
                 "ready": self._tool_client.server_is_ready(),
             },
             {
-                "name": "retraction",
-                "endpoint": "/surgery/retraction",
+                "name": "retraction_adjustment",
+                "endpoint": "/surgery/retraction/adjust",
                 "kind": "action",
                 "ready": self._retraction_client.server_is_ready(),
             },
             {
-                "name": "suction",
-                "endpoint": "/surgery/suction/set",
+                "name": "tool_change",
+                "endpoint": "/surgery/tool_change/request",
                 "kind": "service",
-                "ready": self._suction_client.service_is_ready(),
+                "ready": self._tool_change_client.service_is_ready(),
+            },
+            {
+                "name": "bed_robot_arm_status",
+                "endpoint": "/external/bed_robot_arms/status",
+                "kind": "topic",
+                "ready": bed_robot_ready,
+                "age_sec": (
+                    round(bed_robot_age_sec, 3)
+                    if bed_robot_age_sec is not None
+                    else None
+                ),
+                "detail": dict(self._bed_robot_arm_status_summary),
             },
         ]
         return {
@@ -1214,14 +1308,16 @@ class IntegrationDebugNode(Node):
         }
 
     def _readiness_snapshot(self) -> dict[str, Any]:
+        bed_robot_ready, bed_robot_age_sec = self._bed_robot_arm_status_ready()
         checks = {
             "sentence_publisher": self.count_publishers(
                 "/sensors/surgeon/sentence"
             )
             > 0,
             "tool_handover_server": self._tool_client.server_is_ready(),
-            "retraction_server": self._retraction_client.server_is_ready(),
-            "suction_service": self._suction_client.service_is_ready(),
+            "retraction_adjustment_server": self._retraction_client.server_is_ready(),
+            "tool_change_service": self._tool_change_client.service_is_ready(),
+            "bed_robot_arm_status": bed_robot_ready,
         }
         missing = [name for name, passed in checks.items() if not passed]
         return {
@@ -1229,7 +1325,15 @@ class IntegrationDebugNode(Node):
             "ready": not missing,
             "checks": checks,
             "missing": missing,
-            "details": {"mode": "debug", "perception_required": False},
+            "details": {
+                "mode": "debug",
+                "perception_required": False,
+                "bed_robot_arm_status_age_sec": (
+                    round(bed_robot_age_sec, 3)
+                    if bed_robot_age_sec is not None
+                    else -1.0
+                ),
+            },
             "stamp_sec": round(self.get_clock().now().nanoseconds / 1e9, 6),
         }
 

@@ -1,0 +1,7 @@
+string command_id
+string arm_id
+string target_tool_id
+---
+bool success
+string result
+string reason_code

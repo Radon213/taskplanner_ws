@@ -65,17 +65,23 @@ class ActiveRobotTask:
 
 @dataclass(slots=True)
 class BedRobotArmGroupBelief:
-    """Aggregate state for a logical bed-mounted robot-arm controller group.
+    """Planner belief for the retraction interface compatibility lane.
 
-    The planner intentionally does not model physical member arms.  A downstream
-    controller is free to realize one logical group with any number of devices.
+    Detailed motion state remains controller-owned. The target fields preserve
+    the reviewed public contract without letting the twin invent arm geometry.
     """
 
     group_id: str
-    connected: bool = True
-    state: str = "standby"
+    connected: bool = False
+    state: str = "unknown"
     operation: str = ""
+    arm_id: str = ""
+    target_tool_id: str = ""
+    adjustment_mode: str = ""
+    target_retractor_id: str = ""
+    direction_frame: str = ""
     direction: str = ""
+    axis: str = ""
     distance_mm: float = 0.0
     distance_origin: str = ""
     raw_distance_text: str = ""
@@ -86,11 +92,14 @@ class BedRobotArmGroupBelief:
     error_code: str = ""
     error_message: str = ""
     rejection_reason: str = ""
-    # Source timestamp of the last command/status reduction.  World snapshots
-    # must keep this value stable instead of pretending that an unchanged
-    # aggregate was updated whenever the periodic snapshot was published.
+    # Source timestamp of the last controller-owned arm-state snapshot. World
+    # snapshots must not make an unchanged aggregate look newly observed.
     last_update_stamp_sec: int = 0
     last_update_stamp_nanosec: int = 0
+    # Internal command/result ordering is separate from controller-owned arm
+    # state time. A service result must not make physical status look newer.
+    last_operation_stamp_sec: int = 0
+    last_operation_stamp_nanosec: int = 0
 
 
 @dataclass(slots=True)

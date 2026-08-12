@@ -90,8 +90,8 @@ tools:
   T08: "Mosquito forceps"
   T11: "Thyroid retractor (Middeldorpf)"
 
-# Physical tray inventory confirmed from the demonstration setup. Suction is
-# supplied by the bed-mounted suction group, not by a handover instrument.
+# Physical tray inventory confirmed from the demonstration setup. Clinical
+# suction remains a surgical cue and is not represented as a bed-robot command.
 tool_inventory:
   T01: 1
   T02: 2
@@ -132,88 +132,18 @@ initial_instrument_states:
 bed_robot_arm_groups:
   direction_enum: [UP, DOWN, LEFT, RIGHT, LEFT_RIGHT, UP_DOWN]
   distance_policy:
-    precedence: [explicit_with_unit, explicit_unit_inferred, qualitative_inferred, defaulted]
-    default_distance_mm: 10
-    qualitative_min_mm: 1
-    qualitative_max_mm: 30
+    precedence: [explicit_with_unit]
+    max_distance_mm: 30
     cm_to_mm_multiplier: 10
-    unitless_numeric_unit: mm
+    require_explicit_unit: true
     clamp_explicit_values: false
-    qualitative_integer_mm: true
-    distance_origins: [explicit_with_unit, explicit_unit_inferred, qualitative_inferred, defaulted]
-    qualitative_anchors:
-      "아주 살짝": 1
-      "미세하게": 1
-      "살짝": 5
-      "조금": 10
-      "조금 더": 10
-      "많이": 20
-      "아주 많이": 30
-      "최대한": 30
+    distance_origins: [explicit_with_unit]
   groups:
-    suction:
-      enabled: true
-      initial_end_effector_profile: suction
-      allowed_operations: [suction_start, suction_stop, change_end_effector]
     retraction:
-      enabled: false
-      initial_end_effector_profile: ""
-      allowed_operations: [retraction, release_retraction, change_end_effector]
-  cues:
-    - id: demo_air_suction_p03
-      phase_id: P03
-      group_id: suction
-      operation: suction_start
-      utterances: ["air suction", "suction", "석션", "석션 시작", "석션 주세요"]
-      directions: []
-      default_distance_mm: 0
-      end_effector_profile: suction
-      feedback_text: "흡인을 시작합니다."
-    - id: demo_air_suction_p06
-      phase_id: P06
-      group_id: suction
-      operation: suction_start
-      utterances: ["air suction", "suction", "석션", "석션 시작", "석션 주세요"]
-      directions: []
-      default_distance_mm: 0
-      end_effector_profile: suction
-      feedback_text: "흡인을 시작합니다."
-    - id: demo_air_suction_p08
-      phase_id: P08
-      group_id: suction
-      operation: suction_start
-      utterances: ["air suction", "suction", "석션", "석션 시작", "석션 주세요"]
-      directions: []
-      default_distance_mm: 0
-      end_effector_profile: suction
-      feedback_text: "흡인을 시작합니다."
-    - id: demo_air_suction_stop_p03
-      phase_id: P03
-      group_id: suction
-      operation: suction_stop
-      utterances: ["suction off", "stop suction", "석션 빼", "석션 정지"]
-      directions: []
-      default_distance_mm: 0
-      end_effector_profile: suction
-      feedback_text: "흡인을 정지합니다."
-    - id: demo_air_suction_stop_p06
-      phase_id: P06
-      group_id: suction
-      operation: suction_stop
-      utterances: ["suction off", "stop suction", "석션 빼", "석션 정지"]
-      directions: []
-      default_distance_mm: 0
-      end_effector_profile: suction
-      feedback_text: "흡인을 정지합니다."
-    - id: demo_air_suction_stop_p08
-      phase_id: P08
-      group_id: suction
-      operation: suction_stop
-      utterances: ["suction off", "stop suction", "석션 빼", "석션 정지"]
-      directions: []
-      default_distance_mm: 0
-      end_effector_profile: suction
-      feedback_text: "흡인을 정지합니다."
+      enabled: true
+      initial_end_effector_profile: thyroid_retractor
+      allowed_operations: [change_end_effector]
+  cues: []
   end_effector_transitions: []
 
 phase_flow:
@@ -265,7 +195,7 @@ phase_flow:
       transition_cues:
         anatomy: "the specimen is absent and the resection bed is visible"
         action: "active resection pauses for inspection and residual hemostasis"
-        tool_cue: "the suction group clears the field while T07 or T04 is used only as needed"
+        tool_cue: "clinical field clearing may accompany T07 or T04 as needed"
 
     - from: "P08"
       to: "P09"
@@ -483,7 +413,7 @@ phase_details:
       - current: "T04"
         next: "T07"
         strength: "medium"
-        cue: "suction-group field clearance reveals a focal point requiring hemostasis"
+        cue: "clinical suction clears the field and reveals a focal point requiring hemostasis"
       - current: "T07"
         next: "T04"
         strength: "medium"

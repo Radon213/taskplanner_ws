@@ -1,6 +1,6 @@
 # Taskplanner Roadmap
 
-Last updated: 2026-06-23 KST
+Last updated: 2026-08-12 KST
 
 ## Current Release
 
@@ -44,9 +44,10 @@ It establishes:
    VLM output.
 
 5. Robot adapter boundary
-   Preserve `/skill/execute` as the integration boundary for a future real
-   humanoid action server. The mock server should remain deterministic for
-   regression testing.
+   Preserve `/skill/execute` as the internal humanoid boundary. Keep the
+   bed-mounted integration retraction-only through the documented Tool Change
+   Service, Retraction Adjustment Action, and controller status Topic. The mock
+   servers should remain deterministic for regression testing.
 
 6. Operator workflow
    Keep procedure switching, mid-procedure start, model selection, reset/stop,
@@ -101,10 +102,18 @@ It establishes:
 
 ### 4. Real Robot Integration
 
-- Implement a real `/skill/execute` action server adapter.
+- Implement and site-validate a real `/skill/execute` humanoid adapter.
 - Preserve the existing action names:
   `direct_handover`, `pick_up_and_handover`, `put_down_and_handover`,
   `retrieve_from_mayo`, `return_unused_preposition`, and `predict_tool`.
+- Integrate thyroidectomy retractor Tool Change through
+  `/surgery/tool_change/request` and nephrectomy Malleable adjustment through
+  `/surgery/retraction/adjust`.
+- Consume only retraction entries from `/external/bed_robot_arms/status`; leave
+  pose, trajectory, collision, force, E-stop, and detailed state ownership to
+  the controller.
+- Do not add a bed-mounted suction-arm API. Clinical suction instruments and
+  speech remain normal procedure/tool evidence.
 - Keep the mock action server available as the default regression backend.
 
 ### 5. Dashboard Hardening

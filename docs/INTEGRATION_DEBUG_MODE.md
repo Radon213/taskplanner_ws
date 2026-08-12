@@ -50,10 +50,27 @@ DDS 설정은 이미 시작된 ROS 2 프로세스에서 안전하게 교체할 �
 | 종단 | 타입 | 디버그 기능 |
 |---|---|---|
 | `/surgery/tool_handover` | `surgical_interop_msgs/action/ExecuteToolHandover` | 도구명·인스턴스·허용된 source/target을 직접 입력해 Goal 실행 |
-| `/surgery/retraction` | `surgical_interop_msgs/action/ExecuteRetraction` | 방향별 단일 `MOVE` Goal, `RELEASE`, `CHANGE_END_EFFECTOR` |
-| `/surgery/suction/set` | `surgical_interop_msgs/srv/SetSuction` | 명시적 ON/OFF 요청 및 응답 확인 |
+| `/surgery/tool_change/request` | `surgical_interop_msgs/srv/RequestToolChange` | 물리 로봇팔과 목표 retractor를 지정하고 완료 대기형 툴 교체 결과 확인 |
+| `/surgery/retraction/adjust` | `surgical_interop_msgs/action/ExecuteRetractionAdjustment` | 단일 Malleable의 방향 조절 또는 양측 Malleable의 축 방향 조절과 Cancel 확인 |
+| `/external/bed_robot_arms/status` | `surgical_interop_msgs/msg/BedRobotArmStateArray` | retraction arm 배열의 revision, 역할, 상태, 직접교시 여부와 reason code 확인 |
 
-리트랙터 조그 버튼은 연속 속도 명령을 내지 않는다. 버튼을 한 번 누를 때 최대 30 mm의 독립된 `MOVE` Goal 하나만 발행한다. Action 화면은 command id, 상태, progress, elapsed time, reason code와 Cancel 결과를 표시한다.
+리트랙터 조그 버튼은 연속 속도 명령을 내지 않는다. 버튼을 한 번 누를
+때 문서의 `single` Goal 하나만 발행하고, 양측 조절은 별도의 `multi` Goal로
+발행한다. Action 화면은 command id, `adjusting`/`recovering` 상태, elapsed
+time, reason code와 Cancel 결과를 표시한다. 문서에 없는 progress, 자세,
+속도 또는 상세 제어 상태는 Taskplanner가 만들지 않는다.
+
+석션 로봇암 제어와 상태 UI는 제공하지 않는다. 임상 도구인 석션과 석션
+관련 음성은 도구 전달 및 공개 증거 경로에서 계속 사용할 수 있지만,
+bed-mounted robot-arm 또는 의료기기 흡입 제어 명령으로 변환하지 않는다.
+
+Tool Change 폼은 `command_id`, `arm_id`, `target_tool_id`만 송신하고
+`success`, `result`, `reason_code`만 표시한다. Retraction Adjustment 폼은
+`command_id`, `adjustment_mode`, `target_retractor_id`, `direction_frame`,
+`direction`, `axis`, `distance_mm`만 송신하고, Result의 `success`,
+`final_state`, `reason_code`와 Feedback의 `state`만 표시한다. 상태 화면은
+`stamp`, `revision`, `procedure_type` 및 각 arm의 `arm_id`, `role`,
+`role_instance_id`, `state`, `direct_teach_active`, `reason_code`만 사용한다.
 
 수동 명령 전에는 **수동 제어 활성화**가 필요하다. 활성 상태는 UI heartbeat가 끊기면 6초 안에 자동 해제된다. 동시에 하나의 명령만 허용하고, Cancel recovery가 실패하거나 Cancel이 거부되면 fault lock으로 전환한다. 전체 Taskplanner 핵심 노드가 같은 ROS 도메인에서 발견되면 활성화와 명령을 거부한다.
 
@@ -74,7 +91,11 @@ DDS 설정은 이미 시작된 ROS 2 프로세스에서 안전하게 교체할 �
 
 **음성·로그** 탭에서 완성 문장을 직접 입력해 `/sensors/surgeon/sentence`로 발행할 수 있다. 브라우저가 Web Speech API를 제공하면 한국어 마이크 입력도 같은 문장 토픽으로 발행한다. 마이크를 지원하지 않는 브라우저에서도 텍스트 입력은 계속 사용할 수 있다.
 
-선택적으로 **음성 즉시 실행**을 활성화할 수 있다. 이 경로는 VLM이나 BT를 사용하지 않고 설정된 한국어·영어 도구 별칭, 리트랙터 방향·거리, 석션 ON/OFF 문법만 결정적으로 변환한다. 모호하거나 불완전한 문장은 fail-closed로 기록하고 실행하지 않는다.
+선택적으로 **음성 즉시 실행**을 활성화할 수 있다. 이 경로는 VLM이나
+BT를 사용하지 않고 설정된 한국어·영어 도구 별칭, retractor 툴 교체,
+단일/양측 리트랙터 방향과 거리만 결정적으로 변환한다. 석션 발화는
+bed-mounted robot-arm 명령으로 해석하지 않는다. 모호하거나 불완전한
+문장은 fail-closed로 기록하고 실행하지 않는다.
 
 ## 내부 진단 인터페이스
 

@@ -22,11 +22,6 @@ def _actor(procedure: str = "thyroidectomy", phase_id: str = "P04"):
     actor._pending_group_requests = {}
     actor._bed_group_status_stamp_ns = {}
     actor._bed_group_states = {
-        "suction": {
-            "connected": True,
-            "state": "standby",
-            "end_effector_profile": "suction",
-        },
         "retraction": {
             "connected": True,
             "state": "holding",
@@ -44,19 +39,9 @@ def _operations(actor, group_id: str) -> set[str]:
     }
 
 
-def test_suction_cues_follow_group_state_and_can_repeat_after_completion():
+def test_removed_suction_group_has_no_actor_cues():
     actor = _actor()
-    assert "suction_start" in _operations(actor, "suction")
-    assert "suction_stop" not in _operations(actor, "suction")
-
-    actor._pending_group_requests["suction"] = {"request_id": "pending"}
     assert not _operations(actor, "suction")
-    actor._pending_group_requests.clear()
-    assert "suction_start" in _operations(actor, "suction")
-
-    actor._bed_group_states["suction"]["state"] = "suctioning"
-    assert "suction_stop" in _operations(actor, "suction")
-    assert "suction_start" not in _operations(actor, "suction")
 
 
 def test_humanoid_pending_masks_tool_work_but_not_independent_group_cue():
@@ -64,8 +49,8 @@ def test_humanoid_pending_masks_tool_work_but_not_independent_group_cue():
     actor._pending_action = "handover"
     group_decision = {
         "action": "request_bed_robot_arm_group",
-        "group_id": "suction",
-        "group_operation": "suction_start",
+        "group_id": "retraction",
+        "group_operation": "retraction",
     }
     assert actor._mask_decision_for_pending_lanes(group_decision) == group_decision
 
@@ -87,7 +72,7 @@ def test_pending_group_blocks_phase_advance_but_not_humanoid_tool_lane():
     assert actor._mask_decision_for_pending_lanes(tool_decision) == tool_decision
 
 
-def test_inguinal_exchange_has_no_release_first_dead_end():
+def test_disabled_inguinal_retraction_has_no_actor_cues():
     actor = _actor("inguinal_hernia_repair", "P04")
     actor._bed_group_states["retraction"] = {
         "connected": True,
@@ -95,37 +80,36 @@ def test_inguinal_exchange_has_no_release_first_dead_end():
         "end_effector_profile": "army_navy",
     }
     cues = actor._available_bed_robot_arm_group_cues()
-    assert any(cue["operation"] == "change_end_effector" for cue in cues)
-    assert not any(cue["operation"] == "release_retraction" for cue in cues)
+    assert cues == []
 
 
-def test_actor_ignores_status_older_than_current_group_state():
+def test_actor_ignores_retraction_status_older_than_current_group_state():
     actor = _actor()
     actor._record_event = lambda *args, **kwargs: None
     actor._schedule_next_decision = lambda *_args, **_kwargs: None
 
     completed = BedRobotArmGroupStatus()
     completed.stamp.sec = 20
-    completed.request_id = "req-start"
-    completed.group_id = "suction"
-    completed.operation = "suction_start"
-    completed.state = "suctioning"
+    completed.request_id = "req-adjust-new"
+    completed.group_id = "retraction"
+    completed.operation = "retraction"
+    completed.state = "holding"
     completed.terminal = True
     completed.success = True
     actor._on_bed_robot_arm_group_status(completed)
 
     delayed = BedRobotArmGroupStatus()
     delayed.stamp.sec = 10
-    delayed.request_id = "req-stop"
-    delayed.group_id = "suction"
-    delayed.operation = "suction_stop"
+    delayed.request_id = "req-adjust-old"
+    delayed.group_id = "retraction"
+    delayed.operation = "retraction"
     delayed.state = "standby"
     delayed.terminal = True
     delayed.success = False
     actor._on_bed_robot_arm_group_status(delayed)
 
-    assert actor._bed_group_states["suction"]["state"] == "suctioning"
-    assert actor._bed_group_states["suction"]["operation"] == "suction_start"
+    assert actor._bed_group_states["retraction"]["state"] == "holding"
+    assert actor._bed_group_states["retraction"]["operation"] == "retraction"
 
 
 def test_actor_health_heartbeat_preserves_holding_metadata():
