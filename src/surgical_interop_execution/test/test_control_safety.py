@@ -1,10 +1,13 @@
 import json
 import threading
+import time
 from dataclasses import replace
 from types import SimpleNamespace
 
+from action_msgs.msg import GoalStatus
 from builtin_interfaces.msg import Time
-from surgical_interop_msgs.action import ExecuteToolHandover
+from surgical_interop_msgs.action import ExecuteRetractionAdjustment, ExecuteToolHandover
+from surgical_interop_msgs.msg import BedRobotArmState, BedRobotArmStateArray
 
 from surgical_interop_execution.bridge import (
     ActiveAction,
@@ -43,18 +46,45 @@ def _group(command_id: str = "group-1") -> InternalGroupCommand:
         command_id=command_id,
         group_id="retraction",
         operation="retraction",
-        direction="LEFT",
+        arm_id="",
+        target_tool_id="",
+        adjustment_mode="single",
+        target_retractor_id="left_malleable",
+        direction_frame="surgeon_view",
+        direction="left",
+        axis="none",
         distance_mm=5.0,
-        end_effector_profile="",
+        end_effector_profile="left_malleable",
+    )
+
+
+def _tool_change_group(command_id: str = "tool-change-1") -> InternalGroupCommand:
+    return replace(
+        _group(command_id),
+        operation="change_end_effector",
+        arm_id="arm_1",
+        target_tool_id="army_navy_retractor",
+        adjustment_mode="",
+        target_retractor_id="",
+        direction_frame="",
+        direction="",
+        axis="",
+        distance_mm=0.0,
+        end_effector_profile="army_navy_retractor",
     )
 
 
 class _GoalHandle:
     def __init__(self):
         self.cancel_calls = 0
+        self.accepted = True
+        self.result_future = SimpleNamespace(add_done_callback=lambda callback: None)
 
     def cancel_goal_async(self):
         self.cancel_calls += 1
+
+    def get_result_async(self):
+        return self.result_future
 
 
 def _bare_bridge() -> SurgicalInteropExecutionBridge:
@@ -64,6 +94,19 @@ def _bare_bridge() -> SurgicalInteropExecutionBridge:
     bridge._dispatch_ledger = DispatchLedger(max_entries=8)
     bridge._active_actions = {}
     bridge._active_services = {}
+    bridge._require_bed_robot_status = True
+    bridge._bed_robot_status_timeout_sec = 2.0
+    # Most unit fixtures use small synthetic timestamps to test ordering. Tests
+    # that exercise absolute freshness override this with the production limit.
+    bridge._bed_robot_source_max_age_sec = 10_000_000_000.0
+    bridge._bed_robot_source_future_tolerance_sec = 0.5
+    bridge._bed_robot_revision = None
+    bridge._bed_robot_source_stamp_ns = None
+    bridge._bed_robot_epoch = 0
+    bridge._bed_robot_signature = None
+    bridge._bed_robot_procedure_type = ""
+    bridge._bed_robot_received_monotonic = 0.0
+    bridge._bed_robot_states = {}
     return bridge
 
 
@@ -163,11 +206,11 @@ def test_cancel_recovery_feedback_remains_visible_until_terminal_result():
     ]
 
 
-def test_stop_cancels_pending_and_accepted_actions_and_blocks_new_dispatch():
+def test_stop_requests_action_cancel_and_keeps_blocking_service_in_flight():
     bridge = _bare_bridge()
     skill = _skill()
     group = _group()
-    service_group = _group("suction-1")
+    service_group = _tool_change_group()
     goal_handle = _GoalHandle()
     bridge._active_actions = {
         ("tool_transfer", skill.command_id): ActiveAction(
@@ -178,8 +221,8 @@ def test_stop_cancels_pending_and_accepted_actions_and_blocks_new_dispatch():
         ),
     }
     bridge._active_services = {
-        ("suction", service_group.command_id): ActiveService(
-            route="suction", command=service_group
+        ("tool_change", service_group.command_id): ActiveService(
+            route="tool_change", command=service_group, dispatched=True
         )
     }
     statuses = []
@@ -196,16 +239,269 @@ def test_stop_cancels_pending_and_accepted_actions_and_blocks_new_dispatch():
     assert goal_handle.cancel_calls == 1
     assert all(active.cancelled for active in bridge._active_actions.values())
     assert all(active.cancelled for active in bridge._active_services.values())
+    assert set(bridge._active_actions) == {
+        ("tool_transfer", skill.command_id),
+        ("retraction", group.command_id),
+    }
+    assert set(bridge._active_services) == {
+        ("tool_change", service_group.command_id)
+    }
     assert bridge._begin_action_dispatch("tool_transfer", _skill("after-stop")) == (
         "runtime_not_accepting_commands"
     )
     assert ("skill", "skill-1", {"state": "cancel_requested", "success": False,
             "reason_code": "cancel_requested_by_runtime_control"}) in statuses
-    assert sum(
-        1
-        for category, _, kwargs in statuses
-        if category == "group" and kwargs["outcome"] == "cancelled_by_runtime_control"
-    ) == 2
+    assert ("group", group.command_id, {
+        "state": "cancel_requested",
+        "outcome": "cancel_requested",
+        "terminal": False,
+        "success": False,
+        "reason_code": "cancel_requested_by_runtime_control",
+    }) in statuses
+    assert ("group", service_group.command_id, {
+        "state": "changing_tool",
+        "outcome": "awaiting_service_result_after_stop",
+        "terminal": False,
+        "success": False,
+        "reason_code": "service_not_cancellable_awaiting_response",
+    }) in statuses
+
+
+def test_retraction_cancel_waits_for_remote_terminal_result():
+    bridge = _bare_bridge()
+    command = _group("adjust-cancel-1")
+    goal_handle = _GoalHandle()
+    bridge._active_actions[("retraction", command.command_id)] = ActiveAction(
+        route="retraction",
+        command=command,
+        goal_handle=goal_handle,
+    )
+    statuses = []
+    bridge._publish_group_status = lambda command, **kwargs: statuses.append(kwargs)
+
+    bridge._on_control(SimpleNamespace(data="stop"))
+    assert ("retraction", command.command_id) in bridge._active_actions
+    assert goal_handle.cancel_calls == 1
+    assert statuses[-1]["terminal"] is False
+
+    bridge._on_retraction_feedback(
+        command,
+        SimpleNamespace(
+            feedback=SimpleNamespace(state="recovering", command_id=command.command_id)
+        ),
+    )
+    assert statuses[-1] == {
+        "state": "recovering",
+        "outcome": "cancel_recovery",
+        "terminal": False,
+        "success": False,
+        "reason_code": "cancel_recovery",
+    }
+
+    remote_result = SimpleNamespace(
+        result=lambda: SimpleNamespace(
+            status=GoalStatus.STATUS_CANCELED,
+            result=SimpleNamespace(
+                success=False,
+                final_state="canceled",
+                reason_code="controller_cancel_complete",
+            )
+        )
+    )
+    bridge._on_retraction_result(command, remote_result)
+
+    assert ("retraction", command.command_id) not in bridge._active_actions
+    assert statuses[-1] == {
+        "state": "canceled",
+        "outcome": "canceled",
+        "terminal": True,
+        "success": False,
+        "reason_code": "controller_cancel_complete",
+        "progress": 0.0,
+    }
+
+
+def test_cancel_before_retraction_goal_acceptance_attaches_handle_and_awaits_result():
+    bridge = _bare_bridge()
+    command = _group("adjust-race-1")
+    bridge._active_actions[("retraction", command.command_id)] = ActiveAction(
+        route="retraction", command=command, cancelled=True
+    )
+    goal_handle = _GoalHandle()
+    statuses = []
+    bridge._publish_group_status = lambda command, **kwargs: statuses.append(kwargs)
+
+    bridge._on_retraction_goal_response(
+        command, SimpleNamespace(result=lambda: goal_handle)
+    )
+
+    assert goal_handle.cancel_calls == 1
+    assert bridge._active_actions[("retraction", command.command_id)].goal_handle is goal_handle
+    assert statuses == []
+
+
+def test_retraction_goal_response_loss_keeps_lane_locked_and_nonterminal():
+    bridge = _bare_bridge()
+    command = _group("adjust-response-lost")
+    bridge._active_actions[("retraction", command.command_id)] = ActiveAction(
+        route="retraction", command=command
+    )
+    statuses = []
+    bridge._publish_group_status = lambda command, **kwargs: statuses.append(kwargs)
+
+    def _raise_transport_error():
+        raise RuntimeError("goal response lost")
+
+    bridge._on_retraction_goal_response(
+        command, SimpleNamespace(result=_raise_transport_error)
+    )
+
+    assert ("retraction", command.command_id) in bridge._active_actions
+    assert not bridge._runtime_is_accepting()
+    assert statuses == [{
+        "state": "unknown",
+        "outcome": "remote_state_unknown",
+        "terminal": False,
+        "success": False,
+        "reason_code": "goal_response_unavailable",
+    }]
+
+
+def test_tool_transfer_goal_response_loss_keeps_lane_locked():
+    bridge = _bare_bridge()
+    command = _skill("handover-response-lost")
+    _activate_tool_transfer(bridge, command)
+    statuses = []
+    bridge._publish_skill_status = lambda command, **kwargs: statuses.append(kwargs)
+
+    def _raise_transport_error():
+        raise RuntimeError("goal response lost")
+
+    bridge._on_tool_transfer_goal_response(
+        command, SimpleNamespace(result=_raise_transport_error)
+    )
+
+    assert ("tool_transfer", command.command_id) in bridge._active_actions
+    assert not bridge._runtime_is_accepting()
+    assert statuses == [{
+        "state": "unknown",
+        "success": False,
+        "reason_code": "goal_response_unavailable",
+        "progress": 0.0,
+    }]
+
+
+def test_tool_change_service_result_after_stop_is_not_discarded_or_attachment_verified():
+    bridge = _bare_bridge()
+    command = _tool_change_group("change-after-stop")
+    bridge._active_services[("tool_change", command.command_id)] = ActiveService(
+        route="tool_change",
+        command=command,
+        cancelled=True,
+        dispatched=True,
+        future=object(),
+    )
+    statuses = []
+    bridge._publish_group_status = lambda command, **kwargs: statuses.append(kwargs)
+
+    bridge._on_tool_change_result(
+        command,
+        SimpleNamespace(
+            result=lambda: SimpleNamespace(
+                success=True,
+                result="completed",
+                reason_code="sequence_complete",
+            )
+        ),
+    )
+
+    assert ("tool_change", command.command_id) not in bridge._active_services
+    assert statuses == [{
+        "state": "completed",
+        "outcome": "completed_after_stop",
+        "terminal": True,
+        "success": True,
+        "reason_code": "sequence_complete",
+        "progress": 1.0,
+    }]
+
+
+def test_missing_tool_change_response_after_stop_remains_nonterminal_and_tracked():
+    bridge = _bare_bridge()
+    command = _tool_change_group("change-unknown")
+    bridge._active_services[("tool_change", command.command_id)] = ActiveService(
+        route="tool_change",
+        command=command,
+        cancelled=True,
+        dispatched=True,
+        future=object(),
+    )
+    statuses = []
+    bridge._publish_group_status = lambda command, **kwargs: statuses.append(kwargs)
+
+    bridge._on_tool_change_result(
+        command,
+        SimpleNamespace(result=lambda: None),
+    )
+
+    assert ("tool_change", command.command_id) in bridge._active_services
+    assert not bridge._runtime_is_accepting()
+    assert statuses == [{
+        "state": "unknown",
+        "outcome": "remote_state_unknown",
+        "terminal": False,
+        "success": False,
+        "reason_code": "service_result_unavailable_after_stop",
+    }]
+
+
+def test_missing_retraction_result_after_cancel_remains_nonterminal_and_tracked():
+    bridge = _bare_bridge()
+    command = _group("adjust-unknown")
+    bridge._active_actions[("retraction", command.command_id)] = ActiveAction(
+        route="retraction",
+        command=command,
+        goal_handle=_GoalHandle(),
+        cancelled=True,
+    )
+    statuses = []
+    bridge._publish_group_status = lambda command, **kwargs: statuses.append(kwargs)
+
+    bridge._on_retraction_result(
+        command,
+        SimpleNamespace(result=lambda: None),
+    )
+
+    assert ("retraction", command.command_id) in bridge._active_actions
+    assert not bridge._runtime_is_accepting()
+    assert statuses == [{
+        "state": "unknown",
+        "outcome": "remote_state_unknown",
+        "terminal": False,
+        "success": False,
+        "reason_code": "cancel_result_unavailable",
+    }]
+
+
+def test_tool_change_status_never_claims_physical_attachment():
+    bridge = _bare_bridge()
+    command = _tool_change_group()
+    published = []
+    bridge._stamp = lambda: Time()
+    bridge._group_status_pub = SimpleNamespace(publish=published.append)
+
+    bridge._publish_group_status(
+        command,
+        state="completed",
+        outcome="completed",
+        terminal=True,
+        success=True,
+        reason_code="sequence_complete",
+        progress=1.0,
+    )
+
+    assert published[0].target_tool_id == "army_navy_retractor"
+    assert published[0].end_effector_profile == ""
 
 
 def test_active_command_id_remains_deduplicated_even_after_ledger_eviction():
@@ -260,6 +556,270 @@ def test_only_start_or_start_actors_enable_external_dispatch():
     assert not bridge._runtime_accepting_commands
     bridge._on_control(SimpleNamespace(data="start"))
     assert bridge._runtime_accepting_commands
+
+
+def _bed_robot_snapshot(
+    revision: int = 1,
+    *,
+    state: str = "standby",
+    direct_teach_active: bool = False,
+    procedure_type: str = "nephrectomy",
+    stamp_ns: int = 1_000_000_000,
+) -> BedRobotArmStateArray:
+    snapshot = BedRobotArmStateArray()
+    snapshot.stamp.sec = stamp_ns // 1_000_000_000
+    snapshot.stamp.nanosec = stamp_ns % 1_000_000_000
+    snapshot.revision = revision
+    snapshot.procedure_type = procedure_type
+    layout = (
+        (("arm_1", "army_navy"),)
+        if procedure_type == "thyroidectomy"
+        else (
+            ("arm_1", "left_malleable"),
+            ("arm_2", "right_malleable"),
+        )
+    )
+    for arm_id, role_instance_id in layout:
+        arm = BedRobotArmState()
+        arm.arm_id = arm_id
+        arm.role = "retraction"
+        arm.role_instance_id = role_instance_id
+        arm.state = state
+        arm.direct_teach_active = direct_teach_active
+        arm.reason_code = "ok"
+        snapshot.arms.append(arm)
+    return snapshot
+
+
+def test_bed_robot_status_requires_monotonic_valid_controller_snapshots():
+    bridge = _bare_bridge()
+    bridge.get_logger = lambda: SimpleNamespace(warning=lambda *_: None)
+
+    bridge._on_bed_robot_status(_bed_robot_snapshot(2, stamp_ns=2_000_000_000))
+    accepted_at = bridge._bed_robot_received_monotonic
+    assert bridge._bed_robot_revision == 2
+    assert set(bridge._bed_robot_states) == {"arm_1", "arm_2"}
+
+    bridge._on_bed_robot_status(_bed_robot_snapshot(1, stamp_ns=1_000_000_000))
+    assert bridge._bed_robot_revision == 2
+    assert bridge._bed_robot_received_monotonic == accepted_at
+
+    inconsistent = _bed_robot_snapshot(
+        3,
+        state="standby",
+        direct_teach_active=True,
+        stamp_ns=3_000_000_000,
+    )
+    bridge._on_bed_robot_status(inconsistent)
+    assert bridge._bed_robot_revision == 2
+
+    invalid_layout = _bed_robot_snapshot(3, stamp_ns=3_000_000_000)
+    invalid_layout.procedure_type = "thyroidectomy"
+    bridge._on_bed_robot_status(invalid_layout)
+    assert bridge._bed_robot_revision == 2
+
+
+def test_bed_robot_status_rejects_stale_and_future_source_time():
+    bridge = _bare_bridge()
+    bridge.get_logger = lambda: SimpleNamespace(warning=lambda *_: None)
+    bridge._bed_robot_source_max_age_sec = 2.0
+    bridge._bed_robot_source_future_tolerance_sec = 0.5
+    bridge._wall_time_ns = lambda: 10_000_000_000
+
+    bridge._on_bed_robot_status(
+        _bed_robot_snapshot(1, stamp_ns=7_000_000_000)
+    )
+    assert bridge._bed_robot_states == {}
+
+    bridge._on_bed_robot_status(
+        _bed_robot_snapshot(1, stamp_ns=11_000_000_000)
+    )
+    assert bridge._bed_robot_states == {}
+
+    bridge._on_bed_robot_status(
+        _bed_robot_snapshot(1, stamp_ns=9_000_000_000)
+    )
+    assert set(bridge._bed_robot_states) == {"arm_1", "arm_2"}
+
+
+def test_dispatch_guard_rechecks_source_time_after_reception():
+    from surgical_interop_execution.mappings import RetractionAdjustmentRequest
+
+    bridge = _bare_bridge()
+    snapshot = _bed_robot_snapshot()
+    bridge._bed_robot_states = {arm.arm_id: arm for arm in snapshot.arms}
+    bridge._bed_robot_procedure_type = "nephrectomy"
+    bridge._bed_robot_received_monotonic = time.monotonic()
+    bridge._bed_robot_source_max_age_sec = 2.0
+    bridge._wall_time_ns = lambda: 10_000_000_000
+    bridge._bed_robot_source_stamp_ns = 7_000_000_000
+    request = RetractionAdjustmentRequest(
+        command_id="adjust-stale-source",
+        adjustment_mode="single",
+        target_retractor_id="left_malleable",
+        direction_frame="surgeon_view",
+        direction="left",
+        axis="none",
+        distance_mm=5.0,
+    )
+
+    assert (
+        bridge._bed_robot_dispatch_guard(request)
+        == "bed_robot_source_stamp_stale"
+    )
+
+
+def test_bed_robot_status_accepts_heartbeat_and_new_controller_epoch():
+    bridge = _bare_bridge()
+    bridge.get_logger = lambda: SimpleNamespace(warning=lambda *_: None)
+
+    bridge._on_bed_robot_status(_bed_robot_snapshot(9, stamp_ns=9_000_000_000))
+    bridge._on_bed_robot_status(_bed_robot_snapshot(9, stamp_ns=10_000_000_000))
+    assert bridge._bed_robot_revision == 9
+    assert bridge._bed_robot_source_stamp_ns == 10_000_000_000
+    assert bridge._bed_robot_epoch == 0
+
+    bridge._on_bed_robot_status(_bed_robot_snapshot(1, stamp_ns=11_000_000_000))
+    assert bridge._bed_robot_revision == 1
+    assert bridge._bed_robot_source_stamp_ns == 11_000_000_000
+    assert bridge._bed_robot_epoch == 1
+
+
+def test_controller_restart_during_command_preserves_tracking_and_blocks_dispatch():
+    bridge = _bare_bridge()
+    bridge.get_logger = lambda: SimpleNamespace(warning=lambda *_: None)
+    command = _group("adjust-during-restart")
+    bridge._active_actions[("retraction", command.command_id)] = ActiveAction(
+        route="retraction",
+        command=command,
+        goal_handle=_GoalHandle(),
+    )
+    statuses = []
+    bridge._publish_group_status = lambda command, **kwargs: statuses.append(kwargs)
+
+    bridge._on_bed_robot_status(_bed_robot_snapshot(8, stamp_ns=8_000_000_000))
+    bridge._on_bed_robot_status(_bed_robot_snapshot(1, stamp_ns=9_000_000_000))
+
+    assert ("retraction", command.command_id) in bridge._active_actions
+    assert not bridge._runtime_is_accepting()
+    assert statuses == [{
+        "state": "unknown",
+        "outcome": "remote_state_unknown",
+        "terminal": False,
+        "success": False,
+        "reason_code": "controller_restarted_during_command",
+    }]
+
+
+def test_bed_robot_status_rejects_changed_payload_without_revision_advance():
+    bridge = _bare_bridge()
+    bridge.get_logger = lambda: SimpleNamespace(warning=lambda *_: None)
+
+    bridge._on_bed_robot_status(_bed_robot_snapshot(4, stamp_ns=4_000_000_000))
+    bridge._on_bed_robot_status(
+        _bed_robot_snapshot(
+            4,
+            state="retracting",
+            stamp_ns=5_000_000_000,
+        )
+    )
+
+    assert bridge._bed_robot_revision == 4
+    assert bridge._bed_robot_source_stamp_ns == 4_000_000_000
+    assert all(arm.state == "standby" for arm in bridge._bed_robot_states.values())
+
+
+def test_dispatch_guard_fails_closed_on_missing_stale_and_direct_teach_status():
+    from surgical_interop_execution.mappings import RetractionAdjustmentRequest
+
+    bridge = _bare_bridge()
+    request = RetractionAdjustmentRequest(
+        command_id="adjust-1",
+        adjustment_mode="single",
+        target_retractor_id="left_malleable",
+        direction_frame="surgeon_view",
+        direction="left",
+        axis="none",
+        distance_mm=5.0,
+    )
+    assert bridge._bed_robot_dispatch_guard(request) == "bed_robot_status_missing"
+
+    bridge._bed_robot_states = {"arm_1": _bed_robot_snapshot().arms[0]}
+    bridge._bed_robot_procedure_type = "nephrectomy"
+    bridge._bed_robot_received_monotonic = time.monotonic() - 3.0
+    assert bridge._bed_robot_dispatch_guard(request) == "bed_robot_status_stale"
+
+    direct_teach = _bed_robot_snapshot(
+        state="direct_teach", direct_teach_active=True
+    ).arms[0]
+    bridge._bed_robot_states = {"arm_1": direct_teach}
+    bridge._bed_robot_procedure_type = "nephrectomy"
+    bridge._bed_robot_received_monotonic = time.monotonic()
+    bridge._bed_robot_source_stamp_ns = time.time_ns()
+    assert bridge._bed_robot_dispatch_guard(request) == "direct_teach_active"
+
+
+def test_dispatch_guard_accepts_only_a_fresh_standby_target():
+    from surgical_interop_execution.mappings import RetractionAdjustmentRequest
+
+    bridge = _bare_bridge()
+    snapshot = _bed_robot_snapshot()
+    bridge._bed_robot_states = {arm.arm_id: arm for arm in snapshot.arms}
+    bridge._bed_robot_procedure_type = "nephrectomy"
+    bridge._bed_robot_received_monotonic = time.monotonic()
+    bridge._bed_robot_source_stamp_ns = time.time_ns()
+    request = RetractionAdjustmentRequest(
+        command_id="adjust-1",
+        adjustment_mode="multi",
+        target_retractor_id="both_malleable",
+        direction_frame="surgeon_view",
+        direction="none",
+        axis="left_right",
+        distance_mm=5.0,
+    )
+    assert bridge._bed_robot_dispatch_guard(request) == ""
+
+
+def test_retraction_adjustment_accepts_controller_retracting_state():
+    from surgical_interop_execution.mappings import RetractionAdjustmentRequest
+
+    bridge = _bare_bridge()
+    snapshot = _bed_robot_snapshot(state="retracting")
+    bridge._bed_robot_states = {arm.arm_id: arm for arm in snapshot.arms}
+    bridge._bed_robot_procedure_type = "nephrectomy"
+    bridge._bed_robot_received_monotonic = time.monotonic()
+    bridge._bed_robot_source_stamp_ns = time.time_ns()
+    request = RetractionAdjustmentRequest(
+        command_id="adjust-active",
+        adjustment_mode="single",
+        target_retractor_id="right_malleable",
+        direction_frame="surgeon_view",
+        direction="up",
+        axis="none",
+        distance_mm=3.0,
+    )
+
+    assert bridge._bed_robot_dispatch_guard(request) == ""
+
+
+def test_tool_change_requires_thyroidectomy_standby_arm():
+    from surgical_interop_execution.mappings import ToolChangeRequest
+
+    bridge = _bare_bridge()
+    snapshot = _bed_robot_snapshot(procedure_type="thyroidectomy")
+    bridge._bed_robot_states = {arm.arm_id: arm for arm in snapshot.arms}
+    bridge._bed_robot_procedure_type = "thyroidectomy"
+    bridge._bed_robot_received_monotonic = time.monotonic()
+    bridge._bed_robot_source_stamp_ns = time.time_ns()
+    request = ToolChangeRequest(
+        command_id="change-1",
+        arm_id="arm_1",
+        target_tool_id="army_navy_retractor",
+    )
+
+    assert bridge._bed_robot_dispatch_guard(request) == ""
+    bridge._bed_robot_states["arm_1"].state = "retracting"
+    assert bridge._bed_robot_dispatch_guard(request) == "arm_not_ready_retracting"
 
 
 def test_completed_handover_event_contains_only_the_dt_reconciliation_fields():
@@ -445,6 +1005,7 @@ def test_failed_or_cancelled_tool_transfer_never_publishes_completion_events():
     _activate_tool_transfer(bridge, failed_command)
     failed_future = SimpleNamespace(
         result=lambda: SimpleNamespace(
+            status=GoalStatus.STATUS_ABORTED,
             result=SimpleNamespace(
                 success=False,
                 final_state="failed",
@@ -461,6 +1022,7 @@ def test_failed_or_cancelled_tool_transfer_never_publishes_completion_events():
     _activate_tool_transfer(bridge, canceled_command, cancel_requested=True)
     canceled_future = SimpleNamespace(
         result=lambda: SimpleNamespace(
+            status=GoalStatus.STATUS_CANCELED,
             result=SimpleNamespace(
                 success=False,
                 final_state="canceled",
@@ -485,6 +1047,77 @@ def test_failed_or_cancelled_tool_transfer_never_publishes_completion_events():
     )
 
 
+def test_action_terminal_status_must_match_retraction_payload():
+    bridge = _bare_bridge()
+    command = _group("adjust-status-mismatch")
+    bridge._active_actions[("retraction", command.command_id)] = ActiveAction(
+        route="retraction", command=command, goal_handle=_GoalHandle()
+    )
+    statuses = []
+    bridge._publish_group_status = lambda command, **kwargs: statuses.append(kwargs)
+
+    bridge._on_retraction_result(
+        command,
+        SimpleNamespace(
+            result=lambda: SimpleNamespace(
+                status=GoalStatus.STATUS_ABORTED,
+                result=SimpleNamespace(
+                    success=True,
+                    final_state="completed",
+                    reason_code="completed",
+                ),
+            )
+        ),
+    )
+
+    assert ("retraction", command.command_id) not in bridge._active_actions
+    assert not bridge._runtime_is_accepting()
+    assert statuses[-1] == {
+        "state": "unknown",
+        "outcome": "unknown",
+        "terminal": True,
+        "success": False,
+        "reason_code": "invalid_controller_result",
+        "progress": 0.0,
+    }
+
+
+def test_action_terminal_status_must_match_tool_transfer_payload():
+    bridge = _bare_bridge()
+    command = _skill("handover-status-mismatch")
+    _activate_tool_transfer(bridge, command)
+    events = []
+    statuses = []
+    bridge._publish_tool_transfer_completed_events = (
+        lambda *args, **kwargs: events.append((args, kwargs))
+    )
+    bridge._publish_skill_status = lambda command, **kwargs: statuses.append(kwargs)
+
+    bridge._on_tool_transfer_result(
+        command,
+        SimpleNamespace(
+            result=lambda: SimpleNamespace(
+                status=GoalStatus.STATUS_ABORTED,
+                result=SimpleNamespace(
+                    success=True,
+                    final_state="completed",
+                    reason_code="completed",
+                ),
+            )
+        ),
+    )
+
+    assert events == []
+    assert ("tool_transfer", command.command_id) not in bridge._active_actions
+    assert not bridge._runtime_is_accepting()
+    assert statuses[-1] == {
+        "state": "failed",
+        "success": False,
+        "reason_code": "invalid_controller_result",
+        "progress": 1.0,
+    }
+
+
 def test_failed_tray_to_robot_transfer_never_publishes_a_prepared_event():
     bridge = _bare_bridge()
     events = []
@@ -497,6 +1130,7 @@ def test_failed_tray_to_robot_transfer_never_publishes_a_prepared_event():
     _activate_tool_transfer(bridge, command)
     failed_future = SimpleNamespace(
         result=lambda: SimpleNamespace(
+            status=GoalStatus.STATUS_ABORTED,
             result=SimpleNamespace(
                 success=False,
                 final_state="failed",
@@ -523,6 +1157,7 @@ def test_inconsistent_success_result_fails_closed_without_a_dt_event():
     _activate_tool_transfer(bridge, command)
     inconsistent_future = SimpleNamespace(
         result=lambda: SimpleNamespace(
+            status=GoalStatus.STATUS_ABORTED,
             result=SimpleNamespace(
                 success=True,
                 final_state="failed",
@@ -552,6 +1187,7 @@ def test_canceled_result_requires_a_machine_readable_recovery_outcome():
     bridge._publish_skill_status = lambda command, **kwargs: statuses.append(kwargs)
     ambiguous_future = SimpleNamespace(
         result=lambda: SimpleNamespace(
+            status=GoalStatus.STATUS_CANCELED,
             result=SimpleNamespace(
                 success=False,
                 final_state="canceled",

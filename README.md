@@ -32,8 +32,9 @@ operator dashboard.
 - `retrieve_from_hand` remains only as a legacy/manual path.
 - Bleeding/hemostasis is modeled as an interrupt event, not as a normal
   sequential phase.
-- Bed-mounted arms are exposed only as the logical `suction` and `retraction`
-  groups; the planner never selects or counts physical member arms.
+- Bed-mounted robot integration is retraction-only. Thyroidectomy tool changes
+  use a blocking Service, nephrectomy fine adjustment uses a cancellable Action,
+  and controller-owned arm state arrives as one documented status array.
 
 ## Repository Layout
 
@@ -50,6 +51,12 @@ operator dashboard.
 - `src/taskplanner_bt_nodes`: C++ BehaviorTree.CPP custom nodes.
 - `src/taskplanner_bt_trees`: Behavior Tree XML.
 - `src/skill_execution`: mock skill action server and `/bt/skill_command` bridge.
+- `src/surgical_interop_msgs`: external tool-handover and retraction-only ROS 2
+  Service/Action/Topic definitions.
+- `src/surgical_interop_execution`: fail-closed bridge and fault emulator for
+  the external controller contracts.
+- `src/surgical_interop_gateway`: read-only projection of accepted Taskplanner
+  state for partner systems.
 - `src/bringup`: launch files, smoke tests, edge probes, and multi-bundle probes.
 - `webapp`: Vite/React operator dashboard.
 - `reports`: generated validation reports. JSON/image outputs are ignored by Git.
@@ -75,17 +82,35 @@ To add another surgery, create a new directory with one
 `src/procedure_spec/procedure_spec/specs/display_catalog.yaml`. The dashboard
 and runtime bundle switch use this YAML-driven catalog.
 
-### Bed Robot-Arm Group Contract
+### Bed-Mounted Retraction Arm Contract
 
-Retraction requests use exactly one group Action with one of `UP`, `DOWN`,
-`LEFT`, `RIGHT`, `LEFT_RIGHT`, or `UP_DOWN`. Explicit distances are converted
-to millimetres without planner-side clamping; qualitative distances are limited
-to 1–30 mm and a request without a distance defaults to 10 mm. The downstream
-group controller remains responsible for physical arm selection, collision and
-force control, and final safety-limit rejection.
+Thyroidectomy retractor changes use
+`/surgery/tool_change/request` (`RequestToolChange`) and wait for the controller's
+sequence result. Its request is exactly `command_id`, `arm_id`, and
+`target_tool_id`; its response is `success`, `result`, and `reason_code`.
+Nephrectomy fine adjustments use
+`/surgery/retraction/adjust` (`ExecuteRetractionAdjustment`) with either a
+single target and cardinal direction or both Malleables and an axis. Its Goal
+contains `command_id`, `adjustment_mode`, `target_retractor_id`,
+`direction_frame`, `direction`, `axis`, and `distance_mm`; its Result contains
+`success`, `final_state`, and `reason_code`, and Feedback contains only `state`.
+Explicit distances are converted to millimetres and validated against the
+agreed interface range; they are never silently clamped. The downstream
+controller remains responsible for coordinate conversion, final Goal
+acceptance, collision and force control, E-stop, and distance-limit rejection.
+Controller state is consumed from
+`/external/bed_robot_arms/status` (`BedRobotArmStateArray`): `stamp`,
+`revision`, `procedure_type`, and an `arms` array whose entries contain only
+`arm_id`, `role`, `role_instance_id`, `state`, `direct_teach_active`, and
+`reason_code`.
+
+There is no bed-mounted suction robot-arm control path. The surgical suction
+instrument and public surgeon speech about suction remain part of the normal
+clinical/tool evidence model.
 
 The operator dashboard shows request-correlated speech, VLM interpretation, BT
-validation, group Action, and group status at <http://127.0.0.1:4173/>.
+validation, the tool-change Service or retraction-adjustment Action, and
+controller-owned retraction-arm status at <http://127.0.0.1:4173/>.
 
 ## External Dependency
 
@@ -305,8 +330,10 @@ An external system publishes one completed surgeon sentence as
 the message, suppresses short-window duplicates, and republishes admitted text
 on the internal compatibility topic `/surgery/audio/request_text`. The digital twin resolves
 explicit tool requests against the active procedure YAML and passes the
-canonical tool id to the BT. An exact bed-arm cue from the YAML is routed to the
-suction/retraction group instead of being mistaken for a handover.
+canonical tool id to the BT. An exact retraction-arm cue from the YAML is routed
+to the retraction control lane instead of being mistaken for a handover. A
+suction utterance remains clinical/tool evidence and is never converted into a
+bed-mounted arm command.
 
 When VLM health is unavailable, a sentence-backed request may bypass only the
 `vlm_unhealthy` and phase-uncertain inference gates. Tool existence, active

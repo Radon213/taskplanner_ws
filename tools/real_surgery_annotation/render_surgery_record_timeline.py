@@ -50,17 +50,11 @@ FAILED_SKILL_STATES = {
     "server_unavailable",
 }
 
-GROUP_NAMES_KO = {
-    "suction": "석션",
-    "retraction": "리트랙션",
-}
+GROUP_NAMES_KO = {"retraction": "리트랙션"}
 
 GROUP_OPERATION_NAMES_KO = {
-    "suction_start": "시작",
-    "suction_stop": "중지",
     "retraction": "조정",
-    "release_retraction": "해제",
-    "change_end_effector": "보조 기구 교환",
+    "change_end_effector": "도구 교환",
 }
 
 TERMINAL_STATE_LABELS_KO = {
@@ -360,7 +354,7 @@ def _group_command_item(record: dict[str, Any]) -> TimelineItem | None:
     payload = _mapping(record.get("payload"))
     group_id = _compact_text(payload.get("group_id"))
     operation = _compact_text(payload.get("operation"))
-    if not group_id or not operation:
+    if group_id != "retraction" or not operation:
         return None
     group_name = GROUP_NAMES_KO.get(group_id, group_id)
     operation_name = GROUP_OPERATION_NAMES_KO.get(operation, operation)
@@ -388,6 +382,8 @@ def _group_terminal_item(record: dict[str, Any]) -> TimelineItem | None:
         return None
     group_id = _compact_text(payload.get("group_id"))
     operation = _compact_text(payload.get("operation"))
+    if group_id != "retraction":
+        return None
     group_name = GROUP_NAMES_KO.get(group_id, "수술 보조")
     operation_name = GROUP_OPERATION_NAMES_KO.get(operation, operation or "작업")
     success = bool(payload.get("success"))

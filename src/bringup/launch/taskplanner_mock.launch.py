@@ -1,12 +1,37 @@
 """Bring up the configurable Taskplanner runtime."""
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, ExecuteProcess
+from launch.actions import (
+    DeclareLaunchArgument,
+    ExecuteProcess,
+    OpaqueFunction,
+    SetLaunchConfiguration,
+)
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution, PythonExpression
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
+
+
+def _bed_robot_contract_configuration(context):
+    bundle_id = LaunchConfiguration("default_bundle").perform(context).strip()
+    if bundle_id in {"thyroidectomy", "thyroidectomy_demo"}:
+        procedure_type = "thyroidectomy"
+    elif bundle_id == "nephrectomy":
+        procedure_type = "nephrectomy"
+    else:
+        procedure_type = ""
+    return [
+        SetLaunchConfiguration(
+            "bed_robot_contract_enabled",
+            "true" if procedure_type else "false",
+        ),
+        SetLaunchConfiguration(
+            "bed_robot_contract_procedure_type",
+            procedure_type,
+        ),
+    ]
 
 
 def generate_launch_description() -> LaunchDescription:
@@ -19,6 +44,12 @@ def generate_launch_description() -> LaunchDescription:
     input_profile = LaunchConfiguration("input_profile")
     execution_backend = LaunchConfiguration("execution_backend")
     execution_contract = LaunchConfiguration("execution_contract")
+    bed_robot_contract_enabled = LaunchConfiguration(
+        "bed_robot_contract_enabled"
+    )
+    bed_robot_contract_procedure_type = LaunchConfiguration(
+        "bed_robot_contract_procedure_type"
+    )
     speech_input_mode = LaunchConfiguration("speech_input_mode")
     sentence_input_topic = LaunchConfiguration("sentence_input_topic")
     speech_min_confidence = LaunchConfiguration("speech_min_confidence")
@@ -62,7 +93,7 @@ def generate_launch_description() -> LaunchDescription:
         "preflight_require_perception"
     )
     spec_default = PathJoinSubstitution(
-        [FindPackageShare("procedure_spec"), "specs", "thyroidectomy"]
+        [FindPackageShare("procedure_spec"), "specs", default_bundle]
     )
     mock_vlm_enabled = PythonExpression(
         [
@@ -114,14 +145,52 @@ def generate_launch_description() -> LaunchDescription:
             "'.lower() in ('true', '1', 'yes')",
         ]
     )
-    mock_execution_enabled = PythonExpression(
-        ["'", execution_backend, "' == 'mock'"]
+    mock_legacy_execution_enabled = PythonExpression(
+        [
+            "'",
+            execution_backend,
+            "' == 'mock' and ('",
+            execution_contract,
+            "' == 'legacy' or '",
+            bed_robot_contract_enabled,
+            "'.lower() != 'true')",
+        ]
     )
     legacy_execution_bridge_enabled = PythonExpression(
-        ["'", execution_contract, "' == 'legacy'"]
+        [
+            "'",
+            execution_contract,
+            "' == 'legacy' or ('",
+            execution_backend,
+            "' == 'mock' and '",
+            bed_robot_contract_enabled,
+            "'.lower() != 'true')",
+        ]
     )
     direct_execution_bridge_enabled = PythonExpression(
-        ["'", execution_contract, "' == 'direct'"]
+        [
+            "'",
+            execution_contract,
+            "' == 'direct' and ('",
+            execution_backend,
+            "' != 'mock' or '",
+            bed_robot_contract_enabled,
+            "'.lower() == 'true')",
+        ]
+    )
+    mock_direct_contract_enabled = PythonExpression(
+        [
+            "'",
+            execution_backend,
+            "' == 'mock' and '",
+            execution_contract,
+            "' == 'direct' and '",
+            bed_robot_contract_enabled,
+            "'.lower() == 'true'",
+        ]
+    )
+    robot_contract_profile = PathJoinSubstitution(
+        [FindPackageShare("bringup"), "config", "robot_contract_success.yaml"]
     )
 
     rosbridge_process = ExecuteProcess(
@@ -155,8 +224,8 @@ def generate_launch_description() -> LaunchDescription:
 
     return LaunchDescription(
         [
-            DeclareLaunchArgument("spec_dir", default_value=spec_default),
             DeclareLaunchArgument("default_bundle", default_value="thyroidectomy"),
+            DeclareLaunchArgument("spec_dir", default_value=spec_default),
             DeclareLaunchArgument("enable_rosbridge", default_value="true"),
             DeclareLaunchArgument("rosbridge_port", default_value="9090"),
             DeclareLaunchArgument("rosbridge_address", default_value="127.0.0.1"),
@@ -165,12 +234,13 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("execution_backend", default_value="mock"),
             DeclareLaunchArgument(
                 "execution_contract",
-                default_value="legacy",
+                default_value="direct",
                 description=(
-                    "legacy uses internal generic action bridges; direct uses "
-                    "the focused /surgery robot contracts."
+                    "direct uses the focused public robot contracts; legacy is "
+                    "retained only for humanoid compatibility."
                 ),
             ),
+            OpaqueFunction(function=_bed_robot_contract_configuration),
             DeclareLaunchArgument("speech_input_mode", default_value="utterance"),
             DeclareLaunchArgument(
                 "sentence_input_topic",
@@ -484,7 +554,7 @@ def generate_launch_description() -> LaunchDescription:
                 package="skill_execution",
                 executable="mock_skill_server",
                 name="mock_skill_server",
-                condition=IfCondition(mock_execution_enabled),
+                condition=IfCondition(mock_legacy_execution_enabled),
                 parameters=[
                     {
                         "action_name": "/skill/execute",
@@ -496,24 +566,6 @@ def generate_launch_description() -> LaunchDescription:
                         "cleaning_hold_sec": 4.5,
                         "cleaner_to_rack_sec": 1.0,
                         "mayo_dwell_sec": 0.8,
-                    }
-                ],
-                output="screen",
-            ),
-            Node(
-                package="skill_execution",
-                executable="mock_bed_robot_arm_group_server",
-                name="mock_bed_robot_arm_group_server",
-                condition=IfCondition(mock_execution_enabled),
-                parameters=[
-                    {
-                        "spec_dir": spec_dir,
-                        "max_retraction_mm": 30.0,
-                        "suction_transition_sec": 0.4,
-                        "retraction_sec": 1.2,
-                        "release_sec": 0.6,
-                        "end_effector_change_sec": 1.2,
-                        "approach_sec": 0.6,
                     }
                 ],
                 output="screen",
@@ -533,14 +585,17 @@ def generate_launch_description() -> LaunchDescription:
                 output="screen",
             ),
             Node(
-                package="skill_execution",
-                executable="bed_robot_arm_group_action_bridge",
-                name="bed_robot_arm_group_action_bridge",
-                condition=IfCondition(legacy_execution_bridge_enabled),
+                package="surgical_interop_execution",
+                executable="fault_action_emulator",
+                name="robot_contract_emulator",
+                condition=IfCondition(mock_direct_contract_enabled),
                 parameters=[
                     {
-                        "min_repeat_interval_sec": 2.0,
-                        "server_wait_timeout_sec": 3.0,
+                        "profile_path": robot_contract_profile,
+                        "procedure_type": ParameterValue(
+                            bed_robot_contract_procedure_type,
+                            value_type=str,
+                        ),
                     }
                 ],
                 output="screen",
@@ -554,8 +609,13 @@ def generate_launch_description() -> LaunchDescription:
                     {
                         "spec_dir": spec_dir,
                         "tool_handover_endpoint": "/surgery/tool_handover",
-                        "retraction_endpoint": "/surgery/retraction",
-                        "suction_service": "/surgery/suction/set",
+                        "tool_change_service": "/surgery/tool_change/request",
+                        "retraction_endpoint": "/surgery/retraction/adjust",
+                        "bed_robot_status_endpoint": "/external/bed_robot_arms/status",
+                        "require_bed_robot_status": ParameterValue(
+                            bed_robot_contract_enabled,
+                            value_type=bool,
+                        ),
                         "server_wait_timeout_sec": 3.0,
                     }
                 ],
@@ -572,6 +632,7 @@ def generate_launch_description() -> LaunchDescription:
                 package="bt_orchestrator",
                 executable="bed_robot_arm_group_orchestrator",
                 name="bed_robot_arm_group_orchestrator",
+                condition=IfCondition(bed_robot_contract_enabled),
                 parameters=[
                     {
                         "spec_dir": spec_dir,
@@ -592,6 +653,38 @@ def generate_launch_description() -> LaunchDescription:
                     {
                         "sentence_topic": sentence_input_topic,
                         "tool_handover_action_name": "/surgery/tool_handover",
+                        "tool_change_service_name": "/surgery/tool_change/request",
+                        "require_tool_change_service": ParameterValue(
+                            PythonExpression(
+                                [
+                                    "'",
+                                    bed_robot_contract_procedure_type,
+                                    "' == 'thyroidectomy'",
+                                ]
+                            ),
+                            value_type=bool,
+                        ),
+                        "retraction_adjustment_action_name": "/surgery/retraction/adjust",
+                        "require_retraction_adjustment_server": ParameterValue(
+                            PythonExpression(
+                                [
+                                    "'",
+                                    bed_robot_contract_procedure_type,
+                                    "' == 'nephrectomy'",
+                                ]
+                            ),
+                            value_type=bool,
+                        ),
+                        "bed_robot_arm_status_topic": "/external/bed_robot_arms/status",
+                        "active_bundle": default_bundle,
+                        "procedure_type": ParameterValue(
+                            bed_robot_contract_procedure_type,
+                            value_type=str,
+                        ),
+                        "require_bed_robot_arm_status": ParameterValue(
+                            bed_robot_contract_enabled,
+                            value_type=bool,
+                        ),
                         "require_sentence_publisher": True,
                         "require_perception": ParameterValue(
                             preflight_require_perception,

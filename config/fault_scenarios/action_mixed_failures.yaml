@@ -7,12 +7,12 @@ routes:
       - {outcome: partial_failure, duration_sec: 0.4, fail_progress: 0.45}
       - {outcome: cancel_recovery_failed, duration_sec: 2.0}
     default: {outcome: success, duration_sec: 0.3}
-  retraction:
+  retraction_adjustment:
     sequence:
       - {outcome: reject}
       - {outcome: success, duration_sec: 0.5}
     default: {outcome: success, duration_sec: 0.4}
-  suction:
+  tool_change:
     sequence:
-      - {outcome: abort, reason_code: suction_controller_unavailable}
+      - {outcome: abort, reason_code: controller_unavailable}
     default: {outcome: success}

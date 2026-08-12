@@ -134,18 +134,18 @@ def test_actor_binds_group_request_created_by_public_voice_router() -> None:
     actor = LLMSurgeonActorNode.__new__(LLMSurgeonActorNode)
     actor._spec = load_bundle(spec_dir)
     actor._pending_group_requests = {
-        "suction": {
+        "retraction": {
             "request_id": "",
-            "operation": "suction_start",
-            "speech": "석션 시작",
+            "operation": "retraction",
+            "speech": "왼쪽으로 조금 당겨줘",
         }
     }
     request = BedRobotArmGroupRequest()
     request.request_id = "voice-123"
-    request.group_id = "suction"
-    request.operation = "suction_start"
+    request.group_id = "retraction"
+    request.operation = "retraction"
     request.source = "deterministic_voice_router"
 
     actor._on_bed_robot_arm_group_request(request)
 
-    assert actor._pending_group_requests["suction"]["request_id"] == "voice-123"
+    assert actor._pending_group_requests["retraction"]["request_id"] == "voice-123"

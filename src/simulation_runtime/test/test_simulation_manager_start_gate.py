@@ -20,6 +20,7 @@ except ModuleNotFoundError:
 from simulation_runtime.simulation_manager import (
     RETRYABLE_START_ERROR_MARKERS,
     SimulationManagerNode,
+    external_robot_contract_for_spec,
 )
 
 
@@ -45,6 +46,21 @@ def _manager_for_start_gate(events: list[str]) -> SimulationManagerNode:
     )
     manager.get_logger = lambda: _Logger()
     return manager
+
+
+def _procedure_spec(procedure_id: str, operation: str = ""):
+    groups = []
+    if operation:
+        groups.append(
+            SimpleNamespace(
+                enabled=True,
+                allowed_operations=[operation],
+            )
+        )
+    return SimpleNamespace(
+        procedure_id=procedure_id,
+        bed_robot_arm_groups=SimpleNamespace(groups=groups),
+    )
 
 
 def test_start_actor_commit_and_reset_have_no_reset_then_restart_order():
@@ -93,8 +109,8 @@ def test_bundle_switch_quiesces_old_runtime_before_spec_change_and_restart():
     manager._execution_state = "running"
     manager._active_bundle = "thyroidectomy"
     manager._active_spec_dir = "/specs/thyroidectomy"
-    old_spec = SimpleNamespace()
-    new_spec = SimpleNamespace()
+    old_spec = _procedure_spec("thyroidectomy", "change_end_effector")
+    new_spec = _procedure_spec("thyroidectomy_demo", "change_end_effector")
     manager._active_spec = old_spec
     manager._load_spec_for_bundle = lambda bundle: (
         f"/specs/{bundle}",
@@ -108,15 +124,18 @@ def test_bundle_switch_quiesces_old_runtime_before_spec_change_and_restart():
         events.append("restart-new") or "new bundle running"
     )
 
-    request = SimpleNamespace(bundle_name="nephrectomy", restart_if_running=True)
+    request = SimpleNamespace(
+        bundle_name="thyroidectomy_demo",
+        restart_if_running=True,
+    )
     response = SimpleNamespace()
     result = manager._handle_select_bundle(request, response)
 
     assert result.success is True
-    assert result.active_bundle == "nephrectomy"
+    assert result.active_bundle == "thyroidectomy_demo"
     assert events == [
         "quiesce-old",
-        "set-spec:/specs/nephrectomy",
+        "set-spec:/specs/thyroidectomy_demo",
         "restart-new",
     ]
     assert manager._operation_name == ""
@@ -138,10 +157,17 @@ def test_bundle_switch_quiescence_accepts_launch_time_bundle_before_spec_update(
 def test_external_start_rejects_failed_integration_preflight():
     manager = SimulationManagerNode.__new__(SimulationManagerNode)
     manager._require_integration_preflight = True
+    manager._active_bundle = "thyroidectomy"
+    manager._active_spec = _procedure_spec(
+        "thyroidectomy", "change_end_effector"
+    )
     manager._integration_preflight_client = SimpleNamespace(
         wait_for_service=lambda timeout_sec: True,
         call_async=lambda _request: object(),
     )
+    manager._configure_integration_preflight = lambda *_args, **_kwargs: None
+    manager._operation_cancel = threading.Event()
+    manager._integration_preflight_timeout_sec = 0.01
     manager._wait_future = lambda _future, timeout_sec: SimpleNamespace(
         success=False,
         message="integration not ready: skill_action_server",
@@ -158,16 +184,134 @@ def test_external_start_rejects_failed_integration_preflight():
 def test_external_start_accepts_ready_integration_preflight():
     manager = SimulationManagerNode.__new__(SimulationManagerNode)
     manager._require_integration_preflight = True
+    manager._active_bundle = "thyroidectomy"
+    manager._active_spec = _procedure_spec(
+        "thyroidectomy", "change_end_effector"
+    )
     manager._integration_preflight_client = SimpleNamespace(
         wait_for_service=lambda timeout_sec: True,
         call_async=lambda _request: object(),
     )
+    manager._configure_integration_preflight = lambda *_args, **_kwargs: None
+    manager._operation_cancel = threading.Event()
     manager._wait_future = lambda _future, timeout_sec: SimpleNamespace(
         success=True,
         message="integration ready",
     )
 
     manager._check_integration_preflight()
+
+
+def test_external_robot_contract_is_derived_from_loaded_spec() -> None:
+    thyroid = external_robot_contract_for_spec(
+        _procedure_spec("thyroidectomy_demo", "change_end_effector")
+    )
+    kidney = external_robot_contract_for_spec(
+        _procedure_spec("nephrectomy", "retraction")
+    )
+    no_bed_robot = external_robot_contract_for_spec(
+        _procedure_spec("inguinal_hernia_repair")
+    )
+
+    assert (
+        thyroid.procedure_type,
+        thyroid.require_tool_change_service,
+        thyroid.require_retraction_adjustment_server,
+        thyroid.require_bed_robot_arm_status,
+    ) == ("thyroidectomy", True, False, True)
+    assert (
+        kidney.procedure_type,
+        kidney.require_tool_change_service,
+        kidney.require_retraction_adjustment_server,
+        kidney.require_bed_robot_arm_status,
+    ) == ("nephrectomy", False, True, True)
+    assert no_bed_robot.procedure_type == ""
+    assert no_bed_robot.require_bed_robot_arm_status is False
+
+
+def test_bundle_switch_rejects_external_contract_change_before_quiescence() -> None:
+    events: list[str] = []
+    manager = _manager_for_start_gate(events)
+    manager._operation_name = ""
+    manager._running = False
+    manager._execution_state = "idle"
+    manager._active_bundle = "thyroidectomy"
+    manager._active_spec_dir = "/specs/thyroidectomy"
+    manager._active_spec = _procedure_spec(
+        "thyroidectomy", "change_end_effector"
+    )
+    manager._runtime_external_robot_contract = external_robot_contract_for_spec(
+        manager._active_spec
+    )
+    manager._load_spec_for_bundle = lambda _bundle: (
+        "/specs/nephrectomy",
+        _procedure_spec("nephrectomy", "retraction"),
+    )
+    manager._quiesce_runtime_for_bundle_change = lambda: events.append(
+        "unsafe-quiesce"
+    )
+
+    result = manager._handle_select_bundle(
+        SimpleNamespace(bundle_name="nephrectomy", restart_if_running=True),
+        SimpleNamespace(),
+    )
+
+    assert result.success is False
+    assert "restart the runtime with default_bundle=nephrectomy" in result.message
+    assert result.active_bundle == "thyroidectomy"
+    assert result.spec_dir == "/specs/thyroidectomy"
+    assert events == []
+
+
+def test_same_contract_bundle_switch_closes_then_reopens_preflight() -> None:
+    events: list[str] = []
+    manager = _manager_for_start_gate(events)
+    manager._operation_name = ""
+    manager._running = True
+    manager._execution_state = "running"
+    manager._active_bundle = "thyroidectomy"
+    manager._active_spec_dir = "/specs/thyroidectomy"
+    manager._active_spec = _procedure_spec(
+        "thyroidectomy", "change_end_effector"
+    )
+    manager._runtime_external_robot_contract = external_robot_contract_for_spec(
+        manager._active_spec
+    )
+    target_spec = _procedure_spec(
+        "thyroidectomy_demo", "change_end_effector"
+    )
+    manager._load_spec_for_bundle = lambda _bundle: (
+        "/specs/thyroidectomy_demo",
+        target_spec,
+    )
+    manager._configure_integration_preflight = (
+        lambda bundle, _spec, *, transitioning: events.append(
+            f"preflight:{bundle}:{transitioning}"
+        )
+    )
+    manager._quiesce_runtime_for_bundle_change = lambda: events.append("quiesce")
+    manager._set_spec_dir_on_runtime = lambda _spec_dir: events.append("set-spec")
+    manager._start_sequence = lambda prepare_executor=False: (
+        events.append("restart") or "running"
+    )
+
+    result = manager._handle_select_bundle(
+        SimpleNamespace(
+            bundle_name="thyroidectomy_demo",
+            restart_if_running=True,
+        ),
+        SimpleNamespace(),
+    )
+
+    assert result.success is True
+    assert result.active_bundle == "thyroidectomy_demo"
+    assert events == [
+        "preflight:thyroidectomy:True",
+        "quiesce",
+        "set-spec",
+        "preflight:thyroidectomy_demo:False",
+        "restart",
+    ]
 
 
 def test_empty_node_manifest_catalog_is_a_retryable_start_error():

@@ -112,12 +112,14 @@ REQUIRED_EVENT_DISPLAY_KEYS = {
 }
 
 ALLOWED_BED_ROBOT_ARM_OPERATIONS = {
-    "suction_start",
-    "suction_stop",
     "retraction",
-    "release_retraction",
     "change_end_effector",
 }
+
+BED_ROBOT_ARM_IDS = {"arm_1", "arm_2"}
+BED_ROBOT_ARM_TARGET_TOOLS = {"thyroid_retractor", "army_navy_retractor"}
+BED_ROBOT_ARM_SINGLE_TARGETS = {"left_malleable", "right_malleable"}
+BED_ROBOT_ARM_MULTI_TARGET = "both_malleable"
 
 
 class SpecValidationError(ValueError):
@@ -191,40 +193,32 @@ def _validate_bed_robot_arm_groups(payload: object, phase_ids: set[str]) -> None
     distance_policy = _require_mapping(
         config.get("distance_policy"), "bed_robot_arm_groups distance_policy"
     )
-    default_distance = float(distance_policy.get("default_distance_mm", 0.0))
-    qualitative_min = float(distance_policy.get("qualitative_min_mm", 0.0))
-    qualitative_max = float(distance_policy.get("qualitative_max_mm", 0.0))
-    if default_distance != 10.0:
-        raise SpecValidationError("bed_robot_arm_groups default_distance_mm must be 10.")
-    if qualitative_min != 1.0 or qualitative_max != 30.0:
+    forbidden_inference_keys = {
+        "default_distance_mm",
+        "qualitative_min_mm",
+        "qualitative_max_mm",
+        "qualitative_integer_mm",
+        "qualitative_anchors",
+        "unitless_numeric_unit",
+    }
+    forbidden_present = sorted(forbidden_inference_keys.intersection(distance_policy))
+    if forbidden_present:
         raise SpecValidationError(
-            "bed_robot_arm_groups qualitative distance range must be 1..30 mm."
+            "bed_robot_arm_groups distance policy must not define inferred/default fields: "
+            + ", ".join(forbidden_present)
         )
+    if float(distance_policy.get("max_distance_mm", 0.0)) != 30.0:
+        raise SpecValidationError("bed_robot_arm_groups max_distance_mm must be 30.")
     if [str(item) for item in distance_policy.get("precedence", [])] != list(DISTANCE_ORIGINS):
         raise SpecValidationError(
-            "bed_robot_arm_groups distance precedence must be explicit_with_unit, "
-            "explicit_unit_inferred, qualitative_inferred, defaulted."
+            "bed_robot_arm_groups distance precedence must be explicit_with_unit."
         )
     if float(distance_policy.get("cm_to_mm_multiplier", 0.0)) != 10.0:
         raise SpecValidationError("bed_robot_arm_groups cm_to_mm_multiplier must be 10.")
-    if str(distance_policy.get("unitless_numeric_unit", "")) != "mm":
-        raise SpecValidationError("bed_robot_arm_groups unitless numeric values must use mm.")
+    if distance_policy.get("require_explicit_unit") is not True:
+        raise SpecValidationError("bed_robot_arm_groups distances must require an explicit unit.")
     if distance_policy.get("clamp_explicit_values") is not False:
         raise SpecValidationError("bed_robot_arm_groups explicit distances must not be clamped.")
-    if distance_policy.get("qualitative_integer_mm") is not True:
-        raise SpecValidationError("bed_robot_arm_groups qualitative distances must use integer mm.")
-    anchors = _require_mapping(
-        distance_policy.get("qualitative_anchors"),
-        "bed_robot_arm_groups distance_policy.qualitative_anchors",
-    )
-    for phrase, value in anchors.items():
-        if not str(phrase).strip():
-            raise SpecValidationError("bed_robot_arm_groups qualitative anchor requires text.")
-        distance = float(value)
-        if distance < qualitative_min or distance > qualitative_max:
-            raise SpecValidationError(
-                f"bed_robot_arm_groups qualitative anchor '{phrase}' must be within 1..30 mm."
-            )
     if set(str(item) for item in distance_policy.get("distance_origins", [])) != set(DISTANCE_ORIGINS):
         raise SpecValidationError(
             "bed_robot_arm_groups distance_origins must contain exactly: "
@@ -234,7 +228,7 @@ def _validate_bed_robot_arm_groups(payload: object, phase_ids: set[str]) -> None
     groups = _require_mapping(config.get("groups"), "bed_robot_arm_groups groups")
     if set(groups) != set(BED_ROBOT_ARM_GROUP_IDS):
         raise SpecValidationError(
-            "bed_robot_arm_groups groups must define exactly suction and retraction."
+            "bed_robot_arm_groups groups must define exactly retraction."
         )
     allowed_by_group: dict[str, set[str]] = {}
     enabled_groups: set[str] = set()
@@ -260,9 +254,13 @@ def _validate_bed_robot_arm_groups(payload: object, phase_ids: set[str]) -> None
                 + ", ".join(unsupported)
             )
         allowed_by_group[str(group_id)] = operations
-        if bool(group["enabled"]) and not str(group.get("initial_end_effector_profile", "")).strip():
+        if (
+            bool(group["enabled"])
+            and "change_end_effector" in operations
+            and not str(group.get("initial_end_effector_profile", "")).strip()
+        ):
             raise SpecValidationError(
-                f"enabled bed_robot_arm_groups group '{group_id}' requires initial_end_effector_profile."
+                f"tool-changing bed_robot_arm_groups group '{group_id}' requires initial_end_effector_profile."
             )
 
     cue_ids: set[str] = set()
@@ -314,12 +312,40 @@ def _validate_bed_robot_arm_groups(payload: object, phase_ids: set[str]) -> None
         if operation == "retraction":
             if not cue_directions:
                 raise SpecValidationError(
-                    f"bed_robot_arm_groups retraction cue '{cue_id}' requires directions."
+                    f"bed_robot_arm_groups adjustment cue '{cue_id}' requires directions."
                 )
-            default_mm = float(cue.get("default_distance_mm", 0.0))
-            if default_mm < qualitative_min or default_mm > qualitative_max:
+            adjustment_mode = str(cue.get("adjustment_mode", "")).strip()
+            target_retractor_id = str(cue.get("target_retractor_id", "")).strip()
+            direction_frame = str(cue.get("direction_frame", "")).strip()
+            if direction_frame != "surgeon_view":
                 raise SpecValidationError(
-                    f"bed_robot_arm_groups cue '{cue_id}' default distance must be within 1..30 mm."
+                    f"bed_robot_arm_groups adjustment cue '{cue_id}' requires direction_frame surgeon_view."
+                )
+            if adjustment_mode == "single":
+                if target_retractor_id not in BED_ROBOT_ARM_SINGLE_TARGETS:
+                    raise SpecValidationError(
+                        f"bed_robot_arm_groups single cue '{cue_id}' requires left_malleable or right_malleable."
+                    )
+                if not set(cue_directions) <= {"UP", "DOWN", "LEFT", "RIGHT"}:
+                    raise SpecValidationError(
+                        f"bed_robot_arm_groups single cue '{cue_id}' supports cardinal directions only."
+                    )
+            elif adjustment_mode == "multi":
+                if target_retractor_id != BED_ROBOT_ARM_MULTI_TARGET:
+                    raise SpecValidationError(
+                        f"bed_robot_arm_groups multi cue '{cue_id}' requires both_malleable."
+                    )
+                if not set(cue_directions) <= {"LEFT_RIGHT", "UP_DOWN"}:
+                    raise SpecValidationError(
+                        f"bed_robot_arm_groups multi cue '{cue_id}' supports LEFT_RIGHT or UP_DOWN only."
+                    )
+            else:
+                raise SpecValidationError(
+                    f"bed_robot_arm_groups adjustment cue '{cue_id}' requires single or multi mode."
+                )
+            if "default_distance_mm" in cue:
+                raise SpecValidationError(
+                    f"bed_robot_arm_groups cue '{cue_id}' must not define a default distance."
                 )
 
     transition_ids: set[str] = set()
@@ -354,6 +380,20 @@ def _validate_bed_robot_arm_groups(payload: object, phase_ids: set[str]) -> None
         ).strip():
             raise SpecValidationError(
                 f"bed_robot_arm_groups transition '{transition_id}' requires from_profile and to_profile."
+            )
+        arm_id = str(transition.get("arm_id", "")).strip()
+        target_tool_id = str(transition.get("target_tool_id", "")).strip()
+        if arm_id not in BED_ROBOT_ARM_IDS:
+            raise SpecValidationError(
+                f"bed_robot_arm_groups transition '{transition_id}' requires arm_id arm_1 or arm_2."
+            )
+        if target_tool_id not in BED_ROBOT_ARM_TARGET_TOOLS:
+            raise SpecValidationError(
+                f"bed_robot_arm_groups transition '{transition_id}' has unsupported target_tool_id."
+            )
+        if target_tool_id != str(transition.get("to_profile", "")).strip():
+            raise SpecValidationError(
+                f"bed_robot_arm_groups transition '{transition_id}' target_tool_id must match to_profile."
             )
         utterances = _require_list(
             transition.get("utterances"),

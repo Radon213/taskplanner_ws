@@ -77,26 +77,10 @@ BED_ROBOT_GROUP_LAYERS = {
     "bed_robot_arm_group_request",
     "bed_robot_arm_group_command",
 }
-BED_ROBOT_ACTIVATION_TOKENS = {
-    "activate",
-    "deploy",
-    "enable",
-    "engage",
-    "extend",
-    "handover",
-    "present",
-    "start",
-}
-BED_ROBOT_DEACTIVATION_TOKENS = {
-    "cancel",
-    "disable",
-    "home",
-    "off",
-    "pause",
-    "release",
-    "standby",
-    "stop",
-    "withdraw",
+RETRACTION_GROUP_ID = "retraction"
+RETRACTION_TOOL_CHANGE_OPERATIONS = {
+    "change_end_effector",
+    "tool_change",
 }
 EVALUATION_MASK_SCHEMAS = {
     "taskplanner.evaluation_masks.v1",
@@ -1341,7 +1325,12 @@ def _discover_bed_robot_group_capabilities(
             continue
         payload = _payload(record)
         group_id = _clean(payload.get("group_id"))
-        profile = _clean(payload.get("end_effector_profile"))
+        if group_id != RETRACTION_GROUP_ID:
+            continue
+        profile = _clean(
+            payload.get("target_tool_id")
+            or payload.get("end_effector_profile")
+        )
         if not group_id or not profile:
             continue
         descriptor = descriptors.setdefault(
@@ -1422,18 +1411,10 @@ def _is_bed_robot_activation(
     group_id: str,
     end_effector_profile: str,
 ) -> bool:
-    operation_tokens = _semantic_identifier_tokens(operation)
-    if not operation_tokens:
+    if group_id != RETRACTION_GROUP_ID:
         return False
-    if operation_tokens & BED_ROBOT_DEACTIVATION_TOKENS:
-        return False
-    if operation_tokens & BED_ROBOT_ACTIVATION_TOKENS:
-        return True
-    semantic_tokens = (
-        _semantic_identifier_tokens(group_id)
-        | _semantic_identifier_tokens(end_effector_profile)
-    )
-    return bool(operation_tokens & semantic_tokens)
+    del end_effector_profile
+    return operation in RETRACTION_TOOL_CHANGE_OPERATIONS
 
 
 def _bed_robot_command_id(record: dict[str, Any]) -> str:
@@ -1490,7 +1471,12 @@ def _evaluate_specialized_group_actions(
             continue
         payload = _payload(record)
         group_id = _clean(payload.get("group_id"))
-        profile = _clean(payload.get("end_effector_profile"))
+        if group_id != RETRACTION_GROUP_ID:
+            continue
+        profile = _clean(
+            payload.get("target_tool_id")
+            or payload.get("end_effector_profile")
+        )
         operation = _clean(payload.get("operation"))
         sequence = int(
             record.get("sequence", record.get("_jsonl_line", 0))
@@ -1533,6 +1519,8 @@ def _evaluate_specialized_group_actions(
         if _clean(record.get("layer")) != "bed_robot_arm_group_status":
             continue
         payload = _payload(record)
+        if _clean(payload.get("group_id")) != RETRACTION_GROUP_ID:
+            continue
         command_id = _bed_robot_command_id(record)
         if not command_id or not bool(payload.get("terminal")):
             continue
@@ -1550,6 +1538,8 @@ def _evaluate_specialized_group_actions(
         for record in records
         if _clean(record.get("layer"))
         == "shadow_bed_robot_arm_group_sink"
+        and _clean(_payload(record).get("group_id"))
+        == RETRACTION_GROUP_ID
         and _bed_robot_command_id(record)
     }
 
@@ -1705,7 +1695,7 @@ def _evaluate_specialized_group_actions(
                 if reference_gap_commands
                 else (
                     "confirmed handover targets mapped to uniquely declared "
-                    "bed-robot end-effector capabilities"
+                    "retraction-arm end-effector capabilities"
                 )
             ),
             "capabilities": capabilities,
@@ -5993,7 +5983,7 @@ def evaluate_shadow(
     ]
     if specialized_target_ids:
         notes.append(
-            "Targets uniquely served by declared bed-robot end-effectors are "
+            "Targets uniquely served by declared retraction-arm end-effectors are "
             "excluded from ordinary handover denominators and scored under "
             "specialized_group_actions."
         )

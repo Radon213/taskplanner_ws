@@ -7,9 +7,7 @@ from skill_execution.group_contract import (
     DISTANCE_EXPLICIT_WITH_UNIT,
     DISTANCE_QUALITATIVE_INFERRED,
     GROUP_RETRACTION,
-    GROUP_SUCTION,
     OPERATION_RETRACTION,
-    OPERATION_SUCTION_START,
     mock_safety_rejection,
     validate_command_values,
 )
@@ -104,23 +102,12 @@ def test_defaulted_distance_must_be_10_mm():
     assert error == "defaulted retraction distance must be 10 mm"
 
 
-def test_suction_command_must_not_contain_retraction_fields():
-    assert (
-        validate_command_values(
-            group_id=GROUP_SUCTION,
-            operation=OPERATION_SUCTION_START,
-            direction="",
-            distance_mm=0.0,
-            distance_origin="",
-            confidence=1.0,
-        )
-        == ""
-    )
-    assert "must not include a direction" in validate_command_values(
-        group_id=GROUP_SUCTION,
-        operation=OPERATION_SUCTION_START,
-        direction="LEFT",
+def test_removed_suction_group_is_rejected_at_internal_boundary():
+    assert validate_command_values(
+        group_id="suction",
+        operation="suction_start",
+        direction="",
         distance_mm=0.0,
         distance_origin="",
         confidence=1.0,
-    )
+    ) == "unsupported group_id 'suction'"

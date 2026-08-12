@@ -18,10 +18,10 @@ from rclpy.qos import (
 )
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
+from surgical_interop_msgs.msg import BedRobotArmStateArray
 from surgical_msgs.msg import (
     BedRobotArmGroupCommand,
     BedRobotArmGroupRequest,
-    BedRobotArmGroupStatus,
     BTDecision,
     PhaseEvidence,
     ReducerDecisionEvent,
@@ -388,10 +388,10 @@ class ShadowTraceRecorderNode(Node):
             "surgical_msgs/msg/BedRobotArmGroupCommand",
         )
         self._subscribe(
-            BedRobotArmGroupStatus,
-            "/bed_robot_arm_group/status",
-            "bed_robot_arm_group_status",
-            "surgical_msgs/msg/BedRobotArmGroupStatus",
+            BedRobotArmStateArray,
+            "/external/bed_robot_arms/status",
+            "bed_robot_arm_status",
+            "surgical_interop_msgs/msg/BedRobotArmStateArray",
         )
         self._subscribe(
             TwinEvent,
@@ -403,13 +403,6 @@ class ShadowTraceRecorderNode(Node):
             String,
             "/shadow/skill_outcome",
             "shadow_sink",
-            "std_msgs/msg/String",
-            payload_transform=self._json_string_payload,
-        )
-        self._subscribe(
-            String,
-            "/shadow/bed_robot_arm_group_outcome",
-            "shadow_bed_robot_arm_group_sink",
             "std_msgs/msg/String",
             payload_transform=self._json_string_payload,
         )

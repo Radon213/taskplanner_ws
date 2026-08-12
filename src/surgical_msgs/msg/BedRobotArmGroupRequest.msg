@@ -5,5 +5,10 @@ string operation
 string voice_text
 string procedure_id
 string phase_id
+string arm_id
+string target_tool_id
+string adjustment_mode
+string target_retractor_id
+string direction_frame
 string end_effector_profile
 string source

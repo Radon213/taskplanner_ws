@@ -2,7 +2,8 @@ import { useEffect, useRef, useState, startTransition } from "react";
 import ROSLIB from "roslib";
 
 import type {
-  BedRobotArmGroupState,
+  BedRobotArmState,
+  BedRobotArmStateArray,
   BTDecision,
   Cam4ToolRequestObservation,
   CompressedImageFrame,
@@ -55,7 +56,7 @@ const DEFAULT_STATE: SimulationState = {
   active_robot_task_target_anchor: "",
   active_robot_task_progress: 0,
   active_robot_task_remaining_sec: 0,
-  bed_robot_arm_groups: [],
+  bed_robot_arms: [],
   instrument_states: [],
   recent_events: [],
   layout_json: "",
@@ -199,7 +200,7 @@ const DEFAULT_WORLD_STATE: WorldState = {
   predicted_tool_stability_sec: 0,
   surgeon_request_tool: "",
   explicit_request_voice_backed: false,
-  bed_robot_arm_groups: [],
+  bed_robot_arms: [],
 };
 
 const DEFAULT_SHADOW_REPLAY_STATE: ShadowReplayState = {
@@ -515,37 +516,120 @@ type RosServiceConnection = {
   callOnConnection: (message: Record<string, unknown>) => void;
 };
 
-const BED_ROBOT_ARM_GROUP_IDS = new Set(["suction", "retraction"]);
-
-function normalizeBedRobotArmGroupState(message: unknown): BedRobotArmGroupState | null {
+function normalizeBedRobotArmState(message: unknown): BedRobotArmState | null {
   if (!message || typeof message !== "object") return null;
-  const group = message as Partial<BedRobotArmGroupState>;
-  if (!group.group_id || !BED_ROBOT_ARM_GROUP_IDS.has(group.group_id)) return null;
+  const arm = message as Partial<BedRobotArmState>;
+  const armId = String(arm.arm_id || "").trim();
+  if (!armId || String(arm.role || "").trim().toLowerCase() !== "retraction") {
+    return null;
+  }
   return {
-    stamp: group.stamp ?? { sec: 0, nanosec: 0 },
-    group_id: group.group_id,
-    connected: Boolean(group.connected),
-    state: group.state ?? "offline",
-    operation: group.operation ?? "",
-    direction: group.direction ?? "",
-    distance_mm: Number.isFinite(Number(group.distance_mm)) ? Number(group.distance_mm) : 0,
-    distance_origin: group.distance_origin ?? "",
-    raw_distance_text: group.raw_distance_text ?? "",
-    end_effector_profile: group.end_effector_profile ?? "",
-    active_request_id: group.active_request_id ?? "",
-    active_command_id: group.active_command_id ?? "",
-    progress: Number.isFinite(Number(group.progress)) ? Number(group.progress) : 0,
-    error_code: group.error_code ?? "",
-    error_message: group.error_message ?? "",
-    rejection_reason: group.rejection_reason ?? "",
+    arm_id: armId,
+    role: "retraction",
+    role_instance_id: String(arm.role_instance_id || "").trim(),
+    state: String(arm.state || "unknown").trim().toLowerCase(),
+    direct_teach_active: Boolean(arm.direct_teach_active),
+    reason_code: String(arm.reason_code || "").trim(),
   };
 }
 
-function normalizeBedRobotArmGroupStates(message: unknown): BedRobotArmGroupState[] {
+function normalizeBedRobotArmStates(message: unknown): BedRobotArmState[] {
   if (!Array.isArray(message)) return [];
   return message
-    .map((group) => normalizeBedRobotArmGroupState(group))
-    .filter((group): group is BedRobotArmGroupState => group !== null);
+    .map((arm) => normalizeBedRobotArmState(arm))
+    .filter((arm): arm is BedRobotArmState => arm !== null);
+}
+
+const BED_ROBOT_ARM_STATES = new Set([
+  "standby",
+  "direct_teach",
+  "retracting",
+  "changing_tool",
+  "moving_to_standby",
+  "fault",
+  "protective_stop",
+  "unknown",
+]);
+
+const BED_ROBOT_PROCEDURE_LAYOUTS: Record<string, ReadonlySet<string>> = {
+  thyroidectomy: new Set(["army_navy"]),
+  nephrectomy: new Set(["left_malleable", "right_malleable"]),
+};
+
+const BED_ROBOT_STATUS_MAX_AGE_MS = 3000;
+
+type ValidatedBedRobotArmStatus = {
+  stampMs: number;
+  receivedAtMs: number;
+  revision: number;
+  procedureType: string;
+  arms: BedRobotArmState[];
+};
+
+function canonicalBedRobotProcedure(procedureId: string): string {
+  const normalized = procedureId.trim().toLowerCase();
+  if (normalized === "thyroidectomy" || normalized === "thyroidectomy_demo") {
+    return "thyroidectomy";
+  }
+  return normalized === "nephrectomy" ? normalized : "";
+}
+
+function rosTimeToMilliseconds(stamp: BedRobotArmStateArray["stamp"] | undefined): number | null {
+  const sec = Number(stamp?.sec);
+  const nanosec = Number(stamp?.nanosec);
+  if (
+    !Number.isSafeInteger(sec) ||
+    sec < 0 ||
+    !Number.isInteger(nanosec) ||
+    nanosec < 0 ||
+    nanosec >= 1_000_000_000
+  ) {
+    return null;
+  }
+  return sec * 1000 + nanosec / 1_000_000;
+}
+
+function normalizeBedRobotArmStatus(message: unknown): ValidatedBedRobotArmStatus | null {
+  if (!message || typeof message !== "object") return null;
+  const status = message as Partial<BedRobotArmStateArray>;
+  const procedureType = String(status.procedure_type || "").trim().toLowerCase();
+  const expectedRoles = BED_ROBOT_PROCEDURE_LAYOUTS[procedureType];
+  const stampMs = rosTimeToMilliseconds(status.stamp);
+  const revision = Number(status.revision);
+  if (
+    !expectedRoles ||
+    !Array.isArray(status.arms) ||
+    stampMs === null ||
+    stampMs <= 0 ||
+    !Number.isSafeInteger(revision) ||
+    revision < 0
+  ) {
+    return null;
+  }
+
+  const arms = normalizeBedRobotArmStates(status.arms);
+  if (arms.length !== status.arms.length || arms.length !== expectedRoles.size) {
+    return null;
+  }
+  const armIds = new Set<string>();
+  const roles = new Set<string>();
+  for (const arm of arms) {
+    if (
+      !new Set(["arm_1", "arm_2"]).has(arm.arm_id) ||
+      armIds.has(arm.arm_id) ||
+      !expectedRoles.has(arm.role_instance_id) ||
+      roles.has(arm.role_instance_id) ||
+      !BED_ROBOT_ARM_STATES.has(arm.state) ||
+      arm.direct_teach_active !== (arm.state === "direct_teach")
+    ) {
+      return null;
+    }
+    armIds.add(arm.arm_id);
+    roles.add(arm.role_instance_id);
+  }
+  return roles.size === expectedRoles.size
+    ? { stampMs, receivedAtMs: Date.now(), revision, procedureType, arms }
+    : null;
 }
 
 function normalizeSimulationState(message: unknown): SimulationState {
@@ -553,7 +637,7 @@ function normalizeSimulationState(message: unknown): SimulationState {
   return {
     ...DEFAULT_STATE,
     ...state,
-    bed_robot_arm_groups: normalizeBedRobotArmGroupStates(state.bed_robot_arm_groups),
+    bed_robot_arms: normalizeBedRobotArmStates(state.bed_robot_arms),
     instrument_states: Array.isArray(state.instrument_states) ? state.instrument_states : [],
     recent_events: Array.isArray(state.recent_events) ? state.recent_events : [],
   };
@@ -564,7 +648,7 @@ function normalizeWorldState(message: unknown): WorldState {
   return {
     ...DEFAULT_WORLD_STATE,
     ...state,
-    bed_robot_arm_groups: normalizeBedRobotArmGroupStates(state.bed_robot_arm_groups),
+    bed_robot_arms: normalizeBedRobotArmStates(state.bed_robot_arms),
   };
 }
 
@@ -719,6 +803,8 @@ export function useRosBridge(runtimeMode: TaskplannerRuntimeMode) {
   const [startPhase, setStartPhase] = useState("");
   const [simulationState, setSimulationState] = useState<SimulationState>(DEFAULT_STATE);
   const [worldState, setWorldState] = useState<WorldState>(DEFAULT_WORLD_STATE);
+  const [externalBedRobotArmStatus, setExternalBedRobotArmStatus] =
+    useState<ValidatedBedRobotArmStatus | null>(null);
   const [surgeonState, setSurgeonState] = useState<SurgeonState>(DEFAULT_SURGEON);
   const [surgeonLlmDecision, setSurgeonLlmDecision] = useState<SurgeonLLMDecision>(DEFAULT_SURGEON_LLM_DECISION);
   const [btDecision, setBtDecision] = useState<BTDecision>(DEFAULT_BT_DECISION);
@@ -787,6 +873,7 @@ export function useRosBridge(runtimeMode: TaskplannerRuntimeMode) {
   const reconnectTimerRef = useRef<number | null>(null);
   const bundleDirtyRef = useRef(false);
   const eventSequenceRef = useRef(0);
+  const bedRobotArmStatusRef = useRef<ValidatedBedRobotArmStatus | null>(null);
   const suppressEventsUntilRef = useRef(0);
   const actionRunIdRef = useRef(0);
   const controlRunIdRef = useRef(0);
@@ -829,6 +916,8 @@ export function useRosBridge(runtimeMode: TaskplannerRuntimeMode) {
       setCam3Image(null);
       setCam4Image(null);
       setFlirImage(null);
+      bedRobotArmStatusRef.current = null;
+      setExternalBedRobotArmStatus(null);
       perceptionHealthReceivedRef.current = false;
       perceptionEnabledRef.current = false;
       setPerceptionHealth(DEFAULT_PERCEPTION_HEALTH);
@@ -850,6 +939,8 @@ export function useRosBridge(runtimeMode: TaskplannerRuntimeMode) {
       setCam3Image(null);
       setCam4Image(null);
       setFlirImage(null);
+      bedRobotArmStatusRef.current = null;
+      setExternalBedRobotArmStatus(null);
       perceptionHealthReceivedRef.current = false;
       perceptionEnabledRef.current = false;
       setPerceptionHealth(DEFAULT_PERCEPTION_HEALTH);
@@ -874,6 +965,11 @@ export function useRosBridge(runtimeMode: TaskplannerRuntimeMode) {
       ros,
       name: "/twin/world_state",
       messageType: "surgical_msgs/msg/WorldState",
+    });
+    const bedRobotArmStatusTopic = new ROSLIB.Topic({
+      ros,
+      name: "/external/bed_robot_arms/status",
+      messageType: "surgical_interop_msgs/msg/BedRobotArmStateArray",
     });
     const eventTopic = new ROSLIB.Topic({
       ros,
@@ -1055,6 +1151,27 @@ export function useRosBridge(runtimeMode: TaskplannerRuntimeMode) {
     worldTopic.subscribe((message: unknown) => {
       startTransition(() => {
         setWorldState(normalizeWorldState(message));
+      });
+    });
+    bedRobotArmStatusTopic.subscribe((message: unknown) => {
+      const status = normalizeBedRobotArmStatus(message);
+      if (status === null) return;
+      const expectedProcedure = canonicalBedRobotProcedure(
+        simulationStateRef.current.active_bundle,
+      );
+      if (expectedProcedure && status.procedureType !== expectedProcedure) return;
+      const current = bedRobotArmStatusRef.current;
+      if (
+        current &&
+        (status.stampMs < current.stampMs ||
+          (status.stampMs === current.stampMs &&
+            status.revision <= current.revision))
+      ) {
+        return;
+      }
+      bedRobotArmStatusRef.current = status;
+      startTransition(() => {
+        setExternalBedRobotArmStatus(status);
       });
     });
     eventTopic.subscribe((message: unknown) => {
@@ -1298,6 +1415,7 @@ export function useRosBridge(runtimeMode: TaskplannerRuntimeMode) {
       disposed = true;
       simulationTopic.unsubscribe();
       worldTopic.unsubscribe();
+      bedRobotArmStatusTopic.unsubscribe();
       eventTopic.unsubscribe();
       surgeonTopic.unsubscribe();
       surgeonLlmDecisionTopic.unsubscribe();
@@ -1370,7 +1488,33 @@ export function useRosBridge(runtimeMode: TaskplannerRuntimeMode) {
 
   useEffect(() => {
     setOverrideAck(null);
+    const expectedProcedure = canonicalBedRobotProcedure(activeBundle);
+    const currentStatus = bedRobotArmStatusRef.current;
+    if (
+      currentStatus &&
+      expectedProcedure &&
+      currentStatus.procedureType !== expectedProcedure
+    ) {
+      bedRobotArmStatusRef.current = null;
+      setExternalBedRobotArmStatus(null);
+    }
   }, [activeBundle]);
+
+  useEffect(() => {
+    if (externalBedRobotArmStatus === null) return;
+    const remainingMs =
+      externalBedRobotArmStatus.receivedAtMs + BED_ROBOT_STATUS_MAX_AGE_MS - Date.now();
+    if (remainingMs <= 0) {
+      bedRobotArmStatusRef.current = null;
+      setExternalBedRobotArmStatus(null);
+      return;
+    }
+    const timeout = window.setTimeout(() => {
+      bedRobotArmStatusRef.current = null;
+      setExternalBedRobotArmStatus(null);
+    }, remainingMs);
+    return () => window.clearTimeout(timeout);
+  }, [externalBedRobotArmStatus]);
 
   function setBundleSelection(nextBundle: string) {
     bundleDirtyRef.current = true;
@@ -2268,6 +2412,7 @@ export function useRosBridge(runtimeMode: TaskplannerRuntimeMode) {
     activeBundle,
     simulationState,
     worldState,
+    bedRobotArms: externalBedRobotArmStatus?.arms ?? [],
     surgeonState,
     surgeonLlmDecision,
     btDecision,

@@ -218,7 +218,12 @@ def test_exported_roles_hide_robot_implementation_and_internal_codes() -> None:
         ),
         _record(
             "bed_robot_arm_group_command",
-            {"group_id": "suction", "operation": "suction_start"},
+            {
+                "group_id": "retraction",
+                "operation": "retraction",
+                "direction": "left",
+                "distance_mm": 10.0,
+            },
             time_sec=12.0,
             sequence=3,
             topic="/bt/bed_robot_arm_group_command",
@@ -237,7 +242,7 @@ def test_exported_roles_hide_robot_implementation_and_internal_codes() -> None:
 
     assert "스크럽 널스 | 집도의에게 도구 전달 | Adson forceps 1번" in text
     assert "스크럽 널스 → 집도의" in text
-    assert "어시스턴트 | 행동 | 석션 시작" in text
+    assert "어시스턴트 | 행동 | 리트랙션 조정 | 방향=left | 거리=10 mm" in text
     assert (
         "Bovie surgical cautery is active during "
         "Central-field dissection before fixed retraction"

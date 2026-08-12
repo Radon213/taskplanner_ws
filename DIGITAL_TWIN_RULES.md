@@ -99,8 +99,11 @@ These rules are the source of truth for debugging runtime behavior.
 1. `/surgery/audio/request_text` is admitted public sentence evidence and may
    directly create a canonical explicit tool request when the sentence contains an active
    procedure instrument and command intent.
-2. Procedure-defined suction/retraction utterances are reserved for their bed
-   robot-arm group and must not also become tool-handover requests.
+2. Procedure-defined retraction or retractor-tool-change utterances are reserved
+   for the bed-mounted retraction control lane and must not also become
+   tool-handover requests. Suction speech is not a bed-mounted arm command; it
+   remains clinical/tool evidence and follows the ordinary explicit-request
+   guards when it identifies a procedure instrument.
 3. A sentence-backed explicit request may bypass only `vlm_unhealthy` and phase
    uncertainty. Every physical-state, contamination, ownership, capacity,
    readiness, and active-task guard remains mandatory.
@@ -108,6 +111,30 @@ These rules are the source of truth for debugging runtime behavior.
    and probabilistic Mayo recovery. It must not stop explicit voice handover.
 5. Duplicate transcript and structured request messages for the same pending
    tool are coalesced into one request.
+
+## Bed-Mounted Retraction Arm Boundary
+
+1. Bed-mounted robot integration is retraction-only. A clinical suction
+   instrument and speech about suction remain ordinary tool evidence and must
+   never create a bed-mounted arm command or status.
+2. Thyroidectomy retractor changes use only the completion-waiting
+   `/surgery/tool_change/request` Service. Nephrectomy Malleable fine adjustment
+   uses only the cancellable `/surgery/retraction/adjust` Action.
+3. `/external/bed_robot_arms/status` is controller-owned evidence. The reducer
+   may store its documented snapshot fields but must not invent pose,
+   trajectory, force, collision, progress, attachment verification, or a more
+   detailed controller state.
+4. Only `role=retraction` entries are admissible. Thyroidectomy accepts one
+   `army_navy` entry; nephrectomy accepts one `left_malleable` and one
+   `right_malleable` entry. Missing, stale, malformed, duplicate, or mismatched
+   snapshots fail closed.
+5. Tool Change remains in progress until its Service response arrives. Only
+   `success=true` with `result=completed` is successful, and that means sequence
+   completion rather than verified physical attachment.
+6. Retraction adjustment is complete only when the Action returns
+   `success=true` with `final_state=completed`. Cancel, fault,
+   `protective_stop`, unknown state, controller loss, and ambiguous recovery
+   block the next ordinary retraction command.
 
 ## Contamination and Cleaning Rules
 

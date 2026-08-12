@@ -135,9 +135,10 @@ the robot must do; the old generic `/skill/execute` and
 interfaces and are not the requested cross-institution API.
 
 ```text
-/surgery/tool_handover   surgical_interop_msgs/action/ExecuteToolHandover
-/surgery/retraction      surgical_interop_msgs/action/ExecuteRetraction
-/surgery/suction/set     surgical_interop_msgs/srv/SetSuction
+/surgery/tool_handover        surgical_interop_msgs/action/ExecuteToolHandover
+/surgery/tool_change/request  surgical_interop_msgs/srv/RequestToolChange
+/surgery/retraction/adjust    surgical_interop_msgs/action/ExecuteRetractionAdjustment
+/external/bed_robot_arms/status  surgical_interop_msgs/msg/BedRobotArmStateArray
 ```
 
 `ExecuteToolHandover` is the single tool-transfer Action. It accepts exactly
@@ -158,19 +159,136 @@ Taskplanner also converts an internal instance such as `T04#1` to
 controller chooses the arm. It also excludes planner rationale, detailed
 internal anchors, target-owner, cleaning policy, and execution mode.
 
-`ExecuteRetraction` carries a correlation ID plus only the fields required by
-the selected operation: `MOVE` needs direction and distance, while
-`CHANGE_END_EFFECTOR` needs the requested end-effector profile. `RELEASE` has
-no extra motion parameters. It does not carry a group ID, confidence, raw
-surgeon text, or planner rationale. `SetSuction` carries a correlation ID and
-`enabled`. A simple ON/OFF operation is a service; it becomes an Action only if
-the controller later needs a long-running, cancellable workflow.
+### Retraction tool-change Service
 
-Controllers return a machine-readable final state/reason code, and Actions
-provide only state/progress feedback. They must enforce their own homing,
-E-stop, collision, force, and protective-stop policy. A controller must not
-publish synthetic digital-twin state; Taskplanner converts observed execution
-results into its internal status and event streams.
+`/surgery/tool_change/request` is a completion-waiting Service for
+thyroidectomy. Its wire shape is exactly:
+
+```text
+# RequestToolChange.srv
+string command_id
+string arm_id
+string target_tool_id
+---
+bool success
+string result
+string reason_code
+```
+
+| Field | Allowed values and interpretation |
+| --- | --- |
+| `command_id` | Caller-generated correlation and deduplication ID. |
+| `arm_id` | `arm_1` or `arm_2`; the selected physical retraction arm. |
+| `target_tool_id` | `thyroid_retractor` or `army_navy_retractor`. |
+| `success` | `true` only when `result=completed`; otherwise `false`. |
+| `result` | `completed`, `failed`, `canceled`, `protective_stop`, or `unknown`. |
+| `reason_code` | Machine-readable result such as `ok`, `sequence_failed`, `invalid_arm_id`, `invalid_target_tool`, `unsafe_state`, `estop`, `protective_stop`, `controller_unavailable`, or `timeout`. |
+
+Taskplanner keeps the request active until the Service response arrives.
+`success=true`, `result=completed` means only that the controller's predefined
+Tool Change sequence ended normally; it does not independently verify physical
+attachment. Every other response fails closed and leaves retry, stop, and
+operator notification to the higher-level policy.
+
+### Retraction-adjustment Action
+
+`/surgery/retraction/adjust` is the cancellable fine-adjustment Action for
+nephrectomy. Its wire shape is exactly:
+
+```text
+# ExecuteRetractionAdjustment.action
+string command_id
+string adjustment_mode
+string target_retractor_id
+string direction_frame
+string direction
+string axis
+float32 distance_mm
+---
+bool success
+string final_state
+string reason_code
+---
+string state
+```
+
+| Goal field | Allowed values and interpretation |
+| --- | --- |
+| `command_id` | Caller-generated correlation and deduplication ID. |
+| `adjustment_mode` | `single` or `multi`. |
+| `target_retractor_id` | `left_malleable` or `right_malleable` for `single`; `both_malleable` for `multi`. |
+| `direction_frame` | Always `surgeon_view`; controller performs the setup-specific robot-frame conversion. |
+| `direction` | `up`, `down`, `left`, or `right` for `single`; `none` for `multi`. |
+| `axis` | `none` for `single`; `left_right` or `up_down` for `multi`. A multi distance applies to each Malleable. |
+| `distance_mm` | `0 < distance_mm <= agreed_limit_mm`; Taskplanner converts natural-language cm/mm to mm. |
+
+`success` is true only when `final_state=completed`. Documented terminal states
+include `completed`, `canceled`, `fault`, `protective_stop`, and `unknown`.
+`reason_code` is machine-readable, for example `completed`, `canceled`,
+`goal_rejected`, `invalid_target_retractor`, `invalid_direction`,
+`distance_limit_exceeded`, `estop`, `protective_stop`, or
+`controller_unavailable`; it may be empty on normal completion. Feedback has no
+pose or progress field: `state` is only `adjusting` or `recovering`.
+Interruption uses standard ROS 2 Action cancel, not a separate stop message.
+
+### Retraction-arm status Topic
+
+The controller publishes `/external/bed_robot_arms/status` with exactly these
+messages:
+
+```text
+# BedRobotArmStateArray.msg
+builtin_interfaces/Time stamp
+uint64 revision
+string procedure_type
+BedRobotArmState[] arms
+
+# BedRobotArmState.msg
+string arm_id
+string role
+string role_instance_id
+string state
+bool direct_teach_active
+string reason_code
+```
+
+| Field | Allowed values and interpretation |
+| --- | --- |
+| `stamp` | Wall-clock ROS 2 publication time for the snapshot. It must be fresh at reception and at command dispatch; replay `/clock` must not be used for this controller-owned status. |
+| `revision` | Non-negative, monotonically increasing snapshot sequence. |
+| `procedure_type` | `thyroidectomy` or `nephrectomy`. |
+| `arms` | One entry for thyroidectomy; two entries for nephrectomy. |
+| `arm_id` | `arm_1` or `arm_2`. |
+| `role` | Always `retraction`. |
+| `role_instance_id` | `army_navy` for thyroidectomy; `left_malleable` and `right_malleable` for nephrectomy. |
+| `state` | `standby`, `direct_teach`, `retracting`, `changing_tool`, `moving_to_standby`, `fault`, `protective_stop`, or `unknown`. |
+| `direct_teach_active` | Auxiliary flag for quick direct-teach-state checking. |
+| `reason_code` | Machine-readable context such as `ok`, `teach_button_active`, `estop`, `protective_stop`, or `controller_unavailable`; may be empty when appropriate. |
+
+Detailed controller motion state remains controller-owned. Taskplanner neither
+requests nor synthesizes joint state, pose, trajectory, velocity, force,
+collision state, E-stop internals, or verified tool attachment through this
+contract.
+
+The controller must publish a strictly newer source timestamp for each status
+heartbeat. A recently received message with an old or future-dated source stamp
+is rejected and cannot authorize dispatch. A lower revision is accepted only
+with a strictly newer, fresh source stamp as evidence that the controller
+restarted; any in-flight retraction command then remains unresolved and ordinary
+dispatch is blocked.
+
+The bed-mounted suction arm is not part of this ROS 2 contract or Taskplanner
+control path. In the source interface document, the thyroidectomy suction arm
+is pure direct-teach operation and is therefore excluded from Taskplanner ROS
+integration. Clinical suction instruments and surgeon speech about suction
+remain ordinary surgical evidence and tool semantics; no medical-device
+suction on/off, pressure, or flow command is exposed here.
+
+Controllers return the machine-readable result and reason fields defined by
+each interface. They must enforce their own homing, E-stop, collision, force,
+distance-limit, and protective-stop policy. A controller must not publish
+synthetic digital-twin state; Taskplanner converts observed execution results
+into its internal status and event streams.
 
 ### Tool handover state and interrupt contract
 
@@ -275,7 +393,9 @@ real external integration only after the relevant provider has agreed to the
 contract. It fails closed when:
 
 - the sentence topic has no publisher;
-- required tool-handover/retraction Action 또는 suction Service가 없을 때;
+- the required tool-handover Action, the active procedure's applicable
+  tool-change Service or retraction-adjustment Action, or the retraction-arm
+  status publisher is unavailable;
 - real VLM mode is selected but RF-DETR has no fresh, aligned FLIR/CAM4 result.
 
 The current preflight verifies transport and perception readiness. Physical
@@ -290,7 +410,7 @@ The VLM may consume:
 - camera images
 - completed or observable robot skill events
 - digital-twin tool locations derived from public observations and action status
-- bed robot arm request/status messages derived from public speech and controllers
+- retraction-arm requests derived from public speech and controller-owned status
 - the previous VLM result as temporal memory
 - the active procedure YAML as a prior
 

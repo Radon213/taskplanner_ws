@@ -1,7 +1,7 @@
 # 수술보조 Taskplanner 인수인계 문서
 
-버전: `0.1.0`
-최종 갱신: 2026-06-23 KST
+기준 버전: `0.1.0` 이후 현재 개발 상태
+최종 갱신: 2026-08-12 KST
 
 ## 1. 목적
 
@@ -185,6 +185,18 @@ safety / invariant guard
 - procedure completion 중 오른손에 예측 대기 도구가 남아 있으면
   `return_unused_preposition`으로 정리한다.
 
+### Bed-mounted retraction arm
+
+- bed-mounted robot-arm 연동은 retraction 역할만 대상으로 한다.
+- 갑상샘 절제술 Tool Change는 완료 대기형
+  `/surgery/tool_change/request` Service를 사용한다.
+- 신장 절제술 Malleable 미세 조정은 취소 가능한
+  `/surgery/retraction/adjust` Action을 사용한다.
+- 로봇팔 상태는 `/external/bed_robot_arms/status`의 문서화된 필드만
+  수용한다. 자세, 궤적, 힘, 충돌, 상세 안전 상태는 제어기 소유다.
+- bed-mounted suction arm 제어·상태 경로는 없다. 다만 임상 석션 도구와
+  집도의의 석션 발화는 일반 도구/공개 증거로 계속 처리한다.
+
 ## 9. Dashboard
 
 대시보드는 operator/debug view이다.
@@ -247,5 +259,9 @@ ros2 run bringup taskplanner_smoke_test --spec-name inguinal_hernia_repair
 2. VLM 정확도 개선은 특정 actor trajectory에 과적합하면 안 된다.
 3. actor 내부 ground truth는 평가에는 써도 VLM 입력에는 쓰지 않는다.
 4. procedure YAML을 바꿔도 actor, dashboard, BT가 일반적으로 동작해야 한다.
-5. real robot adapter를 붙일 때도 `/skill/execute` 경계를 유지한다.
-6. mock skill server는 회귀 테스트용으로 계속 보존한다.
+5. 휴머노이드 도구 전달은 내부 `/skill/execute` 경계를 유지하되 외부
+   retraction arm은 `docs/EXTERNAL_INPUT_CONTRACT.md`의 Service/Action/Topic만
+   사용한다.
+6. 외부 retraction 계약에 문서에 없는 자세·진행률·세부 상태를 추가하지
+   않는다.
+7. mock skill server는 회귀 테스트용으로 계속 보존한다.

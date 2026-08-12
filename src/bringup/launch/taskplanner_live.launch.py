@@ -21,6 +21,7 @@ def _env(name: str, default: str) -> EnvironmentVariable:
 def generate_launch_description() -> LaunchDescription:
     vlm_mode = _env("VLM_MODE", "real")
     publish_shared_state = LaunchConfiguration("publish_shared_state")
+    default_bundle = LaunchConfiguration("default_bundle")
     perception_enabled = PythonExpression(
         ["'", vlm_mode, "' in ('real', 'dual')"]
     )
@@ -31,6 +32,11 @@ def generate_launch_description() -> LaunchDescription:
     )
     return LaunchDescription(
         [
+            DeclareLaunchArgument(
+                "default_bundle",
+                default_value=_env("TASKPLANNER_DEFAULT_BUNDLE", "thyroidectomy"),
+                description="Procedure bundle selected for the live runtime.",
+            ),
             DeclareLaunchArgument(
                 "publish_shared_state",
                 default_value="false",
@@ -50,6 +56,7 @@ def generate_launch_description() -> LaunchDescription:
                         "30.0",
                     ),
                     "input_profile": "external",
+                    "default_bundle": default_bundle,
                     "execution_backend": "external",
                     "execution_contract": "direct",
                     "speech_input_mode": "sentence_text",

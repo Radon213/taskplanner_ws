@@ -124,6 +124,12 @@ The software gate requires these properties:
 - BT reads validated digital-twin state and never mutates it directly;
 - command IDs are idempotent and terminal states emit no new robot command;
 - ambiguous Action cancellation fails closed.
+- Tool Change reports success only for `result=completed`, and Retraction
+  Adjustment reports success only for `final_state=completed`;
+- missing, stale, malformed, or procedure-mismatched retraction-arm status
+  blocks bed-mounted commands;
+- no bed-mounted suction-arm command or state is emitted, while clinical
+  suction tool and speech semantics remain available.
 
 ## External asset integrity
 
@@ -149,6 +155,9 @@ environment before calling the physical deployment approved:
 - E-stop, protective stop, cancel, reconnect, and ambiguous-recovery tests;
 - end-to-end timing on the site network under packet loss and disconnects;
 - clinician-approved tool presentation and recovery behavior.
+- retraction Tool Change sequence completion and failure propagation;
+- single/multi Malleable adjustment, Action cancel recovery, direct-teach
+  reporting, and monotonic controller-status revision behavior.
 
 Record these results separately from the software report. A mock Action server
 or recorded replay cannot satisfy the physical gate.

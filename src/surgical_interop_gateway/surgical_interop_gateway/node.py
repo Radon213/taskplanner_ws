@@ -8,7 +8,7 @@ boundary; keep all policy-sensitive field selection there.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 import threading
 import time
 from typing import Any
@@ -17,6 +17,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from surgical_interop_msgs.msg import (
+    BedRobotArmStateArray,
     ClinicalObservation,
     ClinicalObservationArray,
     InstrumentState,
@@ -28,7 +29,6 @@ from surgical_interop_msgs.msg import (
     SurgeryHealth,
 )
 from surgical_msgs.msg import (
-    BedRobotArmGroupStatus,
     InputSourceStatus,
     SkillStatus,
     TwinEvent,
@@ -48,9 +48,8 @@ from .projections import (
     project_clinical_observation,
     project_context,
     project_event,
-    project_group_robot_status,
+    project_bed_robot_arm_state,
     project_instruments,
-    project_robots,
     project_skill_robot_status,
 )
 
@@ -63,6 +62,22 @@ _SKILL_FAILURE_STATES = {
     "result_failed",
     "server_unavailable",
 }
+_BED_ROBOT_PROCEDURE_LAYOUTS = {
+    "thyroidectomy": frozenset({"army_navy"}),
+    "nephrectomy": frozenset({"left_malleable", "right_malleable"}),
+}
+_BED_ROBOT_STATES = frozenset(
+    {
+        "standby",
+        "direct_teach",
+        "retracting",
+        "changing_tool",
+        "moving_to_standby",
+        "fault",
+        "protective_stop",
+        "unknown",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -161,8 +176,9 @@ class SurgicalInteropGateway(Node):
         self._vlm_health: CachedMessage | None = None
         self._input_statuses: dict[str, CachedMessage] = {}
         self._skill_status: CachedMessage | None = None
-        self._group_statuses: dict[str, CachedMessage] = {}
-        self._group_status_last_received_monotonic_sec: float | None = None
+        self._bed_robot_arm_status: CachedMessage | None = None
+        self._bed_robot_arm_revision: int | None = None
+        self._bed_robot_arm_source_stamp_sec: float | None = None
         self._revision = 0
         self._event_sequence = 0
         self._clinical_sequence = 0
@@ -204,9 +220,9 @@ class SurgicalInteropGateway(Node):
         )
         self.create_subscription(SkillStatus, "/skill/status", self._on_skill_status, source_qos)
         self.create_subscription(
-            BedRobotArmGroupStatus,
-            "/bed_robot_arm_group/status",
-            self._on_group_status,
+            BedRobotArmStateArray,
+            "/external/bed_robot_arms/status",
+            self._on_bed_robot_arm_status,
             source_qos,
         )
         self.create_timer(self._publish_period_sec, self._publish_snapshots)
@@ -246,12 +262,64 @@ class SurgicalInteropGateway(Node):
         with self._lock:
             self._skill_status = self._cache(message)
 
-    def _on_group_status(self, message: BedRobotArmGroupStatus) -> None:
-        group_id = str(message.group_id).strip() or "bed_robot_arm_group"
+    def _on_bed_robot_arm_status(self, message: BedRobotArmStateArray) -> None:
+        revision = int(message.revision)
+        source_stamp_sec = (
+            float(message.stamp.sec) + float(message.stamp.nanosec) / 1e9
+        )
+        procedure_type = str(message.procedure_type).strip().casefold()
+        expected_roles = _BED_ROBOT_PROCEDURE_LAYOUTS.get(procedure_type)
+        arm_ids: set[str] = set()
+        roles: set[str] = set()
+        valid = expected_roles is not None and len(message.arms) == len(expected_roles)
+        for arm in message.arms:
+            arm_id = str(arm.arm_id).strip()
+            role_instance = str(arm.role_instance_id).strip()
+            state = str(arm.state).strip()
+            valid = bool(
+                valid
+                and arm_id in {"arm_1", "arm_2"}
+                and arm_id not in arm_ids
+                and str(arm.role).strip() == "retraction"
+                and role_instance in expected_roles
+                and role_instance not in roles
+                and state in _BED_ROBOT_STATES
+                and bool(arm.direct_teach_active) == (state == "direct_teach")
+            )
+            arm_ids.add(arm_id)
+            roles.add(role_instance)
+        if (
+            not valid
+            or frozenset(roles) != expected_roles
+            or source_stamp_sec <= 0.0
+        ):
+            self.get_logger().warning(
+                "ignored invalid bed robot arm status at public gateway"
+            )
+            return
         with self._lock:
-            cached = self._cache(message)
-            self._group_statuses[group_id] = cached
-            self._group_status_last_received_monotonic_sec = cached.received_monotonic_sec
+            current_stamp = self._bed_robot_arm_source_stamp_sec
+            current_revision = self._bed_robot_arm_revision
+            stale = bool(
+                current_stamp is not None
+                and (
+                    source_stamp_sec < current_stamp
+                    or (
+                        source_stamp_sec == current_stamp
+                        and current_revision is not None
+                        and revision <= current_revision
+                    )
+                )
+            )
+            if stale:
+                self.get_logger().warning(
+                    "ignored stale bed robot arm status "
+                    f"stamp={source_stamp_sec:.9f} revision={revision}"
+                )
+                return
+            self._bed_robot_arm_revision = revision
+            self._bed_robot_arm_source_stamp_sec = source_stamp_sec
+            self._bed_robot_arm_status = self._cache(message)
 
     def _on_event(self, message: TwinEvent) -> None:
         """Publish events immediately; snapshots remain rate-limited."""
@@ -285,7 +353,7 @@ class SurgicalInteropGateway(Node):
             vlm_health = self._vlm_health
             input_statuses = dict(self._input_statuses)
             skill_status = self._skill_status
-            group_receipt = self._group_status_last_received_monotonic_sec
+            bed_robot_arm_status = self._bed_robot_arm_status
         freshness = {
             "world_state": freshness_from_receipt(
                 world.received_monotonic_sec if world else None,
@@ -308,7 +376,9 @@ class SurgicalInteropGateway(Node):
                 self._robot_stale_after_sec,
             ),
             "bed_robot_arm_status": freshness_from_receipt(
-                group_receipt,
+                bed_robot_arm_status.received_monotonic_sec
+                if bed_robot_arm_status
+                else None,
                 now_monotonic_sec,
                 self._robot_stale_after_sec,
             ),
@@ -389,45 +459,26 @@ class SurgicalInteropGateway(Node):
 
     def _merged_robot_projections(
         self,
-        world: WorldState | None,
         fresh: dict[str, Freshness],
     ) -> tuple[RobotProjection, ...]:
-        """Prefer current controller status while retaining DT's group identity."""
+        """Publish humanoid state and controller-owned retraction-arm state."""
 
         robots: dict[str, RobotProjection] = {}
-        if world is not None and fresh["world_state"].fresh:
-            robots = {robot.robot_id: robot for robot in project_robots(world)}
 
         with self._lock:
             skill_status = self._skill_status
-            group_statuses = dict(self._group_statuses)
+            bed_robot_arm_status = self._bed_robot_arm_status
 
         if skill_status is not None and fresh["skill_status"].fresh:
             skill_robot = project_skill_robot_status(skill_status.message)
             robots[skill_robot.robot_id] = skill_robot
 
-        if fresh["bed_robot_arm_status"].fresh:
-            for group_id, cached in group_statuses.items():
-                status_robot = project_group_robot_status(cached.message)
-                base = robots.get(group_id)
-                if base is None:
-                    robots[group_id] = status_robot
-                    continue
-                robots[group_id] = replace(
-                    base,
-                    stamp=status_robot.stamp,
-                    connection_state=(
-                        status_robot.connection_state
-                        if status_robot.connection_state != "unknown"
-                        else base.connection_state
-                    ),
-                    execution_state=status_robot.execution_state or base.execution_state,
-                    active_command_id=(
-                        status_robot.active_command_id or base.active_command_id
-                    ),
-                    progress=status_robot.progress,
-                    reason_code=status_robot.reason_code or base.reason_code,
-                )
+        if bed_robot_arm_status is not None and fresh["bed_robot_arm_status"].fresh:
+            array = bed_robot_arm_status.message
+            for arm in array.arms:
+                status_robot = project_bed_robot_arm_state(arm, array.stamp)
+                if status_robot.robot_id:
+                    robots[status_robot.robot_id] = status_robot
         return tuple(robots[key] for key in sorted(robots))
 
     def _health_message(
@@ -447,7 +498,11 @@ class SurgicalInteropGateway(Node):
         with self._lock:
             vlm_health = self._vlm_health.message if self._vlm_health else None
             skill_status = self._skill_status.message if self._skill_status else None
-            group_statuses = [entry.message for entry in self._group_statuses.values()]
+            bed_robot_arm_status = (
+                self._bed_robot_arm_status.message
+                if self._bed_robot_arm_status
+                else None
+            )
             input_statuses = [entry.message for entry in self._input_statuses.values()]
 
         if vlm_health is not None:
@@ -463,7 +518,11 @@ class SurgicalInteropGateway(Node):
         )
         if skill_failed:
             errors.append("skill_execution_failed")
-        if any(str(getattr(status, "error_code", "")).strip() for status in group_statuses):
+        if bed_robot_arm_status is not None and any(
+            str(getattr(arm, "reason_code", "")).strip().lower()
+            not in {"", "ok"}
+            for arm in bed_robot_arm_status.arms
+        ):
             errors.append("bed_robot_error")
         for status in input_statuses:
             error_code = str(getattr(status, "error_code", "")).strip()
@@ -543,7 +602,7 @@ class SurgicalInteropGateway(Node):
             robots.revision = revision
             robots.robots = [
                 self._to_public_robot(projection)
-                for projection in self._merged_robot_projections(world, fresh)
+                for projection in self._merged_robot_projections(fresh)
             ]
             self._robots_pub.publish(robots)
 

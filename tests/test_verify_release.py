@@ -133,3 +133,35 @@ def test_full_checks_include_durability_without_loading_a_model(tmp_path: Path) 
     assert "restart_and_soak_campaign" in names
     assert "shadow_12case_campaign" not in names
     assert all("manager/load" not in check.command for check in checks)
+
+
+def test_web_build_installs_locked_dependencies(tmp_path: Path) -> None:
+    checks = verify.build_checks(
+        config=_config(),
+        run_id="test-quick",
+        report_dir=tmp_path / "report",
+        tier="quick",
+        verify_dataset_payloads=False,
+        restart_iterations=1,
+        soak_hours=0.01,
+        shadow_options=None,
+    )
+    command = {check.name: check.command for check in checks}["web_build"]
+
+    assert command.startswith("npm --prefix webapp ci && ")
+
+
+def test_run_check_records_external_log_path_without_crashing(tmp_path: Path) -> None:
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()
+    result = verify.run_check(
+        verify.CheckSpec(
+            name="external-log",
+            classification="source",
+            command="true",
+        ),
+        logs_dir,
+    )
+
+    assert result.status == "passed"
+    assert Path(result.log_path) == logs_dir / "external-log.log"

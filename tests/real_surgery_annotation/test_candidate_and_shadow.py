@@ -197,9 +197,9 @@ class CandidateAndShadowTest(unittest.TestCase):
         report = evaluate_shadow(
             ground_truth=[
                 self._event(
-                    event_id="fixture-suction",
+                    event_id="fixture-army-navy",
                     time_sec=10.0,
-                    tool_id="yankauer_suction",
+                    tool_id="army_navy_retractor",
                 ),
                 self._event(
                     event_id="fixture-scalpel",
@@ -213,8 +213,8 @@ class CandidateAndShadowTest(unittest.TestCase):
                     time_sec=0.0,
                     layer="bed_robot_arm_group_status",
                     payload={
-                        "group_id": "suction",
-                        "end_effector_profile": "suction",
+                        "group_id": "retraction",
+                        "end_effector_profile": "army_navy_retractor",
                         "state": "standby",
                     },
                 ),
@@ -225,9 +225,11 @@ class CandidateAndShadowTest(unittest.TestCase):
                     payload={
                         "command_id": "group-command-1",
                         "request_id": "group-request-1",
-                        "group_id": "suction",
-                        "end_effector_profile": "suction",
-                        "operation": "suction_start",
+                        "group_id": "retraction",
+                        "arm_id": "arm_1",
+                        "target_tool_id": "army_navy_retractor",
+                        "end_effector_profile": "army_navy_retractor",
+                        "operation": "change_end_effector",
                     },
                 ),
                 self._trace(
@@ -237,8 +239,10 @@ class CandidateAndShadowTest(unittest.TestCase):
                     payload={
                         "command_id": "group-command-1",
                         "request_id": "group-request-1",
-                        "group_id": "suction",
-                        "operation": "suction_start",
+                        "group_id": "retraction",
+                        "arm_id": "arm_1",
+                        "target_tool_id": "army_navy_retractor",
+                        "operation": "change_end_effector",
                     },
                 ),
                 self._trace(
@@ -248,12 +252,14 @@ class CandidateAndShadowTest(unittest.TestCase):
                     payload={
                         "command_id": "group-command-1",
                         "request_id": "group-request-1",
-                        "group_id": "suction",
-                        "end_effector_profile": "suction",
-                        "operation": "suction_start",
+                        "group_id": "retraction",
+                        "arm_id": "arm_1",
+                        "target_tool_id": "army_navy_retractor",
+                        "end_effector_profile": "army_navy_retractor",
+                        "operation": "change_end_effector",
                         "terminal": True,
                         "success": True,
-                        "state": "suctioning",
+                        "state": "standby",
                         "outcome": "succeeded",
                     },
                 ),
@@ -264,9 +270,15 @@ class CandidateAndShadowTest(unittest.TestCase):
                     payload={
                         "command_id": "group-command-2",
                         "request_id": "group-request-2",
-                        "group_id": "suction",
-                        "end_effector_profile": "suction",
-                        "operation": "suction_stop",
+                        "group_id": "retraction",
+                        "adjustment_mode": "single",
+                        "target_retractor_id": "left_malleable",
+                        "direction_frame": "surgeon_view",
+                        "direction": "left",
+                        "axis": "none",
+                        "distance_mm": 10.0,
+                        "end_effector_profile": "army_navy_retractor",
+                        "operation": "retraction",
                     },
                 ),
                 self._trace(
@@ -313,14 +325,14 @@ class CandidateAndShadowTest(unittest.TestCase):
         report = evaluate_shadow(
             ground_truth=[
                 self._event(
-                    event_id="fixture-yankauer",
+                    event_id="fixture-army-navy",
                     time_sec=10.0,
-                    tool_id="yankauer_suction",
+                    tool_id="army_navy_retractor",
                 ),
                 self._event(
-                    event_id="fixture-poole",
+                    event_id="fixture-kocher",
                     time_sec=20.0,
-                    tool_id="poole_suction",
+                    tool_id="kocher_retractor",
                 ),
             ],
             decisions=[
@@ -329,8 +341,8 @@ class CandidateAndShadowTest(unittest.TestCase):
                     time_sec=0.0,
                     layer="bed_robot_arm_group_status",
                     payload={
-                        "group_id": "suction",
-                        "end_effector_profile": "suction",
+                        "group_id": "retraction",
+                        "end_effector_profile": "retractor",
                         "state": "standby",
                     },
                 ),
@@ -340,9 +352,9 @@ class CandidateAndShadowTest(unittest.TestCase):
                     layer="bed_robot_arm_group_command",
                     payload={
                         "command_id": "group-command-1",
-                        "group_id": "suction",
-                        "end_effector_profile": "suction",
-                        "operation": "suction_start",
+                        "group_id": "retraction",
+                        "end_effector_profile": "retractor",
+                        "operation": "retraction",
                     },
                 ),
             ],
@@ -368,9 +380,9 @@ class CandidateAndShadowTest(unittest.TestCase):
         report = evaluate_shadow(
             ground_truth=[
                 self._event(
-                    event_id="fixture-suction",
+                    event_id="fixture-army-navy",
                     time_sec=10.0,
-                    tool_id="yankauer_suction",
+                    tool_id="army_navy_retractor",
                 )
             ],
             decisions=[
@@ -379,8 +391,8 @@ class CandidateAndShadowTest(unittest.TestCase):
                     time_sec=0.0,
                     layer="bed_robot_arm_group_status",
                     payload={
-                        "group_id": "suction",
-                        "end_effector_profile": "suction",
+                        "group_id": "retraction",
+                        "end_effector_profile": "army_navy_retractor",
                         "state": "standby",
                     },
                 )
@@ -413,8 +425,8 @@ class CandidateAndShadowTest(unittest.TestCase):
                     time_sec=0.0,
                     layer="bed_robot_arm_group_status",
                     payload={
-                        "group_id": "suction",
-                        "end_effector_profile": "suction",
+                        "group_id": "retraction",
+                        "end_effector_profile": "army_navy_retractor",
                         "state": "standby",
                     },
                 ),
@@ -424,14 +436,16 @@ class CandidateAndShadowTest(unittest.TestCase):
                     layer="bed_robot_arm_group_command",
                     payload={
                         "command_id": "group-command-1",
-                        "group_id": "suction",
-                        "end_effector_profile": "suction",
-                        "operation": "suction_start",
+                        "group_id": "retraction",
+                        "arm_id": "arm_1",
+                        "target_tool_id": "army_navy_retractor",
+                        "end_effector_profile": "army_navy_retractor",
+                        "operation": "change_end_effector",
                     },
                 ),
             ],
             lead_window_sec=10.0,
-            tool_identity_map={"suction": "yankauer_suction"},
+            tool_identity_map={"army_navy_retractor": "army_navy_retractor"},
         )
 
         specialized = report["specialized_group_actions"]
@@ -451,6 +465,65 @@ class CandidateAndShadowTest(unittest.TestCase):
                 "unscorable_command_count"
             ],
         )
+
+    def test_retired_arm_group_is_not_scored_as_clinical_suction(self) -> None:
+        retired_group = "suc" + "tion"
+        report = evaluate_shadow(
+            ground_truth=[
+                self._event(
+                    event_id="fixture-yankauer",
+                    time_sec=10.0,
+                    tool_id="yankauer_suction",
+                )
+            ],
+            decisions=[
+                self._trace(
+                    sequence=0,
+                    time_sec=0.0,
+                    layer="bed_robot_arm_group_status",
+                    payload={
+                        "group_id": retired_group,
+                        "end_effector_profile": retired_group,
+                        "state": "standby",
+                    },
+                ),
+                self._trace(
+                    sequence=1,
+                    time_sec=8.0,
+                    layer="bed_robot_arm_group_command",
+                    payload={
+                        "command_id": "retired-command",
+                        "group_id": retired_group,
+                        "end_effector_profile": retired_group,
+                        "operation": retired_group + "_start",
+                    },
+                ),
+                self._trace(
+                    sequence=2,
+                    time_sec=8.5,
+                    layer="bt_decision",
+                    payload={
+                        "selected_tool": "yankauer_suction",
+                        "action": "handover",
+                        "confidence": 1.0,
+                    },
+                ),
+            ],
+            lead_window_sec=10.0,
+        )
+
+        self.assertEqual(1, report["confirmed_ordinary_handover_count"])
+        self.assertEqual(
+            0,
+            report["confirmed_specialized_group_action_count"],
+        )
+        self.assertEqual(
+            1,
+            report["layers"]["bt_decision"]["outcomes"]["exact_match"],
+        )
+        specialized = report["specialized_group_actions"]
+        self.assertEqual("no_declared_capabilities", specialized["status"])
+        self.assertEqual(0, specialized["activation_command_count"])
 
     def test_model_raw_scores_frozen_input_time_not_publication_time(
         self,

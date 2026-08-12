@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 import socket
 import threading
@@ -37,6 +38,63 @@ ALLOWED_OVERRIDE_EVENTS = {"request_tool", "voice_request", "return_tool", "canc
 TOOL_REQUIRED_OVERRIDE_EVENTS = {"request_tool", "voice_request", "return_tool"}
 
 
+@dataclass(frozen=True, slots=True)
+class ExternalRobotContract:
+    """Launch-lifetime external controller contract for one procedure bundle."""
+
+    procedure_type: str
+    require_tool_change_service: bool
+    require_retraction_adjustment_server: bool
+    require_bed_robot_arm_status: bool
+
+
+_NO_BED_ROBOT_CONTRACT = ExternalRobotContract("", False, False, False)
+_THYROID_BED_ROBOT_CONTRACT = ExternalRobotContract(
+    "thyroidectomy", True, False, True
+)
+_NEPHRECTOMY_BED_ROBOT_CONTRACT = ExternalRobotContract(
+    "nephrectomy", False, True, True
+)
+
+
+def external_robot_contract_for_spec(spec) -> ExternalRobotContract:
+    """Resolve only the focused controller contracts supported by bringup."""
+
+    procedure_id = str(spec.procedure_id).strip().casefold()
+    bed_spec = spec.bed_robot_arm_groups
+    enabled_groups = [
+        group
+        for group in (bed_spec.groups if bed_spec is not None else [])
+        if bool(group.enabled)
+    ]
+    operations = {
+        str(operation).strip()
+        for group in enabled_groups
+        for operation in group.allowed_operations
+        if str(operation).strip()
+    }
+
+    if procedure_id in {"thyroidectomy", "thyroidectomy_demo"}:
+        if len(enabled_groups) != 1 or operations != {"change_end_effector"}:
+            raise RuntimeError(
+                f"procedure '{procedure_id}' does not match the thyroidectomy "
+                "external robot contract"
+            )
+        return _THYROID_BED_ROBOT_CONTRACT
+    if procedure_id == "nephrectomy":
+        if len(enabled_groups) != 1 or operations != {"retraction"}:
+            raise RuntimeError(
+                "procedure 'nephrectomy' does not match the nephrectomy "
+                "external robot contract"
+            )
+        return _NEPHRECTOMY_BED_ROBOT_CONTRACT
+    if enabled_groups:
+        raise RuntimeError(
+            f"procedure '{procedure_id}' enables an unsupported external robot contract"
+        )
+    return _NO_BED_ROBOT_CONTRACT
+
+
 class SimulationManagerNode(Node):
     def __init__(self) -> None:
         super().__init__("simulation_manager")
@@ -54,10 +112,18 @@ class SimulationManagerNode(Node):
             "integration_preflight_service",
             "/integration/check_readiness",
         )
+        self.declare_parameter(
+            "integration_preflight_node",
+            "/integration_preflight",
+        )
+        self.declare_parameter("integration_preflight_timeout_sec", 5.0)
 
         self._spec_root = Path(str(self.get_parameter("spec_root").value))
         self._active_bundle = str(self.get_parameter("default_bundle").value)
         self._active_spec_dir, self._active_spec = self._load_spec_for_bundle(self._active_bundle)
+        self._runtime_external_robot_contract = external_robot_contract_for_spec(
+            self._active_spec
+        )
         self._executor_name = str(self.get_parameter("executor_name").value)
         self._tick_rate_hz = float(self.get_parameter("tick_rate_hz").value)
         self._groot2_port = int(self.get_parameter("groot2_port").value)
@@ -72,6 +138,10 @@ class SimulationManagerNode(Node):
         ).strip().lower()
         self._require_integration_preflight = bool(
             self.get_parameter("require_integration_preflight").value
+        )
+        self._integration_preflight_timeout_sec = max(
+            0.5,
+            float(self.get_parameter("integration_preflight_timeout_sec").value),
         )
         self._running = False
         self._execution_state = "idle"
@@ -116,6 +186,11 @@ class SimulationManagerNode(Node):
             str(self.get_parameter("integration_preflight_service").value),
             callback_group=self._callback_group,
         )
+        self._integration_preflight_parameter_client = AsyncParameterClient(
+            self,
+            str(self.get_parameter("integration_preflight_node").value),
+            callback_group=self._callback_group,
+        )
         self._parameter_clients = {
             "/mock_vlm_node": AsyncParameterClient(
                 self, "/mock_vlm_node", callback_group=self._callback_group
@@ -141,15 +216,6 @@ class SimulationManagerNode(Node):
                 callback_group=self._callback_group,
             ),
         }
-        if self._execution_backend == "mock":
-            self._parameter_clients[
-                "/mock_bed_robot_arm_group_server"
-            ] = AsyncParameterClient(
-                self,
-                "/mock_bed_robot_arm_group_server",
-                callback_group=self._callback_group,
-            )
-
         self.create_service(
             SelectSimulationBundle,
             "/simulation/select_bundle",
@@ -669,19 +735,81 @@ class SimulationManagerNode(Node):
         self._set_idle_state()
         raise RuntimeError(message or "failed to start simulation")
 
+    def _configure_integration_preflight(
+        self,
+        bundle_name: str,
+        spec,
+        *,
+        transitioning: bool,
+    ) -> None:
+        if not bool(getattr(self, "_require_integration_preflight", False)):
+            return
+        client = getattr(self, "_integration_preflight_parameter_client", None)
+        if client is None or not client.wait_for_services(timeout_sec=2.0):
+            raise RuntimeError("integration preflight parameter service is unavailable")
+        contract = external_robot_contract_for_spec(spec)
+        response = self._wait_future(
+            client.set_parameters_atomically(
+                [
+                    Parameter(name="active_bundle", value=str(bundle_name)),
+                    Parameter(
+                        name="procedure_type",
+                        value=contract.procedure_type,
+                    ),
+                    Parameter(
+                        name="require_tool_change_service",
+                        value=contract.require_tool_change_service,
+                    ),
+                    Parameter(
+                        name="require_retraction_adjustment_server",
+                        value=contract.require_retraction_adjustment_server,
+                    ),
+                    Parameter(
+                        name="require_bed_robot_arm_status",
+                        value=contract.require_bed_robot_arm_status,
+                    ),
+                    Parameter(
+                        name="contract_transitioning",
+                        value=bool(transitioning),
+                    ),
+                ]
+            ),
+            timeout_sec=5.0,
+        )
+        result = getattr(response, "result", None)
+        if result is None or not bool(getattr(result, "successful", False)):
+            reason = str(getattr(result, "reason", "") or "unknown reason")
+            raise RuntimeError(f"integration preflight contract update rejected: {reason}")
+
     def _check_integration_preflight(self) -> None:
         if not bool(getattr(self, "_require_integration_preflight", False)):
             return
+        self._configure_integration_preflight(
+            self._active_bundle,
+            self._active_spec,
+            transitioning=False,
+        )
         client = getattr(self, "_integration_preflight_client", None)
         if client is None or not client.wait_for_service(timeout_sec=2.0):
             raise RuntimeError("integration preflight service is unavailable")
-        response = self._wait_future(
-            client.call_async(Trigger.Request()),
-            timeout_sec=5.0,
+        deadline = time.monotonic() + float(
+            getattr(self, "_integration_preflight_timeout_sec", 5.0)
         )
-        if response is None or not bool(response.success):
-            detail = str(getattr(response, "message", "") or "readiness check failed")
-            raise RuntimeError(detail)
+        detail = "readiness check failed"
+        while time.monotonic() < deadline:
+            self._raise_if_operation_cancelled()
+            remaining = deadline - time.monotonic()
+            response = self._wait_future(
+                client.call_async(Trigger.Request()),
+                timeout_sec=max(0.1, min(1.0, remaining)),
+            )
+            if response is not None and bool(response.success):
+                return
+            detail = str(
+                getattr(response, "message", "") or "readiness check failed"
+            )
+            time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+        raise RuntimeError(detail)
 
     def _commit_start_actors(self, start_phase_id: str = "") -> None:
         """Atomically commit the final start gate against stop/reset.
@@ -813,6 +941,23 @@ class SimulationManagerNode(Node):
                 response.spec_dir = str(self._active_spec_dir)
                 return response
 
+            spec_dir, spec = self._load_spec_for_bundle(request.bundle_name)
+            target_contract = external_robot_contract_for_spec(spec)
+            runtime_contract = getattr(
+                self,
+                "_runtime_external_robot_contract",
+                external_robot_contract_for_spec(self._active_spec),
+            )
+            if target_contract != runtime_contract:
+                response.success = False
+                response.message = (
+                    "bundle switch changes the external robot contract; restart "
+                    f"the runtime with default_bundle={request.bundle_name}"
+                )
+                response.active_bundle = self._active_bundle
+                response.spec_dir = str(self._active_spec_dir)
+                return response
+
             if not self._begin_operation("bundle-switch"):
                 response.success = False
                 response.message = f"{self._operation_name} already in progress"
@@ -821,9 +966,18 @@ class SimulationManagerNode(Node):
                 return response
 
             try:
-                spec_dir, spec = self._load_spec_for_bundle(request.bundle_name)
+                self._configure_integration_preflight(
+                    self._active_bundle,
+                    self._active_spec,
+                    transitioning=True,
+                )
                 self._quiesce_runtime_for_bundle_change()
                 self._set_spec_dir_on_runtime(spec_dir)
+                self._configure_integration_preflight(
+                    request.bundle_name,
+                    spec,
+                    transitioning=False,
+                )
                 self._active_bundle = request.bundle_name
                 self._active_spec_dir = spec_dir
                 self._active_spec = spec

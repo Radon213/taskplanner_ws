@@ -230,19 +230,9 @@ def load_bundle(bundle_dir: str | Path | None = None) -> ProcedureSpec:
                     "precedence", []
                 )
             ],
-            default_distance_mm=float(
+            max_distance_mm=float(
                 (bed_robot_arm_groups.get("distance_policy", {}) or {}).get(
-                    "default_distance_mm", 10.0
-                )
-            ),
-            qualitative_min_mm=float(
-                (bed_robot_arm_groups.get("distance_policy", {}) or {}).get(
-                    "qualitative_min_mm", 1.0
-                )
-            ),
-            qualitative_max_mm=float(
-                (bed_robot_arm_groups.get("distance_policy", {}) or {}).get(
-                    "qualitative_max_mm", 30.0
+                    "max_distance_mm", 30.0
                 )
             ),
             cm_to_mm_multiplier=float(
@@ -250,9 +240,9 @@ def load_bundle(bundle_dir: str | Path | None = None) -> ProcedureSpec:
                     "cm_to_mm_multiplier", 10.0
                 )
             ),
-            unitless_numeric_unit=str(
+            require_explicit_unit=bool(
                 (bed_robot_arm_groups.get("distance_policy", {}) or {}).get(
-                    "unitless_numeric_unit", "mm"
+                    "require_explicit_unit", True
                 )
             ),
             clamp_explicit_values=bool(
@@ -260,20 +250,6 @@ def load_bundle(bundle_dir: str | Path | None = None) -> ProcedureSpec:
                     "clamp_explicit_values", False
                 )
             ),
-            qualitative_integer_mm=bool(
-                (bed_robot_arm_groups.get("distance_policy", {}) or {}).get(
-                    "qualitative_integer_mm", True
-                )
-            ),
-            qualitative_anchors={
-                str(phrase): float(distance)
-                for phrase, distance in (
-                    (bed_robot_arm_groups.get("distance_policy", {}) or {}).get(
-                        "qualitative_anchors", {}
-                    )
-                    or {}
-                ).items()
-            },
             groups=[
                 BedRobotArmGroupSpec(
                     id=str(group_id),
@@ -294,6 +270,9 @@ def load_bundle(bundle_dir: str | Path | None = None) -> ProcedureSpec:
                     group_id=str(cue["group_id"]),
                     operation=str(cue["operation"]),
                     utterances=[str(item) for item in cue.get("utterances", [])],
+                    adjustment_mode=str(cue.get("adjustment_mode", "")),
+                    target_retractor_id=str(cue.get("target_retractor_id", "")),
+                    direction_frame=str(cue.get("direction_frame", "")),
                     directions=[str(item) for item in cue.get("directions", [])],
                     default_distance_mm=float(cue.get("default_distance_mm", 0.0)),
                     end_effector_profile=str(cue.get("end_effector_profile", "")),
@@ -308,6 +287,8 @@ def load_bundle(bundle_dir: str | Path | None = None) -> ProcedureSpec:
                     group_id=str(transition["group_id"]),
                     from_profile=str(transition["from_profile"]),
                     to_profile=str(transition["to_profile"]),
+                    arm_id=str(transition.get("arm_id", "")),
+                    target_tool_id=str(transition.get("target_tool_id", "")),
                     utterances=[str(item) for item in transition.get("utterances", [])],
                     feedback_text=str(transition.get("feedback_text", "")),
                 )

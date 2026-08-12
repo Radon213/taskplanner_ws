@@ -9,7 +9,7 @@ import type {
   useDigitalTwinViewModel,
 } from "../../hooks/useDigitalTwinViewModel";
 import type { PerceptionLayerHealth } from "../../hooks/useRosBridge";
-import { BedRobotArmGroupCard } from "./BedRobotArmGroupCard";
+import { BedRobotArmCard } from "./BedRobotArmCard";
 import {
   StageCameraToggleViewport,
   StageCameraViewport,
@@ -465,14 +465,16 @@ export function OperatingRoomStage({
           <PhaseStepper steps={vm.stage.phaseSteps} label={vm.ui.phaseOverview} />
         </div>
 
-        <div
-          className="bed-robot-group-rail"
-          aria-label={vm.language === "ko" ? "베드 로봇암 그룹 상태" : "Bed robot group status"}
-        >
-          {vm.boardBedRobotArmGroups.map((group) => (
-            <BedRobotArmGroupCard key={group.groupId} group={group} />
-          ))}
-        </div>
+        {vm.boardBedRobotArms.length ? (
+          <div
+            className="bed-robot-arm-rail"
+            aria-label={vm.language === "ko" ? "리트랙션 로봇암 상태" : "Retraction robot arm status"}
+          >
+            {vm.boardBedRobotArms.map((arm) => (
+              <BedRobotArmCard key={arm.armId} arm={arm} />
+            ))}
+          </div>
+        ) : null}
 
         <AnimatePresence initial={false}>
           {visibleInterruptAlert ? (

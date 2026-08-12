@@ -80,36 +80,32 @@ class MockVLMNode(Node):
             20,
         )
 
-    @staticmethod
-    def _mock_qualitative_distance_mm(voice_text: str) -> float | None:
-        """Provide deterministic interpolation for non-anchor mock phrases."""
-
-        text = str(voice_text)
-        if any(token in text for token in ("중간 정도", "적당히", "적당하게")):
-            return 15.0
-        if "약간" in text:
-            return 3.0
-        if any(token in text for token in ("강하게", "세게")):
-            return 25.0
-        if "덜" in text:
-            return 5.0
-        if "더" in text:
-            return 10.0
-        return None
-
     @classmethod
     def _normalize_mock_group_request(cls, voice_text: str):
-        return normalize_retraction_request(
-            voice_text,
-            qualitative_distance_mm=cls._mock_qualitative_distance_mm(voice_text),
-        )
+        return normalize_retraction_request(voice_text)
 
     def _on_bed_robot_arm_group_request(
         self, msg: BedRobotArmGroupRequest
     ) -> None:
         if not bool(self.get_parameter("bed_robot_arm_group_proposals_enabled").value):
             return
-        if msg.group_id != "retraction" or msg.operation != "retraction":
+        if msg.group_id != "retraction" or msg.operation not in {
+            "retraction",
+            "retraction_adjustment",
+        }:
+            return
+        if msg.direction_frame != "surgeon_view":
+            return
+        if msg.adjustment_mode == "single":
+            if msg.target_retractor_id not in {
+                "left_malleable",
+                "right_malleable",
+            }:
+                return
+        elif msg.adjustment_mode == "multi":
+            if msg.target_retractor_id != "both_malleable":
+                return
+        else:
             return
         request_id = str(msg.request_id or "").strip()
         if not request_id or request_id in self._seen_bed_group_request_ids:
@@ -125,6 +121,9 @@ class MockVLMNode(Node):
         command.command_id = f"mock-vlm-{request_id}"
         command.group_id = "retraction"
         command.operation = "retraction"
+        command.adjustment_mode = msg.adjustment_mode
+        command.target_retractor_id = msg.target_retractor_id
+        command.direction_frame = msg.direction_frame
         command.end_effector_profile = msg.end_effector_profile
         try:
             normalized = self._normalize_mock_group_request(msg.voice_text)
@@ -138,7 +137,12 @@ class MockVLMNode(Node):
             command.confidence = 0.0
         else:
             proposal.valid = True
-            command.direction = normalized.direction
+            if msg.adjustment_mode == "multi":
+                command.direction = "none"
+                command.axis = normalized.direction.lower()
+            else:
+                command.direction = normalized.direction.lower()
+                command.axis = "none"
             command.distance_mm = float(normalized.distance_mm)
             command.distance_origin = normalized.distance_origin
             command.raw_distance_text = normalized.raw_distance_text
@@ -151,7 +155,11 @@ class MockVLMNode(Node):
                     "request_id": command.request_id,
                     "group_id": command.group_id,
                     "operation": command.operation,
+                    "adjustment_mode": command.adjustment_mode,
+                    "target_retractor_id": command.target_retractor_id,
+                    "direction_frame": command.direction_frame,
                     "direction": command.direction,
+                    "axis": command.axis,
                     "distance_mm": float(command.distance_mm),
                     "distance_origin": command.distance_origin,
                     "raw_distance_text": command.raw_distance_text,

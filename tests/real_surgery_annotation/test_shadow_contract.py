@@ -18,7 +18,7 @@ from tools.real_surgery_annotation.shadow_contract import (
 
 
 class ShadowContractTest(unittest.TestCase):
-    def test_trace_contract_includes_shadow_bed_robot_arm_group_lane(self) -> None:
+    def test_trace_contract_includes_shadow_retraction_arm_lane(self) -> None:
         self.assertTrue(
             {
                 "bed_robot_arm_group_request",

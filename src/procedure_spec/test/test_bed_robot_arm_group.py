@@ -49,19 +49,11 @@ def test_six_direction_aliases(utterance: str, expected: str) -> None:
         ("1센치 더 당겨줘", 10.0, "explicit_with_unit", "1센치"),
         ("1씨엠 더 당겨줘", 10.0, "explicit_with_unit", "1씨엠"),
         ("2.5 cm 더 당겨줘", 25.0, "explicit_with_unit", "2.5 cm"),
-        ("5 cm 더 당겨줘", 50.0, "explicit_with_unit", "5 cm"),
-        ("10 더 당겨줘", 10.0, "explicit_unit_inferred", "10"),
-        ("아주 살짝 당겨줘", 1.0, "qualitative_inferred", "아주 살짝"),
-        ("미세하게 당겨줘", 1.0, "qualitative_inferred", "미세하게"),
-        ("살짝 당겨줘", 5.0, "qualitative_inferred", "살짝"),
-        ("조금 더 당겨줘", 10.0, "qualitative_inferred", "조금 더"),
-        ("많이 당겨줘", 20.0, "qualitative_inferred", "많이"),
-        ("아주 많이 당겨줘", 30.0, "qualitative_inferred", "아주 많이"),
-        ("최대한 당겨줘", 30.0, "qualitative_inferred", "최대한"),
-        ("당겨줘", 10.0, "defaulted", ""),
+        ("30 mm 더 당겨줘", 30.0, "explicit_with_unit", "30 mm"),
+        ("0.5밀리미터 더 당겨줘", 0.5, "explicit_with_unit", "0.5밀리미터"),
     ],
 )
-def test_distance_precedence_and_anchors(
+def test_only_explicit_mm_or_cm_distances_are_normalized(
     utterance: str,
     distance_mm: float,
     origin: str,
@@ -73,65 +65,88 @@ def test_distance_precedence_and_anchors(
     assert result.raw_distance_text == raw
 
 
-def test_non_anchor_vlm_qualitative_value_is_limited_to_one_through_thirty() -> None:
-    result = normalize_retraction_distance("중간 정도 당겨줘", qualitative_distance_mm=17)
-    assert result.distance_mm == 17
-    assert result.distance_origin == "qualitative_inferred"
+@pytest.mark.parametrize(
+    "utterance",
+    [
+        "",
+        "당겨줘",
+        "견인해줘",
+        "10 더 당겨줘",
+        "조금 더 당겨줘",
+        "살짝 당겨줘",
+        "많이 당겨줘",
+        "아주 많이 당겨줘",
+        "최대한 당겨줘",
+    ],
+)
+def test_missing_unit_or_qualitative_distance_is_rejected(utterance: str) -> None:
+    with pytest.raises(BedRobotArmGroupNormalizationError, match="explicit numeric mm/cm"):
+        normalize_retraction_distance(utterance)
 
-    with pytest.raises(BedRobotArmGroupNormalizationError, match="between 1 and 30"):
-        normalize_retraction_distance("중간 정도 당겨줘", qualitative_distance_mm=31)
-    with pytest.raises(BedRobotArmGroupNormalizationError, match="integer"):
-        normalize_retraction_distance("중간 정도 당겨줘", qualitative_distance_mm=17.5)
+
+def test_vlm_qualitative_distance_is_never_accepted() -> None:
+    with pytest.raises(BedRobotArmGroupNormalizationError, match="not permitted"):
+        normalize_retraction_distance("중간 정도 당겨줘", qualitative_distance_mm=17)
 
 
-@pytest.mark.parametrize("raw_text", ["", "당겨줘", "견인해줘"])
-def test_vlm_cannot_invent_qualitative_distance_without_spoken_intensity(
-    raw_text: str,
-) -> None:
-    with pytest.raises(BedRobotArmGroupNormalizationError, match="intensity expression"):
-        normalize_retraction_distance(raw_text, qualitative_distance_mm=15)
-
-
-def test_explicit_distance_is_not_clamped_but_is_deterministically_rechecked() -> None:
+def test_explicit_distance_is_deterministically_rechecked() -> None:
     result = validate_retraction_distance_proposal(
-        raw_distance_text="5 cm",
-        distance_mm=50,
+        raw_distance_text="3 cm",
+        distance_mm=30,
         distance_origin="explicit_with_unit",
     )
-    assert result.distance_mm == 50
+    assert result.distance_mm == 30
 
     with pytest.raises(BedRobotArmGroupNormalizationError, match="distance mismatch"):
         validate_retraction_distance_proposal(
-            raw_distance_text="5 cm",
-            distance_mm=30,
+            raw_distance_text="2 cm",
+            distance_mm=10,
             distance_origin="explicit_with_unit",
         )
 
 
-@pytest.mark.parametrize("utterance", ["-1 cm 당겨줘", "0 더 당겨줘"])
+@pytest.mark.parametrize("utterance", ["-1 cm 당겨줘", "0 mm 더 당겨줘"])
 def test_non_positive_explicit_distance_is_rejected(utterance: str) -> None:
     with pytest.raises(BedRobotArmGroupNormalizationError, match="positive finite"):
         normalize_retraction_distance(utterance)
 
 
+@pytest.mark.parametrize("utterance", ["30.1 mm 당겨줘", "3.1 cm 당겨줘", "5 cm 당겨줘"])
+def test_distance_above_contract_limit_is_rejected(utterance: str) -> None:
+    with pytest.raises(BedRobotArmGroupNormalizationError, match="30 mm contract limit"):
+        normalize_retraction_distance(utterance)
+
+
+def test_multiple_explicit_distances_are_rejected() -> None:
+    with pytest.raises(BedRobotArmGroupNormalizationError, match="exactly one"):
+        normalize_retraction_distance("왼쪽은 10 mm, 오른쪽은 20 mm 당겨줘")
+
+
 def test_direction_can_come_from_vlm_when_voice_does_not_state_it() -> None:
     result = normalize_retraction_request(
-        "조금 당겨줘",
+        "10 mm 당겨줘",
         vlm_direction="UP_DOWN",
     )
     assert result.direction == "UP_DOWN"
     assert result.distance_mm == 10
 
 
-def test_nephrectomy_initial_mayo_cues_are_mock_vlm_groundable() -> None:
+def test_nephrectomy_retraction_cues_match_reviewed_per_arm_semantics() -> None:
     spec = load_bundle(_spec_root() / "nephrectomy")
-    cues = [
-        cue
-        for cue in spec.get_bed_robot_arm_group_cues("P01")
-        if cue.id == "mayo_muscle_exposure"
-    ]
-    assert cues
-    assert all(infer_retraction_direction(text) for text in cues[0].utterances)
+    cues = spec.get_bed_robot_arm_group_cues("P02")
+    assert {cue.id for cue in cues} == {
+        "left_malleable_adjustment",
+        "right_malleable_adjustment",
+        "bilateral_malleable_adjustment",
+    }
+    assert all(cue.group_id == "retraction" for cue in cues)
+    assert all(cue.operation == "retraction" for cue in cues)
+    assert all(cue.direction_frame == "surgeon_view" for cue in cues)
+    assert all(
+        infer_retraction_direction(text)
+        for cue in cues
+        for text in cue.utterances
+    )
 
 
 def _spec_root() -> Path:
@@ -139,55 +154,74 @@ def _spec_root() -> Path:
 
 
 @pytest.mark.parametrize(
-    ("procedure_id", "suction_enabled", "initial_retraction_profile"),
+    (
+        "procedure_id",
+        "retraction_enabled",
+        "initial_retraction_profile",
+        "allowed_operations",
+        "has_cues",
+    ),
     [
-        ("inguinal_hernia_repair", False, "army_navy"),
-        ("thyroidectomy", True, "thyroid_retractor"),
-        ("nephrectomy", False, "mayo"),
+        ("inguinal_hernia_repair", False, "", [], False),
+        (
+            "thyroidectomy",
+            True,
+            "thyroid_retractor",
+            ["change_end_effector"],
+            False,
+        ),
+        (
+            "thyroidectomy_demo",
+            True,
+            "thyroid_retractor",
+            ["change_end_effector"],
+            False,
+        ),
+        ("nephrectomy", True, "", ["retraction"], True),
     ],
 )
 def test_procedure_bundles_load_group_scenarios(
     procedure_id: str,
-    suction_enabled: bool,
+    retraction_enabled: bool,
     initial_retraction_profile: str,
+    allowed_operations: list[str],
+    has_cues: bool,
 ) -> None:
     bundle_dir = _spec_root() / procedure_id
     spec = load_bundle(bundle_dir)
     group_spec = spec.get_bed_robot_arm_group_spec()
     assert group_spec is not None
     groups = {group.id: group for group in group_spec.groups}
-    assert set(groups) == {"suction", "retraction"}
-    assert groups["suction"].enabled is suction_enabled
+    assert set(groups) == {"retraction"}
+    assert groups["retraction"].enabled is retraction_enabled
     assert groups["retraction"].initial_end_effector_profile == initial_retraction_profile
-    assert group_spec.default_distance_mm == 10
-    assert group_spec.qualitative_min_mm == 1
-    assert group_spec.qualitative_max_mm == 30
+    assert groups["retraction"].allowed_operations == allowed_operations
+    assert group_spec.max_distance_mm == 30
     assert group_spec.cm_to_mm_multiplier == 10
-    assert group_spec.unitless_numeric_unit == "mm"
+    assert group_spec.require_explicit_unit is True
     assert group_spec.clamp_explicit_values is False
-    assert group_spec.qualitative_integer_mm is True
-    assert group_spec.distance_precedence == [
-        "explicit_with_unit",
-        "explicit_unit_inferred",
-        "qualitative_inferred",
-        "defaulted",
-    ]
-    assert spec.get_bed_robot_arm_group_cues()
+    assert group_spec.distance_precedence == ["explicit_with_unit"]
+    assert bool(spec.get_bed_robot_arm_group_cues()) is has_cues
 
     compact = compact_procedure_prompt(bundle_dir)
-    assert compact["bed_robot_arm_groups"]["groups"]["retraction"]["enabled"] is True
+    assert (
+        compact["bed_robot_arm_groups"]["groups"]["retraction"]["enabled"]
+        is retraction_enabled
+    )
 
 
 def test_expected_end_effector_transitions_are_loaded() -> None:
-    expected = {
-        "inguinal_hernia_repair": ("army_navy", "mosquito"),
-        "thyroidectomy": ("thyroid_retractor", "army"),
-        "nephrectomy": ("mayo", "malleable"),
-    }
-    for procedure_id, profiles in expected.items():
+    for procedure_id in ("inguinal_hernia_repair", "nephrectomy", "thyroidectomy_demo"):
         spec = load_bundle(_spec_root() / procedure_id)
-        transitions = spec.get_bed_robot_arm_end_effector_transitions()
-        assert any(
-            (transition.from_profile, transition.to_profile) == profiles
-            for transition in transitions
-        )
+        assert spec.get_bed_robot_arm_end_effector_transitions() == []
+
+    spec = load_bundle(_spec_root() / "thyroidectomy")
+    transitions = spec.get_bed_robot_arm_end_effector_transitions()
+    assert len(transitions) == 1
+    transition = transitions[0]
+    assert (transition.from_profile, transition.to_profile) == (
+        "thyroid_retractor",
+        "army_navy_retractor",
+    )
+    assert transition.arm_id == "arm_1"
+    assert transition.target_tool_id == "army_navy_retractor"

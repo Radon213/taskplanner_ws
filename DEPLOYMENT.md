@@ -9,9 +9,16 @@ Taskplanner.
 
 | Mode | Started services | Intended input |
 | --- | --- | --- |
-| `live` | model control planes, webapp, RF-DETR attempt, ROS runtime/bridge | External cameras, speech, and robot Actions |
+| `live` | model control planes, webapp, RF-DETR attempt, ROS runtime/bridge | External cameras, speech, humanoid Action, and retraction controller contracts |
 | `llm-surgeon` | model control planes, webapp, ROS runtime/bridge | LLM surgeon validation with mock Actions |
 | `replay` | model control planes, webapp, RF-DETR attempt, shadow replay/ROS bridge | External rosbag dataset and timestamped annotations |
+
+In `live` mode, bed-mounted robot integration is retraction-only. Applicable
+deployments must provide `/surgery/tool_change/request`,
+`/surgery/retraction/adjust`, and `/external/bed_robot_arms/status` as defined in
+`docs/EXTERNAL_INPUT_CONTRACT.md`. There is no bed-mounted suction-arm API;
+clinical suction instruments and speech remain part of Taskplanner's ordinary
+tool/evidence path.
 
 The vLLM manager starts with `VLLM_MANAGER_AUTO_START=false`, so its catalog is
 available while no vLLM worker model is loaded. The Compose-managed
@@ -275,6 +282,11 @@ command and acceptance criteria.
 This is the software release boundary. Real robot calibration, trajectories,
 grasp and release behavior, collision avoidance, E-stop behavior, and the site
 network remain a separate physical acceptance gate.
+
+For the retraction controller, that site gate must also verify Tool Change
+Service completion/failure semantics, Retraction Adjustment Goal acceptance and
+cancel recovery, monotonic status revisions, direct-teach reporting, and
+fail-closed behavior for stale or unavailable controller status.
 
 ## Diagnostics
 

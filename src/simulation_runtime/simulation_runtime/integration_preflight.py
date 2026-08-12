@@ -8,14 +8,75 @@ from typing import Any
 
 import rclpy
 from rclpy.action import ActionClient
+from rcl_interfaces.msg import SetParametersResult
 from rclpy.node import Node
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
 from surgical_interop_msgs.action import (
-    ExecuteRetraction,
+    ExecuteRetractionAdjustment,
     ExecuteToolHandover,
 )
-from surgical_interop_msgs.srv import SetSuction
+from surgical_interop_msgs.msg import BedRobotArmStateArray
+from surgical_interop_msgs.srv import RequestToolChange
+
+
+_BED_ROBOT_LAYOUTS = {
+    "thyroidectomy": {"army_navy"},
+    "nephrectomy": {"left_malleable", "right_malleable"},
+}
+_BED_ROBOT_STATES = {
+    "standby",
+    "direct_teach",
+    "retracting",
+    "changing_tool",
+    "moving_to_standby",
+    "fault",
+    "protective_stop",
+    "unknown",
+}
+
+
+def expected_contract_for_bundle(bundle_name: str) -> tuple[str, bool, bool, bool]:
+    """Return procedure, tool-change, adjustment, and status requirements."""
+
+    normalized = str(bundle_name).strip().casefold()
+    if normalized in {"thyroidectomy", "thyroidectomy_demo"}:
+        return "thyroidectomy", True, False, True
+    if normalized == "nephrectomy":
+        return "nephrectomy", False, True, True
+    return "", False, False, False
+
+
+def validate_bed_robot_status_layout(
+    procedure_type: str,
+    arms: list[Any],
+) -> bool:
+    """Validate only controller-owned fields present in the public contract."""
+
+    expected_roles = _BED_ROBOT_LAYOUTS.get(str(procedure_type).strip().casefold())
+    if expected_roles is None or len(arms) != len(expected_roles):
+        return False
+    arm_ids: set[str] = set()
+    roles: set[str] = set()
+    for arm in arms:
+        arm_id = str(getattr(arm, "arm_id", "")).strip()
+        role = str(getattr(arm, "role", "")).strip()
+        role_instance = str(getattr(arm, "role_instance_id", "")).strip()
+        state = str(getattr(arm, "state", "")).strip()
+        direct_teach_active = bool(getattr(arm, "direct_teach_active", False))
+        if (
+            arm_id not in {"arm_1", "arm_2"}
+            or arm_id in arm_ids
+            or role != "retraction"
+            or role_instance not in expected_roles
+            or role_instance in roles
+            or state not in _BED_ROBOT_STATES
+            or direct_teach_active != (state == "direct_teach")
+        ):
+            return False
+        arm_ids.add(arm_id)
+        roles.add(role_instance)
+    return roles == expected_roles
 
 
 def evaluate_readiness(
@@ -23,24 +84,50 @@ def evaluate_readiness(
     sentence_publisher_count: int,
     require_sentence_publisher: bool,
     tool_handover_server_ready: bool,
-    suction_service_ready: bool,
-    retraction_server_ready: bool,
+    tool_change_service_ready: bool,
+    require_tool_change_service: bool,
+    retraction_adjustment_server_ready: bool,
+    require_retraction_adjustment_server: bool,
+    bed_robot_arm_status_valid: bool,
+    bed_robot_arm_status_age_sec: float,
+    bed_robot_arm_status_max_age_sec: float,
+    require_bed_robot_arm_status: bool,
     require_perception: bool,
     rfdetr_health: dict[str, Any] | None,
     rfdetr_age_sec: float,
     perception_max_age_sec: float,
+    contract_configuration_valid: bool = True,
 ) -> dict[str, Any]:
     checks = {
+        "contract_configuration": bool(contract_configuration_valid),
         "surgeon_sentence_publisher": (
             not require_sentence_publisher or sentence_publisher_count > 0
         ),
         "tool_handover_action_server": bool(tool_handover_server_ready),
-        "suction_control_service": bool(suction_service_ready),
-        "retraction_action_server": bool(retraction_server_ready),
+        "tool_change_service": (
+            not require_tool_change_service or bool(tool_change_service_ready)
+        ),
+        "retraction_adjustment_action_server": (
+            not require_retraction_adjustment_server
+            or bool(retraction_adjustment_server_ready)
+        ),
+        "bed_robot_arm_status": (
+            not require_bed_robot_arm_status
+            or (
+                bool(bed_robot_arm_status_valid)
+                and 0.0 <= float(bed_robot_arm_status_age_sec)
+                <= float(bed_robot_arm_status_max_age_sec)
+            )
+        ),
         "perception_input": True,
     }
     details: dict[str, Any] = {
         "sentence_publisher_count": max(0, int(sentence_publisher_count)),
+        "bed_robot_arm_status_age_sec": (
+            round(float(bed_robot_arm_status_age_sec), 3)
+            if bed_robot_arm_status_age_sec >= 0.0
+            else -1.0
+        ),
         "rfdetr_age_sec": (
             round(float(rfdetr_age_sec), 3) if rfdetr_age_sec >= 0.0 else -1.0
         ),
@@ -89,13 +176,27 @@ class IntegrationPreflightNode(Node):
             "/surgery/tool_handover",
         )
         self.declare_parameter(
-            "suction_service_name",
-            "/surgery/suction/set",
+            "tool_change_service_name",
+            "/surgery/tool_change/request",
+        )
+        self.declare_parameter("require_tool_change_service", True)
+        self.declare_parameter(
+            "retraction_adjustment_action_name",
+            "/surgery/retraction/adjust",
         )
         self.declare_parameter(
-            "retraction_action_name",
-            "/surgery/retraction",
+            "require_retraction_adjustment_server",
+            True,
         )
+        self.declare_parameter(
+            "bed_robot_arm_status_topic",
+            "/external/bed_robot_arms/status",
+        )
+        self.declare_parameter("require_bed_robot_arm_status", True)
+        self.declare_parameter("bed_robot_arm_status_max_age_sec", 3.0)
+        self.declare_parameter("active_bundle", "")
+        self.declare_parameter("procedure_type", "")
+        self.declare_parameter("contract_transitioning", False)
 
         self._sentence_topic = str(self.get_parameter("sentence_topic").value)
         self._require_sentence_publisher = bool(
@@ -104,26 +205,62 @@ class IntegrationPreflightNode(Node):
         self._require_perception = bool(
             self.get_parameter("require_perception").value
         )
+        self._require_tool_change_service = bool(
+            self.get_parameter("require_tool_change_service").value
+        )
+        self._require_retraction_adjustment_server = bool(
+            self.get_parameter("require_retraction_adjustment_server").value
+        )
+        self._require_bed_robot_arm_status = bool(
+            self.get_parameter("require_bed_robot_arm_status").value
+        )
+        self._active_bundle = str(
+            self.get_parameter("active_bundle").value
+        ).strip()
+        self._contract_transitioning = bool(
+            self.get_parameter("contract_transitioning").value
+        )
+        self._bed_robot_arm_status_max_age_sec = max(
+            0.1,
+            float(self.get_parameter("bed_robot_arm_status_max_age_sec").value),
+        )
+        self._procedure_type = str(
+            self.get_parameter("procedure_type").value
+        ).strip().casefold()
+        self._bed_robot_status_valid = False
+        self._bed_robot_status_received_monotonic = 0.0
+        self._bed_robot_status_source_stamp_sec = 0.0
+        self._bed_robot_status_revision: int | None = None
         self._perception_max_age_sec = max(
             0.1,
             float(self.get_parameter("perception_max_age_sec").value),
         )
         self._latest_rfdetr_health: dict[str, Any] | None = None
         self._latest_rfdetr_monotonic = 0.0
+        self.add_on_set_parameters_callback(self._on_contract_parameters_changed)
 
         self._tool_handover_client = ActionClient(
             self,
             ExecuteToolHandover,
             str(self.get_parameter("tool_handover_action_name").value),
         )
-        self._suction_client = self.create_client(
-            SetSuction,
-            str(self.get_parameter("suction_service_name").value),
+        self._tool_change_client = self.create_client(
+            RequestToolChange,
+            str(self.get_parameter("tool_change_service_name").value),
         )
         self._retraction_client = ActionClient(
             self,
-            ExecuteRetraction,
-            str(self.get_parameter("retraction_action_name").value),
+            ExecuteRetractionAdjustment,
+            str(self.get_parameter("retraction_adjustment_action_name").value),
+        )
+        self._bed_robot_arm_status_topic = str(
+            self.get_parameter("bed_robot_arm_status_topic").value
+        )
+        self._bed_robot_arm_status_subscription = self.create_subscription(
+            BedRobotArmStateArray,
+            self._bed_robot_arm_status_topic,
+            self._on_bed_robot_arm_status,
+            10,
         )
         self._readiness_pub = self.create_publisher(
             String,
@@ -143,6 +280,89 @@ class IntegrationPreflightNode(Node):
         )
         self.create_timer(1.0, self._publish_readiness)
 
+    def _on_contract_parameters_changed(self, parameters) -> SetParametersResult:
+        candidate = {
+            "active_bundle": self._active_bundle,
+            "procedure_type": self._procedure_type,
+            "require_tool_change_service": self._require_tool_change_service,
+            "require_retraction_adjustment_server": (
+                self._require_retraction_adjustment_server
+            ),
+            "require_bed_robot_arm_status": self._require_bed_robot_arm_status,
+            "contract_transitioning": self._contract_transitioning,
+        }
+        for parameter in parameters:
+            if parameter.name in candidate:
+                candidate[parameter.name] = parameter.value
+
+        active_bundle = str(candidate["active_bundle"]).strip()
+        expected = expected_contract_for_bundle(active_bundle)
+        supplied = (
+            str(candidate["procedure_type"]).strip().casefold(),
+            bool(candidate["require_tool_change_service"]),
+            bool(candidate["require_retraction_adjustment_server"]),
+            bool(candidate["require_bed_robot_arm_status"]),
+        )
+        if not active_bundle:
+            return SetParametersResult(
+                successful=False,
+                reason="active_bundle must be set before readiness can be evaluated",
+            )
+        if supplied != expected:
+            return SetParametersResult(
+                successful=False,
+                reason=(
+                    f"external robot contract mismatch for bundle '{active_bundle}': "
+                    f"expected {expected}, received {supplied}"
+                ),
+            )
+
+        previous_identity = (
+            self._active_bundle,
+            self._procedure_type,
+            self._require_tool_change_service,
+            self._require_retraction_adjustment_server,
+            self._require_bed_robot_arm_status,
+            self._contract_transitioning,
+        )
+        next_identity = (
+            active_bundle,
+            supplied[0],
+            supplied[1],
+            supplied[2],
+            supplied[3],
+            bool(candidate["contract_transitioning"]),
+        )
+        self._active_bundle = active_bundle
+        self._procedure_type = supplied[0]
+        self._require_tool_change_service = supplied[1]
+        self._require_retraction_adjustment_server = supplied[2]
+        self._require_bed_robot_arm_status = supplied[3]
+        self._contract_transitioning = next_identity[5]
+        if next_identity != previous_identity:
+            self._invalidate_bed_robot_status()
+        return SetParametersResult(successful=True)
+
+    def _invalidate_bed_robot_status(self) -> None:
+        self._bed_robot_status_valid = False
+        self._bed_robot_status_received_monotonic = 0.0
+        self._bed_robot_status_source_stamp_sec = 0.0
+        self._bed_robot_status_revision = None
+
+    def _contract_configuration_valid(self) -> bool:
+        expected = expected_contract_for_bundle(self._active_bundle)
+        supplied = (
+            self._procedure_type,
+            self._require_tool_change_service,
+            self._require_retraction_adjustment_server,
+            self._require_bed_robot_arm_status,
+        )
+        return bool(
+            self._active_bundle
+            and not self._contract_transitioning
+            and supplied == expected
+        )
+
     def _on_rfdetr_health(self, msg: String) -> None:
         try:
             payload = json.loads(msg.data)
@@ -155,22 +375,77 @@ class IntegrationPreflightNode(Node):
         self._latest_rfdetr_health = payload
         self._latest_rfdetr_monotonic = time.monotonic()
 
+    def _on_bed_robot_arm_status(self, msg: BedRobotArmStateArray) -> None:
+        source_stamp_sec = float(msg.stamp.sec) + float(msg.stamp.nanosec) / 1e9
+        now_sec = time.time()
+        revision = int(msg.revision)
+        source_is_strictly_newer = (
+            source_stamp_sec > self._bed_robot_status_source_stamp_sec
+        )
+        valid = bool(
+            str(msg.procedure_type).strip().casefold() == self._procedure_type
+            and validate_bed_robot_status_layout(self._procedure_type, list(msg.arms))
+            and source_stamp_sec > 0.0
+            and source_stamp_sec <= now_sec + 0.5
+            and source_is_strictly_newer
+        )
+        if not valid:
+            self._bed_robot_status_valid = False
+            return
+        self._bed_robot_status_valid = True
+        self._bed_robot_status_received_monotonic = time.monotonic()
+        self._bed_robot_status_source_stamp_sec = source_stamp_sec
+        self._bed_robot_status_revision = revision
+
     def _snapshot(self) -> dict[str, Any]:
         rfdetr_age_sec = (
             time.monotonic() - self._latest_rfdetr_monotonic
             if self._latest_rfdetr_monotonic > 0.0
             else -1.0
         )
+        reception_age_sec = (
+            time.monotonic() - self._bed_robot_status_received_monotonic
+            if self._bed_robot_status_received_monotonic > 0.0
+            else -1.0
+        )
+        source_age_sec = (
+            time.time() - self._bed_robot_status_source_stamp_sec
+            if self._bed_robot_status_source_stamp_sec > 0.0
+            else -1.0
+        )
+        bed_robot_status_age_sec = (
+            max(reception_age_sec, source_age_sec)
+            if reception_age_sec >= 0.0 and source_age_sec >= 0.0
+            else -1.0
+        )
         snapshot = evaluate_readiness(
             sentence_publisher_count=self.count_publishers(self._sentence_topic),
             require_sentence_publisher=self._require_sentence_publisher,
             tool_handover_server_ready=self._tool_handover_client.server_is_ready(),
-            suction_service_ready=self._suction_client.service_is_ready(),
-            retraction_server_ready=self._retraction_client.server_is_ready(),
+            tool_change_service_ready=self._tool_change_client.service_is_ready(),
+            require_tool_change_service=self._require_tool_change_service,
+            retraction_adjustment_server_ready=self._retraction_client.server_is_ready(),
+            require_retraction_adjustment_server=(
+                self._require_retraction_adjustment_server
+            ),
+            bed_robot_arm_status_valid=self._bed_robot_status_valid,
+            bed_robot_arm_status_age_sec=bed_robot_status_age_sec,
+            bed_robot_arm_status_max_age_sec=(
+                self._bed_robot_arm_status_max_age_sec
+            ),
+            require_bed_robot_arm_status=self._require_bed_robot_arm_status,
             require_perception=self._require_perception,
             rfdetr_health=self._latest_rfdetr_health,
             rfdetr_age_sec=rfdetr_age_sec,
             perception_max_age_sec=self._perception_max_age_sec,
+            contract_configuration_valid=self._contract_configuration_valid(),
+        )
+        snapshot["details"].update(
+            {
+                "active_bundle": self._active_bundle,
+                "procedure_type": self._procedure_type,
+                "contract_transitioning": self._contract_transitioning,
+            }
         )
         snapshot["stamp_sec"] = round(
             self.get_clock().now().nanoseconds / 1_000_000_000.0,

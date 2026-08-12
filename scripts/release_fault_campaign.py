@@ -235,6 +235,11 @@ def _run_scenario_once(scenario: FaultScenario) -> ScenarioResult:
 
 def _action_contract(profile_path: Path) -> dict[str, Any]:
     profile = EmulatorProfile.load(profile_path)
+    expected_routes = {
+        "tool_handover",
+        "retraction_adjustment",
+        "tool_change",
+    }
     outcomes = {
         route: [item.outcome for item in route_profile.sequence]
         + [route_profile.default.outcome]
@@ -247,7 +252,8 @@ def _action_contract(profile_path: Path) -> dict[str, Any]:
         "surgeon_to_robot": valid_tool_transition("surgeon", "robot"),
     }
     passed = (
-        transitions["tray_to_robot"]
+        set(profile.routes) == expected_routes
+        and transitions["tray_to_robot"]
         and transitions["robot_to_surgeon"]
         and transitions["mayo_to_tray"]
         and not transitions["surgeon_to_robot"]
@@ -255,6 +261,13 @@ def _action_contract(profile_path: Path) -> dict[str, Any]:
     return {
         "profile_id": profile.profile_id,
         "passed": passed,
+        "public_contract": {
+            "tool_handover_action": "/surgery/tool_handover",
+            "tool_change_service": "/surgery/tool_change/request",
+            "retraction_adjustment_action": "/surgery/retraction/adjust",
+            "bed_robot_arm_status": "/external/bed_robot_arms/status",
+        },
+        "routes": sorted(profile.routes),
         "route_outcomes": outcomes,
         "transition_contract": transitions,
     }

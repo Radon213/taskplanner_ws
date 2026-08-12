@@ -140,27 +140,6 @@ class RobotProjection:
     evidence_status: str = DT_ACCEPTED
 
 
-def project_robot_state(state: Any) -> RobotProjection:
-    """Project robot-group operational state without raw request/rationale text."""
-
-    return RobotProjection(
-        stamp=_value(state, "stamp", None),
-        robot_id=str(_value(state, "group_id", "")),
-        robot_type="bed_robot_arm_group",
-        connection_state=(
-            "connected" if bool(_value(state, "connected", False)) else "disconnected"
-        ),
-        execution_state=str(_value(state, "state", "")),
-        active_command_id=str(_value(state, "active_command_id", "")),
-        progress=float(_value(state, "progress", 0.0)),
-        reason_code=str(_value(state, "error_code", "")),
-    )
-
-
-def project_robots(world: Any) -> tuple[RobotProjection, ...]:
-    return tuple(project_robot_state(item) for item in _value(world, "bed_robot_arm_groups", ()))
-
-
 def project_skill_robot_status(status: Any) -> RobotProjection:
     """Expose taskplanner's skill-execution status as one humanoid robot state.
 
@@ -186,19 +165,21 @@ def project_skill_robot_status(status: Any) -> RobotProjection:
     )
 
 
-def project_group_robot_status(status: Any) -> RobotProjection:
-    """Project a current controller status without copying raw status text."""
+def project_bed_robot_arm_state(status: Any, stamp: Any = None) -> RobotProjection:
+    """Project one controller-owned retraction-arm state."""
 
     execution_state = str(_value(status, "state", ""))
     return RobotProjection(
-        stamp=_value(status, "stamp", None),
-        robot_id=str(_value(status, "group_id", "")),
-        robot_type="bed_robot_arm_group",
-        connection_state="offline" if execution_state == "offline" else "unknown",
+        stamp=stamp,
+        robot_id=str(_value(status, "arm_id", "")),
+        robot_type="bed_retraction_arm",
+        # The controller document exposes no connectivity field. Receipt
+        # availability and freshness are projected through SurgeryHealth.
+        connection_state="unknown",
         execution_state=execution_state,
-        active_command_id=str(_value(status, "command_id", "")),
-        progress=float(_value(status, "progress", 0.0)),
-        reason_code=str(_value(status, "error_code", "")),
+        active_command_id="",
+        progress=0.0,
+        reason_code=str(_value(status, "reason_code", "")),
     )
 
 

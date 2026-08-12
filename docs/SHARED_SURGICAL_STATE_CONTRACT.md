@@ -9,6 +9,14 @@ other institutions implement for Taskplanner.  A partner may subscribe to the
 topics below to understand the current case, but must not use them to write
 into the digital twin or to bypass its own robot safety controller.
 
+In particular, `/surgery/robots` is a Taskplanner-owned read-only projection;
+it is not the controller input contract. The bed-mounted controller publishes
+retraction-only source state on `/external/bed_robot_arms/status`, while
+Taskplanner sends Tool Change through `/surgery/tool_change/request` and
+Malleable fine adjustment through `/surgery/retraction/adjust`. No bed-mounted
+suction-arm state or command belongs to either contract. Clinical suction
+instruments and surgeon speech about suction remain ordinary surgical evidence.
+
 Start the public publisher only when the integration network is ready:
 
 ```bash

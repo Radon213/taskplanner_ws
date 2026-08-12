@@ -5,9 +5,18 @@ topics to focused public robot-capability endpoints.
 
 It subscribes to `/bt/skill_command` and `/bt/bed_robot_arm_group_command`.
 A stable next-tool decision, handover, unused held-tool return, and Mayo
-retrieval all map to the single `/surgery/tool_handover` Action. Retraction,
-release, and end-effector changes map to `/surgery/retraction`; suction start
-and stop map to `/surgery/suction/set`.
+retrieval all map to the single `/surgery/tool_handover` Action. Retraction
+adjustments map to `/surgery/retraction/adjust`, while a reviewed retractor
+tool change maps to the blocking `/surgery/tool_change/request` Service. The
+adapter subscribes to controller-owned state on
+`/external/bed_robot_arms/status`. No suction-arm endpoint is exposed.
+
+The internal group envelope remains the inbound compatibility boundary. Only
+its `retraction` group is accepted. A `change_end_effector` command maps its
+`arm_id` and `target_tool_id` to `RequestToolChange`; a `retraction` command
+maps its adjustment mode, target, frame, direction or axis, and distance to
+`ExecuteRetractionAdjustment`. Missing or stale controller state, direct-teach
+mode, invalid document values, and any non-standby target arm fail closed.
 
 The tool Action sends only `command_id`, the real catalog instrument name, a
 human-readable instance ID, and one of six fixed location pairs:
@@ -44,18 +53,22 @@ disabled. `stop` and `reset` prevent new dispatches, cancel pending or accepted
 public Action goals. For tool transfer, the adapter keeps the active Goal until
 the controller reports either verified cancel recovery or failure; recovery
 feedback remains visible instead of being suppressed. Retraction late results
-and ROS service results are ignored after runtime control stops. A bounded
+and Tool Change service results are ignored after runtime control stops. A bounded
 ledger prevents the same `command_id`, or the same explicit request generation,
 from causing a second outbound command.
 
-The external robot does not need to publish a separate integration-state topic
-for the initial contract. It reports the fixed `ExecuteToolHandover` feedback
-states and monotonic progress through the Action itself. Taskplanner projects
-those observations into its shared `/surgery/robots` snapshot. Interrupts use
-the standard ROS 2 Action cancel request; no custom `/interrupt` topic is
-defined.
+The retraction controller publishes `BedRobotArmStateArray`; this state is a
+dispatch prerequisite and is not inferred from service or Action completion.
+Tool handover continues to report its fixed feedback states and monotonic
+progress through the Action itself. Interrupts use standard ROS 2 Action cancel;
+no custom `/interrupt` topic is defined.
 
 Only one tool-transfer Goal may be active, including its cancel recovery. The
 caller sends the next Goal only after the prior Result is terminal. A canceled
 Result is accepted only with `canceled_source_unchanged` or
 `canceled_recovered_to_tray`; an ambiguous cancellation result fails closed.
+
+`RequestToolChange` cannot be canceled after Service dispatch. Its `command_id`
+is reserved before sending and is never retried automatically. A timeout or
+transport ambiguity leaves the command suppressed until operator reset and
+controller-state review.

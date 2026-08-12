@@ -1,5 +1,6 @@
 schema: taskplanner.integration_debug.v1
 monitor_window_sec: 5.0
+bed_robot_arm_status_max_age_sec: 3.0
 status_period_sec: 1.0
 heartbeat_timeout_sec: 6.0
 action_watchdog:
@@ -105,3 +106,5 @@ voice:
     "mosquito": "Mosquito forceps"
     "메첸바움": "Metzenbaum scissors"
     "metzenbaum": "Metzenbaum scissors"
+    "석션": "Yankauer suction"
+    "suction": "Yankauer suction"

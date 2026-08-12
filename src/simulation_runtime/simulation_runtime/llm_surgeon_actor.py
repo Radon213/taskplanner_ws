@@ -849,7 +849,7 @@ class LLMSurgeonActorNode(Node):
 
     def _on_bed_robot_arm_group_status(self, msg: BedRobotArmGroupStatus) -> None:
         group_id = str(msg.group_id or "").strip()
-        if group_id not in {"suction", "retraction"}:
+        if group_id != "retraction":
             return
         status_ns = int(msg.stamp.sec) * 1_000_000_000 + int(msg.stamp.nanosec)
         current_ns = self._bed_group_status_stamp_ns.get(group_id, 0)
@@ -1472,15 +1472,12 @@ class LLMSurgeonActorNode(Node):
                 },
                 "tool": {"type": "string", "enum": ["", *self._tool_ids]},
                 "request_mode": {"type": "string", "enum": ["none", "voice", "hand", "voice_hand"]},
-                "group_id": {"type": "string", "enum": ["", "suction", "retraction"]},
+                "group_id": {"type": "string", "enum": ["", "retraction"]},
                 "group_operation": {
                     "type": "string",
                     "enum": [
                         "",
-                        "suction_start",
-                        "suction_stop",
                         "retraction",
-                        "release_retraction",
                         "change_end_effector",
                     ],
                 },
@@ -1551,9 +1548,9 @@ class LLMSurgeonActorNode(Node):
             "When requesting a tool, choose voice, hand, or voice_hand. "
             "Use action=request_bed_robot_arm_group only for a phase-appropriate entry in context.bed_robot_arm_group.available_cues. "
             "For that action, copy one cue utterance exactly into speech, set group_id/group_operation/end_effector_profile from the cue, and set tool='' and request_mode='none'. "
-            "Never mention or choose a physical robot-arm number, ID, member count, or mounting position; address only the suction or retraction logical group. "
+            "Never mention or choose a physical robot-arm number, ID, member count, or mounting position; address only the retraction logical group. "
             "Retraction speech may use an explicit distance or a qualitative expression such as 조금/많이; the downstream VLM determines one of six directions and mm. "
-            "Do not repeat a group cue while that group has a pending request. Suction, retraction, and humanoid work are independent, so another lane may continue while one group is active. "
+            "Do not repeat a retraction cue while it has a pending request. Retraction and humanoid work are independent, so the other lane may continue while one is active. "
             "The surgeon can hold at most two tools. If context.held_capacity_remaining is positive, you may request a different needed tool while still holding one tool. "
             "If two tools are already held, place one held tool on Mayo before requesting another tool. "
             "If a needed tool is already in context.mayo_stand, request it normally; the humanoid will pick it up from Mayo and hand it over. "
@@ -1581,13 +1578,12 @@ class LLMSurgeonActorNode(Node):
             if not bool(state.get("connected", False)):
                 continue
             execution_state = str(state.get("state", "standby"))
-            if cue.operation == "suction_start" and execution_state != "standby":
-                continue
-            if cue.operation == "suction_stop" and execution_state != "suctioning":
-                continue
-            if cue.operation == "release_retraction" and execution_state != "holding":
-                continue
-            if cue.operation == "retraction" and execution_state not in {"standby", "holding"}:
+            if cue.operation == "retraction" and execution_state not in {
+                "standby",
+                "retracting",
+                "holding",
+                "completed",
+            }:
                 continue
             if (
                 cue.end_effector_profile
@@ -1615,7 +1611,12 @@ class LLMSurgeonActorNode(Node):
             state = self._bed_group_states.get(transition.group_id, {})
             if not bool(state.get("connected", False)):
                 continue
-            if str(state.get("state", "standby")) != "holding":
+            if str(state.get("state", "standby")) not in {
+                "standby",
+                "retracting",
+                "holding",
+                "completed",
+            }:
                 continue
             if state.get("end_effector_profile", "") != transition.from_profile:
                 continue
@@ -1792,10 +1793,8 @@ class LLMSurgeonActorNode(Node):
             raise ValueError(f"unknown phase: {phase}")
         if action == "request_bed_robot_arm_group":
             operations = {
-                "suction": {"suction_start", "suction_stop"},
                 "retraction": {
                     "retraction",
-                    "release_retraction",
                     "change_end_effector",
                 },
             }
