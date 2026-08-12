@@ -93,17 +93,20 @@ accepted data; publisher discovery for startup is reported separately through
 
 ## Vision Input
 
-Raw FLIR field camera:
+The live dashboard consumes the VIPLab camera contract without requiring a
+rename or relay on the camera computer:
 
 ```text
-/surgery/images/flir/compressed  sensor_msgs/msg/CompressedImage
+/camera/cam_1/color/image_raw/compressed  sensor_msgs/msg/CompressedImage
+/camera/cam_2/color/image_raw/compressed  sensor_msgs/msg/CompressedImage
+/camera/cam_3/color/image_raw/compressed  sensor_msgs/msg/CompressedImage
+/camera/cam_4/color/image_raw/compressed  sensor_msgs/msg/CompressedImage
+/flir_camera/image_color/compressed       sensor_msgs/msg/CompressedImage
 ```
 
-Raw CAM4 Mayo camera:
-
-```text
-/surgery/images/cam4/compressed  sensor_msgs/msg/CompressedImage
-```
+CAM1-CAM3 are live observer views. CAM4 and FLIR are also the configured raw
+inputs to the perception bridge through `CAM4_INPUT_TOPIC` and
+`FLIR_INPUT_TOPIC`.
 
 When `VLM_MODE=real`, the live runtime starts `rfdetr_perception_bridge`.
 `RFDETRSegSmall` produces
@@ -112,15 +115,17 @@ CAM4 produces public tool/request semantics on
 `/surgery/perception/cam4/semantics/json`. Raw CAM4 pixels are not forwarded to
 the VLM.
 
-Publish image topics with ROS SensorData QoS:
+Taskplanner subscribes to image topics with ROS SensorData QoS:
 
 - reliability: best effort
 - durability: volatile
 - history: keep last
 
-Taskplanner's VLM subscribers and built-in camera publishers use the same QoS.
-Populate `header.stamp` with the frame acquisition time and `format` with
-`jpeg` or `png`.
+This best-effort/volatile subscriber remains compatible with the VIPLab
+reliable/volatile publishers. Populate `header.stamp` with the frame
+acquisition time and `format` with `jpeg` or `png`. The dashboard marks a view
+disconnected after three seconds without a new frame instead of retaining a
+stale surgical image.
 
 ## Requested Robot Endpoints
 
@@ -321,7 +326,8 @@ prediction, and Mayo recovery remain unavailable until VLM evidence is healthy.
 8. Implement and validate only the requested controller endpoints applicable to
    the scenario, then verify `/integration/check_readiness`.
 9. Validate sentence-only operation with `VLM_MODE=voice_only`.
-10. Add FLIR and CAM4, then verify fresh RF-DETR readiness.
+10. Add CAM1-CAM4 and FLIR, verify all five dashboard/debug inputs, then verify
+    fresh CAM4/FLIR RF-DETR readiness.
 11. Enable the real VLM only after the perception gate is stable.
 
 For routed networks, replace multicast discovery with a DDS discovery server
