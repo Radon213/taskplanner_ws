@@ -62,8 +62,11 @@ Debug 화면을 열 수 있으므로, 신뢰된 통합 시험망에서만 실행
 | 토픽 | 타입 | 기본 QoS | 화면에서 확인하는 값 |
 |---|---|---|---|
 | `/sensors/surgeon/sentence` | `std_msgs/msg/String` | reliable / volatile | publisher, 실측 Hz, 최근 문장, freshness |
-| `/surgery/images/flir/compressed` | `sensor_msgs/msg/CompressedImage` | sensor data | publisher, 실측 Hz, bandwidth, freshness |
-| `/surgery/images/cam4/compressed` | `sensor_msgs/msg/CompressedImage` | sensor data | publisher, 실측 Hz, bandwidth, freshness |
+| `/camera/cam_1/color/image_raw/compressed` | `sensor_msgs/msg/CompressedImage` | sensor data | publisher, 실측 Hz, bandwidth, freshness |
+| `/camera/cam_2/color/image_raw/compressed` | `sensor_msgs/msg/CompressedImage` | sensor data | publisher, 실측 Hz, bandwidth, freshness |
+| `/camera/cam_3/color/image_raw/compressed` | `sensor_msgs/msg/CompressedImage` | sensor data | publisher, 실측 Hz, bandwidth, freshness |
+| `/camera/cam_4/color/image_raw/compressed` | `sensor_msgs/msg/CompressedImage` | sensor data | publisher, 실측 Hz, bandwidth, freshness |
+| `/flir_camera/image_color/compressed` | `sensor_msgs/msg/CompressedImage` | sensor data | publisher, 실측 Hz, bandwidth, freshness |
 
 상태 화면은 발견된 publisher 노드, 실제 타입, 실제 QoS, 누적 메시지 수, 5초 rolling Hz, 대역폭, 마지막 수신 경과 시간을 보여준다. 타입 불일치, 저주기, stale, publisher 없음은 서로 다른 상태로 표시된다.
 
