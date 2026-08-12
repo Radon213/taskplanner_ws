@@ -350,6 +350,34 @@ def test_completed_prepare_records_a_generic_robot_hold_without_an_arm():
     assert event.mode == ""
 
 
+def test_completed_mayo_prepare_preserves_mayo_origin_for_the_digital_twin():
+    bridge = _bare_bridge()
+    events = []
+    bridge._stamp = lambda: Time()
+    bridge._skill_event_pub = SimpleNamespace(publish=events.append)
+    command = replace(
+        _skill(),
+        action="predict_tool",
+        source_location_type="mayo_reuse_zone",
+        source_location_id="mayo_reuse_zone",
+        target_location_type="robot_right_hand",
+        target_location_id="robot_right_hand",
+        mode="anticipatory",
+    )
+
+    bridge._publish_tool_transfer_completed_events(
+        command, final_state="completed", reason_code="completed"
+    )
+
+    assert len(events) == 1
+    event = events[0]
+    assert event.event_type == "ToolPrepared"
+    assert event.source_location_type == "mayo_reuse_zone"
+    assert event.source_location_id == "mayo_reuse_zone"
+    assert event.target_location_type == "robot"
+    assert event.target_location_id == "robot"
+
+
 def test_unused_preposition_return_reconciles_robot_to_tray():
     bridge = _bare_bridge()
     events = []
@@ -376,6 +404,33 @@ def test_unused_preposition_return_reconciles_robot_to_tray():
     assert event.source_location_id == "robot"
     assert event.target_location_type == "tray_slot"
     assert event.target_location_id == "main_tray_slot_4"
+
+
+def test_unused_mayo_preposition_return_uses_the_public_tray_recovery_semantics():
+    bridge = _bare_bridge()
+    events = []
+    bridge._stamp = lambda: Time()
+    bridge._skill_event_pub = SimpleNamespace(publish=events.append)
+    command = replace(
+        _skill(),
+        action="return_unused_preposition",
+        source_location_type="robot_right_hand",
+        source_location_id="robot_right_hand",
+        target_location_type="mayo_reuse_zone",
+        target_location_id="mayo_reuse_zone",
+    )
+
+    bridge._publish_tool_transfer_completed_events(
+        command, final_state="returned_to_tray", reason_code="completed"
+    )
+
+    assert len(events) == 1
+    event = events[0]
+    assert event.event_type == "UnusedPrepositionReturned"
+    assert event.source_location_type == "robot"
+    assert event.source_location_id == "robot"
+    assert event.target_location_type == "tray"
+    assert event.target_location_id == "tray"
 
 
 def test_failed_or_cancelled_tool_transfer_never_publishes_completion_events():

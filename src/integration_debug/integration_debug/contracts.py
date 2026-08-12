@@ -17,6 +17,7 @@ VALID_TOOL_TRANSITIONS = {
     ("tray", "surgeon"),
     ("robot", "surgeon"),
     ("robot", "tray"),
+    ("mayo", "robot"),
     ("mayo", "tray"),
 }
 VALID_RETRACTION_DIRECTIONS = {

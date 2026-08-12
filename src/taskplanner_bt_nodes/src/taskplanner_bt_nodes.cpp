@@ -364,6 +364,20 @@ bool toolIsAnticipatoryCandidate(const BT::TreeNode & node, const std::string & 
   return lifecycle == "home_rack" || lifecycle == "returned_home";
 }
 
+std::string findAnticipatoryInstanceForType(
+  const BT::TreeNode & node, const std::string & instrument_type)
+{
+  for (const auto & tool_id : allTools(node)) {
+    if (
+      toolMatchesType(node, tool_id, instrument_type) &&
+      toolIsAnticipatoryCandidate(node, tool_id))
+    {
+      return tool_id;
+    }
+  }
+  return {};
+}
+
 bool stablePredictionReplacesPreposition(const BT::TreeNode & node)
 {
   std::string predicted_tool;
@@ -374,11 +388,9 @@ bool stablePredictionReplacesPreposition(const BT::TreeNode & node)
   readBlackboard(node, "robot.prepositioned_tool", prepositioned_tool);
   readBlackboard(node, "prediction.confidence", confidence);
   readBlackboard(node, "prediction.stability_sec", stability_sec);
-  const auto replacement_instance = findActiveInstanceForType(
-    node, predicted_tool, {"home_rack", "returned_home", "mayo_reuse"});
-  const bool replacement_available =
-    !replacement_instance.empty() &&
-    toolIsAnticipatoryCandidate(node, replacement_instance);
+  const auto replacement_instance = findAnticipatoryInstanceForType(
+    node, predicted_tool);
+  const bool replacement_available = !replacement_instance.empty();
   return
     !predicted_tool.empty() && !prepositioned_tool.empty() &&
     predicted_tool != prepositioned_tool &&
@@ -1330,11 +1342,9 @@ public:
       prediction_confidence >= kPreparationMinConfidence &&
       prediction_stability_sec >= kPreparationMinStabilitySec)
     {
-      const auto predicted_instance = findActiveInstanceForType(
-        *this, predicted_tool, {"home_rack", "returned_home", "mayo_reuse"});
-      if (
-        !predicted_instance.empty() &&
-        toolIsAnticipatoryCandidate(*this, predicted_instance))
+      const auto predicted_instance = findAnticipatoryInstanceForType(
+        *this, predicted_tool);
+      if (!predicted_instance.empty())
       {
         writeBlackboard(*this, "selected.tool", predicted_instance);
         writeBlackboard(*this, "selected.policy_transition", std::string{});
@@ -1876,14 +1886,29 @@ public:
       if (!toolIsAnticipatoryCandidate(*this, selected_tool)) {
         return BT::NodeStatus::FAILURE;
       }
+      const bool from_mayo_reuse = lifecycle == "mayo_reuse";
+      const auto prepare_source_location =
+        !tool_location.empty() ? tool_location :
+        (from_mayo_reuse ? std::string("mayo_reuse_zone") : home_location_id);
+      const auto prepare_source_type =
+        !tool_location_type.empty() ? tool_location_type :
+        (from_mayo_reuse ? std::string("mayo_reuse_zone") : home_location_type);
       writeBlackboard(*this, "bt.action", std::string("predict_tool"));
       writeBlackboard(*this, "bt.arm", std::string("right"));
-      writeBlackboard(*this, "bt.source_location_id", tool_location);
-      writeBlackboard(*this, "bt.source_location_type", tool_location_type);
+      writeBlackboard(*this, "bt.source_location_id", prepare_source_location);
+      writeBlackboard(*this, "bt.source_location_type", prepare_source_type);
       writeBlackboard(*this, "bt.target_location_id", std::string("robot_right_hand"));
       writeBlackboard(*this, "bt.target_location_type", std::string("robot_right_hand"));
       writeBlackboard(*this, "bt.target_owner", std::string("robot_right_hand"));
       writeBlackboard(*this, "bt.cleaning_required", false);
+      if (from_mayo_reuse) {
+        writeBlackboard(
+          *this, "bt.decision_reason",
+          std::string("stable next-tool prediction selected a Mayo reuse tool for robot hold"));
+        writeBlackboard(
+          *this, "bt.rationale",
+          std::string("prepare the stable predicted tool from Mayo and hold it on the robot"));
+      }
       return BT::NodeStatus::SUCCESS;
     }
 

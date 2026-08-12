@@ -136,12 +136,16 @@ interfaces and are not the requested cross-institution API.
 ```
 
 `ExecuteToolHandover` is the single tool-transfer Action. It accepts exactly
-five transitions: `tray -> robot`, `tray -> surgeon`, `robot -> surgeon`,
-`robot -> tray`, and `mayo -> tray`. `tray -> robot` means that the robot picks
-up the next tool already selected by Taskplanner and holds it ready; it is not
-a robot-side prediction request. Success means stable holding has been reached,
-and holding persists until a later handover or return Goal. The only location
-values are `tray`, `mayo`, `robot`, and `surgeon`; every other pair is invalid.
+six transitions: `tray -> robot`, `mayo -> robot`, `tray -> surgeon`,
+`robot -> surgeon`, `robot -> tray`, and `mayo -> tray`. `tray -> robot` and
+`mayo -> robot` mean that the robot picks up the next tool already selected by
+Taskplanner and holds it ready; neither is a robot-side prediction request.
+Taskplanner emits `mayo -> robot` only for a stable next-tool prediction whose
+selected instance is a verified `mayo_reuse` candidate with future use expected;
+`mayo_recovery` remains ineligible. Success means stable holding has been
+reached, and holding persists until a later handover or `robot -> tray` return
+Goal. The only location values are `tray`, `mayo`, `robot`, and `surgeon`; every
+other pair is invalid.
 `instrument_id` carries the shared real name (for example
 `Bovie surgical cautery`), never an internal catalog code such as `T04`.
 Taskplanner also converts an internal instance such as `T04#1` to
@@ -179,7 +183,7 @@ goal-scoped robot-state report, and Taskplanner owns the public
 | `moving_to_target` | Moving the secured tool toward the Goal's target. |
 | `waiting_for_takeover` | Holding at the surgeon handover pose until takeover is confirmed. |
 | `placing` | Placing and releasing the tool on the tray. |
-| `holding` | Holding the selected tool stably on the robot (`tray -> robot`). |
+| `holding` | Holding the selected tool stably on the robot (`tray -> robot` or `mayo -> robot`). |
 | `stopping` | A cancel was accepted and safe stopping is in progress. |
 | `retreating` | No grasp was confirmed; the robot is retreating while the tool remains at the source. |
 | `recovering_to_tray` | A grasp was confirmed; the robot is returning the held tool to its configured tray recovery pose. |
@@ -223,9 +227,11 @@ blocks the next ordinary command until an operator or a separately defined
 recovery procedure resolves the state. A hardware E-stop or protective stop
 remains controller-local and also aborts the Goal as `failed`.
 
-Cancel is never retroactive. If `tray -> robot` has already completed and the
-robot is holding the prepared tool, Taskplanner sends a new `robot -> tray`
-Goal to put it down; it does not attempt to Cancel the completed Goal.
+Cancel is never retroactive. If `tray -> robot` or `mayo -> robot` has already
+completed and the robot is holding the prepared tool, Taskplanner sends a new
+`robot -> tray` Goal to put it down; it does not attempt to Cancel the completed
+Goal. The public recovery contract intentionally returns an unused held tool to
+the tray rather than requiring a robot placement back onto Mayo.
 
 ## Shared Surgical State Published by Taskplanner
 

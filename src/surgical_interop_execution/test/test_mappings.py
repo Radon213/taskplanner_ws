@@ -111,13 +111,38 @@ def test_prepare_aliases_use_the_same_action_with_tray_to_robot(action):
     assert "arm" not in asdict(request)
 
 
-def test_prepare_rejects_a_non_tray_internal_source_instead_of_misrouting_it():
+@pytest.mark.parametrize("action", ["predict_tool", "prepare_tool", "tool_predict"])
+def test_prepare_aliases_map_mayo_reuse_to_robot(action):
+    request = map_skill_to_tool_handover(
+        _skill(
+            action,
+            source_location_type="mayo_reuse_zone",
+            source_location_id="mayo_stand",
+        ),
+        instrument_name="Bovie surgical cautery",
+        instrument_instance_id="Bovie surgical cautery#1",
+    )
+    assert request.source_location == "mayo"
+    assert request.target_location == "robot"
+
+
+@pytest.mark.parametrize(
+    ("source_location_type", "source_location_id"),
+    [
+        ("surgical_field", "field"),
+        ("mayo_recovery_zone", "mayo_recovery_zone"),
+        ("tray_slot", "mayo_stand"),
+    ],
+)
+def test_prepare_rejects_unsafe_or_ambiguous_internal_sources(
+    source_location_type, source_location_id
+):
     with pytest.raises(MappingFailure, match="invalid_prepare_source_location"):
         map_skill_to_tool_handover(
             _skill(
                 "predict_tool",
-                source_location_type="mayo_reuse_zone",
-                source_location_id="mayo_stand",
+                source_location_type=source_location_type,
+                source_location_id=source_location_id,
             ),
             instrument_name="Bovie surgical cautery",
             instrument_instance_id="Bovie surgical cautery#1",

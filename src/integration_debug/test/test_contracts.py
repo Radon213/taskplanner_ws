@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 from integration_debug.contracts import (
+    VALID_TOOL_TRANSITIONS,
     decode_payload,
     load_config,
     measured_rate,
@@ -20,6 +21,14 @@ VOICE = {
 
 
 def test_validates_only_public_handover_transitions() -> None:
+    assert VALID_TOOL_TRANSITIONS == {
+        ("tray", "robot"),
+        ("mayo", "robot"),
+        ("tray", "surgeon"),
+        ("robot", "surgeon"),
+        ("robot", "tray"),
+        ("mayo", "tray"),
+    }
     mapped = validate_tool_handover(
         {
             "instrument_id": "Kelly forceps",
@@ -28,6 +37,15 @@ def test_validates_only_public_handover_transitions() -> None:
         }
     )
     assert mapped["instrument_instance_id"] == "Kelly forceps#1"
+    mayo_prepare = validate_tool_handover(
+        {
+            "instrument_id": "Kelly forceps",
+            "source_location": "mayo",
+            "target_location": "robot",
+        }
+    )
+    assert mayo_prepare["source_location"] == "mayo"
+    assert mayo_prepare["target_location"] == "robot"
     with pytest.raises(ValueError, match="unsupported"):
         validate_tool_handover(
             {

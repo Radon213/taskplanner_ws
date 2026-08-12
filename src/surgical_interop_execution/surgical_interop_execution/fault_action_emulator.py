@@ -93,6 +93,7 @@ def valid_tool_transition(source: str, target: str) -> bool:
         ("tray", "surgeon"),
         ("robot", "surgeon"),
         ("robot", "tray"),
+        ("mayo", "robot"),
         ("mayo", "tray"),
     }
 

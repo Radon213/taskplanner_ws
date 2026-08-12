@@ -53,6 +53,7 @@ PUBLIC_TOOL_LOCATIONS = frozenset(
 )
 TRAY_HANDOVER_TRANSITION = (LOCATION_TRAY, LOCATION_SURGEON)
 TRAY_PREPARE_TRANSITION = (LOCATION_TRAY, LOCATION_ROBOT)
+MAYO_PREPARE_TRANSITION = (LOCATION_MAYO, LOCATION_ROBOT)
 ROBOT_HANDOVER_TRANSITION = (LOCATION_ROBOT, LOCATION_SURGEON)
 RETURN_TO_TRAY_TRANSITION = (LOCATION_ROBOT, LOCATION_TRAY)
 RETRIEVE_TRANSITION = (LOCATION_MAYO, LOCATION_TRAY)
@@ -220,9 +221,15 @@ def map_skill_to_tool_handover(
         source_hint = " ".join(
             (command.source_location_type, command.source_location_id)
         ).casefold()
-        if "tray" not in source_hint and "rack" not in source_hint:
+        source_is_tray = "tray" in source_hint or "rack" in source_hint
+        source_is_mayo = "mayo" in source_hint and "recovery" not in source_hint
+        if source_is_tray == source_is_mayo:
             raise MappingFailure("invalid_prepare_source_location")
-        source_location, target_location = TRAY_PREPARE_TRANSITION
+        source_location, target_location = (
+            MAYO_PREPARE_TRANSITION
+            if source_is_mayo
+            else TRAY_PREPARE_TRANSITION
+        )
     elif action in TRAY_HANDOVER_ALIASES:
         source_location, target_location = TRAY_HANDOVER_TRANSITION
     elif action in ROBOT_HANDOVER_ALIASES:

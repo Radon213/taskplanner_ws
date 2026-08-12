@@ -725,7 +725,7 @@ function ManualPanel({
           <label className="debug-field"><span>실제 도구명</span><input value={instrument} onChange={(event) => setInstrument(event.target.value)} /></label>
           <label className="debug-field"><span>인스턴스 ID</span><input value={instance} onChange={(event) => setInstance(event.target.value)} /></label>
           <label className="debug-field"><span>전달 경로</span><select value={transition} onChange={(event) => setTransition(event.target.value)}>
-            <option value="tray:robot">tray → robot</option><option value="tray:surgeon">tray → surgeon</option><option value="robot:surgeon">robot → surgeon</option><option value="robot:tray">robot → tray</option><option value="mayo:tray">mayo → tray</option>
+            <option value="tray:robot">tray → robot</option><option value="tray:surgeon">tray → surgeon</option><option value="robot:surgeon">robot → surgeon</option><option value="robot:tray">robot → tray</option><option value="mayo:robot">mayo → robot</option><option value="mayo:tray">mayo → tray</option>
           </select></label>
           <button className="button button-primary full" disabled={motionDisabled || !endpointReady("tool_handover") || !instrument.trim()} type="submit"><Send size={16} aria-hidden="true" />도구 전달 요청</button>
           {!endpointReady("tool_handover") ? <p className="debug-inline-warning">Action 서버를 기다리고 있습니다.</p> : null}
