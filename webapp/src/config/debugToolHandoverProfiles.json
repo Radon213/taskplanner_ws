@@ -1,0 +1,20 @@
+{
+  "schema": "taskplanner.integration_debug.tool_handover_profiles.v1",
+  "profiles": [
+    {
+      "catalogId": "T02",
+      "instrumentId": "Adson forceps",
+      "instanceIds": ["Adson forceps#1", "Adson forceps#2"]
+    },
+    {
+      "catalogId": "T04",
+      "instrumentId": "Bovie surgical cautery",
+      "instanceIds": ["Bovie surgical cautery#1"]
+    },
+    {
+      "catalogId": "T07",
+      "instrumentId": "Bipolar cautery",
+      "instanceIds": ["Bipolar cautery#1"]
+    }
+  ]
+}

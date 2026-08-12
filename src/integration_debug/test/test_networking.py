@@ -10,6 +10,7 @@ from integration_debug.networking import (
     load_network_settings,
     validate_network_settings,
     validate_ping_target,
+    write_fastdds_udp_profile,
     write_network_settings,
 )
 
@@ -40,6 +41,41 @@ def test_network_settings_round_trip_is_atomic_and_private(tmp_path) -> None:
     assert loaded["discovery_range"] == "LOCALHOST"
     assert target.stat().st_mode & 0o777 == 0o600
     assert json.loads(target.read_text())["schema"] == NETWORK_SETTINGS_SCHEMA
+
+
+def test_fastdds_profile_is_generated_for_verified_interface(tmp_path) -> None:
+    sys_class_net = tmp_path / "sys-class-net"
+    (sys_class_net / "enp13s0").mkdir(parents=True)
+    target = tmp_path / "fastdds_udp.xml"
+
+    write_fastdds_udp_profile(
+        target,
+        "enp13s0",
+        sys_class_net=sys_class_net,
+    )
+
+    rendered = target.read_text(encoding="utf-8")
+    assert "<interface>enp13s0</interface>" in rendered
+    assert "<interface>lo</interface>" in rendered
+    assert "DebugUdpTransport" in rendered
+    assert target.stat().st_mode & 0o777 == 0o600
+
+
+def test_fastdds_profile_rejects_missing_or_unsafe_interface(tmp_path) -> None:
+    sys_class_net = tmp_path / "sys-class-net"
+    sys_class_net.mkdir()
+    with pytest.raises(ValueError, match="does not exist"):
+        write_fastdds_udp_profile(
+            tmp_path / "missing.xml",
+            "enp13s0",
+            sys_class_net=sys_class_net,
+        )
+    with pytest.raises(ValueError, match="invalid"):
+        write_fastdds_udp_profile(
+            tmp_path / "unsafe.xml",
+            "eth0</interface>",
+            sys_class_net=sys_class_net,
+        )
 
 
 def test_ping_target_rejects_names_multicast_and_ipv6() -> None:

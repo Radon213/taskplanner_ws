@@ -1,4 +1,4 @@
-import { FormEvent, KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, KeyboardEvent, useEffect, useState } from "react";
 import {
   Activity,
   AlertTriangle,
@@ -11,6 +11,8 @@ import {
   CheckCircle2,
   ChevronDown,
   CircleStop,
+  Download,
+  FileText,
   Headphones,
   LoaderCircle,
   LogOut,
@@ -23,11 +25,14 @@ import {
   Router,
   RotateCcw,
   Send,
+  Server,
   Shield,
   ShieldAlert,
   Square,
   ToggleLeft,
   ToggleRight,
+  Trash2,
+  Usb,
   Wrench,
   XCircle,
 } from "lucide-react";
@@ -37,13 +42,15 @@ import {
   type DebugInputStatus,
   type DebugNetworkStatus,
   type DebugOutputStatus,
+  type DebugSurgeryRecordResult,
   type IntegrationDebugStatus,
   useIntegrationDebugBridge,
 } from "../../hooks/useIntegrationDebugBridge";
+import toolHandoverProfiles from "../../config/debugToolHandoverProfiles.json";
 import { runtimeBridgeUrl } from "../../runtimeModes";
 import type { Language } from "../../utils/display";
 
-type DebugTab = "connection" | "manual" | "output" | "voice";
+type DebugTab = "connection" | "manual" | "output" | "voice" | "record";
 
 interface Notice {
   tone: "success" | "error" | "warning" | "info";
@@ -53,6 +60,16 @@ interface Notice {
 interface DebugCommandOptions {
   silent?: boolean;
 }
+
+interface ToolHandoverOption {
+  catalogId: string;
+  instrumentId: string;
+  instanceIds: readonly string[];
+}
+
+const TOOL_HANDOVER_OPTIONS: readonly ToolHandoverOption[] = toolHandoverProfiles.profiles;
+
+const DEFAULT_TOOL_HANDOVER_OPTION = TOOL_HANDOVER_OPTIONS[0];
 
 type RunDebugCommand = (
   operation: string,
@@ -87,35 +104,59 @@ function localLinkLabel(network: DebugNetworkStatus): string {
   return network.interface_kind === "ethernet" ? "유선 연결" : "연결됨";
 }
 
-interface SpeechRecognitionResultLike {
-  isFinal: boolean;
-  0: { transcript: string };
+const SURGERY_RECORD_CASE_IDS = Array.from({ length: 12 }, (_, index) => `0704_${index + 6}`);
+
+function todayIsoDate(): string {
+  const now = new Date();
+  const local = new Date(now.getTime() - now.getTimezoneOffset() * 60_000);
+  return local.toISOString().slice(0, 10);
 }
 
-interface SpeechRecognitionEventLike {
-  resultIndex: number;
-  results: ArrayLike<SpeechRecognitionResultLike>;
+function isValidWebSocketEndpoint(value: string): boolean {
+  try {
+    const endpoint = new URL(value);
+    return ["ws:", "wss:"].includes(endpoint.protocol)
+      && !endpoint.username
+      && !endpoint.password
+      && !endpoint.search
+      && !endpoint.hash
+      && !value.includes("?")
+      && !value.includes("#")
+      && Boolean(endpoint.hostname);
+  } catch {
+    return false;
+  }
 }
 
-interface SpeechRecognitionLike {
-  lang: string;
-  continuous: boolean;
-  interimResults: boolean;
-  onresult: ((event: SpeechRecognitionEventLike) => void) | null;
-  onerror: ((event: { error?: string }) => void) | null;
-  onend: (() => void) | null;
-  start: () => void;
-  stop: () => void;
+function isValidHttpsEndpoint(value: string): boolean {
+  try {
+    const endpoint = new URL(value);
+    return endpoint.protocol === "https:"
+      && !endpoint.username
+      && !endpoint.password
+      && Boolean(endpoint.hostname)
+      && endpoint.pathname !== "/";
+  } catch {
+    return false;
+  }
 }
 
-type SpeechRecognitionConstructor = new () => SpeechRecognitionLike;
+function formatBytes(value: number): string {
+  if (value >= 1024 * 1024) return `${(value / 1024 / 1024).toFixed(2)} MB`;
+  if (value >= 1024) return `${(value / 1024).toFixed(1)} KB`;
+  return `${value} B`;
+}
 
-function speechRecognitionConstructor(): SpeechRecognitionConstructor | null {
-  const speechWindow = window as unknown as {
-    SpeechRecognition?: SpeechRecognitionConstructor;
-    webkitSpeechRecognition?: SpeechRecognitionConstructor;
-  };
-  return speechWindow.SpeechRecognition ?? speechWindow.webkitSpeechRecognition ?? null;
+function downloadJsonArtifact(value: unknown, filename: string) {
+  const blob = new Blob([JSON.stringify(value, null, 2)], { type: "application/json;charset=utf-8" });
+  const objectUrl = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = objectUrl;
+  anchor.download = filename;
+  document.body.append(anchor);
+  anchor.click();
+  anchor.remove();
+  window.setTimeout(() => URL.revokeObjectURL(objectUrl), 0);
 }
 
 function formatHz(value: number): string {
@@ -144,6 +185,12 @@ function formatEventTime(value: string): string {
   });
 }
 
+function formatAsrLatency(value: number | null | undefined): string {
+  return typeof value === "number" && Number.isFinite(value)
+    ? `${value.toFixed(1)} ms`
+    : "측정 전";
+}
+
 function eventSummary(event: { event_type: string; payload: Record<string, unknown> }): string {
   const payload = event.payload;
   const stringValue = (key: string) => typeof payload[key] === "string" ? String(payload[key]) : "";
@@ -165,7 +212,7 @@ function eventSummary(event: { event_type: string; payload: Record<string, unkno
     return `${stringValue("route") || "명령"} 시작 · ${stringValue("source") || "manual"}`;
   }
   if (event.event_type === "command_finished") {
-    return `${stringValue("route") || "명령"} · ${stringValue("final_state") || "완료"} · ${stringValue("reason_code") || "reason 없음"}`;
+    return `${stringValue("route") || "명령"} · ${displayState(stringValue("final_state") || "완료")} · ${stringValue("reason_code") || "reason 없음"}`;
   }
   if (event.event_type === "ui_command") {
     const accepted = payload.accepted === true ? "수락" : "거부";
@@ -173,6 +220,39 @@ function eventSummary(event: { event_type: string; payload: Record<string, unkno
   }
   if (event.event_type === "voice_dispatch") {
     return `${payload.accepted === true ? "실행 요청" : "실행 거부"} · ${stringValue("message") || "응답 메시지 없음"}`;
+  }
+  if (event.event_type === "asr_started") {
+    return `${stringValue("device_name") || "USB 마이크"} · ${stringValue("server_url") || "ASR 서버"}`;
+  }
+  if (event.event_type === "asr_final") {
+    const latency = typeof payload.response_latency_ms === "number"
+      ? ` · ${formatAsrLatency(payload.response_latency_ms)}`
+      : "";
+    return `확정 문장 · “${stringValue("text") || "빈 문장"}”${latency}`;
+  }
+  if (event.event_type === "asr_stopped") {
+    return `ASR 정지 · 확정 ${String(payload.final_count ?? 0)}건`;
+  }
+  if (event.event_type === "record_submit_started") {
+    return `${stringValue("case_id") || "수술기록"} 제출 · ${stringValue("room_name") || "수술실 미지정"}`;
+  }
+  if (event.event_type === "record_submit_finished") {
+    return `${stringValue("case_id") || "수술기록"} · HTTP ${String(payload.http_status ?? 0)} · ${payload.success === true ? "성공" : "실패"}`;
+  }
+  if (event.event_type === "planner_coexistence_changed") {
+    const current = Array.isArray(payload.current_blocked_nodes)
+      ? payload.current_blocked_nodes.join(", ")
+      : "없음";
+    return `플래너 노드 변화로 수동 제어 자동 해제 · 현재 ${current || "없음"}`;
+  }
+  if (event.event_type === "action_recovery_required") {
+    return `${stringValue("route") || "Action"} 원격 상태 확인 필요 · ${stringValue("reason_code") || "원인 미상"}`;
+  }
+  if (event.event_type === "action_client_recovered") {
+    return `${stringValue("route") || "Action"} 클라이언트 상태 복구 · 원격 정지 확인됨`;
+  }
+  if (event.event_type === "action_late_result_reconciled") {
+    return `${stringValue("route") || "Action"} 지연 Result 자동 반영 · ${stringValue("final_state") || "종료"}`;
   }
   const values = Object.entries(payload)
     .slice(0, 3)
@@ -190,10 +270,37 @@ function isValidIpv4(value: string): boolean {
 }
 
 function stateTone(state: string): "ok" | "warn" | "error" | "idle" {
-  if (["READY", "completed", "succeeded", "ARMED"].includes(state)) return "ok";
-  if (["TYPE_MISMATCH", "FAULT_LOCKED", "failed", "rejected", "cancel_rejected"].includes(state)) return "error";
-  if (["LOW_RATE", "STALE", "BUSY", "cancel_requested"].includes(state)) return "warn";
+  if (["READY", "LISTENING", "SUCCEEDED", "completed", "succeeded", "ARMED"].includes(state)) return "ok";
+  if (["TYPE_MISMATCH", "FAULT_LOCKED", "UNAVAILABLE", "ERROR", "FAILED", "failed", "rejected", "cancel_rejected"].includes(state)) return "error";
+  if (["LOW_RATE", "STALE", "BUSY", "STARTING", "STOPPING", "SUBMITTING", "REMOTE_STATE_UNKNOWN", "remote_state_unknown", "cancel_requested", "cancel_accepted"].includes(state)) return "warn";
   return "idle";
+}
+
+function displayState(state: string): string {
+  return state.toLowerCase() === "remote_state_unknown" ? "REMOTE_STATE_UNKNOWN" : state;
+}
+
+function actionRecoveryExplanation(reasonCode: string): string {
+  switch (reasonCode) {
+    case "action_server_unavailable":
+      return "실행 중이던 Action 서버가 DDS에서 계속 탐색되지 않아 원격 Goal 상태를 확정할 수 없습니다.";
+    case "service_server_unavailable":
+      return "요청을 처리하던 Service 서버가 DDS에서 계속 탐색되지 않아 응답 상태를 확정할 수 없습니다.";
+    case "goal_response_timeout":
+      return "Goal 제출 후 서버의 수락 또는 거부 응답이 제한 시간 안에 도착하지 않았습니다.";
+    case "service_response_timeout":
+      return "Service 요청 결과가 제한 시간 안에 도착하지 않았습니다.";
+    case "action_update_timeout":
+      return "Action 서버의 Feedback, Cancel 응답 또는 Result가 제한 시간 동안 갱신되지 않았습니다.";
+    case "action_duration_timeout":
+      return "Action이 허용된 최대 관찰 시간을 넘겼습니다.";
+    case "cancel_rejected":
+      return "Action 서버가 취소 요청을 거부했습니다. 원격 로봇은 계속 동작 중일 수 있습니다.";
+    case "cancel_response_error":
+      return "취소 응답을 받는 중 연결 오류가 발생해 원격 취소 여부를 확인할 수 없습니다.";
+    default:
+      return "원격 명령의 종료 상태를 확정할 수 없습니다.";
+  }
 }
 
 function StatusBadge({ state, label }: { state: string; label?: string }) {
@@ -202,7 +309,7 @@ function StatusBadge({ state, label }: { state: string; label?: string }) {
   return (
     <span className={"debug-status-badge " + tone} data-slot="debug-status-badge">
       <Icon size={14} aria-hidden="true" />
-      {label ?? state}
+      {label ?? displayState(state)}
     </span>
   );
 }
@@ -212,14 +319,25 @@ function DebugHeader({
   status,
   statusAgeSec,
   url,
+  manualControlLabel,
+  manualControlDisabled,
+  manualControlPending,
+  onManualControl,
   onExit,
 }: {
   connected: boolean;
   status: IntegrationDebugStatus | null;
   statusAgeSec: number | null;
   url: string;
+  manualControlLabel: string;
+  manualControlDisabled: boolean;
+  manualControlPending: boolean;
+  onManualControl: () => void;
   onExit: () => void;
 }) {
+  const ManualControlIcon = status?.action.recovery_required || status?.session.fault_locked
+    ? status?.session.fault_locked ? RotateCcw : ShieldAlert
+    : status?.session.armed ? CircleStop : Play;
   return (
     <header className="debug-header" data-slot="debug-header">
       <div className="debug-title-block">
@@ -234,7 +352,20 @@ function DebugHeader({
         <StatusBadge state={connected ? "READY" : "WAITING"} label={connected ? "ROS 연결" : "ROS 대기"} />
         <span className="debug-meta-pill" title={url}>D{status?.runtime.ros_domain_id ?? "-"} · {status?.runtime.discovery_range ?? "DISCOVERY"}</span>
         <StatusBadge state={statusAgeSec !== null && statusAgeSec <= 3 ? "READY" : "STALE"} label={statusAgeSec === null ? "상태 대기" : statusAgeSec < 1 ? "방금 갱신" : `${statusAgeSec.toFixed(1)}초 전`} />
-        <StatusBadge state={status?.session.state ?? "WAITING"} />
+        <button
+          aria-busy={manualControlPending}
+          aria-pressed={status?.session.armed ?? false}
+          className={`button ${status?.session.armed ? "button-secondary" : "button-primary"} debug-manual-toggle`}
+          disabled={manualControlDisabled}
+          onClick={onManualControl}
+          type="button"
+        >
+          {manualControlPending
+            ? <LoaderCircle className="debug-spinner" size={16} aria-hidden="true" />
+            : <ManualControlIcon size={16} aria-hidden="true" />}
+          {manualControlLabel}
+        </button>
+        <span aria-live="polite" className="sr-only">수동 제어 상태: {status?.session.state ?? "상태 대기"}</span>
         <button className="button button-secondary debug-exit-button" onClick={onExit} type="button">
           <LogOut size={16} aria-hidden="true" />
           운영 화면으로
@@ -650,20 +781,39 @@ function ManualPanel({
   status,
   connected,
   runCommand,
+  coexistenceConfirmed,
+  setCoexistenceConfirmed,
+  manualControlPending,
 }: {
   status: IntegrationDebugStatus;
   connected: boolean;
   runCommand: RunDebugCommand;
+  coexistenceConfirmed: boolean;
+  setCoexistenceConfirmed: (confirmed: boolean) => void;
+  manualControlPending: boolean;
 }) {
-  const [instrument, setInstrument] = useState("Kelly forceps");
-  const [instance, setInstance] = useState("Kelly forceps#1");
+  const [instrument, setInstrument] = useState(DEFAULT_TOOL_HANDOVER_OPTION.instrumentId);
+  const [instance, setInstance] = useState(DEFAULT_TOOL_HANDOVER_OPTION.instanceIds[0]);
   const [transition, setTransition] = useState("tray:surgeon");
   const [distance, setDistance] = useState(5);
   const [profile, setProfile] = useState("wide_retractor");
   const [pending, setPending] = useState("");
+  const [recoveryConfirmed, setRecoveryConfirmed] = useState(false);
   const busy = !status.action.terminal;
+  const recoveryRequired = status.action.recovery_required === true;
   const armed = status.session.armed;
+  const blockedNodes = status.runtime.blocked_nodes ?? [];
+  const coexistenceRequired = blockedNodes.length > 0;
+  const coexistenceAllowed = status.runtime.planner_coexistence_allowed === true;
+  const coexistenceActive = status.session.planner_coexistence_active === true
+    || Boolean(armed && status.session.acknowledged_blocked_nodes?.length);
+  const selectedTool = TOOL_HANDOVER_OPTIONS.find((tool) => tool.instrumentId === instrument)
+    ?? DEFAULT_TOOL_HANDOVER_OPTION;
   const endpointReady = (name: string) => status.endpoints.find((row) => row.name === name)?.ready ?? false;
+
+  useEffect(() => {
+    setRecoveryConfirmed(false);
+  }, [status.action.command_id, recoveryRequired]);
 
   async function invoke(operation: string, payload: Record<string, unknown> = {}) {
     setPending(operation);
@@ -685,8 +835,23 @@ function ManualPanel({
     });
   }
 
+  function selectInstrument(instrumentId: string) {
+    const nextTool = TOOL_HANDOVER_OPTIONS.find((tool) => tool.instrumentId === instrumentId);
+    if (!nextTool) return;
+    setInstrument(nextTool.instrumentId);
+    setInstance(nextTool.instanceIds[0]);
+  }
+
   async function move(direction: string) {
     await invoke("retraction", { operation: "MOVE", direction, distance_mm: distance });
+  }
+
+  async function recoverActionClient() {
+    const response = await invoke("recover_action_client", {
+      expected_command_id: status.action.command_id,
+      remote_motion_stopped_confirmed: recoveryConfirmed,
+    });
+    if (response?.accepted) setRecoveryConfirmed(false);
   }
 
   const motionDisabled = !connected || !armed || busy || Boolean(pending);
@@ -698,32 +863,68 @@ function ManualPanel({
     distance > 30;
   return (
     <section className="debug-panel-stack" data-slot="debug-manual-panel">
-      <article className={"debug-arm-card " + status.session.state.toLowerCase()}>
-        <div className="debug-arm-copy">
-          {status.session.fault_locked ? <ShieldAlert size={24} aria-hidden="true" /> : <Shield size={24} aria-hidden="true" />}
-          <div><p>MANUAL CONTROL</p><h2>{status.session.state}</h2><span>조그와 로봇 명령은 명시적으로 활성화한 동안만 전송됩니다.</span></div>
-        </div>
-        <div className="debug-arm-toolbar">
-          <div className="debug-arm-readiness" aria-label="수동 제어 종단 준비 상태">
-            {status.endpoints.map((endpoint) => <StatusBadge key={endpoint.endpoint} state={endpoint.ready ? "READY" : "WAITING"} label={`${endpoint.name} ${endpoint.ready ? "준비" : "대기"}`} />)}
+      {coexistenceRequired ? (
+        <article className={"debug-coexistence-card " + (coexistenceActive ? "active" : "warning")} id="debug-coexistence-description" role="status">
+          <span className="debug-coexistence-icon">
+            {coexistenceActive ? <CheckCircle2 size={20} aria-hidden="true" /> : <AlertTriangle size={20} aria-hidden="true" />}
+          </span>
+          <div className="debug-coexistence-copy">
+            <strong>{coexistenceActive ? `Domain ${status.runtime.ros_domain_id} 플래너 공존 승인됨` : `Domain ${status.runtime.ros_domain_id}에서 전체 플래너가 발견됐습니다`}</strong>
+            <span>{coexistenceActive ? "발견된 노드 목록이 달라지면 수동 제어와 음성 즉시 실행을 자동 해제합니다." : "상대 플래너의 자동 명령을 중지한 경우에만 이번 Debug 세션에서 공존을 승인하세요."}</span>
+            <div className="debug-coexistence-nodes" aria-label="발견된 전체 플래너 노드">
+              {blockedNodes.map((node) => <code key={node}>{node}</code>)}
+            </div>
           </div>
-          {status.session.fault_locked ? (
-            <button className="button button-secondary" disabled={!connected || Boolean(pending)} onClick={() => void invoke("reset_fault")} type="button">
-              <RotateCcw size={16} aria-hidden="true" /> Fault 해제
-            </button>
+          {coexistenceActive ? (
+            <div className="debug-coexistence-status"><CheckCircle2 size={17} aria-hidden="true" /><span>현재 세션에서만 승인됨</span></div>
+          ) : coexistenceAllowed ? (
+            <label className="debug-coexistence-confirmation">
+              <input id="debug-coexistence-checkbox" checked={coexistenceConfirmed} disabled={!connected || busy || Boolean(pending) || manualControlPending} onChange={(event) => setCoexistenceConfirmed(event.target.checked)} type="checkbox" />
+              <span>상대 플래너의 자동 명령 실행이 중지된 것을 확인했습니다.</span>
+            </label>
           ) : (
-            <button className={armed ? "button button-secondary" : "button button-primary"} disabled={!connected || busy || Boolean(pending)} onClick={() => void invoke(armed ? "disarm" : "arm")} type="button">
-              {armed ? <CircleStop size={16} aria-hidden="true" /> : <Play size={16} aria-hidden="true" />}{armed ? "수동 제어 해제" : "수동 제어 활성화"}
-            </button>
+            <p className="debug-coexistence-unavailable">이 실행에서는 플래너 공존 승인이 비활성화되어 있습니다.</p>
           )}
-        </div>
-      </article>
+        </article>
+      ) : null}
 
       <div className="debug-control-grid debug-manual-grid">
         <form className="debug-section-card debug-control-card" onSubmit={(event) => void submitTool(event)}>
           <div className="debug-section-heading"><div><p>ACTION</p><h2>도구 전달</h2></div><StatusBadge state={endpointReady("tool_handover") ? "READY" : "WAITING"} label={endpointReady("tool_handover") ? "서버 발견" : "서버 대기"} /></div>
-          <label className="debug-field"><span>실제 도구명</span><input value={instrument} onChange={(event) => setInstrument(event.target.value)} /></label>
-          <label className="debug-field"><span>인스턴스 ID</span><input value={instance} onChange={(event) => setInstance(event.target.value)} /></label>
+          <label className="debug-field" htmlFor="debug-handover-instrument">
+            <span>실제 도구명</span>
+            <select
+              aria-describedby="debug-handover-instrument-help"
+              id="debug-handover-instrument"
+              value={instrument}
+              onChange={(event) => selectInstrument(event.target.value)}
+            >
+              {TOOL_HANDOVER_OPTIONS.map((tool) => (
+                <option key={tool.catalogId} value={tool.instrumentId}>
+                  {tool.catalogId} · {tool.instrumentId}
+                </option>
+              ))}
+            </select>
+            <small id="debug-handover-instrument-help">
+              실제 로봇에 등록된 3개 프로파일만 표시합니다. Action instrument_id에는 영문명이 전송됩니다.
+            </small>
+          </label>
+          <label className="debug-field" htmlFor="debug-handover-instance">
+            <span>인스턴스 ID</span>
+            <select
+              aria-describedby="debug-handover-instance-help"
+              id="debug-handover-instance"
+              value={instance}
+              onChange={(event) => setInstance(event.target.value)}
+            >
+              {selectedTool.instanceIds.map((instanceId) => (
+                <option key={instanceId} value={instanceId}>{instanceId}</option>
+              ))}
+            </select>
+            <small id="debug-handover-instance-help">
+              {selectedTool.catalogId} 재고 {selectedTool.instanceIds.length}개 · 선택값을 instrument_instance_id로 전송합니다.
+            </small>
+          </label>
           <label className="debug-field"><span>전달 경로</span><select value={transition} onChange={(event) => setTransition(event.target.value)}>
             <option value="tray:robot">tray → robot</option><option value="tray:surgeon">tray → surgeon</option><option value="robot:surgeon">robot → surgeon</option><option value="robot:tray">robot → tray</option><option value="mayo:tray">mayo → tray</option>
           </select></label>
@@ -761,11 +962,35 @@ function ManualPanel({
           </article>
 
           <article className="debug-section-card debug-action-card" aria-live="polite">
-            <div className="debug-section-heading"><div><p>ACTION FEEDBACK</p><h2>실행 상태</h2></div><Activity size={19} aria-hidden="true" /></div>
+            <div className="debug-section-heading"><div><p>ACTION FEEDBACK</p><h2>{recoveryRequired ? "원격 상태 확인 필요" : "실행 상태"}</h2></div>{recoveryRequired ? <ShieldAlert size={19} aria-hidden="true" /> : <Activity size={19} aria-hidden="true" />}</div>
             <div className="debug-action-summary"><StatusBadge state={status.action.state} /><strong>{status.action.route || "대기"}</strong><code>{status.action.command_id || "활성 명령 없음"}</code></div>
             <div className="debug-progress-track" role="progressbar" aria-label="Action 진행률" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(status.action.progress * 100)} aria-valuetext={`${Math.round(status.action.progress * 100)}%, ${status.action.state}`}><span style={{ width: `${Math.round(status.action.progress * 100)}%` }} /></div>
             <div className="debug-action-meta"><span>{Math.round(status.action.progress * 100)}%</span><span>{(status.action.elapsed_sec ?? 0).toFixed(1)} s</span><span>{status.action.reason_code || "feedback 대기"}</span></div>
-            {busy && status.action.route !== "suction" ? <button className="button button-secondary full" disabled={!connected || Boolean(pending)} onClick={() => void invoke("cancel_active")} type="button"><Square size={15} aria-hidden="true" />현재 Action 취소</button> : null}
+            {recoveryRequired ? (
+              <div className="debug-action-recovery" data-slot="debug-action-recovery" id="debug-action-recovery" role="alert" tabIndex={-1}>
+                <div className="debug-action-recovery-copy">
+                  <AlertTriangle size={18} aria-hidden="true" />
+                  <div>
+                    <strong>로컬 상태만 임의로 초기화하면 안 됩니다</strong>
+                    <p id="debug-action-recovery-description">{actionRecoveryExplanation(status.action.reason_code)}</p>
+                  </div>
+                </div>
+                <dl className="debug-action-recovery-facts">
+                  <div><dt>서버 탐색</dt><dd>{status.action.server_ready ? "발견됨" : "탐색 안 됨"}</dd></div>
+                  <div><dt>마지막 갱신</dt><dd>{formatAge(status.action.last_update_age_sec ?? null)}</dd></div>
+                </dl>
+                <label className="debug-action-recovery-confirmation">
+                  <input aria-describedby="debug-action-recovery-description" checked={recoveryConfirmed} disabled={!connected || Boolean(pending)} onChange={(event) => setRecoveryConfirmed(event.target.checked)} type="checkbox" />
+                  <span>상대 로봇이 정지했거나, 상대측에서 이 Command ID의 종료 상태를 직접 확인했습니다.</span>
+                </label>
+                <div className="debug-action-recovery-actions">
+                  {status.action.cancel_available && status.action.server_ready ? (
+                    <button className="button button-secondary" disabled={!connected || Boolean(pending)} onClick={() => void invoke("cancel_active")} type="button"><Square size={15} aria-hidden="true" />Cancel 재시도</button>
+                  ) : null}
+                  <button className="button button-primary" disabled={!connected || !recoveryConfirmed || Boolean(pending)} onClick={() => void recoverActionClient()} type="button"><RotateCcw size={15} aria-hidden="true" />확인 후 클라이언트 복구</button>
+                </div>
+              </div>
+            ) : busy && status.action.route !== "suction" ? <button className="button button-secondary full" disabled={!connected || Boolean(pending)} onClick={() => void invoke("cancel_active")} type="button"><Square size={15} aria-hidden="true" />현재 Action 취소</button> : null}
           </article>
         </div>
       </div>
@@ -852,9 +1077,22 @@ function VoicePanel({
   notify: (notice: Notice) => void;
 }) {
   const [sentence, setSentence] = useState("");
-  const [listening, setListening] = useState(false);
-  const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
-  const recognitionAvailable = useMemo(() => speechRecognitionConstructor() !== null, []);
+  const preferredDevice = status.asr.device_id
+    ?? status.asr.devices.find((device) => device.default)?.id
+    ?? status.asr.devices[0]?.id;
+  const [selectedDeviceId, setSelectedDeviceId] = useState(
+    preferredDevice === undefined ? "default" : String(preferredDevice),
+  );
+  const [serverUrl, setServerUrl] = useState(status.asr.server_url);
+  const [pendingAsrCommand, setPendingAsrCommand] = useState("");
+
+  useEffect(() => {
+    if (selectedDeviceId !== "default" && status.asr.devices.some((device) => String(device.id) === selectedDeviceId)) return;
+    const nextDevice = status.asr.device_id
+      ?? status.asr.devices.find((device) => device.default)?.id
+      ?? status.asr.devices[0]?.id;
+    if (nextDevice !== undefined) setSelectedDeviceId(String(nextDevice));
+  }, [selectedDeviceId, status.asr.device_id, status.asr.devices]);
 
   function sendSentence(value = sentence) {
     try {
@@ -866,64 +1104,127 @@ function VoicePanel({
     }
   }
 
-  function startMicrophone() {
-    const Constructor = speechRecognitionConstructor();
-    if (!Constructor) {
-      notify({ tone: "error", text: "이 브라우저에서는 음성 인식을 사용할 수 없습니다. 텍스트 입력을 사용해 주세요." });
-      return;
-    }
-    const recognition = new Constructor();
-    recognition.lang = "ko-KR";
-    recognition.continuous = false;
-    recognition.interimResults = false;
-    recognition.onresult = (event) => {
-      for (let index = event.resultIndex; index < event.results.length; index += 1) {
-        const result = event.results[index];
-        if (!result.isFinal) continue;
-        const transcript = result[0].transcript.trim();
-        if (!transcript) continue;
-        setSentence(transcript);
-        sendSentence(transcript);
-      }
-    };
-    recognition.onerror = (event) => {
-      setListening(false);
-      notify({ tone: "error", text: `마이크 입력을 완료하지 못했습니다: ${event.error || "unknown"}` });
-    };
-    recognition.onend = () => {
-      setListening(false);
-      recognitionRef.current = null;
-    };
-    recognitionRef.current = recognition;
-    setListening(true);
+  async function runAsrCommand(operation: string, payload: Record<string, unknown> = {}) {
+    setPendingAsrCommand(operation);
     try {
-      recognition.start();
-    } catch (error) {
-      recognitionRef.current = null;
-      setListening(false);
-      notify({ tone: "error", text: `마이크를 시작할 수 없습니다: ${error instanceof Error ? error.message : String(error)}` });
+      return await runCommand(operation, payload);
+    } finally {
+      setPendingAsrCommand("");
     }
   }
 
-  function stopMicrophone() {
-    recognitionRef.current?.stop();
+  async function startAsr() {
+    await runAsrCommand("asr_start", {
+      device_id: selectedDeviceId === "default" ? "default" : Number(selectedDeviceId),
+      server_url: serverUrl.trim(),
+    });
   }
-
-  useEffect(() => () => recognitionRef.current?.stop(), []);
 
   const parse = status.voice.last_parse;
+  const asrActive = ["STARTING", "LISTENING", "STOPPING"].includes(status.asr.state);
+  const asrStartable = ["STOPPED", "ERROR"].includes(status.asr.state);
+  const serverUrlValid = isValidWebSocketEndpoint(serverUrl);
+  const levelPercent = Math.max(0, Math.min(100, ((status.asr.audio_level_dbfs + 60) / 60) * 100));
+  const selectedDevice = status.asr.devices.find((device) => String(device.id) === selectedDeviceId);
+  const recentFinals = [...status.asr.finals].reverse().slice(0, 8);
+  const latestFinalLatency = recentFinals[0]?.response_latency_ms;
   return (
     <section className="debug-panel-stack" data-slot="debug-voice-panel">
       <div className="debug-voice-workspace">
         <div className="debug-voice-controls">
+          <article aria-busy={Boolean(pendingAsrCommand) || ["STARTING", "STOPPING"].includes(status.asr.state)} className="debug-section-card debug-asr-card">
+            <div className="debug-section-heading">
+              <div><p>USB · PUZZLE ASR</p><h2>마이크 런타임</h2><span>브라우저 WebSpeech가 아닌 호스트 USB 입력을 시험합니다.</span></div>
+              <StatusBadge state={status.asr.state} label={status.asr.state} />
+            </div>
+            <div className="debug-asr-form-grid">
+              <label className="debug-field" htmlFor="debug-asr-device">
+                <span>마이크 입력 장치</span>
+                <select
+                  aria-describedby="debug-asr-device-help"
+                  disabled={asrActive}
+                  id="debug-asr-device"
+                  value={selectedDeviceId}
+                  onChange={(event) => setSelectedDeviceId(event.target.value)}
+                >
+                  {!status.asr.devices.length ? <option value="default">사용 가능한 입력 장치 없음</option> : null}
+                  {status.asr.devices.map((device) => (
+                    <option key={device.id} value={device.id}>
+                      {device.default ? "기본 · " : ""}{device.name}
+                    </option>
+                  ))}
+                </select>
+                <small id="debug-asr-device-help">{selectedDevice ? `${selectedDevice.input_channels} ch · ${selectedDevice.default_samplerate.toLocaleString()} Hz · Ubuntu 현재 입력` : "Ubuntu 설정에서 입력 장치를 선택한 뒤 새로고침하세요."}</small>
+              </label>
+              <label className="debug-field" htmlFor="debug-asr-server">
+                <span>Puzzle ASR WebSocket</span>
+                <input
+                  aria-describedby="debug-asr-server-help"
+                  aria-invalid={!serverUrlValid}
+                  disabled={asrActive}
+                  id="debug-asr-server"
+                  inputMode="url"
+                  spellCheck={false}
+                  type="url"
+                  value={serverUrl}
+                  onChange={(event) => setServerUrl(event.target.value)}
+                />
+                <small id="debug-asr-server-help">자격 증명·query·fragment 없는 ws:// 또는 wss:// 주소만 허용됩니다.</small>
+              </label>
+            </div>
+            <div className="debug-inline-actions">
+              <button className="button button-quiet" disabled={!connected || asrActive || Boolean(pendingAsrCommand)} onClick={() => void runAsrCommand("asr_refresh_devices")} type="button">
+                {pendingAsrCommand === "asr_refresh_devices" ? <LoaderCircle className="debug-spinner" size={16} aria-hidden="true" /> : <RefreshCw size={16} aria-hidden="true" />}장치 새로고침
+              </button>
+              <button className="button button-primary" disabled={!connected || !status.session.armed || !status.asr.available || !status.asr.devices.length || !asrStartable || !serverUrlValid || Boolean(pendingAsrCommand)} onClick={() => void startAsr()} type="button">
+                {pendingAsrCommand === "asr_start" || status.asr.state === "STARTING" ? <LoaderCircle className="debug-spinner" size={16} aria-hidden="true" /> : <Mic size={16} aria-hidden="true" />}ASR 시작
+              </button>
+              <button className="button button-secondary" disabled={!connected || !asrActive || status.asr.state === "STOPPING" || Boolean(pendingAsrCommand)} onClick={() => void runAsrCommand("asr_stop")} type="button">
+                {pendingAsrCommand === "asr_stop" || status.asr.state === "STOPPING" ? <LoaderCircle className="debug-spinner" size={16} aria-hidden="true" /> : <MicOff size={16} aria-hidden="true" />}ASR 중지
+              </button>
+            </div>
+            {!status.session.armed ? <p className="debug-inline-warning">마이크를 열기 전에 화면 상단에서 수동 제어를 활성화하세요. 제어가 해제되면 ASR도 자동 중지됩니다.</p> : null}
+            {status.asr.dependency_error || status.asr.last_error ? (
+              <p className="debug-field-error" role="alert"><XCircle size={15} aria-hidden="true" />{status.asr.dependency_error || status.asr.last_error}</p>
+            ) : null}
+            <div className="debug-asr-live">
+              <div className="debug-asr-level">
+                <span>입력 레벨</span>
+                <div aria-label={`마이크 입력 레벨 ${status.asr.audio_level_dbfs.toFixed(1)} dBFS`} aria-valuemax={0} aria-valuemin={-60} aria-valuenow={Math.max(-60, Math.min(0, status.asr.audio_level_dbfs))} className="debug-asr-meter" role="meter"><span style={{ width: `${levelPercent}%` }} /></div>
+                <strong>{status.asr.audio_level_dbfs.toFixed(1)} dBFS</strong>
+              </div>
+              <p className={status.asr.partial_text ? "active" : ""}><span>부분 인식</span><strong>{status.asr.partial_text || (status.asr.state === "LISTENING" ? "음성 대기 중…" : "ASR 시작 전")}</strong></p>
+            </div>
+            <p aria-atomic="true" aria-live="polite" className="sr-only">ASR {displayState(status.asr.state)}. {recentFinals[0] ? `최근 확정 문장: ${recentFinals[0].text}, final 응답 지연 ${formatAsrLatency(latestFinalLatency)}` : "확정 문장 없음"}</p>
+            <dl className="debug-runtime-facts">
+              <div><dt>서버</dt><dd>{status.asr.connected ? "연결됨" : "미연결"}</dd></div>
+              <div><dt>실행 시간</dt><dd>{status.asr.elapsed_sec.toFixed(1)} s</dd></div>
+              <div><dt>실제 캡처</dt><dd>{status.asr.input_sample_rate.toLocaleString()} Hz · {status.asr.input_channels} ch</dd></div>
+              <div><dt>캡처 블록 크기</dt><dd>{status.asr.input_block_frames.toLocaleString()} frames</dd></div>
+              <div><dt>Wire 변환</dt><dd>{status.asr.resampling ? `${status.asr.sample_rate.toLocaleString()} Hz · ${status.asr.channels} ch 변환` : "변환 없음"}</dd></div>
+              <div><dt>Wire 송신</dt><dd>{status.asr.sent_chunks.toLocaleString()} chunks</dd></div>
+              <div><dt>ASR 응답</dt><dd>{status.asr.responses.toLocaleString()}</dd></div>
+              <div><dt>캡처 횟수</dt><dd>{status.asr.blocks_captured.toLocaleString()}</dd></div>
+              <div><dt>드롭</dt><dd>{(status.asr.input_dropped + status.asr.dropped_chunks).toLocaleString()}</dd></div>
+            </dl>
+            <div className="debug-asr-transcript">
+              <div>
+                <span>확정 문장 로그</span>
+                <small title="마지막 오디오 청크 송신 완료부터 final JSON 응답 수신까지의 참고 간격입니다. 스트리밍 계약상 발화 ID와 상관된 서버 처리시간은 아닙니다.">최근 응답 간격 {formatAsrLatency(latestFinalLatency)} · {status.asr.finals.length}건</small>
+              </div>
+              {recentFinals.length ? (
+                <ol>{recentFinals.map((row, index) => <li key={`${row.stamp}-${index}`}><time dateTime={row.stamp}>{formatEventTime(row.stamp)}</time><span>{row.text}</span><data aria-label={`확정 응답 참고 간격 ${formatAsrLatency(row.response_latency_ms)}`} title="마지막 오디오 청크 송신 완료부터 final JSON 응답 수신까지의 참고 간격" value={row.response_latency_ms ?? undefined}>{formatAsrLatency(row.response_latency_ms)}</data></li>)}</ol>
+              ) : <p>아직 확정된 문장이 없습니다.</p>}
+            </div>
+            <code className="debug-topic-code">{status.asr.topic} · std_msgs/msg/String · {status.asr.sample_rate.toLocaleString()} Hz / {status.asr.sample_width_bits} bit</code>
+          </article>
+
           <article className="debug-section-card">
-            <div className="debug-section-heading"><div><p>SENTENCE INPUT</p><h2>텍스트·마이크 입력</h2></div><Headphones size={19} aria-hidden="true" /></div>
-            <label className="debug-field"><span>집도의 완성 문장</span><textarea rows={4} value={sentence} onChange={(event) => setSentence(event.target.value)} placeholder="예: 켈리 주세요" /></label>
+            <div className="debug-section-heading"><div><p>MANUAL SENTENCE</p><h2>수동 문장 입력</h2><span>ASR과 독립적으로 결정적 라우터를 재현합니다.</span></div><Headphones size={19} aria-hidden="true" /></div>
+            <label className="debug-field" htmlFor="debug-manual-sentence"><span>집도의 완성 문장</span><textarea id="debug-manual-sentence" rows={3} value={sentence} onChange={(event) => setSentence(event.target.value)} placeholder="예: 켈리 주세요" /></label>
             <div className="debug-inline-actions">
               <button className="button button-primary" disabled={!connected || !sentence.trim()} onClick={() => sendSentence()} type="button"><Send size={16} aria-hidden="true" />문장 토픽 발행</button>
-              <button aria-pressed={listening} className="button button-secondary" disabled={!connected || !recognitionAvailable} onClick={listening ? stopMicrophone : startMicrophone} type="button">{listening ? <MicOff size={16} aria-hidden="true" /> : <Mic size={16} aria-hidden="true" />}{listening ? "듣기 중지" : "마이크 입력"}</button>
             </div>
-            {!recognitionAvailable ? <p className="debug-inline-warning">마이크 인식 미지원 환경입니다. 텍스트 발행은 계속 사용할 수 있습니다.</p> : null}
             <code className="debug-topic-code">/sensors/surgeon/sentence · std_msgs/msg/String</code>
           </article>
 
@@ -931,7 +1232,7 @@ function VoicePanel({
             <div className="debug-section-heading"><div><p>DETERMINISTIC ROUTER</p><h2>음성 즉시 실행</h2></div><Shield size={19} aria-hidden="true" /></div>
             <p className="debug-card-description">VLM·BT 없이 설정된 정확한 문법만 Action으로 변환합니다. 모호한 문장은 실행하지 않습니다.</p>
             <button className={status.voice.auto_execute ? "button button-secondary full" : "button button-primary full"} disabled={!connected || !status.session.armed} onClick={() => void runCommand("configure_voice", { enabled: !status.voice.auto_execute })} type="button">{status.voice.auto_execute ? <ToggleRight size={17} aria-hidden="true" /> : <ToggleLeft size={17} aria-hidden="true" />}{status.voice.auto_execute ? "즉시 실행 해제" : "즉시 실행 활성화"}</button>
-            {!status.session.armed ? <p className="debug-inline-warning">수동 실행 탭에서 제어를 먼저 활성화해야 합니다.</p> : null}
+            {!status.session.armed ? <p className="debug-inline-warning">화면 상단에서 수동 제어를 먼저 활성화해야 합니다.</p> : null}
             <div className="debug-parse-preview">
               <span>최근 문장</span><strong>{status.voice.last_sentence || "수신 전"}</strong>
               <span>해석</span><StatusBadge state={parse.matched ? "READY" : parse.ambiguous ? "TYPE_MISMATCH" : "WAITING"} label={parse.matched ? String(parse.operation) : parse.ambiguous ? "모호함 · 실행 안 함" : String(parse.reason || "대기")} />
@@ -960,6 +1261,239 @@ function VoicePanel({
   );
 }
 
+function RecordPanel({
+  status,
+  connected,
+  runCommand,
+  notify,
+}: {
+  status: IntegrationDebugStatus;
+  connected: boolean;
+  runCommand: RunDebugCommand;
+  notify: (notice: Notice) => void;
+}) {
+  const record = status.surgery_record;
+  const initialCaseId = record.examples.find((example) => example.valid_for_api)?.case_id
+    ?? SURGERY_RECORD_CASE_IDS[0];
+  const [caseId, setCaseId] = useState(initialCaseId);
+  const [endpoint, setEndpoint] = useState(record.default_endpoint);
+  const [roomName, setRoomName] = useState("Preclinical Center");
+  const [surgeryCode, setSurgeryCode] = useState(initialCaseId);
+  const [surgeryDate, setSurgeryDate] = useState(todayIsoDate);
+  const [pendingCommand, setPendingCommand] = useState("");
+
+  useEffect(() => {
+    if (record.examples.some((example) => example.case_id === caseId && example.valid_for_api)) return;
+    const nextCase = record.examples.find((example) => example.valid_for_api)?.case_id;
+    if (!nextCase) return;
+    setCaseId(nextCase);
+    setSurgeryCode((current) => current === caseId ? nextCase : current);
+  }, [caseId, record.examples]);
+
+  const selectedExample = record.examples.find((example) => example.case_id === caseId);
+  const endpointAllowed = !record.contract.allowed_endpoints?.length
+    || record.contract.allowed_endpoints.includes(endpoint.trim());
+  const endpointValid = isValidHttpsEndpoint(endpoint) && endpointAllowed;
+  const codeValid = /^[A-Za-z0-9_-]{1,50}$/.test(surgeryCode.trim());
+  const submitting = record.state === "SUBMITTING";
+  const formValid = endpointValid
+    && record.api_key_configured
+    && Boolean(roomName.trim())
+    && codeValid
+    && Boolean(surgeryDate)
+    && Boolean(selectedExample?.valid_for_api);
+  const lastResult = Object.keys(record.last_result).length ? record.last_result : null;
+  const lastResultState = lastResult?.state
+    ?? (lastResult?.success === true
+      ? "SUCCEEDED"
+      : lastResult?.success === false
+        ? "FAILED"
+      : submitting
+        ? "SUBMITTING"
+        : "REMOTE_STATE_UNKNOWN");
+  const lastResultLabel = lastResultState === "SUCCEEDED"
+    ? "성공"
+    : lastResultState === "FAILED"
+      ? "실패"
+      : lastResultState === "SUBMITTING"
+        ? "응답 대기"
+        : "상태 불명";
+
+  async function invoke(operation: string, payload: Record<string, unknown> = {}) {
+    setPendingCommand(operation);
+    try {
+      return await runCommand(operation, payload);
+    } finally {
+      setPendingCommand("");
+    }
+  }
+
+  function selectCase(nextCaseId: string) {
+    setCaseId(nextCaseId);
+    if (surgeryCode === caseId) setSurgeryCode(nextCaseId);
+  }
+
+  async function submitRecord(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!formValid || submitting) return;
+    await invoke("record_submit", {
+      endpoint: endpoint.trim(),
+      case_id: caseId,
+      room_name: roomName.trim(),
+      surgery_code: surgeryCode.trim(),
+      date: surgeryDate,
+    });
+  }
+
+  function downloadReceipt(result: DebugSurgeryRecordResult) {
+    const safeCaseId = result.case_id || "surgery-record";
+    downloadJsonArtifact(result, `${safeCaseId}-api-receipt.json`);
+    notify({ tone: "success", text: "API 검증 영수증 JSON을 다운로드했습니다." });
+  }
+
+  return (
+    <section className="debug-panel-stack" data-slot="debug-record-panel">
+      <div className="debug-record-workspace">
+        <form aria-busy={submitting || Boolean(pendingCommand)} className="debug-section-card debug-record-form" onSubmit={(event) => void submitRecord(event)}>
+          <div className="debug-section-heading">
+            <div><p>POST-OPERATIVE API</p><h2>수술기록 TXT 제출</h2><span>서버에 마운트된 0704_6–0704_17 예제를 API 계약으로 검증합니다.</span></div>
+            <StatusBadge state={record.state} label={record.state} />
+          </div>
+
+          <label className="debug-field" htmlFor="debug-record-endpoint">
+            <span>API endpoint</span>
+            <input
+              aria-describedby="debug-record-endpoint-help"
+              aria-invalid={!endpointValid}
+              id="debug-record-endpoint"
+              inputMode="url"
+              spellCheck={false}
+              type="url"
+              value={endpoint}
+              onChange={(event) => setEndpoint(event.target.value)}
+              list="debug-record-endpoint-options"
+            />
+            <datalist id="debug-record-endpoint-options">
+              {(record.contract.allowed_endpoints ?? [record.default_endpoint]).map((candidate) => <option key={candidate} value={candidate} />)}
+            </datalist>
+            <small id="debug-record-endpoint-help">허용된 계약 endpoint만 전송합니다. 기본값: {record.default_endpoint}</small>
+          </label>
+
+          <div className="debug-record-field-grid">
+            <label className="debug-field" htmlFor="debug-record-case">
+              <span>TXT 예제</span>
+              <select id="debug-record-case" value={caseId} onChange={(event) => selectCase(event.target.value)}>
+                {SURGERY_RECORD_CASE_IDS.map((candidate) => {
+                  const example = record.examples.find((row) => row.case_id === candidate);
+                  return <option disabled={!example?.valid_for_api} key={candidate} value={candidate}>{candidate}{example ? ` · ${formatBytes(example.bytes)}` : " · TXT 없음"}</option>;
+                })}
+              </select>
+              <small>{selectedExample ? `${selectedExample.lines.toLocaleString()}줄 · ${selectedExample.characters.toLocaleString()}자 · SHA-256 ${selectedExample.sha256.slice(0, 10)}…` : "새로고침하여 서버 TXT를 확인하세요."}</small>
+            </label>
+            <label className="debug-field" htmlFor="debug-record-room">
+              <span>수술실 roomName</span>
+              <input aria-describedby="debug-record-room-help" id="debug-record-room" maxLength={100} required value={roomName} onChange={(event) => setRoomName(event.target.value)} />
+              <small id="debug-record-room-help">전임상센터의 계약용 영문명입니다.</small>
+            </label>
+            <label className="debug-field" htmlFor="debug-record-code">
+              <span>수술 코드 surgeryCode</span>
+              <input aria-describedby="debug-record-code-help" aria-invalid={!codeValid} id="debug-record-code" maxLength={50} pattern="[A-Za-z0-9_-]+" required value={surgeryCode} onChange={(event) => setSurgeryCode(event.target.value)} />
+              <small id="debug-record-code-help">영문, 숫자, 밑줄, 하이픈만 허용됩니다.</small>
+            </label>
+            <label className="debug-field" htmlFor="debug-record-date">
+              <span>수술 날짜</span>
+              <input aria-describedby="debug-record-date-help" id="debug-record-date" required type="date" value={surgeryDate} onChange={(event) => setSurgeryDate(event.target.value)} />
+              <small id="debug-record-date-help">오늘을 편의상 기본값으로 채웠습니다. 제출 전 실제 수술일과 반드시 대조하세요.</small>
+            </label>
+          </div>
+
+          <div
+            aria-atomic="true"
+            className={`debug-record-credential-status ${record.api_key_configured ? "is-configured" : "is-missing"}`}
+            role="status"
+          >
+            {record.api_key_configured ? <CheckCircle2 size={16} aria-hidden="true" /> : <XCircle size={16} aria-hidden="true" />}
+            <span><strong>X-API-Key</strong>{record.api_key_configured ? "서버 API 키 설정됨 · 값은 브라우저에 전송되지 않음" : "서버 API 키 미설정 · 제출 비활성화"}</span>
+          </div>
+
+          {record.last_error ? <p className="debug-field-error" role="alert"><XCircle size={15} aria-hidden="true" />{record.last_error}</p> : null}
+          <div className="debug-record-submit-row">
+            <button className="button button-quiet" disabled={!connected || submitting || Boolean(pendingCommand)} onClick={() => void invoke("record_refresh_cases")} type="button">
+              {pendingCommand === "record_refresh_cases" ? <LoaderCircle className="debug-spinner" size={16} aria-hidden="true" /> : <RefreshCw size={16} aria-hidden="true" />}TXT 새로고침
+            </button>
+            <button className="button button-primary" disabled={!connected || !formValid || submitting || Boolean(pendingCommand)} type="submit">
+              {submitting || pendingCommand === "record_submit" ? <LoaderCircle className="debug-spinner" size={16} aria-hidden="true" /> : <Server size={16} aria-hidden="true" />}{submitting ? "API 응답 대기 중" : "TXT 제출 시험"}
+            </button>
+          </div>
+          <p className="debug-record-contract-line">{record.contract.method} · {record.contract.content_type} · 최대 {record.contract.max_text_characters.toLocaleString()}자 / {formatBytes(record.contract.max_body_bytes)} · 서버 제한 {record.contract.server_timeout_sec}s</p>
+        </form>
+
+        <div className="debug-record-results">
+          <article className="debug-section-card debug-record-result-card">
+            <div className="debug-section-heading">
+              <div><p>LATEST RESULT</p><h2>최근 API 결과</h2><span>{record.active_request_id || lastResult?.request_id || "요청 전"}</span></div>
+              {lastResult ? <StatusBadge state={lastResultState} label={lastResultLabel} /> : <StatusBadge state="IDLE" label="대기" />}
+            </div>
+            <p aria-atomic="true" aria-live="polite" className="sr-only">수술기록 API 상태: {lastResult ? lastResultLabel : "대기"}{lastResult?.http_status ? `. HTTP ${lastResult.http_status}` : ""}</p>
+            {lastResult ? (
+              <>
+                <dl className="debug-record-result-grid">
+                  <div><dt>HTTP</dt><dd>{lastResult.http_status || (submitting ? "대기" : "—")}</dd></div>
+                  <div><dt>CASE</dt><dd>{lastResult.case_id || "—"}</dd></div>
+                  <div><dt>RECEIPT</dt><dd title={lastResult.receipt_id}>{lastResult.receipt_id || "—"}</dd></div>
+                  <div><dt>DURATION</dt><dd>{lastResult.duration_sec === undefined ? "—" : `${lastResult.duration_sec.toFixed(3)} s`}</dd></div>
+                </dl>
+                {lastResult.error_message || lastResult.transport_error ? <p className="debug-field-error" role="alert"><XCircle size={15} aria-hidden="true" />{lastResult.error_message || lastResult.transport_error}</p> : null}
+                <div className="debug-record-response-preview">
+                  <span>응답 요약</span>
+                  <code>{JSON.stringify(lastResult.response_json ?? (lastResult.response_text ? { text: lastResult.response_text } : { state: record.state }), null, 2)}</code>
+                </div>
+                <button className="button button-secondary full" onClick={() => downloadReceipt(lastResult)} type="button"><Download size={16} aria-hidden="true" />검증 영수증 JSON 다운로드</button>
+              </>
+            ) : (
+              <div className="debug-empty-state"><FileText size={28} aria-hidden="true" /><p>제출 후 HTTP 상태와 안전한 응답 메타데이터가 표시됩니다.</p></div>
+            )}
+            {!record.contract.result_lookup_defined || !record.contract.generated_record_body_returned ? (
+              <p className="debug-result-boundary"><ShieldAlert size={15} aria-hidden="true" />현재 외부 계약은 생성된 수술기록 본문 조회·다운로드 endpoint를 정의하지 않습니다. 위 다운로드는 API 응답 검증 영수증이며 임상 기록 결과물이 아닙니다.</p>
+            ) : null}
+          </article>
+        </div>
+      </div>
+
+      <article className="debug-section-card debug-record-history-card">
+        <div className="debug-section-heading">
+          <div><p>BOUNDED HISTORY</p><h2>제출 시험 이력</h2><span>API 키와 TXT 본문은 이력에 포함되지 않습니다.</span></div>
+          <div className="debug-heading-actions">
+            <span className="debug-meta-pill">{record.history.length}/20건</span>
+            <button className="button button-quiet" disabled={!connected || submitting || !record.history.length || Boolean(pendingCommand)} onClick={() => void invoke("record_clear_history")} type="button"><Trash2 size={16} aria-hidden="true" />이력 지우기</button>
+          </div>
+        </div>
+        {record.history.length ? (
+          <div className="debug-table-scroll">
+            <table className="debug-table debug-record-history-table">
+              <caption className="sr-only">수술기록 API 제출 시험 이력</caption>
+              <thead><tr><th>완료 시각</th><th>Case · 수술실</th><th>HTTP</th><th>Receipt · 오류</th><th>다운로드</th></tr></thead>
+              <tbody>{[...record.history].reverse().map((result, index) => {
+                const resultState = result.state ?? (result.success === true ? "SUCCEEDED" : result.success === false ? "FAILED" : "REMOTE_STATE_UNKNOWN");
+                const resultLabel = resultState === "SUCCEEDED" ? "성공" : resultState === "FAILED" ? "실패" : "상태 불명";
+                return (
+                  <tr key={`${result.request_id || "record"}-${index}`}>
+                    <td><strong>{result.completed_at ? formatEventTime(result.completed_at) : "—"}</strong><small>{result.duration_sec === undefined ? "" : `${result.duration_sec.toFixed(3)} s`}</small></td>
+                    <td><strong>{result.case_id || "—"}</strong><small>{result.room_name || "수술실 미지정"} · {result.surgery_code || "코드 없음"}</small></td>
+                    <td><StatusBadge state={resultState} label={`${result.http_status || "—"} · ${resultLabel}`} /></td>
+                    <td><code>{result.receipt_id || result.error_code || "receipt 없음"}</code><small>{result.error_message || result.transport_error || (result.success === undefined ? "결과 상태 미확정" : "오류 없음")}</small></td>
+                    <td><button aria-label={`${result.case_id || "수술기록"} 검증 영수증 다운로드`} className="button button-quiet" onClick={() => downloadReceipt(result)} type="button"><Download size={15} aria-hidden="true" />JSON</button></td>
+                  </tr>
+                );
+              })}</tbody>
+            </table>
+          </div>
+        ) : <div className="debug-empty-state"><Activity size={28} aria-hidden="true" /><p>아직 완료된 API 시험이 없습니다.</p></div>}
+      </article>
+    </section>
+  );
+}
+
 export function DebugWorkspace({
   language: _language,
   onExit,
@@ -971,6 +1505,20 @@ export function DebugWorkspace({
   const bridge = useIntegrationDebugBridge(url);
   const [activeTab, setActiveTab] = useState<DebugTab>("connection");
   const [notice, setNotice] = useState<Notice | null>(null);
+  const [manualControlPending, setManualControlPending] = useState(false);
+  const [coexistenceConfirmed, setCoexistenceConfirmed] = useState(false);
+
+  const blockedNodes = bridge.status?.runtime.blocked_nodes ?? [];
+  const blockedNodeSignature = blockedNodes.join("\u0000");
+  const armed = bridge.status?.session.armed ?? false;
+
+  useEffect(() => {
+    setCoexistenceConfirmed(false);
+  }, [blockedNodeSignature, bridge.status?.session.session_id]);
+
+  useEffect(() => {
+    if (!armed) setCoexistenceConfirmed(false);
+  }, [armed]);
 
   useEffect(() => {
     if (!notice) return;
@@ -997,21 +1545,84 @@ export function DebugWorkspace({
 
   async function exitDebugMode() {
     if (bridge.connected) {
+      if (bridge.status && ["STARTING", "LISTENING", "STOPPING"].includes(bridge.status.asr.state)) {
+        try { await bridge.command("asr_stop"); } catch { /* node shutdown remains the final ASR cleanup */ }
+      }
       try { await bridge.command("stop_outputs"); } catch { /* heartbeat timeout remains the fallback */ }
       try { await bridge.command("disarm"); } catch { /* heartbeat timeout remains the fallback */ }
     }
     onExit();
   }
 
+  function focusManualRequirement(targetId: string) {
+    setActiveTab("manual");
+    window.requestAnimationFrame(() => document.getElementById(targetId)?.focus());
+  }
+
+  async function handleManualControl() {
+    const status = bridge.status;
+    if (!status) return;
+    if (status.action.recovery_required) {
+      focusManualRequirement("debug-action-recovery");
+      return;
+    }
+    if (!status.session.armed && status.runtime.blocked_nodes.length > 0 && !coexistenceConfirmed) {
+      setNotice({ tone: "warning", text: "발견된 전체 플래너의 자동 명령이 중지됐는지 먼저 확인하세요." });
+      focusManualRequirement("debug-coexistence-checkbox");
+      return;
+    }
+    setManualControlPending(true);
+    try {
+      if (status.session.fault_locked) {
+        await runCommand("reset_fault");
+      } else if (status.session.armed) {
+        await runCommand("disarm");
+      } else {
+        await runCommand("arm", status.runtime.blocked_nodes.length > 0 ? {
+          planner_coexistence_confirmed: true,
+          acknowledged_blocked_nodes: status.runtime.blocked_nodes,
+        } : {});
+      }
+    } finally {
+      setManualControlPending(false);
+    }
+  }
+
   const readyInputCount = bridge.status?.inputs.filter((row) => row.state === "READY").length ?? 0;
   const readyEndpointCount = bridge.status?.endpoints.filter((row) => row.ready).length ?? 0;
   const enabledOutputCount = bridge.status?.outputs.filter((row) => row.enabled).length ?? 0;
+  const blockedPlannerCount = blockedNodes.length;
   const statusAgeSec = bridge.statusReceivedAt ? Math.max(0, (Date.now() - bridge.statusReceivedAt) / 1000) : null;
+  const manualControlLabel = bridge.status?.action.recovery_required
+    ? "Action 복구 필요"
+    : bridge.status?.session.fault_locked
+      ? "Fault 해제"
+      : bridge.status?.session.armed
+        ? bridge.status.action.terminal
+          ? "수동 제어 해제"
+          : "수동 제어 해제 · Action 취소"
+        : blockedPlannerCount > 0 && !coexistenceConfirmed
+          ? "공존 확인 필요"
+          : "수동 제어 활성화";
+  const manualControlDisabled = !bridge.status
+    || manualControlPending
+    || (bridge.status.action.recovery_required
+      ? false
+      : bridge.status.session.fault_locked
+        ? !bridge.connected
+        : bridge.status.session.armed
+          ? !bridge.connected
+          : !bridge.connected
+            || !bridge.status.action.terminal
+            || statusAgeSec === null
+            || statusAgeSec > 3
+            || (blockedPlannerCount > 0 && bridge.status.runtime.planner_coexistence_allowed !== true));
   const tabs: Array<{ id: DebugTab; label: string; meta: string; icon: typeof Radio }> = [
     { id: "connection", label: "연결·입력", meta: `${readyInputCount}/${bridge.status?.inputs.length ?? 0} 토픽 · ${readyEndpointCount}/${bridge.status?.endpoints.length ?? 0} 종단`, icon: Radio },
-    { id: "manual", label: "조그·수동 실행", meta: bridge.status?.session.state ?? "상태 대기", icon: Wrench },
+    { id: "manual", label: "조그·수동 실행", meta: bridge.status?.action.recovery_required ? "Action 복구 필요" : blockedPlannerCount && !bridge.status?.session.armed ? `공존 확인 필요 · ${blockedPlannerCount}개 노드` : bridge.status?.session.state ?? "상태 대기", icon: Wrench },
     { id: "output", label: "출력 검증", meta: `${enabledOutputCount}/${bridge.status?.outputs.length ?? 0} 발행`, icon: Send },
-    { id: "voice", label: "음성·로그", meta: bridge.status?.voice.auto_execute ? "즉시 실행 ON" : "수동 입력", icon: Mic },
+    { id: "voice", label: "USB 음성·로그", meta: bridge.status ? `${bridge.status.asr.state} · ${bridge.status.voice.auto_execute ? "즉시 실행 ON" : "라우팅 OFF"}` : "ASR 상태 대기", icon: Usb },
+    { id: "record", label: "수술기록 API", meta: bridge.status ? `${bridge.status.surgery_record.state} · 이력 ${bridge.status.surgery_record.history.length}건` : "계약 상태 대기", icon: FileText },
   ];
 
   function handleTabKeyDown(event: KeyboardEvent<HTMLButtonElement>, index: number) {
@@ -1029,7 +1640,17 @@ export function DebugWorkspace({
 
   return (
     <div className="app-shell debug-app-shell" data-slot="debug-workspace">
-      <DebugHeader connected={bridge.connected} status={bridge.status} statusAgeSec={statusAgeSec} url={url} onExit={() => void exitDebugMode()} />
+      <DebugHeader
+        connected={bridge.connected}
+        status={bridge.status}
+        statusAgeSec={statusAgeSec}
+        url={url}
+        manualControlLabel={manualControlLabel}
+        manualControlDisabled={manualControlDisabled}
+        manualControlPending={manualControlPending}
+        onManualControl={() => void handleManualControl()}
+        onExit={() => void exitDebugMode()}
+      />
       {!bridge.status ? (
         <ConnectionFallback connected={bridge.connected} reconnecting={bridge.reconnecting} error={bridge.connectionError} url={url} onRetry={bridge.retry} />
       ) : (
@@ -1043,9 +1664,10 @@ export function DebugWorkspace({
           </div>
           <main aria-labelledby={`debug-tab-${activeTab}`} className="debug-main" id={`debug-panel-${activeTab}`} role="tabpanel" tabIndex={0}>
             {activeTab === "connection" ? <ConnectionPanel connected={bridge.connected} status={bridge.status} readiness={bridge.readiness} runCommand={runCommand} notify={setNotice} /> : null}
-            {activeTab === "manual" ? <ManualPanel connected={bridge.connected} status={bridge.status} runCommand={runCommand} /> : null}
+            {activeTab === "manual" ? <ManualPanel connected={bridge.connected} status={bridge.status} runCommand={runCommand} coexistenceConfirmed={coexistenceConfirmed} setCoexistenceConfirmed={setCoexistenceConfirmed} manualControlPending={manualControlPending} /> : null}
             {activeTab === "output" ? <OutputPanel connected={bridge.connected} status={bridge.status} runCommand={runCommand} /> : null}
             {activeTab === "voice" ? <VoicePanel connected={bridge.connected} status={bridge.status} publishSentence={bridge.publishSentence} runCommand={runCommand} notify={setNotice} /> : null}
+            {activeTab === "record" ? <RecordPanel connected={bridge.connected} status={bridge.status} runCommand={runCommand} notify={setNotice} /> : null}
           </main>
         </>
       )}

@@ -40,15 +40,35 @@ export interface DebugEndpointStatus {
   ready: boolean;
 }
 
+export type DebugActionState =
+  | "idle"
+  | "submitting"
+  | "accepted"
+  | "executing"
+  | "cancel_requested"
+  | "cancel_accepted"
+  | "cancel_rejected"
+  | "completed"
+  | "failed"
+  | "rejected"
+  | "remote_state_unknown"
+  | "REMOTE_STATE_UNKNOWN"
+  | (string & {});
+
 export interface DebugActionStatus {
   route: string;
   command_id: string;
-  state: string;
+  state: DebugActionState;
   progress: number;
   success: boolean;
   terminal: boolean;
   reason_code: string;
+  recovery_required: boolean;
   elapsed_sec?: number;
+  last_update_age_sec?: number | null;
+  recovery_age_sec?: number | null;
+  server_ready?: boolean;
+  cancel_available?: boolean;
   source?: string;
 }
 
@@ -104,6 +124,124 @@ export interface DebugNetworkStatus {
   error?: string;
 }
 
+export interface DebugAsrDevice {
+  id: number;
+  name: string;
+  input_channels: number;
+  default_samplerate: number;
+  default: boolean;
+}
+
+export interface DebugAsrFinal {
+  stamp: string;
+  text: string;
+  response_latency_ms: number | null;
+  latency_basis: "latest_pcm_send_complete_to_final_receive" | "unavailable";
+  latency_correlated: false;
+}
+
+export interface DebugAsrStatus {
+  available: boolean;
+  dependency_error: string;
+  state: "UNAVAILABLE" | "STOPPED" | "STARTING" | "LISTENING" | "STOPPING" | "ERROR";
+  server_url: string;
+  topic: string;
+  device_id: number | null;
+  device_name: string;
+  devices: DebugAsrDevice[];
+  connected: boolean;
+  audio_level_dbfs: number;
+  peak_level_dbfs: number;
+  elapsed_sec: number;
+  blocks_captured: number;
+  input_dropped: number;
+  partial_text: string;
+  finals: DebugAsrFinal[];
+  last_error: string;
+  recording_path: string;
+  transcript_path: string;
+  sample_rate: number;
+  channels: number;
+  sample_width_bits: number;
+  block_frames: number;
+  wire_chunk_bytes: number;
+  input_sample_rate: number;
+  input_channels: number;
+  input_block_frames: number;
+  resampling: boolean;
+  sent_chunks: number;
+  responses: number;
+  dropped_chunks: number;
+  sessions: number;
+  padded_final_bytes: number;
+  pending_chunks: number;
+}
+
+export interface DebugSurgeryRecordExample {
+  case_id: string;
+  filename: string;
+  characters: number;
+  bytes: number;
+  lines: number;
+  sha256: string;
+  valid_for_api: boolean;
+}
+
+export interface DebugSurgeryRecordResult {
+  state?: "SUCCEEDED" | "FAILED" | "REMOTE_STATE_UNKNOWN";
+  request_id?: string;
+  case_id?: string;
+  filename?: string;
+  endpoint?: string;
+  room_name?: string;
+  surgery_code?: string;
+  date?: string;
+  text_characters?: number;
+  body_bytes?: number;
+  text_sha256?: string;
+  submitted_at?: string;
+  completed_at?: string;
+  duration_sec?: number;
+  http_status?: number;
+  success?: boolean;
+  transport_error?: string;
+  response_headers?: Record<string, string>;
+  response_json?: Record<string, unknown> | null;
+  response_text?: string;
+  receipt_id?: string;
+  received_at?: string;
+  error_code?: string;
+  error_message?: string;
+  generated_record_body_returned?: boolean;
+}
+
+export interface DebugSurgeryRecordStatus {
+  state: "IDLE" | "SUBMITTING" | "SUCCEEDED" | "FAILED" | "REMOTE_STATE_UNKNOWN";
+  active_request_id: string;
+  default_endpoint: string;
+  input_dir: string;
+  examples: DebugSurgeryRecordExample[];
+  last_error: string;
+  last_result: DebugSurgeryRecordResult;
+  history: DebugSurgeryRecordResult[];
+  api_key_configured: boolean;
+  contract: {
+    method: "POST";
+    content_type: string;
+    auth_header: "X-API-Key";
+    max_text_characters: number;
+    max_body_bytes: number;
+    max_response_bytes?: number;
+    max_response_text_bytes?: number;
+    server_timeout_sec: number;
+    generated_record_body_returned: boolean;
+    result_lookup_defined: boolean;
+    auto_retry?: boolean;
+    reconciliation_defined?: boolean;
+    allowed_endpoints?: string[];
+  };
+}
+
 export interface IntegrationDebugStatus {
   schema: "taskplanner.integration_debug.status.v1";
   stamp_sec: number;
@@ -111,6 +249,8 @@ export interface IntegrationDebugStatus {
     session_id: string;
     state: DebugSessionState;
     armed: boolean;
+    acknowledged_blocked_nodes?: string[];
+    planner_coexistence_active?: boolean;
     fault_locked: boolean;
     last_error: string;
     event_log_path: string;
@@ -120,6 +260,13 @@ export interface IntegrationDebugStatus {
     rmw_implementation: string;
     discovery_range: string;
     blocked_nodes: string[];
+    planner_coexistence_allowed?: boolean;
+    action_watchdog?: {
+      goal_response_timeout_sec: number;
+      feedback_timeout_sec: number;
+      max_duration_sec: number;
+      server_loss_grace_sec: number;
+    };
     network: DebugNetworkStatus;
   };
   inputs: DebugInputStatus[];
@@ -137,6 +284,8 @@ export interface IntegrationDebugStatus {
       reason?: string;
     };
   };
+  asr: DebugAsrStatus;
+  surgery_record: DebugSurgeryRecordStatus;
   recent_events: DebugRecentEvent[];
 }
 
@@ -162,6 +311,7 @@ function parseStatus(raw: unknown): IntegrationDebugStatus | null {
 export function useIntegrationDebugBridge(url: string) {
   const rosRef = useRef<RosConnection | null>(null);
   const sentenceTopicRef = useRef<RosTopicHandle | null>(null);
+  const heartbeatTopicRef = useRef<RosTopicHandle | null>(null);
   const sentenceUnadvertiseTimerRef = useRef<number | null>(null);
   const [connected, setConnected] = useState(false);
   const [status, setStatus] = useState<IntegrationDebugStatus | null>(null);
@@ -197,7 +347,14 @@ export function useIntegrationDebugBridge(url: string) {
       messageType: "std_msgs/msg/String",
       queue_size: 1,
     });
+    const heartbeatTopic = new ROSLIB.Topic({
+      ros,
+      name: "/integration/debug/heartbeat",
+      messageType: "std_msgs/msg/String",
+      queue_size: 1,
+    });
     sentenceTopicRef.current = sentenceTopic;
+    heartbeatTopicRef.current = heartbeatTopic;
 
     function scheduleReconnect() {
       if (disposed || reconnectTimer !== null) return;
@@ -209,6 +366,7 @@ export function useIntegrationDebugBridge(url: string) {
     }
 
     ros.on("connection", () => {
+      heartbeatTopic.advertise();
       setConnected(true);
       setReconnecting(false);
       setConnectionError("");
@@ -253,6 +411,8 @@ export function useIntegrationDebugBridge(url: string) {
       }
       sentenceTopic.unadvertise();
       sentenceTopicRef.current = null;
+      heartbeatTopic.unadvertise();
+      heartbeatTopicRef.current = null;
       if (rosRef.current === ros) rosRef.current = null;
       try {
         ros.close();
@@ -310,12 +470,15 @@ export function useIntegrationDebugBridge(url: string) {
 
   useEffect(() => {
     if (!connected || !status?.session.armed) return;
-    const heartbeat = window.setInterval(() => {
-      void command("heartbeat").catch(() => undefined);
-    }, 2000);
-    void command("heartbeat").catch(() => undefined);
+    const publishHeartbeat = () => {
+      const topic = heartbeatTopicRef.current;
+      if (!topic) return;
+      topic.publish(new ROSLIB.Message({ data: status.session.session_id }));
+    };
+    const heartbeat = window.setInterval(publishHeartbeat, 2000);
+    publishHeartbeat();
     return () => window.clearInterval(heartbeat);
-  }, [command, connected, status?.session.armed]);
+  }, [connected, status?.session.armed, status?.session.session_id]);
 
   const publishSentence = useCallback((sentence: string) => {
     const topic = sentenceTopicRef.current;

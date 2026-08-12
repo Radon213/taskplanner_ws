@@ -2,6 +2,22 @@ schema: taskplanner.integration_debug.v1
 monitor_window_sec: 5.0
 status_period_sec: 1.0
 heartbeat_timeout_sec: 6.0
+action_watchdog:
+  goal_response_timeout_sec: 10.0
+  feedback_timeout_sec: 30.0
+  max_duration_sec: 300.0
+  server_loss_grace_sec: 5.0
+
+asr:
+  topic: /sensors/surgeon/sentence
+  default_server_url: wss://arpa.worker-02.puzzle-ai.com
+
+surgery_record:
+  input_dir: /surgery-record-inputs
+  default_endpoint: https://dev.puzzle-ai.com:6627/api/v1/surgery/img_texts
+  allowed_endpoints:
+    - https://dev.puzzle-ai.com:6627/api/v1/surgery/img_texts
+  timeout_sec: 35.0
 
 inputs:
   - name: surgeon_sentence

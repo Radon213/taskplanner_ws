@@ -25,13 +25,17 @@ RUN set -e; \
       sleep "$((attempt * 5))"; \
     done; \
     apt-get install -y --no-install-recommends \
+    alsa-utils \
     bash-completion \
     build-essential \
     ca-certificates \
     curl \
     git \
     npm \
+    libportaudio2 \
+    pipewire-alsa \
     python3-matplotlib \
+    python3-numpy \
     python3-opencv \
     openssh-client \
     python3-colcon-common-extensions \
@@ -42,11 +46,18 @@ RUN set -e; \
     python3-requests \
     python3-rosdep \
     python3-twisted \
+    python3-websockets \
     python3-yaml \
     python3-zmq \
     ros-jazzy-ament-cmake-mypy \
-    ros-jazzy-rosbridge-suite; \
+    ros-jazzy-rosbridge-suite \
+    wireplumber; \
     rm -rf /var/lib/apt/lists/*
+
+# Ubuntu 24.04 does not publish python3-sounddevice. Pin the small ctypes
+# wrapper while keeping PortAudio itself under apt lifecycle management.
+RUN python3 -m pip install --break-system-packages --no-cache-dir \
+    sounddevice==0.5.3
 
 RUN mkdir -p "${BTOPS_WS}/src" \
     && git clone --filter=blob:none --no-checkout "${AUTO_APMS_REPO_URL}" "${BTOPS_WS}/src/auto_apms" \

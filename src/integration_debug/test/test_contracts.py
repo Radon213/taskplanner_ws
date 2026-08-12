@@ -3,10 +3,14 @@ from pathlib import Path
 import pytest
 
 from integration_debug.contracts import (
+    action_watchdog_reason,
     decode_payload,
+    load_action_watchdog_policy,
     load_config,
     measured_rate,
     parse_voice_command,
+    validate_action_recovery_acknowledgement,
+    validate_planner_coexistence_acknowledgement,
     validate_retraction,
     validate_tool_handover,
 )
@@ -125,7 +129,155 @@ def test_command_payload_must_be_a_json_object() -> None:
         decode_payload("[]")
 
 
+def test_planner_coexistence_acknowledgement_requires_exact_node_set() -> None:
+    blocked = ["tree_executor", "simulation_manager"]
+    assert validate_planner_coexistence_acknowledgement(
+        {
+            "planner_coexistence_confirmed": True,
+            "acknowledged_blocked_nodes": [
+                "simulation_manager",
+                "tree_executor",
+                "tree_executor",
+            ],
+        },
+        blocked,
+    ) == ["simulation_manager", "tree_executor"]
+
+    with pytest.raises(ValueError, match="partner planner is paused"):
+        validate_planner_coexistence_acknowledgement(
+            {"acknowledged_blocked_nodes": blocked}, blocked
+        )
+    with pytest.raises(ValueError, match="node set changed"):
+        validate_planner_coexistence_acknowledgement(
+            {
+                "planner_coexistence_confirmed": True,
+                "acknowledged_blocked_nodes": ["tree_executor"],
+            },
+            blocked,
+        )
+
+
+def test_planner_coexistence_acknowledgement_is_not_needed_without_blockers() -> None:
+    assert validate_planner_coexistence_acknowledgement({}, []) == []
+
+
 def test_measured_rate_uses_recent_window() -> None:
     rate, count = measured_rate([1.0, 2.0, 3.0, 8.0, 9.0], 9.0, 2.0)
     assert count == 2
     assert rate == 1.0
+
+
+def test_action_watchdog_policy_is_loaded_from_debug_config() -> None:
+    config = load_config(
+        Path(__file__).parents[1] / "config" / "integration_debug.yaml"
+    )
+    policy = load_action_watchdog_policy(config)
+    assert policy == {
+        "goal_response_timeout_sec": 10.0,
+        "feedback_timeout_sec": 30.0,
+        "max_duration_sec": 300.0,
+        "server_loss_grace_sec": 5.0,
+    }
+    with pytest.raises(ValueError, match="greater than 0"):
+        load_action_watchdog_policy(
+            {"action_watchdog": {"feedback_timeout_sec": 0}}
+        )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        (
+            {
+                "server_ready": False,
+                "server_unavailable_age_sec": 5.1,
+            },
+            "action_server_unavailable",
+        ),
+        (
+            {"state": "submitting", "elapsed_sec": 10.1},
+            "goal_response_timeout",
+        ),
+        (
+            {
+                "state": "executing",
+                "elapsed_sec": 31.0,
+                "last_update_age_sec": 30.1,
+            },
+            "action_update_timeout",
+        ),
+        (
+            {
+                "state": "executing",
+                "elapsed_sec": 300.1,
+                "last_update_age_sec": 0.1,
+            },
+            "action_duration_timeout",
+        ),
+    ],
+)
+def test_action_watchdog_reports_uncertain_remote_state(
+    overrides: dict[str, object], expected: str
+) -> None:
+    values: dict[str, object] = {
+        "terminal": False,
+        "recovery_required": False,
+        "state": "accepted",
+        "route": "tool_handover",
+        "elapsed_sec": 1.0,
+        "last_update_age_sec": 1.0,
+        "server_ready": True,
+        "server_unavailable_age_sec": 0.0,
+        "policy": load_action_watchdog_policy({}),
+    }
+    values.update(overrides)
+    assert action_watchdog_reason(**values) == expected
+
+
+def test_action_watchdog_allows_server_loss_grace_and_terminal_states() -> None:
+    policy = load_action_watchdog_policy({})
+    common = {
+        "state": "accepted",
+        "route": "tool_handover",
+        "elapsed_sec": 2.0,
+        "last_update_age_sec": 2.0,
+        "server_ready": False,
+        "server_unavailable_age_sec": 4.9,
+        "policy": policy,
+    }
+    assert action_watchdog_reason(
+        terminal=False, recovery_required=False, **common
+    ) == ""
+    assert action_watchdog_reason(
+        terminal=True,
+        recovery_required=False,
+        **{**common, "server_unavailable_age_sec": 10.0},
+    ) == ""
+    assert action_watchdog_reason(
+        terminal=False,
+        recovery_required=True,
+        **{**common, "server_unavailable_age_sec": 10.0},
+    ) == ""
+
+
+def test_action_client_recovery_requires_exact_command_and_confirmation() -> None:
+    command_id = "debug-command-7"
+    assert validate_action_recovery_acknowledgement(
+        {
+            "expected_command_id": command_id,
+            "remote_motion_stopped_confirmed": True,
+        },
+        command_id,
+    ) == command_id
+    with pytest.raises(ValueError, match="active command changed"):
+        validate_action_recovery_acknowledgement(
+            {
+                "expected_command_id": "debug-command-6",
+                "remote_motion_stopped_confirmed": True,
+            },
+            command_id,
+        )
+    with pytest.raises(ValueError, match="confirm that remote motion stopped"):
+        validate_action_recovery_acknowledgement(
+            {"expected_command_id": command_id}, command_id
+        )
