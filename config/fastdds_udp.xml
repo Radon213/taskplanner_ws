@@ -4,11 +4,23 @@
     <transport_descriptor>
       <transport_id>UdpTransport</transport_id>
       <type>UDPv4</type>
+      <interfaceWhiteList>
+        <interface>enp13s0</interface>
+      </interfaceWhiteList>
     </transport_descriptor>
   </transport_descriptors>
 
   <participant profile_name="udp_transport_profile" is_default_profile="true">
     <rtps>
+      <builtin>
+        <initialPeersList>
+          <locator>
+            <udpv4>
+              <address>192.168.1.6</address>
+            </udpv4>
+          </locator>
+        </initialPeersList>
+      </builtin>
       <userTransports>
         <transport_id>UdpTransport</transport_id>
       </userTransports>
