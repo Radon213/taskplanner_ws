@@ -535,6 +535,11 @@ services:
       VITE_ROSBRIDGE_SHADOW_PORT: ${ROSBRIDGE_SHADOW_PORT:-9099}
       VITE_ROSBRIDGE_DEBUG_URL: ${VITE_ROSBRIDGE_DEBUG_URL:-}
       VITE_ROSBRIDGE_DEBUG_PORT: ${ROSBRIDGE_DEBUG_PORT:-9091}
+      VITE_EXTERNAL_CAM1_TOPIC: ${VITE_EXTERNAL_CAM1_TOPIC:-/camera/cam_1/color/image_raw/compressed}
+      VITE_EXTERNAL_CAM2_TOPIC: ${VITE_EXTERNAL_CAM2_TOPIC:-/camera/cam_2/color/image_raw/compressed}
+      VITE_EXTERNAL_CAM3_TOPIC: ${VITE_EXTERNAL_CAM3_TOPIC:-/camera/cam_3/color/image_raw/compressed}
+      VITE_EXTERNAL_CAM4_TOPIC: ${VITE_EXTERNAL_CAM4_TOPIC:-/camera/cam_4/color/image_raw/compressed}
+      VITE_EXTERNAL_FLIR_TOPIC: ${VITE_EXTERNAL_FLIR_TOPIC:-/flir_camera/image_color/compressed}
       WEBAPP_INSTALL_ON_START: ${WEBAPP_INSTALL_ON_START:-false}
     ports:
       - "127.0.0.1:${WEBAPP_PORT:-4173}:4173"

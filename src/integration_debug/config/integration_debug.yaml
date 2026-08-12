@@ -10,16 +10,34 @@ inputs:
     expected_hz: 0.0
     stale_after_sec: 0.0
     qos: reliable_volatile
-  - name: flir_camera
-    topic: /surgery/images/flir/compressed
+  - name: cam1_camera
+    topic: /camera/cam_1/color/image_raw/compressed
     type: sensor_msgs/msg/CompressedImage
-    expected_hz: 0.0
+    expected_hz: 15.0
+    stale_after_sec: 3.0
+    qos: sensor_data
+  - name: cam2_camera
+    topic: /camera/cam_2/color/image_raw/compressed
+    type: sensor_msgs/msg/CompressedImage
+    expected_hz: 15.0
+    stale_after_sec: 3.0
+    qos: sensor_data
+  - name: cam3_camera
+    topic: /camera/cam_3/color/image_raw/compressed
+    type: sensor_msgs/msg/CompressedImage
+    expected_hz: 15.0
     stale_after_sec: 3.0
     qos: sensor_data
   - name: cam4_camera
-    topic: /surgery/images/cam4/compressed
+    topic: /camera/cam_4/color/image_raw/compressed
     type: sensor_msgs/msg/CompressedImage
-    expected_hz: 0.0
+    expected_hz: 15.0
+    stale_after_sec: 3.0
+    qos: sensor_data
+  - name: flir_camera
+    topic: /flir_camera/image_color/compressed
+    type: sensor_msgs/msg/CompressedImage
+    expected_hz: 15.0
     stale_after_sec: 3.0
     qos: sensor_data
 
