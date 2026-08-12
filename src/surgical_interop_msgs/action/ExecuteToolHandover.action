@@ -8,6 +8,7 @@
 #   tray  -> surgeon  (pick up and hand over)
 #   robot -> surgeon  (hand over a held tool)
 #   robot -> tray     (return an unused held tool)
+#   mayo  -> robot    (pick up a reusable Mayo tool and hold it ready)
 #   mayo  -> tray     (retrieve a used tool)
 # The server selects its own arm and must reject every other transition.
 #

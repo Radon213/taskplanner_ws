@@ -193,9 +193,9 @@ def test_prediction_replacement_returns_old_preposition_before_preparing_new() -
     )
 
     assert "predicted_tool != prepositioned_tool" in replacement
-    assert "replacement_instance = findActiveInstanceForType" in replacement
+    assert "replacement_instance = findAnticipatoryInstanceForType" in replacement
     assert "replacement_available" in replacement
-    assert "toolIsAnticipatoryCandidate(node, replacement_instance)" in replacement
+    assert "replacement_available = !replacement_instance.empty()" in replacement
     assert "confidence >= kPreparationMinConfidence" in replacement
     assert "stability_sec >= kPreparationMinStabilitySec" in replacement
     assert "stablePredictionReplacesPreposition(node)" in recovery_context
@@ -254,10 +254,14 @@ def test_mayo_reuse_preparation_is_future_scoped_and_returns_to_origin() -> None
     assert 'lifecycle == "mayo_reuse"' in candidate_guard
     assert '"future_use_expected"' in candidate_guard
     assert "return future_use_expected" in candidate_guard
-    assert (
-        '{"home_rack", "returned_home", "mayo_reuse"}'
-        in expected_selection
-    )
+    assert "findAnticipatoryInstanceForType" in candidate_guard
+    assert "toolIsAnticipatoryCandidate(node, tool_id)" in candidate_guard
+    assert "findAnticipatoryInstanceForType" in expected_selection
+    assert 'const bool from_mayo_reuse = lifecycle == "mayo_reuse"' in command
+    assert 'std::string("mayo_reuse_zone")' in command
+    assert '"bt.source_location_id", prepare_source_location' in command
+    assert '"bt.source_location_type", prepare_source_type' in command
+    assert "stable next-tool prediction selected a Mayo reuse tool" in command
     assert '"preposition_origin_location"' in recovery_selection
     assert '"preposition_origin_type"' in recovery_selection
     assert '"preposition_origin_location"' in command

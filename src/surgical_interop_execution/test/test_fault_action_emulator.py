@@ -13,6 +13,7 @@ def test_only_reviewed_tool_transitions_are_accepted():
     assert valid_tool_transition("tray", "surgeon")
     assert valid_tool_transition("robot", "surgeon")
     assert valid_tool_transition("robot", "tray")
+    assert valid_tool_transition("mayo", "robot")
     assert valid_tool_transition("mayo", "tray")
     assert not valid_tool_transition("surgeon", "robot")
     assert not valid_tool_transition("mayo", "surgeon")

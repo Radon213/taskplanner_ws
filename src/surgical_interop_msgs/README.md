@@ -39,15 +39,17 @@ stable machine-readable `reason_code`. Action feedback is limited to current
 
 `ExecuteToolHandover` accepts only `tray`, `mayo`, `robot`, and `surgeon` as
 location values. The only valid transitions are `tray -> robot` (pick up the
-Taskplanner-selected next tool and hold it ready), `tray -> surgeon` (direct
-pickup and handover), `robot -> surgeon` (held-tool handover), `robot -> tray`
-(return an unused held tool), and `mayo -> tray` (retrieve a used tool).
+Taskplanner-selected next tool from the supply tray and hold it ready),
+`mayo -> robot` (pick up a reusable Mayo tool selected by the same stable
+next-tool policy and hold it ready), `tray -> surgeon` (direct pickup and
+handover), `robot -> surgeon` (held-tool handover), `robot -> tray` (return an
+unused held tool), and `mayo -> tray` (retrieve a used tool).
 `instrument_id` is
 the shared real instrument name (for example `Bovie surgical cautery`), not a
 private procedure-catalog code such as `T04`. The server chooses the arm; arm
 selection is intentionally absent from the Goal. A successful `tray -> robot`
-Result means stable holding has been reached and the robot keeps holding the
-tool until a later handover or return Goal.
+or `mayo -> robot` Result means stable holding has been reached and the robot
+keeps holding the tool until a later handover or `robot -> tray` return Goal.
 
 `ExecuteToolHandover.Feedback.state` uses exactly nine lower-case values:
 `moving_to_source`, `grasping`, `moving_to_target`,
@@ -76,6 +78,6 @@ has been confirmed, rollback is no longer physically valid and that Goal
 finishes `completed`. This operational interrupt does not replace the
 controller's local E-stop or protective stop.
 
-A `tray -> robot` Goal that already returned `completed` is no longer
-cancellable. Returning that stably held but now-unneeded tool is a new
-`robot -> tray` Goal; Cancel applies only while a Goal is still active.
+A `tray -> robot` or `mayo -> robot` Goal that already returned `completed` is
+no longer cancellable. Returning that stably held but now-unneeded tool is a
+new `robot -> tray` Goal; Cancel applies only while a Goal is still active.

@@ -10,17 +10,19 @@ release, and end-effector changes map to `/surgery/retraction`; suction start
 and stop map to `/surgery/suction/set`.
 
 The tool Action sends only `command_id`, the real catalog instrument name, a
-human-readable instance ID, and one of five fixed location pairs:
+human-readable instance ID, and one of six fixed location pairs:
 
 - `tray -> robot`: pick up the planner-selected next tool and hold it ready
+- `mayo -> robot`: pick up a reusable Mayo tool selected by the planner and hold it ready
 - `tray -> surgeon`: handover
 - `robot -> surgeon`: handover a held tool
 - `robot -> tray`: return an unused held tool
 - `mayo -> tray`: retrieve
 
-For `tray -> robot`, success means stable holding has been reached. The Action
-then terminates while the controller keeps holding the tool until a later
-handover or return Goal. Preparation prediction remains internal to Taskplanner.
+For `tray -> robot` and `mayo -> robot`, success means stable holding has been
+reached. The Action then terminates while the controller keeps holding the tool
+until a later handover or `robot -> tray` return Goal. Preparation prediction
+and the reuse decision remain internal to Taskplanner.
 
 The only public location values are `tray`, `mayo`, `robot`, and `surgeon`.
 Compound internal actions that require returning one tool and handing over
