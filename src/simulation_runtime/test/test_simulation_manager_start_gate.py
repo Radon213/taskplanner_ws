@@ -5,6 +5,8 @@ import sys
 import types
 from types import SimpleNamespace
 
+from procedure_spec import get_default_spec_dir, load_bundle
+
 try:
     from btops_interfaces import srv as _btops_srv  # noqa: F401
 except ModuleNotFoundError:
@@ -227,6 +229,16 @@ def test_external_robot_contract_is_derived_from_loaded_spec() -> None:
     ) == ("nephrectomy", False, True, True)
     assert no_bed_robot.procedure_type == ""
     assert no_bed_robot.require_bed_robot_arm_status is False
+
+
+def test_external_robot_contract_accepts_public_procedure_spec_api() -> None:
+    spec = load_bundle(get_default_spec_dir())
+
+    contract = external_robot_contract_for_spec(spec)
+
+    assert contract == external_robot_contract_for_spec(
+        _procedure_spec("thyroidectomy", "change_end_effector")
+    )
 
 
 def test_bundle_switch_rejects_external_contract_change_before_quiescence() -> None:

@@ -61,7 +61,12 @@ def external_robot_contract_for_spec(spec) -> ExternalRobotContract:
     """Resolve only the focused controller contracts supported by bringup."""
 
     procedure_id = str(spec.procedure_id).strip().casefold()
-    bed_spec = spec.bed_robot_arm_groups
+    get_bed_spec = getattr(spec, "get_bed_robot_arm_group_spec", None)
+    bed_spec = (
+        get_bed_spec()
+        if callable(get_bed_spec)
+        else getattr(spec, "bed_robot_arm_groups", None)
+    )
     enabled_groups = [
         group
         for group in (bed_spec.groups if bed_spec is not None else [])
