@@ -353,6 +353,34 @@ assert_debug_runtime_is_exclusive() {
   fi
 }
 
+prepare_debug_audio_runtime() {
+  local user_runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+  local pipewire_socket="${TASKPLANNER_PIPEWIRE_SOCKET:-${user_runtime_dir}/pipewire-0}"
+  export TASKPLANNER_PIPEWIRE_SOCKET="${pipewire_socket}"
+  if [[ "${DRY_RUN}" != "true" && ! -S "${pipewire_socket}" ]]; then
+    die "Ubuntu PipeWire input is unavailable: ${pipewire_socket}"
+  fi
+}
+
+prepare_debug_surgery_record_secret() {
+  local api_key_file="${PUZZLE_SURGERY_RECORD_API_KEY_FILE:-${HOME}/.config/taskplanner/secrets/puzzle-surgery-record-api-key}"
+  export PUZZLE_SURGERY_RECORD_API_KEY_FILE="${api_key_file}"
+  if [[ "${DRY_RUN}" == "true" ]]; then
+    return
+  fi
+  if [[ ! -f "${api_key_file}" ]]; then
+    die "surgery-record X-API-Key secret is unavailable: ${api_key_file}"
+  fi
+  if [[ ! -s "${api_key_file}" ]]; then
+    die "surgery-record X-API-Key secret is empty: ${api_key_file}"
+  fi
+  local file_mode
+  file_mode="$(stat -c '%a' "${api_key_file}")"
+  if [[ "${file_mode}" != "600" ]]; then
+    die "surgery-record X-API-Key secret must use mode 600: ${api_key_file}"
+  fi
+}
+
 action="${1:-help}"
 shift || true
 DRY_RUN=false
@@ -390,6 +418,10 @@ case "${action}" in
     done
 
     compose_env_args "${mode}"
+    if [[ "${mode}" == "debug" ]]; then
+      prepare_debug_audio_runtime
+      prepare_debug_surgery_record_secret
+    fi
     compose_base
     all_profiles
 
@@ -405,7 +437,7 @@ case "${action}" in
       run_or_print \
         "${COMPOSE[@]}" --profile debug \
         up -d "${BUILD_ARGS[@]}" --force-recreate \
-        webapp integration-debug
+        webapp integration-debug integration-debug-lan-proxy
       if [[ "${DRY_RUN}" != "true" ]]; then
         "${COMPOSE[@]}" --profile debug ps
       fi
@@ -418,10 +450,10 @@ case "${action}" in
 
     run_or_print \
       "${COMPOSE[@]}" "${ALL_PROFILE_ARGS[@]}" \
-      stop taskplanner-runtime shadow-runner object-perception integration-debug
+      stop taskplanner-runtime shadow-runner object-perception integration-debug integration-debug-lan-proxy
     run_or_print \
       "${COMPOSE[@]}" "${ALL_PROFILE_ARGS[@]}" \
-      rm -f taskplanner-runtime shadow-runner object-perception integration-debug
+      rm -f taskplanner-runtime shadow-runner object-perception integration-debug integration-debug-lan-proxy
 
     # Releases before the Compose control plane used a host transient service.
     # Stop only that legacy process so it cannot occupy the manager port.

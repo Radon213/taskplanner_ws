@@ -467,6 +467,8 @@ services:
         TASKPLANNER_SHADOW_CONTRACT_VERSION: ${TASKPLANNER_SHADOW_CONTRACT_VERSION:-shadow-rfdetr-preflight-v1}
     image: taskplanner-ws:dev
     restart: unless-stopped
+    stop_signal: SIGINT
+    stop_grace_period: 45s
     user: "${TASKPLANNER_UID:-1000}:${TASKPLANNER_GID:-1000}"
     working_dir: /workspaces/taskplanner_ws
     network_mode: host
@@ -474,19 +476,32 @@ services:
     volumes:
       - .:/workspaces/taskplanner_ws
       - ${TASKPLANNER_RUN_ROOT:-${HOME}/.local/share/taskplanner/runs}:/taskplanner-runs
+      - ${TASKPLANNER_SURGERY_RECORD_SOURCE_DIR:-../taskplanner_ws/reports/surgery_records/0704_6_17_clinical_prompt_v1}:/surgery-record-inputs:ro
+      - ${PUZZLE_SURGERY_RECORD_API_KEY_FILE:-${HOME}/.config/taskplanner/secrets/puzzle-surgery-record-api-key}:/run/taskplanner-secrets/puzzle-surgery-record-api-key:ro
+      # Follow Ubuntu's PipeWire-selected logical input instead of exposing
+      # stale/raw ALSA endpoints captured when the container was created.
+      - ${TASKPLANNER_PIPEWIRE_SOCKET:-/run/user/1000/pipewire-0}:/run/taskplanner-pipewire/pipewire-0
     environment:
+      XDG_RUNTIME_DIR: /run/taskplanner-pipewire
       ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}
       ROS_AUTOMATIC_DISCOVERY_RANGE: ${ROS_AUTOMATIC_DISCOVERY_RANGE:-SUBNET}
       RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}
       FASTRTPS_DEFAULT_PROFILES_FILE: ${FASTRTPS_DEFAULT_PROFILES_FILE:-/workspaces/taskplanner_ws/config/fastdds_udp.xml}
       ROSBRIDGE_DEBUG_PORT: ${ROSBRIDGE_DEBUG_PORT:-9091}
-      ROSBRIDGE_ADDRESS: ${ROSBRIDGE_ADDRESS:-127.0.0.1}
+      # Remote access must traverse integration-debug-lan-proxy. Never let a
+      # shell-level override expose the unauthenticated bridge on every NIC.
+      ROSBRIDGE_ADDRESS: 127.0.0.1
       ROSBRIDGE_SERVICE_TIMEOUT: ${ROSBRIDGE_SERVICE_TIMEOUT:-30.0}
       TASKPLANNER_RUN_ROOT: /taskplanner-runs
-      TASKPLANNER_DEBUG_NETWORK_SETTINGS: /taskplanner-runs/debug/network-settings.json
+      TASKPLANNER_DEBUG_NETWORK_SETTINGS: ${TASKPLANNER_DEBUG_NETWORK_SETTINGS:-/taskplanner-runs/debug/network-settings.json}
       TASKPLANNER_DEBUG_NETWORK_INTERFACE: ${TASKPLANNER_DEBUG_NETWORK_INTERFACE:-}
+      TASKPLANNER_DEBUG_ALLOW_PLANNER_COEXISTENCE: ${TASKPLANNER_DEBUG_ALLOW_PLANNER_COEXISTENCE:-false}
       TASKPLANNER_DEBUG_ALLOW_SELF_RESTART: "true"
       TASKPLANNER_REBUILD_ON_START: ${TASKPLANNER_REBUILD_ON_START:-false}
+      TASKPLANNER_SURGERY_RECORD_INPUT_DIR: /surgery-record-inputs
+      PUZZLE_ASR_URL: ${PUZZLE_ASR_URL:-wss://arpa.worker-02.puzzle-ai.com}
+      PUZZLE_SURGERY_RECORD_ENDPOINT: ${PUZZLE_SURGERY_RECORD_ENDPOINT:-https://dev.puzzle-ai.com:6627/api/v1/surgery/img_texts}
+      PUZZLE_SURGERY_RECORD_API_KEY_FILE: /run/taskplanner-secrets/puzzle-surgery-record-api-key
     command: >
       bash -lc "if [ \"$${TASKPLANNER_REBUILD_ON_START:-false}\" = 'true' ]; then
         colcon build --symlink-install --packages-select surgical_interop_msgs surgical_msgs integration_debug --cmake-args -DBUILD_TESTING=OFF;
@@ -502,6 +517,33 @@ services:
       rosbridge_address:=$${ROSBRIDGE_ADDRESS}
       rosbridge_service_timeout:=$${ROSBRIDGE_SERVICE_TIMEOUT}
       run_root:=$${TASKPLANNER_RUN_ROOT}"
+
+  integration-debug-lan-proxy:
+    profiles:
+      - debug
+    image: taskplanner-ws:dev
+    restart: unless-stopped
+    user: "${TASKPLANNER_UID:-1000}:${TASKPLANNER_GID:-1000}"
+    working_dir: /workspaces/taskplanner_ws
+    network_mode: host
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+    volumes:
+      - .:/workspaces/taskplanner_ws:ro
+    command:
+      - python3
+      - scripts/taskplanner_debug_lan_proxy.py
+      - --interface
+      - ${TASKPLANNER_DEBUG_NETWORK_INTERFACE:-enp13s0}
+      - --route
+      - ${WEBAPP_PORT:-4173}=127.0.0.1:${WEBAPP_PORT:-4173}
+      - --route
+      - ${ROSBRIDGE_DEBUG_PORT:-9091}=127.0.0.1:${ROSBRIDGE_DEBUG_PORT:-9091}
 
   webapp:
     build:
@@ -535,6 +577,11 @@ services:
       VITE_ROSBRIDGE_SHADOW_PORT: ${ROSBRIDGE_SHADOW_PORT:-9099}
       VITE_ROSBRIDGE_DEBUG_URL: ${VITE_ROSBRIDGE_DEBUG_URL:-}
       VITE_ROSBRIDGE_DEBUG_PORT: ${ROSBRIDGE_DEBUG_PORT:-9091}
+      VITE_EXTERNAL_CAM1_TOPIC: ${VITE_EXTERNAL_CAM1_TOPIC:-/camera/cam_1/color/image_raw/compressed}
+      VITE_EXTERNAL_CAM2_TOPIC: ${VITE_EXTERNAL_CAM2_TOPIC:-/camera/cam_2/color/image_raw/compressed}
+      VITE_EXTERNAL_CAM3_TOPIC: ${VITE_EXTERNAL_CAM3_TOPIC:-/camera/cam_3/color/image_raw/compressed}
+      VITE_EXTERNAL_CAM4_TOPIC: ${VITE_EXTERNAL_CAM4_TOPIC:-/camera/cam_4/color/image_raw/compressed}
+      VITE_EXTERNAL_FLIR_TOPIC: ${VITE_EXTERNAL_FLIR_TOPIC:-/flir_camera/image_color/compressed}
       WEBAPP_INSTALL_ON_START: ${WEBAPP_INSTALL_ON_START:-false}
     ports:
       - "127.0.0.1:${WEBAPP_PORT:-4173}:4173"

@@ -340,6 +340,31 @@ function normalizeShadowGroundTruth(
 // Preserve the recorded camera cadence. A millisecond throttle drops frames
 // when nominal 15 FPS input arrives with normal 59-81 ms scheduling jitter.
 const CAMERA_FRAME_THROTTLE_MS = 0;
+const CAMERA_STALE_AFTER_MS = 3000;
+
+type RawCameraTopicMap = Record<"cam1" | "cam2" | "cam3" | "cam4" | "flir", string>;
+
+const INTERNAL_CAMERA_TOPICS: RawCameraTopicMap = {
+  cam1: "/surgery/images/cam1/compressed",
+  cam2: "/surgery/images/cam2/compressed",
+  cam3: "/surgery/images/cam3/compressed",
+  cam4: "/surgery/images/cam4/compressed",
+  flir: "/surgery/images/flir/compressed",
+};
+
+const EXTERNAL_CAMERA_TOPICS: RawCameraTopicMap = {
+  cam1: import.meta.env.VITE_EXTERNAL_CAM1_TOPIC?.trim() || INTERNAL_CAMERA_TOPICS.cam1,
+  cam2: import.meta.env.VITE_EXTERNAL_CAM2_TOPIC?.trim() || INTERNAL_CAMERA_TOPICS.cam2,
+  cam3: import.meta.env.VITE_EXTERNAL_CAM3_TOPIC?.trim() || INTERNAL_CAMERA_TOPICS.cam3,
+  cam4: import.meta.env.VITE_EXTERNAL_CAM4_TOPIC?.trim() || INTERNAL_CAMERA_TOPICS.cam4,
+  flir: import.meta.env.VITE_EXTERNAL_FLIR_TOPIC?.trim() || INTERNAL_CAMERA_TOPICS.flir,
+};
+
+function rawCameraTopicsForMode(runtimeMode: TaskplannerRuntimeMode): RawCameraTopicMap {
+  return runtimeMode === "live" || runtimeMode === "llm"
+    ? EXTERNAL_CAMERA_TOPICS
+    : INTERNAL_CAMERA_TOPICS;
+}
 
 export type PerceptionLayerHealth = {
   received: boolean;
@@ -799,6 +824,11 @@ export function useRosBridge(runtimeMode: TaskplannerRuntimeMode) {
     });
     ros.on("close", () => {
       setConnected(false);
+      setCam1Image(null);
+      setCam2Image(null);
+      setCam3Image(null);
+      setCam4Image(null);
+      setFlirImage(null);
       perceptionHealthReceivedRef.current = false;
       perceptionEnabledRef.current = false;
       setPerceptionHealth(DEFAULT_PERCEPTION_HEALTH);
@@ -815,6 +845,11 @@ export function useRosBridge(runtimeMode: TaskplannerRuntimeMode) {
     });
     ros.on("error", () => {
       setConnected(false);
+      setCam1Image(null);
+      setCam2Image(null);
+      setCam3Image(null);
+      setCam4Image(null);
+      setFlirImage(null);
       perceptionHealthReceivedRef.current = false;
       perceptionEnabledRef.current = false;
       setPerceptionHealth(DEFAULT_PERCEPTION_HEALTH);
@@ -894,25 +929,26 @@ export function useRosBridge(runtimeMode: TaskplannerRuntimeMode) {
       messageType: "sensor_msgs/msg/CompressedImage",
       throttle_rate: 100,
     });
+    const rawCameraTopics = rawCameraTopicsForMode(runtimeMode);
     const cameraTopics = [
       {
-        name: "/surgery/images/cam1/compressed",
+        name: rawCameraTopics.cam1,
         setter: setCam1Image,
       },
       {
-        name: "/surgery/images/cam2/compressed",
+        name: rawCameraTopics.cam2,
         setter: setCam2Image,
       },
       {
-        name: "/surgery/images/cam3/compressed",
+        name: rawCameraTopics.cam3,
         setter: setCam3Image,
       },
       {
-        name: "/surgery/images/cam4/compressed",
+        name: rawCameraTopics.cam4,
         setter: setCam4Image,
       },
       {
-        name: "/surgery/images/flir/compressed",
+        name: rawCameraTopics.flir,
         setter: setFlirImage,
       },
       {
@@ -1125,8 +1161,10 @@ export function useRosBridge(runtimeMode: TaskplannerRuntimeMode) {
           setVlmImage(null);
           setVlmCompositeImage(null);
           setCam1Image(null);
+          setCam2Image(null);
           setCam3Image(null);
           setCam4Image(null);
+          setFlirImage(null);
           setCam4PerceptionImage(null);
           setFlirPerceptionImage(null);
           setCam4PerceptionOverlay(null);
@@ -1289,7 +1327,22 @@ export function useRosBridge(runtimeMode: TaskplannerRuntimeMode) {
       ros.close();
       rosRef.current = null;
     };
-  }, [url]);
+  }, [runtimeMode, url]);
+
+  useEffect(() => {
+    const clearIfStale = (frame: CompressedImageFrame | null) =>
+      frame && Date.now() - frame.receivedAt > CAMERA_STALE_AFTER_MS
+        ? null
+        : frame;
+    const staleSweep = window.setInterval(() => {
+      setCam1Image(clearIfStale);
+      setCam2Image(clearIfStale);
+      setCam3Image(clearIfStale);
+      setCam4Image(clearIfStale);
+      setFlirImage(clearIfStale);
+    }, 1000);
+    return () => window.clearInterval(staleSweep);
+  }, []);
 
   useEffect(() => {
     simulationStateRef.current = simulationState;

@@ -28,6 +28,12 @@ VALID_RETRACTION_DIRECTIONS = {
     "UP_DOWN",
 }
 MAX_RETRACTION_DISTANCE_MM = 30.0
+DEFAULT_ACTION_WATCHDOG_POLICY = {
+    "goal_response_timeout_sec": 10.0,
+    "feedback_timeout_sec": 30.0,
+    "max_duration_sec": 300.0,
+    "server_loss_grace_sec": 5.0,
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +73,106 @@ def decode_payload(raw: str) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("payload_json must be a JSON object")
     return payload
+
+
+def load_action_watchdog_policy(config: dict[str, Any]) -> dict[str, float]:
+    """Normalize the Action watchdog policy and reject unsafe timeout values."""
+
+    configured = config.get("action_watchdog", {})
+    if configured is None:
+        configured = {}
+    if not isinstance(configured, dict):
+        raise ValueError("action_watchdog must be a mapping")
+    policy: dict[str, float] = {}
+    for key, default in DEFAULT_ACTION_WATCHDOG_POLICY.items():
+        try:
+            value = float(configured.get(key, default))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"action_watchdog.{key} must be numeric") from exc
+        if value <= 0.0:
+            raise ValueError(f"action_watchdog.{key} must be greater than 0")
+        policy[key] = value
+    if policy["max_duration_sec"] <= policy["goal_response_timeout_sec"]:
+        raise ValueError(
+            "action_watchdog.max_duration_sec must exceed goal_response_timeout_sec"
+        )
+    return policy
+
+
+def action_watchdog_reason(
+    *,
+    terminal: bool,
+    recovery_required: bool,
+    state: str,
+    route: str,
+    elapsed_sec: float,
+    last_update_age_sec: float,
+    server_ready: bool,
+    server_unavailable_age_sec: float,
+    policy: dict[str, float],
+) -> str:
+    """Return a stable reason code when an in-flight command becomes uncertain."""
+
+    if terminal or recovery_required:
+        return ""
+    if (
+        not server_ready
+        and server_unavailable_age_sec >= policy["server_loss_grace_sec"]
+    ):
+        return "action_server_unavailable" if route != "suction" else "service_server_unavailable"
+    if elapsed_sec >= policy["max_duration_sec"]:
+        return "action_duration_timeout"
+    if state == "submitting" and elapsed_sec >= policy["goal_response_timeout_sec"]:
+        return "service_response_timeout" if route == "suction" else "goal_response_timeout"
+    if state != "submitting" and last_update_age_sec >= policy["feedback_timeout_sec"]:
+        return "action_update_timeout"
+    return ""
+
+
+def validate_action_recovery_acknowledgement(
+    payload: dict[str, Any], active_command_id: str
+) -> str:
+    """Require exact command identity and an explicit remote-stop confirmation."""
+
+    command_id = str(payload.get("expected_command_id", "")).strip()
+    if not active_command_id:
+        raise ValueError("there is no active Action client state to recover")
+    if command_id != active_command_id:
+        raise ValueError(
+            "active command changed; refresh the status before recovering the client"
+        )
+    if payload.get("remote_motion_stopped_confirmed") is not True:
+        raise ValueError(
+            "confirm that remote motion stopped or the remote command state was checked"
+        )
+    return command_id
+
+
+def validate_planner_coexistence_acknowledgement(
+    payload: dict[str, Any], blocked_nodes: Iterable[str]
+) -> list[str]:
+    """Require an explicit acknowledgement of the exact discovered planner set."""
+
+    expected = sorted(
+        {str(node).strip() for node in blocked_nodes if str(node).strip()}
+    )
+    if not expected:
+        return []
+    if payload.get("planner_coexistence_confirmed") is not True:
+        raise ValueError(
+            "confirm that the partner planner is paused before arming manual control"
+        )
+    acknowledged = payload.get("acknowledged_blocked_nodes")
+    if not isinstance(acknowledged, list) or not all(
+        isinstance(node, str) and node.strip() for node in acknowledged
+    ):
+        raise ValueError("acknowledged_blocked_nodes must be a list of node names")
+    normalized = sorted({node.strip() for node in acknowledged})
+    if normalized != expected:
+        raise ValueError(
+            "planner node set changed; refresh the status and acknowledge it again"
+        )
+    return normalized
 
 
 def validate_tool_handover(payload: dict[str, Any]) -> dict[str, Any]:

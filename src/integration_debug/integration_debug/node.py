@@ -45,14 +45,20 @@ from surgical_interop_msgs.msg import (
 from surgical_interop_msgs.srv import SetSuction
 from surgical_msgs.srv import IntegrationDebugCommand
 
+from integration_debug.asr_runtime import AsrMicrophoneRuntime
 from integration_debug.contracts import (
+    action_watchdog_reason,
     decode_payload,
+    load_action_watchdog_policy,
     load_config,
     measured_rate,
     parse_voice_command,
+    validate_action_recovery_acknowledgement,
+    validate_planner_coexistence_acknowledgement,
     validate_retraction,
     validate_tool_handover,
 )
+from integration_debug.surgery_record_runtime import SurgeryRecordRuntime
 from integration_debug.networking import (
     collect_network_status,
     ping_ipv4,
@@ -142,6 +148,7 @@ class IntegrationDebugNode(Node):
         self._config = load_config(config_path)
         self._lock = threading.RLock()
         self._log_lock = threading.Lock()
+        self._auxiliary_lock = threading.RLock()
         self._callback_group = ReentrantCallbackGroup()
         self._monitor_window_sec = max(
             1.0, float(self._config.get("monitor_window_sec", 5.0))
@@ -149,7 +156,9 @@ class IntegrationDebugNode(Node):
         self._heartbeat_timeout_sec = max(
             2.0, float(self._config.get("heartbeat_timeout_sec", 6.0))
         )
+        self._action_watchdog_policy = load_action_watchdog_policy(self._config)
         self._armed = False
+        self._acknowledged_blocked_nodes: set[str] = set()
         self._fault_locked = False
         self._last_heartbeat_monotonic = 0.0
         self._last_error = ""
@@ -179,10 +188,65 @@ class IntegrationDebugNode(Node):
             .lower()
             in {"1", "true", "yes", "on"}
         )
+        self._planner_coexistence_allowed = (
+            os.environ.get("TASKPLANNER_DEBUG_ALLOW_PLANNER_COEXISTENCE", "")
+            .strip()
+            .lower()
+            in {"1", "true", "yes", "on"}
+        )
         self._restart_scheduled = False
         self._session_dir = run_root / "debug" / self._session_id
         self._session_dir.mkdir(parents=True, exist_ok=True)
         self._event_log_path = self._session_dir / "events.jsonl"
+
+        asr_config = dict(self._config.get("asr", {}))
+        self._asr_topic = str(
+            asr_config.get("topic", "/sensors/surgeon/sentence")
+        ).strip()
+        self._asr_sentence_pub: Any | None = None
+        self._asr = AsrMicrophoneRuntime(
+            default_url=os.environ.get(
+                "PUZZLE_ASR_URL",
+                str(
+                    asr_config.get(
+                        "default_server_url",
+                        "wss://arpa.worker-02.puzzle-ai.com",
+                    )
+                ),
+            ),
+            topic=self._asr_topic,
+            output_dir=self._session_dir / "asr",
+        )
+        record_config = dict(self._config.get("surgery_record", {}))
+        self._surgery_record = SurgeryRecordRuntime(
+            input_dir=os.environ.get(
+                "TASKPLANNER_SURGERY_RECORD_INPUT_DIR",
+                str(record_config.get("input_dir", "/surgery-record-inputs")),
+            ),
+            default_endpoint=os.environ.get(
+                "PUZZLE_SURGERY_RECORD_ENDPOINT",
+                str(
+                    record_config.get(
+                        "default_endpoint",
+                        "https://dev.puzzle-ai.com:6627/api/v1/surgery/img_texts",
+                    )
+                ),
+            ),
+            api_key_file=os.environ.get(
+                "PUZZLE_SURGERY_RECORD_API_KEY_FILE",
+                "/run/taskplanner-secrets/puzzle-surgery-record-api-key",
+            ),
+            allowed_endpoints=tuple(
+                str(endpoint)
+                for endpoint in record_config.get(
+                    "allowed_endpoints",
+                    [
+                        "https://dev.puzzle-ai.com:6627/api/v1/surgery/img_texts",
+                    ],
+                )
+            ),
+            timeout_sec=float(record_config.get("timeout_sec", 35.0)),
+        )
 
         self._status_pub = self.create_publisher(
             String, "/integration/debug/status", 10
@@ -197,6 +261,18 @@ class IntegrationDebugNode(Node):
             IntegrationDebugCommand,
             "/integration/debug/command",
             self._handle_command,
+            callback_group=self._callback_group,
+        )
+        self._heartbeat_subscription = self.create_subscription(
+            String,
+            "/integration/debug/heartbeat",
+            self._on_heartbeat,
+            QoSProfile(
+                history=QoSHistoryPolicy.KEEP_LAST,
+                depth=5,
+                reliability=QoSReliabilityPolicy.RELIABLE,
+                durability=QoSDurabilityPolicy.VOLATILE,
+            ),
             callback_group=self._callback_group,
         )
         self._readiness_service = self.create_service(
@@ -288,6 +364,11 @@ class IntegrationDebugNode(Node):
             self._publish_enabled_outputs,
             callback_group=self._callback_group,
         )
+        self.create_timer(
+            0.1,
+            self._drain_auxiliary_events,
+            callback_group=self._callback_group,
+        )
         self._record(
             "session_started",
             {
@@ -306,7 +387,11 @@ class IntegrationDebugNode(Node):
             "success": False,
             "terminal": True,
             "reason_code": "",
+            "recovery_required": False,
             "started_monotonic": 0.0,
+            "last_update_monotonic": 0.0,
+            "server_unavailable_since_monotonic": 0.0,
+            "recovery_detected_monotonic": 0.0,
         }
 
     def _session_state(self) -> str:
@@ -317,6 +402,13 @@ class IntegrationDebugNode(Node):
         if self._armed:
             return "ARMED"
         return "MONITOR_ONLY"
+
+    def _disarm_locked(self) -> None:
+        """Clear every session-scoped write authorization while holding the lock."""
+
+        self._armed = False
+        self._voice_auto_execute = False
+        self._acknowledged_blocked_nodes.clear()
 
     def _record(self, event_type: str, payload: dict[str, Any]) -> None:
         row = {
@@ -390,6 +482,12 @@ class IntegrationDebugNode(Node):
                 },
             )
 
+    def _on_heartbeat(self, msg: String) -> None:
+        if str(msg.data).strip() != self._session_id:
+            return
+        with self._lock:
+            self._last_heartbeat_monotonic = time.monotonic()
+
     def _on_image_input(self, topic: str, msg: CompressedImage) -> None:
         now = time.monotonic()
         source_sec = float(msg.header.stamp.sec) + float(msg.header.stamp.nanosec) / 1e9
@@ -442,6 +540,14 @@ class IntegrationDebugNode(Node):
                 )
             elif operation == "ping_host":
                 accepted, command_id, message, result = self._ping_host(payload)
+            elif operation.startswith("asr_"):
+                accepted, command_id, message, result = self._handle_asr_command(
+                    operation, payload
+                )
+            elif operation.startswith("record_"):
+                accepted, command_id, message, result = (
+                    self._handle_surgery_record_command(operation, payload)
+                )
             else:
                 accepted, command_id, message = self._execute_command(
                     operation, payload
@@ -464,6 +570,13 @@ class IntegrationDebugNode(Node):
             with self._lock:
                 self._last_error = message
         if operation != "heartbeat":
+            safe_result = result
+            if operation == "record_submit":
+                # Never retain the transient X-API-Key or request body in the
+                # generic UI command audit trail.
+                safe_result = {
+                    "request_id": str(result.get("request_id", ""))
+                }
             self._record(
                 "ui_command",
                 {
@@ -471,10 +584,113 @@ class IntegrationDebugNode(Node):
                     "accepted": accepted,
                     "command_id": command_id,
                     "message": message,
-                    "result": result,
+                    "result": safe_result,
                 },
             )
         return response
+
+    def _ensure_asr_publisher(self) -> None:
+        with self._auxiliary_lock:
+            if self._asr_sentence_pub is not None:
+                return
+            self._asr_sentence_pub = self.create_publisher(
+                String,
+                self._asr_topic,
+                QoSProfile(
+                    history=QoSHistoryPolicy.KEEP_LAST,
+                    depth=10,
+                    reliability=QoSReliabilityPolicy.RELIABLE,
+                    durability=QoSDurabilityPolicy.VOLATILE,
+                ),
+            )
+
+    def _destroy_asr_publisher(self) -> None:
+        with self._auxiliary_lock:
+            publisher = self._asr_sentence_pub
+            self._asr_sentence_pub = None
+            if publisher is not None:
+                self.destroy_publisher(publisher)
+
+    def _handle_asr_command(
+        self, operation: str, payload: dict[str, Any]
+    ) -> tuple[bool, str, str, dict[str, Any]]:
+        if operation == "asr_refresh_devices":
+            devices = self._asr.refresh_devices()
+            return True, "", f"found {len(devices)} microphone input device(s)", {
+                "devices": devices
+            }
+        if operation == "asr_start":
+            with self._lock:
+                if not self._armed:
+                    return False, "", "arm manual control before starting the microphone", {}
+                if self._fault_locked:
+                    return False, "", "manual control is fault locked", {}
+            with self._auxiliary_lock:
+                # Consume a previous session's terminal event before creating
+                # the publisher for this new session.
+                self._drain_auxiliary_events()
+                state = str(self._asr.snapshot().get("state", ""))
+                if state not in {"STOPPED", "ERROR"}:
+                    raise ValueError("ASR microphone session is already active")
+                publisher_created = self._asr_sentence_pub is None
+                self._ensure_asr_publisher()
+                try:
+                    self._asr.start(
+                        device_id=payload.get("device_id"),
+                        server_url=payload.get("server_url"),
+                    )
+                except Exception:
+                    if publisher_created:
+                        self._destroy_asr_publisher()
+                    raise
+            return True, "", "USB microphone ASR session started", self._asr.snapshot()
+        if operation == "asr_stop":
+            with self._auxiliary_lock:
+                self._asr.stop_async()
+                snapshot = self._asr.snapshot()
+            return True, "", "USB microphone ASR stop requested", snapshot
+        return False, "", "unknown ASR debug operation", {}
+
+    def _handle_surgery_record_command(
+        self, operation: str, payload: dict[str, Any]
+    ) -> tuple[bool, str, str, dict[str, Any]]:
+        if operation == "record_refresh_cases":
+            examples = self._surgery_record.refresh_cases()
+            return True, "", f"found {len(examples)} surgery-record example(s)", {
+                "examples": examples
+            }
+        if operation == "record_submit":
+            request_id = self._surgery_record.submit_async(payload)
+            return (
+                True,
+                request_id,
+                "surgery-record API request submitted",
+                {"request_id": request_id},
+            )
+        if operation == "record_clear_history":
+            self._surgery_record.clear_history()
+            return True, "", "surgery-record test history cleared", {}
+        return False, "", "unknown surgery-record debug operation", {}
+
+    def _drain_auxiliary_events(self) -> None:
+        with self._auxiliary_lock:
+            for event in self._asr.drain_events():
+                event_type = str(event.get("type", "asr_event"))
+                if event_type == "asr_final":
+                    text = str(event.get("text", "")).strip()
+                    publisher = self._asr_sentence_pub
+                    if text and publisher is not None:
+                        message = String()
+                        message.data = text
+                        publisher.publish(message)
+                elif event_type == "asr_stopped":
+                    self._destroy_asr_publisher()
+                # Partial hypotheses are high-volume transient UI state. They stay
+                # in the bounded ASR snapshot and are not duplicated in JSONL.
+                if event_type != "asr_partial":
+                    self._record(event_type, event)
+            for event in self._surgery_record.drain_events():
+                self._record(str(event.get("type", "record_event")), event)
 
     def _execute_command(
         self, operation: str, payload: dict[str, Any]
@@ -486,19 +702,41 @@ class IntegrationDebugNode(Node):
             return True, "", "heartbeat accepted"
         if operation == "arm":
             blocked = self._blocked_nodes()
+            acknowledged: list[str] = []
             with self._lock:
                 if self._fault_locked:
                     return False, "", "reset the fault lock before arming"
-                if blocked:
+            if blocked:
+                if not self._planner_coexistence_allowed:
                     return False, "", "full Taskplanner nodes are active: " + ", ".join(blocked)
+                acknowledged = validate_planner_coexistence_acknowledgement(
+                    payload, blocked
+                )
+                if self._blocked_nodes() != blocked:
+                    return (
+                        False,
+                        "",
+                        "planner node set changed; refresh the status and acknowledge it again",
+                    )
+            with self._lock:
+                if self._fault_locked:
+                    return False, "", "reset the fault lock before arming"
                 self._armed = True
+                self._acknowledged_blocked_nodes = set(acknowledged)
                 self._last_heartbeat_monotonic = now
                 self._last_error = ""
+            if acknowledged:
+                return (
+                    True,
+                    "",
+                    "manual control armed with planner coexistence acknowledgement",
+                )
             return True, "", "manual control armed"
         if operation == "disarm":
             with self._lock:
-                self._armed = False
-                self._voice_auto_execute = False
+                self._disarm_locked()
+            with self._auxiliary_lock:
+                self._asr.stop_async()
             if self._active_command_id:
                 self._request_cancel()
                 return True, self._active_command_id, "disarmed; active Action cancel requested"
@@ -511,6 +749,8 @@ class IntegrationDebugNode(Node):
                 self._last_error = ""
                 self._action_status = self._idle_action_status()
             return True, "", "fault lock reset"
+        if operation == "recover_action_client":
+            return self._recover_action_client(payload)
         if operation == "cancel_active":
             return self._request_cancel()
         if operation == "configure_voice":
@@ -538,6 +778,45 @@ class IntegrationDebugNode(Node):
             return True, "", "all debug output publishers stopped"
         return self._dispatch_action(operation, payload, source="ui")
 
+    def _recover_action_client(
+        self, payload: dict[str, Any]
+    ) -> tuple[bool, str, str]:
+        with self._lock:
+            command_id = self._active_command_id
+            if not command_id:
+                return False, "", "there is no active Action client state to recover"
+            if not bool(self._action_status.get("recovery_required")):
+                return False, command_id, "the active Action does not require recovery"
+            validate_action_recovery_acknowledgement(payload, command_id)
+            route = self._active_route
+            previous_state = str(self._action_status.get("state", ""))
+            previous_reason = str(self._action_status.get("reason_code", ""))
+            started = float(self._action_status.get("started_monotonic", 0.0))
+            elapsed_sec = max(0.0, time.monotonic() - started) if started else 0.0
+            self._disarm_locked()
+            self._active_route = ""
+            self._active_command_id = ""
+            self._active_goal_handle = None
+            self._fault_locked = False
+            self._last_error = ""
+            self._action_status = self._idle_action_status()
+        self._record(
+            "action_client_recovered",
+            {
+                "route": route,
+                "command_id": command_id,
+                "previous_state": previous_state,
+                "previous_reason_code": previous_reason,
+                "elapsed_sec": round(elapsed_sec, 3),
+                "remote_motion_stopped_confirmed": True,
+            },
+        )
+        return (
+            True,
+            command_id,
+            "Action client state recovered; manual control remains disarmed",
+        )
+
     def _apply_network_settings(
         self, payload: dict[str, Any]
     ) -> tuple[bool, str, str, dict[str, Any]]:
@@ -558,6 +837,14 @@ class IntegrationDebugNode(Node):
                 return False, "", "disarm manual control before changing DDS settings", {}
             if any(state.enabled for state in self._output_states.values()):
                 return False, "", "stop debug output publishers before changing DDS settings", {}
+        if self._asr.snapshot().get("state") not in {
+            "STOPPED",
+            "ERROR",
+            "UNAVAILABLE",
+        }:
+            return False, "", "stop the USB ASR session before changing DDS settings", {}
+        if self._surgery_record.snapshot().get("state") == "SUBMITTING":
+            return False, "", "wait for the surgery-record request before changing DDS settings", {}
 
         current_domain = int(os.environ.get("ROS_DOMAIN_ID", "0") or 0)
         current_discovery = os.environ.get(
@@ -577,8 +864,7 @@ class IntegrationDebugNode(Node):
         write_network_settings(self._network_settings_path, settings)
         with self._lock:
             self._restart_scheduled = True
-            self._armed = False
-            self._voice_auto_execute = False
+            self._disarm_locked()
         threading.Thread(
             target=self._restart_runtime_after_response,
             name="debug-network-restart",
@@ -624,8 +910,21 @@ class IntegrationDebugNode(Node):
             if self._active_command_id:
                 return False, self._active_command_id, "another command is active"
         blocked = self._blocked_nodes()
-        if blocked:
-            return False, "", "full Taskplanner nodes are active: " + ", ".join(blocked)
+        with self._lock:
+            if not self._armed:
+                return False, "", "manual control is not armed"
+            if self._fault_locked:
+                return False, "", "manual control is fault locked"
+            if self._active_command_id:
+                return False, self._active_command_id, "another command is active"
+            acknowledged = sorted(self._acknowledged_blocked_nodes)
+            if blocked != acknowledged:
+                self._disarm_locked()
+                self._last_error = (
+                    "planner node set changed; manual control was disarmed: "
+                    + ", ".join(blocked or ["none"])
+                )
+                return False, "", self._last_error
         command_id = f"debug-{uuid4()}"
         if operation == "tool_handover":
             mapped = validate_tool_handover(payload)
@@ -685,7 +984,17 @@ class IntegrationDebugNode(Node):
             return True, command_id, "suction request submitted"
         return False, "", "unsupported integration debug operation"
 
+    def _route_server_ready(self, route: str) -> bool:
+        if route == "tool_handover":
+            return self._tool_client.server_is_ready()
+        if route == "retraction":
+            return self._retraction_client.server_is_ready()
+        if route == "suction":
+            return self._suction_client.service_is_ready()
+        return False
+
     def _start_action(self, route: str, command_id: str, source: str) -> None:
+        now = time.monotonic()
         with self._lock:
             self._active_route = route
             self._active_command_id = command_id
@@ -698,8 +1007,12 @@ class IntegrationDebugNode(Node):
                 "success": False,
                 "terminal": False,
                 "reason_code": "",
+                "recovery_required": False,
                 "source": source,
-                "started_monotonic": time.monotonic(),
+                "started_monotonic": now,
+                "last_update_monotonic": now,
+                "server_unavailable_since_monotonic": 0.0,
+                "recovery_detected_monotonic": 0.0,
             }
         self._record(
             "command_started",
@@ -719,7 +1032,9 @@ class IntegrationDebugNode(Node):
             if self._active_command_id != command_id:
                 return
             self._active_goal_handle = goal_handle
-            self._action_status["state"] = "accepted"
+            self._action_status["last_update_monotonic"] = time.monotonic()
+            if not self._action_status.get("recovery_required"):
+                self._action_status["state"] = "accepted"
         result_future = goal_handle.get_result_async()
         result_future.add_done_callback(
             lambda result: self._on_action_result(route, command_id, result)
@@ -732,10 +1047,12 @@ class IntegrationDebugNode(Node):
         with self._lock:
             if self._active_command_id != command_id:
                 return
-            self._action_status["state"] = str(feedback.state or "executing")
+            if not self._action_status.get("recovery_required"):
+                self._action_status["state"] = str(feedback.state or "executing")
             self._action_status["progress"] = min(
                 1.0, max(0.0, float(feedback.progress))
             )
+            self._action_status["last_update_monotonic"] = time.monotonic()
 
     def _on_action_result(self, route: str, command_id: str, future: Any) -> None:
         try:
@@ -770,9 +1087,11 @@ class IntegrationDebugNode(Node):
         final_state: str,
         reason_code: str,
     ) -> None:
+        reconciled = False
         with self._lock:
             if self._active_command_id != command_id:
                 return
+            reconciled = bool(self._action_status.get("recovery_required"))
             started = float(self._action_status.get("started_monotonic", 0.0))
             self._action_status.update(
                 {
@@ -781,16 +1100,33 @@ class IntegrationDebugNode(Node):
                     "success": success,
                     "terminal": True,
                     "reason_code": reason_code,
+                    "recovery_required": False,
                     "elapsed_sec": max(0.0, time.monotonic() - started),
+                    "last_update_monotonic": time.monotonic(),
+                    "server_unavailable_since_monotonic": 0.0,
+                    "recovery_detected_monotonic": 0.0,
                 }
             )
             self._active_route = ""
             self._active_command_id = ""
             self._active_goal_handle = None
+            if reconciled:
+                self._fault_locked = False
+                self._last_error = ""
             if reason_code in {"cancel_recovery_failed", "cancel_rejected"}:
                 self._fault_locked = True
-                self._armed = False
-                self._voice_auto_execute = False
+                self._disarm_locked()
+        if reconciled:
+            self._record(
+                "action_late_result_reconciled",
+                {
+                    "route": route,
+                    "command_id": command_id,
+                    "success": success,
+                    "final_state": final_state,
+                    "reason_code": reason_code,
+                },
+            )
         self._record(
             "command_finished",
             {
@@ -814,6 +1150,7 @@ class IntegrationDebugNode(Node):
             if goal_handle is None:
                 return False, command_id, "Action Goal has not been accepted yet"
             self._action_status["state"] = "cancel_requested"
+            self._action_status["last_update_monotonic"] = time.monotonic()
         future = goal_handle.cancel_goal_async()
         future.add_done_callback(
             lambda result: self._on_cancel_response(route, command_id, result)
@@ -825,20 +1162,62 @@ class IntegrationDebugNode(Node):
         try:
             response = future.result()
             accepted = bool(response.goals_canceling)
+            reason_code = "cancel_rejected"
         except Exception:
             accepted = False
+            reason_code = "cancel_response_error"
         if accepted:
+            with self._lock:
+                if self._active_command_id == command_id:
+                    self._action_status["state"] = "cancel_accepted"
+                    self._action_status["last_update_monotonic"] = time.monotonic()
+            self._record(
+                "cancel_accepted", {"route": route, "command_id": command_id}
+            )
             return
-        with self._lock:
-            if self._active_command_id == command_id:
-                self._fault_locked = True
-                self._armed = False
-                self._voice_auto_execute = False
-                self._action_status["state"] = "cancel_rejected"
-                self._action_status["reason_code"] = "cancel_rejected"
-        self._record(
-            "cancel_rejected", {"route": route, "command_id": command_id}
+        self._mark_action_recovery_required(
+            reason_code,
+            state="cancel_rejected" if reason_code == "cancel_rejected" else "remote_state_unknown",
         )
+        self._record(
+            reason_code, {"route": route, "command_id": command_id}
+        )
+
+    def _mark_action_recovery_required(
+        self, reason_code: str, *, state: str = "remote_state_unknown"
+    ) -> bool:
+        now = time.monotonic()
+        with self._lock:
+            command_id = self._active_command_id
+            route = self._active_route
+            if not command_id or self._action_status.get("terminal"):
+                return False
+            if self._action_status.get("recovery_required"):
+                return False
+            started = float(self._action_status.get("started_monotonic", 0.0))
+            self._fault_locked = True
+            self._disarm_locked()
+            self._action_status.update(
+                {
+                    "state": state,
+                    "reason_code": reason_code,
+                    "recovery_required": True,
+                    "recovery_detected_monotonic": now,
+                }
+            )
+            self._last_error = (
+                f"remote command state is uncertain ({reason_code}); "
+                "confirm the remote robot state before recovering the client"
+            )
+            event = {
+                "route": route,
+                "command_id": command_id,
+                "state": state,
+                "reason_code": reason_code,
+                "elapsed_sec": round(max(0.0, now - started), 3) if started else 0.0,
+            }
+        self._record("action_recovery_required", event)
+        return True
 
     def _configure_output(
         self, payload: dict[str, Any]
@@ -1129,7 +1508,30 @@ class IntegrationDebugNode(Node):
                 action["elapsed_sec"] = round(
                     now - float(action["started_monotonic"]), 3
                 )
+            last_update = float(action.get("last_update_monotonic", 0.0))
+            action["last_update_age_sec"] = (
+                round(max(0.0, now - last_update), 3) if last_update else None
+            )
+            recovery_detected = float(
+                action.get("recovery_detected_monotonic", 0.0)
+            )
+            action["recovery_age_sec"] = (
+                round(max(0.0, now - recovery_detected), 3)
+                if recovery_detected
+                else None
+            )
+            action["cancel_available"] = bool(
+                self._active_command_id
+                and self._active_route != "suction"
+                and self._active_goal_handle is not None
+            )
+            action["server_ready"] = self._route_server_ready(
+                str(action.get("route", ""))
+            )
             action.pop("started_monotonic", None)
+            action.pop("last_update_monotonic", None)
+            action.pop("server_unavailable_since_monotonic", None)
+            action.pop("recovery_detected_monotonic", None)
             recent_events = list(self._recent_events)
             voice = {
                 "auto_execute": self._voice_auto_execute,
@@ -1137,6 +1539,7 @@ class IntegrationDebugNode(Node):
                 "last_parse": dict(self._last_voice_parse),
             }
             armed = self._armed
+            acknowledged_blocked_nodes = sorted(self._acknowledged_blocked_nodes)
             last_error = self._last_error
         blocked = self._blocked_nodes()
         try:
@@ -1192,6 +1595,10 @@ class IntegrationDebugNode(Node):
                 "session_id": self._session_id,
                 "state": self._session_state(),
                 "armed": armed,
+                "acknowledged_blocked_nodes": acknowledged_blocked_nodes,
+                "planner_coexistence_active": bool(
+                    armed and acknowledged_blocked_nodes
+                ),
                 "fault_locked": self._fault_locked,
                 "last_error": last_error,
                 "event_log_path": str(self._event_log_path),
@@ -1203,6 +1610,8 @@ class IntegrationDebugNode(Node):
                     "ROS_AUTOMATIC_DISCOVERY_RANGE", ""
                 ),
                 "blocked_nodes": blocked,
+                "planner_coexistence_allowed": self._planner_coexistence_allowed,
+                "action_watchdog": dict(self._action_watchdog_policy),
                 "network": network,
             },
             "inputs": self._input_status_rows(now),
@@ -1210,15 +1619,34 @@ class IntegrationDebugNode(Node):
             "action": action,
             "outputs": self._output_status_rows(now),
             "voice": voice,
+            "asr": self._asr.snapshot(),
+            "surgery_record": self._surgery_record.snapshot(),
             "recent_events": recent_events,
         }
 
     def _readiness_snapshot(self) -> dict[str, Any]:
+        sentence_external_publisher = False
+        try:
+            publisher_infos = self.get_publishers_info_by_topic(self._asr_topic)
+        except Exception:
+            publisher_infos = []
+        for info in publisher_infos:
+            if not (
+                str(info.node_name) == self.get_name()
+                and str(info.node_namespace) == self.get_namespace()
+            ):
+                sentence_external_publisher = True
+                break
+        asr = self._asr.snapshot()
+        managed_asr_ready = bool(
+            self._asr_sentence_pub is not None
+            and asr.get("state") == "LISTENING"
+            and asr.get("connected")
+        )
         checks = {
-            "sentence_publisher": self.count_publishers(
-                "/sensors/surgeon/sentence"
-            )
-            > 0,
+            "sentence_publisher": (
+                sentence_external_publisher or managed_asr_ready
+            ),
             "tool_handover_server": self._tool_client.server_is_ready(),
             "retraction_server": self._retraction_client.server_is_ready(),
             "suction_service": self._suction_client.service_is_ready(),
@@ -1258,27 +1686,106 @@ class IntegrationDebugNode(Node):
         )
         self._readiness_pub.publish(message)
 
-    def _check_heartbeat(self) -> None:
+    def _check_runtime_safety(self) -> None:
         now = time.monotonic()
+        with self._lock:
+            if not self._armed:
+                return
+        blocked = self._blocked_nodes()
         with self._lock:
             expired = (
                 self._armed
                 and self._last_heartbeat_monotonic > 0.0
                 and now - self._last_heartbeat_monotonic > self._heartbeat_timeout_sec
             )
-            if not expired:
+            acknowledged = sorted(self._acknowledged_blocked_nodes)
+            planner_set_changed = self._armed and blocked != acknowledged
+            if not expired and not planner_set_changed:
                 return
-            self._armed = False
-            self._voice_auto_execute = False
             command_id = self._active_command_id
-        self._record(
-            "heartbeat_timeout", {"active_command_id": command_id}
-        )
+            self._disarm_locked()
+            if planner_set_changed:
+                self._last_error = (
+                    "planner node set changed; manual control was disarmed: "
+                    + ", ".join(blocked or ["none"])
+                )
+        if planner_set_changed:
+            self._record(
+                "planner_coexistence_changed",
+                {
+                    "active_command_id": command_id,
+                    "acknowledged_blocked_nodes": acknowledged,
+                    "current_blocked_nodes": blocked,
+                },
+            )
+        else:
+            self._record(
+                "heartbeat_timeout", {"active_command_id": command_id}
+            )
+        with self._auxiliary_lock:
+            self._asr.stop_async()
         if command_id:
             self._request_cancel()
 
+    def _check_action_watchdog(self) -> None:
+        with self._lock:
+            command_id = self._active_command_id
+            route = self._active_route
+            if (
+                not command_id
+                or self._action_status.get("terminal")
+                or self._action_status.get("recovery_required")
+            ):
+                return
+        server_ready = self._route_server_ready(route)
+        now = time.monotonic()
+        with self._lock:
+            if (
+                self._active_command_id != command_id
+                or self._action_status.get("terminal")
+                or self._action_status.get("recovery_required")
+            ):
+                return
+            unavailable_since = float(
+                self._action_status.get(
+                    "server_unavailable_since_monotonic", 0.0
+                )
+            )
+            if server_ready:
+                unavailable_since = 0.0
+                self._action_status["server_unavailable_since_monotonic"] = 0.0
+            elif unavailable_since <= 0.0:
+                unavailable_since = now
+                self._action_status[
+                    "server_unavailable_since_monotonic"
+                ] = unavailable_since
+            started = float(self._action_status.get("started_monotonic", now))
+            last_update = float(
+                self._action_status.get("last_update_monotonic", started)
+            )
+            reason_code = action_watchdog_reason(
+                terminal=bool(self._action_status.get("terminal")),
+                recovery_required=bool(
+                    self._action_status.get("recovery_required")
+                ),
+                state=str(self._action_status.get("state", "")),
+                route=route,
+                elapsed_sec=max(0.0, now - started),
+                last_update_age_sec=max(0.0, now - last_update),
+                server_ready=server_ready,
+                server_unavailable_age_sec=(
+                    max(0.0, now - unavailable_since)
+                    if unavailable_since > 0.0
+                    else 0.0
+                ),
+                policy=self._action_watchdog_policy,
+            )
+        if reason_code:
+            self._mark_action_recovery_required(reason_code)
+
     def _publish_status(self) -> None:
-        self._check_heartbeat()
+        self._check_runtime_safety()
+        self._check_action_watchdog()
         message = String()
         message.data = json.dumps(
             self._status_snapshot(),
@@ -1291,10 +1798,13 @@ class IntegrationDebugNode(Node):
 
     def close(self) -> None:
         with self._lock:
-            self._armed = False
-            self._voice_auto_execute = False
+            self._disarm_locked()
             for state in self._output_states.values():
                 state.enabled = False
+        with self._auxiliary_lock:
+            self._asr.close()
+        self._drain_auxiliary_events()
+        self._destroy_asr_publisher()
         self._record("session_stopped", {})
 
 
@@ -1308,8 +1818,8 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
-        node.close()
         executor.shutdown()
+        node.close()
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()

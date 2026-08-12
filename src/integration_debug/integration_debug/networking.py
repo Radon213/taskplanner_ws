@@ -8,11 +8,13 @@ import ipaddress
 import json
 import os
 from pathlib import Path
+import re
 import socket
 import struct
 import time
 from typing import Any
 from uuid import uuid4
+from xml.sax.saxutils import escape
 
 
 NETWORK_SETTINGS_SCHEMA = "taskplanner.integration_debug.network_settings.v1"
@@ -26,6 +28,7 @@ _SIOCGIFNETMASK = 0x891B
 _IFF_UP = 0x1
 _IFF_LOOPBACK = 0x8
 _IFF_MULTICAST = 0x1000
+_INTERFACE_NAME = re.compile(r"^[A-Za-z0-9_.:-]{1,15}$")
 
 
 def validate_network_settings(payload: dict[str, Any]) -> dict[str, Any]:
@@ -58,6 +61,49 @@ def write_network_settings(path: str | Path, settings: dict[str, Any]) -> None:
     encoded = json.dumps(settings, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
     temporary = target.with_name(f".{target.name}.{uuid4().hex}.tmp")
     temporary.write_text(encoded, encoding="utf-8")
+    temporary.chmod(0o600)
+    os.replace(temporary, target)
+
+
+def write_fastdds_udp_profile(
+    path: str | Path,
+    interface: str,
+    *,
+    sys_class_net: str | Path = "/sys/class/net",
+) -> None:
+    """Write a Fast DDS UDP profile constrained to one verified host NIC."""
+
+    selected = str(interface).strip()
+    if not _INTERFACE_NAME.fullmatch(selected):
+        raise ValueError("debug network interface name is invalid")
+    if not (Path(sys_class_net) / selected).is_dir():
+        raise ValueError(f"debug network interface does not exist: {selected}")
+    rendered = f"""<?xml version="1.0" encoding="UTF-8" ?>
+<profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+  <transport_descriptors>
+    <transport_descriptor>
+      <transport_id>DebugUdpTransport</transport_id>
+      <type>UDPv4</type>
+      <interfaceWhiteList>
+        <interface>{escape(selected)}</interface>
+        <interface>lo</interface>
+      </interfaceWhiteList>
+    </transport_descriptor>
+  </transport_descriptors>
+  <participant profile_name="debug_udp_transport_profile" is_default_profile="true">
+    <rtps>
+      <userTransports>
+        <transport_id>DebugUdpTransport</transport_id>
+      </userTransports>
+      <useBuiltinTransports>false</useBuiltinTransports>
+    </rtps>
+  </participant>
+</profiles>
+    """
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f".{target.name}.{uuid4().hex}.tmp")
+    temporary.write_text(rendered, encoding="utf-8")
     temporary.chmod(0o600)
     os.replace(temporary, target)
 
