@@ -12,8 +12,10 @@ from collections import deque
 import contextlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import fcntl
 import json
 import math
+import os
 from pathlib import Path
 import subprocess
 import threading
@@ -50,6 +52,18 @@ DEFAULT_KEYWORDS: tuple[tuple[str, int], ...] = (
 
 PIPEWIRE_DEFAULT_SOURCE = "@DEFAULT_AUDIO_SOURCE@"
 PIPEWIRE_CAPTURE_NAMES = frozenset({"default", "pipewire"})
+DEVICE_STATUS_READY = "READY"
+DEVICE_STATUS_NO_INPUT = "NO_INPUT"
+DEVICE_STATUS_HOST_AUDIO_UNAVAILABLE = "HOST_AUDIO_UNAVAILABLE"
+DEVICE_STATUS_BRIDGE_ERROR = "BRIDGE_ERROR"
+
+
+class AudioInputUnavailable(RuntimeError):
+    """A classified host-audio state discovered without opening a device."""
+
+    def __init__(self, status: str, message: str) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 def _utc_now() -> str:
@@ -112,11 +126,39 @@ def _query_pipewire_default_source() -> dict[str, Any]:
             text=True,
             timeout=2.0,
         )
+    except subprocess.CalledProcessError as exc:
+        # ``wpctl inspect @DEFAULT_AUDIO_SOURCE@`` exits non-zero both when the
+        # PipeWire server cannot be reached and when the live graph simply has
+        # no default Source. Probe the graph itself to keep the normal
+        # unplugged/no-input state out of the error channel.
+        try:
+            subprocess.run(
+                ["wpctl", "status"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+            )
+        except (OSError, subprocess.SubprocessError) as status_exc:
+            raise AudioInputUnavailable(
+                DEVICE_STATUS_HOST_AUDIO_UNAVAILABLE,
+                "Ubuntu PipeWire is not reachable from Debug Mode",
+            ) from status_exc
+        raise AudioInputUnavailable(
+            DEVICE_STATUS_NO_INPUT,
+            "Ubuntu currently exposes no PipeWire microphone input",
+        ) from exc
     except (OSError, subprocess.SubprocessError) as exc:
-        raise RuntimeError("Ubuntu PipeWire default input is unavailable") from exc
+        raise AudioInputUnavailable(
+            DEVICE_STATUS_HOST_AUDIO_UNAVAILABLE,
+            "Ubuntu PipeWire is not reachable from Debug Mode",
+        ) from exc
     properties = _parse_wpctl_properties(completed.stdout)
     if properties.get("media.class") != "Audio/Source":
-        raise RuntimeError("Ubuntu PipeWire default input is not an audio source")
+        raise AudioInputUnavailable(
+            DEVICE_STATUS_NO_INPUT,
+            "Ubuntu currently exposes no PipeWire microphone input",
+        )
     nickname = (
         properties.get("node.nick")
         or properties.get("api.alsa.card.name")
@@ -605,11 +647,24 @@ class AsrWsClient:
 class AsrMicrophoneRuntime:
     """Own one microphone/ASR test session and expose a JSON-safe snapshot."""
 
-    def __init__(self, *, default_url: str, topic: str, output_dir: str | Path) -> None:
+    def __init__(
+        self,
+        *,
+        default_url: str,
+        topic: str,
+        output_dir: str | Path,
+        save_artifacts: bool = True,
+        capture_lock_path: str | Path | None = None,
+    ) -> None:
         self._np, self._sd, self._websockets, dependency_error = _optional_audio_modules()
         self._default_url = validate_websocket_url(default_url)
         self._topic = str(topic)
         self._output_dir = Path(output_dir)
+        self._save_artifacts_enabled = bool(save_artifacts)
+        self._capture_lock_path = (
+            Path(capture_lock_path) if capture_lock_path is not None else None
+        )
+        self._capture_lock_fd: int | None = None
         self._lock = threading.RLock()
         self._lifecycle_lock = threading.Lock()
         self._events: deque[dict[str, Any]] = deque(maxlen=256)
@@ -617,6 +672,12 @@ class AsrMicrophoneRuntime:
         self._state = "STOPPED" if not dependency_error else "UNAVAILABLE"
         self._dependency_error = dependency_error
         self._last_error = dependency_error
+        self._device_status = (
+            DEVICE_STATUS_BRIDGE_ERROR if dependency_error else DEVICE_STATUS_NO_INPUT
+        )
+        self._device_message = dependency_error or (
+            "Ubuntu microphone input has not been discovered yet"
+        )
         self._server_url = self._default_url
         self._device_id: int | None = None
         self._device_name = ""
@@ -688,11 +749,28 @@ class AsrMicrophoneRuntime:
                     self._state = "STOPPED"
                 self._dependency_error = ""
                 self._last_error = ""
+                self._device_status = DEVICE_STATUS_READY
+                self._device_message = (
+                    f"Ubuntu current input: {logical_source['name']}"
+                )
             return rows
+        except AudioInputUnavailable as exc:
+            with self._lock:
+                self._devices = []
+                self._device_status = exc.status
+                self._device_message = str(exc)
+                # A reachable host graph with no Source is an expected
+                # hotplug/selection state, not a runtime failure.
+                self._last_error = (
+                    "" if exc.status == DEVICE_STATUS_NO_INPUT else str(exc)
+                )
+            return []
         except Exception as exc:
             with self._lock:
                 self._devices = []
-                self._last_error = f"Microphone discovery failed: {exc}"
+                self._device_status = DEVICE_STATUS_BRIDGE_ERROR
+                self._device_message = f"Microphone discovery failed: {exc}"
+                self._last_error = self._device_message
             return []
 
     def start(self, *, device_id: Any = None, server_url: Any = None) -> None:
@@ -774,6 +852,7 @@ class AsrMicrophoneRuntime:
         client: AsrWsClient | None = None
         stream: Any | None = None
         try:
+            self._acquire_capture_lock()
             input_format, _device_info = _select_input_format(
                 self._sd,
                 requested_device,
@@ -824,6 +903,7 @@ class AsrMicrophoneRuntime:
                 self._resampler = None
                 self._state = "ERROR"
                 self._last_error = f"Microphone start failed: {exc}"
+            self._release_capture_lock()
             raise RuntimeError(self._last_error) from exc
         with self._lock:
             self._stream = stream
@@ -878,7 +958,9 @@ class AsrMicrophoneRuntime:
                 self._on_error("ASR microphone stop did not finish before shutdown")
                 with self._lock:
                     self._state = "ERROR"
+                self._release_capture_lock()
                 return False
+        self._release_capture_lock()
         return True
 
     def drain_events(self) -> list[dict[str, Any]]:
@@ -905,6 +987,8 @@ class AsrMicrophoneRuntime:
                 "device_id": self._device_id,
                 "device_name": self._device_name,
                 "devices": list(self._devices),
+                "device_status": self._device_status,
+                "device_message": self._device_message,
                 "connected": self._connected,
                 "audio_level_dbfs": round(self._audio_level_dbfs, 1),
                 "peak_level_dbfs": round(self._peak_level_dbfs, 1),
@@ -916,6 +1000,7 @@ class AsrMicrophoneRuntime:
                 "last_error": self._last_error,
                 "recording_path": self._recording_path,
                 "transcript_path": self._transcript_path,
+                "artifacts_enabled": self._save_artifacts_enabled,
                 "sample_rate": SAMPLE_RATE,
                 "channels": CHANNELS,
                 "sample_width_bits": SAMPLE_WIDTH * 8,
@@ -955,7 +1040,7 @@ class AsrMicrophoneRuntime:
             self._blocks_captured += 1
             self._audio_level_dbfs = max(-99.0, dbfs)
             self._peak_level_dbfs = max(self._audio_level_dbfs, self._peak_level_dbfs - 0.5)
-            if pcm:
+            if pcm and self._save_artifacts_enabled:
                 self._recorded_pcm.append(pcm)
             if status:
                 self._input_dropped += 1
@@ -1015,6 +1100,15 @@ class AsrMicrophoneRuntime:
             )
 
     def _finish_stop(self) -> None:
+        try:
+            self._finish_stop_impl()
+        finally:
+            # The microphone stream is already closed before this worker is
+            # launched. Never retain cross-container ownership because the
+            # WebSocket worker or artifact writer failed during teardown.
+            self._release_capture_lock()
+
+    def _finish_stop_impl(self) -> None:
         with self._lock:
             client = self._client
         transport_stopped = True
@@ -1064,6 +1158,8 @@ class AsrMicrophoneRuntime:
             pcm = b"".join(self._recorded_pcm)
             finals = list(self._finals)
             self._recorded_pcm = []
+        if not self._save_artifacts_enabled:
+            return "", ""
         if not pcm and not finals:
             return "", ""
         self._output_dir.mkdir(parents=True, exist_ok=True)
@@ -1089,3 +1185,39 @@ class AsrMicrophoneRuntime:
             str(wav_path) if str(wav_path) != "." else "",
             str(txt_path) if str(txt_path) != "." else "",
         )
+
+    def _acquire_capture_lock(self) -> None:
+        path = self._capture_lock_path
+        if path is None:
+            return
+        with self._lock:
+            if self._capture_lock_fd is not None:
+                raise RuntimeError("microphone capture lock is already held")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(path, flags, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            os.close(fd)
+            raise RuntimeError(
+                "microphone capture is already owned by another Taskplanner ASR runtime"
+            ) from exc
+        except Exception:
+            os.close(fd)
+            raise
+        with self._lock:
+            self._capture_lock_fd = fd
+
+    def _release_capture_lock(self) -> None:
+        with self._lock:
+            fd = self._capture_lock_fd
+            self._capture_lock_fd = None
+        if fd is None:
+            return
+        with contextlib.suppress(OSError):
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        with contextlib.suppress(OSError):
+            os.close(fd)

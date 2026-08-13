@@ -62,17 +62,22 @@ TRACE_LAYERS = {
     "bed_robot_arm_group_request",
     "bed_robot_arm_group_command",
     "bed_robot_arm_group_status",
+    "bed_robot_arm_status",
     "shadow_bed_robot_arm_group_sink",
     "evaluation_observation",
     "evaluation_ground_truth",
 }
 TRACE_LAYER_TOPIC_CONTRACTS = {
+    "bed_robot_arm_status": {"/external/bed_robot_arms/status"},
     "evaluation_ground_truth": {"/shadow/ground_truth/state"},
     "fault_injection_status": {"/test/fault/status"},
     "vlm_tool_observation": {"/vlm/tool_observations"},
     "bt_context_ingress": {"/bt/context_ingress"},
 }
 TRACE_LAYER_MESSAGE_TYPE_CONTRACTS = {
+    "bed_robot_arm_status": {
+        "surgical_interop_msgs/msg/BedRobotArmStateArray"
+    },
     "evaluation_ground_truth": {"std_msgs/msg/String"},
     "fault_injection_status": {"std_msgs/msg/String"},
     "vlm_tool_observation": {"surgical_msgs/msg/ToolObservation"},

@@ -21,8 +21,8 @@ def generate_launch_description() -> LaunchDescription:
         cmd=[
             "ros2",
             "run",
-            "rosbridge_server",
-            "rosbridge_websocket",
+            "integration_debug",
+            "secure_debug_rosbridge",
             "--ros-args",
             "-p",
             ["port:=", rosbridge_port],
@@ -53,14 +53,6 @@ def generate_launch_description() -> LaunchDescription:
                 ),
             ),
             rosbridge,
-            Node(
-                package="rosapi",
-                executable="rosapi_node",
-                name="debug_rosapi",
-                condition=IfCondition(enable_rosbridge),
-                parameters=[{"use_sim_time": False}],
-                output="screen",
-            ),
             Node(
                 package="integration_debug",
                 executable="integration_debug_node",

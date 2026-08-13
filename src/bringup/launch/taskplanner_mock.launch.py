@@ -8,7 +8,12 @@ from launch.actions import (
     SetLaunchConfiguration,
 )
 from launch.conditions import IfCondition
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution, PythonExpression
+from launch.substitutions import (
+    EnvironmentVariable,
+    LaunchConfiguration,
+    PathJoinSubstitution,
+    PythonExpression,
+)
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
@@ -34,9 +39,24 @@ def _bed_robot_contract_configuration(context):
     ]
 
 
+def _validate_perception_backend(context):
+    """Fail before launch if the ownership cut-over mode is misspelled."""
+
+    backend = LaunchConfiguration("perception_backend").perform(context)
+    normalized = str(backend).strip().casefold()
+    if normalized not in {"local", "external", "disabled"}:
+        raise RuntimeError(
+            "perception_backend must be local, external, or disabled; "
+            f"received {backend!r}"
+        )
+    return []
+
+
 def generate_launch_description() -> LaunchDescription:
     spec_dir = LaunchConfiguration("spec_dir")
     default_bundle = LaunchConfiguration("default_bundle")
+    publish_shared_state = LaunchConfiguration("publish_shared_state")
+    publish_shared_free_text = LaunchConfiguration("publish_shared_free_text")
     enable_rosbridge = LaunchConfiguration("enable_rosbridge")
     rosbridge_port = LaunchConfiguration("rosbridge_port")
     rosbridge_address = LaunchConfiguration("rosbridge_address")
@@ -79,6 +99,7 @@ def generate_launch_description() -> LaunchDescription:
     enable_synthetic_scene_camera = LaunchConfiguration("enable_synthetic_scene_camera")
     field_snapshot_url = LaunchConfiguration("field_snapshot_url")
     enable_rfdetr_perception = LaunchConfiguration("enable_rfdetr_perception")
+    perception_backend = LaunchConfiguration("perception_backend")
     rfdetr_service_url = LaunchConfiguration("rfdetr_service_url")
     flir_input_topic = LaunchConfiguration("flir_input_topic")
     cam4_input_topic = LaunchConfiguration("cam4_input_topic")
@@ -91,6 +112,18 @@ def generate_launch_description() -> LaunchDescription:
     )
     preflight_require_perception = LaunchConfiguration(
         "preflight_require_perception"
+    )
+    cv_contract_status_topic = LaunchConfiguration("cv_contract_status_topic")
+    cv_cam4_rgb_topic = LaunchConfiguration("cv_cam4_rgb_topic")
+    cv_cam4_rgb_alias_topic = LaunchConfiguration("cv_cam4_rgb_alias_topic")
+    cv_cam4_camera_info_topic = LaunchConfiguration("cv_cam4_camera_info_topic")
+    cv_cam4_aligned_depth_topic = LaunchConfiguration("cv_cam4_aligned_depth_topic")
+    cv_handover_tray_rgb_topic = LaunchConfiguration("cv_handover_tray_rgb_topic")
+    cv_handover_tray_camera_info_topic = LaunchConfiguration(
+        "cv_handover_tray_camera_info_topic"
+    )
+    cv_handover_tray_aligned_depth_topic = LaunchConfiguration(
+        "cv_handover_tray_aligned_depth_topic"
     )
     spec_default = PathJoinSubstitution(
         [FindPackageShare("procedure_spec"), "specs", default_bundle]
@@ -178,6 +211,15 @@ def generate_launch_description() -> LaunchDescription:
             "'.lower() == 'true')",
         ]
     )
+    local_rfdetr_perception_enabled = PythonExpression(
+        [
+            "'",
+            perception_backend,
+            "' == 'local' and '",
+            enable_rfdetr_perception,
+            "'.lower() in ('true', '1', 'yes')",
+        ]
+    )
     mock_direct_contract_enabled = PythonExpression(
         [
             "'",
@@ -195,6 +237,8 @@ def generate_launch_description() -> LaunchDescription:
 
     rosbridge_process = ExecuteProcess(
         condition=IfCondition(enable_rosbridge),
+        respawn=True,
+        respawn_delay=5.0,
         cmd=[
             "bash",
             "-lc",
@@ -225,6 +269,25 @@ def generate_launch_description() -> LaunchDescription:
     return LaunchDescription(
         [
             DeclareLaunchArgument("default_bundle", default_value="thyroidectomy"),
+            DeclareLaunchArgument(
+                "publish_shared_state",
+                default_value=EnvironmentVariable(
+                    "PUBLISH_SHARED_STATE",
+                    default_value="true",
+                ),
+                description="Publish the curated read-only /surgery/* state gateway.",
+            ),
+            DeclareLaunchArgument(
+                "publish_shared_free_text",
+                default_value=EnvironmentVariable(
+                    "PUBLISH_SHARED_FREE_TEXT",
+                    default_value="false",
+                ),
+                description=(
+                    "Publish public ASR transcript and VLM summary text. "
+                    "Keep false unless the deployment has reviewed PHI handling."
+                ),
+            ),
             DeclareLaunchArgument("spec_dir", default_value=spec_default),
             DeclareLaunchArgument("enable_rosbridge", default_value="true"),
             DeclareLaunchArgument("rosbridge_port", default_value="9090"),
@@ -274,6 +337,17 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("field_snapshot_url", default_value=""),
             DeclareLaunchArgument("enable_rfdetr_perception", default_value="false"),
             DeclareLaunchArgument(
+                "perception_backend",
+                default_value=EnvironmentVariable(
+                    "PERCEPTION_BACKEND",
+                    default_value="local",
+                ),
+                description=(
+                    "local owns built-in RF-DETR outputs; external disables it "
+                    "and reserves the CV-team contract; disabled owns neither."
+                ),
+            ),
+            DeclareLaunchArgument(
                 "rfdetr_service_url",
                 default_value="http://127.0.0.1:8010",
             ),
@@ -305,6 +379,55 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument(
                 "preflight_require_perception",
                 default_value="false",
+            ),
+            DeclareLaunchArgument(
+                "cv_contract_status_topic",
+                default_value="/integration/cv_contract/status",
+            ),
+            DeclareLaunchArgument(
+                "cv_cam4_rgb_topic",
+                default_value="/camera/cam_4/color/image_raw/compressed",
+            ),
+            DeclareLaunchArgument(
+                "cv_cam4_rgb_alias_topic",
+                default_value="/surgery/images/cam4/compressed",
+            ),
+            DeclareLaunchArgument(
+                "cv_cam4_camera_info_topic",
+                default_value="/surgery/cameras/cam4/color/camera_info",
+            ),
+            DeclareLaunchArgument(
+                "cv_cam4_aligned_depth_topic",
+                default_value="/surgery/cameras/cam4/aligned_depth",
+            ),
+            DeclareLaunchArgument(
+                "cv_handover_tray_rgb_topic",
+                default_value="/surgery/images/tray/compressed",
+            ),
+            DeclareLaunchArgument(
+                "cv_handover_tray_camera_info_topic",
+                default_value="/surgery/cameras/tray/color/camera_info",
+            ),
+            DeclareLaunchArgument(
+                "cv_handover_tray_aligned_depth_topic",
+                default_value="/surgery/cameras/tray/aligned_depth",
+            ),
+            OpaqueFunction(function=_validate_perception_backend),
+            Node(
+                package="surgical_interop_gateway",
+                executable="surgical_interop_gateway",
+                name="surgical_interop_gateway",
+                condition=IfCondition(publish_shared_state),
+                parameters=[
+                    {
+                        "default_bundle": default_bundle,
+                        "publish_free_text": ParameterValue(
+                            publish_shared_free_text,
+                            value_type=bool,
+                        ),
+                    }
+                ],
+                output="screen",
             ),
             Node(
                 package="btops_gateway",
@@ -367,10 +490,33 @@ def generate_launch_description() -> LaunchDescription:
                 output="screen",
             ),
             Node(
+                package="simulation_runtime",
+                executable="cv_contract_monitor",
+                name="cv_contract_monitor",
+                parameters=[
+                    {
+                        "perception_backend": perception_backend,
+                        "status_topic": cv_contract_status_topic,
+                        "cam4_rgb_topic": cv_cam4_rgb_topic,
+                        "cam4_rgb_alias_topic": cv_cam4_rgb_alias_topic,
+                        "cam4_camera_info_topic": cv_cam4_camera_info_topic,
+                        "cam4_aligned_depth_topic": cv_cam4_aligned_depth_topic,
+                        "handover_tray_rgb_topic": cv_handover_tray_rgb_topic,
+                        "handover_tray_camera_info_topic": (
+                            cv_handover_tray_camera_info_topic
+                        ),
+                        "handover_tray_aligned_depth_topic": (
+                            cv_handover_tray_aligned_depth_topic
+                        ),
+                    }
+                ],
+                output="screen",
+            ),
+            Node(
                 package="vlm_node",
                 executable="rfdetr_perception_bridge",
                 name="rfdetr_perception_bridge",
-                condition=IfCondition(enable_rfdetr_perception),
+                condition=IfCondition(local_rfdetr_perception_enabled),
                 parameters=[
                     {
                         "service_url": rfdetr_service_url,
@@ -690,6 +836,8 @@ def generate_launch_description() -> LaunchDescription:
                             preflight_require_perception,
                             value_type=bool,
                         ),
+                        "perception_backend": perception_backend,
+                        "cv_contract_status_topic": cv_contract_status_topic,
                     }
                 ],
                 output="screen",

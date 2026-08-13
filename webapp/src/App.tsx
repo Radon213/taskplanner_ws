@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { motion } from "framer-motion";
 
 import { ProcedureDock } from "./components/command/ProcedureDock";
+import { LiveAsrPanel } from "./components/command/LiveAsrPanel";
 import { DebugWorkspace } from "./components/debug/DebugWorkspace";
 import {
   type PublicSurgeonGesture,
@@ -280,6 +281,17 @@ function MissionWorkspace({
             canPauseResume={controlCanPauseResume}
             onControl={(command) => void ros.control(command)}
           />
+          {runtimeMode === "live" ? (
+            <LiveAsrPanel
+              status={ros.liveAsrStatus}
+              statusReceivedAt={ros.liveAsrStatusReceivedAt}
+              connected={ros.connected}
+              pendingOperation={ros.liveAsrControlPending}
+              controlMessage={ros.liveAsrControlMessage}
+              language={language}
+              onControl={ros.controlLiveAsr}
+            />
+          ) : null}
           <ObservabilityPanel
             vm={vm}
             language={language}

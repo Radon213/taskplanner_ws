@@ -197,7 +197,7 @@ def test_missing_server_api_key_is_reported_without_path_or_secret(tmp_path) -> 
 @pytest.mark.parametrize(
     "configure_secret",
     [
-        lambda path: path.write_text(SECRET, encoding="utf-8"),
+        lambda path: (path.write_text(SECRET, encoding="utf-8"), path.chmod(0o400)),
         lambda path: (path.write_text(SECRET, encoding="utf-8"), path.chmod(0o644)),
         lambda path: (
             path.write_text("x" * (MAX_API_KEY_FILE_BYTES + 1), encoding="utf-8"),

@@ -8,6 +8,10 @@ import type {
   Cam4ToolRequestObservation,
   CompressedImageFrame,
   InputSourceStatus,
+  LiveAsrControlResult,
+  LiveAsrDevice,
+  LiveAsrFinal,
+  LiveAsrStatus,
   ModelCatalogEntry,
   ModelProviderStatus,
   ModelRuntimeCommand,
@@ -229,17 +233,124 @@ const DEFAULT_SHADOW_REPLAY_STATE: ShadowReplayState = {
   active_skill_count: 0,
 };
 
+const DEFAULT_LIVE_ASR_STATUS: LiveAsrStatus = {
+  schema: "taskplanner.asr.status.v1",
+  stamp_sec: 0,
+  available: false,
+  dependency_error: "",
+  state: "UNAVAILABLE",
+  server_url: "",
+  topic: "/sensors/surgeon/sentence",
+  device_id: null,
+  device_name: "",
+  devices: [],
+  device_status: "NO_INPUT",
+  device_message: "ASR 상태를 기다리는 중입니다.",
+  connected: false,
+  audio_level_dbfs: -99,
+  peak_level_dbfs: -99,
+  elapsed_sec: 0,
+  partial_text: "",
+  finals: [],
+  last_error: "",
+  sample_rate: 16000,
+  channels: 1,
+  sample_width_bits: 16,
+};
+
 type RosCompressedImage = {
   header?: {
     frame_id?: string;
   };
   format?: string;
-  data?: string | number[];
+  data?: string | number[] | Uint8Array;
 };
 
 type RosString = {
   data?: string;
 };
+
+function finiteNumber(value: unknown, fallback = 0): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function normalizeLiveAsrDevice(value: unknown): LiveAsrDevice | null {
+  if (!value || typeof value !== "object") return null;
+  const device = value as Record<string, unknown>;
+  const id = Number(device.id);
+  if (!Number.isInteger(id)) return null;
+  return {
+    id,
+    name: String(device.name ?? `Input ${id}`),
+    input_channels: Math.max(0, Math.trunc(finiteNumber(device.input_channels))),
+    default_samplerate: Math.max(0, finiteNumber(device.default_samplerate)),
+    default: Boolean(device.default),
+  };
+}
+
+function normalizeLiveAsrFinal(value: unknown): LiveAsrFinal | null {
+  if (!value || typeof value !== "object") return null;
+  const final = value as Record<string, unknown>;
+  const text = String(final.text ?? "").trim();
+  if (!text) return null;
+  const latencyMissing = final.response_latency_ms === null
+    || final.response_latency_ms === undefined
+    || final.response_latency_ms === "";
+  const rawLatency = latencyMissing ? Number.NaN : Number(final.response_latency_ms);
+  return {
+    stamp: String(final.stamp ?? ""),
+    text,
+    response_latency_ms: Number.isFinite(rawLatency) && rawLatency >= 0 ? rawLatency : null,
+    latency_basis: String(final.latency_basis ?? "unavailable"),
+    latency_correlated: Boolean(final.latency_correlated),
+  };
+}
+
+export function normalizeLiveAsrStatus(message: unknown): LiveAsrStatus | null {
+  const raw = String((message as RosString | null)?.data ?? "");
+  try {
+    const envelope = JSON.parse(raw) as Record<string, unknown>;
+    if (envelope.schema !== "taskplanner.asr.status.v1") return null;
+    const snapshot = envelope.asr && typeof envelope.asr === "object"
+      ? envelope.asr as Record<string, unknown>
+      : {};
+    const rawDevices = Array.isArray(snapshot.devices) ? snapshot.devices : [];
+    const rawFinals = Array.isArray(snapshot.finals) ? snapshot.finals : [];
+    const rawDeviceId = snapshot.device_id;
+    return {
+      ...DEFAULT_LIVE_ASR_STATUS,
+      schema: "taskplanner.asr.status.v1",
+      stamp_sec: finiteNumber(envelope.stamp_sec),
+      available: Boolean(snapshot.available),
+      dependency_error: String(snapshot.dependency_error ?? ""),
+      state: String(snapshot.state ?? "UNAVAILABLE").toUpperCase(),
+      server_url: String(snapshot.server_url ?? ""),
+      topic: String(snapshot.topic ?? "/sensors/surgeon/sentence"),
+      device_id: rawDeviceId === null || rawDeviceId === undefined || rawDeviceId === ""
+        ? null
+        : Number.isInteger(Number(rawDeviceId))
+          ? Number(rawDeviceId)
+          : null,
+      device_name: String(snapshot.device_name ?? ""),
+      devices: rawDevices.map(normalizeLiveAsrDevice).filter((value): value is LiveAsrDevice => value !== null),
+      device_status: String(snapshot.device_status ?? "NO_INPUT"),
+      device_message: String(snapshot.device_message ?? ""),
+      connected: Boolean(snapshot.connected),
+      audio_level_dbfs: finiteNumber(snapshot.audio_level_dbfs, -99),
+      peak_level_dbfs: finiteNumber(snapshot.peak_level_dbfs, -99),
+      elapsed_sec: Math.max(0, finiteNumber(snapshot.elapsed_sec)),
+      partial_text: String(snapshot.partial_text ?? ""),
+      finals: rawFinals.map(normalizeLiveAsrFinal).filter((value): value is LiveAsrFinal => value !== null),
+      last_error: String(snapshot.last_error ?? ""),
+      sample_rate: Math.max(0, finiteNumber(snapshot.sample_rate, 16000)),
+      channels: Math.max(0, Math.trunc(finiteNumber(snapshot.channels, 1))),
+      sample_width_bits: Math.max(0, Math.trunc(finiteNumber(snapshot.sample_width_bits, 16))),
+    };
+  } catch {
+    return null;
+  }
+}
 
 const CAM4_TOOL_REQUEST_STATES = new Set<
   Cam4ToolRequestObservation["state"]
@@ -337,6 +448,12 @@ function normalizeShadowGroundTruth(
     return DEFAULT_SHADOW_GROUND_TRUTH;
   }
 }
+
+// Keep only the freshest not-yet-serialized frame per image subscription.
+// rosbridge otherwise accepts an unbounded stream (queue_length=0) and can
+// accumulate large outgoing WebSocket writes when a browser falls behind.
+const ROSBRIDGE_IMAGE_QUEUE_LENGTH = 1;
+const ROSBRIDGE_IMAGE_COMPRESSION = "cbor";
 
 // Preserve the recorded camera cadence. A millisecond throttle drops frames
 // when nominal 15 FPS input arrives with normal 59-81 ms scheduling jitter.
@@ -679,7 +796,7 @@ function mimeTypeFromCompressedFormat(format: string): string {
   return "image/jpeg";
 }
 
-function byteArrayToBase64(data: number[]): string {
+function byteArrayToBase64(data: number[] | Uint8Array): string {
   let binary = "";
   const chunkSize = 0x8000;
   for (let index = 0; index < data.length; index += chunkSize) {
@@ -856,6 +973,13 @@ export function useRosBridge(runtimeMode: TaskplannerRuntimeMode) {
   const [shadowTranscript, setShadowTranscript] = useState<SpeechUtterance[]>([]);
   const [shadowGroundTruth, setShadowGroundTruth] =
     useState<ShadowGroundTruthState>(DEFAULT_SHADOW_GROUND_TRUTH);
+  const [liveAsrStatus, setLiveAsrStatus] = useState<LiveAsrStatus>(
+    DEFAULT_LIVE_ASR_STATUS,
+  );
+  const [liveAsrStatusReceivedAt, setLiveAsrStatusReceivedAt] = useState<number | null>(null);
+  const [liveAsrStatusBridgeUrl, setLiveAsrStatusBridgeUrl] = useState("");
+  const [liveAsrControlPending, setLiveAsrControlPending] = useState("");
+  const [liveAsrControlMessage, setLiveAsrControlMessage] = useState("");
 
   const rosRef = useRef<unknown>(null);
   const simulationStateRef = useRef<SimulationState>(DEFAULT_STATE);
@@ -887,6 +1011,15 @@ export function useRosBridge(runtimeMode: TaskplannerRuntimeMode) {
   const cameraFlushFrameRef = useRef<number | null>(null);
 
   const activeBundle = bundle || simulationState.active_bundle;
+
+  useEffect(() => {
+    if (runtimeMode === "live") return;
+    setLiveAsrStatus(DEFAULT_LIVE_ASR_STATUS);
+    setLiveAsrStatusReceivedAt(null);
+    setLiveAsrStatusBridgeUrl("");
+    setLiveAsrControlPending("");
+    setLiveAsrControlMessage("");
+  }, [runtimeMode]);
 
   useEffect(() => {
     let disposed = false;
@@ -929,6 +1062,10 @@ export function useRosBridge(runtimeMode: TaskplannerRuntimeMode) {
       cam4ToolRequestRef.current = DEFAULT_CAM4_TOOL_REQUEST;
       setShadowGroundTruth(DEFAULT_SHADOW_GROUND_TRUTH);
       shadowGroundTruthRef.current = DEFAULT_SHADOW_GROUND_TRUTH;
+      setLiveAsrStatus(DEFAULT_LIVE_ASR_STATUS);
+      setLiveAsrStatusReceivedAt(null);
+      setLiveAsrStatusBridgeUrl("");
+      setLiveAsrControlPending("");
       setActionMessage("ROS bridge disconnected. Reconnecting...");
       scheduleReconnect();
     });
@@ -952,6 +1089,10 @@ export function useRosBridge(runtimeMode: TaskplannerRuntimeMode) {
       cam4ToolRequestRef.current = DEFAULT_CAM4_TOOL_REQUEST;
       setShadowGroundTruth(DEFAULT_SHADOW_GROUND_TRUTH);
       shadowGroundTruthRef.current = DEFAULT_SHADOW_GROUND_TRUTH;
+      setLiveAsrStatus(DEFAULT_LIVE_ASR_STATUS);
+      setLiveAsrStatusReceivedAt(null);
+      setLiveAsrStatusBridgeUrl("");
+      setLiveAsrControlPending("");
       setActionMessage("ROS bridge error. Retrying connection...");
       scheduleReconnect();
     });
@@ -1023,7 +1164,9 @@ export function useRosBridge(runtimeMode: TaskplannerRuntimeMode) {
       ros,
       name: "/surgery/images/field/compressed",
       messageType: "sensor_msgs/msg/CompressedImage",
+      compression: ROSBRIDGE_IMAGE_COMPRESSION,
       throttle_rate: 100,
+      queue_length: ROSBRIDGE_IMAGE_QUEUE_LENGTH,
     });
     const rawCameraTopics = rawCameraTopicsForMode(runtimeMode);
     const cameraTopics = [
@@ -1072,7 +1215,9 @@ export function useRosBridge(runtimeMode: TaskplannerRuntimeMode) {
         ros,
         name,
         messageType: "sensor_msgs/msg/CompressedImage",
+        compression: ROSBRIDGE_IMAGE_COMPRESSION,
         throttle_rate: CAMERA_FRAME_THROTTLE_MS,
+        queue_length: ROSBRIDGE_IMAGE_QUEUE_LENGTH,
       });
       topic.subscribe((message: unknown) => {
         if (
@@ -1136,6 +1281,11 @@ export function useRosBridge(runtimeMode: TaskplannerRuntimeMode) {
     const shadowGroundTruthTopic = new ROSLIB.Topic({
       ros,
       name: "/shadow/ground_truth/state",
+      messageType: "std_msgs/msg/String",
+    });
+    const liveAsrStatusTopic = new ROSLIB.Topic({
+      ros,
+      name: "/input/asr/runtime_status",
       messageType: "std_msgs/msg/String",
     });
 
@@ -1372,6 +1522,15 @@ export function useRosBridge(runtimeMode: TaskplannerRuntimeMode) {
         setShadowGroundTruth(observation);
       });
     });
+    if (runtimeMode === "live") {
+      liveAsrStatusTopic.subscribe((message: unknown) => {
+        const parsed = normalizeLiveAsrStatus(message);
+        if (!parsed) return;
+        setLiveAsrStatus(parsed);
+        setLiveAsrStatusReceivedAt(Date.now());
+        setLiveAsrStatusBridgeUrl(url);
+      });
+    }
     shadowTranscriptTopic.subscribe((message: unknown) => {
       const utterance = message as SpeechUtterance;
       if (!utterance.is_final || !utterance.text?.trim()) return;
@@ -1438,6 +1597,7 @@ export function useRosBridge(runtimeMode: TaskplannerRuntimeMode) {
       shadowTranscriptTopic.unsubscribe();
       shadowTranscriptHistoryTopic.unsubscribe();
       shadowGroundTruthTopic.unsubscribe();
+      if (runtimeMode === "live") liveAsrStatusTopic.unsubscribe();
       if (reconnectTimerRef.current !== null) {
         window.clearTimeout(reconnectTimerRef.current);
         reconnectTimerRef.current = null;
@@ -2395,6 +2555,51 @@ export function useRosBridge(runtimeMode: TaskplannerRuntimeMode) {
     );
   }
 
+  async function controlLiveAsr(
+    operation: "refresh_devices" | "start" | "stop",
+    deviceId = -1,
+  ): Promise<LiveAsrControlResult> {
+    if (runtimeMode !== "live") {
+      return { accepted: false, message: "ASR control is available only in live integration mode." };
+    }
+    if (liveAsrControlPending) {
+      return { accepted: false, message: "Another ASR control request is still pending." };
+    }
+    setLiveAsrControlPending(operation);
+    setLiveAsrControlMessage("");
+    try {
+      const response = await callService(
+        "/input/asr/control",
+        "surgical_msgs/srv/AsrControl",
+        {
+          operation,
+          device_id: deviceId,
+          server_url: liveAsrStatus.server_url,
+        },
+        20000,
+      );
+      const accepted = Boolean(response.accepted);
+      const message = String(response.message || (accepted ? "ASR request accepted." : "ASR request rejected."));
+      const rawResult = String(response.result_json ?? "").trim();
+      if (rawResult) {
+        const parsed = normalizeLiveAsrStatus({ data: rawResult });
+        if (parsed) {
+          setLiveAsrStatus(parsed);
+          setLiveAsrStatusReceivedAt(Date.now());
+          setLiveAsrStatusBridgeUrl(url);
+        }
+      }
+      setLiveAsrControlMessage(message);
+      return { accepted, message };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setLiveAsrControlMessage(message);
+      return { accepted: false, message };
+    } finally {
+      setLiveAsrControlPending("");
+    }
+  }
+
   const runtimeMessage = runtimeStatusMessage(simulationState);
   const simulationReady = connected && simulationState.instrument_states.length > 0;
   const shouldPreferRuntimeMessage =
@@ -2454,6 +2659,10 @@ export function useRosBridge(runtimeMode: TaskplannerRuntimeMode) {
     shadowReplayState,
     shadowTranscript,
     shadowGroundTruth,
+    liveAsrStatus,
+    liveAsrStatusReceivedAt: liveAsrStatusBridgeUrl === url ? liveAsrStatusReceivedAt : null,
+    liveAsrControlPending,
+    liveAsrControlMessage,
     applyBundle,
     control,
     sendOverride,
@@ -2463,6 +2672,7 @@ export function useRosBridge(runtimeMode: TaskplannerRuntimeMode) {
     controlActorModelRuntime,
     setActorEnabled,
     setPerceptionEnabled,
+    controlLiveAsr,
     selectShadowCase,
     configureShadowReplay,
   };

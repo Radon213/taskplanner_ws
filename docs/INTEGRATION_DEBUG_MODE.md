@@ -4,6 +4,26 @@
 
 ## 실행
 
+시연용 운영 런타임과 통합해서 사용할 때는 평소와 같이 운영 모드를 시작한다.
+
+```bash
+scripts/taskplanner up live --build
+```
+
+이 명령은 운영 런타임, 단일 Web UI와 함께 같은 `taskplanner_ws` Compose
+프로젝트의 `integration-debug` 및 유선 LAN 프록시를 시작한다. UI 상단의
+**디버그 모드** 버튼으로 화면만 전환하며 별도 4174 UI를 실행하지 않는다.
+Debug 화면은 운영 시나리오의 실행 여부와 관계없이 입력·토픽·Action 상태를
+계속 모니터링한다. 수동 제어와 쓰기 명령은 `/simulation/state`에서 최신
+안전 정지 상태(`idle`, `halted`, `completed`, `terminated`)를 확인한 동안에만
+허용하고, 시나리오가 실행 중이거나
+상태가 없거나 오래되었으면 fail-closed로 거부한다. 따라서 운영 컨테이너를
+내릴 필요 없이 운영 화면에서 시나리오를 정지한 뒤 같은 UI에서 시험할 수 있다.
+
+전체 운영 런타임을 실행하지 않는 개별 기능 시험은 다음 standalone 명령을
+사용한다. 같은 4173 UI를 사용하며, 이미 `taskplanner-runtime` 또는
+`shadow-runner`가 실행 중이면 시작을 거부한다.
+
 ```bash
 scripts/taskplanner up debug --build
 ```
@@ -15,11 +35,12 @@ Debug Mode의 마이크 캡처는 Ubuntu가 현재 선택한 PipeWire 입력을 
 **음성 로그 → 장치 새로고침**을 누르면 되고, USB hotplug 때문에 컨테이너를
 다시 생성할 필요는 없다.
 
-- UI: `http://127.0.0.1:4174`
+- 통합/standalone 공용 UI: `http://127.0.0.1:4173`
+- 운영 ROSBridge: `ws://127.0.0.1:9090`
 - Debug ROSBridge: `ws://127.0.0.1:9091`
 - 기본 포트와 ROS 도메인은 `docker/orchestration/debug.env`와 로컬 `.env`에서 바꿀 수 있다.
-- 같은 Compose 프로젝트에서 `taskplanner-runtime` 또는 `shadow-runner`가 실행 중이면 디버그 모드 시작을 거부한다.
-- Debug 프로파일은 `webapp`과 `integration-debug`만 시작하며 GPU·모델·perception 서비스를 시작하거나 중지하지 않는다.
+- standalone Debug 프로파일은 `webapp`과 `integration-debug`만 시작하며 GPU·모델·perception 서비스를 시작하거나 중지하지 않는다.
+- `live`와 `llm-surgeon` 시작 시 Debug sidecar도 같은 Compose 프로젝트에서 자동으로 유지된다.
 
 기존 Taskplanner UI의 상단 **디버그 모드** 버튼 또는 실행 직후 기본 Debug 화면에서 진입한다. 나갈 때 연속 더미 발행을 정지하고 수동 제어를 해제한다.
 
@@ -34,7 +55,15 @@ Debug Mode의 마이크 캡처는 Ubuntu가 현재 선택한 PipeWire 입력을 
 
 DDS 설정은 이미 시작된 ROS 2 프로세스에서 안전하게 교체할 수 없으므로, **적용하고 재연결**을 누르면 설정을 저장한 뒤 `integration-debug` 런타임 컨테이너만 재시작한다. 웹 UI는 유지되며 ROSBridge에 자동 재연결한다. 수동 제어가 활성화되어 있거나 Action이 실행 중이거나 연속 더미 토픽을 발행 중일 때에는 설정 변경을 거부한다.
 
-설정은 `${TASKPLANNER_RUN_ROOT}/debug/network-settings.json`에 보존되어 다음 디버그 모드 시작에도 적용된다. 전체 Taskplanner 런타임이나 다른 Compose 프로젝트는 재시작하지 않는다. LAN 연결 확인에는 `SUBNET`, 동일 Domain ID, 양측 multicast 허용, 호스트 방화벽의 DDS/RTPS 트래픽 허용이 모두 필요하며, 핑 성공만으로 DDS discovery 성공을 의미하지는 않는다.
+설정은 `${TASKPLANNER_RUN_ROOT}/debug/network-settings.json`에 보존되어 다음
+standalone 디버그 모드 시작에도 적용된다. 운영 런타임에 통합된 sidecar는 과거에
+저장한 Domain/discovery 값을 의도적으로 무시하고 운영 런타임의
+`ROS_DOMAIN_ID`와 discovery 범위에 잠긴다. 따라서 과거 D97 설정 등으로 핵심
+운영 노드 감지를 우회해 수동 제어가 열리지 않는다. 네트워크 편집은 standalone
+Debug에서만 수행한다. 전체 Taskplanner 런타임이나 다른 Compose 프로젝트는
+재시작하지 않는다. LAN 연결 확인에는 `SUBNET`, 동일 Domain ID, 양측 multicast
+허용, 호스트 방화벽의 DDS/RTPS 트래픽 허용이 모두 필요하며, 핑 성공만으로 DDS
+discovery 성공을 의미하지는 않는다.
 
 `TASKPLANNER_DEBUG_NETWORK_INTERFACE`를 지정하면 Debug UI의 `LOCAL IP`는 해당
 인터페이스만 주 주소로 사용한다. 이 PC의 기본값은 유선 5GbE 포트
@@ -103,7 +132,24 @@ Tool Change 폼은 `command_id`, `arm_id`, `target_tool_id`만 송신하고
 
 Result를 끝내 받을 수 없으면 화면의 **Action 복구 필요** 카드에서 상대 로봇 정지 또는 동일 Command ID의 원격 종료 상태를 직접 확인한 뒤 **확인 후 클라이언트 복구**를 누른다. 확인 체크와 화면에 표시된 정확한 Command ID가 모두 일치해야 로컬 클라이언트 상태를 비우며, 복구 후 수동 제어는 자동 재활성화되지 않는다. 감지와 복구 내역은 `action_recovery_required`, `action_late_result_reconciled`, `action_client_recovered` 이벤트로 남는다. 이 버튼은 상대 로봇을 정지시키는 기능이 아니다.
 
-전체 Taskplanner 핵심 노드가 같은 ROS 도메인에서 발견되면 기본 동작은 활성화와 명령 거부다. 격리된 통합 시험 실행에서 `TASKPLANNER_DEBUG_ALLOW_PLANNER_COEXISTENCE=true`를 명시한 경우에만, 화면에 표시된 노드의 자동 명령이 중지됐음을 사용자가 확인하고 **현재 노드 목록과 정확히 일치하는 세션 공존 승인**을 할 수 있다. 이 승인은 Debug 세션 메모리에만 남으며, 발견된 핵심 노드 목록 변화, heartbeat 중단, 수동 제어 해제, Fault, 런타임 재시작 중 하나라도 발생하면 즉시 폐기되고 활성 Action에는 Cancel을 요청한다. 상대 플래너를 정지시키거나 그 안전 상태를 대신 보증하는 기능은 아니다.
+운영 프로파일의 Debug sidecar는 `/simulation/state`를 안전 interlock으로
+사용한다. 최신 `execution_state`가 `idle`, `halted`, `completed`,
+`terminated` 중 하나이고 `running=false`, 활성 로봇 task 없음, 로봇·cleaner
+비활성까지 모두 확인될 때만 `operational_runtime_stopped=true`가 된다.
+여기에 Fault가 없고 진행 중 Action도 없어야 `manual_control_available=true`가
+되어 수동 제어를 활성화할 수 있다. 실행 중, 상태 미수신, freshness 만료 또는 안전을
+확정할 수 없는 값은 모두 **운영 시나리오 실행/상태 불명**으로 처리한다.
+시나리오 정지가 확인되어도 Fault나 진행 중 Action 등 다른 안전 조건이 남아
+있으면 별도의 **수동 잠금** 상태를 표시한다. 수동 Action·Service·더미
+토픽·문장·마이크 명령은 운영 화면에서 시나리오를 정지하고 Debug 화면에
+**운영 시나리오 정지 확인**과 **수동 활성화 가능**이 모두 표시된 뒤 시험한다.
+운영 컨테이너 자체를 종료할 필요는 없다.
+
+운영 프로파일은 추가로 `TASKPLANNER_DEBUG_ALLOW_PLANNER_COEXISTENCE=false`와
+runtime network lock을 적용한다. UI 확인만으로 불명확한 상태를 승인하거나
+DDS 설정을 바꿔 interlock을 우회할 수 없다. 실행 중 상태로 바뀌거나 상태가
+stale해지면 수동 제어와 쓰기 publisher를 자동 해제한다. Debug 기능은 상대
+플래너나 원격 로봇을 정지시키지 않으며 그 안전 상태를 대신 보증하지 않는다.
 
 ## 외부로 발행하는 공개 토픽
 
@@ -116,13 +162,32 @@ Result를 끝내 받을 수 없으면 화면의 **Action 복구 필요** 카드�
 | `/surgery/clinical_observations` | `surgical_interop_msgs/msg/ClinicalObservationArray` | reliable / transient local |
 | `/surgery/health` | `surgical_interop_msgs/msg/SurgeryHealth` | reliable / transient local |
 
-각 토픽은 1회 발행 또는 0.1–10 Hz 연속 발행을 지원한다. 더미 메시지는 임상·수술 상태로 오인되지 않도록 `DEBUG_DUMMY_DATA`, `UNKNOWN`, `integration_debug` 값을 명시하며 확인되지 않은 관찰을 만들지 않는다. 같은 토픽에 다른 publisher가 발견되면 디버그 publisher의 발행을 거부한다. 화면의 Subscriber 수는 DDS discovery 확인값이며, 상대 기관의 실제 callback 처리는 상대 측 echo 또는 로그로 함께 확인해야 한다.
+각 토픽은 수동 제어가 활성화된 동안 1회 발행 또는 0.1–10 Hz 연속
+발행을 지원한다. 이미 시작된 연속 발행의 개별 정지와 전체 정지는
+수동 제어가 해제되어도 항상 허용한다. 더미 메시지는 임상·수술 상태로
+오인되지 않도록 `DEBUG_DUMMY_DATA`, `UNKNOWN`, `integration_debug`
+값을 명시하며 확인되지 않은 관찰을 만들지 않는다. 같은 토픽에 다른
+publisher가 발견되면 디버그 publisher의 발행을 거부한다. 화면의
+Subscriber 수는 DDS discovery 확인값이며, 상대 기관의 실제 callback
+처리는 상대 측 echo 또는 로그로 함께 확인해야 한다.
 
 ## 문장·USB 마이크 입력
 
-**음성·로그** 탭에서 완성 문장을 직접 입력해 `/sensors/surgeon/sentence`로 발행하거나, 호스트에 연결한 USB 마이크로 Puzzle AI WebSocket ASR을 시험할 수 있다. 마이크 세션은 사용자가 명시적으로 시작할 때만 열리고, 서버가 `is_final`로 확정한 비어 있지 않은 문장만 같은 ROS 토픽으로 발행한다. 중간 인식 문장은 화면 진단용으로만 표시하며 ROS에 발행하지 않는다.
+**음성·로그** 탭에서 완성 문장을 직접 입력해
+`/sensors/surgeon/sentence`로 발행할 수 있다. standalone Debug에서는 호스트에
+연결한 USB 마이크로 Puzzle AI WebSocket ASR도 시험할 수 있다. live 운영
+런타임에 포함된 통합 Debug sidecar에서는 `asr_start`를 거부하며, 같은 UI의
+운영 화면 **수술실 음성 입력**에서 USB ASR을 시작해야 한다. 통합 Debug의 장치
+새로고침과 중지는 허용한다. 이 구분은 Debug publisher가 운영 preflight를 대신
+만족한 직후 시나리오 interlock으로 사라지는 경로를 막는다. 브라우저는
+이 토픽을 직접 advertise하지 않고 `publish_voice_command` 백엔드
+명령을 통해 수동 제어·Fault·운영 시나리오 interlock을 다시 확인한 후
+발행한다. 마이크 세션은 사용자가 명시적으로 시작할 때만 열리고,
+서버가 `is_final`로 확정한 비어 있지 않은 문장만 같은 ROS 토픽으로
+발행한다. 중간 인식 문장은 화면 진단용으로만 표시하며 ROS에
+발행하지 않는다.
 
-마이크 시작 전에는 화면 최상단의 **수동 제어 활성화**가 필요하다. 이 전역
+standalone Debug 마이크 시작 전에는 화면 최상단의 **수동 제어 활성화**가 필요하다. 이 전역
 제어는 조그 탭 안에 중복 표시하지 않는다. 수동 제어 해제, UI
 heartbeat timeout, Fault 또는 런타임 종료 시 마이크를 자동 중지한다. 자체 ASR
 publisher가 존재한다는 이유만으로 입력 준비 완료로 보지 않으며, WebSocket이
@@ -160,8 +225,8 @@ bed-mounted robot-arm 명령으로 해석하지 않는다. 모호하거나 불�
 - `/integration/debug/events` (`std_msgs/msg/String`): 검증 이벤트 JSON
 - `/integration/debug/heartbeat` (`std_msgs/msg/String`): 현재 Debug 세션 ID를 담은 UI 생존 신호
 - `/integration/debug/command` (`surgical_msgs/srv/IntegrationDebugCommand`): UI 명령 게이트웨이
-- `/integration/readiness` (`std_msgs/msg/String`): sentence publisher 및 로봇 종단 준비 상태
-- `/integration/check_readiness` (`std_srvs/srv/Trigger`): 현재 readiness 질의
+- `/integration/debug/readiness` (`std_msgs/msg/String`): Debug sentence publisher 및 로봇 종단 준비 상태
+- `/integration/debug/check_readiness` (`std_srvs/srv/Trigger`): 현재 Debug readiness 질의
 
 세션 이벤트는 `${TASKPLANNER_RUN_ROOT}/debug/<session-id>/events.jsonl`에 JSONL로 남는다.
 

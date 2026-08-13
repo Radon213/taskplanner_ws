@@ -8,7 +8,10 @@ from integration_debug.contracts import (
     decode_payload,
     load_action_watchdog_policy,
     load_config,
+    manual_write_block_reason,
     measured_rate,
+    operational_runtime_stopped,
+    operational_state_publisher_trusted,
     parse_voice_command,
     validate_action_recovery_acknowledgement,
     validate_planner_coexistence_acknowledgement,
@@ -205,6 +208,7 @@ def test_debug_config_exposes_exact_public_contract() -> None:
     )
     assert {(row["topic"], row["type"]) for row in config["inputs"]} == {
         ("/sensors/surgeon/sentence", "std_msgs/msg/String"),
+        ("/integration/cv_contract/status", "std_msgs/msg/String"),
         ("/camera/cam_1/color/image_raw/compressed", "sensor_msgs/msg/CompressedImage"),
         ("/camera/cam_2/color/image_raw/compressed", "sensor_msgs/msg/CompressedImage"),
         ("/camera/cam_3/color/image_raw/compressed", "sensor_msgs/msg/CompressedImage"),
@@ -261,6 +265,169 @@ def test_planner_coexistence_acknowledgement_requires_exact_node_set() -> None:
 
 def test_planner_coexistence_acknowledgement_is_not_needed_without_blockers() -> None:
     assert validate_planner_coexistence_acknowledgement({}, []) == []
+
+
+def test_manual_writes_fail_closed_while_full_runtime_is_active() -> None:
+    reason = manual_write_block_reason(
+        armed=False,
+        fault_locked=False,
+        blocked_nodes=["simulation_manager", "tree_executor"],
+        planner_coexistence_allowed=False,
+        acknowledged_blocked_nodes=[],
+    )
+    assert reason == (
+        "full Taskplanner nodes are active: simulation_manager, tree_executor"
+    )
+
+
+def test_manual_writes_require_exact_acknowledgement_during_coexistence() -> None:
+    values = {
+        "armed": True,
+        "fault_locked": False,
+        "blocked_nodes": ["simulation_manager", "tree_executor"],
+        "planner_coexistence_allowed": True,
+    }
+    assert manual_write_block_reason(
+        **values,
+        acknowledged_blocked_nodes=["tree_executor"],
+    ).startswith("planner node set changed")
+    assert manual_write_block_reason(
+        **values,
+        acknowledged_blocked_nodes=["tree_executor", "simulation_manager"],
+    ) == ""
+
+
+def test_manual_output_write_requires_arming_when_runtime_is_stopped() -> None:
+    assert manual_write_block_reason(
+        armed=False,
+        fault_locked=False,
+        blocked_nodes=[],
+        planner_coexistence_allowed=False,
+        acknowledged_blocked_nodes=[],
+    ) == "manual control is not armed"
+    assert manual_write_block_reason(
+        armed=False,
+        fault_locked=False,
+        blocked_nodes=[],
+        planner_coexistence_allowed=False,
+        acknowledged_blocked_nodes=[],
+    ) == "manual control is not armed"
+
+
+def test_fault_lock_always_blocks_manual_ros_writes() -> None:
+    assert manual_write_block_reason(
+        armed=True,
+        fault_locked=True,
+        blocked_nodes=[],
+        planner_coexistence_allowed=False,
+        acknowledged_blocked_nodes=[],
+    ) == "manual control is fault locked"
+
+
+@pytest.mark.parametrize(
+    "execution_state", ["idle", "halted", "stopped", "completed", "terminated"]
+)
+def test_operational_runtime_accepts_only_fresh_explicit_stopped_states(
+    execution_state: str,
+) -> None:
+    assert operational_runtime_stopped(
+        received=True,
+        running=False,
+        execution_state=execution_state,
+        active_robot_task_id="",
+        robot_state="idle",
+        cleaner_busy=False,
+        publisher_trusted=True,
+        age_sec=2.9,
+        max_age_sec=3.0,
+    )
+
+
+@pytest.mark.parametrize(
+    ("received", "running", "execution_state", "age_sec"),
+    [
+        (False, False, "idle", None),
+        (True, True, "idle", 0.1),
+        (True, False, "running", 0.1),
+        (True, False, "starting", 0.1),
+        (True, False, "paused", 0.1),
+        (True, False, "stopping", 0.1),
+        (True, False, "resetting", 0.1),
+        (True, False, "unknown", 0.1),
+        (True, False, "idle", 3.1),
+    ],
+)
+def test_operational_runtime_fails_closed_for_active_or_untrusted_state(
+    received: bool,
+    running: bool,
+    execution_state: str,
+    age_sec: float | None,
+) -> None:
+    assert not operational_runtime_stopped(
+        received=received,
+        running=running,
+        execution_state=execution_state,
+        active_robot_task_id="",
+        robot_state="idle",
+        cleaner_busy=False,
+        publisher_trusted=True,
+        age_sec=age_sec,
+        max_age_sec=3.0,
+    )
+
+
+@pytest.mark.parametrize(
+    ("active_robot_task_id", "robot_state", "cleaner_busy"),
+    [
+        ("task-17", "idle", False),
+        ("", "moving", False),
+        ("", "handover_in_progress", False),
+        ("", "idle", True),
+    ],
+)
+def test_operational_runtime_rejects_orphan_robot_activity(
+    active_robot_task_id: str,
+    robot_state: str,
+    cleaner_busy: bool,
+) -> None:
+    assert not operational_runtime_stopped(
+        received=True,
+        running=False,
+        execution_state="idle",
+        active_robot_task_id=active_robot_task_id,
+        robot_state=robot_state,
+        cleaner_busy=cleaner_busy,
+        publisher_trusted=True,
+        age_sec=0.1,
+        max_age_sec=3.0,
+    )
+
+
+def test_operational_runtime_rejects_untrusted_state_publisher() -> None:
+    assert not operational_runtime_stopped(
+        received=True,
+        running=False,
+        execution_state="idle",
+        active_robot_task_id="",
+        robot_state="idle",
+        cleaner_busy=False,
+        publisher_trusted=False,
+        age_sec=0.1,
+        max_age_sec=3.0,
+    )
+
+
+def test_operational_state_requires_one_exact_publisher_identity() -> None:
+    assert operational_state_publisher_trusted(
+        ["/or_digital_twin"], "/or_digital_twin"
+    )
+    assert not operational_state_publisher_trusted([], "/or_digital_twin")
+    assert not operational_state_publisher_trusted(
+        ["/or_digital_twin", "/spoof"], "/or_digital_twin"
+    )
+    assert not operational_state_publisher_trusted(
+        ["/unexpected"], "/or_digital_twin"
+    )
 
 
 def test_measured_rate_uses_recent_window() -> None:

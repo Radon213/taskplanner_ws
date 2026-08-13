@@ -121,6 +121,7 @@ export interface DebugNetworkStatus {
   settings_path: string;
   restart_supported: boolean;
   restart_scheduled: boolean;
+  locked_to_runtime?: boolean;
   error?: string;
 }
 
@@ -149,6 +150,8 @@ export interface DebugAsrStatus {
   device_id: number | null;
   device_name: string;
   devices: DebugAsrDevice[];
+  device_status: "READY" | "NO_INPUT" | "HOST_AUDIO_UNAVAILABLE" | "BRIDGE_ERROR";
+  device_message: string;
   connected: boolean;
   audio_level_dbfs: number;
   peak_level_dbfs: number;
@@ -260,6 +263,11 @@ export interface IntegrationDebugStatus {
     rmw_implementation: string;
     discovery_range: string;
     blocked_nodes: string[];
+    detected_planner_nodes?: string[];
+    operational_state?: string | null;
+    operational_state_age_sec?: number | null;
+    operational_runtime_stopped?: boolean;
+    manual_control_available?: boolean;
     planner_coexistence_allowed?: boolean;
     action_watchdog?: {
       goal_response_timeout_sec: number;
@@ -333,9 +341,7 @@ function parseStatus(raw: unknown): IntegrationDebugStatus | null {
 
 export function useIntegrationDebugBridge(url: string) {
   const rosRef = useRef<RosConnection | null>(null);
-  const sentenceTopicRef = useRef<RosTopicHandle | null>(null);
   const heartbeatTopicRef = useRef<RosTopicHandle | null>(null);
-  const sentenceUnadvertiseTimerRef = useRef<number | null>(null);
   const [connected, setConnected] = useState(false);
   const [status, setStatus] = useState<IntegrationDebugStatus | null>(null);
   const [readiness, setReadiness] = useState<Record<string, unknown> | null>(null);
@@ -361,14 +367,8 @@ export function useIntegrationDebugBridge(url: string) {
     });
     const readinessTopic = new ROSLIB.Topic({
       ros,
-      name: "/integration/readiness",
+      name: "/integration/debug/readiness",
       messageType: "std_msgs/msg/String",
-    });
-    const sentenceTopic = new ROSLIB.Topic({
-      ros,
-      name: "/sensors/surgeon/sentence",
-      messageType: "std_msgs/msg/String",
-      queue_size: 1,
     });
     const heartbeatTopic = new ROSLIB.Topic({
       ros,
@@ -376,7 +376,6 @@ export function useIntegrationDebugBridge(url: string) {
       messageType: "std_msgs/msg/String",
       queue_size: 1,
     });
-    sentenceTopicRef.current = sentenceTopic;
     heartbeatTopicRef.current = heartbeatTopic;
 
     function scheduleReconnect() {
@@ -428,12 +427,6 @@ export function useIntegrationDebugBridge(url: string) {
       if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
       statusTopic.unsubscribe();
       readinessTopic.unsubscribe();
-      if (sentenceUnadvertiseTimerRef.current !== null) {
-        window.clearTimeout(sentenceUnadvertiseTimerRef.current);
-        sentenceUnadvertiseTimerRef.current = null;
-      }
-      sentenceTopic.unadvertise();
-      sentenceTopicRef.current = null;
       heartbeatTopic.unadvertise();
       heartbeatTopicRef.current = null;
       if (rosRef.current === ros) rosRef.current = null;
@@ -503,24 +496,6 @@ export function useIntegrationDebugBridge(url: string) {
     return () => window.clearInterval(heartbeat);
   }, [connected, status?.session.armed, status?.session.session_id]);
 
-  const publishSentence = useCallback((sentence: string) => {
-    const topic = sentenceTopicRef.current;
-    if (!topic || !connected) {
-      throw new Error("디버그 ROSBridge가 연결되지 않았습니다.");
-    }
-    const normalized = sentence.trim();
-    if (!normalized) throw new Error("완성된 문장을 입력해 주세요.");
-    topic.advertise();
-    topic.publish(new ROSLIB.Message({ data: normalized }));
-    if (sentenceUnadvertiseTimerRef.current !== null) {
-      window.clearTimeout(sentenceUnadvertiseTimerRef.current);
-    }
-    sentenceUnadvertiseTimerRef.current = window.setTimeout(() => {
-      if (sentenceTopicRef.current === topic) topic.unadvertise();
-      sentenceUnadvertiseTimerRef.current = null;
-    }, 500);
-  }, [connected]);
-
   const retry = useCallback(() => {
     setReconnecting(true);
     setConnectionNonce((value) => value + 1);
@@ -535,7 +510,6 @@ export function useIntegrationDebugBridge(url: string) {
     readiness,
     statusReceivedAt,
     command,
-    publishSentence,
     retry,
   };
 }

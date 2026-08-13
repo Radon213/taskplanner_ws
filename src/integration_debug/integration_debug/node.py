@@ -47,6 +47,7 @@ from surgical_interop_msgs.msg import (
     SurgeryHealth,
 )
 from surgical_interop_msgs.srv import RequestToolChange
+from surgical_msgs.msg import SimulationState
 from surgical_msgs.srv import IntegrationDebugCommand
 
 from integration_debug.asr_runtime import AsrMicrophoneRuntime
@@ -55,7 +56,10 @@ from integration_debug.contracts import (
     decode_payload,
     load_action_watchdog_policy,
     load_config,
+    manual_write_block_reason,
     measured_rate,
+    operational_runtime_stopped,
+    operational_state_publisher_trusted,
     parse_voice_command,
     validate_action_recovery_acknowledgement,
     validate_planner_coexistence_acknowledgement,
@@ -200,6 +204,35 @@ class IntegrationDebugNode(Node):
             .lower()
             in {"1", "true", "yes", "on"}
         )
+        self._network_locked_to_runtime = (
+            os.environ.get("TASKPLANNER_DEBUG_LOCK_TO_RUNTIME_NETWORK", "")
+            .strip()
+            .lower()
+            in {"1", "true", "yes", "on"}
+        )
+        self._operational_state_max_age_sec = max(
+            0.5,
+            float(
+                os.environ.get(
+                    "TASKPLANNER_DEBUG_OPERATIONAL_STATE_MAX_AGE_SEC", "3.0"
+                )
+                or 3.0
+            ),
+        )
+        self._operational_state_expected_publisher = (
+            os.environ.get(
+                "TASKPLANNER_DEBUG_OPERATIONAL_STATE_PUBLISHER",
+                "/or_digital_twin",
+            ).strip()
+            or "/or_digital_twin"
+        )
+        self._operational_state_received = False
+        self._operational_state_received_monotonic = 0.0
+        self._operational_running = False
+        self._operational_execution_state = "unknown"
+        self._operational_active_robot_task_id = ""
+        self._operational_robot_state = "unknown"
+        self._operational_cleaner_busy = False
         self._restart_scheduled = False
         self._session_dir = run_root / "debug" / self._session_id
         self._session_dir.mkdir(parents=True, exist_ok=True)
@@ -210,6 +243,11 @@ class IntegrationDebugNode(Node):
             asr_config.get("topic", "/sensors/surgeon/sentence")
         ).strip()
         self._asr_sentence_pub: Any | None = None
+        # A Debug ASR session may coexist with the operational runtime for
+        # monitoring, but its graph-visible sentence publisher must never make
+        # the live preflight pass before Puzzle ASR is actually connected.
+        self._asr_capture_requested = False
+        self._manual_sentence_pub: Any | None = None
         self._asr = AsrMicrophoneRuntime(
             default_url=os.environ.get(
                 "PUZZLE_ASR_URL",
@@ -222,6 +260,10 @@ class IntegrationDebugNode(Node):
             ),
             topic=self._asr_topic,
             output_dir=self._session_dir / "asr",
+            capture_lock_path=os.environ.get(
+                "TASKPLANNER_ASR_CAPTURE_LOCK",
+                "/taskplanner-runs/asr/microphone.lock",
+            ),
         )
         record_config = dict(self._config.get("surgery_record", {}))
         self._surgery_record = SurgeryRecordRuntime(
@@ -261,7 +303,7 @@ class IntegrationDebugNode(Node):
             String, "/integration/debug/events", 50
         )
         self._readiness_pub = self.create_publisher(
-            String, "/integration/readiness", 10
+            String, "/integration/debug/readiness", 10
         )
         self._command_service = self.create_service(
             IntegrationDebugCommand,
@@ -281,9 +323,21 @@ class IntegrationDebugNode(Node):
             ),
             callback_group=self._callback_group,
         )
+        self._operational_state_subscription = self.create_subscription(
+            SimulationState,
+            "/simulation/state",
+            self._on_operational_state,
+            QoSProfile(
+                history=QoSHistoryPolicy.KEEP_LAST,
+                depth=5,
+                reliability=QoSReliabilityPolicy.RELIABLE,
+                durability=QoSDurabilityPolicy.VOLATILE,
+            ),
+            callback_group=self._callback_group,
+        )
         self._readiness_service = self.create_service(
             Trigger,
-            "/integration/check_readiness",
+            "/integration/debug/check_readiness",
             self._handle_readiness,
             callback_group=self._callback_group,
         )
@@ -359,6 +413,7 @@ class IntegrationDebugNode(Node):
 
         self._output_states: dict[str, OutputState] = {}
         self._output_publishers: dict[str, Any] = {}
+        self._output_qos_profiles: dict[str, QoSProfile] = {}
         for row in self._config["outputs"]:
             topic = str(row["topic"])
             message_type = str(row["type"])
@@ -366,9 +421,7 @@ class IntegrationDebugNode(Node):
             if message_class is None:
                 raise ValueError(f"unsupported debug output type: {message_type}")
             qos = _event_qos() if str(row.get("qos")) == "event" else _snapshot_qos()
-            self._output_publishers[topic] = self.create_publisher(
-                message_class, topic, qos
-            )
+            self._output_qos_profiles[topic] = qos
             self._output_states[topic] = OutputState(
                 topic=topic,
                 message_type=message_type,
@@ -510,6 +563,22 @@ class IntegrationDebugNode(Node):
         with self._lock:
             self._last_heartbeat_monotonic = time.monotonic()
 
+    def _on_operational_state(self, msg: SimulationState) -> None:
+        with self._lock:
+            self._operational_state_received = True
+            self._operational_state_received_monotonic = time.monotonic()
+            self._operational_running = bool(msg.running)
+            self._operational_execution_state = (
+                str(msg.execution_state).strip().lower() or "unknown"
+            )
+            self._operational_active_robot_task_id = str(
+                msg.active_robot_task_id
+            ).strip()
+            self._operational_robot_state = (
+                str(msg.robot_state).strip().lower() or "unknown"
+            )
+            self._operational_cleaner_busy = bool(msg.cleaner_busy)
+
     def _on_image_input(self, topic: str, msg: CompressedImage) -> None:
         now = time.monotonic()
         source_sec = float(msg.header.stamp.sec) + float(msg.header.stamp.nanosec) / 1e9
@@ -572,13 +641,94 @@ class IntegrationDebugNode(Node):
         age_sec = time.monotonic() - self._bed_robot_arm_status_received_monotonic
         return age_sec <= self._bed_robot_arm_status_max_age_sec, age_sec
 
-    def _blocked_nodes(self) -> list[str]:
+    def _detected_planner_nodes(self) -> list[str]:
         expected = {str(value) for value in self._config.get("blocked_nodes", [])}
         try:
             discovered = {name for name, _namespace in self.get_node_names_and_namespaces()}
         except Exception:
             return []
         return sorted(expected & discovered)
+
+    def _operational_runtime_status(self) -> dict[str, Any]:
+        now = time.monotonic()
+        with self._lock:
+            received = self._operational_state_received
+            received_at = self._operational_state_received_monotonic
+            running = self._operational_running
+            execution_state = self._operational_execution_state
+            active_robot_task_id = self._operational_active_robot_task_id
+            robot_state = self._operational_robot_state
+            cleaner_busy = self._operational_cleaner_busy
+        age_sec = max(0.0, now - received_at) if received and received_at else None
+        try:
+            publisher_infos = self.get_publishers_info_by_topic(
+                "/simulation/state"
+            )
+        except Exception:
+            publisher_infos = []
+        publishers = sorted(
+            _node_identity(str(info.node_namespace), str(info.node_name))
+            for info in publisher_infos
+        )
+        publisher_trusted = operational_state_publisher_trusted(
+            publishers,
+            self._operational_state_expected_publisher,
+        )
+        stopped = operational_runtime_stopped(
+            received=received,
+            running=running,
+            execution_state=execution_state,
+            active_robot_task_id=active_robot_task_id,
+            robot_state=robot_state,
+            cleaner_busy=cleaner_busy,
+            publisher_trusted=publisher_trusted,
+            age_sec=age_sec,
+            max_age_sec=self._operational_state_max_age_sec,
+        )
+        return {
+            "received": received,
+            "running": running,
+            "execution_state": execution_state,
+            "active_robot_task_id": active_robot_task_id,
+            "robot_state": robot_state,
+            "cleaner_busy": cleaner_busy,
+            "publishers": publishers,
+            "expected_publisher": self._operational_state_expected_publisher,
+            "publisher_trusted": publisher_trusted,
+            "age_sec": age_sec,
+            "fresh": bool(
+                received
+                and age_sec is not None
+                and age_sec <= self._operational_state_max_age_sec
+            ),
+            "stopped": stopped,
+        }
+
+    def _blocked_nodes(self) -> list[str]:
+        detected = self._detected_planner_nodes()
+        if not self._network_locked_to_runtime:
+            return detected
+        operational = self._operational_runtime_status()
+        if operational["stopped"]:
+            return []
+        if detected:
+            return detected
+        if not operational["received"] or not operational["fresh"]:
+            return ["simulation_runtime_state_unavailable"]
+        return ["simulation_runtime_active"]
+
+    def _manual_write_block_reason(self) -> str:
+        """Evaluate current graph/session state immediately before a ROS write."""
+
+        blocked = self._blocked_nodes()
+        with self._lock:
+            return manual_write_block_reason(
+                armed=self._armed,
+                fault_locked=self._fault_locked,
+                blocked_nodes=blocked,
+                planner_coexistence_allowed=self._planner_coexistence_allowed,
+                acknowledged_blocked_nodes=self._acknowledged_blocked_nodes,
+            )
 
     def _output_conflicts(self, topic: str) -> list[str]:
         conflicts: set[str] = set()
@@ -681,6 +831,79 @@ class IntegrationDebugNode(Node):
             if publisher is not None:
                 self.destroy_publisher(publisher)
 
+    def _sync_asr_publisher(self, connected: bool) -> None:
+        """Expose Debug ASR readiness only for a requested, connected capture."""
+
+        with self._auxiliary_lock:
+            should_publish = bool(connected and self._asr_capture_requested)
+            if should_publish:
+                self._ensure_asr_publisher()
+            else:
+                self._destroy_asr_publisher()
+
+    def _ensure_manual_sentence_publisher(self) -> Any:
+        with self._auxiliary_lock:
+            if self._manual_sentence_pub is None:
+                self._manual_sentence_pub = self.create_publisher(
+                    String,
+                    self._asr_topic,
+                    QoSProfile(
+                        history=QoSHistoryPolicy.KEEP_LAST,
+                        depth=1,
+                        reliability=QoSReliabilityPolicy.RELIABLE,
+                        durability=QoSDurabilityPolicy.VOLATILE,
+                    ),
+                )
+            return self._manual_sentence_pub
+
+    def _destroy_manual_sentence_publisher(self) -> None:
+        with self._auxiliary_lock:
+            publisher = self._manual_sentence_pub
+            self._manual_sentence_pub = None
+            if publisher is not None:
+                self.destroy_publisher(publisher)
+
+    def _ensure_output_publisher(self, topic: str) -> Any:
+        with self._lock:
+            publisher = self._output_publishers.get(topic)
+            if publisher is not None:
+                return publisher
+            state = self._output_states[topic]
+            message_class = PUBLIC_OUTPUT_TYPES[state.message_type]
+            publisher = self.create_publisher(
+                message_class,
+                topic,
+                self._output_qos_profiles[topic],
+            )
+            self._output_publishers[topic] = publisher
+            return publisher
+
+    def _destroy_output_publisher(self, topic: str) -> None:
+        with self._lock:
+            publisher = self._output_publishers.pop(topic, None)
+        if publisher is not None:
+            self.destroy_publisher(publisher)
+
+    def _release_manual_publishers(self) -> None:
+        """Revoke every manual write path, including microphone capture."""
+
+        with self._lock:
+            for state in self._output_states.values():
+                state.enabled = False
+            publishers = list(self._output_publishers.values())
+            self._output_publishers.clear()
+        for publisher in publishers:
+            self.destroy_publisher(publisher)
+        self._destroy_manual_sentence_publisher()
+        with self._auxiliary_lock:
+            self._asr_capture_requested = False
+            self._destroy_asr_publisher()
+            # Removing only the ROS publisher would leave privacy-sensitive
+            # microphone audio streaming to the external ASR server invisibly.
+            # The runtime stop is idempotent, so every authority-revocation path
+            # may safely enforce it here.
+            self._asr.stop_async()
+
     def _handle_asr_command(
         self, operation: str, payload: dict[str, Any]
     ) -> tuple[bool, str, str, dict[str, Any]]:
@@ -690,32 +913,45 @@ class IntegrationDebugNode(Node):
                 "devices": devices
             }
         if operation == "asr_start":
-            with self._lock:
-                if not self._armed:
-                    return False, "", "arm manual control before starting the microphone", {}
-                if self._fault_locked:
-                    return False, "", "manual control is fault locked", {}
+            if self._network_locked_to_runtime:
+                return (
+                    False,
+                    "",
+                    "integrated runtime owns USB ASR; use the live operating-screen ASR controls",
+                    {},
+                )
+            blocked_reason = self._manual_write_block_reason()
+            if blocked_reason:
+                if blocked_reason == "manual control is not armed":
+                    blocked_reason = "arm manual control before starting the microphone"
+                return False, "", blocked_reason, {}
             with self._auxiliary_lock:
                 # Consume a previous session's terminal event before creating
-                # the publisher for this new session.
+                # readiness for this new session.
                 self._drain_auxiliary_events()
                 state = str(self._asr.snapshot().get("state", ""))
                 if state not in {"STOPPED", "ERROR"}:
                     raise ValueError("ASR microphone session is already active")
-                publisher_created = self._asr_sentence_pub is None
-                self._ensure_asr_publisher()
+                self._asr_capture_requested = False
+                self._destroy_asr_publisher()
                 try:
                     self._asr.start(
                         device_id=payload.get("device_id"),
                         server_url=payload.get("server_url"),
                     )
                 except Exception:
-                    if publisher_created:
-                        self._destroy_asr_publisher()
+                    self._asr_capture_requested = False
+                    self._destroy_asr_publisher()
                     raise
+                self._asr_capture_requested = True
+                self._sync_asr_publisher(
+                    bool(self._asr.snapshot().get("connected", False))
+                )
             return True, "", "USB microphone ASR session started", self._asr.snapshot()
         if operation == "asr_stop":
             with self._auxiliary_lock:
+                self._asr_capture_requested = False
+                self._destroy_asr_publisher()
                 self._asr.stop_async()
                 snapshot = self._asr.snapshot()
             return True, "", "USB microphone ASR stop requested", snapshot
@@ -746,19 +982,37 @@ class IntegrationDebugNode(Node):
         with self._auxiliary_lock:
             for event in self._asr.drain_events():
                 event_type = str(event.get("type", "asr_event"))
-                if event_type == "asr_final":
+                if event_type == "asr_connection":
+                    self._sync_asr_publisher(bool(event.get("connected", False)))
+                elif event_type == "asr_final":
                     text = str(event.get("text", "")).strip()
                     publisher = self._asr_sentence_pub
-                    if text and publisher is not None:
+                    blocked_reason = self._manual_write_block_reason()
+                    if (
+                        text
+                        and self._asr_capture_requested
+                        and publisher is not None
+                        and not blocked_reason
+                    ):
                         message = String()
                         message.data = text
                         publisher.publish(message)
+                    elif text and blocked_reason:
+                        event = {
+                            **event,
+                            "publish_suppressed": True,
+                            "publish_suppressed_reason": blocked_reason,
+                        }
                 elif event_type == "asr_stopped":
+                    self._asr_capture_requested = False
                     self._destroy_asr_publisher()
                 # Partial hypotheses are high-volume transient UI state. They stay
                 # in the bounded ASR snapshot and are not duplicated in JSONL.
                 if event_type != "asr_partial":
                     self._record(event_type, event)
+            self._sync_asr_publisher(
+                bool(self._asr.snapshot().get("connected", False))
+            )
             for event in self._surgery_record.drain_events():
                 self._record(str(event.get("type", "record_event")), event)
 
@@ -807,6 +1061,7 @@ class IntegrationDebugNode(Node):
                 self._disarm_locked()
             with self._auxiliary_lock:
                 self._asr.stop_async()
+            self._release_manual_publishers()
             if self._active_command_id:
                 accepted, command_id, message = self._request_cancel()
                 if accepted:
@@ -829,26 +1084,51 @@ class IntegrationDebugNode(Node):
             return self._request_cancel()
         if operation == "configure_voice":
             enabled = bool(payload.get("enabled", False))
+            if enabled:
+                blocked_reason = self._manual_write_block_reason()
+                if blocked_reason:
+                    if blocked_reason == "manual control is not armed":
+                        blocked_reason = (
+                            "arm manual control before enabling voice dispatch"
+                        )
+                    return False, "", blocked_reason
             with self._lock:
-                if enabled and not self._armed:
-                    return False, "", "arm manual control before enabling voice dispatch"
                 self._voice_auto_execute = enabled
             return True, "", "voice auto-dispatch enabled" if enabled else "voice auto-dispatch disabled"
+        if operation == "publish_voice_command":
+            blocked_reason = self._manual_write_block_reason()
+            if blocked_reason:
+                return False, "", blocked_reason
+            text = str(payload.get("text", "")).strip()
+            if not text:
+                return False, "", "text is required"
+            if len(text) > 1000:
+                return False, "", "text must be at most 1000 characters"
+            publisher = self._ensure_manual_sentence_publisher()
+            message = String()
+            message.data = text
+            publisher.publish(message)
+            return True, "", f"published manual sentence on {self._asr_topic}"
         if operation == "configure_output":
+            if bool(payload.get("enabled", False)):
+                blocked_reason = self._manual_write_block_reason()
+                if blocked_reason:
+                    return False, "", blocked_reason
             return self._configure_output(payload)
         if operation == "publish_once":
             topic = str(payload.get("topic", "")).strip()
             if topic not in self._output_states:
                 return False, "", "unknown public output topic"
+            blocked_reason = self._manual_write_block_reason()
+            if blocked_reason:
+                return False, "", blocked_reason
             conflicts = self._output_conflicts(topic)
             if conflicts:
                 return False, "", "another publisher owns the topic: " + ", ".join(conflicts)
             self._publish_output(topic)
             return True, "", f"published one debug message on {topic}"
         if operation == "stop_outputs":
-            with self._lock:
-                for state in self._output_states.values():
-                    state.enabled = False
+            self._release_output_publishers()
             return True, "", "all debug output publishers stopped"
         return self._dispatch_action(operation, payload, source="ui")
 
@@ -874,6 +1154,7 @@ class IntegrationDebugNode(Node):
             self._fault_locked = False
             self._last_error = ""
             self._action_status = self._idle_action_status()
+        self._release_manual_publishers()
         self._record(
             "action_client_recovered",
             {
@@ -894,6 +1175,19 @@ class IntegrationDebugNode(Node):
     def _apply_network_settings(
         self, payload: dict[str, Any]
     ) -> tuple[bool, str, str, dict[str, Any]]:
+        if self._network_locked_to_runtime:
+            return (
+                False,
+                "",
+                "DDS settings are locked to the active Taskplanner runtime",
+                {
+                    "domain_id": int(os.environ.get("ROS_DOMAIN_ID", "0") or 0),
+                    "discovery_range": os.environ.get(
+                        "ROS_AUTOMATIC_DISCOVERY_RANGE", ""
+                    ).strip().upper(),
+                    "locked_to_runtime": True,
+                },
+            )
         if not self._restart_supported:
             return (
                 False,
@@ -939,6 +1233,7 @@ class IntegrationDebugNode(Node):
         with self._lock:
             self._restart_scheduled = True
             self._disarm_locked()
+        self._release_manual_publishers()
         threading.Thread(
             target=self._restart_runtime_after_response,
             name="debug-network-restart",
@@ -976,29 +1271,12 @@ class IntegrationDebugNode(Node):
     def _dispatch_action(
         self, operation: str, payload: dict[str, Any], *, source: str
     ) -> tuple[bool, str, str]:
+        blocked_reason = self._manual_write_block_reason()
+        if blocked_reason:
+            return False, "", blocked_reason
         with self._lock:
-            if not self._armed:
-                return False, "", "manual control is not armed"
-            if self._fault_locked:
-                return False, "", "manual control is fault locked"
             if self._active_command_id:
                 return False, self._active_command_id, "another command is active"
-        blocked = self._blocked_nodes()
-        with self._lock:
-            if not self._armed:
-                return False, "", "manual control is not armed"
-            if self._fault_locked:
-                return False, "", "manual control is fault locked"
-            if self._active_command_id:
-                return False, self._active_command_id, "another command is active"
-            acknowledged = sorted(self._acknowledged_blocked_nodes)
-            if blocked != acknowledged:
-                self._disarm_locked()
-                self._last_error = (
-                    "planner node set changed; manual control was disarmed: "
-                    + ", ".join(blocked or ["none"])
-                )
-                return False, "", self._last_error
         command_id = f"debug-{uuid4()}"
         if operation == "tool_handover":
             mapped = validate_tool_handover(payload)
@@ -1197,6 +1475,8 @@ class IntegrationDebugNode(Node):
             if reason_code in {"cancel_recovery_failed", "cancel_rejected"}:
                 self._fault_locked = True
                 self._disarm_locked()
+        if reason_code in {"cancel_recovery_failed", "cancel_rejected"}:
+            self._release_manual_publishers()
         if reconciled:
             self._record(
                 "action_late_result_reconciled",
@@ -1298,6 +1578,7 @@ class IntegrationDebugNode(Node):
                 "elapsed_sec": round(max(0.0, now - started), 3) if started else 0.0,
             }
         self._record("action_recovery_required", event)
+        self._release_manual_publishers()
         return True
 
     def _configure_output(
@@ -1318,11 +1599,23 @@ class IntegrationDebugNode(Node):
             conflicts = self._output_conflicts(topic)
             if conflicts:
                 return False, "", "another publisher owns the topic: " + ", ".join(conflicts)
+            self._ensure_output_publisher(topic)
         with self._lock:
             state.rate_hz = rate_hz
             state.enabled = enabled
             state.last_published_monotonic = 0.0
+        if not enabled:
+            self._destroy_output_publisher(topic)
         return True, "", f"{topic} {'enabled' if enabled else 'disabled'} at {rate_hz:.2f} Hz"
+
+    def _release_output_publishers(self) -> None:
+        with self._lock:
+            for state in self._output_states.values():
+                state.enabled = False
+            publishers = list(self._output_publishers.values())
+            self._output_publishers.clear()
+        for publisher in publishers:
+            self.destroy_publisher(publisher)
 
     def _publish_enabled_outputs(self) -> None:
         now = time.monotonic()
@@ -1334,6 +1627,22 @@ class IntegrationDebugNode(Node):
                 period = 1.0 / max(0.1, state.rate_hz)
                 if state.last_published_monotonic <= 0.0 or now - state.last_published_monotonic >= period:
                     due.append(topic)
+        if due:
+            blocked_reason = self._manual_write_block_reason()
+            if blocked_reason:
+                with self._lock:
+                    stopped = [
+                        state.topic
+                        for state in self._output_states.values()
+                        if state.enabled
+                    ]
+                    self._last_error = blocked_reason
+                self._release_output_publishers()
+                self._record(
+                    "outputs_stopped_by_runtime_gate",
+                    {"topics": stopped, "reason": blocked_reason},
+                )
+                return
         for topic in due:
             if self._output_conflicts(topic):
                 with self._lock:
@@ -1343,6 +1652,7 @@ class IntegrationDebugNode(Node):
                     "output_conflict",
                     {"topic": topic, "publishers": self._output_conflicts(topic)},
                 )
+                self._destroy_output_publisher(topic)
                 continue
             self._publish_output(topic)
 
@@ -1352,7 +1662,7 @@ class IntegrationDebugNode(Node):
             state.sequence += 1
             sequence = state.sequence
         message = self._dummy_message(topic, sequence)
-        self._output_publishers[topic].publish(message)
+        self._ensure_output_publisher(topic).publish(message)
         now = time.monotonic()
         with self._lock:
             state.last_published_monotonic = now
@@ -1411,6 +1721,11 @@ class IntegrationDebugNode(Node):
             msg = SurgeryEvent()
             msg.stamp = stamp
             msg.sequence = sequence
+            msg.schema_version = "1.0.0"
+            msg.catalog_version = "debug:none"
+            msg.gateway_instance_id = f"debug:{self._session_id}"
+            msg.procedure_run_id = f"debug:{self._session_id}"
+            msg.procedure_type = "integration_debug"
             msg.event_type = "DEBUG_DUMMY_DATA"
             msg.subject_type = "integration_debug"
             msg.subject_id = self._session_id
@@ -1553,6 +1868,7 @@ class IntegrationDebugNode(Node):
         rows: list[dict[str, Any]] = []
         with self._lock:
             states = list(self._output_states.values())
+            publisher_topics = set(self._output_publishers)
         for state in states:
             rate_hz, _count = measured_rate(
                 list(state.publish_times), now, self._monitor_window_sec
@@ -1577,6 +1893,7 @@ class IntegrationDebugNode(Node):
                     "subscriber_count": len(subscribers),
                     "subscribers": subscribers,
                     "conflicting_publishers": conflicts,
+                    "publisher_active": state.topic in publisher_topics,
                 }
             )
         return rows
@@ -1622,7 +1939,20 @@ class IntegrationDebugNode(Node):
             armed = self._armed
             acknowledged_blocked_nodes = sorted(self._acknowledged_blocked_nodes)
             last_error = self._last_error
+        detected_planner_nodes = self._detected_planner_nodes()
+        operational = self._operational_runtime_status()
         blocked = self._blocked_nodes()
+        operational_runtime_is_stopped = bool(
+            operational["stopped"]
+            if self._network_locked_to_runtime
+            else not detected_planner_nodes
+        )
+        manual_control_available = bool(
+            operational_runtime_is_stopped
+            and not blocked
+            and not self._fault_locked
+            and not self._active_command_id
+        )
         try:
             network = collect_network_status()
         except Exception as exc:
@@ -1647,6 +1977,19 @@ class IntegrationDebugNode(Node):
                 "settings_path": str(self._network_settings_path),
                 "restart_supported": self._restart_supported,
                 "restart_scheduled": self._restart_scheduled,
+                "locked_to_runtime": self._network_locked_to_runtime,
+                "locked_to_runtime_network": self._network_locked_to_runtime,
+                "lock_reason": (
+                    "DDS settings follow the active Taskplanner runtime"
+                    if self._network_locked_to_runtime
+                    else ""
+                ),
+                "active_domain_id": int(
+                    os.environ.get("ROS_DOMAIN_ID", "0") or 0
+                ),
+                "active_discovery_range": os.environ.get(
+                    "ROS_AUTOMATIC_DISCOVERY_RANGE", ""
+                ).strip().upper(),
             }
         )
         bed_robot_ready, bed_robot_age_sec = self._bed_robot_arm_status_ready()
@@ -1704,6 +2047,29 @@ class IntegrationDebugNode(Node):
                     "ROS_AUTOMATIC_DISCOVERY_RANGE", ""
                 ),
                 "blocked_nodes": blocked,
+                "detected_planner_nodes": detected_planner_nodes,
+                "operational_state": operational["execution_state"],
+                "operational_running": operational["running"],
+                "operational_active_robot_task_id": operational[
+                    "active_robot_task_id"
+                ],
+                "operational_robot_state": operational["robot_state"],
+                "operational_cleaner_busy": operational["cleaner_busy"],
+                "operational_state_publishers": operational["publishers"],
+                "operational_state_expected_publisher": operational[
+                    "expected_publisher"
+                ],
+                "operational_state_publisher_trusted": operational[
+                    "publisher_trusted"
+                ],
+                "operational_state_age_sec": (
+                    round(float(operational["age_sec"]), 3)
+                    if operational["age_sec"] is not None
+                    else None
+                ),
+                "operational_state_fresh": operational["fresh"],
+                "operational_runtime_stopped": operational_runtime_is_stopped,
+                "manual_control_available": manual_control_available,
                 "planner_coexistence_allowed": self._planner_coexistence_allowed,
                 "action_watchdog": dict(self._action_watchdog_policy),
                 "network": network,
@@ -1733,7 +2099,8 @@ class IntegrationDebugNode(Node):
                 break
         asr = self._asr.snapshot()
         managed_asr_ready = bool(
-            self._asr_sentence_pub is not None
+            self._asr_capture_requested
+            and self._asr_sentence_pub is not None
             and asr.get("state") == "LISTENING"
             and asr.get("connected")
         )
@@ -1749,7 +2116,7 @@ class IntegrationDebugNode(Node):
         }
         missing = [name for name, passed in checks.items() if not passed]
         return {
-            "schema": "taskplanner.integration_readiness.v1",
+            "schema": "taskplanner.integration_debug.readiness.v1",
             "ready": not missing,
             "checks": checks,
             "missing": missing,
@@ -1828,6 +2195,7 @@ class IntegrationDebugNode(Node):
             )
         with self._auxiliary_lock:
             self._asr.stop_async()
+        self._release_manual_publishers()
         if command_id:
             self._request_cancel()
 
@@ -1906,9 +2274,11 @@ class IntegrationDebugNode(Node):
             for state in self._output_states.values():
                 state.enabled = False
         with self._auxiliary_lock:
+            self._asr_capture_requested = False
+            self._destroy_asr_publisher()
             self._asr.close()
+        self._release_manual_publishers()
         self._drain_auxiliary_events()
-        self._destroy_asr_publisher()
         self._record("session_stopped", {})
 
 

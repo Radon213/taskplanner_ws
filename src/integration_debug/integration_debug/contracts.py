@@ -200,6 +200,110 @@ def validate_planner_coexistence_acknowledgement(
     return normalized
 
 
+def manual_write_block_reason(
+    *,
+    armed: bool,
+    fault_locked: bool,
+    blocked_nodes: Iterable[str],
+    planner_coexistence_allowed: bool,
+    acknowledged_blocked_nodes: Iterable[str],
+) -> str:
+    """Return the fail-closed reason for a Debug Mode ROS write.
+
+    Every ROS write requires an armed session.  Once a Taskplanner runtime is
+    discovered, the explicit coexistence policy and an acknowledgement of the
+    exact current node set are required as well.
+    """
+
+    blocked = sorted(
+        {str(node).strip() for node in blocked_nodes if str(node).strip()}
+    )
+    acknowledged = sorted(
+        {
+            str(node).strip()
+            for node in acknowledged_blocked_nodes
+            if str(node).strip()
+        }
+    )
+    if fault_locked:
+        return "manual control is fault locked"
+    if blocked:
+        if not planner_coexistence_allowed:
+            return "full Taskplanner nodes are active: " + ", ".join(blocked)
+        if armed and acknowledged != blocked:
+            return (
+                "planner node set changed; refresh the status and arm manual "
+                "control with an exact coexistence acknowledgement"
+            )
+    if not armed:
+        return "manual control is not armed"
+    return ""
+
+
+SAFE_STOPPED_EXECUTION_STATES = {
+    "idle",
+    "halted",
+    "stopped",
+    "completed",
+    "terminated",
+}
+UNSAFE_OPERATIONAL_ROBOT_STATES = {
+    "busy",
+    "cleaning",
+    "executing",
+    "handover_in_progress",
+    "handover_ready",
+    "moving",
+    "picking",
+    "ready_to_return",
+    "recovery_in_progress",
+    "returning_home",
+    "stopping",
+}
+
+
+def operational_runtime_stopped(
+    *,
+    received: bool,
+    running: bool,
+    execution_state: str,
+    active_robot_task_id: str,
+    robot_state: str,
+    cleaner_busy: bool,
+    publisher_trusted: bool,
+    age_sec: float | None,
+    max_age_sec: float,
+) -> bool:
+    """Require a fresh, explicit stopped state before integrated manual writes."""
+
+    state = str(execution_state).strip().lower()
+    robot = str(robot_state).strip().lower()
+    return bool(
+        received
+        and publisher_trusted
+        and age_sec is not None
+        and 0.0 <= age_sec <= max_age_sec
+        and not running
+        and state in SAFE_STOPPED_EXECUTION_STATES
+        and not str(active_robot_task_id).strip()
+        and robot not in UNSAFE_OPERATIONAL_ROBOT_STATES
+        and not cleaner_busy
+    )
+
+
+def operational_state_publisher_trusted(
+    publisher_identities: Iterable[str], expected_identity: str
+) -> bool:
+    """Trust a runtime-stop signal only from one exact publisher identity."""
+
+    publishers = [
+        str(identity).strip()
+        for identity in publisher_identities
+        if str(identity).strip()
+    ]
+    return len(publishers) == 1 and publishers[0] == str(expected_identity).strip()
+
+
 def validate_tool_handover(payload: dict[str, Any]) -> dict[str, Any]:
     instrument_id = str(payload.get("instrument_id", "")).strip()
     instance_id = str(payload.get("instrument_instance_id", "")).strip()

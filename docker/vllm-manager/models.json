@@ -58,6 +58,37 @@
       "local_only": true
     },
     {
+      "source_model_id": "/root/.cache/huggingface/taskplanner-local/qwen35_9b_offline/base_model",
+      "served_model_name": "taskplanner/qwen35-9b-p03-tool-lora",
+      "client_model_id": "p03-tool",
+      "display_name": "Qwen3.5 9B P03 Tool LoRA (BF16)",
+      "capabilities": ["text", "image"],
+      "max_model_len": 4096,
+      "max_num_seqs": 1,
+      "gpu_memory_utilization": 0.72,
+      "generation_config": "vllm",
+      "reasoning_parser": "",
+      "local_only": true,
+      "extra_args": [
+        "--enable-lora",
+        "--lora-modules",
+        "p03-tool=/root/.cache/huggingface/taskplanner-local/qwen35_9b_offline/package/adapters/qwen35_9b_base_history_only_r32_2epoch_bf16_px196k_run001",
+        "--max-lora-rank",
+        "32",
+        "--max-loras",
+        "1",
+        "--enable-prefix-caching",
+        "--enable-chunked-prefill",
+        "--max-num-batched-tokens",
+        "4096",
+        "--limit-mm-per-prompt",
+        "{\"image\":1}",
+        "--mm-processor-kwargs",
+        "{\"max_pixels\":196608}",
+        "--no-enable-log-requests"
+      ]
+    },
+    {
       "source_model_id": "AxionML/Qwen3.5-4B-NVFP4",
       "served_model_name": "AxionML/Qwen3.5-4B-NVFP4",
       "display_name": "Qwen3.5 4B NVFP4",

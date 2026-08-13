@@ -97,6 +97,9 @@ def evaluate_readiness(
     rfdetr_age_sec: float,
     perception_max_age_sec: float,
     contract_configuration_valid: bool = True,
+    perception_backend: str = "local",
+    cv_contract_status: dict[str, Any] | None = None,
+    cv_contract_age_sec: float = -1.0,
 ) -> dict[str, Any]:
     checks = {
         "contract_configuration": bool(contract_configuration_valid),
@@ -133,7 +136,12 @@ def evaluate_readiness(
         ),
     }
 
-    if require_perception:
+    normalized_backend = str(perception_backend).strip().casefold()
+    if normalized_backend not in {"local", "external", "disabled"}:
+        normalized_backend = "invalid"
+    details["perception_backend"] = normalized_backend
+
+    if require_perception and normalized_backend == "local":
         health = rfdetr_health if isinstance(rfdetr_health, dict) else {}
         perception_ready = (
             bool(health.get("connected"))
@@ -144,6 +152,33 @@ def evaluate_readiness(
         checks["perception_input"] = perception_ready
         details["rfdetr_status"] = str(health.get("status", "missing"))
         details["cam4_aligned"] = bool(health.get("cam4_aligned"))
+    elif require_perception and normalized_backend == "external":
+        contract = (
+            cv_contract_status if isinstance(cv_contract_status, dict) else {}
+        )
+        # The current scaffold deliberately cannot authorize external evidence:
+        # custom IDL, timing, calibration and the adapter have not arrived.
+        # Retain this explicit condition so a future adapter must opt in by
+        # changing the monitor's contract rather than by a topic-name match.
+        perception_ready = (
+            contract.get("schema") == "taskplanner.cv_external_contract.v1"
+            and bool(contract.get("ready_for_external_evidence"))
+            and 0.0 <= float(cv_contract_age_sec) <= float(perception_max_age_sec)
+        )
+        checks["perception_input"] = perception_ready
+        details["cv_contract_state"] = str(
+            contract.get("readiness_state", "missing")
+        )
+        details["cv_contract_age_sec"] = (
+            round(float(cv_contract_age_sec), 3)
+            if cv_contract_age_sec >= 0.0
+            else -1.0
+        )
+    elif require_perception:
+        checks["perception_input"] = False
+        details["perception_backend_error"] = (
+            "perception backend is disabled or invalid"
+        )
 
     missing = [name for name, passed in checks.items() if not passed]
     return {
@@ -171,6 +206,11 @@ class IntegrationPreflightNode(Node):
         self.declare_parameter("require_sentence_publisher", True)
         self.declare_parameter("require_perception", False)
         self.declare_parameter("perception_max_age_sec", 3.0)
+        self.declare_parameter("perception_backend", "local")
+        self.declare_parameter(
+            "cv_contract_status_topic",
+            "/integration/cv_contract/status",
+        )
         self.declare_parameter(
             "tool_handover_action_name",
             "/surgery/tool_handover",
@@ -205,6 +245,9 @@ class IntegrationPreflightNode(Node):
         self._require_perception = bool(
             self.get_parameter("require_perception").value
         )
+        self._perception_backend = str(
+            self.get_parameter("perception_backend").value
+        ).strip().casefold()
         self._require_tool_change_service = bool(
             self.get_parameter("require_tool_change_service").value
         )
@@ -237,6 +280,8 @@ class IntegrationPreflightNode(Node):
         )
         self._latest_rfdetr_health: dict[str, Any] | None = None
         self._latest_rfdetr_monotonic = 0.0
+        self._latest_cv_contract_status: dict[str, Any] | None = None
+        self._latest_cv_contract_monotonic = 0.0
         self.add_on_set_parameters_callback(self._on_contract_parameters_changed)
 
         self._tool_handover_client = ActionClient(
@@ -271,6 +316,12 @@ class IntegrationPreflightNode(Node):
             String,
             str(self.get_parameter("rfdetr_health_topic").value),
             self._on_rfdetr_health,
+            10,
+        )
+        self.create_subscription(
+            String,
+            str(self.get_parameter("cv_contract_status_topic").value),
+            self._on_cv_contract_status,
             10,
         )
         self.create_service(
@@ -375,6 +426,19 @@ class IntegrationPreflightNode(Node):
         self._latest_rfdetr_health = payload
         self._latest_rfdetr_monotonic = time.monotonic()
 
+    def _on_cv_contract_status(self, msg: String) -> None:
+        try:
+            payload = json.loads(msg.data)
+        except (TypeError, ValueError):
+            return
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema") != "taskplanner.cv_external_contract.v1"
+        ):
+            return
+        self._latest_cv_contract_status = payload
+        self._latest_cv_contract_monotonic = time.monotonic()
+
     def _on_bed_robot_arm_status(self, msg: BedRobotArmStateArray) -> None:
         source_stamp_sec = float(msg.stamp.sec) + float(msg.stamp.nanosec) / 1e9
         now_sec = time.time()
@@ -401,6 +465,11 @@ class IntegrationPreflightNode(Node):
         rfdetr_age_sec = (
             time.monotonic() - self._latest_rfdetr_monotonic
             if self._latest_rfdetr_monotonic > 0.0
+            else -1.0
+        )
+        cv_contract_age_sec = (
+            time.monotonic() - self._latest_cv_contract_monotonic
+            if self._latest_cv_contract_monotonic > 0.0
             else -1.0
         )
         reception_age_sec = (
@@ -439,6 +508,9 @@ class IntegrationPreflightNode(Node):
             rfdetr_age_sec=rfdetr_age_sec,
             perception_max_age_sec=self._perception_max_age_sec,
             contract_configuration_valid=self._contract_configuration_valid(),
+            perception_backend=self._perception_backend,
+            cv_contract_status=self._latest_cv_contract_status,
+            cv_contract_age_sec=cv_contract_age_sec,
         )
         snapshot["details"].update(
             {

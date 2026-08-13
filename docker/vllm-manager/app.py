@@ -62,6 +62,11 @@ class ModelProfile:
     reasoning_parser: str
     extra_args: tuple[str, ...]
     local_only: bool = True
+    client_model_id: str = ""
+
+    @property
+    def advertised_model_id(self) -> str:
+        return self.client_model_id or self.served_model_name
 
     @classmethod
     def from_payload(cls, row: dict[str, Any]) -> "ModelProfile":
@@ -79,9 +84,13 @@ class ModelProfile:
             row.get("capabilities"),
             default=("text", "image"),
         )
+        client_model_id = str(
+            row.get("client_model_id", served_name)
+        ).strip() or served_name
         return cls(
             source_model_id=source_model_id,
             served_model_name=served_name,
+            client_model_id=client_model_id,
             display_name=str(row.get("display_name", served_name)).strip()
             or served_name,
             capabilities=capabilities or ("text",),
@@ -105,7 +114,13 @@ class ModelProfile:
     @property
     def aliases(self) -> tuple[str, ...]:
         return tuple(
-            dict.fromkeys((self.served_model_name, self.source_model_id))
+            dict.fromkeys(
+                (
+                    self.advertised_model_id,
+                    self.served_model_name,
+                    self.source_model_id,
+                )
+            )
         )
 
 
@@ -400,7 +415,7 @@ class RuntimeManager:
                 loaded_at = 0.0
             return {
                 "provider": "vllm",
-                "model_id": selected.served_model_name,
+                "model_id": selected.advertised_model_id,
                 "source_model_id": selected.source_model_id,
                 "display_name": selected.display_name,
                 "state": state,
@@ -421,7 +436,7 @@ class RuntimeManager:
         is_loaded = state == "loaded"
         selectable = self._profile_selectable(profile)
         return {
-            "id": profile.served_model_name,
+            "id": profile.advertised_model_id,
             "object": "model",
             "owned_by": "taskplanner-vllm-manager",
             "source_model_id": profile.source_model_id,
@@ -429,7 +444,7 @@ class RuntimeManager:
             "capabilities": list(profile.capabilities),
             "loaded": is_loaded,
             "loaded_instances": (
-                [{"id": profile.served_model_name}]
+                [{"id": profile.advertised_model_id}]
                 if is_loaded
                 else []
             ),

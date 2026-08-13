@@ -22,6 +22,8 @@ setup(
     entry_points={
         "console_scripts": [
             "surgical_interop_gateway = surgical_interop_gateway.node:main",
+            "camera_alias_relay = surgical_interop_gateway.camera_alias_relay:main",
+            "public_rosbridge = surgical_interop_gateway.public_rosbridge:main",
         ],
     },
 )

@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <package format="3">
   <name>surgical_interop_msgs</name>
-  <version>0.2.0</version>
+  <version>0.3.0</version>
   <description>Public ROS 2 interfaces for sharing safe surgical context and requesting focused robot capabilities.</description>
   <maintainer email="Radon213@users.noreply.github.com">Radon213</maintainer>
   <license>Apache-2.0</license>

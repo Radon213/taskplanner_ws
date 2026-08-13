@@ -124,6 +124,28 @@ class VllmManagerTest(unittest.TestCase):
         self.assertTrue(all(row["cached"] for row in rows))
         self.assertEqual([row["load_state"] for row in rows], ["unloaded"] * 2)
 
+    def test_catalog_can_advertise_lora_client_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile = self._profile("org/vision-base")
+            profile = app_module.ModelProfile(
+                **{
+                    **profile.__dict__,
+                    "client_model_id": "instrument-lora",
+                }
+            )
+            self._cache(root, profile.source_model_id)
+            manager = app_module.RuntimeManager(
+                self._settings(root, [profile])
+            )
+
+            row = manager.model_rows()[0]
+            resolved = manager._resolve_profile("instrument-lora")
+
+        self.assertEqual(row["id"], "instrument-lora")
+        self.assertEqual(row["loaded_instances"], [])
+        self.assertIs(resolved, profile)
+
     def test_missing_local_model_is_visible_but_not_selectable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

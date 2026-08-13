@@ -46,6 +46,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/VLMResult.msg"
   "msg/WorldState.msg"
   "srv/ControlModelRuntime.srv"
+  "srv/AsrControl.srv"
   "srv/ControlSimulation.srv"
   "srv/ControlShadowReplay.srv"
   "srv/InjectSurgeonOverride.srv"

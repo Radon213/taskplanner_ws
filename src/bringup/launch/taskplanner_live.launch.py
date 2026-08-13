@@ -21,9 +21,28 @@ def _env(name: str, default: str) -> EnvironmentVariable:
 def generate_launch_description() -> LaunchDescription:
     vlm_mode = _env("VLM_MODE", "real")
     publish_shared_state = LaunchConfiguration("publish_shared_state")
+    publish_shared_free_text = LaunchConfiguration("publish_shared_free_text")
+    publish_camera_aliases = LaunchConfiguration("publish_camera_aliases")
+    perception_backend = LaunchConfiguration("perception_backend")
     default_bundle = LaunchConfiguration("default_bundle")
+    flir_input_topic = _env(
+        "FLIR_INPUT_TOPIC",
+        "/flir_camera/image_color/compressed",
+    )
+    cam4_input_topic = _env(
+        "CAM4_INPUT_TOPIC",
+        "/camera/cam_4/color/image_raw/compressed",
+    )
     perception_enabled = PythonExpression(
-        ["'", vlm_mode, "' in ('real', 'dual')"]
+        [
+            "'",
+            perception_backend,
+            "' == 'local' and '",
+            _env("ENABLE_RFDETR_PERCEPTION", "true"),
+            "'.lower() in ('true', '1', 'yes') and '",
+            vlm_mode,
+            "' in ('real', 'dual')",
+        ]
     )
     base_launch = PythonLaunchDescriptionSource(
         PathJoinSubstitution(
@@ -39,10 +58,34 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument(
                 "publish_shared_state",
-                default_value="false",
+                default_value="true",
                 description=(
                     "Publish the curated read-only shared surgical state on "
                     "/surgery/* topics."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "publish_shared_free_text",
+                default_value=_env("PUBLISH_SHARED_FREE_TEXT", "false"),
+                description=(
+                    "Publish public ASR transcript and VLM summary text only "
+                    "after deployment privacy review."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "publish_camera_aliases",
+                default_value="true",
+                description=(
+                    "Expose the external FLIR and CAM4 compressed streams on "
+                    "stable /surgery/images/* aliases."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "perception_backend",
+                default_value=_env("PERCEPTION_BACKEND", "local"),
+                description=(
+                    "local runs the built-in RF-DETR bridge; external reserves "
+                    "the CV-team contract; disabled runs neither backend."
                 ),
             ),
             IncludeLaunchDescription(
@@ -57,6 +100,8 @@ def generate_launch_description() -> LaunchDescription:
                     ),
                     "input_profile": "external",
                     "default_bundle": default_bundle,
+                    "publish_shared_state": publish_shared_state,
+                    "publish_shared_free_text": publish_shared_free_text,
                     "execution_backend": "external",
                     "execution_contract": "direct",
                     "speech_input_mode": "sentence_text",
@@ -98,18 +143,13 @@ def generate_launch_description() -> LaunchDescription:
                     "enable_no_image_camera": "false",
                     "enable_synthetic_scene_camera": "false",
                     "enable_rfdetr_perception": perception_enabled,
+                    "perception_backend": perception_backend,
                     "rfdetr_service_url": _env(
                         "RFDETR_SERVICE_URL",
                         "http://127.0.0.1:8010",
                     ),
-                    "flir_input_topic": _env(
-                        "FLIR_INPUT_TOPIC",
-                        "/surgery/images/flir/compressed",
-                    ),
-                    "cam4_input_topic": _env(
-                        "CAM4_INPUT_TOPIC",
-                        "/surgery/images/cam4/compressed",
-                    ),
+                    "flir_input_topic": flir_input_topic,
+                    "cam4_input_topic": cam4_input_topic,
                     "field_image_topic": _env(
                         "SEGMENTED_FLIR_TOPIC",
                         "/surgery/images/flir/segmented/compressed",
@@ -128,13 +168,54 @@ def generate_launch_description() -> LaunchDescription:
                         "REQUIRE_PERCEPTION_ON_START",
                         "false",
                     ),
+                    "cv_contract_status_topic": _env(
+                        "CV_CONTRACT_STATUS_TOPIC",
+                        "/integration/cv_contract/status",
+                    ),
+                    "cv_cam4_rgb_topic": _env(
+                        "CV_CAM4_RGB_TOPIC",
+                        "/camera/cam_4/color/image_raw/compressed",
+                    ),
+                    "cv_cam4_rgb_alias_topic": _env(
+                        "CV_CAM4_RGB_ALIAS_TOPIC",
+                        "/surgery/images/cam4/compressed",
+                    ),
+                    "cv_cam4_camera_info_topic": _env(
+                        "CV_CAM4_CAMERA_INFO_TOPIC",
+                        "/surgery/cameras/cam4/color/camera_info",
+                    ),
+                    "cv_cam4_aligned_depth_topic": _env(
+                        "CV_CAM4_ALIGNED_DEPTH_TOPIC",
+                        "/surgery/cameras/cam4/aligned_depth",
+                    ),
+                    "cv_handover_tray_rgb_topic": _env(
+                        "CV_HANDOVER_TRAY_RGB_TOPIC",
+                        "/surgery/images/tray/compressed",
+                    ),
+                    "cv_handover_tray_camera_info_topic": _env(
+                        "CV_HANDOVER_TRAY_CAMERA_INFO_TOPIC",
+                        "/surgery/cameras/tray/color/camera_info",
+                    ),
+                    "cv_handover_tray_aligned_depth_topic": _env(
+                        "CV_HANDOVER_TRAY_ALIGNED_DEPTH_TOPIC",
+                        "/surgery/cameras/tray/aligned_depth",
+                    ),
                 }.items(),
             ),
             Node(
                 package="surgical_interop_gateway",
-                executable="surgical_interop_gateway",
-                name="surgical_interop_gateway",
-                condition=IfCondition(publish_shared_state),
+                executable="camera_alias_relay",
+                name="surgical_camera_alias_relay",
+                condition=IfCondition(publish_camera_aliases),
+                parameters=[
+                    {
+                        "flir_source_topic": flir_input_topic,
+                        "flir_public_topic": "/surgery/images/flir/compressed",
+                        "cam4_source_topic": cam4_input_topic,
+                        "cam4_public_topic": "/surgery/images/cam4/compressed",
+                        "default_bundle": default_bundle,
+                    }
+                ],
                 output="screen",
             ),
         ]

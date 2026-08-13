@@ -4,10 +4,12 @@ from pathlib import Path
 from launch import LaunchContext
 from launch.actions import (
     DeclareLaunchArgument,
+    ExecuteProcess,
     IncludeLaunchDescription,
     SetLaunchConfiguration,
 )
 from launch_ros.actions import Node
+from launch_ros.utilities import evaluate_parameters
 from launch.utilities import perform_substitutions
 
 
@@ -32,11 +34,55 @@ def test_base_launch_conditions_mock_execution_servers() -> None:
     assert {
         "execution_backend",
         "default_bundle",
+        "publish_shared_state",
+        "publish_shared_free_text",
         "speech_input_mode",
         "sentence_input_topic",
         "enable_rfdetr_perception",
+        "perception_backend",
+        "cv_contract_status_topic",
+        "cv_cam4_rgb_topic",
+        "cv_handover_tray_rgb_topic",
         "require_integration_preflight",
     }.issubset(arguments)
+
+    gateway = next(
+        entity
+        for entity in description.entities
+        if isinstance(entity, Node)
+        and entity.node_executable == "surgical_interop_gateway"
+    )
+    assert gateway.condition is not None
+    context = LaunchContext()
+    declaration = next(
+        entity
+        for entity in description.entities
+        if isinstance(entity, DeclareLaunchArgument)
+        and entity.name == "publish_shared_state"
+    )
+    assert perform_substitutions(
+        context, declaration._DeclareLaunchArgument__default_value
+    ) == "true"
+
+    free_text_declaration = next(
+        entity
+        for entity in description.entities
+        if isinstance(entity, DeclareLaunchArgument)
+        and entity.name == "publish_shared_free_text"
+    )
+    assert perform_substitutions(
+        context, free_text_declaration._DeclareLaunchArgument__default_value
+    ) == "false"
+    context.launch_configurations.update(
+        {
+            "default_bundle": "thyroidectomy",
+            "publish_shared_free_text": "false",
+        }
+    )
+    gateway_parameters = evaluate_parameters(
+        context, gateway._Node__parameters
+    )[0]
+    assert gateway_parameters["publish_free_text"] is False
 
     mock_nodes = [
         entity
@@ -69,6 +115,58 @@ def test_base_launch_conditions_mock_execution_servers() -> None:
     ]
     assert len(rosapi_nodes) == 1
     assert rosapi_nodes[0].condition is not None
+
+
+def test_perception_backend_keeps_local_and_external_publishers_exclusive() -> None:
+    module = _load_launch_module("taskplanner_mock.launch.py")
+    description = module.generate_launch_description()
+    rfdetr = next(
+        entity
+        for entity in description.entities
+        if isinstance(entity, Node)
+        and entity.node_executable == "rfdetr_perception_bridge"
+    )
+    monitor = next(
+        entity
+        for entity in description.entities
+        if isinstance(entity, Node)
+        and entity.node_executable == "cv_contract_monitor"
+    )
+    parameters = {
+        _parameter_name(key): value
+        for key, value in monitor._Node__parameters[0].items()
+    }
+    assert {
+        "perception_backend",
+        "status_topic",
+        "cam4_rgb_topic",
+        "cam4_camera_info_topic",
+        "cam4_aligned_depth_topic",
+        "handover_tray_rgb_topic",
+    }.issubset(parameters)
+
+    context = LaunchContext()
+    context.launch_configurations.update(
+        {"perception_backend": "local", "enable_rfdetr_perception": "true"}
+    )
+    assert rfdetr.condition.evaluate(context) is True
+    context.launch_configurations["perception_backend"] = "external"
+    assert rfdetr.condition.evaluate(context) is False
+
+
+def test_rosbridge_process_restarts_after_failure() -> None:
+    module = _load_launch_module("taskplanner_mock.launch.py")
+    description = module.generate_launch_description()
+    processes = [
+        entity
+        for entity in description.entities
+        if isinstance(entity, ExecuteProcess) and not isinstance(entity, Node)
+    ]
+
+    assert len(processes) == 1
+    rosbridge_process = processes[0]
+    assert rosbridge_process._ExecuteLocal__respawn is True
+    assert rosbridge_process._ExecuteLocal__respawn_delay == 5.0
 
 
 def _bed_robot_config(module, bundle_id: str) -> dict[str, str]:
@@ -299,6 +397,10 @@ def test_live_launch_wraps_external_runtime_contract() -> None:
     )
     assert arguments["execution_backend"] == "external"
     assert arguments["speech_input_mode"] == "sentence_text"
+    assert (
+        arguments["perception_backend"]._LaunchConfiguration__variable_name[0].text
+        == "perception_backend"
+    )
     assert arguments["surgeon_actor_mode"] == "none"
     assert arguments["require_integration_preflight"] == "true"
     assert arguments["vlm_mode"].name[0].text == "VLM_MODE"
@@ -310,3 +412,56 @@ def test_live_launch_wraps_external_runtime_contract() -> None:
         arguments["preflight_require_perception"].default_value[0].text
         == "false"
     )
+
+
+def test_live_public_contract_is_enabled_and_loop_safe_by_default() -> None:
+    module = _load_launch_module("taskplanner_live.launch.py")
+    description = module.generate_launch_description()
+    declared = {
+        entity.name: entity
+        for entity in description.entities
+        if isinstance(entity, DeclareLaunchArgument)
+    }
+    context = LaunchContext()
+    for name in ("publish_shared_state", "publish_camera_aliases"):
+        default_value = declared[name]._DeclareLaunchArgument__default_value
+        assert perform_substitutions(context, default_value) == "true"
+    free_text_default = declared[
+        "publish_shared_free_text"
+    ]._DeclareLaunchArgument__default_value
+    assert perform_substitutions(context, free_text_default) == "false"
+
+    nodes = {
+        entity.node_executable: entity
+        for entity in description.entities
+        if isinstance(entity, Node)
+        and entity.node_executable
+        in {"surgical_interop_gateway", "camera_alias_relay"}
+    }
+    # Gateway ownership lives in the included base runtime, avoiding duplicate
+    # publishers across simulation and live profiles.
+    assert set(nodes) == {"camera_alias_relay"}
+    assert all(node.condition is not None for node in nodes.values())
+
+    context.launch_configurations["default_bundle"] = "thyroidectomy_demo"
+    include = next(
+        entity
+        for entity in description.entities
+        if isinstance(entity, IncludeLaunchDescription)
+    )
+    included_arguments = dict(include._IncludeLaunchDescription__launch_arguments)
+    assert (
+        included_arguments["default_bundle"].perform(context)
+        == "thyroidectomy_demo"
+    )
+    context.launch_configurations["publish_shared_state"] = "false"
+    assert included_arguments["publish_shared_state"].perform(context) == "false"
+    context.launch_configurations["publish_shared_free_text"] = "true"
+    assert included_arguments["publish_shared_free_text"].perform(context) == "true"
+
+    alias_parameters = evaluate_parameters(
+        context, nodes["camera_alias_relay"]._Node__parameters
+    )[0]
+    assert alias_parameters["flir_public_topic"] == "/surgery/images/flir/compressed"
+    assert alias_parameters["cam4_public_topic"] == "/surgery/images/cam4/compressed"
+    assert alias_parameters["default_bundle"] == "thyroidectomy_demo"

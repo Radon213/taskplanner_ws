@@ -27,6 +27,7 @@ setup(
             "sentence_input_adapter = simulation_runtime.speech_input_adapter:main",
             "integration_preflight = simulation_runtime.integration_preflight:main",
             "source_health_monitor = simulation_runtime.source_health_monitor:main",
+            "cv_contract_monitor = simulation_runtime.cv_contract_monitor:main",
             "fault_injector = simulation_runtime.fault_injector:main",
         ],
     },

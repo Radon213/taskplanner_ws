@@ -162,6 +162,38 @@ def test_real_vlm_runtime_requires_fresh_aligned_perception() -> None:
     assert stale["missing"] == ["perception_input"]
 
 
+def test_external_perception_stays_fail_closed_until_adapter_is_explicitly_ready() -> None:
+    result = _snapshot(
+        require_perception=True,
+        perception_backend="external",
+        cv_contract_status={
+            "schema": "taskplanner.cv_external_contract.v1",
+            "readiness_state": "PENDING_EXTERNAL_IDL_AND_ADAPTER",
+            "ready_for_external_evidence": False,
+        },
+        cv_contract_age_sec=0.1,
+    )
+    assert result["ready"] is False
+    assert result["missing"] == ["perception_input"]
+    assert result["details"]["cv_contract_state"] == (
+        "PENDING_EXTERNAL_IDL_AND_ADAPTER"
+    )
+
+
+def test_external_perception_requires_fresh_explicit_adapter_authorization() -> None:
+    result = _snapshot(
+        require_perception=True,
+        perception_backend="external",
+        cv_contract_status={
+            "schema": "taskplanner.cv_external_contract.v1",
+            "readiness_state": "READY",
+            "ready_for_external_evidence": True,
+        },
+        cv_contract_age_sec=0.1,
+    )
+    assert result["ready"] is True
+
+
 def test_contract_configuration_mismatch_fails_closed() -> None:
     result = _snapshot(contract_configuration_valid=False)
 
@@ -239,9 +271,12 @@ def _ready_snapshot_node() -> IntegrationPreflightNode:
     node._sentence_topic = "/sensors/surgeon/sentence"
     node._require_sentence_publisher = True
     node._require_perception = False
+    node._perception_backend = "local"
     node._perception_max_age_sec = 3.0
     node._latest_rfdetr_health = None
     node._latest_rfdetr_monotonic = 0.0
+    node._latest_cv_contract_status = None
+    node._latest_cv_contract_monotonic = 0.0
     node._bed_robot_arm_status_max_age_sec = 3.0
     node._tool_handover_client = SimpleNamespace(server_is_ready=lambda: True)
     node._tool_change_client = SimpleNamespace(service_is_ready=lambda: True)

@@ -10,8 +10,38 @@ import sys
 
 from integration_debug.networking import (
     load_network_settings,
+    validate_network_settings,
     write_fastdds_udp_profile,
 )
+
+
+def _enabled(value: str | None) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _select_network_settings(
+    settings_path: Path,
+) -> tuple[dict[str, object] | None, bool]:
+    """Resolve the network without letting saved standalone settings bypass runtime locks."""
+
+    locked_to_runtime = _enabled(
+        os.environ.get("TASKPLANNER_DEBUG_LOCK_TO_RUNTIME_NETWORK")
+    )
+    if locked_to_runtime:
+        settings = validate_network_settings(
+            {
+                "domain_id": os.environ.get("ROS_DOMAIN_ID", "0"),
+                "discovery_range": os.environ.get(
+                    "ROS_AUTOMATIC_DISCOVERY_RANGE", "SUBNET"
+                ),
+            }
+        )
+        return settings, True
+    try:
+        return load_network_settings(settings_path), False
+    except ValueError as exc:
+        print(f"warning: {exc}; using Compose network settings", file=sys.stderr)
+        return None, False
 
 
 def main() -> None:
@@ -26,11 +56,7 @@ def main() -> None:
         parser.error("a runtime command is required after --")
 
     settings_path = Path(args.settings)
-    try:
-        settings = load_network_settings(settings_path)
-    except ValueError as exc:
-        print(f"warning: {exc}; using Compose network settings", file=sys.stderr)
-        settings = None
+    settings, locked_to_runtime = _select_network_settings(settings_path)
     discovery_range = str(
         settings["discovery_range"]
         if settings is not None
@@ -68,12 +94,20 @@ def main() -> None:
         os.environ["ROS_AUTOMATIC_DISCOVERY_RANGE"] = str(
             settings["discovery_range"]
         )
-        print(
-            "Loaded Debug Mode network settings: "
-            f"domain={settings['domain_id']} "
-            f"discovery={settings['discovery_range']}",
-            flush=True,
-        )
+        if locked_to_runtime:
+            print(
+                "Locked integrated Debug Mode to runtime network: "
+                f"domain={settings['domain_id']} "
+                f"discovery={settings['discovery_range']}",
+                flush=True,
+            )
+        else:
+            print(
+                "Loaded Debug Mode network settings: "
+                f"domain={settings['domain_id']} "
+                f"discovery={settings['discovery_range']}",
+                flush=True,
+            )
     os.environ["TASKPLANNER_DEBUG_NETWORK_SETTINGS"] = str(settings_path)
     os.execvpe(command[0], command, os.environ)
 

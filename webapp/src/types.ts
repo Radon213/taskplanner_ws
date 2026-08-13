@@ -166,6 +166,52 @@ export type SpeechUtterance = {
   source: string;
 };
 
+export type LiveAsrDevice = {
+  id: number;
+  name: string;
+  input_channels: number;
+  default_samplerate: number;
+  default: boolean;
+};
+
+export type LiveAsrFinal = {
+  stamp: string;
+  text: string;
+  response_latency_ms: number | null;
+  latency_basis: string;
+  latency_correlated: boolean;
+};
+
+export type LiveAsrStatus = {
+  schema: "taskplanner.asr.status.v1";
+  stamp_sec: number;
+  available: boolean;
+  dependency_error: string;
+  state: "UNAVAILABLE" | "STOPPED" | "STARTING" | "LISTENING" | "STOPPING" | "ERROR" | string;
+  server_url: string;
+  topic: string;
+  device_id: number | null;
+  device_name: string;
+  devices: LiveAsrDevice[];
+  device_status: string;
+  device_message: string;
+  connected: boolean;
+  audio_level_dbfs: number;
+  peak_level_dbfs: number;
+  elapsed_sec: number;
+  partial_text: string;
+  finals: LiveAsrFinal[];
+  last_error: string;
+  sample_rate: number;
+  channels: number;
+  sample_width_bits: number;
+};
+
+export type LiveAsrControlResult = {
+  accepted: boolean;
+  message: string;
+};
+
 export type ShadowReplayState = {
   stamp: RosTime;
   run_id: string;

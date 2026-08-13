@@ -2,8 +2,9 @@
 
 `surgical_interop_msgs` is the small, public ROS 2 interface package used for
 sharing safe surgical context between institutions and requesting focused robot
-capabilities. It deliberately excludes patient identifiers, raw model output,
-internal planner rationale, prompts, and diagnostic text.
+capabilities. Its default runtime policy excludes free-form speech/clinical
+summary text, patient identifiers, raw model output, internal planner rationale,
+prompts, and diagnostic text.
 
 ## Public state topics
 
@@ -13,15 +14,73 @@ internal planner rationale, prompts, and diagnostic text.
 | `/surgery/instruments` | `InstrumentStateArray` | Latest semantic locations and states for instrument instances. A location is not a calibrated Cartesian pose. |
 | `/surgery/robots` | `RobotStateArray` | Connection and execution status for each robot capability. |
 | `/surgery/events` | `SurgeryEvent` | Ordered public state changes; `sequence` establishes the event order. |
-| `/surgery/clinical_observations` | `ClinicalObservationArray` | Model observations, their confidence, and authority; not automatically confirmed clinical facts. |
+| `/surgery/clinical_observations` | `ClinicalObservationArray` | Structured model observations, confidence, and authority; free-form summary is redacted by default. |
 | `/surgery/health` | `SurgeryHealth` | Public freshness and availability summary for the integration. |
+| `/surgery/gateway_info` | `GatewayInfo` | Gateway heartbeat, schema/interface identity, process identity, and active procedure-run identity. |
+| `/surgery/tool_predictions` | `ToolPredictionArray` | Ranked advisory next-instrument predictions; never a robot command or handover authorization. |
+| `/surgery/robot_end_effectors` | `RobotEndEffectorStateArray` | Semantic empty/holding/unknown state and held instrument for each robot end effector. |
+| `/surgery/catalog` | `ProcedureCatalog` | Procedure-scoped Korean/English phase and instrument display metadata. |
+| `/surgery/speech` | `SpeechRecognitionState` | ASR availability, connectivity, finalized sequence, and measured latency; transcript text is redacted by default. |
 | `/external/bed_robot_arms/status` | `BedRobotArmStateArray` | Controller-owned state of the bed-mounted retraction arms. |
 
-State snapshots carry a monotonically increasing `revision`. Events and clinical
-observations carry a `sequence`. All public state and observation messages carry
-an `evidence_status` value. Recommended values are `MODEL_OBSERVED`,
+State snapshots carry a `revision` that increases within one gateway instance.
+Events and clinical observations carry a `sequence`. Each item that asserts an
+observed state carries an `evidence_status` value. Recommended values are `MODEL_OBSERVED`,
 `DT_ACCEPTED`, `CLINICIAN_CONFIRMED`, `GATEWAY_OBSERVED`, `UNKNOWN`, and
-`REJECTED`.
+`REJECTED`. `GATEWAY_OBSERVED_REDACTED` and `MODEL_OBSERVED_REDACTED`
+explicitly mean an upstream free-text value was suppressed by public policy.
+
+### Consumer identity and idle semantics
+
+`/surgery/gateway_info` is a periodic heartbeat and remains available while no
+procedure is active. A new `gateway_instance_id` means the gateway restarted;
+consumers must discard revision/sequence deduplication state from the previous
+instance. `revision` is a process-local publication-cycle counter and may reset
+on restart. `procedure_run_id` is an opaque, non-PHI identifier that is populated
+only while a procedure run is active and changes between runs.
+
+`schema_version` identifies the public projection schema. `interface_version`
+is the installed `surgical_interop_msgs` package version. `catalog_version` is a
+deterministic digest of the published catalog content, allowing a UI to rebuild
+its label cache only when metadata changes.
+
+`SurgeryEvent.sequence` and `ClinicalObservation.sequence` increase for the
+gateway process lifetime and reset only when `gateway_instance_id` changes.
+Each `SurgeryEvent` embeds `schema_version`, `catalog_version`,
+`gateway_instance_id`, `procedure_run_id`, and `procedure_type`, so an event
+that arrives before the next one-hertz heartbeat can still be assigned to the
+correct run. `SpeechRecognitionState.utterance_sequence` is run-local and
+resets when `procedure_run_id` changes. Consumers should still receive
+`gateway_info` before attaching timelines, and must group events by
+`(gateway_instance_id, procedure_run_id)` rather than sequence alone.
+
+When `procedure_active=false`, dynamic state topics publish safe empty/unknown
+snapshots instead of replaying a previous scenario. In particular,
+`ToolPredictionArray.predictions` and
+`RobotEndEffectorStateArray.end_effectors` are empty. `ProcedureCatalog` is safe
+static configuration and keeps its phase and instrument entries populated while
+idle so clients can build screens before a run begins. A missing
+`/surgery/gateway_info` heartbeat is not the same as idle and must be treated as
+gateway unavailable.
+
+`/surgery/speech` is the supported public speech snapshot. By default its
+`text` is empty while the finalized-utterance sequence, ASR state, and validated
+latency metadata remain available. A deployment may explicitly enable free-text
+publication only after privacy review; that transcript is not confirmation that
+the planner accepted or executed a command and is not de-identified by the
+Gateway. `latency_available` gates `response_latency_ms`; clients must not
+interpret a zero latency when that flag is false. While no procedure is active
+it reports `available=false` with empty text. Existing plain String speech topics
+remain compatibility/internal inputs and are not the public UI contract.
+
+Confidence and uncertainty fields are finite values in `[0.0, 1.0]`.
+Malformed scalar claims are made `UNKNOWN` or omitted; malformed clinical
+parallel-array rows are never emitted as aligned evidence. Tool-prediction
+`stability_sec` is elapsed seconds for which the same prediction remained
+selected. Empty identifiers mean not available, never an inferred default.
+Instrument IDs are procedure scoped: consumers must join them with
+`procedure_type` and the matching `catalog_version`, not assume that a code such
+as `T04` has the same meaning in every procedure.
 
 ## Focused capability requests
 

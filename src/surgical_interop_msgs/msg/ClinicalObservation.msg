@@ -3,6 +3,9 @@
 builtin_interfaces/Time stamp
 uint64 sequence
 string source
+# Empty by default when the upstream model produced free-form prose. Deployments
+# must explicitly opt in before publishing it; structured IDs/confidences below
+# remain available and *_REDACTED evidence_status marks suppression.
 string summary
 string[] phase_ids
 float32[] phase_confidences

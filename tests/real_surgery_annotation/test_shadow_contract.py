@@ -28,6 +28,21 @@ class ShadowContractTest(unittest.TestCase):
             }.issubset(TRACE_LAYERS)
         )
 
+    def test_trace_contract_includes_external_bed_arm_status(self) -> None:
+        record = TraceRecord(
+            run_id="run-1",
+            sequence=0,
+            mode="strict",
+            layer="bed_robot_arm_status",
+            topic="/external/bed_robot_arms/status",
+            message_type="surgical_interop_msgs/msg/BedRobotArmStateArray",
+            ros_time_sec=1.0,
+            wall_time_sec=100.0,
+            payload={"arms": [], "procedure_type": "thyroidectomy"},
+        ).as_dict()
+
+        self.assertEqual([], validate_trace_records([record]))
+
     def test_trace_contract_includes_replay_clock_observability(self) -> None:
         self.assertIn("shadow_replay_state", TRACE_LAYERS)
 

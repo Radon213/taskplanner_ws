@@ -7712,12 +7712,260 @@ textarea {
     "timeline";
 }
 
+/* Live-only USB ASR settings and health card. It shares the compact runtime
+   column without obscuring procedure state, stage video, or the timeline. */
+.live-asr-panel {
+  display: grid;
+  min-width: 0;
+  gap: 12px;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: none;
+}
+
+.live-asr-panel.capturing {
+  border-color: rgba(105, 193, 255, 0.42);
+}
+
+.live-asr-header,
+.live-asr-meter-copy,
+.live-asr-finals > div,
+.live-asr-facts {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.live-asr-header h3 {
+  margin: 0;
+  color: var(--text);
+  font-size: 16px;
+  line-height: 1.15;
+}
+
+.live-asr-state {
+  display: inline-flex;
+  min-height: 44px;
+  align-items: center;
+  gap: 7px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.035);
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.live-asr-state.active {
+  border-color: rgba(105, 193, 255, 0.42);
+  background: rgba(105, 193, 255, 0.1);
+  color: var(--robot-strong);
+}
+
+.live-asr-state.active svg {
+  animation: live-asr-pulse 1.8s ease-in-out infinite;
+}
+
+.live-asr-controls {
+  display: grid;
+  min-width: 0;
+  gap: 10px;
+}
+
+.live-asr-device-field small {
+  min-height: 13px;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.3;
+}
+
+.live-asr-panel .field select {
+  min-height: 44px;
+}
+
+.live-asr-panel .field select:focus-visible {
+  outline: 2px solid rgba(105, 193, 255, 0.78);
+  outline-offset: 2px;
+}
+
+.live-asr-actions {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.live-asr-actions .button {
+  min-height: 44px;
+  min-width: 0;
+  padding-inline: 8px;
+  font-size: 11px;
+}
+
+.live-asr-live,
+.live-asr-finals {
+  display: grid;
+  min-width: 0;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.live-asr-meter-copy span,
+.live-asr-facts span,
+.live-asr-finals > div > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.live-asr-meter-copy strong {
+  color: var(--text);
+  font-size: 13px;
+}
+
+.live-asr-meter {
+  height: 8px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(143, 163, 191, 0.2);
+}
+
+.live-asr-meter > span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--robot);
+  transition: width 120ms linear;
+}
+
+.live-asr-live > p {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 8px;
+  margin: 0;
+}
+
+.live-asr-live > p > span {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.live-asr-live > p > strong {
+  overflow: hidden;
+  color: var(--soft);
+  font-size: 12px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.live-asr-facts {
+  align-items: flex-start;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.live-asr-facts code {
+  display: block;
+  width: 100%;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.live-asr-finals > div > small {
+  color: var(--muted);
+  font-size: 10px;
+  text-align: right;
+}
+
+.live-asr-finals ol {
+  display: grid;
+  gap: 5px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.live-asr-finals li {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 7px;
+  color: var(--soft);
+  font-size: 10px;
+}
+
+.live-asr-finals li time,
+.live-asr-finals li data {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.live-asr-finals li span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.live-asr-finals > p,
+.live-asr-message {
+  margin: 0;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.4;
+}
+
+.live-asr-message {
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  background: rgba(107, 184, 255, 0.08);
+  color: var(--soft);
+}
+
+.live-asr-message.error {
+  background: rgba(255, 108, 122, 0.08);
+  color: var(--warning);
+}
+
+.live-asr-spinner {
+  animation: model-runtime-spin 0.9s linear infinite;
+}
+
+@keyframes live-asr-pulse {
+  0%, 100% { opacity: 0.72; transform: scale(0.94); }
+  50% { opacity: 1; transform: scale(1); }
+}
+
 @media (min-width: 1280px) {
   .mission-layout.live-stage-expanded {
     grid-template-columns: minmax(0, 1fr) minmax(300px, 0.56fr);
     grid-template-areas:
       "stage runtime"
       "timeline timeline";
+  }
+
+  .mission-layout.live-stage-expanded .runtime-area {
+    grid-template-rows: auto auto minmax(0, 1fr);
   }
 }
 
@@ -9282,6 +9530,20 @@ textarea {
   }
 }
 
+@media (max-width: 620px) {
+  .live-asr-actions {
+    grid-template-columns: 1fr;
+  }
+
+  .live-asr-finals li {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .live-asr-finals li data {
+    grid-column: 2;
+  }
+}
+
 @media (max-width: 760px) {
   .debug-tabs {
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -9319,6 +9581,16 @@ textarea {
 
 @media (prefers-reduced-motion: reduce) {
   .debug-asr-meter > span {
+    transition-duration: 0.01ms;
+  }
+
+  .live-asr-state.active svg,
+  .live-asr-spinner {
+    animation-duration: 0.01ms;
+    animation-iteration-count: 1;
+  }
+
+  .live-asr-meter > span {
     transition-duration: 0.01ms;
   }
 }

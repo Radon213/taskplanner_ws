@@ -277,6 +277,43 @@ id 111, type PipeWire:Interface:Node
     }
 
 
+def test_wpctl_distinguishes_reachable_graph_with_no_input(monkeypatch) -> None:
+    calls = []
+
+    def fake_run(command, **_kwargs):
+        calls.append(command)
+        if command == ["wpctl", "status"]:
+            return SimpleNamespace(stdout="Audio\n Sources:\n")
+        raise asr_runtime.subprocess.CalledProcessError(3, command)
+
+    monkeypatch.setattr(asr_runtime.subprocess, "run", fake_run)
+
+    with pytest.raises(asr_runtime.AudioInputUnavailable) as exc_info:
+        asr_runtime._query_pipewire_default_source()
+
+    assert exc_info.value.status == asr_runtime.DEVICE_STATUS_NO_INPUT
+    assert "no PipeWire microphone input" in str(exc_info.value)
+    assert calls == [
+        ["wpctl", "inspect", asr_runtime.PIPEWIRE_DEFAULT_SOURCE],
+        ["wpctl", "status"],
+    ]
+
+
+def test_wpctl_reports_unreachable_host_audio_graph(monkeypatch) -> None:
+    def fake_run(command, **_kwargs):
+        if command == ["wpctl", "status"]:
+            raise asr_runtime.subprocess.CalledProcessError(3, command)
+        raise asr_runtime.subprocess.CalledProcessError(3, command)
+
+    monkeypatch.setattr(asr_runtime.subprocess, "run", fake_run)
+
+    with pytest.raises(asr_runtime.AudioInputUnavailable) as exc_info:
+        asr_runtime._query_pipewire_default_source()
+
+    assert exc_info.value.status == asr_runtime.DEVICE_STATUS_HOST_AUDIO_UNAVAILABLE
+    assert "not reachable" in str(exc_info.value)
+
+
 def test_runtime_exposes_only_pipewire_default_input(monkeypatch, tmp_path) -> None:
     sounddevice = FakeSoundDevice({(16_000, 1)}, name="default")
     monkeypatch.setattr(
@@ -308,6 +345,44 @@ def test_runtime_exposes_only_pipewire_default_input(monkeypatch, tmp_path) -> N
             "default": True,
         }
     ]
+    assert runtime.snapshot()["device_status"] == "READY"
+    assert "Shure MVX2U GEN 2" in runtime.snapshot()["device_message"]
+
+
+def test_runtime_treats_reachable_pipewire_with_no_input_as_device_state(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    sounddevice = FakeSoundDevice({(16_000, 1)}, name="default")
+    monkeypatch.setattr(
+        asr_runtime,
+        "_optional_audio_modules",
+        lambda: (np, sounddevice, object(), ""),
+    )
+    monkeypatch.setattr(
+        asr_runtime,
+        "_query_pipewire_default_source",
+        lambda: (_ for _ in ()).throw(
+            asr_runtime.AudioInputUnavailable(
+                asr_runtime.DEVICE_STATUS_NO_INPUT,
+                "Ubuntu currently exposes no PipeWire microphone input",
+            )
+        ),
+    )
+
+    runtime = asr_runtime.AsrMicrophoneRuntime(
+        default_url="wss://asr.example.test/v1",
+        topic="/sensors/surgeon/sentence",
+        output_dir=tmp_path,
+    )
+
+    snapshot = runtime.snapshot()
+    assert snapshot["available"] is True
+    assert snapshot["state"] == "STOPPED"
+    assert snapshot["devices"] == []
+    assert snapshot["device_status"] == "NO_INPUT"
+    assert "no PipeWire microphone input" in snapshot["device_message"]
+    assert snapshot["last_error"] == ""
 
 
 def test_runtime_fails_closed_when_portaudio_exposes_raw_alsa(monkeypatch, tmp_path) -> None:
@@ -331,6 +406,7 @@ def test_runtime_fails_closed_when_portaudio_exposes_raw_alsa(monkeypatch, tmp_p
 
     snapshot = runtime.snapshot()
     assert snapshot["devices"] == []
+    assert snapshot["device_status"] == "BRIDGE_ERROR"
     assert "not connected to Ubuntu PipeWire" in snapshot["last_error"]
 
 
@@ -510,3 +586,123 @@ def test_concurrent_stop_cannot_be_undone_by_inflight_start(
 
     assert runtime.snapshot()["state"] == "STOPPED"
     assert sounddevice.streams[0].closed
+
+
+def test_capture_lock_prevents_two_runtimes_and_is_released_on_stop(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    sounddevice = FakeSoundDevice({(16_000, 1)}, name="default")
+    FakeAsrWsClient.instances = []
+    monkeypatch.setattr(
+        asr_runtime,
+        "_optional_audio_modules",
+        lambda: (np, sounddevice, object(), ""),
+    )
+    monkeypatch.setattr(asr_runtime, "AsrWsClient", FakeAsrWsClient)
+    monkeypatch.setattr(
+        asr_runtime,
+        "_query_pipewire_default_source",
+        lambda: {"name": "Analog Input - Test Mic", "input_channels": 1},
+    )
+    lock_path = tmp_path / "shared" / "microphone.lock"
+    first = asr_runtime.AsrMicrophoneRuntime(
+        default_url="wss://asr.example.test/v1",
+        topic="/sensors/surgeon/sentence",
+        output_dir=tmp_path / "first",
+        capture_lock_path=lock_path,
+    )
+    second = asr_runtime.AsrMicrophoneRuntime(
+        default_url="wss://asr.example.test/v1",
+        topic="/sensors/surgeon/sentence",
+        output_dir=tmp_path / "second",
+        capture_lock_path=lock_path,
+    )
+
+    first.start(device_id=0)
+    with pytest.raises(RuntimeError, match="already owned"):
+        second.start(device_id=0)
+
+    assert first.close()
+    second.start(device_id=0)
+    assert second.snapshot()["state"] == "LISTENING"
+    assert second.close()
+
+
+def test_capture_lock_is_released_when_start_fails(monkeypatch, tmp_path) -> None:
+    sounddevice = FakeSoundDevice({(16_000, 1)}, name="default")
+
+    class StartFailClient(FakeAsrWsClient):
+        def start(self) -> None:
+            raise RuntimeError("websocket setup failed")
+
+    monkeypatch.setattr(
+        asr_runtime,
+        "_optional_audio_modules",
+        lambda: (np, sounddevice, object(), ""),
+    )
+    monkeypatch.setattr(asr_runtime, "AsrWsClient", StartFailClient)
+    monkeypatch.setattr(
+        asr_runtime,
+        "_query_pipewire_default_source",
+        lambda: {"name": "Analog Input - Test Mic", "input_channels": 1},
+    )
+    lock_path = tmp_path / "microphone.lock"
+    failed = asr_runtime.AsrMicrophoneRuntime(
+        default_url="wss://asr.example.test/v1",
+        topic="/sensors/surgeon/sentence",
+        output_dir=tmp_path / "failed",
+        capture_lock_path=lock_path,
+    )
+
+    with pytest.raises(RuntimeError, match="websocket setup failed"):
+        failed.start(device_id=0)
+
+    monkeypatch.setattr(asr_runtime, "AsrWsClient", FakeAsrWsClient)
+    replacement = asr_runtime.AsrMicrophoneRuntime(
+        default_url="wss://asr.example.test/v1",
+        topic="/sensors/surgeon/sentence",
+        output_dir=tmp_path / "replacement",
+        capture_lock_path=lock_path,
+    )
+    replacement.start(device_id=0)
+    assert replacement.close()
+
+
+def test_operational_mode_does_not_save_wav_or_transcript(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    sounddevice = FakeSoundDevice({(16_000, 1)}, name="default")
+    FakeAsrWsClient.instances = []
+    monkeypatch.setattr(
+        asr_runtime,
+        "_optional_audio_modules",
+        lambda: (np, sounddevice, object(), ""),
+    )
+    monkeypatch.setattr(asr_runtime, "AsrWsClient", FakeAsrWsClient)
+    monkeypatch.setattr(
+        asr_runtime,
+        "_query_pipewire_default_source",
+        lambda: {"name": "Analog Input - Test Mic", "input_channels": 1},
+    )
+    output_dir = tmp_path / "operational-artifacts"
+    runtime = asr_runtime.AsrMicrophoneRuntime(
+        default_url="wss://asr.example.test/v1",
+        topic="/sensors/surgeon/sentence",
+        output_dir=output_dir,
+        save_artifacts=False,
+        capture_lock_path=tmp_path / "microphone.lock",
+    )
+
+    runtime.start(device_id=0)
+    block = np.full((1_600, 1), 2_000, dtype=np.int16)
+    sounddevice.streams[-1].callback(block, 1_600, None, None)
+    FakeAsrWsClient.instances[-1].kwargs["on_final"]("Bovie please")
+    assert runtime.close()
+
+    snapshot = runtime.snapshot()
+    assert snapshot["artifacts_enabled"] is False
+    assert snapshot["recording_path"] == ""
+    assert snapshot["transcript_path"] == ""
+    assert not output_dir.exists()

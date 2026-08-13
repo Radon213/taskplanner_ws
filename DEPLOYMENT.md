@@ -120,11 +120,14 @@ or after dependency/interface changes, request those operations explicitly:
 scripts/taskplanner up live --build
 ```
 
-`--build` sets `TASKPLANNER_REBUILD_ON_START=true` and
-`WEBAPP_INSTALL_ON_START=true` for that invocation. The same flags can be set
-independently in `.env`. Without existing `install/setup.bash` or Vite in
-`node_modules`, fast startup exits with a clear instruction instead of silently
-performing package installation.
+`--build` first runs one foreground `colcon build` in a dedicated one-off
+development container and verifies the required install artifacts. Only after
+that command exits successfully does the launcher start the runtime and its
+sidecars. Runtime containers never build in parallel against the shared
+`build/`, `install/`, and `log/` bind mounts. The option also sets
+`WEBAPP_INSTALL_ON_START=true` for that invocation. Without an existing
+`install/setup.bash` or Vite in `node_modules`, fast startup exits with a clear
+instruction instead of silently performing package installation.
 
 To inspect commands without changing the machine:
 

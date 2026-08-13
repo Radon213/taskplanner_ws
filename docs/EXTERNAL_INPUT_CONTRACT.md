@@ -108,7 +108,8 @@ CAM1-CAM3 are live observer views. CAM4 and FLIR are also the configured raw
 inputs to the perception bridge through `CAM4_INPUT_TOPIC` and
 `FLIR_INPUT_TOPIC`.
 
-When `VLM_MODE=real`, the live runtime starts `rfdetr_perception_bridge`.
+When `VLM_MODE=real` and `PERCEPTION_BACKEND=local`, the live runtime starts
+`rfdetr_perception_bridge`.
 `RFDETRSegSmall` produces
 `/surgery/images/flir/segmented/compressed` for the VLM image channel, while
 CAM4 produces public tool/request semantics on
@@ -126,6 +127,20 @@ reliable/volatile publishers. Populate `header.stamp` with the frame
 acquisition time and `format` with `jpeg` or `png`. The dashboard marks a view
 disconnected after three seconds without a new frame instead of retaining a
 stale surgical image.
+
+### Pending external CV backend
+
+The computer-vision team's source packages, CameraInfo/depth streams, timing
+limits, TF/calibration and ontology are not inferred from topic names.  The
+runtime already provides a standard-message contract monitor at
+`/integration/cv_contract/status`, and reserves a mutually exclusive
+`PERCEPTION_BACKEND=external` cut-over that suppresses the local RF-DETR
+publisher.  Until the actual custom IDLs and a validating adapter are installed,
+external CV evidence remains fail-closed and cannot authorize planning.
+
+See [CV_EXTERNAL_INTERFACE_SCAFFOLD_KO.md](CV_EXTERNAL_INTERFACE_SCAFFOLD_KO.md)
+for the exact prepared endpoints, current `WAITING_FOR_PUBLISHER` behavior, and
+the on-site package/ownership verification sequence.
 
 ## Requested Robot Endpoints
 
@@ -358,30 +373,85 @@ the tray rather than requiring a robot placement back onto Mayo.
 
 ## Shared Surgical State Published by Taskplanner
 
-When the `surgical_interop_gateway` is explicitly enabled, Taskplanner publishes
-the following read-only, human-readable topics:
+The `surgical_interop_gateway` is enabled by default and publishes the following
+read-only, human-readable topics. An intentionally isolated deployment may set
+`PUBLISH_SHARED_STATE=false`.
+
+Free-form text has a separate fail-closed switch. The default
+`PUBLISH_SHARED_FREE_TEXT=false` keeps ASR/VLM typed metadata public but emits
+empty `SpeechRecognitionState.text` and `ClinicalObservation.summary`. Evidence
+status ends in `_REDACTED` when an upstream value was suppressed. Setting this
+switch true is a deployment-level PHI decision; the Gateway does not
+de-identify the resulting transcript or summary.
+
+Browser-only consumers use the dedicated read-only WebSocket endpoint
+`ws://<Taskplanner-wired-IP>:9092`. It registers only the Subscribe capability
+(`subscribe` and `unsubscribe` operations) and has an exact allowlist containing
+the eleven topics below plus the two gated camera aliases. Incoming `fragment`
+frames and every unknown operation are rejected rather than reassembled. The
+endpoint is a memory-limited sidecar behind the designated
+wired-interface/subnet proxy; the sidecar rejects direct non-loopback peers
+before WebSocket upgrade, including VPN/Tailscale loopback-DNAT bypasses. It is
+not the operator rosbridge on port 9090. Origin validation is defense in depth,
+not authentication. Each incoming frame must be one complete JSON request and
+is capped at 64 KiB; malformed/incomplete input clears the parser and closes the
+connection. Camera compression is forced to CBOR, and outgoing fragmentation is
+disabled so a logical message over 4 MiB is dropped without emitting fragments.
+
+Native DDS is deliberately limited to mutually trusted, managed controller
+computers. It is not an authentication or ACL boundary: any participant on the
+same ROS domain/discovery network can discover internal topics and can publish
+conflicting samples under public or internal topic names. Gateway free-text
+suppression, camera gating, and the port-9092 allowlist constrain only
+Taskplanner-owned outputs; they do not filter another DDS participant. A
+browser-only UI computer must use port 9092 and must not join the ROS domain.
+Do not route DDS over Wi-Fi, Tailscale/VPN, or the Internet. Untrusted native
+DDS requires ROS 2/DDS Security identities, governance, and permissions.
 
 ```text
 /surgery/context                surgical_interop_msgs/msg/SurgeryContext
 /surgery/instruments            surgical_interop_msgs/msg/InstrumentStateArray
 /surgery/robots                 surgical_interop_msgs/msg/RobotStateArray
+/surgery/robot_end_effectors    surgical_interop_msgs/msg/RobotEndEffectorStateArray
+/surgery/tool_predictions       surgical_interop_msgs/msg/ToolPredictionArray
+/surgery/speech                 surgical_interop_msgs/msg/SpeechRecognitionState
 /surgery/events                 surgical_interop_msgs/msg/SurgeryEvent
 /surgery/clinical_observations  surgical_interop_msgs/msg/ClinicalObservationArray
 /surgery/health                 surgical_interop_msgs/msg/SurgeryHealth
+/surgery/gateway_info           surgical_interop_msgs/msg/GatewayInfo
+/surgery/catalog                surgical_interop_msgs/msg/ProcedureCatalog
 ```
 
 These are projections of DT and VLM data, not aliases of the internal topics.
 The gateway never publishes `raw_json`, `detail_json`, planner rationale,
-predicted next tool, hidden actor state, or an unvalidated clinical conclusion.
+hidden actor state, or an unvalidated clinical conclusion. The reviewed rank-1
+next-tool forecast and semantic robot-hand possession state are narrow v0.3
+projections with dedicated public types; the rest of internal `WorldState`
+remains private.
+Each `SurgeryEvent` embeds schema/catalog, gateway-instance, procedure-run, and
+procedure-type identity. Consumers group events by
+`(gateway_instance_id, procedure_run_id)` before ordering them by `sequence`;
+this remains unambiguous when the first event precedes the next heartbeat.
+Every public confidence/uncertainty value is finite and within `[0,1]`.
+Malformed claims become `UNKNOWN` or are omitted, and clinical parallel arrays
+are length-validated at the Gateway boundary.
 Instrument locations are semantic anchors such as `mayo`, `right_hand`, or
 `field`; they are not 3D poses unless a separately calibrated pose contract is
 added.
+
+When no procedure is active or WorldState is stale, dynamic topics overwrite
+their retained samples with empty/unknown values. `gateway_info`, `catalog`,
+and `health` remain available so an external UI can distinguish idle from an
+unreachable runtime. See `docs/SHARED_SURGICAL_STATE_CONTRACT.md` for the full
+QoS, run identity, reconnect, media-alias, and idle-state contract.
 
 Every public state, event, and observation carries an `evidence_status`:
 
 - `DT_ACCEPTED`: accepted by the deterministic digital-twin reducer as current
   operational state.
 - `MODEL_OBSERVED`: a VLM observation or hypothesis, not a clinical fact.
+- `GATEWAY_OBSERVED_REDACTED` or `MODEL_OBSERVED_REDACTED`: a free-text value
+  existed upstream but was suppressed; use only the remaining typed metadata.
 - `CLINICIAN_CONFIRMED`: available only after a clinician confirmation workflow
   supplies it.
 - `UNKNOWN` or `REJECTED`: insufficient or rejected evidence.

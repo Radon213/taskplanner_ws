@@ -27,6 +27,12 @@ inputs:
     expected_hz: 0.0
     stale_after_sec: 0.0
     qos: reliable_volatile
+  - name: external_cv_contract
+    topic: /integration/cv_contract/status
+    type: std_msgs/msg/String
+    expected_hz: 1.0
+    stale_after_sec: 3.0
+    qos: reliable_transient_local
   - name: cam1_camera
     topic: /camera/cam_1/color/image_raw/compressed
     type: sensor_msgs/msg/CompressedImage

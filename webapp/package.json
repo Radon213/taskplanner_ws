@@ -7,6 +7,9 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "check:domain-hardcoding": "node scripts/check-domain-hardcoding.cjs",
+    "check:debug-safety": "node scripts/check-debug-safety.cjs",
+    "check:live-asr-ui": "node scripts/check-live-asr-ui.cjs",
+    "check:rosbridge-image-backpressure": "node scripts/check-rosbridge-image-backpressure.cjs",
     "test:e2e": "playwright test",
     "preview": "vite preview"
   },
