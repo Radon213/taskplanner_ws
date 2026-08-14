@@ -34,35 +34,35 @@ inputs:
     stale_after_sec: 3.0
     qos: reliable_transient_local
   - name: cam1_camera
-    topic: /camera/cam_1/color/image_raw/compressed
+    topic: /synced/cam_1/color/image_raw/compressed
     type: sensor_msgs/msg/CompressedImage
     expected_hz: 15.0
     stale_after_sec: 3.0
-    qos: sensor_data
+    qos: reliable_volatile
   - name: cam2_camera
-    topic: /camera/cam_2/color/image_raw/compressed
+    topic: /synced/cam_2/color/image_raw/compressed
     type: sensor_msgs/msg/CompressedImage
     expected_hz: 15.0
     stale_after_sec: 3.0
-    qos: sensor_data
+    qos: reliable_volatile
   - name: cam3_camera
-    topic: /camera/cam_3/color/image_raw/compressed
+    topic: /synced/cam_3/color/image_raw/compressed
     type: sensor_msgs/msg/CompressedImage
     expected_hz: 15.0
     stale_after_sec: 3.0
-    qos: sensor_data
+    qos: reliable_volatile
   - name: cam4_camera
-    topic: /camera/cam_4/color/image_raw/compressed
+    topic: /synced/cam_4/color/image_raw/compressed
     type: sensor_msgs/msg/CompressedImage
     expected_hz: 15.0
     stale_after_sec: 3.0
-    qos: sensor_data
+    qos: reliable_volatile
   - name: flir_camera
-    topic: /flir_camera/image_color/compressed
+    topic: /synced/flir/color/image_raw/compressed
     type: sensor_msgs/msg/CompressedImage
     expected_hz: 15.0
     stale_after_sec: 3.0
-    qos: sensor_data
+    qos: reliable_volatile
 
 outputs:
   - topic: /surgery/context

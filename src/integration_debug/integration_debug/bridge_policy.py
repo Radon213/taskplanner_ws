@@ -7,12 +7,34 @@ from typing import Any
 
 
 DEBUG_TOPICS_PUBLISH_ALLOWLIST = ("/integration/debug/heartbeat",)
+DEBUG_MULTICAM_SUBSCRIBE_ALLOWLIST = (
+    # Driver and synchronized images/metadata required by the operator
+    # multicam console.  These patterns are subscribe-only; publishing remains
+    # restricted to the debug heartbeat below.
+    "/camera/*",
+    "/flir_camera/*",
+    "/synced/*",
+    "/multicam_node/*",
+    "/tf_static",
+    "/world_anchor_node/status",
+)
 DEBUG_TOPICS_SUBSCRIBE_ALLOWLIST = (
     "/integration/debug/status",
     "/integration/debug/events",
     "/integration/debug/readiness",
+) + DEBUG_MULTICAM_SUBSCRIBE_ALLOWLIST
+DEBUG_MULTICAM_SERVICES_ALLOWLIST = (
+    # The browser maps the original world_console keys b/x/w/p to these exact
+    # Trigger calls.  No robot-control Action or service is admitted here.
+    "/world_anchor_node/begin",
+    "/world_anchor_node/stop",
+    "/world_anchor_node/solve",
+    "/world_anchor_node/publish",
 )
-DEBUG_SERVICES_ALLOWLIST = ("/integration/debug/command",)
+DEBUG_ROSAPI_SERVICES_ALLOWLIST = ("/rosapi/topics",)
+DEBUG_SERVICES_ALLOWLIST = (
+    "/integration/debug/command",
+) + DEBUG_MULTICAM_SERVICES_ALLOWLIST + DEBUG_ROSAPI_SERVICES_ALLOWLIST
 DEBUG_ACTIONS_ALLOWLIST: tuple[str, ...] = ()
 DEBUG_CAPABILITY_CLASS_NAMES = (
     "Advertise",
@@ -27,6 +49,7 @@ DEBUG_TOPICS_ALLOWLIST = tuple(
         | set(DEBUG_TOPICS_SUBSCRIBE_ALLOWLIST)
     )
 )
+DEBUG_ROSAPI_TOPICS_GLOB = "[" + ", ".join(DEBUG_TOPICS_SUBSCRIBE_ALLOWLIST) + "]"
 
 
 def restrict_debug_rosbridge_protocol(

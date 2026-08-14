@@ -25,7 +25,6 @@ from rclpy.qos import (
     QoSHistoryPolicy,
     QoSProfile,
     QoSReliabilityPolicy,
-    qos_profile_sensor_data,
 )
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
@@ -79,6 +78,8 @@ from integration_debug.networking import (
 
 STATUS_SCHEMA = "taskplanner.integration_debug.status.v1"
 EVENT_SCHEMA = "taskplanner.integration_debug.event.v1"
+MAX_EVENT_SUMMARY_STRING_CHARS = 2048
+MAX_EVENT_SUMMARY_ITEMS = 32
 PUBLIC_OUTPUT_TYPES: dict[str, type[Any]] = {
     "surgical_interop_msgs/msg/SurgeryContext": SurgeryContext,
     "surgical_interop_msgs/msg/InstrumentStateArray": InstrumentStateArray,
@@ -87,6 +88,36 @@ PUBLIC_OUTPUT_TYPES: dict[str, type[Any]] = {
     "surgical_interop_msgs/msg/ClinicalObservationArray": ClinicalObservationArray,
     "surgical_interop_msgs/msg/SurgeryHealth": SurgeryHealth,
 }
+
+
+def _bounded_event_summary(value: Any) -> Any:
+    """Bound event payloads embedded in the once-per-second status snapshot.
+
+    The append-only JSONL event log and the event topic retain the authoritative
+    payload.  The status topic is a dashboard snapshot, so allowing one large
+    diagnostic String to be copied into every recent-event row makes rosbridge
+    repeatedly serialize megabytes and can starve the Debug UI.
+    """
+
+    if isinstance(value, str):
+        if len(value) <= MAX_EVENT_SUMMARY_STRING_CHARS:
+            return value
+        omitted = len(value) - MAX_EVENT_SUMMARY_STRING_CHARS
+        return f"{value[:MAX_EVENT_SUMMARY_STRING_CHARS]}… [{omitted} chars omitted]"
+    if isinstance(value, dict):
+        return {
+            str(key): _bounded_event_summary(item)
+            for key, item in list(value.items())[:MAX_EVENT_SUMMARY_ITEMS]
+        }
+    if isinstance(value, (list, tuple)):
+        items = [
+            _bounded_event_summary(item)
+            for item in list(value)[:MAX_EVENT_SUMMARY_ITEMS]
+        ]
+        if len(value) > MAX_EVENT_SUMMARY_ITEMS:
+            items.append(f"[{len(value) - MAX_EVENT_SUMMARY_ITEMS} items omitted]")
+        return items
+    return value
 
 
 @dataclass(slots=True)
@@ -379,7 +410,17 @@ class IntegrationDebugNode(Node):
                     lambda msg, source_topic=topic: self._on_image_input(
                         source_topic, msg
                     ),
-                    qos_profile_sensor_data,
+                    QoSProfile(
+                        history=QoSHistoryPolicy.KEEP_LAST,
+                        # Debug monitoring never needs an old-frame backlog,
+                        # but FLIR JPEGs span enough UDP fragments that a
+                        # BEST_EFFORT reader can lose every sample on a busy
+                        # integration LAN. Match the provider's RELIABLE QoS
+                        # while keeping only the newest delivered frame.
+                        depth=1,
+                        reliability=QoSReliabilityPolicy.RELIABLE,
+                        durability=QoSDurabilityPolicy.VOLATILE,
+                    ),
                     callback_group=self._callback_group,
                 )
             else:
@@ -500,7 +541,7 @@ class IntegrationDebugNode(Node):
         summary = {
             "stamp": row["stamp"],
             "event_type": event_type,
-            "payload": payload,
+            "payload": _bounded_event_summary(payload),
         }
         with self._lock:
             self._recent_events.append(summary)
@@ -520,6 +561,13 @@ class IntegrationDebugNode(Node):
             stats.last_received_monotonic = now
             stats.last_sample = text[:240]
             stats.message_count += 1
+        # The Debug monitor also receives structured JSON status topics.  They
+        # are not speech: do not parse them as voice commands, overwrite the
+        # last surgeon sentence, or append the full JSON every second to the
+        # recent-event snapshot.
+        if topic != self._asr_topic:
+            return
+        with self._lock:
             self._last_sentence = text
         parsed = parse_voice_command(text, dict(self._config.get("voice", {})))
         with self._lock:

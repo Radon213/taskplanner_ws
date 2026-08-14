@@ -50,6 +50,7 @@ RUN set -e; \
     python3-yaml \
     python3-zmq \
     ros-jazzy-ament-cmake-mypy \
+    ros-jazzy-rmw-cyclonedds-cpp \
     ros-jazzy-rosbridge-suite \
     wireplumber; \
     rm -rf /var/lib/apt/lists/*

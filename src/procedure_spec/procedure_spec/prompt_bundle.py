@@ -411,8 +411,7 @@ def _build_scene_layout(
     ]
     locations.extend(
         [
-            {"id": "mayo_recovery_zone", "type": "mayo_recovery_zone"},
-            {"id": "mayo_reuse_zone", "type": "mayo_reuse_zone"},
+            {"id": "mayo_stand", "type": "mayo_stand"},
             {"id": "field_region_procedure", "type": "surgical_field"},
             {"id": "surgeon_handover_zone", "type": "handover_zone"},
             {"id": "surgeon_return_zone", "type": "return_zone"},
@@ -470,8 +469,6 @@ def _build_simulation_layout(procedure_id: str, tool_ids: list[str]) -> dict[str
             {"id": "surgeon_return_zone", "attached_to": "surgeon_actor", "x": 78.5, "y": 53.0, "label": "Return Zone"},
             {"id": "surgeon_hand", "attached_to": "surgeon_actor", "x": 88.0, "y": 42.5, "label": "Surgeon Hand"},
             {"id": field_id, "attached_to": f"{procedure_id}_bed", "x": 66.2, "y": 44.8, "label": "Surgical Field"},
-            {"id": "mayo_recovery_zone", "attached_to": "mayo_stand", "x": 61.5, "y": 66.5, "label": "Recovery Zone"},
-            {"id": "mayo_reuse_zone", "attached_to": "mayo_stand", "x": 76.5, "y": 66.5, "label": "Reuse Zone"},
             {"id": "unknown_zone_anchor", "attached_to": "unknown_zone", "x": 93.0, "y": 66.0, "label": "Unknown"},
             *[_slot_anchor(index, len(tool_ids)) for index in range(len(tool_ids))],
         ],

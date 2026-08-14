@@ -180,7 +180,7 @@ def test_unused_mayo_preposition_returns_to_mayo_instead_of_rack() -> None:
     )
 
     assert state.lifecycle_stage == LIFECYCLE_PREPOSITIONED_RIGHT
-    assert state.preposition_origin_location_id == "mayo_reuse_zone"
+    assert state.preposition_origin_location_id == "mayo_stand"
     assert state.preposition_origin_lifecycle_stage == LIFECYCLE_MAYO_REUSE
 
     returned = _event(
@@ -197,7 +197,7 @@ def test_unused_mayo_preposition_returns_to_mayo_instead_of_rack() -> None:
     twin.apply_event(returned)
 
     assert state.lifecycle_stage == LIFECYCLE_MAYO_REUSE
-    assert state.location_id == "mayo_reuse_zone"
+    assert state.location_id == "mayo_stand"
     assert state.contaminated is True
     assert state.preposition_origin_location_id == ""
     assert twin.state.right_hand_tool == ""
@@ -467,6 +467,62 @@ def test_recovery_evidence_never_promotes_lifecycle_or_opens_transaction() -> No
     assert state.lifecycle_stage == LIFECYCLE_MAYO_REUSE
     assert state.next_required_transition == ""
     assert twin.state.active_recovery_tool_instances == []
+
+
+def test_recovery_transaction_promotes_mayo_state_and_queues_once() -> None:
+    twin = _thyroid_demo_twin()
+    state = _state(twin, "T01")
+    twin._set_lifecycle(
+        state,
+        LIFECYCLE_MAYO_REUSE,
+        location_type="mayo_reuse_zone",
+        location_id="mayo_reuse_zone",
+        confidence=0.9,
+    )
+
+    twin._open_recovery_transaction(state.instance_id, "approved_return")
+    twin._open_recovery_transaction(state.instance_id, "duplicate_return")
+
+    assert state.lifecycle_stage == LIFECYCLE_MAYO_RECOVERY
+    assert state.status == "awaiting_retrieval"
+    assert (state.location_type, state.location_id) == (
+        "mayo_stand",
+        "mayo_stand",
+    )
+    assert twin.state.active_recovery_tool_instances == [state.instance_id]
+
+
+def test_open_return_waits_for_physical_mayo_arrival_before_state_promotion() -> None:
+    twin = _thyroid_demo_twin()
+    state = _state(twin, "T01")
+    twin._set_lifecycle(
+        state,
+        LIFECYCLE_SURGEON_OWNED,
+        location_type="surgeon_hand",
+        location_id="surgeon_hand",
+        confidence=1.0,
+    )
+    twin._open_recovery_transaction(state.instance_id, "surgeon_return_request")
+
+    assert state.lifecycle_stage == LIFECYCLE_SURGEON_OWNED
+    assert twin.state.active_recovery_tool_instances == [state.instance_id]
+
+    observation = ToolObservation()
+    observation.instrument_id = state.instance_id
+    observation.location_type = "mayo_stand"
+    observation.location_id = "mayo_stand"
+    observation.visible = True
+    observation.confidence = 1.0
+    observation.stamp.sec = 10
+    twin.reconcile_observation(
+        observation,
+        source="cam4_rfdetr_mayo_observation",
+        proposal_id="test:mayo-arrival",
+    )
+
+    assert state.lifecycle_stage == LIFECYCLE_MAYO_RECOVERY
+    assert state.status == "awaiting_retrieval"
+    assert twin.state.active_recovery_tool_instances == [state.instance_id]
 
 
 def test_completion_cleanup_policy_evidence_still_does_not_mutate_lifecycle() -> None:

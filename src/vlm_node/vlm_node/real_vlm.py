@@ -2969,6 +2969,13 @@ class RealVLMNode(Node):
         command = command.strip().lower()
         start_phase_id = start_phase_id.strip()
         if command in {"start", "start_actors"}:
+            # The interactive replay controller publishes a retained start
+            # heartbeat while it is active.  Treat that heartbeat as
+            # idempotent: resetting the epoch here would discard every
+            # in-flight live inference whose latency exceeds the heartbeat
+            # period.
+            if self._active:
+                return
             self._reset_model_input_dedupe(advance_epoch=True)
             self._reset_public_evidence()
             self._last_replay_image_stamp_sec = None

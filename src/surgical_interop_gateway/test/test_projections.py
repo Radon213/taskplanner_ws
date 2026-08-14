@@ -107,6 +107,70 @@ def test_tool_prediction_is_empty_without_a_current_forecast():
     assert project_tool_predictions(SimpleNamespace(predicted_tool="")) == ()
 
 
+def test_tool_prediction_projects_reducer_accepted_top_three():
+    world = SimpleNamespace(
+        stamp=SimpleNamespace(sec=4, nanosec=0),
+        predicted_tool="T02",
+        predicted_tool_confidence=0.91,
+        predicted_tool_stability_sec=3.4,
+        ranked_tool_predictions=[
+            SimpleNamespace(rank=1, instrument_id="T02", confidence=0.91, stability_sec=3.4),
+            SimpleNamespace(rank=2, instrument_id="T04", confidence=0.73, stability_sec=0.0),
+            SimpleNamespace(rank=3, instrument_id="T07", confidence=0.61, stability_sec=0.0),
+        ],
+    )
+
+    projected = project_tool_predictions(world)
+
+    assert [row.rank for row in projected] == [1, 2, 3]
+    assert [row.instrument_id for row in projected] == ["T02", "T04", "T07"]
+    assert [row.confidence for row in projected] == [0.91, 0.73, 0.61]
+    assert [row.stability_sec for row in projected] == [3.4, 0.0, 0.0]
+
+
+def test_ranked_prediction_snapshot_fails_closed_as_one_unit():
+    valid_rows = [
+        SimpleNamespace(rank=1, instrument_id="T02", confidence=0.91, stability_sec=3.4),
+        SimpleNamespace(rank=2, instrument_id="T04", confidence=0.73, stability_sec=0.0),
+    ]
+    malformed_snapshots = [
+        [valid_rows[0], SimpleNamespace(rank=3, instrument_id="T04", confidence=0.73, stability_sec=0.0)],
+        [valid_rows[0], SimpleNamespace(rank=2, instrument_id="T02", confidence=0.73, stability_sec=0.0)],
+        [valid_rows[0], SimpleNamespace(rank=2, instrument_id="T04", confidence=0.99, stability_sec=0.0)],
+        valid_rows + [
+            SimpleNamespace(rank=3, instrument_id="T07", confidence=0.61, stability_sec=0.0),
+            SimpleNamespace(rank=4, instrument_id="T08", confidence=0.55, stability_sec=0.0),
+        ],
+    ]
+    for rows in malformed_snapshots:
+        world = SimpleNamespace(
+            predicted_tool="T02",
+            predicted_tool_confidence=0.91,
+            predicted_tool_stability_sec=3.4,
+            ranked_tool_predictions=rows,
+        )
+        assert project_tool_predictions(world) == ()
+
+    scalar_mismatch = SimpleNamespace(
+        predicted_tool="T99",
+        predicted_tool_confidence=0.91,
+        predicted_tool_stability_sec=3.4,
+        ranked_tool_predictions=valid_rows,
+    )
+    assert project_tool_predictions(scalar_mismatch) == ()
+
+
+def test_empty_ranked_prediction_field_does_not_fall_back_to_scalar():
+    world = SimpleNamespace(
+        predicted_tool="T02",
+        predicted_tool_confidence=0.91,
+        predicted_tool_stability_sec=3.4,
+        ranked_tool_predictions=[],
+    )
+
+    assert project_tool_predictions(world) == ()
+
+
 def test_tool_prediction_drops_non_finite_or_out_of_range_numeric_claims():
     for confidence in (float("nan"), float("inf"), -0.01, 1.01):
         world = SimpleNamespace(
@@ -195,8 +259,8 @@ def test_instrument_location_is_semantic_and_visibility_is_not_inferred():
 
     projected = asdict(project_instrument(instrument))
 
-    assert projected["location_type"] == "mayo_tray"
-    assert projected["location_id"] == "mayo_zone_a"
+    assert projected["location_type"] == "mayo_stand"
+    assert projected["location_id"] == "mayo_stand"
     assert projected["visible"] is False
     assert projected["evidence_status"] == DT_ACCEPTED
     assert "visual_anchor_id" not in projected
@@ -211,6 +275,58 @@ def test_invalid_instrument_confidence_is_explicitly_unknown():
 
     assert projected.confidence == 0.0
     assert projected.evidence_status == UNKNOWN
+
+
+def test_public_instrument_locations_hide_internal_policy_and_planner_zones():
+    mayo_reuse = project_instrument(
+        SimpleNamespace(
+            instrument_id="T01",
+            instance_id="T01#1",
+            location_type="mayo_reuse_zone",
+            location_id="mayo_reuse_zone",
+            owner="none",
+            status="parked_for_reuse",
+            confidence=0.9,
+        )
+    )
+    mayo_recovery = project_instrument(
+        SimpleNamespace(
+            instrument_id="T04",
+            instance_id="T04#1",
+            location_type="mayo_recovery_zone",
+            location_id="mayo_recovery_zone",
+            owner="none",
+            status="awaiting_retrieval",
+            confidence=0.9,
+        )
+    )
+    surgeon_field = project_instrument(
+        SimpleNamespace(
+            instrument_id="T03",
+            instance_id="T03#1",
+            location_type="surgical_field",
+            location_id="field_region_procedure",
+            owner="surgeon",
+            status="in_use",
+            confidence=1.0,
+        )
+    )
+
+    assert (mayo_reuse.location_type, mayo_reuse.location_id) == (
+        "mayo_stand",
+        "mayo_stand",
+    )
+    assert (mayo_recovery.location_type, mayo_recovery.location_id) == (
+        "mayo_stand",
+        "mayo_stand",
+    )
+    assert mayo_reuse.state == "parked_for_reuse"
+    assert mayo_recovery.state == "awaiting_retrieval"
+    assert (surgeon_field.location_type, surgeon_field.location_id) == (
+        "surgeon",
+        "surgeon",
+    )
+    assert surgeon_field.holder_role == "surgeon"
 
 
 def test_event_projection_removes_detail_and_planner_intent():
@@ -235,6 +351,8 @@ def test_event_projection_removes_detail_and_planner_intent():
     assert projected["subject_type"] == "instrument"
     assert projected["subject_id"] == "forceps#2"
     assert projected["phase"] == "dissection"
+    assert projected["location_type"] == "surgeon"
+    assert projected["location_id"] == "surgeon"
     assert projected["state"] == "completed"
     assert projected["evidence_status"] == DT_ACCEPTED
     assert "detail_json" not in projected
@@ -306,6 +424,8 @@ def test_clinical_projection_never_leaks_raw_vlm_json_or_prediction_fields():
 
     assert projected["source"] == "cam4_vlm"
     assert projected["evidence_status"] == MODEL_OBSERVED
+    assert projected["observed_location_types"] == ("surgeon",)
+    assert projected["observed_location_ids"] == ("surgeon",)
     assert "raw_json" not in projected
     assert "predicted_tool_ids" not in projected
 
@@ -353,8 +473,8 @@ def test_clinical_projection_drops_only_bad_rows_and_maximizes_bad_uncertainty()
     assert projected.phase_ids == ("P01",)
     assert projected.phase_confidences == (0.9,)
     assert projected.observed_tool_ids == ("T02",)
-    assert projected.observed_location_ids == ("field",)
-    assert projected.observed_location_types == ("surgical_field",)
+    assert projected.observed_location_ids == ("surgeon",)
+    assert projected.observed_location_types == ("surgeon",)
     assert projected.observed_confidences == (0.7,)
     assert projected.gesture_event_type == ""
     assert projected.gesture_requested_tool == ""
@@ -636,7 +756,7 @@ def test_world_start_establishes_run_before_first_event_and_does_not_reset_twice
     assert published[0].gateway_instance_id == "gateway-1"
     assert published[0].procedure_run_id == first_run_id
     assert published[0].procedure_type == "thyroidectomy"
-    assert published[0].schema_version == "1.0.0"
+    assert published[0].schema_version == "1.1.0"
     assert published[0].catalog_version == "sha256:test"
 
 

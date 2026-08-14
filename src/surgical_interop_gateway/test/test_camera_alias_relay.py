@@ -5,10 +5,20 @@ import pytest
 from surgical_interop_gateway.camera_alias_relay import (
     CameraAliasBinding,
     CameraAliasRelay,
+    _camera_qos,
     active_camera_aliases,
     procedure_is_active,
     publish_when_requested,
 )
+from rclpy.qos import DurabilityPolicy, ReliabilityPolicy
+
+
+def test_default_physical_sources_use_multicam_synced_topics() -> None:
+    source = __import__(
+        "inspect"
+    ).getsource(CameraAliasRelay.__init__)
+    assert "/synced/flir/color/image_raw/compressed" in source
+    assert "/synced/cam_4/color/image_raw/compressed" in source
 
 
 def _binding(name: str, source: str, public: str) -> CameraAliasBinding:
@@ -74,6 +84,13 @@ def test_frame_payload_is_forwarded_unchanged_on_demand() -> None:
 
     assert publish_when_requested(publisher, message) is True
     assert publisher.messages == [message]
+
+
+def test_camera_alias_qos_matches_cv_workbook() -> None:
+    qos = _camera_qos()
+    assert qos.depth == 5
+    assert qos.reliability == ReliabilityPolicy.BEST_EFFORT
+    assert qos.durability == DurabilityPolicy.VOLATILE
 
 
 def test_camera_gate_requires_fresh_matching_active_procedure() -> None:

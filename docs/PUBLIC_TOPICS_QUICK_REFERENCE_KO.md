@@ -13,7 +13,7 @@ ID/confidence는 계속 제공된다. 이 Gateway는 자유문장을 비식별�
 
 - 상태 snapshot 10개: Reliable / Transient Local / Keep Last 1 / 기본 약 1 Hz
 - Event 1개: Reliable / Volatile / Keep Last 50 / 발생 즉시
-- 카메라 alias 2개: Best Effort / Volatile / Keep Last 1 / 활성 시나리오에서만 전달
+- 카메라 alias 2개: Best Effort / Volatile / Keep Last 5 / 활성 시나리오에서만 전달
 - wire 계약의 최종 원본: `src/surgical_interop_msgs/msg`, `action`, `srv`
 
 ## UI 권장 초기 구독 순서
@@ -48,7 +48,7 @@ ID/confidence는 계속 제공된다. 이 Gateway는 자유문장을 비식별�
 ### Gateway heartbeat
 
 ```yaml
-schema_version: "1.0.0"
+schema_version: "1.1.0"
 interface_version: "0.3.0"
 catalog_version: "sha256:<catalog digest>"
 gateway_instance_id: "<opaque gateway UUID>"
@@ -105,9 +105,25 @@ predictions:
     stability_sec: 3.4
     source: digital_twin
     evidence_status: DT_ACCEPTED
+  - rank: 2
+    instrument_id: T04
+    instance_id: ""
+    confidence: 0.73
+    stability_sec: 0.0
+    source: digital_twin
+    evidence_status: DT_ACCEPTED
+  - rank: 3
+    instrument_id: T07
+    instance_id: ""
+    confidence: 0.61
+    stability_sec: 0.0
+    source: digital_twin
+    evidence_status: DT_ACCEPTED
 ```
 
-예측은 UI 표시용 advisory 정보이며 Action 실행 지시나 승인으로 사용하면 안 된다.
+예측은 최대 3개이며 confidence 내림차순이다. rank 1만 기존 내부 BT scalar와
+동일하고, rank 2·3은 제어에 들어가지 않는다. 이 예측 전체는 UI 표시용 advisory
+정보이며 Action 실행 지시나 승인으로 사용하면 안 된다.
 
 ### 로봇 손과 도구 상태
 
@@ -128,9 +144,16 @@ end_effectors:
     instance_id: ""
 ```
 
-집도의 보유 도구는 `/surgery/instruments`에서 `holder_role`, `state`,
-`location_type`, `location_id`를 함께 확인한다. 도구가 항상 하나라고
-가정하지 않는다.
+집도의가 현재 사용하는 도구 목록은 `/surgery/instruments`에서
+`holder_role=surgeon`이고 `state`가 `handed_over` 또는 `in_use`인 row를 고른다.
+공개 위치는 모두 `location_type=surgeon`, `location_id=surgeon`으로 단순화되며,
+내부의 `surgeon_hand`, `surgical_field`, `bed_fixed_tool` 구분은 노출하지 않는다.
+도구가 항상 하나라고 가정하지 않는다.
+
+Mayo 위 도구 목록은 `location_type=mayo_stand`인 row를 고른다. 물리 위치는
+하나이며, `state=parked_for_reuse`는 재사용 대기,
+`state=awaiting_retrieval`은 회수 queue에 등록된 상태다.
+`mayo_reuse_zone`과 `mayo_recovery_zone`은 공개 위치값이 아니다.
 
 ### 확정 음성 인식 메타데이터와 latency — 기본 redaction
 
@@ -161,7 +184,7 @@ VLM도 기본 정책에서 단계·도구·위치·gesture의 구조화된 값�
 
 ```yaml
 sequence: 287
-schema_version: "1.0.0"
+schema_version: "1.1.0"
 catalog_version: "sha256:<catalog digest>"
 gateway_instance_id: "<opaque gateway UUID>"
 procedure_run_id: "<opaque run UUID>"
@@ -188,8 +211,8 @@ Gateway가 길이를 검증한다. UI도 배열을 결합하기 전에 길이를
 
 | 공개 토픽 | 기본 원본 | 조건 |
 | --- | --- | --- |
-| `/surgery/images/flir/compressed` | `/flir_camera/image_color/compressed` | fresh active procedure + subscriber |
-| `/surgery/images/cam4/compressed` | `/camera/cam_4/color/image_raw/compressed` | fresh active procedure + subscriber |
+| `/surgery/images/flir/compressed` | `/synced/flir/color/image_raw/compressed` | fresh active procedure + subscriber |
+| `/surgery/images/cam4/compressed` | `/synced/cam_4/color/image_raw/compressed` | fresh active procedure + subscriber |
 
 시나리오 유휴·정지·stale·procedure mismatch이면 공개 토픽은 발견되지만
 프레임은 전달되지 않는다. relay는 원본 JPEG를 decode/re-encode하지 않는다.

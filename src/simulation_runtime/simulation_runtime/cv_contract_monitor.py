@@ -33,6 +33,7 @@ from .cv_contract import (
     CV_CONTRACT_SCHEMA,
     CV_CONTRACT_VERSION,
     EXTERNAL_OUTPUT_ENDPOINTS,
+    endpoint_by_key,
     normalize_perception_backend,
 )
 
@@ -279,17 +280,17 @@ class CvContractMonitor(Node):
         self.declare_parameter("perception_backend", "local")
         self.declare_parameter("status_topic", "/integration/cv_contract/status")
         self.declare_parameter(
-            "cam4_rgb_topic", "/camera/cam_4/color/image_raw/compressed"
+            "cam4_rgb_topic", "/synced/cam_4/color/image_raw/compressed"
         )
         self.declare_parameter(
             "cam4_rgb_alias_topic", "/surgery/images/cam4/compressed"
         )
         self.declare_parameter(
             "cam4_camera_info_topic",
-            "/surgery/cameras/cam4/color/camera_info",
+            "/synced/cam_4/color/camera_info",
         )
         self.declare_parameter(
-            "cam4_aligned_depth_topic", "/surgery/cameras/cam4/aligned_depth"
+            "cam4_aligned_depth_topic", "/synced/cam_4/depth/image_rect_raw"
         )
         self.declare_parameter(
             "handover_tray_rgb_topic", "/surgery/images/tray/compressed"
@@ -311,13 +312,13 @@ class CvContractMonitor(Node):
                 "cam4_rgb",
                 str(self.get_parameter("cam4_rgb_topic").value),
                 "sensor_msgs/msg/CompressedImage",
-                "BEST_EFFORT/VOLATILE/KEEP_LAST(5)",
+                endpoint_by_key("cam4_rgb").qos,
             ),
             "cam4_camera_info": InputTracker(
                 "cam4_camera_info",
                 str(self.get_parameter("cam4_camera_info_topic").value),
                 "sensor_msgs/msg/CameraInfo",
-                "RELIABLE/VOLATILE/KEEP_LAST(1)",
+                endpoint_by_key("cam4_camera_info").qos,
                 "provider_and_calibration_pending",
             ),
             "cam4_aligned_depth": InputTracker(
@@ -338,7 +339,7 @@ class CvContractMonitor(Node):
                 "handover_tray_camera_info",
                 str(self.get_parameter("handover_tray_camera_info_topic").value),
                 "sensor_msgs/msg/CameraInfo",
-                "RELIABLE/VOLATILE/KEEP_LAST(1)",
+                endpoint_by_key("handover_tray_camera_info").qos,
                 "optional_handover_tray_camera_not_mayo",
             ),
             "handover_tray_aligned_depth": InputTracker(
@@ -349,9 +350,21 @@ class CvContractMonitor(Node):
                 "optional_handover_tray_camera_not_mayo",
             ),
         }
-        info_qos = QoSProfile(
+        synced_info_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
-            depth=1,
+            depth=20,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        synced_rgb_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=20,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        tray_info_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=5,
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.VOLATILE,
         )
@@ -361,7 +374,7 @@ class CvContractMonitor(Node):
             lambda message: self._trackers["cam4_rgb"].observe(
                 message, validate_compressed_image
             ),
-            qos_profile_sensor_data,
+            synced_rgb_qos,
         )
         self.create_subscription(
             CameraInfo,
@@ -369,7 +382,7 @@ class CvContractMonitor(Node):
             lambda message: self._trackers["cam4_camera_info"].observe(
                 message, validate_camera_info
             ),
-            info_qos,
+            synced_info_qos,
         )
         self.create_subscription(
             Image,
@@ -393,7 +406,7 @@ class CvContractMonitor(Node):
             lambda message: self._trackers["handover_tray_camera_info"].observe(
                 message, validate_camera_info
             ),
-            info_qos,
+            tray_info_qos,
         )
         self.create_subscription(
             Image,
@@ -497,12 +510,18 @@ class CvContractMonitor(Node):
         }
         alias_topic = str(self.get_parameter("cam4_rgb_alias_topic").value)
         alias_publishers = self._publisher_info(alias_topic)
+        alias_contract = endpoint_by_key("cam4_rgb_alias")
         inputs["cam4_rgb_alias"] = {
             "topic": alias_topic,
-            "expected_type": "sensor_msgs/msg/CompressedImage",
+            "expected_type": alias_contract.message_type,
+            "expected_qos": alias_contract.qos,
             "alias_of": "cam4_rgb",
             "publisher_count": len(alias_publishers),
             "publishers": alias_publishers,
+            "qos_verification": [
+                qos_contract_state(alias_contract.qos, publisher)
+                for publisher in alias_publishers
+            ],
             "state": "ALIAS_NOT_SAMPLED_TO_AVOID_DOUBLE_COUNTING",
             "policy_state": "SCENARIO_AND_DEMAND_GATED_BY_TASKPLANNER",
         }

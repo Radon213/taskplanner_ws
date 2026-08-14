@@ -6,6 +6,7 @@ from surgical_interop_gateway.public_bridge_policy import (
     PUBLIC_ALLOWED_INCOMING_OPERATIONS,
     PUBLIC_ALLOWED_COMPRESSIONS,
     PUBLIC_CAMERA_COMPRESSION,
+    PUBLIC_CAMERA_QOS,
     PUBLIC_CAMERA_TOPICS,
     PUBLIC_CAMERA_QUEUE_LENGTH,
     PUBLIC_CAMERA_MIN_THROTTLE_MS,
@@ -16,9 +17,11 @@ from surgical_interop_gateway.public_bridge_policy import (
     PUBLIC_MAX_OUTGOING_MESSAGE_BYTES,
     PUBLIC_MAX_OUTGOING_QUEUE,
     PUBLIC_MAX_SUBSCRIPTION_IDS_PER_TOPIC,
+    PUBLIC_EVENT_QOS,
     PUBLIC_REJECTED_OPERATION,
     PUBLIC_LOOPBACK_ADDRESS,
     PUBLIC_STATE_TOPICS,
+    PUBLIC_SNAPSHOT_QOS,
     PUBLIC_SUBSCRIBE_ALLOWLIST,
     origin_is_allowed,
     parse_allowed_origins,
@@ -119,8 +122,8 @@ def test_public_bridge_excludes_internal_control_and_raw_sensor_topics() -> None
         "/sensors/surgeon/sentence",
         "/surgery/audio/request_text",
         "/external/bed_robot_arms/status",
-        "/flir_camera/image_color/compressed",
-        "/camera/cam_4/color/image_raw/compressed",
+        "/synced/flir/color/image_raw/compressed",
+        "/synced/cam_4/color/image_raw/compressed",
         "/surgery/images/flir/segmented/compressed",
         "/surgery/tool_change/request",
         "/surgery/retraction/adjust",
@@ -173,6 +176,7 @@ def test_camera_subscription_is_latest_only_even_if_client_requests_unbounded() 
             == PUBLIC_CAMERA_MIN_THROTTLE_MS
             == 100
         )
+        assert restricted["qos"] == PUBLIC_CAMERA_QOS
 
         slower = restrict_public_subscription_request(
             {
@@ -184,13 +188,43 @@ def test_camera_subscription_is_latest_only_even_if_client_requests_unbounded() 
         )
         assert slower["throttle_rate"] == 250
         assert slower["compression"] == "cbor"
+        assert slower["qos"] == PUBLIC_CAMERA_QOS
 
     state_request = {
         "op": "subscribe",
         "topic": "/surgery/context",
         "queue_length": 5,
     }
-    assert restrict_public_subscription_request(state_request) == state_request
+    assert restrict_public_subscription_request(state_request) == {
+        **state_request,
+        "qos": PUBLIC_SNAPSHOT_QOS,
+    }
+
+
+def test_public_subscription_qos_is_fixed_by_topic_class() -> None:
+    hostile = {
+        "history": "keep_all",
+        "depth": 1_000_000,
+        "reliability": "best_available",
+        "durability": "best_available",
+    }
+    camera = restrict_public_subscription_request(
+        {
+            "op": "subscribe",
+            "topic": "/surgery/images/flir/compressed",
+            "qos": hostile,
+        }
+    )
+    snapshot = restrict_public_subscription_request(
+        {"op": "subscribe", "topic": "/surgery/context", "qos": hostile}
+    )
+    event = restrict_public_subscription_request(
+        {"op": "subscribe", "topic": "/surgery/events", "qos": hostile}
+    )
+
+    assert camera["qos"] == PUBLIC_CAMERA_QOS
+    assert snapshot["qos"] == PUBLIC_SNAPSHOT_QOS
+    assert event["qos"] == PUBLIC_EVENT_QOS
 
 
 def test_all_client_camera_requests_are_forced_to_cbor_not_png() -> None:

@@ -84,8 +84,8 @@ The live integration runtime also advertises two stable media aliases:
 
 | Public topic | Type | Default native source |
 | --- | --- | --- |
-| `/surgery/images/flir/compressed` | `sensor_msgs/msg/CompressedImage` | `/flir_camera/image_color/compressed` |
-| `/surgery/images/cam4/compressed` | `sensor_msgs/msg/CompressedImage` | `/camera/cam_4/color/image_raw/compressed` |
+| `/surgery/images/flir/compressed` | `sensor_msgs/msg/CompressedImage` | `/synced/flir/color/image_raw/compressed` |
+| `/surgery/images/cam4/compressed` | `sensor_msgs/msg/CompressedImage` | `/synced/cam_4/color/image_raw/compressed` |
 
 ## QoS and publication behavior
 
@@ -93,7 +93,7 @@ The live integration runtime also advertises two stable media aliases:
 | --- | --- | --- | --- | --- |
 | Ten state snapshots | Reliable | Transient Local | Keep Last 1 | Approximately 1 Hz; late joiners receive the latest snapshot. |
 | `/surgery/events` | Reliable | Volatile | Keep Last 50 | Emitted immediately; no durable replay before subscription. |
-| Camera aliases | Best Effort | Volatile | Keep Last 1 | Frames pass through only on active, fresh, matched demand. |
+| Camera aliases | Best Effort | Volatile | Keep Last 5 | Frames pass through only on active, fresh, matched demand. |
 
 Snapshot subscribers that need the retained value should request reliable and
 transient-local QoS. Event subscribers should use reliable and volatile QoS.
@@ -123,7 +123,7 @@ Sequence alone is never a globally unique event key.
 `/surgery/gateway_info` is the first topic a consumer should acquire. Its
 fields have the following semantics:
 
-- `schema_version`: public projection schema (`1.0.0` for this contract).
+- `schema_version`: public projection schema (`1.1.0` for this contract).
 - `interface_version`: installed interface package (`0.3.0`).
 - `catalog_version`: deterministic SHA-256 digest of the published catalog.
 - `gateway_instance_id`: opaque non-PHI UUID created once per Gateway process.
@@ -224,6 +224,17 @@ state, confidence, and evidence. Locations are not calibrated 3D poses or robot
 frames. `visible=false` currently means the Gateway makes no visibility
 assertion; it must not be shown as proof that a tool was visually absent.
 
+The public physical ontology deliberately collapses private planner detail:
+
+- A surgeon-side tool uses `location_type=surgeon` and
+  `location_id=surgeon`. Current surgeon-used tools are rows with
+  `holder_role=surgeon` and `state` equal to `handed_over` or `in_use`.
+- Every tool physically on Mayo uses `location_type=mayo_stand` and
+  `location_id=mayo_stand`. `state=parked_for_reuse` versus
+  `state=awaiting_retrieval` expresses policy; these are not separate zones.
+- Private values such as `surgeon_hand`, `surgical_field`, `bed_fixed_tool`,
+  `mayo_reuse_zone`, and `mayo_recovery_zone` are never public location values.
+
 ### `/surgery/robots`
 
 This snapshot combines fresh Taskplanner skill status for the humanoid and
@@ -244,10 +255,13 @@ intentionally excluded.
 
 ### `/surgery/tool_predictions`
 
-The current implementation publishes at most rank 1 from the reducer-accepted
-`predicted_tool`, with confidence, stability seconds, source, and evidence.
-An empty array means no public prediction is available. This topic is advisory
-display information and is never authorization to issue a handover.
+The current implementation publishes up to three reducer-accepted candidates,
+ordered by descending confidence with contiguous ranks `1..N`. Rank 1 is the
+same candidate used by the legacy private control scalar; ranks 2 and 3 never
+enter BT or robot-control policy. Their `stability_sec` is conservatively `0.0`
+until an independent advisory continuity contract exists. An empty array means
+no public prediction is available. Every row is advisory display information
+and is never authorization to issue a handover.
 
 ### `/surgery/speech`
 
@@ -420,7 +434,7 @@ without de-identification. It does not permit any other private field. The
 deployment owner, not the Gateway, is responsible for its authorization and
 receiver controls.
 
-The reviewed rank-1 tool forecast and semantic hand possession added in v0.3
+The reviewed ranked tool forecast and semantic hand possession added in v0.3
 are narrow exceptions, represented only by their dedicated public IDLs. They do
 not make the remaining internal `WorldState` public.
 

@@ -75,11 +75,11 @@ def publish_when_requested(publisher: Any, message: CompressedImage) -> bool:
 
 
 def _camera_qos() -> QoSProfile:
-    """Low-latency image QoS compatible with reliable or best-effort sources."""
+    """Workbook image QoS compatible with reliable or best-effort sources."""
 
     return QoSProfile(
         history=HistoryPolicy.KEEP_LAST,
-        depth=1,
+        depth=5,
         reliability=ReliabilityPolicy.BEST_EFFORT,
         durability=DurabilityPolicy.VOLATILE,
     )
@@ -139,7 +139,7 @@ class CameraAliasRelay(Node):
                     str(
                         self.declare_parameter(
                             "flir_source_topic",
-                            "/flir_camera/image_color/compressed",
+                            "/synced/flir/color/image_raw/compressed",
                         ).value
                     )
                 ),
@@ -158,7 +158,7 @@ class CameraAliasRelay(Node):
                     str(
                         self.declare_parameter(
                             "cam4_source_topic",
-                            "/camera/cam_4/color/image_raw/compressed",
+                            "/synced/cam_4/color/image_raw/compressed",
                         ).value
                     )
                 ),
@@ -195,7 +195,7 @@ class CameraAliasRelay(Node):
             self.get_logger().info(
                 f"public {binding.name} camera alias: "
                 f"{binding.source_topic} -> {binding.public_topic} "
-                "(best-effort/volatile, depth 1, demand-driven)"
+                "(best-effort/volatile, depth 5, demand-driven)"
             )
         self._demand_timer = self.create_timer(0.5, self._reconcile_source_demand)
         self._world_subscription = self.create_subscription(

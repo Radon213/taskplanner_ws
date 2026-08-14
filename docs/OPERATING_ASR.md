@@ -51,7 +51,7 @@ publisher healthcheck와 최종 문장 publisher readiness는 서로 다른 검�
 ## 컨테이너 경계
 
 sidecar는 `taskplanner-runtime`과 같은 `taskplanner-ws:dev` 이미지, host
-network, IPC, `ROS_DOMAIN_ID`, discovery 범위, RMW와 Fast DDS profile을 쓴다.
+network, IPC, `ROS_DOMAIN_ID`, discovery 범위, Cyclone DDS RMW/profile을 쓴다.
 호스트 사용자와 동일한 `TASKPLANNER_UID:TASKPLANNER_GID`로 실행하고 다음만
 추가로 공유한다.
 

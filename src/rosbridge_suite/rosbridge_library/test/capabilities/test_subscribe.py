@@ -10,7 +10,12 @@ from typing import Any
 import rclpy
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
-from rclpy.qos import DurabilityPolicy, QoSProfile
+from rclpy.qos import (
+    DurabilityPolicy,
+    HistoryPolicy,
+    QoSProfile,
+    ReliabilityPolicy,
+)
 from rosbridge_library.capabilities import subscribe
 from rosbridge_library.internal.exceptions import (
     InvalidArgumentException,
@@ -109,6 +114,50 @@ class TestSubscribe(unittest.TestCase):
 
         msg = {"op": "subscribe", "topic": "/jon", "compression": 9000}
         self.assertRaises(InvalidArgumentException, sub.subscribe, msg)
+
+        msg = {"op": "subscribe", "topic": "/jon", "qos": "reliable"}
+        self.assertRaises(InvalidArgumentException, sub.subscribe, msg)
+
+        msg = {
+            "op": "subscribe",
+            "topic": "/jon",
+            "type": "std_msgs/String",
+            "qos": {"reliability": "guaranteed"},
+        }
+        self.assertRaises(InvalidArgumentException, sub.subscribe, msg)
+
+    def test_explicit_qos_is_applied(self) -> None:
+        proto = Protocol("test_explicit_qos_is_applied", self.node)
+        sub = subscribe.Subscribe(proto)
+        topic = "/test_explicit_qos_is_applied"
+
+        try:
+            sub.subscribe(
+                {
+                    "op": "subscribe",
+                    "topic": topic,
+                    "type": "std_msgs/String",
+                    "qos": {
+                        "history": "keep_last",
+                        "depth": 1,
+                        "reliability": "reliable",
+                        "durability": "volatile",
+                    },
+                }
+            )
+            deadline = time.monotonic() + 2.0
+            infos = self.node.get_subscriptions_info_by_topic(topic)
+            while not infos and time.monotonic() < deadline:
+                time.sleep(0.01)
+                infos = self.node.get_subscriptions_info_by_topic(topic)
+            self.assertEqual(len(infos), 1)
+            qos = infos[0].qos_profile
+            self.assertEqual(qos.history, HistoryPolicy.KEEP_LAST)
+            self.assertEqual(qos.depth, 1)
+            self.assertEqual(qos.reliability, ReliabilityPolicy.RELIABLE)
+            self.assertEqual(qos.durability, DurabilityPolicy.VOLATILE)
+        finally:
+            sub.finish()
 
     def test_subscribe_works(self) -> None:
         proto = Protocol("test_subscribe_works", self.node)

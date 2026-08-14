@@ -209,11 +209,11 @@ def test_debug_config_exposes_exact_public_contract() -> None:
     assert {(row["topic"], row["type"]) for row in config["inputs"]} == {
         ("/sensors/surgeon/sentence", "std_msgs/msg/String"),
         ("/integration/cv_contract/status", "std_msgs/msg/String"),
-        ("/camera/cam_1/color/image_raw/compressed", "sensor_msgs/msg/CompressedImage"),
-        ("/camera/cam_2/color/image_raw/compressed", "sensor_msgs/msg/CompressedImage"),
-        ("/camera/cam_3/color/image_raw/compressed", "sensor_msgs/msg/CompressedImage"),
-        ("/camera/cam_4/color/image_raw/compressed", "sensor_msgs/msg/CompressedImage"),
-        ("/flir_camera/image_color/compressed", "sensor_msgs/msg/CompressedImage"),
+        ("/synced/cam_1/color/image_raw/compressed", "sensor_msgs/msg/CompressedImage"),
+        ("/synced/cam_2/color/image_raw/compressed", "sensor_msgs/msg/CompressedImage"),
+        ("/synced/cam_3/color/image_raw/compressed", "sensor_msgs/msg/CompressedImage"),
+        ("/synced/cam_4/color/image_raw/compressed", "sensor_msgs/msg/CompressedImage"),
+        ("/synced/flir/color/image_raw/compressed", "sensor_msgs/msg/CompressedImage"),
     }
     assert {(row["topic"], row["type"], row["qos"]) for row in config["outputs"]} == {
         ("/surgery/context", "surgical_interop_msgs/msg/SurgeryContext", "snapshot"),

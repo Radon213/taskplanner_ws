@@ -30,7 +30,7 @@ TEMPLATE = ROOT / "docs/Taskplanner_ROS2_External_Interface_Contract_v0.2.0_KO.d
 OUTPUT = ROOT / "docs/Taskplanner_ROS2_External_Interface_Contract_v0.3.0_KO.docx"
 
 BASELINE = "0.3.0"
-SCHEMA_VERSION = "1.0.0"
+SCHEMA_VERSION = "1.1.0"
 DATE = date(2026, 8, 13).isoformat()
 FONT_BODY = "NanumBarunGothic"
 FONT_HEADING = "NanumSquare Neo"
@@ -129,7 +129,7 @@ TOPIC_DETAILS = (
         "Gateway 생존, wire/schema 버전, catalog digest, 프로세스 UUID와 활성 run UUID를 제공한다.",
         "heartbeat 유지; procedure_active=false, procedure_run_id는 빈 문자열.",
         "가장 먼저 구독한다. gateway_instance_id가 바뀌면 revision/sequence 캐시를 전부 버린다.",
-        """schema_version: \"1.0.0\"
+        """schema_version: \"1.1.0\"
 interface_version: \"0.3.0\"
 catalog_version: \"sha256:<digest>\"
 gateway_instance_id: \"<opaque UUID>\"
@@ -171,13 +171,15 @@ safety_flags: []""",
         "surgical_interop_msgs/msg/InstrumentStateArray",
         "도구 instance의 의미적 위치, 보유자, lifecycle 상태와 confidence를 전체 snapshot으로 제공한다.",
         "instruments=[]",
-        "location은 3D pose가 아니다. visible=false는 현재 '시각적 부재'가 아니라 visibility 단언 없음이다.",
+        "집도의: holder_role=surgeon + state=handed_over|in_use. "
+        "Mayo: location_type=mayo_stand; 회수 여부는 "
+        "state=parked_for_reuse|awaiting_retrieval로 구분한다.",
         """revision: 1042
 instruments:
   - instrument_id: T04
     instance_id: \"T04#1\"
-    location_type: surgeon_hand
-    location_id: surgeon_right_hand
+    location_type: surgeon
+    location_id: surgeon
     holder_role: surgeon
     state: in_use
     visible: false
@@ -223,7 +225,7 @@ end_effectors:
     TopicDetail(
         "/surgery/tool_predictions",
         "surgical_interop_msgs/msg/ToolPredictionArray",
-        "현재 구현은 reducer가 수용한 rank 1 next-tool forecast를 confidence/stability와 함께 제공한다.",
+        "현재 구현은 reducer가 수용한 next-tool forecast를 confidence 내림차순 Top-3까지 제공한다.",
         "predictions=[]",
         "advisory UI 정보다. Action Goal이나 handover 권한으로 사용하면 안 된다.",
         """procedure_active: true
@@ -233,6 +235,20 @@ predictions:
     instance_id: \"\"
     confidence: 0.87
     stability_sec: 3.4
+    source: digital_twin
+    evidence_status: DT_ACCEPTED
+  - rank: 2
+    instrument_id: T04
+    instance_id: ""
+    confidence: 0.73
+    stability_sec: 0.0
+    source: digital_twin
+    evidence_status: DT_ACCEPTED
+  - rank: 3
+    instrument_id: T07
+    instance_id: ""
+    confidence: 0.61
+    stability_sec: 0.0
     source: digital_twin
     evidence_status: DT_ACCEPTED""",
     ),
@@ -266,8 +282,8 @@ observations:
     phase_ids: [P04]
     phase_confidences: [0.75]
     observed_tool_ids: [T08]
-    observed_location_types: [surgical_field]
-    observed_location_ids: [surgical_field]
+    observed_location_types: [surgeon]
+    observed_location_ids: [surgeon]
     observed_confidences: [0.84]
     uncertainty: 0.22
     evidence_status: MODEL_OBSERVED_REDACTED""",
@@ -293,7 +309,7 @@ evidence_status: GATEWAY_OBSERVED""",
         "발행하지 않음; 과거 replay 없음.",
         "DT_ACCEPTED는 event fact의 공개 수용이다. 성공/거절/실패는 state를 확인한다. sequence gap이면 snapshot을 재조회한다.",
         """sequence: 287
-schema_version: "1.0.0"
+schema_version: "1.1.0"
 catalog_version: "sha256:<catalog digest>"
 gateway_instance_id: "<opaque gateway UUID>"
 procedure_run_id: "<opaque run UUID>"
@@ -666,8 +682,7 @@ def _configure_styles(doc: DocumentType) -> None:
     code.paragraph_format.line_spacing = 1.0
 
 
-def _configure_section(doc: DocumentType) -> None:
-    section = doc.sections[0]
+def _set_section_geometry(section) -> None:
     section.page_width = Inches(8.5)
     section.page_height = Inches(11)
     section.top_margin = Inches(1)
@@ -676,9 +691,47 @@ def _configure_section(doc: DocumentType) -> None:
     section.right_margin = Inches(1)
     section.header_distance = Inches(0.492)
     section.footer_distance = Inches(0.492)
-    section.different_first_page_header_footer = True
 
-    header = section.header
+
+def _configure_section(doc: DocumentType) -> None:
+    """Configure a headerless cover section.
+
+    Keeping the cover and body in separate sections avoids a LibreOffice
+    pagination defect where ``titlePg`` can be applied to naturally flowed
+    continuation pages, dropping their header and top margin.
+    """
+    section = doc.sections[0]
+    _set_section_geometry(section)
+    section.different_first_page_header_footer = False
+    # LibreOffice renders left/even pages through the explicit even-page
+    # relationship once a document contains section-specific headers.
+    doc.settings.odd_and_even_pages_header_footer = True
+    section.header.paragraphs[0].clear()
+    section.footer.paragraphs[0].clear()
+
+
+def _start_body_section(doc: DocumentType) -> None:
+    section = doc.add_section(WD_SECTION.NEW_PAGE)
+    _set_section_geometry(section)
+    section.different_first_page_header_footer = False
+
+    for header in (
+        section.header,
+        section.even_page_header,
+        section.first_page_header,
+    ):
+        header.is_linked_to_previous = False
+        _populate_body_header(header)
+    for footer in (
+        section.footer,
+        section.even_page_footer,
+        section.first_page_footer,
+    ):
+        footer.is_linked_to_previous = False
+        _populate_body_footer(footer)
+
+
+def _populate_body_header(header) -> None:
     p = header.paragraphs[0]
     p.clear()
     p.paragraph_format.tab_stops.add_tab_stop(
@@ -692,7 +745,8 @@ def _configure_section(doc: DocumentType) -> None:
     _set_run_font(r2, FONT_BODY, 8)
     r2.font.color.rgb = RGBColor.from_string(MUTED)
 
-    footer = section.footer
+
+def _populate_body_footer(footer) -> None:
     fp = footer.paragraphs[0]
     fp.clear()
     fp.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -700,32 +754,6 @@ def _configure_section(doc: DocumentType) -> None:
     _set_run_font(fr, FONT_BODY, 8.5)
     fr.font.color.rgb = RGBColor.from_string(MUTED)
     _add_page_field(fp)
-
-    even_header = section.even_page_header
-    ep = even_header.paragraphs[0]
-    ep.clear()
-    ep.paragraph_format.tab_stops.add_tab_stop(
-        Inches(6.5), WD_TAB_ALIGNMENT.RIGHT
-    )
-    er = ep.add_run("TASKPLANNER  |  ROS 2 EXTERNAL INTERFACE CONTRACT")
-    er.bold = True
-    _set_run_font(er, FONT_HEADING, 8)
-    er.font.color.rgb = RGBColor.from_string(MUTED)
-    er2 = ep.add_run(f"\tBASELINE {BASELINE}")
-    _set_run_font(er2, FONT_BODY, 8)
-    er2.font.color.rgb = RGBColor.from_string(MUTED)
-
-    even_footer = section.even_page_footer
-    efp = even_footer.paragraphs[0]
-    efp.clear()
-    efp.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    efr = efp.add_run("Taskplanner Integration Baseline  |  ")
-    _set_run_font(efr, FONT_BODY, 8.5)
-    efr.font.color.rgb = RGBColor.from_string(MUTED)
-    _add_page_field(efp)
-
-    section.first_page_header.paragraphs[0].clear()
-    section.first_page_footer.paragraphs[0].clear()
 
 
 def _cover(doc: DocumentType, head: str) -> None:
@@ -754,8 +782,8 @@ def _cover(doc: DocumentType, head: str) -> None:
     sr.font.color.rgb = RGBColor.from_string("1F4D78")
 
     for label, value, mono in (
-        ("계약 기준", "surgical_interop_msgs 0.3.0 / schema 1.0.0", False),
-        ("대상 환경", "ROS 2 Jazzy · Fast DDS 검증 기준", False),
+        ("계약 기준", "surgical_interop_msgs 0.3.0 / schema 1.1.0", False),
+        ("대상 환경", "ROS 2 Jazzy · Cyclone DDS 검증 기준", False),
         ("소스 기준", f"local main@{head} + 동봉 IDL SHA-256", True),
         ("기준일", DATE, False),
     ):
@@ -783,7 +811,7 @@ def _cover(doc: DocumentType, head: str) -> None:
     nr.bold = True
     _set_run_font(nr, FONT_BODY, 10)
     nr.font.color.rgb = RGBColor.from_string(NAVY)
-    doc.add_page_break()
+    _start_body_section(doc)
 
 
 def _document_control(w: Writer, head: str) -> None:
@@ -870,7 +898,7 @@ def _scope(w: Writer) -> None:
     ):
         w.bullet(item)
     w.body(
-        "0.3.0의 rank-1 도구 예측과 semantic robot-hand possession은 명시적으로 검토된 좁은 예외다. "
+        "0.3.0의 Top-3 도구 예측과 semantic robot-hand possession은 명시적으로 검토된 좁은 예외다. "
         "그 때문에 내부 /twin/world_state 전체가 공개되는 것은 아니다."
     )
 
@@ -887,8 +915,8 @@ def _overview(w: Writer) -> None:
         "Taskplanner → 외부 UI camera media",
         ("공개 토픽", "Type", "기본 native source"),
         (
-            ("/surgery/images/flir/compressed", "sensor_msgs/msg/CompressedImage", "/flir_camera/image_color/compressed"),
-            ("/surgery/images/cam4/compressed", "sensor_msgs/msg/CompressedImage", "/camera/cam_4/color/image_raw/compressed"),
+            ("/surgery/images/flir/compressed", "sensor_msgs/msg/CompressedImage", "/synced/flir/color/image_raw/compressed"),
+            ("/surgery/images/cam4/compressed", "sensor_msgs/msg/CompressedImage", "/synced/cam_4/color/image_raw/compressed"),
         ),
         (3100, 2700, 3560),
     )
@@ -916,9 +944,10 @@ def _transport(w: Writer) -> None:
         "현재 local main 기본값",
         ("항목", "기본", "비고"),
         (
-            ("ROS_DOMAIN_ID", "0", "기관 간 합의값으로 변경 가능; 양측이 반드시 같아야 함"),
+            ("ROS_DOMAIN_ID", "0", "현재 외부 통합 고정값; 양측이 반드시 같아야 함"),
             ("Discovery", "SUBNET (live mode)", "동일 subnet multicast/discovery 허용 필요"),
-            ("RMW", "rmw_fastrtps_cpp", "상호 호환 및 실제 discovery 검증 필요"),
+            ("RMW", "rmw_cyclonedds_cpp", "양측 일치 및 실제 discovery 검증 필요"),
+            ("Cyclone profile", "wired NIC + FragmentSize 1344B", "1500-byte MTU에서 IP fragmentation 회피"),
             ("State Gateway", "PUBLISH_SHARED_STATE=true", "live와 simulation/LLM base runtime 공통"),
             ("Public free text", "PUBLISH_SHARED_FREE_TEXT=false", "speech.text·clinical.summary 기본 suppression"),
             ("Browser bridge", "ENABLE_PUBLIC_ROSBRIDGE=true", "dedicated sidecar; loopback 9092 + wired-LAN proxy"),
@@ -929,8 +958,10 @@ def _transport(w: Writer) -> None:
         (2600, 2280, 4480),
     )
     w.body(
-        "문서의 Domain 0은 현재 local deployment의 기본값이지 영구 wire 상수가 아니다. 배포 담당자는 실제 "
-        "접속 전에 Domain, RMW, discovery range, interface/subnet과 방화벽을 하나의 인수표로 제공해야 한다."
+        "현재 외부 통합 runtime, ASR, public bridge와 Debug sidecar는 Domain 0, SUBNET, Cyclone DDS 및 "
+        "검토된 wired profile을 함께 사용한다. replay/shadow는 외부 통합 참가자가 아니며 D71/LOCALHOST로 "
+        "격리한다. 배포 담당자는 실제 접속 전에 Domain, RMW, discovery range, interface/subnet, MTU와 "
+        "방화벽을 하나의 인수표로 제공해야 한다."
     )
     w.heading("3.2 QoS", 2)
     w.table(
@@ -939,7 +970,7 @@ def _transport(w: Writer) -> None:
         (
             ("10 snapshot", "Reliable", "Transient Local", "Keep Last 1", "late join retained sample 수신"),
             ("/surgery/events", "Reliable", "Volatile", "Keep Last 50", "연결 이후 live event만"),
-            ("camera alias", "Best Effort", "Volatile", "Keep Last 1", "latest frame only"),
+            ("camera alias", "Best Effort", "Volatile", "Keep Last 5", "latest frames, demand-gated"),
         ),
         (1800, 1500, 1680, 1380, 3000),
     )
@@ -1095,8 +1126,8 @@ def _camera(w: Writer) -> None:
         "Stable camera aliases",
         ("공개 토픽", "Native source", "QoS", "Gate"),
         (
-            ("/surgery/images/flir/compressed", "/flir_camera/image_color/compressed", "BestEffort/Volatile/KL1", "fresh matching active + demand"),
-            ("/surgery/images/cam4/compressed", "/camera/cam_4/color/image_raw/compressed", "BestEffort/Volatile/KL1", "fresh matching active + demand"),
+            ("/surgery/images/flir/compressed", "/synced/flir/color/image_raw/compressed", "BestEffort/Volatile/KL5", "fresh matching active + demand"),
+            ("/surgery/images/cam4/compressed", "/synced/cam_4/color/image_raw/compressed", "BestEffort/Volatile/KL5", "fresh matching active + demand"),
         ),
         (2800, 2800, 1900, 1860),
     )

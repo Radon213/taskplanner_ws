@@ -757,16 +757,16 @@ def _report(
     runtime_rows,
 )}
 
-- Pooled VLM latency: n={pooled_vlm['count']}, mean={pooled_vlm['mean']:.3f}s, median={pooled_vlm['median']:.3f}s, p95={pooled_vlm['p95']:.3f}s, max={pooled_vlm['max']:.3f}s
+- Pooled VLM latency: n={pooled_vlm['count']}, mean={_seconds(pooled_vlm['mean'])}, median={_seconds(pooled_vlm['median'])}, p95={_seconds(pooled_vlm['p95'])}, max={_seconds(pooled_vlm['max'])}
 - VLM unhealthy: {total_unhealthy}건, parse retry: {total_retries}건
-- Request→handover source-clock latency: n={behavior_latency['latency_sec']['count']}, median={behavior_latency['latency_sec']['median']:.3f}s, p95={behavior_latency['latency_sec']['p95']:.3f}s
-- Request→handover wall-clock latency: n={behavior_latency['wall_clock_latency_sec']['count']}, median={behavior_latency['wall_clock_latency_sec']['median']:.3f}s, p95={behavior_latency['wall_clock_latency_sec']['p95']:.3f}s
-- GT request→DT fact source latency: median={behavior_latency['ground_truth_to_dt_request_fact_latency_sec']['median']:.3f}s
+- Request→handover source-clock latency: n={behavior_latency['latency_sec']['count']}, median={_seconds(behavior_latency['latency_sec']['median'])}, p95={_seconds(behavior_latency['latency_sec']['p95'])}
+- Request→handover wall-clock latency: n={behavior_latency['wall_clock_latency_sec']['count']}, median={_seconds(behavior_latency['wall_clock_latency_sec']['median'])}, p95={_seconds(behavior_latency['wall_clock_latency_sec']['p95'])}
+- GT request→DT fact source latency: median={_seconds(behavior_latency['ground_truth_to_dt_request_fact_latency_sec']['median'])}
 - DT fact→BT context ingress wall latency: median/p95={_seconds(behavior_latency['dt_request_fact_to_bt_ingress_wall_clock_latency_sec']['median'])}/{_seconds(bt_ingress_wall_p95)}
 - DT→BT ingress p95 ≤ 0.250s software gate: **{bt_ingress_gate}**
 - DT fact→BT first decision publication source latency: median/p95={_seconds(behavior_latency['dt_request_fact_to_bt_evaluation_latency_sec']['median'])}/{_seconds(behavior_latency['dt_request_fact_to_bt_evaluation_latency_sec']['p95'])}
 - DT fact→BT action acceptance source latency: median/p95={_seconds(behavior_latency['dt_request_fact_to_bt_acceptance_latency_sec']['median'])}/{_seconds(behavior_latency['dt_request_fact_to_bt_acceptance_latency_sec']['p95'])} (정책·가용성 대기 포함)
-- BT acceptance→handover wall latency: median={behavior_latency['bt_acceptance_to_handover_wall_clock_latency_sec']['median']:.3f}s
+- BT acceptance→handover wall latency: median={_seconds(behavior_latency['bt_acceptance_to_handover_wall_clock_latency_sec']['median'])}
 
 ![Latency by case](latency_by_case.png)
 

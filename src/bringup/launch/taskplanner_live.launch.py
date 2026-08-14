@@ -27,11 +27,11 @@ def generate_launch_description() -> LaunchDescription:
     default_bundle = LaunchConfiguration("default_bundle")
     flir_input_topic = _env(
         "FLIR_INPUT_TOPIC",
-        "/flir_camera/image_color/compressed",
+        "/synced/flir/color/image_raw/compressed",
     )
     cam4_input_topic = _env(
         "CAM4_INPUT_TOPIC",
-        "/camera/cam_4/color/image_raw/compressed",
+        "/synced/cam_4/color/image_raw/compressed",
     )
     perception_enabled = PythonExpression(
         [
@@ -174,7 +174,7 @@ def generate_launch_description() -> LaunchDescription:
                     ),
                     "cv_cam4_rgb_topic": _env(
                         "CV_CAM4_RGB_TOPIC",
-                        "/camera/cam_4/color/image_raw/compressed",
+                        "/synced/cam_4/color/image_raw/compressed",
                     ),
                     "cv_cam4_rgb_alias_topic": _env(
                         "CV_CAM4_RGB_ALIAS_TOPIC",
@@ -182,11 +182,11 @@ def generate_launch_description() -> LaunchDescription:
                     ),
                     "cv_cam4_camera_info_topic": _env(
                         "CV_CAM4_CAMERA_INFO_TOPIC",
-                        "/surgery/cameras/cam4/color/camera_info",
+                        "/synced/cam_4/color/camera_info",
                     ),
                     "cv_cam4_aligned_depth_topic": _env(
                         "CV_CAM4_ALIGNED_DEPTH_TOPIC",
-                        "/surgery/cameras/cam4/aligned_depth",
+                        "/synced/cam_4/depth/image_rect_raw",
                     ),
                     "cv_handover_tray_rgb_topic": _env(
                         "CV_HANDOVER_TRAY_RGB_TOPIC",

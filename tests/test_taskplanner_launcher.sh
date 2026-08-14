@@ -88,6 +88,22 @@ assert_single_serial_build "${llm_build_output}" "llm-surgeon"
 replay_build_output="$("${ROOT_DIR}/scripts/taskplanner" up replay --dry-run --build)"
 assert_single_serial_build "${replay_build_output}" "replay"
 
+python3 - "${ROOT_DIR}/config/cyclonedds_lan.xml" <<'PY'
+import sys
+from xml.etree import ElementTree
+
+root = ElementTree.parse(sys.argv[1]).getroot()
+namespace = {"c": "https://cdds.io/config"}
+domain = root.find("c:Domain", namespace)
+assert domain is not None
+assert domain.attrib == {"Id": "any"}
+fragment_size = domain.findtext("c:General/c:FragmentSize", namespaces=namespace)
+assert fragment_size == "1344B"
+peers = domain.findall("c:Discovery/c:Peers/c:Peer", namespace)
+assert peers
+assert all(set(peer.attrib) == {"Address"} for peer in peers)
+PY
+
 live_config="$("${ROOT_DIR}/scripts/taskplanner" config live)"
 assert_contains "${live_config}" "taskplanner-asr:"
 assert_contains "${live_config}" "integration-debug:"
@@ -107,6 +123,8 @@ config = yaml.safe_load(sys.stdin)
 asr = config["services"]["taskplanner-asr"]
 runtime = config["services"]["taskplanner-runtime"]
 public_bridge = config["services"]["public-rosbridge"]
+integration_debug = config["services"]["integration-debug"]
+webapp = config["services"]["webapp"]
 assert asr["profiles"] == ["live"]
 assert asr["image"] == runtime["image"]
 assert asr["network_mode"] == runtime["network_mode"] == "host"
@@ -115,10 +133,41 @@ for key in (
     "ROS_DOMAIN_ID",
     "ROS_AUTOMATIC_DISCOVERY_RANGE",
     "RMW_IMPLEMENTATION",
-    "FASTRTPS_DEFAULT_PROFILES_FILE",
+    "CYCLONEDDS_URI",
     "SENTENCE_INPUT_TOPIC",
 ):
     assert asr["environment"][key] == runtime["environment"][key], key
+for service in (runtime, asr, public_bridge, integration_debug):
+    environment = service["environment"]
+    assert environment["ROS_DOMAIN_ID"] == "0"
+    assert environment["ROS_AUTOMATIC_DISCOVERY_RANGE"] == "SUBNET"
+    assert environment["RMW_IMPLEMENTATION"] == "rmw_cyclonedds_cpp"
+    assert environment["CYCLONEDDS_URI"].endswith(
+        "/config/cyclonedds_lan.xml"
+    )
+    assert "FASTRTPS_DEFAULT_PROFILES_FILE" not in environment
+assert runtime["environment"]["CAM4_INPUT_TOPIC"] == (
+    "/synced/cam_4/color/image_raw/compressed"
+)
+assert runtime["environment"]["FLIR_INPUT_TOPIC"] == (
+    "/synced/flir/color/image_raw/compressed"
+)
+assert runtime["environment"]["CV_CAM4_RGB_TOPIC"] == (
+    "/synced/cam_4/color/image_raw/compressed"
+)
+assert runtime["environment"]["CV_CAM4_CAMERA_INFO_TOPIC"] == (
+    "/synced/cam_4/color/camera_info"
+)
+assert runtime["environment"]["CV_CAM4_ALIGNED_DEPTH_TOPIC"] == (
+    "/synced/cam_4/depth/image_rect_raw"
+)
+for camera in ("CAM1", "CAM2", "CAM3", "CAM4"):
+    assert webapp["environment"][f"VITE_EXTERNAL_{camera}_TOPIC"].startswith(
+        "/synced/"
+    )
+assert webapp["environment"]["VITE_EXTERNAL_FLIR_TOPIC"] == (
+    "/synced/flir/color/image_raw/compressed"
+)
 targets = {volume["target"] for volume in asr["volumes"]}
 assert "/workspaces/taskplanner_ws" in targets
 assert "/taskplanner-runs" in targets
@@ -158,6 +207,26 @@ command = proxy["command"]
 assert "9092=127.0.0.1:9092" in command
 '
 
+stale_fastdds_config="$(
+  FASTRTPS_DEFAULT_PROFILES_FILE=/tmp/must-not-leak.xml \
+    "${ROOT_DIR}/scripts/taskplanner" config live
+)"
+printf '%s\n' "${stale_fastdds_config}" | python3 -c '
+import sys
+import yaml
+
+config = yaml.safe_load(sys.stdin)
+for name in (
+    "taskplanner-runtime",
+    "taskplanner-asr",
+    "public-rosbridge",
+    "integration-debug",
+):
+    environment = config["services"][name]["environment"]
+    assert environment["RMW_IMPLEMENTATION"] == "rmw_cyclonedds_cpp"
+    assert "FASTRTPS_DEFAULT_PROFILES_FILE" not in environment, name
+'
+
 llm_config="$("${ROOT_DIR}/scripts/taskplanner" config llm-surgeon)"
 assert_not_contains "${llm_config}" "taskplanner-asr:"
 assert_not_contains "${llm_config}" "operational_asr_node"
@@ -179,6 +248,18 @@ debug_config="$("${ROOT_DIR}/scripts/taskplanner" config debug)"
 replay_config="$("${ROOT_DIR}/scripts/taskplanner" config replay)"
 assert_not_contains "${debug_config}" "colcon build"
 assert_not_contains "${replay_config}" "colcon build"
+printf '%s\n' "${replay_config}" | python3 -c '
+import sys
+import yaml
+
+config = yaml.safe_load(sys.stdin)
+environment = config["services"]["shadow-runner"]["environment"]
+assert environment["ROS_DOMAIN_ID"] == "71"
+assert environment["ROS_AUTOMATIC_DISCOVERY_RANGE"] == "LOCALHOST"
+assert environment["RMW_IMPLEMENTATION"] == "rmw_cyclonedds_cpp"
+assert "CYCLONEDDS_URI" not in environment
+assert "FASTRTPS_DEFAULT_PROFILES_FILE" not in environment
+'
 grep -q 'acquire_launcher_lock' "${ROOT_DIR}/scripts/taskplanner" ||
   fail "launcher lifecycle must be serialized across concurrent invocations"
 [[ "$(grep -c '^    acquire_launcher_lock$' "${ROOT_DIR}/scripts/taskplanner")" == "2" ]] ||
@@ -224,14 +305,20 @@ network_output="$(
   TASKPLANNER_DEBUG_NETWORK_INTERFACE=lo \
   ROS_DOMAIN_ID=0 \
   ROS_AUTOMATIC_DISCOVERY_RANGE=SUBNET \
+  RMW_IMPLEMENTATION=rmw_cyclonedds_cpp \
+  CYCLONEDDS_URI=file:///tmp/cyclonedds-test.xml \
+  FASTRTPS_DEFAULT_PROFILES_FILE=/tmp/must-not-leak.xml \
     python3 "${ROOT_DIR}/scripts/run_integration_debug.py" \
       --settings "${temporary_dir}/network-settings.json" \
       -- python3 -c \
-        'import os; print("ACTIVE_NETWORK=" + os.environ["ROS_DOMAIN_ID"] + "/" + os.environ["ROS_AUTOMATIC_DISCOVERY_RANGE"])'
+        'import os; print("ACTIVE_NETWORK=" + os.environ["ROS_DOMAIN_ID"] + "/" + os.environ["ROS_AUTOMATIC_DISCOVERY_RANGE"]); print("ACTIVE_RMW=" + os.environ["RMW_IMPLEMENTATION"]); print("FASTRTPS_PRESENT=" + str("FASTRTPS_DEFAULT_PROFILES_FILE" in os.environ)); print("CYCLONEDDS_URI=" + os.environ.get("CYCLONEDDS_URI", ""))'
 )"
 assert_contains "${network_output}" \
   "Locked integrated Debug Mode to runtime network: domain=0 discovery=SUBNET"
 assert_contains "${network_output}" "ACTIVE_NETWORK=0/SUBNET"
+assert_contains "${network_output}" "ACTIVE_RMW=rmw_cyclonedds_cpp"
+assert_contains "${network_output}" "FASTRTPS_PRESENT=False"
+assert_contains "${network_output}" "CYCLONEDDS_URI=file:///tmp/cyclonedds-test.xml"
 assert_not_contains "${network_output}" "ACTIVE_NETWORK=97/LOCALHOST"
 
 standalone_network_output="$(
@@ -240,13 +327,16 @@ standalone_network_output="$(
   TASKPLANNER_DEBUG_NETWORK_INTERFACE=lo \
   ROS_DOMAIN_ID=0 \
   ROS_AUTOMATIC_DISCOVERY_RANGE=SUBNET \
+  RMW_IMPLEMENTATION=rmw_cyclonedds_cpp \
+  CYCLONEDDS_URI=file:///tmp/must-not-leak.xml \
     python3 "${ROOT_DIR}/scripts/run_integration_debug.py" \
       --settings "${temporary_dir}/network-settings.json" \
       -- python3 -c \
-        'import os; print("ACTIVE_NETWORK=" + os.environ["ROS_DOMAIN_ID"] + "/" + os.environ["ROS_AUTOMATIC_DISCOVERY_RANGE"])'
+        'import os; print("ACTIVE_NETWORK=" + os.environ["ROS_DOMAIN_ID"] + "/" + os.environ["ROS_AUTOMATIC_DISCOVERY_RANGE"]); print("CYCLONEDDS_PRESENT=" + str("CYCLONEDDS_URI" in os.environ))'
 )"
 assert_contains "${standalone_network_output}" \
   "Loaded Debug Mode network settings: domain=97 discovery=LOCALHOST"
 assert_contains "${standalone_network_output}" "ACTIVE_NETWORK=97/LOCALHOST"
+assert_contains "${standalone_network_output}" "CYCLONEDDS_PRESENT=False"
 
 printf 'PASS: launcher serializes colcon before runtime/sidecars and preserves mode gates\n'

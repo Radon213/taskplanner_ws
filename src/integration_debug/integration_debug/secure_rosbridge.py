@@ -3,9 +3,9 @@
 The upstream rosbridge executable automatically adds ``/rosapi/*`` whenever a
 service allowlist is configured.  On the shared live ROS domain that would let
 a Debug UI client reach mutable rosapi services owned by the production
-runtime.  This wrapper deliberately omits that append and does not launch a
-rosapi node; the browser already provides every message and service type it
-uses.
+runtime.  This wrapper deliberately omits that append.  The launch file starts
+a separate, topic-filtered rosapi node and the policy permits only its
+read-only ``/rosapi/topics`` service for the multicam console.
 """
 
 from __future__ import annotations

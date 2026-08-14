@@ -114,9 +114,9 @@ CAM4_MAYO_OBSERVATION_SOURCES = frozenset(
 )
 CAM4_MAYO_TRANSITION_MIN_CONFIDENCE = 0.60
 SURGEON_ACTOR_LOCATION_EVENTS = {
-    "place_on_mayo": ("mayo_reuse_zone", "mayo_reuse_zone", LIFECYCLE_MAYO_REUSE),
-    "place_on_mayo_reuse": ("mayo_reuse_zone", "mayo_reuse_zone", LIFECYCLE_MAYO_REUSE),
-    "place_on_mayo_recovery": ("mayo_recovery_zone", "mayo_recovery_zone", LIFECYCLE_MAYO_RECOVERY),
+    "place_on_mayo": ("mayo_stand", "mayo_stand", LIFECYCLE_MAYO_REUSE),
+    "place_on_mayo_reuse": ("mayo_stand", "mayo_stand", LIFECYCLE_MAYO_REUSE),
+    "place_on_mayo_recovery": ("mayo_stand", "mayo_stand", LIFECYCLE_MAYO_RECOVERY),
     "continue_using": ("surgeon_hand", "surgeon_hand", LIFECYCLE_SURGEON_OWNED),
 }
 
@@ -714,9 +714,9 @@ def _location_for_lifecycle(state: InstrumentBelief, lifecycle_stage: str) -> tu
             return (state.location_type, state.location_id or "surgeon_hand")
         return ("surgeon_hand", "surgeon_hand")
     if lifecycle_stage == LIFECYCLE_MAYO_REUSE:
-        return ("mayo_reuse_zone", "mayo_reuse_zone")
+        return ("mayo_stand", "mayo_stand")
     if lifecycle_stage == LIFECYCLE_MAYO_RECOVERY:
-        return ("mayo_recovery_zone", "mayo_recovery_zone")
+        return ("mayo_stand", "mayo_stand")
     if lifecycle_stage == LIFECYCLE_DROPPED_FLOOR:
         return ("floor_zone", "floor_zone")
     if lifecycle_stage == LIFECYCLE_RECOVERING_LEFT:
@@ -733,10 +733,14 @@ def _observed_lifecycle_for_location(state: InstrumentBelief, location_type: str
         return LIFECYCLE_PREPOSITIONED_RIGHT
     if location_type in SURGEON_OWNED_LOCATION_TYPES:
         return LIFECYCLE_SURGEON_OWNED
-    if location_type in {"mayo_stand", "mayo_reuse_zone"}:
-        return LIFECYCLE_MAYO_REUSE
     if location_type == "mayo_recovery_zone":
         return LIFECYCLE_MAYO_RECOVERY
+    if location_type in {"mayo_stand", "mayo_reuse_zone"}:
+        # A physical Mayo observation cannot distinguish policy. Preserve an
+        # existing recovery decision instead of demoting it back to reuse.
+        if state.lifecycle_stage == LIFECYCLE_MAYO_RECOVERY:
+            return LIFECYCLE_MAYO_RECOVERY
+        return LIFECYCLE_MAYO_REUSE
     if location_type == "floor_zone":
         return LIFECYCLE_DROPPED_FLOOR
     if location_type == "robot_left_hand":
@@ -1675,10 +1679,12 @@ class ORDigitalTwin:
             return "cleaner_slot"
         if lifecycle_stage == LIFECYCLE_DROPPED_FLOOR or location_type == "floor_zone":
             return "floor_zone"
-        if lifecycle_stage == LIFECYCLE_MAYO_REUSE or location_type == "mayo_reuse_zone":
-            return "mayo_reuse_zone"
-        if lifecycle_stage == LIFECYCLE_MAYO_RECOVERY or location_type == "mayo_recovery_zone":
-            return "mayo_recovery_zone"
+        if lifecycle_stage in {LIFECYCLE_MAYO_REUSE, LIFECYCLE_MAYO_RECOVERY} or location_type in {
+            "mayo_stand",
+            "mayo_reuse_zone",
+            "mayo_recovery_zone",
+        }:
+            return "mayo_stand"
         if location_type == "return_zone":
             return "surgeon_return_zone"
         if location_type == "handover_zone":
@@ -2460,6 +2466,7 @@ class ORDigitalTwin:
         self.state.predicted_tool = ""
         self.state.predicted_tool_confidence = 0.0
         self.state.predicted_tool_stability_sec = 0.0
+        self.state.ranked_tool_predictions = []
         self.state.recent_event_types.appendleft(f"ActiveInterruptContext:{phase_id}")
         self._record_event(
             "ActiveInterruptContextUpdated",
@@ -3173,6 +3180,12 @@ class ORDigitalTwin:
                     "lifecycle_stage": state.lifecycle_stage,
                 },
             )
+            self._set_lifecycle(
+                state,
+                LIFECYCLE_MAYO_RECOVERY,
+                location_type="mayo_stand",
+                location_id="mayo_stand",
+            )
         elif state.lifecycle_stage not in {
             LIFECYCLE_SURGEON_OWNED,
             LIFECYCLE_MAYO_RECOVERY,
@@ -3520,8 +3533,14 @@ class ORDigitalTwin:
             state.ever_surgeon_owned = True
 
         default_location_type, default_location_id = _location_for_lifecycle(state, lifecycle_stage)
-        state.location_type = location_type or default_location_type
-        state.location_id = location_id or default_location_id
+        if lifecycle_stage in {LIFECYCLE_MAYO_REUSE, LIFECYCLE_MAYO_RECOVERY}:
+            # Reuse/recovery are lifecycle states, never distinct physical
+            # Mayo zones. Legacy inputs are accepted but never re-published.
+            state.location_type = "mayo_stand"
+            state.location_id = "mayo_stand"
+        else:
+            state.location_type = location_type or default_location_type
+            state.location_id = location_id or default_location_id
         state.owner = _owner_for_lifecycle(state)
         state.status = _status_for_lifecycle(state)
         if confidence is not None:
@@ -3875,6 +3894,16 @@ class ORDigitalTwin:
             self.state.active_recovery_tool_instances
         ):
             state = self._state_by_instance(instance_id)
+            if state is not None and state.lifecycle_stage == LIFECYCLE_MAYO_REUSE:
+                # An explicit return may open the queue while the surgeon still
+                # holds the tool. Once it physically reaches Mayo, preserve the
+                # queued policy as awaiting retrieval.
+                self._set_lifecycle(
+                    state,
+                    LIFECYCLE_MAYO_RECOVERY,
+                    location_type="mayo_stand",
+                    location_id="mayo_stand",
+                )
             if state is None or state.lifecycle_stage in {LIFECYCLE_HOME_RACK, LIFECYCLE_RETURNED_HOME}:
                 self._close_recovery_transaction(
                     instance_id, "terminal_lifecycle_observed"
@@ -4605,6 +4634,13 @@ class ORDigitalTwin:
             or observation.instrument_id
         )
         location_type = observation.location_type
+        location_id = observation.location_id
+        if location_type == "surgeon":
+            # 0704 annotations identify the holder, not a particular hand or
+            # field sub-location. Keep that conservative input vocabulary and
+            # map it to the existing private surgeon-owned lane.
+            location_type = "surgeon_hand"
+            location_id = "surgeon_hand"
         preferred_lifecycles: set[str] | None = None
         if location_type in {
             "mayo_stand",
@@ -4632,8 +4668,8 @@ class ORDigitalTwin:
             current = self._select_instance(instrument_id)
         if current is None:
             return None
-        location_type = observation.location_type or current.location_type
-        location_id = observation.location_id or current.location_id
+        location_type = location_type or current.location_type
+        location_id = location_id or current.location_id
         confidence = float(observation.confidence)
         stamp_sec = _stamp_to_sec(observation.stamp)
         proposal_id = proposal_id or (
@@ -4984,6 +5020,9 @@ class ORDigitalTwin:
                 or event.source_location_type in {"mayo_stand", "mayo_reuse_zone", "mayo_recovery_zone"}
                 or event.source_location_id in {"mayo_stand", "mayo_reuse_zone", "mayo_recovery_zone"}
             )
+            if picked_from_mayo:
+                origin_location_type = "mayo_stand"
+                origin_location_id = "mayo_stand"
             if not self._apply_event_transition(
                 state=state,
                 next_stage=LIFECYCLE_PREPOSITIONED_RIGHT,
@@ -5214,10 +5253,10 @@ class ORDigitalTwin:
                     state,
                     LIFECYCLE_MAYO_REUSE,
                     location_type=(
-                        event.target_location_type or "mayo_reuse_zone"
+                        event.target_location_type or "mayo_stand"
                     ),
                     location_id=(
-                        event.target_location_id or "mayo_reuse_zone"
+                        event.target_location_id or "mayo_stand"
                     ),
                     confidence=max(float(event.confidence), 0.95),
                     last_update_sec=getattr(

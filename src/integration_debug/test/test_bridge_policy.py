@@ -1,6 +1,10 @@
 from integration_debug.bridge_policy import (
     DEBUG_ACTIONS_ALLOWLIST,
     DEBUG_CAPABILITY_CLASS_NAMES,
+    DEBUG_MULTICAM_SERVICES_ALLOWLIST,
+    DEBUG_MULTICAM_SUBSCRIBE_ALLOWLIST,
+    DEBUG_ROSAPI_SERVICES_ALLOWLIST,
+    DEBUG_ROSAPI_TOPICS_GLOB,
     DEBUG_SERVICES_ALLOWLIST,
     DEBUG_TOPICS_ALLOWLIST,
     DEBUG_TOPICS_PUBLISH_ALLOWLIST,
@@ -9,7 +13,7 @@ from integration_debug.bridge_policy import (
 )
 
 
-def test_debug_rosbridge_policy_is_exact_and_has_no_rosapi_access() -> None:
+def test_debug_rosbridge_policy_is_exact_and_has_only_readonly_rosapi_topics() -> None:
     restricted = restrict_debug_rosbridge_protocol(
         {
             "topics_pub_glob": None,
@@ -23,27 +27,17 @@ def test_debug_rosbridge_policy_is_exact_and_has_no_rosapi_access() -> None:
     assert restricted["topics_pub_glob"] == list(
         DEBUG_TOPICS_PUBLISH_ALLOWLIST
     ) == ["/integration/debug/heartbeat"]
-    assert restricted["topics_sub_glob"] == list(
-        DEBUG_TOPICS_SUBSCRIBE_ALLOWLIST
-    ) == [
-        "/integration/debug/status",
-        "/integration/debug/events",
-        "/integration/debug/readiness",
-    ]
-    assert restricted["topics_glob"] == list(DEBUG_TOPICS_ALLOWLIST) == [
-        "/integration/debug/events",
-        "/integration/debug/heartbeat",
-        "/integration/debug/readiness",
-        "/integration/debug/status",
-    ]
-    assert restricted["services_glob"] == list(
-        DEBUG_SERVICES_ALLOWLIST
-    ) == ["/integration/debug/command"]
+    assert restricted["topics_sub_glob"] == list(DEBUG_TOPICS_SUBSCRIBE_ALLOWLIST)
+    assert set(DEBUG_MULTICAM_SUBSCRIBE_ALLOWLIST).issubset(restricted["topics_sub_glob"])
+    assert restricted["topics_glob"] == list(DEBUG_TOPICS_ALLOWLIST)
+    assert restricted["services_glob"] == list(DEBUG_SERVICES_ALLOWLIST)
+    assert set(DEBUG_MULTICAM_SERVICES_ALLOWLIST).issubset(restricted["services_glob"])
+    assert set(DEBUG_ROSAPI_SERVICES_ALLOWLIST).issubset(restricted["services_glob"])
     assert restricted["actions_glob"] == list(DEBUG_ACTIONS_ALLOWLIST) == []
-    assert not any(
-        pattern.startswith("/rosapi")
-        for pattern in restricted["services_glob"]
-    )
+    assert "/rosapi/*" not in restricted["services_glob"]
+    assert {
+        pattern for pattern in restricted["services_glob"] if pattern.startswith("/rosapi")
+    } == {"/rosapi/topics"}
     assert restricted["max_message_size"] == 1_000_000
 
 
@@ -73,6 +67,13 @@ def test_debug_rosbridge_policy_excludes_live_runtime_endpoints() -> None:
     }
     assert denied_topics.isdisjoint(restricted["topics_glob"])
     assert "/integration/check_readiness" not in restricted["services_glob"]
+
+
+def test_multicam_rosapi_uses_the_same_bounded_topic_patterns() -> None:
+    assert DEBUG_ROSAPI_TOPICS_GLOB.startswith("[")
+    assert DEBUG_ROSAPI_TOPICS_GLOB.endswith("]")
+    for pattern in DEBUG_TOPICS_SUBSCRIBE_ALLOWLIST:
+        assert pattern in DEBUG_ROSAPI_TOPICS_GLOB
 
 
 def test_debug_rosbridge_has_only_browser_required_capabilities() -> None:

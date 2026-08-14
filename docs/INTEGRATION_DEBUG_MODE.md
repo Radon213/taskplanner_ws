@@ -65,13 +65,21 @@ Debug에서만 수행한다. 전체 Taskplanner 런타임이나 다른 Compose �
 허용, 호스트 방화벽의 DDS/RTPS 트래픽 허용이 모두 필요하며, 핑 성공만으로 DDS
 discovery 성공을 의미하지는 않는다.
 
+이 Domain 0/SUBNET 유선 계약은 live 런타임, 운영 ASR, public bridge와 통합
+Debug sidecar에 적용된다. 데이터셋 replay/shadow는 외부 통합 참가자가 아니므로
+회귀 재생을 운영 graph에서 격리하기 위해 D71/LOCALHOST를 유지하고 유선
+`CYCLONEDDS_URI`를 전달받지 않는다.
+
 `TASKPLANNER_DEBUG_NETWORK_INTERFACE`를 지정하면 Debug UI의 `LOCAL IP`는 해당
 인터페이스만 주 주소로 사용한다. 이 PC의 기본값은 유선 5GbE 포트
 `enp13s0`이다. 케이블이나 IPv4 주소가 없을 때 Wi-Fi 주소로 대체하지 않고
 `유선 IP 없음`을 표시하므로, 상대 기관 LAN을 연결한 뒤 유선 주소가 실제로
-할당됐는지 확인할 수 있다. 시작 wrapper는 같은 인터페이스로 Fast DDS UDP
-allowlist를 원자적으로 생성한다. 설정한 NIC가 호스트에 없으면 UI만 열린 채
-DDS가 다른 NIC로 빠지는 상태를 허용하지 않고 Debug ROS 런타임 시작을 거부한다.
+할당됐는지 확인할 수 있다. `SUBNET` 배포는 같은 인터페이스를 지정한
+`CYCLONEDDS_URI` 프로파일을 사용한다. 프로파일의 `FragmentSize=1344B`는
+1500-byte Ethernet MTU에서 RTPS/UDP/IP 헤더까지 포함한 datagram이 MTU 아래에
+머물도록 해 대용량 카메라 sample의 IP fragmentation을 피한다. 설정한 NIC가
+호스트에 없으면 UI만 열린 채 DDS가 다른 NIC로 빠지는 상태를 허용하지 않고
+Debug ROS 런타임 시작을 거부한다.
 
 Debug 프로파일은 localhost 전용 UI·ROSBridge를 그대로 유지하면서
 `integration-debug-lan-proxy`를 함께 시작한다. 프록시는
@@ -91,11 +99,11 @@ Debug 화면을 열 수 있으므로, 신뢰된 통합 시험망에서만 실행
 | 토픽 | 타입 | 기본 QoS | 화면에서 확인하는 값 |
 |---|---|---|---|
 | `/sensors/surgeon/sentence` | `std_msgs/msg/String` | reliable / volatile | publisher, 실측 Hz, 최근 문장, freshness |
-| `/camera/cam_1/color/image_raw/compressed` | `sensor_msgs/msg/CompressedImage` | sensor data | publisher, 실측 Hz, bandwidth, freshness |
-| `/camera/cam_2/color/image_raw/compressed` | `sensor_msgs/msg/CompressedImage` | sensor data | publisher, 실측 Hz, bandwidth, freshness |
-| `/camera/cam_3/color/image_raw/compressed` | `sensor_msgs/msg/CompressedImage` | sensor data | publisher, 실측 Hz, bandwidth, freshness |
-| `/camera/cam_4/color/image_raw/compressed` | `sensor_msgs/msg/CompressedImage` | sensor data | publisher, 실측 Hz, bandwidth, freshness |
-| `/flir_camera/image_color/compressed` | `sensor_msgs/msg/CompressedImage` | sensor data | publisher, 실측 Hz, bandwidth, freshness |
+| `/synced/cam_1/color/image_raw/compressed` | `sensor_msgs/msg/CompressedImage` | reliable / volatile / depth 20 | publisher, 실측 Hz, bandwidth, freshness |
+| `/synced/cam_2/color/image_raw/compressed` | `sensor_msgs/msg/CompressedImage` | reliable / volatile / depth 20 | publisher, 실측 Hz, bandwidth, freshness |
+| `/synced/cam_3/color/image_raw/compressed` | `sensor_msgs/msg/CompressedImage` | reliable / volatile / depth 20 | publisher, 실측 Hz, bandwidth, freshness |
+| `/synced/cam_4/color/image_raw/compressed` | `sensor_msgs/msg/CompressedImage` | reliable / volatile / depth 20 | publisher, 실측 Hz, bandwidth, freshness |
+| `/synced/flir/color/image_raw/compressed` | `sensor_msgs/msg/CompressedImage` | reliable / volatile / depth 20 | publisher, 실측 Hz, bandwidth, freshness |
 
 상태 화면은 발견된 publisher 노드, 실제 타입, 실제 QoS, 누적 메시지 수, 5초 rolling Hz, 대역폭, 마지막 수신 경과 시간을 보여준다. 타입 불일치, 저주기, stale, publisher 없음은 서로 다른 상태로 표시된다.
 

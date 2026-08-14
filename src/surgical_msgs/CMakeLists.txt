@@ -25,6 +25,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/PerceptionScene.msg"
   "msg/PhaseTransitionCue.msg"
   "msg/ReducerDecisionEvent.msg"
+  "msg/RankedToolPrediction.msg"
   "msg/SimulationEvent.msg"
   "msg/SimulationState.msg"
   "msg/ShadowReplayState.msg"

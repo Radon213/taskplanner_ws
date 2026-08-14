@@ -13,7 +13,13 @@ from typing import Any
 import requests
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import (
+    DurabilityPolicy,
+    HistoryPolicy,
+    QoSProfile,
+    ReliabilityPolicy,
+    qos_profile_sensor_data,
+)
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
 from std_srvs.srv import SetBool
@@ -56,6 +62,76 @@ def closest_aligned_frame(
     if abs(closest.source_stamp_sec - reference_stamp_sec) > max_skew_sec:
         return None
     return closest
+
+
+def _nonnegative_float(value: Any) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if result < 0.0 or result != result or result in (float("inf"), float("-inf")):
+        return 0.0
+    return round(result, 3)
+
+
+def build_contract_diagnostics(
+    raw: Any,
+    *,
+    cam4: BufferedFrame | None,
+    sequence: int,
+    source_to_output_latency_ms: float,
+) -> dict[str, Any]:
+    """Project the local service result onto the CV-team diagnostics schema."""
+
+    payload = raw if isinstance(raw, dict) else {}
+    cam4_payload = payload.get("cam4")
+    cam4_diag = cam4_payload if isinstance(cam4_payload, dict) else {}
+    instances = cam4_diag.get("instances")
+    instance_rows = instances if isinstance(instances, list) else []
+    if cam4 is None:
+        stamp_sec = 0
+        stamp_nanosec = 0
+        frame_id = ""
+        observation_id = ""
+        error_code = "NO_ALIGNED_CAM4"
+        error_message = "no CAM4 frame satisfied the alignment policy"
+    else:
+        stamp_sec = int(cam4.stamp_sec)
+        stamp_nanosec = int(cam4.stamp_nanosec)
+        frame_id = str(cam4.frame_id)
+        observation_id = f"cam4:{stamp_sec}:{stamp_nanosec}"
+        error_code = ""
+        error_message = ""
+    return {
+        "schema": "pnu.rfdetr_diagnostics.v2",
+        "view": "cam4",
+        "source_stamp_sec": stamp_sec,
+        "source_stamp_nanosec": stamp_nanosec,
+        "frame_id": frame_id,
+        "observation_id": observation_id,
+        "sequence": max(0, int(sequence)),
+        "decode_latency_ms": _nonnegative_float(payload.get("decode_latency_ms")),
+        "depth_to_xyz_latency_ms": 0.0,
+        "inference_latency_ms": _nonnegative_float(
+            cam4_diag.get("inference_latency_ms")
+        ),
+        "pose_latency_ms": 0.0,
+        "render_encode_latency_ms": _nonnegative_float(
+            payload.get("render_encode_latency_ms")
+        ),
+        "source_to_output_latency_ms": _nonnegative_float(
+            source_to_output_latency_ms
+        ),
+        "queue_age_ms": 0.0,
+        "dropped_frames": 0,
+        "instance_count": len(instance_rows),
+        "valid_pose_count": 0,
+        "endpoint_sign_low_count": 0,
+        "model_version": str(cam4_diag.get("model", "RFDETRSmall"))[:120],
+        "calibration_version": "",
+        "error_code": error_code,
+        "error_message": error_message,
+    }
 
 
 class RFDETRBridgeNode(Node):
@@ -163,6 +239,25 @@ class RFDETRBridgeNode(Node):
         )
         self._generation = 0
 
+        contract_overlay_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=2,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        contract_diagnostics_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        contract_health_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+
         self._segmented_flir_pub = self.create_publisher(
             CompressedImage,
             self._flir_output_topic,
@@ -181,7 +276,7 @@ class RFDETRBridgeNode(Node):
         self._cam4_overlay_pub = self.create_publisher(
             CompressedImage,
             self._cam4_overlay_topic,
-            qos_profile_sensor_data,
+            contract_overlay_qos,
         )
         self._cam4_semantics_pub = self.create_publisher(
             String,
@@ -196,12 +291,12 @@ class RFDETRBridgeNode(Node):
         self._diagnostics_pub = self.create_publisher(
             String,
             self._diagnostics_topic,
-            10,
+            contract_diagnostics_qos,
         )
         self._health_pub = self.create_publisher(
             String,
             self._health_topic,
-            10,
+            contract_health_qos,
         )
         self.create_subscription(
             CompressedImage,
@@ -230,6 +325,7 @@ class RFDETRBridgeNode(Node):
         self._last_request_started = 0.0
         self._last_success_monotonic = 0.0
         self._last_segmented_requested_monotonic = 0.0
+        self._diagnostics_sequence = 0
         self._worker = threading.Thread(
             target=self._worker_loop,
             name="rfdetr-bridge-worker",
@@ -451,9 +547,7 @@ class RFDETRBridgeNode(Node):
                     cam4_overlay_msg.header.stamp.sec = cam4.stamp_sec
                     cam4_overlay_msg.header.stamp.nanosec = cam4.stamp_nanosec
                     cam4_overlay_msg.header.frame_id = (
-                        f"{cam4.frame_id}|rfdetr_bbox_overlay"
-                        if cam4.frame_id
-                        else "cam4_rfdetr_bbox_overlay"
+                        cam4.frame_id
                     )
                     cam4_overlay_msg.format = str(
                         cam4_overlay.get("mime_type", "image/webp")
@@ -480,15 +574,21 @@ class RFDETRBridgeNode(Node):
                 self._cam4_semantics_pub.publish(semantics_msg)
                 self._publish_cam4_mayo_observations(public_semantics)
 
+            latency_ms = (time.perf_counter() - started) * 1000.0
+            self._diagnostics_sequence += 1
             diagnostics_msg = String()
             diagnostics_msg.data = json.dumps(
-                payload.get("diagnostics", {}),
+                build_contract_diagnostics(
+                    payload.get("diagnostics", {}),
+                    cam4=cam4,
+                    sequence=self._diagnostics_sequence,
+                    source_to_output_latency_ms=latency_ms,
+                ),
                 ensure_ascii=False,
                 separators=(",", ":"),
                 sort_keys=True,
             )
             self._diagnostics_pub.publish(diagnostics_msg)
-            latency_ms = (time.perf_counter() - started) * 1000.0
             self._last_success_monotonic = time.monotonic()
             self._publish_health(
                 connected=True,
@@ -550,22 +650,30 @@ class RFDETRBridgeNode(Node):
     ) -> None:
         with self._condition:
             enabled = self._enabled
+        stamp = self.get_clock().now().to_msg()
+        cam4_ready = bool(connected and pair_skew_sec is not None)
         msg = String()
         msg.data = json.dumps(
             {
-                "schema": "taskplanner.rfdetr_health.v1",
-                "enabled": enabled,
-                "connected": connected,
-                "status": status,
-                "service_url": self._service_url,
-                "latency_ms": round(max(0.0, latency_ms), 3),
-                "cam4_aligned": pair_skew_sec is not None,
-                "source_skew_sec": (
-                    round(pair_skew_sec, 6)
-                    if pair_skew_sec is not None
-                    else None
-                ),
-                "last_error": str(error)[:500],
+                "schema": "pnu.rfdetr_health.v2",
+                "stamp_sec": int(stamp.sec),
+                "stamp_nanosec": int(stamp.nanosec),
+                "node": self.get_name(),
+                "state": status if enabled else "disabled",
+                "cam4_rgb_ready": cam4_ready,
+                "cam4_camera_info_ready": False,
+                "cam4_depth_ready": False,
+                "cam4_calibration_ready": False,
+                "cam4_pose_ready": False,
+                "tray_rgb_ready": False,
+                "tray_camera_info_ready": False,
+                "tray_depth_ready": False,
+                "tray_calibration_ready": False,
+                "tray_model_ready": False,
+                "tray_pose_ready": False,
+                "model_ready": bool(connected),
+                "last_error_code": "RFDETR_REQUEST_FAILED" if error else "",
+                "last_error_message": str(error)[:500],
             },
             separators=(",", ":"),
             sort_keys=True,

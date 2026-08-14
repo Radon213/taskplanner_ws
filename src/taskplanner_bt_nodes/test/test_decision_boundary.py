@@ -258,7 +258,9 @@ def test_mayo_reuse_preparation_is_future_scoped_and_returns_to_origin() -> None
     assert "toolIsAnticipatoryCandidate(node, tool_id)" in candidate_guard
     assert "findAnticipatoryInstanceForType" in expected_selection
     assert 'const bool from_mayo_reuse = lifecycle == "mayo_reuse"' in command
-    assert 'std::string("mayo_reuse_zone")' in command
+    assert 'std::string("mayo_stand")' in command
+    assert 'std::string("mayo_reuse_zone")' not in command
+    assert 'std::string("mayo_recovery_zone")' not in command
     assert '"bt.source_location_id", prepare_source_location' in command
     assert '"bt.source_location_type", prepare_source_type' in command
     assert "stable next-tool prediction selected a Mayo reuse tool" in command
@@ -267,6 +269,34 @@ def test_mayo_reuse_preparation_is_future_scoped_and_returns_to_origin() -> None
     assert '"preposition_origin_location"' in command
     assert '"preposition_origin_type"' in command
     assert "return to its source" in command
+
+
+def test_recovery_selection_consumes_instance_fifo_before_generic_scan() -> None:
+    source = CPP_PATH.read_text(encoding="utf-8")
+    recovery_selection = _section(
+        source, "class SelectRecoveryTool", "class SetIdleDecision"
+    )
+
+    queue_at = recovery_selection.index('"active_recovery_instances.csv"')
+    generic_at = recovery_selection.index(
+        "for (const auto & tool_id : allTools(*this))", queue_at
+    )
+    assert queue_at < generic_at
+    assert 'toolLifecycle(*this, instance_id) == "mayo_recovery"' in recovery_selection
+    assert 'hasActiveRobotTask(*this)' in recovery_selection
+    assert '"robot.left_hand_tool"' in recovery_selection
+    assert '"cleaner.busy"' in recovery_selection
+    assert "hasBlockingSafetyFlag(*this)" in recovery_selection
+
+
+def test_bt_control_reads_only_rank_one_scalar_prediction_fields() -> None:
+    source = CPP_PATH.read_text(encoding="utf-8")
+    load_world = _section(source, "class LoadWorldState", "class IsProcedureActive")
+
+    assert "msg.predicted_tool" in load_world
+    assert "msg.predicted_tool_confidence" in load_world
+    assert "msg.predicted_tool_stability_sec" in load_world
+    assert "ranked_tool_predictions" not in load_world
 
 
 def test_stale_prediction_releases_reversible_preposition_in_bt() -> None:

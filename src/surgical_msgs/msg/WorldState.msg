@@ -24,6 +24,7 @@ string prepositioned_tool_instance_id
 string predicted_tool
 float32 predicted_tool_confidence
 float32 predicted_tool_stability_sec
+surgical_msgs/RankedToolPrediction[] ranked_tool_predictions
 string surgeon_intent
 string surgeon_request_tool
 string surgeon_request_instance_id

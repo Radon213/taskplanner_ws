@@ -454,10 +454,19 @@ function normalizeShadowGroundTruth(
 // accumulate large outgoing WebSocket writes when a browser falls behind.
 const ROSBRIDGE_IMAGE_QUEUE_LENGTH = 1;
 const ROSBRIDGE_IMAGE_COMPRESSION = "cbor";
+const ROSBRIDGE_RELIABLE_IMAGE_QOS = {
+  history: "keep_last",
+  depth: 1,
+  reliability: "reliable",
+  durability: "volatile",
+} as const;
 
-// Preserve the recorded camera cadence. A millisecond throttle drops frames
-// when nominal 15 FPS input arrives with normal 59-81 ms scheduling jitter.
-const CAMERA_FRAME_THROTTLE_MS = 0;
+// The browser is an operator preview, not the acquisition recorder. Cap every
+// image stream at 10 FPS and keep queue_length=1 so five synchronized cameras
+// plus derived overlays cannot build a rosbridge serialization backlog when a
+// tab is briefly slow or hidden. ROS/CV consumers still receive the native
+// 15 FPS topics directly.
+const CAMERA_FRAME_THROTTLE_MS = 100;
 const CAMERA_STALE_AFTER_MS = 3000;
 
 type RawCameraTopicMap = Record<"cam1" | "cam2" | "cam3" | "cam4" | "flir", string>;
@@ -471,17 +480,39 @@ const INTERNAL_CAMERA_TOPICS: RawCameraTopicMap = {
 };
 
 const EXTERNAL_CAMERA_TOPICS: RawCameraTopicMap = {
-  cam1: import.meta.env.VITE_EXTERNAL_CAM1_TOPIC?.trim() || INTERNAL_CAMERA_TOPICS.cam1,
-  cam2: import.meta.env.VITE_EXTERNAL_CAM2_TOPIC?.trim() || INTERNAL_CAMERA_TOPICS.cam2,
-  cam3: import.meta.env.VITE_EXTERNAL_CAM3_TOPIC?.trim() || INTERNAL_CAMERA_TOPICS.cam3,
-  cam4: import.meta.env.VITE_EXTERNAL_CAM4_TOPIC?.trim() || INTERNAL_CAMERA_TOPICS.cam4,
-  flir: import.meta.env.VITE_EXTERNAL_FLIR_TOPIC?.trim() || INTERNAL_CAMERA_TOPICS.flir,
+  cam1: import.meta.env.VITE_EXTERNAL_CAM1_TOPIC?.trim()
+    || "/synced/cam_1/color/image_raw/compressed",
+  cam2: import.meta.env.VITE_EXTERNAL_CAM2_TOPIC?.trim()
+    || "/synced/cam_2/color/image_raw/compressed",
+  cam3: import.meta.env.VITE_EXTERNAL_CAM3_TOPIC?.trim()
+    || "/synced/cam_3/color/image_raw/compressed",
+  cam4: import.meta.env.VITE_EXTERNAL_CAM4_TOPIC?.trim()
+    || "/synced/cam_4/color/image_raw/compressed",
+  flir: import.meta.env.VITE_EXTERNAL_FLIR_TOPIC?.trim()
+    || "/synced/flir/color/image_raw/compressed",
 };
 
 function rawCameraTopicsForMode(runtimeMode: TaskplannerRuntimeMode): RawCameraTopicMap {
   return runtimeMode === "live" || runtimeMode === "llm"
     ? EXTERNAL_CAMERA_TOPICS
     : INTERNAL_CAMERA_TOPICS;
+}
+
+function requireReliableImageSubscription(topic: any): void {
+  // roslib 1.4.1 does not expose rosbridge's per-subscription QoS option.
+  // Decorate its connection command so the same reliable request is also
+  // replayed after a WebSocket reconnect. This is used only for the five
+  // synchronized physical cameras, whose publishers are RELIABLE; derived
+  // perception images may be BEST_EFFORT and therefore keep rosbridge's
+  // compatibility default.
+  const sendOnConnection = topic.callForSubscribeAndAdvertise.bind(topic);
+  topic.callForSubscribeAndAdvertise = (request: Record<string, unknown>) => {
+    sendOnConnection(
+      request.op === "subscribe"
+        ? { ...request, qos: ROSBRIDGE_RELIABLE_IMAGE_QOS }
+        : request,
+    );
+  };
 }
 
 export type PerceptionLayerHealth = {
@@ -1169,6 +1200,8 @@ export function useRosBridge(runtimeMode: TaskplannerRuntimeMode) {
       queue_length: ROSBRIDGE_IMAGE_QUEUE_LENGTH,
     });
     const rawCameraTopics = rawCameraTopicsForMode(runtimeMode);
+    const requireReliableRawCameras = runtimeMode === "live" || runtimeMode === "llm";
+    const reliableRawCameraNames = new Set(Object.values(rawCameraTopics));
     const cameraTopics = [
       {
         name: rawCameraTopics.cam1,
@@ -1219,6 +1252,9 @@ export function useRosBridge(runtimeMode: TaskplannerRuntimeMode) {
         throttle_rate: CAMERA_FRAME_THROTTLE_MS,
         queue_length: ROSBRIDGE_IMAGE_QUEUE_LENGTH,
       });
+      if (requireReliableRawCameras && reliableRawCameraNames.has(name)) {
+        requireReliableImageSubscription(topic);
+      }
       topic.subscribe((message: unknown) => {
         if (
           (name === "/surgery/images/cam4/detected/compressed" ||

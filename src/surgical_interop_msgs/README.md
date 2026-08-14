@@ -82,6 +82,16 @@ Instrument IDs are procedure scoped: consumers must join them with
 `procedure_type` and the matching `catalog_version`, not assume that a code such
 as `T04` has the same meaning in every procedure.
 
+`/surgery/instruments` uses a deliberately small public location ontology.
+Surgeon-side rows use `location_type=surgeon`; current-use rows are selected by
+`holder_role=surgeon` and `state=handed_over|in_use`. All Mayo rows use
+`location_type=mayo_stand`; `state=parked_for_reuse|awaiting_retrieval`
+distinguishes lifecycle policy without inventing physical Mayo zones.
+
+`/surgery/tool_predictions` contains zero to three contiguous ranks in
+descending confidence order. Rank 1 matches the private control-compatible
+scalar. Ranks 2 and 3 are display-only and currently use `stability_sec=0.0`.
+
 ## Focused capability requests
 
 The recommended public endpoints are:

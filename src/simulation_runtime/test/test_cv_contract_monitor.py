@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from simulation_runtime.cv_contract import normalize_perception_backend
+from simulation_runtime.cv_contract import endpoint_by_key, normalize_perception_backend
 from simulation_runtime.cv_contract_monitor import (
     qos_contract_matches,
     qos_contract_state,
@@ -39,6 +39,36 @@ def test_qos_contract_checker_requires_exact_external_profile() -> None:
         expected,
         {"reliability": 1, "durability": 1, "depth": 0},
     ) == "UNVERIFIABLE_DEPTH"
+
+
+def test_workbook_qos_profiles_remain_exact() -> None:
+    assert endpoint_by_key("cam4_rgb").topic == (
+        "/synced/cam_4/color/image_raw/compressed"
+    )
+    assert endpoint_by_key("cam4_rgb").qos == (
+        "RELIABLE/VOLATILE/KEEP_LAST(20)"
+    )
+    assert endpoint_by_key("cam4_camera_info").topic == (
+        "/synced/cam_4/color/camera_info"
+    )
+    assert endpoint_by_key("cam4_camera_info").qos == (
+        "RELIABLE/VOLATILE/KEEP_LAST(20)"
+    )
+    assert endpoint_by_key("cam4_aligned_depth").topic == (
+        "/synced/cam_4/depth/image_rect_raw"
+    )
+    assert endpoint_by_key("cam4_rgb_alias").qos == (
+        "BEST_EFFORT/VOLATILE/KEEP_LAST(5)"
+    )
+    assert endpoint_by_key("handover_tray_camera_info").qos == (
+        "RELIABLE/VOLATILE/KEEP_LAST(5)"
+    )
+    assert endpoint_by_key("suction_camera_info").qos == (
+        "RELIABLE/TRANSIENT_LOCAL/KEEP_LAST(1)"
+    )
+    assert endpoint_by_key("bleeding_mask").qos == (
+        "BEST_EFFORT/VOLATILE/KEEP_LAST(5)"
+    )
 
 
 def test_compressed_image_requires_payload_stamp_and_frame() -> None:

@@ -206,4 +206,4 @@ def test_field_tool_does_not_jump_to_mayo_without_return_context() -> None:
 
     assert accepted is not None
     assert accepted["accepted"] is True
-    assert state.location_type == "mayo_reuse_zone"
+    assert state.location_type == "mayo_stand"

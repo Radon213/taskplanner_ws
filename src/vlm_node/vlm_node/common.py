@@ -58,10 +58,8 @@ def instrument_anchor_id(instrument, layout_bundle: dict[str, Any]) -> str:
     if getattr(instrument, "location_id", "") in anchors:
         return str(getattr(instrument, "location_id", ""))
     lifecycle_stage = str(getattr(instrument, "lifecycle_stage", ""))
-    if lifecycle_stage == "mayo_recovery" and "mayo_recovery_zone" in anchors:
-        return "mayo_recovery_zone"
-    if lifecycle_stage == "mayo_reuse" and "mayo_reuse_zone" in anchors:
-        return "mayo_reuse_zone"
+    if lifecycle_stage in {"mayo_recovery", "mayo_reuse"} and "mayo_stand" in anchors:
+        return "mayo_stand"
     if lifecycle_stage == "prepositioned_right" and "robot_right_hand" in anchors:
         return "robot_right_hand"
     if lifecycle_stage in {"recovering_left", "cleaning_left", "cleaned_left"}:

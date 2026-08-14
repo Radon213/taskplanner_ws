@@ -157,7 +157,7 @@ std::string toolNextRequiredTransition(const BT::TreeNode & node, const std::str
 bool isSurgeonSideHoldingArea(const std::string & location_type)
 {
   static const std::unordered_set<std::string> location_types = {
-    "surgical_field", "surgeon_hand", "return_zone", "mayo_recovery_zone", "mayo_reuse_zone"};
+    "surgical_field", "surgeon_hand", "return_zone", "mayo_stand"};
   return location_types.count(location_type) > 0;
 }
 
@@ -1369,10 +1369,35 @@ public:
 
   BT::NodeStatus tick() override
   {
-    for (const auto & tool_id : allTools(*this)) {
-      if (toolNextRequiredTransition(*this, tool_id) == "recover_left") {
+    std::string execution_state;
+    std::string left_hand_tool;
+    bool cleaner_busy = false;
+    readBlackboard(*this, "runtime.execution_state", execution_state);
+    readBlackboard(*this, "robot.left_hand_tool", left_hand_tool);
+    readBlackboard(*this, "cleaner.busy", cleaner_busy);
+    if (
+      (execution_state != "running" && execution_state != "finishing") ||
+      hasActiveRobotTask(*this) || !left_hand_tool.empty() || cleaner_busy ||
+      hasBlockingSafetyFlag(*this))
+    {
+      return BT::NodeStatus::FAILURE;
+    }
+
+    // The instance queue is append ordered. Select only physically present
+    // Mayo recovery items so a surgeon-held return request cannot be executed
+    // before the tool actually reaches the stand.
+    std::string active_recovery_instances_csv;
+    readBlackboard(
+      *this, "active_recovery_instances.csv",
+      active_recovery_instances_csv);
+    for (const auto & instance_id : splitCsv(active_recovery_instances_csv)) {
+      if (
+        toolIsActive(*this, instance_id) &&
+        toolLifecycle(*this, instance_id) == "mayo_recovery" &&
+        toolNextRequiredTransition(*this, instance_id) == "recover_left")
+      {
         return selectTool(
-          tool_id, "recover_left", "authoritative_recovery_transaction");
+          instance_id, "recover_left", "authoritative_recovery_transaction");
       }
     }
 
@@ -1394,27 +1419,15 @@ public:
       }
     }
 
-    std::string active_recovery_instances_csv;
-    readBlackboard(
-      *this, "active_recovery_instances.csv",
-      active_recovery_instances_csv);
-    for (const auto & instance_id : splitCsv(active_recovery_instances_csv)) {
-      const auto lifecycle = toolLifecycle(*this, instance_id);
-      if (
-        toolIsActive(*this, instance_id) &&
-        (lifecycle == "mayo_recovery" || lifecycle == "mayo_reuse"))
-      {
-        return selectTool(
-          instance_id, "recover_left", "authoritative_recovery_transaction");
-      }
-    }
-
     std::string active_recovery_csv;
     readBlackboard(*this, "active_recovery_tools.csv", active_recovery_csv);
     for (const auto & instrument_type : splitCsv(active_recovery_csv)) {
       const auto instance_id = findActiveInstanceForType(
-        *this, instrument_type, {"mayo_recovery", "mayo_reuse"});
-      if (!instance_id.empty()) {
+        *this, instrument_type, {"mayo_recovery"});
+      if (
+        !instance_id.empty() &&
+        toolNextRequiredTransition(*this, instance_id) == "recover_left")
+      {
         return selectTool(
           instance_id, "recover_left", "authoritative_recovery_transaction");
       }
@@ -1424,7 +1437,7 @@ public:
       const auto lifecycle = toolLifecycle(*this, tool_id);
       if (lifecycle == "mayo_recovery") {
         return selectTool(
-          tool_id, "recover_left", "observed_mayo_recovery_zone");
+          tool_id, "recover_left", "observed_mayo_recovery_state");
       }
     }
 
@@ -1889,10 +1902,10 @@ public:
       const bool from_mayo_reuse = lifecycle == "mayo_reuse";
       const auto prepare_source_location =
         !tool_location.empty() ? tool_location :
-        (from_mayo_reuse ? std::string("mayo_reuse_zone") : home_location_id);
+        (from_mayo_reuse ? std::string("mayo_stand") : home_location_id);
       const auto prepare_source_type =
         !tool_location_type.empty() ? tool_location_type :
-        (from_mayo_reuse ? std::string("mayo_reuse_zone") : home_location_type);
+        (from_mayo_reuse ? std::string("mayo_stand") : home_location_type);
       writeBlackboard(*this, "bt.action", std::string("predict_tool"));
       writeBlackboard(*this, "bt.arm", std::string("right"));
       writeBlackboard(*this, "bt.source_location_id", prepare_source_location);
@@ -1955,8 +1968,7 @@ public:
       {
         return BT::NodeStatus::FAILURE;
       }
-      const auto recovery_source_location = lifecycle == "mayo_reuse" ?
-        std::string("mayo_reuse_zone") : std::string("mayo_recovery_zone");
+      const auto recovery_source_location = std::string("mayo_stand");
       writeBlackboard(*this, "bt.action", std::string("retrieve_from_mayo"));
       writeBlackboard(*this, "bt.arm", std::string("left"));
       writeBlackboard(*this, "bt.source_location_id", tool_location.empty() ? recovery_source_location : tool_location);

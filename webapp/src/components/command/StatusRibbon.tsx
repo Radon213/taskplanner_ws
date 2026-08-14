@@ -1,4 +1,4 @@
-import { Bug, Languages, Radio } from "lucide-react";
+import { Bug, Camera, Languages, Radio } from "lucide-react";
 import { ProviderModelSelect } from "./ProviderModelSelect";
 import type { Language } from "../../utils/display";
 import type { useDigitalTwinViewModel } from "../../hooks/useDigitalTwinViewModel";
@@ -32,6 +32,7 @@ export function StatusRibbon({
   onVlmModelChange,
   onVlmRuntimeAction,
   onDebugMode,
+  onMulticamOps,
 }: {
   vm: ViewModel;
   connected: boolean;
@@ -48,6 +49,7 @@ export function StatusRibbon({
     command: ModelRuntimeCommand,
   ) => void;
   onDebugMode: () => void;
+  onMulticamOps: () => void;
 }) {
   const vlmSelectDisabled =
     !connected || Boolean(actionPending) || !modelOptions.some((entry) => entry.selectable);
@@ -65,6 +67,10 @@ export function StatusRibbon({
         </div>
       </div>
       <div className="ribbon-cluster">
+        <button className="debug-mode-entry" onClick={onMulticamOps} type="button">
+          <Camera size={16} aria-hidden="true" />
+          <span>{language === "ko" ? "멀티캠 관제" : "Multicam Ops"}</span>
+        </button>
         <button className="debug-mode-entry" onClick={onDebugMode} type="button">
           <Bug size={16} aria-hidden="true" />
           <span>{language === "ko" ? "디버그 모드" : "Debug Mode"}</span>

@@ -13,15 +13,21 @@
 
 | 논리 입력 | 기본 토픽 | 타입 | 현재 처리 |
 | --- | --- | --- | --- |
-| CAM4 RGB (canonical) | `/camera/cam_4/color/image_raw/compressed` | `sensor_msgs/msg/CompressedImage` | payload, stamp, frame_id 관찰 |
+| CAM4 RGB (canonical) | `/synced/cam_4/color/image_raw/compressed` | `sensor_msgs/msg/CompressedImage` | payload, stamp, frame_id 관찰 |
 | CAM4 RGB 공개 alias | `/surgery/images/cam4/compressed` | `sensor_msgs/msg/CompressedImage` | CAM4 canonical과 동일한 물리 source로 표시만 함; 이중 집계하지 않음 |
-| CAM4 CameraInfo | `/surgery/cameras/cam4/color/camera_info` | `sensor_msgs/msg/CameraInfo` | 해상도·행렬 shape·유한수 관찰 |
-| CAM4 aligned depth | `/surgery/cameras/cam4/aligned_depth` | `sensor_msgs/msg/Image` | encoding·step·payload 크기 관찰 |
+| CAM4 CameraInfo | `/synced/cam_4/color/camera_info` | `sensor_msgs/msg/CameraInfo` | 해상도·행렬 shape·유한수 관찰 |
+| CAM4 aligned depth (pending) | `/synced/cam_4/depth/image_rect_raw` | `sensor_msgs/msg/Image` | publisher가 생길 때 encoding·step·payload 크기 관찰 |
 | 도구전달 tray RGB | `/surgery/images/tray/compressed` | `sensor_msgs/msg/CompressedImage` | 선택 입력으로 관찰 |
 | 도구전달 tray CameraInfo/depth | `/surgery/cameras/tray/{color/camera_info,aligned_depth}` | `CameraInfo` / `Image` | 선택 입력으로 관찰 |
 
 여기서 **tray는 Mayo가 아니라 도구전달 tray**다. 기존 Mayo placement
 tracker와 이 경로를 연결하지 않는다.
+
+현재 `/synced/cam_4/depth/image_rect_raw/compressedDepth`는
+`sensor_msgs/msg/CompressedImage`이고 depth optical frame이다. 계약의
+color-aligned `sensor_msgs/msg/Image`와 타입·좌표계가 다르므로 단순 remap하지
+않는다. decode·color registration·TF/calibration·skew 정책을 받은 뒤에만
+`/surgery/cameras/cam4/aligned_depth`를 발행한다.
 
 아래의 CV 팀 출력은 동일한 이름·예상 타입·QoS·소유자 정보로 ROS graph에서
 점검한다. custom IDL은 문자열 계약으로만 보관하며, 패키지를 받기 전에는

@@ -43,10 +43,9 @@ class PromptBuilder:
         location_lines = [
             "Location ontology:",
             "- tray_slot: home rack slot",
-            "- mayo_reuse_zone: surgeon-side temporary park for likely reuse",
-            "- mayo_recovery_zone: robot pickup intent zone for recovery",
-            "- surgical_field: surgeon-owned tool currently active on patient/bed",
-            "- surgeon_hand: surgeon-owned tool currently in hand",
+            "- mayo_stand: the single physical Mayo stand location",
+            "- Mayo reuse versus recovery is a policy state, not a location",
+            "- surgeon: surgeon-held/used tool; do not infer hand versus field",
             "- cleaner_slot: left-hand occupied tool held in cleaner",
             "- robot_right_hand: anticipatory/prepositioned or handover-ready tool",
             "- robot_left_hand: recovered tool on way to cleaner or rack",

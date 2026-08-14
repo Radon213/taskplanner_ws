@@ -82,6 +82,55 @@ def test_v4_ranked_tool_rows_are_preserved_for_fusion() -> None:
     ) == [["T02", 0.91], ["T04", 0.63]]
 
 
+def test_reducer_preserves_deterministic_top_three_but_rank_one_owns_control() -> None:
+    node = ORDigitalTwinNode.__new__(ORDigitalTwinNode)
+    node._tool_predict_stability = {}
+    node._tool_predict_evidence_threshold = 0.5
+    node._tool_predict_threshold = 0.8
+    node._tool_predict_stability_sec = 3.0
+    state = SimpleNamespace(
+        predicted_tool="",
+        predicted_tool_confidence=0.0,
+        predicted_tool_stability_sec=0.0,
+        ranked_tool_predictions=[],
+    )
+    node._twin = SimpleNamespace(state=state)
+    node._tool_prediction_sample_status = lambda **_kwargs: "accepted"
+    node._fused_tool_prediction = lambda *_args: (
+        "T02",
+        0.91,
+        {
+            "fused": {"T07": 0.61, "T04": 0.73, "T09": 0.49, "T02": 0.91},
+            "selected_duration_sec": 3.4,
+        },
+    )
+    node._clear_stale_tool_prediction = lambda _now: None
+    node._publish_reducer_decision_event = lambda **_kwargs: None
+    node._publish_event = lambda *_args, **_kwargs: None
+
+    node._handle_vlm_tool_prediction(
+        {"v": "4", "tool": [["T07", 0.61], ["T02", 0.91], ["T04", 0.73]]},
+        SimpleNamespace(source="real_vlm:test"),
+        10.0,
+        10.1,
+    )
+
+    assert state.predicted_tool == "T02"
+    assert state.predicted_tool_confidence == 0.91
+    assert state.predicted_tool_stability_sec == 3.4
+    assert [row.instrument_id for row in state.ranked_tool_predictions] == [
+        "T02",
+        "T04",
+        "T07",
+    ]
+    assert [row.rank for row in state.ranked_tool_predictions] == [1, 2, 3]
+    assert [row.stability_sec for row in state.ranked_tool_predictions] == [
+        3.4,
+        0.0,
+        0.0,
+    ]
+
+
 def test_vlm_result_is_accepted_while_optional_perception_is_disabled() -> None:
     spec_dir = (
         Path(__file__).parents[2]
@@ -274,6 +323,7 @@ def test_prediction_expiry_uses_result_receipt_time_not_capture_time() -> None:
             predicted_tool="T02",
             predicted_tool_confidence=0.85,
             predicted_tool_stability_sec=3.2,
+            ranked_tool_predictions=[SimpleNamespace(instrument_id="T02")],
         )
     )
 
@@ -292,6 +342,7 @@ def test_prediction_expiry_uses_result_receipt_time_not_capture_time() -> None:
 
     node._clear_stale_tool_prediction(15.6)
     assert node._twin.state.predicted_tool == ""
+    assert node._twin.state.ranked_tool_predictions == []
 
 
 def _prediction_fusion_node(

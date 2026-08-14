@@ -82,7 +82,7 @@ from .projections import (
 GATEWAY_OBSERVED = "GATEWAY_OBSERVED"
 GATEWAY_OBSERVED_REDACTED = "GATEWAY_OBSERVED_REDACTED"
 MODEL_OBSERVED_REDACTED = "MODEL_OBSERVED_REDACTED"
-SCHEMA_VERSION = "1.0.0"
+SCHEMA_VERSION = "1.1.0"
 INTERFACE_VERSION = "0.3.0"
 _MAX_ASR_STATUS_BYTES = 256 * 1024
 _MAX_SPEECH_TEXT_CHARS = 2000
@@ -835,11 +835,21 @@ class SurgicalInteropGateway(Node):
     ) -> ToolPrediction | None:
         confidence = finite_probability(projection.confidence)
         stability_sec = finite_nonnegative(projection.stability_sec)
-        if confidence is None or stability_sec is None:
+        try:
+            rank = int(projection.rank)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if (
+            confidence is None
+            or stability_sec is None
+            or isinstance(projection.rank, bool)
+            or not 1 <= rank <= 3
+            or not str(projection.instrument_id).strip()
+        ):
             return None
         message = ToolPrediction()
         message.stamp = projection.stamp
-        message.rank = projection.rank
+        message.rank = rank
         message.instrument_id = projection.instrument_id
         message.instance_id = projection.instance_id
         message.confidence = confidence

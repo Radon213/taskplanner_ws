@@ -7,6 +7,8 @@ from launch.substitutions import EnvironmentVariable, LaunchConfiguration, PathJ
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 
+from integration_debug.bridge_policy import DEBUG_ROSAPI_TOPICS_GLOB
+
 
 def generate_launch_description() -> LaunchDescription:
     enable_rosbridge = LaunchConfiguration("enable_rosbridge")
@@ -51,6 +53,25 @@ def generate_launch_description() -> LaunchDescription:
                 default_value=EnvironmentVariable(
                     "TASKPLANNER_RUN_ROOT", default_value="/tmp/taskplanner-runs"
                 ),
+            ),
+            # rosapi only exposes the same bounded multicam/debug topic set
+            # that secure_debug_rosbridge can subscribe to.  The browser can
+            # call /rosapi/topics, but no parameter-mutating rosapi service.
+            Node(
+                package="rosapi",
+                executable="rosapi_node",
+                # roslib's discovery client calls the conventional
+                # absolute /rosapi/topics service, so retain rosapi's
+                # canonical node/service namespace.
+                name="rosapi",
+                parameters=[
+                    {
+                        "topics_glob": DEBUG_ROSAPI_TOPICS_GLOB,
+                        "services_glob": "[]",
+                        "params_glob": "[]",
+                    }
+                ],
+                output="screen",
             ),
             rosbridge,
             Node(

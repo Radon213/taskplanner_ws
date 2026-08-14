@@ -117,6 +117,14 @@ class SurgeonRequestCue:
 
 
 @dataclass(slots=True)
+class RankedToolPredictionBelief:
+    rank: int
+    instrument_id: str
+    confidence: float
+    stability_sec: float = 0.0
+
+
+@dataclass(slots=True)
 class TwinState:
     procedure_id: str
     filtered_phase: str
@@ -133,6 +141,9 @@ class TwinState:
     predicted_tool: str = ""
     predicted_tool_confidence: float = 0.0
     predicted_tool_stability_sec: float = 0.0
+    ranked_tool_predictions: list[RankedToolPredictionBelief] = field(
+        default_factory=list
+    )
     surgeon_intent: str = ""
     surgeon_request_tool: str = ""
     surgeon_request_instance_id: str = ""

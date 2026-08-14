@@ -4,6 +4,7 @@ import { motion } from "framer-motion";
 import { ProcedureDock } from "./components/command/ProcedureDock";
 import { LiveAsrPanel } from "./components/command/LiveAsrPanel";
 import { DebugWorkspace } from "./components/debug/DebugWorkspace";
+import { MulticamOpsWorkspace } from "./components/multicam/MulticamOpsWorkspace";
 import {
   type PublicSurgeonGesture,
 } from "./components/command/PublicSurgeonGestureStatus";
@@ -22,8 +23,18 @@ import {
 } from "./runtimeModes";
 import { type Language } from "./utils/display";
 
+type PrimaryWorkspace = "mission" | "multicam";
+
+function workspaceFromLocation(): PrimaryWorkspace {
+  if (typeof window === "undefined") return "mission";
+  return new URLSearchParams(window.location.search).get("workspace") === "multicam"
+    ? "multicam"
+    : "mission";
+}
+
 export default function App() {
   const [runtimeMode, setRuntimeMode] = useState<TaskplannerRuntimeMode>(initialRuntimeMode);
+  const [workspace, setWorkspace] = useState<PrimaryWorkspace>(workspaceFromLocation);
   const [language, setLanguage] = useState<Language>(() => {
     if (typeof window === "undefined") return "ko";
     return window.localStorage.getItem("taskplanner.language") === "en" ? "en" : "ko";
@@ -47,6 +58,26 @@ export default function App() {
     }
   }, [runtimeMode]);
 
+  useEffect(() => {
+    const onPopState = () => setWorkspace(workspaceFromLocation());
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, []);
+
+  const navigateWorkspace = (next: PrimaryWorkspace) => {
+    if (typeof window !== "undefined") {
+      const location = new URL(window.location.href);
+      if (next === "multicam") location.searchParams.set("workspace", "multicam");
+      else location.searchParams.delete("workspace");
+      window.history.pushState({}, "", location);
+    }
+    setWorkspace(next);
+  };
+
+  if (workspace === "multicam") {
+    return <MulticamOpsWorkspace language={language} onExit={() => navigateWorkspace("mission")} />;
+  }
+
   if (runtimeMode === "debug") {
     return <DebugWorkspace language={language} onExit={() => setRuntimeMode(lastMissionMode)} />;
   }
@@ -57,6 +88,7 @@ export default function App() {
       onRuntimeModeChange={setRuntimeMode}
       language={language}
       onLanguageChange={setLanguage}
+      onMulticamOps={() => navigateWorkspace("multicam")}
     />
   );
 }
@@ -66,11 +98,13 @@ function MissionWorkspace({
   onRuntimeModeChange,
   language,
   onLanguageChange,
+  onMulticamOps,
 }: {
   runtimeMode: Exclude<TaskplannerRuntimeMode, "debug">;
   onRuntimeModeChange: (mode: TaskplannerRuntimeMode) => void;
   language: Language;
   onLanguageChange: (language: Language) => void;
+  onMulticamOps: () => void;
 }) {
   const ros = useRosBridge(runtimeMode);
   const [stageAspectRatio, setStageAspectRatio] = useState(1.55);
@@ -178,6 +212,7 @@ function MissionWorkspace({
           void ros.controlVlmModelRuntime(selection, command)
         }
         onDebugMode={() => onRuntimeModeChange("debug")}
+        onMulticamOps={onMulticamOps}
       />
 
       <motion.main

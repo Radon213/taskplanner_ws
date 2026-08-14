@@ -34,6 +34,7 @@ from surgical_msgs.msg import (
     PerceptionScene,
     PhaseEvidence,
     PhaseTransitionCue,
+    RankedToolPrediction,
     ReducerDecisionEvent,
     SimulationEvent,
     SimulationState,
@@ -51,6 +52,7 @@ from surgical_msgs.msg import (
 )
 
 from .twin import ORDigitalTwin
+from .models import RankedToolPredictionBelief
 
 
 class ORDigitalTwinNode(Node):
@@ -744,6 +746,14 @@ class ORDigitalTwinNode(Node):
         world.predicted_tool = self._twin.state.predicted_tool
         world.predicted_tool_confidence = float(self._twin.state.predicted_tool_confidence)
         world.predicted_tool_stability_sec = float(self._twin.state.predicted_tool_stability_sec)
+        world.ranked_tool_predictions = []
+        for belief in self._twin.state.ranked_tool_predictions:
+            prediction = RankedToolPrediction()
+            prediction.rank = int(belief.rank)
+            prediction.instrument_id = belief.instrument_id
+            prediction.confidence = float(belief.confidence)
+            prediction.stability_sec = float(belief.stability_sec)
+            world.ranked_tool_predictions.append(prediction)
         world.surgeon_intent = self._twin.state.surgeon_intent
         world.surgeon_request_tool = self._twin.state.surgeon_request_tool
         world.surgeon_request_instance_id = (
@@ -1740,12 +1750,14 @@ class ORDigitalTwinNode(Node):
             ):
                 self._tool_predict_stability.pop(tool_id, None)
         if not self._twin.state.predicted_tool:
+            self._twin.state.ranked_tool_predictions = []
             return
         entry = self._tool_predict_stability.get(self._twin.state.predicted_tool)
         if entry is None:
             self._twin.state.predicted_tool = ""
             self._twin.state.predicted_tool_confidence = 0.0
             self._twin.state.predicted_tool_stability_sec = 0.0
+            self._twin.state.ranked_tool_predictions = []
 
     def _expire_stale_vlm_evidence(self, now_sec: float) -> None:
         """Withdraw visual facts even when the VLM stops publishing."""
@@ -1784,6 +1796,7 @@ class ORDigitalTwinNode(Node):
         self._twin.state.predicted_tool = ""
         self._twin.state.predicted_tool_confidence = 0.0
         self._twin.state.predicted_tool_stability_sec = 0.0
+        self._twin.state.ranked_tool_predictions = []
 
     def _tool_prediction_sample_status(
         self,
@@ -2147,6 +2160,13 @@ class ORDigitalTwinNode(Node):
         now_sec: float,
         received_sec: float | None = None,
     ) -> None:
+        if (
+            not self._twin.state.predicted_tool
+            and not getattr(self._twin.state, "ranked_tool_predictions", [])
+        ):
+            # A reset/interrupt may clear reducer state outside this callback.
+            # Never carry the previous run's continuity clock into a new rank 1.
+            self._tool_predict_stability.clear()
         sample_status = self._tool_prediction_sample_status(
             source=str(msg.source),
             now_sec=now_sec,
@@ -2211,6 +2231,31 @@ class ORDigitalTwinNode(Node):
         self._twin.state.predicted_tool = tool_id
         self._twin.state.predicted_tool_confidence = confidence
         self._twin.state.predicted_tool_stability_sec = duration
+        if legacy_v2:
+            ranked_rows = [(tool_id, confidence)]
+        else:
+            ranked_rows = sorted(
+                (
+                    (candidate_id, float(candidate_confidence))
+                    for candidate_id, candidate_confidence in fusion_detail.get(
+                        "fused", {}
+                    ).items()
+                    if float(candidate_confidence)
+                    >= self._tool_predict_evidence_threshold
+                ),
+                key=lambda item: (-item[1], item[0]),
+            )[:3]
+        self._twin.state.ranked_tool_predictions = [
+            RankedToolPredictionBelief(
+                rank=rank,
+                instrument_id=candidate_id,
+                confidence=candidate_confidence,
+                stability_sec=duration if rank == 1 else 0.0,
+            )
+            for rank, (candidate_id, candidate_confidence) in enumerate(
+                ranked_rows, start=1
+            )
+        ]
         self._publish_reducer_decision_event(
             input_type="vlm_tool_prediction",
             input_id=f"tool_prediction:{tool_id}:{now_sec:.3f}",

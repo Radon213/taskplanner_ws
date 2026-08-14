@@ -273,9 +273,10 @@ class MockVLMNode(Node):
             return
         delivered = self._delivered_by_phase.setdefault(phase_id, set())
         delivered_location_types = {
+            "surgeon",
             "surgeon_hand",
             "surgical_field",
-            "bed_fixed_tool",
+            "mayo_stand",
             "mayo_reuse_zone",
             "mayo_recovery_zone",
             "robot_left_hand",

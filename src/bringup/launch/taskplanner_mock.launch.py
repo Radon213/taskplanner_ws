@@ -386,7 +386,7 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument(
                 "cv_cam4_rgb_topic",
-                default_value="/camera/cam_4/color/image_raw/compressed",
+                default_value="/synced/cam_4/color/image_raw/compressed",
             ),
             DeclareLaunchArgument(
                 "cv_cam4_rgb_alias_topic",
@@ -394,11 +394,11 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument(
                 "cv_cam4_camera_info_topic",
-                default_value="/surgery/cameras/cam4/color/camera_info",
+                default_value="/synced/cam_4/color/camera_info",
             ),
             DeclareLaunchArgument(
                 "cv_cam4_aligned_depth_topic",
-                default_value="/surgery/cameras/cam4/aligned_depth",
+                default_value="/synced/cam_4/depth/image_rect_raw",
             ),
             DeclareLaunchArgument(
                 "cv_handover_tray_rgb_topic",

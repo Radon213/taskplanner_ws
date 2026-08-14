@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CycloneDDS xmlns="https://cdds.io/config">
+  <Domain Id="any">
+    <General>
+      <!-- This deployment's authoritative wired ROS interface. -->
+      <Interfaces>
+        <NetworkInterface name="enp13s0" multicast="true" />
+      </Interfaces>
+      <AllowMulticast>true</AllowMulticast>
+      <MaxMessageSize>65500B</MaxMessageSize>
+      <!-- Keep DDS/UDP datagrams below a 1500-byte Ethernet MTU after RTPS,
+           UDP and IP headers so large camera samples avoid IP fragmentation. -->
+      <FragmentSize>1344B</FragmentSize>
+    </General>
+    <Discovery>
+      <!-- Multicast remains enabled; fixed peers make discovery resilient when
+           a partner switch suppresses multicast. Offline peers are retried. -->
+      <Peers>
+        <Peer Address="127.0.0.1" />
+        <Peer Address="192.168.1.6" />
+        <Peer Address="192.168.1.7" />
+      </Peers>
+      <ParticipantIndex>auto</ParticipantIndex>
+      <MaxAutoParticipantIndex>60</MaxAutoParticipantIndex>
+    </Discovery>
+    <Internal>
+      <SocketReceiveBufferSize max="64MB" />
+      <SocketSendBufferSize max="64MB" />
+      <Watermarks>
+        <WhcHigh>4MB</WhcHigh>
+      </Watermarks>
+    </Internal>
+    <Tracing>
+      <Verbosity>warning</Verbosity>
+      <OutputFile>stderr</OutputFile>
+    </Tracing>
+  </Domain>
+</CycloneDDS>

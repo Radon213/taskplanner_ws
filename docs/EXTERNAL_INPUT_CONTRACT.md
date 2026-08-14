@@ -97,11 +97,11 @@ The live dashboard consumes the VIPLab camera contract without requiring a
 rename or relay on the camera computer:
 
 ```text
-/camera/cam_1/color/image_raw/compressed  sensor_msgs/msg/CompressedImage
-/camera/cam_2/color/image_raw/compressed  sensor_msgs/msg/CompressedImage
-/camera/cam_3/color/image_raw/compressed  sensor_msgs/msg/CompressedImage
-/camera/cam_4/color/image_raw/compressed  sensor_msgs/msg/CompressedImage
-/flir_camera/image_color/compressed       sensor_msgs/msg/CompressedImage
+/synced/cam_1/color/image_raw/compressed  sensor_msgs/msg/CompressedImage
+/synced/cam_2/color/image_raw/compressed  sensor_msgs/msg/CompressedImage
+/synced/cam_3/color/image_raw/compressed  sensor_msgs/msg/CompressedImage
+/synced/cam_4/color/image_raw/compressed  sensor_msgs/msg/CompressedImage
+/synced/flir/color/image_raw/compressed   sensor_msgs/msg/CompressedImage
 ```
 
 CAM1-CAM3 are live observer views. CAM4 and FLIR are also the configured raw
@@ -116,14 +116,10 @@ CAM4 produces public tool/request semantics on
 `/surgery/perception/cam4/semantics/json`. Raw CAM4 pixels are not forwarded to
 the VLM.
 
-Taskplanner subscribes to image topics with ROS SensorData QoS:
-
-- reliability: best effort
-- durability: volatile
-- history: keep last
-
-This best-effort/volatile subscriber remains compatible with the VIPLab
-reliable/volatile publishers. Populate `header.stamp` with the frame
+Taskplanner subscribes to the multicam synchronized image topics with the
+provider's `RELIABLE / VOLATILE / KEEP_LAST(20)` profile. The public
+`/surgery/images/*` aliases remain best-effort low-latency outputs.
+Populate `header.stamp` with the frame
 acquisition time and `format` with `jpeg` or `png`. The dashboard marks a view
 disconnected after three seconds without a new frame instead of retaining a
 stale surgical image.
@@ -424,7 +420,7 @@ DDS requires ROS 2/DDS Security identities, governance, and permissions.
 
 These are projections of DT and VLM data, not aliases of the internal topics.
 The gateway never publishes `raw_json`, `detail_json`, planner rationale,
-hidden actor state, or an unvalidated clinical conclusion. The reviewed rank-1
+hidden actor state, or an unvalidated clinical conclusion. The reviewed top-3
 next-tool forecast and semantic robot-hand possession state are narrow v0.3
 projections with dedicated public types; the rest of internal `WorldState`
 remains private.
@@ -435,8 +431,11 @@ this remains unambiguous when the first event precedes the next heartbeat.
 Every public confidence/uncertainty value is finite and within `[0,1]`.
 Malformed claims become `UNKNOWN` or are omitted, and clinical parallel arrays
 are length-validated at the Gateway boundary.
-Instrument locations are semantic anchors such as `mayo`, `right_hand`, or
-`field`; they are not 3D poses unless a separately calibrated pose contract is
+Public surgeon-side instrument rows use the single semantic location
+`surgeon`; public Mayo rows use the single physical location `mayo_stand` and
+distinguish reuse from recovery with `state`. Internal hand/field/bed and
+reuse/recovery-zone values are not public. Locations are not 3D poses unless a
+separately calibrated pose contract is
 added.
 
 When no procedure is active or WorldState is stale, dynamic topics overwrite

@@ -68,6 +68,32 @@ def finite_nonnegative(value: Any) -> float | None:
     return number
 
 
+def _public_semantic_location(
+    location_type: Any, location_id: Any
+) -> tuple[str, str]:
+    """Collapse private planner/policy locations into the public ontology."""
+
+    normalized_type = str(location_type or "")
+    normalized_id = str(location_id or "")
+    if normalized_type in {
+        "surgeon",
+        "surgeon_hand",
+        "surgical_field",
+        "bed_fixed_tool",
+        "return_zone",
+    }:
+        return ("surgeon", "surgeon")
+    if normalized_type in {
+        "mayo",
+        "mayo_tray",
+        "mayo_stand",
+        "mayo_reuse_zone",
+        "mayo_recovery_zone",
+    }:
+        return ("mayo_stand", "mayo_stand")
+    return (normalized_type, normalized_id)
+
+
 @dataclass(frozen=True)
 class Freshness:
     """Freshness based on local receipt time, not untrusted source clock time."""
@@ -145,14 +171,22 @@ def project_instrument(instrument: Any) -> InstrumentProjection:
 
     confidence = finite_probability(_value(instrument, "confidence", 0.0))
     confidence_valid = confidence is not None
+    internal_location_type = str(_value(instrument, "location_type", ""))
+    internal_location_id = str(_value(instrument, "location_id", ""))
+    holder_role = str(_value(instrument, "owner", ""))
+    location_type, location_id = _public_semantic_location(
+        internal_location_type, internal_location_id
+    )
+    if location_type == "surgeon":
+        holder_role = "surgeon"
 
     return InstrumentProjection(
         stamp=_value(instrument, "stamp", None),
         instrument_id=str(_value(instrument, "instrument_id", "")),
         instance_id=str(_value(instrument, "instance_id", "")),
-        location_type=str(_value(instrument, "location_type", "")),
-        location_id=str(_value(instrument, "location_id", "")),
-        holder_role=str(_value(instrument, "owner", "")),
+        location_type=location_type,
+        location_id=location_id,
+        holder_role=holder_role,
         state=str(_value(instrument, "status", "")),
         # `visual_anchor_id` is a semantic/display anchor, not a camera
         # observation.  Never turn it into a visibility assertion.
@@ -168,7 +202,7 @@ def project_instruments(world: Any) -> tuple[InstrumentProjection, ...]:
 
 @dataclass(frozen=True)
 class ToolPredictionProjection:
-    """One reviewed current-tool forecast for display, never an instruction."""
+    """One reducer-accepted current-tool forecast, never an instruction."""
 
     stamp: Any
     rank: int
@@ -181,7 +215,76 @@ class ToolPredictionProjection:
 
 
 def project_tool_predictions(world: Any) -> tuple[ToolPredictionProjection, ...]:
-    """Project the reducer-accepted top forecast as a ranked public snapshot."""
+    """Project up to three reducer-accepted forecasts as one atomic snapshot.
+
+    New WorldState publishers must provide ``ranked_tool_predictions``. The
+    scalar fields remain the control-compatible rank-1 lane and are checked for
+    exact semantic agreement. A missing ranked field means an older publisher,
+    for which the legacy scalar projection remains supported.
+    """
+
+    if hasattr(world, "ranked_tool_predictions"):
+        raw_rows = tuple(_value(world, "ranked_tool_predictions", ()))
+        if not raw_rows or len(raw_rows) > 3:
+            return ()
+
+        projections: list[ToolPredictionProjection] = []
+        seen_ids: set[str] = set()
+        previous_confidence = math.inf
+        for expected_rank, row in enumerate(raw_rows, start=1):
+            try:
+                rank = int(_value(row, "rank", 0))
+            except (TypeError, ValueError, OverflowError):
+                return ()
+            instrument_id = str(_value(row, "instrument_id", "")).strip()
+            confidence = finite_probability(_value(row, "confidence", 0.0))
+            stability_sec = finite_nonnegative(
+                _value(row, "stability_sec", 0.0)
+            )
+            if (
+                rank != expected_rank
+                or not instrument_id
+                or instrument_id in seen_ids
+                or confidence is None
+                or stability_sec is None
+                or confidence > previous_confidence
+            ):
+                return ()
+            seen_ids.add(instrument_id)
+            previous_confidence = confidence
+            projections.append(
+                ToolPredictionProjection(
+                    stamp=_value(world, "stamp", None),
+                    rank=rank,
+                    instrument_id=instrument_id,
+                    instance_id="",
+                    confidence=confidence,
+                    stability_sec=stability_sec,
+                    source="digital_twin",
+                )
+            )
+
+        scalar_tool = str(_value(world, "predicted_tool", "")).strip()
+        scalar_confidence = finite_probability(
+            _value(world, "predicted_tool_confidence", 0.0)
+        )
+        scalar_stability = finite_nonnegative(
+            _value(world, "predicted_tool_stability_sec", 0.0)
+        )
+        first = projections[0]
+        if (
+            scalar_tool != first.instrument_id
+            or scalar_confidence is None
+            or scalar_stability is None
+            or not math.isclose(
+                scalar_confidence, first.confidence, rel_tol=1e-6, abs_tol=1e-6
+            )
+            or not math.isclose(
+                scalar_stability, first.stability_sec, rel_tol=1e-6, abs_tol=1e-6
+            )
+        ):
+            return ()
+        return tuple(projections)
 
     instrument_id = str(_value(world, "predicted_tool", "")).strip()
     if not instrument_id:
@@ -381,14 +484,18 @@ def project_event(event: Any) -> EventProjection:
             ).strip()
 
     confidence = finite_probability(_value(event, "confidence", 0.0))
+    location_type, location_id = _public_semantic_location(
+        _value(event, "location_type", ""),
+        _value(event, "location_id", ""),
+    )
     return EventProjection(
         stamp=_value(event, "stamp", None),
         event_type=event_type,
         subject_type=subject_type,
         subject_id=subject_id,
         phase=phase_id,
-        location_type=str(_value(event, "location_type", "")),
-        location_id=str(_value(event, "location_id", "")),
+        location_type=location_type,
+        location_id=location_id,
         state=state,
         correlation_id=correlation_id,
         confidence=confidence if confidence is not None else 0.0,
@@ -482,8 +589,16 @@ def project_clinical_observation(result: Any) -> ClinicalObservationProjection:
             if confidence is None:
                 malformed = True
                 continue
+            public_location_type, public_location_id = _public_semantic_location(
+                location_type, location_id
+            )
             valid_observed_rows.append(
-                (tool_id, location_id, location_type, confidence)
+                (
+                    tool_id,
+                    public_location_id,
+                    public_location_type,
+                    confidence,
+                )
             )
         observed_tool_ids = tuple(row[0] for row in valid_observed_rows)
         observed_location_ids = tuple(row[1] for row in valid_observed_rows)

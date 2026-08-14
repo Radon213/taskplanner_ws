@@ -12,6 +12,12 @@ export TASKPLANNER_WS_ROOT="$PWD"
 Use Isaac Sim as a host desktop app. Do not run Isaac Sim in Docker unless a
 specific deployment test requires it.
 
+This page documents a legacy Isaac compatibility experiment only. It is not the
+operational external-integration contract: live Taskplanner uses Domain 0,
+SUBNET, `rmw_cyclonedds_cpp`, and the reviewed wired Cyclone profile. Keep the
+Fast DDS commands below isolated to the Isaac experiment and never export them
+into the live launcher environment.
+
 Reason:
 
 - Host ROS can receive `/surgery/images/field/image_raw` from Isaac at about

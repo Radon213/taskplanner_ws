@@ -92,6 +92,47 @@ class TestSubscriberManager(unittest.TestCase):
         self.assertFalse(topic in manager._subscribers)
         self.assert_topic_not_subscribed(topic)
 
+    def test_late_client_receives_all_transient_local_publisher_snapshots(self) -> None:
+        """Do not drop sibling /tf_static-style retained publisher messages."""
+        topic = "/test_late_client_retained_snapshots"
+        msg_type = "std_msgs/String"
+        first_client = "client_test_late_retained_first"
+        late_client = "client_test_late_retained_late"
+        publisher_qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        anchor_publisher = self.node.create_publisher(String, topic, publisher_qos)
+        multicam_publisher = self.node.create_publisher(String, topic, publisher_qos)
+        first_received: list[str] = []
+        late_received: list[str] = []
+
+        def first_callback(message: OutgoingMessage[String]) -> None:
+            first_received.append(message.message.data)
+
+        def late_callback(message: OutgoingMessage[String]) -> None:
+            late_received.append(message.message.data)
+
+        try:
+            anchor_publisher.publish(String(data="world-anchor"))
+            multicam_publisher.publish(String(data="multicam"))
+            time.sleep(0.1)
+
+            retained_qos = QoSProfile(depth=8, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+            manager.subscribe(first_client, topic, first_callback, self.node, msg_type, qos=retained_qos)
+            deadline = time.monotonic() + 2.0
+            while set(first_received) != {"world-anchor", "multicam"} and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(set(first_received), {"world-anchor", "multicam"})
+
+            manager.subscribe(late_client, topic, late_callback, self.node, msg_type, qos=retained_qos)
+            deadline = time.monotonic() + 2.0
+            while set(late_received) != {"world-anchor", "multicam"} and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(set(late_received), {"world-anchor", "multicam"})
+        finally:
+            manager.unsubscribe(late_client, topic)
+            manager.unsubscribe(first_client, topic)
+            self.node.destroy_publisher(anchor_publisher)
+            self.node.destroy_publisher(multicam_publisher)
+
     def test_register_json_and_raw_subscribers_on_same_topic(self) -> None:
         """Keep decoded and CDR subscriptions isolated for mixed clients."""
         topic = "/test_register_json_and_raw_subscribers_on_same_topic"

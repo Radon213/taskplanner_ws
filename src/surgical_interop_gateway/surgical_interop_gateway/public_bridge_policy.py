@@ -41,6 +41,24 @@ PUBLIC_CAMERA_QUEUE_LENGTH = 1
 PUBLIC_CAMERA_MIN_THROTTLE_MS = 100
 PUBLIC_CAMERA_COMPRESSION = "cbor"
 PUBLIC_ALLOWED_COMPRESSIONS = ("none", "cbor", "cbor-raw")
+PUBLIC_CAMERA_QOS = {
+    "history": "keep_last",
+    "depth": 1,
+    "reliability": "best_effort",
+    "durability": "volatile",
+}
+PUBLIC_SNAPSHOT_QOS = {
+    "history": "keep_last",
+    "depth": 1,
+    "reliability": "reliable",
+    "durability": "transient_local",
+}
+PUBLIC_EVENT_QOS = {
+    "history": "keep_last",
+    "depth": 50,
+    "reliability": "reliable",
+    "durability": "volatile",
+}
 PUBLIC_MAX_SUBSCRIPTION_IDS_PER_TOPIC = 4
 PUBLIC_MAX_CLIENTS = 8
 PUBLIC_MAX_INCOMING_BYTES = 64 * 1024
@@ -152,6 +170,7 @@ def restrict_public_subscription_request(request: Mapping[str, Any]) -> dict[str
             requested_throttle,
             PUBLIC_CAMERA_MIN_THROTTLE_MS,
         )
+        restricted["qos"] = dict(PUBLIC_CAMERA_QOS)
     else:
         if requested_compression not in PUBLIC_ALLOWED_COMPRESSIONS:
             raise ValueError(
@@ -159,6 +178,11 @@ def restrict_public_subscription_request(request: Mapping[str, Any]) -> dict[str
             )
         if "compression" in restricted:
             restricted["compression"] = requested_compression
+        restricted["qos"] = dict(
+            PUBLIC_EVENT_QOS
+            if restricted.get("topic") == "/surgery/events"
+            else PUBLIC_SNAPSHOT_QOS
+        )
     return restricted
 
 

@@ -69,16 +69,22 @@ def main() -> None:
         raise SystemExit(
             "TASKPLANNER_DEBUG_NETWORK_INTERFACE is required for Debug Mode"
         )
-    if discovery_range == "LOCALHOST":
-        # A physical-interface-only custom transport prevents Fast DDS from
-        # advertising loopback locators. Built-in transports plus the ROS
-        # discovery restriction provide the correct host-only boundary.
+    rmw_implementation = os.environ.get(
+        "RMW_IMPLEMENTATION", "rmw_cyclonedds_cpp"
+    ).strip()
+    if rmw_implementation == "rmw_cyclonedds_cpp":
+        # Fast DDS configuration must never leak into a Cyclone process. The
+        # deployment-owned CYCLONEDDS_URI pins SUBNET traffic to the wired NIC;
+        # ROS discovery range remains the authoritative LOCALHOST/SUBNET gate.
         os.environ.pop("FASTRTPS_DEFAULT_PROFILES_FILE", None)
+        if discovery_range == "LOCALHOST":
+            os.environ.pop("CYCLONEDDS_URI", None)
         print(
-            "Using built-in loopback DDS transport for LOCALHOST discovery",
+            "Using Cyclone DDS transport "
+            f"for {discovery_range} discovery on {debug_interface}",
             flush=True,
         )
-    else:
+    elif rmw_implementation == "rmw_fastrtps_cpp" and discovery_range != "LOCALHOST":
         fastdds_profile = settings_path.parent / "fastdds_udp.xml"
         try:
             write_fastdds_udp_profile(fastdds_profile, debug_interface)
@@ -88,6 +94,17 @@ def main() -> None:
         print(
             f"Bound Debug Mode Fast DDS UDP transport to {debug_interface}",
             flush=True,
+        )
+    elif rmw_implementation == "rmw_fastrtps_cpp":
+        os.environ.pop("FASTRTPS_DEFAULT_PROFILES_FILE", None)
+        print(
+            "Using built-in loopback Fast DDS transport for LOCALHOST discovery",
+            flush=True,
+        )
+    else:
+        raise SystemExit(
+            "unsupported RMW_IMPLEMENTATION for Debug Mode: "
+            f"{rmw_implementation or '<empty>'}"
         )
     if settings is not None:
         os.environ["ROS_DOMAIN_ID"] = str(settings["domain_id"])

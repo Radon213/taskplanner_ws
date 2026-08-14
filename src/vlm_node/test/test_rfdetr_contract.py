@@ -13,6 +13,7 @@ from vlm_node.real_vlm import (
 from vlm_node.rfdetr_bridge import (
     BufferedFrame,
     RFDETRBridgeNode,
+    build_contract_diagnostics,
     closest_aligned_frame,
 )
 from vlm_node.rfdetr_contract import (
@@ -32,6 +33,42 @@ def _frame(stamp: float) -> BufferedFrame:
         format="jpeg",
         data=b"image",
     )
+
+
+def test_local_diagnostics_project_to_cv_workbook_schema() -> None:
+    result = build_contract_diagnostics(
+        {
+            "decode_latency_ms": 2.5,
+            "render_encode_latency_ms": 3.5,
+            "cam4": {
+                "model": "RFDETRSmall",
+                "inference_latency_ms": 12.25,
+                "instances": [{"id": 1}, {"id": 2}],
+            },
+        },
+        cam4=_frame(12.25),
+        sequence=7,
+        source_to_output_latency_ms=22.0,
+    )
+
+    assert result["schema"] == "pnu.rfdetr_diagnostics.v2"
+    assert result["source_stamp_sec"] == 12
+    assert result["source_stamp_nanosec"] == 250_000_000
+    assert result["frame_id"] == "cam4"
+    assert result["sequence"] == 7
+    assert result["instance_count"] == 2
+    assert result["valid_pose_count"] == 0
+    assert result["error_code"] == ""
+
+
+def test_local_diagnostics_fail_closed_without_aligned_cam4() -> None:
+    result = build_contract_diagnostics(
+        {}, cam4=None, sequence=1, source_to_output_latency_ms=float("nan")
+    )
+
+    assert result["observation_id"] == ""
+    assert result["source_to_output_latency_ms"] == 0.0
+    assert result["error_code"] == "NO_ALIGNED_CAM4"
 
 
 def test_cam4_summary_contains_counts_and_request_but_no_coordinates() -> None:
