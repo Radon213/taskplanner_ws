@@ -66,11 +66,8 @@ class AdvertisedActionHandler(
     def __init__(
         self, action_name: str, action_type: str, protocol: Protocol, sleep_time: float = 0.001
     ) -> None:
-        self.goal_futures: dict[str, Future[ROSActionResultT]] = {}
-        self.goal_handles: dict[
-            str,
-            ServerGoalHandle[ROSActionGoalT, ROSActionResultT, ROSActionFeedbackT, ROSActionImplT],
-        ] = {}
+        self.goal_futures: dict[str, Future] = {}
+        self.goal_handles: dict[str, ServerGoalHandle] = {}
         self.goal_statuses: dict[str, int] = {}
 
         self.action_name = action_name
@@ -78,9 +75,7 @@ class AdvertisedActionHandler(
         self.protocol = protocol
         self.sleep_time = sleep_time
         # setup the action
-        self.action_server = ActionServer[
-            ROSActionGoalT, ROSActionResultT, ROSActionFeedbackT, ROSActionImplT
-        ](
+        self.action_server = ActionServer(
             protocol.node_handle,
             get_action_class(action_type),
             action_name,
@@ -96,9 +91,7 @@ class AdvertisedActionHandler(
 
     async def execute_callback(
         self,
-        goal: ServerGoalHandle[
-            ROSActionGoalT, ROSActionResultT, ROSActionFeedbackT, ROSActionImplT
-        ],
+        goal: ServerGoalHandle,
     ) -> ROSActionResultT:
         """
         Execute action goal.
@@ -108,7 +101,7 @@ class AdvertisedActionHandler(
         # generate a unique ID
         goal_id = f"action_goal:{self.action_name}:{self.next_id()}"
 
-        def done_callback(fut: Future[ROSActionResultT]) -> None:
+        def done_callback(fut: Future) -> None:
             if fut.cancelled():
                 goal.abort()
                 self.protocol.log("info", f"Aborted goal {goal_id}")
@@ -125,7 +118,7 @@ class AdvertisedActionHandler(
                 else:
                     goal.abort()
 
-        future: Future[ROSActionResultT] = Future()
+        future: Future = Future()
         future.add_done_callback(done_callback)
         self.goal_handles[goal_id] = goal
         self.goal_futures[goal_id] = future
@@ -153,9 +146,7 @@ class AdvertisedActionHandler(
 
     def cancel_callback(
         self,
-        goal: ServerGoalHandle[
-            ROSActionGoalT, ROSActionResultT, ROSActionFeedbackT, ROSActionImplT
-        ],
+        goal: ServerGoalHandle,
     ) -> CancelResponse:
         """
         Cancel action goal.

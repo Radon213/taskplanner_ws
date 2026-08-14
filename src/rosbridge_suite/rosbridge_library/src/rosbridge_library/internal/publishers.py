@@ -135,7 +135,7 @@ class MultiPublisher(Generic[ROSMessageT]):
         else:
             publisher_qos.depth = 1
 
-        self.publisher: Publisher[ROSMessageT] = node_handle.create_publisher(
+        self.publisher: Publisher = node_handle.create_publisher(
             msg_class, topic, qos_profile=publisher_qos
         )
 

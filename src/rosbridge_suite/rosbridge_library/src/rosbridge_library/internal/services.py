@@ -68,6 +68,7 @@ class ServiceCaller(Thread):
         success_callback: Callable[[dict], None],
         error_callback: Callable[[Exception], None],
         node_handle: Node,
+        service_type: str | None = None,
     ) -> None:
         """
         Create a service caller for the specified service.
@@ -84,6 +85,7 @@ class ServiceCaller(Thread):
         :param error_callback: A callback to call if an error occurs. The callback will be passed
             the exception that caused the failure
         :param node_handle: A ROS 2 node handle to call services
+        :param service_type: Optional service type supplied by the client to avoid a graph lookup.
         """
         Thread.__init__(self)
         self.daemon = True
@@ -93,6 +95,7 @@ class ServiceCaller(Thread):
         self.success = success_callback
         self.error = error_callback
         self.node_handle = node_handle
+        self.service_type = service_type
 
     def run(self) -> None:
         try:
@@ -103,6 +106,7 @@ class ServiceCaller(Thread):
                     self.service,
                     args=self.args,
                     server_response_timeout=self.timeout,
+                    service_type=self.service_type,
                 )
             )
         except Exception as e:
@@ -134,20 +138,22 @@ def call_service(
     args: list | dict[str, Any] | None = None,
     server_ready_timeout: float = 1.0,
     server_response_timeout: float = 5.0,
+    service_type: str | None = None,
 ) -> dict:
     # Get the fully qualified service name with remappings applied
     service = node_handle.resolve_service_name(service)
 
     # Given the service name, fetch the type and class of the service, and a request instance
-    service_names_and_types = dict(node_handle.get_service_names_and_types())
-    service_types = service_names_and_types.get(service)
-    if service_types is None:
-        raise InvalidServiceException(service)
+    if service_type is None:
+        service_names_and_types = dict(node_handle.get_service_names_and_types())
+        service_types = service_names_and_types.get(service)
+        if service_types is None:
+            raise InvalidServiceException(service)
 
-    # service_type is a tuple of types at this point; only one type is supported.
-    if len(service_types) > 1:
-        node_handle.get_logger().warning(f"More than one service type detected: {service_types}")
-    service_type = service_types[0]
+        # service_type is a tuple of types at this point; only one type is supported.
+        if len(service_types) > 1:
+            node_handle.get_logger().warning(f"More than one service type detected: {service_types}")
+        service_type = service_types[0]
 
     service_class = get_service_class(service_type)
     inst = get_service_request_instance(service_type)

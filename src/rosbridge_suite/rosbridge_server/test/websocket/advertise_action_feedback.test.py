@@ -19,10 +19,8 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
     from common import TestClientProtocol
-    from rclpy.action.client import ClientGoalHandle
     from rclpy.node import Node
     from rclpy.task import Future
-    from rclpy.type_support import FeedbackMessage
 
 log.startLogging(sys.stderr)
 
@@ -31,16 +29,16 @@ generate_test_description = common.generate_test_description
 
 class TestActionFeedback(unittest.TestCase):
     goal_result_future: Future | None
-    latest_feedback: FeedbackMessage | None
+    latest_feedback: Any | None
 
-    def goal_response_callback(self, future: Future[ClientGoalHandle]) -> None:
+    def goal_response_callback(self, future: Future) -> None:
         goal_handle = future.result()
         assert goal_handle is not None
         if not goal_handle.accepted:
             return
         self.goal_result_future = goal_handle.get_result_async()
 
-    def feedback_callback(self, msg: FeedbackMessage) -> None:
+    def feedback_callback(self, msg: Any) -> None:
         self.latest_feedback = msg
 
     @websocket_test
@@ -62,7 +60,7 @@ class TestActionFeedback(unittest.TestCase):
         )
         client.wait_for_server()
 
-        requests_future: Future[list[dict[str, Any]]]
+        requests_future: Future
         requests_future, ws_client.message_handler = expect_messages(
             1, "WebSocket", node.get_logger()
         )

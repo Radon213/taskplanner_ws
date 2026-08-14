@@ -44,9 +44,6 @@ from rosbridge_library.internal.actions import ActionClientHandler
 from rosbridge_library.internal.message_conversion import extract_values
 
 if TYPE_CHECKING:
-    from rclpy.type_support import FeedbackMessage
-
-    from rosbridge_library.internal.type_support import ROSMessage
     from rosbridge_library.protocol import Protocol
 
 
@@ -206,7 +203,7 @@ class SendActionGoal(Capability):
             outgoing_message["id"] = cid
         self.protocol.send(outgoing_message)
 
-    def _feedback(self, cid: str | None, action: str, message: FeedbackMessage[ROSMessage]) -> None:
+    def _feedback(self, cid: str | None, action: str, message: Any) -> None:
         outgoing_message = {
             "op": "action_feedback",
             "action": action,

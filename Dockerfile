@@ -34,6 +34,7 @@ RUN set -e; \
     npm \
     libportaudio2 \
     pipewire-alsa \
+    python3-autobahn \
     python3-matplotlib \
     python3-numpy \
     python3-opencv \
@@ -50,6 +51,7 @@ RUN set -e; \
     python3-yaml \
     python3-zmq \
     ros-jazzy-ament-cmake-mypy \
+    ros-jazzy-control-msgs \
     ros-jazzy-rmw-cyclonedds-cpp \
     ros-jazzy-rosbridge-suite \
     wireplumber; \

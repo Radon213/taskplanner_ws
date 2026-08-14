@@ -198,6 +198,11 @@ def msg_class_type_repr(msg_class: type[ROSMessage]) -> str:
     return f"{class_repr[0]}/{class_repr[1]}/{class_repr[3]}"
 
 
+def _is_ros_message_instance(inst: object) -> bool:
+    """Return whether an object exposes the generated ROS message interface."""
+    return callable(getattr(inst, "get_fields_and_field_types", None))
+
+
 def _from_inst(
     inst: ROSMessage | ListType | PrimitiveType | bytes, rostype: str
 ) -> dict | list | PrimitiveType | bytes | None:
@@ -232,7 +237,7 @@ def _from_inst(
         return _from_list_inst(inst, rostype)
 
     # Assume it's otherwise a full ros msg object
-    if not isinstance(inst, ROSMessage):
+    if not _is_ros_message_instance(inst):
         err_msg = f"inst is not a ROS Message, but a {type(inst)}"
         raise TypeError(err_msg)
     return _from_object_inst(inst, rostype)
@@ -343,7 +348,7 @@ def _to_inst(
     if not isinstance(msg, dict):
         err_msg = f"msg is not a dict, but a {type(msg)}"
         raise TypeError(err_msg)
-    if not isinstance(inst, ROSMessage):
+    if not _is_ros_message_instance(inst):
         err_msg = f"inst is not a ROS Message, but a {type(inst)}"
         raise TypeError(err_msg)
     return _to_object_inst(msg, rostype, roottype, clock, inst, stack)

@@ -47,6 +47,7 @@ if TYPE_CHECKING:
 class CallService(Capability):
     call_service_msg_fields = (
         (True, "service", str),
+        (False, "type", str),
         (False, "fragment_size", (int, type(None))),
         (False, "compression", str),
     )
@@ -86,6 +87,7 @@ class CallService(Capability):
 
         # Extract the args
         service: str = message["service"]
+        service_type: str | None = message.get("type")
         fragment_size: int | None = message.get("fragment_size")
         compression: str = message.get("compression", "none")
         args: list | dict[str, Any] = message.get("args", [])
@@ -128,6 +130,7 @@ class CallService(Capability):
             s_cb,
             e_cb,
             self.protocol.node_handle,
+            service_type=service_type,
         ).run()
 
     def _success(

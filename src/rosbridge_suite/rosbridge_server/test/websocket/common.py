@@ -33,7 +33,7 @@ class TestClientProtocol(WebSocketClientProtocol):
     message_handler: Callable[[Any], None]
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:  # noqa: ANN401
-        self.connected_future: Future[None] = Future()
+        self.connected_future: Future = Future()
         self.message_handler = lambda _: None
         super().__init__(*args, **kwargs)
 
@@ -188,22 +188,19 @@ def websocket_test(
     return run_test
 
 
-MsgT = TypeVar("MsgT")
-
-
 def expect_messages(
     count: int, description: str, logger: RcutilsLogger
-) -> tuple[Future[list[MsgT]], Callable[[MsgT], None]]:
+) -> tuple[Future, Callable[[Any], None]]:
     """
     Expect a specific number of messages.
 
     Convenience function to create a Future and a message handler function which gathers results
     into a list and waits for the list to have the expected number of items.
     """
-    future: Future[list[MsgT]] = Future()
-    results: list[MsgT] = []
+    future: Future = Future()
+    results: list[Any] = []
 
-    def handler(msg: MsgT) -> None:
+    def handler(msg: Any) -> None:
         logger.info(f"Received message on {description}: {msg}")  # noqa: G004
         results.append(msg)
         if len(results) == count:
