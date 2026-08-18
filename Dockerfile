@@ -1,4 +1,6 @@
 # syntax=docker/dockerfile:1.7
+FROM node:22-bookworm-slim@sha256:d649c27dae7ba0137b3cef5dd75baa422c08dc3d9e3fc0c23dfb172dc3cc6436 AS node_runtime
+
 FROM ros:jazzy-ros-base@sha256:eac11a5285beeb1e1884e71f7091c610e08452e823bfb3f43afaa334375325f6
 
 SHELL ["/bin/bash", "-c"]
@@ -31,7 +33,6 @@ RUN set -e; \
     ca-certificates \
     curl \
     git \
-    npm \
     libportaudio2 \
     pipewire-alsa \
     python3-autobahn \
@@ -56,6 +57,16 @@ RUN set -e; \
     ros-jazzy-rosbridge-suite \
     wireplumber; \
     rm -rf /var/lib/apt/lists/*
+
+# Ubuntu 24.04 ships Node 18, but the current webapp toolchain (Vite 8)
+# requires Node 20.19 or newer. Keep ROS on the Jazzy base and copy a pinned
+# Node 22 LTS runtime solely for the webapp and its build checks.
+COPY --from=node_runtime /usr/local/bin/node /usr/local/bin/node
+COPY --from=node_runtime /usr/local/lib/node_modules /usr/local/lib/node_modules
+RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
+    && ln -s ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx \
+    && ln -s ../lib/node_modules/corepack/dist/corepack.js /usr/local/bin/corepack \
+    && node --version && npm --version
 
 # Ubuntu 24.04 does not publish python3-sounddevice. Pin the small ctypes
 # wrapper while keeping PortAudio itself under apt lifecycle management.
