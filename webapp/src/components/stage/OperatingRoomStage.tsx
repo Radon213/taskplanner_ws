@@ -1,5 +1,6 @@
 import { type CSSProperties, useEffect, useMemo, useRef, useState } from "react";
-import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
+import { AnimatePresence, useReducedMotion } from "framer-motion";
+import * as m from "framer-motion/m";
 import { Hand, ScanLine } from "lucide-react";
 
 import type {
@@ -9,6 +10,7 @@ import type {
   useDigitalTwinViewModel,
 } from "../../hooks/useDigitalTwinViewModel";
 import type { PerceptionLayerHealth } from "../../hooks/useRosBridge";
+import { MOTION_DURATION, SILK_EASE } from "../../motion-system";
 import { BedRobotArmCard } from "./BedRobotArmCard";
 import {
   StageCameraToggleViewport,
@@ -267,12 +269,13 @@ function toolMoveDurationMs(
   metrics: BoardMetrics,
   reduceMotion: boolean,
 ): number {
-  if (reduceMotion || !previous) return 220;
+  if (reduceMotion) return 10;
+  if (!previous) return 200;
   const dx = ((chip.left - previous.left) / 100) * metrics.width;
   const dy = ((chip.top - previous.top) / 100) * metrics.height;
   const distance = Math.hypot(dx, dy);
-  if (distance < 2) return 260;
-  return Math.round(Math.min(980, Math.max(360, 260 + distance * 1.15)));
+  if (distance < 2) return 200;
+  return Math.round(Math.min(480, Math.max(240, 180 + distance * 0.5)));
 }
 
 function voiceAgeLabel(occurredAt: number | undefined, nowMs: number, language: "ko" | "en"): string {
@@ -478,7 +481,7 @@ export function OperatingRoomStage({
 
         <AnimatePresence initial={false}>
           {visibleInterruptAlert ? (
-            <motion.div
+            <m.div
               key={visibleInterruptAlert.phaseId}
               className="phase-interrupt-alert"
               role="status"
@@ -491,7 +494,7 @@ export function OperatingRoomStage({
               <span>{visibleInterruptAlert.title}</span>
               <strong>{visibleInterruptAlert.label}</strong>
               <p>{visibleInterruptAlert.message}</p>
-            </motion.div>
+            </m.div>
           ) : null}
         </AnimatePresence>
       </div>
@@ -539,7 +542,7 @@ export function OperatingRoomStage({
 
           <AnimatePresence>
             {vm.boardActionBubbles.filter((bubble) => !bubble.id.startsWith("surgeon-")).map((bubble) => (
-              <motion.div
+              <m.div
                 key={bubble.id}
                 className={`holder-bubble ${bubble.tone}`}
                 style={{ left: `${bubble.left}%`, top: `${bubble.top}%` }}
@@ -550,7 +553,7 @@ export function OperatingRoomStage({
               >
                 <span>{bubble.title}</span>
                 <strong>{bubble.text}</strong>
-              </motion.div>
+              </m.div>
             ))}
           </AnimatePresence>
 
@@ -567,7 +570,7 @@ export function OperatingRoomStage({
           <div className="surgical-bed-label">
             <strong>{vm.boardSurgicalBed.label}</strong>
           </div>
-          <motion.div
+          <m.div
             className="bed-phase-badge"
             key={vm.stage.phaseName}
             initial={{ opacity: 0, y: reduceMotion ? 0 : -4 }}
@@ -576,7 +579,7 @@ export function OperatingRoomStage({
           >
             <small>{vm.ui.currentPhase}</small>
             <strong>{vm.stage.phaseName}</strong>
-          </motion.div>
+          </m.div>
           <div className="surgical-bed-body" aria-hidden="true">
             <span />
           </div>
@@ -749,7 +752,7 @@ export function OperatingRoomStage({
             const previousRect = previousToolRects[chip.id];
             const moveDurationMs = toolMoveDurationMs(chip, previousRect, boardMetricsRef.current, Boolean(reduceMotion));
             return (
-              <motion.div
+              <m.div
                 key={chip.id}
                 layout
                 className="tool-chip-anchor"
@@ -768,8 +771,8 @@ export function OperatingRoomStage({
                 }
                 transition={{
                   layout: {
-                    duration: reduceMotion ? 0.12 : moveDurationMs / 1000,
-                    ease: [0.22, 1, 0.36, 1],
+                    duration: reduceMotion ? 0.01 : moveDurationMs / 1000,
+                    ease: SILK_EASE,
                   },
                 }}
                 title={chip.label}
@@ -792,13 +795,13 @@ export function OperatingRoomStage({
                     })}
                   </span>
                 ) : null}
-                <motion.article
+                <m.article
                   className={`tool-chip ${chip.layoutVariant} ${chip.displayState} ${chip.highlight} ${chip.active ? "active" : ""} ${
                     chip.contaminated ? "contaminated" : ""
                   } ${chip.compact ? "compact" : ""} ${chip.quantity > 1 ? "quantity-stack" : ""} density-${chip.density}`}
                   initial={{ opacity: 0, scale: reduceMotion ? 1 : 0.96 }}
                   animate={{ opacity: 1, scale: 1 }}
-                  transition={{ duration: reduceMotion ? 0.1 : 0.2, ease: [0.22, 1, 0.36, 1] }}
+                  transition={{ duration: reduceMotion ? 0.01 : MOTION_DURATION.normal, ease: SILK_EASE }}
                 >
                   <div className="tool-chip-header">
                     <strong>
@@ -825,8 +828,8 @@ export function OperatingRoomStage({
                       </span>
                     ))}
                   </div>
-                </motion.article>
-              </motion.div>
+                </m.article>
+              </m.div>
             );
           })}
         </div>
@@ -864,7 +867,7 @@ export function OperatingRoomStage({
                 <div className="holder-alert-stack" aria-label={`${surgeonHolder.label} alerts`}>
                   <AnimatePresence initial={false}>
                     {displayedSurgeonAlerts.map((bubble) => (
-                      <motion.div
+                      <m.div
                         key={bubble.id}
                         layout
                         className="holder-embedded-bubble"
@@ -872,7 +875,7 @@ export function OperatingRoomStage({
                         animate={{ opacity: 1, y: 0 }}
                         exit={{ opacity: 0, y: reduceMotion ? 0 : -4, scale: reduceMotion ? 1 : 0.98 }}
                         transition={{
-                          layout: { duration: reduceMotion ? 0.1 : 0.22, ease: [0.22, 1, 0.36, 1] },
+                          layout: { duration: reduceMotion ? 0.01 : MOTION_DURATION.normal, ease: SILK_EASE },
                           opacity: { duration: reduceMotion ? 0.1 : 0.16 },
                           y: { duration: reduceMotion ? 0.1 : 0.18 },
                           scale: { duration: reduceMotion ? 0.1 : 0.18 },
@@ -883,7 +886,7 @@ export function OperatingRoomStage({
                           {bubble.occurredAt ? <time>{voiceAgeLabel(bubble.occurredAt, nowMs, vm.language)}</time> : null}
                         </span>
                         <strong>{bubble.text}</strong>
-                      </motion.div>
+                      </m.div>
                     ))}
                   </AnimatePresence>
                 </div>

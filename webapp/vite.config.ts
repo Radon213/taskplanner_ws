@@ -27,14 +27,19 @@ function runtimeControlProxy() {
 export default defineConfig({
   plugins: [react()],
   build: {
+    manifest: true,
+    chunkSizeWarningLimit: 650,
     rollupOptions: {
       output: {
-        manualChunks: {
-          "react-vendor": ["react", "react-dom"],
-          "motion-vendor": ["framer-motion"],
-          "ros-vendor": ["roslib"],
-          "icons-vendor": ["lucide-react"],
-          "three-vendor": ["three", "three/addons/loaders/GLTFLoader.js"],
+        manualChunks(id: string) {
+          if (!id.includes("/node_modules/")) return undefined;
+          if (/\/(react|react-dom|scheduler)\//.test(id)) return "react-vendor";
+          if (/\/(roslib|socket\.io|socket\.io-client|engine\.io|engine\.io-client|ws)\//.test(id)) {
+            return "ros-vendor";
+          }
+          if (id.includes("/lucide-react/")) return "icons-vendor";
+          if (id.includes("/three/")) return "three-vendor";
+          return undefined;
         },
       },
     },

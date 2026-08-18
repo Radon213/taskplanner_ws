@@ -1,4 +1,5 @@
-import { AnimatePresence, motion } from "framer-motion";
+import { AnimatePresence } from "framer-motion";
+import * as m from "framer-motion/m";
 import {
   Film,
   Gauge,
@@ -15,6 +16,7 @@ import type {
   ShadowReplayMode,
 } from "../../hooks/useRosBridge";
 import { type Language } from "../../utils/display";
+import { MOTION_DURATION, SILK_EASE } from "../../motion-system";
 import {
   PublicSurgeonGestureStatus,
   type PublicSurgeonGesture,
@@ -266,7 +268,7 @@ export function ShadowReplayDock({
         <div className="llm-speech-log-list" aria-live="polite">
           <AnimatePresence initial={false}>
             {transcript.map((item) => (
-              <motion.article
+              <m.article
                 key={item.utterance_id}
                 className="llm-speech-log-item shadow-transcript-item"
                 layout
@@ -274,9 +276,9 @@ export function ShadowReplayDock({
                 animate={{ opacity: 1, x: 0 }}
                 exit={{ opacity: 0, x: 8 }}
                 transition={{
-                  opacity: { duration: 0.18 },
-                  x: { duration: 0.22 },
-                  layout: { duration: 0.24, ease: [0.22, 1, 0.36, 1] },
+                  opacity: { duration: MOTION_DURATION.normal },
+                  x: { duration: MOTION_DURATION.normal, ease: SILK_EASE },
+                  layout: { duration: MOTION_DURATION.moderate, ease: SILK_EASE },
                 }}
                 data-latest={
                   item.utterance_id === latestTranscript ? "true" : "false"
@@ -287,7 +289,7 @@ export function ShadowReplayDock({
                   <strong>{item.text}</strong>
                   <small>{item.speaker_role || "surgeon"}</small>
                 </div>
-              </motion.article>
+              </m.article>
             ))}
           </AnimatePresence>
           {transcript.length === 0 ? (

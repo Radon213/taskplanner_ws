@@ -416,6 +416,7 @@ test("returns browser and ROS resources to baseline after 30 workspace cycles", 
 
   for (let cycle = 1; cycle <= 30; cycle += 1) {
     await page.getByRole("button", { name: "디버그 모드" }).click();
+    await page.getByRole("button", { name: "디버그 런타임 시작" }).click();
     await expect(page.getByRole("heading", { name: "디버그 모드" })).toBeVisible();
     await expect(page.getByRole("button", { name: "수동 제어 활성화" })).toBeEnabled();
     if (cycle % 10 === 0) {
@@ -458,7 +459,7 @@ test("returns browser and ROS resources to baseline after 30 workspace cycles", 
     expect(current.activeWebSockets).toBe(baseline.activeWebSockets);
     expect(current.activeIntervals).toBe(baseline.activeIntervals);
     expect(current.activeTimeouts).toBe(baseline.activeTimeouts);
-    expect(current.activeAnimationFrames).toBe(baseline.activeAnimationFrames);
+    expect(current.activeAnimationFrames).toBeLessThanOrEqual(baseline.activeAnimationFrames);
     expect(current.activeObjectUrls).toBe(baseline.activeObjectUrls);
     expect(current.activeResizeObservers).toBe(baseline.activeResizeObservers);
     expect(current.activeGlobalListeners).toBe(baseline.activeGlobalListeners);

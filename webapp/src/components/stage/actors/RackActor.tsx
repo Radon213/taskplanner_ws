@@ -1,5 +1,6 @@
-import { motion } from "framer-motion";
+import * as m from "framer-motion/m";
 
+import { silk } from "../../../motion-system";
 import type { LayoutEntity } from "../../../types";
 import { entityStyle } from "../../../utils/stageGeometry";
 
@@ -12,11 +13,10 @@ export function RackActor({ entity, slotCount }: { entity: LayoutEntity; slotCou
       data-layout-type={entity.type}
       aria-label="Instrument rack"
     >
-      <motion.div
+      <m.div
         className="stage-actor-motion"
-        initial={{ opacity: 0, x: -14 }}
-        animate={{ opacity: 1, x: 0 }}
-        transition={{ duration: 0.36 }}
+        initial={silk.entrance.initial}
+        animate={silk.entrance.animate}
       >
         <div className="rack-shell">
           <div className="rack-title">{entity.label}</div>
@@ -26,7 +26,7 @@ export function RackActor({ entity, slotCount }: { entity: LayoutEntity; slotCou
             ))}
           </div>
         </div>
-      </motion.div>
+      </m.div>
     </div>
   );
 }

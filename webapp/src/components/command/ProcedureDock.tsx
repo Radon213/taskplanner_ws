@@ -1,11 +1,17 @@
+import { useState } from "react";
+import { AnimatePresence, useReducedMotion } from "framer-motion";
+import * as m from "framer-motion/m";
 import { GitBranch, Pause, Play, RadioTower, RotateCcw, Square, Wifi } from "lucide-react";
 
+import { SafetyConfirmationDialog } from "../common/SafetyConfirmationDialog";
 import type { ControlCommand } from "../../hooks/useRosBridge";
 import type { useDigitalTwinViewModel } from "../../hooks/useDigitalTwinViewModel";
 import type { RuntimeTransitionStatus } from "../../hooks/useRuntimeControl";
+import { shimmer, statusSwap } from "../../motion-system";
 import type { TaskplannerRuntimeMode } from "../../runtimeModes";
 
 type ViewModel = ReturnType<typeof useDigitalTwinViewModel>;
+type MissionRuntimeMode = Exclude<TaskplannerRuntimeMode, "debug">;
 
 export function ProcedureDock({
   vm,
@@ -50,6 +56,8 @@ export function ProcedureDock({
   canPauseResume: boolean;
   onControl: (command: ControlCommand) => void;
 }) {
+  const [resetConfirmationOpen, setResetConfirmationOpen] = useState(false);
+  const reducedMotion = useReducedMotion();
   const runtimeSwitchPending = runtimeTransition.phase === "starting";
   const startInFlight = executionState === "starting" || actionPending.toLowerCase().includes("starting");
   const commandBusy = Boolean(actionPending);
@@ -60,7 +68,9 @@ export function ProcedureDock({
   const startDisabled = disabled || commandBusy || !runtimeReady || isRunning || startInFlight;
   const pauseResumeDisabled =
     disabled || commandBusy || startInFlight || !canPauseResume;
-  const interruptDisabled = disabled || (commandBusy && !startInFlight);
+  const resetDisabled = disabled || commandBusy || startInFlight;
+  const stopDisabled =
+    !connected || runtimeSwitchPending || (!isRunning && !isPaused && !startInFlight && !commandBusy);
   const statusMessage = vm.runtime.statusMessage;
   const trimmedActionMessage = actionMessage.trim();
   const shouldShowActionMessage =
@@ -75,7 +85,7 @@ export function ProcedureDock({
         ? "pending"
         : "normal";
   const runtimeModeOptions: Array<{
-    id: TaskplannerRuntimeMode;
+    id: MissionRuntimeMode;
     label: string;
     detail: string;
   }> =
@@ -84,13 +94,11 @@ export function ProcedureDock({
           { id: "live", label: "실제 통합 모드", detail: "실시간 로봇 · 영상 · 음성" },
           { id: "llm", label: "LLM 집도의 모드", detail: "LLM 기반 검증 시뮬레이션" },
           { id: "shadow", label: "리플레이 (Shadow) 모드", detail: "기록 영상 재생 및 평가" },
-          { id: "debug", label: "디버그 모드", detail: "시나리오 없이 입출력·조그 검증" },
         ]
       : [
           { id: "live", label: "Live integration", detail: "Live robot, vision, and speech" },
           { id: "llm", label: "LLM surgeon", detail: "LLM-driven validation simulation" },
           { id: "shadow", label: "Replay (Shadow)", detail: "Recorded replay and evaluation" },
-          { id: "debug", label: "Debug Mode", detail: "Scenario-free I/O and jog validation" },
         ];
   const displayedRuntimeMode = runtimeSwitchPending
     ? runtimeTransition.requestedMode ?? runtimeMode
@@ -137,21 +145,53 @@ export function ProcedureDock({
         : noActiveRuntime
           ? "error"
         : "";
+  const operationBusy = runtimeSwitchPending || commandBusy;
+  const operationLabel = runtimeSwitchPending
+    ? vm.language === "ko" ? "런타임을 안전하게 전환하는 중" : "Switching runtime safely"
+    : vm.language === "ko" ? "제어 요청 결과를 확인하는 중" : "Waiting for control result";
 
   return (
-    <aside className="dock procedure-dock" data-slot="procedure-dock">
-      <div className="dock-header">
-        <div>
-          <p className="section-kicker">{vm.ui.currentState}</p>
-          <h2>{vm.runtime.stateLabel}</h2>
-          {statusMessage ? <span className="dock-inline-status">{statusMessage}</span> : null}
+    <>
+      <aside
+        aria-busy={operationBusy}
+        className="dock procedure-dock"
+        data-slot="procedure-dock"
+        id="mission-controls"
+      >
+        <div className="dock-header">
+          <div>
+            <p className="section-kicker">{vm.ui.currentState}</p>
+            <h2>{vm.runtime.stateLabel}</h2>
+            {statusMessage ? <span className="dock-inline-status">{statusMessage}</span> : null}
+          </div>
+          <GitBranch aria-hidden="true" size={18} />
         </div>
-        <GitBranch size={18} />
-      </div>
 
       {shouldShowActionMessage ? (
-        <div className={["dock-action-message", actionMessageTone].join(" ")}>{trimmedActionMessage}</div>
+        <div className={["dock-action-message", actionMessageTone].join(" ")}>
+          {trimmedActionMessage}
+        </div>
       ) : null}
+
+      <AnimatePresence initial={false}>
+        {operationBusy ? (
+          <m.div
+            {...statusSwap}
+            aria-label={operationLabel}
+            aria-valuetext={operationLabel}
+            className="operation-progress"
+            key="operation-progress"
+            role="progressbar"
+          >
+            <m.span
+              animate={reducedMotion ? undefined : shimmer.animate}
+              aria-hidden="true"
+              className="operation-progress-bar"
+              transition={reducedMotion ? undefined : shimmer.transition}
+            />
+          </m.div>
+        ) : null}
+      </AnimatePresence>
 
       <div className="control-stack">
         <label className="field">
@@ -162,7 +202,7 @@ export function ProcedureDock({
               value={displayedRuntimeMode}
               aria-describedby={runtimeModeLocked ? "runtime-mode-lock-note" : undefined}
               disabled={runtimeModeLocked}
-              onChange={(event) => void onRuntimeModeChange(event.target.value as TaskplannerRuntimeMode)}
+              onChange={(event) => void onRuntimeModeChange(event.target.value as MissionRuntimeMode)}
             >
               {runtimeModeOptions.map((option) => (
                 <option value={option.id} key={option.id}>
@@ -250,9 +290,9 @@ export function ProcedureDock({
         </label>
       </div>
 
-      <div className="transport-controls" aria-label={vm.ui.control}>
+        <div className="transport-controls" aria-label={vm.ui.control}>
         <button className="button button-primary" disabled={startDisabled} onClick={() => onControl("start")} type="button">
-          <Play size={17} />
+          <Play aria-hidden="true" size={17} />
           {runtimeReady ? vm.ui.start : vm.ui.preparing}
         </button>
         <button
@@ -261,19 +301,37 @@ export function ProcedureDock({
           onClick={() => onControl(isPaused ? "resume" : "pause")}
           type="button"
         >
-          {isPaused ? <Play size={17} /> : <Pause size={17} />}
+          {isPaused ? <Play aria-hidden="true" size={17} /> : <Pause aria-hidden="true" size={17} />}
           {isPaused ? vm.ui.resume : vm.ui.pause}
         </button>
-        <button className="button button-secondary" disabled={interruptDisabled} onClick={() => onControl("reset")} type="button">
-          <RotateCcw size={17} />
+        <button className="button button-secondary" disabled={resetDisabled} onClick={() => setResetConfirmationOpen(true)} type="button">
+          <RotateCcw aria-hidden="true" size={17} />
           {vm.ui.reset}
         </button>
-        <button className="button button-quiet" disabled={interruptDisabled} onClick={() => onControl("stop")} type="button">
-          <Square size={16} />
+        <button className="button button-stop" disabled={stopDisabled} onClick={() => onControl("stop")} type="button">
+          <Square aria-hidden="true" size={16} />
           {vm.ui.stop}
         </button>
-      </div>
-
-    </aside>
+        </div>
+      </aside>
+      <SafetyConfirmationDialog
+        closeLabel={vm.language === "ko" ? "닫기" : "Close"}
+        confirmLabel={vm.language === "ko" ? "실행 상태 초기화" : "Reset run state"}
+        description={
+          vm.language === "ko"
+            ? "현재 실행 진행 상태를 지우고 선택한 시작 단계의 초기 상태로 되돌립니다. 이 작업은 되돌릴 수 없습니다."
+            : "Clear the current run progress and return to the initial state for the selected start phase. This cannot be undone."
+        }
+        note={
+          vm.language === "ko"
+            ? "즉시 정지가 필요하면 이 창을 닫고 ‘정지’를 사용하세요. 정지는 확인 없이 바로 요청됩니다."
+            : "For an immediate halt, close this dialog and use Stop. Stop is requested without confirmation."
+        }
+        onClose={() => setResetConfirmationOpen(false)}
+        onConfirm={() => onControl("reset")}
+        open={resetConfirmationOpen}
+        title={vm.language === "ko" ? "실행 상태를 초기화할까요?" : "Reset the run state?"}
+      />
+    </>
   );
 }

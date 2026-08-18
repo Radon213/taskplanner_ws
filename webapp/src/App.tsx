@@ -10,8 +10,10 @@ import {
   type ErrorInfo,
   type ReactNode,
 } from "react";
-import { motion } from "framer-motion";
+import { useReducedMotion } from "framer-motion";
+import * as m from "framer-motion/m";
 
+import { ControlAuthorityStrip } from "./components/command/ControlAuthorityStrip";
 import { ProcedureDock } from "./components/command/ProcedureDock";
 import { LiveAsrPanel } from "./components/command/LiveAsrPanel";
 import {
@@ -33,6 +35,7 @@ import {
   type TaskplannerRuntimeMode,
 } from "./runtimeModes";
 import { type Language } from "./utils/display";
+import { shimmer } from "./motion-system";
 
 type PrimaryWorkspace = "mission" | "multicam";
 type MissionRuntimeMode = Exclude<TaskplannerRuntimeMode, "debug">;
@@ -65,9 +68,11 @@ function WorkspaceLoading({
   onRetry?: () => void;
   retryLabel?: string;
 }) {
+  const reduceMotion = useReducedMotion();
+  const shimmerMotion = reduceMotion ? {} : shimmer;
   return (
     <div className="app-shell" data-slot="workspace-loading-state">
-      <main aria-busy={!error} aria-live="polite" className="debug-main">
+      <main aria-busy={!error} aria-live="polite" className="debug-main" id="workspace-loading-main">
         <section className="debug-feedback-card debug-loading-card" role={error ? "alert" : "status"}>
           {error ? (
             <div className="runtime-transition-feedback error">
@@ -80,9 +85,9 @@ function WorkspaceLoading({
             </div>
           ) : (
             <>
-              <div className="debug-skeleton-title" />
-              <div className="debug-skeleton-row" />
-              <div className="debug-skeleton-row short" />
+              <m.div className="debug-skeleton-title" {...shimmerMotion} />
+              <m.div className="debug-skeleton-row" {...shimmerMotion} />
+              <m.div className="debug-skeleton-row short" {...shimmerMotion} />
               <span className="sr-only">{label}</span>
             </>
           )}
@@ -380,7 +385,10 @@ function MissionWorkspace({
     controlStartInFlight ||
     Boolean(ros.actionPending);
   return (
-    <div className="app-shell">
+    <div className="app-shell mission-app-shell" data-slot="mission-workspace">
+      <a className="skip-link" href="#mission-main">
+        {language === "ko" ? "미션 본문으로 이동" : "Skip to mission content"}
+      </a>
       <StatusRibbon
         vm={vm}
         connected={ros.connected}
@@ -400,13 +408,31 @@ function MissionWorkspace({
         onMulticamOps={onMulticamOps}
       />
 
-      <motion.main
+      <main
         className={`mission-layout ${runtimeMode === "live" ? "live-stage-expanded" : ""}`}
-        initial={{ opacity: 0, y: 16 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ duration: 0.38, ease: [0.22, 1, 0.36, 1] }}
+        id="mission-main"
+        tabIndex={-1}
       >
-        <div className="stage-area">
+        <div className="authority-area">
+          <ControlAuthorityStrip
+            language={language}
+            connected={ros.connected}
+            procedure={vm.stage.procedureLabel}
+            phase={vm.stage.phaseName}
+            runtimeState={vm.runtime.stateLabel}
+            vlmHealth={ros.vlmHealth}
+            worldState={ros.worldState}
+            btDecision={ros.btDecision}
+            skillStatus={ros.skillStatus}
+          />
+        </div>
+
+        <div
+          aria-label={language === "ko" ? "수술실 디지털 트윈 상세 보기" : "Operating room digital twin detail"}
+          className="stage-area"
+          role="region"
+          tabIndex={0}
+        >
           <OperatingRoomStage
             vm={vm}
             cameraFrames={{
@@ -555,7 +581,7 @@ function MissionWorkspace({
             variant="timeline"
           />
         </div>
-      </motion.main>
+      </main>
     </div>
   );
 }

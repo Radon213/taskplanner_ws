@@ -1,4 +1,6 @@
 import { memo, useEffect, useMemo, useRef, useState, type PointerEvent } from "react";
+import { LayoutGroup } from "framer-motion";
+import * as m from "framer-motion/m";
 import * as THREE from "three";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import {
@@ -34,6 +36,7 @@ import {
   type WorldAnchorStatus,
   useMulticamOpsBridge,
 } from "../../hooks/useMulticamOpsBridge";
+import { silk } from "../../motion-system";
 
 type Language = "ko" | "en";
 type DepthPresentation = "visualized" | "raw";
@@ -933,6 +936,9 @@ export function MulticamOpsWorkspace({ language, onExit }: { language: Language;
 
   return (
     <div className="app-shell ops-app-shell" data-slot="multicam-ops-workspace">
+      <a className="skip-link" href="#multicam-main">
+        {language === "ko" ? "멀티캠 본문으로 이동" : "Skip to multicamera content"}
+      </a>
       <header className="ops-header">
         <div className="ops-brand"><button className="ops-back-button" onClick={onExit} type="button"><ArrowLeft size={18} />{language === "ko" ? "미션 화면" : "Mission"}</button><div><p>ARPA MULTICAM · ROS 2 OPERATIONS</p><h1>멀티캠 관제 콘솔</h1><span>동기화 영상, 고정 TF, Capture 상태 및 World Anchor를 하나의 ROSBridge 세션에서 확인합니다.</span></div></div>
         <div className="ops-connection"><div className="ops-observer-signals" aria-label="멀티캠 observer 상태"><div className={`ops-connection-state ${bridge.socketConnected ? "ok" : "warn"}`}><Radio size={16} /><span>Transport {bridge.socketConnected ? "연결" : "대기"}</span></div><div className={`ops-connection-state ${bridge.captureTopicDiscovered ? "ok" : "warn"}`}><Activity size={16} /><span>Graph topic {bridge.captureTopicDiscovered ? "발견" : "미발견"}</span></div><div className={`ops-connection-state ${bridge.captureStatusFresh ? "ok" : "warn"}`}><Gauge size={16} /><span>CaptureStatus {bridge.captureStatusFresh ? "fresh" : bridge.captureStatus ? "stale" : "대기"}</span></div></div><div className="ops-observer-endpoint"><code title={bridge.url}>{bridge.url}</code><button className="ops-icon-button" onClick={bridge.retry} type="button" title="멀티캠 observer 재연결" aria-label="멀티캠 observer 재연결"><RefreshCw size={16} /></button></div><small aria-live="polite">{bridge.connectionMessage} · {view} frame fresh {freshFrameCount}/{view === "color" ? 5 : 4}</small></div>
@@ -940,11 +946,68 @@ export function MulticamOpsWorkspace({ language, onExit }: { language: Language;
 
       {!bridge.connected ? <p className="ops-disconnected-banner"><CircleAlert size={16} />전용 멀티캠 observer가 ready 상태가 아닙니다. 실행 중인 모드는 유지되며, fresh CaptureStatus 확인 전에는 관측 내용을 신뢰하지 않습니다.</p> : null}
 
-      <main className="ops-layout">
+      <main className="ops-layout" id="multicam-main" tabIndex={-1}>
         <section className="ops-card ops-preview-card" aria-labelledby="ops-preview-heading">
           <header className="ops-card-heading">
             <div><p>SYNCED PREVIEW</p><h2 id="ops-preview-heading">주요 동기화 뷰</h2><span>{view === "color" ? "5개 /synced color stream · 토픽 수신 프레임을 원본 그대로 표시" : depthPresentation === "visualized" ? "D455 4대의 /synced compressedDepth stream · 원본 거리값을 화면 대비로만 가시화" : "D455 4대의 /synced compressedDepth stream · 토픽 원본 PNG 표시 · FLIR은 depth 센서가 없습니다."}</span></div>
-            <div className="ops-preview-actions"><div className="ops-segmented" role="tablist" aria-label="영상 유형"><button aria-selected={view === "color"} className={view === "color" ? "active" : ""} onClick={() => setView("color")} role="tab" type="button"><Eye size={15} />Color</button><button aria-selected={view === "depth"} className={view === "depth" ? "active" : ""} onClick={() => setView("depth")} role="tab" type="button"><Box size={15} />Depth</button></div>{view === "depth" ? <div className="ops-segmented ops-depth-presentation" aria-label="Depth 표시 방식" role="group"><button aria-pressed={depthPresentation === "visualized"} className={depthPresentation === "visualized" ? "active" : ""} onClick={() => setDepthPresentation("visualized")} type="button">가시화</button><button aria-pressed={depthPresentation === "raw"} className={depthPresentation === "raw" ? "active" : ""} onClick={() => setDepthPresentation("raw")} type="button">원본 PNG</button></div> : null}</div>
+            <div className="ops-preview-actions">
+              <LayoutGroup id="multicam-view-tabs">
+                <div className="ops-segmented" role="tablist" aria-label="영상 유형">
+                  {(["color", "depth"] as const).map((option) => {
+                    const active = view === option;
+                    const Icon = option === "color" ? Eye : Box;
+                    return (
+                      <button
+                        aria-selected={active}
+                        className={active ? "active" : ""}
+                        key={option}
+                        onClick={() => setView(option)}
+                        role="tab"
+                        type="button"
+                      >
+                        {active ? (
+                          <m.span
+                            aria-hidden="true"
+                            className="ops-segment-focus"
+                            layoutId="multicam-active-view"
+                            transition={silk.layout.transition}
+                          />
+                        ) : null}
+                        <span className="ops-segment-label"><Icon size={15} />{option === "color" ? "Color" : "Depth"}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </LayoutGroup>
+              {view === "depth" ? (
+                <LayoutGroup id="multicam-depth-presentation">
+                  <div className="ops-segmented ops-depth-presentation" aria-label="Depth 표시 방식" role="group">
+                    {(["visualized", "raw"] as const).map((option) => {
+                      const active = depthPresentation === option;
+                      return (
+                        <button
+                          aria-pressed={active}
+                          className={active ? "active" : ""}
+                          key={option}
+                          onClick={() => setDepthPresentation(option)}
+                          type="button"
+                        >
+                          {active ? (
+                            <m.span
+                              aria-hidden="true"
+                              className="ops-segment-focus"
+                              layoutId="multicam-active-depth-presentation"
+                              transition={silk.layout.transition}
+                            />
+                          ) : null}
+                          <span className="ops-segment-label">{option === "visualized" ? "가시화" : "원본 PNG"}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </LayoutGroup>
+              ) : null}
+            </div>
           </header>
           <CameraGrid captureStatus={bridge.captureStatus} depthPresentation={depthPresentation} frames={activeFrames} now={now} view={view} />
         </section>

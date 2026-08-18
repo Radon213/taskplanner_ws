@@ -1,5 +1,6 @@
-import { motion } from "framer-motion";
+import * as m from "framer-motion/m";
 
+import { silk } from "../../../motion-system";
 import type { LayoutEntity } from "../../../types";
 import { entityStyle } from "../../../utils/stageGeometry";
 
@@ -12,11 +13,10 @@ export function MayoStandActor({ entity }: { entity: LayoutEntity }) {
       data-layout-type={entity.type}
       aria-label="Mayo stand"
     >
-      <motion.div
+      <m.div
         className="stage-actor-motion"
-        initial={{ opacity: 0, y: 12 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ duration: 0.34 }}
+        initial={silk.entrance.initial}
+        animate={silk.entrance.animate}
       >
         <div className="mayo-table">
           <div className="mayo-zone recovery">Recovery</div>
@@ -24,7 +24,7 @@ export function MayoStandActor({ entity }: { entity: LayoutEntity }) {
         </div>
         <div className="mayo-leg left" />
         <div className="mayo-leg right" />
-      </motion.div>
+      </m.div>
     </div>
   );
 }

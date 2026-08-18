@@ -1,5 +1,7 @@
-import { AnimatePresence, motion } from "framer-motion";
+import { AnimatePresence } from "framer-motion";
+import * as m from "framer-motion/m";
 
+import { silk, statusSwap } from "../../../motion-system";
 import type { LayoutEntity } from "../../../types";
 import { entityStyle } from "../../../utils/stageGeometry";
 
@@ -22,23 +24,19 @@ export function SurgeonActor({
       data-layout-type={entity.type}
       aria-label="Lead surgeon"
     >
-      <motion.div
+      <m.div
         className="stage-actor-motion"
-        initial={{ opacity: 0, y: 12 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ duration: 0.42, ease: [0.22, 1, 0.36, 1] }}
+        initial={silk.entrance.initial}
+        animate={silk.entrance.animate}
       >
         <AnimatePresence>
           {intentBubble ? (
-            <motion.div
+            <m.div
               className="intent-bubble"
-              initial={{ opacity: 0, y: 8, scale: 0.96 }}
-              animate={{ opacity: 1, y: 0, scale: 1 }}
-              exit={{ opacity: 0, y: 6, scale: 0.96 }}
-              transition={{ duration: 0.26 }}
+              {...statusSwap}
             >
               {intentBubble}
-            </motion.div>
+            </m.div>
           ) : null}
         </AnimatePresence>
         <div className="actor-shadow warm" />
@@ -52,7 +50,7 @@ export function SurgeonActor({
           <div className="surgeon-arm right" />
         </div>
         <div className="actor-label">{label}</div>
-      </motion.div>
+      </m.div>
     </div>
   );
 }

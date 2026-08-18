@@ -1,5 +1,6 @@
-import { motion } from "framer-motion";
+import * as m from "framer-motion/m";
 
+import { silk } from "../../../motion-system";
 import type { LayoutEntity } from "../../../types";
 import { entityStyle } from "../../../utils/stageGeometry";
 
@@ -12,11 +13,10 @@ export function HumanoidActor({ entity, active, label }: { entity: LayoutEntity;
       data-layout-type={entity.type}
       aria-label="Humanoid assistant"
     >
-      <motion.div
+      <m.div
         className="stage-actor-motion"
-        initial={{ opacity: 0, y: 12 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ duration: 0.42, ease: [0.22, 1, 0.36, 1] }}
+        initial={silk.entrance.initial}
+        animate={silk.entrance.animate}
       >
         <div className="actor-shadow" />
         <div className="robot-figure">
@@ -33,7 +33,7 @@ export function HumanoidActor({ entity, active, label }: { entity: LayoutEntity;
           <div className="robot-leg right" />
         </div>
         <div className="actor-label">{label}</div>
-      </motion.div>
+      </m.div>
     </div>
   );
 }

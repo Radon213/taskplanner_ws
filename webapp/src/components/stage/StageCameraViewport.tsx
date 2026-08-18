@@ -169,7 +169,7 @@ export function StageCameraToggleViewport({
               aria-pressed={resolvedCamera === cameraId}
               onClick={() => setActiveCamera(cameraId)}
             >
-              {cameraId.toUpperCase()}
+              <span>{cameraId.toUpperCase()}</span>
             </button>
           ))}
         </div>
