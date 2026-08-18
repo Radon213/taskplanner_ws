@@ -1,6 +1,8 @@
-import { motion, useReducedMotion } from "framer-motion";
+import { useReducedMotion } from "framer-motion";
+import * as m from "framer-motion/m";
 
 import type { StageTool } from "../../hooks/useDigitalTwinViewModel";
+import { MOTION_DURATION, SILK_EASE } from "../../motion-system";
 import { scenePointStyle } from "../../utils/stageGeometry";
 
 export function ToolToken({ tool }: { tool: StageTool }) {
@@ -13,27 +15,25 @@ export function ToolToken({ tool }: { tool: StageTool }) {
       data-tool-id={tool.id}
       title={`${tool.label} · ${tool.lifecycle}`}
     >
-      <motion.div
+      <m.div
         className={`tool-token ${tool.tone}${tool.active ? " active" : ""}${tool.contaminated ? " contaminated" : ""}${
           tool.compact ? " compact" : ""
         }`}
-        initial={{ opacity: 0, scale: 0.84 }}
-        animate={{ opacity: 1, scale: tool.active ? 1.16 : 1 }}
-        exit={{ opacity: 0, scale: 0.82 }}
+        initial={{ opacity: 0, scale: 0.94 }}
+        animate={{ opacity: 1, scale: tool.active ? 1.06 : 1 }}
+        exit={{ opacity: 0, scale: 0.96 }}
         transition={
           reduceMotion
-            ? { duration: 0.12 }
+            ? { duration: MOTION_DURATION.instant }
             : {
-                type: "spring",
-                stiffness: 260,
-                damping: 28,
-                mass: 0.8,
+                duration: MOTION_DURATION.moderate,
+                ease: SILK_EASE,
               }
         }
       >
         <span className="tool-token-core">{tool.shortLabel}</span>
         {!tool.compact && <span className="tool-token-label">{tool.lifecycle}</span>}
-      </motion.div>
+      </m.div>
     </div>
   );
 }

@@ -1,5 +1,6 @@
-import { motion } from "framer-motion";
+import * as m from "framer-motion/m";
 
+import { silk } from "../../../motion-system";
 import type { LayoutEntity } from "../../../types";
 import { entityStyle } from "../../../utils/stageGeometry";
 
@@ -22,11 +23,10 @@ export function CleanerActor({
       data-layout-type={entity.type}
       aria-label="Cleaner station"
     >
-      <motion.div
+      <m.div
         className="stage-actor-motion"
-        initial={{ opacity: 0, x: -12 }}
-        animate={{ opacity: 1, x: 0 }}
-        transition={{ duration: 0.34 }}
+        initial={silk.entrance.initial}
+        animate={silk.entrance.animate}
       >
         <div className="cleaner-halo" />
         <div className="cleaner-unit">
@@ -35,7 +35,7 @@ export function CleanerActor({
           </div>
           <div className="cleaner-label">{label}</div>
         </div>
-      </motion.div>
+      </m.div>
     </div>
   );
 }

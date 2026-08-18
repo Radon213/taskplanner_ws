@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import { AnimatePresence, motion } from "framer-motion";
+import { AnimatePresence } from "framer-motion";
+import * as m from "framer-motion/m";
 import { BrainCircuit, Clock3, MessageSquareText, Power, PowerOff, UserRound } from "lucide-react";
 
 import { ProviderModelSelect } from "./ProviderModelSelect";
@@ -15,6 +16,7 @@ import type {
   ModelSelection,
   SurgeonLLMDecision,
 } from "../../types";
+import { MOTION_DURATION, SILK_EASE } from "../../motion-system";
 import { type Language } from "../../utils/display";
 
 type ViewModel = ReturnType<typeof useDigitalTwinViewModel>;
@@ -246,7 +248,7 @@ export function SurgeonIntentDock({
         <div className="llm-speech-log-list" aria-live="polite" ref={speechLogListRef}>
           <AnimatePresence initial={false}>
             {speechLog.map((item, index) => (
-              <motion.article
+              <m.article
                 key={item.id}
                 className="llm-speech-log-item"
                 layout
@@ -254,10 +256,10 @@ export function SurgeonIntentDock({
                 animate={{ opacity: 1, y: 0, scale: 1 }}
                 exit={{ opacity: 0, y: 8, scale: 0.98 }}
                 transition={{
-                  opacity: { duration: 0.18 },
-                  y: { duration: 0.22 },
-                  scale: { duration: 0.22 },
-                  layout: { duration: 0.24, ease: [0.22, 1, 0.36, 1] },
+                  opacity: { duration: MOTION_DURATION.normal },
+                  y: { duration: MOTION_DURATION.normal, ease: SILK_EASE },
+                  scale: { duration: MOTION_DURATION.normal, ease: SILK_EASE },
+                  layout: { duration: MOTION_DURATION.moderate, ease: SILK_EASE },
                 }}
                 data-latest={index === 0 ? "true" : "false"}
               >
@@ -269,7 +271,7 @@ export function SurgeonIntentDock({
                     {item.tool ? ` · ${vm.displayToolName(item.tool)}` : ""}
                   </small>
                 </div>
-              </motion.article>
+              </m.article>
             ))}
           </AnimatePresence>
           {speechLog.length === 0 ? (

@@ -1,4 +1,8 @@
-import { useEffect, useMemo, useRef, useState, type PointerEvent } from "react";
+import { memo, useEffect, useMemo, useRef, useState, type PointerEvent } from "react";
+import { LayoutGroup } from "framer-motion";
+import * as m from "framer-motion/m";
+import * as THREE from "three";
+import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import {
   Activity,
   ArrowLeft,
@@ -10,7 +14,6 @@ import {
   Eye,
   Gauge,
   LoaderCircle,
-  Network,
   Play,
   Radio,
   RefreshCw,
@@ -33,6 +36,7 @@ import {
   type WorldAnchorStatus,
   useMulticamOpsBridge,
 } from "../../hooks/useMulticamOpsBridge";
+import { silk } from "../../motion-system";
 
 type Language = "ko" | "en";
 type DepthPresentation = "visualized" | "raw";
@@ -48,11 +52,13 @@ type Vec3 = { x: number; y: number; z: number };
 type Quaternion = { x: number; y: number; z: number; w: number };
 type TfPointerDrag = { id: number; x: number; y: number; mode: "orbit" | "pan" };
 type TfViewPreset = { id: string; label: string; azimuth: number; elevation: number; description: string };
+type TfModelStatus = "loading" | "ready" | "error";
 
 const IDENTITY: Quaternion = { x: 0, y: 0, z: 0, w: 1 };
 const ORIGIN: Vec3 = { x: 0, y: 0, z: 0 };
 const ORBIT_ELEVATION_LIMIT = Math.PI / 2 - 0.01;
 const ISOMETRIC_VIEW = { azimuth: -0.78, elevation: 0.48 };
+const TF_MODEL_URL = "/models/humanoid-tray-tag1.glb";
 const TF_VIEW_PRESETS: TfViewPreset[] = [
   { id: "isometric", label: "등각", ...ISOMETRIC_VIEW, description: "등각 보기" },
   { id: "plus-x", label: "+X", azimuth: Math.PI / 2, elevation: 0, description: "+X 쪽에서 보기" },
@@ -247,15 +253,27 @@ function isOperationalFrame(frame: string): boolean {
   return /^(world|tag\d+|cam_[1-4]_color_optical_frame|humanoid|bed_|mayo|surgeon)/i.test(frame);
 }
 
-function TfScene({ transforms }: { transforms: StaticTransform[] }) {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
+const TfScene = memo(function TfScene({ transforms }: { transforms: StaticTransform[] }) {
+  const viewportRef = useRef<HTMLDivElement>(null);
+  const labelLayerRef = useRef<HTMLDivElement>(null);
   const pointerRef = useRef<TfPointerDrag | null>(null);
   const viewScaleRef = useRef(1);
+  const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
+  const sceneRef = useRef<THREE.Scene | null>(null);
+  const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
+  const framesRootRef = useRef<THREE.Group | null>(null);
+  const modelAnchorRef = useRef<THREE.Group | null>(null);
+  const modelRef = useRef<THREE.Object3D | null>(null);
+  const modelMeshCountRef = useRef(0);
+  const renderSceneRef = useRef<() => void>(() => undefined);
+  const sceneExtentRef = useRef(1);
   const [azimuth, setAzimuth] = useState(ISOMETRIC_VIEW.azimuth);
   const [elevation, setElevation] = useState(ISOMETRIC_VIEW.elevation);
   const [pan, setPan] = useState<Vec3>(ORIGIN);
   const [zoom, setZoom] = useState(1);
   const [showAllFrames, setShowAllFrames] = useState(true);
+  const [showModel, setShowModel] = useState(true);
+  const [modelStatus, setModelStatus] = useState<TfModelStatus>("loading");
   const allPoses = useMemo(() => buildFramePoses(transforms), [transforms]);
   const referenceFrame = useMemo(() => {
     if (allPoses.some((pose) => pose.frame === "humanoid")) return "humanoid";
@@ -272,6 +290,10 @@ function TfScene({ transforms }: { transforms: StaticTransform[] }) {
     const requiredParents = new Set(selected.map((pose) => pose.parentFrame).filter(Boolean));
     return humanoidRelativePoses.filter((pose) => selected.includes(pose) || requiredParents.has(pose.frame));
   }, [humanoidRelativePoses, showAllFrames]);
+  const tagPose = useMemo(
+    () => humanoidRelativePoses.find((pose) => pose.frame.toLowerCase() === "tag1") || null,
+    [humanoidRelativePoses],
+  );
   const activeViewPreset = useMemo(
     () => TF_VIEW_PRESETS.find((preset) => Math.abs(preset.azimuth - azimuth) < 0.01 && Math.abs(preset.elevation - elevation) < 0.01)?.id || null,
     [azimuth, elevation],
@@ -290,140 +312,295 @@ function TfScene({ transforms }: { transforms: StaticTransform[] }) {
   };
 
   useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
+    const viewport = viewportRef.current;
+    if (!viewport) return;
     const onWheel = (event: WheelEvent) => {
       event.preventDefault();
       setZoom((current) => Math.max(0.5, Math.min(2.2, current - event.deltaY * 0.001)));
     };
-    canvas.addEventListener("wheel", onWheel, { passive: false });
-    return () => canvas.removeEventListener("wheel", onWheel);
+    viewport.addEventListener("wheel", onWheel, { passive: false });
+    return () => viewport.removeEventListener("wheel", onWheel);
   }, []);
 
   useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const context = canvas.getContext("2d");
-    if (!context) return;
-    const draw = () => {
-      const bounds = canvas.getBoundingClientRect();
-      const dpr = window.devicePixelRatio || 1;
-      canvas.width = Math.max(1, Math.round(bounds.width * dpr));
-      canvas.height = Math.max(1, Math.round(bounds.height * dpr));
-      context.setTransform(dpr, 0, 0, dpr, 0, 0);
-      context.clearRect(0, 0, bounds.width, bounds.height);
-      const styles = getComputedStyle(canvas);
-      const color = (name: string, fallback: string) => styles.getPropertyValue(name).trim() || fallback;
-      const palette = {
-        grid: color("--line", "rgba(220, 231, 235, 0.16)"),
-        link: color("--line-strong", "rgba(220, 231, 235, 0.3)"),
-        text: color("--soft", "#c6d0d4"),
-        muted: color("--muted", "#9eabb1"),
-        active: color("--robot", "#70ddd1"),
-        world: color("--clinical", "#75a7ff"),
-        x: color("--tf-axis-x", "#ff8a74"),
-        y: color("--tf-axis-y", "#92d979"),
-        z: color("--tf-axis-z", "#75a7ff"),
-      };
-      context.fillStyle = color("--ops-canvas", "rgba(8, 12, 14, 0.34)");
-      context.fillRect(0, 0, bounds.width, bounds.height);
-      if (!poses.length) {
-        context.fillStyle = palette.muted;
-        context.font = "13px sans-serif";
-        context.textAlign = "center";
-        context.fillText("/tf_static 수신을 기다리는 중입니다.", bounds.width / 2, bounds.height / 2);
-        return;
-      }
-      const maxExtent = Math.max(0.75, ...poses.flatMap((pose) => [
-        Math.abs(pose.position.x),
-        Math.abs(pose.position.y),
-        Math.abs(pose.position.z),
-      ]));
-      const scale = Math.min(bounds.width, bounds.height) / (maxExtent * 3.1) * zoom;
-      viewScaleRef.current = scale;
-      const basis = cameraBasis(azimuth, elevation);
-      const cameraDistance = maxExtent * 3.8;
-      const project = (point: Vec3) => {
-        const relative = subtract(point, pan);
-        const depth = dot(relative, basis.forward);
-        const perspective = cameraDistance / Math.max(cameraDistance * 0.38, cameraDistance + depth);
-        return {
-          x: bounds.width / 2 + dot(relative, basis.right) * scale * perspective,
-          y: bounds.height / 2 - dot(relative, basis.up) * scale * perspective,
-          depth,
-        };
-      };
-      const drawLine = (start: Vec3, end: Vec3, stroke: string, width = 1) => {
-        const a = project(start);
-        const b = project(end);
-        context.beginPath();
-        context.moveTo(a.x, a.y);
-        context.lineTo(b.x, b.y);
-        context.strokeStyle = stroke;
-        context.lineWidth = width;
-        context.stroke();
-      };
-      for (let index = -3; index <= 3; index += 1) {
-        drawLine({ x: index * maxExtent / 3, y: -maxExtent, z: 0 }, { x: index * maxExtent / 3, y: maxExtent, z: 0 }, palette.grid);
-        drawLine({ x: -maxExtent, y: index * maxExtent / 3, z: 0 }, { x: maxExtent, y: index * maxExtent / 3, z: 0 }, palette.grid);
-      }
-      const byFrame = new Map(poses.map((pose) => [pose.frame, pose]));
-      for (const pose of poses) {
-        if (!pose.parentFrame) continue;
-        const parent = byFrame.get(pose.parentFrame);
-        if (parent) drawLine(parent.position, pose.position, palette.link, 1.25);
-      }
-      const axisLength = Math.max(0.12, Math.min(0.38, maxExtent * 0.14));
-      const drawLocalAxes = (pose: FramePose) => {
-        const emphasis = pose.frame === referenceFrame;
-        const opacity = emphasis ? 1 : isOperationalFrame(pose.frame) ? 0.86 : 0.66;
-        const width = emphasis ? 2.3 : 1.3;
-        const axes = [
-          { direction: { x: axisLength, y: 0, z: 0 }, color: palette.x },
-          { direction: { x: 0, y: axisLength, z: 0 }, color: palette.y },
-          { direction: { x: 0, y: 0, z: axisLength }, color: palette.z },
-        ];
-        context.save();
-        context.globalAlpha = opacity;
-        for (const axis of axes) {
-          drawLine(pose.position, add(pose.position, rotateVector(pose.rotation, axis.direction)), axis.color, width);
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+    let disposed = false;
+    let renderer: THREE.WebGLRenderer;
+    try {
+      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, powerPreference: "high-performance" });
+    } catch (error) {
+      console.error("TF WebGL renderer initialization failed", error);
+      setModelStatus("error");
+      return;
+    }
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.05;
+    renderer.setClearColor(0x000000, 0);
+    renderer.domElement.setAttribute("aria-hidden", "true");
+    viewport.prepend(renderer.domElement);
+
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(40, 1, 0.01, 100);
+    camera.up.set(0, 0, 1);
+    const framesRoot = new THREE.Group();
+    const modelAnchor = new THREE.Group();
+    scene.add(framesRoot, modelAnchor);
+    scene.add(new THREE.HemisphereLight(0xe8f6ff, 0x263038, 2.1));
+    const keyLight = new THREE.DirectionalLight(0xffffff, 2.5);
+    keyLight.position.set(4, -3, 7);
+    scene.add(keyLight);
+    const fillLight = new THREE.DirectionalLight(0x8fc8ff, 1.3);
+    fillLight.position.set(-4, 2, 2);
+    scene.add(fillLight);
+
+    rendererRef.current = renderer;
+    sceneRef.current = scene;
+    cameraRef.current = camera;
+    framesRootRef.current = framesRoot;
+    modelAnchorRef.current = modelAnchor;
+
+    const resize = () => {
+      const bounds = viewport.getBoundingClientRect();
+      if (bounds.width <= 0 || bounds.height <= 0) return;
+      renderer.setSize(bounds.width, bounds.height, false);
+      camera.aspect = bounds.width / bounds.height;
+      camera.updateProjectionMatrix();
+      renderSceneRef.current();
+    };
+    const observer = new ResizeObserver(resize);
+    observer.observe(viewport);
+    resize();
+
+    const loader = new GLTFLoader();
+    loader.load(
+      TF_MODEL_URL,
+      (gltf) => {
+        if (disposed) {
+          gltf.scene.traverse((object) => {
+            if (!(object instanceof THREE.Mesh)) return;
+            object.geometry.dispose();
+            const materials = Array.isArray(object.material) ? object.material : [object.material];
+            for (const material of materials) material.dispose();
+          });
+          return;
         }
-        context.restore();
-      };
-      for (const pose of poses) drawLocalAxes(pose);
-      const compactLabels = bounds.width < 480;
-      context.font = "11px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace";
-      context.textAlign = "left";
-      const occupiedLabels: Array<{ x: number; y: number; width: number }> = [];
-      for (const pose of [...poses].sort((left, right) => left.position.z - right.position.z)) {
-        const point = project(pose.position);
-        const operational = isOperationalFrame(pose.frame);
-        context.beginPath();
-        context.arc(point.x, point.y, operational ? 4.5 : 3, 0, Math.PI * 2);
-        context.fillStyle = pose.frame === "world" || /^tag\d+$/i.test(pose.frame) ? palette.world : operational ? palette.active : palette.muted;
-        context.fill();
-        const labelIsAnchor = pose.frame === "world" || /^tag\d+$/i.test(pose.frame);
-        if ((operational || showAllFrames) && (!compactLabels || labelIsAnchor)) {
-          const label = labelForFrame(pose.frame);
-          const x = point.x + 7;
-          const y = point.y - 6;
-          const width = context.measureText(label).width;
-          const collides = occupiedLabels.some((placed) => Math.abs(placed.y - y) < 13 && x < placed.x + placed.width + 8 && x + width + 8 > placed.x);
-          if (!collides || labelIsAnchor) {
-            context.fillStyle = palette.text;
-            context.fillText(label, x, y);
-            occupiedLabels.push({ x, y, width });
+        modelRef.current = gltf.scene;
+        gltf.scene.name = "humanoid-tray-tag1";
+        let meshCount = 0;
+        gltf.scene.traverse((object) => {
+          if (!(object instanceof THREE.Mesh)) return;
+          meshCount += 1;
+          object.frustumCulled = true;
+          const materials = Array.isArray(object.material) ? object.material : [object.material];
+          for (const material of materials) {
+            if ("roughness" in material && typeof material.roughness === "number") material.roughness = Math.max(0.42, material.roughness);
           }
+        });
+        modelMeshCountRef.current = meshCount;
+        setModelStatus("ready");
+      },
+      undefined,
+      (error) => {
+        if (disposed) return;
+        console.error("TF model load failed", error);
+        setModelStatus("error");
+      },
+    );
+
+    return () => {
+      disposed = true;
+      observer.disconnect();
+      if (modelRef.current) {
+        modelRef.current.traverse((object) => {
+          if (!(object instanceof THREE.Mesh)) return;
+          object.geometry.dispose();
+          const materials = Array.isArray(object.material) ? object.material : [object.material];
+          for (const material of materials) material.dispose();
+        });
+      }
+      renderer.dispose();
+      renderer.forceContextLoss();
+      renderer.domElement.remove();
+      rendererRef.current = null;
+      sceneRef.current = null;
+      cameraRef.current = null;
+      framesRootRef.current = null;
+      modelAnchorRef.current = null;
+      modelRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    const framesRoot = framesRootRef.current;
+    const modelAnchor = modelAnchorRef.current;
+    if (!framesRoot || !modelAnchor) return;
+    for (const child of [...framesRoot.children]) {
+      framesRoot.remove(child);
+      child.traverse((object) => {
+        if (!(object instanceof THREE.Line || object instanceof THREE.LineSegments || object instanceof THREE.Mesh)) return;
+        object.geometry.dispose();
+        const materials = Array.isArray(object.material) ? object.material : [object.material];
+        for (const material of materials) material.dispose();
+      });
+    }
+    modelAnchor.clear();
+    modelAnchor.position.set(0, 0, 0);
+    modelAnchor.quaternion.identity();
+    const viewport = viewportRef.current;
+    if (viewport) {
+      viewport.dataset.modelState = showModel ? modelStatus : "hidden";
+      delete viewport.dataset.modelBounds;
+      delete viewport.dataset.modelMeshCount;
+    }
+
+    let maxExtent = Math.max(0.75, ...poses.flatMap((pose) => [
+      Math.abs(pose.position.x),
+      Math.abs(pose.position.y),
+      Math.abs(pose.position.z),
+    ]));
+    const gridSize = maxExtent * 2.2;
+    const grid = new THREE.GridHelper(gridSize, 12, 0x49616b, 0x293a42);
+    grid.rotation.x = Math.PI / 2;
+    grid.position.z = 0;
+    framesRoot.add(grid);
+
+    const byFrame = new Map(poses.map((pose) => [pose.frame, pose]));
+    const linkPositions: number[] = [];
+    for (const pose of poses) {
+      if (!pose.parentFrame) continue;
+      const parent = byFrame.get(pose.parentFrame);
+      if (!parent) continue;
+      linkPositions.push(
+        parent.position.x, parent.position.y, parent.position.z,
+        pose.position.x, pose.position.y, pose.position.z,
+      );
+    }
+    if (linkPositions.length) {
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute("position", new THREE.Float32BufferAttribute(linkPositions, 3));
+      framesRoot.add(new THREE.LineSegments(geometry, new THREE.LineBasicMaterial({ color: 0x77909b, transparent: true, opacity: 0.62 })));
+    }
+
+    const axisLength = Math.max(0.12, Math.min(0.38, maxExtent * 0.14));
+    for (const pose of poses) {
+      const isReferenceFrame = pose.frame === referenceFrame;
+      const axes = new THREE.AxesHelper(axisLength);
+      axes.position.set(pose.position.x, pose.position.y, pose.position.z);
+      axes.quaternion.set(pose.rotation.x, pose.rotation.y, pose.rotation.z, pose.rotation.w);
+      const material = axes.material as THREE.LineBasicMaterial;
+      material.transparent = true;
+      material.opacity = isReferenceFrame ? 1 : isOperationalFrame(pose.frame) ? 0.9 : 0.68;
+      if (isReferenceFrame) {
+        material.depthTest = false;
+        material.depthWrite = false;
+        axes.renderOrder = 1_000;
+      }
+      framesRoot.add(axes);
+
+      const dotGeometry = new THREE.SphereGeometry(isReferenceFrame ? axisLength * 0.075 : axisLength * 0.05, 10, 8);
+      const dotColor = isReferenceFrame ? 0x9cf7ed : pose.frame === "world" || /^tag\d+$/i.test(pose.frame) ? 0x75a7ff : isOperationalFrame(pose.frame) ? 0x70ddd1 : 0x9eabb1;
+      const dotMaterial = new THREE.MeshBasicMaterial({
+        color: dotColor,
+        depthTest: !isReferenceFrame,
+        depthWrite: !isReferenceFrame,
+      });
+      const dot = new THREE.Mesh(dotGeometry, dotMaterial);
+      dot.position.copy(axes.position);
+      if (isReferenceFrame) dot.renderOrder = 1_002;
+      framesRoot.add(dot);
+
+      if (isReferenceFrame) {
+        const halo = new THREE.Mesh(
+          new THREE.SphereGeometry(axisLength * 0.16, 16, 12),
+          new THREE.MeshBasicMaterial({
+            color: 0x70ddd1,
+            depthTest: false,
+            depthWrite: false,
+            opacity: 0.18,
+            transparent: true,
+          }),
+        );
+        halo.position.copy(axes.position);
+        halo.renderOrder = 1_001;
+        framesRoot.add(halo);
+      }
+    }
+
+    if (showModel && modelStatus === "ready" && modelRef.current && tagPose) {
+      modelAnchor.position.set(tagPose.position.x, tagPose.position.y, tagPose.position.z);
+      modelAnchor.quaternion.set(tagPose.rotation.x, tagPose.rotation.y, tagPose.rotation.z, tagPose.rotation.w);
+      modelAnchor.add(modelRef.current);
+      const box = new THREE.Box3().setFromObject(modelAnchor);
+      if (!box.isEmpty()) {
+        maxExtent = Math.max(
+          maxExtent,
+          Math.abs(box.min.x), Math.abs(box.min.y), Math.abs(box.min.z),
+          Math.abs(box.max.x), Math.abs(box.max.y), Math.abs(box.max.z),
+        );
+        if (viewport) {
+          viewport.dataset.modelBounds = [box.min.x, box.min.y, box.min.z, box.max.x, box.max.y, box.max.z]
+            .map((value) => value.toFixed(3))
+            .join(",");
+          viewport.dataset.modelMeshCount = String(modelMeshCountRef.current);
         }
+      }
+    }
+    sceneExtentRef.current = Math.max(0.75, maxExtent);
+    renderSceneRef.current();
+  }, [modelStatus, poses, referenceFrame, showModel, tagPose]);
+
+  useEffect(() => {
+    renderSceneRef.current = () => {
+      const renderer = rendererRef.current;
+      const scene = sceneRef.current;
+      const camera = cameraRef.current;
+      const viewport = viewportRef.current;
+      if (!renderer || !scene || !camera || !viewport) return;
+      const bounds = viewport.getBoundingClientRect();
+      if (bounds.width <= 0 || bounds.height <= 0) return;
+      const maxExtent = sceneExtentRef.current;
+      const basis = cameraBasis(azimuth, elevation);
+      const eyeDirection = scaleVector(basis.forward, -1);
+      const cameraDistance = maxExtent * 3.45 / zoom;
+      camera.position.set(
+        pan.x + eyeDirection.x * cameraDistance,
+        pan.y + eyeDirection.y * cameraDistance,
+        pan.z + eyeDirection.z * cameraDistance,
+      );
+      camera.up.set(basis.up.x, basis.up.y, basis.up.z);
+      camera.near = Math.max(0.005, cameraDistance / 1000);
+      camera.far = Math.max(100, cameraDistance * 20);
+      camera.lookAt(pan.x, pan.y, pan.z);
+      camera.updateProjectionMatrix();
+      viewScaleRef.current = bounds.height / (2 * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)) * cameraDistance);
+      renderer.render(scene, camera);
+
+      const labelLayer = labelLayerRef.current;
+      if (!labelLayer) return;
+      for (const element of labelLayer.querySelectorAll<HTMLElement>("[data-tf-frame]")) {
+        const pose = byFrameForLabels.get(element.dataset.tfFrame || "");
+        if (!pose) {
+          element.hidden = true;
+          continue;
+        }
+        const projected = new THREE.Vector3(pose.position.x, pose.position.y, pose.position.z).project(camera);
+        const visible = projected.z >= -1 && projected.z <= 1;
+        element.hidden = !visible;
+        if (!visible) continue;
+        const x = (projected.x * 0.5 + 0.5) * bounds.width;
+        const y = (-projected.y * 0.5 + 0.5) * bounds.height;
+        element.style.transform = `translate3d(${Math.round(x + 7)}px, ${Math.round(y - 7)}px, 0)`;
       }
     };
-    const observer = new ResizeObserver(draw);
-    observer.observe(canvas);
-    draw();
-    return () => observer.disconnect();
-  }, [azimuth, elevation, pan, poses, referenceFrame, showAllFrames, zoom]);
+    renderSceneRef.current();
+  }, [azimuth, elevation, pan, poses, zoom]);
 
-  const onPointerDown = (event: PointerEvent<HTMLCanvasElement>) => {
+  const byFrameForLabels = useMemo(() => new Map(poses.map((pose) => [pose.frame, pose])), [poses]);
+
+  const onPointerDown = (event: PointerEvent<HTMLDivElement>) => {
     event.preventDefault();
     event.currentTarget.focus({ preventScroll: true });
     event.currentTarget.setPointerCapture(event.pointerId);
@@ -434,7 +611,7 @@ function TfScene({ transforms }: { transforms: StaticTransform[] }) {
       mode: event.button === 1 || event.button === 2 || event.shiftKey ? "pan" : "orbit",
     };
   };
-  const onPointerMove = (event: PointerEvent<HTMLCanvasElement>) => {
+  const onPointerMove = (event: PointerEvent<HTMLDivElement>) => {
     const pointer = pointerRef.current;
     if (!pointer || pointer.id !== event.pointerId) return;
     event.preventDefault();
@@ -460,9 +637,13 @@ function TfScene({ transforms }: { transforms: StaticTransform[] }) {
         <div>
           <p>TF_STATIC</p>
           <h2 id="ops-tf-heading">공간 좌표계</h2>
-          <span>{transforms.length ? `${transforms.length}개 고정 변환 · ${referenceFrame || "기준"} 기준 · 모든 프레임 XYZ 축` : "고정 변환 대기"}</span>
+          <span>{transforms.length ? `${transforms.length}개 고정 변환 · ${referenceFrame || "기준"} 기준 · 모든 프레임 XYZ 축 · tag1 모델 정합` : "고정 변환 대기"}</span>
         </div>
         <div className="ops-heading-actions">
+          <span aria-live="polite" className={`ops-model-chip ${modelStatus === "error" ? "error" : modelStatus === "ready" && tagPose ? "ready" : "loading"}`} role="status">
+            MODEL {modelStatus === "error" ? "ERROR" : modelStatus !== "ready" ? "LOADING" : tagPose ? "TAG1" : "TF WAIT"}
+          </span>
+          <label className="ops-checkline"><input checked={showModel} onChange={(event) => setShowModel(event.target.checked)} type="checkbox" />3D 모델</label>
           <label className="ops-checkline"><input checked={showAllFrames} onChange={(event) => setShowAllFrames(event.target.checked)} type="checkbox" />전체 프레임</label>
           <button className="ops-icon-button" onClick={resetView} type="button" title="휴머노이드 기준 전체 맞춤" aria-label="휴머노이드 기준 좌표계 전체 맞춤"><RotateCcw size={16} /></button>
         </div>
@@ -471,10 +652,12 @@ function TfScene({ transforms }: { transforms: StaticTransform[] }) {
         {TF_VIEW_PRESETS.map((preset) => <button aria-pressed={activeViewPreset === preset.id} className="ops-button ops-tf-view-button" key={preset.id} onClick={() => applyViewPreset(preset)} title={preset.description} type="button">{preset.label}</button>)}
         <button className="ops-button ops-tf-fit-button" onClick={resetView} title="휴머노이드 원점으로 전체 맞춤" type="button">전체 맞춤</button>
       </div>
-      <canvas
-        ref={canvasRef}
+      <div
+        ref={viewportRef}
         className="ops-tf-canvas"
-        aria-label="휴머노이드 기준 tf_static 고정 좌표계 3차원 보기. 모든 프레임의 X Y Z 축이 표시됩니다. 좌클릭 드래그로 회전하고 Shift 또는 가운데나 오른쪽 드래그로 이동하며 휠로 확대합니다."
+        aria-label="휴머노이드 기준 tf_static 고정 좌표계와 tag1 기준 컬러 모델 3차원 보기. 모든 프레임의 X Y Z 축이 표시되며 휴머노이드 기준축은 모델 앞에 항상 표시됩니다. 좌클릭 드래그로 회전하고 Shift 또는 가운데나 오른쪽 드래그로 이동하며 휠로 확대합니다."
+        aria-describedby="ops-tf-controls-help"
+        aria-keyshortcuts="ArrowLeft ArrowRight ArrowUp ArrowDown Home"
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
         onPointerUp={() => { pointerRef.current = null; }}
@@ -484,14 +667,29 @@ function TfScene({ transforms }: { transforms: StaticTransform[] }) {
         role="img"
         tabIndex={0}
         onKeyDown={(event) => {
+          if (["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home"].includes(event.key)) event.preventDefault();
           if (event.key === "ArrowLeft") setAzimuth((current) => current - 0.12);
           if (event.key === "ArrowRight") setAzimuth((current) => current + 0.12);
           if (event.key === "ArrowUp") setElevation((current) => Math.max(-ORBIT_ELEVATION_LIMIT, current - 0.12));
           if (event.key === "ArrowDown") setElevation((current) => Math.min(ORBIT_ELEVATION_LIMIT, current + 0.12));
-          if (event.key === "Home") { event.preventDefault(); resetView(); }
+          if (event.key === "Home") resetView();
         }}
-      />
-      <div className="ops-tf-legend" aria-label="좌표 축 범례"><span className="axis-x">X</span><span className="axis-y">Y</span><span className="axis-z">Z</span><span>모든 프레임의 로컬 축 · humanoid 원점 · 좌클릭 회전 · Shift/가운데/오른쪽 드래그 이동 · 휠 확대 · 더블클릭 전체 맞춤</span></div>
+      >
+        {!poses.length && <div className="ops-tf-empty">/tf_static 수신을 기다리는 중입니다.</div>}
+        <div ref={labelLayerRef} className="ops-tf-label-layer" aria-hidden="true">
+          {poses.map((pose) => (
+            <span
+              className={[
+                pose.frame === referenceFrame ? "reference" : "",
+                pose.frame === "world" || /^tag\d+$/i.test(pose.frame) ? "anchor" : isOperationalFrame(pose.frame) ? "operational" : "",
+              ].filter(Boolean).join(" ")}
+              data-tf-frame={pose.frame}
+              key={pose.frame}
+            >{labelForFrame(pose.frame)}</span>
+          ))}
+        </div>
+      </div>
+      <div className="ops-tf-legend" id="ops-tf-controls-help" aria-label="좌표 축 범례"><span className="axis-x">X</span><span className="axis-y">Y</span><span className="axis-z">Z</span><span>모든 프레임의 로컬 축 · humanoid 기준축은 모델 앞에 항상 표시 · 컬러 모델은 tag1 원점 정합 · 좌클릭 회전 · Shift/가운데/오른쪽 드래그 이동 · 휠 확대 · 방향키 회전 · Home/더블클릭 전체 맞춤</span></div>
       <div className="ops-tf-tree" aria-label="고정 좌표계 목록">
         {transforms.length ? transforms.map((transform) => (
           <div key={transform.childFrame} className={isOperationalFrame(transform.childFrame) ? "operational" : ""}>
@@ -502,7 +700,7 @@ function TfScene({ transforms }: { transforms: StaticTransform[] }) {
       </div>
     </section>
   );
-}
+});
 
 function CameraGrid({
   view,
@@ -645,22 +843,15 @@ function Metric({ icon: Icon, label, value, detail, tone }: { icon: typeof Camer
 function WorldAnchorPanel({
   status,
   now,
-  connected,
   pending,
   result,
-  onAction,
 }: {
   status: WorldAnchorStatus | null;
   now: number;
-  connected: boolean;
   pending: WorldAction | null;
   result: WorldActionResult | null;
-  onAction: (action: WorldAction) => Promise<WorldActionResult>;
 }) {
-  const [confirmed, setConfirmed] = useState(false);
   const stale = Boolean(status && now - status.receivedAt > 3_000);
-  const invoke = (action: WorldAction) => void onAction(action);
-  const protectedDisabled = !connected || Boolean(pending) || !confirmed;
   return (
     <section className="ops-card ops-world-card" aria-labelledby="ops-world-heading">
       <header className="ops-card-heading">
@@ -677,13 +868,13 @@ function WorldAnchorPanel({
         {!status?.tags || !Object.keys(status.tags).length ? <p className="ops-empty-inline">태그 샘플 상태 대기</p> : null}
       </div>
       <div className="ops-world-actions">
-        <button className="ops-button secondary" disabled={!connected || Boolean(pending) || Boolean(status?.collecting)} onClick={() => invoke("begin")} type="button"><Play size={16} />샘플 수집 시작</button>
-        <button className="ops-button secondary" disabled={!connected || Boolean(pending) || !status?.collecting} onClick={() => invoke("stop")} type="button"><Square size={16} />수집 중지</button>
-        <label className="ops-confirmation"><input checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} type="checkbox" /><span>태그가 움직이지 않는 기준점이며, 기존 월드 좌표계를 교체해도 안전함을 확인했습니다.</span></label>
-        <button className="ops-button danger" disabled={protectedDisabled} onClick={() => invoke("solve")} type="button">{pending === "solve" ? <LoaderCircle className="ops-spin" size={16} /> : <Save size={16} />}Solve · 저장 · TF 발행</button>
-        <button className="ops-button secondary" disabled={protectedDisabled} onClick={() => invoke("publish")} type="button">{pending === "publish" ? <LoaderCircle className="ops-spin" size={16} /> : <RefreshCw size={16} />}저장된 Anchor 다시 발행</button>
+        <button className="ops-button secondary" disabled type="button"><Play size={16} />샘플 수집 시작</button>
+        <button className="ops-button secondary" disabled type="button"><Square size={16} />수집 중지</button>
+        <label className="ops-confirmation"><input disabled type="checkbox" /><span>Observer 화면에서는 World Anchor 변경을 승인하거나 실행할 수 없습니다.</span></label>
+        <button className="ops-button danger" disabled type="button">{pending === "solve" ? <LoaderCircle className="ops-spin" size={16} /> : <Save size={16} />}Solve · 저장 · TF 발행</button>
+        <button className="ops-button secondary" disabled type="button">{pending === "publish" ? <LoaderCircle className="ops-spin" size={16} /> : <RefreshCw size={16} />}저장된 Anchor 다시 발행</button>
       </div>
-      <p className="ops-control-boundary"><CircleAlert size={15} />`solve`와 `publish`는 `world → camera/tag` static TF를 바꿉니다. 로봇 구동 명령은 보내지 않지만, TF 소비 노드에는 영향을 줄 수 있습니다.</p>
+      <p className="ops-control-boundary"><CircleAlert size={15} />전용 observer는 read-only입니다. 이 화면은 World Anchor Trigger 서비스를 호출하지 않으며 실행 중인 런타임을 변경하지 않습니다.</p>
       {result ? <p className={`ops-action-result ${result.success ? "ok" : "error"}`} role="status">{result.success ? <CheckCircle2 size={16} /> : <CircleAlert size={16} />}<span><strong>{result.action}</strong> · {result.message}</span></p> : null}
     </section>
   );
@@ -733,53 +924,95 @@ function TopicInspector({
   );
 }
 
-function validWebSocketUrl(value: string): boolean {
-  try {
-    const url = new URL(value);
-    return (url.protocol === "ws:" || url.protocol === "wss:") && !url.username && !url.password;
-  } catch {
-    return false;
-  }
-}
-
 export function MulticamOpsWorkspace({ language, onExit }: { language: Language; onExit: () => void }) {
   const [view, setView] = useState<MulticamView>("color");
   const [depthPresentation, setDepthPresentation] = useState<DepthPresentation>("visualized");
   const bridge = useMulticamOpsBridge(view);
-  const [draftUrl, setDraftUrl] = useState(bridge.url);
-  const [urlError, setUrlError] = useState("");
   const now = useClock();
-
-  useEffect(() => setDraftUrl(bridge.url), [bridge.url]);
-  const connect = () => {
-    if (!validWebSocketUrl(draftUrl.trim())) {
-      setUrlError("ws:// 또는 wss:// URL을 입력하세요.");
-      return;
-    }
-    setUrlError("");
-    bridge.setUrl(draftUrl.trim());
-  };
   const activeFrames = view === "color" ? bridge.colorFrames : bridge.depthFrames;
+  const freshFrameCount = Object.values(activeFrames).filter(
+    (frame) => frame && now - frame.receivedAt <= 3_000,
+  ).length;
 
   return (
     <div className="app-shell ops-app-shell" data-slot="multicam-ops-workspace">
+      <a className="skip-link" href="#multicam-main">
+        {language === "ko" ? "멀티캠 본문으로 이동" : "Skip to multicamera content"}
+      </a>
       <header className="ops-header">
         <div className="ops-brand"><button className="ops-back-button" onClick={onExit} type="button"><ArrowLeft size={18} />{language === "ko" ? "미션 화면" : "Mission"}</button><div><p>ARPA MULTICAM · ROS 2 OPERATIONS</p><h1>멀티캠 관제 콘솔</h1><span>동기화 영상, 고정 TF, Capture 상태 및 World Anchor를 하나의 ROSBridge 세션에서 확인합니다.</span></div></div>
-        <div className="ops-connection"><div className={`ops-connection-state ${bridge.connected ? "ok" : "warn"}`}><Radio size={16} /><span>{bridge.connected ? "ROSBridge 연결" : "ROSBridge 대기"}</span></div><form onSubmit={(event) => { event.preventDefault(); connect(); }}><input aria-describedby={urlError ? "ops-bridge-url-error" : undefined} aria-invalid={Boolean(urlError)} aria-label="ROSBridge WebSocket URL" onChange={(event) => setDraftUrl(event.target.value)} value={draftUrl} /><button className="ops-icon-button" type="submit" title="이 ROSBridge에 연결" aria-label="이 ROSBridge에 연결"><Network size={16} /></button><button className="ops-icon-button" onClick={bridge.retry} type="button" title="현재 URL로 재연결" aria-label="현재 URL로 재연결"><RefreshCw size={16} /></button></form>{urlError ? <small className="ops-url-error" id="ops-bridge-url-error" role="alert">{urlError}</small> : <small aria-live="polite">{bridge.connectionMessage}</small>}</div>
+        <div className="ops-connection"><div className="ops-observer-signals" aria-label="멀티캠 observer 상태"><div className={`ops-connection-state ${bridge.socketConnected ? "ok" : "warn"}`}><Radio size={16} /><span>Transport {bridge.socketConnected ? "연결" : "대기"}</span></div><div className={`ops-connection-state ${bridge.captureTopicDiscovered ? "ok" : "warn"}`}><Activity size={16} /><span>Graph topic {bridge.captureTopicDiscovered ? "발견" : "미발견"}</span></div><div className={`ops-connection-state ${bridge.captureStatusFresh ? "ok" : "warn"}`}><Gauge size={16} /><span>CaptureStatus {bridge.captureStatusFresh ? "fresh" : bridge.captureStatus ? "stale" : "대기"}</span></div></div><div className="ops-observer-endpoint"><code title={bridge.url}>{bridge.url}</code><button className="ops-icon-button" onClick={bridge.retry} type="button" title="멀티캠 observer 재연결" aria-label="멀티캠 observer 재연결"><RefreshCw size={16} /></button></div><small aria-live="polite">{bridge.connectionMessage} · {view} frame fresh {freshFrameCount}/{view === "color" ? 5 : 4}</small></div>
       </header>
 
-      {!bridge.connected ? <p className="ops-disconnected-banner"><CircleAlert size={16} />브리지 재연결 전에는 마지막 수신 내용을 신뢰하지 않으며 World Anchor 조작이 잠깁니다.</p> : null}
+      {!bridge.connected ? <p className="ops-disconnected-banner"><CircleAlert size={16} />전용 멀티캠 observer가 ready 상태가 아닙니다. 실행 중인 모드는 유지되며, fresh CaptureStatus 확인 전에는 관측 내용을 신뢰하지 않습니다.</p> : null}
 
-      <main className="ops-layout">
+      <main className="ops-layout" id="multicam-main" tabIndex={-1}>
         <section className="ops-card ops-preview-card" aria-labelledby="ops-preview-heading">
           <header className="ops-card-heading">
             <div><p>SYNCED PREVIEW</p><h2 id="ops-preview-heading">주요 동기화 뷰</h2><span>{view === "color" ? "5개 /synced color stream · 토픽 수신 프레임을 원본 그대로 표시" : depthPresentation === "visualized" ? "D455 4대의 /synced compressedDepth stream · 원본 거리값을 화면 대비로만 가시화" : "D455 4대의 /synced compressedDepth stream · 토픽 원본 PNG 표시 · FLIR은 depth 센서가 없습니다."}</span></div>
-            <div className="ops-preview-actions"><div className="ops-segmented" role="tablist" aria-label="영상 유형"><button aria-selected={view === "color"} className={view === "color" ? "active" : ""} onClick={() => setView("color")} role="tab" type="button"><Eye size={15} />Color</button><button aria-selected={view === "depth"} className={view === "depth" ? "active" : ""} onClick={() => setView("depth")} role="tab" type="button"><Box size={15} />Depth</button></div>{view === "depth" ? <div className="ops-segmented ops-depth-presentation" aria-label="Depth 표시 방식" role="group"><button aria-pressed={depthPresentation === "visualized"} className={depthPresentation === "visualized" ? "active" : ""} onClick={() => setDepthPresentation("visualized")} type="button">가시화</button><button aria-pressed={depthPresentation === "raw"} className={depthPresentation === "raw" ? "active" : ""} onClick={() => setDepthPresentation("raw")} type="button">원본 PNG</button></div> : null}</div>
+            <div className="ops-preview-actions">
+              <LayoutGroup id="multicam-view-tabs">
+                <div className="ops-segmented" role="tablist" aria-label="영상 유형">
+                  {(["color", "depth"] as const).map((option) => {
+                    const active = view === option;
+                    const Icon = option === "color" ? Eye : Box;
+                    return (
+                      <button
+                        aria-selected={active}
+                        className={active ? "active" : ""}
+                        key={option}
+                        onClick={() => setView(option)}
+                        role="tab"
+                        type="button"
+                      >
+                        {active ? (
+                          <m.span
+                            aria-hidden="true"
+                            className="ops-segment-focus"
+                            layoutId="multicam-active-view"
+                            transition={silk.layout.transition}
+                          />
+                        ) : null}
+                        <span className="ops-segment-label"><Icon size={15} />{option === "color" ? "Color" : "Depth"}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </LayoutGroup>
+              {view === "depth" ? (
+                <LayoutGroup id="multicam-depth-presentation">
+                  <div className="ops-segmented ops-depth-presentation" aria-label="Depth 표시 방식" role="group">
+                    {(["visualized", "raw"] as const).map((option) => {
+                      const active = depthPresentation === option;
+                      return (
+                        <button
+                          aria-pressed={active}
+                          className={active ? "active" : ""}
+                          key={option}
+                          onClick={() => setDepthPresentation(option)}
+                          type="button"
+                        >
+                          {active ? (
+                            <m.span
+                              aria-hidden="true"
+                              className="ops-segment-focus"
+                              layoutId="multicam-active-depth-presentation"
+                              transition={silk.layout.transition}
+                            />
+                          ) : null}
+                          <span className="ops-segment-label">{option === "visualized" ? "가시화" : "원본 PNG"}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </LayoutGroup>
+              ) : null}
+            </div>
           </header>
           <CameraGrid captureStatus={bridge.captureStatus} depthPresentation={depthPresentation} frames={activeFrames} now={now} view={view} />
         </section>
         <TfScene transforms={bridge.tfTransforms} />
-        <WorldAnchorPanel connected={bridge.connected} now={now} onAction={bridge.callWorldAction} pending={bridge.worldActionPending} result={bridge.worldActionResult} status={bridge.worldStatus} />
+        <WorldAnchorPanel now={now} pending={bridge.worldActionPending} result={bridge.worldActionResult} status={bridge.worldStatus} />
         <CaptureStatusPanel colorFrames={bridge.colorFrames} now={now} status={bridge.captureStatus} />
         <TopicInspector now={now} onRefresh={bridge.refreshTopics} onSelect={bridge.setSelectedTopic} sample={bridge.selectedTopicSample} selectedTopic={bridge.selectedTopic} selectedType={bridge.selectedTopicType} topicError={bridge.topicError} topics={bridge.topics} />
       </main>

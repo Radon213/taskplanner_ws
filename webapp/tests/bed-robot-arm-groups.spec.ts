@@ -141,6 +141,18 @@ async function installRosbridgeFixture(
     bedRobotStatusMessages?: TimedMessage[];
   } = {},
 ) {
+  await page.route("**/api/runtime/status", (route) =>
+    route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        phase: "idle",
+        active_mode: "live",
+        requested_mode: "live",
+        message: "fixture runtime",
+        retryable: false,
+      }),
+    }),
+  );
   const simulationMessages = options.simulationMessages ?? [
     { delayMs: 0, message: SIMULATION_STATE },
   ];

@@ -1,4 +1,6 @@
 import { FormEvent, KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
+import { AnimatePresence, LayoutGroup } from "framer-motion";
+import * as m from "framer-motion/m";
 import {
   Activity,
   AlertTriangle,
@@ -48,6 +50,7 @@ import {
 } from "../../hooks/useIntegrationDebugBridge";
 import toolHandoverProfiles from "../../config/debugToolHandoverProfiles.json";
 import { runtimeBridgeUrl } from "../../runtimeModes";
+import { silk, statusSwap } from "../../motion-system";
 import type { Language } from "../../utils/display";
 
 type DebugTab = "connection" | "manual" | "output" | "voice" | "record";
@@ -328,7 +331,7 @@ function StatusBadge({ state, label }: { state: string; label?: string }) {
 function DebugHeader({
   connected,
   status,
-  statusAgeSec,
+  statusReceivedAt,
   url,
   manualControlLabel,
   manualControlDisabled,
@@ -338,7 +341,7 @@ function DebugHeader({
 }: {
   connected: boolean;
   status: IntegrationDebugStatus | null;
-  statusAgeSec: number | null;
+  statusReceivedAt: number;
   url: string;
   manualControlLabel: string;
   manualControlDisabled: boolean;
@@ -346,6 +349,17 @@ function DebugHeader({
   onManualControl: () => void;
   onExit: () => void;
 }) {
+  const [statusAgeSec, setStatusAgeSec] = useState<number | null>(() =>
+    statusReceivedAt ? Math.max(0, (Date.now() - statusReceivedAt) / 1_000) : null,
+  );
+  useEffect(() => {
+    const updateAge = () => setStatusAgeSec(
+      statusReceivedAt ? Math.max(0, (Date.now() - statusReceivedAt) / 1_000) : null,
+    );
+    updateAge();
+    const timer = window.setInterval(updateAge, 500);
+    return () => window.clearInterval(timer);
+  }, [statusReceivedAt]);
   const ManualControlIcon = status?.action.recovery_required || status?.session.fault_locked
     ? status?.session.fault_locked ? RotateCcw : ShieldAlert
     : status?.session.armed ? CircleStop : Play;
@@ -416,7 +430,7 @@ function ConnectionFallback({
 }) {
   if (connected || reconnecting) {
     return (
-      <main className="debug-feedback-card debug-loading-card" aria-live="polite" data-slot="debug-loading-state">
+      <main className="debug-feedback-card debug-loading-card" aria-live="polite" data-slot="debug-loading-state" id="debug-fallback">
         <div className="debug-skeleton-title" />
         <div className="debug-skeleton-row" />
         <div className="debug-skeleton-row short" />
@@ -425,7 +439,7 @@ function ConnectionFallback({
     );
   }
   return (
-    <main className="debug-feedback-card" data-slot="debug-error-state">
+    <main className="debug-feedback-card" data-slot="debug-error-state" id="debug-fallback">
       <AlertTriangle size={32} aria-hidden="true" />
       <h2>디버그 ROSBridge에 연결할 수 없습니다</h2>
       <p>{error || `${url}에서 연결 응답을 기다리고 있습니다.`}</p>
@@ -728,16 +742,16 @@ function ConnectionPanel({
     <section className="debug-panel-stack" data-slot="debug-connection-panel">
       <dl className="debug-health-strip" aria-label="통합 연결 요약">
         <div className={readyInputs === status.inputs.length && status.inputs.length ? "ok" : "warn"}>
-          <dt>입력 토픽</dt><dd><strong>{readyInputs}</strong><span>/{status.inputs.length} 정상</span></dd><small>실시간 메시지 수신</small>
+          <dt>입력 토픽</dt><dd><strong>{readyInputs}</strong><span>/{status.inputs.length} 정상</span><small>실시간 메시지 수신</small></dd>
         </div>
         <div className={readyEndpoints === status.endpoints.length && status.endpoints.length ? "ok" : "warn"}>
-          <dt>Action·Service</dt><dd><strong>{readyEndpoints}</strong><span>/{status.endpoints.length} 발견</span></dd><small>외부 로봇 종단</small>
+          <dt>Action·Service</dt><dd><strong>{readyEndpoints}</strong><span>/{status.endpoints.length} 발견</span><small>외부 로봇 종단</small></dd>
         </div>
         <div className={outputSubscribers > 0 ? "ok" : enabledOutputs > 0 ? "warn" : "idle"}>
-          <dt>출력 토픽</dt><dd><strong>{enabledOutputs}</strong><span> 발행 · {outputSubscribers} 구독</span></dd><small>총 {status.outputs.length}개 계약</small>
+          <dt>출력 토픽</dt><dd><strong>{enabledOutputs}</strong><span> 발행 · {outputSubscribers} 구독</span><small>총 {status.outputs.length}개 계약</small></dd>
         </div>
         <div className={networkReady ? "ok debug-health-network" : "warn debug-health-network"}>
-          <dt>{wiredSelected ? "유선 네트워크" : "로컬 네트워크"}</dt><dd><strong>{localAddressLabel(network)}</strong></dd><small>{network.primary_interface || "interface 대기"} · {localLinkLabel(network)} · D{status.runtime.ros_domain_id} · {status.runtime.discovery_range}</small>
+          <dt>{wiredSelected ? "유선 네트워크" : "로컬 네트워크"}</dt><dd><strong>{localAddressLabel(network)}</strong><small>{network.primary_interface || "interface 대기"} · {localLinkLabel(network)} · D{status.runtime.ros_domain_id} · {status.runtime.discovery_range}</small></dd>
         </div>
       </dl>
 
@@ -1613,7 +1627,7 @@ function RecordPanel({
 }
 
 export function DebugWorkspace({
-  language: _language,
+  language,
   onExit,
 }: {
   language: Language;
@@ -1766,10 +1780,13 @@ export function DebugWorkspace({
 
   return (
     <div className="app-shell debug-app-shell" data-slot="debug-workspace">
+      <a className="skip-link" href={bridge.status ? `#debug-panel-${activeTab}` : "#debug-fallback"}>
+        {language === "ko" ? "디버그 본문으로 이동" : "Skip to Debug content"}
+      </a>
       <DebugHeader
         connected={bridge.connected}
         status={bridge.status}
-        statusAgeSec={statusAgeSec}
+        statusReceivedAt={bridge.statusReceivedAt}
         url={url}
         manualControlLabel={manualControlLabel}
         manualControlDisabled={manualControlDisabled}
@@ -1778,16 +1795,43 @@ export function DebugWorkspace({
         onExit={() => void exitDebugMode()}
       />
       {!bridge.status ? (
-        <ConnectionFallback connected={bridge.connected} reconnecting={bridge.reconnecting} error={bridge.connectionError} url={url} onRetry={bridge.retry} />
+        <ConnectionFallback connected={bridge.transportConnected} reconnecting={bridge.reconnecting} error={bridge.connectionError} url={url} onRetry={bridge.retry} />
       ) : (
         <>
-          {!bridge.connected ? <div className="debug-disconnected-banner" role="status"><AlertTriangle size={16} aria-hidden="true" />ROSBridge 재연결 중입니다. 표시된 값은 마지막 수신 상태이며 모든 쓰기 제어는 잠겼습니다.</div> : null}
-          <div className="debug-tabs" role="tablist" aria-label="디버그 모드 기능">
-            {tabs.map((tab, index) => {
-              const Icon = tab.icon;
-              return <button aria-controls={`debug-panel-${tab.id}`} aria-selected={activeTab === tab.id} className={activeTab === tab.id ? "active" : ""} id={`debug-tab-${tab.id}`} key={tab.id} onClick={() => setActiveTab(tab.id)} onKeyDown={(event) => handleTabKeyDown(event, index)} role="tab" tabIndex={activeTab === tab.id ? 0 : -1} type="button"><span><Icon size={17} aria-hidden="true" />{tab.label}</span><small>{tab.meta}</small></button>;
-            })}
-          </div>
+          {!bridge.connected ? <div className="debug-disconnected-banner" role="status"><AlertTriangle size={16} aria-hidden="true" /><span>{bridge.transportConnected ? "디버그 상태 heartbeat가 만료되었습니다. 표시된 값은 마지막 수신 상태이며 모든 쓰기 제어는 잠겼습니다." : "ROSBridge 재연결 중입니다. 표시된 값은 마지막 수신 상태이며 모든 쓰기 제어는 잠겼습니다."}</span><button className="runtime-transition-retry" onClick={bridge.retry} type="button">다시 연결</button></div> : null}
+          <LayoutGroup id="debug-workspace-tabs">
+            <div className="debug-tabs" role="tablist" aria-label="디버그 모드 기능">
+              {tabs.map((tab, index) => {
+                const Icon = tab.icon;
+                const active = activeTab === tab.id;
+                return (
+                  <button
+                    aria-controls={`debug-panel-${tab.id}`}
+                    aria-selected={active}
+                    className={active ? "active" : ""}
+                    id={`debug-tab-${tab.id}`}
+                    key={tab.id}
+                    onClick={() => setActiveTab(tab.id)}
+                    onKeyDown={(event) => handleTabKeyDown(event, index)}
+                    role="tab"
+                    tabIndex={active ? 0 : -1}
+                    type="button"
+                  >
+                    {active ? (
+                      <m.span
+                        aria-hidden="true"
+                        className="debug-tab-focus"
+                        layoutId="debug-active-tab"
+                        transition={silk.layout.transition}
+                      />
+                    ) : null}
+                    <span className="debug-tab-label"><Icon size={17} aria-hidden="true" />{tab.label}</span>
+                    <small>{tab.meta}</small>
+                  </button>
+                );
+              })}
+            </div>
+          </LayoutGroup>
           <main aria-labelledby={`debug-tab-${activeTab}`} className="debug-main" id={`debug-panel-${activeTab}`} role="tabpanel" tabIndex={0}>
             {activeTab === "connection" ? <ConnectionPanel connected={bridge.connected} status={bridge.status} readiness={bridge.readiness} runCommand={runCommand} notify={setNotice} /> : null}
             {activeTab === "manual" ? <ManualPanel connected={bridge.connected} status={bridge.status} runCommand={runCommand} coexistenceConfirmed={coexistenceConfirmed} setCoexistenceConfirmed={setCoexistenceConfirmed} manualControlPending={manualControlPending} /> : null}
@@ -1797,7 +1841,23 @@ export function DebugWorkspace({
           </main>
         </>
       )}
-      {notice ? <div className={"debug-toast " + notice.tone} role={notice.tone === "error" ? "alert" : "status"}>{notice.tone === "error" || notice.tone === "warning" ? <AlertTriangle size={17} aria-hidden="true" /> : notice.tone === "success" ? <CheckCircle2 size={17} aria-hidden="true" /> : <RefreshCw size={17} aria-hidden="true" />}{notice.text}</div> : null}
+      <AnimatePresence initial={false}>
+        {notice ? (
+          <m.div
+            {...statusSwap}
+            className={`debug-toast ${notice.tone}`}
+            key={`${notice.tone}-${notice.text}`}
+            role={notice.tone === "error" ? "alert" : "status"}
+          >
+            {notice.tone === "error" || notice.tone === "warning"
+              ? <AlertTriangle size={17} aria-hidden="true" />
+              : notice.tone === "success"
+                ? <CheckCircle2 size={17} aria-hidden="true" />
+                : <RefreshCw size={17} aria-hidden="true" />}
+            {notice.text}
+          </m.div>
+        ) : null}
+      </AnimatePresence>
     </div>
   );
 }

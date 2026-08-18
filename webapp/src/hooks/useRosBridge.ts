@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, startTransition } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, startTransition } from "react";
 import ROSLIB from "roslib";
 
 import type {
@@ -468,6 +468,7 @@ const ROSBRIDGE_RELIABLE_IMAGE_QOS = {
 // 15 FPS topics directly.
 const CAMERA_FRAME_THROTTLE_MS = 100;
 const CAMERA_STALE_AFTER_MS = 3000;
+const RUNTIME_STATE_MAX_AGE_MS = 4000;
 
 type RawCameraTopicMap = Record<"cam1" | "cam2" | "cam3" | "cam4" | "flir", string>;
 
@@ -658,11 +659,23 @@ type RosServiceResponseMessage = {
 
 type RosServiceConnection = {
   idCounter?: number;
+  isConnected?: boolean;
   on: (event: string, callback: (message: RosServiceResponseMessage) => void) => void;
   off?: (event: string, callback: (message: RosServiceResponseMessage) => void) => void;
   removeListener?: (event: string, callback: (message: RosServiceResponseMessage) => void) => void;
   callOnConnection: (message: Record<string, unknown>) => void;
 };
+
+function unsubscribeWhileConnected(ros: any, topics: any[]): void {
+  if (!ros?.isConnected || ros.socket?.readyState !== WebSocket.OPEN) return;
+  topics.forEach((topic) => {
+    try {
+      topic.unsubscribe();
+    } catch {
+      // A closed bridge already discarded all subscriptions.
+    }
+  });
+}
 
 function normalizeBedRobotArmState(message: unknown): BedRobotArmState | null {
   if (!message || typeof message !== "object") return null;
@@ -778,6 +791,25 @@ function normalizeBedRobotArmStatus(message: unknown): ValidatedBedRobotArmStatu
   return roles.size === expectedRoles.size
     ? { stampMs, receivedAtMs: Date.now(), revision, procedureType, arms }
     : null;
+}
+
+function sameBedRobotArmState(
+  left: BedRobotArmState[],
+  right: BedRobotArmState[],
+): boolean {
+  if (left.length !== right.length) return false;
+  const leftById = new Map(left.map((arm) => [arm.arm_id, arm]));
+  return right.every((arm) => {
+    const previous = leftById.get(arm.arm_id);
+    return Boolean(
+      previous &&
+      previous.role === arm.role &&
+      previous.role_instance_id === arm.role_instance_id &&
+      previous.state === arm.state &&
+      previous.direct_teach_active === arm.direct_teach_active &&
+      previous.reason_code === arm.reason_code,
+    );
+  });
 }
 
 function normalizeSimulationState(message: unknown): SimulationState {
@@ -946,6 +978,7 @@ function legacyCatalog(modelIds: string[], providerName: string) {
 
 export function useRosBridge(runtimeMode: TaskplannerRuntimeMode) {
   const [url, setUrl] = useState(() => runtimeBridgeUrl(runtimeMode));
+  const [transportConnected, setTransportConnected] = useState(false);
   const [connected, setConnected] = useState(false);
   const [bundle, setBundle] = useState("");
   const [startPhase, setStartPhase] = useState("");
@@ -1026,6 +1059,13 @@ export function useRosBridge(runtimeMode: TaskplannerRuntimeMode) {
     DEFAULT_SHADOW_GROUND_TRUTH,
   );
   const reconnectTimerRef = useRef<number | null>(null);
+  const bridgeGenerationRef = useRef(0);
+  const commandReadyGenerationRef = useRef(0);
+  const simulationStateReceivedAtRef = useRef(0);
+  const shadowReplayStateReceivedAtRef = useRef(0);
+  const pendingServiceCancelsRef = useRef(
+    new Set<(reason: string) => void>(),
+  );
   const bundleDirtyRef = useRef(false);
   const eventSequenceRef = useRef(0);
   const bedRobotArmStatusRef = useRef<ValidatedBedRobotArmStatus | null>(null);
@@ -1052,79 +1092,165 @@ export function useRosBridge(runtimeMode: TaskplannerRuntimeMode) {
     setLiveAsrControlMessage("");
   }, [runtimeMode]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     let disposed = false;
-    const ros = new ROSLIB.Ros({ url });
+    let connectionTimer: number | null = null;
+    let bedRobotArmExpiryTimer: number | null = null;
+    const generation = bridgeGenerationRef.current + 1;
+    bridgeGenerationRef.current = generation;
+    commandReadyGenerationRef.current = 0;
+    simulationStateReceivedAtRef.current = 0;
+    shadowReplayStateReceivedAtRef.current = 0;
+    for (const cancel of Array.from(pendingServiceCancelsRef.current)) {
+      cancel("ROS bridge changed before the service response arrived.");
+    }
+    actionRunIdRef.current += 1;
+    controlRunIdRef.current += 1;
+    bundleApplyRunIdRef.current += 1;
+    simulationStateRef.current = DEFAULT_STATE;
+    shadowReplayStateRef.current = DEFAULT_SHADOW_REPLAY_STATE;
+    bedRobotArmStatusRef.current = null;
+    cam4ToolRequestRef.current = DEFAULT_CAM4_TOOL_REQUEST;
+    shadowGroundTruthRef.current = DEFAULT_SHADOW_GROUND_TRUTH;
+    perceptionHealthReceivedRef.current = false;
+    perceptionEnabledRef.current = false;
+    bundleDirtyRef.current = false;
+    setTransportConnected(false);
+    setConnected(false);
+    setBundle("");
+    setStartPhase("");
+    setSimulationState(DEFAULT_STATE);
+    setWorldState(DEFAULT_WORLD_STATE);
+    setExternalBedRobotArmStatus(null);
+    setSurgeonState(DEFAULT_SURGEON);
+    setSurgeonLlmDecision(DEFAULT_SURGEON_LLM_DECISION);
+    setBtDecision(DEFAULT_BT_DECISION);
+    setSkillStatus(DEFAULT_SKILL_STATUS);
+    setVlmHealth(DEFAULT_VLM_HEALTH);
+    setInputSourceStatuses({});
+    setVlmResult(DEFAULT_VLM_RESULT);
+    setVlmReducerDecisions([]);
+    setVlmHealthReceivedAt(null);
+    setVlmResultReceivedAt(null);
+    setEvents([]);
+    setActionPending("");
+    setActionMessage("Connecting to ROS bridge...");
+    setOverrideAck(null);
+    setShadowReplayState(DEFAULT_SHADOW_REPLAY_STATE);
+    setShadowTranscript([]);
+    setShadowGroundTruth(DEFAULT_SHADOW_GROUND_TRUTH);
+    setCam1Image(null);
+    setCam2Image(null);
+    setCam3Image(null);
+    setCam4Image(null);
+    setFlirImage(null);
+    setVlmImage(null);
+    setVlmCompositeImage(null);
+    setCam4PerceptionImage(null);
+    setFlirPerceptionImage(null);
+    setCam4PerceptionOverlay(null);
+    setFlirPerceptionOverlay(null);
+    setPerceptionHealth(DEFAULT_PERCEPTION_HEALTH);
+    setCam4ToolRequest(DEFAULT_CAM4_TOOL_REQUEST);
+    const ros = new ROSLIB.Ros();
+    const isCurrentGeneration = () =>
+      !disposed && bridgeGenerationRef.current === generation;
+    const clearBedRobotArmExpiry = () => {
+      if (bedRobotArmExpiryTimer !== null) {
+        window.clearTimeout(bedRobotArmExpiryTimer);
+        bedRobotArmExpiryTimer = null;
+      }
+    };
+    const clearBedRobotArmStatus = () => {
+      clearBedRobotArmExpiry();
+      bedRobotArmStatusRef.current = null;
+      setExternalBedRobotArmStatus(null);
+    };
+    const scheduleBedRobotArmExpiry = (status: ValidatedBedRobotArmStatus) => {
+      clearBedRobotArmExpiry();
+      bedRobotArmExpiryTimer = window.setTimeout(() => {
+        bedRobotArmExpiryTimer = null;
+        if (!isCurrentGeneration()) return;
+        if (bedRobotArmStatusRef.current !== status) return;
+        bedRobotArmStatusRef.current = null;
+        setExternalBedRobotArmStatus(null);
+      }, BED_ROBOT_STATUS_MAX_AGE_MS);
+    };
     const scheduleReconnect = () => {
-      if (disposed || reconnectTimerRef.current !== null) return;
+      if (!isCurrentGeneration() || reconnectTimerRef.current !== null) return;
       reconnectTimerRef.current = window.setTimeout(() => {
         reconnectTimerRef.current = null;
-        if (!disposed) {
+        if (isCurrentGeneration()) {
           ros.connect(url);
         }
       }, 1500);
     };
+    const invalidateConnectedSnapshot = (message: string) => {
+      commandReadyGenerationRef.current = 0;
+      actionRunIdRef.current += 1;
+      controlRunIdRef.current += 1;
+      bundleApplyRunIdRef.current += 1;
+      for (const cancel of Array.from(pendingServiceCancelsRef.current)) {
+        cancel(message);
+      }
+      simulationStateRef.current = DEFAULT_STATE;
+      shadowReplayStateRef.current = DEFAULT_SHADOW_REPLAY_STATE;
+      simulationStateReceivedAtRef.current = 0;
+      shadowReplayStateReceivedAtRef.current = 0;
+      setTransportConnected(false);
+      setConnected(false);
+      setBundle("");
+      setStartPhase("");
+      setSimulationState(DEFAULT_STATE);
+      setWorldState(DEFAULT_WORLD_STATE);
+      setShadowReplayState(DEFAULT_SHADOW_REPLAY_STATE);
+      setEvents([]);
+      setActionPending("");
+      setCam1Image(null);
+      setCam2Image(null);
+      setCam3Image(null);
+      setCam4Image(null);
+      setFlirImage(null);
+      clearBedRobotArmStatus();
+      perceptionHealthReceivedRef.current = false;
+      perceptionEnabledRef.current = false;
+      setPerceptionHealth(DEFAULT_PERCEPTION_HEALTH);
+      setCam4PerceptionImage(null);
+      setFlirPerceptionImage(null);
+      setCam4PerceptionOverlay(null);
+      setFlirPerceptionOverlay(null);
+      setCam4ToolRequest(DEFAULT_CAM4_TOOL_REQUEST);
+      cam4ToolRequestRef.current = DEFAULT_CAM4_TOOL_REQUEST;
+      setShadowGroundTruth(DEFAULT_SHADOW_GROUND_TRUTH);
+      shadowGroundTruthRef.current = DEFAULT_SHADOW_GROUND_TRUTH;
+      setLiveAsrStatus(DEFAULT_LIVE_ASR_STATUS);
+      setLiveAsrStatusReceivedAt(null);
+      setLiveAsrStatusBridgeUrl("");
+      setLiveAsrControlPending("");
+      setActionMessage(message);
+    };
 
     ros.on("connection", () => {
-      setConnected(true);
-      setActionMessage("ROS bridge connected.");
+      if (!isCurrentGeneration()) return;
+      commandReadyGenerationRef.current = 0;
+      simulationStateReceivedAtRef.current = 0;
+      shadowReplayStateReceivedAtRef.current = 0;
+      setTransportConnected(true);
+      setConnected(false);
+      setActionMessage("ROS bridge connected. Waiting for fresh runtime state...");
       if (reconnectTimerRef.current !== null) {
         window.clearTimeout(reconnectTimerRef.current);
         reconnectTimerRef.current = null;
       }
     });
     ros.on("close", () => {
-      setConnected(false);
-      setCam1Image(null);
-      setCam2Image(null);
-      setCam3Image(null);
-      setCam4Image(null);
-      setFlirImage(null);
-      bedRobotArmStatusRef.current = null;
-      setExternalBedRobotArmStatus(null);
-      perceptionHealthReceivedRef.current = false;
-      perceptionEnabledRef.current = false;
-      setPerceptionHealth(DEFAULT_PERCEPTION_HEALTH);
-      setCam4PerceptionImage(null);
-      setFlirPerceptionImage(null);
-      setCam4PerceptionOverlay(null);
-      setFlirPerceptionOverlay(null);
-      setCam4ToolRequest(DEFAULT_CAM4_TOOL_REQUEST);
-      cam4ToolRequestRef.current = DEFAULT_CAM4_TOOL_REQUEST;
-      setShadowGroundTruth(DEFAULT_SHADOW_GROUND_TRUTH);
-      shadowGroundTruthRef.current = DEFAULT_SHADOW_GROUND_TRUTH;
-      setLiveAsrStatus(DEFAULT_LIVE_ASR_STATUS);
-      setLiveAsrStatusReceivedAt(null);
-      setLiveAsrStatusBridgeUrl("");
-      setLiveAsrControlPending("");
-      setActionMessage("ROS bridge disconnected. Reconnecting...");
+      if (!isCurrentGeneration()) return;
+      invalidateConnectedSnapshot("ROS bridge disconnected. Reconnecting...");
       scheduleReconnect();
     });
     ros.on("error", () => {
-      setConnected(false);
-      setCam1Image(null);
-      setCam2Image(null);
-      setCam3Image(null);
-      setCam4Image(null);
-      setFlirImage(null);
-      bedRobotArmStatusRef.current = null;
-      setExternalBedRobotArmStatus(null);
-      perceptionHealthReceivedRef.current = false;
-      perceptionEnabledRef.current = false;
-      setPerceptionHealth(DEFAULT_PERCEPTION_HEALTH);
-      setCam4PerceptionImage(null);
-      setFlirPerceptionImage(null);
-      setCam4PerceptionOverlay(null);
-      setFlirPerceptionOverlay(null);
-      setCam4ToolRequest(DEFAULT_CAM4_TOOL_REQUEST);
-      cam4ToolRequestRef.current = DEFAULT_CAM4_TOOL_REQUEST;
-      setShadowGroundTruth(DEFAULT_SHADOW_GROUND_TRUTH);
-      shadowGroundTruthRef.current = DEFAULT_SHADOW_GROUND_TRUTH;
-      setLiveAsrStatus(DEFAULT_LIVE_ASR_STATUS);
-      setLiveAsrStatusReceivedAt(null);
-      setLiveAsrStatusBridgeUrl("");
-      setLiveAsrControlPending("");
-      setActionMessage("ROS bridge error. Retrying connection...");
+      if (!isCurrentGeneration()) return;
+      invalidateConnectedSnapshot("ROS bridge error. Retrying connection...");
       scheduleReconnect();
     });
 
@@ -1256,6 +1382,7 @@ export function useRosBridge(runtimeMode: TaskplannerRuntimeMode) {
         requireReliableImageSubscription(topic);
       }
       topic.subscribe((message: unknown) => {
+        if (!isCurrentGeneration()) return;
         if (
           (name === "/surgery/images/cam4/detected/compressed" ||
             name === "/surgery/images/flir/segmented/compressed" ||
@@ -1326,6 +1453,8 @@ export function useRosBridge(runtimeMode: TaskplannerRuntimeMode) {
     });
 
     simulationTopic.subscribe((message: unknown) => {
+      if (!isCurrentGeneration()) return;
+      simulationStateReceivedAtRef.current = Date.now();
       const receivedState = normalizeSimulationState(message);
       const nextState =
         !receivedState.running && receivedState.execution_state === "idle" && receivedState.recent_events.length
@@ -1333,13 +1462,20 @@ export function useRosBridge(runtimeMode: TaskplannerRuntimeMode) {
           : receivedState;
       simulationStateRef.current = nextState;
       setSimulationState(nextState);
+      if (runtimeMode !== "shadow" && ros.isConnected) {
+        commandReadyGenerationRef.current = generation;
+        setConnected(true);
+        setActionMessage("ROS bridge connected.");
+      }
     });
     worldTopic.subscribe((message: unknown) => {
+      if (!isCurrentGeneration()) return;
       startTransition(() => {
         setWorldState(normalizeWorldState(message));
       });
     });
     bedRobotArmStatusTopic.subscribe((message: unknown) => {
+      if (!isCurrentGeneration()) return;
       const status = normalizeBedRobotArmStatus(message);
       if (status === null) return;
       const expectedProcedure = canonicalBedRobotProcedure(
@@ -1356,11 +1492,20 @@ export function useRosBridge(runtimeMode: TaskplannerRuntimeMode) {
         return;
       }
       bedRobotArmStatusRef.current = status;
+      scheduleBedRobotArmExpiry(status);
+      if (
+        current &&
+        current.procedureType === status.procedureType &&
+        sameBedRobotArmState(current.arms, status.arms)
+      ) {
+        return;
+      }
       startTransition(() => {
         setExternalBedRobotArmStatus(status);
       });
     });
     eventTopic.subscribe((message: unknown) => {
+      if (!isCurrentGeneration()) return;
       const receivedAt = Date.now();
       if (receivedAt < suppressEventsUntilRef.current) return;
       eventSequenceRef.current += 1;
@@ -1379,30 +1524,36 @@ export function useRosBridge(runtimeMode: TaskplannerRuntimeMode) {
       });
     });
     surgeonTopic.subscribe((message: unknown) => {
+      if (!isCurrentGeneration()) return;
       startTransition(() => {
         setSurgeonState(message as SurgeonState);
       });
     });
     surgeonLlmDecisionTopic.subscribe((message: unknown) => {
+      if (!isCurrentGeneration()) return;
       startTransition(() => {
         setSurgeonLlmDecision(message as SurgeonLLMDecision);
       });
     });
     btDecisionTopic.subscribe((message: unknown) => {
+      if (!isCurrentGeneration()) return;
       startTransition(() => {
         setBtDecision(message as BTDecision);
       });
     });
     skillStatusTopic.subscribe((message: unknown) => {
+      if (!isCurrentGeneration()) return;
       startTransition(() => {
         setSkillStatus(message as SkillStatus);
       });
     });
     vlmHealthTopic.subscribe((message: unknown) => {
+      if (!isCurrentGeneration()) return;
       setVlmHealth(message as VLMHealth);
       setVlmHealthReceivedAt(Date.now());
     });
     vlmResultTopic.subscribe((message: unknown) => {
+      if (!isCurrentGeneration()) return;
       startTransition(() => {
         setVlmResult(message as VLMResult);
         setVlmResultReceivedAt(Date.now());
@@ -1410,6 +1561,7 @@ export function useRosBridge(runtimeMode: TaskplannerRuntimeMode) {
     });
     inputSourceStatusTopics.forEach((topic) => {
       topic.subscribe((message: unknown) => {
+        if (!isCurrentGeneration()) return;
         const status = message as InputSourceStatus;
         const sourceId = String(status.source_id || "").trim().toLowerCase();
         if (!sourceId) return;
@@ -1422,11 +1574,13 @@ export function useRosBridge(runtimeMode: TaskplannerRuntimeMode) {
       });
     });
     vlmReducerTopic.subscribe((message: unknown) => {
+      if (!isCurrentGeneration()) return;
       startTransition(() => {
         setVlmReducerDecisions((current) => [message as VLMReducerDecision, ...current].slice(0, 8));
       });
     });
     vlmFieldImageTopic.subscribe((message: unknown) => {
+      if (!isCurrentGeneration()) return;
       if (
         perceptionHealthReceivedRef.current &&
         !perceptionEnabledRef.current
@@ -1440,6 +1594,8 @@ export function useRosBridge(runtimeMode: TaskplannerRuntimeMode) {
       });
     });
     shadowReplayStateTopic.subscribe((message: unknown) => {
+      if (!isCurrentGeneration()) return;
+      shadowReplayStateReceivedAtRef.current = Date.now();
       const next = {
         ...DEFAULT_SHADOW_REPLAY_STATE,
         ...(message as Partial<ShadowReplayState>),
@@ -1454,6 +1610,11 @@ export function useRosBridge(runtimeMode: TaskplannerRuntimeMode) {
         next.loaded &&
         next.source_time_sec + 0.25 < previous.source_time_sec;
       shadowReplayStateRef.current = next;
+      if (runtimeMode === "shadow" && ros.isConnected) {
+        commandReadyGenerationRef.current = generation;
+        setConnected(true);
+        setActionMessage("ROS bridge connected.");
+      }
       startTransition(() => {
         if (runChanged || replayRewound) {
           setShadowTranscript([]);
@@ -1485,6 +1646,7 @@ export function useRosBridge(runtimeMode: TaskplannerRuntimeMode) {
       });
     });
     perceptionHealthTopic.subscribe((message: unknown) => {
+      if (!isCurrentGeneration()) return;
       const health = normalizePerceptionHealth(message);
       const wasEnabled = perceptionEnabledRef.current;
       perceptionHealthReceivedRef.current = health.received;
@@ -1513,6 +1675,7 @@ export function useRosBridge(runtimeMode: TaskplannerRuntimeMode) {
       }
     });
     cam4SemanticsTopic.subscribe((message: unknown) => {
+      if (!isCurrentGeneration()) return;
       const parsed = normalizeCam4ToolRequest(message);
       const previous = cam4ToolRequestRef.current;
       const startsRequest =
@@ -1540,6 +1703,7 @@ export function useRosBridge(runtimeMode: TaskplannerRuntimeMode) {
       });
     });
     shadowGroundTruthTopic.subscribe((message: unknown) => {
+      if (!isCurrentGeneration()) return;
       const parsed = normalizeShadowGroundTruth(message);
       const previous = shadowGroundTruthRef.current;
       const sameEvent =
@@ -1560,6 +1724,7 @@ export function useRosBridge(runtimeMode: TaskplannerRuntimeMode) {
     });
     if (runtimeMode === "live") {
       liveAsrStatusTopic.subscribe((message: unknown) => {
+        if (!isCurrentGeneration()) return;
         const parsed = normalizeLiveAsrStatus(message);
         if (!parsed) return;
         setLiveAsrStatus(parsed);
@@ -1568,6 +1733,7 @@ export function useRosBridge(runtimeMode: TaskplannerRuntimeMode) {
       });
     }
     shadowTranscriptTopic.subscribe((message: unknown) => {
+      if (!isCurrentGeneration()) return;
       const utterance = message as SpeechUtterance;
       if (!utterance.is_final || !utterance.text?.trim()) return;
       const messageRunId = transcriptRunId(utterance.source || "");
@@ -1586,6 +1752,7 @@ export function useRosBridge(runtimeMode: TaskplannerRuntimeMode) {
       });
     });
     shadowTranscriptHistoryTopic.subscribe((message: unknown) => {
+      if (!isCurrentGeneration()) return;
       const history = normalizeShadowTranscriptHistory(message);
       const activeRunId = shadowReplayStateRef.current.run_id;
       if (
@@ -1605,41 +1772,90 @@ export function useRosBridge(runtimeMode: TaskplannerRuntimeMode) {
     });
 
     rosRef.current = ros;
+    const runtimeStateFreshnessTimer = window.setInterval(() => {
+      if (!isCurrentGeneration() || commandReadyGenerationRef.current !== generation) return;
+      const receivedAt = runtimeMode === "shadow"
+        ? shadowReplayStateReceivedAtRef.current
+        : simulationStateReceivedAtRef.current;
+      if (receivedAt > 0 && Date.now() - receivedAt <= RUNTIME_STATE_MAX_AGE_MS) return;
+      commandReadyGenerationRef.current = 0;
+      actionRunIdRef.current += 1;
+      controlRunIdRef.current += 1;
+      bundleApplyRunIdRef.current += 1;
+      for (const cancel of Array.from(pendingServiceCancelsRef.current)) {
+        cancel("Runtime state heartbeat expired before the service response arrived.");
+      }
+      setConnected(false);
+      setActionPending("");
+      setActionMessage("Runtime state heartbeat expired. Waiting for a fresh state...");
+      if (runtimeMode === "shadow") {
+        shadowReplayStateRef.current = DEFAULT_SHADOW_REPLAY_STATE;
+        setShadowReplayState(DEFAULT_SHADOW_REPLAY_STATE);
+      } else {
+        simulationStateRef.current = DEFAULT_STATE;
+        setSimulationState(DEFAULT_STATE);
+      }
+    }, 500);
+    connectionTimer = window.setTimeout(() => {
+      connectionTimer = null;
+      if (isCurrentGeneration()) ros.connect(url);
+    }, 0);
 
     return () => {
       disposed = true;
-      simulationTopic.unsubscribe();
-      worldTopic.unsubscribe();
-      bedRobotArmStatusTopic.unsubscribe();
-      eventTopic.unsubscribe();
-      surgeonTopic.unsubscribe();
-      surgeonLlmDecisionTopic.unsubscribe();
-      btDecisionTopic.unsubscribe();
-      skillStatusTopic.unsubscribe();
-      vlmHealthTopic.unsubscribe();
-      vlmResultTopic.unsubscribe();
-      inputSourceStatusTopics.forEach((topic) => topic.unsubscribe());
-      vlmReducerTopic.unsubscribe();
-      vlmFieldImageTopic.unsubscribe();
-      cameraTopics.forEach((topic) => topic.unsubscribe());
+      if (bridgeGenerationRef.current === generation) {
+        commandReadyGenerationRef.current = 0;
+        simulationStateReceivedAtRef.current = 0;
+        shadowReplayStateReceivedAtRef.current = 0;
+        simulationStateRef.current = DEFAULT_STATE;
+        shadowReplayStateRef.current = DEFAULT_SHADOW_REPLAY_STATE;
+        rosRef.current = null;
+        setTransportConnected(false);
+        setConnected(false);
+        setSimulationState(DEFAULT_STATE);
+        setShadowReplayState(DEFAULT_SHADOW_REPLAY_STATE);
+        setActionPending("");
+        for (const cancel of Array.from(pendingServiceCancelsRef.current)) {
+          cancel("ROS bridge changed before the service response arrived.");
+        }
+      }
+      if (connectionTimer !== null) window.clearTimeout(connectionTimer);
+      window.clearInterval(runtimeStateFreshnessTimer);
+      clearBedRobotArmExpiry();
+      unsubscribeWhileConnected(ros, [
+        simulationTopic,
+        worldTopic,
+        bedRobotArmStatusTopic,
+        eventTopic,
+        surgeonTopic,
+        surgeonLlmDecisionTopic,
+        btDecisionTopic,
+        skillStatusTopic,
+        vlmHealthTopic,
+        vlmResultTopic,
+        ...inputSourceStatusTopics,
+        vlmReducerTopic,
+        vlmFieldImageTopic,
+        ...cameraTopics,
+        shadowReplayStateTopic,
+        perceptionHealthTopic,
+        cam4SemanticsTopic,
+        shadowTranscriptTopic,
+        shadowTranscriptHistoryTopic,
+        shadowGroundTruthTopic,
+        ...(runtimeMode === "live" ? [liveAsrStatusTopic] : []),
+      ]);
       pendingCameraFramesRef.current.clear();
       if (cameraFlushFrameRef.current !== null) {
         window.cancelAnimationFrame(cameraFlushFrameRef.current);
         cameraFlushFrameRef.current = null;
       }
-      shadowReplayStateTopic.unsubscribe();
-      perceptionHealthTopic.unsubscribe();
-      cam4SemanticsTopic.unsubscribe();
-      shadowTranscriptTopic.unsubscribe();
-      shadowTranscriptHistoryTopic.unsubscribe();
-      shadowGroundTruthTopic.unsubscribe();
-      if (runtimeMode === "live") liveAsrStatusTopic.unsubscribe();
       if (reconnectTimerRef.current !== null) {
         window.clearTimeout(reconnectTimerRef.current);
         reconnectTimerRef.current = null;
       }
       ros.close();
-      rosRef.current = null;
+      if (rosRef.current === ros) rosRef.current = null;
     };
   }, [runtimeMode, url]);
 
@@ -1696,22 +1912,6 @@ export function useRosBridge(runtimeMode: TaskplannerRuntimeMode) {
     }
   }, [activeBundle]);
 
-  useEffect(() => {
-    if (externalBedRobotArmStatus === null) return;
-    const remainingMs =
-      externalBedRobotArmStatus.receivedAtMs + BED_ROBOT_STATUS_MAX_AGE_MS - Date.now();
-    if (remainingMs <= 0) {
-      bedRobotArmStatusRef.current = null;
-      setExternalBedRobotArmStatus(null);
-      return;
-    }
-    const timeout = window.setTimeout(() => {
-      bedRobotArmStatusRef.current = null;
-      setExternalBedRobotArmStatus(null);
-    }, remainingMs);
-    return () => window.clearTimeout(timeout);
-  }, [externalBedRobotArmStatus]);
-
   function setBundleSelection(nextBundle: string) {
     bundleDirtyRef.current = true;
     setBundle(nextBundle);
@@ -1723,17 +1923,25 @@ export function useRosBridge(runtimeMode: TaskplannerRuntimeMode) {
     request: Record<string, unknown>,
     timeoutMs = 20000,
   ) {
-    if (!rosRef.current || !connected) {
-      throw new Error("ROS bridge is offline.");
-    }
+    const generation = bridgeGenerationRef.current;
     const ros = rosRef.current as RosServiceConnection;
+    if (
+      !ros ||
+      !ros.isConnected ||
+      commandReadyGenerationRef.current !== generation
+    ) {
+      throw new Error("ROS bridge is waiting for a fresh runtime state.");
+    }
     return new Promise<Record<string, unknown>>((resolve, reject) => {
       const serviceCallId = `call_service:${name}:${Number(ros.idCounter ?? 0) + 1}`;
       ros.idCounter = Number(ros.idCounter ?? 0) + 1;
       const timeoutSec = Math.max(1, timeoutMs / 1000);
       let timeout = 0;
+      let settled = false;
+      let cancel = (_reason: string) => {};
       const cleanup = (handler: (message: RosServiceResponseMessage) => void) => {
         window.clearTimeout(timeout);
+        pendingServiceCancelsRef.current.delete(cancel);
         if (typeof ros.off === "function") {
           ros.off(serviceCallId, handler);
         } else if (typeof ros.removeListener === "function") {
@@ -1741,6 +1949,16 @@ export function useRosBridge(runtimeMode: TaskplannerRuntimeMode) {
         }
       };
       const handler = (message: RosServiceResponseMessage) => {
+        if (settled) return;
+        if (
+          generation !== bridgeGenerationRef.current ||
+          commandReadyGenerationRef.current !== generation ||
+          rosRef.current !== ros
+        ) {
+          cancel("ROS bridge changed before the service response arrived.");
+          return;
+        }
+        settled = true;
         cleanup(handler);
         if (message.result === false) {
           reject(new Error(String(message.values || `Service call failed for ${name}.`)));
@@ -1748,19 +1966,29 @@ export function useRosBridge(runtimeMode: TaskplannerRuntimeMode) {
         }
         resolve(typeof message.values === "object" && message.values !== null ? message.values : {});
       };
-      timeout = window.setTimeout(() => {
+      cancel = (reason: string) => {
+        if (settled) return;
+        settled = true;
         cleanup(handler);
-        reject(new Error(`Timed out waiting for service response from ${name}`));
+        reject(new Error(reason));
+      };
+      pendingServiceCancelsRef.current.add(cancel);
+      timeout = window.setTimeout(() => {
+        cancel(`Timed out waiting for service response from ${name}`);
       }, timeoutMs);
       ros.on(serviceCallId, handler);
-      ros.callOnConnection({
-        op: "call_service",
-        id: serviceCallId,
-        service: name,
-        type: serviceType,
-        args: new ROSLIB.ServiceRequest(request),
-        timeout: timeoutSec,
-      });
+      try {
+        ros.callOnConnection({
+          op: "call_service",
+          id: serviceCallId,
+          service: name,
+          type: serviceType,
+          args: new ROSLIB.ServiceRequest(request),
+          timeout: timeoutSec,
+        });
+      } catch (error) {
+        cancel(error instanceof Error ? error.message : String(error));
+      }
     });
   }
 
@@ -2637,7 +2865,11 @@ export function useRosBridge(runtimeMode: TaskplannerRuntimeMode) {
   }
 
   const runtimeMessage = runtimeStatusMessage(simulationState);
-  const simulationReady = connected && simulationState.instrument_states.length > 0;
+  const simulationReady = connected && (
+    runtimeMode === "shadow"
+      ? shadowReplayState.loaded
+      : simulationState.instrument_states.length > 0
+  );
   const shouldPreferRuntimeMessage =
     !actionPending && Boolean(runtimeMessage) && (actionMessage === "Ready." || actionMessage === "ROS bridge connected.");
   const displayActionMessage = shouldPreferRuntimeMessage ? runtimeMessage : actionMessage;
@@ -2645,6 +2877,7 @@ export function useRosBridge(runtimeMode: TaskplannerRuntimeMode) {
   return {
     url,
     setUrl,
+    transportConnected,
     connected,
     bundle,
     setBundleSelection,

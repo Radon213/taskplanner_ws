@@ -1,5 +1,6 @@
 import { useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
-import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
+import { AnimatePresence, useReducedMotion } from "framer-motion";
+import * as m from "framer-motion/m";
 import { BrainCircuit, Code2, ListTree, RadioTower } from "lucide-react";
 
 import type { BedRobotArmTrace, useDigitalTwinViewModel } from "../../hooks/useDigitalTwinViewModel";
@@ -15,6 +16,7 @@ import type {
   VLMResult,
   WorldState,
 } from "../../types";
+import { MOTION_DURATION, SILK_EASE } from "../../motion-system";
 import { type Language } from "../../utils/display";
 
 type ViewModel = ReturnType<typeof useDigitalTwinViewModel>;
@@ -425,7 +427,7 @@ export function ObservabilityPanel({
         >
           <AnimatePresence initial={false}>
             {visibleTimeline.map((item, index) => (
-              <motion.article
+              <m.article
                 key={item.uiId || item.id}
                 layout="position"
                 data-timeline-index={index}
@@ -441,16 +443,16 @@ export function ObservabilityPanel({
                   prefersReducedMotion
                     ? { duration: 0 }
                     : {
-                        opacity: { duration: 0.16 },
-                        x: { duration: 0.22, ease: [0.22, 1, 0.36, 1] },
-                        layout: { duration: 0.34, ease: [0.22, 1, 0.36, 1] },
+                        opacity: { duration: MOTION_DURATION.normal },
+                        x: { duration: MOTION_DURATION.normal, ease: SILK_EASE },
+                        layout: { duration: MOTION_DURATION.moderate, ease: SILK_EASE },
                       }
                 }
               >
                 <span />
                 <strong>{item.title}</strong>
                 <TimelineMeta value={item.meta} />
-              </motion.article>
+              </m.article>
             ))}
           </AnimatePresence>
           {visibleTimeline.length === 0 ? (
@@ -515,7 +517,11 @@ export function ObservabilityPanel({
           </div>
         </div>
 
-        <div className="decision-scroll">
+        <div
+          aria-label={language === "ko" ? "판단 상세 스크롤 영역" : "Decision detail scroll region"}
+          className="decision-scroll"
+          tabIndex={0}
+        >
           <section className="bed-arm-trace-section" aria-labelledby="bed-arm-trace-title">
             <div className="bed-arm-trace-title-row">
               <div>
@@ -545,9 +551,9 @@ export function ObservabilityPanel({
             )}
           </section>
 
-          <AnimatePresence mode="wait">
+          <AnimatePresence initial={false} mode="wait">
             {tab === "bt" ? (
-              <motion.div
+              <m.div
                 id="observability-panel-bt"
                 key="bt"
                 className="detail-grid"
@@ -574,11 +580,11 @@ export function ObservabilityPanel({
                   <span>{vm.ui.rationale}</span>
                   <strong>{btDecision.decision_reason || btDecision.rationale || vm.ui.none}</strong>
                 </article>
-              </motion.div>
+              </m.div>
             ) : null}
 
             {tab === "vlm" ? (
-              <motion.div
+              <m.div
                 id="observability-panel-vlm"
                 key="vlm"
                 className="detail-grid"
@@ -661,11 +667,11 @@ export function ObservabilityPanel({
                       : vm.ui.none}
                   </strong>
                 </article>
-              </motion.div>
+              </m.div>
             ) : null}
 
             {tab === "raw" ? (
-              <motion.pre
+              <m.pre
                 id="observability-panel-raw"
                 key="raw"
                 className="raw-block"
@@ -677,7 +683,7 @@ export function ObservabilityPanel({
                 transition={{ duration: prefersReducedMotion ? 0 : 0.18 }}
               >
                 {vlmResult.raw_json || "{}"}
-              </motion.pre>
+              </m.pre>
             ) : null}
           </AnimatePresence>
         </div>

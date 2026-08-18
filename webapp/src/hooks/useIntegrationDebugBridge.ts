@@ -1,8 +1,17 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import ROSLIB from "roslib";
+
+const DEBUG_STATUS_MAX_AGE_MS = 3000;
+const DEBUG_COMMAND_TIMEOUT_MS = 10000;
 
 interface RosConnection {
   close: () => void;
+  idCounter?: number;
+  isConnected?: boolean;
+  on: (event: string, callback: (message: unknown) => void) => void;
+  off?: (event: string, callback: (message: unknown) => void) => void;
+  removeListener?: (event: string, callback: (message: unknown) => void) => void;
+  callOnConnection: (message: Record<string, unknown>) => void;
 }
 
 interface RosTopicHandle {
@@ -339,9 +348,30 @@ function parseStatus(raw: unknown): IntegrationDebugStatus | null {
   }
 }
 
+function cleanupDebugTopics(ros: any, topics: any[], advertisedTopic: any): void {
+  if (!ros?.isConnected || ros.socket?.readyState !== WebSocket.OPEN) return;
+  topics.forEach((topic) => {
+    try {
+      topic.unsubscribe();
+    } catch {
+      // The closed bridge has already released the subscription.
+    }
+  });
+  try {
+    advertisedTopic.unadvertise();
+  } catch {
+    // The closed bridge has already released the advertisement.
+  }
+}
+
 export function useIntegrationDebugBridge(url: string) {
   const rosRef = useRef<RosConnection | null>(null);
   const heartbeatTopicRef = useRef<RosTopicHandle | null>(null);
+  const bridgeGenerationRef = useRef(0);
+  const commandReadyGenerationRef = useRef(0);
+  const statusReceivedAtRef = useRef(0);
+  const pendingCommandCancelsRef = useRef(new Set<(reason: string) => void>());
+  const [transportConnected, setTransportConnected] = useState(false);
   const [connected, setConnected] = useState(false);
   const [status, setStatus] = useState<IntegrationDebugStatus | null>(null);
   const [readiness, setReadiness] = useState<Record<string, unknown> | null>(null);
@@ -350,9 +380,17 @@ export function useIntegrationDebugBridge(url: string) {
   const [connectionNonce, setConnectionNonce] = useState(0);
   const [reconnecting, setReconnecting] = useState(false);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     let disposed = false;
     let reconnectTimer: number | null = null;
+    const generation = bridgeGenerationRef.current + 1;
+    bridgeGenerationRef.current = generation;
+    commandReadyGenerationRef.current = 0;
+    statusReceivedAtRef.current = 0;
+    for (const cancel of Array.from(pendingCommandCancelsRef.current)) {
+      cancel("디버그 ROSBridge 연결이 변경되어 대기 중인 명령을 취소했습니다.");
+    }
+    setTransportConnected(false);
     setConnected(false);
     setStatus(null);
     setReadiness(null);
@@ -360,6 +398,8 @@ export function useIntegrationDebugBridge(url: string) {
 
     const ros = new ROSLIB.Ros();
     rosRef.current = ros;
+    const isCurrentGeneration = () =>
+      !disposed && bridgeGenerationRef.current === generation && rosRef.current === ros;
     const statusTopic = new ROSLIB.Topic({
       ros,
       name: "/integration/debug/status",
@@ -379,36 +419,58 @@ export function useIntegrationDebugBridge(url: string) {
     heartbeatTopicRef.current = heartbeatTopic;
 
     function scheduleReconnect() {
-      if (disposed || reconnectTimer !== null) return;
+      if (!isCurrentGeneration() || reconnectTimer !== null) return;
       setReconnecting(true);
       reconnectTimer = window.setTimeout(() => {
         reconnectTimer = null;
-        setConnectionNonce((value) => value + 1);
+        if (isCurrentGeneration()) setConnectionNonce((value) => value + 1);
       }, 1200);
     }
 
+    function invalidateCommandReadiness(reason: string) {
+      if (!isCurrentGeneration() || commandReadyGenerationRef.current !== generation) return;
+      commandReadyGenerationRef.current = 0;
+      setConnected(false);
+      for (const cancel of Array.from(pendingCommandCancelsRef.current)) {
+        cancel(reason);
+      }
+    }
+
     ros.on("connection", () => {
+      if (!isCurrentGeneration()) return;
       heartbeatTopic.advertise();
-      setConnected(true);
+      setTransportConnected(true);
+      setConnected(false);
       setReconnecting(false);
       setConnectionError("");
     });
     ros.on("error", (error: unknown) => {
+      if (!isCurrentGeneration()) return;
+      setTransportConnected(false);
+      invalidateCommandReadiness("디버그 ROSBridge 오류로 대기 중인 명령을 취소했습니다.");
       setConnectionError(error instanceof Error ? error.message : "ROSBridge 연결에 실패했습니다.");
       scheduleReconnect();
     });
     ros.on("close", () => {
-      setConnected(false);
+      if (!isCurrentGeneration()) return;
+      setTransportConnected(false);
+      invalidateCommandReadiness("디버그 ROSBridge 연결이 종료되어 대기 중인 명령을 취소했습니다.");
       setConnectionError("ROSBridge 연결이 종료되었습니다.");
       scheduleReconnect();
     });
     statusTopic.subscribe((message: { data?: unknown }) => {
+      if (!isCurrentGeneration()) return;
       const parsed = parseStatus(message.data);
       if (!parsed) return;
+      const receivedAt = Date.now();
+      statusReceivedAtRef.current = receivedAt;
+      commandReadyGenerationRef.current = generation;
       setStatus(parsed);
-      setStatusReceivedAt(Date.now());
+      setStatusReceivedAt(receivedAt);
+      if (ros.isConnected) setConnected(true);
     });
     readinessTopic.subscribe((message: { data?: unknown }) => {
+      if (!isCurrentGeneration()) return;
       if (typeof message.data !== "string") return;
       try {
         const value = JSON.parse(message.data) as Record<string, unknown>;
@@ -418,16 +480,35 @@ export function useIntegrationDebugBridge(url: string) {
       }
     });
     const connectionTimer = window.setTimeout(() => {
-      if (!disposed) ros.connect(url);
+      if (isCurrentGeneration()) ros.connect(url);
     }, 0);
+    const freshnessTimer = window.setInterval(() => {
+      if (!isCurrentGeneration()) return;
+      if (
+        commandReadyGenerationRef.current === generation &&
+        Date.now() - statusReceivedAtRef.current > DEBUG_STATUS_MAX_AGE_MS
+      ) {
+        invalidateCommandReadiness(
+          "디버그 상태 heartbeat가 만료되어 대기 중인 명령을 취소했습니다.",
+        );
+      }
+    }, 500);
 
     return () => {
       disposed = true;
       window.clearTimeout(connectionTimer);
+      window.clearInterval(freshnessTimer);
       if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
-      statusTopic.unsubscribe();
-      readinessTopic.unsubscribe();
-      heartbeatTopic.unadvertise();
+      if (bridgeGenerationRef.current === generation) {
+        commandReadyGenerationRef.current = 0;
+        statusReceivedAtRef.current = 0;
+        setTransportConnected(false);
+        setConnected(false);
+        for (const cancel of Array.from(pendingCommandCancelsRef.current)) {
+          cancel("디버그 ROSBridge 연결이 변경되어 대기 중인 명령을 취소했습니다.");
+        }
+      }
+      cleanupDebugTopics(ros, [statusTopic, readinessTopic], heartbeatTopic);
       heartbeatTopicRef.current = null;
       if (rosRef.current === ros) rosRef.current = null;
       try {
@@ -441,44 +522,95 @@ export function useIntegrationDebugBridge(url: string) {
   const command = useCallback(
     async (operation: string, payload: Record<string, unknown> = {}): Promise<DebugCommandResponse> => {
       const ros = rosRef.current;
-      if (!ros || !connected) {
-        throw new Error("디버그 ROSBridge가 연결되지 않았습니다.");
+      const generation = bridgeGenerationRef.current;
+      if (
+        !ros ||
+        !ros.isConnected ||
+        !connected ||
+        commandReadyGenerationRef.current !== generation
+      ) {
+        throw new Error("디버그 상태 heartbeat를 기다리고 있어 쓰기 제어가 잠겼습니다.");
       }
-      const service = new ROSLIB.Service({
-        ros,
-        name: "/integration/debug/command",
-        serviceType: "surgical_msgs/srv/IntegrationDebugCommand",
-      });
       return new Promise<DebugCommandResponse>((resolve, reject) => {
-        const request = new ROSLIB.ServiceRequest({
-          operation,
-          payload_json: JSON.stringify(payload),
-        });
-        service.callService(
-          request,
-          (raw: Record<string, unknown>) => {
-            let result: Record<string, unknown> = {};
-            if (typeof raw.result_json === "string" && raw.result_json) {
-              try {
-                const parsed = JSON.parse(raw.result_json) as unknown;
-                if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-                  result = parsed as Record<string, unknown>;
-                }
-              } catch {
-                result = {};
+        let settled = false;
+        let timeout = 0;
+        const serviceCallId = `call_service:/integration/debug/command:${Number(ros.idCounter ?? 0) + 1}`;
+        ros.idCounter = Number(ros.idCounter ?? 0) + 1;
+        const cleanup = (handler: (message: unknown) => void) => {
+          window.clearTimeout(timeout);
+          pendingCommandCancelsRef.current.delete(cancel);
+          if (typeof ros.off === "function") ros.off(serviceCallId, handler);
+          else if (typeof ros.removeListener === "function") ros.removeListener(serviceCallId, handler);
+        };
+        let cancel = (_reason: string) => {};
+        const isCurrentCommand = () =>
+          generation === bridgeGenerationRef.current &&
+          commandReadyGenerationRef.current === generation &&
+          rosRef.current === ros &&
+          ros.isConnected;
+        const handler = (message: unknown) => {
+          if (!isCurrentCommand()) {
+            cancel("디버그 ROSBridge 연결이 변경되어 이전 명령 응답을 무시했습니다.");
+            return;
+          }
+          if (settled) return;
+          settled = true;
+          cleanup(handler);
+          const response = message && typeof message === "object"
+            ? message as { result?: boolean; values?: Record<string, unknown> | string }
+            : {};
+          if (response.result === false) {
+            reject(new Error(String(response.values || "디버그 명령이 거부되었습니다.")));
+            return;
+          }
+          const raw = response.values && typeof response.values === "object"
+            ? response.values
+            : {};
+          let result: Record<string, unknown> = {};
+          if (typeof raw.result_json === "string" && raw.result_json) {
+            try {
+              const parsed = JSON.parse(raw.result_json) as unknown;
+              if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+                result = parsed as Record<string, unknown>;
               }
+            } catch {
+              result = {};
             }
-            resolve({
-              accepted: Boolean(raw.accepted),
-              command_id: String(raw.command_id ?? ""),
-              message: String(raw.message ?? ""),
-              result,
-            });
-          },
-          (error: unknown) => {
-            reject(error instanceof Error ? error : new Error(String(error)));
-          },
+          }
+          resolve({
+            accepted: Boolean(raw.accepted),
+            command_id: String(raw.command_id ?? ""),
+            message: String(raw.message ?? ""),
+            result,
+          });
+        };
+        cancel = (reason: string) => {
+          if (settled) return;
+          settled = true;
+          cleanup(handler);
+          reject(new Error(reason));
+        };
+        pendingCommandCancelsRef.current.add(cancel);
+        timeout = window.setTimeout(
+          () => cancel("디버그 명령 응답 시간이 초과되었습니다."),
+          DEBUG_COMMAND_TIMEOUT_MS,
         );
+        ros.on(serviceCallId, handler);
+        try {
+          ros.callOnConnection({
+            op: "call_service",
+            id: serviceCallId,
+            service: "/integration/debug/command",
+            type: "surgical_msgs/srv/IntegrationDebugCommand",
+            args: new ROSLIB.ServiceRequest({
+              operation,
+              payload_json: JSON.stringify(payload),
+            }),
+            timeout: DEBUG_COMMAND_TIMEOUT_MS / 1_000,
+          });
+        } catch (error) {
+          cancel(error instanceof Error ? error.message : String(error));
+        }
       });
     },
     [connected],
@@ -503,6 +635,7 @@ export function useIntegrationDebugBridge(url: string) {
 
   return {
     url,
+    transportConnected,
     connected,
     reconnecting,
     connectionError,

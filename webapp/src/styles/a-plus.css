@@ -1,0 +1,1225 @@
+/*
+ * A+ experience layer
+ *
+ * This file intentionally sits after the legacy stylesheet. It establishes a
+ * coherent HIG-inspired shell without rewriting runtime- or ROS-facing code.
+ */
+
+html {
+  min-width: 320px;
+  background: var(--color-page);
+  scrollbar-gutter: stable;
+}
+
+body {
+  background: var(--color-page);
+  color: var(--color-text);
+}
+
+::selection {
+  background: color-mix(in srgb, var(--color-accent) 34%, transparent);
+  color: var(--color-text);
+}
+
+.skip-link {
+  position: fixed;
+  top: 12px;
+  left: 12px;
+  z-index: 5000;
+  min-height: 44px;
+  padding: 11px 14px;
+  border-radius: var(--radius-control);
+  background: var(--color-accent);
+  color: var(--color-accent-ink);
+  font-size: 14px;
+  font-weight: 700;
+  text-decoration: none;
+  transform: translateY(-160%);
+  transition: transform var(--duration-fast) var(--ease-default);
+}
+
+.skip-link:focus {
+  transform: translateY(0);
+}
+
+.app-shell {
+  width: min(1920px, 100%);
+  max-width: 100%;
+}
+
+.top-ribbon,
+.dock,
+.stage-card,
+.timeline-panel,
+.explain-panel,
+.live-asr-panel,
+.ops-header,
+.ops-card,
+.ops-disconnected-banner,
+.debug-header,
+.debug-tabs,
+.debug-kpi-card,
+.debug-section-card,
+.debug-arm-card,
+.debug-feedback-card {
+  border-color: var(--color-border);
+  border-radius: var(--radius-card);
+  background: var(--color-surface);
+  box-shadow: var(--shadow-card);
+}
+
+.app-shell.app-shell :where(button, select, input:not([type="checkbox"]):not([type="radio"]), textarea) {
+  min-height: 44px;
+}
+
+.app-shell.app-shell button {
+  min-width: 44px;
+}
+
+.app-shell :where(button, select, input, textarea, [tabindex]):focus-visible {
+  outline: 3px solid color-mix(in srgb, var(--color-accent) 84%, white);
+  outline-offset: 3px;
+}
+
+.app-shell button {
+  touch-action: manipulation;
+}
+
+.app-shell :where(button, select, input, textarea) {
+  transition:
+    background-color var(--duration-fast) var(--ease-silk),
+    border-color var(--duration-fast) var(--ease-silk),
+    box-shadow var(--duration-fast) var(--ease-silk),
+    color var(--duration-fast) var(--ease-silk),
+    opacity var(--duration-fast) var(--ease-silk);
+}
+
+.app-shell button:active:not(:disabled) {
+  filter: brightness(0.96);
+}
+
+.app-shell button:disabled,
+.app-shell select:disabled,
+.app-shell input:disabled,
+.app-shell textarea:disabled {
+  cursor: not-allowed;
+  opacity: 0.52;
+}
+
+.top-ribbon {
+  display: grid;
+  min-height: 88px;
+  grid-template-columns: minmax(250px, 0.7fr) minmax(0, 2.3fr);
+  align-items: center;
+  gap: 18px;
+  padding: 14px 16px;
+}
+
+.brand-mark {
+  border-radius: var(--radius-control);
+  background: var(--color-accent);
+  color: var(--color-accent-ink);
+}
+
+.brand-block p,
+.section-kicker,
+.ops-brand p,
+.ops-card-heading p,
+.debug-title-block p,
+.debug-section-heading p,
+.debug-arm-card p {
+  color: var(--color-accent-strong);
+  font-size: 12px;
+}
+
+.brand-block h1 {
+  font-size: clamp(24px, 1.65vw, 30px);
+  letter-spacing: -0.01em;
+}
+
+.brand-block span {
+  color: var(--color-text-muted);
+  font-size: 13px;
+}
+
+.ribbon-cluster {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: auto minmax(290px, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+}
+
+.workspace-navigation {
+  display: grid;
+  min-width: 250px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 4px;
+  padding: 4px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-card);
+  background: var(--color-page-raised);
+}
+
+.workspace-navigation :where(button, .workspace-navigation-current) {
+  display: inline-flex;
+  min-width: 0;
+  min-height: 44px;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  padding: 0 12px;
+  border-radius: var(--radius-control);
+  background: transparent;
+  color: var(--color-text-muted);
+  font-size: 13px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.workspace-navigation .workspace-navigation-current {
+  background: var(--color-surface-raised);
+  box-shadow: var(--shadow-card);
+  color: var(--color-text);
+}
+
+.workspace-navigation button:hover {
+  background: color-mix(in srgb, var(--color-accent) 9%, var(--color-surface));
+  color: var(--color-accent-strong);
+}
+
+.ribbon-status-actions {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.system-pill,
+.language-control,
+.ribbon-model-control,
+.debug-mode-entry {
+  min-height: 44px;
+  border-color: var(--color-border);
+  border-radius: var(--radius-control);
+  background: var(--color-page-raised);
+}
+
+.system-pill {
+  padding-inline: 12px;
+}
+
+.system-pill.ok {
+  border-color: color-mix(in srgb, var(--color-success) 40%, var(--color-border));
+  color: var(--color-success);
+}
+
+.system-pill.warn {
+  border-color: color-mix(in srgb, var(--color-danger) 40%, var(--color-border));
+  color: var(--color-danger);
+}
+
+.ribbon-model-control {
+  min-width: 0;
+  max-width: none;
+  padding: 4px 8px;
+}
+
+.debug-mode-entry {
+  min-width: 138px;
+  padding: 0 12px;
+  border-color: var(--color-border-strong);
+  background: transparent;
+  color: var(--color-text-secondary);
+}
+
+.debug-mode-entry:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--color-warning) 50%, var(--color-border));
+  background: color-mix(in srgb, var(--color-warning) 8%, transparent);
+  color: var(--color-warning-text);
+}
+
+.language-control {
+  gap: 3px;
+  padding: 3px;
+}
+
+.language-control > svg {
+  margin-inline: 6px 2px;
+}
+
+.language-control button {
+  min-width: 48px;
+  min-height: 44px;
+  padding: 0 10px;
+  border-radius: var(--radius-inner);
+}
+
+.language-control button.active {
+  background: var(--color-surface-raised);
+  box-shadow: var(--shadow-card);
+  color: var(--color-text);
+}
+
+.button {
+  min-height: 44px;
+  border-radius: var(--radius-control);
+  transition:
+    background-color var(--duration-fast) var(--ease-default),
+    border-color var(--duration-fast) var(--ease-default),
+    color var(--duration-fast) var(--ease-default),
+    opacity var(--duration-fast) var(--ease-default);
+}
+
+.button:hover:not(:disabled) {
+  transform: none;
+}
+
+.button-primary {
+  border: 1px solid transparent;
+  background: var(--color-accent);
+  color: var(--color-accent-ink);
+}
+
+.button-primary:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--color-accent) 86%, white);
+}
+
+.button-secondary {
+  border-color: var(--color-border-strong);
+  background: var(--color-surface-raised);
+  color: var(--color-text);
+}
+
+.button-quiet {
+  border-color: var(--color-border);
+  background: transparent;
+  color: var(--color-text-secondary);
+}
+
+.button-stop {
+  border: 1px solid color-mix(in srgb, var(--color-danger) 46%, var(--color-border));
+  background: color-mix(in srgb, var(--color-danger) 9%, transparent);
+  color: var(--color-danger-text);
+}
+
+.button-stop:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--color-danger) 16%, transparent);
+}
+
+.field input,
+.field select,
+.runtime-mode-select,
+.runtime-mode-select select,
+.debug-field input,
+.debug-field select,
+.debug-field textarea,
+.ops-topic-controls input,
+.ops-topic-controls select {
+  border-color: var(--color-border);
+  border-radius: var(--radius-control);
+  background: var(--color-page-raised);
+  color: var(--color-text);
+}
+
+/* Operational labels stay legible even inside the dense stage canvas. */
+.model-trigger-copy small,
+.model-load-state,
+.stage-perception-toggle span,
+.stage-perception-toggle strong,
+.humanoid-action-kicker,
+.humanoid-action-topline .humanoid-action-kicker,
+.humanoid-action-state,
+.humanoid-action-copy em,
+.humanoid-action-tool,
+.bed-phase-badge small,
+.stage-camera-viewport figcaption > i,
+.stage-camera-empty span,
+.holder-title .holder-inline-badges span,
+.public-gesture-status span,
+.llm-speech-log-header small,
+.runtime-mode-select > i,
+.runtime-mode-detail {
+  font-size: 12px;
+}
+
+.humanoid-action-status.idle .humanoid-action-tool {
+  color: var(--color-text-muted);
+}
+
+.runtime-transition-retry {
+  min-height: 44px;
+  border-radius: var(--radius-control);
+}
+
+.mission-app-shell .runtime-area .field :where(input, select),
+.mission-app-shell .runtime-area .runtime-mode-select select {
+  min-height: 44px;
+}
+
+/* Control authority is intentionally descriptive, never an actuation claim. */
+.authority-area {
+  grid-area: authority;
+  min-width: 0;
+}
+
+.authority-strip {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(210px, 0.72fr) minmax(0, 2.5fr);
+  align-items: stretch;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-card);
+  background: var(--color-surface);
+  box-shadow: var(--shadow-card);
+}
+
+.authority-summary {
+  display: grid;
+  align-content: center;
+  gap: 3px;
+  min-width: 0;
+  padding-inline: 4px 10px;
+}
+
+.authority-summary p,
+.authority-summary h2,
+.authority-summary span,
+.authority-step p,
+.authority-step strong,
+.authority-step small {
+  margin: 0;
+}
+
+.authority-summary p {
+  color: var(--color-accent-strong);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.authority-summary h2 {
+  color: var(--color-text);
+  font-size: 18px;
+  line-height: 1.3;
+  letter-spacing: -0.01em;
+}
+
+.authority-summary span {
+  overflow: hidden;
+  color: var(--color-text-muted);
+  font-size: 12px;
+  line-height: 1.45;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.authority-chain {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: repeat(6, minmax(128px, 1fr));
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.authority-step {
+  position: relative;
+  display: grid;
+  min-width: 0;
+  min-height: 64px;
+  align-content: center;
+  gap: 3px;
+  padding: 9px 10px 9px 13px;
+  border-radius: var(--radius-inner);
+  background: var(--color-page-raised);
+  isolation: isolate;
+}
+
+.authority-focus {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  border: 1px solid color-mix(in srgb, var(--color-accent) 42%, var(--color-border));
+  border-radius: inherit;
+  background: var(--state-selected);
+  box-shadow: var(--shadow-focus);
+  pointer-events: none;
+}
+
+.authority-step[aria-current="step"] :where(p, strong, small) {
+  position: relative;
+  z-index: 1;
+}
+
+.authority-step[aria-current="step"]::before {
+  z-index: 2;
+}
+
+.authority-step::before {
+  position: absolute;
+  inset-block: 10px;
+  inset-inline-start: 5px;
+  width: 3px;
+  border-radius: 3px;
+  background: var(--color-text-disabled);
+  content: "";
+}
+
+.authority-step p {
+  color: var(--color-text-muted);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.authority-step strong {
+  overflow: hidden;
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  line-height: 1.3;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.authority-step small {
+  display: -webkit-box;
+  overflow: hidden;
+  color: var(--color-text-muted);
+  font-size: 12px;
+  line-height: 1.25;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.authority-step.ready::before,
+.authority-step.active::before {
+  background: var(--color-success);
+}
+
+.authority-step.ready strong,
+.authority-step.active strong {
+  color: var(--color-success-text);
+}
+
+.authority-step.advisory::before {
+  background: var(--color-warning);
+}
+
+.authority-step.advisory strong {
+  color: var(--color-warning-text);
+}
+
+.authority-step.blocked::before {
+  background: var(--color-danger);
+}
+
+.authority-step.blocked strong {
+  color: var(--color-danger-text);
+}
+
+.ops-checkline,
+.ops-confirmation {
+  min-height: 44px;
+  font-size: 12px;
+}
+
+.ops-confirmation {
+  align-items: center;
+}
+
+.ops-connection small,
+.ops-connection-state,
+.ops-camera-card header span,
+.ops-camera-card .ops-status-dot,
+.ops-camera-card footer,
+.ops-camera-card footer > *,
+.ops-model-chip,
+.ops-tf-legend,
+.ops-tf-legend > *,
+.ops-empty-inline,
+.ops-control-boundary,
+.ops-kpi-grid article > div > span,
+.ops-kpi-grid article > div > small,
+.ops-inventory-note,
+.ops-inventory-note span,
+.ops-inventory-note strong,
+.ops-table th,
+.ops-table td,
+.ops-table code,
+.ops-inline-status,
+.ops-topic-preview span,
+.ops-topic-preview small,
+.ops-topic-preview pre {
+  font-size: 12px;
+}
+
+.ops-camera-card footer code,
+.ops-world-tags .ops-empty-inline,
+.ops-table thead th {
+  font-size: 12px;
+}
+
+.ops-model-chip {
+  font-size: 12px !important;
+}
+
+/* Dense engineering data still needs a readable floor at every viewport. */
+.debug-app-shell.debug-app-shell :where(small, code, time, dt, dd, legend),
+.debug-app-shell :is(
+  .debug-status-badge,
+  .debug-meta-pill,
+  .debug-title-block p,
+  .debug-section-heading p,
+  .debug-section-heading span,
+  .debug-arm-card p,
+  .debug-arm-card span,
+  .debug-table th,
+  .debug-table td span,
+  .debug-sample,
+  .debug-health-strip dd span,
+  .debug-output-overview-grid > div > span,
+  .debug-output-overview-grid strong,
+  .debug-active-action-compact > span,
+  .debug-active-action-compact > strong,
+  .debug-action-meta span,
+  .debug-network-toggle-title p,
+  .debug-network-overview strong,
+  .debug-network-toggle-hint,
+  .debug-network-description,
+  .debug-network-subheading span,
+  .debug-network-note,
+  .debug-ping-result span,
+  .debug-coexistence-copy > span,
+  .debug-coexistence-confirmation span,
+  .debug-coexistence-status span,
+  .debug-coexistence-unavailable,
+  .debug-action-recovery-copy strong,
+  .debug-action-recovery-copy p,
+  .debug-action-recovery-confirmation span,
+  .debug-event-list strong,
+  .debug-event-summary,
+  .debug-event-raw summary,
+  .debug-card-description,
+  .debug-asr-level > span,
+  .debug-asr-level > strong,
+  .debug-asr-live p > span,
+  .debug-asr-transcript > p,
+  .debug-asr-transcript > div > span,
+  .debug-parse-preview > span,
+  .debug-record-response-preview > span,
+  .debug-result-boundary,
+  .debug-record-credential-status strong,
+  .debug-record-contract-line,
+  .debug-row-actions .button
+) {
+  font-size: max(12px, 100%);
+}
+
+.authority-step.external::before {
+  background: var(--color-accent);
+}
+
+.authority-step.external strong {
+  color: var(--color-accent-strong);
+}
+
+.mission-layout {
+  grid-template-areas:
+    "authority"
+    "stage"
+    "surgeon"
+    "runtime"
+    "timeline";
+}
+
+.mission-layout.live-stage-expanded {
+  grid-template-areas:
+    "authority"
+    "stage"
+    "runtime"
+    "timeline";
+}
+
+.stage-area:focus-visible {
+  border-radius: var(--radius-card);
+}
+
+/* Safety confirmation follows a single, reversible interaction pattern. */
+.safety-dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 4000;
+  display: grid;
+  padding: 24px;
+  place-items: center;
+  background: var(--overlay-scrim);
+  backdrop-filter: blur(10px);
+}
+
+.safety-dialog {
+  width: min(440px, 100%);
+  padding: 24px;
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-card);
+  background: var(--color-surface-raised);
+  box-shadow: var(--shadow-elevated);
+}
+
+.safety-dialog-icon {
+  display: grid;
+  width: 44px;
+  height: 44px;
+  margin-bottom: 18px;
+  border-radius: var(--radius-control);
+  place-items: center;
+  background: color-mix(in srgb, var(--color-warning) 13%, transparent);
+  color: var(--color-warning);
+}
+
+.safety-dialog h2 {
+  margin: 0;
+  color: var(--color-text);
+  font-size: 20px;
+  line-height: 1.35;
+  letter-spacing: -0.01em;
+}
+
+.safety-dialog p {
+  margin: 10px 0 0;
+  color: var(--color-text-secondary);
+  font-size: 14px;
+  line-height: 1.55;
+}
+
+.safety-dialog-note {
+  padding: 10px 12px;
+  border-radius: var(--radius-inner);
+  background: var(--color-page-raised);
+  color: var(--color-text-muted) !important;
+  font-size: 13px !important;
+}
+
+.safety-dialog-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 24px;
+}
+
+.safety-dialog-actions button {
+  min-height: 44px;
+  border-radius: var(--radius-control);
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.safety-dialog-close {
+  border: 1px solid var(--color-border-strong);
+  background: transparent;
+  color: var(--color-text);
+}
+
+.safety-dialog-confirm {
+  background: var(--color-accent);
+  color: var(--color-accent-ink);
+}
+
+.safety-dialog-close:hover,
+.safety-dialog-close:active {
+  background: var(--state-hover);
+}
+
+.safety-dialog-confirm:hover {
+  background: color-mix(in srgb, var(--color-accent) 86%, white);
+}
+
+.operation-progress {
+  position: relative;
+  overflow: hidden;
+  height: 3px;
+  margin-block: 2px 8px;
+  border-radius: 999px;
+  background: var(--skeleton-base);
+}
+
+.operation-progress-bar {
+  position: absolute;
+  inset: 0;
+  background:
+    linear-gradient(
+      90deg,
+      transparent 0%,
+      var(--color-accent) 42%,
+      var(--color-accent-strong) 50%,
+      var(--color-accent) 58%,
+      transparent 100%
+    );
+  background-size: 220% 100%;
+  opacity: 0.82;
+}
+
+/* Embedded camera choices retain a 44px hit box while keeping compact labels. */
+.switchable-stage-camera figcaption {
+  position: relative;
+  z-index: 2;
+}
+
+.stage-camera-toggle {
+  position: relative;
+  overflow: visible;
+}
+
+.stage-camera-toggle button {
+  position: relative;
+  top: -15px;
+  min-height: 44px;
+  padding: 0 4px;
+  background: transparent;
+  font-size: 12px;
+}
+
+.stage-camera-toggle button > span {
+  display: grid;
+  min-height: 18px;
+  padding: 2px 4px;
+  border-radius: 5px;
+  place-items: center;
+}
+
+.stage-camera-toggle button.active {
+  background: transparent;
+  color: var(--color-text);
+}
+
+.stage-camera-toggle button.active > span {
+  background: color-mix(in srgb, var(--color-accent) 22%, var(--color-surface-raised));
+}
+
+.stage-camera-toggle button:focus-visible {
+  outline-offset: -2px;
+}
+
+/* Multicam and engineering workspaces always expose their full content. */
+.ops-app-shell,
+.debug-app-shell {
+  min-height: 100dvh;
+}
+
+.ops-back-button,
+.ops-icon-button,
+.ops-button,
+.ops-segmented button,
+.ops-topic-list button {
+  border-radius: var(--radius-control);
+}
+
+.debug-tabs button,
+.ops-segmented button {
+  position: relative;
+  isolation: isolate;
+  overflow: hidden;
+  background: transparent;
+}
+
+.debug-tabs button.active,
+.ops-segmented button.active {
+  background: transparent;
+}
+
+.debug-tabs button > .debug-tab-focus,
+.ops-segmented button > .ops-segment-focus {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  display: block;
+  border: 1px solid color-mix(in srgb, var(--color-accent) 28%, var(--color-border));
+  border-radius: inherit;
+  background: var(--state-selected);
+  box-shadow: var(--shadow-card);
+  pointer-events: none;
+}
+
+.debug-tabs button > .debug-tab-label,
+.debug-tabs button > small,
+.ops-segmented button > .ops-segment-label {
+  position: relative;
+  z-index: 1;
+}
+
+.ops-segment-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.debug-skeleton-title,
+.debug-skeleton-row {
+  background:
+    linear-gradient(
+      90deg,
+      var(--skeleton-base) 0%,
+      var(--skeleton-highlight) 50%,
+      var(--skeleton-base) 100%
+    );
+  background-size: 220% 100%;
+  animation: none;
+}
+
+.debug-toast {
+  border-color: var(--color-border-strong);
+  background: color-mix(in srgb, var(--color-surface-raised) 96%, transparent);
+  box-shadow: var(--shadow-elevated);
+  backdrop-filter: blur(16px);
+}
+
+.debug-toast.success {
+  border-color: color-mix(in srgb, var(--color-success) 44%, var(--color-border));
+  color: var(--color-success-text);
+}
+
+.debug-toast.error {
+  border-color: color-mix(in srgb, var(--color-danger) 48%, var(--color-border));
+  color: var(--color-danger-text);
+}
+
+.debug-toast.warning {
+  border-color: color-mix(in srgb, var(--color-warning) 48%, var(--color-border));
+  color: var(--color-warning-text);
+}
+
+.debug-toast.info {
+  border-color: color-mix(in srgb, var(--color-accent) 42%, var(--color-border));
+  color: var(--color-accent-strong);
+}
+
+.debug-health-strip dd {
+  flex-wrap: wrap;
+}
+
+.debug-health-strip dd > small {
+  flex-basis: 100%;
+}
+
+.ops-header,
+.debug-header {
+  box-shadow: var(--shadow-card);
+}
+
+.ops-status-dot,
+.debug-status-badge,
+.debug-meta-pill {
+  min-height: 32px;
+}
+
+.ops-brand span,
+.ops-card-heading span,
+.debug-title-block span,
+.debug-section-heading span,
+.debug-arm-card span {
+  color: var(--color-text-muted);
+  font-size: 13px;
+}
+
+.debug-tabs button > small {
+  color: var(--color-text-muted);
+  font-size: 11px;
+}
+
+.debug-table th,
+.debug-table td,
+.debug-event-list,
+.debug-field,
+.ops-topic-list button,
+.ops-topic-preview,
+.ops-capture-table {
+  font-size: 12px;
+}
+
+@media (min-width: 1280px) {
+  .mission-layout {
+    grid-template-columns: minmax(600px, 1.58fr) minmax(250px, 0.48fr) minmax(300px, 0.56fr);
+    grid-template-areas:
+      "authority authority authority"
+      "stage surgeon runtime"
+      "timeline timeline timeline";
+  }
+
+  .mission-layout.live-stage-expanded {
+    grid-template-columns: minmax(0, 1fr) minmax(300px, 0.56fr);
+    grid-template-areas:
+      "authority authority"
+      "stage runtime"
+      "timeline timeline";
+  }
+
+  .surgeon-area,
+  .runtime-area {
+    display: block;
+    overflow-y: auto;
+    overscroll-behavior-y: contain;
+    scrollbar-gutter: stable;
+  }
+
+  .surgeon-area > .dock,
+  .runtime-area > .dock,
+  .runtime-area > .observability-panel,
+  .runtime-area .explain-panel {
+    height: auto;
+    overflow: visible;
+  }
+
+  .runtime-area > * + * {
+    margin-top: 14px;
+  }
+}
+
+@media (min-width: 1440px) and (min-height: 850px) {
+  .mission-app-shell {
+    display: grid;
+    height: 100dvh;
+    grid-template-rows: auto minmax(0, 1fr);
+    overflow: hidden;
+  }
+
+  .mission-layout {
+    grid-template-rows: auto minmax(0, 1fr) clamp(168px, 19vh, 248px);
+  }
+
+  .ops-app-shell,
+  .debug-app-shell {
+    display: block;
+    height: 100dvh;
+    overflow-y: auto;
+    overscroll-behavior-y: contain;
+    scrollbar-gutter: stable;
+  }
+}
+
+@media (max-width: 1279px) {
+  .top-ribbon {
+    grid-template-columns: 1fr;
+  }
+
+  .ribbon-cluster {
+    grid-template-columns: auto minmax(280px, 1fr) auto;
+  }
+
+  .authority-strip {
+    grid-template-columns: 1fr;
+  }
+
+  .authority-summary {
+    padding-inline: 2px;
+  }
+
+  .authority-chain {
+    overflow-x: auto;
+    padding-bottom: 4px;
+    scroll-snap-type: x proximity;
+    scrollbar-width: thin;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .authority-step {
+    min-width: 148px;
+    scroll-snap-align: start;
+  }
+}
+
+@media (max-width: 900px) {
+  .ribbon-cluster {
+    grid-template-columns: 1fr;
+  }
+
+  .workspace-navigation,
+  .ribbon-model-control,
+  .ribbon-status-actions {
+    width: 100%;
+  }
+
+  .ribbon-status-actions {
+    justify-content: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .ribbon-model-control {
+    min-width: 0;
+  }
+}
+
+@media (max-width: 760px) {
+  .app-shell,
+  .ops-app-shell,
+  .debug-app-shell {
+    padding: 12px;
+    padding-top: max(12px, env(safe-area-inset-top));
+    padding-right: max(12px, env(safe-area-inset-right));
+    padding-bottom: max(12px, env(safe-area-inset-bottom));
+    padding-left: max(12px, env(safe-area-inset-left));
+  }
+
+  .top-ribbon,
+  .authority-strip,
+  .dock,
+  .stage-card,
+  .timeline-panel,
+  .explain-panel,
+  .ops-header,
+  .ops-card,
+  .debug-header,
+  .debug-section-card {
+    padding: 12px;
+  }
+
+  .brand-block {
+    align-items: center;
+  }
+
+  .brand-block span {
+    display: none;
+  }
+
+  .system-pill,
+  .debug-mode-entry {
+    flex: 1 1 150px;
+  }
+
+  .language-control {
+    flex: 1 1 140px;
+  }
+
+  .stage-area {
+    overflow-x: auto;
+    border-radius: var(--radius-card);
+    overscroll-behavior-inline: contain;
+    scroll-snap-type: x proximity;
+    scrollbar-width: thin;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .stage-area > .stage-card {
+    width: 720px;
+    min-width: 720px;
+    scroll-snap-align: start;
+  }
+
+  .stage-area .foxglove-board {
+    height: 520px;
+    min-height: 520px;
+    aspect-ratio: 1.55 / 1;
+  }
+
+  .model-trigger-copy small,
+  .stage-perception-toggle span,
+  .stage-perception-toggle strong,
+  .humanoid-action-kicker,
+  .humanoid-action-state,
+  .humanoid-action-detail,
+  .humanoid-action-tool,
+  .surgical-bed-label strong,
+  .surgical-bed-label span,
+  .stage-camera-viewport figcaption span,
+  .stage-camera-empty span,
+  .public-gesture-status,
+  .runtime-mode-select i,
+  .runtime-mode-detail,
+  .runtime-endpoint,
+  .bed-arm-trace-title-row p {
+    font-size: 12px;
+  }
+
+  .humanoid-action-topline .humanoid-action-kicker,
+  .humanoid-action-copy em,
+  .bed-phase-badge small,
+  .holder-inline-badges span,
+  .holder-title .holder-inline-badges span,
+  .public-gesture-status span,
+  .llm-speech-log-header small {
+    font-size: 12px;
+  }
+
+  .stage-camera-viewport figcaption > i {
+    display: none;
+  }
+
+  .authority-summary span {
+    white-space: normal;
+  }
+
+  .safety-dialog-backdrop {
+    align-items: end;
+    padding: 12px;
+    padding-right: max(12px, env(safe-area-inset-right));
+    padding-bottom: max(12px, env(safe-area-inset-bottom));
+    padding-left: max(12px, env(safe-area-inset-left));
+  }
+
+  .safety-dialog {
+    padding: 18px;
+  }
+}
+
+@media (max-width: 520px) {
+  .top-ribbon {
+    gap: 12px;
+  }
+
+  .brand-mark {
+    width: 40px;
+    height: 40px;
+  }
+
+  .brand-block h1 {
+    font-size: 22px;
+  }
+
+  .ribbon-status-actions > :where(.system-pill, .debug-mode-entry, .language-control) {
+    width: 100%;
+  }
+
+  .language-control {
+    justify-content: stretch;
+  }
+
+  .language-control button {
+    flex: 1 1 0;
+  }
+
+  .authority-summary h2 {
+    font-size: 17px;
+  }
+
+  .safety-dialog-actions {
+    grid-template-columns: 1fr;
+  }
+
+  .safety-dialog-close {
+    order: 2;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+@media (prefers-contrast: more) {
+  :root {
+    --color-border: rgb(220 235 250 / 42%);
+    --color-border-strong: rgb(231 242 252 / 62%);
+    --color-text-muted: var(--color-text-muted-high-contrast);
+  }
+}

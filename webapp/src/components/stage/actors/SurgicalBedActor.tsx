@@ -1,5 +1,6 @@
-import { motion } from "framer-motion";
+import * as m from "framer-motion/m";
 
+import { silk } from "../../../motion-system";
 import type { LayoutAnchor, LayoutEntity } from "../../../types";
 import { anchorInsideEntity, entityStyle } from "../../../utils/stageGeometry";
 
@@ -22,11 +23,10 @@ export function SurgicalBedActor({
       data-layout-type={entity.type}
       aria-label="Surgical bed"
     >
-      <motion.div
+      <m.div
         className="stage-actor-motion"
-        initial={{ opacity: 0, scale: 0.96 }}
-        animate={{ opacity: 1, scale: 1 }}
-        transition={{ duration: 0.4 }}
+        initial={silk.entrance.initial}
+        animate={silk.entrance.animate}
       >
         <div className="bed-platform">
           <div className="bed-mattress">
@@ -37,7 +37,7 @@ export function SurgicalBedActor({
           </div>
         </div>
         <div className="bed-base" />
-      </motion.div>
+      </m.div>
     </div>
   );
 }

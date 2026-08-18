@@ -1,0 +1,88 @@
+{
+  "source": "/home/arl/Downloads/humanoid+tray+tag1.step",
+  "output": "webapp/public/models/humanoid-tray-tag1.glb",
+  "root": "Thyroidectomy",
+  "sourceUnits": "millimetres in OpenCascade (STEP declares metres)",
+  "outputUnits": "metres",
+  "tagCentreCadMm": [
+    563.9500001000002,
+    597.9617513459489,
+    1016.8500000000001
+  ],
+  "tagBlackBoundsCadMm": [
+    562.9499999000001,
+    505.96175124594885,
+    924.8499999000001,
+    563.9500001000001,
+    689.961751445949,
+    1108.8500001000002
+  ],
+  "tagWhiteBoundsCadMm": [
+    553.9499999000001,
+    482.96175124594885,
+    901.8499999000001,
+    563.9500001000002,
+    712.961751445949,
+    1131.8500001000002
+  ],
+  "tagBasisInCad": {
+    "x": [
+      0.0,
+      1.0,
+      0.0
+    ],
+    "y": [
+      0.0,
+      0.0,
+      1.0
+    ],
+    "z": [
+      1.0,
+      0.0,
+      0.0
+    ]
+  },
+  "glTfStorageCoordinateSystem": "standard Y-up before scene-root transform",
+  "sceneCoordinateSystem": "ROS tag1: x right, y up, z toward viewer",
+  "sceneRootTranslationM": [
+    -0.5979617513459489,
+    -1.01685,
+    -0.5639500001000003
+  ],
+  "sceneRootRotationXyzw": [
+    0.0,
+    -0.7071067811865476,
+    0.0,
+    0.7071067811865476
+  ],
+  "linearDeflectionMm": 1.25,
+  "angularDeflectionRad": 0.35,
+  "elapsedSeconds": 20.961,
+  "webOptimization": {
+    "pipeline": "gltf-transform optimize with source hierarchy preserved",
+    "cliVersion": "4.3.0",
+    "coreVersion": "4.4.2",
+    "options": {
+      "flatten": false,
+      "join": false,
+      "instance": false,
+      "sparse": false,
+      "compress": "quantize"
+    },
+    "compressionExtensions": ["KHR_mesh_quantization"],
+    "simplifyRatio": 0.1,
+    "simplifyErrorFractionOfMeshRadius": 0.001,
+    "sourceBytes": 42941632,
+    "sourceSha256": "84cda9aeca7c10b77fc6fbd8788f3ab8880ae59a17197913985dc26aa6cf119a",
+    "outputBytes": 13107904,
+    "outputSha256": "ef78a0b30ca319ceaef55cef6f47d948189ac078bdd3bf78711d99a6788610bd",
+    "sourceRenderVertices": 5071944,
+    "outputRenderVertices": 1969800,
+    "sourceUploadVertices": 1369892,
+    "outputUploadVertices": 578458,
+    "bboxMin": [-0.69311, -1.02327, -1.25483],
+    "bboxMax": [0.42298, 0.75193, 0.08821],
+    "browserValidatedMeshCount": 490,
+    "browserValidatedBounds": [-0.694, -1.023, -1.257, 0.423, 0.752, 0.088]
+  }
+}
