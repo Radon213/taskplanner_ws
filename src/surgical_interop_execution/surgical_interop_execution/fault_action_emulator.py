@@ -65,6 +65,8 @@ _TOOL_CHANGE_RESULT_BY_OUTCOME = {
     "reject": "failed",
 }
 
+_BED_ROBOT_STATUS_PERIOD_SEC = 0.5
+
 
 @dataclass(frozen=True, slots=True)
 class Outcome:
@@ -236,8 +238,17 @@ class FaultActionEmulator(Node):
         self._bed_robot_status_pub = self.create_publisher(
             BedRobotArmStateArray, "/external/bed_robot_arms/status", 10
         )
+        self._start_bed_robot_status_heartbeat()
         self.create_timer(1.0, self._publish_status)
-        self.create_timer(0.25, self._publish_bed_robot_status)
+
+    def _start_bed_robot_status_heartbeat(self) -> None:
+        """Publish the initial snapshot now, then refresh it at the safe cadence."""
+
+        self._publish_bed_robot_status()
+        self._bed_robot_status_timer = self.create_timer(
+            _BED_ROBOT_STATUS_PERIOD_SEC,
+            self._publish_bed_robot_status,
+        )
 
     def _count(self, route: str, outcome: str) -> None:
         values = self._route_counts.setdefault(route, {})

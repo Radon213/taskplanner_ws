@@ -228,6 +228,7 @@ class MockVLMNode(Node):
                 try:
                     self._spec_dir = str(parameter.value)
                     self._load_spec(self._spec_dir)
+                    self._last_lifecycle_control_command = ""
                 except Exception as exc:
                     return SetParametersResult(
                         successful=False,
@@ -955,6 +956,18 @@ class MockVLMNode(Node):
 
     def _on_control(self, msg: String) -> None:
         command = msg.data.strip().partition(":")[0].strip().lower()
+        if command in {
+            "start",
+            "start_actors",
+            "pause",
+            "resume",
+            "stop",
+        }:
+            if command == getattr(
+                self, "_last_lifecycle_control_command", ""
+            ):
+                return
+            self._last_lifecycle_control_command = command
         if command in {"start", "start_actors"}:
             state_backed = self._state_backed_observations_enabled()
             scene_backed = self._perception_scene_observations_enabled()
@@ -975,6 +988,7 @@ class MockVLMNode(Node):
             self._state_activation_enabled = False
             self._active = False
         elif command == "reset":
+            self._last_lifecycle_control_command = ""
             self._state_activation_enabled = False
             self._active = False
             self._latest_state = None

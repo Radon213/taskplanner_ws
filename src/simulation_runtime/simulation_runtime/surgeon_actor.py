@@ -130,6 +130,7 @@ class SurgeonActorNode(Node):
             if parameter.name == "spec_dir":
                 try:
                     self._load_spec(str(parameter.value))
+                    self._last_lifecycle_control_signature = None
                 except Exception as exc:
                     return SetParametersResult(successful=False, reason=str(exc))
             elif parameter.name == "decision_period_sec":
@@ -748,6 +749,19 @@ class SurgeonActorNode(Node):
         command, _, start_phase_id = raw_command.partition(":")
         command = command.strip().lower()
         start_phase_id = start_phase_id.strip()
+        signature = (command, start_phase_id)
+        if command in {
+            "start",
+            "start_actors",
+            "pause",
+            "resume",
+            "stop",
+        }:
+            if signature == getattr(
+                self, "_last_lifecycle_control_signature", None
+            ):
+                return
+            self._last_lifecycle_control_signature = signature
         if command == "mute_actor":
             try:
                 mute_sec = max(0.0, float(start_phase_id or 8.0))
@@ -758,6 +772,8 @@ class SurgeonActorNode(Node):
                 self._current_time_sec() + mute_sec,
             )
         elif command in {"start", "start_actors"}:
+            if self._active and not start_phase_id:
+                return
             self._phase_hint = None
             if start_phase_id:
                 self._current_phase_id = self._coerce_phase_id(start_phase_id)
@@ -770,6 +786,7 @@ class SurgeonActorNode(Node):
         elif command == "stop":
             self._active = False
         elif command == "reset":
+            self._last_lifecycle_control_signature = None
             self._active = False
             self._manual_override_mute_until_sec = 0.0
             self._world = None

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from procedure_spec import BedRobotArmGroupNormalizationError
@@ -47,3 +49,37 @@ def test_mock_vlm_refuses_unsafe_or_inferred_distance(
 ) -> None:
     with pytest.raises(BedRobotArmGroupNormalizationError, match=error):
         MockVLMNode._normalize_mock_group_request(voice_text)
+
+
+def test_mock_vlm_reset_is_repeatable_and_reopens_the_next_start_edge() -> None:
+    node = MockVLMNode.__new__(MockVLMNode)
+    node._last_lifecycle_control_command = ""
+    node._active = False
+    node._state_activation_enabled = False
+    node._tick = 0
+    node._state_backed_observations_enabled = lambda: False
+    node._perception_scene_observations_enabled = lambda: False
+    publish_calls: list[bool] = []
+    node._publish = lambda: publish_calls.append(True)
+    node._latest_state = object()
+    node._latest_scene = object()
+    node._latest_outward_signal = object()
+    node._tool_location_history = {"T01": ["surgeon"]}
+    node._state_phase_id = "P02"
+    node._state_phase_ticks = 3
+    node._state_stage_index = 2
+    node._state_stage_ticks = 4
+    node._delivered_by_phase = {"P02": {"T01"}}
+    node._completion_request_emitted = True
+    node._completion_confirm_emitted = True
+    node._seen_bed_group_request_ids = {"request-1"}
+
+    node._on_control(SimpleNamespace(data="start"))
+    node._on_control(SimpleNamespace(data="start"))
+    node._on_control(SimpleNamespace(data="reset"))
+    node._on_control(SimpleNamespace(data="reset"))
+    node._on_control(SimpleNamespace(data="start"))
+
+    assert publish_calls == [True, True]
+    assert node._active is True
+    assert node._last_lifecycle_control_command == "start"

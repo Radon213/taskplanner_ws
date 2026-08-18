@@ -60,6 +60,13 @@ TRANSIENT_BED_ROBOT_ARM_STATES = {
     "moving_to_standby",
 }
 VALID_MODES = {"realtime_1x", "elastic_demo"}
+ACTIVE_REPLAY_STATES = frozenset({"running", "held", "draining"})
+ACTIVE_TICK_PERIOD_SEC = 0.02
+IDLE_TICK_PERIOD_SEC = 1.0
+ACTIVE_CONTROL_HEARTBEAT_SEC = 0.5
+IDLE_CONTROL_HEARTBEAT_SEC = 2.0
+ACTIVE_GROUND_TRUTH_PERIOD_SEC = 0.05
+IDLE_GROUND_TRUTH_PERIOD_SEC = 1.0
 NO_INPUT_VLM_ERRORS = {
     "missing fresh rfdetr-segmented flir image",
     "no fresh field image",
@@ -289,6 +296,22 @@ def validate_shadow_case_selection(
             f"shadow case '{normalized}' is unavailable or incomplete"
         )
     return asset
+
+
+def replay_timer_periods(state: str) -> tuple[float, float]:
+    """Return deterministic tick and late-join heartbeat periods."""
+
+    if str(state).strip().lower() in ACTIVE_REPLAY_STATES:
+        return ACTIVE_TICK_PERIOD_SEC, ACTIVE_CONTROL_HEARTBEAT_SEC
+    return IDLE_TICK_PERIOD_SEC, IDLE_CONTROL_HEARTBEAT_SEC
+
+
+def replay_ground_truth_timer_period(state: str) -> float:
+    """Return the semantic ground-truth polling period for replay activity."""
+
+    if str(state).strip().lower() in ACTIVE_REPLAY_STATES:
+        return ACTIVE_GROUND_TRUTH_PERIOD_SEC
+    return IDLE_GROUND_TRUTH_PERIOD_SEC
 
 
 def load_implicit_request_intervals(
@@ -706,6 +729,27 @@ def advance_replay_source_time(
     return min(
         max(0.0, float(duration_sec)),
         source + max(0.0, float(delta_sec)) * max(0.0, float(playback_rate)),
+    )
+
+
+def replay_clock_publish_due(
+    *,
+    source_time_sec: float,
+    last_source_time_sec: float | None,
+    now_monotonic: float,
+    last_publish_monotonic: float,
+    idle_heartbeat_sec: float,
+    force: bool = False,
+) -> bool:
+    """Publish every advancing clock tick, but bound an unchanged heartbeat."""
+
+    if force or last_source_time_sec is None:
+        return True
+    if float(source_time_sec) != float(last_source_time_sec):
+        return True
+    return (
+        float(now_monotonic) - float(last_publish_monotonic)
+        >= max(0.1, float(idle_heartbeat_sec))
     )
 
 
@@ -1235,6 +1279,7 @@ class InteractiveReplayControllerNode(Node):
         self.declare_parameter("drain_timeout_sec", 30.0)
         self.declare_parameter("drain_settle_sec", 1.25)
         self.declare_parameter("state_heartbeat_sec", 1.0)
+        self.declare_parameter("idle_clock_heartbeat_sec", 1.0)
         self.declare_parameter("ground_truth_events_path", "")
         self.declare_parameter("ground_truth_phase_path", "")
         self.declare_parameter("annotation_cases_root", "")
@@ -1441,6 +1486,10 @@ class InteractiveReplayControllerNode(Node):
             0.25,
             float(self.get_parameter("state_heartbeat_sec").value),
         )
+        self._idle_clock_heartbeat_sec = max(
+            0.1,
+            float(self.get_parameter("idle_clock_heartbeat_sec").value),
+        )
 
         self._source: FilteredBagSource | None = None
         self._state = "loading"
@@ -1486,6 +1535,8 @@ class InteractiveReplayControllerNode(Node):
         self._last_state_publish_at = float("-inf")
         self._force_state_publish = True
         self._last_ground_truth_key = ""
+        self._last_clock_publish_at = float("-inf")
+        self._last_clock_source_time_sec: float | None = None
 
         state_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
@@ -1584,12 +1635,24 @@ class InteractiveReplayControllerNode(Node):
         )
 
         self._load_source()
+        # Seed the transient-local ground-truth snapshot immediately. The
+        # adaptive idle timer must not add up to one second of startup latency.
+        self._publish_ground_truth(force=True)
         # This node intentionally uses wall time. Other shadow nodes consume
         # the /clock published here as their source-time clock.
-        self.create_timer(0.02, self._tick)
-        self.create_timer(0.05, self._publish_ground_truth)
+        tick_period_sec, control_heartbeat_sec = replay_timer_periods(
+            self._state
+        )
+        self._tick_timer = self.create_timer(tick_period_sec, self._tick)
+        self._ground_truth_timer = self.create_timer(
+            replay_ground_truth_timer_period(self._state),
+            self._publish_ground_truth,
+        )
         self.create_timer(0.1, self._publish_state)
-        self.create_timer(0.5, self._publish_runtime_control_heartbeat)
+        self._runtime_control_timer = self.create_timer(
+            control_heartbeat_sec,
+            self._publish_runtime_control_heartbeat,
+        )
         if bool(self.get_parameter("auto_start").value) and self._source:
             self._start(reset=True)
 
@@ -1627,13 +1690,47 @@ class InteractiveReplayControllerNode(Node):
         message.data = str(command).strip().lower()
         self._runtime_control_publisher.publish(message)
 
+    def _publish_discontinuous_clock(self) -> None:
+        if getattr(self, "_clock_publisher", None) is not None:
+            self._publish_clock(force=True)
+
+    @staticmethod
+    def _reschedule_timer(timer, period_sec: float) -> bool:
+        if timer is None:
+            return False
+        period_ns = int(round(float(period_sec) * 1_000_000_000.0))
+        if int(getattr(timer, "timer_period_ns", period_ns)) == period_ns:
+            return False
+        timer.cancel()
+        timer.timer_period_ns = period_ns
+        timer.reset()
+        return True
+
+    def _sync_activity_timers_locked(self) -> None:
+        tick_period_sec, control_heartbeat_sec = replay_timer_periods(
+            self._state
+        )
+        self._reschedule_timer(
+            getattr(self, "_tick_timer", None),
+            tick_period_sec,
+        )
+        self._reschedule_timer(
+            getattr(self, "_runtime_control_timer", None),
+            control_heartbeat_sec,
+        )
+        self._reschedule_timer(
+            getattr(self, "_ground_truth_timer", None),
+            replay_ground_truth_timer_period(self._state),
+        )
+
     def _publish_runtime_control_heartbeat(self) -> None:
         with self._lock:
-            command = (
-                "start"
-                if self._state in {"running", "held", "draining"}
-                else "stop"
-            )
+            if self._state in ACTIVE_REPLAY_STATES:
+                command = "start"
+            elif self._state == "paused":
+                command = "pause"
+            else:
+                command = "stop"
         self._publish_runtime_control(command)
 
     def _reset_counters(
@@ -1698,21 +1795,26 @@ class InteractiveReplayControllerNode(Node):
             self._load_source()
         if self._source is None:
             return False, self._last_error or "shadow source is unavailable"
-        if reset or self._state in {
+        source_clock_reset = reset or self._state in {
             "blocked",
             "completed",
             "timed_out",
             "stopped",
             "error",
-        }:
+        }
+        if source_clock_reset:
             self._reset_counters()
         elif not self._run_id:
             self._reset_counters(self._source_time_sec)
+            source_clock_reset = True
         self._state = "running"
         self._hold_reason = ""
         self._effective_playback_rate = self._playback_rate
         self._last_tick_at = time.monotonic()
         self._force_state_publish = True
+        self._sync_activity_timers_locked()
+        if source_clock_reset:
+            self._publish_discontinuous_clock()
         self._publish_runtime_control("start")
         return True, f"shadow replay running in {self._mode}"
 
@@ -1852,7 +1954,10 @@ class InteractiveReplayControllerNode(Node):
                         self._state = "paused"
                         self._hold_reason = self._control_reason
                         self._effective_playback_rate = 0.0
-                        self._publish_runtime_control("stop")
+                        # Drain any GT boundary crossed by the last active tick
+                        # before lowering its polling timer to the idle cadence.
+                        self._publish_ground_truth()
+                        self._publish_runtime_control("pause")
                         success = True
                         message = "shadow replay paused"
                     else:
@@ -1869,7 +1974,8 @@ class InteractiveReplayControllerNode(Node):
                         self._effective_playback_rate = self._playback_rate
                         self._last_tick_at = time.monotonic()
                         self._grant_vlm_resume_grace(self._last_tick_at)
-                        self._publish_runtime_control("start")
+                        self._sync_activity_timers_locked()
+                        self._publish_runtime_control("resume")
                         success = True
                         message = "shadow replay resumed"
                     elif self._state in {"running", "held", "draining"}:
@@ -1882,6 +1988,8 @@ class InteractiveReplayControllerNode(Node):
                     self._reset_counters()
                     self._state = "ready"
                     self._effective_playback_rate = 0.0
+                    self._publish_discontinuous_clock()
+                    self._publish_ground_truth(force=True)
                     self._publish_runtime_control("reset")
                     success = True
                     message = "shadow replay rewound; start when runtime is ready"
@@ -1899,6 +2007,7 @@ class InteractiveReplayControllerNode(Node):
                     self._active_bed_robot_arms.clear()
                     self._vlm_wait_started_at = None
                     self._no_input_since_at = None
+                    self._publish_ground_truth()
                     self._publish_runtime_control("stop")
                     success = True
                     message = "shadow replay stopped"
@@ -1917,6 +2026,8 @@ class InteractiveReplayControllerNode(Node):
                     self._state_before_manual_pause = "running"
                     self._hold_reason = self._control_reason
                     self._effective_playback_rate = 0.0
+                    self._publish_discontinuous_clock()
+                    self._publish_ground_truth(force=True)
                     self._publish_runtime_control("reset")
                     success = True
                     message = f"shadow replay seeked to {seek_sec:.2f}s"
@@ -1931,6 +2042,9 @@ class InteractiveReplayControllerNode(Node):
                 message = str(exc)
                 self._last_error = message
             self._force_state_publish = True
+            self._sync_activity_timers_locked()
+            if getattr(self, "_state_publisher", None) is not None:
+                self._publish_state(force=True)
             response.success = bool(success)
             response.message = message
             response.state_json = json.dumps(
@@ -2002,7 +2116,10 @@ class InteractiveReplayControllerNode(Node):
                 self._last_error = ""
                 self._force_state_publish = True
                 self._last_ground_truth_key = ""
+                self._publish_discontinuous_clock()
+                self._publish_ground_truth(force=True)
                 self._publish_runtime_control("reset")
+                self._sync_activity_timers_locked()
                 response.success = True
                 response.message = (
                     f"shadow case {asset.case_id} loaded and rewound"
@@ -2021,7 +2138,6 @@ class InteractiveReplayControllerNode(Node):
                 sort_keys=True,
             )
             self._publish_state(force=True)
-            self._publish_ground_truth(force=True)
             return response
 
     def _on_vlm_health(self, msg: VLMHealth) -> None:
@@ -2317,10 +2433,23 @@ class InteractiveReplayControllerNode(Node):
     def _vlm_ready_for_sync(self, now: float) -> bool:
         return self._vlm_ready() or self._vlm_failure_grace_active(now)
 
-    def _publish_clock(self) -> None:
+    def _publish_clock(self, *, force: bool = False) -> bool:
+        now = time.monotonic()
+        if not replay_clock_publish_due(
+            source_time_sec=self._source_time_sec,
+            last_source_time_sec=self._last_clock_source_time_sec,
+            now_monotonic=now,
+            last_publish_monotonic=self._last_clock_publish_at,
+            idle_heartbeat_sec=self._idle_clock_heartbeat_sec,
+            force=force,
+        ):
+            return False
         clock = Clock()
         clock.clock = _time_message(self._source_time_sec)
         self._clock_publisher.publish(clock)
+        self._last_clock_publish_at = now
+        self._last_clock_source_time_sec = float(self._source_time_sec)
+        return True
 
     def _image_input_active(self) -> bool:
         return bool(
@@ -2375,6 +2504,7 @@ class InteractiveReplayControllerNode(Node):
         self._last_error = message
         self._effective_playback_rate = 0.0
         self._force_state_publish = True
+        self._publish_ground_truth()
         self._publish_runtime_control("stop")
         self.get_logger().error(message)
 
@@ -2413,6 +2543,7 @@ class InteractiveReplayControllerNode(Node):
                 f"{self._drain_timeout_sec:.1f}s; pending={pending}"
             )
             self._force_state_publish = True
+            self._publish_ground_truth()
             self._publish_runtime_control("stop")
             return
         if self._drain_clear_since_at is None:
@@ -2425,6 +2556,7 @@ class InteractiveReplayControllerNode(Node):
         self._state = "completed"
         self._hold_reason = ""
         self._force_state_publish = True
+        self._publish_ground_truth()
         self._publish_runtime_control("stop")
 
     def _publish_due_records(self) -> None:
@@ -2542,7 +2674,21 @@ class InteractiveReplayControllerNode(Node):
                 self._tick_draining(now)
             elif self._state in {"paused", "ready"}:
                 self._effective_playback_rate = 0.0
-                self._publish_clock()
+                # The adaptive idle timer is already the 1 Hz throttle.  A
+                # second elapsed-time gate here can see a 0.999s callback and
+                # skip until the next tick, degrading /clock to about 0.5 Hz.
+                self._publish_clock(force=True)
+            else:
+                # Keep source time visible to late-joining consumers while a
+                # replay is stopped, completed, blocked, or unavailable.
+                self._effective_playback_rate = 0.0
+                self._publish_clock(force=True)
+            self._sync_activity_timers_locked()
+            if (
+                self._force_state_publish
+                and getattr(self, "_state_publisher", None) is not None
+            ):
+                self._publish_state(force=True)
 
     def _publish_state(self, *, force: bool = False) -> None:
         with self._lock:

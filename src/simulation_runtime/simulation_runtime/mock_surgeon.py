@@ -94,6 +94,7 @@ class MockSurgeonNode(Node):
                 try:
                     self._spec_dir = str(parameter.value)
                     self._load_spec(self._spec_dir)
+                    self._last_lifecycle_control_signature = None
                 except Exception as exc:
                     return SetParametersResult(
                         successful=False,
@@ -399,6 +400,13 @@ class MockSurgeonNode(Node):
         command, _, start_phase_id = raw_command.partition(":")
         command = command.strip().lower()
         start_phase_id = start_phase_id.strip()
+        signature = (command, start_phase_id)
+        if command in {"start", "pause", "resume", "stop"}:
+            if signature == getattr(
+                self, "_last_lifecycle_control_signature", None
+            ):
+                return
+            self._last_lifecycle_control_signature = signature
         if command == "start":
             self._active = True
             if start_phase_id:
@@ -410,6 +418,7 @@ class MockSurgeonNode(Node):
         elif command == "stop":
             self._active = False
         elif command == "reset":
+            self._last_lifecycle_control_signature = None
             self._active = False
             self._tick = 0
             self._last_stage_name = ""

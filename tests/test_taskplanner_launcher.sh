@@ -46,9 +46,29 @@ live_output="$(
 assert_contains "${live_output}" \
   "--profile live --profile debug up -d --force-recreate integration-debug integration-debug-lan-proxy"
 assert_contains "${live_output}" \
-  "stop taskplanner-runtime public-rosbridge taskplanner-asr shadow-runner object-perception integration-debug integration-debug-lan-proxy"
+  "--profile live up -d integration-debug-tailscale-proxy"
 assert_contains "${live_output}" \
-  "rm -f taskplanner-runtime public-rosbridge taskplanner-asr shadow-runner object-perception integration-debug integration-debug-lan-proxy"
+  "stop taskplanner-runtime public-rosbridge taskplanner-asr shadow-runner integration-debug integration-debug-lan-proxy"
+assert_contains "${live_output}" \
+  "rm -f taskplanner-runtime public-rosbridge taskplanner-asr shadow-runner integration-debug integration-debug-lan-proxy"
+assert_not_contains "${live_output}" \
+  "stop taskplanner-runtime public-rosbridge taskplanner-asr shadow-runner object-perception integration-debug integration-debug-lan-proxy integration-debug-tailscale-proxy"
+assert_contains "${live_output}" \
+  "--profile live --profile debug up -d --remove-orphans --wait --wait-timeout 300 vllm-manager ninfer-manager webapp"
+assert_contains "${live_output}" \
+  "--profile live up -d multicam-observer"
+assert_not_contains "${live_output}" \
+  "--wait --wait-timeout 300 vllm-manager ninfer-manager webapp multicam-observer"
+assert_not_contains "${live_output}" \
+  "--force-recreate --remove-orphans --wait --wait-timeout 300 vllm-manager ninfer-manager webapp"
+assert_contains "${live_output}" \
+  "+ wait-for-websocket 127.0.0.1 9091 /live live\\ ROS\\ bridge\\ router"
+assert_contains "${live_output}" \
+  "+ wait_for_multicam_observer live"
+assert_not_contains "${live_output}" "stop multicam-observer"
+assert_not_contains "${live_output}" "rm -f multicam-observer"
+assert_contains "${live_output}" \
+  "+ wait-for-ros-semantic-ready live taskplanner-runtime /simulation/state surgical_msgs/msg/SimulationState /simulation/control surgical_msgs/srv/ControlSimulation"
 assert_contains "${live_output}" \
   "--profile live up -d --force-recreate --wait --wait-timeout 300 taskplanner-asr"
 asr_start_line="$(grep -n -- 'taskplanner-asr$' <<<"${live_output}" | tail -n 1 | cut -d: -f1)"
@@ -56,7 +76,9 @@ runtime_start_line="$(grep -n -- 'up -d --force-recreate taskplanner-runtime$' <
 assert_contains "${live_output}" \
   "--profile live up -d --force-recreate --wait --wait-timeout 300 public-rosbridge"
 assert_contains "${live_output}" \
-  "--profile live up -d --force-recreate --wait --wait-timeout 300 object-perception"
+  "--profile live up -d object-perception"
+assert_contains "${live_output}" \
+  "--profile live up -d --wait --wait-timeout 30 object-perception"
 disabled_bridge_output="$(ENABLE_PUBLIC_ROSBRIDGE=false "${ROOT_DIR}/scripts/taskplanner" up live --dry-run)"
 assert_not_contains "${disabled_bridge_output}" \
   "--profile live up -d --force-recreate public-rosbridge"
@@ -66,7 +88,9 @@ assert_not_contains "${disabled_bridge_output}" \
 
 external_cv_output="$(PERCEPTION_BACKEND=external "${ROOT_DIR}/scripts/taskplanner" up live --dry-run)"
 assert_not_contains "${external_cv_output}" \
-  "--profile live up -d --force-recreate --wait --wait-timeout 300 object-perception"
+  "--profile live up -d object-perception"
+assert_not_contains "${external_cv_output}" \
+  "--profile live up -d --wait --wait-timeout 30 object-perception"
 
 live_build_output="$("${ROOT_DIR}/scripts/taskplanner" up live --dry-run --build)"
 assert_single_serial_build "${live_build_output}" "live"
@@ -80,13 +104,43 @@ assert_not_contains "${live_build_output}" \
 llm_output="$("${ROOT_DIR}/scripts/taskplanner" up llm-surgeon --dry-run)"
 assert_contains "${llm_output}" \
   "--profile llm-surgeon --profile debug up -d --force-recreate integration-debug integration-debug-lan-proxy"
+assert_contains "${llm_output}" \
+  "--profile llm-surgeon up -d integration-debug-tailscale-proxy"
+assert_contains "${llm_output}" \
+  "+ wait-for-websocket 127.0.0.1 9091 /llm llm-surgeon\\ ROS\\ bridge\\ router"
+assert_contains "${llm_output}" \
+  "+ wait-for-ros-semantic-ready llm-surgeon taskplanner-runtime /simulation/state surgical_msgs/msg/SimulationState /simulation/control surgical_msgs/srv/ControlSimulation"
 assert_not_contains "${llm_output}" \
   "--profile llm-surgeon up -d --force-recreate --wait --wait-timeout 300 taskplanner-asr"
 llm_build_output="$("${ROOT_DIR}/scripts/taskplanner" up llm-surgeon --dry-run --build)"
 assert_single_serial_build "${llm_build_output}" "llm-surgeon"
 
+degraded_live_output="$(
+  TASKPLANNER_PIPEWIRE_SOCKET=/definitely/missing/taskplanner-pipewire \
+  PUZZLE_SURGERY_RECORD_API_KEY_FILE=/definitely/missing/taskplanner-key \
+    "${ROOT_DIR}/scripts/taskplanner" up live --dry-run 2>&1
+)"
+assert_contains "${degraded_live_output}" \
+  "warning: optional integrated Debug sidecar skipped:"
+assert_not_contains "${degraded_live_output}" \
+  "--profile live --profile debug up -d --force-recreate integration-debug integration-debug-lan-proxy"
+assert_contains "${degraded_live_output}" \
+  "+ wait-for-ros-semantic-ready live taskplanner-runtime /simulation/state surgical_msgs/msg/SimulationState /simulation/control surgical_msgs/srv/ControlSimulation"
+
 replay_build_output="$("${ROOT_DIR}/scripts/taskplanner" up replay --dry-run --build)"
 assert_single_serial_build "${replay_build_output}" "replay"
+assert_contains "${replay_build_output}" \
+  "+ wait-for-websocket 127.0.0.1 9091 /shadow replay\\ ROS\\ bridge\\ router"
+assert_contains "${replay_build_output}" \
+  "--profile replay up -d --build --remove-orphans --wait --wait-timeout 300 vllm-manager ninfer-manager webapp"
+assert_contains "${replay_build_output}" \
+  "--profile replay up -d --build multicam-observer"
+assert_contains "${replay_build_output}" \
+  "+ wait_for_multicam_observer replay"
+assert_contains "${replay_build_output}" \
+  "integration-debug integration-debug-lan-proxy multicam-observer"
+assert_contains "${replay_build_output}" \
+  "+ wait-for-ros-semantic-ready replay shadow-runner /shadow/replay_state surgical_msgs/msg/ShadowReplayState /shadow/control_replay surgical_msgs/srv/ControlShadowReplay"
 
 python3 - "${ROOT_DIR}/config/cyclonedds_lan.xml" <<'PY'
 import sys
@@ -124,8 +178,31 @@ asr = config["services"]["taskplanner-asr"]
 runtime = config["services"]["taskplanner-runtime"]
 public_bridge = config["services"]["public-rosbridge"]
 integration_debug = config["services"]["integration-debug"]
+multicam_observer = config["services"]["multicam-observer"]
 webapp = config["services"]["webapp"]
 assert asr["profiles"] == ["live"]
+assert asr["healthcheck"]["interval"] == "5s"
+assert asr["healthcheck"]["start_interval"] == "1s"
+assert asr["healthcheck"]["timeout"] == "6s"
+assert asr["healthcheck"]["start_period"] == "10s"
+assert asr["healthcheck"]["retries"] == 60
+assert asr["stop_grace_period"] == "45s"
+assert runtime["stop_signal"] == "SIGINT"
+assert runtime["stop_grace_period"] == "15s"
+rendered_asr_command = " ".join(asr["command"])
+assert "exec /workspaces/taskplanner_ws/install/integration_debug/lib/integration_debug/operational_asr_node" in rendered_asr_command
+assert "exec ros2 run" not in rendered_asr_command
+rendered_public_bridge_command = " ".join(public_bridge["command"])
+assert "exec /workspaces/taskplanner_ws/install/surgical_interop_gateway/lib/surgical_interop_gateway/public_rosbridge" in rendered_public_bridge_command
+assert "exec ros2 run" not in rendered_public_bridge_command
+assert public_bridge["healthcheck"]["start_interval"] == "1s"
+assert public_bridge["healthcheck"]["interval"] == "5s"
+assert public_bridge["healthcheck"]["start_period"] == "5s"
+assert public_bridge["healthcheck"]["timeout"] == "2s"
+assert public_bridge["healthcheck"]["retries"] == 60
+rendered_public_health = " ".join(public_bridge["healthcheck"]["test"])
+assert "taskplanner_public_bridge_health.py" in rendered_public_health
+assert "socket.create_connection" not in rendered_public_health
 assert asr["image"] == runtime["image"]
 assert asr["network_mode"] == runtime["network_mode"] == "host"
 assert asr["user"]
@@ -146,6 +223,12 @@ for service in (runtime, asr, public_bridge, integration_debug):
         "/config/cyclonedds_lan.xml"
     )
     assert "FASTRTPS_DEFAULT_PROFILES_FILE" not in environment
+assert integration_debug["environment"]["TASKPLANNER_DEBUG_ROSBRIDGE_EXECUTABLE"] == (
+    "secure_operational_debug_rosbridge"
+)
+assert "rosbridge_executable:=$${TASKPLANNER_DEBUG_ROSBRIDGE_EXECUTABLE}" in (
+    " ".join(integration_debug["command"])
+)
 assert runtime["environment"]["CAM4_INPUT_TOPIC"] == (
     "/synced/cam_4/color/image_raw/compressed"
 )
@@ -205,6 +288,39 @@ assert "PUBLIC_ROSBRIDGE_PORT" in " ".join(public_bridge["healthcheck"]["test"])
 proxy = config["services"]["integration-debug-lan-proxy"]
 command = proxy["command"]
 assert "9092=127.0.0.1:9092" in command
+tailscale_proxy = config["services"]["integration-debug-tailscale-proxy"]
+assert tailscale_proxy["profiles"] == ["live", "llm-surgeon", "replay", "debug"]
+tailscale_command = tailscale_proxy["command"]
+assert "9091/live=127.0.0.1:9090" in tailscale_command
+assert "9091/llm=127.0.0.1:9090" in tailscale_command
+assert "9091/shadow=127.0.0.1:9099" in tailscale_command
+assert "9091/multicam=127.0.0.1:9094" in tailscale_command
+assert multicam_observer["profiles"] == ["live", "llm-surgeon", "replay", "debug"]
+assert multicam_observer["network_mode"] == "host"
+assert multicam_observer["read_only"] is True
+assert multicam_observer["cap_drop"] == ["ALL"]
+assert multicam_observer["security_opt"] == ["no-new-privileges:true"]
+assert multicam_observer["restart"] == "unless-stopped"
+assert multicam_observer["environment"]["ROS_DOMAIN_ID"] == "0"
+assert multicam_observer["environment"]["ROS_AUTOMATIC_DISCOVERY_RANGE"] == "SUBNET"
+assert multicam_observer["environment"]["RMW_IMPLEMENTATION"] == "rmw_cyclonedds_cpp"
+assert multicam_observer["environment"]["CYCLONEDDS_URI"].endswith(
+    "/config/cyclonedds_lan.xml"
+)
+assert multicam_observer["environment"]["ROSBRIDGE_MULTICAM_PORT"] == "9094"
+assert "/multicam_node/capture_status" not in " ".join(
+    multicam_observer["healthcheck"]["test"]
+)
+assert "multicam_observer.launch.py" in " ".join(multicam_observer["command"])
+assert webapp["network_mode"] == "host"
+assert "ports" not in webapp
+assert webapp["environment"]["TASKPLANNER_RUNTIME_CONTROL_URL"] == "http://127.0.0.1:8150"
+assert webapp["environment"]["TASKPLANNER_RUNTIME_CONTROL_TOKEN_FILE"] == "/run/taskplanner-secrets/runtime-control-token"
+assert webapp["environment"]["VITE_ROSBRIDGE_LIVE_TAILSCALE_PORT"] == "9091"
+assert webapp["environment"]["VITE_ROSBRIDGE_LIVE_TAILSCALE_PATH"] == "/live"
+assert webapp["environment"]["VITE_ROSBRIDGE_TAILSCALE_PORT"] == "9091"
+assert webapp["environment"]["VITE_ROSBRIDGE_LLM_TAILSCALE_PATH"] == "/llm"
+assert webapp["environment"]["VITE_ROSBRIDGE_SHADOW_TAILSCALE_PATH"] == "/shadow"
 '
 
 stale_fastdds_config="$(
@@ -231,16 +347,38 @@ llm_config="$("${ROOT_DIR}/scripts/taskplanner" config llm-surgeon)"
 assert_not_contains "${llm_config}" "taskplanner-asr:"
 assert_not_contains "${llm_config}" "operational_asr_node"
 assert_not_contains "${llm_config}" "colcon build"
+printf '%s\n' "${llm_config}" | python3 -c '
+import sys
+import yaml
+
+config = yaml.safe_load(sys.stdin)
+debug = config["services"]["integration-debug"]
+assert debug["environment"]["TASKPLANNER_DEBUG_ROSBRIDGE_EXECUTABLE"] == (
+    "secure_operational_debug_rosbridge"
+)
+'
 
 debug_output="$("${ROOT_DIR}/scripts/taskplanner" up debug --dry-run)"
 assert_contains "${debug_output}" \
-  "--profile debug up -d --force-recreate webapp integration-debug integration-debug-lan-proxy"
+  "--profile debug up -d webapp"
+assert_contains "${debug_output}" \
+  "--profile debug up -d multicam-observer"
+assert_contains "${debug_output}" \
+  "--profile debug up -d --force-recreate integration-debug integration-debug-lan-proxy"
+assert_contains "${debug_output}" \
+  "--profile debug up -d integration-debug-tailscale-proxy"
+assert_contains "${debug_output}" \
+  "+ wait-for-websocket 127.0.0.1 9091 / debug\\ ROS\\ bridge\\ router"
+assert_contains "${debug_output}" \
+  "+ wait_for_multicam_observer debug"
+assert_contains "${debug_output}" \
+  "+ wait-for-ros-semantic-ready debug integration-debug /integration/debug/status std_msgs/msg/String /integration/debug/check_readiness std_srvs/srv/Trigger"
 debug_build_output="$("${ROOT_DIR}/scripts/taskplanner" up debug --dry-run --build)"
 assert_single_serial_build "${debug_build_output}" "debug"
 assert_contains "${debug_build_output}" \
-  "stop taskplanner-runtime public-rosbridge taskplanner-asr shadow-runner object-perception integration-debug integration-debug-lan-proxy"
+  "stop taskplanner-runtime public-rosbridge taskplanner-asr shadow-runner object-perception integration-debug integration-debug-lan-proxy multicam-observer"
 assert_contains "${debug_build_output}" \
-  "rm -f taskplanner-runtime public-rosbridge taskplanner-asr shadow-runner object-perception integration-debug integration-debug-lan-proxy"
+  "rm -f taskplanner-runtime public-rosbridge taskplanner-asr shadow-runner object-perception integration-debug integration-debug-lan-proxy multicam-observer"
 assert_contains "${debug_build_output}" \
   "colcon\\ build\\ --symlink-install\\ --packages-select\\ surgical_interop_msgs\\ surgical_msgs\\ rosbridge_test_msgs\\ integration_debug"
 
@@ -248,12 +386,28 @@ debug_config="$("${ROOT_DIR}/scripts/taskplanner" config debug)"
 replay_config="$("${ROOT_DIR}/scripts/taskplanner" config replay)"
 assert_not_contains "${debug_config}" "colcon build"
 assert_not_contains "${replay_config}" "colcon build"
+for rendered_config in "${live_config}" "${llm_config}" "${debug_config}" "${replay_config}"; do
+  assert_contains "${rendered_config}" "VITE_DEFAULT_RUNTIME_MODE: llm"
+done
+printf '%s\n' "${debug_config}" | python3 -c '
+import sys
+import yaml
+
+config = yaml.safe_load(sys.stdin)
+debug = config["services"]["integration-debug"]
+assert debug["environment"]["TASKPLANNER_DEBUG_ROSBRIDGE_EXECUTABLE"] == (
+    "secure_debug_rosbridge"
+)
+'
 printf '%s\n' "${replay_config}" | python3 -c '
 import sys
 import yaml
 
 config = yaml.safe_load(sys.stdin)
-environment = config["services"]["shadow-runner"]["environment"]
+shadow = config["services"]["shadow-runner"]
+environment = shadow["environment"]
+assert shadow["stop_signal"] == "SIGINT"
+assert shadow["stop_grace_period"] == "15s"
 assert environment["ROS_DOMAIN_ID"] == "71"
 assert environment["ROS_AUTOMATIC_DISCOVERY_RANGE"] == "LOCALHOST"
 assert environment["RMW_IMPLEMENTATION"] == "rmw_cyclonedds_cpp"
@@ -262,8 +416,36 @@ assert "FASTRTPS_DEFAULT_PROFILES_FILE" not in environment
 '
 grep -q 'acquire_launcher_lock' "${ROOT_DIR}/scripts/taskplanner" ||
   fail "launcher lifecycle must be serialized across concurrent invocations"
-[[ "$(grep -c '^    acquire_launcher_lock$' "${ROOT_DIR}/scripts/taskplanner")" == "2" ]] ||
+[[ "$(grep -c '^    acquire_launcher_lock$' "${ROOT_DIR}/scripts/taskplanner")" -ge "2" ]] ||
   fail "both launcher up and down must acquire the lifecycle lock"
+[[ "$(grep -c '^[[:space:]]\+verify_runtime_control_transition_interlock$' "${ROOT_DIR}/scripts/taskplanner")" == "2" ]] ||
+  fail "both runtime replacement branches must repeat the stopped-state gate"
+gate_output="$(
+  TASKPLANNER_RUNTIME_REQUIRE_STOPPED=1 \
+  TASKPLANNER_RUNTIME_EXPECTED_ACTIVE_MODE=replay \
+    "${ROOT_DIR}/scripts/taskplanner" up replay --dry-run
+)"
+gate_line="$(grep -n -F '+ verify-runtime-transition-interlock replay' <<<"${gate_output}" | cut -d: -f1)"
+stop_line="$(grep -n -F ' stop taskplanner-runtime' <<<"${gate_output}" | head -n 1 | cut -d: -f1)"
+[[ -n "${gate_line}" && -n "${stop_line}" && "${gate_line}" -lt "${stop_line}" ]] ||
+  fail "controller child must recheck stopped state before marker clear and stop"
+python3 - "${ROOT_DIR}/scripts/taskplanner" <<'PY'
+import sys
+from pathlib import Path
+
+lines = Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+gates = [
+    index
+    for index, line in enumerate(lines)
+    if line.strip() == "verify_runtime_control_transition_interlock"
+]
+assert len(gates) == 2
+for index in gates:
+    assert any(
+        line.strip() == "clear_active_runtime_mode"
+        for line in lines[index + 1 : index + 8]
+    )
+PY
 grep -q 'exec \${LAUNCHER_LOCK_FD}>&-' "${ROOT_DIR}/scripts/taskplanner" ||
   fail "LM Studio child must not inherit the Taskplanner launcher lock"
 

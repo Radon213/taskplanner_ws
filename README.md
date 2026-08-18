@@ -304,10 +304,20 @@ ROSBridge는 `ws://127.0.0.1:9091`에서 열린다. 종단 목록, 안전 동작
 상대 기관 확인 절차는
 [`docs/INTEGRATION_DEBUG_MODE.md`](docs/INTEGRATION_DEBUG_MODE.md)를 따른다.
 
-When the dashboard is opened through another hostname, such as a Tailscale
-IPv4 address or MagicDNS name, it connects to rosbridge on that same hostname
-and `ROSBRIDGE_PORT`. Set `VITE_ROSBRIDGE_URL` only when an explicit websocket
-endpoint is required.
+When the dashboard is opened through another hostname, it connects to
+rosbridge on that same hostname and the selected mode's configured port. A
+Tailscale IPv4 browser uses the reviewed path routes `/live`, `/llm`, and
+`/shadow` on the existing permitted port; it does not need direct access to
+the replay bridge port. Set `VITE_ROSBRIDGE_URL` only when an explicit
+websocket endpoint is required.
+
+After any normal `scripts/taskplanner up <mode>` start, the dashboard's
+**Runtime mode** selector can switch among Live, LLM surgeon, Replay, and
+Debug without another terminal command. The selector asks a transient,
+loopback-only, token-gated host service to run the same allowlisted launcher
+profiles documented below, shows startup/retry state, then reconnects ROS
+automatically. A mode switch stops the previous profile before starting the
+next one; it does not send a robot Action goal.
 
 The selected profile launches the appropriate subset of:
 

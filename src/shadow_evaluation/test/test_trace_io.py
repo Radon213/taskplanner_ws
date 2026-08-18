@@ -154,6 +154,115 @@ def test_async_writer_does_not_wait_for_slow_disk_append() -> None:
     assert target.closed
 
 
+def test_async_writer_bounds_pending_records_and_fails_loudly() -> None:
+    class SlowWriter:
+        count = 0
+
+        def __init__(self) -> None:
+            self.started = threading.Event()
+            self.release = threading.Event()
+            self.closed = False
+
+        def append(self, **_kwargs: Any) -> None:
+            self.started.set()
+            assert self.release.wait(timeout=2.0)
+            self.count += 1
+
+        def close(self) -> None:
+            self.closed = True
+
+    target = SlowWriter()
+    writer = AsyncTraceWriter(
+        target,
+        max_pending_records=1,
+        enqueue_timeout_sec=0.01,
+    )
+    _append(writer, 1)
+    assert target.started.wait(timeout=1.0)
+    _append(writer, 2)
+
+    with pytest.raises(RuntimeError, match="asynchronous trace writer failed"):
+        _append(writer, 3)
+
+    target.release.set()
+    with pytest.raises(RuntimeError, match="asynchronous trace writer failed"):
+        writer.close()
+    assert target.count == 1
+    assert target.closed
+
+
+def test_async_writer_close_timeout_does_not_hang_runtime_shutdown() -> None:
+    class HungWriter:
+        count = 0
+
+        def __init__(self) -> None:
+            self.started = threading.Event()
+            self.release = threading.Event()
+            self.closed = False
+
+        def append(self, **_kwargs: Any) -> None:
+            self.started.set()
+            assert self.release.wait(timeout=2.0)
+            self.count += 1
+
+        def close(self) -> None:
+            self.closed = True
+
+    target = HungWriter()
+    writer = AsyncTraceWriter(target, close_timeout_sec=0.02)
+    _append(writer, 1)
+    assert target.started.wait(timeout=1.0)
+
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match="asynchronous trace writer failed") as exc:
+        writer.close()
+    assert time.monotonic() - started < 0.5
+    assert isinstance(exc.value.__cause__, TimeoutError)
+    assert not target.closed
+
+    target.release.set()
+    deadline = time.monotonic() + 1.0
+    while not target.closed and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert target.closed
+
+
+def test_async_writer_underlying_close_timeout_is_bounded() -> None:
+    class HungCloseWriter:
+        count = 0
+
+        def __init__(self) -> None:
+            self.close_started = threading.Event()
+            self.release = threading.Event()
+            self.closed = False
+
+        def append(self, **_kwargs: Any) -> None:
+            self.count += 1
+
+        def close(self) -> None:
+            self.close_started.set()
+            assert self.release.wait(timeout=2.0)
+            self.closed = True
+
+    target = HungCloseWriter()
+    writer = AsyncTraceWriter(target, close_timeout_sec=0.03)
+    _append(writer, 1)
+
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match="asynchronous trace writer failed") as exc:
+        writer.close()
+    assert target.close_started.wait(timeout=0.5)
+    assert time.monotonic() - started < 0.5
+    assert isinstance(exc.value.__cause__, TimeoutError)
+    assert not target.closed
+
+    target.release.set()
+    deadline = time.monotonic() + 1.0
+    while not target.closed and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert target.closed
+
+
 def test_async_writer_surfaces_worker_failure_and_closes() -> None:
     class FailingWriter:
         count = 0
@@ -202,3 +311,24 @@ def test_async_trace_file_is_valid_append_only_jsonl(tmp_path: Path) -> None:
     assert [record["payload"]["value"] for record in records] == list(
         range(40)
     )
+
+
+def test_async_trace_flushes_sparse_records_during_idle(tmp_path: Path) -> None:
+    path = tmp_path / "sparse.jsonl"
+    writer = AsyncTraceWriter(
+        TraceWriter(
+            path,
+            run_id="run",
+            mode="strict",
+            flush_every_records=128,
+        ),
+        idle_flush_interval_sec=0.02,
+    )
+    try:
+        _append(writer, 1)
+        deadline = time.monotonic() + 1.0
+        while path.stat().st_size == 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert path.stat().st_size > 0
+    finally:
+        writer.close()

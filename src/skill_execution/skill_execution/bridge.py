@@ -98,6 +98,8 @@ class SkillActionBridge(Node):
         self._active_goal_handle = None
         self._cancelled_command_ids: set[str] = set()
         self._command_started_ns: dict[str, int] = {}
+        self._runtime_accepting_commands = False
+        self._last_lifecycle_control_signature: tuple[str, str] | None = None
         self._status_pub = self.create_publisher(SkillStatus, "/skill/status", 20)
         self._action_client = ActionClient(self, ExecuteSkill, self._action_name)
         self.create_subscription(SkillCommand, "/bt/skill_command", self._on_command, 20)
@@ -271,6 +273,7 @@ class SkillActionBridge(Node):
         result_future.add_done_callback(lambda result, command=command: self._on_result(command, result))
 
     def _on_result(self, command: CommandEnvelope, future) -> None:
+        self._cancelled_command_ids.discard(command.command_id)
         try:
             wrapped_result = future.result()
         except Exception as exc:  # pragma: no cover - transport failures are runtime-only
@@ -366,9 +369,11 @@ class SkillActionBridge(Node):
             self._active_signature = None
             self._active_command_id = ""
             return
+        if command.command_id in self._cancelled_command_ids:
+            return
+        self._cancelled_command_ids.add(command.command_id)
         self._publish_status(command, "cancel_requested", False, f"cancel requested by simulation {reason}")
         if goal_handle is None:
-            self._cancelled_command_ids.add(command.command_id)
             self._active_signature = None
             self._active_command_id = ""
             self._active_command = None
@@ -380,14 +385,36 @@ class SkillActionBridge(Node):
             self.get_logger().warn(f"failed to cancel active skill goal: {exc}")
 
     def _on_control(self, msg: String) -> None:
-        command = msg.data.strip().lower()
-        if command in {"stop", "reset"}:
+        command, _, detail = msg.data.strip().partition(":")
+        command = command.lower()
+        signature = (command, detail.strip())
+        if command in {"start", "start_runtime", "start_actors", "pause", "resume", "stop"}:
+            if signature == self._last_lifecycle_control_signature:
+                return
+            self._last_lifecycle_control_signature = signature
+        if command in {"start", "start_actors", "resume"}:
+            self._runtime_accepting_commands = True
+            return
+        if command == "start_runtime":
+            self._runtime_accepting_commands = False
+            return
+        if command in {"pause", "stop", "reset"}:
+            self._runtime_accepting_commands = False
             self._cancel_active_goal(command)
         if command == "reset":
+            self._last_lifecycle_control_signature = None
             self._request_dispatch_ledger.clear()
 
     def _on_command(self, msg: SkillCommand) -> None:
         command = self._coerce_command(msg)
+        if not getattr(self, "_runtime_accepting_commands", False):
+            self._publish_status(
+                command,
+                "rejected",
+                False,
+                "simulation runtime is not accepting skill commands",
+            )
+            return
         if command.action not in ALLOWED_ACTIONS:
             self._publish_status(
                 command,

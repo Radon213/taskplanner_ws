@@ -8,6 +8,47 @@ from bt_orchestrator.bed_robot_arm_group_orchestrator import (
     BedRobotArmGroupOrchestrator,
     PendingRetractionAdjustment,
 )
+
+
+def test_start_heartbeat_does_not_clear_ready_runtime() -> None:
+    router = BedRobotArmGroupOrchestrator.__new__(
+        BedRobotArmGroupOrchestrator
+    )
+    router._bt_ready = True
+    router._last_lifecycle_control_signature = None
+    router._clear_runtime_state = lambda: (_ for _ in ()).throw(
+        AssertionError("ready start heartbeat cleared runtime state")
+    )
+
+    router._on_control(SimpleNamespace(data="start"))
+    router._on_control(SimpleNamespace(data="start"))
+
+    assert router._bt_ready is True
+
+
+def test_reset_is_repeatable_and_reopens_the_next_start_edge() -> None:
+    router = BedRobotArmGroupOrchestrator.__new__(
+        BedRobotArmGroupOrchestrator
+    )
+    router._bt_ready = False
+    router._last_lifecycle_control_signature = None
+    clear_count = 0
+
+    def clear_runtime_state() -> None:
+        nonlocal clear_count
+        clear_count += 1
+        router._bt_ready = False
+
+    router._clear_runtime_state = clear_runtime_state
+
+    router._on_control(SimpleNamespace(data="start"))
+    router._on_control(SimpleNamespace(data="start"))
+    router._on_control(SimpleNamespace(data="reset"))
+    router._on_control(SimpleNamespace(data="reset"))
+    router._on_control(SimpleNamespace(data="start"))
+
+    assert clear_count == 4
+    assert router._bt_ready is True
 from procedure_spec import load_bundle
 from std_msgs.msg import String
 from surgical_interop_msgs.msg import BedRobotArmState, BedRobotArmStateArray

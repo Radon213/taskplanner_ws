@@ -258,6 +258,10 @@ services:
       - shadow
     image: taskplanner-ws:dev
     restart: "no"
+    # ros2 launch owns a process group and handles SIGINT cooperatively. Docker's
+    # default SIGTERM left the launch process running until a forced kill.
+    stop_signal: SIGINT
+    stop_grace_period: 15s
     user: "${TASKPLANNER_UID:-1000}:${TASKPLANNER_GID:-1000}"
     working_dir: /workspaces/taskplanner_ws
     network_mode: host
@@ -394,7 +398,8 @@ services:
           ros2 topic info --no-daemon --spin-time 1.5 --verbose
           /input/asr/runtime_status | grep -q "Node name: taskplanner_asr"'
       interval: 5s
-      timeout: 4s
+      start_interval: 1s
+      timeout: 6s
       retries: 60
       start_period: 10s
     command: >
@@ -403,7 +408,7 @@ services:
         exit 2;
       fi &&
       source install/setup.bash &&
-      exec ros2 run integration_debug operational_asr_node"
+      exec /workspaces/taskplanner_ws/install/integration_debug/lib/integration_debug/operational_asr_node"
 
   taskplanner-runtime:
     profiles:
@@ -424,6 +429,10 @@ services:
         TASKPLANNER_SHADOW_CONTRACT_VERSION: ${TASKPLANNER_SHADOW_CONTRACT_VERSION:-shadow-rfdetr-preflight-v1}
     image: taskplanner-ws:dev
     restart: "no"
+    # Give ros2 launch its native interrupt so every child can flush state and
+    # exit before Docker's grace deadline instead of being force-killed at 10s.
+    stop_signal: SIGINT
+    stop_grace_period: 15s
     working_dir: /workspaces/taskplanner_ws
     network_mode: host
     ipc: host
@@ -574,10 +583,10 @@ services:
       test:
         - CMD-SHELL
         - >-
-          python3 -c 'import os, socket;
-          s = socket.create_connection(("127.0.0.1", int(os.environ["PUBLIC_ROSBRIDGE_PORT"])), 1.0);
-          s.close()'
+          python3 /workspaces/taskplanner_ws/scripts/taskplanner_public_bridge_health.py
+          --port "$${PUBLIC_ROSBRIDGE_PORT}" --timeout 1
       interval: 5s
+      start_interval: 1s
       timeout: 2s
       retries: 60
       start_period: 5s
@@ -585,14 +594,76 @@ services:
       bash -lc "for attempt in $$(seq 1 150); do
         if [ -f install/setup.bash ]; then
           source install/setup.bash;
-          if ros2 pkg executables surgical_interop_gateway 2>/dev/null | grep -q 'public_rosbridge'; then
-            exec ros2 run surgical_interop_gateway public_rosbridge --port $${PUBLIC_ROSBRIDGE_PORT} --address 127.0.0.1 --websocket_ping_interval 20.0 --websocket_ping_timeout 30.0;
+          if [ -x install/surgical_interop_gateway/lib/surgical_interop_gateway/public_rosbridge ]; then
+            exec /workspaces/taskplanner_ws/install/surgical_interop_gateway/lib/surgical_interop_gateway/public_rosbridge --port $${PUBLIC_ROSBRIDGE_PORT} --address 127.0.0.1 --websocket_ping_interval 20.0 --websocket_ping_timeout 30.0;
           fi;
         fi;
         sleep 2;
       done;
       echo 'public_rosbridge executable unavailable after 300 seconds' >&2;
       exit 2"
+
+  multicam-observer:
+    profiles:
+      - live
+      - llm-surgeon
+      - replay
+      - debug
+    image: taskplanner-ws:dev
+    restart: unless-stopped
+    stop_signal: SIGINT
+    stop_grace_period: 15s
+    user: "${TASKPLANNER_UID:-1000}:${TASKPLANNER_GID:-1000}"
+    working_dir: /workspaces/taskplanner_ws
+    network_mode: host
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 512m
+    memswap_limit: 512m
+    tmpfs:
+      - /tmp
+    volumes:
+      - .:/workspaces/taskplanner_ws:ro
+    environment:
+      # Multicam capture runs on the facility ROS domain independently of the
+      # selected planner/replay domain.  These dedicated variables prevent a
+      # mode env file from silently moving the read-only observer elsewhere.
+      ROS_DOMAIN_ID: ${MULTICAM_ROS_DOMAIN_ID:-0}
+      ROS_AUTOMATIC_DISCOVERY_RANGE: ${MULTICAM_ROS_DISCOVERY_RANGE:-SUBNET}
+      RMW_IMPLEMENTATION: ${MULTICAM_RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}
+      CYCLONEDDS_URI: ${MULTICAM_CYCLONEDDS_URI:-file:///workspaces/taskplanner_ws/config/cyclonedds_lan.xml}
+      ROS_LOG_DIR: /tmp/ros-logs
+      ROSBRIDGE_MULTICAM_PORT: ${ROSBRIDGE_MULTICAM_PORT:-9094}
+      ROSBRIDGE_ADDRESS: 127.0.0.1
+      ROSBRIDGE_SERVICE_TIMEOUT: ${ROSBRIDGE_MULTICAM_SERVICE_TIMEOUT:-10.0}
+    healthcheck:
+      # Capture publishers may be absent when the facility cameras are off.
+      # Health therefore covers only the read-only bridge process; capture
+      # status remains an explicit UI operational state, not a boot gate.
+      test:
+        - CMD-SHELL
+        - >-
+          python3 -c 'import os, socket;
+          s = socket.create_connection(("127.0.0.1", int(os.environ["ROSBRIDGE_MULTICAM_PORT"])), 1.0);
+          s.close()'
+      interval: 5s
+      timeout: 2s
+      retries: 60
+      start_period: 5s
+    command: >
+      bash -lc "if [ ! -f install/setup.bash ] || [ ! -x install/integration_debug/lib/integration_debug/secure_multicam_rosbridge ]; then
+        echo 'Multicam observer is missing from install; rerun launcher with --build' >&2;
+        exit 2;
+      fi &&
+      source install/setup.bash &&
+      exec ros2 launch integration_debug multicam_observer.launch.py
+      rosbridge_port:=$${ROSBRIDGE_MULTICAM_PORT}
+      rosbridge_address:=$${ROSBRIDGE_ADDRESS}
+      rosbridge_service_timeout:=$${ROSBRIDGE_SERVICE_TIMEOUT}"
 
   integration-debug:
     profiles:
@@ -632,7 +703,9 @@ services:
       ROS_AUTOMATIC_DISCOVERY_RANGE: ${ROS_AUTOMATIC_DISCOVERY_RANGE:-SUBNET}
       RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}
       CYCLONEDDS_URI: ${CYCLONEDDS_URI:-}
-      ROSBRIDGE_DEBUG_PORT: ${ROSBRIDGE_DEBUG_PORT:-9091}
+      # Keep Debug behind the loopback path router. 9091 remains the external
+      # endpoint while this sidecar owns its isolated upstream socket.
+      ROSBRIDGE_DEBUG_PORT: ${ROSBRIDGE_DEBUG_UPSTREAM_PORT:-9093}
       # Remote access must traverse integration-debug-lan-proxy. Never let a
       # shell-level override expose the unauthenticated bridge on every NIC.
       ROSBRIDGE_ADDRESS: 127.0.0.1
@@ -644,6 +717,10 @@ services:
       # they cannot escape the planner's fail-closed node detection domain.
       TASKPLANNER_DEBUG_LOCK_TO_RUNTIME_NETWORK: ${TASKPLANNER_DEBUG_LOCK_TO_RUNTIME_NETWORK:-false}
       TASKPLANNER_DEBUG_ALLOW_PLANNER_COEXISTENCE: ${TASKPLANNER_DEBUG_ALLOW_PLANNER_COEXISTENCE:-false}
+      # Live/LLM select a separate bridge executable whose allowlist omits all
+      # world-anchor mutation services. Standalone Debug keeps the explicit
+      # operator policy.
+      TASKPLANNER_DEBUG_ROSBRIDGE_EXECUTABLE: ${TASKPLANNER_DEBUG_ROSBRIDGE_EXECUTABLE:-secure_debug_rosbridge}
       TASKPLANNER_DEBUG_ALLOW_SELF_RESTART: "true"
       TASKPLANNER_SURGERY_RECORD_INPUT_DIR: /surgery-record-inputs
       PUZZLE_ASR_URL: ${PUZZLE_ASR_URL:-wss://arpa.worker-02.puzzle-ai.com}
@@ -662,6 +739,7 @@ services:
       rosbridge_port:=$${ROSBRIDGE_DEBUG_PORT}
       rosbridge_address:=$${ROSBRIDGE_ADDRESS}
       rosbridge_service_timeout:=$${ROSBRIDGE_SERVICE_TIMEOUT}
+      rosbridge_executable:=$${TASKPLANNER_DEBUG_ROSBRIDGE_EXECUTABLE}
       run_root:=$${TASKPLANNER_RUN_ROOT}"
 
   integration-debug-lan-proxy:
@@ -693,6 +771,49 @@ services:
       - --route
       - ${PUBLIC_ROSBRIDGE_PORT:-9092}=127.0.0.1:${PUBLIC_ROSBRIDGE_PORT:-9092}
 
+  integration-debug-tailscale-proxy:
+    profiles:
+      - live
+      - llm-surgeon
+      - replay
+      - debug
+    image: taskplanner-ws:dev
+    restart: unless-stopped
+    user: "${TASKPLANNER_UID:-1000}:${TASKPLANNER_GID:-1000}"
+    working_dir: /workspaces/taskplanner_ws
+    network_mode: host
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+    volumes:
+      - .:/workspaces/taskplanner_ws:ro
+    command:
+      - python3
+      - scripts/taskplanner_debug_lan_proxy.py
+      # Tailscale's localhost gateway DNATs permitted Tailnet TCP to 127.0.0.1.
+      # Route that single port by websocket path without opening a new port.
+      - --bind-address
+      - 127.0.0.1
+      - --allow-network
+      - 100.64.0.0/10
+      - --allow-loopback-clients
+      - --route
+      - ${ROSBRIDGE_DEBUG_PORT:-9091}=127.0.0.1:${ROSBRIDGE_DEBUG_UPSTREAM_PORT:-9093}
+      # The existing Tailnet-permitted port carries each reviewed runtime only
+      # on an explicit websocket path. Root traffic remains Debug Mode.
+      - --route
+      - ${ROSBRIDGE_DEBUG_PORT:-9091}/live=127.0.0.1:${ROSBRIDGE_PORT:-9090}
+      - --route
+      - ${ROSBRIDGE_DEBUG_PORT:-9091}/llm=127.0.0.1:${ROSBRIDGE_PORT:-9090}
+      - --route
+      - ${ROSBRIDGE_DEBUG_PORT:-9091}/shadow=127.0.0.1:${ROSBRIDGE_SHADOW_PORT:-9099}
+      - --route
+      - ${ROSBRIDGE_DEBUG_PORT:-9091}/multicam=127.0.0.1:${ROSBRIDGE_MULTICAM_PORT:-9094}
+
   webapp:
     build:
       context: .
@@ -710,15 +831,29 @@ services:
     image: taskplanner-ws:dev
     restart: "no"
     working_dir: /workspaces/taskplanner_ws/webapp
+    # The Vite server stays loopback-only on the host. Host networking lets its
+    # server-side proxy reach the loopback-only runtime-control service without
+    # opening that control service on a Docker or Tailnet interface.
+    network_mode: host
     volumes:
       - .:/workspaces/taskplanner_ws
       - taskplanner_web_node_modules:/workspaces/taskplanner_ws/webapp/node_modules
+      - ${TASKPLANNER_RUNTIME_CONTROL_TOKEN_FILE:-${HOME}/.config/taskplanner/secrets/runtime-control-token}:/run/taskplanner-secrets/runtime-control-token:ro
     environment:
+      TASKPLANNER_RUNTIME_CONTROL_URL: http://127.0.0.1:${TASKPLANNER_RUNTIME_CONTROL_PORT:-8150}
+      TASKPLANNER_RUNTIME_CONTROL_TOKEN_FILE: /run/taskplanner-secrets/runtime-control-token
       VITE_ROSBRIDGE_URL: ${VITE_ROSBRIDGE_URL:-}
       VITE_ROSBRIDGE_PORT: ${ROSBRIDGE_PORT:-9090}
-      VITE_DEFAULT_RUNTIME_MODE: ${VITE_DEFAULT_RUNTIME_MODE:-llm}
+      # Runtime status is authoritative. Keep this fallback mode-independent so
+      # switching ROS profiles does not restart the dashboard that requested it.
+      VITE_DEFAULT_RUNTIME_MODE: ${TASKPLANNER_WEBAPP_FALLBACK_MODE:-llm}
       VITE_ROSBRIDGE_LIVE_URL: ${VITE_ROSBRIDGE_LIVE_URL:-}
       VITE_ROSBRIDGE_LIVE_PORT: ${ROSBRIDGE_LIVE_PORT:-9090}
+      VITE_ROSBRIDGE_LIVE_TAILSCALE_PORT: ${VITE_ROSBRIDGE_LIVE_TAILSCALE_PORT:-9091}
+      VITE_ROSBRIDGE_LIVE_TAILSCALE_PATH: ${VITE_ROSBRIDGE_LIVE_TAILSCALE_PATH:-/live}
+      VITE_ROSBRIDGE_TAILSCALE_PORT: ${VITE_ROSBRIDGE_TAILSCALE_PORT:-9091}
+      VITE_ROSBRIDGE_LLM_TAILSCALE_PATH: ${VITE_ROSBRIDGE_LLM_TAILSCALE_PATH:-/llm}
+      VITE_ROSBRIDGE_SHADOW_TAILSCALE_PATH: ${VITE_ROSBRIDGE_SHADOW_TAILSCALE_PATH:-/shadow}
       VITE_ROSBRIDGE_LLM_URL: ${VITE_ROSBRIDGE_LLM_URL:-}
       VITE_ROSBRIDGE_LLM_PORT: ${ROSBRIDGE_LLM_PORT:-9090}
       VITE_ROSBRIDGE_SHADOW_URL: ${VITE_ROSBRIDGE_SHADOW_URL:-}
@@ -731,8 +866,6 @@ services:
       VITE_EXTERNAL_CAM4_TOPIC: ${VITE_EXTERNAL_CAM4_TOPIC:-/synced/cam_4/color/image_raw/compressed}
       VITE_EXTERNAL_FLIR_TOPIC: ${VITE_EXTERNAL_FLIR_TOPIC:-/synced/flir/color/image_raw/compressed}
       WEBAPP_INSTALL_ON_START: ${WEBAPP_INSTALL_ON_START:-false}
-    ports:
-      - "127.0.0.1:${WEBAPP_PORT:-4173}:4173"
     command: >
       bash -lc "
         if [ \"$${WEBAPP_INSTALL_ON_START:-false}\" = 'true' ]; then
@@ -741,7 +874,7 @@ services:
           echo 'webapp node_modules is missing; rerun launcher with --build' >&2;
           exit 2;
         fi &&
-        npm run dev -- --host 0.0.0.0 --port 4173
+        npm run dev -- --host 127.0.0.1 --port ${WEBAPP_PORT:-4173}
       "
 
 volumes:

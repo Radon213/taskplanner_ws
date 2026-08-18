@@ -30,6 +30,8 @@ setup(
             "operational_asr_node = integration_debug.operational_asr_node:main",
             "taskplanner_asr_node = integration_debug.operational_asr_node:main",
             "secure_debug_rosbridge = integration_debug.secure_rosbridge:main",
+            "secure_operational_debug_rosbridge = integration_debug.secure_rosbridge:operational_main",
+            "secure_multicam_rosbridge = integration_debug.secure_multicam_rosbridge:main",
         ],
     },
 )

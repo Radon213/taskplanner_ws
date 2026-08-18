@@ -42,6 +42,16 @@ def _thyroid_demo_spec():
     )
 
 
+def _nephrectomy_spec():
+    return load_bundle(
+        Path(__file__).parents[2]
+        / "procedure_spec"
+        / "procedure_spec"
+        / "specs"
+        / "nephrectomy"
+    )
+
+
 def _controller_status(
     *,
     revision: int = 1,
@@ -63,6 +73,32 @@ def _controller_status(
     arm.direct_teach_active = state == "direct_teach"
     arm.reason_code = "ok"
     status.arms.append(arm)
+    return status
+
+
+def _two_arm_controller_status(
+    *,
+    revision: int,
+    stamp: int,
+    left_state: str,
+    right_state: str,
+) -> BedRobotArmStateArray:
+    status = BedRobotArmStateArray()
+    status.stamp.sec = stamp
+    status.revision = revision
+    status.procedure_type = "nephrectomy"
+    for arm_id, role_instance_id, state in (
+        ("arm_1", "left_malleable", left_state),
+        ("arm_2", "right_malleable", right_state),
+    ):
+        arm = BedRobotArmState()
+        arm.arm_id = arm_id
+        arm.role = "retraction"
+        arm.role_instance_id = role_instance_id
+        arm.state = state
+        arm.direct_teach_active = state == "direct_teach"
+        arm.reason_code = "ok"
+        status.arms.append(arm)
     return status
 
 
@@ -207,6 +243,55 @@ def test_controller_restart_rejects_delayed_old_epoch_and_changed_heartbeat() ->
     assert twin._bed_robot_arm_controller_epoch == 1
     assert twin._bed_robot_arm_controller_source_stamp_ns == 32_000_000_000
     assert belief.last_update_stamp_sec == 32
+
+
+def test_controller_heartbeat_refreshes_freshness_without_recording_an_event() -> None:
+    twin = ORDigitalTwin(_thyroid_spec())
+    assert twin.update_bed_robot_arm_controller_status(
+        _controller_status(revision=1, stamp=10, arm_id="arm_1", state="standby")
+    ) is True
+    first_events = list(twin.event_history)
+    assert twin.bed_robot_arm_controller_state_changed() is True
+
+    # The public controller increments its revision for every status
+    # heartbeat, even if the arm state has not changed.
+    assert twin.update_bed_robot_arm_controller_status(
+        _controller_status(revision=2, stamp=11, arm_id="arm_1", state="standby")
+    ) is True
+
+    belief = twin.state.bed_robot_arm_groups["retraction"]
+    assert twin.bed_robot_arm_controller_state_changed() is False
+    assert belief.last_update_stamp_sec == 11
+    assert list(twin.event_history) == first_events
+
+
+def test_two_arm_role_state_change_is_not_hidden_by_same_aggregate_state() -> None:
+    twin = ORDigitalTwin(_nephrectomy_spec())
+    assert twin.update_bed_robot_arm_controller_status(
+        _two_arm_controller_status(
+            revision=1,
+            stamp=10,
+            left_state="retracting",
+            right_state="standby",
+        )
+    ) is True
+    assert twin.bed_robot_arm_controller_state_changed() is True
+    first_event_count = len(twin.event_history)
+
+    assert twin.update_bed_robot_arm_controller_status(
+        _two_arm_controller_status(
+            revision=2,
+            stamp=11,
+            left_state="standby",
+            right_state="retracting",
+        )
+    ) is True
+
+    belief = twin.state.bed_robot_arm_groups["retraction"]
+    assert belief.state == "retracting"
+    assert belief.arm_id == ""
+    assert twin.bed_robot_arm_controller_state_changed() is True
+    assert len(twin.event_history) == first_event_count + 1
 
 
 def test_periodic_world_serialization_does_not_retimestamp_unchanged_group():
@@ -475,6 +560,42 @@ def test_node_does_not_publish_unchanged_health_heartbeat_as_event():
 
     assert published_events == []
     assert published_world_states == []
+
+
+def test_node_does_not_publish_unchanged_controller_heartbeat_as_event():
+    node = ORDigitalTwinNode.__new__(ORDigitalTwinNode)
+    node._twin = ORDigitalTwin(_thyroid_spec())
+    node._bed_robot_source_max_age_sec = 2.0
+    node._bed_robot_source_future_tolerance_sec = 0.5
+    node._bed_robot_status_received_monotonic = 0.0
+    node._bed_robot_status_source_stamp_ns = None
+    wall_time_ns = [10_000_000_000]
+    monotonic_sec = [100.0]
+    node._wall_time_ns = lambda: wall_time_ns[0]
+    node._monotonic_sec = lambda: monotonic_sec[0]
+    published_events = []
+    published_world_states = []
+    node._publish_event = lambda event_type, **kwargs: published_events.append(
+        (event_type, kwargs)
+    )
+    node._publish_world_state = lambda: published_world_states.append(True)
+
+    node._on_bed_robot_arm_controller_status(
+        _controller_status(revision=1, stamp=10, arm_id="arm_1", state="standby")
+    )
+
+    wall_time_ns[0] = 11_000_000_000
+    monotonic_sec[0] = 101.0
+    node._on_bed_robot_arm_controller_status(
+        _controller_status(revision=2, stamp=11, arm_id="arm_1", state="standby")
+    )
+
+    assert [event_type for event_type, _ in published_events] == [
+        "BedRobotArmControllerStateUpdated"
+    ]
+    assert published_world_states == [True]
+    assert node._bed_robot_status_source_stamp_ns == 11_000_000_000
+    assert node._bed_robot_status_received_monotonic == 101.0
 
 
 def test_group_reducer_suppresses_duplicate_progress_but_keeps_semantic_boundaries():

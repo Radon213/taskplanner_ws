@@ -25,6 +25,59 @@ STALE = "STALE"
 ERROR = "ERROR"
 DISABLED = "DISABLED"
 
+STATUS_CHECKPOINT_SEC = 1.0
+
+
+def status_semantic_signature(status: InputSourceStatus) -> tuple[object, ...]:
+    """Return the fields whose change must be published without checkpoint delay."""
+
+    return (
+        str(status.source_id),
+        str(status.modality),
+        str(status.state),
+        bool(status.healthy),
+        int(status.epoch),
+        str(status.error_code),
+        str(status.detail),
+    )
+
+
+@dataclass
+class StatusPublicationGate:
+    """Per-source transition gate with sparse unchanged-state checkpoints."""
+
+    checkpoint_sec: float = STATUS_CHECKPOINT_SEC
+
+    def __post_init__(self) -> None:
+        self.checkpoint_sec = max(0.0, float(self.checkpoint_sec))
+        self._last_success: dict[str, tuple[tuple[object, ...], float]] = {}
+
+    def due(
+        self,
+        source: str,
+        status: InputSourceStatus,
+        now_monotonic_sec: float,
+    ) -> bool:
+        previous = self._last_success.get(str(source))
+        if previous is None:
+            return True
+        signature = status_semantic_signature(status)
+        return bool(
+            signature != previous[0]
+            or float(now_monotonic_sec) - previous[1] >= self.checkpoint_sec
+        )
+
+    def commit(
+        self,
+        source: str,
+        status: InputSourceStatus,
+        now_monotonic_sec: float,
+    ) -> None:
+        self._last_success[str(source)] = (
+            status_semantic_signature(status),
+            float(now_monotonic_sec),
+        )
+
 
 @dataclass
 class SourceTracker:
@@ -163,6 +216,7 @@ class SourceHealthMonitor(Node):
         }
         self._last_stamps = {key: None for key in self._trackers}
         self._vlm_health_blocked = False
+        self._status_publication_gate = StatusPublicationGate()
         self._status_publishers = {
             "flir": self.create_publisher(
                 InputSourceStatus,
@@ -248,38 +302,81 @@ class SourceHealthMonitor(Node):
                 tracker.samples_in_epoch = 0
                 tracker._stale_latched = True
 
+    def _status_message(
+        self,
+        source: str,
+        tracker: SourceTracker,
+        *,
+        now_monotonic: float,
+        now_stamp,
+    ) -> InputSourceStatus:
+        state, healthy, age = tracker.snapshot(now_monotonic)
+        status = InputSourceStatus()
+        status.stamp = now_stamp
+        status.source_id = tracker.source_id
+        status.modality = tracker.modality
+        status.state = state
+        status.healthy = healthy
+        source_stamp = self._last_stamps[source]
+        if source_stamp is not None:
+            total_nanoseconds = max(
+                0,
+                int(round(source_stamp * 1_000_000_000)),
+            )
+            whole, nanoseconds = divmod(
+                total_nanoseconds,
+                1_000_000_000,
+            )
+            status.last_observation_stamp.sec = whole
+            status.last_observation_stamp.nanosec = nanoseconds
+        status.age_sec = float(age)
+        status.received_count = tracker.received_count
+        status.accepted_count = tracker.accepted_count
+        status.rejected_count = tracker.rejected_count
+        status.epoch = tracker.epoch
+        status.dropped_count = tracker.dropped_count
+        status.error_code = tracker.error_code
+        status.detail = tracker.detail
+        return status
+
+    def _publish_status_if_due(
+        self,
+        source: str,
+        status: InputSourceStatus,
+        *,
+        now_monotonic: float,
+    ) -> bool:
+        gate = self._status_publication_gate
+        if not gate.due(source, status, now_monotonic):
+            return False
+        try:
+            self._status_publishers[source].publish(status)
+        except Exception as exc:  # pragma: no cover - defensive ROS boundary
+            self.get_logger().error(
+                f"Unable to publish {source} input status: {exc}"
+            )
+            return False
+        gate.commit(source, status, now_monotonic)
+        return True
+
     def _publish(self) -> None:
+        # Keep freshness evaluation at 4 Hz so READY->STALE and recovery edges
+        # retain their existing <=250 ms detection latency. Only unchanged
+        # diagnostic snapshots are checkpointed at the slower cadence.
         now_monotonic = self._monotonic()
         now_stamp = self.get_clock().now().to_msg()
         for source, tracker in self._trackers.items():
-            state, healthy, age = tracker.snapshot(now_monotonic)
-            status = InputSourceStatus()
-            status.stamp = now_stamp
-            status.source_id = tracker.source_id
-            status.modality = tracker.modality
-            status.state = state
-            status.healthy = healthy
-            source_stamp = self._last_stamps[source]
-            if source_stamp is not None:
-                total_nanoseconds = max(
-                    0,
-                    int(round(source_stamp * 1_000_000_000)),
-                )
-                whole, nanoseconds = divmod(
-                    total_nanoseconds,
-                    1_000_000_000,
-                )
-                status.last_observation_stamp.sec = whole
-                status.last_observation_stamp.nanosec = nanoseconds
-            status.age_sec = float(age)
-            status.received_count = tracker.received_count
-            status.accepted_count = tracker.accepted_count
-            status.rejected_count = tracker.rejected_count
-            status.epoch = tracker.epoch
-            status.dropped_count = tracker.dropped_count
-            status.error_code = tracker.error_code
-            status.detail = tracker.detail
-            self._status_publishers[source].publish(status)
+            status = self._status_message(
+                source,
+                tracker,
+                now_monotonic=now_monotonic,
+                now_stamp=now_stamp,
+            )
+            self._publish_status_if_due(
+                source,
+                status,
+                now_monotonic=now_monotonic,
+            )
 
 
 def main() -> None:

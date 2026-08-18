@@ -31,6 +31,7 @@ export function StatusRibbon({
   actionPending,
   onVlmModelChange,
   onVlmRuntimeAction,
+  debugModeDisabled,
   onDebugMode,
   onMulticamOps,
 }: {
@@ -48,6 +49,7 @@ export function StatusRibbon({
     selection: ModelSelection,
     command: ModelRuntimeCommand,
   ) => void;
+  debugModeDisabled: boolean;
   onDebugMode: () => void;
   onMulticamOps: () => void;
 }) {
@@ -71,10 +73,30 @@ export function StatusRibbon({
           <Camera size={16} aria-hidden="true" />
           <span>{language === "ko" ? "멀티캠 관제" : "Multicam Ops"}</span>
         </button>
-        <button className="debug-mode-entry" onClick={onDebugMode} type="button">
+        <button
+          aria-describedby={debugModeDisabled ? "debug-mode-lock-reason" : undefined}
+          className="debug-mode-entry"
+          disabled={debugModeDisabled}
+          onClick={onDebugMode}
+          title={
+            debugModeDisabled
+              ? language === "ko"
+                ? "진행 상태를 보존하려면 먼저 실행을 정지해 주세요."
+                : "Stop the run before entering standalone Debug mode."
+              : undefined
+          }
+          type="button"
+        >
           <Bug size={16} aria-hidden="true" />
           <span>{language === "ko" ? "디버그 모드" : "Debug Mode"}</span>
         </button>
+        {debugModeDisabled ? (
+          <span className="sr-only" id="debug-mode-lock-reason">
+            {language === "ko"
+              ? "실행 중이거나 일시정지 또는 시작 처리 중에는 디버그 모드로 전환할 수 없습니다. 먼저 실행을 정지해 주세요."
+              : "Debug mode is unavailable while running, paused, or starting. Stop the run first."}
+          </span>
+        ) : null}
         <div className={`system-pill ${connected ? "ok" : "warn"}`}>
           <Radio size={16} />
           <span>{connected ? vm.ui.rosOnline : vm.ui.rosOffline}</span>

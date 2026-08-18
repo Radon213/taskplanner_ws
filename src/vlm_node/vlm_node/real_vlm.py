@@ -772,6 +772,7 @@ INFERENCE_TRIGGER_REPLAY_FRAME = "replay_frame"
 INFERENCE_TRIGGER_SOURCE_FRAME = "source_frame_live"
 INFERENCE_TRIGGER_FORCED = "forced"
 INFERENCE_FAILURE_HISTORY_LENGTH = 32
+INFERENCE_FAILURE_LOG_REPEAT_SEC = 30.0
 
 
 def normalize_clinical_analysis(value: Any) -> str:
@@ -961,10 +962,12 @@ class InferenceBackpressure:
             self._pending_trigger = normalized
             return InferenceAdmission(disposition, normalized)
 
-    def complete(self) -> str | None:
+    def complete(self, *, drop_pending: bool = False) -> str | None:
         with self._lock:
             if not self._in_flight:
                 return None
+            if drop_pending:
+                self._pending_trigger = ""
             if self._pending_trigger:
                 self._current_trigger = self._pending_trigger
                 self._pending_trigger = ""
@@ -972,6 +975,21 @@ class InferenceBackpressure:
             self._in_flight = False
             self._current_trigger = ""
             return None
+
+    def defer_until_ready(self, fallback_trigger: str = "") -> str:
+        """Release the consumer while retaining the newest retryable work."""
+
+        normalized_fallback = (
+            self._normalize_trigger(fallback_trigger)
+            if str(fallback_trigger).strip()
+            else ""
+        )
+        with self._lock:
+            if not self._pending_trigger and normalized_fallback:
+                self._pending_trigger = normalized_fallback
+            self._in_flight = False
+            self._current_trigger = ""
+            return self._pending_trigger
 
     def clear_pending(self) -> None:
         with self._lock:
@@ -984,6 +1002,60 @@ class InferenceBackpressure:
                 "current_trigger": self._current_trigger,
                 "pending_trigger": self._pending_trigger,
                 "coalesced_count": self._coalesced_count,
+            }
+
+
+class InferenceFailureBackoff:
+    """Bound retries after a fast transport failure without blocking callbacks."""
+
+    def __init__(self, initial_sec: float = 0.5, maximum_sec: float = 2.0) -> None:
+        self._lock = threading.Lock()
+        self._initial_sec = max(0.0, float(initial_sec))
+        self._maximum_sec = max(self._initial_sec, float(maximum_sec))
+        self._consecutive_failures = 0
+        self._not_before_monotonic = 0.0
+
+    def configure(self, *, initial_sec: float, maximum_sec: float) -> None:
+        with self._lock:
+            self._initial_sec = max(0.0, float(initial_sec))
+            self._maximum_sec = max(self._initial_sec, float(maximum_sec))
+            if self._not_before_monotonic > 0.0:
+                self._not_before_monotonic = min(
+                    self._not_before_monotonic,
+                    time.monotonic() + self._maximum_sec,
+                )
+
+    def record_failure(self, *, now_monotonic: float | None = None) -> float:
+        now = time.monotonic() if now_monotonic is None else float(now_monotonic)
+        with self._lock:
+            exponent = min(self._consecutive_failures, 30)
+            delay = min(
+                self._maximum_sec,
+                self._initial_sec * (2.0**exponent),
+            )
+            self._consecutive_failures += 1
+            self._not_before_monotonic = max(
+                self._not_before_monotonic,
+                now + delay,
+            )
+            return delay
+
+    def record_success(self) -> None:
+        with self._lock:
+            self._consecutive_failures = 0
+            self._not_before_monotonic = 0.0
+
+    def remaining(self, *, now_monotonic: float | None = None) -> float:
+        now = time.monotonic() if now_monotonic is None else float(now_monotonic)
+        with self._lock:
+            return max(0.0, self._not_before_monotonic - now)
+
+    def snapshot(self, *, now_monotonic: float | None = None) -> dict[str, Any]:
+        with self._lock:
+            now = time.monotonic() if now_monotonic is None else float(now_monotonic)
+            return {
+                "consecutive_failures": self._consecutive_failures,
+                "remaining_sec": max(0.0, self._not_before_monotonic - now),
             }
 
 
@@ -1511,6 +1583,8 @@ class RealVLMNode(Node):
         self._inference_wakeup = threading.Event()
         self._inference_shutdown = threading.Event()
         self._inference_worker: threading.Thread | None = None
+        self._inference_retry_lock = threading.Lock()
+        self._inference_retry_timer: threading.Timer | None = None
         self._inference_failures: deque[InferenceFailure] = deque(
             maxlen=INFERENCE_FAILURE_HISTORY_LENGTH
         )
@@ -1530,6 +1604,8 @@ class RealVLMNode(Node):
         self.declare_parameter("reasoning_effort", "")
         self.declare_parameter("task_profile", VLM_TASK_PROFILE_FULL)
         self.declare_parameter("retry_count", 2)
+        self.declare_parameter("transport_failure_backoff_initial_sec", 0.5)
+        self.declare_parameter("transport_failure_backoff_max_sec", 2.0)
         self.declare_parameter("publish_period_sec", 2.0)
         self.declare_parameter("response_mode", "live")
         self.declare_parameter("source_time_triggered_live", True)
@@ -1607,6 +1683,7 @@ class RealVLMNode(Node):
         self._last_simulation_bundle = ""
         self._last_vlm_phase = ""
         self._last_authoritative_phase = ""
+        self._last_lifecycle_control_signature: tuple[str, str] | None = None
         self._phase_bootstrap_id = ""
         self._phase_bootstrap_observation_count = 0
         self._phase_bootstrap_explicit = False
@@ -1880,6 +1957,25 @@ class RealVLMNode(Node):
                 "task_profile must be one of " + ", ".join(sorted(VLM_TASK_PROFILES))
             )
         self._retry_count = int(param_value("retry_count"))
+        self._transport_failure_backoff_initial_sec = max(
+            0.0,
+            float(param_value("transport_failure_backoff_initial_sec")),
+        )
+        self._transport_failure_backoff_max_sec = max(
+            self._transport_failure_backoff_initial_sec,
+            float(param_value("transport_failure_backoff_max_sec")),
+        )
+        failure_backoff = getattr(self, "_transport_failure_backoff", None)
+        if failure_backoff is None:
+            self._transport_failure_backoff = InferenceFailureBackoff(
+                self._transport_failure_backoff_initial_sec,
+                self._transport_failure_backoff_max_sec,
+            )
+        else:
+            failure_backoff.configure(
+                initial_sec=self._transport_failure_backoff_initial_sec,
+                maximum_sec=self._transport_failure_backoff_max_sec,
+            )
         self._publish_period_sec = float(param_value("publish_period_sec"))
         self._response_mode = str(param_value("response_mode"))
         self._source_time_triggered_live = bool(
@@ -2137,6 +2233,8 @@ class RealVLMNode(Node):
                 "reasoning_effort",
                 "task_profile",
                 "retry_count",
+                "transport_failure_backoff_initial_sec",
+                "transport_failure_backoff_max_sec",
                 "publish_period_sec",
                 "response_mode",
                 "source_time_triggered_live",
@@ -2168,6 +2266,7 @@ class RealVLMNode(Node):
                 self._load_parameters(overrides)
                 self._reset_model_input_dedupe(advance_epoch=True)
                 if spec_changed:
+                    self._last_lifecycle_control_signature = None
                     self._recent_events.clear()
                     self._last_good_raw = ""
                     self._last_good_payload = None
@@ -2467,11 +2566,72 @@ class RealVLMNode(Node):
             self._run_inference_chain(current_trigger)
 
     def _queue_inference(self, trigger: str) -> InferenceAdmission:
+        normalized = InferenceBackpressure._normalize_trigger(trigger)
+        failure_backoff = getattr(self, "_transport_failure_backoff", None)
+        backoff_remaining = (
+            failure_backoff.remaining()
+            if failure_backoff is not None
+            else 0.0
+        )
+        if (
+            normalized != INFERENCE_TRIGGER_FORCED
+            and backoff_remaining > 0.0
+        ):
+            # Keep exactly the newest trigger. Source-time modes have no
+            # periodic timer, so dropping it here could leave inference idle
+            # forever after the provider recovers.
+            self._inference_backpressure.queue(normalized)
+            self._schedule_inference_retry(backoff_remaining)
+            return InferenceAdmission("backoff", normalized)
         admission = self._inference_backpressure.queue(trigger)
         wakeup = getattr(self, "_inference_wakeup", None)
         if wakeup is not None:
             wakeup.set()
         return admission
+
+    def _schedule_inference_retry(self, delay_sec: float) -> None:
+        shutdown = getattr(self, "_inference_shutdown", None)
+        if shutdown is not None and shutdown.is_set():
+            return
+        retry_lock = getattr(self, "_inference_retry_lock", None)
+        if retry_lock is None:
+            wakeup = getattr(self, "_inference_wakeup", None)
+            if wakeup is not None:
+                wakeup.set()
+            return
+
+        timer: threading.Timer | None = None
+
+        def wake_worker() -> None:
+            with retry_lock:
+                if self._inference_retry_timer is timer:
+                    self._inference_retry_timer = None
+            shutdown = getattr(self, "_inference_shutdown", None)
+            if shutdown is None or not shutdown.is_set():
+                wakeup = getattr(self, "_inference_wakeup", None)
+                if wakeup is not None:
+                    wakeup.set()
+
+        with retry_lock:
+            if shutdown is not None and shutdown.is_set():
+                return
+            previous = getattr(self, "_inference_retry_timer", None)
+            if previous is not None:
+                previous.cancel()
+            timer = threading.Timer(max(0.0, float(delay_sec)), wake_worker)
+            timer.daemon = True
+            self._inference_retry_timer = timer
+            timer.start()
+
+    def _cancel_inference_retry(self) -> None:
+        retry_lock = getattr(self, "_inference_retry_lock", None)
+        if retry_lock is None:
+            return
+        with retry_lock:
+            timer = getattr(self, "_inference_retry_timer", None)
+            self._inference_retry_timer = None
+            if timer is not None:
+                timer.cancel()
 
     def _inference_worker_loop(self) -> None:
         while not self._inference_shutdown.is_set():
@@ -2482,6 +2642,17 @@ class RealVLMNode(Node):
             current_trigger = self._inference_backpressure.begin()
             if current_trigger is None:
                 continue
+            failure_backoff = getattr(self, "_transport_failure_backoff", None)
+            backoff_remaining = (
+                failure_backoff.remaining()
+                if failure_backoff is not None
+                and current_trigger != INFERENCE_TRIGGER_FORCED
+                else 0.0
+            )
+            if backoff_remaining > 0.0:
+                self._inference_backpressure.defer_until_ready(current_trigger)
+                self._schedule_inference_retry(backoff_remaining)
+                continue
             self._run_inference_chain(current_trigger)
 
     def destroy_node(self):
@@ -2490,6 +2661,7 @@ class RealVLMNode(Node):
         worker = getattr(self, "_inference_worker", None)
         if shutdown is not None:
             shutdown.set()
+        self._cancel_inference_retry()
         if wakeup is not None:
             wakeup.set()
         if worker is not None and worker is not threading.current_thread():
@@ -2968,6 +3140,19 @@ class RealVLMNode(Node):
         command, _, start_phase_id = msg.data.strip().partition(":")
         command = command.strip().lower()
         start_phase_id = start_phase_id.strip()
+        signature = (command, start_phase_id)
+        if command in {
+            "start",
+            "start_actors",
+            "pause",
+            "resume",
+            "stop",
+        }:
+            if signature == getattr(
+                self, "_last_lifecycle_control_signature", None
+            ):
+                return
+            self._last_lifecycle_control_signature = signature
         if command in {"start", "start_actors"}:
             # The interactive replay controller publishes a retained start
             # heartbeat while it is active.  Treat that heartbeat as
@@ -3012,6 +3197,7 @@ class RealVLMNode(Node):
             self._reset_source_time_live_trigger(reset_stamp=True)
             self._reset_fast_cam4_mayo_observations()
         elif command == "reset":
+            self._last_lifecycle_control_signature = None
             self._reset_model_input_dedupe(advance_epoch=True)
             self._active = False
             self._inference_backpressure.clear_pending()
@@ -3039,6 +3225,10 @@ class RealVLMNode(Node):
                 max(0, int(getattr(self, "_model_input_epoch", 0))) + 1
             )
             self._vlm_result_sequence = 0
+            failure_backoff = getattr(self, "_transport_failure_backoff", None)
+            if failure_backoff is not None:
+                failure_backoff.record_success()
+            self._reset_inference_failure_log_throttle()
         self._last_submitted_model_input_key = ""
 
     def _next_visual_evidence_metadata(
@@ -5466,6 +5656,13 @@ class RealVLMNode(Node):
             )
         ):
             return False
+        failure_backoff = getattr(self, "_transport_failure_backoff", None)
+        if (
+            trigger != INFERENCE_TRIGGER_FORCED
+            and failure_backoff is not None
+            and failure_backoff.remaining() > 0.0
+        ):
+            return False
         admission = self._inference_backpressure.request(trigger)
         if not admission.started:
             return False
@@ -5494,7 +5691,39 @@ class RealVLMNode(Node):
                     connected=False,
                 )
             finally:
-                current_trigger = self._inference_backpressure.complete()
+                failure_backoff = getattr(
+                    self,
+                    "_transport_failure_backoff",
+                    None,
+                )
+                backoff_remaining = (
+                    failure_backoff.remaining()
+                    if failure_backoff is not None
+                    else 0.0
+                )
+                if backoff_remaining > 0.0:
+                    retryable_current = (
+                        current_trigger
+                        if current_trigger != INFERENCE_TRIGGER_FORCED
+                        else ""
+                    )
+                    pending_trigger = self._inference_backpressure.defer_until_ready(
+                        retryable_current
+                    )
+                    if pending_trigger == INFERENCE_TRIGGER_FORCED:
+                        # An operator request queued while ordinary inference
+                        # was failing must retain the forced backoff bypass.
+                        # Wake the single consumer immediately instead of
+                        # inheriting the transport retry delay.
+                        self._cancel_inference_retry()
+                        wakeup = getattr(self, "_inference_wakeup", None)
+                        if wakeup is not None:
+                            wakeup.set()
+                    elif pending_trigger:
+                        self._schedule_inference_retry(backoff_remaining)
+                    current_trigger = None
+                else:
+                    current_trigger = self._inference_backpressure.complete()
 
     def _tick_once(
         self,
@@ -5686,6 +5915,10 @@ class RealVLMNode(Node):
             return
         if payload is None:
             return
+        failure_backoff = getattr(self, "_transport_failure_backoff", None)
+        if failure_backoff is not None:
+            failure_backoff.record_success()
+        self._reset_inference_failure_log_throttle()
         payload = self._canonicalize_payload_ids(payload)
         model_raw_json = json.dumps(
             payload,
@@ -5954,6 +6187,10 @@ class RealVLMNode(Node):
         connected: bool,
         output_chars: int = 0,
     ) -> None:
+        if not connected:
+            failure_backoff = getattr(self, "_transport_failure_backoff", None)
+            if failure_backoff is not None:
+                failure_backoff.record_failure()
         self._inference_failure_count += 1
         failure = InferenceFailure(
             sequence=self._inference_failure_count,
@@ -5966,10 +6203,7 @@ class RealVLMNode(Node):
             recorded_monotonic=time.monotonic(),
         )
         self._inference_failures.append(failure)
-        self.get_logger().error(
-            "VLM inference failed "
-            f"[{failure.trigger}/{failure.mode}]: {failure.error}"
-        )
+        self._log_inference_failure(failure)
         self._publish_health(
             image_source=failure.image_source,
             latency_sec=failure.latency_sec,
@@ -5983,6 +6217,54 @@ class RealVLMNode(Node):
             healthy=False,
             connected=connected,
         )
+
+    def _log_inference_failure(self, failure: InferenceFailure) -> None:
+        signature = (failure.trigger, failure.mode, failure.error)
+        previous_signature = getattr(
+            self,
+            "_last_inference_failure_log_signature",
+            None,
+        )
+        previous_monotonic = float(
+            getattr(self, "_last_inference_failure_log_monotonic", 0.0)
+        )
+        elapsed = failure.recorded_monotonic - previous_monotonic
+        if (
+            signature == previous_signature
+            and elapsed < INFERENCE_FAILURE_LOG_REPEAT_SEC
+        ):
+            self._suppressed_inference_failure_log_count = (
+                int(
+                    getattr(
+                        self,
+                        "_suppressed_inference_failure_log_count",
+                        0,
+                    )
+                )
+                + 1
+            )
+            return
+
+        suppressed = int(
+            getattr(self, "_suppressed_inference_failure_log_count", 0)
+        )
+        suffix = (
+            f" ({suppressed} identical failures suppressed)"
+            if signature == previous_signature and suppressed > 0
+            else ""
+        )
+        self.get_logger().error(
+            "VLM inference failed "
+            f"[{failure.trigger}/{failure.mode}]: {failure.error}{suffix}"
+        )
+        self._last_inference_failure_log_signature = signature
+        self._last_inference_failure_log_monotonic = failure.recorded_monotonic
+        self._suppressed_inference_failure_log_count = 0
+
+    def _reset_inference_failure_log_throttle(self) -> None:
+        self._last_inference_failure_log_signature = None
+        self._last_inference_failure_log_monotonic = 0.0
+        self._suppressed_inference_failure_log_count = 0
 
     def _publish_model_raw_result(
         self,

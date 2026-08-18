@@ -5,6 +5,7 @@ import time
 import pytest
 
 from surgical_interop_execution.fault_action_emulator import (
+    _BED_ROBOT_STATUS_PERIOD_SEC,
     EmulatorProfile,
     FaultActionEmulator,
     Outcome,
@@ -179,6 +180,52 @@ def _bare_emulator(outcome: Outcome) -> FaultActionEmulator:
         }
     )
     return emulator
+
+
+def test_bed_robot_status_heartbeat_publishes_initial_snapshot_before_timer():
+    emulator = FaultActionEmulator.__new__(FaultActionEmulator)
+    calls = []
+    timer = object()
+    emulator._publish_bed_robot_status = lambda: calls.append(("publish", None))
+
+    def create_timer(period_sec, callback):
+        calls.append(("timer", period_sec, callback))
+        return timer
+
+    emulator.create_timer = create_timer
+
+    emulator._start_bed_robot_status_heartbeat()
+
+    assert calls[0] == ("publish", None)
+    assert calls[1][0:2] == ("timer", _BED_ROBOT_STATUS_PERIOD_SEC)
+    assert calls[1][2] is emulator._publish_bed_robot_status
+    assert _BED_ROBOT_STATUS_PERIOD_SEC == 0.5
+    assert emulator._bed_robot_status_timer is timer
+
+
+def test_bed_robot_status_revisions_are_monotonic_across_checkpoints():
+    emulator = FaultActionEmulator.__new__(FaultActionEmulator)
+    published = []
+    stamps = iter((11, 12, 13))
+    emulator._bed_robot_revision = 0
+    emulator._procedure_type = "thyroidectomy"
+    emulator._bed_robot_status_pub = SimpleNamespace(
+        publish=lambda message: published.append(message)
+    )
+    emulator.get_clock = lambda: SimpleNamespace(
+        now=lambda: SimpleNamespace(
+            to_msg=lambda: SimpleNamespace(sec=next(stamps), nanosec=0)
+        )
+    )
+
+    emulator._publish_bed_robot_status()
+    emulator._publish_bed_robot_status()
+
+    assert [message.revision for message in published] == [1, 2]
+    assert [message.stamp.sec for message in published] == [11, 12]
+    assert all(message.procedure_type == "thyroidectomy" for message in published)
+    assert all(len(message.arms) == 1 for message in published)
+    assert all(message.arms[0].state == "standby" for message in published)
 
 
 def test_retraction_cancel_emits_recovering_before_remote_canceled_result():

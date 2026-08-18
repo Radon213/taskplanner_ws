@@ -33,12 +33,16 @@ from urllib.parse import parse_qs, urlencode, urlparse
 import yaml
 
 try:
+    from .artifact_path_contract import resolve_repo_artifact_identity
     from .clinical_review_store import (
         ClinicalConflictError,
         ClinicalInputError,
         ClinicalReviewStore,
     )
 except ImportError:
+    from artifact_path_contract import (  # type: ignore[no-redef]
+        resolve_repo_artifact_identity,
+    )
     from clinical_review_store import (  # type: ignore[no-redef]
         ClinicalConflictError,
         ClinicalInputError,
@@ -2016,12 +2020,23 @@ class FinalReviewBundle:
                 self.reference["dt_reference"]["sha256"],
             ),
         }
+        repo_root = self.case_dir.parent.parent.parent.parent
         for key, (path, count, digest) in expected_outputs.items():
             output = outputs.get(key)
+            if not isinstance(output, dict):
+                raise InputError(f"projection report {key} output이 다릅니다.")
+            try:
+                resolve_repo_artifact_identity(
+                    output.get("path"),
+                    expected_path=path,
+                    repo_root=repo_root,
+                    expected_sha256=digest,
+                    label=f"projection report {key} output",
+                )
+            except ValueError as exc:
+                raise InputError(str(exc)) from exc
             if (
-                not isinstance(output, dict)
-                or Path(str(output.get("path", ""))).resolve() != path
-                or output.get("record_count") != count
+                output.get("record_count") != count
                 or output.get("sha256") != digest
             ):
                 raise InputError(f"projection report {key} output이 다릅니다.")

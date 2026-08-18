@@ -18,6 +18,7 @@ class PhaseEstimatorNode(Node):
         self.declare_parameter("spec_dir", str(get_default_spec_dir()))
         self._spec_dir = str(self.get_parameter("spec_dir").value)
         self._load_spec(self._spec_dir)
+        self._last_lifecycle_control_signature: tuple[str, str] | None = None
         self.add_on_set_parameters_callback(self._on_parameters_changed)
         self._publisher = self.create_publisher(FilteredPhase, "/phase/filtered", 20)
         self.create_subscription(PhaseEvidence, "/vlm/phase_evidence", self._on_evidence, 20)
@@ -36,6 +37,7 @@ class PhaseEstimatorNode(Node):
                 try:
                     self._spec_dir = str(parameter.value)
                     self._load_spec(self._spec_dir)
+                    self._last_lifecycle_control_signature = None
                 except Exception as exc:
                     return SetParametersResult(
                         successful=False,
@@ -60,8 +62,24 @@ class PhaseEstimatorNode(Node):
         self._publisher.publish(filtered)
 
     def _on_control(self, msg: String) -> None:
-        command = msg.data.strip().lower()
+        command, _, detail = msg.data.strip().partition(":")
+        command = command.lower()
+        signature = (command, detail.strip())
+        if command in {
+            "start",
+            "start_runtime",
+            "start_actors",
+            "pause",
+            "resume",
+            "stop",
+        }:
+            if signature == getattr(
+                self, "_last_lifecycle_control_signature", None
+            ):
+                return
+            self._last_lifecycle_control_signature = signature
         if command == "reset":
+            self._last_lifecycle_control_signature = None
             self._load_spec(self._spec_dir)
 
 

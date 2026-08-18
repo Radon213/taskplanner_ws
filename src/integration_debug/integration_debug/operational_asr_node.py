@@ -15,6 +15,7 @@ import threading
 from typing import Any, Callable
 
 import rclpy
+from rclpy._rclpy_pybind11 import RCLError
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
@@ -368,7 +369,19 @@ class OperationalAsrNode(Node):
             stopped = self._runtime.close()
             self._drain_runtime_events()
             self._sync_sentence_publisher(False)
-            self._publish_status()
+            # SIGINT may invalidate the rclpy context before the executor
+            # reaches this finally path. Runtime/device cleanup must still
+            # complete, but publishing on that invalid context would turn an
+            # otherwise graceful shutdown into exit code 1.
+            if rclpy.ok(context=self.context):
+                try:
+                    self._publish_status()
+                except RCLError:
+                    # Close only the signal race where the context becomes
+                    # invalid after the check. Preserve every RCLError raised
+                    # while the context is still live.
+                    if rclpy.ok(context=self.context):
+                        raise
             return stopped
 
 

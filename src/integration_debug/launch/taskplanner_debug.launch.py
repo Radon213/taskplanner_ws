@@ -15,6 +15,7 @@ def generate_launch_description() -> LaunchDescription:
     rosbridge_port = LaunchConfiguration("rosbridge_port")
     rosbridge_address = LaunchConfiguration("rosbridge_address")
     rosbridge_timeout = LaunchConfiguration("rosbridge_service_timeout")
+    rosbridge_executable = LaunchConfiguration("rosbridge_executable")
     config_path = LaunchConfiguration("config_path")
     run_root = LaunchConfiguration("run_root")
 
@@ -24,7 +25,7 @@ def generate_launch_description() -> LaunchDescription:
             "ros2",
             "run",
             "integration_debug",
-            "secure_debug_rosbridge",
+            rosbridge_executable,
             "--ros-args",
             "-p",
             ["port:=", rosbridge_port],
@@ -33,6 +34,7 @@ def generate_launch_description() -> LaunchDescription:
             "-p",
             ["default_call_service_timeout:=", rosbridge_timeout],
         ],
+        on_exit=Shutdown(reason="integration debug rosbridge stopped"),
         output="screen",
     )
 
@@ -42,6 +44,10 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("rosbridge_port", default_value="9091"),
             DeclareLaunchArgument("rosbridge_address", default_value="127.0.0.1"),
             DeclareLaunchArgument("rosbridge_service_timeout", default_value="30.0"),
+            DeclareLaunchArgument(
+                "rosbridge_executable",
+                default_value="secure_debug_rosbridge",
+            ),
             DeclareLaunchArgument(
                 "config_path",
                 default_value=PathJoinSubstitution(

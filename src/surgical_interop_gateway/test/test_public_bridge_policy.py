@@ -4,6 +4,8 @@ import pytest
 
 from surgical_interop_gateway.public_bridge_policy import (
     PUBLIC_ALLOWED_INCOMING_OPERATIONS,
+    PUBLIC_BRIDGE_CONTRACT,
+    PUBLIC_BRIDGE_CONTRACT_HEADER,
     PUBLIC_ALLOWED_COMPRESSIONS,
     PUBLIC_CAMERA_COMPRESSION,
     PUBLIC_CAMERA_QOS,
@@ -33,6 +35,7 @@ from surgical_interop_gateway.public_bridge_policy import (
 from surgical_interop_gateway.public_rosbridge import (
     _bound_public_tornado_settings,
     _build_public_rosbridge_protocol,
+    _set_public_contract_header,
 )
 
 
@@ -150,6 +153,20 @@ def test_public_bridge_registers_only_read_only_capabilities() -> None:
         "Defragment",
     }
     assert forbidden.isdisjoint(PUBLIC_CAPABILITY_CLASS_NAMES)
+
+
+def test_public_bridge_attaches_exact_contract_header() -> None:
+    class Handler:
+        headers: list[tuple[str, str]] = []
+
+        def set_header(self, name: str, value: str) -> None:
+            self.headers.append((name, value))
+
+    handler = Handler()
+    _set_public_contract_header(handler)
+    assert handler.headers == [
+        (PUBLIC_BRIDGE_CONTRACT_HEADER, PUBLIC_BRIDGE_CONTRACT)
+    ]
 
 
 def test_public_rosbridge_runtime_registers_only_subscribe_capability() -> None:

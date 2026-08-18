@@ -447,6 +447,7 @@ class LLMSurgeonActorNode(Node):
             try:
                 self._load_parameters(overrides)
                 if spec_changed:
+                    self._last_lifecycle_control_signature = None
                     self._reset_runtime()
                 else:
                     self._schedule_interrupt_for_phase(self._current_phase_id, "parameter_reload")
@@ -699,6 +700,19 @@ class LLMSurgeonActorNode(Node):
         command, _, start_phase_id = raw_command.partition(":")
         command = command.strip().lower()
         start_phase_id = start_phase_id.strip()
+        signature = (command, start_phase_id)
+        if command in {
+            "start",
+            "start_actors",
+            "pause",
+            "resume",
+            "stop",
+        }:
+            if signature == getattr(
+                self, "_last_lifecycle_control_signature", None
+            ):
+                return
+            self._last_lifecycle_control_signature = signature
 
         if command == "mute_actor":
             try:
@@ -713,6 +727,12 @@ class LLMSurgeonActorNode(Node):
             self._schedule_next_decision(mute_sec + 0.2)
             return
         if command in {"start", "start_actors", "resume"}:
+            if (
+                command in {"start", "start_actors"}
+                and not start_phase_id
+                and self._control_running
+            ):
+                return
             if command in {"start", "start_actors"} and start_phase_id:
                 self._set_initial_phase(start_phase_id, "control_start_phase")
             elif command in {"start", "start_actors"}:
@@ -730,6 +750,7 @@ class LLMSurgeonActorNode(Node):
             self._control_running = False
             self._active = False
         elif command == "reset":
+            self._last_lifecycle_control_signature = None
             self._control_running = False
             self._manual_override_mute_until_sec = 0.0
             self._reset_runtime(start_phase_id)

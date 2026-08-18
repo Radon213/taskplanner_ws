@@ -807,6 +807,10 @@ class ORDigitalTwin:
         self._bed_robot_arm_controller_source_stamp_ns: int | None = None
         self._bed_robot_arm_controller_signature: tuple[Any, ...] | None = None
         self._bed_robot_arm_controller_epoch = 0
+        # A controller status snapshot can be accepted solely to refresh the
+        # freshness fence. Keep that distinct from a semantic arm-state
+        # transition so consumers do not turn status heartbeats into events.
+        self._bed_robot_arm_controller_state_changed = False
         self.instrument_states: dict[str, InstrumentBelief] = {}
         self._observation_candidates: dict[str, dict[str, Any]] = {}
         self._shadow_counterfactual_locked_instances: set[str] = set()
@@ -858,6 +862,7 @@ class ORDigitalTwin:
         self._bed_robot_arm_controller_source_stamp_ns = None
         self._bed_robot_arm_controller_signature = None
         self._bed_robot_arm_controller_epoch = 0
+        self._bed_robot_arm_controller_state_changed = False
         self._observation_candidates.clear()
         self._shadow_counterfactual_locked_instances.clear()
         self._observation_violation_cooldowns.clear()
@@ -1133,7 +1138,15 @@ class ORDigitalTwin:
     def update_bed_robot_arm_controller_status(
         self, status: BedRobotArmStateArray
     ) -> bool | None:
-        """Reduce only the controller-owned fields from the public status."""
+        """Reduce only the controller-owned fields from the public status.
+
+        A ``True`` return means the snapshot was accepted, including an
+        unchanged heartbeat that refreshed the controller freshness fence.
+        Call :meth:`bed_robot_arm_controller_state_changed` after a successful
+        update to decide whether it represents a timeline-worthy transition.
+        """
+
+        self._bed_robot_arm_controller_state_changed = False
 
         procedure_type = self._public_bed_robot_procedure_type(status.procedure_type)
         current_procedure = self._public_bed_robot_procedure_type(
@@ -1173,6 +1186,7 @@ class ORDigitalTwin:
         )
         previous_stamp_ns = self._bed_robot_arm_controller_source_stamp_ns
         previous_revision = self._bed_robot_arm_controller_revision
+        previous_signature = self._bed_robot_arm_controller_signature
         controller_restarted = False
         if previous_stamp_ns is not None:
             # The source timestamp is the cross-epoch ordering fence. This also
@@ -1217,12 +1231,8 @@ class ORDigitalTwin:
             }
         )
         next_error_code = ";".join(reason_codes)
-        changed = bool(
-            not belief.connected
-            or belief.state != next_state
-            or belief.arm_id != next_arm_id
-            or belief.error_code != next_error_code
-        )
+        changed = bool(controller_restarted or previous_signature != signature)
+        self._bed_robot_arm_controller_state_changed = changed
         belief.connected = True
         belief.state = next_state
         belief.arm_id = next_arm_id
@@ -1244,21 +1254,27 @@ class ORDigitalTwin:
                     "procedure_type": procedure_type,
                 },
             )
-        self._record_event(
-            "BedRobotArmControllerStateUpdated",
-            {
-                "controller_epoch": self._bed_robot_arm_controller_epoch,
-                "epoch_restarted": controller_restarted,
-                "revision": revision,
-                "procedure_type": procedure_type,
-                "state": next_state,
-                "arm_ids": sorted(arm_ids),
-                "role_instance_ids": sorted(arms_by_role),
-                "reason_codes": reason_codes,
-                "changed": changed,
-            },
-        )
+        if changed:
+            self._record_event(
+                "BedRobotArmControllerStateUpdated",
+                {
+                    "controller_epoch": self._bed_robot_arm_controller_epoch,
+                    "epoch_restarted": controller_restarted,
+                    "revision": revision,
+                    "procedure_type": procedure_type,
+                    "state": next_state,
+                    "arm_ids": sorted(arm_ids),
+                    "role_instance_ids": sorted(arms_by_role),
+                    "reason_codes": reason_codes,
+                    "changed": True,
+                },
+            )
         return True
+
+    def bed_robot_arm_controller_state_changed(self) -> bool:
+        """Whether the most recently accepted controller snapshot changed state."""
+
+        return bool(self._bed_robot_arm_controller_state_changed)
 
     def expire_bed_robot_arm_controller_status(
         self, reason_code: str = "controller_status_stale"

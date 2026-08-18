@@ -4,20 +4,32 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 COMPOSE_FILE="${ROOT_DIR}/docker-compose.yml"
 WAIT_TIMEOUT_SEC="${TASKPLANNER_COMPOSE_WAIT_SEC:-300}"
+OPTIONAL_WAIT_TIMEOUT_SEC="${TASKPLANNER_OPTIONAL_WAIT_SEC:-30}"
 RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}/taskplanner"
 NINFER_MANAGER_PID_FILE="${RUNTIME_DIR}/ninfer-manager.pid"
 NINFER_MANAGER_UNIT="taskplanner-ninfer-manager.service"
 LMSTUDIO_STARTED_FILE="${RUNTIME_DIR}/lmstudio.started"
+LMSTUDIO_CONTROL_UNIT="taskplanner-lmstudio-control.scope"
 UNSLOTH_CONTROL_UNIT="taskplanner-unsloth-control.service"
+RUNTIME_CONTROL_UNIT="taskplanner-runtime-control.service"
+RUNTIME_CONTROL_PORT="${TASKPLANNER_RUNTIME_CONTROL_PORT:-8150}"
+RUNTIME_CONTROL_TRANSITION_TIMEOUT_SEC="${TASKPLANNER_RUNTIME_TRANSITION_TIMEOUT_SEC:-420}"
+RUNTIME_CONTROL_TOKEN_FILE="${TASKPLANNER_RUNTIME_CONTROL_TOKEN_FILE:-${HOME}/.config/taskplanner/secrets/runtime-control-token}"
+RUNTIME_CONTROL_STATE_FILE="${RUNTIME_DIR}/active-runtime-mode.json"
+RUNTIME_CONTROL_PID_FILE="${RUNTIME_DIR}/runtime-control.pid"
+RUNTIME_CONTROL_LOG_FILE="${RUNTIME_DIR}/runtime-control.log"
+RUNTIME_CONTROL_LAUNCH_LOG_FILE="${RUNTIME_DIR}/runtime-control-launch.log"
+export TASKPLANNER_RUNTIME_CONTROL_TOKEN_FILE="${RUNTIME_CONTROL_TOKEN_FILE}"
 
 usage() {
   cat <<'EOF'
 Taskplanner deployment launcher
 
 Usage:
-  scripts/taskplanner up <live|llm-surgeon|replay|debug> [--dry-run] [--build]
+  scripts/taskplanner up <live|llm-surgeon|replay|debug> [--dry-run] [--build] [--replace-active]
   scripts/taskplanner down [--dry-run]
   scripts/taskplanner status
+  scripts/taskplanner runtime-control [--dry-run]
   scripts/taskplanner config <live|llm-surgeon|replay|debug>
   scripts/taskplanner verify-release [--tier quick|rc|full]
   scripts/taskplanner help
@@ -31,9 +43,14 @@ Commands:
            Live and llm-surgeon keep the integrated Debug sidecar available in
            the same UI; manual control unlocks only while the operational
            scenario reports a trusted, fresh stopped state.
+           --replace-active permits an explicit reviewed transition from an
+           operational runtime into standalone Debug Mode.
            Reuses install/ and node_modules unless --build is supplied.
   down     Stop and remove every Taskplanner Compose profile.
   status   Show containers from every Taskplanner profile.
+  runtime-control
+           Start or verify the loopback-only, token-gated service used by the
+           dashboard to switch among reviewed runtime modes.
   config   Render the fully resolved Compose configuration for one mode.
   verify-release
            Run reproducible software release gates and write JSON/CSV/Markdown/SVG reports.
@@ -118,11 +135,53 @@ acquire_launcher_lock() {
     die "another Taskplanner start/stop operation is still in progress"
 }
 
+verify_runtime_control_transition_interlock() {
+  if [[ "${TASKPLANNER_RUNTIME_REQUIRE_STOPPED:-0}" != "1" ]]; then
+    return 0
+  fi
+  local expected_mode="${TASKPLANNER_RUNTIME_EXPECTED_ACTIVE_MODE:-}"
+  if [[ "${DRY_RUN}" == "true" ]]; then
+    print_command verify-runtime-transition-interlock "${expected_mode:-none}"
+    unset TASKPLANNER_RUNTIME_REQUIRE_STOPPED
+    unset TASKPLANNER_RUNTIME_EXPECTED_ACTIVE_MODE
+    return 0
+  fi
+  if ! python3 - "${ROOT_DIR}" "${RUNTIME_CONTROL_STATE_FILE}" "${expected_mode}" <<'PY'
+import importlib.util
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1]).resolve()
+state_file = Path(sys.argv[2])
+expected_mode = sys.argv[3] or None
+module_path = root / "scripts" / "taskplanner_runtime_control.py"
+spec = importlib.util.spec_from_file_location("taskplanner_runtime_control_gate", module_path)
+if spec is None or spec.loader is None:
+    raise SystemExit("cannot load the runtime transition safety gate")
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+safe, reason = module.final_transition_interlock_is_safe(
+    root,
+    state_file,
+    expected_mode,
+)
+if not safe:
+    raise SystemExit(reason)
+PY
+  then
+    die "runtime state changed after the controller safety check; transition cancelled"
+  fi
+  unset TASKPLANNER_RUNTIME_REQUIRE_STOPPED
+  unset TASKPLANNER_RUNTIME_EXPECTED_ACTIVE_MODE
+}
+
 run_serial_workspace_build() {
   local mode="$1"
   local build_command
   local -a build_profile_args=(--profile "${mode}" --profile dev)
-  if mode_uses_integrated_debug_sidecar "${mode}"; then
+  if mode_uses_integrated_debug_sidecar "${mode}" &&
+      [[ "${INTEGRATED_DEBUG_ENABLED:-true}" == "true" ]]; then
     build_profile_args+=(--profile debug)
   fi
 
@@ -191,6 +250,201 @@ user_systemd_available() {
     systemctl --user show-environment >/dev/null 2>&1
 }
 
+runtime_control_ready() {
+  local expected_fingerprint="${1:-}"
+  python3 - "${RUNTIME_CONTROL_PORT}" "${expected_fingerprint}" <<'PY'
+import json
+import sys
+from urllib.error import URLError
+from urllib.request import urlopen
+
+try:
+    port = int(sys.argv[1])
+    expected_fingerprint = sys.argv[2]
+    with urlopen(f"http://127.0.0.1:{port}/health", timeout=1.0) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+except (OSError, URLError, ValueError):
+    raise SystemExit(1)
+raise SystemExit(
+    0
+    if (
+        payload.get("service") == "taskplanner-runtime-control"
+        and payload.get("ready") is True
+        and (
+            not expected_fingerprint
+            or payload.get("code_fingerprint") == expected_fingerprint
+        )
+    )
+    else 1
+)
+PY
+}
+
+ensure_runtime_control_token() {
+  if [[ "${DRY_RUN}" == "true" ]]; then
+    return 0
+  fi
+  python3 - "${RUNTIME_CONTROL_TOKEN_FILE}" <<'PY'
+import os
+import secrets
+import stat
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+path.parent.mkdir(parents=True, exist_ok=True)
+try:
+    entry = path.lstat()
+except FileNotFoundError:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except OSError as error:
+        raise SystemExit(f"cannot create runtime-control token: {error}")
+    with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+        output.write(secrets.token_urlsafe(32) + "\n")
+    raise SystemExit(0)
+
+if not stat.S_ISREG(entry.st_mode) or entry.st_uid != os.getuid():
+    raise SystemExit("runtime-control token must be a regular file owned by the current user")
+if entry.st_size < 32:
+    raise SystemExit("runtime-control token is empty or invalid")
+os.chmod(path, 0o600)
+PY
+}
+
+write_active_runtime_mode() {
+  local mode="$1"
+  if [[ "${DRY_RUN}" == "true" ]]; then
+    return 0
+  fi
+  python3 - "${RUNTIME_CONTROL_STATE_FILE}" "${mode}" <<'PY'
+import json
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+path = Path(sys.argv[1])
+mode = sys.argv[2]
+path.parent.mkdir(parents=True, exist_ok=True)
+descriptor, temporary = tempfile.mkstemp(prefix="active-runtime-mode.", dir=path.parent)
+try:
+    with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+        json.dump({"mode": mode}, output, separators=(",", ":"))
+        output.write("\n")
+        output.flush()
+        os.fsync(output.fileno())
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, path)
+finally:
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+PY
+}
+
+clear_active_runtime_mode() {
+  if [[ "${DRY_RUN}" == "true" ]]; then
+    return 0
+  fi
+  rm -f -- "${RUNTIME_CONTROL_STATE_FILE}"
+}
+
+runtime_control_pid_matches() {
+  local pid="$1"
+  [[ "${pid}" =~ ^[0-9]+$ && -r "/proc/${pid}/cmdline" ]] || return 1
+  local command_line
+  command_line="$(tr '\0' ' ' <"/proc/${pid}/cmdline")"
+  [[ "${command_line}" == *"${ROOT_DIR}/scripts/taskplanner_runtime_control.py"* ]]
+}
+
+stop_runtime_control_service() {
+  if [[ "${DRY_RUN}" == "true" ]]; then
+    print_command systemctl --user stop "${RUNTIME_CONTROL_UNIT}"
+    print_command rm -f "${RUNTIME_CONTROL_PID_FILE}"
+    return 0
+  fi
+  if user_systemd_available; then
+    systemctl --user stop "${RUNTIME_CONTROL_UNIT}" >/dev/null 2>&1 || true
+  fi
+  if [[ -f "${RUNTIME_CONTROL_PID_FILE}" ]]; then
+    local pid
+    pid="$(cat "${RUNTIME_CONTROL_PID_FILE}")"
+    if runtime_control_pid_matches "${pid}"; then
+      kill "${pid}" >/dev/null 2>&1 || true
+    fi
+    rm -f -- "${RUNTIME_CONTROL_PID_FILE}"
+  fi
+}
+
+ensure_runtime_control_service() {
+  if [[ "${DRY_RUN}" == "true" ]]; then
+    return 0
+  fi
+  [[ "${RUNTIME_CONTROL_PORT}" =~ ^[0-9]+$ ]] ||
+    die "TASKPLANNER_RUNTIME_CONTROL_PORT must be a numeric loopback port"
+  (( RUNTIME_CONTROL_PORT >= 1024 && RUNTIME_CONTROL_PORT <= 65535 )) ||
+    die "TASKPLANNER_RUNTIME_CONTROL_PORT must be between 1024 and 65535"
+  ensure_runtime_control_token
+  local expected_fingerprint
+  expected_fingerprint="$(sha256sum "${ROOT_DIR}/scripts/taskplanner_runtime_control.py" | awk '{print $1}')"
+  if runtime_control_ready "${expected_fingerprint}"; then
+    return 0
+  fi
+
+  # A controller-launched transition is still owned by the currently loaded
+  # controller process. Never kill that supervisor from its child launcher.
+  # A later explicit launcher/runtime-control invocation performs the idle
+  # handoff to the new fingerprint.
+  if [[ "${TASKPLANNER_RUNTIME_CONTROL_CHILD:-}" == "1" ]] && runtime_control_ready; then
+    return 0
+  fi
+
+  stop_runtime_control_service
+  mkdir -p "${RUNTIME_DIR}"
+  local -a command=(
+    python3
+    "${ROOT_DIR}/scripts/taskplanner_runtime_control.py"
+    --root "${ROOT_DIR}"
+    --token-file "${RUNTIME_CONTROL_TOKEN_FILE}"
+    --state-file "${RUNTIME_CONTROL_STATE_FILE}"
+    --launcher-log-file "${RUNTIME_CONTROL_LAUNCH_LOG_FILE}"
+    --bind-address 127.0.0.1
+    --port "${RUNTIME_CONTROL_PORT}"
+    --transition-timeout-sec "${RUNTIME_CONTROL_TRANSITION_TIMEOUT_SEC}"
+    --rosbridge-router-port "${ROSBRIDGE_DEBUG_PORT:-9091}"
+    --rosbridge-live-path "${VITE_ROSBRIDGE_LIVE_TAILSCALE_PATH:-/live}"
+    --rosbridge-llm-path "${VITE_ROSBRIDGE_LLM_TAILSCALE_PATH:-/llm}"
+    --rosbridge-replay-path "${VITE_ROSBRIDGE_SHADOW_TAILSCALE_PATH:-/shadow}"
+  )
+  if user_systemd_available; then
+    systemd-run --user \
+      --unit="${RUNTIME_CONTROL_UNIT%.service}" \
+      --collect \
+      --property=Restart=on-failure \
+      --property=RestartSec=2 \
+      "${command[@]}" >/dev/null
+  else
+    (
+      umask 077
+      nohup "${command[@]}" >>"${RUNTIME_CONTROL_LOG_FILE}" 2>&1 &
+      printf '%s\n' "$!" >"${RUNTIME_CONTROL_PID_FILE}"
+    )
+  fi
+
+  local attempt
+  for attempt in $(seq 1 50); do
+    if runtime_control_ready "${expected_fingerprint}"; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  die "runtime-control service did not become ready on 127.0.0.1:${RUNTIME_CONTROL_PORT}"
+}
+
 compose_environment_value() {
   local profile="$1"
   local service="$2"
@@ -210,6 +464,195 @@ print(
     .get(key, fallback)
 )
 ' "${profile}" "${service}" "${key}" "${fallback}"
+}
+
+wait_for_websocket_endpoint() {
+  local host="$1"
+  local port="$2"
+  local path="$3"
+  local label="$4"
+  local timeout_sec="${5:-${WAIT_TIMEOUT_SEC}}"
+  if [[ "${DRY_RUN}" == "true" ]]; then
+    printf '+ wait-for-websocket %q %q %q %q\n' \
+      "${host}" "${port}" "${path}" "${label}"
+    return 0
+  fi
+  [[ "${port}" =~ ^[0-9]+$ ]] || die "${label} port is not numeric: ${port}"
+  (( port >= 1 && port <= 65535 )) || die "${label} port is invalid: ${port}"
+  [[ "${path}" == /* ]] || die "${label} websocket path must start with /"
+  python3 - "${host}" "${port}" "${path}" "${timeout_sec}" "${label}" <<'PY'
+import base64
+import os
+import socket
+import sys
+import time
+
+host, port_raw, path, timeout_raw, label = sys.argv[1:]
+port = int(port_raw)
+timeout = max(1.0, float(timeout_raw))
+deadline = time.monotonic() + timeout
+last_error = "endpoint did not accept a websocket handshake"
+
+while time.monotonic() < deadline:
+    try:
+        key = base64.b64encode(os.urandom(16)).decode("ascii")
+        request = (
+            f"GET {path} HTTP/1.1\r\n"
+            f"Host: {host}:{port}\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\n"
+            "Sec-WebSocket-Version: 13\r\n\r\n"
+        ).encode("ascii")
+        with socket.create_connection((host, port), timeout=1.0) as connection:
+            connection.settimeout(1.0)
+            connection.sendall(request)
+            response = bytearray()
+            while b"\r\n\r\n" not in response and len(response) < 8192:
+                chunk = connection.recv(4096)
+                if not chunk:
+                    break
+                response.extend(chunk)
+        status_line = bytes(response).split(b"\r\n", 1)[0]
+        if status_line.startswith((b"HTTP/1.1 101 ", b"HTTP/1.0 101 ")):
+            print(f"{label}: websocket ready on {host}:{port}{path}")
+            raise SystemExit(0)
+        last_error = f"unexpected handshake response: {status_line[:120]!r}"
+    except OSError as error:
+        last_error = str(error)
+    time.sleep(0.1)
+
+raise SystemExit(f"{label} was not ready after {timeout:g}s: {last_error}")
+PY
+}
+
+wait_for_mode_rosbridge() {
+  local mode="$1"
+  local router_port
+  router_port="$(
+    compose_environment_value \
+      "${mode}" webapp VITE_ROSBRIDGE_TAILSCALE_PORT 9091
+  )"
+  local websocket_path="/"
+  case "${mode}" in
+    live)
+      websocket_path="$(
+        compose_environment_value \
+          "${mode}" webapp VITE_ROSBRIDGE_LIVE_TAILSCALE_PATH /live
+      )"
+      ;;
+    llm-surgeon)
+      websocket_path="$(
+        compose_environment_value \
+          "${mode}" webapp VITE_ROSBRIDGE_LLM_TAILSCALE_PATH /llm
+      )"
+      ;;
+    replay)
+      websocket_path="$(
+        compose_environment_value \
+          "${mode}" webapp VITE_ROSBRIDGE_SHADOW_TAILSCALE_PATH /shadow
+      )"
+      ;;
+  esac
+  wait_for_websocket_endpoint \
+    127.0.0.1 "${router_port}" "${websocket_path}" "${mode} ROS bridge router"
+}
+
+wait_for_multicam_observer() {
+  local mode="$1"
+  local router_port
+  router_port="$(
+    compose_environment_value \
+      "${mode}" webapp VITE_ROSBRIDGE_DEBUG_PORT 9091
+  )"
+  # Camera publishers and /multicam_node/capture_status are intentionally not
+  # boot prerequisites.  The operator UI reports their absence separately;
+  # startup only verifies that the read-only observer websocket is reachable.
+  wait_for_websocket_endpoint \
+    127.0.0.1 "${router_port}" /multicam "multicam observer" \
+    "${TASKPLANNER_MULTICAM_OBSERVER_WAIT_TIMEOUT_SEC:-8}"
+}
+
+wait_for_mode_semantic_ready() {
+  local mode="$1"
+  local service topic message_type control_service control_service_type
+  local expected_case="" expected_bundle=""
+  case "${mode}" in
+    live|llm-surgeon)
+      service="taskplanner-runtime"
+      topic="/simulation/state"
+      message_type="surgical_msgs/msg/SimulationState"
+      control_service="/simulation/control"
+      control_service_type="surgical_msgs/srv/ControlSimulation"
+      expected_bundle="$(
+        compose_environment_value \
+          "${mode}" taskplanner-runtime TASKPLANNER_DEFAULT_BUNDLE thyroidectomy
+      )"
+      ;;
+    replay)
+      service="shadow-runner"
+      topic="/shadow/replay_state"
+      message_type="surgical_msgs/msg/ShadowReplayState"
+      control_service="/shadow/control_replay"
+      control_service_type="surgical_msgs/srv/ControlShadowReplay"
+      expected_case="$(
+        compose_environment_value \
+          "${mode}" shadow-runner SHADOW_CASE_ID "${SHADOW_CASE_ID:-0704_6}"
+      )"
+      ;;
+    debug)
+      service="integration-debug"
+      topic="/integration/debug/status"
+      message_type="std_msgs/msg/String"
+      control_service="/integration/debug/check_readiness"
+      control_service_type="std_srvs/srv/Trigger"
+      ;;
+    *)
+      die "unsupported semantic readiness mode: ${mode}"
+      ;;
+  esac
+  if [[ "${DRY_RUN}" == "true" ]]; then
+    printf '+ wait-for-ros-semantic-ready %q %q %q %q %q %q %q\n' \
+      "${mode}" "${service}" "${topic}" "${message_type}" \
+      "${control_service}" "${control_service_type}" "${expected_bundle}"
+    return 0
+  fi
+
+  local timeout_sec="${TASKPLANNER_SEMANTIC_READY_TIMEOUT_SEC:-30}"
+  [[ "${timeout_sec}" =~ ^[0-9]+$ && "${timeout_sec}" -ge 1 ]] ||
+    die "TASKPLANNER_SEMANTIC_READY_TIMEOUT_SEC must be a positive integer"
+  local deadline=$((SECONDS + timeout_sec))
+  while (( SECONDS < deadline )); do
+    if "${COMPOSE[@]}" --profile "${mode}" exec -T "${service}" \
+        bash -lc 'set -o pipefail
+          source /opt/ros/jazzy/setup.bash
+          source /opt/btops_ws/install/setup.bash
+          source /workspaces/taskplanner_ws/install/setup.bash
+          actual_type="$(timeout 8 ros2 service type "$1")"
+          [[ "${actual_type}" == "$2" ]]
+          if [[ "$5" == "live" || "$5" == "llm-surgeon" ]]; then
+            publisher_info="$(timeout 8 ros2 topic info --no-daemon -v "$3")"
+            [[ "$(grep -c "Node name: or_digital_twin$" <<<"${publisher_info}")" == "1" ]]
+            [[ "$(awk "/^Publisher count:/{print \$3; exit}" <<<"${publisher_info}")" == "1" ]]
+            transition_service="/simulation/check_transition_ready"
+            transition_type="std_srvs/srv/Trigger"
+            [[ "$(timeout 8 ros2 service type "${transition_service}")" == "${transition_type}" ]]
+            timeout 8 ros2 service call "${transition_service}" "${transition_type}" "{}" |
+              grep -Eq "success=(True|true)"
+          elif [[ "$5" == "debug" ]]; then
+            timeout 8 ros2 service call "$1" "$2" "{}" |
+              grep -Eq "success=(True|False), message="
+          fi
+          timeout 8 ros2 topic echo --once --no-daemon --spin-time 1 --timeout 5 --flow-style --full-length "$3" "$4" |
+            python3 /workspaces/taskplanner_ws/scripts/taskplanner_ros_readiness.py --mode "$5" --expected-case "$6" --expected-bundle "$7"' \
+        -- "${control_service}" "${control_service_type}" "${topic}" \
+        "${message_type}" "${mode}" "${expected_case}" "${expected_bundle}"; then
+      printf '%s ROS semantic readiness: received %s\n' "${mode}" "${topic}"
+      return 0
+    fi
+    sleep 0.2
+  done
+  die "${mode} ROS semantic readiness timed out waiting for ${topic}"
 }
 
 endpoint_host_port() {
@@ -252,7 +695,17 @@ start_lmstudio_control_plane() {
     if [[ "${LAUNCHER_LOCK_FD:-}" =~ ^[0-9]+$ ]]; then
       eval "exec ${LAUNCHER_LOCK_FD}>&-"
     fi
-    lms server start --port "${port}" --bind "${host}" >/dev/null
+    if user_systemd_available; then
+      # lms launches a long-lived Electron service before its CLI exits. Put
+      # that process tree in its own scope so restarting runtime-control cannot
+      # also kill the model catalog server through cgroup ownership.
+      systemctl --user stop "${LMSTUDIO_CONTROL_UNIT}" >/dev/null 2>&1 || true
+      systemd-run --user --scope \
+        --unit="${LMSTUDIO_CONTROL_UNIT%.scope}" \
+        lms server start --port "${port}" --bind "${host}" >/dev/null
+    else
+      lms server start --port "${port}" --bind "${host}" >/dev/null
+    fi
   )
   local attempt
   for attempt in $(seq 1 100); do
@@ -269,6 +722,9 @@ stop_lmstudio_control_plane() {
   [[ -f "${LMSTUDIO_STARTED_FILE}" ]] || return 0
   if command -v lms >/dev/null 2>&1; then
     lms server stop >/dev/null 2>&1 || true
+  fi
+  if user_systemd_available; then
+    systemctl --user stop "${LMSTUDIO_CONTROL_UNIT}" >/dev/null 2>&1 || true
   fi
   rm -f "${LMSTUDIO_STARTED_FILE}"
 }
@@ -478,11 +934,34 @@ prepare_debug_surgery_record_secret() {
   fi
 }
 
+prepare_optional_integrated_debug() {
+  local user_runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+  local pipewire_socket="${TASKPLANNER_PIPEWIRE_SOCKET:-${user_runtime_dir}/pipewire-0}"
+  local api_key_file="${PUZZLE_SURGERY_RECORD_API_KEY_FILE:-${HOME}/.config/taskplanner/secrets/puzzle-surgery-record-api-key}"
+  export TASKPLANNER_PIPEWIRE_SOCKET="${pipewire_socket}"
+  export PUZZLE_SURGERY_RECORD_API_KEY_FILE="${api_key_file}"
+
+  local unavailable=()
+  [[ -S "${pipewire_socket}" ]] || unavailable+=("PipeWire socket ${pipewire_socket}")
+  if [[ ! -f "${api_key_file}" || ! -s "${api_key_file}" ]]; then
+    unavailable+=("surgery-record key ${api_key_file}")
+  elif [[ "$(stat -c '%a' "${api_key_file}")" != "600" ]]; then
+    unavailable+=("surgery-record key mode must be 600")
+  fi
+  if (( ${#unavailable[@]} > 0 )); then
+    printf 'warning: optional integrated Debug sidecar skipped: %s\n' \
+      "$(IFS='; '; printf '%s' "${unavailable[*]}")" >&2
+    return 1
+  fi
+  return 0
+}
+
 action="${1:-help}"
 shift || true
 DRY_RUN=false
 BUILD_ARGS=()
 BUILD_REQUESTED=false
+REPLACE_ACTIVE_RUNTIME=false
 
 case "${action}" in
   help|-h|--help)
@@ -506,6 +985,7 @@ case "${action}" in
           BUILD_REQUESTED=false
           export WEBAPP_INSTALL_ON_START=false
           ;;
+        --replace-active) REPLACE_ACTIVE_RUNTIME=true ;;
         -h|--help)
           usage
           exit 0
@@ -514,17 +994,29 @@ case "${action}" in
       esac
       shift
     done
+    if [[ "${REPLACE_ACTIVE_RUNTIME}" == "true" && "${mode}" != "debug" ]]; then
+      die "--replace-active is valid only with debug"
+    fi
 
     # Runtime services never mutate the shared colcon workspace themselves.
     # --build is handled by run_serial_workspace_build below.
     export TASKPLANNER_REBUILD_ON_START=false
+    # Container profiles own this URI. A shell value often points at a host
+    # path and would otherwise override the mode file with an unreadable DDS
+    # configuration inside the container. Put deliberate overrides in .env.
+    unset CYCLONEDDS_URI
     acquire_launcher_lock
+    ensure_runtime_control_service
 
     compose_env_args "${mode}"
-    if [[ "${mode}" == "debug" ]] ||
-        mode_uses_integrated_debug_sidecar "${mode}"; then
+    INTEGRATED_DEBUG_ENABLED=false
+    if [[ "${mode}" == "debug" ]]; then
       prepare_debug_audio_runtime
       prepare_debug_surgery_record_secret
+    elif mode_uses_integrated_debug_sidecar "${mode}"; then
+      if prepare_optional_integrated_debug; then
+        INTEGRATED_DEBUG_ENABLED=true
+      fi
     fi
     if mode_uses_integrated_debug_sidecar "${mode}"; then
       # These are operational safety invariants, not user-tunable launcher
@@ -569,7 +1061,7 @@ case "${action}" in
 
     if [[ "${DRY_RUN}" != "true" ]]; then
       command -v docker >/dev/null 2>&1 || die "docker is not installed"
-      if mode_uses_integrated_debug_sidecar "${mode}"; then
+      if [[ "${INTEGRATED_DEBUG_ENABLED}" == "true" ]]; then
         "${COMPOSE[@]}" --profile "${mode}" --profile debug config --quiet
       else
         "${COMPOSE[@]}" --profile "${mode}" config --quiet
@@ -581,7 +1073,7 @@ case "${action}" in
     fi
 
     if [[ "${mode}" == "debug" ]]; then
-      if [[ "${DRY_RUN}" != "true" ]]; then
+      if [[ "${DRY_RUN}" != "true" && "${REPLACE_ACTIVE_RUNTIME}" != "true" ]]; then
         assert_debug_runtime_is_exclusive
       fi
       # A crashed or manually stopped operational runtime can leave a
@@ -598,6 +1090,15 @@ case "${action}" in
         integration-debug
         integration-debug-lan-proxy
       )
+      if [[ "${BUILD_REQUESTED}" == "true" ]]; then
+        # The observer reads the shared symlink-install tree. Stop it only for
+        # a serialized build; ordinary mode switches keep it warm.
+        debug_reset_services+=(multicam-observer)
+      fi
+      verify_runtime_control_transition_interlock
+      # Preserve the old marker through preflight failures. Clear it only
+      # after the final stopped-state gate, immediately before the stop.
+      clear_active_runtime_mode
       run_or_print \
         "${COMPOSE[@]}" "${ALL_PROFILE_ARGS[@]}" \
         stop "${debug_reset_services[@]}"
@@ -607,13 +1108,32 @@ case "${action}" in
       if [[ "${BUILD_REQUESTED}" == "true" ]]; then
         run_serial_workspace_build "${mode}"
       fi
+      # Keep the dashboard process alive across mode transitions. Runtime status
+      # is authoritative and the webapp configuration is intentionally mode-
+      # independent, so restarting it would only discard client transition state.
       run_or_print \
         "${COMPOSE[@]}" --profile debug \
-        up -d "${BUILD_ARGS[@]}" --force-recreate \
-        webapp integration-debug integration-debug-lan-proxy
+        up -d "${BUILD_ARGS[@]}" webapp
+      run_best_effort \
+        "multicam observer did not start; core Debug runtime remains available" \
+        "${COMPOSE[@]}" --profile debug \
+        up -d "${BUILD_ARGS[@]}" multicam-observer
+      run_or_print \
+        "${COMPOSE[@]}" --profile debug \
+        up -d --force-recreate \
+        integration-debug integration-debug-lan-proxy
+      run_or_print \
+        "${COMPOSE[@]}" --profile debug \
+        up -d "${BUILD_ARGS[@]}" integration-debug-tailscale-proxy
       if [[ "${DRY_RUN}" != "true" ]]; then
         "${COMPOSE[@]}" --profile debug ps
       fi
+      wait_for_mode_rosbridge "${mode}"
+      wait_for_mode_semantic_ready "${mode}"
+      write_active_runtime_mode "${mode}"
+      run_best_effort \
+        "multicam observer is unavailable; camera monitoring remains degraded" \
+        wait_for_multicam_observer "${mode}"
       exit 0
     fi
 
@@ -626,8 +1146,14 @@ case "${action}" in
       public-rosbridge
       taskplanner-asr
       shadow-runner
-      object-perception
     )
+    if [[ ! ( ( "${mode}" == "live" || "${mode}" == "replay" ) && \
+        "${perception_backend}" == "local" && \
+        "${local_rfdetr_enabled}" == "true" ) ]]; then
+      # The HTTP-only detector can stay warm between Live and Replay, but modes
+      # that do not own local perception must release its GPU allocation.
+      runtime_reset_services+=(object-perception)
+    fi
     # Never carry an armed/manual Debug session across an operational runtime
     # restart. Recreate the sidecar only after the new runtime is running, so
     # its scenario-state interlock starts from a clean MONITOR_ONLY session.
@@ -635,6 +1161,16 @@ case "${action}" in
       integration-debug
       integration-debug-lan-proxy
     )
+    if [[ "${BUILD_REQUESTED}" == "true" ]]; then
+      # The observer is mode-independent and normally stays warm, but it must
+      # not read the symlink-install tree while colcon replaces that tree.
+      runtime_reset_services+=(multicam-observer)
+    fi
+    verify_runtime_control_transition_interlock
+    # Preserve the old marker through preflight failures. Clear it only after
+    # the final controller-authorized stopped-state check and immediately
+    # before stopping the old runtime.
+    clear_active_runtime_mode
     run_or_print \
       "${COMPOSE[@]}" "${ALL_PROFILE_ARGS[@]}" \
       stop "${runtime_reset_services[@]}"
@@ -662,15 +1198,20 @@ case "${action}" in
       start_unsloth_control_plane "${mode}" "${runtime_service}"
 
     runtime_profile_args=(--profile "${mode}")
-    if mode_uses_integrated_debug_sidecar "${mode}"; then
+    if [[ "${INTEGRATED_DEBUG_ENABLED}" == "true" ]]; then
       runtime_profile_args+=(--profile debug)
     fi
     run_or_print \
       "${COMPOSE[@]}" "${runtime_profile_args[@]}" \
-      up -d "${BUILD_ARGS[@]}" --force-recreate \
+      up -d "${BUILD_ARGS[@]}" \
       --remove-orphans \
       --wait --wait-timeout "${WAIT_TIMEOUT_SEC}" \
       vllm-manager ninfer-manager webapp
+
+    run_best_effort \
+      "multicam observer did not start; core runtime remains available" \
+      "${COMPOSE[@]}" --profile "${mode}" \
+      up -d "${BUILD_ARGS[@]}" multicam-observer
 
     if mode_uses_operational_asr_sidecar "${mode}"; then
       # Health means the dedicated ROS node has advertised its status topic.
@@ -686,12 +1227,13 @@ case "${action}" in
     if [[ ( "${mode}" == "live" || "${mode}" == "replay" ) && \
         "${perception_backend}" == "local" && \
         "${local_rfdetr_enabled}" == "true" ]]; then
+      # RF-DETR is optional and has an independent health contract. Start its
+      # warm-up before the ROS runtime so GPU/model initialization overlaps the
+      # bridge launch instead of adding serial mode-switch latency.
       run_best_effort \
         "optional object perception did not start; continuing with ROS and voice inputs" \
         "${COMPOSE[@]}" --profile "${mode}" \
-        up -d "${BUILD_ARGS[@]}" --force-recreate \
-        --wait --wait-timeout "${WAIT_TIMEOUT_SEC}" \
-        object-perception
+        up -d "${BUILD_ARGS[@]}" object-perception
     fi
 
     if [[ "${mode}" == "replay" ]]; then
@@ -714,7 +1256,7 @@ case "${action}" in
         --wait --wait-timeout "${WAIT_TIMEOUT_SEC}" public-rosbridge
     fi
 
-    if mode_uses_integrated_debug_sidecar "${mode}"; then
+    if [[ "${INTEGRATED_DEBUG_ENABLED}" == "true" ]]; then
       # Start this only after the operational runtime. It exposes monitoring on
       # 9091 and unlocks manual commands only from a trusted, fresh stopped
       # /simulation/state; the operational container itself may remain running.
@@ -724,9 +1266,34 @@ case "${action}" in
         integration-debug integration-debug-lan-proxy
     fi
 
+    # One Tailnet-permitted loopback port routes each selected runtime by
+    # websocket path. It is intentionally separate from the LAN proxy and
+    # opens no new network listener.
+    run_or_print \
+      "${COMPOSE[@]}" --profile "${mode}" \
+      up -d "${BUILD_ARGS[@]}" \
+      integration-debug-tailscale-proxy
+
+    if [[ ( "${mode}" == "live" || "${mode}" == "replay" ) && \
+        "${perception_backend}" == "local" && \
+        "${local_rfdetr_enabled}" == "true" ]]; then
+      run_best_effort \
+        "optional object perception is not healthy; continuing with ROS and voice inputs" \
+        "${COMPOSE[@]}" --profile "${mode}" \
+        up -d "${BUILD_ARGS[@]}" \
+        --wait --wait-timeout "${OPTIONAL_WAIT_TIMEOUT_SEC}" \
+        object-perception
+    fi
+
     if [[ "${DRY_RUN}" != "true" ]]; then
       "${COMPOSE[@]}" "${runtime_profile_args[@]}" ps
     fi
+    wait_for_mode_rosbridge "${mode}"
+    wait_for_mode_semantic_ready "${mode}"
+    write_active_runtime_mode "${mode}"
+    run_best_effort \
+      "multicam observer is unavailable; camera monitoring remains degraded" \
+      wait_for_multicam_observer "${mode}"
     ;;
 
   down)
@@ -748,6 +1315,8 @@ case "${action}" in
     run_or_print \
       "${COMPOSE[@]}" "${ALL_PROFILE_ARGS[@]}" \
       down --remove-orphans
+    clear_active_runtime_mode
+    stop_runtime_control_service
     stop_legacy_ninfer_manager
     stop_lmstudio_control_plane
     stop_unsloth_control_plane
@@ -775,6 +1344,25 @@ case "${action}" in
       printf 'Unsloth Studio catalog server: active transient user service\n'
     else
       printf 'Unsloth Studio catalog server: external or stopped\n'
+    fi
+    ;;
+
+  runtime-control)
+    while (($#)); do
+      case "$1" in
+        --dry-run) DRY_RUN=true ;;
+        -h|--help)
+          usage
+          exit 0
+          ;;
+        *) die "unknown runtime-control option: $1" ;;
+      esac
+      shift
+    done
+    acquire_launcher_lock
+    ensure_runtime_control_service
+    if [[ "${DRY_RUN}" != "true" ]]; then
+      printf 'Taskplanner runtime-control: ready on 127.0.0.1:%s\n' "${RUNTIME_CONTROL_PORT}"
     fi
     ;;
 

@@ -532,6 +532,40 @@ def test_active_start_heartbeat_does_not_advance_vlm_epoch() -> None:
     assert node._phase_bootstrap_id == "P03"
 
 
+def test_repeated_stop_heartbeat_does_not_advance_vlm_epoch() -> None:
+    node = _node()
+    node._model_input_epoch = 41
+    node._active = True
+
+    node._on_control(SimpleNamespace(data="stop"))
+    epoch_after_stop = node._model_input_epoch
+    node._vlm_result_sequence = 7
+    node._last_submitted_model_input_key = "preserved"
+
+    node._on_control(SimpleNamespace(data="stop"))
+
+    assert node._active is False
+    assert node._model_input_epoch == epoch_after_stop
+    assert node._vlm_result_sequence == 7
+    assert node._last_submitted_model_input_key == "preserved"
+
+
+def test_reset_is_repeatable_and_reopens_the_next_start_edge() -> None:
+    node = _node()
+    node._model_input_epoch = 10
+    node._vlm_result_sequence = 0
+    node._last_submitted_model_input_key = ""
+
+    node._on_control(SimpleNamespace(data="start"))
+    node._on_control(SimpleNamespace(data="start"))
+    node._on_control(SimpleNamespace(data="reset"))
+    node._on_control(SimpleNamespace(data="reset"))
+    node._on_control(SimpleNamespace(data="start"))
+
+    assert node._active is True
+    assert node._model_input_epoch == 14
+
+
 def test_model_phase_ranking_is_not_overwritten_by_procedure_prior() -> None:
     node = _node()
     payload = {

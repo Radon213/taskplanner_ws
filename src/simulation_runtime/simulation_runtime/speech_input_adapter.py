@@ -186,6 +186,8 @@ class SpeechInputAdapterNode(Node):
         self._last_detail = self._waiting_detail()
         self._last_observation_stamp = None
         self._last_accepted_monotonic = 0.0
+        self._lifecycle_control_state = "stopped"
+        self._last_lifecycle_control_signature: tuple[str, str] | None = None
 
         self._transcript_pub = self.create_publisher(
             String,
@@ -299,12 +301,46 @@ class SpeechInputAdapterNode(Node):
         self._publish_status()
 
     def _on_control(self, msg: String) -> None:
-        command = str(msg.data or "").strip().partition(":")[0].lower()
-        if command not in {"start", "start_actors", "reset"}:
+        command, _, detail = str(msg.data or "").strip().partition(":")
+        command = command.lower()
+        signature = (command, detail.strip())
+        if command not in {
+            "start",
+            "start_runtime",
+            "start_actors",
+            "pause",
+            "resume",
+            "stop",
+            "reset",
+        }:
             return
+        if command != "reset":
+            if signature == getattr(
+                self, "_last_lifecycle_control_signature", None
+            ):
+                return
+            self._last_lifecycle_control_signature = signature
+        if command == "start_runtime":
+            self._lifecycle_control_state = "starting"
+            return
+        if command == "pause":
+            self._lifecycle_control_state = "paused"
+            return
+        if command == "resume":
+            self._lifecycle_control_state = "running"
+            return
+        if command == "stop":
+            self._lifecycle_control_state = "stopped"
+            return
+        if command in {"start", "start_actors"}:
+            if getattr(self, "_lifecycle_control_state", "stopped") == "running":
+                return
+            self._lifecycle_control_state = "running"
         self._recent_ids.clear()
         self._recent_sentences.clear()
         if command == "reset":
+            self._last_lifecycle_control_signature = None
+            self._lifecycle_control_state = "stopped"
             self._epoch += 1
             self._received_count = 0
             self._accepted_count = 0

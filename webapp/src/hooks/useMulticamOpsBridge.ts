@@ -1,7 +1,7 @@
-import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { startTransition, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import ROSLIB from "roslib";
 
-import { runtimeBridgeUrl } from "../runtimeModes";
+import { multicamBridgeUrl } from "../runtimeModes";
 
 export const MULTICAM_CAMERAS = [
   {
@@ -149,6 +149,9 @@ const STATIC_TF_QUEUE_LENGTH = 32;
 // The multicam synchronizer is the rate authority (currently 15 Hz). Do not
 // add a browser-side ROSBridge throttle: render each /synced message received.
 const IMAGE_THROTTLE_MS = 0;
+const CAPTURE_STATUS_MAX_AGE_MS = 3_500;
+const TOPIC_DISCOVERY_TIMEOUT_MS = 4_000;
+const OBSERVER_TOPICS_SERVICE = "/multicam_observer/rosapi/topics";
 const IMAGE_QOS = {
   history: "keep_last",
   depth: 1,
@@ -164,11 +167,18 @@ const TF_STATIC_QOS = {
   durability: "transient_local",
 } as const;
 
-const WORLD_SERVICES: Record<WorldAction, string> = {
-  begin: "/world_anchor_node/begin",
-  stop: "/world_anchor_node/stop",
-  solve: "/world_anchor_node/solve",
-  publish: "/world_anchor_node/publish",
+type ObserverServiceResponseMessage = {
+  result?: boolean;
+  values?: Record<string, unknown> | string;
+};
+
+type ObserverServiceConnection = {
+  idCounter?: number;
+  isConnected?: boolean;
+  on: (event: string, callback: (message: ObserverServiceResponseMessage) => void) => void;
+  off?: (event: string, callback: (message: ObserverServiceResponseMessage) => void) => void;
+  removeListener?: (event: string, callback: (message: ObserverServiceResponseMessage) => void) => void;
+  callOnConnection: (message: Record<string, unknown>) => void;
 };
 
 function emptyFrames(): CameraFrames {
@@ -179,10 +189,6 @@ function emptyFrames(): CameraFrames {
     cam_4: null,
     flir: null,
   };
-}
-
-function defaultBridgeUrl(): string {
-  return import.meta.env.VITE_MULTICAM_ROSBRIDGE_URL?.trim() || runtimeBridgeUrl("debug");
 }
 
 function stringArray(value: unknown): string[] {
@@ -435,11 +441,24 @@ function injectQos(topic: any, qos: Record<string, unknown>): void {
   };
 }
 
+function unsubscribeWhileConnected(ros: any, topics: any[]): void {
+  if (!ros?.isConnected || ros.socket?.readyState !== WebSocket.OPEN) return;
+  topics.forEach((topic) => {
+    try {
+      topic.unsubscribe();
+    } catch {
+      // Closing the socket already releases server-side subscriptions.
+    }
+  });
+}
+
 export function useMulticamOpsBridge(activeView: MulticamView) {
-  const [url, setUrl] = useState(defaultBridgeUrl);
+  const [url] = useState(multicamBridgeUrl);
   const [retryGeneration, setRetryGeneration] = useState(0);
-  const [connected, setConnected] = useState(false);
-  const [connectionMessage, setConnectionMessage] = useState("ROSBridge 연결 대기");
+  const [socketConnected, setSocketConnected] = useState(false);
+  const [captureTopicDiscovered, setCaptureTopicDiscovered] = useState(false);
+  const [captureStatusFresh, setCaptureStatusFresh] = useState(false);
+  const [connectionMessage, setConnectionMessage] = useState("멀티캠 observer 연결 대기");
   const [colorFrames, setColorFrames] = useState<CameraFrames>(emptyFrames);
   const [depthFrames, setDepthFrames] = useState<CameraFrames>(emptyFrames);
   const [captureStatus, setCaptureStatus] = useState<CaptureStatus | null>(null);
@@ -452,6 +471,7 @@ export function useMulticamOpsBridge(activeView: MulticamView) {
   const [worldActionPending, setWorldActionPending] = useState<WorldAction | null>(null);
   const [worldActionResult, setWorldActionResult] = useState<WorldActionResult | null>(null);
   const [activeRos, setActiveRos] = useState<any>(null);
+  const connected = socketConnected && captureStatusFresh;
 
   const rosRef = useRef<any>(null);
   const tfByChildRef = useRef(new Map<string, StaticTransform>());
@@ -460,17 +480,92 @@ export function useMulticamOpsBridge(activeView: MulticamView) {
   const previewTimesRef = useRef(new Map<string, number[]>());
   const frameFlushRef = useRef<number | null>(null);
   const objectUrlsRef = useRef(new Set<string>());
+  const captureStatusFreshRef = useRef(false);
+  const observerGenerationRef = useRef(0);
+  const topicRefreshInFlightRef = useRef(false);
+  const pendingServiceCancelsRef = useRef(new Set<(reason: string) => void>());
 
   const selectedTopicType = useMemo(
     () => topics.find((topic) => topic.name === selectedTopic)?.type || "",
     [selectedTopic, topics],
   );
 
+  const callObserverTopics = useCallback((
+    ros: ObserverServiceConnection,
+    generation: number,
+  ): Promise<Record<string, unknown>> => new Promise((resolve, reject) => {
+    const serviceCallId = `call_service:${OBSERVER_TOPICS_SERVICE}:${Number(ros.idCounter ?? 0) + 1}`;
+    ros.idCounter = Number(ros.idCounter ?? 0) + 1;
+    let timeout = 0;
+    let settled = false;
+    let cancel = (_reason: string) => {};
+    const cleanup = (handler: (message: ObserverServiceResponseMessage) => void) => {
+      window.clearTimeout(timeout);
+      pendingServiceCancelsRef.current.delete(cancel);
+      if (typeof ros.off === "function") ros.off(serviceCallId, handler);
+      else if (typeof ros.removeListener === "function") ros.removeListener(serviceCallId, handler);
+    };
+    const handler = (message: ObserverServiceResponseMessage) => {
+      if (settled) return;
+      if (
+        generation !== observerGenerationRef.current ||
+        rosRef.current !== ros ||
+        !ros.isConnected
+      ) {
+        cancel("멀티캠 observer 연결이 변경되어 이전 서비스 응답을 무시했습니다.");
+        return;
+      }
+      settled = true;
+      cleanup(handler);
+      if (message.result === false) {
+        reject(new Error(String(message.values || "rosapi topic discovery failed")));
+        return;
+      }
+      resolve(
+        typeof message.values === "object" && message.values !== null
+          ? message.values
+          : {},
+      );
+    };
+    cancel = (reason: string) => {
+      if (settled) return;
+      settled = true;
+      cleanup(handler);
+      reject(new Error(reason));
+    };
+    pendingServiceCancelsRef.current.add(cancel);
+    timeout = window.setTimeout(
+      () => cancel("멀티캠 observer 토픽 조회 응답 시간이 초과되었습니다."),
+      TOPIC_DISCOVERY_TIMEOUT_MS,
+    );
+    ros.on(serviceCallId, handler);
+    try {
+      ros.callOnConnection({
+        op: "call_service",
+        id: serviceCallId,
+        service: OBSERVER_TOPICS_SERVICE,
+        type: "rosapi_msgs/srv/Topics",
+        args: new ROSLIB.ServiceRequest({}),
+        timeout: TOPIC_DISCOVERY_TIMEOUT_MS / 1_000,
+      });
+    } catch (error) {
+      cancel(error instanceof Error ? error.message : String(error));
+    }
+  }), []);
+
   const refreshTopics = useCallback(() => {
-    const ros = rosRef.current;
-    if (!ros) return;
-    ros.getTopics(
-      (result: { topics?: unknown; types?: unknown }) => {
+    const ros = rosRef.current as ObserverServiceConnection | null;
+    const generation = observerGenerationRef.current;
+    if (!ros?.isConnected || topicRefreshInFlightRef.current) return;
+    topicRefreshInFlightRef.current = true;
+    // roslib's legacy getTopics() identifies this ROS 2 service as
+    // `rosapi/Topics`, which makes rosbridge try to import the nonexistent
+    // Python module rosapi.srv. Call the canonical Jazzy interface directly,
+    // with an explicit listener timeout so a silent observer cannot accumulate
+    // one pending response handler on every polling interval.
+    void callObserverTopics(ros, generation)
+      .then((result) => {
+        if (observerGenerationRef.current !== generation || rosRef.current !== ros) return;
         const names = Array.isArray(result.topics) ? result.topics : [];
         const types = Array.isArray(result.types) ? result.types : [];
         const next = names
@@ -478,89 +573,135 @@ export function useMulticamOpsBridge(activeView: MulticamView) {
           .filter((topic) => topic.name.startsWith("/"))
           .sort((left, right) => left.name.localeCompare(right.name));
         setTopics(next);
-        setTopicError("");
+        const observerReady = next.some(
+          (topic) => topic.name === "/multicam_node/capture_status",
+        );
+        setTopicError(observerReady ? "" : "멀티캠 observer 토픽을 찾지 못했습니다.");
+        if (!observerReady) {
+          setCaptureTopicDiscovered(false);
+          setConnectionMessage("멀티캠 observer unavailable · CaptureStatus 토픽 미발견");
+        } else {
+          setCaptureTopicDiscovered(true);
+          if (!captureStatusFreshRef.current) {
+            setConnectionMessage("CaptureStatus 토픽 발견 · 실제 메시지 수신 대기");
+          }
+        }
         setSelectedTopic((current) => {
           if (next.some((topic) => topic.name === current)) return current;
           return next.find((topic) => topic.name === "/multicam_node/capture_status")?.name || next[0]?.name || "";
         });
-      },
-      (error: unknown) => {
-        setTopicError(String((error as { error?: unknown } | null)?.error || "rosapi topic discovery failed"));
-      },
-    );
-  }, []);
+      })
+      .catch((error: unknown) => {
+        if (observerGenerationRef.current !== generation || rosRef.current !== ros) return;
+        const message = String((error as { error?: unknown } | null)?.error || "rosapi topic discovery failed");
+        setCaptureTopicDiscovered(false);
+        setTopicError(message);
+        setConnectionMessage("멀티캠 observer unavailable · 실행 중인 런타임은 변경하지 않았습니다.");
+      })
+      .finally(() => {
+        if (observerGenerationRef.current === generation && rosRef.current === ros) {
+          topicRefreshInFlightRef.current = false;
+        }
+      });
+  }, [callObserverTopics]);
 
   const retry = useCallback(() => {
     setRetryGeneration((current) => current + 1);
   }, []);
 
   const callWorldAction = useCallback(async (action: WorldAction): Promise<WorldActionResult> => {
-    const ros = rosRef.current;
-    if (!ros || !connected) {
-      const result = {
-        action,
-        success: false,
-        message: "ROSBridge가 연결되지 않아 명령을 전송하지 않았습니다.",
-        completedAt: Date.now(),
-      };
-      setWorldActionResult(result);
-      return result;
-    }
-    setWorldActionPending(action);
-    const result = await new Promise<WorldActionResult>((resolve) => {
-      let finished = false;
-      const finish = (success: boolean, message: string) => {
-        if (finished) return;
-        finished = true;
-        window.clearTimeout(timeout);
-        resolve({ action, success, message, completedAt: Date.now() });
-      };
-      const timeout = window.setTimeout(() => {
-        finish(false, "서비스 응답 시간이 초과되었습니다. 원격 노드 상태를 확인하세요.");
-      }, 10_000);
-      const service = new ROSLIB.Service({
-        ros,
-        name: WORLD_SERVICES[action],
-        serviceType: "std_srvs/srv/Trigger",
-      });
-      service.callService(
-        new ROSLIB.ServiceRequest({}),
-        (response: { success?: unknown; message?: unknown }) => {
-          finish(Boolean(response.success), String(response.message || "응답 메시지 없음"));
-        },
-        (error: unknown) => {
-          finish(false, String((error as { error?: unknown } | null)?.error || error || "서비스 호출 실패"));
-        },
-      );
-    });
-    setWorldActionPending(null);
+    const result: WorldActionResult = {
+      action,
+      success: false,
+      message: "멀티캠 observer는 read-only입니다. World Anchor 서비스 호출을 전송하지 않았습니다.",
+      completedAt: Date.now(),
+    };
     setWorldActionResult(result);
     return result;
-  }, [connected]);
+  }, []);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     let disposed = false;
-    const ros = new ROSLIB.Ros({ url });
+    let reconnectTimer: number | null = null;
+    let connectionTimer: number | null = null;
+    const generation = observerGenerationRef.current + 1;
+    observerGenerationRef.current = generation;
+    for (const cancel of Array.from(pendingServiceCancelsRef.current)) {
+      cancel("멀티캠 observer 연결 세대가 변경되어 토픽 조회를 취소했습니다.");
+    }
+    topicRefreshInFlightRef.current = false;
+    const isCurrentGeneration = () =>
+      !disposed && observerGenerationRef.current === generation;
+    captureStatusFreshRef.current = false;
+    tfByChildRef.current.clear();
+    colorPendingRef.current.clear();
+    depthPendingRef.current.clear();
+    previewTimesRef.current.clear();
+    setSocketConnected(false);
+    setCaptureTopicDiscovered(false);
+    setCaptureStatusFresh(false);
+    setCaptureStatus(null);
+    setWorldStatus(null);
+    setTfTransforms([]);
+    setTopics([]);
+    setTopicError("");
+    setSelectedTopic("/multicam_node/capture_status");
+    setSelectedTopicSample(null);
+    setWorldActionPending(null);
+    setWorldActionResult(null);
+    setColorFrames(emptyFrames());
+    setDepthFrames(emptyFrames());
+    setActiveRos(null);
+    setConnectionMessage("멀티캠 observer 연결 대기");
+    const scheduleReconnect = () => {
+      if (!isCurrentGeneration() || reconnectTimer !== null) return;
+      reconnectTimer = window.setTimeout(() => {
+        reconnectTimer = null;
+        setRetryGeneration((current) => current + 1);
+      }, 1_500);
+    };
+    const ros = new ROSLIB.Ros();
     rosRef.current = ros;
 
     ros.on("connection", () => {
-      if (disposed) return;
-      setConnected(true);
+      if (!isCurrentGeneration()) return;
+      if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+      setSocketConnected(true);
+      setCaptureTopicDiscovered(false);
+      captureStatusFreshRef.current = false;
+      setCaptureStatusFresh(false);
       setActiveRos(ros);
-      setConnectionMessage("ROSBridge 연결됨 · 멀티캠 상태 수신 중");
+      setConnectionMessage("멀티캠 observer 연결 확인 중");
       refreshTopics();
     });
     ros.on("close", () => {
-      if (disposed) return;
-      setConnected(false);
+      if (!isCurrentGeneration()) return;
+      for (const cancel of Array.from(pendingServiceCancelsRef.current)) {
+        cancel("멀티캠 observer 연결이 종료되어 토픽 조회를 취소했습니다.");
+      }
+      topicRefreshInFlightRef.current = false;
+      setSocketConnected(false);
+      setCaptureTopicDiscovered(false);
+      captureStatusFreshRef.current = false;
+      setCaptureStatusFresh(false);
       setActiveRos((current: any) => current === ros ? null : current);
-      setConnectionMessage("ROSBridge 연결이 끊겼습니다. 재시도 중입니다.");
+      setConnectionMessage("멀티캠 observer 연결이 끊겼습니다. 재시도 중입니다.");
+      scheduleReconnect();
     });
     ros.on("error", () => {
-      if (disposed) return;
-      setConnected(false);
+      if (!isCurrentGeneration()) return;
+      for (const cancel of Array.from(pendingServiceCancelsRef.current)) {
+        cancel("멀티캠 observer 연결 오류로 토픽 조회를 취소했습니다.");
+      }
+      topicRefreshInFlightRef.current = false;
+      setSocketConnected(false);
+      setCaptureTopicDiscovered(false);
+      captureStatusFreshRef.current = false;
+      setCaptureStatusFresh(false);
       setActiveRos((current: any) => current === ros ? null : current);
-      setConnectionMessage("ROSBridge 오류 · URL과 디버그 브리지를 확인하세요.");
+      setConnectionMessage("멀티캠 observer unavailable · 실행 중인 런타임은 변경하지 않았습니다.");
+      scheduleReconnect();
     });
 
     const subscriptions: any[] = [];
@@ -570,7 +711,13 @@ export function useMulticamOpsBridge(activeView: MulticamView) {
       messageType: "arpa_multicam_msgs/msg/CaptureStatus",
       queue_length: 1,
     });
-    captureTopic.subscribe((message: unknown) => setCaptureStatus(captureStatusFromMessage(message)));
+    captureTopic.subscribe((message: unknown) => {
+      if (!isCurrentGeneration()) return;
+      setCaptureStatus(captureStatusFromMessage(message));
+      captureStatusFreshRef.current = true;
+      setCaptureStatusFresh(true);
+      setConnectionMessage("멀티캠 observer ready · CaptureStatus fresh");
+    });
     subscriptions.push(captureTopic);
 
     const worldTopic = new ROSLIB.Topic({
@@ -579,7 +726,10 @@ export function useMulticamOpsBridge(activeView: MulticamView) {
       messageType: "std_msgs/msg/String",
       queue_length: 1,
     });
-    worldTopic.subscribe((message: unknown) => setWorldStatus(worldStatusFromMessage(message)));
+    worldTopic.subscribe((message: unknown) => {
+      if (!isCurrentGeneration()) return;
+      setWorldStatus(worldStatusFromMessage(message));
+    });
     subscriptions.push(worldTopic);
 
     const tfTopic = new ROSLIB.Topic({
@@ -590,21 +740,36 @@ export function useMulticamOpsBridge(activeView: MulticamView) {
     });
     injectQos(tfTopic, TF_STATIC_QOS);
     tfTopic.subscribe((message: unknown) => {
+      if (!isCurrentGeneration()) return;
       const additions = transformsFromMessage(message);
       if (!additions.length) return;
       for (const transform of additions) tfByChildRef.current.set(transform.childFrame, transform);
       setTfTransforms([...tfByChildRef.current.values()].sort((left, right) => left.childFrame.localeCompare(right.childFrame)));
     });
     subscriptions.push(tfTopic);
+    connectionTimer = window.setTimeout(() => {
+      connectionTimer = null;
+      if (isCurrentGeneration()) ros.connect(url);
+    }, 0);
 
     return () => {
       disposed = true;
-      subscriptions.forEach((topic) => topic.unsubscribe());
+      if (observerGenerationRef.current === generation) {
+        for (const cancel of Array.from(pendingServiceCancelsRef.current)) {
+          cancel("멀티캠 observer 화면을 닫아 토픽 조회를 취소했습니다.");
+        }
+        topicRefreshInFlightRef.current = false;
+      }
+      if (connectionTimer !== null) window.clearTimeout(connectionTimer);
+      if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
+      unsubscribeWhileConnected(ros, subscriptions);
       if (frameFlushRef.current !== null) window.cancelAnimationFrame(frameFlushRef.current);
       frameFlushRef.current = null;
       tfByChildRef.current.clear();
       objectUrlsRef.current.forEach((objectUrl) => URL.revokeObjectURL(objectUrl));
       objectUrlsRef.current.clear();
+      colorPendingRef.current.clear();
+      depthPendingRef.current.clear();
       setActiveRos((current: any) => current === ros ? null : current);
       if (rosRef.current === ros) rosRef.current = null;
       if (typeof ros.close === "function") ros.close();
@@ -612,7 +777,32 @@ export function useMulticamOpsBridge(activeView: MulticamView) {
   }, [refreshTopics, retryGeneration, url]);
 
   useEffect(() => {
+    const generation = observerGenerationRef.current;
+    const updateFreshness = () => {
+      if (observerGenerationRef.current !== generation) return;
+      const fresh = Boolean(
+        socketConnected &&
+        captureStatus &&
+        Date.now() - captureStatus.receivedAt <= CAPTURE_STATUS_MAX_AGE_MS,
+      );
+      captureStatusFreshRef.current = fresh;
+      setCaptureStatusFresh((current) => {
+        if (current && !fresh && socketConnected) {
+          setConnectionMessage("멀티캠 observer degraded · CaptureStatus stale");
+        }
+        return fresh;
+      });
+    };
+    updateFreshness();
+    const timer = window.setInterval(updateFreshness, 500);
+    return () => window.clearInterval(timer);
+  }, [captureStatus, socketConnected]);
+
+  useEffect(() => {
     if (!activeRos) return;
+    const generation = observerGenerationRef.current;
+    const isCurrentGeneration = () =>
+      observerGenerationRef.current === generation && rosRef.current === activeRos;
     const pendingFrames = activeView === "color" ? colorPendingRef : depthPendingRef;
     const setFrames = activeView === "color" ? setColorFrames : setDepthFrames;
     const imageTopics = MULTICAM_CAMERAS.flatMap((camera) => {
@@ -632,6 +822,7 @@ export function useMulticamOpsBridge(activeView: MulticamView) {
       const streamKey = `${camera.id}:${activeView}`;
       previewTimesRef.current.delete(streamKey);
       topic.subscribe((message: unknown) => {
+        if (!isCurrentGeneration()) return;
         const now = Date.now();
         const samples = previewTimesRef.current.get(streamKey) || [];
         samples.push(now);
@@ -649,6 +840,7 @@ export function useMulticamOpsBridge(activeView: MulticamView) {
         if (frameFlushRef.current !== null) return;
         frameFlushRef.current = window.requestAnimationFrame(() => {
           frameFlushRef.current = null;
+          if (!isCurrentGeneration()) return;
           const nextFrames = pendingFrames.current;
           if (!nextFrames.size) return;
           if (activeView === "color") colorPendingRef.current = new Map();
@@ -671,15 +863,27 @@ export function useMulticamOpsBridge(activeView: MulticamView) {
       });
       return topic;
     });
-    return () => subscriptions.forEach((topic) => topic.unsubscribe());
+    return () => {
+      unsubscribeWhileConnected(activeRos, subscriptions);
+      if (frameFlushRef.current !== null) {
+        window.cancelAnimationFrame(frameFlushRef.current);
+        frameFlushRef.current = null;
+      }
+      pendingFrames.current.forEach((frame) => {
+        if (!frame.objectUrl) return;
+        objectUrlsRef.current.delete(frame.src);
+        URL.revokeObjectURL(frame.src);
+      });
+      pendingFrames.current.clear();
+    };
   }, [activeRos, activeView]);
 
   useEffect(() => {
-    if (!connected) return;
+    if (!socketConnected) return;
     refreshTopics();
     const timer = window.setInterval(refreshTopics, 5_000);
     return () => window.clearInterval(timer);
-  }, [connected, refreshTopics]);
+  }, [refreshTopics, socketConnected]);
 
   useEffect(() => {
     const ros = rosRef.current;
@@ -688,6 +892,7 @@ export function useMulticamOpsBridge(activeView: MulticamView) {
       return;
     }
     const isCompressedImage = selectedTopicType.includes("CompressedImage");
+    const generation = observerGenerationRef.current;
     const topic = new ROSLIB.Topic({
       ros,
       name: selectedTopic,
@@ -699,6 +904,7 @@ export function useMulticamOpsBridge(activeView: MulticamView) {
     const samples: number[] = [];
     setSelectedTopicSample(null);
     topic.subscribe((message: unknown) => {
+      if (observerGenerationRef.current !== generation || rosRef.current !== ros) return;
       const now = Date.now();
       samples.push(now);
       while (samples.length && now - samples[0] > 5_000) samples.shift();
@@ -711,13 +917,15 @@ export function useMulticamOpsBridge(activeView: MulticamView) {
         preview: previewMessage(message),
       });
     });
-    return () => topic.unsubscribe();
+    return () => unsubscribeWhileConnected(ros, [topic]);
   }, [connected, selectedTopic, selectedTopicType]);
 
   return {
     url,
-    setUrl,
     connected,
+    socketConnected,
+    captureTopicDiscovered,
+    captureStatusFresh,
     connectionMessage,
     retry,
     colorFrames,

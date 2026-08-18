@@ -18,6 +18,7 @@ def _prepare_result_handler(node: ORDigitalTwinNode) -> None:
     node._handle_vlm_implicit_request = lambda *_args: None
     node._mayo_retrieve_stability = {}
     node._mayo_reuse_stability = {}
+    node._publish_world_state_if_dirty = lambda: None
     node._publish_world_state = lambda: None
     node._stamp = lambda: None
 
@@ -244,8 +245,10 @@ def test_disabling_optional_detector_does_not_clear_vlm_phase_evidence() -> None
         clear_object_detection_evidence=lambda: calls.append("detector"),
         clear_perception_evidence=lambda: calls.append("all"),
     )
-    node._refresh_vlm_safety_flags = lambda: None
-    node._publish_world_state = lambda: None
+    node._run_time_based_maintenance = lambda: None
+    node._world_maintenance_signature = lambda: ("unchanged",)
+    node._last_world_emit_signature = ("unchanged",)
+    node._emit_world_state = lambda: None
 
     msg = String()
     msg.data = json.dumps(

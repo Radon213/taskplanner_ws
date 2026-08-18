@@ -19,7 +19,9 @@ from shadow_evaluation.interactive_replay_controller import (
     perception_enabled_from_health,
     record_vlm_input_obligation,
     replay_drain_decision,
+    replay_ground_truth_timer_period,
     replay_state_change_key,
+    replay_timer_periods,
     unresolvable_vlm_tail_count,
     vlm_completion_watermark,
     vlm_observation_id,
@@ -29,6 +31,224 @@ from shadow_evaluation.interactive_replay_controller import (
     vlm_source_slot_id,
     vlm_watchdog_error,
 )
+
+
+class _FakeTimer:
+    def __init__(self, period_sec: float) -> None:
+        self.timer_period_ns = int(period_sec * 1_000_000_000)
+        self.cancel_count = 0
+        self.reset_count = 0
+
+    def cancel(self) -> None:
+        self.cancel_count += 1
+
+    def reset(self) -> None:
+        self.reset_count += 1
+
+
+def test_replay_timer_lifecycle_is_50hz_active_and_1hz_idle() -> None:
+    assert replay_timer_periods("running") == (0.02, 0.5)
+    assert replay_timer_periods("held") == (0.02, 0.5)
+    assert replay_timer_periods("draining") == (0.02, 0.5)
+    for state in ("ready", "paused", "stopped", "completed", "blocked", "error"):
+        assert replay_timer_periods(state) == (1.0, 2.0)
+
+    node = InteractiveReplayControllerNode.__new__(
+        InteractiveReplayControllerNode
+    )
+    node._state = "ready"
+    node._tick_timer = _FakeTimer(1.0)
+    node._runtime_control_timer = _FakeTimer(2.0)
+    node._ground_truth_timer = _FakeTimer(1.0)
+    node._sync_activity_timers_locked()
+    assert node._tick_timer.reset_count == 0
+
+    node._state = "running"
+    node._sync_activity_timers_locked()
+    assert node._tick_timer.timer_period_ns == 20_000_000
+    assert node._runtime_control_timer.timer_period_ns == 500_000_000
+    assert node._ground_truth_timer.timer_period_ns == 50_000_000
+    assert node._tick_timer.cancel_count == node._tick_timer.reset_count == 1
+
+    node._state = "held"
+    node._sync_activity_timers_locked()
+    assert node._tick_timer.reset_count == 1
+
+    node._state = "paused"
+    node._sync_activity_timers_locked()
+    assert node._tick_timer.timer_period_ns == 1_000_000_000
+    assert node._runtime_control_timer.timer_period_ns == 2_000_000_000
+    assert node._ground_truth_timer.timer_period_ns == 1_000_000_000
+    assert node._tick_timer.cancel_count == node._tick_timer.reset_count == 2
+
+
+def test_ground_truth_timer_is_20hz_active_and_1hz_inactive() -> None:
+    for state in ("running", "held", "draining"):
+        assert replay_ground_truth_timer_period(state) == 0.05
+    for state in ("ready", "paused", "stopped", "completed", "blocked", "error"):
+        assert replay_ground_truth_timer_period(state) == 1.0
+
+
+def test_runtime_control_heartbeat_preserves_paused_semantics() -> None:
+    node = InteractiveReplayControllerNode.__new__(
+        InteractiveReplayControllerNode
+    )
+    node._lock = threading.RLock()
+    published: list[str] = []
+    node._publish_runtime_control = published.append
+
+    for state in ("ready", "paused", "running", "held", "draining"):
+        node._state = state
+        node._publish_runtime_control_heartbeat()
+
+    assert published == ["stop", "pause", "start", "start", "start"]
+
+
+@pytest.mark.parametrize("state", ["ready", "paused", "stopped", "completed"])
+def test_idle_tick_uses_timer_as_the_only_clock_throttle(
+    state: str,
+    monkeypatch,
+) -> None:
+    node = InteractiveReplayControllerNode.__new__(
+        InteractiveReplayControllerNode
+    )
+    node._lock = threading.RLock()
+    node._wall_elapsed_sec = 0.0
+    node._last_tick_at = 9.0
+    node._state = state
+    node._effective_playback_rate = 1.0
+    node._force_state_publish = False
+    node._state_publisher = None
+    clock_calls: list[bool] = []
+    node._publish_clock = lambda *, force=False: clock_calls.append(force)
+    node._sync_activity_timers_locked = lambda: None
+    monkeypatch.setattr(replay_controller.time, "monotonic", lambda: 10.0)
+
+    node._tick()
+
+    assert clock_calls == [True]
+
+
+def test_start_reset_publishes_clock_before_runtime_control() -> None:
+    node = InteractiveReplayControllerNode.__new__(
+        InteractiveReplayControllerNode
+    )
+    node._source = SimpleNamespace()
+    node._state = "ready"
+    node._run_id = ""
+    node._mode = "elastic_demo"
+    node._playback_rate = 1.0
+    node._reset_counters = lambda *args, **kwargs: events.append("reset")
+    node._sync_activity_timers_locked = lambda: events.append("timers")
+    node._publish_discontinuous_clock = lambda: events.append("clock")
+    node._publish_runtime_control = lambda command: events.append(
+        f"control:{command}"
+    )
+    events: list[str] = []
+
+    success, _message = node._start(reset=True)
+
+    assert success is True
+    assert events == ["reset", "timers", "clock", "control:start"]
+
+
+def test_discontinuous_controls_publish_clock_before_reset_edge() -> None:
+    source = Path(replay_controller.__file__).read_text(encoding="utf-8")
+    control_method = source[
+        source.index("    def _on_control(")
+        : source.index("    def _on_select_case(")
+    ]
+    for branch, next_branch in (
+        ('elif command == "restart":', 'elif command == "stop":'),
+        ('elif command == "seek":', 'elif command == "status":'),
+    ):
+        section = control_method[
+            control_method.index(branch) : control_method.index(next_branch)
+        ]
+        assert section.index("_publish_discontinuous_clock()") < section.index(
+            "_publish_ground_truth(force=True)"
+        )
+        assert section.index("_publish_ground_truth(force=True)") < section.index(
+            '_publish_runtime_control("reset")'
+        )
+
+    select_method = source[
+        source.index("    def _on_select_case(")
+        : source.index("    def _on_vlm_health(")
+    ]
+    assert select_method.index("_publish_discontinuous_clock()") < select_method.index(
+        "_publish_ground_truth(force=True)"
+    )
+    assert select_method.index("_publish_ground_truth(force=True)") < select_method.index(
+        '_publish_runtime_control("reset")'
+    )
+
+
+def test_pause_and_stop_drain_ground_truth_before_control_edge() -> None:
+    source = Path(replay_controller.__file__).read_text(encoding="utf-8")
+    control_method = source[
+        source.index("    def _on_control(")
+        : source.index("    def _on_select_case(")
+    ]
+    for branch, next_branch, control in (
+        ('elif command == "pause":', 'elif command == "resume":', "pause"),
+        ('elif command == "stop":', 'elif command == "seek":', "stop"),
+    ):
+        section = control_method[
+            control_method.index(branch) : control_method.index(next_branch)
+        ]
+        assert section.index("self._publish_ground_truth()") < section.index(
+            f'self._publish_runtime_control("{control}")'
+        )
+
+
+def test_terminal_transitions_drain_ground_truth_before_stop_edge() -> None:
+    source = Path(replay_controller.__file__).read_text(encoding="utf-8")
+    for start, end in (
+        ("    def _block(", "    def _enter_draining("),
+        ("        if decision.timed_out:", "        if self._drain_clear_since_at is None:"),
+        ("        self._state = \"completed\"", "    def _publish_due_records("),
+    ):
+        section = source[source.index(start) : source.index(end)]
+        assert section.index("self._publish_ground_truth()") < section.index(
+            'self._publish_runtime_control("stop")'
+        )
+
+
+def test_initial_source_load_forces_ground_truth_before_idle_timer() -> None:
+    source = Path(replay_controller.__file__).read_text(encoding="utf-8")
+    init_method = source[
+        source.index("    def __init__(") : source.index("    def _load_source(")
+    ]
+
+    assert init_method.index("self._load_source()") < init_method.index(
+        "self._publish_ground_truth(force=True)"
+    )
+    assert init_method.index("self._publish_ground_truth(force=True)") < init_method.index(
+        "self._ground_truth_timer = self.create_timer("
+    )
+
+
+def test_forced_ground_truth_publish_has_no_second_time_throttle() -> None:
+    node = InteractiveReplayControllerNode.__new__(
+        InteractiveReplayControllerNode
+    )
+    node._lock = threading.RLock()
+    node._run_id = "run-1"
+    node._case_id = "0704_6"
+    node._source_time_sec = 0.0
+    node._source = SimpleNamespace(duration_sec=10.0)
+    node._implicit_request_intervals = ()
+    node._phase_ground_truth_events = ()
+    node._last_ground_truth_key = ""
+    messages: list[String] = []
+    node._ground_truth_publisher = SimpleNamespace(publish=messages.append)
+
+    node._publish_ground_truth(force=True)
+    node._publish_ground_truth(force=True)
+    node._publish_ground_truth()
+
+    assert len(messages) == 2
 
 
 def _decision(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 
 import rclpy
@@ -63,6 +64,10 @@ class MockSkillActionServer(Node):
         self._event_pub = self.create_publisher(TwinEvent, "/skill/events", 20)
         self._world: WorldState | None = None
         self._control_generation = 0
+        self._runtime_accepting_commands = False
+        self._last_lifecycle_control_signature: tuple[str, str] | None = None
+        self._control_lock = threading.Lock()
+        self._accepted_goal_generations: dict[tuple[str, object], int] = {}
         self.create_subscription(
             WorldState,
             "/twin/world_state",
@@ -95,9 +100,27 @@ class MockSkillActionServer(Node):
         self._world = msg
 
     def _on_control(self, msg: String) -> None:
-        command = msg.data.strip().lower()
-        if command in {"stop", "reset"}:
-            self._control_generation += 1
+        command, _, detail = msg.data.strip().partition(":")
+        command = command.lower()
+        signature = (command, detail.strip())
+        with self._control_lock:
+            if command in {"start", "start_runtime", "start_actors", "pause", "resume", "stop"}:
+                if signature == self._last_lifecycle_control_signature:
+                    return
+                self._last_lifecycle_control_signature = signature
+            if command in {"start", "start_actors", "resume"}:
+                self._runtime_accepting_commands = True
+                return
+            if command == "start_runtime":
+                self._runtime_accepting_commands = False
+                self._accepted_goal_generations.clear()
+                return
+            if command in {"pause", "stop", "reset"}:
+                self._runtime_accepting_commands = False
+                self._control_generation += 1
+                self._accepted_goal_generations.clear()
+                if command == "reset":
+                    self._last_lifecycle_control_signature = None
 
     def _find_instrument(self, instrument_id: str, instance_id: str = ""):
         if self._world is None:
@@ -115,11 +138,20 @@ class MockSkillActionServer(Node):
         return None
 
     def _on_goal(self, goal_request: ExecuteSkill.Goal) -> GoalResponse:
-        if goal_request.action not in ALLOWED_ACTIONS:
-            self.get_logger().warning(
-                f"rejected unsupported mock goal action={goal_request.action} tool={goal_request.instrument_id or 'none'}"
-            )
-            return GoalResponse.REJECT
+        with self._control_lock:
+            if not getattr(self, "_runtime_accepting_commands", False):
+                self.get_logger().warning(
+                    "rejected mock goal while simulation runtime is inactive"
+                )
+                return GoalResponse.REJECT
+            if goal_request.action not in ALLOWED_ACTIONS:
+                self.get_logger().warning(
+                    f"rejected unsupported mock goal action={goal_request.action} tool={goal_request.instrument_id or 'none'}"
+                )
+                return GoalResponse.REJECT
+            self._accepted_goal_generations[
+                self._goal_admission_key(goal_request)
+            ] = self._control_generation
         self.get_logger().info(
             f"accepted mock goal action={goal_request.action} tool={goal_request.instrument_id or 'none'} mode={goal_request.mode or 'default'}"
         )
@@ -127,6 +159,27 @@ class MockSkillActionServer(Node):
 
     def _on_cancel(self, _goal_handle) -> CancelResponse:
         return CancelResponse.ACCEPT
+
+    @staticmethod
+    def _goal_admission_key(goal: ExecuteSkill.Goal) -> tuple[str, object]:
+        command_id = str(getattr(goal, "command_id", "") or "").strip()
+        if command_id:
+            return ("command_id", command_id)
+        return ("request_id", id(goal))
+
+    def _begin_goal_execution(self, goal: ExecuteSkill.Goal) -> int:
+        with self._control_lock:
+            generation = self._accepted_goal_generations.pop(
+                self._goal_admission_key(goal),
+                None,
+            )
+            if (
+                generation is None
+                or not self._runtime_accepting_commands
+                or generation != self._control_generation
+            ):
+                raise SkillGoalInterrupted()
+            return generation
 
     def _stamp(self):
         return self.get_clock().now().to_msg()
@@ -141,8 +194,14 @@ class MockSkillActionServer(Node):
         goal_handle.publish_feedback(feedback)
 
     def _guard_goal_active(self, goal_handle, generation: int) -> None:
-        if goal_handle.is_cancel_requested or generation != self._control_generation:
+        if goal_handle.is_cancel_requested:
             raise SkillGoalInterrupted()
+        with self._control_lock:
+            if (
+                not self._runtime_accepting_commands
+                or generation != self._control_generation
+            ):
+                raise SkillGoalInterrupted()
 
     def _step_sleep(self, goal_handle, state: str, message: str, start_progress: float, end_progress: float, duration_sec: float, steps: int = 4, generation: int | None = None) -> None:
         if generation is not None:
@@ -376,7 +435,7 @@ class MockSkillActionServer(Node):
     def _execute_goal(self, goal_handle):
         goal = goal_handle.request
         action = ACTION_ALIASES.get(goal.action, goal.action)
-        generation = self._control_generation
+        generation = self._begin_goal_execution(goal)
         event = None
         message = ""
 

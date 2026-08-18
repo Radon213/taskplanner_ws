@@ -328,7 +328,7 @@ function StatusBadge({ state, label }: { state: string; label?: string }) {
 function DebugHeader({
   connected,
   status,
-  statusAgeSec,
+  statusReceivedAt,
   url,
   manualControlLabel,
   manualControlDisabled,
@@ -338,7 +338,7 @@ function DebugHeader({
 }: {
   connected: boolean;
   status: IntegrationDebugStatus | null;
-  statusAgeSec: number | null;
+  statusReceivedAt: number;
   url: string;
   manualControlLabel: string;
   manualControlDisabled: boolean;
@@ -346,6 +346,17 @@ function DebugHeader({
   onManualControl: () => void;
   onExit: () => void;
 }) {
+  const [statusAgeSec, setStatusAgeSec] = useState<number | null>(() =>
+    statusReceivedAt ? Math.max(0, (Date.now() - statusReceivedAt) / 1_000) : null,
+  );
+  useEffect(() => {
+    const updateAge = () => setStatusAgeSec(
+      statusReceivedAt ? Math.max(0, (Date.now() - statusReceivedAt) / 1_000) : null,
+    );
+    updateAge();
+    const timer = window.setInterval(updateAge, 500);
+    return () => window.clearInterval(timer);
+  }, [statusReceivedAt]);
   const ManualControlIcon = status?.action.recovery_required || status?.session.fault_locked
     ? status?.session.fault_locked ? RotateCcw : ShieldAlert
     : status?.session.armed ? CircleStop : Play;
@@ -1769,7 +1780,7 @@ export function DebugWorkspace({
       <DebugHeader
         connected={bridge.connected}
         status={bridge.status}
-        statusAgeSec={statusAgeSec}
+        statusReceivedAt={bridge.statusReceivedAt}
         url={url}
         manualControlLabel={manualControlLabel}
         manualControlDisabled={manualControlDisabled}
@@ -1778,10 +1789,10 @@ export function DebugWorkspace({
         onExit={() => void exitDebugMode()}
       />
       {!bridge.status ? (
-        <ConnectionFallback connected={bridge.connected} reconnecting={bridge.reconnecting} error={bridge.connectionError} url={url} onRetry={bridge.retry} />
+        <ConnectionFallback connected={bridge.transportConnected} reconnecting={bridge.reconnecting} error={bridge.connectionError} url={url} onRetry={bridge.retry} />
       ) : (
         <>
-          {!bridge.connected ? <div className="debug-disconnected-banner" role="status"><AlertTriangle size={16} aria-hidden="true" />ROSBridge 재연결 중입니다. 표시된 값은 마지막 수신 상태이며 모든 쓰기 제어는 잠겼습니다.</div> : null}
+          {!bridge.connected ? <div className="debug-disconnected-banner" role="status"><AlertTriangle size={16} aria-hidden="true" /><span>{bridge.transportConnected ? "디버그 상태 heartbeat가 만료되었습니다. 표시된 값은 마지막 수신 상태이며 모든 쓰기 제어는 잠겼습니다." : "ROSBridge 재연결 중입니다. 표시된 값은 마지막 수신 상태이며 모든 쓰기 제어는 잠겼습니다."}</span><button className="runtime-transition-retry" onClick={bridge.retry} type="button">다시 연결</button></div> : null}
           <div className="debug-tabs" role="tablist" aria-label="디버그 모드 기능">
             {tabs.map((tab, index) => {
               const Icon = tab.icon;

@@ -62,7 +62,7 @@ class InterruptPreemptionTest(unittest.TestCase):
     def test_floor_drop_blocks_until_human_recovery(self) -> None:
         twin = ORDigitalTwin(load_bundle(SPEC_ROOT / "thyroidectomy"))
         tool_id = twin.spec.list_instrument_ids()[0]
-        state = twin.instrument_states[tool_id]
+        state = twin.instrument_states[f"{tool_id}#1"]
         twin._set_lifecycle(state, LIFECYCLE_DROPPED_FLOOR, confidence=0.99)
         twin._recompute_transient_state()
 

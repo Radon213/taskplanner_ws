@@ -111,6 +111,14 @@ starts installed LM Studio and Unsloth catalog backends, prepares
 mode-appropriate perception/video services, and starts the selected ROS
 runtime. The dashboard remains at `http://127.0.0.1:4173`.
 
+Once the dashboard is running, its **Runtime mode** selector performs this
+same reviewed profile transition automatically. It is serialized with terminal
+launches, accepts only `live`, `llm-surgeon`, `replay`, or `debug`, and reports
+starting or retryable failure inline before ROS reconnects. The host control
+service is loopback-only; its token is read by the Vite server-side proxy and
+is never sent to the browser. Selecting a mode changes runtime services only;
+it does not issue a physical robot Action goal.
+
 Normal startup reuses the repository's existing `build/` and `install/`
 artifacts plus the persistent `taskplanner_web_node_modules` volume. It does not
 run `colcon build`, rebuild images, or run `npm install`. For a first deployment

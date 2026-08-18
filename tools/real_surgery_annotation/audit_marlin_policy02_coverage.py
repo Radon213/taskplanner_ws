@@ -17,6 +17,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from tools.real_surgery_annotation.artifact_path_contract import (
+    resolve_repo_artifact_identity,
+)
 from tools.real_surgery_annotation.build_policy02_review_index import (
     calculate_scan_coverage,
     load_json,
@@ -59,6 +62,7 @@ def validate_run_report(
     proposal_path: Path,
     report_path: Path,
     timeline_path: Path,
+    repo_root: Path,
 ) -> dict[str, Any]:
     report = load_json(report_path)
     errors: list[str] = []
@@ -72,26 +76,63 @@ def validate_run_report(
         errors.append("case_id mismatch")
     if report.get("phase_annotation_performed") is not False:
         errors.append("Marlin must not annotate Phase")
-    if report.get("output") != str(proposal_path.resolve()):
-        errors.append("report output path mismatch")
     proposal_sha256 = sha256_file(proposal_path)
+    try:
+        resolve_repo_artifact_identity(
+            report.get("output"),
+            expected_path=proposal_path,
+            repo_root=repo_root,
+            expected_sha256=report.get("output_sha256"),
+            label="report output",
+        )
+    except ValueError as exc:
+        errors.append(str(exc))
     if report.get("output_sha256") != proposal_sha256:
         errors.append("proposal SHA-256 mismatch")
 
     inputs = report.get("inputs", {})
-    if inputs.get("timeline") != str(timeline_path.resolve()):
-        errors.append("timeline path mismatch")
+    try:
+        resolve_repo_artifact_identity(
+            inputs.get("timeline"),
+            expected_path=timeline_path,
+            repo_root=repo_root,
+            expected_sha256=inputs.get("timeline_sha256"),
+            label="timeline",
+        )
+    except ValueError as exc:
+        errors.append(str(exc))
     if inputs.get("timeline_sha256") != sha256_file(timeline_path):
         errors.append("timeline SHA-256 mismatch")
     anchor_value = inputs.get("anchors")
-    anchor_path = (
-        Path(anchor_value)
-        if isinstance(anchor_value, str) and anchor_value
-        else None
-    )
-    if anchor_path is None or not anchor_path.is_file():
-        errors.append("anchor file missing")
-    elif inputs.get("anchors_sha256") != sha256_file(anchor_path):
+    anchor_path: Path | None = None
+    if isinstance(anchor_value, str) and anchor_value:
+        declared_anchor = Path(anchor_value)
+        canonical_parent = Path(
+            "annotations", "observable_tool_events", "cases", case_id
+        )
+        canonical_tail = (*canonical_parent.parts, declared_anchor.name)
+        if declared_anchor.name and tuple(
+            declared_anchor.parts[-len(canonical_tail) :]
+        ) == canonical_tail:
+            anchor_path = repo_root / canonical_parent / declared_anchor.name
+    if anchor_path is None:
+        errors.append("anchor path does not match the canonical case contract")
+    else:
+        try:
+            resolve_repo_artifact_identity(
+                anchor_value,
+                expected_path=anchor_path,
+                repo_root=repo_root,
+                expected_sha256=inputs.get("anchors_sha256"),
+                label="anchor",
+            )
+        except ValueError as exc:
+            errors.append(str(exc))
+    if (
+        anchor_path is not None
+        and anchor_path.is_file()
+        and inputs.get("anchors_sha256") != sha256_file(anchor_path)
+    ):
         errors.append("anchor SHA-256 mismatch")
     video_value = inputs.get("video")
     video_sha256 = inputs.get("video_sha256")
@@ -255,6 +296,7 @@ def audit_case(repo_root: Path, case_id: str) -> dict[str, Any]:
                 proposal_path=proposal_path,
                 report_path=report_path,
                 timeline_path=timeline_path,
+                repo_root=repo_root,
             )
             revisions.add(str(run["model_revision"]))
             intervals, counts = clip_intervals_from_records(

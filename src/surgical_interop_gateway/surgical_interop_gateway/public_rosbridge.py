@@ -20,6 +20,8 @@ from types import ModuleType
 from typing import Any
 
 from surgical_interop_gateway.public_bridge_policy import (
+    PUBLIC_BRIDGE_CONTRACT,
+    PUBLIC_BRIDGE_CONTRACT_HEADER,
     PUBLIC_MAX_CLIENTS,
     PUBLIC_MAX_INCOMING_BYTES,
     PUBLIC_MAX_INCOMING_QUEUE,
@@ -44,6 +46,12 @@ def _bound_public_tornado_settings(settings: dict[str, Any]) -> None:
     """Force Tornado to reject oversized frames before handler allocation."""
 
     settings["websocket_max_message_size"] = PUBLIC_MAX_INCOMING_BYTES
+
+
+def _set_public_contract_header(handler: Any) -> None:
+    """Attach the immutable public-bridge identity to a WebSocket upgrade."""
+
+    handler.set_header(PUBLIC_BRIDGE_CONTRACT_HEADER, PUBLIC_BRIDGE_CONTRACT)
 
 
 def _build_public_rosbridge_protocol(
@@ -204,6 +212,7 @@ def main() -> None:
                 self.set_status(403)
                 self.finish("Forbidden")
                 return
+            _set_public_contract_header(self)
             super().prepare()
 
         def check_origin(self, origin: str) -> bool:

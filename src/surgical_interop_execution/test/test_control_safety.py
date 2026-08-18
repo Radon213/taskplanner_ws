@@ -558,6 +558,55 @@ def test_only_start_or_start_actors_enable_external_dispatch():
     assert bridge._runtime_accepting_commands
 
 
+def test_reset_is_repeatable_and_reopens_the_next_start_edge():
+    bridge = _bare_bridge()
+    bridge._runtime_accepting_commands = False
+    bridge._last_lifecycle_control_signature = None
+    bridge._bed_robot_revision = 7
+
+    bridge._on_control(SimpleNamespace(data="start"))
+    bridge._on_control(SimpleNamespace(data="start"))
+    bridge._on_control(SimpleNamespace(data="reset"))
+    assert bridge._bed_robot_revision is None
+    bridge._bed_robot_revision = 9
+    bridge._on_control(SimpleNamespace(data="reset"))
+    assert bridge._bed_robot_revision is None
+    bridge._on_control(SimpleNamespace(data="start"))
+
+    assert bridge._runtime_accepting_commands
+    assert bridge._last_lifecycle_control_signature == ("start", "")
+
+
+def test_full_lifecycle_transport_duplicates_are_edge_idempotent():
+    bridge = _bare_bridge()
+    bridge._runtime_accepting_commands = False
+    bridge._last_lifecycle_control_signature = None
+    reset_calls: list[bool] = []
+    bridge._dispatch_ledger = SimpleNamespace(
+        clear=lambda: reset_calls.append(True)
+    )
+
+    for control in (
+        "reset",
+        "reset",
+        "start_runtime:P03",
+        "start_runtime:P03",
+        "start_actors:P03",
+        "start_actors:P03",
+        "pause",
+        "pause",
+        "resume",
+        "resume",
+        "stop",
+        "stop",
+    ):
+        bridge._on_control(SimpleNamespace(data=control))
+
+    assert reset_calls == [True, True]
+    assert bridge._runtime_accepting_commands is False
+    assert bridge._last_lifecycle_control_signature == ("stop", "")
+
+
 def _bed_robot_snapshot(
     revision: int = 1,
     *,

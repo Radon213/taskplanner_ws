@@ -55,6 +55,13 @@ from .twin import ORDigitalTwin
 from .models import RankedToolPredictionBelief
 
 
+WORLD_STATE_MAINTENANCE_PERIOD_SEC = 0.5
+WORLD_STATE_IDLE_CHECKPOINT_SEC = 2.0
+WORLD_STATE_KNOWN_INACTIVE = frozenset(
+    {"idle", "halted", "completed", "terminated"}
+)
+
+
 class ORDigitalTwinNode(Node):
     _IMPORTANT_NORMAL_EVENTS = {
         "PhaseUpdated",
@@ -188,6 +195,9 @@ class ORDigitalTwinNode(Node):
             str, tuple[int, int, float]
         ] = {}
         self._visual_runtime_epoch_floor = 0
+        self._last_lifecycle_control_signature: tuple[str, str] | None = None
+        self._last_world_emit_signature: tuple | None = None
+        self._last_world_emit_monotonic = 0.0
         self._vlm_evidence_blocked = False
         self._perception_health_seen = False
         self._perception_enabled = True
@@ -315,7 +325,10 @@ class ORDigitalTwinNode(Node):
         self.create_subscription(FilteredPhase, "/phase/filtered", self._on_phase, 20)
         self.create_subscription(String, "/simulation/control_state", self._on_control, 20)
 
-        self.create_timer(0.5, self._publish_world_state)
+        self.create_timer(
+            WORLD_STATE_MAINTENANCE_PERIOD_SEC,
+            self._on_world_state_timer,
+        )
         self._publish_world_state()
 
     def _on_parameters_changed(self, params):
@@ -339,6 +352,7 @@ class ORDigitalTwinNode(Node):
                     self._pending_bed_robot_arm_group_requests.clear()
                     self._reset_bed_robot_controller_freshness()
                     self._phase_entered_ros_sec = self._stamp_sec(self._stamp())
+                    self._last_lifecycle_control_signature = None
                     self._publish_world_state()
                 except Exception as exc:
                     return SetParametersResult(
@@ -416,7 +430,7 @@ class ORDigitalTwinNode(Node):
 
     def _on_vlm_health(self, topic: str, msg: VLMHealth) -> None:
         self._vlm_health_by_topic[topic] = (msg, time.monotonic())
-        self._refresh_vlm_safety_flags()
+        self._publish_world_state_if_dirty()
 
     def _on_input_source_status(self, msg: InputSourceStatus) -> None:
         source_id = str(msg.source_id or "").strip().lower()
@@ -424,7 +438,7 @@ class ORDigitalTwinNode(Node):
             return
         self._input_source_status_by_id[source_id] = msg
         if source_id == "vlm":
-            self._refresh_vlm_safety_flags()
+            self._publish_world_state_if_dirty()
 
     def _source_is_ready(self, source_id: str) -> bool:
         status = getattr(self, "_input_source_status_by_id", {}).get(source_id)
@@ -435,7 +449,10 @@ class ORDigitalTwinNode(Node):
     def _perception_gate_active(self) -> bool:
         # RF-DETR remains advisory. This gate concerns the VLM evidence stream
         # itself, so raw pixels may still be used when detection is disabled.
-        self._refresh_vlm_safety_flags()
+        # Refreshing this gate can itself withdraw public VLM evidence when a
+        # health lease expires. Publish that semantic edge immediately rather
+        # than waiting for the next maintenance checkpoint.
+        self._publish_world_state_if_dirty()
         return bool(
             "vlm_unhealthy"
             in getattr(getattr(self._twin, "state", None), "safety_flags", [])
@@ -581,12 +598,26 @@ class ORDigitalTwinNode(Node):
             or payload.get("schema") != "taskplanner.rfdetr_health.v1"
         ):
             return
+        previous_health = (
+            bool(getattr(self, "_perception_health_seen", False)),
+            bool(getattr(self, "_perception_enabled", True)),
+        )
         self._perception_health_seen = True
         self._perception_enabled = bool(payload.get("enabled"))
         if not self._perception_enabled:
             self._twin.clear_object_detection_evidence()
-        self._refresh_vlm_safety_flags()
-        self._publish_world_state()
+        health_changed = previous_health != (
+            self._perception_health_seen,
+            self._perception_enabled,
+        )
+        self._run_time_based_maintenance()
+        current_signature = self._world_maintenance_signature()
+        if (
+            health_changed
+            or getattr(self, "_last_world_emit_signature", None) is None
+            or current_signature != self._last_world_emit_signature
+        ):
+            self._emit_world_state()
 
     def _refresh_vlm_safety_flags(self) -> None:
         required_topics = self._required_vlm_health_topics()
@@ -707,12 +738,111 @@ class ORDigitalTwinNode(Node):
             augmented.setdefault("status", kwargs["status"])
         return augmented
 
-    def _publish_world_state(self) -> None:
-        self._expire_bed_robot_controller_status()
+    def _world_maintenance_signature(self) -> tuple:
+        state = self._twin.state
+        retraction = state.bed_robot_arm_groups.get("retraction")
+        ranked = tuple(
+            (
+                int(item.rank),
+                str(item.instrument_id),
+                float(item.confidence),
+                float(item.stability_sec),
+            )
+            for item in state.ranked_tool_predictions
+        )
+        return (
+            (
+                bool(getattr(retraction, "connected", False)),
+                str(getattr(retraction, "state", "unknown")),
+                str(getattr(retraction, "arm_id", "")),
+                str(getattr(retraction, "end_effector_profile", "")),
+                str(getattr(retraction, "error_code", "")),
+            ),
+            str(state.filtered_phase),
+            float(state.phase_confidence),
+            bool(state.phase_uncertain),
+            float(state.phase_stability),
+            "vlm_unhealthy" in state.safety_flags,
+            str(state.predicted_tool),
+            float(state.predicted_tool_confidence),
+            float(state.predicted_tool_stability_sec),
+            ranked,
+            bool(state.implicit_request_visible),
+            str(state.implicit_request_tool),
+            str(state.implicit_request_hand_pose),
+            float(state.implicit_request_confidence),
+            float(state.implicit_request_stability_sec),
+        )
+
+    def _run_time_based_maintenance(self) -> bool:
+        before = self._world_maintenance_signature()
+        bed_expired = self._expire_bed_robot_controller_status()
         self._expire_stale_vlm_evidence(
             self._stamp_sec(self._stamp()),
         )
         self._refresh_vlm_safety_flags()
+        return bool(
+            bed_expired
+            or self._world_maintenance_signature() != before
+        )
+
+    def _world_state_emit_due(
+        self,
+        *,
+        now_monotonic: float,
+        signature: tuple,
+    ) -> bool:
+        state = self._twin.state
+        execution_state = str(state.execution_state).strip().lower()
+        known_inactive = (
+            not bool(state.running)
+            and execution_state in WORLD_STATE_KNOWN_INACTIVE
+        )
+        if not known_inactive:
+            # Active, paused, transitional, or inconsistent/unknown states use
+            # the fail-safe 0.5 s cadence.
+            return True
+        previous_signature = getattr(
+            self,
+            "_last_world_emit_signature",
+            None,
+        )
+        if previous_signature is None or signature != previous_signature:
+            return True
+        return (
+            float(now_monotonic)
+            - float(getattr(self, "_last_world_emit_monotonic", 0.0))
+            >= WORLD_STATE_IDLE_CHECKPOINT_SEC
+        )
+
+    def _on_world_state_timer(self) -> None:
+        self._run_time_based_maintenance()
+        signature = self._world_maintenance_signature()
+        if self._world_state_emit_due(
+            now_monotonic=self._monotonic_sec(),
+            signature=signature,
+        ):
+            self._emit_world_state()
+
+    def _publish_world_state_if_dirty(self) -> None:
+        self._run_time_based_maintenance()
+        signature = self._world_maintenance_signature()
+        if (
+            getattr(self, "_last_world_emit_signature", None) is None
+            or signature != self._last_world_emit_signature
+        ):
+            self._emit_world_state()
+
+    def _publish_world_state(self) -> None:
+        """Run maintenance and immediately emit a semantic state edge."""
+
+        self._run_time_based_maintenance()
+        self._emit_world_state()
+
+    def _emit_world_state(self) -> None:
+        # Normalization may update public fields outside the compact cadence
+        # signature. Run it only on an actual emission so an inactive skipped
+        # checkpoint cannot hide an untracked semantic mutation.
         self._twin.normalize_for_publish()
         world = WorldState()
         world.stamp = self._stamp()
@@ -972,6 +1102,9 @@ class ORDigitalTwinNode(Node):
         self._simulation_state_pub.publish(simulation)
         self._publish_perception_scene(world)
         self._publish_vlm_context(world)
+        # Commit the gate only after the entire public output bundle succeeds.
+        self._last_world_emit_signature = self._world_maintenance_signature()
+        self._last_world_emit_monotonic = self._monotonic_sec()
 
     def _stamp_all_bed_robot_arm_groups(self) -> None:
         for belief in self._twin.state.bed_robot_arm_groups.values():
@@ -2769,6 +2902,11 @@ class ORDigitalTwinNode(Node):
             return
         self._bed_robot_status_received_monotonic = self._monotonic_sec()
         self._bed_robot_status_source_stamp_ns = source_stamp_ns
+        # Accepted controller heartbeats keep freshness alive, but they are not
+        # clinical/task events. Publishing each one flooded replay timelines
+        # even while no bed-robot request or command existed.
+        if not self._twin.bed_robot_arm_controller_state_changed():
+            return
         self._publish_event(
             "BedRobotArmControllerStateUpdated",
             status=self._twin.state.bed_robot_arm_groups["retraction"].state,
@@ -2816,11 +2954,11 @@ class ORDigitalTwinNode(Node):
         self._bed_robot_status_received_monotonic = 0.0
         self._bed_robot_status_source_stamp_ns = None
 
-    def _expire_bed_robot_controller_status(self) -> None:
+    def _expire_bed_robot_controller_status(self) -> bool:
         received_at = self._bed_robot_status_received_monotonic
         source_stamp_ns = self._bed_robot_status_source_stamp_ns
         if received_at <= 0.0 or source_stamp_ns is None:
-            return
+            return False
         receipt_age_sec = self._monotonic_sec() - received_at
         source_age_sec = self._bed_robot_controller_source_age_sec(source_stamp_ns)
         if (
@@ -2828,9 +2966,10 @@ class ORDigitalTwinNode(Node):
             and source_age_sec <= self._bed_robot_source_max_age_sec
             and source_age_sec >= -self._bed_robot_source_future_tolerance_sec
         ):
-            return
+            return False
         self._reset_bed_robot_controller_freshness()
-        if self._twin.expire_bed_robot_arm_controller_status():
+        expired = bool(self._twin.expire_bed_robot_arm_controller_status())
+        if expired:
             self._publish_event(
                 "BedRobotArmControllerStateExpired",
                 status="unknown",
@@ -2841,6 +2980,7 @@ class ORDigitalTwinNode(Node):
                     "source_age_sec": source_age_sec,
                 },
             )
+        return expired
 
     def _on_bed_robot_arm_group_status(self, msg: BedRobotArmGroupStatus) -> None:
         if not int(msg.stamp.sec) and not int(msg.stamp.nanosec):
@@ -3031,6 +3171,56 @@ class ORDigitalTwinNode(Node):
         command, _, start_phase_id = raw_command.partition(":")
         command = command.strip().lower()
         start_phase_id = start_phase_id.strip()
+        lifecycle_commands = {
+            "start",
+            "start_runtime",
+            "pause",
+            "resume",
+            "stop",
+        }
+        signature = (command, start_phase_id)
+        if command in lifecycle_commands:
+            if signature == getattr(
+                self, "_last_lifecycle_control_signature", None
+            ):
+                # Duplicate transport frames are mutation-idempotent, but a
+                # fresh state acknowledgment is still required by the
+                # manager's publish-until-observed retry contract.
+                self._publish_world_state()
+                return
+            if (
+                command == "start"
+                and not start_phase_id
+                and bool(self._twin.state.running)
+                and self._twin.state.execution_state == "running"
+            ):
+                self._last_lifecycle_control_signature = signature
+                self._publish_world_state()
+                return
+            if (
+                command == "pause"
+                and self._twin.state.execution_state == "paused"
+            ):
+                self._last_lifecycle_control_signature = signature
+                self._publish_world_state()
+                return
+            if (
+                command == "resume"
+                and bool(self._twin.state.running)
+                and self._twin.state.execution_state == "running"
+            ):
+                self._last_lifecycle_control_signature = signature
+                self._publish_world_state()
+                return
+            if (
+                command == "stop"
+                and not bool(self._twin.state.running)
+                and self._twin.state.execution_state == "halted"
+            ):
+                self._last_lifecycle_control_signature = signature
+                self._publish_world_state()
+                return
+            self._last_lifecycle_control_signature = signature
         if command in {
             "start",
             "start_runtime",
@@ -3062,6 +3252,7 @@ class ORDigitalTwinNode(Node):
             self._clear_vlm_implicit_request_state()
             self._twin.set_execution_state(False, "halted")
         elif command == "reset":
+            self._last_lifecycle_control_signature = None
             self._pending_bed_robot_arm_group_requests.clear()
             self._clear_vlm_implicit_request_state()
             self._clear_tool_histories()

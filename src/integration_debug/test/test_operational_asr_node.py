@@ -5,6 +5,7 @@ import time
 
 import pytest
 import rclpy
+from rclpy._rclpy_pybind11 import RCLError
 from rclpy.qos import DurabilityPolicy, ReliabilityPolicy
 from surgical_msgs.srv import AsrControl
 
@@ -219,6 +220,69 @@ def test_refresh_no_input_is_successful_and_shutdown_is_idempotent(node) -> None
     assert node.close() is True
     assert node._runtime.close_calls == 1
     assert node._sentence_pub is None
+
+
+def test_close_publishes_final_status_while_context_is_valid(
+    node, monkeypatch
+) -> None:
+    published = []
+    monkeypatch.setattr(node, "_publish_status", lambda: published.append(True))
+
+    assert node.close() is True
+
+    assert published == [True]
+    assert node._runtime.close_calls == 1
+
+
+def test_close_skips_final_status_after_context_shutdown(node, monkeypatch) -> None:
+    published = []
+    with monkeypatch.context() as scoped:
+        scoped.setattr(rclpy, "ok", lambda *, context=None: False)
+        scoped.setattr(node, "_publish_status", lambda: published.append(True))
+
+        assert node.close() is True
+
+    assert published == []
+    assert node._runtime.close_calls == 1
+    assert node._runtime.events == []
+    assert node._sentence_pub is None
+
+
+def test_close_tolerates_only_context_invalidation_publish_race(
+    node, monkeypatch
+) -> None:
+    context_states = iter((True, False))
+
+    def context_ok(*, context=None) -> bool:
+        assert context is node.context
+        return next(context_states)
+
+    def invalid_context_publish() -> None:
+        raise RCLError("publisher context became invalid")
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(rclpy, "ok", context_ok)
+        scoped.setattr(node, "_publish_status", invalid_context_publish)
+
+        assert node.close() is True
+
+    assert node._runtime.close_calls == 1
+
+
+def test_close_preserves_publish_error_while_context_remains_valid(
+    node, monkeypatch
+) -> None:
+    def invalid_publish() -> None:
+        raise RCLError("publisher failed while context remained valid")
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(rclpy, "ok", lambda *, context=None: True)
+        scoped.setattr(node, "_publish_status", invalid_publish)
+
+        with pytest.raises(RCLError, match="context remained valid"):
+            node.close()
+
+    assert node._runtime.close_calls == 1
 
 
 def test_start_and_stop_handlers_are_serialized(node) -> None:

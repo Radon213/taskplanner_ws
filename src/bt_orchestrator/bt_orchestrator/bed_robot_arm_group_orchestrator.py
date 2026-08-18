@@ -150,6 +150,7 @@ class BedRobotArmGroupOrchestrator(Node):
         self._controller_status_signature: tuple[object, ...] | None = None
         self._controller_status_epoch = 0
         self._operation_status_ns: dict[str, int] = {}
+        self._last_lifecycle_control_signature: tuple[str, str] | None = None
         self.add_on_set_parameters_callback(self._on_parameters_changed)
 
         self._request_pub = self.create_publisher(
@@ -218,6 +219,7 @@ class BedRobotArmGroupOrchestrator(Node):
                     )
                 self._spec_dir = new_spec_dir
                 self._spec = new_spec
+                self._last_lifecycle_control_signature = None
                 self._clear_runtime_state()
             elif parameter.name == "vlm_confidence_threshold":
                 self._confidence_threshold = float(parameter.value)
@@ -1101,15 +1103,38 @@ class BedRobotArmGroupOrchestrator(Node):
         self._operation_status_ns.clear()
 
     def _on_control(self, msg: String) -> None:
-        command = msg.data.partition(":")[0].strip().lower()
+        command, _, detail = msg.data.partition(":")
+        command = command.strip().lower()
+        signature = (command, detail.strip())
+        if command in {
+            "start",
+            "start_runtime",
+            "start_actors",
+            "pause",
+            "resume",
+            "stop",
+        }:
+            if signature == getattr(
+                self, "_last_lifecycle_control_signature", None
+            ):
+                return
+            self._last_lifecycle_control_signature = signature
         if command == "start":
+            if self._bt_ready:
+                return
             self._clear_runtime_state()
             self._bt_ready = True
         elif command == "start_runtime":
             self._clear_runtime_state()
         elif command == "start_actors":
             self._bt_ready = True
+        elif command == "pause":
+            self._bt_ready = False
+        elif command == "resume":
+            self._bt_ready = True
         elif command in {"stop", "reset"}:
+            if command == "reset":
+                self._last_lifecycle_control_signature = None
             self._clear_runtime_state()
 
 

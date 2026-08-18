@@ -7,14 +7,17 @@ from types import SimpleNamespace
 
 from builtin_interfaces.msg import Time
 import requests
+import vlm_node.real_vlm as real_vlm
 
 from vlm_node.real_vlm import (
     INFERENCE_FAILURE_HISTORY_LENGTH,
+    INFERENCE_TRIGGER_FORCED,
     INFERENCE_TRIGGER_PERIODIC_LIVE,
     INFERENCE_TRIGGER_REPLAY_FRAME,
     INFERENCE_TRIGGER_SPEECH,
     INFERENCE_TRIGGER_SOURCE_FRAME,
     InferenceBackpressure,
+    InferenceFailureBackoff,
     ModelImage,
     RealVLMNode,
     actor_log_request_context,
@@ -179,6 +182,193 @@ def test_queued_source_frames_keep_only_one_pending_slot() -> None:
     assert policy.queue("source-frame-3").disposition == "coalesced"
     assert policy.begin() == "source-frame-3"
     assert policy.complete() is None
+
+
+def test_transport_failure_backoff_grows_bounded_and_resets() -> None:
+    policy = InferenceFailureBackoff(initial_sec=0.5, maximum_sec=2.0)
+
+    assert policy.record_failure(now_monotonic=10.0) == 0.5
+    assert policy.remaining(now_monotonic=10.25) == 0.25
+    assert policy.record_failure(now_monotonic=10.5) == 1.0
+    assert policy.record_failure(now_monotonic=11.5) == 2.0
+    assert policy.record_failure(now_monotonic=13.5) == 2.0
+    assert policy.snapshot(now_monotonic=13.5)["consecutive_failures"] == 4
+
+    policy.record_success()
+
+    assert policy.snapshot(now_monotonic=13.5) == {
+        "consecutive_failures": 0,
+        "remaining_sec": 0.0,
+    }
+
+
+def test_transport_backoff_retains_latest_frame_after_fast_failure() -> None:
+    node = RealVLMNode.__new__(RealVLMNode)
+    node._inference_backpressure = InferenceBackpressure()
+    node._transport_failure_backoff = InferenceFailureBackoff(
+        initial_sec=10.0,
+        maximum_sec=10.0,
+    )
+    calls: list[str] = []
+
+    def tick_once(*, force: bool, inference_trigger: str) -> None:
+        assert force
+        calls.append(inference_trigger)
+        node._inference_backpressure.queue("newest-frame")
+        node._transport_failure_backoff.record_failure()
+
+    node._tick_once = tick_once
+
+    assert node._tick(force=True, inference_trigger="failing-frame")
+    assert calls == ["failing-frame"]
+    assert node._inference_backpressure.snapshot()["in_flight"] is False
+    assert node._inference_backpressure.snapshot()["pending_trigger"] == "newest-frame"
+
+
+def test_transport_backoff_retains_source_frame_and_schedules_worker() -> None:
+    node = RealVLMNode.__new__(RealVLMNode)
+    node._inference_backpressure = InferenceBackpressure()
+    node._transport_failure_backoff = InferenceFailureBackoff(
+        initial_sec=10.0,
+        maximum_sec=10.0,
+    )
+    node._transport_failure_backoff.record_failure()
+    node._inference_wakeup = threading.Event()
+
+    admission = node._queue_inference(INFERENCE_TRIGGER_SOURCE_FRAME)
+
+    assert admission.disposition == "backoff"
+    assert node._inference_wakeup.is_set()
+    assert (
+        node._inference_backpressure.snapshot()["pending_trigger"]
+        == INFERENCE_TRIGGER_SOURCE_FRAME
+    )
+
+
+def test_transport_backoff_timer_retries_latest_source_frame() -> None:
+    node = RealVLMNode.__new__(RealVLMNode)
+    node._inference_backpressure = InferenceBackpressure()
+    node._transport_failure_backoff = InferenceFailureBackoff(
+        initial_sec=0.03,
+        maximum_sec=0.03,
+    )
+    node._transport_failure_backoff.record_failure()
+    node._inference_wakeup = threading.Event()
+    node._inference_shutdown = threading.Event()
+    node._inference_retry_lock = threading.Lock()
+    node._inference_retry_timer = None
+
+    try:
+        first = node._queue_inference("older-frame")
+        second = node._queue_inference("newest-frame")
+
+        assert first.disposition == "backoff"
+        assert second.disposition == "backoff"
+        assert not node._inference_wakeup.wait(timeout=0.005)
+        assert node._inference_wakeup.wait(timeout=0.2)
+        assert node._inference_backpressure.begin() == "newest-frame"
+    finally:
+        node._cancel_inference_retry()
+
+
+def test_forced_request_queued_during_failure_bypasses_pending_backoff() -> None:
+    node = RealVLMNode.__new__(RealVLMNode)
+    node._inference_backpressure = InferenceBackpressure()
+    node._transport_failure_backoff = InferenceFailureBackoff(
+        initial_sec=10.0,
+        maximum_sec=10.0,
+    )
+    node._inference_wakeup = threading.Event()
+    node._inference_shutdown = threading.Event()
+    node._inference_retry_lock = threading.Lock()
+    node._inference_retry_timer = None
+    started = threading.Event()
+    release = threading.Event()
+
+    def tick_once(*, force: bool, inference_trigger: str) -> None:
+        assert force
+        assert inference_trigger == "ordinary-frame"
+        started.set()
+        assert release.wait(timeout=2.0)
+
+    node._tick_once = tick_once
+    worker = threading.Thread(
+        target=lambda: node._tick(
+            force=True,
+            inference_trigger="ordinary-frame",
+        ),
+        daemon=True,
+    )
+    worker.start()
+    assert started.wait(timeout=2.0)
+
+    node._transport_failure_backoff.record_failure()
+    node._queue_inference(INFERENCE_TRIGGER_FORCED)
+    node._inference_wakeup.clear()
+    release.set()
+    worker.join(timeout=2.0)
+
+    assert not worker.is_alive()
+    assert node._inference_wakeup.is_set()
+    assert node._inference_retry_timer is None
+    assert (
+        node._inference_backpressure.snapshot()["pending_trigger"]
+        == INFERENCE_TRIGGER_FORCED
+    )
+
+
+def test_shutdown_does_not_schedule_a_new_inference_retry_timer() -> None:
+    node = RealVLMNode.__new__(RealVLMNode)
+    node._inference_wakeup = threading.Event()
+    node._inference_shutdown = threading.Event()
+    node._inference_shutdown.set()
+    node._inference_retry_lock = threading.Lock()
+    node._inference_retry_timer = None
+
+    node._schedule_inference_retry(10.0)
+
+    assert node._inference_retry_timer is None
+    assert not node._inference_wakeup.is_set()
+
+
+def test_cancelled_retry_callback_cannot_clear_replacement_timer(
+    monkeypatch,
+) -> None:
+    timers = []
+
+    class FakeTimer:
+        def __init__(self, interval, callback) -> None:
+            self.interval = interval
+            self.callback = callback
+            self.daemon = False
+            self.cancelled = False
+            timers.append(self)
+
+        def start(self) -> None:
+            return None
+
+        def cancel(self) -> None:
+            self.cancelled = True
+
+    monkeypatch.setattr(real_vlm.threading, "Timer", FakeTimer)
+    node = RealVLMNode.__new__(RealVLMNode)
+    node._inference_wakeup = threading.Event()
+    node._inference_shutdown = threading.Event()
+    node._inference_retry_lock = threading.Lock()
+    node._inference_retry_timer = None
+
+    node._schedule_inference_retry(10.0)
+    first = timers[-1]
+    node._schedule_inference_retry(5.0)
+    replacement = timers[-1]
+
+    assert first.cancelled
+    assert node._inference_retry_timer is replacement
+    first.callback()
+    assert node._inference_retry_timer is replacement
+
+    node._cancel_inference_retry()
+    assert replacement.cancelled
 
 
 def test_latest_frame_worker_runs_without_periodic_timer() -> None:
@@ -493,6 +683,83 @@ def test_failure_history_is_bounded_and_keeps_latest_sequence() -> None:
     assert node._inference_failures[-1].sequence == (
         INFERENCE_FAILURE_HISTORY_LENGTH + 5
     )
+
+
+def test_identical_inference_failure_logs_are_summarized_without_hiding_health(
+    monkeypatch,
+) -> None:
+    node = RealVLMNode.__new__(RealVLMNode)
+    node._inference_failures = deque(maxlen=INFERENCE_FAILURE_HISTORY_LENGTH)
+    node._inference_failure_count = 0
+    node._model_id = "test-model"
+    logged: list[str] = []
+    health: list[dict] = []
+    node.get_logger = lambda: SimpleNamespace(error=logged.append)
+    node._publish_health = lambda **kwargs: health.append(kwargs)
+    monotonic_times = iter((100.0, 101.0, 102.0, 131.0))
+    monkeypatch.setattr(
+        real_vlm.time,
+        "monotonic",
+        lambda: next(monotonic_times),
+    )
+
+    for _ in range(4):
+        node._record_inference_failure(
+            trigger=INFERENCE_TRIGGER_SOURCE_FRAME,
+            mode="inference_transport_failed",
+            error="503 no model loaded",
+            image_source="flir_cam4_raw_fallback",
+            latency_sec=0.01,
+            prompt_chars=10,
+            retry_count=0,
+            connected=False,
+        )
+
+    assert len(node._inference_failures) == 4
+    assert len(health) == 4
+    assert len(logged) == 2
+    assert "2 identical failures suppressed" in logged[-1]
+
+
+def test_failure_log_signature_change_and_success_reset_log_immediately(
+    monkeypatch,
+) -> None:
+    node = RealVLMNode.__new__(RealVLMNode)
+    node._inference_failures = deque(maxlen=INFERENCE_FAILURE_HISTORY_LENGTH)
+    node._inference_failure_count = 0
+    node._model_id = "test-model"
+    logged: list[str] = []
+    node.get_logger = lambda: SimpleNamespace(error=logged.append)
+    node._publish_health = lambda **_kwargs: None
+    monotonic_times = iter((100.0, 101.0, 102.0, 103.0))
+    monkeypatch.setattr(
+        real_vlm.time,
+        "monotonic",
+        lambda: next(monotonic_times),
+    )
+
+    def record(error: str) -> None:
+        node._record_inference_failure(
+            trigger=INFERENCE_TRIGGER_SOURCE_FRAME,
+            mode="inference_transport_failed",
+            error=error,
+            image_source="flir_cam4_raw_fallback",
+            latency_sec=0.01,
+            prompt_chars=10,
+            retry_count=0,
+            connected=False,
+        )
+
+    record("503 no model loaded")
+    record("503 no model loaded")
+    record("provider connection refused")
+    node._reset_inference_failure_log_throttle()
+    record("provider connection refused")
+
+    assert len(logged) == 3
+    assert "503 no model loaded" in logged[0]
+    assert "provider connection refused" in logged[1]
+    assert "provider connection refused" in logged[2]
 
 
 def test_visual_evidence_metadata_is_monotonic_within_runtime_epoch() -> None:

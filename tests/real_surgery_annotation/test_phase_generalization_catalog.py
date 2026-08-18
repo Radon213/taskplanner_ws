@@ -154,7 +154,7 @@ def test_v3_migration_hashes_and_semantic_mapping_are_current() -> None:
     assert migration["scoring_policy"]["phase_accuracy_enabled"] is False
 
 
-def test_case_agnostic_prompt_matches_v3_granularity_contract() -> None:
+def test_case_agnostic_v4_prompt_matches_v3_granularity_contract() -> None:
     catalog = _load_yaml(CATALOG_PATH)
     prompt = _load_yaml(PROMPT_PATH)
     serialized_prompt = json.dumps(
@@ -163,7 +163,7 @@ def test_case_agnostic_prompt_matches_v3_granularity_contract() -> None:
         sort_keys=True,
     )
 
-    assert prompt["id"] == "thyroidectomy_demo_prompt_v3"
+    assert prompt["id"] == "thyroidectomy_demo_prompt_v4"
     assert prompt["phase_inference_policy"]["time_prior_role"] == "forbidden"
     assert prompt["phase_inference_policy"][
         "case_specific_timestamp_role"

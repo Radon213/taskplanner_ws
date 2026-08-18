@@ -87,8 +87,15 @@ Debug 프로파일은 localhost 전용 UI·ROSBridge를 그대로 유지하면�
 열고, 해당 인터페이스의 직접 연결 서브넷에서 들어온 TCP 연결만 localhost
 종단으로 전달한다. 따라서 다른 PC에서는 화면에 표시된 주소를 사용해
 `http://<유선-IP>:<WEBAPP_PORT>/`로 접속할 수 있고, 브라우저는 같은 호스트의
-`ROSBRIDGE_DEBUG_PORT`로 자동 연결한다. Wi-Fi 및 Tailscale 주소에는 별도
-리스너를 만들지 않으며, 유선 IPv4가 바뀌면 리스너도 자동으로 다시 바인딩한다.
+`ROSBRIDGE_DEBUG_PORT`로 자동 연결한다. 유선 IPv4가 바뀌면 리스너도 자동으로
+다시 바인딩한다.
+
+Tailnet에서 허용된 TCP는 호스트의 loopback으로 전달되므로, Tailscale IPv4
+접속도 같은 `ROSBRIDGE_DEBUG_PORT`의 loopback 경로 라우터를 통과한다. `/`는
+격리된 Debug upstream으로, `/live`와 `/llm`은 운영 ROSBridge로, `/shadow`는
+리플레이 ROSBridge로만 전달된다. 라우터는 Tailnet CGNAT 대역과 로컬 프록시만
+허용하며 새 외부 포트를 열지 않는다. 대시보드의 실행 모드 선택은 이 경로를
+사용해 선택한 프로파일을 기동하고 ROS 재연결을 기다린다.
 
 이 프록시는 사용자 인증을 추가하지 않는다. 같은 유선 서브넷의 사용자는
 Debug 화면을 열 수 있으므로, 신뢰된 통합 시험망에서만 실행하고 수동 제어

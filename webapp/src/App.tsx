@@ -1,10 +1,19 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  Component,
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ErrorInfo,
+  type ReactNode,
+} from "react";
 import { motion } from "framer-motion";
 
 import { ProcedureDock } from "./components/command/ProcedureDock";
 import { LiveAsrPanel } from "./components/command/LiveAsrPanel";
-import { DebugWorkspace } from "./components/debug/DebugWorkspace";
-import { MulticamOpsWorkspace } from "./components/multicam/MulticamOpsWorkspace";
 import {
   type PublicSurgeonGesture,
 } from "./components/command/PublicSurgeonGestureStatus";
@@ -15,8 +24,10 @@ import { ObservabilityPanel } from "./components/observability/ObservabilityPane
 import { OperatingRoomStage } from "./components/stage/OperatingRoomStage";
 import { useDigitalTwinViewModel } from "./hooks/useDigitalTwinViewModel";
 import { useRosBridge } from "./hooks/useRosBridge";
+import { useRuntimeControl } from "./hooks/useRuntimeControl";
 import {
   initialRuntimeMode,
+  lastMissionModeStorageKey,
   persistRuntimeMode,
   runtimeBridgeUrl,
   type TaskplannerRuntimeMode,
@@ -24,6 +35,92 @@ import {
 import { type Language } from "./utils/display";
 
 type PrimaryWorkspace = "mission" | "multicam";
+type MissionRuntimeMode = Exclude<TaskplannerRuntimeMode, "debug">;
+type RuntimeTransitionSafety = {
+  isRunning: boolean;
+  isPaused: boolean;
+  startInFlight: boolean;
+  actionPending: boolean;
+};
+
+const DebugWorkspace = lazy(() =>
+  import("./components/debug/DebugWorkspace").then((module) => ({
+    default: module.DebugWorkspace,
+  })),
+);
+const MulticamOpsWorkspace = lazy(() =>
+  import("./components/multicam/MulticamOpsWorkspace").then((module) => ({
+    default: module.MulticamOpsWorkspace,
+  })),
+);
+
+function WorkspaceLoading({
+  label,
+  error = "",
+  onRetry,
+  retryLabel = "Retry",
+}: {
+  label: string;
+  error?: string;
+  onRetry?: () => void;
+  retryLabel?: string;
+}) {
+  return (
+    <div className="app-shell" data-slot="workspace-loading-state">
+      <main aria-busy={!error} aria-live="polite" className="debug-main">
+        <section className="debug-feedback-card debug-loading-card" role={error ? "alert" : "status"}>
+          {error ? (
+            <div className="runtime-transition-feedback error">
+              <span>{error}</span>
+              {onRetry ? (
+                <button className="runtime-transition-retry" onClick={onRetry} type="button">
+                  {retryLabel}
+                </button>
+              ) : null}
+            </div>
+          ) : (
+            <>
+              <div className="debug-skeleton-title" />
+              <div className="debug-skeleton-row" />
+              <div className="debug-skeleton-row short" />
+              <span className="sr-only">{label}</span>
+            </>
+          )}
+        </section>
+      </main>
+    </div>
+  );
+}
+
+class WorkspaceErrorBoundary extends Component<{
+  children: ReactNode;
+  errorMessage: string;
+  reloadLabel: string;
+}, { error: Error | null }> {
+  state: { error: Error | null } = { error: null };
+
+  static getDerivedStateFromError(error: Error) {
+    return { error };
+  }
+
+  componentDidCatch(error: Error, info: ErrorInfo) {
+    console.error("Workspace chunk failed to load", error, info.componentStack);
+  }
+
+  render() {
+    if (this.state.error) {
+      return (
+        <WorkspaceLoading
+          error={this.props.errorMessage}
+          label={this.props.errorMessage}
+          onRetry={() => window.location.reload()}
+          retryLabel={this.props.reloadLabel}
+        />
+      );
+    }
+    return this.props.children;
+  }
+}
 
 function workspaceFromLocation(): PrimaryWorkspace {
   if (typeof window === "undefined") return "mission";
@@ -34,14 +131,19 @@ function workspaceFromLocation(): PrimaryWorkspace {
 
 export default function App() {
   const [runtimeMode, setRuntimeMode] = useState<TaskplannerRuntimeMode>(initialRuntimeMode);
+  const {
+    status: runtimeTransition,
+    refresh: refreshRuntimeControl,
+    requestTransition,
+  } = useRuntimeControl();
   const [workspace, setWorkspace] = useState<PrimaryWorkspace>(workspaceFromLocation);
   const [language, setLanguage] = useState<Language>(() => {
     if (typeof window === "undefined") return "ko";
     return window.localStorage.getItem("taskplanner.language") === "en" ? "en" : "ko";
   });
-  const [lastMissionMode, setLastMissionMode] = useState<Exclude<TaskplannerRuntimeMode, "debug">>(() => {
+  const [lastMissionMode, setLastMissionMode] = useState<MissionRuntimeMode>(() => {
     if (typeof window === "undefined") return "llm";
-    const stored = window.localStorage.getItem("taskplanner.lastMissionMode");
+    const stored = window.localStorage.getItem(lastMissionModeStorageKey());
     return stored === "live" || stored === "llm" || stored === "shadow" ? stored : "llm";
   });
 
@@ -54,38 +156,101 @@ export default function App() {
     persistRuntimeMode(runtimeMode);
     if (runtimeMode !== "debug") {
       setLastMissionMode(runtimeMode);
-      window.localStorage.setItem("taskplanner.lastMissionMode", runtimeMode);
+      window.localStorage.setItem(lastMissionModeStorageKey(), runtimeMode);
     }
   }, [runtimeMode]);
 
   useEffect(() => {
-    const onPopState = () => setWorkspace(workspaceFromLocation());
-    window.addEventListener("popstate", onPopState);
-    return () => window.removeEventListener("popstate", onPopState);
-  }, []);
+    if (
+      workspace !== "mission" ||
+      runtimeTransition.phase !== "idle" ||
+      runtimeTransition.activeMode === null ||
+      runtimeTransition.activeMode === runtimeMode
+    ) {
+      return;
+    }
+    setRuntimeMode(runtimeTransition.activeMode);
+  }, [runtimeMode, runtimeTransition.activeMode, runtimeTransition.phase, workspace]);
 
-  const navigateWorkspace = (next: PrimaryWorkspace) => {
+  const navigateWorkspace = useCallback((next: PrimaryWorkspace, pushHistory = true) => {
     if (typeof window !== "undefined") {
       const location = new URL(window.location.href);
       if (next === "multicam") location.searchParams.set("workspace", "multicam");
       else location.searchParams.delete("workspace");
-      window.history.pushState({}, "", location);
+      if (pushHistory) window.history.pushState({}, "", location);
     }
     setWorkspace(next);
-  };
+  }, []);
+
+  useEffect(() => {
+    const onPopState = () => {
+      navigateWorkspace(workspaceFromLocation(), false);
+    };
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, [navigateWorkspace]);
+
+  const requestRuntimeMode = useCallback(async (
+    mode: TaskplannerRuntimeMode,
+    safety?: RuntimeTransitionSafety,
+  ) => {
+    if (
+      runtimeTransition.phase === "starting" ||
+      safety?.isRunning ||
+      safety?.isPaused ||
+      safety?.startInFlight ||
+      safety?.actionPending
+    ) {
+      return;
+    }
+    if (
+      mode === runtimeMode &&
+      runtimeTransition.activeMode === mode &&
+      runtimeTransition.phase !== "failed"
+    ) {
+      void refreshRuntimeControl();
+      return;
+    }
+    return requestTransition(mode);
+  }, [
+    refreshRuntimeControl,
+    requestTransition,
+    runtimeMode,
+    runtimeTransition.activeMode,
+    runtimeTransition.phase,
+  ]);
 
   if (workspace === "multicam") {
-    return <MulticamOpsWorkspace language={language} onExit={() => navigateWorkspace("mission")} />;
+    return (
+      <WorkspaceErrorBoundary
+        errorMessage={language === "ko" ? "멀티캠 관제 화면을 불러오지 못했습니다." : "Could not load multicamera operations."}
+        reloadLabel={language === "ko" ? "페이지 다시 불러오기" : "Reload page"}
+      >
+        <Suspense fallback={<WorkspaceLoading label={language === "ko" ? "멀티캠 관제 화면을 불러오는 중입니다." : "Loading multicamera operations."} />}>
+          <MulticamOpsWorkspace language={language} onExit={() => navigateWorkspace("mission")} />
+        </Suspense>
+      </WorkspaceErrorBoundary>
+    );
   }
 
   if (runtimeMode === "debug") {
-    return <DebugWorkspace language={language} onExit={() => setRuntimeMode(lastMissionMode)} />;
+    return (
+      <WorkspaceErrorBoundary
+        errorMessage={language === "ko" ? "디버그 화면을 불러오지 못했습니다." : "Could not load the Debug workspace."}
+        reloadLabel={language === "ko" ? "페이지 다시 불러오기" : "Reload page"}
+      >
+        <Suspense fallback={<WorkspaceLoading label={language === "ko" ? "디버그 화면을 불러오는 중입니다." : "Loading debug workspace."} />}>
+          <DebugWorkspace language={language} onExit={() => void requestRuntimeMode(lastMissionMode)} />
+        </Suspense>
+      </WorkspaceErrorBoundary>
+    );
   }
 
   return (
     <MissionWorkspace
       runtimeMode={runtimeMode}
-      onRuntimeModeChange={setRuntimeMode}
+      onRuntimeModeChange={requestRuntimeMode}
+      runtimeTransition={runtimeTransition}
       language={language}
       onLanguageChange={setLanguage}
       onMulticamOps={() => navigateWorkspace("multicam")}
@@ -96,12 +261,17 @@ export default function App() {
 function MissionWorkspace({
   runtimeMode,
   onRuntimeModeChange,
+  runtimeTransition,
   language,
   onLanguageChange,
   onMulticamOps,
 }: {
   runtimeMode: Exclude<TaskplannerRuntimeMode, "debug">;
-  onRuntimeModeChange: (mode: TaskplannerRuntimeMode) => void;
+  onRuntimeModeChange: (
+    mode: TaskplannerRuntimeMode,
+    safety?: RuntimeTransitionSafety,
+  ) => void | boolean | Promise<void | boolean>;
+  runtimeTransition: ReturnType<typeof useRuntimeControl>["status"];
   language: Language;
   onLanguageChange: (language: Language) => void;
   onMulticamOps: () => void;
@@ -194,7 +364,21 @@ function MissionWorkspace({
       ? shadowTransportActive
       : ros.simulationState.running ||
         ros.simulationState.execution_state === "paused";
-
+  const controlStartInFlight =
+    ros.simulationState.execution_state === "starting" ||
+    ros.actionPending.toLowerCase().includes("starting");
+  const runtimeTransitionSafety: RuntimeTransitionSafety = {
+    isRunning: controlIsRunning,
+    isPaused: controlIsPaused,
+    startInFlight: controlStartInFlight,
+    actionPending: Boolean(ros.actionPending),
+  };
+  const runtimeModeLocked =
+    runtimeTransition.phase === "starting" ||
+    controlIsRunning ||
+    controlIsPaused ||
+    controlStartInFlight ||
+    Boolean(ros.actionPending);
   return (
     <div className="app-shell">
       <StatusRibbon
@@ -211,7 +395,8 @@ function MissionWorkspace({
         onVlmRuntimeAction={(selection, command) =>
           void ros.controlVlmModelRuntime(selection, command)
         }
-        onDebugMode={() => onRuntimeModeChange("debug")}
+        debugModeDisabled={runtimeModeLocked}
+        onDebugMode={() => void onRuntimeModeChange("debug", runtimeTransitionSafety)}
         onMulticamOps={onMulticamOps}
       />
 
@@ -297,7 +482,16 @@ function MissionWorkspace({
             vm={vm}
             url={ros.url}
             runtimeMode={runtimeMode}
-            onRuntimeModeChange={onRuntimeModeChange}
+            onRuntimeModeChange={(mode) => {
+              void onRuntimeModeChange(mode, runtimeTransitionSafety);
+            }}
+            runtimeTransition={runtimeTransition}
+            onRetryRuntimeMode={() =>
+              void onRuntimeModeChange(
+                runtimeTransition.requestedMode ?? runtimeMode,
+                runtimeTransitionSafety,
+              )
+            }
             bundle={ros.bundle}
             onBundleChange={(nextBundle) => {
               ros.setBundleSelection(nextBundle);

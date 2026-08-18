@@ -174,6 +174,7 @@ class SurgicalInteropExecutionBridge(Node):
         )
         self._dispatch_lock = threading.RLock()
         self._runtime_accepting_commands = False
+        self._last_lifecycle_control_signature: tuple[str, str] | None = None
         self._dispatch_ledger = DispatchLedger(
             int(self.declare_parameter("dedupe_max_entries", 512).value)
         )
@@ -569,8 +570,20 @@ class SurgicalInteropExecutionBridge(Node):
             self._active_services.pop(self._action_key(route, command_id), None)
 
     def _on_control(self, msg: String) -> None:
-        control = msg.data.partition(":")[0].strip().lower()
+        control, _, detail = msg.data.partition(":")
+        control = control.strip().lower()
+        signature = (control, detail.strip())
+        if control in {"start", "start_runtime", "start_actors", "pause", "resume", "stop"}:
+            if signature == getattr(
+                self, "_last_lifecycle_control_signature", None
+            ):
+                return
+            self._last_lifecycle_control_signature = signature
         if control in {"start", "start_actors"}:
+            with self._dispatch_lock:
+                self._runtime_accepting_commands = True
+            return
+        if control == "resume":
             with self._dispatch_lock:
                 self._runtime_accepting_commands = True
             return
@@ -578,8 +591,11 @@ class SurgicalInteropExecutionBridge(Node):
             with self._dispatch_lock:
                 self._runtime_accepting_commands = False
             return
-        if control not in {"stop", "reset"}:
+        if control not in {"pause", "stop", "reset"}:
             return
+
+        if control == "reset":
+            self._last_lifecycle_control_signature = None
 
         with self._dispatch_lock:
             self._runtime_accepting_commands = False

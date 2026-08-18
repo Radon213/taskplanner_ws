@@ -26,6 +26,7 @@ from shadow_evaluation.interactive_replay_controller import (
     advance_replay_elapsed,
     advance_replay_source_time,
     public_replay_topic_routes,
+    replay_clock_publish_due,
 )
 from shadow_evaluation.reference_reconciler import (
     load_runtime_tool_map,
@@ -305,6 +306,37 @@ def test_pause_and_stop_freeze_elapsed_and_source_until_resume():
         100.0,
         advancing=True,
     ) == 8.25
+
+
+def test_replay_clock_keeps_active_precision_but_bounds_idle_heartbeat():
+    assert replay_clock_publish_due(
+        source_time_sec=8.02,
+        last_source_time_sec=8.0,
+        now_monotonic=10.02,
+        last_publish_monotonic=10.0,
+        idle_heartbeat_sec=1.0,
+    )
+    assert not replay_clock_publish_due(
+        source_time_sec=8.02,
+        last_source_time_sec=8.02,
+        now_monotonic=10.5,
+        last_publish_monotonic=10.02,
+        idle_heartbeat_sec=1.0,
+    )
+    assert replay_clock_publish_due(
+        source_time_sec=8.02,
+        last_source_time_sec=8.02,
+        now_monotonic=11.02,
+        last_publish_monotonic=10.02,
+        idle_heartbeat_sec=1.0,
+    )
+    assert replay_clock_publish_due(
+        source_time_sec=0.0,
+        last_source_time_sec=None,
+        now_monotonic=1.0,
+        last_publish_monotonic=float("-inf"),
+        idle_heartbeat_sec=1.0,
+    )
 
 
 def test_public_replay_routes_only_raw_cameras_and_public_perception_json():

@@ -36,6 +36,13 @@ RETRYABLE_START_ERROR_MARKERS = (
 )
 ALLOWED_OVERRIDE_EVENTS = {"request_tool", "voice_request", "return_tool", "cancel_request"}
 TOOL_REQUIRED_OVERRIDE_EVENTS = {"request_tool", "voice_request", "return_tool"}
+TRANSITION_READY_MANAGER_STATES = {"idle", "halted", "completed", "terminated"}
+TRANSITION_READY_EXECUTOR_STATES = {"idle", "halted", "terminated"}
+NO_RUNTIME_SNAPSHOT_PREFIX = "No runtime snapshot is available for"
+TRANSITION_STATE_MAX_AGE_SEC = 3.0
+TRANSITION_PROTOCOL_MARKER = (
+    "transition-reservation-v2; dt_receipt_max_age=3.0;"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,6 +129,7 @@ class SimulationManagerNode(Node):
             "/integration_preflight",
         )
         self.declare_parameter("integration_preflight_timeout_sec", 5.0)
+        self.declare_parameter("transition_reservation_ttl_sec", 75.0)
 
         self._spec_root = Path(str(self.get_parameter("spec_root").value))
         self._active_bundle = str(self.get_parameter("default_bundle").value)
@@ -148,15 +156,33 @@ class SimulationManagerNode(Node):
             0.5,
             float(self.get_parameter("integration_preflight_timeout_sec").value),
         )
+        # The launcher may need to wait through the ASR container's 45 second
+        # graceful shutdown budget.  Keep the reservation valid throughout
+        # that stop, while still allowing automatic recovery if the launcher
+        # itself disappears.
+        self._transition_reservation_ttl_sec = max(
+            60.0,
+            float(self.get_parameter("transition_reservation_ttl_sec").value),
+        )
         self._running = False
         self._execution_state = "idle"
         self._bundle_dirty = False
         self._operation_name = ""
         self._operation_cancel = threading.Event()
         self._operation_lock = threading.Lock()
+        self._operation_rejection_message = ""
+        self._transition_reservation_until_monotonic = 0.0
+        self._bundle_transition_in_progress = False
+        self._override_in_progress = False
         self._completion_terminate_started = False
+        # A fresh manager has never dispatched this executor.  Once a start is
+        # attempted, only an explicit terminal BTops snapshot can restore this
+        # bit.  This distinguishes a legitimate initial no-session state from
+        # a lost/unknown runtime snapshot after execution began.
+        self._executor_settled_confirmed = True
         self._latest_state: SimulationState | None = None
         self._latest_state_generation = 0
+        self._latest_state_received_monotonic = 0.0
         self._latest_state_lock = threading.Lock()
         self._callback_group = ReentrantCallbackGroup()
 
@@ -234,6 +260,18 @@ class SimulationManagerNode(Node):
             callback_group=self._callback_group,
         )
         self.create_service(
+            Trigger,
+            "/simulation/check_transition_ready",
+            self._handle_check_transition_ready,
+            callback_group=self._callback_group,
+        )
+        self.create_service(
+            Trigger,
+            "/simulation/reserve_transition",
+            self._handle_reserve_transition,
+            callback_group=self._callback_group,
+        )
+        self.create_service(
             InjectSurgeonOverride,
             "/simulation/inject_surgeon_override",
             self._handle_override,
@@ -286,6 +324,9 @@ class SimulationManagerNode(Node):
         with self._latest_state_lock:
             self._latest_state = msg
             self._latest_state_generation += 1
+            # Receipt time, rather than source time, is the mode-transition
+            # liveness contract.  Identical semantic heartbeats must refresh it.
+            self._latest_state_received_monotonic = time.monotonic()
         if msg.execution_state == "completed":
             should_terminate = self._running or self._execution_state != "completed"
             self._running = False
@@ -474,6 +515,10 @@ class SimulationManagerNode(Node):
             request.tick_rate_hz = float(self._tick_rate_hz)
             request.requested_groot2_port = int(requested_groot2_port)
             request.parameter_assignments = []
+            # From dispatch until a terminal executor snapshot is observed, a
+            # mode transition must fail closed even if the digital twin has
+            # already published an inactive-looking frame.
+            self._executor_settled_confirmed = False
             future = self._start_client.call_async(request)
             deadline = time.time() + 15.0
             response = None
@@ -491,6 +536,7 @@ class SimulationManagerNode(Node):
             if response.success:
                 return True, str(response.message)
             last_message = str(response.message)
+            self._restore_settled_after_explicit_start_rejection()
             lowered_message = last_message.lower()
             if any(
                 marker in lowered_message
@@ -509,6 +555,27 @@ class SimulationManagerNode(Node):
                 continue
             return False, last_message
         return False, last_message
+
+    def _restore_settled_after_explicit_start_rejection(self) -> bool:
+        """Recover the initial no-session invariant after an explicit reject.
+
+        A timed-out StartBehavior call may still have dispatched work, so it
+        deliberately leaves the executor fail-closed.  Only an actual failed
+        response followed by BTops' exact no-snapshot result proves that the
+        rejected request created no executor session.
+        """
+
+        try:
+            success, _state, detail = self._get_runtime_state_detail(
+                service_timeout_sec=0.25,
+                response_timeout_sec=0.75,
+            )
+        except Exception:
+            return False
+        if not success and str(detail).startswith(NO_RUNTIME_SNAPSHOT_PREFIX):
+            self._executor_settled_confirmed = True
+            return True
+        return False
 
     def _reserve_groot2_port(self) -> int:
         if self._groot2_port > 0:
@@ -530,29 +597,184 @@ class SimulationManagerNode(Node):
             return False, "btops command_executor returned no response"
         return bool(response.success), str(response.message)
 
-    def _get_runtime_state(self) -> tuple[bool, str]:
-        if not self._runtime_client.wait_for_service(timeout_sec=5.0):
-            return False, "unknown"
+    def _get_runtime_state_detail(
+        self,
+        *,
+        service_timeout_sec: float = 5.0,
+        response_timeout_sec: float = 10.0,
+    ) -> tuple[bool, str, str]:
+        if not self._runtime_client.wait_for_service(
+            timeout_sec=service_timeout_sec
+        ):
+            return False, "unknown", "btops runtime-state service is unavailable"
         request = GetRuntimeState.Request()
         request.executor_name = self._executor_name
         future = self._runtime_client.call_async(request)
-        response = self._wait_future(future, timeout_sec=10.0)
-        if response is None or not response.success:
-            return False, "unknown"
-        return True, str(response.snapshot.execution_state).lower()
+        response = self._wait_future(future, timeout_sec=response_timeout_sec)
+        if response is None:
+            return False, "unknown", "btops runtime-state returned no response"
+        if not response.success:
+            return False, "unknown", str(response.message or "runtime state unavailable")
+        return (
+            True,
+            str(response.snapshot.execution_state).strip().lower(),
+            str(response.message or "ok"),
+        )
+
+    def _get_runtime_state(self) -> tuple[bool, str]:
+        success, state, _detail = self._get_runtime_state_detail()
+        return success, state
 
     def _wait_for_executor_idle(self, timeout_sec: float = 8.0) -> bool:
         deadline = time.time() + timeout_sec
-        idle_states = {"", "idle", "terminated", "halted", "unknown"}
         while time.time() < deadline:
             try:
-                success, state = self._get_runtime_state()
-                if not success or state in idle_states:
+                success, state, detail = self._get_runtime_state_detail()
+                if success and state in TRANSITION_READY_EXECUTOR_STATES:
+                    self._executor_settled_confirmed = True
+                    return True
+                if (
+                    not success
+                    and str(detail).startswith(NO_RUNTIME_SNAPSHOT_PREFIX)
+                    and self._executor_settled_confirmed
+                ):
                     return True
             except Exception:
-                return True
+                pass
             time.sleep(0.15)
         return False
+
+    def _transition_reservation_active_locked(self) -> bool:
+        deadline = float(getattr(self, "_transition_reservation_until_monotonic", 0.0))
+        if deadline <= 0.0:
+            return False
+        if time.monotonic() >= deadline:
+            self._transition_reservation_until_monotonic = 0.0
+            return False
+        return True
+
+    def _local_transition_ready_status_locked(self) -> tuple[bool, str]:
+        """Check all cheap local and digital-twin gates under ``_operation_lock``."""
+
+        if self._transition_reservation_active_locked():
+            return False, "runtime mode transition is already reserved"
+        operation = str(self._operation_name or "")
+        if operation:
+            return False, f"simulation operation is still pending: {operation}"
+        if bool(getattr(self, "_bundle_transition_in_progress", False)):
+            return False, "simulation bundle selection is still pending"
+        if bool(getattr(self, "_override_in_progress", False)):
+            return False, "surgeon override publication is still pending"
+        if self._operation_cancel.is_set():
+            return False, "simulation operation cancellation is still settling"
+        if self._completion_terminate_started:
+            return False, "completion-triggered executor termination is still pending"
+        if self._running or self._execution_state not in TRANSITION_READY_MANAGER_STATES:
+            return False, f"simulation manager is not inactive: {self._execution_state}"
+
+        with self._latest_state_lock:
+            state = self._latest_state
+            received_monotonic = float(
+                getattr(self, "_latest_state_received_monotonic", 0.0)
+            )
+        if state is None:
+            return False, "digital twin state is unavailable"
+        age = time.monotonic() - received_monotonic
+        if received_monotonic <= 0.0 or age > TRANSITION_STATE_MAX_AGE_SEC:
+            return False, "digital twin state receipt is stale"
+        if bool(state.running) or str(state.execution_state).strip().lower() not in (
+            TRANSITION_READY_MANAGER_STATES
+        ):
+            return False, "digital twin has not reached an inactive state"
+        if str(getattr(state, "active_robot_task_id", "") or "").strip():
+            return False, "a robot task is still active"
+        if bool(getattr(state, "cleaner_busy", False)):
+            return False, "cleaner activity is still pending"
+        if list(getattr(state, "pending_transition_tools", []) or []):
+            return False, "tool transitions are still pending"
+        if list(getattr(state, "active_recovery_tools", []) or []):
+            return False, "tool recovery is still active"
+
+        return True, "local runtime state is transition ready"
+
+    def _transition_ready_status_locked(self) -> tuple[bool, str]:
+        """Return readiness while the caller owns ``_operation_lock``."""
+
+        ready, message = self._local_transition_ready_status_locked()
+        if not ready:
+            return False, message
+
+        try:
+            success, executor_state, detail = self._get_runtime_state_detail(
+                service_timeout_sec=0.5,
+                response_timeout_sec=1.5,
+            )
+        except Exception as exc:
+            return False, f"executor state check failed: {exc}"
+
+        # The executor query may take up to two seconds while SimulationState
+        # callbacks continue in the reentrant group.  Recheck every cheap local
+        # gate and the receipt deadline immediately before accepting/reserving.
+        ready, message = self._local_transition_ready_status_locked()
+        if not ready:
+            return False, message
+        if success and executor_state in TRANSITION_READY_EXECUTOR_STATES:
+            self._executor_settled_confirmed = True
+            return True, (
+                f"{TRANSITION_PROTOCOL_MARKER} "
+                f"transition ready; executor={executor_state}"
+            )
+        if (
+            not success
+            and str(detail).startswith(NO_RUNTIME_SNAPSHOT_PREFIX)
+            and self._executor_settled_confirmed
+        ):
+            return True, (
+                f"{TRANSITION_PROTOCOL_MARKER} "
+                "transition ready; executor has no active session"
+            )
+        if not success:
+            return False, f"executor state is unavailable: {detail}"
+        return False, f"executor is not settled: {executor_state or 'unknown'}"
+
+    def _transition_ready_status(self) -> tuple[bool, str]:
+        """Return manager-authoritative readiness without reserving it."""
+
+        with self._operation_lock:
+            return self._transition_ready_status_locked()
+
+    def _handle_check_transition_ready(self, _request, response):
+        response.success, response.message = self._transition_ready_status()
+        return response
+
+    def _handle_reserve_transition(self, _request, response):
+        with self._operation_lock:
+            # Idempotent callers share the original deadline.  Never renew it:
+            # an abandoned launcher must not strand the runtime indefinitely.
+            if self._transition_reservation_active_locked():
+                response.success = True
+                response.message = (
+                    f"{TRANSITION_PROTOCOL_MARKER} "
+                    "runtime transition is already reserved"
+                )
+                return response
+            ready, message = self._transition_ready_status_locked()
+            if not ready:
+                response.success = False
+                response.message = message
+                return response
+            self._transition_reservation_until_monotonic = (
+                time.monotonic()
+                + float(getattr(self, "_transition_reservation_ttl_sec", 75.0))
+            )
+            response.success = True
+            response.message = (
+                f"{TRANSITION_PROTOCOL_MARKER} "
+                "runtime transition reserved; mutation commands are blocked "
+                "for up to "
+                f"{float(getattr(self, '_transition_reservation_ttl_sec', 75.0)):.1f}s"
+            )
+            return response
 
     def _wait_for_executor_running(self, timeout_sec: float = 10.0) -> bool:
         deadline = time.time() + timeout_sec
@@ -631,7 +853,19 @@ class SimulationManagerNode(Node):
 
     def _begin_operation(self, name: str) -> bool:
         with self._operation_lock:
+            self._operation_rejection_message = ""
+            if (
+                name in {"start", "resume", "pause", "reset", "bundle-switch"}
+                and self._transition_reservation_active_locked()
+            ):
+                self._operation_rejection_message = (
+                    "runtime mode transition is reserved; mutation command rejected"
+                )
+                return False
             if self._operation_name:
+                self._operation_rejection_message = (
+                    f"{self._operation_name} already in progress"
+                )
                 return False
             self._operation_cancel.clear()
             self._operation_name = name
@@ -654,7 +888,7 @@ class SimulationManagerNode(Node):
 
     def _run_async(self, name: str, target) -> tuple[bool, str]:
         if not self._begin_operation(name):
-            return False, f"{self._operation_name} already in progress"
+            return False, self._operation_rejection_message or "operation rejected"
 
         def runner() -> None:
             try:
@@ -673,7 +907,7 @@ class SimulationManagerNode(Node):
 
     def _run_sync(self, name: str, target) -> tuple[bool, str]:
         if not self._begin_operation(name):
-            return False, f"{self._operation_name} already in progress"
+            return False, self._operation_rejection_message or "operation rejected"
         try:
             message = target()
             return True, str(message or f"{name} completed")
@@ -841,10 +1075,14 @@ class SimulationManagerNode(Node):
             self._execution_state = "resetting" if command == "reset" else "stopping"
         self._publish_control("reset" if command == "reset" else "stop")
         try:
-            self._command_executor("terminate")
-            self._wait_for_executor_idle(timeout_sec=6.0)
+            success, message = self._command_executor("terminate")
+            if not success:
+                raise RuntimeError(message or "failed to request executor termination")
+            if not self._wait_for_executor_idle(timeout_sec=6.0):
+                raise RuntimeError("behavior tree executor did not settle after termination")
         except Exception as exc:
             self.get_logger().warn(f"failed to terminate executor while interrupting start: {exc}")
+            raise
         if command == "reset":
             self._publish_control("reset")
             self._set_idle_state()
@@ -892,7 +1130,10 @@ class SimulationManagerNode(Node):
         self._execution_state = "stopping"
         self._stop_digital_twin_to_halted()
         success, message = self._command_executor("terminate")
-        self._wait_for_executor_idle(timeout_sec=8.0)
+        if not success:
+            raise RuntimeError(message or "failed to request executor termination")
+        if not self._wait_for_executor_idle(timeout_sec=8.0):
+            raise RuntimeError("behavior tree executor did not settle after termination")
         if success:
             self._execution_state = "halted"
             self.get_logger().info(message or "simulation stopped")
@@ -901,6 +1142,7 @@ class SimulationManagerNode(Node):
         raise RuntimeError(message or "failed to stop simulation")
 
     def _reset_sequence(self) -> str:
+        self._bundle_dirty = False
         self._running = False
         self._execution_state = "resetting"
         self._completion_terminate_started = False
@@ -913,6 +1155,29 @@ class SimulationManagerNode(Node):
         self._execution_state = "idle"
 
     def _handle_select_bundle(self, request, response):
+        with self._operation_lock:
+            if self._transition_reservation_active_locked():
+                response.success = False
+                response.message = (
+                    "runtime mode transition is reserved; bundle selection rejected"
+                )
+                response.active_bundle = self._active_bundle
+                response.spec_dir = str(self._active_spec_dir)
+                return response
+            if bool(getattr(self, "_bundle_transition_in_progress", False)):
+                response.success = False
+                response.message = "another bundle selection is already in progress"
+                response.active_bundle = self._active_bundle
+                response.spec_dir = str(self._active_spec_dir)
+                return response
+            self._bundle_transition_in_progress = True
+        try:
+            return self._handle_select_bundle_impl(request, response)
+        finally:
+            with self._operation_lock:
+                self._bundle_transition_in_progress = False
+
+    def _handle_select_bundle_impl(self, request, response):
         try:
             interrupted_start = False
             if self._operation_name == "start":
@@ -965,7 +1230,7 @@ class SimulationManagerNode(Node):
 
             if not self._begin_operation("bundle-switch"):
                 response.success = False
-                response.message = f"{self._operation_name} already in progress"
+                response.message = self._operation_rejection_message or "bundle switch rejected"
                 response.active_bundle = self._active_bundle
                 response.spec_dir = str(self._active_spec_dir)
                 return response
@@ -1011,6 +1276,17 @@ class SimulationManagerNode(Node):
         command = request.command.strip().lower()
         requested_start_phase = str(getattr(request, "start_phase_id", "") or "").strip()
         try:
+            if command not in {"status", "stop"}:
+                with self._operation_lock:
+                    if self._transition_reservation_active_locked():
+                        response.success = False
+                        response.message = (
+                            "runtime mode transition is reserved; "
+                            f"{command or 'mutation'} command rejected"
+                        )
+                        response.running = self._running
+                        response.execution_state = self._execution_state
+                        return response
             if self._operation_name == "start":
                 if command in {"stop", "reset"}:
                     message = self._interrupt_start_sequence(command)
@@ -1063,8 +1339,6 @@ class SimulationManagerNode(Node):
                     response.success = True
                     response.message = "simulation already running"
                 else:
-                    self._running = False
-                    self._execution_state = "starting"
                     success, message = self._run_async(
                         "start",
                         lambda: self._start_sequence(normalized_start_phase),
@@ -1083,7 +1357,6 @@ class SimulationManagerNode(Node):
                 response.success = True
                 response.message = "simulation status"
             elif command == "reset":
-                self._bundle_dirty = False
                 success, message = self._run_async("reset", self._reset_sequence)
                 response.success = success
                 response.message = message
@@ -1111,6 +1384,25 @@ class SimulationManagerNode(Node):
             return response
 
     def _handle_override(self, request, response):
+        with self._operation_lock:
+            if self._transition_reservation_active_locked():
+                response.success = False
+                response.message = (
+                    "runtime mode transition is reserved; surgeon override rejected"
+                )
+                return response
+            if bool(getattr(self, "_override_in_progress", False)):
+                response.success = False
+                response.message = "another surgeon override is already in progress"
+                return response
+            self._override_in_progress = True
+        try:
+            return self._handle_override_impl(request, response)
+        finally:
+            with self._operation_lock:
+                self._override_in_progress = False
+
+    def _handle_override_impl(self, request, response):
         event_type = request.event_type.strip()
         if event_type not in ALLOWED_OVERRIDE_EVENTS:
             response.success = False

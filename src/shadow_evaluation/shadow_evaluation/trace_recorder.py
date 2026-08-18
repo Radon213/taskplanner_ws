@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 import re
+import threading
 import time
 from typing import Any, Callable
 
@@ -55,7 +57,126 @@ IMAGE_TRACE_QOS = QoSProfile(
     reliability=ReliabilityPolicy.BEST_EFFORT,
     durability=DurabilityPolicy.VOLATILE,
 )
+DIAGNOSTICS_TRACE_QOS = QoSProfile(
+    history=HistoryPolicy.KEEP_LAST,
+    depth=50,
+    reliability=ReliabilityPolicy.BEST_EFFORT,
+    durability=DurabilityPolicy.VOLATILE,
+)
 RECORDER_FLUSH_EVERY_RECORDS = 128
+SEMANTIC_CHECKPOINT_LAYERS = frozenset(
+    {
+        "bed_robot_arm_status",
+        "bt_context_ingress",
+        "reducer_fused",
+        "rfdetr_health",
+        "runtime_control",
+        "runtime_state",
+        "shadow_replay_state",
+    }
+)
+
+
+def semantic_trace_signature(payload: dict[str, Any]) -> str:
+    """Hash semantic state while ignoring transport freshness metadata."""
+
+    def normalize(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                str(key): normalize(item)
+                for key, item in value.items()
+                if str(key)
+                not in {"stamp", "stamp_nanosec", "stamp_sec", "revision"}
+            }
+        if isinstance(value, list):
+            return [normalize(item) for item in value]
+        return value
+
+    encoded = json.dumps(
+        normalize(payload),
+        separators=(",", ":"),
+        sort_keys=True,
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+class SemanticTraceGate:
+    """Record transitions immediately and unchanged state as sparse checkpoints."""
+
+    def __init__(
+        self,
+        *,
+        checkpoint_sec: float = 30.0,
+        layers: frozenset[str] = SEMANTIC_CHECKPOINT_LAYERS,
+    ) -> None:
+        self._checkpoint_sec = max(0.0, float(checkpoint_sec))
+        self._layers = layers
+        self._state: dict[tuple[str, str], tuple[str, float]] = {}
+        self._source_revisions: dict[tuple[str, str], int] = {}
+        self._lock = threading.Lock()
+
+    def should_append(
+        self,
+        *,
+        layer: str,
+        topic: str,
+        payload: dict[str, Any],
+        now_monotonic: float | None = None,
+    ) -> bool:
+        if layer not in self._layers or self._checkpoint_sec <= 0.0:
+            return True
+        # Runtime controls are semantic state transitions plus late-join
+        # heartbeats. Preserve the first edge and checkpoint, but do not turn
+        # identical retained retries into duplicate trace history.
+        runtime_reset = False
+        if layer == "runtime_control":
+            control = (
+                str(payload.get("data", ""))
+                .partition(":")[0]
+                .strip()
+                .lower()
+            )
+            runtime_reset = control == "reset"
+            if not runtime_reset and control not in {
+                "start",
+                "start_runtime",
+                "start_actors",
+                "pause",
+                "resume",
+                "stop",
+            }:
+                return True
+        now = time.monotonic() if now_monotonic is None else float(now_monotonic)
+        signature = semantic_trace_signature(payload)
+        key = (str(layer), str(topic))
+        with self._lock:
+            if runtime_reset:
+                # Reset is an explicit edge, not a heartbeat. Record every
+                # request and invalidate the previous lifecycle checkpoint so
+                # the next identical start/stop edge is never suppressed.
+                self._state.pop(key, None)
+                return True
+            previous = self._state.get(key)
+            revision_rollback = False
+            if layer == "bed_robot_arm_status":
+                raw_revision = payload.get("revision")
+                if isinstance(raw_revision, int) and not isinstance(raw_revision, bool):
+                    previous_revision = self._source_revisions.get(key)
+                    revision_rollback = (
+                        previous_revision is not None
+                        and raw_revision < previous_revision
+                    )
+                    self._source_revisions[key] = raw_revision
+            if (
+                previous is not None
+                and signature == previous[0]
+                and not revision_rollback
+                and now - previous[1] < self._checkpoint_sec
+            ):
+                return False
+            self._state[key] = (signature, now)
+            return True
 
 
 def _safe_run_component(run_id: str) -> str:
@@ -121,6 +242,7 @@ class ShadowTraceRecorderNode(Node):
         self.declare_parameter("run_id", "")
         self.declare_parameter("mode", "strict")
         self.declare_parameter("existing_file_policy", "unique")
+        self.declare_parameter("semantic_checkpoint_sec", 30.0)
         self.declare_parameter(
             "field_image_topic",
             "/surgery/cam4/color/image/compressed",
@@ -174,6 +296,11 @@ class ShadowTraceRecorderNode(Node):
             ),
             asynchronous=True,
             flush_every_records=RECORDER_FLUSH_EVERY_RECORDS,
+        )
+        self._semantic_trace_gate = SemanticTraceGate(
+            checkpoint_sec=float(
+                self.get_parameter("semantic_checkpoint_sec").value
+            )
         )
 
         self._subscribe_image(
@@ -246,6 +373,7 @@ class ShadowTraceRecorderNode(Node):
             "rfdetr_diagnostics",
             "std_msgs/msg/String",
             payload_transform=self._json_string_payload,
+            qos=DIAGNOSTICS_TRACE_QOS,
         )
         self._subscribe(
             String,
@@ -464,6 +592,12 @@ class ShadowTraceRecorderNode(Node):
         payload: dict[str, Any],
         source_stamp_sec: float | None,
     ) -> None:
+        if not self._semantic_trace_gate.should_append(
+            layer=layer,
+            topic=topic,
+            payload=payload,
+        ):
+            return
         self._writer.append(
             layer=layer,
             topic=topic,
@@ -483,6 +617,7 @@ class ShadowTraceRecorderNode(Node):
         message_type: str,
         *,
         payload_transform: Callable[[Any], dict[str, Any]] = message_payload,
+        qos: int | QoSProfile = 50,
     ) -> None:
         if not topic:
             return
@@ -496,7 +631,7 @@ class ShadowTraceRecorderNode(Node):
                 source_stamp_sec=message_source_stamp(msg),
             )
 
-        self.create_subscription(message_class, topic, callback, 50)
+        self.create_subscription(message_class, topic, callback, qos)
 
     def _subscribe_image(
         self,
