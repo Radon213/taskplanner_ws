@@ -19,6 +19,7 @@
         <Peer Address="127.0.0.1" />
         <Peer Address="192.168.1.6" />
         <Peer Address="192.168.1.7" />
+        <Peer Address="192.168.1.37" />
       </Peers>
       <ParticipantIndex>auto</ParticipantIndex>
       <MaxAutoParticipantIndex>60</MaxAutoParticipantIndex>

@@ -1,7 +1,7 @@
 string GROUP_RETRACTION="retraction"
 
-# The legacy envelope remains while the public bridge maps these two distinct
-# operations to ExecuteRetractionAdjustment and RequestToolChange.
+# The legacy envelope remains while the public bridge maps compatible commands
+# to the single ExecuteRetractionCommand Service.
 string OPERATION_RETRACTION_ADJUSTMENT="retraction"
 string OPERATION_TOOL_CHANGE="change_end_effector"
 

@@ -1,0 +1,93 @@
+{
+  "calibration_selection_evidence": {
+    "baseline_result_sha256": "ec9d8600b4214f3afbc879a71a31f14a649e08485d339c04d06645fb573722a9",
+    "explicit_crop_semantic_regression": {
+      "acknowledged": true,
+      "baseline_accuracy": 0.6363636363636364,
+      "baseline_correct": 7,
+      "selected_v4_accuracy": 0.45454545454545453,
+      "selected_v4_correct": 5,
+      "selection_rationale": "Frozen objective is temporal arrival; crop regression is recorded and not hidden."
+    },
+    "strict_contract_gain": {
+      "baseline_valid_contracts": 6,
+      "selected_v4_valid_contracts": 14
+    },
+    "temporal_arrival_gain": {
+      "baseline_accepted_target_recall": 0.0,
+      "baseline_false_positive_total": 1,
+      "baseline_target_recall": 0.0,
+      "selected_v4_accepted_target_recall": 0.5,
+      "selected_v4_false_positive_total": 0,
+      "selected_v4_target_recall": 0.5
+    },
+    "v4_result_sha256": "c44df399ee38bf3642e4ae2204f677a0a51ee6021c62e42b8c9dc67ee1571414"
+  },
+  "created_at_utc": "2026-08-18T10:15:11.279076+00:00",
+  "frozen_config": {
+    "arrival_request_context_sha256": "48aafc88aff31e24368c8a5facf48a776aa820a8d5d7ef8f1ea6c8af69286ca2",
+    "batch_size": 1,
+    "event_reference_sha256": "8efa9b85307383f08d6f713f6891ed07da70e0837465bd4adc0a1e2ba00d5b8f",
+    "image_preprocess_flag": "letterbox_512_q95",
+    "image_preprocess_policy": {
+      "applied_to": "every_model_input_image",
+      "aspect_preserving": true,
+      "deterministic": true,
+      "evaluation_only": true,
+      "id": "aspect_preserving_512_square_black_letterbox_q95",
+      "jpeg_quality": 95,
+      "padding_bgr": [
+        0,
+        0,
+        0
+      ],
+      "requested_flag": "letterbox_512_q95",
+      "target_dimensions_px": [
+        512,
+        512
+      ]
+    },
+    "model_id": "qwen3.6-35b-a3b",
+    "model_request_config": {
+      "enable_thinking": false,
+      "max_tokens": 220,
+      "reasoning_effort": "none",
+      "stream": false,
+      "temperature": 0.0,
+      "top_p": 1.0
+    },
+    "prompt_sha256_by_mode": {
+      "arrival": "061de281545541fc947e794c6c63b08754ec3202cd1d650a17a9be24e7b15ae6"
+    },
+    "prompt_version": "mayo-recognition-v4",
+    "retries": 0,
+    "sample_ids": [
+      "0704_5-challenge-arrival-0704_5-E0016",
+      "0704_5-challenge-arrival-0704_5-E0020",
+      "0704_5-challenge-arrival-0704_5-E0031",
+      "0704_5-challenge-arrival-0704_5-E0037",
+      "0704_5-challenge-arrival-0704_5-E0041"
+    ],
+    "score_only_if_complete": true,
+    "selected_variant": "optimized_v4",
+    "threshold_policy": {
+      "confidence_threshold": null,
+      "postprocess_filtering": "none",
+      "semantic_scoring": "closed_catalog_exact_match_without_confidence_threshold"
+    },
+    "tool_catalog_sha256": "4bac84751c5c261bf008eec76c725b36e2fcebc3126e5aeaa989bbe999087bb2"
+  },
+  "post_selection_policy": {
+    "frozen_post_budget": 5,
+    "no_cross_case_claim": true,
+    "normalizer_change_after_frozen_review": "prohibited",
+    "prompt_change_after_frozen_review": "prohibited",
+    "threshold_change_after_frozen_review": "prohibited"
+  },
+  "prompt_version": "mayo-recognition-v4",
+  "schema": "taskplanner.mayo_frozen_selection.v1",
+  "selected_for_objective": "pre_registered_within_case_temporal_arrival_only",
+  "selected_variant": "optimized_v4",
+  "selection_id": "394854bb2855334b204352e7a6f60c17445a9cecd2600b9245ecf59c05563bc9",
+  "selection_status": "locked"
+}

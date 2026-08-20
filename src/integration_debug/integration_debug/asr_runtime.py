@@ -33,6 +33,19 @@ CHUNK_BYTES = CHUNK_FRAMES * SAMPLE_WIDTH * CHANNELS
 DEFAULT_BLOCK_FRAMES = 1_600
 DEFAULT_KEYWORDS: tuple[tuple[str, int], ...] = (
     ("nephrectomy", 7),
+    # Demo retractor command vocabulary.  Supplying both Korean phrases and
+    # common English renderings helps the remote STT preserve the terms that
+    # distinguish the six closed Service commands.
+    ("직접 교시", 9),
+    ("direct teach", 9),
+    ("리트랙션", 9),
+    ("retraction", 9),
+    ("retractor", 8),
+    ("툴 체인지", 9),
+    ("tool change", 9),
+    ("왼쪽", 8),
+    ("오른쪽", 8),
+    ("5 센티미터", 8),
     ("Bovie", 7),
     ("Army", 7),
     ("Metzenbaum", 7),

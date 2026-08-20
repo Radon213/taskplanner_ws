@@ -109,6 +109,33 @@ def generate_launch_description() -> LaunchDescription:
                         "SENTENCE_INPUT_TOPIC",
                         "/sensors/surgeon/sentence",
                     ),
+                    # The speech adapter remains the only ASR owner.  This
+                    # text-only VLM receives its final transcript downstream
+                    # and falls back deterministically if the local model is
+                    # unavailable or returns an invalid closed-schema answer.
+                    "retractor_voice_normalization_enabled": "true",
+                    "retractor_voice_interpreter_mode": _env(
+                        "RETRACTOR_VOICE_INTERPRETER_MODE",
+                        "vlm_with_fallback",
+                    ),
+                    "retractor_voice_vlm_base_url": _env(
+                        "RETRACTOR_VOICE_VLM_BASE_URL",
+                        _env("VLM_BASE_URL", "http://127.0.0.1:8001"),
+                    ),
+                    "retractor_voice_vlm_model_id": _env(
+                        "RETRACTOR_VOICE_VLM_MODEL_ID",
+                        _env(
+                            "VLM_MODEL_ID",
+                            "unsloth/gemma-4-E4B-it-NVFP4",
+                        ),
+                    ),
+                    "retractor_voice_vlm_api_key": _env(
+                        "RETRACTOR_VOICE_VLM_API_KEY",
+                        _env("VLM_API_KEY", ""),
+                    ),
+                    "retractor_voice_vlm_timeout_sec": _env(
+                        "RETRACTOR_VOICE_VLM_TIMEOUT_SEC", "2.0"
+                    ),
                     "vlm_mode": vlm_mode,
                     "vlm_base_url": _env(
                         "VLM_BASE_URL",

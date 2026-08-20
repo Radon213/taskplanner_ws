@@ -2997,6 +2997,10 @@ class ORDigitalTwinNode(Node):
             return
         if msg.outcome == "cancelled_by_runtime_control":
             event_type = "BedRobotArmGroupCommandCancelled"
+        elif msg.outcome == "accepted":
+            # The unified retraction Service reports request admission, not
+            # physical completion of the controller-side command.
+            event_type = "BedRobotArmGroupCommandAccepted"
         elif is_health:
             event_type = "BedRobotArmGroupAvailabilityChanged"
         elif bool(msg.terminal):
@@ -3021,6 +3025,7 @@ class ORDigitalTwinNode(Node):
                 "outcome": msg.outcome,
                 "terminal": bool(msg.terminal),
                 "success": bool(msg.success),
+                "admission_only": msg.outcome == "accepted",
                 "message": msg.message,
                 "arm_id": msg.arm_id,
                 "target_tool_id": msg.target_tool_id,

@@ -451,12 +451,6 @@ function MissionWorkspace({
               flir: ros.flirPerceptionOverlay,
             }}
             perceptionHealth={ros.perceptionHealth}
-            perceptionControlPending={ros.actionPending.includes(
-              "object recognition",
-            )}
-            onPerceptionEnabledChange={(enabled) =>
-              void ros.setPerceptionEnabled(enabled)
-            }
             systemSurgeonRequest={fusedSurgeonRequest}
             onStageAspectChange={(ratio) => {
               setStageAspectRatio((current) => (Math.abs(current - ratio) > 0.01 ? ratio : current));

@@ -38,6 +38,10 @@ def test_base_launch_conditions_mock_execution_servers() -> None:
         "publish_shared_free_text",
         "speech_input_mode",
         "sentence_input_topic",
+        "retractor_voice_normalization_enabled",
+        "retractor_voice_interpreter_mode",
+        "retractor_voice_vlm_base_url",
+        "retractor_voice_vlm_model_id",
         "enable_rfdetr_perception",
         "perception_backend",
         "cv_contract_status_topic",
@@ -210,8 +214,7 @@ def _preflight_requirements(module, bundle_id: str) -> dict[str, bool]:
     return {
         name: bool(parameters[name].evaluate(context))
         for name in (
-            "require_tool_change_service",
-            "require_retraction_adjustment_server",
+            "require_retraction_service",
             "require_bed_robot_arm_status",
         )
     }
@@ -265,23 +268,19 @@ def test_preflight_requirements_follow_external_procedure_contract() -> None:
     module = _load_launch_module("taskplanner_mock.launch.py")
 
     assert _preflight_requirements(module, "thyroidectomy") == {
-        "require_tool_change_service": True,
-        "require_retraction_adjustment_server": False,
+        "require_retraction_service": True,
         "require_bed_robot_arm_status": True,
     }
     assert _preflight_requirements(module, "thyroidectomy_demo") == {
-        "require_tool_change_service": True,
-        "require_retraction_adjustment_server": False,
+        "require_retraction_service": True,
         "require_bed_robot_arm_status": True,
     }
     assert _preflight_requirements(module, "nephrectomy") == {
-        "require_tool_change_service": False,
-        "require_retraction_adjustment_server": True,
+        "require_retraction_service": True,
         "require_bed_robot_arm_status": True,
     }
     assert _preflight_requirements(module, "inguinal_hernia_repair") == {
-        "require_tool_change_service": False,
-        "require_retraction_adjustment_server": False,
+        "require_retraction_service": False,
         "require_bed_robot_arm_status": False,
     }
 
@@ -397,6 +396,15 @@ def test_live_launch_wraps_external_runtime_contract() -> None:
     )
     assert arguments["execution_backend"] == "external"
     assert arguments["speech_input_mode"] == "sentence_text"
+    assert arguments["retractor_voice_interpreter_mode"].name[0].text == (
+        "RETRACTOR_VOICE_INTERPRETER_MODE"
+    )
+    assert arguments["retractor_voice_interpreter_mode"].default_value[0].text == (
+        "vlm_with_fallback"
+    )
+    assert arguments["retractor_voice_vlm_base_url"].name[0].text == (
+        "RETRACTOR_VOICE_VLM_BASE_URL"
+    )
     assert (
         arguments["perception_backend"]._LaunchConfiguration__variable_name[0].text
         == "perception_backend"
@@ -412,6 +420,37 @@ def test_live_launch_wraps_external_runtime_contract() -> None:
         arguments["preflight_require_perception"].default_value[0].text
         == "false"
     )
+
+
+def test_live_retractor_text_vlm_inherits_the_loaded_vlm_endpoint(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("RETRACTOR_VOICE_VLM_BASE_URL", raising=False)
+    monkeypatch.delenv("RETRACTOR_VOICE_VLM_MODEL_ID", raising=False)
+    monkeypatch.delenv("RETRACTOR_VOICE_VLM_API_KEY", raising=False)
+    monkeypatch.setenv("VLM_BASE_URL", "http://127.0.0.1:8080")
+    monkeypatch.setenv("VLM_MODEL_ID", "qwen3.6-35b-a3b")
+    monkeypatch.setenv("VLM_API_KEY", "test-key")
+
+    module = _load_launch_module("taskplanner_live.launch.py")
+    description = module.generate_launch_description()
+    include = next(
+        entity
+        for entity in description.entities
+        if isinstance(entity, IncludeLaunchDescription)
+    )
+    arguments = dict(include.launch_arguments)
+    context = LaunchContext()
+
+    assert perform_substitutions(
+        context, [arguments["retractor_voice_vlm_base_url"]]
+    ) == "http://127.0.0.1:8080"
+    assert perform_substitutions(
+        context, [arguments["retractor_voice_vlm_model_id"]]
+    ) == "qwen3.6-35b-a3b"
+    assert perform_substitutions(
+        context, [arguments["retractor_voice_vlm_api_key"]]
+    ) == "test-key"
 
 
 def test_live_public_contract_is_enabled_and_loop_safe_by_default() -> None:

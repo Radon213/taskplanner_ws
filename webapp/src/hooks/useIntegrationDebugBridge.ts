@@ -43,7 +43,7 @@ export interface DebugInputStatus {
 }
 
 export interface DebugEndpointStatus {
-  name: "tool_handover" | "retraction_adjustment" | "tool_change" | "bed_robot_arm_status";
+  name: "tool_handover" | "retraction_service" | "bed_robot_arm_status";
   endpoint: string;
   kind: "action" | "service" | "topic";
   ready: boolean;
@@ -67,6 +67,11 @@ export type DebugActionState =
 export interface DebugActionStatus {
   route: string;
   command_id: string;
+  command?: string;
+  response_semantics?: "action" | "admission";
+  request_accepted?: boolean | null;
+  result_code?: number | null;
+  response_message?: string;
   state: DebugActionState;
   progress: number;
   success: boolean;
@@ -79,6 +84,42 @@ export interface DebugActionStatus {
   server_ready?: boolean;
   cancel_available?: boolean;
   source?: string;
+}
+
+export interface DebugRetractionVoiceInterpretation {
+  transcript: string;
+  command: string | null;
+  target_side: string;
+  distance_m: number;
+  confidence: number;
+  reason: string;
+  /** Provenance such as text_vlm, deterministic_fallback, or shared_deterministic. */
+  interpreter_source: string;
+  /** True only after a model transport attempt actually occurred. */
+  vlm_invoked: boolean;
+  /** Bounded machine-readable outcome used to explain VLM success or fallback. */
+  detail?: string;
+}
+
+export interface DebugRetractionVoiceStatus {
+  /**
+   * This gate only decides whether a final sentence already received on the
+   * surgeon-sentence topic may be normalized and submitted.  It never owns
+   * microphone capture or the ASR process.
+   */
+  mode: "buttons_only" | "voice_and_buttons" | (string & {});
+  /** Local Debug bookkeeping derived from Service admission, never robot pose. */
+  internal_state: string;
+  /** Selected runtime policy; voice mode alone never changes this setting. */
+  interpreter_mode?: "deterministic" | "vlm_with_fallback" | (string & {});
+  /** A final transcript is being interpreted asynchronously; no Service call yet. */
+  interpreter_pending?: boolean;
+  /** Commands admitted by the shared local policy for the current internal state. */
+  allowed_commands: string[];
+  service_ready: boolean;
+  in_flight: boolean;
+  last_interpretation: DebugRetractionVoiceInterpretation;
+  last_rejection_reason: string;
 }
 
 export interface DebugOutputStatus {
@@ -300,6 +341,7 @@ export interface IntegrationDebugStatus {
       payload?: Record<string, unknown>;
       reason?: string;
     };
+    retraction?: DebugRetractionVoiceStatus;
   };
   asr: DebugAsrStatus;
   surgery_record: DebugSurgeryRecordStatus;
@@ -362,6 +404,58 @@ function cleanupDebugTopics(ros: any, topics: any[], advertisedTopic: any): void
   } catch {
     // The closed bridge has already released the advertisement.
   }
+}
+
+function reconcileAcknowledgedSessionTransition(
+  current: IntegrationDebugStatus | null,
+  operation: string,
+  payload: Record<string, unknown>,
+): IntegrationDebugStatus | null {
+  if (!current) return current;
+  if (operation === "arm") {
+    const acknowledgedBlockedNodes = Array.isArray(payload.acknowledged_blocked_nodes)
+      ? payload.acknowledged_blocked_nodes
+        .filter((node): node is string => typeof node === "string")
+        .map((node) => node.trim())
+        .filter(Boolean)
+      : [];
+    return {
+      ...current,
+      session: {
+        ...current.session,
+        state: "ARMED",
+        armed: true,
+        fault_locked: false,
+        last_error: "",
+        acknowledged_blocked_nodes: acknowledgedBlockedNodes,
+        planner_coexistence_active: acknowledgedBlockedNodes.length > 0,
+      },
+    };
+  }
+  if (operation === "disarm") {
+    return {
+      ...current,
+      session: {
+        ...current.session,
+        state: "MONITOR_ONLY",
+        armed: false,
+        acknowledged_blocked_nodes: [],
+        planner_coexistence_active: false,
+      },
+    };
+  }
+  if (operation === "reset_fault") {
+    return {
+      ...current,
+      session: {
+        ...current.session,
+        state: current.session.armed ? current.session.state : "MONITOR_ONLY",
+        fault_locked: false,
+        last_error: "",
+      },
+    };
+  }
+  return current;
 }
 
 export function useIntegrationDebugBridge(url: string) {
@@ -577,12 +671,23 @@ export function useIntegrationDebugBridge(url: string) {
               result = {};
             }
           }
-          resolve({
+          const commandResponse = {
             accepted: Boolean(raw.accepted),
             command_id: String(raw.command_id ?? ""),
             message: String(raw.message ?? ""),
             result,
-          });
+          };
+          if (commandResponse.accepted) {
+            // The command service is the authority that admitted arm/disarm.
+            // Reflect that receipt immediately, while the next status topic
+            // remains the source of truth and freshness still expires normally.
+            setStatus((current) => reconcileAcknowledgedSessionTransition(
+              current,
+              operation,
+              payload,
+            ));
+          }
+          resolve(commandResponse);
         };
         cancel = (reason: string) => {
           if (settled) return;

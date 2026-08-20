@@ -6,17 +6,24 @@ topics to focused public robot-capability endpoints.
 It subscribes to `/bt/skill_command` and `/bt/bed_robot_arm_group_command`.
 A stable next-tool decision, handover, unused held-tool return, and Mayo
 retrieval all map to the single `/surgery/tool_handover` Action. Retraction
-adjustments map to `/surgery/retraction/adjust`, while a reviewed retractor
-tool change maps to the blocking `/surgery/tool_change/request` Service. The
-adapter subscribes to controller-owned state on
+commands all map to the single `/surgery/retraction/command`
+`ExecuteRetractionCommand` Service. The adapter subscribes to controller-owned state on
 `/external/bed_robot_arms/status`. No suction-arm endpoint is exposed.
 
 The internal group envelope remains the inbound compatibility boundary. Only
-its `retraction` group is accepted. A `change_end_effector` command maps its
-`arm_id` and `target_tool_id` to `RequestToolChange`; a `retraction` command
-maps its adjustment mode, target, frame, direction or axis, and distance to
-`ExecuteRetractionAdjustment`. Missing or stale controller state, direct-teach
-mode, invalid document values, and any non-standby target arm fail closed.
+its `retraction` group is accepted. The bridge maps direct-teach start/end,
+retraction start/stop, generic tool change, and a losslessly representable
+single-side adjustment onto the Service command enum. The legacy Action's
+multi-arm, direction-vector, axis, arm-ID, and tool-ID fields do not exist in
+the Service. They are never silently dropped: multi-axis or non-lateral legacy
+adjustments are rejected locally. A left/right adjustment is sent as
+`TARGET_LEFT`/`TARGET_RIGHT` plus metres (`5 cm = 0.050`).
+
+The Service response is admission only. `request_accepted=true` proves only
+that the controller received the request; it does not prove direct teach,
+retraction, or tool change physically completed. The compatibility status uses
+`state=accepted`, `outcome=accepted` to mark the Service-call lifecycle and
+never exposes a requested end-effector profile as confirmed physical state.
 
 The tool Action sends only `command_id`, the real catalog instrument name, a
 human-readable instance ID, and one of six fixed location pairs:
@@ -50,10 +57,11 @@ sent to external servers.
 It also observes `/simulation/control_state`. It starts with dispatch disabled;
 only `start` or `start_actors` enables it, while `start_runtime` keeps it
 disabled. `stop` and `reset` prevent new dispatches, cancel pending or accepted
-public Action goals. For tool transfer, the adapter keeps the active Goal until
+public tool-transfer Action goals. For tool transfer, the adapter keeps the active Goal until
 the controller reports either verified cancel recovery or failure; recovery
-feedback remains visible instead of being suppressed. Retraction late results
-and Tool Change service results are ignored after runtime control stops. A bounded
+feedback remains visible instead of being suppressed. Retraction Service calls
+cannot be canceled after dispatch; an admission response received after a local
+stop leaves physical state unknown and blocks further dispatch. A bounded
 ledger prevents the same `command_id`, or the same explicit request generation,
 from causing a second outbound command.
 
@@ -68,7 +76,7 @@ caller sends the next Goal only after the prior Result is terminal. A canceled
 Result is accepted only with `canceled_source_unchanged` or
 `canceled_recovered_to_tray`; an ambiguous cancellation result fails closed.
 
-`RequestToolChange` cannot be canceled after Service dispatch. Its `command_id`
-is reserved before sending and is never retried automatically. A timeout or
-transport ambiguity leaves the command suppressed until operator reset and
-controller-state review.
+`ExecuteRetractionCommand` cannot be canceled after Service dispatch. Its
+`command_id` is reserved before sending and is never retried automatically. A
+timeout, malformed response, or transport ambiguity leaves the command
+suppressed until operator reset and controller-state review.

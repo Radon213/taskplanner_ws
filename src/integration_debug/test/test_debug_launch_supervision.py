@@ -3,7 +3,8 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
-from launch.actions import ExecuteProcess, Shutdown
+from launch import LaunchContext
+from launch.actions import DeclareLaunchArgument, ExecuteProcess, Shutdown
 from launch.conditions import IfCondition
 from launch_ros.actions import Node
 
@@ -49,3 +50,55 @@ def test_critical_debug_children_shutdown_the_launch() -> None:
     ]
     assert len(gateways) == 1
     assert _shutdown_reason(gateways[0]) == "integration debug gateway stopped"
+
+
+def test_debug_launch_exposes_the_single_retraction_service_name() -> None:
+    entities = list(_load_launch_description().entities)
+    context = LaunchContext()
+    retraction_argument = next(
+        entity
+        for entity in entities
+        if isinstance(entity, DeclareLaunchArgument)
+        and entity.name == "retraction_service_name"
+    )
+    retraction_argument.execute(context)
+
+    assert context.launch_configurations["retraction_service_name"] == (
+        "/surgery/retraction/command"
+    )
+
+
+def test_debug_retractor_vlm_settings_inherit_shared_vlm_environment(
+    monkeypatch,
+) -> None:
+    inherited = {
+        "retraction_voice_vlm_base_url": (
+            "RETRACTOR_VOICE_VLM_BASE_URL",
+            "VLM_BASE_URL",
+            "http://127.0.0.1:8123",
+        ),
+        "retraction_voice_vlm_model_id": (
+            "RETRACTOR_VOICE_VLM_MODEL_ID",
+            "VLM_MODEL_ID",
+            "local/retractor-test-model",
+        ),
+        "retraction_voice_vlm_api_key": (
+            "RETRACTOR_VOICE_VLM_API_KEY",
+            "VLM_API_KEY",
+            "test-key",
+        ),
+    }
+    entities = list(_load_launch_description().entities)
+
+    for launch_name, (specific_env, shared_env, expected) in inherited.items():
+        monkeypatch.delenv(specific_env, raising=False)
+        monkeypatch.setenv(shared_env, expected)
+        context = LaunchContext()
+        argument = next(
+            entity
+            for entity in entities
+            if isinstance(entity, DeclareLaunchArgument)
+            and entity.name == launch_name
+        )
+        argument.execute(context)
+        assert context.launch_configurations[launch_name] == expected

@@ -1,0 +1,54 @@
+# Synthetic profile for fake/shadow tests only.  None of these values are
+# approved for Neuromeka, AFT200, HIL, or patient-adjacent operation.
+schema_version: 1
+profile:
+  name: synthetic_fake
+  version: 1.0.0
+  procedure_type: nephrectomy
+calibration:
+  approved: true
+  revision: synthetic-test-only
+  expected_checksum: sha256:334ac70d2d35557f842ff6c45d9756f6de88e89c73726ed58afb8a30c15709c5
+robot:
+  controller_ip: 127.0.0.1
+  sdk_version: fake
+  timeout_sec: 1.0
+data:
+  directory: /tmp/retraction-control
+control:
+  friction_compensation:
+    direct_teach: 0.0
+    normal: 0.0
+  custom_gain:
+    synthetic: [0.0]
+  force_threshold: 1.0
+  force_freshness_timeout_sec: 1.0
+  stop_policy: hold
+side_mapping:
+  LEFT:
+    arm_id: arm_1
+    role_instance_id: left_malleable
+    sensor_id: fake_left
+    joint_start: 0
+    joint_end: 6
+    jog: {axis: x, sign: 1, frame: tool}
+    force: {axis: x, sign: 1}
+  RIGHT:
+    arm_id: arm_2
+    role_instance_id: right_malleable
+    sensor_id: fake_right
+    joint_start: 0
+    joint_end: 6
+    jog: {axis: x, sign: -1, frame: tool}
+    force: {axis: x, sign: -1}
+tool_change:
+  waypoints:
+    - name: fake_left_wait
+      arm_id: arm_1
+      joint_positions: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    - name: fake_right_wait
+      arm_id: arm_2
+      joint_positions: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+limits:
+  single_jog_mm: 50.0
+  cumulative_jog_mm: 100.0

@@ -128,8 +128,7 @@ def test_public_bridge_excludes_internal_control_and_raw_sensor_topics() -> None
         "/synced/flir/color/image_raw/compressed",
         "/synced/cam_4/color/image_raw/compressed",
         "/surgery/images/flir/segmented/compressed",
-        "/surgery/tool_change/request",
-        "/surgery/retraction/adjust",
+        "/surgery/retraction/command",
         "/rosapi/topics",
     }
     assert denied.isdisjoint(PUBLIC_SUBSCRIBE_ALLOWLIST)

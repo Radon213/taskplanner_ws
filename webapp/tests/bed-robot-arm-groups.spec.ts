@@ -212,7 +212,9 @@ test("shows only document-defined retraction arms while preserving clinical suct
 
   await expect(page.getByText("석션 로봇암")).toHaveCount(0);
   await expect(page.getByText("suction_arm")).toHaveCount(0);
-  await expect(page.getByText(/Yankauer suction/i).first()).toBeVisible();
+  // Landscape monitoring intentionally conceals the timeline, but the clinical
+  // suction evidence must remain available in the mounted observability feed.
+  await expect(page.locator(".timeline-area").getByText(/Yankauer suction/i).first()).toBeAttached();
 
   const traceRegion = page.getByRole("region", { name: "리트랙션 로봇암 요청 추적" });
   await expect(traceRegion.locator(`[data-bed-arm-request-id="${RETRACTION_REQUEST_ID}"]`)).toHaveCount(1);

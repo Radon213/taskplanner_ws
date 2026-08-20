@@ -99,29 +99,26 @@ The recommended public endpoints are:
 | Endpoint | Type | Meaning |
 | --- | --- | --- |
 | `/surgery/tool_handover` | `ExecuteToolHandover` action | Use one Action for preparation, handover, unused-tool return, and Mayo retrieval. |
-| `/surgery/tool_change/request` | `RequestToolChange` service | Request a tool change on one bed-mounted robot arm and wait for the controller response. |
-| `/surgery/retraction/adjust` | `ExecuteRetractionAdjustment` action | Adjust one or both configured retractors and support ROS 2 Action cancellation. |
+| `/surgery/retraction/command` | `ExecuteRetractionCommand` service | Send one direct-teach, retraction, adjustment, tool-change, or stop command to the retractor controller. |
 
-Every request has a caller-provided `command_id` for correlation and idempotency.
-Results and service responses expose `success`, their documented terminal state,
-and a stable machine-readable `reason_code`.
+`ExecuteRetractionCommand` is the single public endpoint for the retractor
+controller. Its Request contains `protocol_version`, `source_id`,
+caller-provided `command_id`, `command`, `target_side`, and `distance_m`.
+`PROTOCOL_VERSION_V1` is `1`. The supported commands are
+`COMMAND_START_DIRECT_TEACH`, `COMMAND_FINISH_DIRECT_TEACH`,
+`COMMAND_START_RETRACTION`, `COMMAND_ADJUST_RETRACTION`,
+`COMMAND_CHANGE_TOOL`, and `COMMAND_STOP_RETRACTION`.
 
-`RequestToolChange.arm_id` accepts `arm_1` and `arm_2`.
-`target_tool_id` accepts `thyroid_retractor` and `army_navy_retractor`. Its
-`result` is `completed`, `failed`, `canceled`, `protective_stop`, or `unknown`.
-A `completed` response confirms completion of the controller's motion sequence;
-it does not independently verify physical tool attachment.
+For commands other than `COMMAND_ADJUST_RETRACTION`, callers send
+`TARGET_NONE` and `distance_m=0.0`. An adjustment sends `TARGET_LEFT` or
+`TARGET_RIGHT` and a metre distance; for example, 5 cm is `distance_m=0.050`.
 
-`ExecuteRetractionAdjustment.adjustment_mode` is `single` or `multi`.
-`target_retractor_id` is `left_malleable`, `right_malleable`, or
-`both_malleable`; `direction_frame` is `surgeon_view`; `direction` is `up`,
-`down`, `left`, `right`, or `none`; and `axis` is `left_right`, `up_down`, or
-`none`. The controller owns Goal acceptance, motion planning, protective stop,
-and E-stop handling. Feedback `state` is `adjusting` or `recovering`.
-`ExecuteRetractionAdjustment` feedback contains no progress estimate.
-Its Result payload must agree with the ROS 2 Action terminal status: completed
-uses SUCCEEDED, canceled uses CANCELED, and fault/protective_stop/unknown use
-ABORTED. A missing or contradictory terminal result is not treated as success.
+The Response contains `request_accepted`, `result_code`, `command_id`, and
+`message`. `RESULT_ACCEPTED` means the server accepted the Request;
+`RESULT_INVALID_COMMAND`, `RESULT_INVALID_PARAMETER`, `RESULT_REJECTED`, and
+`RESULT_ERROR` distinguish the minimum non-acceptance cases. This response does
+not report physical execution progress, completion, or controller state. The
+controller owns all execution, safety, and completion behavior.
 
 `BedRobotArmState.role` is `retraction`. Its `role_instance_id` is
 `left_malleable`, `right_malleable`, or `army_navy`, and `state` is `standby`,

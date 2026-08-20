@@ -3,20 +3,30 @@ from dataclasses import asdict
 import pytest
 
 from surgical_interop_execution.mappings import (
-    ADJUSTMENT_MULTI,
-    ADJUSTMENT_SINGLE,
     MAX_RETRACTION_DISTANCE_MM,
     DispatchLedger,
     GROUP_RETRACTION,
     OPERATION_CHANGE_END_EFFECTOR,
+    OPERATION_FINISH_DIRECT_TEACH,
     OPERATION_RELEASE_RETRACTION,
     OPERATION_RETRACTION,
+    OPERATION_START_DIRECT_TEACH,
+    OPERATION_START_RETRACTION,
+    OPERATION_STOP_RETRACTION,
     PUBLIC_TOOL_LOCATIONS,
+    RETRACTION_COMMAND_ADJUST_RETRACTION,
+    RETRACTION_COMMAND_CHANGE_TOOL,
+    RETRACTION_COMMAND_FINISH_DIRECT_TEACH,
+    RETRACTION_COMMAND_START_DIRECT_TEACH,
+    RETRACTION_COMMAND_START_RETRACTION,
+    RETRACTION_COMMAND_STOP_RETRACTION,
+    RETRACTION_TARGET_LEFT,
+    RETRACTION_TARGET_NONE,
+    RETRACTION_TARGET_RIGHT,
     InternalGroupCommand,
     InternalSkillCommand,
     MappingFailure,
-    RetractionAdjustmentRequest,
-    ToolChangeRequest,
+    RetractionCommandRequest,
     map_group_command,
     map_skill_to_tool_handover,
     public_instrument_instance_id,
@@ -245,52 +255,49 @@ def _group(operation: str, **overrides) -> InternalGroupCommand:
     return InternalGroupCommand(**values)
 
 
-def test_retraction_move_preserves_only_physical_motion_fields():
+def test_retraction_move_projects_to_single_service_command_fields():
     request = map_group_command(
         _group(OPERATION_RETRACTION)
     )
-    assert request == RetractionAdjustmentRequest(
+    assert request == RetractionCommandRequest(
         command_id="group-1",
-        adjustment_mode=ADJUSTMENT_SINGLE,
-        target_retractor_id="left_malleable",
-        direction_frame="surgeon_view",
-        direction="left",
-        axis="none",
-        distance_mm=8.0,
+        command=RETRACTION_COMMAND_ADJUST_RETRACTION,
+        target_side=RETRACTION_TARGET_LEFT,
+        distance_m=0.008,
     )
     assert asdict(request) == {
         "command_id": "group-1",
-        "adjustment_mode": "single",
-        "target_retractor_id": "left_malleable",
-        "direction_frame": "surgeon_view",
-        "direction": "left",
-        "axis": "none",
-        "distance_mm": 8.0,
+        "command": RETRACTION_COMMAND_ADJUST_RETRACTION,
+        "target_side": RETRACTION_TARGET_LEFT,
+        "distance_m": 0.008,
     }
 
 
-def test_multi_adjustment_maps_axis_without_guessing_direction():
+def test_right_retraction_move_maps_to_right_target_side():
     request = map_group_command(
         _group(
             OPERATION_RETRACTION,
-            adjustment_mode="multi",
-            target_retractor_id="both_malleable",
-            direction="none",
-            axis="up_down",
+            target_retractor_id="right_malleable",
+            direction="right",
         )
     )
-    assert request == RetractionAdjustmentRequest(
-        command_id="group-1",
-        adjustment_mode=ADJUSTMENT_MULTI,
-        target_retractor_id="both_malleable",
-        direction_frame="surgeon_view",
-        direction="none",
-        axis="up_down",
-        distance_mm=8.0,
-    )
+    assert request.target_side == RETRACTION_TARGET_RIGHT
 
 
-def test_end_effector_change_maps_to_document_tool_change_service():
+def test_multi_axis_retraction_is_rejected_instead_of_losing_information():
+    with pytest.raises(MappingFailure, match="unsupported_retraction_adjustment_mode"):
+        map_group_command(
+            _group(
+                OPERATION_RETRACTION,
+                adjustment_mode="multi",
+                target_retractor_id="both_malleable",
+                direction="none",
+                axis="up_down",
+            )
+        )
+
+
+def test_end_effector_change_maps_to_generic_single_service_command():
     request = map_group_command(
         _group(
             OPERATION_CHANGE_END_EFFECTOR,
@@ -300,10 +307,11 @@ def test_end_effector_change_maps_to_document_tool_change_service():
             distance_mm=0.0,
         )
     )
-    assert request == ToolChangeRequest(
+    assert request == RetractionCommandRequest(
         command_id="group-1",
-        arm_id="arm_2",
-        target_tool_id="army_navy_retractor",
+        command=RETRACTION_COMMAND_CHANGE_TOOL,
+        target_side=RETRACTION_TARGET_NONE,
+        distance_m=0.0,
     )
 
 
@@ -317,43 +325,56 @@ def test_suction_group_is_explicitly_rejected_at_public_boundary():
         )
 
 
-def test_release_is_not_in_the_new_public_contract():
-    with pytest.raises(MappingFailure, match="unsupported_retraction_operation"):
-        map_group_command(
-            _group(
-                OPERATION_RELEASE_RETRACTION,
-                direction="",
-                distance_mm=0.0,
-            )
+def test_release_maps_to_stop_retraction_compatibility_command():
+    request = map_group_command(
+        _group(
+            OPERATION_RELEASE_RETRACTION,
+            direction="",
+            distance_mm=0.0,
         )
+    )
+    assert request.command == RETRACTION_COMMAND_STOP_RETRACTION
+    assert request.target_side == RETRACTION_TARGET_NONE
+    assert request.distance_m == 0.0
 
 
-def test_single_adjustment_requires_an_explicit_document_target():
-    with pytest.raises(MappingFailure, match="invalid_target_retractor"):
+@pytest.mark.parametrize(
+    ("operation", "service_command"),
+    [
+        (OPERATION_START_DIRECT_TEACH, RETRACTION_COMMAND_START_DIRECT_TEACH),
+        (OPERATION_FINISH_DIRECT_TEACH, RETRACTION_COMMAND_FINISH_DIRECT_TEACH),
+        (OPERATION_START_RETRACTION, RETRACTION_COMMAND_START_RETRACTION),
+        (OPERATION_STOP_RETRACTION, RETRACTION_COMMAND_STOP_RETRACTION),
+    ],
+)
+def test_basic_retraction_lifecycle_operations_map_to_parameterless_service_commands(
+    operation, service_command
+):
+    request = map_group_command(_group(operation, direction="", distance_mm=0.0))
+    assert request == RetractionCommandRequest(
+        command_id="group-1",
+        command=service_command,
+        target_side=RETRACTION_TARGET_NONE,
+        distance_m=0.0,
+    )
+
+
+def test_single_adjustment_requires_an_explicit_service_target():
+    with pytest.raises(MappingFailure, match="unsupported_retraction_target"):
         map_group_command(_group(OPERATION_RETRACTION, target_retractor_id=""))
 
 
-def test_tool_change_rejects_unknown_tool_and_arm_values():
-    with pytest.raises(MappingFailure, match="invalid_target_tool"):
-        map_group_command(
-            _group(
-                OPERATION_CHANGE_END_EFFECTOR,
-                arm_id="arm_1",
-                target_tool_id="wide_retractor",
-                direction="",
-                distance_mm=0.0,
-            )
+def test_tool_change_does_not_project_unrepresented_arm_or_tool_fields():
+    request = map_group_command(
+        _group(
+            OPERATION_CHANGE_END_EFFECTOR,
+            arm_id="left_arm",
+            target_tool_id="wide_retractor",
+            direction="",
+            distance_mm=0.0,
         )
-    with pytest.raises(MappingFailure, match="invalid_arm_id"):
-        map_group_command(
-            _group(
-                OPERATION_CHANGE_END_EFFECTOR,
-                arm_id="left_arm",
-                target_tool_id="thyroid_retractor",
-                direction="",
-                distance_mm=0.0,
-            )
-        )
+    )
+    assert request.command == RETRACTION_COMMAND_CHANGE_TOOL
 
 
 def test_retraction_requires_a_positive_finite_distance():
@@ -367,22 +388,37 @@ def test_retraction_requires_a_positive_finite_distance():
 
 
 def test_retraction_distance_is_bounded_by_configured_public_limit():
-    assert MAX_RETRACTION_DISTANCE_MM == 30.0
+    assert MAX_RETRACTION_DISTANCE_MM == 50.0
     assert map_group_command(
         _group(
             OPERATION_RETRACTION,
             distance_mm=MAX_RETRACTION_DISTANCE_MM,
             target_retractor_id="right_malleable",
+            direction="right",
         )
-    ).distance_mm == 30.0
+    ).distance_m == 0.050
     with pytest.raises(MappingFailure, match="invalid_retraction_distance"):
         map_group_command(
             _group(
                 OPERATION_RETRACTION,
                 distance_mm=MAX_RETRACTION_DISTANCE_MM + 0.1,
                 target_retractor_id="right_malleable",
+                direction="right",
             )
         )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "reason"),
+    [
+        ({"direction": "up"}, "unsupported_retraction_direction_for_service"),
+        ({"direction": "right"}, "unsupported_retraction_direction_for_service"),
+        ({"axis": "left_right"}, "unsupported_retraction_axis"),
+    ],
+)
+def test_unrepresented_legacy_direction_fields_are_explicitly_rejected(overrides, reason):
+    with pytest.raises(MappingFailure, match=reason):
+        map_group_command(_group(OPERATION_RETRACTION, **overrides))
 
 
 def test_dispatch_ledger_suppresses_a_repeated_command_id():

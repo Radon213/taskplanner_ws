@@ -219,16 +219,14 @@ def test_external_robot_contract_is_derived_from_loaded_spec() -> None:
 
     assert (
         thyroid.procedure_type,
-        thyroid.require_tool_change_service,
-        thyroid.require_retraction_adjustment_server,
+        thyroid.require_retraction_service,
         thyroid.require_bed_robot_arm_status,
-    ) == ("thyroidectomy", True, False, True)
+    ) == ("thyroidectomy", True, True)
     assert (
         kidney.procedure_type,
-        kidney.require_tool_change_service,
-        kidney.require_retraction_adjustment_server,
+        kidney.require_retraction_service,
         kidney.require_bed_robot_arm_status,
-    ) == ("nephrectomy", False, True, True)
+    ) == ("nephrectomy", True, True)
     assert no_bed_robot.procedure_type == ""
     assert no_bed_robot.require_bed_robot_arm_status is False
 

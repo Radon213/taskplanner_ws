@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
@@ -11,7 +12,7 @@ from pathlib import Path
 import signal
 import threading
 import time
-from typing import Any, Callable
+from typing import Any
 from uuid import uuid4
 
 from ament_index_python.packages import get_package_share_directory
@@ -29,10 +30,7 @@ from rclpy.qos import (
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
-from surgical_interop_msgs.action import (
-    ExecuteRetractionAdjustment,
-    ExecuteToolHandover,
-)
+from surgical_interop_msgs.action import ExecuteToolHandover
 from surgical_interop_msgs.msg import (
     BedRobotArmStateArray,
     ClinicalObservation,
@@ -45,9 +43,22 @@ from surgical_interop_msgs.msg import (
     SurgeryEvent,
     SurgeryHealth,
 )
-from surgical_interop_msgs.srv import RequestToolChange
+from surgical_interop_msgs.srv import ExecuteRetractionCommand
 from surgical_msgs.msg import SimulationState
 from surgical_msgs.srv import IntegrationDebugCommand
+
+from procedure_spec import (
+    NormalizedRetractionCommand,
+    RetractionCommand,
+    RetractionState,
+    allowed_retractor_commands,
+    apply_retractor_service_admission,
+    normalize_retractor_command,
+)
+from bt_orchestrator.retractor_voice_interpreter import (
+    RetractionVoiceInterpretation,
+    TextOnlyRetractionVLMInterpreter,
+)
 
 from integration_debug.asr_runtime import AsrMicrophoneRuntime
 from integration_debug.contracts import (
@@ -63,9 +74,8 @@ from integration_debug.contracts import (
     validate_action_recovery_acknowledgement,
     validate_planner_coexistence_acknowledgement,
     validate_bed_robot_arm_status,
-    validate_retraction_adjustment,
-    validate_tool_change,
     validate_tool_handover,
+    validate_retraction_command,
 )
 from integration_debug.surgery_record_runtime import SurgeryRecordRuntime
 from integration_debug.networking import (
@@ -80,6 +90,21 @@ STATUS_SCHEMA = "taskplanner.integration_debug.status.v1"
 EVENT_SCHEMA = "taskplanner.integration_debug.event.v1"
 MAX_EVENT_SUMMARY_STRING_CHARS = 2048
 MAX_EVENT_SUMMARY_ITEMS = 32
+RETRACTION_SERVICE_DEFAULT_NAME = "/surgery/retraction/command"
+RETRACTION_SERVICE_SOURCE_ID = "taskplanner_debug"
+RETRACTION_COMMAND_CONSTANTS = {
+    "start_direct_teach": "COMMAND_START_DIRECT_TEACH",
+    "finish_direct_teach": "COMMAND_FINISH_DIRECT_TEACH",
+    "start_retraction": "COMMAND_START_RETRACTION",
+    "adjust_retraction": "COMMAND_ADJUST_RETRACTION",
+    "change_tool": "COMMAND_CHANGE_TOOL",
+    "stop_retraction": "COMMAND_STOP_RETRACTION",
+}
+RETRACTION_TARGET_SIDE_CONSTANTS = {
+    "none": "TARGET_NONE",
+    "left": "TARGET_LEFT",
+    "right": "TARGET_RIGHT",
+}
 PUBLIC_OUTPUT_TYPES: dict[str, type[Any]] = {
     "surgical_interop_msgs/msg/SurgeryContext": SurgeryContext,
     "surgical_interop_msgs/msg/InstrumentStateArray": InstrumentStateArray,
@@ -142,6 +167,17 @@ class OutputState:
     sequence: int = 0
 
 
+@dataclass(slots=True)
+class PendingDebugRetractionInterpretation:
+    """One asynchronous text-only VLM request owned by Debug Mode."""
+
+    transcript: str
+    current_state: RetractionState
+    voice_generation: int
+    submitted_monotonic: float
+    future: Future[RetractionVoiceInterpretation]
+
+
 def _snapshot_qos() -> QoSProfile:
     return QoSProfile(
         history=QoSHistoryPolicy.KEEP_LAST,
@@ -185,7 +221,77 @@ class IntegrationDebugNode(Node):
             "run_root",
             os.environ.get("TASKPLANNER_RUN_ROOT", "/tmp/taskplanner-runs"),
         )
+        self.declare_parameter(
+            "retraction_service_name", RETRACTION_SERVICE_DEFAULT_NAME
+        )
+        self.declare_parameter(
+            "retraction_voice_interpreter_mode",
+            os.environ.get(
+                "RETRACTOR_VOICE_INTERPRETER_MODE", "vlm_with_fallback"
+            ),
+        )
+        self.declare_parameter(
+            "retraction_voice_vlm_base_url",
+            os.environ.get("RETRACTOR_VOICE_VLM_BASE_URL", "").strip()
+            or os.environ.get("VLM_BASE_URL", "").strip()
+            or "http://127.0.0.1:8001",
+        )
+        self.declare_parameter(
+            "retraction_voice_vlm_model_id",
+            os.environ.get("RETRACTOR_VOICE_VLM_MODEL_ID", "").strip()
+            or os.environ.get("VLM_MODEL_ID", "").strip()
+            or "unsloth/gemma-4-E4B-it-NVFP4",
+        )
+        self.declare_parameter(
+            "retraction_voice_vlm_api_key",
+            os.environ.get("RETRACTOR_VOICE_VLM_API_KEY", "").strip()
+            or os.environ.get("VLM_API_KEY", "").strip(),
+        )
+        self.declare_parameter(
+            "retraction_voice_vlm_timeout_sec",
+            float(os.environ.get("RETRACTOR_VOICE_VLM_TIMEOUT_SEC", "2.0")),
+        )
         config_path = str(self.get_parameter("config_path").value)
+        self._retraction_service_name = str(
+            self.get_parameter("retraction_service_name").value
+        ).strip()
+        if not self._retraction_service_name:
+            raise ValueError("retraction_service_name must not be empty")
+        requested_retraction_voice_interpreter_mode = str(
+            self.get_parameter("retraction_voice_interpreter_mode").value
+        ).strip().lower()
+        if requested_retraction_voice_interpreter_mode not in {
+            "deterministic",
+            "vlm_with_fallback",
+        }:
+            raise ValueError(
+                "retraction_voice_interpreter_mode must be deterministic or "
+                "vlm_with_fallback"
+            )
+        self._retraction_voice_interpreter_mode = (
+            requested_retraction_voice_interpreter_mode
+        )
+        self._retraction_voice_interpreter = TextOnlyRetractionVLMInterpreter(
+            base_url=str(
+                self.get_parameter("retraction_voice_vlm_base_url").value
+            ),
+            model_id=str(
+                self.get_parameter("retraction_voice_vlm_model_id").value
+            ),
+            api_key=str(
+                self.get_parameter("retraction_voice_vlm_api_key").value
+            ),
+            timeout_sec=float(
+                self.get_parameter("retraction_voice_vlm_timeout_sec").value
+            ),
+        )
+        self._retraction_voice_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="integration_debug_retractor_voice_vlm",
+        )
+        self._pending_retraction_voice_interpretation: (
+            PendingDebugRetractionInterpretation | None
+        ) = None
         self._config = load_config(config_path)
         self._lock = threading.RLock()
         self._log_lock = threading.Lock()
@@ -208,6 +314,22 @@ class IntegrationDebugNode(Node):
         self._active_goal_handle: Any | None = None
         self._action_status: dict[str, Any] = self._idle_action_status()
         self._voice_auto_execute = False
+        # This is deliberately independent of USB microphone ownership.  It
+        # gates only retractor normalization and dispatch of final strings that
+        # have already reached ``_asr_topic``.
+        self._retraction_voice_auto_dispatch = False
+        # Incremented whenever voice dispatch authority is revoked or its mode
+        # is changed.  Async interpretations carry the generation that was
+        # current at submission so an old result cannot dispatch after a
+        # buttons-only -> voice-enabled toggle cycle.
+        self._retraction_voice_generation = 0
+        self._retraction_state = RetractionState.IDLE
+        self._last_retraction_interpretation = self._retraction_interpretation(
+            "", normalize_retractor_command("", self._retraction_state)
+        )
+        self._last_retraction_rejection_reason = ""
+        self._last_retraction_voice_dispatch_text = ""
+        self._last_retraction_voice_dispatch_monotonic = 0.0
         self._last_sentence = ""
         self._last_voice_parse: dict[str, Any] = {}
         self._last_voice_dispatch_text = ""
@@ -433,15 +555,9 @@ class IntegrationDebugNode(Node):
             "/surgery/tool_handover",
             callback_group=self._callback_group,
         )
-        self._retraction_client = ActionClient(
-            self,
-            ExecuteRetractionAdjustment,
-            "/surgery/retraction/adjust",
-            callback_group=self._callback_group,
-        )
-        self._tool_change_client = self.create_client(
-            RequestToolChange,
-            "/surgery/tool_change/request",
+        self._retraction_client = self.create_client(
+            ExecuteRetractionCommand,
+            self._retraction_service_name,
             callback_group=self._callback_group,
         )
         self._bed_robot_arm_status_subscription = self.create_subscription(
@@ -498,6 +614,11 @@ class IntegrationDebugNode(Node):
         return {
             "route": "",
             "command_id": "",
+            "command": "",
+            "response_semantics": "action",
+            "request_accepted": None,
+            "result_code": None,
+            "response_message": "",
             "state": "idle",
             "progress": 0.0,
             "success": False,
@@ -524,7 +645,32 @@ class IntegrationDebugNode(Node):
 
         self._armed = False
         self._voice_auto_execute = False
+        self._retraction_voice_auto_dispatch = False
+        self._retraction_voice_generation += 1
         self._acknowledged_blocked_nodes.clear()
+
+    @staticmethod
+    def _retraction_interpretation(
+        transcript: str,
+        normalized: NormalizedRetractionCommand,
+        *,
+        interpreter_source: str = "shared_deterministic",
+        vlm_invoked: bool = False,
+        detail: str = "",
+    ) -> dict[str, Any]:
+        """Serialize one grounded text interpretation for Debug status."""
+
+        return {
+            "transcript": str(transcript),
+            "command": normalized.command.value if normalized.command else None,
+            "target_side": normalized.target_side.value,
+            "distance_m": float(normalized.distance_m),
+            "confidence": float(normalized.confidence),
+            "reason": str(normalized.reason),
+            "interpreter_source": str(interpreter_source),
+            "vlm_invoked": bool(vlm_invoked),
+            "detail": str(detail),
+        }
 
     def _record(self, event_type: str, payload: dict[str, Any]) -> None:
         row = {
@@ -551,6 +697,246 @@ class IntegrationDebugNode(Node):
         message.data = encoded
         self._event_pub.publish(message)
 
+    def _apply_retraction_voice_interpretation(
+        self,
+        transcript: str,
+        interpretation: RetractionVoiceInterpretation,
+        *,
+        expected_state: RetractionState | None = None,
+        expected_voice_generation: int | None = None,
+    ) -> None:
+        """Gate and dispatch one completed, locally grounded interpretation."""
+
+        now = time.monotonic()
+        normalized = interpretation.normalized
+        serialized = self._retraction_interpretation(
+            transcript,
+            normalized,
+            interpreter_source=interpretation.interpreter_source,
+            vlm_invoked=interpretation.vlm_invoked,
+            detail=interpretation.detail,
+        )
+        retraction_service_ready = self._retraction_client.service_is_ready()
+        should_dispatch = False
+        with self._lock:
+            self._last_retraction_interpretation = serialized
+            if (
+                expected_voice_generation is not None
+                and expected_voice_generation
+                != self._retraction_voice_generation
+            ):
+                self._last_retraction_rejection_reason = (
+                    "retraction_voice_authority_changed_while_interpreting"
+                )
+            elif (
+                expected_state is not None
+                and expected_state != self._retraction_state
+            ):
+                self._last_retraction_rejection_reason = (
+                    "retraction_state_changed_while_interpreting"
+                )
+            elif normalized.command is None:
+                self._last_retraction_rejection_reason = normalized.reason
+            elif not self._retraction_voice_auto_dispatch:
+                self._last_retraction_rejection_reason = "voice_mode_buttons_only"
+            elif not self._armed:
+                self._last_retraction_rejection_reason = "manual_control_not_armed"
+            elif self._active_command_id:
+                self._last_retraction_rejection_reason = (
+                    "retraction_command_in_flight"
+                )
+            elif not retraction_service_ready:
+                self._last_retraction_rejection_reason = (
+                    "retraction_service_unavailable"
+                )
+            elif normalized.command not in allowed_retractor_commands(
+                self._retraction_state
+            ):
+                self._last_retraction_rejection_reason = (
+                    "retraction_command_not_allowed_in_debug_state"
+                )
+            elif (
+                transcript != self._last_retraction_voice_dispatch_text
+                or now - self._last_retraction_voice_dispatch_monotonic > 2.0
+            ):
+                should_dispatch = True
+                self._last_retraction_voice_dispatch_text = transcript
+                self._last_retraction_voice_dispatch_monotonic = now
+                self._last_retraction_rejection_reason = ""
+
+        self._record(
+            "retraction_voice_interpretation",
+            {"interpretation": serialized},
+        )
+        if not should_dispatch or normalized.command is None:
+            return
+        retraction_payload = {
+            "command": normalized.command.value,
+            "target_side": normalized.target_side.value,
+            "distance_m": normalized.distance_m,
+        }
+        accepted, command_id, message = self._dispatch_action(
+            "retraction_command", retraction_payload, source="voice"
+        )
+        if not accepted:
+            with self._lock:
+                self._last_retraction_rejection_reason = message
+        self._record(
+            "retraction_voice_dispatch",
+            {
+                "accepted": accepted,
+                "command_id": command_id,
+                "message": message,
+                "interpretation": serialized,
+            },
+        )
+
+    def _submit_retraction_voice_interpretation(
+        self,
+        transcript: str,
+        current_state: RetractionState,
+        voice_generation: int | None = None,
+    ) -> None:
+        """Submit one non-blocking VLM request or use the shared normalizer."""
+
+        deterministic = normalize_retractor_command(transcript, current_state)
+        if voice_generation is None:
+            with self._lock:
+                voice_generation = self._retraction_voice_generation
+        if (
+            getattr(self, "_retraction_voice_interpreter_mode", "deterministic")
+            != "vlm_with_fallback"
+            or not getattr(self, "_retraction_voice_auto_dispatch", False)
+        ):
+            IntegrationDebugNode._apply_retraction_voice_interpretation(
+                self,
+                transcript,
+                RetractionVoiceInterpretation(
+                    normalized=deterministic,
+                    interpreter_source="shared_deterministic",
+                    vlm_invoked=False,
+                    detail="deterministic_normalizer",
+                ),
+                expected_state=current_state,
+                expected_voice_generation=voice_generation,
+            )
+            return
+
+        interpreter = getattr(self, "_retraction_voice_interpreter", None)
+        executor = getattr(self, "_retraction_voice_executor", None)
+        if interpreter is None or executor is None:
+            IntegrationDebugNode._apply_retraction_voice_interpretation(
+                self,
+                transcript,
+                RetractionVoiceInterpretation(
+                    normalized=deterministic,
+                    interpreter_source="deterministic_fallback",
+                    vlm_invoked=False,
+                    detail="text_vlm_runtime_unavailable",
+                ),
+                expected_state=current_state,
+                expected_voice_generation=voice_generation,
+            )
+            return
+        submit_error: Exception | None = None
+        with self._lock:
+            pending = getattr(
+                self, "_pending_retraction_voice_interpretation", None
+            )
+            if pending is not None:
+                self._last_retraction_interpretation = (
+                    self._retraction_interpretation(
+                        transcript,
+                        deterministic,
+                        interpreter_source="text_vlm_busy",
+                        vlm_invoked=False,
+                        detail="previous_text_vlm_request_pending",
+                    )
+                )
+                self._last_retraction_rejection_reason = (
+                    "retraction_interpreter_busy"
+                )
+                return
+            try:
+                future = executor.submit(
+                    interpreter.interpret,
+                    transcript,
+                    current_state,
+                )
+            except Exception as exc:  # pragma: no cover - executor failure
+                submit_error = exc
+            else:
+                self._pending_retraction_voice_interpretation = (
+                    PendingDebugRetractionInterpretation(
+                        transcript=transcript,
+                        current_state=current_state,
+                        voice_generation=voice_generation,
+                        submitted_monotonic=time.monotonic(),
+                        future=future,
+                    )
+                )
+                self._last_retraction_interpretation = (
+                    self._retraction_interpretation(
+                        transcript,
+                        deterministic,
+                        interpreter_source="text_vlm_pending",
+                        vlm_invoked=False,
+                        detail="text_vlm_request_submitted",
+                    )
+                )
+                self._last_retraction_rejection_reason = ""
+        if submit_error is not None:
+            IntegrationDebugNode._apply_retraction_voice_interpretation(
+                self,
+                transcript,
+                RetractionVoiceInterpretation(
+                    normalized=deterministic,
+                    interpreter_source="deterministic_fallback",
+                    vlm_invoked=False,
+                    detail=(
+                        "text_vlm_submit_error:"
+                        f"{type(submit_error).__name__}"
+                    ),
+                ),
+                expected_state=current_state,
+                expected_voice_generation=voice_generation,
+            )
+            return
+        self._record(
+            "retraction_voice_interpreter_submitted",
+            {
+                "interpreter_source": "text_vlm_pending",
+                "vlm_invoked": False,
+            },
+        )
+
+    def _drain_retraction_voice_interpretation(self) -> None:
+        pending = getattr(self, "_pending_retraction_voice_interpretation", None)
+        if pending is None or not pending.future.done():
+            return
+        with self._lock:
+            if self._pending_retraction_voice_interpretation is not pending:
+                return
+            self._pending_retraction_voice_interpretation = None
+        try:
+            interpretation = pending.future.result()
+        except Exception as exc:  # pragma: no cover - executor boundary
+            interpretation = RetractionVoiceInterpretation(
+                normalized=normalize_retractor_command(
+                    pending.transcript, pending.current_state
+                ),
+                interpreter_source="deterministic_fallback",
+                vlm_invoked=False,
+                detail=f"text_vlm_executor_error:{type(exc).__name__}",
+            )
+        IntegrationDebugNode._apply_retraction_voice_interpretation(
+            self,
+            pending.transcript,
+            interpretation,
+            expected_state=pending.current_state,
+            expected_voice_generation=pending.voice_generation,
+        )
+
     def _on_string_input(self, topic: str, msg: String) -> None:
         now = time.monotonic()
         text = str(msg.data).strip()
@@ -567,32 +953,65 @@ class IntegrationDebugNode(Node):
         # recent-event snapshot.
         if topic != self._asr_topic:
             return
-        with self._lock:
-            self._last_sentence = text
         parsed = parse_voice_command(text, dict(self._config.get("voice", {})))
         with self._lock:
+            self._last_sentence = text
             self._last_voice_parse = parsed.as_dict()
-            should_dispatch = (
+            retraction_state = self._retraction_state
+            retraction_voice_generation = self._retraction_voice_generation
+            # The legacy generic voice router continues to own tool handover,
+            # but it must never bypass the dedicated retractor voice gate.
+            should_generic_dispatch = (
                 self._voice_auto_execute
                 and self._armed
                 and not self._active_command_id
                 and parsed.matched
-                and text != self._last_voice_dispatch_text
-            ) or (
-                self._voice_auto_execute
-                and self._armed
-                and not self._active_command_id
-                and parsed.matched
-                and now - self._last_voice_dispatch_monotonic > 2.0
+                and parsed.operation != "retraction_command"
+                and (
+                    text != self._last_voice_dispatch_text
+                    or now - self._last_voice_dispatch_monotonic > 2.0
+                )
             )
-            if should_dispatch:
+            if should_generic_dispatch:
                 self._last_voice_dispatch_text = text
                 self._last_voice_dispatch_monotonic = now
+
+        deterministic_preview = normalize_retractor_command(
+            text, retraction_state
+        )
         self._record(
             "sentence_received",
-            {"topic": topic, "text": text, "parse": parsed.as_dict()},
+            {
+                "topic": topic,
+                "text": text,
+                "parse": parsed.as_dict(),
+                "retraction_parse": self._retraction_interpretation(
+                    text,
+                    deterministic_preview,
+                    interpreter_source=(
+                        "text_vlm_pending"
+                        if getattr(
+                            self,
+                            "_retraction_voice_interpreter_mode",
+                            "deterministic",
+                        )
+                        == "vlm_with_fallback"
+                        and getattr(
+                            self, "_retraction_voice_auto_dispatch", False
+                        )
+                        else "shared_deterministic"
+                    ),
+                    vlm_invoked=False,
+                ),
+            },
         )
-        if should_dispatch and parsed.payload is not None:
+        IntegrationDebugNode._submit_retraction_voice_interpretation(
+            self,
+            text,
+            retraction_state,
+            retraction_voice_generation,
+        )
+        if should_generic_dispatch and parsed.payload is not None:
             accepted, command_id, message = self._dispatch_action(
                 parsed.operation, parsed.payload, source="voice"
             )
@@ -855,6 +1274,11 @@ class IntegrationDebugNode(Node):
                     "result": safe_result,
                 },
             )
+        if operation in {"arm", "disarm", "reset_fault"}:
+            # A session transition must be visible before the next periodic
+            # status tick so the browser can start or stop its heartbeat from
+            # the authoritative server state without an avoidable lockout.
+            self._publish_status()
         return response
 
     def _ensure_asr_publisher(self) -> None:
@@ -1026,7 +1450,42 @@ class IntegrationDebugNode(Node):
             return True, "", "surgery-record test history cleared", {}
         return False, "", "unknown surgery-record debug operation", {}
 
+    def _configure_retraction_voice(
+        self, payload: dict[str, Any]
+    ) -> tuple[bool, str, str]:
+        """Configure only the final-transcript dispatch gate for the retractor.
+
+        This method deliberately does not inspect, start, stop, or otherwise
+        acquire the USB ASR runtime.  The ASR tab remains the sole microphone
+        capture owner; this switch is safe to change even while the Service is
+        not discovered because it only controls future final transcripts.
+        """
+
+        enabled = payload.get("enabled")
+        if not isinstance(enabled, bool):
+            return False, "", "enabled must be a boolean"
+        if enabled:
+            blocked_reason = self._manual_write_block_reason()
+            if blocked_reason:
+                if blocked_reason == "manual control is not armed":
+                    blocked_reason = (
+                        "arm manual control before enabling retraction voice dispatch"
+                    )
+                return False, "", blocked_reason
+        with self._lock:
+            if self._retraction_voice_auto_dispatch != enabled:
+                self._retraction_voice_generation += 1
+            self._retraction_voice_auto_dispatch = enabled
+        return (
+            True,
+            "",
+            "retraction final-transcript dispatch enabled"
+            if enabled
+            else "retraction final-transcript dispatch disabled",
+        )
+
     def _drain_auxiliary_events(self) -> None:
+        IntegrationDebugNode._drain_retraction_voice_interpretation(self)
         with self._auxiliary_lock:
             for event in self._asr.drain_events():
                 event_type = str(event.get("type", "asr_event"))
@@ -1114,20 +1573,24 @@ class IntegrationDebugNode(Node):
                 accepted, command_id, message = self._request_cancel()
                 if accepted:
                     return True, command_id, "disarmed; active Action cancel requested"
-                if self._active_route == "tool_change":
-                    return True, command_id, "disarmed; tool change Service remains in flight"
+                if self._active_route == "retraction_service":
+                    return (
+                        True,
+                        command_id,
+                        "disarmed; retraction Service response remains pending",
+                    )
                 return False, command_id, message
             return True, "", "manual control disarmed"
         if operation == "reset_fault":
             with self._lock:
                 if self._active_command_id:
-                    return False, "", "cannot reset while an Action is active"
+                    return False, "", "cannot reset while a command is active"
                 self._fault_locked = False
                 self._last_error = ""
                 self._action_status = self._idle_action_status()
             return True, "", "fault lock reset"
-        if operation == "recover_action_client":
-            return self._recover_action_client(payload)
+        if operation in {"recover_action_client", "recover_command_client"}:
+            return self._recover_command_client(payload)
         if operation == "cancel_active":
             return self._request_cancel()
         if operation == "configure_voice":
@@ -1143,6 +1606,8 @@ class IntegrationDebugNode(Node):
             with self._lock:
                 self._voice_auto_execute = enabled
             return True, "", "voice auto-dispatch enabled" if enabled else "voice auto-dispatch disabled"
+        if operation == "configure_retraction_voice":
+            return self._configure_retraction_voice(payload)
         if operation == "publish_voice_command":
             blocked_reason = self._manual_write_block_reason()
             if blocked_reason:
@@ -1180,31 +1645,40 @@ class IntegrationDebugNode(Node):
             return True, "", "all debug output publishers stopped"
         return self._dispatch_action(operation, payload, source="ui")
 
-    def _recover_action_client(
+    def _recover_command_client(
         self, payload: dict[str, Any]
     ) -> tuple[bool, str, str]:
         with self._lock:
             command_id = self._active_command_id
             if not command_id:
-                return False, "", "there is no active Action client state to recover"
+                return False, "", "there is no active command client state to recover"
             if not bool(self._action_status.get("recovery_required")):
-                return False, command_id, "the active Action does not require recovery"
+                return False, command_id, "the active command does not require recovery"
             validate_action_recovery_acknowledgement(payload, command_id)
             route = self._active_route
             previous_state = str(self._action_status.get("state", ""))
             previous_reason = str(self._action_status.get("reason_code", ""))
             started = float(self._action_status.get("started_monotonic", 0.0))
             elapsed_sec = max(0.0, time.monotonic() - started) if started else 0.0
+            retraction_state_reset = route == "retraction_service"
             self._disarm_locked()
             self._active_route = ""
             self._active_command_id = ""
             self._active_goal_handle = None
             self._fault_locked = False
             self._last_error = ""
+            if retraction_state_reset:
+                # A lost Service response makes the local admission state
+                # unknown.  Recovery is permitted only after the operator
+                # explicitly confirms the remote state/motion check above;
+                # use that confirmation to establish a fresh Debug baseline.
+                # This is local bookkeeping, not a claim that the arm moved.
+                self._retraction_state = RetractionState.IDLE
+                self._last_retraction_rejection_reason = ""
             self._action_status = self._idle_action_status()
         self._release_manual_publishers()
         self._record(
-            "action_client_recovered",
+            "command_client_recovered",
             {
                 "route": route,
                 "command_id": command_id,
@@ -1212,12 +1686,20 @@ class IntegrationDebugNode(Node):
                 "previous_reason_code": previous_reason,
                 "elapsed_sec": round(elapsed_sec, 3),
                 "remote_motion_stopped_confirmed": True,
+                "retraction_state_reset": (
+                    RetractionState.IDLE.value if retraction_state_reset else ""
+                ),
             },
         )
         return (
             True,
             command_id,
-            "Action client state recovered; manual control remains disarmed",
+            (
+                "retraction Service client recovered to Debug idle; "
+                "manual control remains disarmed"
+                if retraction_state_reset
+                else "command client state recovered; manual control remains disarmed"
+            ),
         )
 
     def _apply_network_settings(
@@ -1319,14 +1801,42 @@ class IntegrationDebugNode(Node):
     def _dispatch_action(
         self, operation: str, payload: dict[str, Any], *, source: str
     ) -> tuple[bool, str, str]:
+        # Reject the old Debug API before the arm/interlock check so callers get
+        # an explicit migration error rather than a misleading safety error.
+        if operation == "retraction_adjustment":
+            return (
+                False,
+                "",
+                "legacy direction, axis, and multi-retractor adjustment fields are "
+                "unsupported; use retraction_command with target_side and distance_m",
+            )
+        if operation == "tool_change":
+            return (
+                False,
+                "",
+                "legacy arm_id and target_tool_id fields are unsupported; use "
+                "retraction_command with command change_tool",
+            )
+        retraction_command = (
+            validate_retraction_command(payload)
+            if operation == "retraction_command"
+            else None
+        )
+        normalized_retraction_command: RetractionCommand | None = None
+        if retraction_command is not None:
+            # ``validate_retraction_command`` owns the public wire vocabulary;
+            # enum conversion makes the local admission-state check explicit.
+            normalized_retraction_command = RetractionCommand(
+                str(retraction_command["command"])
+            )
         blocked_reason = self._manual_write_block_reason()
         if blocked_reason:
             return False, "", blocked_reason
-        with self._lock:
-            if self._active_command_id:
-                return False, self._active_command_id, "another command is active"
-        command_id = f"debug-{uuid4()}"
         if operation == "tool_handover":
+            with self._lock:
+                if self._active_command_id:
+                    return False, self._active_command_id, "another command is active"
+            command_id = f"debug-{uuid4()}"
             mapped = validate_tool_handover(payload)
             if not self._tool_client.server_is_ready():
                 return False, "", "/surgery/tool_handover Action server is unavailable"
@@ -1349,81 +1859,208 @@ class IntegrationDebugNode(Node):
                 )
             )
             return True, command_id, "tool handover Goal submitted"
-        if operation == "retraction_adjustment":
-            mapped = validate_retraction_adjustment(payload)
-            if not self._retraction_client.server_is_ready():
-                return False, "", "/surgery/retraction/adjust Action server is unavailable"
-            goal = ExecuteRetractionAdjustment.Goal()
-            goal.command_id = command_id
-            goal.adjustment_mode = mapped["adjustment_mode"]
-            goal.target_retractor_id = mapped["target_retractor_id"]
-            goal.direction_frame = mapped["direction_frame"]
-            goal.direction = mapped["direction"]
-            goal.axis = mapped["axis"]
-            goal.distance_mm = mapped["distance_mm"]
-            self._start_action("retraction_adjustment", command_id, source)
-            future = self._retraction_client.send_goal_async(
-                goal,
-                feedback_callback=lambda feedback: self._on_action_feedback(
-                    "retraction_adjustment", command_id, feedback
-                ),
+        if operation == "retraction_command":
+            assert retraction_command is not None
+            assert normalized_retraction_command is not None
+            if not self._retraction_client.service_is_ready():
+                with self._lock:
+                    self._last_retraction_rejection_reason = (
+                        "retraction_service_unavailable"
+                    )
+                return (
+                    False,
+                    "",
+                    f"{self._retraction_service_name} Service is unavailable",
+                )
+            command_id = f"debug-{uuid4()}"
+            with self._lock:
+                # The graph-level interlock was checked immediately above,
+                # but arm/voice authority can change on another executor
+                # thread while Service readiness is inspected.  Revalidate
+                # the session-scoped gates atomically with reservation of the
+                # one active command slot.
+                if not self._armed:
+                    return False, "", "manual control is not armed"
+                if self._fault_locked:
+                    return False, "", "reset the fault lock before manual control"
+                if source == "voice" and not self._retraction_voice_auto_dispatch:
+                    self._last_retraction_rejection_reason = (
+                        "voice_mode_buttons_only"
+                    )
+                    return False, "", "retraction voice dispatch is disabled"
+                if self._active_command_id:
+                    return False, self._active_command_id, "another command is active"
+                state_before_dispatch = self._retraction_state
+                if normalized_retraction_command not in allowed_retractor_commands(
+                    state_before_dispatch
+                ):
+                    self._last_retraction_rejection_reason = (
+                        "retraction_command_not_allowed_in_debug_state"
+                    )
+                    return (
+                        False,
+                        "",
+                        f"{normalized_retraction_command.value} is not allowed in "
+                        f"Debug retraction state {state_before_dispatch.value}",
+                    )
+                # This is only ROS-message serialization, not a transport
+                # write.  Keep it after the state guard so invalid direct
+                # API/UI commands cannot even progress toward a Service call.
+                request = self._build_retraction_service_request(
+                    command_id, retraction_command
+                )
+                self._start_action_locked(
+                    "retraction_service",
+                    command_id,
+                    source,
+                    command=normalized_retraction_command.value,
+                    response_semantics="admission",
+                )
+                self._last_retraction_rejection_reason = ""
+            self._record(
+                "command_started",
+                {
+                    "route": "retraction_service",
+                    "command_id": command_id,
+                    "source": source,
+                },
             )
+            try:
+                future = self._retraction_client.call_async(request)
+            except Exception as exc:
+                # ``call_async`` raising means the client could not enqueue
+                # the request.  Release the reservation without advancing or
+                # invalidating the local state; there was no admission result
+                # to apply and no physical-completion claim is made.
+                reason_code = f"service_submit_error:{type(exc).__name__}"
+                with self._lock:
+                    if self._active_command_id == command_id:
+                        started = float(
+                            self._action_status.get("started_monotonic", 0.0)
+                        )
+                        self._action_status.update(
+                            {
+                                "state": "failed",
+                                "progress": 0.0,
+                                "success": False,
+                                "terminal": True,
+                                "request_accepted": False,
+                                "result_code": None,
+                                "reason_code": reason_code,
+                                "response_message": "",
+                                "elapsed_sec": max(
+                                    0.0, time.monotonic() - started
+                                ),
+                                "last_update_monotonic": time.monotonic(),
+                            }
+                        )
+                        self._active_route = ""
+                        self._active_command_id = ""
+                        self._active_goal_handle = None
+                        self._last_retraction_rejection_reason = reason_code
+                self._record(
+                    "retraction_service_submit_failed",
+                    {
+                        "command_id": command_id,
+                        "command": normalized_retraction_command.value,
+                        "reason_code": reason_code,
+                    },
+                )
+                return (
+                    False,
+                    "",
+                    f"failed to submit retraction Service request ({reason_code})",
+                )
             future.add_done_callback(
-                lambda result: self._on_goal_response(
-                    "retraction_adjustment", command_id, result
+                lambda result: self._on_retraction_service_response(
+                    command_id, result
                 )
             )
-            return True, command_id, "retraction adjustment Goal submitted"
-        if operation == "tool_change":
-            mapped = validate_tool_change(payload)
-            if not self._tool_change_client.service_is_ready():
-                return False, "", "/surgery/tool_change/request Service is unavailable"
-            request = RequestToolChange.Request()
-            request.command_id = command_id
-            request.arm_id = mapped["arm_id"]
-            request.target_tool_id = mapped["target_tool_id"]
-            self._start_action("tool_change", command_id, source)
-            future = self._tool_change_client.call_async(request)
-            future.add_done_callback(
-                lambda result: self._on_tool_change_result(command_id, result)
-            )
-            return True, command_id, "tool change request submitted"
+            return True, command_id, "retraction Service request submitted"
         return False, "", "unsupported integration debug operation"
 
     def _route_server_ready(self, route: str) -> bool:
         if route == "tool_handover":
             return self._tool_client.server_is_ready()
-        if route == "retraction_adjustment":
-            return self._retraction_client.server_is_ready()
-        if route == "tool_change":
-            return self._tool_change_client.service_is_ready()
+        if route == "retraction_service":
+            return self._retraction_client.service_is_ready()
         return False
 
-    def _start_action(self, route: str, command_id: str, source: str) -> None:
-        now = time.monotonic()
+    def _build_retraction_service_request(
+        self, command_id: str, mapped: dict[str, Any]
+    ) -> ExecuteRetractionCommand.Request:
+        request = ExecuteRetractionCommand.Request()
+        request.protocol_version = ExecuteRetractionCommand.Request.PROTOCOL_VERSION_V1
+        request.source_id = RETRACTION_SERVICE_SOURCE_ID
+        request.command_id = command_id
+        request.command = getattr(
+            ExecuteRetractionCommand.Request,
+            RETRACTION_COMMAND_CONSTANTS[str(mapped["command"])],
+        )
+        request.target_side = getattr(
+            ExecuteRetractionCommand.Request,
+            RETRACTION_TARGET_SIDE_CONSTANTS[str(mapped["target_side"])],
+        )
+        request.distance_m = float(mapped["distance_m"])
+        return request
+
+    def _start_action(
+        self,
+        route: str,
+        command_id: str,
+        source: str,
+        *,
+        command: str = "",
+        response_semantics: str = "action",
+    ) -> None:
         with self._lock:
-            self._active_route = route
-            self._active_command_id = command_id
-            self._active_goal_handle = None
-            self._action_status = {
-                "route": route,
-                "command_id": command_id,
-                "state": "submitting",
-                "progress": 0.0,
-                "success": False,
-                "terminal": False,
-                "reason_code": "",
-                "recovery_required": False,
-                "source": source,
-                "started_monotonic": now,
-                "last_update_monotonic": now,
-                "server_unavailable_since_monotonic": 0.0,
-                "recovery_detected_monotonic": 0.0,
-            }
+            self._start_action_locked(
+                route,
+                command_id,
+                source,
+                command=command,
+                response_semantics=response_semantics,
+            )
         self._record(
             "command_started",
             {"route": route, "command_id": command_id, "source": source},
         )
+
+    def _start_action_locked(
+        self,
+        route: str,
+        command_id: str,
+        source: str,
+        *,
+        command: str = "",
+        response_semantics: str = "action",
+    ) -> None:
+        """Reserve the single active command while ``self._lock`` is held."""
+
+        now = time.monotonic()
+        self._active_route = route
+        self._active_command_id = command_id
+        self._active_goal_handle = None
+        self._action_status = {
+            "route": route,
+            "command_id": command_id,
+            "command": command,
+            "response_semantics": response_semantics,
+            "request_accepted": None,
+            "result_code": None,
+            "response_message": "",
+            "state": "submitting",
+            "progress": 0.0,
+            "success": False,
+            "terminal": False,
+            "reason_code": "",
+            "recovery_required": False,
+            "source": source,
+            "started_monotonic": now,
+            "last_update_monotonic": now,
+            "server_unavailable_since_monotonic": 0.0,
+            "recovery_detected_monotonic": 0.0,
+        }
 
     def _on_goal_response(self, route: str, command_id: str, future: Any) -> None:
         try:
@@ -1474,17 +2111,147 @@ class IntegrationDebugNode(Node):
             reason_code = f"result_error:{exc}"
         self._finish_action(route, command_id, success, final_state, reason_code)
 
-    def _on_tool_change_result(self, command_id: str, future: Any) -> None:
+    def _on_retraction_service_response(self, command_id: str, future: Any) -> None:
+        """Record only the Service admission response, never physical completion."""
+
         try:
-            result = future.result()
-            success = bool(result.success)
-            final_state = str(result.result or ("completed" if success else "failed"))
-            reason_code = str(result.reason_code or final_state)
+            response = future.result()
+            response_command_id = str(response.command_id).strip()
+            request_accepted = bool(response.request_accepted)
+            result_code = int(response.result_code)
+            response_message = str(response.message).strip()
         except Exception as exc:
-            success = False
-            final_state = "failed"
-            reason_code = f"service_error:{exc}"
-        self._finish_action("tool_change", command_id, success, final_state, reason_code)
+            self._finish_retraction_service_admission(
+                command_id,
+                request_accepted=False,
+                result_code=None,
+                state="failed",
+                reason_code=f"service_response_error:{exc}",
+                response_message="",
+            )
+            return
+
+        if response_command_id != command_id:
+            self._finish_retraction_service_admission(
+                command_id,
+                request_accepted=False,
+                result_code=result_code,
+                state="failed",
+                reason_code="response_command_id_mismatch",
+                response_message=response_message,
+            )
+            return
+
+        accepted_code = ExecuteRetractionCommand.Response.RESULT_ACCEPTED
+        if request_accepted and result_code == accepted_code:
+            state = "accepted"
+            reason_code = "RESULT_ACCEPTED"
+        elif request_accepted:
+            state = "failed"
+            reason_code = "response_contract_mismatch"
+        else:
+            state = "rejected"
+            reason_code = self._retraction_result_code_name(result_code)
+
+        self._finish_retraction_service_admission(
+            command_id,
+            request_accepted=request_accepted,
+            result_code=result_code,
+            state=state,
+            reason_code=reason_code,
+            response_message=response_message,
+        )
+
+    @staticmethod
+    def _retraction_result_code_name(result_code: int) -> str:
+        names = {
+            ExecuteRetractionCommand.Response.RESULT_INVALID_COMMAND: "RESULT_INVALID_COMMAND",
+            ExecuteRetractionCommand.Response.RESULT_INVALID_PARAMETER: "RESULT_INVALID_PARAMETER",
+            ExecuteRetractionCommand.Response.RESULT_REJECTED: "RESULT_REJECTED",
+            ExecuteRetractionCommand.Response.RESULT_ERROR: "RESULT_ERROR",
+        }
+        return names.get(result_code, f"RESULT_CODE_{result_code}")
+
+    def _finish_retraction_service_admission(
+        self,
+        command_id: str,
+        *,
+        request_accepted: bool,
+        result_code: int | None,
+        state: str,
+        reason_code: str,
+        response_message: str,
+    ) -> None:
+        with self._lock:
+            if self._active_command_id != command_id:
+                return
+            started = float(self._action_status.get("started_monotonic", 0.0))
+            command = str(self._action_status.get("command", ""))
+            try:
+                normalized_command = RetractionCommand(command)
+            except ValueError:
+                normalized_command = None
+            state_before_admission = self._retraction_state
+            if state == "accepted" and request_accepted:
+                if (
+                    normalized_command is None
+                    or normalized_command
+                    not in allowed_retractor_commands(state_before_admission)
+                ):
+                    # The peer admitted a request that this local state cannot
+                    # represent.  Do not invent a physical state; block future
+                    # voice normalization until an operator resolves it.
+                    self._retraction_state = RetractionState.UNKNOWN
+                    self._last_retraction_rejection_reason = (
+                        "admission_not_allowed_in_debug_state"
+                    )
+                else:
+                    self._retraction_state = apply_retractor_service_admission(
+                        state_before_admission,
+                        normalized_command,
+                        True,
+                    )
+                    self._last_retraction_rejection_reason = ""
+            elif state == "failed":
+                # A transport/contract failure leaves admission uncertain.  It
+                # is intentionally not treated as a controller failure.
+                self._retraction_state = RetractionState.UNKNOWN
+                self._last_retraction_rejection_reason = reason_code
+            else:
+                self._last_retraction_rejection_reason = reason_code
+            self._action_status.update(
+                {
+                    "state": state,
+                    # A Service response is terminal only for the client call.
+                    # It is not a physical-motion terminal state.
+                    "progress": 0.0,
+                    "success": False,
+                    "terminal": True,
+                    "request_accepted": request_accepted,
+                    "result_code": result_code,
+                    "reason_code": reason_code,
+                    "response_message": response_message,
+                    "recovery_required": False,
+                    "elapsed_sec": max(0.0, time.monotonic() - started),
+                    "last_update_monotonic": time.monotonic(),
+                    "server_unavailable_since_monotonic": 0.0,
+                    "recovery_detected_monotonic": 0.0,
+                }
+            )
+            self._active_route = ""
+            self._active_command_id = ""
+            self._active_goal_handle = None
+        self._record(
+            "retraction_service_response",
+            {
+                "command_id": command_id,
+                "command": command,
+                "request_accepted": request_accepted,
+                "result_code": result_code,
+                "reason_code": reason_code,
+                "message": response_message,
+            },
+        )
 
     def _finish_action(
         self,
@@ -1554,8 +2321,13 @@ class IntegrationDebugNode(Node):
             route = self._active_route
             if not command_id:
                 return False, "", "no active Action to cancel"
-            if route == "tool_change":
-                return False, command_id, "tool change is a non-cancellable Service"
+            if route == "retraction_service":
+                return (
+                    False,
+                    command_id,
+                    "the retraction Service request is non-cancellable; wait for the "
+                    "response, then issue an explicit stop_retraction command if needed",
+                )
             if goal_handle is None:
                 return False, command_id, "Action Goal has not been accepted yet"
             self._action_status["state"] = "cancel_requested"
@@ -1604,8 +2376,17 @@ class IntegrationDebugNode(Node):
             if self._action_status.get("recovery_required"):
                 return False
             started = float(self._action_status.get("started_monotonic", 0.0))
+            admission_only = (
+                self._action_status.get("response_semantics") == "admission"
+            )
             self._fault_locked = True
             self._disarm_locked()
+            if admission_only and route == "retraction_service":
+                # No timeout/server-loss path can prove whether the request was
+                # admitted. Preserve that uncertainty in the local voice
+                # normalizer rather than guessing a state transition.
+                self._retraction_state = RetractionState.UNKNOWN
+                self._last_retraction_rejection_reason = reason_code
             self._action_status.update(
                 {
                     "state": state,
@@ -1614,18 +2395,32 @@ class IntegrationDebugNode(Node):
                     "recovery_detected_monotonic": now,
                 }
             )
-            self._last_error = (
-                f"remote command state is uncertain ({reason_code}); "
-                "confirm the remote robot state before recovering the client"
-            )
+            if admission_only:
+                self._last_error = (
+                    f"retraction Service request acceptance is uncertain ({reason_code}); "
+                    "confirm the remote robot state before recovering the client"
+                )
+            else:
+                self._last_error = (
+                    f"remote command state is uncertain ({reason_code}); "
+                    "confirm the remote robot state before recovering the client"
+                )
             event = {
                 "route": route,
                 "command_id": command_id,
+                "response_semantics": (
+                    "admission" if admission_only else "action"
+                ),
                 "state": state,
                 "reason_code": reason_code,
                 "elapsed_sec": round(max(0.0, now - started), 3) if started else 0.0,
             }
-        self._record("action_recovery_required", event)
+        self._record(
+            "service_admission_recovery_required"
+            if admission_only
+            else "action_recovery_required",
+            event,
+        )
         self._release_manual_publishers()
         return True
 
@@ -1968,7 +2763,7 @@ class IntegrationDebugNode(Node):
             )
             action["cancel_available"] = bool(
                 self._active_command_id
-                and self._active_route != "tool_change"
+                and self._active_route != "retraction_service"
                 and self._active_goal_handle is not None
             )
             action["server_ready"] = self._route_server_ready(
@@ -1979,14 +2774,68 @@ class IntegrationDebugNode(Node):
             action.pop("server_unavailable_since_monotonic", None)
             action.pop("recovery_detected_monotonic", None)
             recent_events = list(self._recent_events)
+            retraction_state = self._retraction_state
+            retraction_in_flight = bool(
+                self._active_command_id and self._active_route == "retraction_service"
+            )
+            pending_retraction_interpretation = getattr(
+                self,
+                "_pending_retraction_voice_interpretation",
+                None,
+            )
             voice = {
                 "auto_execute": self._voice_auto_execute,
                 "last_sentence": self._last_sentence,
                 "last_parse": dict(self._last_voice_parse),
+                "retraction": {
+                    "mode": (
+                        "voice_and_buttons"
+                        if self._retraction_voice_auto_dispatch
+                        else "buttons_only"
+                    ),
+                    "internal_state": retraction_state.value,
+                    "interpreter_mode": getattr(
+                        self,
+                        "_retraction_voice_interpreter_mode",
+                        "deterministic",
+                    ),
+                    "interpreter_pending": bool(
+                        pending_retraction_interpretation
+                    ),
+                    "interpreter_pending_age_sec": (
+                        round(
+                            max(
+                                0.0,
+                                now
+                                - (
+                                    pending_retraction_interpretation
+                                    .submitted_monotonic
+                                ),
+                            ),
+                            3,
+                        )
+                        if pending_retraction_interpretation is not None
+                        else None
+                    ),
+                    "allowed_commands": sorted(
+                        command.value
+                        for command in allowed_retractor_commands(retraction_state)
+                    ),
+                    # The client checks DDS readiness outside this lock below.
+                    "service_ready": False,
+                    "in_flight": retraction_in_flight,
+                    "last_interpretation": dict(
+                        self._last_retraction_interpretation
+                    ),
+                    "last_rejection_reason": self._last_retraction_rejection_reason,
+                },
             }
             armed = self._armed
             acknowledged_blocked_nodes = sorted(self._acknowledged_blocked_nodes)
             last_error = self._last_error
+        voice["retraction"]["service_ready"] = bool(
+            self._retraction_client.service_is_ready()
+        )
         detected_planner_nodes = self._detected_planner_nodes()
         operational = self._operational_runtime_status()
         blocked = self._blocked_nodes()
@@ -2049,16 +2898,10 @@ class IntegrationDebugNode(Node):
                 "ready": self._tool_client.server_is_ready(),
             },
             {
-                "name": "retraction_adjustment",
-                "endpoint": "/surgery/retraction/adjust",
-                "kind": "action",
-                "ready": self._retraction_client.server_is_ready(),
-            },
-            {
-                "name": "tool_change",
-                "endpoint": "/surgery/tool_change/request",
+                "name": "retraction_service",
+                "endpoint": self._retraction_service_name,
                 "kind": "service",
-                "ready": self._tool_change_client.service_is_ready(),
+                "ready": self._retraction_client.service_is_ready(),
             },
             {
                 "name": "bed_robot_arm_status",
@@ -2158,8 +3001,7 @@ class IntegrationDebugNode(Node):
                 sentence_external_publisher or managed_asr_ready
             ),
             "tool_handover_server": self._tool_client.server_is_ready(),
-            "retraction_adjustment_server": self._retraction_client.server_is_ready(),
-            "tool_change_service": self._tool_change_client.service_is_ready(),
+            "retraction_service": self._retraction_client.service_is_ready(),
             "bed_robot_arm_status": bed_robot_ready,
         }
         missing = [name for name, passed in checks.items() if not passed]
@@ -2325,6 +3167,13 @@ class IntegrationDebugNode(Node):
             self._asr_capture_requested = False
             self._destroy_asr_publisher()
             self._asr.close()
+        pending = getattr(self, "_pending_retraction_voice_interpretation", None)
+        if pending is not None:
+            pending.future.cancel()
+        self._pending_retraction_voice_interpretation = None
+        executor = getattr(self, "_retraction_voice_executor", None)
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
         self._release_manual_publishers()
         self._drain_auxiliary_events()
         self._record("session_stopped", {})

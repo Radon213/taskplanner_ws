@@ -4,10 +4,6 @@ import * as m from "framer-motion/m";
 import {
   Activity,
   AlertTriangle,
-  ArrowDown,
-  ArrowLeft,
-  ArrowRight,
-  ArrowUp,
   Bug,
   Cable,
   CheckCircle2,
@@ -69,6 +65,14 @@ interface ToolHandoverOption {
   instrumentId: string;
   instanceIds: readonly string[];
 }
+
+type RetractionCommand =
+  | "start_direct_teach"
+  | "finish_direct_teach"
+  | "start_retraction"
+  | "adjust_retraction"
+  | "change_tool"
+  | "stop_retraction";
 
 const TOOL_HANDOVER_OPTIONS: readonly ToolHandoverOption[] = toolHandoverProfiles.profiles;
 
@@ -251,8 +255,16 @@ function eventSummary(event: { event_type: string; payload: Record<string, unkno
   if (event.event_type === "action_recovery_required") {
     return `${stringValue("route") || "Action"} 원격 상태 확인 필요 · ${stringValue("reason_code") || "원인 미상"}`;
   }
-  if (event.event_type === "action_client_recovered") {
-    return `${stringValue("route") || "Action"} 클라이언트 상태 복구 · 원격 정지 확인됨`;
+  if (event.event_type === "service_admission_recovery_required") {
+    return `${stringValue("route") || "Service"} 요청 접수 상태 확인 필요 · ${stringValue("reason_code") || "원인 미상"}`;
+  }
+  if (event.event_type === "retraction_service_response") {
+    const command = stringValue("command") || "retraction command";
+    const accepted = payload.request_accepted === true ? "요청 수락" : "요청 거부";
+    return `${command} · ${accepted} · ${stringValue("reason_code") || "결과 코드 없음"}`;
+  }
+  if (event.event_type === "action_client_recovered" || event.event_type === "command_client_recovered") {
+    return `${stringValue("route") || "명령"} 클라이언트 상태 복구 · 원격 상태 확인됨`;
   }
   if (event.event_type === "action_late_result_reconciled") {
     return `${stringValue("route") || "Action"} 지연 Result 자동 반영 · ${stringValue("final_state") || "종료"}`;
@@ -273,7 +285,7 @@ function isValidIpv4(value: string): boolean {
 }
 
 function stateTone(state: string): "ok" | "warn" | "error" | "idle" {
-  if (["READY", "LISTENING", "SUCCEEDED", "completed", "succeeded", "ARMED"].includes(state)) return "ok";
+  if (["READY", "LISTENING", "SUCCEEDED", "completed", "succeeded", "accepted", "ARMED"].includes(state)) return "ok";
   if (["TYPE_MISMATCH", "FAULT_LOCKED", "UNAVAILABLE", "ERROR", "FAILED", "failed", "rejected", "cancel_rejected"].includes(state)) return "error";
   if (["LOW_RATE", "STALE", "BUSY", "STARTING", "STOPPING", "SUBMITTING", "REMOTE_STATE_UNKNOWN", "remote_state_unknown", "cancel_requested", "cancel_accepted"].includes(state)) return "warn";
   return "idle";
@@ -283,11 +295,130 @@ function displayState(state: string): string {
   return state.toLowerCase() === "remote_state_unknown" ? "REMOTE_STATE_UNKNOWN" : state;
 }
 
+function retractionInternalStateLabel(state: string): string {
+  switch (state) {
+    case "idle":
+      return "대기";
+    case "direct_teaching":
+      return "직접 교시 중";
+    case "taught_ready":
+      return "교시 완료";
+    case "retraction_active":
+      return "리트랙션 요청 접수";
+    case "unknown":
+      return "접수 상태 미확정";
+    default:
+      return state || "대기";
+  }
+}
+
+function retractionCommandLabel(command: string | null | undefined): string {
+  switch (command) {
+    case "start_direct_teach":
+      return "직접 교시 시작";
+    case "finish_direct_teach":
+      return "직접 교시 종료";
+    case "start_retraction":
+      return "Retraction 시작";
+    case "adjust_retraction":
+      return "Retraction 더";
+    case "change_tool":
+      return "Tool change";
+    case "stop_retraction":
+      return "Retraction 종료";
+    default:
+      return "해석 안 됨";
+  }
+}
+
+function retractionInterpretationLabel(interpretation: {
+  command: string | null;
+  target_side: string;
+  distance_m: number;
+  reason: string;
+} | undefined): string {
+  if (!interpretation?.command) return interpretation?.reason || "수신 전";
+  if (interpretation.command !== "adjust_retraction") {
+    return retractionCommandLabel(interpretation.command);
+  }
+  const distanceCm = interpretation.distance_m * 100;
+  const side = interpretation.target_side === "left" ? "왼쪽" : interpretation.target_side === "right" ? "오른쪽" : "대상 없음";
+  return `${retractionCommandLabel(interpretation.command)} · ${side} ${Number.isFinite(distanceCm) ? distanceCm.toFixed(distanceCm % 1 === 0 ? 0 : 1) : "?"} cm`;
+}
+
+function retractionInterpreterSourceLabel(interpretation: {
+  interpreter_source?: string;
+  vlm_invoked?: boolean;
+} | undefined): string {
+  if (!interpretation) return "수신 전";
+  if (interpretation.interpreter_source === "text_vlm_pending") {
+    return "Text VLM 요청 제출 · 응답 대기";
+  }
+  if (interpretation.interpreter_source === "text_vlm_busy") {
+    return "Text VLM 이전 요청 처리 중 · 새 문장 보류";
+  }
+  if (interpretation.interpreter_source === "text_vlm") {
+    return "Text VLM · 원문 근거 재검증 완료";
+  }
+  if (interpretation.interpreter_source === "deterministic_fallback") {
+    return interpretation.vlm_invoked
+      ? "Text VLM 호출 후 공용 정규화기로 폴백"
+      : "공용 정규화기로 폴백 · VLM 미호출";
+  }
+  if (interpretation.interpreter_source === "shared_deterministic") {
+    return interpretation.vlm_invoked
+      ? "공용 결정론 정규화기 · VLM 호출됨"
+      : "공용 결정론 정규화기 · VLM 미호출";
+  }
+  if (interpretation.interpreter_source) {
+    return interpretation.vlm_invoked
+      ? `${interpretation.interpreter_source} · VLM 호출됨`
+      : interpretation.interpreter_source;
+  }
+  return "해석기 정보 없음";
+}
+
+function retractionInterpreterDetailLabel(detail: string | undefined): string {
+  if (!detail) return "상세 정보 없음";
+  switch (detail) {
+    case "deterministic_normalizer":
+      return "공용 정규화기를 직접 사용했습니다.";
+    case "text_vlm_not_configured":
+      return "Text VLM endpoint 또는 model이 없어 공용 정규화기를 사용했습니다.";
+    case "text_vlm_runtime_unavailable":
+      return "Text VLM 런타임을 준비할 수 없어 공용 정규화기를 사용했습니다.";
+    case "text_vlm_request_submitted":
+      return "Text VLM 요청을 제출하고 비동기 응답을 기다립니다.";
+    case "previous_text_vlm_request_pending":
+      return "이전 Text VLM 요청이 끝나지 않아 새 확정 문장을 보류했습니다.";
+    case "text_vlm_normalized":
+      return "Text VLM 결과가 폐쇄형 스키마와 원문 근거 검증을 통과했습니다.";
+    default:
+      if (detail.startsWith("text_vlm_unavailable:")) {
+        return `Text VLM 연결 또는 응답 실패로 공용 정규화기를 사용했습니다. (${detail.split(":").slice(1).join(":")})`;
+      }
+      if (detail.startsWith("text_vlm_submit_error:")) {
+        return `Text VLM 요청 제출 실패로 공용 정규화기를 사용했습니다. (${detail.split(":").slice(1).join(":")})`;
+      }
+      if (detail.startsWith("text_vlm_executor_error:")) {
+        return `Text VLM 작업 처리 실패로 공용 정규화기를 사용했습니다. (${detail.split(":").slice(1).join(":")})`;
+      }
+      return detail;
+  }
+}
+
+function retractionAllowedCommandsLabel(commands: readonly string[]): string {
+  return commands.length
+    ? commands.map((command) => retractionCommandLabel(command)).join(" · ")
+    : "없음";
+}
+
 function manualAvailabilityLabel(status: IntegrationDebugStatus | null): string {
   if (!status) return "수동 잠금 · 상태 대기";
-  if (status.action.recovery_required) return "수동 잠금 · Action 복구 필요";
+  const admissionOnly = status.action.response_semantics === "admission";
+  if (status.action.recovery_required) return `수동 잠금 · ${admissionOnly ? "Service 요청" : "Action"} 복구 필요`;
   if (status.session.fault_locked) return "수동 잠금 · Fault";
-  if (!status.action.terminal) return "수동 잠금 · Action 실행 중";
+  if (!status.action.terminal) return `수동 잠금 · ${admissionOnly ? "Service 응답 대기" : "Action 실행 중"}`;
   if (status.session.armed) return "수동 제어 활성";
   if (status.runtime.manual_control_available === true) return "수동 활성화 가능";
   if (status.runtime.operational_runtime_stopped !== true) return "수동 잠금 · 시나리오 상태";
@@ -304,6 +435,12 @@ function actionRecoveryExplanation(reasonCode: string): string {
       return "Goal 제출 후 서버의 수락 또는 거부 응답이 제한 시간 안에 도착하지 않았습니다.";
     case "service_response_timeout":
       return "Service 요청 결과가 제한 시간 안에 도착하지 않았습니다.";
+    case "service_response_error":
+      return "Service 응답을 읽는 중 오류가 발생해 요청 접수 여부를 확정할 수 없습니다.";
+    case "response_command_id_mismatch":
+      return "Service 응답의 Command ID가 현재 요청과 달라 요청 접수 여부를 확정할 수 없습니다.";
+    case "response_contract_mismatch":
+      return "Service 응답의 수락 표시와 결과 코드가 서로 맞지 않아 요청 접수 여부를 확정할 수 없습니다.";
     case "action_update_timeout":
       return "Action 서버의 Feedback, Cancel 응답 또는 Result가 제한 시간 동안 갱신되지 않았습니다.";
     case "action_duration_timeout":
@@ -795,14 +932,14 @@ function ConnectionPanel({
           </article>
         </div>
 
-        <aside className="debug-observability-rail" aria-label="Action과 네트워크 상태">
+        <aside className="debug-observability-rail" aria-label="명령과 네트워크 상태">
           <article className="debug-section-card debug-endpoint-card">
             <div className="debug-section-heading">
               <div><p>CAPABILITY DISCOVERY</p><h2>로봇 Action·Service</h2></div>
               <StatusBadge state={Boolean(readiness?.ready) ? "READY" : "WAITING"} label={Boolean(readiness?.ready) ? "전체 Preflight 정상" : "전체 Preflight 미완료"} />
             </div>
             <div className="debug-active-action-compact" aria-live="polite">
-              <span>실행 상태</span>
+              <span>{status.action.response_semantics === "admission" ? "요청 접수" : "실행 상태"}</span>
               <StatusBadge state={status.action.state} />
               <strong>{status.action.route || "활성 명령 없음"}</strong>
             </div>
@@ -841,12 +978,7 @@ function ManualPanel({
   const [instrument, setInstrument] = useState(DEFAULT_TOOL_HANDOVER_OPTION.instrumentId);
   const [instance, setInstance] = useState(DEFAULT_TOOL_HANDOVER_OPTION.instanceIds[0]);
   const [transition, setTransition] = useState("tray:surgeon");
-  const [distance, setDistance] = useState(5);
-  const [adjustmentMode, setAdjustmentMode] = useState<"single" | "multi">("single");
-  const [targetRetractorId, setTargetRetractorId] = useState("left_malleable");
-  const [axis, setAxis] = useState<"left_right" | "up_down">("left_right");
-  const [toolChangeArmId, setToolChangeArmId] = useState("arm_1");
-  const [targetToolId, setTargetToolId] = useState("thyroid_retractor");
+  const [retractionTargetSide, setRetractionTargetSide] = useState<"left" | "right">("left");
   const [pending, setPending] = useState("");
   const [recoveryConfirmed, setRecoveryConfirmed] = useState(false);
   const busy = !status.action.terminal;
@@ -899,38 +1031,21 @@ function ManualPanel({
     setInstance(nextTool.instanceIds[0]);
   }
 
-  async function move(direction: "up" | "down" | "left" | "right") {
-    await invoke("retraction_adjustment", {
-      adjustment_mode: "single",
-      target_retractor_id: targetRetractorId,
-      direction_frame: "surgeon_view",
-      direction,
-      axis: "none",
-      distance_mm: distance,
+  async function submitRetractionCommand(command: RetractionCommand) {
+    const adjustment = command === "adjust_retraction";
+    await invoke("retraction_command", {
+      command,
+      target_side: adjustment ? retractionTargetSide : "none",
+      distance_m: adjustment ? 0.05 : 0,
     });
   }
 
-  async function moveBoth() {
-    await invoke("retraction_adjustment", {
-      adjustment_mode: "multi",
-      target_retractor_id: "both_malleable",
-      direction_frame: "surgeon_view",
-      direction: "none",
-      axis,
-      distance_mm: distance,
-    });
+  async function configureRetractionVoice(enabled: boolean) {
+    await invoke("configure_retraction_voice", { enabled });
   }
 
-  async function requestToolChange(event: FormEvent) {
-    event.preventDefault();
-    await invoke("tool_change", {
-      arm_id: toolChangeArmId,
-      target_tool_id: targetToolId,
-    });
-  }
-
-  async function recoverActionClient() {
-    const response = await invoke("recover_action_client", {
+  async function recoverCommandClient() {
+    const response = await invoke("recover_command_client", {
       expected_command_id: status.action.command_id,
       remote_motion_stopped_confirmed: recoveryConfirmed,
     });
@@ -938,12 +1053,27 @@ function ManualPanel({
   }
 
   const motionDisabled = !connected || !armed || busy || Boolean(pending);
-  const moveDisabled =
-    motionDisabled ||
-    !endpointReady("retraction_adjustment") ||
-    !Number.isFinite(distance) ||
-    distance <= 0 ||
-    distance > 30;
+  const retractionService = status.endpoints.find((row) => row.name === "retraction_service");
+  const retractionServiceReady = retractionService?.ready ?? false;
+  const retractionServiceEndpoint = retractionService?.endpoint ?? "/surgery/retraction/command";
+  const retractionVoice = status.voice.retraction;
+  const retractionVoiceMode = retractionVoice?.mode === "voice_and_buttons"
+    ? "voice_and_buttons"
+    : "buttons_only";
+  const retractionInFlight = retractionVoice?.in_flight === true
+    || (!status.action.terminal && status.action.route === "retraction_service");
+  const retractionVoiceServiceReady = retractionVoice?.service_ready ?? retractionServiceReady;
+  const retractionInternalState = retractionVoice?.internal_state ?? "idle";
+  const retractionAllowedCommands = retractionVoice?.allowed_commands ?? [];
+  const retractionInterpretation = retractionVoice?.last_interpretation;
+  const retractionInterpreterPending = retractionVoice?.interpreter_pending === true;
+  const retractionVoiceToggleBusy = pending === "configure_retraction_voice";
+  const retractionVoiceEnableDisabled = !connected || !armed || retractionInFlight || retractionInterpreterPending || Boolean(pending);
+  const retractionVoiceDisableDisabled = !connected || retractionVoiceToggleBusy || (Boolean(pending) && retractionVoiceMode === "buttons_only");
+  const retractionDisabled = motionDisabled || retractionInFlight || retractionInterpreterPending || !retractionVoiceServiceReady;
+  const retractionCommandDisabled = (command: RetractionCommand) =>
+    retractionDisabled || !retractionAllowedCommands.includes(command);
+  const admissionOnly = status.action.response_semantics === "admission";
   return (
     <section className="debug-panel-stack" data-slot="debug-manual-panel">
       <article
@@ -1047,49 +1177,78 @@ function ManualPanel({
             <option value="tray:robot">tray → robot</option><option value="tray:surgeon">tray → surgeon</option><option value="robot:surgeon">robot → surgeon</option><option value="robot:tray">robot → tray</option><option value="mayo:robot">mayo → robot</option><option value="mayo:tray">mayo → tray</option>
           </select></label>
           <button className="button button-primary full" disabled={motionDisabled || !endpointReady("tool_handover") || !instrument.trim()} type="submit"><Send size={16} aria-hidden="true" />도구 전달 요청</button>
-          {!endpointReady("tool_handover") ? <p className="debug-inline-warning">Action 서버를 기다리고 있습니다.</p> : null}
+          {!endpointReady("tool_handover") ? (
+            <p className="debug-inline-warning">
+              {armed
+                ? "수동 제어는 활성화되었습니다. Action 서버가 발견될 때까지 도구 전달 요청은 잠깁니다."
+                : "수동 제어와 Action 서버가 모두 준비된 뒤 도구 전달 요청을 보낼 수 있습니다."}
+            </p>
+          ) : null}
         </form>
 
-        <article className="debug-section-card debug-control-card">
-          <div className="debug-section-heading"><div><p>ACTION</p><h2>리트랙션 조정</h2></div><StatusBadge state={endpointReady("retraction_adjustment") ? "READY" : "WAITING"} label={endpointReady("retraction_adjustment") ? "서버 발견" : "서버 대기"} /></div>
-          <div className="debug-segmented-control" aria-label="리트랙션 조정 모드">
-            <button aria-pressed={adjustmentMode === "single"} className={adjustmentMode === "single" ? "active" : ""} onClick={() => setAdjustmentMode("single")} type="button">단일 리트랙터<small>single</small></button>
-            <button aria-pressed={adjustmentMode === "multi"} className={adjustmentMode === "multi" ? "active" : ""} onClick={() => setAdjustmentMode("multi")} type="button">양측 동시<small>multi</small></button>
+        <article aria-busy={retractionInFlight || retractionInterpreterPending || retractionVoiceToggleBusy} className="debug-section-card debug-control-card">
+          <div className="debug-section-heading"><div><p>SERVICE</p><h2>리트랙터 명령</h2><span>단일 Service · {retractionServiceEndpoint}</span></div><StatusBadge state={retractionServiceReady ? "READY" : "WAITING"} label={retractionServiceReady ? "서비스 발견" : "서비스 대기"} /></div>
+          <p className="debug-inline-warning">응답은 요청 접수 여부만 뜻합니다. 실제 물리 동작의 진행·완료·상태는 이 화면에서 판정하지 않습니다.</p>
+          <div aria-describedby="debug-retraction-voice-ownership" className="debug-segmented-control" aria-label="리트랙터 음성 처리 모드" data-slot="debug-retraction-voice-mode" role="group">
+            <button aria-pressed={retractionVoiceMode === "buttons_only"} className={retractionVoiceMode === "buttons_only" ? "active" : ""} disabled={retractionVoiceDisableDisabled} onClick={() => void configureRetractionVoice(false)} type="button">버튼만<small>음성 해석·전송 안 함</small></button>
+            <button aria-pressed={retractionVoiceMode === "voice_and_buttons"} className={retractionVoiceMode === "voice_and_buttons" ? "active" : ""} disabled={retractionVoiceEnableDisabled} onClick={() => void configureRetractionVoice(true)} type="button">음성 + 버튼<small>USB ASR 확정 문장만</small></button>
           </div>
-          {adjustmentMode === "single" ? (
-            <label className="debug-field"><span>대상 리트랙터</span><select value={targetRetractorId} onChange={(event) => setTargetRetractorId(event.target.value)}><option value="left_malleable">left_malleable</option><option value="right_malleable">right_malleable</option></select></label>
-          ) : (
-            <label className="debug-field"><span>동시 조정 축</span><select value={axis} onChange={(event) => setAxis(event.target.value as "left_right" | "up_down")}><option value="left_right">left_right</option><option value="up_down">up_down</option></select></label>
-          )}
-          <label className="debug-field"><span>이동 스텝</span><input aria-invalid={!Number.isFinite(distance) || distance <= 0 || distance > 30} min="0.1" max="30" step="0.5" type="number" value={distance} onChange={(event) => setDistance(Number(event.target.value))} /><small>집도의 시점 기준 · 최대 30 mm</small></label>
-          {adjustmentMode === "single" ? (
-            <div className="debug-jog-pad" aria-label="리트랙터 방향 조그">
-              <button aria-label="위로 이동" disabled={moveDisabled} onClick={() => void move("up")} type="button"><ArrowUp aria-hidden="true" /></button>
-              <button aria-label="왼쪽으로 이동" disabled={moveDisabled} onClick={() => void move("left")} type="button"><ArrowLeft aria-hidden="true" /></button>
-              <span>{distance || 0}<small>mm</small></span>
-              <button aria-label="오른쪽으로 이동" disabled={moveDisabled} onClick={() => void move("right")} type="button"><ArrowRight aria-hidden="true" /></button>
-              <button aria-label="아래로 이동" disabled={moveDisabled} onClick={() => void move("down")} type="button"><ArrowDown aria-hidden="true" /></button>
-            </div>
-          ) : (
-            <button className="button button-primary full" disabled={moveDisabled} onClick={() => void moveBoth()} type="button"><ArrowLeft size={16} aria-hidden="true" />양측 리트랙터 동시 조정<ArrowRight size={16} aria-hidden="true" /></button>
-          )}
-          {!endpointReady("retraction_adjustment") ? <p className="debug-inline-warning">Action 서버가 발견될 때까지 조정 명령을 전송하지 않습니다.</p> : null}
+          <div className="debug-voice-ownership-note" data-slot="debug-retraction-voice-ownership" id="debug-retraction-voice-ownership" role="note">
+            <Mic size={17} aria-hidden="true" />
+            <div><strong>마이크 캡처는 USB 음성·로그 탭 하나만 사용합니다</strong><span>이 모드는 그 탭이 발행한 확정 문장의 해석·전송 게이트만 바꾸며, 별도 마이크나 ASR 세션을 시작·중지하지 않습니다.</span></div>
+          </div>
+          <div aria-atomic="true" aria-live="polite" className="debug-parse-preview" data-slot="debug-retraction-voice-status">
+            <span>음성 모드</span><StatusBadge state={retractionVoiceMode === "voice_and_buttons" ? "READY" : "WAITING"} label={retractionVoiceMode === "voice_and_buttons" ? "음성 + 버튼" : "버튼만"} />
+            <span>Debug 내부 상태</span><StatusBadge state={retractionInternalState === "unknown" ? "ERROR" : retractionInternalState === "idle" ? "WAITING" : "READY"} label={retractionInternalStateLabel(retractionInternalState)} />
+            <span>Service</span><StatusBadge state={retractionInFlight ? "SUBMITTING" : retractionVoiceServiceReady ? "READY" : "WAITING"} label={retractionInFlight ? "접수 응답 대기" : retractionVoiceServiceReady ? "서비스 발견" : "서비스 대기"} />
+            <span>음성 해석</span><StatusBadge state={retractionInterpreterPending ? "SUBMITTING" : "READY"} label={retractionInterpreterPending ? "Text VLM 해석 중" : retractionVoice?.interpreter_mode === "vlm_with_fallback" ? "Text VLM + 폴백" : "결정론"} />
+            <span>현재 허용 명령</span><strong>{retractionAllowedCommandsLabel(retractionAllowedCommands)}</strong>
+            <span>최근 확정 문장</span><strong>{retractionInterpretation?.transcript || "수신 전"}</strong>
+            <span>마지막 해석</span><strong>{retractionInterpretationLabel(retractionInterpretation)}</strong>
+            <span>해석기</span><strong>{retractionInterpreterSourceLabel(retractionInterpretation)}</strong>
+            <span>해석 상세</span><div className="debug-provenance-detail"><strong>{retractionInterpreterDetailLabel(retractionInterpretation?.detail)}</strong>{retractionInterpretation?.detail ? <code>{retractionInterpretation.detail}</code> : null}</div>
+            <span>거부 이유</span><strong>{retractionVoice?.last_rejection_reason || "없음"}</strong>
+          </div>
+          <div className="debug-segmented-control" aria-label="리트랙션 조정 대상" role="group">
+            <button aria-pressed={retractionTargetSide === "left"} className={retractionTargetSide === "left" ? "active" : ""} onClick={() => setRetractionTargetSide("left")} type="button">왼쪽<small>left</small></button>
+            <button aria-pressed={retractionTargetSide === "right"} className={retractionTargetSide === "right" ? "active" : ""} onClick={() => setRetractionTargetSide("right")} type="button">오른쪽<small>right</small></button>
+          </div>
+          <div className="debug-inline-actions" aria-label="리트랙터 Service 명령" role="group">
+            <button className="button button-secondary" disabled={retractionCommandDisabled("start_direct_teach")} onClick={() => void submitRetractionCommand("start_direct_teach")} type="button"><Play size={16} aria-hidden="true" />직접 교시 시작</button>
+            <button className="button button-secondary" disabled={retractionCommandDisabled("finish_direct_teach")} onClick={() => void submitRetractionCommand("finish_direct_teach")} type="button"><CircleStop size={16} aria-hidden="true" />직접 교시 종료</button>
+            <button className="button button-primary" disabled={retractionCommandDisabled("start_retraction")} onClick={() => void submitRetractionCommand("start_retraction")} type="button"><Play size={16} aria-hidden="true" />Retraction 시작</button>
+            <button className="button button-primary" disabled={retractionCommandDisabled("adjust_retraction")} onClick={() => void submitRetractionCommand("adjust_retraction")} type="button">{retractionTargetSide === "left" ? "왼쪽" : "오른쪽"} 5 cm 더</button>
+            <button className="button button-secondary" disabled={retractionCommandDisabled("change_tool")} onClick={() => void submitRetractionCommand("change_tool")} type="button"><RefreshCw size={16} aria-hidden="true" />Tool change</button>
+            <button className="button button-secondary" disabled={retractionCommandDisabled("stop_retraction")} onClick={() => void submitRetractionCommand("stop_retraction")} type="button"><CircleStop size={16} aria-hidden="true" />Retraction 종료</button>
+          </div>
+          <p className="debug-inline-warning">방향·축·양측 조정과 arm_id·target_tool_id는 이 Service 인터페이스에 없으므로 Debug Mode에서 전송하지 않습니다.</p>
+          {retractionInterpreterPending ? <p className="debug-inline-warning">확정 문장을 Text VLM이 해석하고 있습니다. 결과는 원문 근거와 현재 Debug 상태를 다시 통과해야 Service 요청이 됩니다.</p> : null}
+          {retractionInFlight ? <p className="debug-inline-warning">리트랙터 Service의 요청 접수 응답을 기다리는 동안 새 버튼·음성 명령은 전송하지 않습니다.</p> : null}
+          {retractionVoiceServiceReady && armed && !retractionInFlight && !retractionAllowedCommands.length ? <p className="debug-inline-warning">현재 Debug 내부 상태에서는 새 리트랙터 요청을 만들 수 없습니다. 상대 Service가 수락한 요청만 이 상태를 갱신하며, 물리 상태를 뜻하지 않습니다.</p> : null}
+          {!retractionServiceReady ? (
+            <p className="debug-inline-warning">
+              {armed
+                ? "수동 제어는 활성화되었습니다. Service 서버가 발견될 때까지 리트랙터 버튼 명령은 잠깁니다. 음성 + 버튼 모드는 설정할 수 있지만 확정 문장은 전송되지 않습니다."
+                : "수동 제어와 Service 서버가 모두 준비된 뒤 리트랙터 명령을 보낼 수 있습니다."}
+            </p>
+          ) : null}
         </article>
 
         <div className="debug-manual-side">
-          <form className="debug-section-card debug-control-card" onSubmit={(event) => void requestToolChange(event)}>
-            <div className="debug-section-heading"><div><p>SERVICE</p><h2>리트랙션 도구 교환</h2></div><StatusBadge state={endpointReady("tool_change") ? "READY" : "WAITING"} label={endpointReady("tool_change") ? "서비스 발견" : "서비스 대기"} /></div>
-            <label className="debug-field"><span>로봇암</span><select value={toolChangeArmId} onChange={(event) => setToolChangeArmId(event.target.value)}><option value="arm_1">arm_1</option><option value="arm_2">arm_2</option></select></label>
-            <label className="debug-field"><span>대상 도구</span><select value={targetToolId} onChange={(event) => setTargetToolId(event.target.value)}><option value="thyroid_retractor">thyroid_retractor</option><option value="army_navy_retractor">army_navy_retractor</option></select></label>
-            <button className="button button-primary full" disabled={motionDisabled || !endpointReady("tool_change")} type="submit"><RefreshCw size={16} aria-hidden="true" />도구 교환 요청</button>
-            {!endpointReady("tool_change") ? <p className="debug-inline-warning">Service 서버를 기다리고 있습니다.</p> : null}
-          </form>
-
           <article className="debug-section-card debug-action-card" aria-live="polite">
-            <div className="debug-section-heading"><div><p>ACTION FEEDBACK</p><h2>{recoveryRequired ? "원격 상태 확인 필요" : "실행 상태"}</h2></div>{recoveryRequired ? <ShieldAlert size={19} aria-hidden="true" /> : <Activity size={19} aria-hidden="true" />}</div>
-            <div className="debug-action-summary"><StatusBadge state={status.action.state} /><strong>{status.action.route || "대기"}</strong><code>{status.action.command_id || "활성 명령 없음"}</code></div>
-            <div className="debug-progress-track" role="progressbar" aria-label="Action 진행률" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(status.action.progress * 100)} aria-valuetext={`${Math.round(status.action.progress * 100)}%, ${status.action.state}`}><span style={{ width: `${Math.round(status.action.progress * 100)}%` }} /></div>
-            <div className="debug-action-meta"><span>{Math.round(status.action.progress * 100)}%</span><span>{(status.action.elapsed_sec ?? 0).toFixed(1)} s</span><span>{status.action.reason_code || "feedback 대기"}</span></div>
+            <div className="debug-section-heading"><div><p>{admissionOnly ? "SERVICE RESPONSE" : "ACTION FEEDBACK"}</p><h2>{recoveryRequired ? "원격 상태 확인 필요" : admissionOnly ? "요청 접수 결과" : "실행 상태"}</h2></div>{recoveryRequired ? <ShieldAlert size={19} aria-hidden="true" /> : <Activity size={19} aria-hidden="true" />}</div>
+            <div className="debug-action-summary"><StatusBadge state={status.action.state} /><strong>{status.action.command || status.action.route || "대기"}</strong><code>{status.action.command_id || "활성 명령 없음"}</code></div>
+            {admissionOnly ? (
+              <>
+                <div className="debug-action-meta"><span>접수: {status.action.state === "failed" ? "미확정" : status.action.request_accepted === true ? "수락" : status.action.state === "rejected" ? "거부" : status.action.request_accepted === false ? "미확정" : "응답 대기"}</span><span>결과 코드: {status.action.result_code ?? "—"}</span><span>{(status.action.elapsed_sec ?? 0).toFixed(1)} s</span></div>
+                <p className="debug-inline-warning">{status.action.response_message ? `${status.action.response_message} · ` : ""}이 Service 응답은 요청 접수만 나타내며 로봇의 물리 실행·완료 상태는 표시하지 않습니다.</p>
+              </>
+            ) : (
+              <>
+                <div className="debug-progress-track" role="progressbar" aria-label="Action 진행률" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(status.action.progress * 100)} aria-valuetext={`${Math.round(status.action.progress * 100)}%, ${status.action.state}`}><span style={{ width: `${Math.round(status.action.progress * 100)}%` }} /></div>
+                <div className="debug-action-meta"><span>{Math.round(status.action.progress * 100)}%</span><span>{(status.action.elapsed_sec ?? 0).toFixed(1)} s</span><span>{status.action.reason_code || "feedback 대기"}</span></div>
+              </>
+            )}
             {recoveryRequired ? (
               <div className="debug-action-recovery" data-slot="debug-action-recovery" id="debug-action-recovery" role="alert" tabIndex={-1}>
                 <div className="debug-action-recovery-copy">
@@ -1105,16 +1264,16 @@ function ManualPanel({
                 </dl>
                 <label className="debug-action-recovery-confirmation">
                   <input aria-describedby="debug-action-recovery-description" checked={recoveryConfirmed} disabled={!connected || Boolean(pending)} onChange={(event) => setRecoveryConfirmed(event.target.checked)} type="checkbox" />
-                  <span>상대 로봇이 정지했거나, 상대측에서 이 Command ID의 종료 상태를 직접 확인했습니다.</span>
+                  <span>{admissionOnly ? "상대측에서 이 Command ID의 요청 접수 여부와 로봇 상태를 직접 확인했습니다." : "상대 로봇이 정지했거나, 상대측에서 이 Command ID의 종료 상태를 직접 확인했습니다."}</span>
                 </label>
                 <div className="debug-action-recovery-actions">
-                  {status.action.cancel_available && status.action.server_ready ? (
+                  {!admissionOnly && status.action.cancel_available && status.action.server_ready ? (
                     <button className="button button-secondary" disabled={!connected || Boolean(pending)} onClick={() => void invoke("cancel_active")} type="button"><Square size={15} aria-hidden="true" />Cancel 재시도</button>
                   ) : null}
-                  <button className="button button-primary" disabled={!connected || !recoveryConfirmed || Boolean(pending)} onClick={() => void recoverActionClient()} type="button"><RotateCcw size={15} aria-hidden="true" />확인 후 클라이언트 복구</button>
+                  <button className="button button-primary" disabled={!connected || !recoveryConfirmed || Boolean(pending)} onClick={() => void recoverCommandClient()} type="button"><RotateCcw size={15} aria-hidden="true" />확인 후 클라이언트 복구</button>
                 </div>
               </div>
-            ) : busy && status.action.cancel_available ? <button className="button button-secondary full" disabled={!connected || Boolean(pending)} onClick={() => void invoke("cancel_active")} type="button"><Square size={15} aria-hidden="true" />현재 Action 취소</button> : null}
+            ) : !admissionOnly && busy && status.action.cancel_available ? <button className="button button-secondary full" disabled={!connected || Boolean(pending)} onClick={() => void invoke("cancel_active")} type="button"><Square size={15} aria-hidden="true" />현재 Action 취소</button> : null}
           </article>
         </div>
       </div>
@@ -1264,6 +1423,10 @@ function VoicePanel({
               <div><p>USB · PUZZLE ASR</p><h2>마이크 런타임</h2><span>브라우저 WebSpeech가 아닌 호스트 USB 입력을 시험합니다.</span></div>
               <StatusBadge state={status.asr.state} label={status.asr.state} />
             </div>
+            <div className="debug-voice-ownership-note" data-slot="debug-asr-sole-owner" role="note">
+              <Mic size={17} aria-hidden="true" />
+              <div><strong>이 탭이 Debug 마이크 캡처를 단독 소유합니다</strong><span>조그 탭의 리트랙터 ‘음성 + 버튼’은 이 ASR의 확정 문장을 재사용하며 두 번째 오디오 스트림을 열지 않습니다.</span></div>
+            </div>
             <div className="debug-asr-form-grid">
               <label className="debug-field" htmlFor="debug-asr-device">
                 <span>마이크 입력 장치</span>
@@ -1351,18 +1514,19 @@ function VoicePanel({
           </article>
 
           <article className="debug-section-card">
-            <div className="debug-section-heading"><div><p>MANUAL SENTENCE</p><h2>수동 문장 입력</h2><span>ASR과 독립적으로 결정적 라우터를 재현합니다.</span></div><Headphones size={19} aria-hidden="true" /></div>
+            <div className="debug-section-heading"><div><p>MANUAL SENTENCE</p><h2>수동 문장 입력</h2><span>ASR 없이 동일한 확정 문장 토픽을 재현합니다.</span></div><Headphones size={19} aria-hidden="true" /></div>
             <label className="debug-field" htmlFor="debug-manual-sentence"><span>집도의 완성 문장</span><textarea id="debug-manual-sentence" rows={3} value={sentence} onChange={(event) => setSentence(event.target.value)} placeholder="예: 켈리 주세요" /></label>
             <div className="debug-inline-actions">
               <button className="button button-primary" disabled={!connected || !status.session.armed || !sentence.trim() || sentencePending} onClick={() => void sendSentence()} type="button">{sentencePending ? <LoaderCircle className="debug-spinner" size={16} aria-hidden="true" /> : <Send size={16} aria-hidden="true" />}문장 토픽 발행</button>
             </div>
             {!status.session.armed ? <p className="debug-inline-warning">수동 제어를 활성화한 후에만 문장을 발행할 수 있습니다.</p> : null}
+            <p className="debug-card-description">도구 전달 즉시 실행과 리트랙터 ‘음성 + 버튼’ 게이트가 각각 켜져 있으면, 이 수동 문장도 해당 경로의 입력으로 처리됩니다.</p>
             <code className="debug-topic-code">/sensors/surgeon/sentence · std_msgs/msg/String</code>
           </article>
 
           <article className="debug-section-card">
-            <div className="debug-section-heading"><div><p>DETERMINISTIC ROUTER</p><h2>음성 즉시 실행</h2></div><Shield size={19} aria-hidden="true" /></div>
-            <p className="debug-card-description">VLM·BT 없이 설정된 정확한 문법만 Action으로 변환합니다. 모호한 문장은 실행하지 않습니다.</p>
+            <div className="debug-section-heading"><div><p>DETERMINISTIC ROUTER</p><h2>도구 전달 음성 즉시 실행</h2></div><Shield size={19} aria-hidden="true" /></div>
+            <p className="debug-card-description">VLM·BT 없이 설정된 정확한 도구 전달 문장만 Action으로 변환합니다. 리트랙션 음성 명령은 수동 실행 탭의 별도 ‘음성 + 버튼’ 모드에서만 처리합니다.</p>
             <button className={status.voice.auto_execute ? "button button-secondary full" : "button button-primary full"} disabled={!connected || !status.session.armed} onClick={() => void runCommand("configure_voice", { enabled: !status.voice.auto_execute })} type="button">{status.voice.auto_execute ? <ToggleRight size={17} aria-hidden="true" /> : <ToggleLeft size={17} aria-hidden="true" />}{status.voice.auto_execute ? "즉시 실행 해제" : "즉시 실행 활성화"}</button>
             {!status.session.armed ? <p className="debug-inline-warning">화면 상단에서 수동 제어를 먼저 활성화해야 합니다.</p> : null}
             <div className="debug-parse-preview">
@@ -1699,7 +1863,7 @@ export function DebugWorkspace({
       return;
     }
     if (!status.session.armed && !status.session.fault_locked && status.runtime.manual_control_available !== true) {
-      setNotice({ tone: "warning", text: `${manualAvailabilityLabel(status)}입니다. 운영 시나리오와 Fault/Action 상태를 확인하세요.` });
+      setNotice({ tone: "warning", text: `${manualAvailabilityLabel(status)}입니다. 운영 시나리오와 Fault/명령 상태를 확인하세요.` });
       focusManualRequirement("debug-operational-interlock");
       return;
     }
@@ -1730,14 +1894,17 @@ export function DebugWorkspace({
   const enabledOutputCount = bridge.status?.outputs.filter((row) => row.enabled).length ?? 0;
   const blockedPlannerCount = blockedNodes.length;
   const statusAgeSec = bridge.statusReceivedAt ? Math.max(0, (Date.now() - bridge.statusReceivedAt) / 1000) : null;
+  const activeCommandIsAdmission = bridge.status?.action.response_semantics === "admission";
   const manualControlLabel = bridge.status?.action.recovery_required
-    ? "Action 복구 필요"
+    ? "명령 복구 필요"
     : bridge.status?.session.fault_locked
       ? "Fault 해제"
       : bridge.status?.session.armed
         ? bridge.status.action.terminal
           ? "수동 제어 해제"
-          : "수동 제어 해제 · Action 취소"
+          : activeCommandIsAdmission
+            ? "수동 제어 해제 · Service 응답 대기"
+            : "수동 제어 해제 · Action 취소"
         : blockedPlannerCount > 0 && bridge.status?.runtime.planner_coexistence_allowed === true && !coexistenceConfirmed
           ? "공존 확인 필요"
           : bridge.status?.runtime.manual_control_available === true
@@ -1759,9 +1926,9 @@ export function DebugWorkspace({
             || (blockedPlannerCount > 0 && bridge.status.runtime.planner_coexistence_allowed !== true));
   const tabs: Array<{ id: DebugTab; label: string; meta: string; icon: typeof Radio }> = [
     { id: "connection", label: "연결·입력", meta: `${readyInputCount}/${bridge.status?.inputs.length ?? 0} 토픽 · ${readyEndpointCount}/${bridge.status?.endpoints.length ?? 0} 종단`, icon: Radio },
-    { id: "manual", label: "조그·수동 실행", meta: bridge.status?.action.recovery_required ? "Action 복구 필요" : bridge.status && !bridge.status.session.armed && bridge.status.runtime.manual_control_available !== true ? manualAvailabilityLabel(bridge.status) : blockedPlannerCount && bridge.status?.runtime.planner_coexistence_allowed === true && !bridge.status?.session.armed ? `공존 확인 필요 · ${blockedPlannerCount}개 노드` : bridge.status?.session.state ?? "상태 대기", icon: Wrench },
+    { id: "manual", label: "조그·수동 실행", meta: bridge.status?.action.recovery_required ? "명령 복구 필요" : bridge.status && !bridge.status.session.armed && bridge.status.runtime.manual_control_available !== true ? manualAvailabilityLabel(bridge.status) : blockedPlannerCount && bridge.status?.runtime.planner_coexistence_allowed === true && !bridge.status?.session.armed ? `공존 확인 필요 · ${blockedPlannerCount}개 노드` : bridge.status?.session.state ?? "상태 대기", icon: Wrench },
     { id: "output", label: "출력 검증", meta: `${enabledOutputCount}/${bridge.status?.outputs.length ?? 0} 발행`, icon: Send },
-    { id: "voice", label: "USB 음성·로그", meta: bridge.status ? `${bridge.status.asr.state} · ${bridge.status.voice.auto_execute ? "즉시 실행 ON" : "라우팅 OFF"}` : "ASR 상태 대기", icon: Usb },
+    { id: "voice", label: "USB 음성·로그", meta: bridge.status ? `${bridge.status.asr.state} · 리트랙터 ${bridge.status.voice.retraction?.mode === "voice_and_buttons" ? "음성 ON" : "버튼만"}` : "ASR 상태 대기", icon: Usb },
     { id: "record", label: "수술기록 API", meta: bridge.status ? `${bridge.status.surgery_record.state} · 이력 ${bridge.status.surgery_record.history.length}건` : "계약 상태 대기", icon: FileText },
   ];
 

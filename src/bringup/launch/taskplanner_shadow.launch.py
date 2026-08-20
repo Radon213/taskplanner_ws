@@ -1347,6 +1347,11 @@ def generate_launch_description() -> LaunchDescription:
                     {
                         **use_sim_time,
                         "spec_dir": spec_dir,
+                        # Replay keeps the same single transcript path, but
+                        # does not make live model calls while evaluating a
+                        # recorded case.
+                        "retractor_voice_normalization_enabled": True,
+                        "retractor_voice_interpreter_mode": "deterministic",
                     }
                 ],
                 output="screen",
@@ -1386,8 +1391,7 @@ def generate_launch_description() -> LaunchDescription:
                         **use_sim_time,
                         "spec_dir": spec_dir,
                         "tool_handover_endpoint": "/surgery/tool_handover",
-                        "tool_change_service": "/surgery/tool_change/request",
-                        "retraction_endpoint": "/surgery/retraction/adjust",
+                        "retraction_service_name": "/surgery/retraction/command",
                         "bed_robot_status_endpoint": (
                             "/external/bed_robot_arms/status"
                         ),

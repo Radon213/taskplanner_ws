@@ -50,17 +50,16 @@ class ExternalRobotContract:
     """Launch-lifetime external controller contract for one procedure bundle."""
 
     procedure_type: str
-    require_tool_change_service: bool
-    require_retraction_adjustment_server: bool
+    require_retraction_service: bool
     require_bed_robot_arm_status: bool
 
 
-_NO_BED_ROBOT_CONTRACT = ExternalRobotContract("", False, False, False)
+_NO_BED_ROBOT_CONTRACT = ExternalRobotContract("", False, False)
 _THYROID_BED_ROBOT_CONTRACT = ExternalRobotContract(
-    "thyroidectomy", True, False, True
+    "thyroidectomy", True, True
 )
 _NEPHRECTOMY_BED_ROBOT_CONTRACT = ExternalRobotContract(
-    "nephrectomy", False, True, True
+    "nephrectomy", True, True
 )
 
 
@@ -996,12 +995,8 @@ class SimulationManagerNode(Node):
                         value=contract.procedure_type,
                     ),
                     Parameter(
-                        name="require_tool_change_service",
-                        value=contract.require_tool_change_service,
-                    ),
-                    Parameter(
-                        name="require_retraction_adjustment_server",
-                        value=contract.require_retraction_adjustment_server,
+                        name="require_retraction_service",
+                        value=contract.require_retraction_service,
                     ),
                     Parameter(
                         name="require_bed_robot_arm_status",

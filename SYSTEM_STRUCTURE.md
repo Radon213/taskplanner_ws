@@ -215,22 +215,22 @@ always completes configured actions and emits public `/skill/status` plus
 `/skill/events`.
 
 Bed-mounted robot-arm integration is a separate, retraction-only lane. It maps
-internal validated requests onto `/surgery/tool_change/request` for
-thyroidectomy or `/surgery/retraction/adjust` for nephrectomy, and consumes
-controller-owned state from `/external/bed_robot_arms/status`. There is no
-bed-mounted suction-arm command or status path. Clinical suction instruments
-and surgeon speech about suction remain normal tool/evidence semantics.
+internal validated requests onto the single `/surgery/retraction/command`
+Service and consumes controller-owned state from
+`/external/bed_robot_arms/status`. The Service response is request admission
+only, not a physical-completion claim. There is no bed-mounted suction-arm
+command or status path. Clinical suction instruments and surgeon speech about
+suction remain normal tool/evidence semantics.
 
 ### `surgical_interop_msgs` and `surgical_interop_execution`
 
 The external retraction contract is intentionally smaller than the internal
 planner state:
 
-- `RequestToolChange`: request `command_id`, `arm_id`, `target_tool_id`; response
-  `success`, `result`, `reason_code`.
-- `ExecuteRetractionAdjustment`: Goal `command_id`, `adjustment_mode`,
-  `target_retractor_id`, `direction_frame`, `direction`, `axis`, `distance_mm`;
-  Result `success`, `final_state`, `reason_code`; Feedback `state`.
+- `ExecuteRetractionCommand`: request `protocol_version`, `source_id`,
+  `command_id`, `command`, `target_side`, `distance_m`; response
+  `request_accepted`, `result_code`, `command_id`, `message`. It reports
+  admission only and has no feedback, cancellation, or physical-result field.
 - `BedRobotArmStateArray`: `stamp`, `revision`, `procedure_type`, `arms`, where
   each arm has `arm_id`, `role`, `role_instance_id`, `state`,
   `direct_teach_active`, and `reason_code`.

@@ -655,6 +655,26 @@ def test_group_reducer_suppresses_duplicate_progress_but_keeps_semantic_boundari
     ]
 
 
+def test_group_reducer_records_service_admission_without_completion():
+    twin = ORDigitalTwin(_thyroid_spec())
+    admitted = BedRobotArmGroupStatus()
+    admitted.stamp.sec = 21
+    admitted.request_id = "req-admission"
+    admitted.command_id = "cmd-admission"
+    admitted.group_id = "retraction"
+    admitted.operation = "change_end_effector"
+    admitted.state = "accepted"
+    admitted.outcome = "accepted"
+    admitted.terminal = True
+    admitted.success = True
+
+    assert twin.update_bed_robot_arm_group_status(admitted) is True
+
+    event = list(twin.event_history)[-1]
+    assert event["event_type"] == "BedRobotArmGroupCommandAccepted"
+    assert event["admission_only"] is True
+
+
 def test_ignored_stale_group_status_does_not_poison_duplicate_cache():
     twin = ORDigitalTwin(_thyroid_spec())
 

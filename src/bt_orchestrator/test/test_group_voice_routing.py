@@ -1,13 +1,23 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 import time
 
+import pytest
+
+from procedure_spec import (
+    NormalizedRetractionCommand,
+    RetractionCommand,
+    RetractionState,
+    RetractionTargetSide,
+)
 from bt_orchestrator.bed_robot_arm_group_orchestrator import (
     BedRobotArmGroupOrchestrator,
     PendingRetractionAdjustment,
 )
+from bt_orchestrator.retractor_voice_interpreter import RetractionVoiceInterpretation
 
 
 def test_start_heartbeat_does_not_clear_ready_runtime() -> None:
@@ -142,9 +152,18 @@ def _router(
     router._seen_request_ids = set()
     router._dispatched_request_ids = set()
     router._recent_voice_requests = {}
+    router._retractor_voice_normalization_enabled = True
+    router._retractor_voice_interpreter_mode = "deterministic"
+    router._retractor_voice_state = RetractionState.IDLE
+    router._normalized_retractor_requests = {}
+    router._normalized_retractor_commands = {}
+    router._normalized_retractor_command_requests = {}
+    router._normalized_retractor_sources = {}
+    router._pending_text_vlm_interpretations = {}
     router._command_pub = _CapturePublisher()
     router._request_pub = _CapturePublisher()
     router._status_pub = _CapturePublisher()
+    router._retractor_voice_status_pub = _CapturePublisher()
     router._confidence_threshold = 0.6
     router._visual_direction_threshold = 0.75
     router._bed_robot_status_timeout_sec = 2.0
@@ -677,3 +696,252 @@ def test_non_retraction_status_cannot_create_a_state_entry() -> None:
     router._on_group_status(status)
 
     assert set(router._group_states) == {"retraction"}
+
+
+def _dispatch_normalized_voice(router, transcript: str) -> BedRobotArmGroupCommand:
+    message = String()
+    message.data = transcript
+    router._on_voice(message)
+    request = router._request_pub.messages[-1]
+    router._on_group_request(request)
+    return router._command_pub.messages[-1]
+
+
+def _service_admission(
+    router,
+    command: BedRobotArmGroupCommand,
+    *,
+    accepted: bool,
+) -> None:
+    status = BedRobotArmGroupStatus()
+    status.request_id = command.request_id
+    status.command_id = command.command_id
+    status.group_id = "retraction"
+    status.operation = command.operation
+    status.terminal = True
+    status.success = accepted
+    status.outcome = "accepted" if accepted else "rejected"
+    status.message = "request_accepted" if accepted else "request_rejected"
+    router._on_group_status(status)
+
+
+def test_six_retractor_voice_commands_dispatch_through_one_service_lane() -> None:
+    router = _router("nephrectomy", "P02")
+
+    direct_start = _dispatch_normalized_voice(router, "직접 교시 시작")
+    assert direct_start.operation == "start_direct_teach"
+    assert router._retractor_voice_state == RetractionState.IDLE
+    _service_admission(router, direct_start, accepted=True)
+    assert router._retractor_voice_state == RetractionState.DIRECT_TEACHING
+
+    direct_finish = _dispatch_normalized_voice(router, "직접 교시 종료")
+    assert direct_finish.operation == "finish_direct_teach"
+    _service_admission(router, direct_finish, accepted=True)
+    assert router._retractor_voice_state == RetractionState.TAUGHT_READY
+
+    retraction_start = _dispatch_normalized_voice(router, "Retraction 시작")
+    assert retraction_start.operation == "start_retraction"
+    _service_admission(router, retraction_start, accepted=True)
+    assert router._retractor_voice_state == RetractionState.RETRACTION_ACTIVE
+
+    adjustment = _dispatch_normalized_voice(router, "Retraction 오른쪽 5cm 더")
+    assert adjustment.operation == "retraction"
+    assert adjustment.target_retractor_id == "right_malleable"
+    assert adjustment.direction == "right"
+    assert adjustment.axis == "none"
+    assert adjustment.distance_mm == 50.0
+    _service_admission(router, adjustment, accepted=True)
+    assert router._retractor_voice_state == RetractionState.RETRACTION_ACTIVE
+
+    tool_change = _dispatch_normalized_voice(router, "Tool change")
+    assert tool_change.operation == "change_end_effector"
+    assert tool_change.target_tool_id == ""
+    _service_admission(router, tool_change, accepted=True)
+    assert router._retractor_voice_state == RetractionState.RETRACTION_ACTIVE
+
+    retraction_stop = _dispatch_normalized_voice(router, "Retraction 종료")
+    assert retraction_stop.operation == "stop_retraction"
+    _service_admission(router, retraction_stop, accepted=True)
+    assert router._retractor_voice_state == RetractionState.TAUGHT_READY
+
+    event = json.loads(router._retractor_voice_status_pub.messages[-1].data)
+    assert event["stage"] == "service_admitted"
+    assert event["interpreter_source"] == "deterministic"
+    assert event["vlm_invoked"] is False
+    assert event["state"] == "taught_ready"
+
+
+def test_voice_state_does_not_advance_for_non_admission_status() -> None:
+    router = _router("nephrectomy", "P02")
+    command = _dispatch_normalized_voice(router, "직접 교시 시작")
+
+    _service_admission(router, command, accepted=False)
+
+    assert router._retractor_voice_state == RetractionState.IDLE
+    event = json.loads(router._retractor_voice_status_pub.messages[-1].data)
+    assert event["stage"] == "service_not_admitted"
+    assert event["vlm_invoked"] is False
+
+
+class _ImmediateFuture:
+    def __init__(self, result) -> None:
+        self._result = result
+
+    def done(self) -> bool:
+        return True
+
+    def result(self):
+        return self._result
+
+
+class _ImmediateExecutor:
+    def __init__(self, result) -> None:
+        self._result = result
+
+    def submit(self, *_args, **_kwargs):
+        return _ImmediateFuture(self._result)
+
+
+class _StaticInterpreter:
+    def __init__(self, result) -> None:
+        self._result = result
+
+    def interpret(self, *_args, **_kwargs):
+        return self._result
+
+
+class _FailingExecutor:
+    def submit(self, *_args, **_kwargs):
+        raise RuntimeError("executor closed")
+
+
+@pytest.mark.parametrize(
+    ("transcript", "state", "command", "operation"),
+    [
+        (
+            "리트렉터 직접 가르치기 모드 켜줘",
+            RetractionState.IDLE,
+            RetractionCommand.START_DIRECT_TEACH,
+            "start_direct_teach",
+        ),
+        (
+            "가르치기 이제 다 됐어",
+            RetractionState.DIRECT_TEACHING,
+            RetractionCommand.FINISH_DIRECT_TEACH,
+            "finish_direct_teach",
+        ),
+        (
+            "이제 견인 들어가자",
+            RetractionState.TAUGHT_READY,
+            RetractionCommand.START_RETRACTION,
+            "start_retraction",
+        ),
+        (
+            "오른쪽으로 한 번 더 당겨",
+            RetractionState.RETRACTION_ACTIVE,
+            RetractionCommand.ADJUST_RETRACTION,
+            "retraction",
+        ),
+        (
+            "장비 다른 걸로 바꿔줘",
+            RetractionState.RETRACTION_ACTIVE,
+            RetractionCommand.CHANGE_TOOL,
+            "change_end_effector",
+        ),
+        (
+            "견인은 여기서 끝내",
+            RetractionState.RETRACTION_ACTIVE,
+            RetractionCommand.STOP_RETRACTION,
+            "stop_retraction",
+        ),
+    ],
+)
+def test_fuzzy_demo_corpus_reaches_text_vlm_before_legacy_router(
+    transcript: str,
+    state: RetractionState,
+    command: RetractionCommand,
+    operation: str,
+) -> None:
+    router = _router("nephrectomy", "P02")
+    router._retractor_voice_state = state
+    router._retractor_voice_interpreter_mode = "vlm_with_fallback"
+    target_side = (
+        RetractionTargetSide.RIGHT
+        if command == RetractionCommand.ADJUST_RETRACTION
+        else RetractionTargetSide.NONE
+    )
+    result = RetractionVoiceInterpretation(
+        normalized=NormalizedRetractionCommand(
+            command=command,
+            target_side=target_side,
+            distance_m=(0.050 if command == RetractionCommand.ADJUST_RETRACTION else 0.0),
+            confidence=0.80,
+            reason="normalized_text_vlm_grounded",
+        ),
+        interpreter_source="text_vlm",
+        vlm_invoked=True,
+        detail="text_vlm_normalized",
+    )
+    router._retractor_voice_interpreter = _StaticInterpreter(result)
+    router._retractor_voice_executor = _ImmediateExecutor(result)
+
+    message = String()
+    message.data = transcript
+    router._on_voice(message)
+    router._drain_text_vlm_interpretations()
+
+    request = router._request_pub.messages[-1]
+    assert request.operation == operation
+    assert request.source.endswith(":text_vlm")
+
+
+def test_text_vlm_result_is_routed_with_explicit_provenance() -> None:
+    router = _router("nephrectomy", "P02")
+    router._retractor_voice_state = RetractionState.TAUGHT_READY
+    router._retractor_voice_interpreter_mode = "vlm_with_fallback"
+    result = RetractionVoiceInterpretation(
+        normalized=NormalizedRetractionCommand(
+            command=RetractionCommand.START_RETRACTION,
+            target_side=RetractionTargetSide.NONE,
+            distance_m=0.0,
+            confidence=0.80,
+            reason="normalized_text_vlm",
+        ),
+        interpreter_source="text_vlm",
+        vlm_invoked=True,
+        detail="text_vlm_normalized",
+    )
+    router._retractor_voice_interpreter = _StaticInterpreter(result)
+    router._retractor_voice_executor = _ImmediateExecutor(result)
+
+    message = String()
+    message.data = "Retraction 시작"
+    router._on_voice(message)
+    router._drain_text_vlm_interpretations()
+
+    request = router._request_pub.messages[-1]
+    assert request.operation == "start_retraction"
+    assert request.source.endswith(":text_vlm")
+    event = json.loads(router._retractor_voice_status_pub.messages[-1].data)
+    assert event["stage"] == "normalized"
+    assert event["interpreter_source"] == "text_vlm"
+    assert event["vlm_invoked"] is True
+
+
+def test_text_vlm_submit_failure_falls_back_without_claiming_invocation() -> None:
+    router = _router("nephrectomy", "P02")
+    router._retractor_voice_interpreter_mode = "vlm_with_fallback"
+    router._retractor_voice_interpreter = _StaticInterpreter(None)
+    router._retractor_voice_executor = _FailingExecutor()
+
+    message = String()
+    message.data = "직접 교시 시작"
+    router._on_voice(message)
+
+    request = router._request_pub.messages[-1]
+    assert request.operation == "start_direct_teach"
+    assert request.source.endswith(":deterministic_fallback")
+    event = json.loads(router._retractor_voice_status_pub.messages[-1].data)
+    assert event["interpreter_source"] == "deterministic_fallback"
+    assert event["vlm_invoked"] is False
+    assert event["detail"] == "text_vlm_submit_error:RuntimeError"

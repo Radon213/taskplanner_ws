@@ -943,20 +943,32 @@ body {
 }
 
 @media (min-width: 1280px) {
+  /* Landscape monitoring prioritizes an undistorted operating-room board.
+     The detailed event timeline remains available in compact layouts. */
   .mission-layout {
     grid-template-columns: minmax(600px, 1.58fr) minmax(250px, 0.48fr) minmax(300px, 0.56fr);
     grid-template-areas:
       "authority authority authority"
-      "stage surgeon runtime"
-      "timeline timeline timeline";
+      "stage surgeon runtime";
   }
 
   .mission-layout.live-stage-expanded {
     grid-template-columns: minmax(0, 1fr) minmax(300px, 0.56fr);
     grid-template-areas:
       "authority authority"
-      "stage runtime"
-      "timeline timeline";
+      "stage runtime";
+  }
+
+  .timeline-area {
+    display: none;
+  }
+
+  .stage-area .foxglove-board {
+    height: auto;
+    min-height: 0;
+    max-height: none;
+    aspect-ratio: 1.55 / 1;
+    align-self: start;
   }
 
   .surgeon-area,
@@ -989,7 +1001,7 @@ body {
   }
 
   .mission-layout {
-    grid-template-rows: auto minmax(0, 1fr) clamp(168px, 19vh, 248px);
+    grid-template-rows: auto minmax(0, 1fr);
   }
 
   .ops-app-shell,

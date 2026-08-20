@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="light" />
+    <title>Open-hand visual review</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#review-panel">검토 화면으로 건너뛰기</a>
+    <main class="app-shell" aria-labelledby="page-title">
+      <header class="card identity-card" data-slot="review-header">
+        <div class="identity-copy">
+          <p class="eyebrow">VLM EVALUATION · HUMAN VISUAL REVIEW</p>
+          <h1 id="page-title">오른쪽 위 집도의 손 검토</h1>
+          <p class="subtitle">
+            이미지에서 열린 손을 내밀고 있는지만 판정합니다. 기존 이벤트 라벨은 이 화면에서 수정되지 않습니다.
+          </p>
+        </div>
+        <div class="progress-block" aria-label="검토 진행률">
+          <div class="progress-copy">
+            <span>검토 완료</span>
+            <strong id="progress-text">불러오는 중…</strong>
+          </div>
+          <div
+            id="progress-track"
+            class="progress-track"
+            role="progressbar"
+            aria-valuemin="0"
+            aria-valuemax="0"
+            aria-valuenow="0"
+            aria-labelledby="progress-text"
+          >
+            <span id="progress-fill"></span>
+          </div>
+        </div>
+      </header>
+
+      <section id="review-panel" class="card review-card" data-slot="review-panel" aria-live="polite">
+        <div id="loading-state" class="loading-state">
+          <p class="eyebrow">PREPARING REVIEW</p>
+          <h2>검토 샘플을 불러오는 중입니다.</h2>
+          <p>원본 이미지와 VLM 입력 crop을 준비하고 있습니다.</p>
+        </div>
+
+        <div id="review-content" hidden>
+          <header class="sample-header">
+            <div>
+              <p id="sample-position" class="eyebrow">SAMPLE</p>
+              <h2 id="sample-title">—</h2>
+              <p id="comparison-state" class="eyebrow">—</p>
+            </div>
+            <div id="decision-state" class="decision-state" aria-live="polite">미검토</div>
+          </header>
+
+          <div class="review-grid">
+            <figure class="image-card" data-slot="source-frame">
+              <figcaption>
+                <p class="eyebrow">ORIGINAL CAM4</p>
+                <strong>원본 프레임</strong>
+                <span>노란 선은 VLM이 본 crop 영역입니다.</span>
+              </figcaption>
+              <a id="original-link" class="image-link" target="_blank" rel="noopener" aria-label="원본 CAM4 프레임을 새 탭에서 열기">
+                <span class="crop-marker" aria-hidden="true"></span>
+                <img id="original-image" alt="원본 CAM4 프레임" decoding="async" />
+              </a>
+            </figure>
+
+            <figure class="image-card" data-slot="vlm-input">
+              <figcaption>
+                <p class="eyebrow">MODEL INPUT</p>
+                <strong>VLM 입력 crop</strong>
+                <span>모델에 실제로 전달된 오른쪽 위 영역입니다.</span>
+              </figcaption>
+              <a id="vlm-input-link" class="image-link" target="_blank" rel="noopener" aria-label="VLM 입력 crop을 새 탭에서 열기">
+                <img id="vlm-input-image" alt="VLM에 전달된 오른쪽 위 손 crop" decoding="async" />
+              </a>
+            </figure>
+          </div>
+
+          <div class="evidence-grid" aria-label="참조 정보와 VLM 응답">
+            <section class="evidence-card" aria-labelledby="event-proxy-title">
+              <p class="eyebrow">EXISTING EVENT PROXY</p>
+              <h3 id="event-proxy-title">기존 이벤트 기반 참조</h3>
+              <p id="event-proxy-value" class="evidence-value">—</p>
+              <p class="evidence-note">이벤트 구간에서 만든 참조이며, 프레임별 시각 정답과는 다를 수 있습니다.</p>
+            </section>
+            <section class="evidence-card" aria-labelledby="vlm-answer-title">
+              <p class="eyebrow">VLM RESPONSE</p>
+              <h3 id="vlm-answer-title">모델의 답</h3>
+              <p id="vlm-answer-value" class="evidence-value">—</p>
+              <pre id="raw-model-text" class="raw-model-text" aria-label="모델 원본 JSON 응답">—</pre>
+            </section>
+          </div>
+
+          <section class="decision-card" data-slot="visual-decision" aria-labelledby="decision-title">
+            <div class="decision-copy">
+              <p class="eyebrow">YOUR VISUAL JUDGMENT</p>
+              <h3 id="decision-title">보이는 손을 기준으로 판정해 주세요.</h3>
+              <p>도구 요청 의도나 이벤트 문맥은 판단하지 않습니다. 선택하면 별도 검토 이력에 저장되고 다음 샘플로 이동합니다.</p>
+            </div>
+            <label class="note-field" for="review-note">
+              <span>선택 메모 <em>(선택)</em></span>
+              <textarea id="review-note" rows="2" maxlength="1000" placeholder="예: 손가락은 보이지만 손바닥 방향이 불명확함"></textarea>
+            </label>
+            <div class="decision-actions" role="group" aria-label="시각 판정 저장">
+              <button class="decision-button" type="button" data-decision="open_hand">
+                <span class="shortcut" aria-hidden="true">O</span>
+                <span><strong>열린 손</strong><small>open_hand · 저장 후 다음</small></span>
+              </button>
+              <button class="decision-button" type="button" data-decision="not_open_hand">
+                <span class="shortcut" aria-hidden="true">X</span>
+                <span><strong>열린 손 아님</strong><small>not_open_hand · 저장 후 다음</small></span>
+              </button>
+              <button class="decision-button" type="button" data-decision="ambiguous">
+                <span class="shortcut" aria-hidden="true">A</span>
+                <span><strong>판정 애매함</strong><small>ambiguous · 저장 후 다음</small></span>
+              </button>
+            </div>
+          </section>
+
+          <nav class="navigation-row" aria-label="검토 샘플 이동">
+            <button id="previous-button" class="secondary-button" type="button">← 이전</button>
+            <button id="next-unreviewed-button" class="primary-button" type="button">다음 미검토 →</button>
+            <button id="next-button" class="secondary-button" type="button">다음 →</button>
+          </nav>
+        </div>
+
+        <section id="completion-state" class="completion-state" hidden aria-labelledby="completion-title">
+          <p class="eyebrow">REVIEW COMPLETE</p>
+          <h2 id="completion-title">현재 검토 샘플을 모두 확인했습니다.</h2>
+          <p>판정은 기존 이벤트 라벨과 분리된 append-only 검토 이력에 보존되었습니다.</p>
+          <button id="restart-button" class="primary-button" type="button">첫 샘플 다시 보기</button>
+        </section>
+      </section>
+
+      <section id="error-state" class="card error-card" role="alert" hidden>
+        <p class="eyebrow">REVIEW UI ERROR</p>
+        <h2>화면을 갱신할 수 없습니다.</h2>
+        <p id="error-message">잠시 후 다시 시도해 주세요.</p>
+        <button id="reload-button" class="primary-button" type="button">다시 불러오기</button>
+      </section>
+    </main>
+    <div id="status-message" class="sr-only" aria-live="polite"></div>
+    <script src="/app.js" defer></script>
+  </body>
+</html>

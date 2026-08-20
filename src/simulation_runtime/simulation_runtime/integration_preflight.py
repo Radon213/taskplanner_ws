@@ -12,12 +12,9 @@ from rcl_interfaces.msg import SetParametersResult
 from rclpy.node import Node
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
-from surgical_interop_msgs.action import (
-    ExecuteRetractionAdjustment,
-    ExecuteToolHandover,
-)
+from surgical_interop_msgs.action import ExecuteToolHandover
 from surgical_interop_msgs.msg import BedRobotArmStateArray
-from surgical_interop_msgs.srv import RequestToolChange
+from surgical_interop_msgs.srv import ExecuteRetractionCommand
 
 
 _BED_ROBOT_LAYOUTS = {
@@ -36,15 +33,15 @@ _BED_ROBOT_STATES = {
 }
 
 
-def expected_contract_for_bundle(bundle_name: str) -> tuple[str, bool, bool, bool]:
-    """Return procedure, tool-change, adjustment, and status requirements."""
+def expected_contract_for_bundle(bundle_name: str) -> tuple[str, bool, bool]:
+    """Return procedure, retraction Service, and status requirements."""
 
     normalized = str(bundle_name).strip().casefold()
     if normalized in {"thyroidectomy", "thyroidectomy_demo"}:
-        return "thyroidectomy", True, False, True
+        return "thyroidectomy", True, True
     if normalized == "nephrectomy":
-        return "nephrectomy", False, True, True
-    return "", False, False, False
+        return "nephrectomy", True, True
+    return "", False, False
 
 
 def validate_bed_robot_status_layout(
@@ -84,10 +81,8 @@ def evaluate_readiness(
     sentence_publisher_count: int,
     require_sentence_publisher: bool,
     tool_handover_server_ready: bool,
-    tool_change_service_ready: bool,
-    require_tool_change_service: bool,
-    retraction_adjustment_server_ready: bool,
-    require_retraction_adjustment_server: bool,
+    retraction_service_ready: bool,
+    require_retraction_service: bool,
     bed_robot_arm_status_valid: bool,
     bed_robot_arm_status_age_sec: float,
     bed_robot_arm_status_max_age_sec: float,
@@ -107,12 +102,8 @@ def evaluate_readiness(
             not require_sentence_publisher or sentence_publisher_count > 0
         ),
         "tool_handover_action_server": bool(tool_handover_server_ready),
-        "tool_change_service": (
-            not require_tool_change_service or bool(tool_change_service_ready)
-        ),
-        "retraction_adjustment_action_server": (
-            not require_retraction_adjustment_server
-            or bool(retraction_adjustment_server_ready)
+        "retraction_command_service": (
+            not require_retraction_service or bool(retraction_service_ready)
         ),
         "bed_robot_arm_status": (
             not require_bed_robot_arm_status
@@ -216,18 +207,10 @@ class IntegrationPreflightNode(Node):
             "/surgery/tool_handover",
         )
         self.declare_parameter(
-            "tool_change_service_name",
-            "/surgery/tool_change/request",
+            "retraction_service_name",
+            "/surgery/retraction/command",
         )
-        self.declare_parameter("require_tool_change_service", True)
-        self.declare_parameter(
-            "retraction_adjustment_action_name",
-            "/surgery/retraction/adjust",
-        )
-        self.declare_parameter(
-            "require_retraction_adjustment_server",
-            True,
-        )
+        self.declare_parameter("require_retraction_service", True)
         self.declare_parameter(
             "bed_robot_arm_status_topic",
             "/external/bed_robot_arms/status",
@@ -248,11 +231,8 @@ class IntegrationPreflightNode(Node):
         self._perception_backend = str(
             self.get_parameter("perception_backend").value
         ).strip().casefold()
-        self._require_tool_change_service = bool(
-            self.get_parameter("require_tool_change_service").value
-        )
-        self._require_retraction_adjustment_server = bool(
-            self.get_parameter("require_retraction_adjustment_server").value
+        self._require_retraction_service = bool(
+            self.get_parameter("require_retraction_service").value
         )
         self._require_bed_robot_arm_status = bool(
             self.get_parameter("require_bed_robot_arm_status").value
@@ -289,14 +269,9 @@ class IntegrationPreflightNode(Node):
             ExecuteToolHandover,
             str(self.get_parameter("tool_handover_action_name").value),
         )
-        self._tool_change_client = self.create_client(
-            RequestToolChange,
-            str(self.get_parameter("tool_change_service_name").value),
-        )
-        self._retraction_client = ActionClient(
-            self,
-            ExecuteRetractionAdjustment,
-            str(self.get_parameter("retraction_adjustment_action_name").value),
+        self._retraction_client = self.create_client(
+            ExecuteRetractionCommand,
+            str(self.get_parameter("retraction_service_name").value),
         )
         self._bed_robot_arm_status_topic = str(
             self.get_parameter("bed_robot_arm_status_topic").value
@@ -335,10 +310,7 @@ class IntegrationPreflightNode(Node):
         candidate = {
             "active_bundle": self._active_bundle,
             "procedure_type": self._procedure_type,
-            "require_tool_change_service": self._require_tool_change_service,
-            "require_retraction_adjustment_server": (
-                self._require_retraction_adjustment_server
-            ),
+            "require_retraction_service": self._require_retraction_service,
             "require_bed_robot_arm_status": self._require_bed_robot_arm_status,
             "contract_transitioning": self._contract_transitioning,
         }
@@ -350,8 +322,7 @@ class IntegrationPreflightNode(Node):
         expected = expected_contract_for_bundle(active_bundle)
         supplied = (
             str(candidate["procedure_type"]).strip().casefold(),
-            bool(candidate["require_tool_change_service"]),
-            bool(candidate["require_retraction_adjustment_server"]),
+            bool(candidate["require_retraction_service"]),
             bool(candidate["require_bed_robot_arm_status"]),
         )
         if not active_bundle:
@@ -371,8 +342,7 @@ class IntegrationPreflightNode(Node):
         previous_identity = (
             self._active_bundle,
             self._procedure_type,
-            self._require_tool_change_service,
-            self._require_retraction_adjustment_server,
+            self._require_retraction_service,
             self._require_bed_robot_arm_status,
             self._contract_transitioning,
         )
@@ -381,15 +351,13 @@ class IntegrationPreflightNode(Node):
             supplied[0],
             supplied[1],
             supplied[2],
-            supplied[3],
             bool(candidate["contract_transitioning"]),
         )
         self._active_bundle = active_bundle
         self._procedure_type = supplied[0]
-        self._require_tool_change_service = supplied[1]
-        self._require_retraction_adjustment_server = supplied[2]
-        self._require_bed_robot_arm_status = supplied[3]
-        self._contract_transitioning = next_identity[5]
+        self._require_retraction_service = supplied[1]
+        self._require_bed_robot_arm_status = supplied[2]
+        self._contract_transitioning = next_identity[4]
         if next_identity != previous_identity:
             self._invalidate_bed_robot_status()
         return SetParametersResult(successful=True)
@@ -404,8 +372,7 @@ class IntegrationPreflightNode(Node):
         expected = expected_contract_for_bundle(self._active_bundle)
         supplied = (
             self._procedure_type,
-            self._require_tool_change_service,
-            self._require_retraction_adjustment_server,
+            self._require_retraction_service,
             self._require_bed_robot_arm_status,
         )
         return bool(
@@ -491,12 +458,8 @@ class IntegrationPreflightNode(Node):
             sentence_publisher_count=self.count_publishers(self._sentence_topic),
             require_sentence_publisher=self._require_sentence_publisher,
             tool_handover_server_ready=self._tool_handover_client.server_is_ready(),
-            tool_change_service_ready=self._tool_change_client.service_is_ready(),
-            require_tool_change_service=self._require_tool_change_service,
-            retraction_adjustment_server_ready=self._retraction_client.server_is_ready(),
-            require_retraction_adjustment_server=(
-                self._require_retraction_adjustment_server
-            ),
+            retraction_service_ready=self._retraction_client.service_is_ready(),
+            require_retraction_service=self._require_retraction_service,
             bed_robot_arm_status_valid=self._bed_robot_status_valid,
             bed_robot_arm_status_age_sec=bed_robot_status_age_sec,
             bed_robot_arm_status_max_age_sec=(

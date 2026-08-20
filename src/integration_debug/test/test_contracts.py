@@ -16,8 +16,7 @@ from integration_debug.contracts import (
     validate_action_recovery_acknowledgement,
     validate_planner_coexistence_acknowledgement,
     validate_bed_robot_arm_status,
-    validate_retraction_adjustment,
-    validate_tool_change,
+    validate_retraction_command,
     validate_tool_handover,
 )
 
@@ -65,42 +64,51 @@ def test_validates_only_public_handover_transitions() -> None:
         )
 
 
-def test_retraction_adjustment_matches_document_contract() -> None:
-    mapped = validate_retraction_adjustment(
+def test_retraction_command_uses_only_the_single_service_contract() -> None:
+    adjustment = validate_retraction_command(
         {
-            "adjustment_mode": "single",
-            "target_retractor_id": "left_malleable",
-            "direction_frame": "surgeon_view",
-            "direction": "left",
-            "axis": "none",
-            "distance_mm": 5,
+            "command": "adjust_retraction",
+            "target_side": "left",
+            "distance_m": 0.05,
         }
     )
-    assert mapped["direction"] == "left"
-    with pytest.raises(ValueError, match="at most 30"):
-        validate_retraction_adjustment(
-            {**mapped, "distance_mm": 31}
+    assert adjustment == {
+        "command": "adjust_retraction",
+        "target_side": "left",
+        "distance_m": 0.05,
+    }
+    assert validate_retraction_command(
+        {
+            "command": "start_direct_teach",
+            "target_side": "none",
+            "distance_m": 0,
+        }
+    ) == {
+        "command": "start_direct_teach",
+        "target_side": "none",
+        "distance_m": 0.0,
+    }
+    with pytest.raises(ValueError, match="unsupported retraction command fields"):
+        validate_retraction_command(
+            {
+                **adjustment,
+                "direction": "left",
+                "axis": "left_right",
+                "arm_id": "arm_1",
+                "target_tool_id": "thyroid_retractor",
+            }
         )
-    multi = validate_retraction_adjustment(
-        {
-            "adjustment_mode": "multi",
-            "target_retractor_id": "both_malleable",
-            "direction_frame": "surgeon_view",
-            "direction": "none",
-            "axis": "left_right",
-            "distance_mm": 3,
-        }
-    )
-    assert multi["axis"] == "left_right"
-
-
-def test_tool_change_accepts_only_document_ids() -> None:
-    assert validate_tool_change(
-        {"arm_id": "arm_1", "target_tool_id": "thyroid_retractor"}
-    ) == {"arm_id": "arm_1", "target_tool_id": "thyroid_retractor"}
-    with pytest.raises(ValueError, match="arm_id"):
-        validate_tool_change(
-            {"arm_id": "suction_arm", "target_tool_id": "thyroid_retractor"}
+    with pytest.raises(ValueError, match="target_side left or right"):
+        validate_retraction_command(
+            {"command": "adjust_retraction", "target_side": "none", "distance_m": 0.05}
+        )
+    with pytest.raises(ValueError, match="requires target_side none"):
+        validate_retraction_command(
+            {"command": "change_tool", "target_side": "left", "distance_m": 0}
+        )
+    with pytest.raises(ValueError, match="finite"):
+        validate_retraction_command(
+            {"command": "adjust_retraction", "target_side": "left", "distance_m": float("nan")}
         )
 
 
@@ -161,37 +169,51 @@ def test_voice_ambiguity_never_dispatches() -> None:
     assert parsed.ambiguous
 
 
-def test_voice_retraction_requires_direction_and_distance() -> None:
-    parsed = parse_voice_command("왼쪽 견인기 왼쪽 5밀리 이동", VOICE)
+@pytest.mark.parametrize(
+    ("text", "command"),
+    [
+        ("직접 교시 시작", "start_direct_teach"),
+        ("직접 교시 종료", "finish_direct_teach"),
+        ("Retraction 시작", "start_retraction"),
+        ("Tool change", "change_tool"),
+        ("Retraction 종료", "stop_retraction"),
+    ],
+)
+def test_voice_retraction_service_commands_are_exact(
+    text: str, command: str
+) -> None:
+    parsed = parse_voice_command(text, VOICE)
     assert parsed.matched
-    assert parsed.operation == "retraction_adjustment"
-    assert parsed.payload["direction"] == "left"
-    assert parsed.payload["target_retractor_id"] == "left_malleable"
-    assert parsed.payload["distance_mm"] == 5.0
-    assert not parse_voice_command("리트랙터 왼쪽 이동", VOICE).matched
-
-    document_example = parse_voice_command(
-        "왼쪽 말레어블을 오른쪽으로 1센치 더 당겨주세요",
-        VOICE,
-    )
-    assert document_example.matched
-    assert document_example.payload["target_retractor_id"] == "left_malleable"
-    assert document_example.payload["direction"] == "right"
-    assert document_example.payload["distance_mm"] == 10.0
-
-
-def test_voice_multi_retraction_uses_axis_not_conflicting_directions() -> None:
-    parsed = parse_voice_command("좌우로 1센치 더 당겨주세요", VOICE)
-    assert parsed.matched
-    assert parsed.operation == "retraction_adjustment"
+    assert parsed.operation == "retraction_command"
     assert parsed.payload == {
-        "adjustment_mode": "multi",
-        "target_retractor_id": "both_malleable",
-        "direction_frame": "surgeon_view",
-        "direction": "none",
-        "axis": "left_right",
-        "distance_mm": 10.0,
+        "command": command,
+        "target_side": "none",
+        "distance_m": 0.0,
     }
+
+
+def test_voice_retraction_adjustment_uses_side_and_distance_only() -> None:
+    parsed = parse_voice_command("리트랙션 오른쪽 5cm 더", VOICE)
+    assert parsed.matched
+    assert parsed.operation == "retraction_command"
+    assert parsed.payload == {
+        "command": "adjust_retraction",
+        "target_side": "right",
+        "distance_m": 0.05,
+    }
+
+    legacy_direction = parse_voice_command("왼쪽 견인기 왼쪽 5밀리 이동", VOICE)
+    assert not legacy_direction.matched
+    assert legacy_direction.reason == "unsupported_retraction_command"
+
+    ambiguous_sides = parse_voice_command("리트랙션 왼쪽 오른쪽 1cm 더", VOICE)
+    assert not ambiguous_sides.matched
+    assert ambiguous_sides.ambiguous
+    assert ambiguous_sides.reason == "ambiguous_retraction_target_side"
+
+    legacy_multi = parse_voice_command("리트랙션 좌우로 1센치 더", VOICE)
+    assert not legacy_multi.matched
+    assert legacy_multi.reason == "unsupported_retraction_command"
 
 
 def test_bed_mounted_suction_and_legacy_release_are_not_commands() -> None:
@@ -529,7 +551,7 @@ def test_action_watchdog_allows_server_loss_grace_and_terminal_states() -> None:
     ) == ""
 
 
-def test_action_watchdog_uses_service_reasons_only_for_tool_change() -> None:
+def test_action_watchdog_uses_service_reasons_only_for_retraction_service() -> None:
     policy = load_action_watchdog_policy({})
     common = {
         "terminal": False,
@@ -541,11 +563,22 @@ def test_action_watchdog_uses_service_reasons_only_for_tool_change() -> None:
         "server_unavailable_age_sec": 0.0,
         "policy": policy,
     }
-    assert action_watchdog_reason(route="tool_change", **common) == (
+    assert action_watchdog_reason(route="retraction_service", **common) == (
         "service_response_timeout"
     )
-    assert action_watchdog_reason(route="retraction_adjustment", **common) == (
+    assert action_watchdog_reason(route="tool_handover", **common) == (
         "goal_response_timeout"
+    )
+
+    feedback_wait = {
+        **common,
+        "state": "accepted",
+        "elapsed_sec": 20.0,
+        "last_update_age_sec": 31.0,
+    }
+    assert action_watchdog_reason(route="retraction_service", **feedback_wait) == ""
+    assert action_watchdog_reason(route="tool_handover", **feedback_wait) == (
+        "action_update_timeout"
     )
 
 

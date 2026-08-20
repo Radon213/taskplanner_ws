@@ -117,9 +117,10 @@ These rules are the source of truth for debugging runtime behavior.
 1. Bed-mounted robot integration is retraction-only. A clinical suction
    instrument and speech about suction remain ordinary tool evidence and must
    never create a bed-mounted arm command or status.
-2. Thyroidectomy retractor changes use only the completion-waiting
-   `/surgery/tool_change/request` Service. Nephrectomy Malleable fine adjustment
-   uses only the cancellable `/surgery/retraction/adjust` Action.
+2. Direct teach, retraction, adjustment, tool change, and stop use only the
+   `/surgery/retraction/command` (`ExecuteRetractionCommand`) Service. Its
+   request contains only the documented version, source, command ID, command,
+   side, and distance fields.
 3. `/external/bed_robot_arms/status` is controller-owned evidence. The reducer
    may store its documented snapshot fields but must not invent pose,
    trajectory, force, collision, progress, attachment verification, or a more
@@ -128,13 +129,12 @@ These rules are the source of truth for debugging runtime behavior.
    `army_navy` entry; nephrectomy accepts one `left_malleable` and one
    `right_malleable` entry. Missing, stale, malformed, duplicate, or mismatched
    snapshots fail closed.
-5. Tool Change remains in progress until its Service response arrives. Only
-   `success=true` with `result=completed` is successful, and that means sequence
-   completion rather than verified physical attachment.
-6. Retraction adjustment is complete only when the Action returns
-   `success=true` with `final_state=completed`. Cancel, fault,
-   `protective_stop`, unknown state, controller loss, and ambiguous recovery
-   block the next ordinary retraction command.
+5. A Service response describes request admission only. `request_accepted=true`
+   with `result_code=RESULT_ACCEPTED` does not assert physical completion,
+   progress, controller state, tool attachment, cancellation, or recovery.
+6. The controller owns all post-admission behavior and safety policy. The
+   reducer must not infer a physical terminal state or an implementation-specific
+   retry/idempotency policy from the Service response.
 
 ## Contamination and Cleaning Rules
 

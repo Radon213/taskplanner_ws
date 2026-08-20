@@ -91,6 +91,59 @@ In external mode its `modality` is `sentence_text`. This topic describes recent
 accepted data; publisher discovery for startup is reported separately through
 `/integration/readiness`.
 
+### Retraction voice normalization
+
+The same single adapter output, `/surgery/audio/request_text`, is the only STT
+input to the retractor voice path.  Taskplanner does not start a second
+microphone/ASR owner. The adapter remains the source-level final-text
+deduplication point; the downstream command router retains only its existing
+short request-dispatch duplicate suppression. A final transcript follows this
+bounded route:
+
+```text
+/sensors/surgeon/sentence
+  -> speech_input_adapter (final-text validation + dedupe)
+  -> /surgery/audio/request_text
+  -> text-only retractor interpreter
+  -> BT group command (request_id + command_id)
+  -> /surgery/retraction/command
+```
+
+The interpreter has the closed vocabulary `start_direct_teach`,
+`finish_direct_teach`, `start_retraction`, `adjust_retraction`,
+`change_tool`, and `stop_retraction`.  It never produces arm IDs, poses,
+directions other than an adjustment side, or a physical-completion assertion.
+An adjustment requires exactly one left/right side; `5 cm` maps to `0.050` m.
+
+The live launch defaults to `RETRACTOR_VOICE_INTERPRETER_MODE=vlm_with_fallback`.
+It makes a text-only OpenAI-compatible request to
+`RETRACTOR_VOICE_VLM_BASE_URL` / `RETRACTOR_VOICE_VLM_MODEL_ID`, supplies the
+current allowed command set, and validates the returned closed JSON object
+locally. A model result is also rechecked against the final raw transcript:
+it cannot invent a lifecycle intent, an adjustment side, or a distance that is
+missing from the source text. If the endpoint is unconfigured, unavailable,
+times out, or returns an invalid/out-of-state/ungrounded result, the same
+transcript is handled by the
+deterministic normalizer instead. `RETRACTOR_VOICE_VLM_API_KEY` takes priority;
+an empty value falls back to `VLM_API_KEY`. Set the interpreter mode to
+`deterministic` for replay or a no-model demonstration.
+
+The local status topic below makes this provenance explicit without repeating
+the raw surgeon text:
+
+```text
+/bed_robot_arm_group/voice_normalization_status  std_msgs/msg/String (JSON)
+```
+
+Its `interpreter_source` is `text_vlm`, `deterministic`, or
+`deterministic_fallback`; `vlm_invoked` is true only when a model request was
+actually attempted. Its `stage=service_admitted` is a correlated Service
+admission receipt, not a statement that a robot moved. The local command state
+advances only on a correlated `request_id` + `command_id` status with
+`outcome=accepted`; all other Service outcomes leave it unchanged. That state
+is only a parser/admission gate, while controller motion and safety remain
+controller-owned.
+
 ## Vision Input
 
 The live dashboard consumes the VIPLab camera contract without requiring a
@@ -147,8 +200,7 @@ interfaces and are not the requested cross-institution API.
 
 ```text
 /surgery/tool_handover        surgical_interop_msgs/action/ExecuteToolHandover
-/surgery/tool_change/request  surgical_interop_msgs/srv/RequestToolChange
-/surgery/retraction/adjust    surgical_interop_msgs/action/ExecuteRetractionAdjustment
+/surgery/retraction/command   surgical_interop_msgs/srv/ExecuteRetractionCommand
 /external/bed_robot_arms/status  surgical_interop_msgs/msg/BedRobotArmStateArray
 ```
 
@@ -170,77 +222,55 @@ Taskplanner also converts an internal instance such as `T04#1` to
 controller chooses the arm. It also excludes planner rationale, detailed
 internal anchors, target-owner, cleaning policy, and execution mode.
 
-### Retraction tool-change Service
+### Retraction command Service
 
-`/surgery/tool_change/request` is a completion-waiting Service for
-thyroidectomy. Its wire shape is exactly:
-
-```text
-# RequestToolChange.srv
-string command_id
-string arm_id
-string target_tool_id
----
-bool success
-string result
-string reason_code
-```
-
-| Field | Allowed values and interpretation |
-| --- | --- |
-| `command_id` | Caller-generated correlation and deduplication ID. |
-| `arm_id` | `arm_1` or `arm_2`; the selected physical retraction arm. |
-| `target_tool_id` | `thyroid_retractor` or `army_navy_retractor`. |
-| `success` | `true` only when `result=completed`; otherwise `false`. |
-| `result` | `completed`, `failed`, `canceled`, `protective_stop`, or `unknown`. |
-| `reason_code` | Machine-readable result such as `ok`, `sequence_failed`, `invalid_arm_id`, `invalid_target_tool`, `unsafe_state`, `estop`, `protective_stop`, `controller_unavailable`, or `timeout`. |
-
-Taskplanner keeps the request active until the Service response arrives.
-`success=true`, `result=completed` means only that the controller's predefined
-Tool Change sequence ended normally; it does not independently verify physical
-attachment. Every other response fails closed and leaves retry, stop, and
-operator notification to the higher-level policy.
-
-### Retraction-adjustment Action
-
-`/surgery/retraction/adjust` is the cancellable fine-adjustment Action for
-nephrectomy. Its wire shape is exactly:
+`/surgery/retraction/command` is the single Service for direct teach,
+retraction, adjustment, tool change, and retraction stop. Its wire shape is
+exactly:
 
 ```text
-# ExecuteRetractionAdjustment.action
+# ExecuteRetractionCommand.srv
+uint16 PROTOCOL_VERSION_V1=1
+uint8 COMMAND_START_DIRECT_TEACH=1
+uint8 COMMAND_FINISH_DIRECT_TEACH=2
+uint8 COMMAND_START_RETRACTION=3
+uint8 COMMAND_ADJUST_RETRACTION=4
+uint8 COMMAND_CHANGE_TOOL=5
+uint8 COMMAND_STOP_RETRACTION=6
+uint8 TARGET_NONE=0
+uint8 TARGET_LEFT=1
+uint8 TARGET_RIGHT=2
+uint16 protocol_version
+string source_id
 string command_id
-string adjustment_mode
-string target_retractor_id
-string direction_frame
-string direction
-string axis
-float32 distance_mm
+uint8 command
+uint8 target_side
+float64 distance_m
 ---
-bool success
-string final_state
-string reason_code
----
-string state
+uint16 RESULT_ACCEPTED=0
+uint16 RESULT_INVALID_COMMAND=1
+uint16 RESULT_INVALID_PARAMETER=2
+uint16 RESULT_REJECTED=3
+uint16 RESULT_ERROR=255
+bool request_accepted
+uint16 result_code
+string command_id
+string message
 ```
 
-| Goal field | Allowed values and interpretation |
+| Request field | Interpretation |
 | --- | --- |
-| `command_id` | Caller-generated correlation and deduplication ID. |
-| `adjustment_mode` | `single` or `multi`. |
-| `target_retractor_id` | `left_malleable` or `right_malleable` for `single`; `both_malleable` for `multi`. |
-| `direction_frame` | Always `surgeon_view`; controller performs the setup-specific robot-frame conversion. |
-| `direction` | `up`, `down`, `left`, or `right` for `single`; `none` for `multi`. |
-| `axis` | `none` for `single`; `left_right` or `up_down` for `multi`. A multi distance applies to each Malleable. |
-| `distance_mm` | `0 < distance_mm <= agreed_limit_mm`; Taskplanner converts natural-language cm/mm to mm. |
+| `protocol_version` | `PROTOCOL_VERSION_V1` for this interface version. |
+| `source_id` | Calling client identifier. |
+| `command_id` | Caller-generated Request/Response correlation ID. |
+| `command` | One of the six documented `COMMAND_*` constants. |
+| `target_side` | `TARGET_NONE`, `TARGET_LEFT`, or `TARGET_RIGHT`; adjustment uses left or right. |
+| `distance_m` | Metres; a 5 cm adjustment is `0.050`. All non-adjustment commands use `0.0`. |
 
-`success` is true only when `final_state=completed`. Documented terminal states
-include `completed`, `canceled`, `fault`, `protective_stop`, and `unknown`.
-`reason_code` is machine-readable, for example `completed`, `canceled`,
-`goal_rejected`, `invalid_target_retractor`, `invalid_direction`,
-`distance_limit_exceeded`, `estop`, `protective_stop`, or
-`controller_unavailable`; it may be empty on normal completion. Feedback has no
-pose or progress field: `state` is only `adjusting` or `recovering`.
-Interruption uses standard ROS 2 Action cancel, not a separate stop message.
+`request_accepted` and `result_code` describe only whether the server admitted
+the Request. They do not indicate physical completion, progress, controller
+state, cancellation, tool attachment, or a retry/idempotency policy. The
+controller owns implementation and safety behavior after admission.
 
 ### Retraction-arm status Topic
 

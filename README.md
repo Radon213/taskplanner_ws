@@ -82,22 +82,21 @@ To add another surgery, create a new directory with one
 `src/procedure_spec/procedure_spec/specs/display_catalog.yaml`. The dashboard
 and runtime bundle switch use this YAML-driven catalog.
 
-### Bed-Mounted Retraction Arm Contract
+### Bed-Mounted Retraction Arm Service
 
-Thyroidectomy retractor changes use
-`/surgery/tool_change/request` (`RequestToolChange`) and wait for the controller's
-sequence result. Its request is exactly `command_id`, `arm_id`, and
-`target_tool_id`; its response is `success`, `result`, and `reason_code`.
-Nephrectomy fine adjustments use
-`/surgery/retraction/adjust` (`ExecuteRetractionAdjustment`) with either a
-single target and cardinal direction or both Malleables and an axis. Its Goal
-contains `command_id`, `adjustment_mode`, `target_retractor_id`,
-`direction_frame`, `direction`, `axis`, and `distance_mm`; its Result contains
-`success`, `final_state`, and `reason_code`, and Feedback contains only `state`.
-Explicit distances are converted to millimetres and validated against the
-agreed interface range; they are never silently clamped. The downstream
-controller remains responsible for coordinate conversion, final Goal
-acceptance, collision and force control, E-stop, and distance-limit rejection.
+All retractor-arm requests use the single
+`/surgery/retraction/command` (`ExecuteRetractionCommand`) Service. Its Request
+contains `protocol_version`, `source_id`, `command_id`, `command`,
+`target_side`, and `distance_m`; the six command constants cover direct-teach
+start/finish, retraction start/adjust/stop, and tool change. A 5 cm adjustment,
+for example, is `COMMAND_ADJUST_RETRACTION`, `TARGET_LEFT` or `TARGET_RIGHT`,
+and `distance_m=0.050`.
+
+The Response (`request_accepted`, `result_code`, `command_id`, `message`) is an
+admission response only. It does not indicate physical completion, progress,
+controller state, or tool attachment. The downstream controller owns those
+implementation details as well as coordinate conversion, collision and force
+control, E-stop, and distance-limit handling.
 Controller state is consumed from
 `/external/bed_robot_arms/status` (`BedRobotArmStateArray`): `stamp`,
 `revision`, `procedure_type`, and an `arms` array whose entries contain only
@@ -109,8 +108,8 @@ instrument and public surgeon speech about suction remain part of the normal
 clinical/tool evidence model.
 
 The operator dashboard shows request-correlated speech, VLM interpretation, BT
-validation, the tool-change Service or retraction-adjustment Action, and
-controller-owned retraction-arm status at <http://127.0.0.1:4173/>.
+validation, retraction Service admission, and controller-owned retraction-arm
+status at <http://127.0.0.1:4173/>.
 
 ## External Dependency
 

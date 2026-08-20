@@ -10,10 +10,10 @@ from surgical_interop_execution.fault_action_emulator import (
     FaultActionEmulator,
     Outcome,
     RouteProfile,
-    _TOOL_CHANGE_RESULT_BY_OUTCOME,
-    validate_retraction_adjustment,
+    validate_retraction_command,
     valid_tool_transition,
 )
+from surgical_interop_msgs.srv import ExecuteRetractionCommand
 
 
 def test_only_reviewed_tool_transitions_are_accepted():
@@ -38,8 +38,7 @@ routes:
       - {outcome: partial_failure, duration_sec: 0.1, fail_progress: 0.4}
       - {outcome: success, duration_sec: 0.2}
     default: {outcome: abort, reason_code: exhausted}
-  retraction_adjustment: {available: false}
-  tool_change: {default: {outcome: success}}
+  retraction_command: {available: false}
 """,
         encoding="utf-8",
     )
@@ -48,7 +47,7 @@ routes:
     assert route.next().outcome == "partial_failure"
     assert route.next().outcome == "success"
     assert route.next().reason_code == "exhausted"
-    assert profile.routes["retraction_adjustment"].available is False
+    assert profile.routes["retraction_command"].available is False
     assert "suction" not in profile.routes
 
 
@@ -65,118 +64,94 @@ routes:
         EmulatorProfile.load(path)
 
 
-def _adjustment(**overrides):
+def _command(**overrides):
     values = {
+        "protocol_version": 1,
+        "source_id": "taskplanner",
         "command_id": "adjust-1",
-        "adjustment_mode": "single",
-        "target_retractor_id": "left_malleable",
-        "direction_frame": "surgeon_view",
-        "direction": "left",
-        "axis": "none",
-        "distance_mm": 5.0,
+        "command": ExecuteRetractionCommand.Request.COMMAND_ADJUST_RETRACTION,
+        "target_side": ExecuteRetractionCommand.Request.TARGET_LEFT,
+        "distance_m": 0.005,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
 
 
 @pytest.mark.parametrize(
-    ("overrides", "reason"),
+    ("overrides", "result_code", "reason"),
     [
-        ({"command_id": ""}, "missing_command_id"),
-        ({"adjustment_mode": "vendor_mode"}, "invalid_adjustment_mode"),
-        ({"target_retractor_id": "both_malleable"}, "invalid_target_retractor_id"),
-        ({"direction_frame": "robot_base"}, "invalid_direction_frame"),
-        ({"direction": "none"}, "invalid_single_adjustment"),
-        ({"axis": "left_right"}, "invalid_single_adjustment"),
-        ({"distance_mm": 0.0}, "invalid_distance_mm"),
-        ({"distance_mm": 30.1}, "invalid_distance_mm"),
         (
-            {
-                "adjustment_mode": "multi",
-                "target_retractor_id": "left_malleable",
-                "direction": "none",
-                "axis": "left_right",
-            },
-            "invalid_target_retractor_id",
+            {"protocol_version": 99},
+            ExecuteRetractionCommand.Response.RESULT_INVALID_PARAMETER,
+            "unsupported_protocol_version",
+        ),
+        (
+            {"source_id": ""},
+            ExecuteRetractionCommand.Response.RESULT_INVALID_PARAMETER,
+            "missing_source_id",
+        ),
+        (
+            {"command_id": ""},
+            ExecuteRetractionCommand.Response.RESULT_INVALID_PARAMETER,
+            "missing_command_id",
         ),
         (
             {
-                "adjustment_mode": "multi",
-                "target_retractor_id": "both_malleable",
-                "direction": "left",
-                "axis": "left_right",
+                "command": 99,
             },
-            "invalid_multi_adjustment",
+            ExecuteRetractionCommand.Response.RESULT_INVALID_COMMAND,
+            "invalid_command",
+        ),
+        (
+            {
+                "target_side": ExecuteRetractionCommand.Request.TARGET_NONE,
+            },
+            ExecuteRetractionCommand.Response.RESULT_INVALID_PARAMETER,
+            "adjust_requires_left_or_right_target",
+        ),
+        (
+            {"distance_m": 0.0},
+            ExecuteRetractionCommand.Response.RESULT_INVALID_PARAMETER,
+            "invalid_adjust_distance_m",
+        ),
+        (
+            {"distance_m": 0.051},
+            ExecuteRetractionCommand.Response.RESULT_INVALID_PARAMETER,
+            "invalid_adjust_distance_m",
         ),
     ],
 )
-def test_retraction_adjustment_contract_rejects_invalid_goal_fields(overrides, reason):
-    assert validate_retraction_adjustment(_adjustment(**overrides)) == reason
+def test_retraction_command_contract_rejects_invalid_request_fields(
+    overrides, result_code, reason
+):
+    assert validate_retraction_command(_command(**overrides)) == (result_code, reason)
 
 
-def test_retraction_adjustment_contract_accepts_document_single_and_multi_forms():
-    assert validate_retraction_adjustment(_adjustment()) == ""
-    assert validate_retraction_adjustment(
-        _adjustment(
-            adjustment_mode="multi",
-            target_retractor_id="both_malleable",
-            direction="none",
-            axis="up_down",
-            distance_mm=7.0,
+def test_retraction_command_contract_accepts_adjust_and_parameterless_forms():
+    assert validate_retraction_command(_command()) == (
+        ExecuteRetractionCommand.Response.RESULT_ACCEPTED,
+        "",
+    )
+    assert validate_retraction_command(
+        _command(
+            command=ExecuteRetractionCommand.Request.COMMAND_CHANGE_TOOL,
+            target_side=ExecuteRetractionCommand.Request.TARGET_NONE,
+            distance_m=0.0,
         )
-    ) == ""
-
-
-def test_tool_change_emulator_covers_every_document_result_state():
-    assert set(_TOOL_CHANGE_RESULT_BY_OUTCOME.values()) == {
-        "completed",
-        "failed",
-        "canceled",
-        "protective_stop",
-        "unknown",
-    }
-
-
-class _Feedback:
-    def __init__(self):
-        self.state = ""
-        self.command_id = ""
-
-
-class _FakeGoalHandle:
-    def __init__(self, request, *, cancel_after_feedback=False):
-        self.request = request
-        self.is_cancel_requested = False
-        self.cancel_after_feedback = cancel_after_feedback
-        self.feedback = []
-        self.terminal = ""
-
-    def publish_feedback(self, feedback):
-        self.feedback.append((feedback.state, feedback.command_id))
-        if self.cancel_after_feedback and feedback.state == "adjusting":
-            self.is_cancel_requested = True
-
-    def succeed(self):
-        self.terminal = "succeeded"
-
-    def abort(self):
-        self.terminal = "aborted"
-
-    def canceled(self):
-        self.terminal = "canceled"
+    ) == (ExecuteRetractionCommand.Response.RESULT_ACCEPTED, "")
 
 
 def _bare_emulator(outcome: Outcome) -> FaultActionEmulator:
     emulator = FaultActionEmulator.__new__(FaultActionEmulator)
     emulator._lock = __import__("threading").RLock()
     emulator._active_ids = set()
-    emulator._selected_outcomes = {("retraction_adjustment", "adjust-1"): outcome}
+    emulator._selected_outcomes = {}
     emulator._completed = {}
     emulator._route_counts = {}
+    emulator._max_retraction_distance_m = 0.050
     emulator._profile = SimpleNamespace(
         routes={
-            "retraction_adjustment": RouteProfile(default=outcome),
-            "tool_change": RouteProfile(default=outcome),
+            "retraction_command": RouteProfile(default=outcome),
         }
     )
     return emulator
@@ -228,44 +203,7 @@ def test_bed_robot_status_revisions_are_monotonic_across_checkpoints():
     assert all(message.arms[0].state == "standby" for message in published)
 
 
-def test_retraction_cancel_emits_recovering_before_remote_canceled_result():
-    emulator = _bare_emulator(Outcome(outcome="success", duration_sec=0.2))
-    handle = _FakeGoalHandle(_adjustment(), cancel_after_feedback=True)
-
-    state, reason, progress = emulator._run_action(
-        "retraction_adjustment", handle, _Feedback
-    )
-
-    assert [row[0] for row in handle.feedback][:2] == ["adjusting", "recovering"]
-    assert all(row[1] == "adjust-1" for row in handle.feedback)
-    assert handle.terminal == "canceled"
-    assert (state, reason, progress) == ("canceled", "canceled", 1.0)
-
-
-@pytest.mark.parametrize(
-    ("outcome_name", "final_state", "terminal"),
-    [
-        ("failed", "fault", "aborted"),
-        ("canceled", "canceled", "canceled"),
-        ("protective_stop", "protective_stop", "aborted"),
-        ("unknown", "unknown", "aborted"),
-    ],
-)
-def test_retraction_emulator_returns_document_terminal_states(
-    outcome_name, final_state, terminal
-):
-    emulator = _bare_emulator(Outcome(outcome=outcome_name, duration_sec=0.0))
-    handle = _FakeGoalHandle(_adjustment())
-
-    state, _, _ = emulator._run_action(
-        "retraction_adjustment", handle, _Feedback
-    )
-
-    assert state == final_state
-    assert handle.terminal == terminal
-
-
-def test_tool_change_service_honors_blocking_delay_and_document_result():
+def test_retraction_service_is_immediate_admission_not_physical_result():
     emulator = _bare_emulator(
         Outcome(
             outcome="protective_stop",
@@ -273,18 +211,36 @@ def test_tool_change_service_honors_blocking_delay_and_document_result():
             reason_code="guard_triggered",
         )
     )
-    request = SimpleNamespace(
-        command_id="change-1",
-        arm_id="arm_1",
-        target_tool_id="army_navy_retractor",
+    request = _command(command_id="service-1")
+    response = SimpleNamespace(
+        request_accepted=None,
+        result_code=-1,
+        command_id="",
+        message="",
     )
-    response = SimpleNamespace(success=None, result="", reason_code="")
 
     started = time.monotonic()
-    result = emulator._request_tool_change(request, response)
+    result = emulator._request_retraction_command(request, response)
     elapsed = time.monotonic() - started
 
-    assert elapsed >= 0.025
-    assert result.success is False
-    assert result.result == "protective_stop"
-    assert result.reason_code == "guard_triggered"
+    assert elapsed < 0.025
+    assert result.request_accepted is True
+    assert result.result_code == ExecuteRetractionCommand.Response.RESULT_ACCEPTED
+    assert result.command_id == "service-1"
+    assert result.message == "guard_triggered"
+
+
+def test_retraction_service_profile_rejects_without_claiming_execution():
+    emulator = _bare_emulator(Outcome(outcome="reject", reason_code="controller_busy"))
+    response = SimpleNamespace(
+        request_accepted=None,
+        result_code=-1,
+        command_id="",
+        message="",
+    )
+
+    result = emulator._request_retraction_command(_command(), response)
+
+    assert result.request_accepted is False
+    assert result.result_code == ExecuteRetractionCommand.Response.RESULT_REJECTED
+    assert result.message == "controller_busy"

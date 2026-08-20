@@ -14,9 +14,11 @@ Taskplanner.
 | `replay` | model control planes, webapp, RF-DETR attempt, shadow replay/ROS bridge | External rosbag dataset and timestamped annotations |
 
 In `live` mode, bed-mounted robot integration is retraction-only. Applicable
-deployments must provide `/surgery/tool_change/request`,
-`/surgery/retraction/adjust`, and `/external/bed_robot_arms/status` as defined in
-`docs/EXTERNAL_INPUT_CONTRACT.md`. There is no bed-mounted suction-arm API;
+deployments must provide `/surgery/retraction/command` and
+`/external/bed_robot_arms/status` as defined in
+`docs/EXTERNAL_INPUT_CONTRACT.md`. The former is the single
+`ExecuteRetractionCommand` Service; its response confirms request admission,
+not physical completion. There is no bed-mounted suction-arm API;
 clinical suction instruments and speech remain part of Taskplanner's ordinary
 tool/evidence path.
 
@@ -294,10 +296,12 @@ This is the software release boundary. Real robot calibration, trajectories,
 grasp and release behavior, collision avoidance, E-stop behavior, and the site
 network remain a separate physical acceptance gate.
 
-For the retraction controller, that site gate must also verify Tool Change
-Service completion/failure semantics, Retraction Adjustment Goal acceptance and
-cancel recovery, monotonic status revisions, direct-teach reporting, and
-fail-closed behavior for stale or unavailable controller status.
+For the retraction controller, that site gate must also verify
+`ExecuteRetractionCommand` version/parameter validation and response
+correlation, monotonic status revisions where status is provided,
+direct-teach reporting, and fail-closed behavior for stale or unavailable
+controller status. A Service admission response is not a physical-completion,
+cancel-recovery, or tool-attachment assertion.
 
 ## Diagnostics
 

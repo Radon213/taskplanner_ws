@@ -119,33 +119,32 @@ Debug 화면을 열 수 있으므로, 신뢰된 통합 시험망에서만 실행
 | 종단 | 타입 | 디버그 기능 |
 |---|---|---|
 | `/surgery/tool_handover` | `surgical_interop_msgs/action/ExecuteToolHandover` | 도구명·인스턴스·허용된 source/target을 직접 입력해 Goal 실행 |
-| `/surgery/tool_change/request` | `surgical_interop_msgs/srv/RequestToolChange` | 물리 로봇팔과 목표 retractor를 지정하고 완료 대기형 툴 교체 결과 확인 |
-| `/surgery/retraction/adjust` | `surgical_interop_msgs/action/ExecuteRetractionAdjustment` | 단일 Malleable의 방향 조절 또는 양측 Malleable의 축 방향 조절과 Cancel 확인 |
+| `/surgery/retraction/command` | `surgical_interop_msgs/srv/ExecuteRetractionCommand` | 직접교시, Retraction, 조절, Tool change, 종료 command의 Request admission 확인 |
 | `/external/bed_robot_arms/status` | `surgical_interop_msgs/msg/BedRobotArmStateArray` | retraction arm 배열의 revision, 역할, 상태, 직접교시 여부와 reason code 확인 |
 
-리트랙터 조그 버튼은 연속 속도 명령을 내지 않는다. 버튼을 한 번 누를
-때 문서의 `single` Goal 하나만 발행하고, 양측 조절은 별도의 `multi` Goal로
-발행한다. Action 화면은 command id, `adjusting`/`recovering` 상태, elapsed
-time, reason code와 Cancel 결과를 표시한다. 문서에 없는 progress, 자세,
-속도 또는 상세 제어 상태는 Taskplanner가 만들지 않는다.
+리트랙터 제어는 단일 Service Request로만 발행한다. Request는
+`protocol_version`, `source_id`, `command_id`, `command`, `target_side`,
+`distance_m`만 포함하며, 5 cm 조절은 `distance_m=0.050`이다. Service 화면은
+`request_accepted`, `result_code`, 응답 `command_id`, `message`만 표시한다.
+이는 Request admission 확인일 뿐, 물리 동작의 완료·진행률·상태·Tool 부착을
+의미하지 않는다. 문서에 없는 자세, 속도 또는 상세 제어 상태는 Taskplanner가
+만들지 않는다.
 
 석션 로봇암 제어와 상태 UI는 제공하지 않는다. 임상 도구인 석션과 석션
 관련 음성은 도구 전달 및 공개 증거 경로에서 계속 사용할 수 있지만,
 bed-mounted robot-arm 또는 의료기기 흡입 제어 명령으로 변환하지 않는다.
 
-Tool Change 폼은 `command_id`, `arm_id`, `target_tool_id`만 송신하고
-`success`, `result`, `reason_code`만 표시한다. Retraction Adjustment 폼은
-`command_id`, `adjustment_mode`, `target_retractor_id`, `direction_frame`,
-`direction`, `axis`, `distance_mm`만 송신하고, Result의 `success`,
-`final_state`, `reason_code`와 Feedback의 `state`만 표시한다. 상태 화면은
-`stamp`, `revision`, `procedure_type` 및 각 arm의 `arm_id`, `role`,
-`role_instance_id`, `state`, `direct_teach_active`, `reason_code`만 사용한다.
+기존 Tool Change와 Retraction Adjustment의 별도 form/Action Cancel은 더 이상
+제공하지 않는다. 상태 화면은 `stamp`, `revision`, `procedure_type` 및 각 arm의
+`arm_id`, `role`, `role_instance_id`, `state`, `direct_teach_active`,
+`reason_code`만 사용한다.
 
 수동 명령 전에는 **수동 제어 활성화**가 필요하다. 활성 상태는 UI heartbeat가 끊기면 6초 안에 자동 해제된다. 동시에 하나의 명령만 허용한다.
 
-실행 중인 명령은 Action 서버 소실(기본 유예 5초), Goal 응답 지연(10초), Feedback·Cancel·Result 갱신 정지(30초), 최대 관찰 시간 초과(300초)를 감시한다. 이 조건이나 Cancel 거부가 발생하면 원격 동작을 임의로 종료됐다고 가정하지 않고 `remote_state_unknown`/`FAULT_LOCKED`로 전환해 새 명령을 막는다. 늦게 정상 Result가 도착하면 해당 Command ID를 자동으로 종결 상태에 반영한다.
-
-Result를 끝내 받을 수 없으면 화면의 **Action 복구 필요** 카드에서 상대 로봇 정지 또는 동일 Command ID의 원격 종료 상태를 직접 확인한 뒤 **확인 후 클라이언트 복구**를 누른다. 확인 체크와 화면에 표시된 정확한 Command ID가 모두 일치해야 로컬 클라이언트 상태를 비우며, 복구 후 수동 제어는 자동 재활성화되지 않는다. 감지와 복구 내역은 `action_recovery_required`, `action_late_result_reconciled`, `action_client_recovered` 이벤트로 남는다. 이 버튼은 상대 로봇을 정지시키는 기능이 아니다.
+`/surgery/retraction/command`는 Response가 돌아오면 admission 조회를 끝낸다.
+그 뒤의 원격 동작을 Debug Mode가 완료·취소·복구됐다고 추정하지 않는다. Action
+watchdog, Cancel 및 복구 카드는 계속 Action인 `/surgery/tool_handover`에만
+적용된다.
 
 운영 프로파일의 Debug sidecar는 `/simulation/state`를 안전 interlock으로
 사용한다. 최신 `execution_state`가 `idle`, `halted`, `completed`,
@@ -188,7 +187,7 @@ Subscriber 수는 DDS discovery 확인값이며, 상대 기관의 실제 callbac
 
 ## 문장·USB 마이크 입력
 
-**음성·로그** 탭에서 완성 문장을 직접 입력해
+**USB 음성·로그** 탭에서 완성 문장을 직접 입력해
 `/sensors/surgeon/sentence`로 발행할 수 있다. standalone Debug에서는 호스트에
 연결한 USB 마이크로 Puzzle AI WebSocket ASR도 시험할 수 있다. live 운영
 런타임에 포함된 통합 Debug sidecar에서는 `asr_start`를 거부하며, 같은 UI의
@@ -220,11 +219,18 @@ Debug 컨테이너는 raw `/dev/snd` 대신 호스트 PipeWire socket을 사용�
 
 세션 종료 후 WAV와 확정 문장 TXT가 `${TASKPLANNER_RUN_ROOT}/debug/<session-id>/asr/`에 저장된다. 이는 음성 개인정보가 될 수 있으므로 실제 임상망이 아니라 비식별 통합 시험에서만 사용하고, 세션 산출물의 접근·보존 정책을 별도로 적용한다. 현재 ASR WebSocket 계약에는 별도 애플리케이션 인증이 정의되어 있지 않으며 URL query/userinfo에 자격증명을 넣는 방식은 거부한다.
 
-선택적으로 **음성 즉시 실행**을 활성화할 수 있다. 이 경로는 VLM이나
-BT를 사용하지 않고 설정된 한국어·영어 도구 별칭, retractor 툴 교체,
-단일/양측 리트랙터 방향과 거리만 결정적으로 변환한다. 석션 발화는
-bed-mounted robot-arm 명령으로 해석하지 않는다. 모호하거나 불완전한
-문장은 fail-closed로 기록하고 실행하지 않는다.
+도구 전달용 **음성 즉시 실행**과 리트랙터용 **음성 + 버튼**은 서로 다른
+게이트다. 전자는 설정된 도구 별칭만 결정적으로 변환한다. 후자는 조그·수동
+실행 탭에서 별도로 켜며, USB ASR 탭이 이미 발행한 final 문장을 text-only
+VLM에 비동기로 전달한다. 리트랙터 음성 게이트는 별도 마이크나 ASR 세션을
+열지 않으며, standalone Debug의 마이크 캡처 소유자는 **USB 음성·로그** 탭
+하나뿐이다. 같은 탭의 수동 문장 입력도 동일한 final 문장 토픽을 사용하므로
+해당 게이트가 켜져 있으면 리트랙터 음성 입력으로 처리된다. VLM 응답은 6개
+명령의 폐쇄형 스키마, 현재 Debug 내부 상태, 원문
+근거를 다시 검증한 뒤에만 단일 `/surgery/retraction/command` Service 요청이
+된다. 모델이 없거나 timeout·형식 오류가 나면 동일한 공용 결정론 정규화기로
+폴백하고, 화면과 이벤트 로그에 `interpreter_source`와 `vlm_invoked`를 표시한다.
+Service 응답은 요청 접수 여부일 뿐 물리 실행·완료를 뜻하지 않는다.
 
 ## 수술기록 생성 API 시험
 

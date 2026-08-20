@@ -7053,11 +7053,59 @@ body {
   letter-spacing: 0.06em;
 }
 
-.debug-segmented-control button:hover,
+.debug-segmented-control button:hover:not(:disabled),
 .debug-segmented-control button.active {
   border-color: rgba(112, 221, 209, 0.28);
   background: rgba(28, 35, 40, 0.92);
   color: var(--robot-strong);
+}
+
+.debug-segmented-control button:disabled {
+  cursor: not-allowed;
+  opacity: 0.42;
+}
+
+.debug-segmented-control button.active:disabled {
+  opacity: 0.72;
+}
+
+.debug-voice-ownership-note {
+  display: flex;
+  min-height: 44px;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid color-mix(in srgb, var(--robot) 28%, transparent);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--robot) 7%, transparent);
+  color: var(--robot-strong);
+}
+
+.debug-voice-ownership-note > svg {
+  flex: 0 0 auto;
+  margin-top: 2px;
+}
+
+.debug-voice-ownership-note > div {
+  min-width: 0;
+}
+
+.debug-voice-ownership-note strong,
+.debug-voice-ownership-note span {
+  display: block;
+}
+
+.debug-voice-ownership-note strong {
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.debug-voice-ownership-note span {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
 }
 
 .debug-network-settings .debug-inline-warning {
@@ -7541,6 +7589,26 @@ body {
 .debug-parse-preview > strong {
   color: var(--text);
   font-size: 13px;
+}
+
+.debug-provenance-detail {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+}
+
+.debug-provenance-detail > strong {
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.debug-provenance-detail > code {
+  width: fit-content;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  color: var(--clinical-strong);
+  font-size: 12px;
 }
 
 .debug-parse-preview > code {

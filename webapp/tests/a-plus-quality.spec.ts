@@ -196,6 +196,25 @@ test("Mission and its safety dialog pass WCAG AA with composed motion", async ({
   await expect(reset).toBeFocused();
 });
 
+test("landscape monitoring keeps the operating-room stage proportionate", async ({ page }) => {
+  await installIsolatedStubs(page);
+  await page.goto("/");
+
+  await expect(page.getByRole("heading", { name: "수술실 디지털 트윈" })).toBeVisible();
+  await expect(page.getByText("휴머노이드 도구 전달과 집도의 의도 흐름을 실시간으로 조율합니다.")).toHaveCount(0);
+  await expect(page.getByRole("switch", { name: /객체 인식/ })).toHaveCount(0);
+  await expect(page.locator(".timeline-area")).toBeHidden();
+
+  const board = page.locator(".stage-area .foxglove-board");
+  await expect(board).toBeVisible();
+  const bounds = await board.evaluate((element) => {
+    const { width, height } = element.getBoundingClientRect();
+    return { width, height, ratio: width / height };
+  });
+  expect(bounds.height).toBeGreaterThan(600);
+  expect(bounds.ratio).toBeCloseTo(1.55, 1);
+});
+
 test("Multicam and Debug workspaces pass WCAG AA", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "fhd", "One browser run is sufficient for the semantic audit.");
   await installIsolatedStubs(page);

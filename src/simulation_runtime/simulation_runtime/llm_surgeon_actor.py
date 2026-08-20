@@ -931,7 +931,15 @@ class LLMSurgeonActorNode(Node):
                 ),
             }
         )
-        if msg.end_effector_profile and bool(msg.terminal and msg.success):
+        admission_only = str(msg.outcome or "") == "accepted"
+        # The unified Service acknowledges only controller admission.  In
+        # particular, an admitted change_tool command must not make the local
+        # simulation believe that an end effector is physically attached.
+        if (
+            msg.end_effector_profile
+            and bool(msg.terminal and msg.success)
+            and not admission_only
+        ):
             state["end_effector_profile"] = msg.end_effector_profile
         if (
             bool(msg.terminal)
@@ -940,7 +948,15 @@ class LLMSurgeonActorNode(Node):
         ):
             self._pending_group_requests.pop(group_id, None)
             self._record_event(
-                "bed_robot_arm_group_completed" if msg.success else "bed_robot_arm_group_rejected",
+                (
+                    "bed_robot_arm_group_admitted"
+                    if admission_only
+                    else (
+                        "bed_robot_arm_group_completed"
+                        if msg.success
+                        else "bed_robot_arm_group_rejected"
+                    )
+                ),
                 "",
                 {
                     "request_id": msg.request_id,
@@ -951,6 +967,7 @@ class LLMSurgeonActorNode(Node):
                     "distance_mm": float(msg.distance_mm),
                     "error_code": msg.error_code,
                     "rejection_reason": msg.rejection_reason,
+                    "admission_only": admission_only,
                 },
             )
             self._schedule_next_decision(0.5)

@@ -5,7 +5,6 @@ export function getUiCopy(language: Language) {
     ? {
         appName: "수술실 디지털 트윈",
         eyebrow: "태스크플래너 v1",
-        subtitle: "휴머노이드 도구 전달과 집도의 의도 흐름을 실시간으로 조율합니다.",
         language: "언어",
         korean: "한국어",
         english: "English",
@@ -103,7 +102,6 @@ export function getUiCopy(language: Language) {
     : {
         appName: "OR Digital Twin",
         eyebrow: "TaskPlanner v1",
-        subtitle: "Coordinate humanoid handover and surgeon intent in real time.",
         language: "Language",
         korean: "한국어",
         english: "English",

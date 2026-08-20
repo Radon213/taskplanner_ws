@@ -29,6 +29,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/SurgeryHealth.msg"
   "msg/ToolPrediction.msg"
   "msg/ToolPredictionArray.msg"
+  "srv/ExecuteRetractionCommand.srv"
   "srv/RequestToolChange.srv"
   DEPENDENCIES action_msgs builtin_interfaces
 )

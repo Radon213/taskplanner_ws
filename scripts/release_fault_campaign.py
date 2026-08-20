@@ -233,12 +233,11 @@ def _run_scenario_once(scenario: FaultScenario) -> ScenarioResult:
     )
 
 
-def _action_contract(profile_path: Path) -> dict[str, Any]:
+def _robot_contract(profile_path: Path) -> dict[str, Any]:
     profile = EmulatorProfile.load(profile_path)
     expected_routes = {
         "tool_handover",
-        "retraction_adjustment",
-        "tool_change",
+        "retraction_command",
     }
     outcomes = {
         route: [item.outcome for item in route_profile.sequence]
@@ -263,11 +262,12 @@ def _action_contract(profile_path: Path) -> dict[str, Any]:
         "passed": passed,
         "public_contract": {
             "tool_handover_action": "/surgery/tool_handover",
-            "tool_change_service": "/surgery/tool_change/request",
-            "retraction_adjustment_action": "/surgery/retraction/adjust",
+            "retraction_command_service": "/surgery/retraction/command",
             "bed_robot_arm_status": "/external/bed_robot_arms/status",
         },
         "routes": sorted(profile.routes),
+        # retraction_command outcomes model admission only; they do not claim
+        # physical completion, failure, or a controller state transition.
         "route_outcomes": outcomes,
         "transition_contract": transitions,
     }
@@ -313,7 +313,8 @@ def main() -> int:
         default=ROOT / "config" / "fault_scenarios",
     )
     parser.add_argument(
-        "--action-profile",
+        "--robot-contract-profile",
+        dest="robot_contract_profile",
         type=Path,
         default=ROOT
         / "config"
@@ -351,10 +352,10 @@ def main() -> int:
             )
         results.append(first)
 
-    action_contract = _action_contract(args.action_profile)
+    robot_contract = _robot_contract(args.robot_contract_profile)
     passed = (
         deterministic
-        and bool(action_contract["passed"])
+        and bool(robot_contract["passed"])
         and all(result.passed for result in results)
     )
     report = {
@@ -362,7 +363,7 @@ def main() -> int:
         "passed": passed,
         "deterministic": deterministic,
         "scenario_count": len(results),
-        "action_contract": action_contract,
+        "robot_contract": robot_contract,
         "scenarios": [asdict(result) for result in results],
     }
     (output_dir / "fault_results.json").write_text(

@@ -142,3 +142,31 @@ def test_actor_health_heartbeat_preserves_holding_metadata():
     assert state["end_effector_profile"] == "thyroid_retractor"
     assert state["error_code"] == "distance_limit_exceeded"
     assert state["rejection_reason"] == "50 mm exceeds the configured controller limit"
+
+
+def test_actor_keeps_physical_end_effector_state_on_service_admission():
+    actor = _actor()
+    events = []
+    actor._record_event = lambda *args: events.append(args)
+    actor._schedule_next_decision = lambda *_args: None
+    actor._pending_group_requests["retraction"] = {"request_id": "req-change"}
+
+    admitted = BedRobotArmGroupStatus()
+    admitted.stamp.sec = 40
+    admitted.request_id = "req-change"
+    admitted.command_id = "cmd-change"
+    admitted.group_id = "retraction"
+    admitted.operation = "change_end_effector"
+    admitted.state = "accepted"
+    admitted.outcome = "accepted"
+    admitted.terminal = True
+    admitted.success = True
+    admitted.end_effector_profile = "army_navy"
+
+    actor._on_bed_robot_arm_group_status(admitted)
+
+    state = actor._bed_group_states["retraction"]
+    assert state["end_effector_profile"] == "thyroid_retractor"
+    assert "retraction" not in actor._pending_group_requests
+    assert events[-1][0] == "bed_robot_arm_group_admitted"
+    assert events[-1][2]["admission_only"] is True

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import math
 import re
 from pathlib import Path
 from typing import Any, Iterable
@@ -21,16 +22,15 @@ VALID_TOOL_TRANSITIONS = {
     ("mayo", "tray"),
 }
 VALID_ARM_IDS = {"arm_1", "arm_2"}
-VALID_TARGET_TOOL_IDS = {"thyroid_retractor", "army_navy_retractor"}
-VALID_ADJUSTMENT_MODES = {"single", "multi"}
-VALID_TARGET_RETRACTOR_IDS = {
-    "left_malleable",
-    "right_malleable",
-    "both_malleable",
+RETRACTION_COMMANDS = {
+    "start_direct_teach",
+    "finish_direct_teach",
+    "start_retraction",
+    "adjust_retraction",
+    "change_tool",
+    "stop_retraction",
 }
-VALID_RETRACTION_DIRECTIONS = {"up", "down", "left", "right", "none"}
-VALID_RETRACTION_AXES = {"left_right", "up_down", "none"}
-MAX_RETRACTION_DISTANCE_MM = 30.0
+RETRACTION_TARGET_SIDES = {"none", "left", "right"}
 DEFAULT_ACTION_WATCHDOG_POLICY = {
     "goal_response_timeout_sec": 10.0,
     "feedback_timeout_sec": 30.0,
@@ -130,6 +130,7 @@ def action_watchdog_reason(
 ) -> str:
     """Return a stable reason code when an in-flight command becomes uncertain."""
 
+    service_route = route == "retraction_service"
     if terminal or recovery_required:
         return ""
     if (
@@ -138,7 +139,7 @@ def action_watchdog_reason(
     ):
         return (
             "service_server_unavailable"
-            if route == "tool_change"
+            if service_route
             else "action_server_unavailable"
         )
     if elapsed_sec >= policy["max_duration_sec"]:
@@ -146,10 +147,14 @@ def action_watchdog_reason(
     if state == "submitting" and elapsed_sec >= policy["goal_response_timeout_sec"]:
         return (
             "service_response_timeout"
-            if route == "tool_change"
+            if service_route
             else "goal_response_timeout"
         )
-    if state != "submitting" and last_update_age_sec >= policy["feedback_timeout_sec"]:
+    if (
+        not service_route
+        and state != "submitting"
+        and last_update_age_sec >= policy["feedback_timeout_sec"]
+    ):
         return "action_update_timeout"
     return ""
 
@@ -161,7 +166,7 @@ def validate_action_recovery_acknowledgement(
 
     command_id = str(payload.get("expected_command_id", "")).strip()
     if not active_command_id:
-        raise ValueError("there is no active Action client state to recover")
+        raise ValueError("there is no active command client state to recover")
     if command_id != active_command_id:
         raise ValueError(
             "active command changed; refresh the status before recovering the client"
@@ -321,53 +326,49 @@ def validate_tool_handover(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def validate_tool_change(payload: dict[str, Any]) -> dict[str, str]:
-    arm_id = str(payload.get("arm_id", "")).strip().lower()
-    target_tool_id = str(payload.get("target_tool_id", "")).strip().lower()
-    if arm_id not in VALID_ARM_IDS:
-        raise ValueError("arm_id must be arm_1 or arm_2")
-    if target_tool_id not in VALID_TARGET_TOOL_IDS:
-        raise ValueError("unsupported target_tool_id")
-    return {"arm_id": arm_id, "target_tool_id": target_tool_id}
+def validate_retraction_command(payload: dict[str, Any]) -> dict[str, Any]:
+    """Validate the exact Debug Mode payload for the single retractor Service.
 
+    The external service deliberately has no direction/axis/multi-arm or tool-id
+    fields.  Reject those legacy fields instead of silently dropping a clinical
+    instruction while changing interfaces.
+    """
 
-def validate_retraction_adjustment(payload: dict[str, Any]) -> dict[str, Any]:
-    adjustment_mode = str(payload.get("adjustment_mode", "")).strip().lower()
-    target_retractor_id = str(payload.get("target_retractor_id", "")).strip().lower()
-    direction_frame = str(payload.get("direction_frame", "surgeon_view")).strip().lower()
-    direction = str(payload.get("direction", "none")).strip().lower()
-    axis = str(payload.get("axis", "none")).strip().lower()
-    if adjustment_mode not in VALID_ADJUSTMENT_MODES:
-        raise ValueError("adjustment_mode must be single or multi")
-    if target_retractor_id not in VALID_TARGET_RETRACTOR_IDS:
-        raise ValueError("unsupported target_retractor_id")
-    if adjustment_mode == "single" and target_retractor_id == "both_malleable":
-        raise ValueError("single adjustment requires one target retractor")
-    if adjustment_mode == "multi" and target_retractor_id != "both_malleable":
-        raise ValueError("multi adjustment requires both_malleable")
-    if direction_frame != "surgeon_view":
-        raise ValueError("direction_frame must be surgeon_view")
-    if direction not in VALID_RETRACTION_DIRECTIONS:
-        raise ValueError("unsupported retraction direction")
-    if axis not in VALID_RETRACTION_AXES:
-        raise ValueError("unsupported retraction axis")
-    if adjustment_mode == "single" and (direction == "none" or axis != "none"):
-        raise ValueError("single adjustment requires a direction and axis=none")
-    if adjustment_mode == "multi" and (axis == "none" or direction != "none"):
-        raise ValueError("multi adjustment requires an axis and direction=none")
+    allowed_fields = {"command", "target_side", "distance_m"}
+    unexpected_fields = sorted(set(payload).difference(allowed_fields))
+    if unexpected_fields:
+        raise ValueError(
+            "unsupported retraction command fields: "
+            + ", ".join(unexpected_fields)
+        )
+
+    command = str(payload.get("command", "")).strip().lower()
+    target_side = str(payload.get("target_side", "none")).strip().lower()
+    if command not in RETRACTION_COMMANDS:
+        raise ValueError("unsupported retraction command")
+    if target_side not in RETRACTION_TARGET_SIDES:
+        raise ValueError("target_side must be none, left, or right")
     try:
-        distance_mm = float(payload.get("distance_mm", 0.0))
+        distance_m = float(payload.get("distance_m", 0.0))
     except (TypeError, ValueError) as exc:
-        raise ValueError("distance_mm must be numeric") from exc
-    if not 0.0 < distance_mm <= MAX_RETRACTION_DISTANCE_MM:
-        raise ValueError("distance_mm must be greater than 0 and at most 30")
+        raise ValueError("distance_m must be numeric") from exc
+    if not math.isfinite(distance_m):
+        raise ValueError("distance_m must be finite")
+
+    if command == "adjust_retraction":
+        if target_side == "none":
+            raise ValueError("adjust_retraction requires target_side left or right")
+        if distance_m <= 0.0:
+            raise ValueError("adjust_retraction requires distance_m greater than 0")
+    elif target_side != "none" or distance_m != 0.0:
+        raise ValueError(
+            f"{command} requires target_side none and distance_m 0"
+        )
+
     return {
-        "adjustment_mode": adjustment_mode,
-        "target_retractor_id": target_retractor_id,
-        "direction_frame": direction_frame,
-        "direction": direction,
-        "axis": axis,
-        "distance_mm": distance_mm,
+        "command": command,
+        "target_side": target_side,
+        "distance_m": distance_m,
     }
 
 
@@ -441,103 +442,118 @@ def parse_voice_command(text: str, voice_config: dict[str, Any]) -> VoiceParse:
     if not normalized:
         return VoiceParse(False, False, reason="empty_sentence")
 
-    axis_aliases = {
-        "왼쪽 오른쪽": "left_right",
-        "좌우": "left_right",
-        "위 아래": "up_down",
-        "위아래": "up_down",
-        "상하": "up_down",
-    }
-    axes = {value for alias, value in axis_aliases.items() if alias in normalized}
-    target_aliases = {
-        "왼쪽 말레어블": "left_malleable",
-        "left malleable": "left_malleable",
-        "왼쪽 견인기": "left_malleable",
-        "left retractor": "left_malleable",
-        "오른쪽 말레어블": "right_malleable",
-        "right malleable": "right_malleable",
-        "오른쪽 견인기": "right_malleable",
-        "right retractor": "right_malleable",
-    }
-    target_matches = {
-        value for alias, value in target_aliases.items() if alias in normalized
-    }
-    is_retractor = bool(
-        "리트랙터" in normalized
-        or "견인기" in normalized
-        or "retractor" in normalized
-        or "말레어블" in normalized
-        or "malleable" in normalized
-        or (axes and any(token in normalized for token in ("당겨", "pull")))
-    )
-    if is_retractor:
-        direction_aliases = {
-            "오른쪽": "right", "right": "right", "왼쪽": "left", "left": "left",
-            "아래": "down", "down": "down", "위": "up", "up": "up",
-        }
-        direction_text = normalized
-        for alias in target_aliases:
-            direction_text = direction_text.replace(alias, " ")
-        directions = (
-            set()
-            if axes
-            else {
-                value
-                for alias, value in direction_aliases.items()
-                if alias in direction_text
-            }
+    direct_teach = "직접 교시" in normalized or "direct teach" in normalized
+    if direct_teach:
+        starts = any(token in normalized for token in ("시작", "start"))
+        finishes = any(token in normalized for token in ("종료", "끝", "finish", "stop"))
+        if starts and finishes:
+            return VoiceParse(False, True, reason="ambiguous_direct_teach_command")
+        if starts or finishes:
+            payload = validate_retraction_command(
+                {
+                    "command": (
+                        "start_direct_teach" if starts else "finish_direct_teach"
+                    ),
+                    "target_side": "none",
+                    "distance_m": 0.0,
+                }
+            )
+            return VoiceParse(
+                True,
+                False,
+                operation="retraction_command",
+                payload=payload,
+            )
+        return VoiceParse(False, False, reason="incomplete_direct_teach_command")
+
+    if any(
+        phrase in normalized
+        for phrase in ("tool change", "toolchange", "도구 교환", "도구 변경")
+    ):
+        return VoiceParse(
+            True,
+            False,
+            operation="retraction_command",
+            payload=validate_retraction_command(
+                {
+                    "command": "change_tool",
+                    "target_side": "none",
+                    "distance_m": 0.0,
+                }
+            ),
         )
+
+    retraction_terms = (
+        "리트랙션",
+        "retraction",
+        "리트랙터",
+        "retractor",
+        "견인기",
+        "말레어블",
+        "malleable",
+    )
+    is_retractor = any(term in normalized for term in retraction_terms)
+    if is_retractor:
+        starts = any(token in normalized for token in ("시작", "start"))
+        stops = any(token in normalized for token in ("종료", "끝", "stop", "finish"))
+        if starts and stops:
+            return VoiceParse(False, True, reason="ambiguous_retraction_command")
+        if starts or stops:
+            return VoiceParse(
+                True,
+                False,
+                operation="retraction_command",
+                payload=validate_retraction_command(
+                    {
+                        "command": "start_retraction" if starts else "stop_retraction",
+                        "target_side": "none",
+                        "distance_m": 0.0,
+                    }
+                ),
+            )
+
+        target_aliases = {
+            "왼쪽": "left",
+            "left": "left",
+            "오른쪽": "right",
+            "right": "right",
+        }
+        target_sides = {
+            side for alias, side in target_aliases.items() if alias in normalized
+        }
         distance_match = re.search(
             r"(\d+(?:\.\d+)?)\s*"
             r"(mm|밀리(?:미터)?|cm|센티(?:미터)?|센치(?:미터)?)",
             normalized,
         )
-        distance_mm = 0.0
-        if distance_match:
-            distance_mm = float(distance_match.group(1))
-            if distance_match.group(2) in {"cm", "센티", "센티미터", "센치", "센치미터"}:
-                distance_mm *= 10.0
-        target = (
-            "both_malleable"
-            if axes
-            else next(iter(target_matches))
-            if len(target_matches) == 1
-            else ""
-        )
-        if len(directions) == 1 and not axes and distance_match and target:
-            payload = {
-                "adjustment_mode": "single",
-                "target_retractor_id": target,
-                "direction_frame": "surgeon_view",
-                "direction": directions.pop(),
-                "axis": "none",
-                "distance_mm": distance_mm,
-            }
+        if len(target_sides) > 1:
+            return VoiceParse(False, True, reason="ambiguous_retraction_target_side")
+        if len(target_sides) == 1 and distance_match and "더" in normalized:
+            distance_m = float(distance_match.group(1))
+            if distance_match.group(2) in {"mm", "밀리", "밀리미터"}:
+                distance_m /= 1000.0
+            else:
+                distance_m /= 100.0
             try:
                 return VoiceParse(
                     True,
                     False,
-                    operation="retraction_adjustment",
-                    payload=validate_retraction_adjustment(payload),
+                    operation="retraction_command",
+                    payload=validate_retraction_command(
+                        {
+                            "command": "adjust_retraction",
+                            "target_side": target_sides.pop(),
+                            "distance_m": distance_m,
+                        }
+                    ),
                 )
             except ValueError as exc:
                 return VoiceParse(False, False, reason=str(exc))
-        if len(axes) == 1 and not directions and distance_match:
-            payload = {
-                "adjustment_mode": "multi",
-                "target_retractor_id": "both_malleable",
-                "direction_frame": "surgeon_view",
-                "direction": "none",
-                "axis": axes.pop(),
-                "distance_mm": distance_mm,
-            }
-            try:
-                return VoiceParse(True, False, operation="retraction_adjustment", payload=validate_retraction_adjustment(payload))
-            except ValueError as exc:
-                return VoiceParse(False, False, reason=str(exc))
-        if len(directions) > 1 or len(axes) > 1 or (directions and axes):
-            return VoiceParse(False, True, reason="ambiguous_retraction_direction")
-        return VoiceParse(False, False, reason="incomplete_retraction_command")
+        return VoiceParse(
+            False,
+            False,
+            reason="unsupported_retraction_command",
+        )
 
     request_words = ("줘", "주세요", "전달", "건네", "please", "handover", "give")
     if not any(word in normalized for word in request_words):

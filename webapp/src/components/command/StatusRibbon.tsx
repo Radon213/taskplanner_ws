@@ -69,7 +69,6 @@ export function StatusRibbon({
           <div>
             <p>{vm.ui.eyebrow}</p>
             <h1>{vm.ui.appName}</h1>
-            <span>{vm.ui.subtitle}</span>
           </div>
         </div>
         <div className="ribbon-cluster">

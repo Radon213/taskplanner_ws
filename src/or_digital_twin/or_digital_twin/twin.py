@@ -1465,8 +1465,13 @@ class ORDigitalTwin:
         if bool(status.terminal):
             belief.active_request_id = ""
             belief.active_command_id = ""
+        admission_only = str(status.outcome) == "accepted"
         if control_cancelled:
             event_type = "BedRobotArmGroupCommandCancelled"
+        elif admission_only:
+            # ExecuteRetractionCommand acknowledges admission only.  Do not
+            # turn that acknowledgement into a physical-completion fact.
+            event_type = "BedRobotArmGroupCommandAccepted"
         elif not status.operation and status.request_id.startswith("health-"):
             event_type = "BedRobotArmGroupAvailabilityChanged"
         else:
@@ -1484,6 +1489,7 @@ class ORDigitalTwin:
                 "outcome": status.outcome,
                 "success": bool(status.success),
                 "terminal": bool(status.terminal),
+                "admission_only": admission_only,
                 "arm_id": status.arm_id,
                 "target_tool_id": status.target_tool_id,
                 "adjustment_mode": status.adjustment_mode,

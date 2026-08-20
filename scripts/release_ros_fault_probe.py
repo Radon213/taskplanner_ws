@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise source degradation, voice-only fallback, and Action safety on ROS.
+"""Exercise source degradation, voice-only fallback, and robot admission on ROS.
 
 The probe intentionally starts only deterministic test nodes in an isolated ROS
 domain. It does not load a VLM, open a video, or talk to a physical robot.
@@ -28,11 +28,10 @@ from rclpy.node import Node
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
 from surgical_interop_msgs.action import (
-    ExecuteRetractionAdjustment,
     ExecuteToolHandover,
 )
 from surgical_interop_msgs.msg import BedRobotArmStateArray
-from surgical_interop_msgs.srv import RequestToolChange
+from surgical_interop_msgs.srv import ExecuteRetractionCommand
 from surgical_msgs.msg import (
     InputSourceStatus,
     ReducerDecisionEvent,
@@ -52,7 +51,7 @@ SPEC_DIR = (
     / "thyroidectomy_demo"
 )
 SCENARIO = ROOT / "config" / "fault_scenarios" / "release_smoke.yaml"
-ACTION_PROFILE = (
+ROBOT_CONTRACT_PROFILE = (
     ROOT / "config" / "fault_scenarios" / "action_mixed_failures.yaml"
 )
 
@@ -147,14 +146,9 @@ class ReleaseProbeNode(Node):
         self.action_client = ActionClient(
             self, ExecuteToolHandover, "/surgery/tool_handover"
         )
-        self.retraction_client = ActionClient(
-            self,
-            ExecuteRetractionAdjustment,
-            "/surgery/retraction/adjust",
-        )
-        self.tool_change_client = self.create_client(
-            RequestToolChange,
-            "/surgery/tool_change/request",
+        self.retraction_client = self.create_client(
+            ExecuteRetractionCommand,
+            "/surgery/retraction/command",
         )
         self.create_subscription(
             BedRobotArmStateArray,
@@ -380,13 +374,9 @@ class ReleaseProbeNode(Node):
         return rows
 
     def run_bed_robot_contract(self) -> dict[str, Any]:
-        if not self.retraction_client.wait_for_server(timeout_sec=8.0):
+        if not self.retraction_client.wait_for_service(timeout_sec=8.0):
             raise RuntimeError(
-                "/surgery/retraction/adjust Action server did not appear"
-            )
-        if not self.tool_change_client.wait_for_service(timeout_sec=8.0):
-            raise RuntimeError(
-                "/surgery/tool_change/request Service did not appear"
+                "/surgery/retraction/command Service did not appear"
             )
         deadline = time.monotonic() + 3.0
         while not self.bed_robot_status_history and time.monotonic() < deadline:
@@ -396,79 +386,52 @@ class ReleaseProbeNode(Node):
                 "/external/bed_robot_arms/status did not publish a snapshot"
             )
 
-        def adjust(command_id: str) -> dict[str, Any]:
-            goal = ExecuteRetractionAdjustment.Goal()
-            goal.command_id = command_id
-            goal.adjustment_mode = "single"
-            goal.target_retractor_id = "left_malleable"
-            goal.direction_frame = "surgeon_view"
-            goal.direction = "up"
-            goal.axis = "none"
-            goal.distance_mm = 5.0
-            started = time.monotonic()
-            handle = _wait_future(
-                self.retraction_client.send_goal_async(goal), timeout_sec=5.0
-            )
-            row: dict[str, Any] = {
-                "command_id": command_id,
-                "accepted": bool(handle.accepted),
-                "goal_acceptance_latency_sec": round(
-                    time.monotonic() - started,
-                    6,
-                ),
-            }
-            if not handle.accepted:
-                row["duration_sec"] = round(time.monotonic() - started, 4)
-                return row
-            wrapped = _wait_future(handle.get_result_async(), timeout_sec=8.0)
-            row.update(
-                {
-                    "status": int(wrapped.status),
-                    "success": bool(wrapped.result.success),
-                    "final_state": str(wrapped.result.final_state),
-                    "reason_code": str(wrapped.result.reason_code),
-                    "duration_sec": round(time.monotonic() - started, 4),
-                }
-            )
-            return row
-
-        def change_tool(
+        def command(
             command_id: str,
-            target_tool_id: str,
+            *,
+            command_code: int,
+            target_side: int,
+            distance_m: float,
         ) -> dict[str, Any]:
-            request = RequestToolChange.Request()
+            request = ExecuteRetractionCommand.Request()
+            request.protocol_version = ExecuteRetractionCommand.Request.PROTOCOL_VERSION_V1
+            request.source_id = "release_ros_fault_probe"
             request.command_id = command_id
-            request.arm_id = "arm_1"
-            request.target_tool_id = target_tool_id
+            request.command = command_code
+            request.target_side = target_side
+            request.distance_m = distance_m
             started = time.monotonic()
             response = _wait_future(
-                self.tool_change_client.call_async(request), timeout_sec=5.0
+                self.retraction_client.call_async(request), timeout_sec=5.0
             )
             return {
                 "command_id": command_id,
-                "arm_id": request.arm_id,
-                "target_tool_id": target_tool_id,
-                "success": bool(response.success),
-                "result": str(response.result),
-                "reason_code": str(response.reason_code),
+                "command": int(command_code),
+                "target_side": int(target_side),
+                "distance_m": float(distance_m),
+                "request_accepted": bool(response.request_accepted),
+                "result_code": int(response.result_code),
+                "response_command_id": str(response.command_id),
+                "message": str(response.message),
                 "duration_sec": round(time.monotonic() - started, 4),
             }
 
         return {
             "status_snapshot": self.bed_robot_status_history[-1],
-            "retraction_rejected": adjust("release-retraction-reject"),
-            "retraction_success": adjust("release-retraction-success"),
-            "tool_change_failed": change_tool(
-                "release-tool-change-failure",
-                "thyroid_retractor",
+            # The prior direction/axis and target-tool forms have no equivalent
+            # fields in ExecuteRetractionCommand.  These calls intentionally
+            # exercise only documented admission payloads, not motion outcome.
+            "adjust_retraction_admission": command(
+                "release-retraction-adjust",
+                command_code=ExecuteRetractionCommand.Request.COMMAND_ADJUST_RETRACTION,
+                target_side=ExecuteRetractionCommand.Request.TARGET_LEFT,
+                distance_m=0.005,
             ),
-            "tool_change_success": change_tool(
-                "release-tool-change-success",
-                "army_navy_retractor",
-            ),
-            "tool_change_replay": change_tool(
-                "release-tool-change-success",
-                "army_navy_retractor",
+            "change_tool_admission": command(
+                "release-retraction-tool-change",
+                command_code=ExecuteRetractionCommand.Request.COMMAND_CHANGE_TOOL,
+                target_side=ExecuteRetractionCommand.Request.TARGET_NONE,
+                distance_m=0.0,
             ),
         }
 
@@ -705,42 +668,25 @@ def _assertions(
         and all(row.get("role") == "retraction" for row in arms),
         json.dumps(status_snapshot, sort_keys=True),
     )
-    retraction_rejected = bed_robot_results.get("retraction_rejected", {})
-    retraction_success = bed_robot_results.get("retraction_success", {})
+    retraction_rejected = bed_robot_results.get("adjust_retraction_admission", {})
+    retraction_accepted = bed_robot_results.get("change_tool_admission", {})
     add(
-        "retraction_adjustment_profile_rejection",
-        retraction_rejected.get("accepted") is False,
+        "retraction_command_rejection_is_admission_only",
+        retraction_rejected.get("request_accepted") is False
+        and retraction_rejected.get("result_code")
+        == ExecuteRetractionCommand.Response.RESULT_REJECTED
+        and retraction_rejected.get("response_command_id")
+        == retraction_rejected.get("command_id"),
         json.dumps(retraction_rejected, sort_keys=True),
     )
     add(
-        "retraction_adjustment_success",
-        retraction_success.get("accepted") is True
-        and retraction_success.get("success") is True
-        and retraction_success.get("final_state") == "completed",
-        json.dumps(retraction_success, sort_keys=True),
-    )
-    tool_change_failed = bed_robot_results.get("tool_change_failed", {})
-    tool_change_success = bed_robot_results.get("tool_change_success", {})
-    tool_change_replay = bed_robot_results.get("tool_change_replay", {})
-    add(
-        "tool_change_service_reports_failure",
-        tool_change_failed.get("success") is False
-        and tool_change_failed.get("result") == "failed",
-        json.dumps(tool_change_failed, sort_keys=True),
-    )
-    add(
-        "tool_change_service_success",
-        tool_change_success.get("success") is True
-        and tool_change_success.get("result") == "completed",
-        json.dumps(tool_change_success, sort_keys=True),
-    )
-    add(
-        "tool_change_command_id_idempotent",
-        tool_change_replay.get("success") is True
-        and tool_change_replay.get("result") == tool_change_success.get("result")
-        and tool_change_replay.get("reason_code")
-        == tool_change_success.get("reason_code"),
-        json.dumps(tool_change_replay, sort_keys=True),
+        "retraction_command_acceptance_is_admission_only",
+        retraction_accepted.get("request_accepted") is True
+        and retraction_accepted.get("result_code")
+        == ExecuteRetractionCommand.Response.RESULT_ACCEPTED
+        and retraction_accepted.get("response_command_id")
+        == retraction_accepted.get("command_id"),
+        json.dumps(retraction_accepted, sort_keys=True),
     )
     add(
         "all_ros_children_survived_campaign",
@@ -766,7 +712,7 @@ def _write_reports(
         "ros_domain_id": domain_id,
         "models_loaded": False,
         "scenario": str(SCENARIO.relative_to(ROOT)),
-        "action_profile": str(ACTION_PROFILE.relative_to(ROOT)),
+        "robot_contract_profile": str(ROBOT_CONTRACT_PROFILE.relative_to(ROOT)),
         "assertions": [asdict(item) for item in assertions],
         "source_history": node.source_history,
         "world_history": node.world_history,
@@ -800,7 +746,7 @@ def _write_reports(
     svg = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}">',
         '<rect width="100%" height="100%" fill="#ffffff"/>',
-        '<text x="24" y="34" font-family="sans-serif" font-size="22" font-weight="700">ROS fault and Action contract probe</text>',
+        '<text x="24" y="34" font-family="sans-serif" font-size="22" font-weight="700">ROS fault and robot admission probe</text>',
         f'<text x="24" y="58" font-family="sans-serif" font-size="13">domain {domain_id} | models loaded: false</text>',
     ]
     for index, item in enumerate(assertions):
@@ -931,7 +877,7 @@ def main() -> int:
                         "fault_action_emulator",
                         "--ros-args",
                         "-p",
-                        f"profile_path:={ACTION_PROFILE}",
+                        f"profile_path:={ROBOT_CONTRACT_PROFILE}",
                         "-p",
                         "procedure_type:=nephrectomy",
                     ],

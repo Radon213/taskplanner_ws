@@ -45,9 +45,10 @@ It establishes:
 
 5. Robot adapter boundary
    Preserve `/skill/execute` as the internal humanoid boundary. Keep the
-   bed-mounted integration retraction-only through the documented Tool Change
-   Service, Retraction Adjustment Action, and controller status Topic. The mock
-   servers should remain deterministic for regression testing.
+   bed-mounted integration retraction-only through the documented
+   `/surgery/retraction/command` Service and controller status Topic. The mock
+   servers should remain deterministic for regression testing; Service
+   admission must not be reported as physical completion.
 
 6. Operator workflow
    Keep procedure switching, mid-procedure start, model selection, reset/stop,
@@ -106,9 +107,8 @@ It establishes:
 - Preserve the existing action names:
   `direct_handover`, `pick_up_and_handover`, `put_down_and_handover`,
   `retrieve_from_mayo`, `return_unused_preposition`, and `predict_tool`.
-- Integrate thyroidectomy retractor Tool Change through
-  `/surgery/tool_change/request` and nephrectomy Malleable adjustment through
-  `/surgery/retraction/adjust`.
+- Integrate direct teach, retraction, adjustment, tool change, and stop through
+  the single `/surgery/retraction/command` Service.
 - Consume only retraction entries from `/external/bed_robot_arms/status`; leave
   pose, trajectory, collision, force, E-stop, and detailed state ownership to
   the controller.

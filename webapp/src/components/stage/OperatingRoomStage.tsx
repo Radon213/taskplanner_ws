@@ -1,7 +1,7 @@
 import { type CSSProperties, useEffect, useMemo, useRef, useState } from "react";
 import { AnimatePresence, useReducedMotion } from "framer-motion";
 import * as m from "framer-motion/m";
-import { Hand, ScanLine } from "lucide-react";
+import { Hand } from "lucide-react";
 
 import type {
   StagePhaseStep,
@@ -304,8 +304,6 @@ export function OperatingRoomStage({
   perceptionCameraFrames,
   perceptionOverlayFrames,
   perceptionHealth,
-  perceptionControlPending,
-  onPerceptionEnabledChange,
   systemSurgeonRequest,
   onStageAspectChange,
 }: {
@@ -314,8 +312,6 @@ export function OperatingRoomStage({
   perceptionCameraFrames?: StageCameraFrames;
   perceptionOverlayFrames?: StageCameraFrames;
   perceptionHealth?: PerceptionLayerHealth;
-  perceptionControlPending?: boolean;
-  onPerceptionEnabledChange?: (enabled: boolean) => void;
   systemSurgeonRequest: SystemSurgeonRequest;
   onStageAspectChange?: (ratio: number) => void;
 }) {
@@ -336,34 +332,6 @@ export function OperatingRoomStage({
   const perceptionEnabled = Boolean(
     perceptionHealth?.received && perceptionHealth.enabled,
   );
-  const perceptionAvailable = Boolean(perceptionHealth?.received);
-  const perceptionError = perceptionHealth?.status === "error";
-  const perceptionStateLabel = !perceptionAvailable
-    ? vm.language === "ko"
-      ? "사용 불가"
-      : "Unavailable"
-    : perceptionError
-      ? vm.language === "ko"
-        ? "오류"
-        : "Error"
-      : perceptionEnabled
-        ? vm.language === "ko"
-          ? "켜짐"
-          : "On"
-        : vm.language === "ko"
-          ? "꺼짐"
-          : "Off";
-  const perceptionControlLabel =
-    vm.language === "ko" ? "객체 인식" : "Object detection";
-  const perceptionTitle =
-    perceptionHealth?.lastError ||
-    (perceptionEnabled
-      ? vm.language === "ko"
-        ? "RF-DETR 객체 인식 결과를 영상에 표시합니다."
-        : "Show RF-DETR detections in the camera views."
-      : vm.language === "ko"
-        ? "원본 영상을 표시합니다."
-        : "Show raw camera frames.");
   const surgeonRequestConfirmed = systemSurgeonRequest.confirmed;
   const confirmedRequestTool = systemSurgeonRequest.requestedTool
     ? vm.displayToolName(systemSurgeonRequest.requestedTool)
@@ -436,34 +404,6 @@ export function OperatingRoomStage({
           <div>
             <p className="section-kicker">{vm.ui.stageTitle}</p>
             <h2>{vm.stage.procedureLabel}</h2>
-            <button
-              type="button"
-              className={`stage-perception-toggle ${
-                perceptionEnabled ? "enabled" : "disabled"
-              } ${perceptionError ? "error" : ""}`}
-              role="switch"
-              aria-checked={perceptionEnabled}
-              aria-label={`${perceptionControlLabel}: ${perceptionStateLabel}`}
-              title={perceptionTitle}
-              disabled={
-                !perceptionAvailable ||
-                Boolean(perceptionControlPending) ||
-                !onPerceptionEnabledChange
-              }
-              onClick={() =>
-                onPerceptionEnabledChange?.(!perceptionEnabled)
-              }
-            >
-              <ScanLine aria-hidden="true" size={16} strokeWidth={2.1} />
-              <span>{perceptionControlLabel}</span>
-              <strong>
-                {perceptionControlPending
-                  ? vm.language === "ko"
-                    ? "변경 중"
-                    : "Updating"
-                  : perceptionStateLabel}
-              </strong>
-            </button>
           </div>
           <PhaseStepper steps={vm.stage.phaseSteps} label={vm.ui.phaseOverview} />
         </div>

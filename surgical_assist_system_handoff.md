@@ -188,10 +188,9 @@ safety / invariant guard
 ### Bed-mounted retraction arm
 
 - bed-mounted robot-arm 연동은 retraction 역할만 대상으로 한다.
-- 갑상샘 절제술 Tool Change는 완료 대기형
-  `/surgery/tool_change/request` Service를 사용한다.
-- 신장 절제술 Malleable 미세 조정은 취소 가능한
-  `/surgery/retraction/adjust` Action을 사용한다.
+- 직접교시, Retraction, 조절, Tool Change, 종료는 단일
+  `/surgery/retraction/command` (`ExecuteRetractionCommand`) Service를
+  사용한다. 응답은 요청 admission만 나타내며 물리 동작 완료를 뜻하지 않는다.
 - 로봇팔 상태는 `/external/bed_robot_arms/status`의 문서화된 필드만
   수용한다. 자세, 궤적, 힘, 충돌, 상세 안전 상태는 제어기 소유다.
 - bed-mounted suction arm 제어·상태 경로는 없다. 다만 임상 석션 도구와

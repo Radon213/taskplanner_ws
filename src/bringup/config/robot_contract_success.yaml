@@ -3,7 +3,5 @@ profile_id: bringup-robot-contract-success
 routes:
   tool_handover:
     default: {outcome: success, duration_sec: 0.6}
-  retraction_adjustment:
+  retraction_command:
     default: {outcome: success, duration_sec: 0.6}
-  tool_change:
-    default: {outcome: success}

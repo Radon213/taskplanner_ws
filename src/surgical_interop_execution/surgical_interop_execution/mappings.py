@@ -63,8 +63,29 @@ GROUP_RETRACTION = "retraction"
 OPERATION_RETRACTION = "retraction"
 OPERATION_RELEASE_RETRACTION = "release_retraction"
 OPERATION_CHANGE_END_EFFECTOR = "change_end_effector"
+OPERATION_START_DIRECT_TEACH = "start_direct_teach"
+OPERATION_FINISH_DIRECT_TEACH = "finish_direct_teach"
+OPERATION_START_RETRACTION = "start_retraction"
+OPERATION_STOP_RETRACTION = "stop_retraction"
 
-MAX_RETRACTION_DISTANCE_MM = 30.0
+# The reviewed single-service command supports the clinically requested 5 cm
+# adjustment.  Deployments may set a stricter value through the bridge
+# parameter, but the default must not make the documented command impossible.
+MAX_RETRACTION_DISTANCE_MM = 50.0
+
+# Keep the public-service values in this pure module so validation and mapping
+# remain testable without generated ROS interfaces.  They intentionally match
+# surgical_interop_msgs/srv/ExecuteRetractionCommand.srv.
+RETRACTION_PROTOCOL_VERSION_V1 = 1
+RETRACTION_COMMAND_START_DIRECT_TEACH = 1
+RETRACTION_COMMAND_FINISH_DIRECT_TEACH = 2
+RETRACTION_COMMAND_START_RETRACTION = 3
+RETRACTION_COMMAND_ADJUST_RETRACTION = 4
+RETRACTION_COMMAND_CHANGE_TOOL = 5
+RETRACTION_COMMAND_STOP_RETRACTION = 6
+RETRACTION_TARGET_NONE = 0
+RETRACTION_TARGET_LEFT = 1
+RETRACTION_TARGET_RIGHT = 2
 
 ARM_IDS = frozenset({"arm_1", "arm_2"})
 TOOL_THYROID_RETRACTOR = "thyroid_retractor"
@@ -189,21 +210,19 @@ class ToolHandoverRequest:
 
 
 @dataclass(frozen=True, slots=True)
-class RetractionAdjustmentRequest:
-    command_id: str
-    adjustment_mode: str
-    target_retractor_id: str
-    direction_frame: str
-    direction: str
-    axis: str
-    distance_mm: float
+class RetractionCommandRequest:
+    """The complete controller-facing content of the unified Service request.
 
+    ``source_id`` is deliberately a bridge configuration value, not a planner
+    command field.  Planner rationale, old controller-specific direction/axis
+    fields, arm IDs, and tool IDs are not represented by the reviewed Service
+    and must never be silently projected onto it.
+    """
 
-@dataclass(frozen=True, slots=True)
-class ToolChangeRequest:
     command_id: str
-    arm_id: str
-    target_tool_id: str
+    command: int
+    target_side: int
+    distance_m: float
 
 
 def public_instrument_instance_id(
@@ -288,8 +307,15 @@ def map_group_command(
     command: InternalGroupCommand,
     *,
     max_retraction_distance_mm: float = MAX_RETRACTION_DISTANCE_MM,
-) -> RetractionAdjustmentRequest | ToolChangeRequest:
-    """Validate and project the internal envelope onto the reviewed contract."""
+) -> RetractionCommandRequest:
+    """Project one internal command onto the single reviewed Service contract.
+
+    The previous action accepted controller-specific direction, axis, multi-arm,
+    arm-ID, and tool-ID fields.  The replacement Service intentionally does
+    not.  This mapper therefore accepts only legacy commands whose meaning is
+    losslessly expressible by ``command``, ``target_side``, and ``distance_m``;
+    it rejects the rest instead of discarding safety-relevant detail.
+    """
 
     if not command.command_id.strip():
         raise MappingFailure("invalid_command_id")
@@ -299,20 +325,26 @@ def map_group_command(
             "suction_arm_removed" if command.group_id == "suction" else "unsupported_group"
         )
 
-    if command.operation == OPERATION_CHANGE_END_EFFECTOR:
-        arm_id = command.arm_id.strip().casefold()
-        if arm_id not in ARM_IDS:
-            raise MappingFailure("invalid_arm_id")
-        target_tool_id = command.target_tool_id.strip().casefold()
-        if target_tool_id not in TARGET_TOOL_IDS:
-            raise MappingFailure("invalid_target_tool")
-        return ToolChangeRequest(
+    operation = command.operation.strip().casefold()
+    basic_commands = {
+        OPERATION_START_DIRECT_TEACH: RETRACTION_COMMAND_START_DIRECT_TEACH,
+        OPERATION_FINISH_DIRECT_TEACH: RETRACTION_COMMAND_FINISH_DIRECT_TEACH,
+        OPERATION_START_RETRACTION: RETRACTION_COMMAND_START_RETRACTION,
+        OPERATION_STOP_RETRACTION: RETRACTION_COMMAND_STOP_RETRACTION,
+        # ``release_retraction`` existed in the internal envelope before the
+        # reviewed Service was introduced.  It is a compatible spelling of the
+        # new stop command, so preserve it as an explicit compatibility alias.
+        OPERATION_RELEASE_RETRACTION: RETRACTION_COMMAND_STOP_RETRACTION,
+        OPERATION_CHANGE_END_EFFECTOR: RETRACTION_COMMAND_CHANGE_TOOL,
+    }
+    if operation in basic_commands:
+        return RetractionCommandRequest(
             command_id=command.command_id,
-            arm_id=arm_id,
-            target_tool_id=target_tool_id,
+            command=basic_commands[operation],
+            target_side=RETRACTION_TARGET_NONE,
+            distance_m=0.0,
         )
-
-    if command.operation != OPERATION_RETRACTION:
+    if operation != OPERATION_RETRACTION:
         raise MappingFailure("unsupported_retraction_operation")
 
     adjustment_mode = command.adjustment_mode.strip().casefold()
@@ -320,8 +352,30 @@ def map_group_command(
     direction_frame = command.direction_frame.strip().casefold()
     direction = command.direction.strip().casefold()
     axis = command.axis.strip().casefold()
+    if adjustment_mode != ADJUSTMENT_SINGLE:
+        raise MappingFailure("unsupported_retraction_adjustment_mode")
     if direction_frame != DIRECTION_FRAME_SURGEON_VIEW:
         raise MappingFailure("invalid_direction_frame")
+    if axis != "none":
+        raise MappingFailure("unsupported_retraction_axis")
+
+    side_by_target = {
+        TARGET_LEFT_MALLEABLE: RETRACTION_TARGET_LEFT,
+        TARGET_RIGHT_MALLEABLE: RETRACTION_TARGET_RIGHT,
+    }
+    target_side = side_by_target.get(target_retractor_id)
+    if target_side is None:
+        raise MappingFailure("unsupported_retraction_target")
+    # The old action's vector was richer than the new Service.  A side and a
+    # matching lateral direction have one unambiguous meaning; every other
+    # direction (including up/down or an opposing lateral vector) must stay
+    # rejected until the public Service grows a field for it.
+    expected_direction = (
+        "left" if target_side == RETRACTION_TARGET_LEFT else "right"
+    )
+    if direction != expected_direction:
+        raise MappingFailure("unsupported_retraction_direction_for_service")
+
     distance_mm = float(command.distance_mm)
     maximum = float(max_retraction_distance_mm)
     if (
@@ -333,28 +387,9 @@ def map_group_command(
     ):
         raise MappingFailure("invalid_retraction_distance")
 
-    if adjustment_mode == ADJUSTMENT_SINGLE:
-        if target_retractor_id not in {
-            TARGET_LEFT_MALLEABLE,
-            TARGET_RIGHT_MALLEABLE,
-        }:
-            raise MappingFailure("invalid_target_retractor")
-        if direction not in CARDINAL_DIRECTIONS or axis != "none":
-            raise MappingFailure("invalid_single_adjustment")
-    elif adjustment_mode == ADJUSTMENT_MULTI:
-        if target_retractor_id != TARGET_BOTH_MALLEABLE:
-            raise MappingFailure("invalid_target_retractor")
-        if direction != "none" or axis not in ADJUSTMENT_AXES:
-            raise MappingFailure("invalid_multi_adjustment")
-    else:
-        raise MappingFailure("invalid_adjustment_mode")
-
-    return RetractionAdjustmentRequest(
+    return RetractionCommandRequest(
         command_id=command.command_id,
-        adjustment_mode=adjustment_mode,
-        target_retractor_id=target_retractor_id,
-        direction_frame=direction_frame,
-        direction=direction,
-        axis=axis,
-        distance_mm=distance_mm,
+        command=RETRACTION_COMMAND_ADJUST_RETRACTION,
+        target_side=target_side,
+        distance_m=distance_mm / 1000.0,
     )

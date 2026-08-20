@@ -75,6 +75,18 @@ def generate_launch_description() -> LaunchDescription:
     speech_min_confidence = LaunchConfiguration("speech_min_confidence")
     speech_max_age_sec = LaunchConfiguration("speech_max_age_sec")
     speech_source_timeout_sec = LaunchConfiguration("speech_source_timeout_sec")
+    retractor_voice_normalization_enabled = LaunchConfiguration(
+        "retractor_voice_normalization_enabled"
+    )
+    retractor_voice_interpreter_mode = LaunchConfiguration(
+        "retractor_voice_interpreter_mode"
+    )
+    retractor_voice_vlm_base_url = LaunchConfiguration("retractor_voice_vlm_base_url")
+    retractor_voice_vlm_model_id = LaunchConfiguration("retractor_voice_vlm_model_id")
+    retractor_voice_vlm_api_key = LaunchConfiguration("retractor_voice_vlm_api_key")
+    retractor_voice_vlm_timeout_sec = LaunchConfiguration(
+        "retractor_voice_vlm_timeout_sec"
+    )
     vlm_mode = LaunchConfiguration("vlm_mode")
     vlm_base_url = LaunchConfiguration("vlm_base_url")
     vlm_provider_id = LaunchConfiguration("vlm_provider_id")
@@ -312,6 +324,26 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("speech_min_confidence", default_value="0.55"),
             DeclareLaunchArgument("speech_max_age_sec", default_value="3.0"),
             DeclareLaunchArgument("speech_source_timeout_sec", default_value="5.0"),
+            DeclareLaunchArgument(
+                "retractor_voice_normalization_enabled", default_value="true"
+            ),
+            DeclareLaunchArgument(
+                "retractor_voice_interpreter_mode",
+                default_value="deterministic",
+                choices=("deterministic", "vlm_with_fallback"),
+                description=(
+                    "Use the dedicated text-only VLM normalizer when configured; "
+                    "deterministic normalization remains the safe fallback."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "retractor_voice_vlm_base_url", default_value="http://127.0.0.1:8001"
+            ),
+            DeclareLaunchArgument("retractor_voice_vlm_model_id", default_value=""),
+            DeclareLaunchArgument("retractor_voice_vlm_api_key", default_value=""),
+            DeclareLaunchArgument(
+                "retractor_voice_vlm_timeout_sec", default_value="2.0"
+            ),
             DeclareLaunchArgument("vlm_mode", default_value="real"),
             DeclareLaunchArgument("vlm_base_url", default_value="http://127.0.0.1:8001"),
             DeclareLaunchArgument("vlm_provider_id", default_value="vllm"),
@@ -755,8 +787,7 @@ def generate_launch_description() -> LaunchDescription:
                     {
                         "spec_dir": spec_dir,
                         "tool_handover_endpoint": "/surgery/tool_handover",
-                        "tool_change_service": "/surgery/tool_change/request",
-                        "retraction_endpoint": "/surgery/retraction/adjust",
+                        "retraction_service_name": "/surgery/retraction/command",
                         "bed_robot_status_endpoint": "/external/bed_robot_arms/status",
                         "require_bed_robot_status": ParameterValue(
                             bed_robot_contract_enabled,
@@ -786,6 +817,18 @@ def generate_launch_description() -> LaunchDescription:
                         "visual_direction_confidence_threshold": 0.75,
                         # real_vlm: 20 sec per attempt * 3 attempts + margin
                         "vlm_proposal_timeout_sec": 70.0,
+                        "retractor_voice_normalization_enabled": ParameterValue(
+                            retractor_voice_normalization_enabled,
+                            value_type=bool,
+                        ),
+                        "retractor_voice_interpreter_mode": retractor_voice_interpreter_mode,
+                        "retractor_voice_vlm_base_url": retractor_voice_vlm_base_url,
+                        "retractor_voice_vlm_model_id": retractor_voice_vlm_model_id,
+                        "retractor_voice_vlm_api_key": retractor_voice_vlm_api_key,
+                        "retractor_voice_vlm_timeout_sec": ParameterValue(
+                            retractor_voice_vlm_timeout_sec,
+                            value_type=float,
+                        ),
                     }
                 ],
                 output="screen",
@@ -799,26 +842,9 @@ def generate_launch_description() -> LaunchDescription:
                     {
                         "sentence_topic": sentence_input_topic,
                         "tool_handover_action_name": "/surgery/tool_handover",
-                        "tool_change_service_name": "/surgery/tool_change/request",
-                        "require_tool_change_service": ParameterValue(
-                            PythonExpression(
-                                [
-                                    "'",
-                                    bed_robot_contract_procedure_type,
-                                    "' == 'thyroidectomy'",
-                                ]
-                            ),
-                            value_type=bool,
-                        ),
-                        "retraction_adjustment_action_name": "/surgery/retraction/adjust",
-                        "require_retraction_adjustment_server": ParameterValue(
-                            PythonExpression(
-                                [
-                                    "'",
-                                    bed_robot_contract_procedure_type,
-                                    "' == 'nephrectomy'",
-                                ]
-                            ),
+                        "retraction_service_name": "/surgery/retraction/command",
+                        "require_retraction_service": ParameterValue(
+                            bed_robot_contract_enabled,
                             value_type=bool,
                         ),
                         "bed_robot_arm_status_topic": "/external/bed_robot_arms/status",

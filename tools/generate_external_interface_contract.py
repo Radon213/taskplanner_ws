@@ -68,8 +68,7 @@ IDL_FILES = (
     "src/surgical_interop_msgs/msg/BedRobotArmState.msg",
     "src/surgical_interop_msgs/msg/BedRobotArmStateArray.msg",
     "src/surgical_interop_msgs/action/ExecuteToolHandover.action",
-    "src/surgical_interop_msgs/action/ExecuteRetractionAdjustment.action",
-    "src/surgical_interop_msgs/srv/RequestToolChange.srv",
+    "src/surgical_interop_msgs/srv/ExecuteRetractionCommand.srv",
 )
 
 
@@ -925,8 +924,7 @@ def _overview(w: Writer) -> None:
         ("Endpoint", "종류·Type", "소유"),
         (
             ("/surgery/tool_handover", "Action · ExecuteToolHandover", "외부 humanoid server"),
-            ("/surgery/tool_change/request", "Service · RequestToolChange", "외부 bed-arm controller"),
-            ("/surgery/retraction/adjust", "Action · ExecuteRetractionAdjustment", "외부 bed-arm controller"),
+            ("/surgery/retraction/command", "Service · ExecuteRetractionCommand", "외부 bed-arm controller"),
         ),
         (3100, 3400, 2860),
     )
@@ -1195,8 +1193,8 @@ def _robot_endpoints(w: Writer) -> None:
     w.heading("8. 로봇 기능 Action/Service 계약", 1, page_break=True)
     w.callout(
         "공통 안전 규칙",
-        "모든 request는 caller-provided command_id를 사용합니다. remote timeout 또는 연결 단절은 성공이 아니며, terminal state를 확인할 수 없으면 "
-        "UNKNOWN/REMOTE_STATE_UNKNOWN으로 보존하고 새 ordinary command를 보내지 않습니다.",
+        "모든 request는 caller-provided command_id를 사용합니다. remote timeout 또는 연결 단절은 성공이 아닙니다. "
+        "Action의 terminal result와 달리 Retraction Service 응답은 request admission만 뜻하며, 물리 terminal state·진행률·취소·tool attachment를 뜻하지 않습니다.",
         tone="gold",
     )
     w.heading("8.1 /surgery/tool_handover", 2)
@@ -1233,36 +1231,26 @@ def _robot_endpoints(w: Writer) -> None:
         "Result final_state는 completed, canceled, failed이며 ROS Action terminal status와 일치해야 한다. Cancel은 즉시 stop이 아니라 "
         "verified compensating recovery다. canceled_source_unchanged 또는 canceled_recovered_to_tray를 확인한 뒤에만 다음 명령이 가능하다."
     )
-    w.heading("8.2 /surgery/tool_change/request", 2)
+    w.heading("8.2 /surgery/retraction/command", 2)
     w.table(
-        "RequestToolChange",
+        "ExecuteRetractionCommand",
         ("구분", "필드", "규칙"),
         (
+            ("Request", "protocol_version", "PROTOCOL_VERSION_V1 (=1)"),
+            ("Request", "source_id", "호출 client 식별자"),
             ("Request", "command_id", "caller correlation ID"),
-            ("Request", "arm_id", "arm_1 또는 arm_2"),
-            ("Request", "target_tool_id", "thyroid_retractor 또는 army_navy_retractor"),
-            ("Response", "success", "boolean outcome"),
-            ("Response", "result", "completed, failed, canceled, protective_stop, unknown"),
-            ("Response", "reason_code", "stable machine-readable reason"),
+            ("Request", "command", "6개 COMMAND_* 상수 중 하나"),
+            ("Request", "target_side / distance_m", "조절은 LEFT/RIGHT와 metre 거리; 그 외는 NONE / 0.0"),
+            ("Response", "request_accepted / result_code", "요청 admission 여부와 stable result code"),
+            ("Response", "command_id / message", "request correlation echo와 선택적 설명"),
         ),
         (1500, 2400, 5460),
     )
-    w.doc.add_page_break()
-    w.heading("8.3 /surgery/retraction/adjust", 2)
-    w.table(
-        "ExecuteRetractionAdjustment 핵심 enum",
-        ("필드", "허용값/범위"),
-        (
-            ("adjustment_mode", "single | multi"),
-            ("target_retractor_id", "left_malleable | right_malleable | both_malleable"),
-            ("direction_frame", "surgeon_view"),
-            ("direction", "up | down | left | right | none"),
-            ("axis", "left_right | up_down | none"),
-            ("distance_mm", "procedure/controller policy 범위; safety controller 최종 권위"),
-            ("Feedback.state", "adjusting | recovering"),
-            ("Result.final_state", "completed | canceled | failed"),
-        ),
-        (3000, 6360),
+    w.body(
+        "명령은 direct teach 시작/종료, retraction 시작/조절/종료, Tool Change의 여섯 COMMAND_* 상수로 고정한다. "
+        "예를 들어 왼쪽 5 cm 조절은 COMMAND_ADJUST_RETRACTION, TARGET_LEFT, distance_m=0.050이다. "
+        "Response는 admission receipt일 뿐 물리 완료, controller state, feedback, cancel, retry/idempotency, tool attachment를 확인하지 않는다. "
+        "그 이후의 구현과 안전 판단은 controller 소유이다."
     )
 
 

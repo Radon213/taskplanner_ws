@@ -14,10 +14,8 @@ def _snapshot(**overrides):
         "sentence_publisher_count": 1,
         "require_sentence_publisher": True,
         "tool_handover_server_ready": True,
-        "tool_change_service_ready": True,
-        "require_tool_change_service": True,
-        "retraction_adjustment_server_ready": True,
-        "require_retraction_adjustment_server": True,
+        "retraction_service_ready": True,
+        "require_retraction_service": True,
         "bed_robot_arm_status_valid": True,
         "bed_robot_arm_status_age_sec": 0.1,
         "bed_robot_arm_status_max_age_sec": 3.0,
@@ -39,8 +37,7 @@ def test_sentence_only_runtime_can_start_without_perception() -> None:
         "contract_configuration": True,
         "surgeon_sentence_publisher": True,
         "tool_handover_action_server": True,
-        "tool_change_service": True,
-        "retraction_adjustment_action_server": True,
+        "retraction_command_service": True,
         "bed_robot_arm_status": True,
         "perception_input": True,
     }
@@ -67,16 +64,10 @@ def test_missing_tool_handover_action_server_fails_closed() -> None:
     assert result["missing"] == ["tool_handover_action_server"]
 
 
-def test_missing_tool_change_service_fails_closed() -> None:
-    result = _snapshot(tool_change_service_ready=False)
+def test_missing_retraction_command_service_fails_closed() -> None:
+    result = _snapshot(retraction_service_ready=False)
     assert result["ready"] is False
-    assert result["missing"] == ["tool_change_service"]
-
-
-def test_missing_retraction_adjustment_action_server_fails_closed() -> None:
-    result = _snapshot(retraction_adjustment_server_ready=False)
-    assert result["ready"] is False
-    assert result["missing"] == ["retraction_adjustment_action_server"]
+    assert result["missing"] == ["retraction_command_service"]
 
 
 def test_missing_bed_robot_arm_status_fails_closed() -> None:
@@ -91,28 +82,10 @@ def test_stale_bed_robot_arm_status_fails_closed() -> None:
     assert result["missing"] == ["bed_robot_arm_status"]
 
 
-def test_thyroid_contract_does_not_require_nephrectomy_action() -> None:
+def test_procedure_without_bed_robot_contract_does_not_require_service() -> None:
     result = _snapshot(
-        require_retraction_adjustment_server=False,
-        retraction_adjustment_server_ready=False,
-    )
-    assert result["ready"] is True
-
-
-def test_nephrectomy_contract_does_not_require_tool_change_service() -> None:
-    result = _snapshot(
-        require_tool_change_service=False,
-        tool_change_service_ready=False,
-    )
-    assert result["ready"] is True
-
-
-def test_procedure_without_bed_robot_contract_requires_neither_endpoint() -> None:
-    result = _snapshot(
-        require_tool_change_service=False,
-        tool_change_service_ready=False,
-        require_retraction_adjustment_server=False,
-        retraction_adjustment_server_ready=False,
+        require_retraction_service=False,
+        retraction_service_ready=False,
         require_bed_robot_arm_status=False,
         bed_robot_arm_status_valid=False,
         bed_robot_arm_status_age_sec=-1.0,
@@ -205,24 +178,20 @@ def test_expected_contract_tracks_bundle_not_launch_default() -> None:
     assert expected_contract_for_bundle("thyroidectomy") == (
         "thyroidectomy",
         True,
-        False,
         True,
     )
     assert expected_contract_for_bundle("thyroidectomy_demo") == (
         "thyroidectomy",
         True,
-        False,
         True,
     )
     assert expected_contract_for_bundle("nephrectomy") == (
         "nephrectomy",
-        False,
         True,
         True,
     )
     assert expected_contract_for_bundle("inguinal_hernia_repair") == (
         "",
-        False,
         False,
         False,
     )
@@ -236,8 +205,7 @@ def _preflight_contract_state() -> IntegrationPreflightNode:
     node = IntegrationPreflightNode.__new__(IntegrationPreflightNode)
     node._active_bundle = "thyroidectomy"
     node._procedure_type = "thyroidectomy"
-    node._require_tool_change_service = True
-    node._require_retraction_adjustment_server = False
+    node._require_retraction_service = True
     node._require_bed_robot_arm_status = True
     node._contract_transitioning = False
     node._bed_robot_status_valid = True
@@ -279,8 +247,7 @@ def _ready_snapshot_node() -> IntegrationPreflightNode:
     node._latest_cv_contract_monotonic = 0.0
     node._bed_robot_arm_status_max_age_sec = 3.0
     node._tool_handover_client = SimpleNamespace(server_is_ready=lambda: True)
-    node._tool_change_client = SimpleNamespace(service_is_ready=lambda: True)
-    node._retraction_client = SimpleNamespace(server_is_ready=lambda: True)
+    node._retraction_client = SimpleNamespace(service_is_ready=lambda: True)
     node.count_publishers = lambda _topic: 1
     return node
 
@@ -292,8 +259,7 @@ def test_contract_transition_closes_readiness_and_invalidates_status() -> None:
         [
             _parameter("active_bundle", "thyroidectomy_demo"),
             _parameter("procedure_type", "thyroidectomy"),
-            _parameter("require_tool_change_service", True),
-            _parameter("require_retraction_adjustment_server", False),
+            _parameter("require_retraction_service", True),
             _parameter("require_bed_robot_arm_status", True),
             _parameter("contract_transitioning", True),
         ]
@@ -314,8 +280,7 @@ def test_contract_update_rejects_bundle_requirement_mismatch_atomically() -> Non
         [
             _parameter("active_bundle", "nephrectomy"),
             _parameter("procedure_type", "thyroidectomy"),
-            _parameter("require_tool_change_service", True),
-            _parameter("require_retraction_adjustment_server", False),
+            _parameter("require_retraction_service", True),
             _parameter("require_bed_robot_arm_status", True),
         ]
     )
