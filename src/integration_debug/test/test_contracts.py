@@ -112,6 +112,26 @@ def test_retraction_command_uses_only_the_single_service_contract() -> None:
         )
 
 
+def test_retraction_adjustment_enforces_the_five_centimetre_contract_limit() -> None:
+    accepted = validate_retraction_command(
+        {
+            "command": "adjust_retraction",
+            "target_side": "right",
+            "distance_m": 0.050,
+        }
+    )
+    assert accepted["distance_m"] == 0.050
+
+    with pytest.raises(ValueError, match=r"at most 0\.050"):
+        validate_retraction_command(
+            {
+                "command": "adjust_retraction",
+                "target_side": "right",
+                "distance_m": 0.051,
+            }
+        )
+
+
 def test_bed_robot_status_requires_the_documented_procedure_layout() -> None:
     arms = validate_bed_robot_arm_status(
         "nephrectomy",
@@ -230,6 +250,8 @@ def test_debug_config_exposes_exact_public_contract() -> None:
     )
     assert {(row["topic"], row["type"]) for row in config["inputs"]} == {
         ("/sensors/surgeon/sentence", "std_msgs/msg/String"),
+        ("/surgery/audio/request_text", "std_msgs/msg/String"),
+        ("/input/speech/status", "surgical_msgs/msg/InputSourceStatus"),
         ("/integration/cv_contract/status", "std_msgs/msg/String"),
         ("/synced/cam_1/color/image_raw/compressed", "sensor_msgs/msg/CompressedImage"),
         ("/synced/cam_2/color/image_raw/compressed", "sensor_msgs/msg/CompressedImage"),

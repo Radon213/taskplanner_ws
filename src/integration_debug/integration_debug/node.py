@@ -44,7 +44,7 @@ from surgical_interop_msgs.msg import (
     SurgeryHealth,
 )
 from surgical_interop_msgs.srv import ExecuteRetractionCommand
-from surgical_msgs.msg import SimulationState
+from surgical_msgs.msg import InputSourceStatus, SimulationState
 from surgical_msgs.srv import IntegrationDebugCommand
 
 from procedure_spec import (
@@ -84,6 +84,12 @@ from integration_debug.networking import (
     validate_network_settings,
     write_network_settings,
 )
+from integration_debug.retractor_health import (
+    FixedVLMRuntimeClient,
+    RetractionVLMHealthResult,
+    VLMRuntimeStatus,
+    run_retraction_vlm_health_probe,
+)
 
 
 STATUS_SCHEMA = "taskplanner.integration_debug.status.v1"
@@ -91,6 +97,18 @@ EVENT_SCHEMA = "taskplanner.integration_debug.event.v1"
 MAX_EVENT_SUMMARY_STRING_CHARS = 2048
 MAX_EVENT_SUMMARY_ITEMS = 32
 RETRACTION_SERVICE_DEFAULT_NAME = "/surgery/retraction/command"
+VIRTUAL_RETRACTION_SERVICE_DEFAULT_NAME = (
+    "/integration/debug/virtual/retraction/command"
+)
+TOOL_HANDOVER_DEFAULT_NAME = "/surgery/tool_handover"
+VIRTUAL_TOOL_HANDOVER_DEFAULT_NAME = (
+    "/integration/debug/virtual/tool_handover"
+)
+BED_ROBOT_STATUS_DEFAULT_TOPIC = "/external/bed_robot_arms/status"
+VIRTUAL_BED_ROBOT_STATUS_DEFAULT_TOPIC = (
+    "/integration/debug/virtual/bed_robot_arms/status"
+)
+VIRTUAL_ROBOT_PROFILE_ID = "integration_debug_virtual_robot_v1"
 RETRACTION_SERVICE_SOURCE_ID = "taskplanner_debug"
 RETRACTION_COMMAND_CONSTANTS = {
     "start_direct_teach": "COMMAND_START_DIRECT_TEACH",
@@ -178,6 +196,15 @@ class PendingDebugRetractionInterpretation:
     future: Future[RetractionVoiceInterpretation]
 
 
+@dataclass(slots=True)
+class PendingDebugVLMObservation:
+    """One non-commanding manager refresh plus optional model micro-test."""
+
+    submitted_monotonic: float
+    run_micro_test: bool
+    future: Future[tuple[VLMRuntimeStatus, RetractionVLMHealthResult | None]]
+
+
 def _snapshot_qos() -> QoSProfile:
     return QoSProfile(
         history=QoSHistoryPolicy.KEEP_LAST,
@@ -193,6 +220,22 @@ def _event_qos() -> QoSProfile:
         depth=50,
         reliability=QoSReliabilityPolicy.RELIABLE,
         durability=QoSDurabilityPolicy.VOLATILE,
+    )
+
+
+def _configured_string_input_qos(qos_name: object) -> QoSProfile:
+    """Build the configured monitor QoS without latching live speech text."""
+
+    transient_local = str(qos_name or "").strip().lower() == "reliable_transient_local"
+    return QoSProfile(
+        history=QoSHistoryPolicy.KEEP_LAST,
+        depth=1 if transient_local else 20,
+        reliability=QoSReliabilityPolicy.RELIABLE,
+        durability=(
+            QoSDurabilityPolicy.TRANSIENT_LOCAL
+            if transient_local
+            else QoSDurabilityPolicy.VOLATILE
+        ),
     )
 
 
@@ -225,6 +268,23 @@ class IntegrationDebugNode(Node):
             "retraction_service_name", RETRACTION_SERVICE_DEFAULT_NAME
         )
         self.declare_parameter(
+            "robot_endpoint_source",
+            os.environ.get("TASKPLANNER_DEBUG_ROBOT_ENDPOINT_SOURCE", "external"),
+        )
+        self.declare_parameter("virtual_robot_enabled", True)
+        self.declare_parameter(
+            "virtual_retraction_service_name",
+            VIRTUAL_RETRACTION_SERVICE_DEFAULT_NAME,
+        )
+        self.declare_parameter(
+            "virtual_tool_handover_name",
+            VIRTUAL_TOOL_HANDOVER_DEFAULT_NAME,
+        )
+        self.declare_parameter(
+            "virtual_bed_robot_status_topic",
+            VIRTUAL_BED_ROBOT_STATUS_DEFAULT_TOPIC,
+        )
+        self.declare_parameter(
             "retraction_voice_interpreter_mode",
             os.environ.get(
                 "RETRACTOR_VOICE_INTERPRETER_MODE", "vlm_with_fallback"
@@ -234,13 +294,13 @@ class IntegrationDebugNode(Node):
             "retraction_voice_vlm_base_url",
             os.environ.get("RETRACTOR_VOICE_VLM_BASE_URL", "").strip()
             or os.environ.get("VLM_BASE_URL", "").strip()
-            or "http://127.0.0.1:8001",
+            or "http://127.0.0.1:8080",
         )
         self.declare_parameter(
             "retraction_voice_vlm_model_id",
             os.environ.get("RETRACTOR_VOICE_VLM_MODEL_ID", "").strip()
             or os.environ.get("VLM_MODEL_ID", "").strip()
-            or "unsloth/gemma-4-E4B-it-NVFP4",
+            or "qwen3.6-35b-a3b",
         )
         self.declare_parameter(
             "retraction_voice_vlm_api_key",
@@ -251,12 +311,54 @@ class IntegrationDebugNode(Node):
             "retraction_voice_vlm_timeout_sec",
             float(os.environ.get("RETRACTOR_VOICE_VLM_TIMEOUT_SEC", "2.0")),
         )
+        self.declare_parameter(
+            "retraction_voice_vlm_probe_interval_sec",
+            float(os.environ.get("RETRACTOR_VOICE_VLM_PROBE_INTERVAL_SEC", "15.0")),
+        )
         config_path = str(self.get_parameter("config_path").value)
-        self._retraction_service_name = str(
+        external_retraction_service_name = str(
             self.get_parameter("retraction_service_name").value
         ).strip()
-        if not self._retraction_service_name:
+        if not external_retraction_service_name:
             raise ValueError("retraction_service_name must not be empty")
+        self._virtual_retraction_service_name = str(
+            self.get_parameter("virtual_retraction_service_name").value
+        ).strip()
+        self._virtual_tool_handover_name = str(
+            self.get_parameter("virtual_tool_handover_name").value
+        ).strip()
+        self._virtual_bed_robot_status_topic = str(
+            self.get_parameter("virtual_bed_robot_status_topic").value
+        ).strip()
+        if (
+            not self._virtual_retraction_service_name
+            or not self._virtual_tool_handover_name
+            or not self._virtual_bed_robot_status_topic
+        ):
+            raise ValueError("virtual robot endpoint names must not be empty")
+        if self._virtual_retraction_service_name == external_retraction_service_name:
+            raise ValueError(
+                "virtual retraction Service must use a dedicated endpoint"
+            )
+        self._virtual_robot_enabled = bool(
+            self.get_parameter("virtual_robot_enabled").value
+        )
+        selected_robot_source = str(
+            self.get_parameter("robot_endpoint_source").value
+        ).strip().lower()
+        if selected_robot_source not in {"external", "virtual"}:
+            raise ValueError("robot_endpoint_source must be external or virtual")
+        if selected_robot_source == "virtual" and not self._virtual_robot_enabled:
+            raise ValueError(
+                "robot_endpoint_source virtual requires virtual_robot_enabled"
+            )
+        self._robot_endpoint_source = selected_robot_source
+        self._external_retraction_service_name = external_retraction_service_name
+        self._retraction_service_name = (
+            self._virtual_retraction_service_name
+            if selected_robot_source == "virtual"
+            else self._external_retraction_service_name
+        )
         requested_retraction_voice_interpreter_mode = str(
             self.get_parameter("retraction_voice_interpreter_mode").value
         ).strip().lower()
@@ -271,20 +373,64 @@ class IntegrationDebugNode(Node):
         self._retraction_voice_interpreter_mode = (
             requested_retraction_voice_interpreter_mode
         )
+        self._retraction_voice_vlm_base_url = str(
+            self.get_parameter("retraction_voice_vlm_base_url").value
+        ).strip()
+        self._retraction_voice_vlm_model_id = str(
+            self.get_parameter("retraction_voice_vlm_model_id").value
+        ).strip()
+        retraction_voice_vlm_api_key = str(
+            self.get_parameter("retraction_voice_vlm_api_key").value
+        ).strip()
+        retraction_voice_vlm_timeout_sec = float(
+            self.get_parameter("retraction_voice_vlm_timeout_sec").value
+        )
         self._retraction_voice_interpreter = TextOnlyRetractionVLMInterpreter(
-            base_url=str(
-                self.get_parameter("retraction_voice_vlm_base_url").value
-            ),
-            model_id=str(
-                self.get_parameter("retraction_voice_vlm_model_id").value
-            ),
-            api_key=str(
-                self.get_parameter("retraction_voice_vlm_api_key").value
-            ),
-            timeout_sec=float(
-                self.get_parameter("retraction_voice_vlm_timeout_sec").value
+            base_url=self._retraction_voice_vlm_base_url,
+            model_id=self._retraction_voice_vlm_model_id,
+            api_key=retraction_voice_vlm_api_key,
+            timeout_sec=retraction_voice_vlm_timeout_sec,
+        )
+        self._vlm_runtime = FixedVLMRuntimeClient(
+            base_url=self._retraction_voice_vlm_base_url,
+            model_id=self._retraction_voice_vlm_model_id,
+            api_key=retraction_voice_vlm_api_key,
+            timeout_sec=retraction_voice_vlm_timeout_sec,
+        )
+        self._vlm_probe_interval_sec = max(
+            2.0,
+            float(
+                self.get_parameter(
+                    "retraction_voice_vlm_probe_interval_sec"
+                ).value
             ),
         )
+        self._vlm_status: dict[str, Any] = {
+            "base_url": self._retraction_voice_vlm_base_url,
+            "model_id": self._retraction_voice_vlm_model_id,
+            "manager_reachable": False,
+            "catalog_reachable": False,
+            "load_state": "not_checked",
+            "loaded": False,
+            "available": False,
+            "runtime_managed": False,
+            "detail": "waiting_for_vlm_probe",
+            "last_probe_monotonic": 0.0,
+            "micro_test": {
+                "state": "not_checked",
+                "transcript": "리트렉터 직접 가르치기 모드 켜줘",
+                "interpretation": {},
+                "latency_ms": None,
+                "error": "",
+            },
+        }
+        self._vlm_observation_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="integration_debug_vlm_observation",
+        )
+        self._pending_vlm_observation: PendingDebugVLMObservation | None = None
+        self._last_vlm_observation_submitted_monotonic = 0.0
+        self._vlm_explicit_probe_requested = False
         self._retraction_voice_executor = ThreadPoolExecutor(
             max_workers=1,
             thread_name_prefix="integration_debug_retractor_voice_vlm",
@@ -316,7 +462,7 @@ class IntegrationDebugNode(Node):
         self._voice_auto_execute = False
         # This is deliberately independent of USB microphone ownership.  It
         # gates only retractor normalization and dispatch of final strings that
-        # have already reached ``_asr_topic``.
+        # have passed the shared speech admission boundary.
         self._retraction_voice_auto_dispatch = False
         # Incremented whenever voice dispatch authority is revoked or its mode
         # is changed.  Async interpretations carry the generation that was
@@ -395,6 +541,15 @@ class IntegrationDebugNode(Node):
         self._asr_topic = str(
             asr_config.get("topic", "/sensors/surgeon/sentence")
         ).strip()
+        self._voice_request_topic = str(
+            dict(self._config.get("voice", {})).get(
+                "request_topic", "/surgery/audio/request_text"
+            )
+        ).strip()
+        if not self._voice_request_topic or self._voice_request_topic == self._asr_topic:
+            raise ValueError(
+                "voice request topic must be distinct from the raw ASR topic"
+            )
         self._asr_sentence_pub: Any | None = None
         # A Debug ASR session may coexist with the operational runtime for
         # monitoring, but its graph-visible sentence publisher must never make
@@ -506,6 +661,10 @@ class IntegrationDebugNode(Node):
             float(self._config.get("bed_robot_arm_status_max_age_sec", 3.0)),
         )
         self._bed_robot_arm_status_summary: dict[str, Any] = {}
+        self._bed_robot_arm_status_sources: dict[str, dict[str, Any]] = {
+            "external": {},
+            "virtual": {},
+        }
         for row in self._config["inputs"]:
             topic = str(row["topic"])
             message_type = str(row["type"])
@@ -517,9 +676,19 @@ class IntegrationDebugNode(Node):
                     lambda msg, source_topic=topic: self._on_string_input(
                         source_topic, msg
                     ),
+                    _configured_string_input_qos(row.get("qos")),
+                    callback_group=self._callback_group,
+                )
+            elif message_type == "surgical_msgs/msg/InputSourceStatus":
+                subscription = self.create_subscription(
+                    InputSourceStatus,
+                    topic,
+                    lambda msg, source_topic=topic: (
+                        self._on_input_source_status(source_topic, msg)
+                    ),
                     QoSProfile(
                         history=QoSHistoryPolicy.KEEP_LAST,
-                        depth=20,
+                        depth=10,
                         reliability=QoSReliabilityPolicy.RELIABLE,
                         durability=QoSDurabilityPolicy.VOLATILE,
                     ),
@@ -549,24 +718,54 @@ class IntegrationDebugNode(Node):
                 raise ValueError(f"unsupported debug input type: {message_type}")
             self._input_subscriptions.append(subscription)
 
-        self._tool_client = ActionClient(
+        self._external_tool_client = ActionClient(
             self,
             ExecuteToolHandover,
-            "/surgery/tool_handover",
+            TOOL_HANDOVER_DEFAULT_NAME,
             callback_group=self._callback_group,
         )
-        self._retraction_client = self.create_client(
+        self._virtual_tool_client = ActionClient(
+            self,
+            ExecuteToolHandover,
+            self._virtual_tool_handover_name,
+            callback_group=self._callback_group,
+        )
+        self._external_retraction_client = self.create_client(
             ExecuteRetractionCommand,
-            self._retraction_service_name,
+            self._external_retraction_service_name,
             callback_group=self._callback_group,
         )
-        self._bed_robot_arm_status_subscription = self.create_subscription(
+        self._virtual_retraction_client = self.create_client(
+            ExecuteRetractionCommand,
+            self._virtual_retraction_service_name,
+            callback_group=self._callback_group,
+        )
+        self._tool_client = (
+            self._virtual_tool_client
+            if self._robot_endpoint_source == "virtual"
+            else self._external_tool_client
+        )
+        self._retraction_client = (
+            self._virtual_retraction_client
+            if self._robot_endpoint_source == "virtual"
+            else self._external_retraction_client
+        )
+        self._bed_robot_arm_status_subscriptions = [
+            self.create_subscription(
+                BedRobotArmStateArray,
+                BED_ROBOT_STATUS_DEFAULT_TOPIC,
+                lambda msg: self._on_bed_robot_arm_status(msg, "external"),
+                _event_qos(),
+                callback_group=self._callback_group,
+            )
+        ]
+        self._bed_robot_arm_status_subscriptions.append(self.create_subscription(
             BedRobotArmStateArray,
-            "/external/bed_robot_arms/status",
-            self._on_bed_robot_arm_status,
+            self._virtual_bed_robot_status_topic,
+            lambda msg: self._on_bed_robot_arm_status(msg, "virtual"),
             _event_qos(),
             callback_group=self._callback_group,
-        )
+        ))
 
         self._output_states: dict[str, OutputState] = {}
         self._output_publishers: dict[str, Any] = {}
@@ -601,11 +800,17 @@ class IntegrationDebugNode(Node):
             self._drain_auxiliary_events,
             callback_group=self._callback_group,
         )
+        self.create_timer(
+            0.25,
+            self._maintain_vlm_observation,
+            callback_group=self._callback_group,
+        )
         self._record(
             "session_started",
             {
                 "config_path": config_path,
                 "ros_domain_id": os.environ.get("ROS_DOMAIN_ID", "0"),
+                "robot_endpoint_source": self._robot_endpoint_source,
             },
         )
 
@@ -951,7 +1156,7 @@ class IntegrationDebugNode(Node):
         # are not speech: do not parse them as voice commands, overwrite the
         # last surgeon sentence, or append the full JSON every second to the
         # recent-event snapshot.
-        if topic != self._asr_topic:
+        if topic != getattr(self, "_voice_request_topic", self._asr_topic):
             return
         parsed = parse_voice_command(text, dict(self._config.get("voice", {})))
         with self._lock:
@@ -959,6 +1164,9 @@ class IntegrationDebugNode(Node):
             self._last_voice_parse = parsed.as_dict()
             retraction_state = self._retraction_state
             retraction_voice_generation = self._retraction_voice_generation
+            retraction_voice_enabled = bool(
+                self._retraction_voice_auto_dispatch
+            )
             # The legacy generic voice router continues to own tool handover,
             # but it must never bypass the dedicated retractor voice gate.
             should_generic_dispatch = (
@@ -976,41 +1184,43 @@ class IntegrationDebugNode(Node):
                 self._last_voice_dispatch_text = text
                 self._last_voice_dispatch_monotonic = now
 
-        deterministic_preview = normalize_retractor_command(
-            text, retraction_state
-        )
-        self._record(
-            "sentence_received",
-            {
-                "topic": topic,
-                "text": text,
-                "parse": parsed.as_dict(),
-                "retraction_parse": self._retraction_interpretation(
-                    text,
-                    deterministic_preview,
-                    interpreter_source=(
-                        "text_vlm_pending"
-                        if getattr(
-                            self,
-                            "_retraction_voice_interpreter_mode",
-                            "deterministic",
-                        )
-                        == "vlm_with_fallback"
-                        and getattr(
-                            self, "_retraction_voice_auto_dispatch", False
-                        )
-                        else "shared_deterministic"
-                    ),
-                    vlm_invoked=False,
+        event_payload: dict[str, Any] = {
+            "topic": topic,
+            "text": text,
+            "parse": parsed.as_dict(),
+            "retraction_voice_enabled": retraction_voice_enabled,
+            "retraction_parse": None,
+        }
+        if retraction_voice_enabled:
+            deterministic_preview = normalize_retractor_command(
+                text, retraction_state
+            )
+            event_payload["retraction_parse"] = self._retraction_interpretation(
+                text,
+                deterministic_preview,
+                interpreter_source=(
+                    "text_vlm_pending"
+                    if getattr(
+                        self,
+                        "_retraction_voice_interpreter_mode",
+                        "deterministic",
+                    )
+                    == "vlm_with_fallback"
+                    else "shared_deterministic"
                 ),
-            },
+                vlm_invoked=False,
+            )
+        self._record(
+            "admitted_voice_request_received",
+            event_payload,
         )
-        IntegrationDebugNode._submit_retraction_voice_interpretation(
-            self,
-            text,
-            retraction_state,
-            retraction_voice_generation,
-        )
+        if retraction_voice_enabled:
+            IntegrationDebugNode._submit_retraction_voice_interpretation(
+                self,
+                text,
+                retraction_state,
+                retraction_voice_generation,
+            )
         if should_generic_dispatch and parsed.payload is not None:
             accepted, command_id, message = self._dispatch_action(
                 parsed.operation, parsed.payload, source="voice"
@@ -1046,6 +1256,37 @@ class IntegrationDebugNode(Node):
             )
             self._operational_cleaner_busy = bool(msg.cleaner_busy)
 
+    def _on_input_source_status(
+        self,
+        topic: str,
+        msg: InputSourceStatus,
+    ) -> None:
+        """Monitor the shared speech admission boundary without dispatching."""
+
+        now = time.monotonic()
+        sample = json.dumps(
+            {
+                "source_id": str(msg.source_id),
+                "modality": str(msg.modality),
+                "state": str(msg.state),
+                "healthy": bool(msg.healthy),
+                "received_count": int(msg.received_count),
+                "accepted_count": int(msg.accepted_count),
+                "rejected_count": int(msg.rejected_count),
+                "detail": str(msg.detail),
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        with self._lock:
+            stats = self._input_stats[topic]
+            stats.arrivals.append(now)
+            stats.sizes.append((now, len(sample.encode("utf-8"))))
+            stats.last_received_monotonic = now
+            stats.source_delay_sec = max(0.0, float(msg.age_sec))
+            stats.last_sample = sample[:240]
+            stats.message_count += 1
+
     def _on_image_input(self, topic: str, msg: CompressedImage) -> None:
         now = time.monotonic()
         source_sec = float(msg.header.stamp.sec) + float(msg.header.stamp.nanosec) / 1e9
@@ -1060,19 +1301,43 @@ class IntegrationDebugNode(Node):
             stats.last_sample = f"{msg.format or 'unknown'} · {len(msg.data)} bytes"
             stats.message_count += 1
 
-    def _on_bed_robot_arm_status(self, msg: BedRobotArmStateArray) -> None:
+    def _on_bed_robot_arm_status(
+        self,
+        msg: BedRobotArmStateArray,
+        source: str = "external",
+    ) -> None:
+        source = str(source).strip().lower()
+        if source not in {"external", "virtual"}:
+            return
         try:
             arms = validate_bed_robot_arm_status(msg.procedure_type, msg.arms)
         except ValueError as exc:
             with self._lock:
-                self._bed_robot_arm_status_received = False
-                self._bed_robot_arm_status_summary = {"error": str(exc)}
+                records = getattr(self, "_bed_robot_arm_status_sources", None)
+                if isinstance(records, dict):
+                    records[source] = {
+                        "received": False,
+                        "summary": {"error": str(exc)},
+                    }
+                if source == getattr(self, "_robot_endpoint_source", "external"):
+                    self._bed_robot_arm_status_received = False
+                    self._bed_robot_arm_status_summary = {"error": str(exc)}
             self.get_logger().warning(f"ignored invalid bed robot arm status: {exc}")
             return
         source_stamp_sec = float(msg.stamp.sec) + float(msg.stamp.nanosec) / 1e9
         revision = int(msg.revision)
-        current_stamp = self._bed_robot_arm_status_source_stamp_sec
-        current_revision = self._bed_robot_arm_status_revision
+        records = getattr(self, "_bed_robot_arm_status_sources", None)
+        current = records.get(source, {}) if isinstance(records, dict) else {}
+        current_stamp = float(
+            current.get(
+                "source_stamp_sec",
+                getattr(self, "_bed_robot_arm_status_source_stamp_sec", 0.0),
+            )
+        )
+        current_revision = current.get(
+            "revision",
+            getattr(self, "_bed_robot_arm_status_revision", None),
+        )
         ordered = bool(
             source_stamp_sec > 0.0
             and (
@@ -1090,19 +1355,48 @@ class IntegrationDebugNode(Node):
                 f"stamp={source_stamp_sec:.9f} revision={revision}"
             )
             return
+        received_monotonic = time.monotonic()
+        summary = {
+            "revision": revision,
+            "procedure_type": str(msg.procedure_type),
+            "arm_count": len(arms),
+            "arms": arms,
+        }
         with self._lock:
-            self._bed_robot_arm_status_received = True
-            self._bed_robot_arm_status_received_monotonic = time.monotonic()
-            self._bed_robot_arm_status_source_stamp_sec = source_stamp_sec
-            self._bed_robot_arm_status_revision = revision
-            self._bed_robot_arm_status_summary = {
-                "revision": revision,
-                "procedure_type": str(msg.procedure_type),
-                "arm_count": len(arms),
-                "arms": arms,
-            }
+            if isinstance(records, dict):
+                records[source] = {
+                    "received": True,
+                    "received_monotonic": received_monotonic,
+                    "source_stamp_sec": source_stamp_sec,
+                    "revision": revision,
+                    "summary": summary,
+                }
+            if source == getattr(self, "_robot_endpoint_source", "external"):
+                self._bed_robot_arm_status_received = True
+                self._bed_robot_arm_status_received_monotonic = received_monotonic
+                self._bed_robot_arm_status_source_stamp_sec = source_stamp_sec
+                self._bed_robot_arm_status_revision = revision
+                self._bed_robot_arm_status_summary = summary
+
+    def _bed_robot_arm_source_ready(
+        self,
+        source: str,
+    ) -> tuple[bool, float | None]:
+        records = getattr(self, "_bed_robot_arm_status_sources", None)
+        if not isinstance(records, dict):
+            return self._bed_robot_arm_status_ready()
+        record = records.get(str(source), {})
+        if not record.get("received"):
+            return False, None
+        age_sec = time.monotonic() - float(record["received_monotonic"])
+        return age_sec <= self._bed_robot_arm_status_max_age_sec, age_sec
 
     def _bed_robot_arm_status_ready(self) -> tuple[bool, float | None]:
+        records = getattr(self, "_bed_robot_arm_status_sources", None)
+        if isinstance(records, dict):
+            return self._bed_robot_arm_source_ready(
+                getattr(self, "_robot_endpoint_source", "external")
+            )
         if not self._bed_robot_arm_status_received:
             return False, None
         age_sec = time.monotonic() - self._bed_robot_arm_status_received_monotonic
@@ -1212,6 +1506,349 @@ class IntegrationDebugNode(Node):
             conflicts.add(_node_identity(str(info.node_namespace), str(info.node_name)))
         return sorted(conflicts)
 
+    def _observe_vlm_runtime(
+        self,
+        *,
+        run_micro_test: bool = False,
+    ) -> tuple[VLMRuntimeStatus, RetractionVLMHealthResult | None]:
+        runtime = self._vlm_runtime.refresh()
+        health = (
+            run_retraction_vlm_health_probe(self._retraction_voice_interpreter)
+            if run_micro_test and runtime.loaded
+            else None
+        )
+        return runtime, health
+
+    def _apply_vlm_observation(
+        self,
+        runtime: VLMRuntimeStatus,
+        health: RetractionVLMHealthResult | None,
+    ) -> None:
+        now = time.monotonic()
+        completed_micro_test = (
+            {
+                "state": "passed" if health.healthy else "failed",
+                "transcript": "리트렉터 직접 가르치기 모드 켜줘",
+                "interpretation": {
+                    "command": health.actual_command or None,
+                    "interpreter_source": health.interpreter_source,
+                    "vlm_invoked": health.vlm_invoked,
+                    "detail": health.detail,
+                },
+                "latency_ms": round(health.latency_ms, 3),
+                "error": health.error_type,
+            }
+            if health is not None
+            else None
+        )
+        with self._lock:
+            micro_test = (
+                completed_micro_test
+                if completed_micro_test is not None
+                else dict(self._vlm_status.get("micro_test", {}))
+            )
+            self._vlm_status = {
+                "base_url": self._retraction_voice_vlm_base_url,
+                "model_id": self._retraction_voice_vlm_model_id,
+                **runtime.as_dict(),
+                "last_probe_monotonic": now,
+                "micro_test": micro_test,
+            }
+
+    def _submit_vlm_observation(
+        self,
+        *,
+        force: bool = False,
+        run_micro_test: bool = False,
+    ) -> bool:
+        now = time.monotonic()
+        with self._lock:
+            if self._pending_vlm_observation is not None:
+                if (
+                    force
+                    and run_micro_test
+                    and not self._pending_vlm_observation.run_micro_test
+                ):
+                    self._vlm_explicit_probe_requested = True
+                return False
+            if (
+                not force
+                and self._last_vlm_observation_submitted_monotonic > 0.0
+                and now - self._last_vlm_observation_submitted_monotonic
+                < self._vlm_probe_interval_sec
+            ):
+                return False
+        try:
+            future = self._vlm_observation_executor.submit(
+                self._observe_vlm_runtime,
+                run_micro_test=run_micro_test,
+            )
+        except Exception as exc:
+            with self._lock:
+                self._vlm_status["detail"] = (
+                    f"vlm_probe_submit_error:{type(exc).__name__}"
+                )
+            return False
+        with self._lock:
+            self._pending_vlm_observation = PendingDebugVLMObservation(
+                submitted_monotonic=now,
+                run_micro_test=run_micro_test,
+                future=future,
+            )
+            self._last_vlm_observation_submitted_monotonic = now
+            self._vlm_status["detail"] = "vlm_probe_pending"
+        return True
+
+    def _maintain_vlm_observation(self) -> None:
+        with self._lock:
+            pending = self._pending_vlm_observation
+        if pending is None:
+            self._submit_vlm_observation()
+            return
+        if not pending.future.done():
+            return
+        try:
+            runtime, health = pending.future.result()
+        except Exception as exc:
+            runtime = VLMRuntimeStatus(
+                manager_reachable=False,
+                catalog_reachable=False,
+                load_state="error",
+                loaded=False,
+                available=False,
+                runtime_managed=False,
+                detail=f"vlm_probe_error:{type(exc).__name__}",
+            )
+            health = None
+        with self._lock:
+            if self._pending_vlm_observation is not pending:
+                return
+            self._pending_vlm_observation = None
+            explicit_probe_requested = self._vlm_explicit_probe_requested
+            self._vlm_explicit_probe_requested = False
+        self._apply_vlm_observation(runtime, health)
+        if explicit_probe_requested:
+            self._submit_vlm_observation(
+                force=True,
+                run_micro_test=True,
+            )
+
+    def _vlm_status_snapshot(self, now: float | None = None) -> dict[str, Any]:
+        current = time.monotonic() if now is None else float(now)
+        with self._lock:
+            payload = dict(self._vlm_status)
+            payload["micro_test"] = dict(
+                self._vlm_status.get("micro_test", {})
+            )
+            pending = self._pending_vlm_observation is not None
+            explicit_probe_queued = self._vlm_explicit_probe_requested
+        last_probe = float(payload.pop("last_probe_monotonic", 0.0))
+        payload["last_probe_age_sec"] = (
+            round(max(0.0, current - last_probe), 3) if last_probe else None
+        )
+        payload["probe_pending"] = pending
+        payload["explicit_probe_queued"] = explicit_probe_queued
+        return payload
+
+    def _handle_vlm_command(
+        self,
+        operation: str,
+        payload: dict[str, Any],
+    ) -> tuple[bool, str, str, dict[str, Any]]:
+        """Model diagnostics never dispatch ROS commands or change robot authority."""
+
+        if operation == "vlm_refresh":
+            submitted = self._submit_vlm_observation(
+                force=True,
+                run_micro_test=True,
+            )
+            return (
+                True,
+                "",
+                "VLM refresh submitted" if submitted else "VLM refresh already pending",
+                self._vlm_status_snapshot(),
+            )
+        if operation == "vlm_load":
+            runtime = self._vlm_runtime.load()
+            with self._lock:
+                stale_probe = self._pending_vlm_observation
+                self._pending_vlm_observation = None
+                self._vlm_explicit_probe_requested = False
+            if stale_probe is not None:
+                stale_probe.future.cancel()
+            self._apply_vlm_observation(runtime, None)
+            self._last_vlm_observation_submitted_monotonic = 0.0
+            accepted = runtime.load_state in {"loading", "loaded"}
+            return (
+                accepted,
+                "",
+                runtime.detail or runtime.load_state,
+                self._vlm_status_snapshot(),
+            )
+        if operation == "vlm_interpret":
+            text = str(payload.get("text", "")).strip()
+            if not text:
+                raise ValueError("text is required")
+            if len(text) > 512:
+                raise ValueError("text must be at most 512 characters")
+            state_value = str(payload.get("state", "idle")).strip().lower()
+            try:
+                state = RetractionState(state_value)
+            except ValueError as exc:
+                raise ValueError("state is not a supported retraction state") from exc
+            started = time.monotonic()
+            interpretation = self._retraction_voice_interpreter.interpret(
+                text,
+                state,
+            )
+            latency_ms = (time.monotonic() - started) * 1_000.0
+            result = self._retraction_interpretation(
+                text,
+                interpretation.normalized,
+                interpreter_source=interpretation.interpreter_source,
+                vlm_invoked=interpretation.vlm_invoked,
+                detail=interpretation.detail,
+            )
+            result.update(
+                {
+                    "state": "completed",
+                    "latency_ms": round(max(0.0, latency_ms), 3),
+                    "dispatch_performed": False,
+                }
+            )
+            return (
+                True,
+                "",
+                "VLM interpretation completed without ROS dispatch",
+                result,
+            )
+        return False, "", "unknown VLM debug operation", {}
+
+    def _robot_source_snapshot(self) -> dict[str, Any]:
+        external_bed_ready, _ = self._bed_robot_arm_source_ready("external")
+        virtual_bed_ready, _ = self._bed_robot_arm_source_ready("virtual")
+        selected = self._robot_endpoint_source
+        external_tool_ready = self._external_tool_client.server_is_ready()
+        virtual_tool_ready = self._virtual_tool_client.server_is_ready()
+        external_retraction_ready = (
+            self._external_retraction_client.service_is_ready()
+        )
+        virtual_retraction_ready = (
+            self._virtual_retraction_client.service_is_ready()
+        )
+        return {
+            "enabled": self._virtual_robot_enabled,
+            "selected_source": selected,
+            "profile_id": VIRTUAL_ROBOT_PROFILE_ID,
+            "tool_handover_ready": (
+                virtual_tool_ready if selected == "virtual" else external_tool_ready
+            ),
+            "retraction_service_ready": (
+                virtual_retraction_ready
+                if selected == "virtual"
+                else external_retraction_ready
+            ),
+            "bed_status_ready": (
+                virtual_bed_ready if selected == "virtual" else external_bed_ready
+            ),
+            "external_tool_handover_ready": external_tool_ready,
+            "virtual_tool_handover_ready": virtual_tool_ready,
+            "external_retraction_service_ready": external_retraction_ready,
+            "virtual_retraction_service_ready": virtual_retraction_ready,
+            "external_bed_status_ready": external_bed_ready,
+            "virtual_bed_status_ready": virtual_bed_ready,
+            "external": {
+                "tool_handover": TOOL_HANDOVER_DEFAULT_NAME,
+                "retraction_service": self._external_retraction_service_name,
+                "bed_status": BED_ROBOT_STATUS_DEFAULT_TOPIC,
+            },
+            "virtual": {
+                "tool_handover": self._virtual_tool_handover_name,
+                "retraction_service": self._virtual_retraction_service_name,
+                "bed_status": self._virtual_bed_robot_status_topic,
+            },
+        }
+
+    def _configure_robot_endpoint_source(
+        self,
+        payload: dict[str, Any],
+    ) -> tuple[bool, str, str, dict[str, Any]]:
+        source = str(payload.get("source", "")).strip().lower()
+        if source not in {"external", "virtual"}:
+            raise ValueError("source must be external or virtual")
+        with self._lock:
+            if self._active_command_id:
+                return (
+                    False,
+                    self._active_command_id,
+                    "wait for the active command before switching robot source",
+                    self._robot_source_snapshot(),
+                )
+            if self._armed:
+                return (
+                    False,
+                    "",
+                    "disarm manual control before switching robot source",
+                    self._robot_source_snapshot(),
+                )
+            if source == "virtual" and not self._virtual_robot_enabled:
+                return (
+                    False,
+                    "",
+                    "virtual robot emulator is disabled by launch configuration",
+                    self._robot_source_snapshot(),
+                )
+            previous = self._robot_endpoint_source
+            if previous == source:
+                return (
+                    True,
+                    "",
+                    f"robot endpoint source is already {source}",
+                    self._robot_source_snapshot(),
+                )
+            self._robot_endpoint_source = source
+            self._tool_client = (
+                self._virtual_tool_client
+                if source == "virtual"
+                else self._external_tool_client
+            )
+            self._retraction_client = (
+                self._virtual_retraction_client
+                if source == "virtual"
+                else self._external_retraction_client
+            )
+            self._retraction_service_name = (
+                self._virtual_retraction_service_name
+                if source == "virtual"
+                else self._external_retraction_service_name
+            )
+            record = self._bed_robot_arm_status_sources.get(source, {})
+            self._bed_robot_arm_status_received = bool(record.get("received"))
+            self._bed_robot_arm_status_received_monotonic = float(
+                record.get("received_monotonic", 0.0)
+            )
+            self._bed_robot_arm_status_source_stamp_sec = float(
+                record.get("source_stamp_sec", 0.0)
+            )
+            self._bed_robot_arm_status_revision = record.get("revision")
+            self._bed_robot_arm_status_summary = dict(record.get("summary", {}))
+            # Admission state belongs to one selected endpoint.  Never carry it
+            # between a physical controller and the emulator.
+            self._retraction_state = RetractionState.IDLE
+            self._retraction_voice_auto_dispatch = False
+            self._retraction_voice_generation += 1
+            self._last_retraction_rejection_reason = ""
+        self._record(
+            "robot_endpoint_source_changed",
+            {"previous_source": previous, "selected_source": source},
+        )
+        return (
+            True,
+            "",
+            f"robot endpoint source changed to {source}; retraction state reset to idle",
+            self._robot_source_snapshot(),
+        )
+
     def _handle_command(
         self,
         request: IntegrationDebugCommand.Request,
@@ -1227,6 +1864,14 @@ class IntegrationDebugNode(Node):
                 )
             elif operation == "ping_host":
                 accepted, command_id, message, result = self._ping_host(payload)
+            elif operation.startswith("vlm_"):
+                accepted, command_id, message, result = self._handle_vlm_command(
+                    operation, payload
+                )
+            elif operation == "configure_robot_endpoint_source":
+                accepted, command_id, message, result = (
+                    self._configure_robot_endpoint_source(payload)
+                )
             elif operation.startswith("asr_"):
                 accepted, command_id, message, result = self._handle_asr_command(
                     operation, payload
@@ -1839,7 +2484,13 @@ class IntegrationDebugNode(Node):
             command_id = f"debug-{uuid4()}"
             mapped = validate_tool_handover(payload)
             if not self._tool_client.server_is_ready():
-                return False, "", "/surgery/tool_handover Action server is unavailable"
+                tool_endpoint = (
+                    self._virtual_tool_handover_name
+                    if getattr(self, "_robot_endpoint_source", "external")
+                    == "virtual"
+                    else TOOL_HANDOVER_DEFAULT_NAME
+                )
+                return False, "", f"{tool_endpoint} Action server is unavailable"
             goal = ExecuteToolHandover.Goal()
             goal.command_id = command_id
             goal.instrument_id = mapped["instrument_id"]
@@ -1923,6 +2574,9 @@ class IntegrationDebugNode(Node):
                     "route": "retraction_service",
                     "command_id": command_id,
                     "source": source,
+                    "robot_endpoint_source": getattr(
+                        self, "_robot_endpoint_source", "external"
+                    ),
                 },
             )
             try:
@@ -2056,6 +2710,9 @@ class IntegrationDebugNode(Node):
             "reason_code": "",
             "recovery_required": False,
             "source": source,
+            "robot_endpoint_source": getattr(
+                self, "_robot_endpoint_source", "external"
+            ),
             "started_monotonic": now,
             "last_update_monotonic": now,
             "server_unavailable_since_monotonic": 0.0,
@@ -2823,6 +3480,8 @@ class IntegrationDebugNode(Node):
                     ),
                     # The client checks DDS readiness outside this lock below.
                     "service_ready": False,
+                    "service_source": self._robot_endpoint_source,
+                    "service_endpoint": self._retraction_service_name,
                     "in_flight": retraction_in_flight,
                     "last_interpretation": dict(
                         self._last_retraction_interpretation
@@ -2890,24 +3549,37 @@ class IntegrationDebugNode(Node):
             }
         )
         bed_robot_ready, bed_robot_age_sec = self._bed_robot_arm_status_ready()
+        robot_source = self._robot_source_snapshot()
         endpoints = [
             {
                 "name": "tool_handover",
-                "endpoint": "/surgery/tool_handover",
+                "endpoint": (
+                    self._virtual_tool_handover_name
+                    if self._robot_endpoint_source == "virtual"
+                    else TOOL_HANDOVER_DEFAULT_NAME
+                ),
                 "kind": "action",
                 "ready": self._tool_client.server_is_ready(),
+                "source": self._robot_endpoint_source,
             },
             {
                 "name": "retraction_service",
                 "endpoint": self._retraction_service_name,
                 "kind": "service",
                 "ready": self._retraction_client.service_is_ready(),
+                "source": self._robot_endpoint_source,
+                "admission_only": True,
             },
             {
                 "name": "bed_robot_arm_status",
-                "endpoint": "/external/bed_robot_arms/status",
+                "endpoint": (
+                    self._virtual_bed_robot_status_topic
+                    if self._robot_endpoint_source == "virtual"
+                    else BED_ROBOT_STATUS_DEFAULT_TOPIC
+                ),
                 "kind": "topic",
                 "ready": bed_robot_ready,
+                "source": self._robot_endpoint_source,
                 "age_sec": (
                     round(bed_robot_age_sec, 3)
                     if bed_robot_age_sec is not None
@@ -2970,6 +3642,8 @@ class IntegrationDebugNode(Node):
             "action": action,
             "outputs": self._output_status_rows(now),
             "voice": voice,
+            "vlm": self._vlm_status_snapshot(now),
+            "virtual_robot": robot_source,
             "asr": self._asr.snapshot(),
             "surgery_record": self._surgery_record.snapshot(),
             "recent_events": recent_events,
@@ -3013,6 +3687,7 @@ class IntegrationDebugNode(Node):
             "details": {
                 "mode": "debug",
                 "perception_required": False,
+                "robot_endpoint_source": self._robot_endpoint_source,
                 "bed_robot_arm_status_age_sec": (
                     round(bed_robot_age_sec, 3)
                     if bed_robot_age_sec is not None
@@ -3174,6 +3849,13 @@ class IntegrationDebugNode(Node):
         executor = getattr(self, "_retraction_voice_executor", None)
         if executor is not None:
             executor.shutdown(wait=False, cancel_futures=True)
+        pending_vlm = getattr(self, "_pending_vlm_observation", None)
+        if pending_vlm is not None:
+            pending_vlm.future.cancel()
+        self._pending_vlm_observation = None
+        vlm_executor = getattr(self, "_vlm_observation_executor", None)
+        if vlm_executor is not None:
+            vlm_executor.shutdown(wait=False, cancel_futures=True)
         self._release_manual_publishers()
         self._drain_auxiliary_events()
         self._record("session_stopped", {})

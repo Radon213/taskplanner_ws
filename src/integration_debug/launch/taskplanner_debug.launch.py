@@ -20,6 +20,17 @@ def generate_launch_description() -> LaunchDescription:
     config_path = LaunchConfiguration("config_path")
     run_root = LaunchConfiguration("run_root")
     retraction_service_name = LaunchConfiguration("retraction_service_name")
+    robot_endpoint_source = LaunchConfiguration("robot_endpoint_source")
+    enable_virtual_robot = LaunchConfiguration("enable_virtual_robot")
+    virtual_retraction_service_name = LaunchConfiguration(
+        "virtual_retraction_service_name"
+    )
+    virtual_tool_handover_name = LaunchConfiguration(
+        "virtual_tool_handover_name"
+    )
+    virtual_bed_robot_status_topic = LaunchConfiguration(
+        "virtual_bed_robot_status_topic"
+    )
     retraction_voice_interpreter_mode = LaunchConfiguration(
         "retraction_voice_interpreter_mode"
     )
@@ -55,6 +66,52 @@ def generate_launch_description() -> LaunchDescription:
         output="screen",
     )
 
+    speech_input_adapter = Node(
+        package="simulation_runtime",
+        executable="speech_input_adapter",
+        name="debug_speech_input_adapter",
+        parameters=[
+            {
+                "input_mode": "sentence_text",
+                "sentence_input_topic": "/sensors/surgeon/sentence",
+                "output_topic": "/surgery/audio/request_text",
+                "status_topic": "/input/speech/status",
+                "sentence_source_id": "integration_debug_asr_sentence",
+                "sentence_dedupe_sec": 1.0,
+            }
+        ],
+        on_exit=Shutdown(reason="debug speech input adapter stopped"),
+        output="screen",
+    )
+
+    virtual_robot = Node(
+        condition=IfCondition(enable_virtual_robot),
+        package="surgical_interop_execution",
+        executable="fault_action_emulator",
+        name="integration_debug_virtual_robot",
+        parameters=[
+            {
+                "profile_path": PathJoinSubstitution(
+                    [
+                        FindPackageShare("integration_debug"),
+                        "config",
+                        "virtual_robot.yaml",
+                    ]
+                ),
+                "procedure_type": "nephrectomy",
+                "max_retraction_distance_m": 0.050,
+            }
+        ],
+        remappings=[
+            ("/surgery/tool_handover", virtual_tool_handover_name),
+            ("/surgery/retraction/command", virtual_retraction_service_name),
+            ("/external/bed_robot_arms/status", virtual_bed_robot_status_topic),
+            ("/test/action_emulator/status", "/integration/debug/virtual/status"),
+        ],
+        on_exit=Shutdown(reason="integration debug virtual robot stopped"),
+        output="screen",
+    )
+
     return LaunchDescription(
         [
             DeclareLaunchArgument("enable_rosbridge", default_value="true"),
@@ -82,6 +139,29 @@ def generate_launch_description() -> LaunchDescription:
                 default_value="/surgery/retraction/command",
             ),
             DeclareLaunchArgument(
+                "robot_endpoint_source",
+                default_value=EnvironmentVariable(
+                    "TASKPLANNER_DEBUG_ROBOT_ENDPOINT_SOURCE",
+                    default_value="external",
+                ),
+                choices=("external", "virtual"),
+            ),
+            DeclareLaunchArgument("enable_virtual_robot", default_value="true"),
+            DeclareLaunchArgument(
+                "virtual_retraction_service_name",
+                default_value="/integration/debug/virtual/retraction/command",
+            ),
+            DeclareLaunchArgument(
+                "virtual_tool_handover_name",
+                default_value="/integration/debug/virtual/tool_handover",
+            ),
+            DeclareLaunchArgument(
+                "virtual_bed_robot_status_topic",
+                default_value=(
+                    "/integration/debug/virtual/bed_robot_arms/status"
+                ),
+            ),
+            DeclareLaunchArgument(
                 "retraction_voice_interpreter_mode",
                 default_value=EnvironmentVariable(
                     "RETRACTOR_VOICE_INTERPRETER_MODE",
@@ -93,20 +173,14 @@ def generate_launch_description() -> LaunchDescription:
                 "retraction_voice_vlm_base_url",
                 default_value=EnvironmentVariable(
                     "RETRACTOR_VOICE_VLM_BASE_URL",
-                    default_value=EnvironmentVariable(
-                        "VLM_BASE_URL",
-                        default_value="http://127.0.0.1:8001",
-                    ),
+                    default_value="http://127.0.0.1:8080",
                 ),
             ),
             DeclareLaunchArgument(
                 "retraction_voice_vlm_model_id",
                 default_value=EnvironmentVariable(
                     "RETRACTOR_VOICE_VLM_MODEL_ID",
-                    default_value=EnvironmentVariable(
-                        "VLM_MODEL_ID",
-                        default_value="unsloth/gemma-4-E4B-it-NVFP4",
-                    ),
+                    default_value="qwen3.6-35b-a3b",
                 ),
             ),
             DeclareLaunchArgument(
@@ -124,6 +198,8 @@ def generate_launch_description() -> LaunchDescription:
                     "RETRACTOR_VOICE_VLM_TIMEOUT_SEC", default_value="2.0"
                 ),
             ),
+            speech_input_adapter,
+            virtual_robot,
             # rosapi only exposes the same bounded multicam/debug topic set
             # that secure_debug_rosbridge can subscribe to.  The browser can
             # call /rosapi/topics, but no parameter-mutating rosapi service.
@@ -153,6 +229,20 @@ def generate_launch_description() -> LaunchDescription:
                         "config_path": config_path,
                         "run_root": run_root,
                         "retraction_service_name": retraction_service_name,
+                        "robot_endpoint_source": robot_endpoint_source,
+                        "virtual_robot_enabled": ParameterValue(
+                            enable_virtual_robot,
+                            value_type=bool,
+                        ),
+                        "virtual_retraction_service_name": (
+                            virtual_retraction_service_name
+                        ),
+                        "virtual_tool_handover_name": (
+                            virtual_tool_handover_name
+                        ),
+                        "virtual_bed_robot_status_topic": (
+                            virtual_bed_robot_status_topic
+                        ),
                         "retraction_voice_interpreter_mode": (
                             retraction_voice_interpreter_mode
                         ),

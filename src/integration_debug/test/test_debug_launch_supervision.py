@@ -68,31 +68,26 @@ def test_debug_launch_exposes_the_single_retraction_service_name() -> None:
     )
 
 
-def test_debug_retractor_vlm_settings_inherit_shared_vlm_environment(
+def test_debug_retractor_vlm_identity_does_not_inherit_visual_vlm_environment(
     monkeypatch,
 ) -> None:
-    inherited = {
+    fixed = {
         "retraction_voice_vlm_base_url": (
             "RETRACTOR_VOICE_VLM_BASE_URL",
             "VLM_BASE_URL",
-            "http://127.0.0.1:8123",
+            "http://127.0.0.1:8080",
         ),
         "retraction_voice_vlm_model_id": (
             "RETRACTOR_VOICE_VLM_MODEL_ID",
             "VLM_MODEL_ID",
-            "local/retractor-test-model",
-        ),
-        "retraction_voice_vlm_api_key": (
-            "RETRACTOR_VOICE_VLM_API_KEY",
-            "VLM_API_KEY",
-            "test-key",
+            "qwen3.6-35b-a3b",
         ),
     }
     entities = list(_load_launch_description().entities)
 
-    for launch_name, (specific_env, shared_env, expected) in inherited.items():
+    for launch_name, (specific_env, shared_env, expected) in fixed.items():
         monkeypatch.delenv(specific_env, raising=False)
-        monkeypatch.setenv(shared_env, expected)
+        monkeypatch.setenv(shared_env, "must-not-override-retractor")
         context = LaunchContext()
         argument = next(
             entity
@@ -102,3 +97,64 @@ def test_debug_retractor_vlm_settings_inherit_shared_vlm_environment(
         )
         argument.execute(context)
         assert context.launch_configurations[launch_name] == expected
+
+
+def test_debug_retractor_vlm_api_key_may_inherit_shared_secret(monkeypatch) -> None:
+    monkeypatch.delenv("RETRACTOR_VOICE_VLM_API_KEY", raising=False)
+    monkeypatch.setenv("VLM_API_KEY", "test-key")
+    entities = list(_load_launch_description().entities)
+    context = LaunchContext()
+    argument = next(
+        entity
+        for entity in entities
+        if isinstance(entity, DeclareLaunchArgument)
+        and entity.name == "retraction_voice_vlm_api_key"
+    )
+    argument.execute(context)
+    assert context.launch_configurations[argument.name] == "test-key"
+
+
+def test_debug_launch_uses_admitted_speech_path_and_isolated_virtual_robot() -> None:
+    entities = list(_load_launch_description().entities)
+    nodes = {
+        getattr(entity, "_Node__node_name", None): entity
+        for entity in entities
+        if isinstance(entity, Node)
+    }
+
+    speech = nodes["debug_speech_input_adapter"]
+    assert getattr(speech, "_Node__package") == "simulation_runtime"
+    assert getattr(speech, "_Node__node_executable") == "speech_input_adapter"
+    assert _shutdown_reason(speech) == "debug speech input adapter stopped"
+
+    virtual = nodes["integration_debug_virtual_robot"]
+    assert getattr(virtual, "_Node__package") == "surgical_interop_execution"
+    assert getattr(virtual, "_Node__node_executable") == "fault_action_emulator"
+    assert isinstance(virtual.condition, IfCondition)
+    assert _shutdown_reason(virtual) == "integration debug virtual robot stopped"
+
+
+def test_debug_launch_defaults_to_external_source_with_virtual_available() -> None:
+    entities = list(_load_launch_description().entities)
+    expected = {
+        "robot_endpoint_source": "external",
+        "enable_virtual_robot": "true",
+        "virtual_retraction_service_name": (
+            "/integration/debug/virtual/retraction/command"
+        ),
+        "virtual_tool_handover_name": (
+            "/integration/debug/virtual/tool_handover"
+        ),
+        "virtual_bed_robot_status_topic": (
+            "/integration/debug/virtual/bed_robot_arms/status"
+        ),
+    }
+    context = LaunchContext()
+    for name, value in expected.items():
+        argument = next(
+            entity
+            for entity in entities
+            if isinstance(entity, DeclareLaunchArgument) and entity.name == name
+        )
+        argument.execute(context)
+        assert context.launch_configurations[name] == value

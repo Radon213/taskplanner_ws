@@ -27,6 +27,18 @@ inputs:
     expected_hz: 0.0
     stale_after_sec: 0.0
     qos: reliable_volatile
+  - name: admitted_request_text
+    topic: /surgery/audio/request_text
+    type: std_msgs/msg/String
+    expected_hz: 0.0
+    stale_after_sec: 0.0
+    qos: reliable_volatile
+  - name: speech_input_status
+    topic: /input/speech/status
+    type: surgical_msgs/msg/InputSourceStatus
+    expected_hz: 1.0
+    stale_after_sec: 3.0
+    qos: reliable_volatile
   - name: external_cv_contract
     topic: /integration/cv_contract/status
     type: std_msgs/msg/String
@@ -97,6 +109,7 @@ blocked_nodes:
   - surgical_interop_gateway
 
 voice:
+  request_topic: /surgery/audio/request_text
   default_source_location: tray
   default_target_location: surgeon
   aliases:

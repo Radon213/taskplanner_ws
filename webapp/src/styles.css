@@ -10849,3 +10849,387 @@ textarea {
     transition-duration: 0.01ms;
   }
 }
+
+/* Integration Debug information architecture --------------------------- */
+
+.debug-tabs.debug-tab-groups {
+  grid-template-columns: minmax(0, 4fr) minmax(0, 2fr) minmax(132px, 1fr) minmax(0, 2fr);
+  align-items: stretch;
+  gap: 6px;
+  padding: 6px;
+}
+
+.debug-tab-group {
+  display: grid;
+  min-width: 0;
+  grid-template-rows: auto 1fr;
+  gap: 4px;
+  padding: 4px;
+  border: 1px solid color-mix(in srgb, var(--line) 78%, transparent);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--surface) 32%, transparent);
+}
+
+.debug-tab-group > p {
+  margin: 0;
+  padding: 2px 7px;
+  color: var(--color-text-muted);
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  line-height: 1.3;
+  text-transform: uppercase;
+}
+
+.debug-tab-group > div {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+}
+
+.debug-tab-group.individual > div {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.debug-tab-group.scenario > div,
+.debug-tab-group.utilities > div {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.debug-tab-group.observability > div {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.debug-tab-group .debug-tab-label {
+  justify-content: center;
+  text-align: center;
+}
+
+.debug-diagnostic-grid,
+.debug-log-grid,
+.debug-stt-controls {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: start;
+  gap: 12px;
+}
+
+.debug-stt-controls {
+  grid-template-columns: minmax(0, 1.35fr) minmax(300px, 0.65fr);
+}
+
+.debug-stt-controls .debug-asr-card {
+  grid-column: auto;
+}
+
+.debug-manual-grid.single-scenario {
+  grid-template-columns: minmax(0, 1.25fr) minmax(320px, 0.75fr);
+}
+
+.debug-flow-strip {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.debug-flow-strip.four {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.debug-flow-strip li {
+  display: grid;
+  min-width: 0;
+  min-height: 72px;
+  grid-template-columns: 30px minmax(0, 1fr);
+  align-items: center;
+  gap: 9px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--surface) 44%, transparent);
+}
+
+.debug-flow-strip li > span {
+  display: inline-flex;
+  width: 30px;
+  height: 30px;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.debug-flow-strip li > div,
+.debug-flow-strip li strong,
+.debug-flow-strip li small {
+  display: block;
+  min-width: 0;
+}
+
+.debug-flow-strip li strong {
+  overflow: hidden;
+  color: var(--soft);
+  font-size: 12px;
+  line-height: 1.3;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.debug-flow-strip li small {
+  margin-top: 4px;
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1.4;
+}
+
+.debug-flow-strip li.success {
+  border-color: color-mix(in srgb, var(--robot) 36%, var(--line));
+  background: color-mix(in srgb, var(--robot) 7%, transparent);
+}
+
+.debug-flow-strip li.success > span {
+  border-color: color-mix(in srgb, var(--robot) 50%, var(--line));
+  color: var(--robot-strong);
+}
+
+.debug-flow-strip li.error {
+  border-color: color-mix(in srgb, var(--warning) 44%, var(--line));
+  background: color-mix(in srgb, var(--warning) 7%, transparent);
+}
+
+.debug-flow-strip li.error > span {
+  border-color: color-mix(in srgb, var(--warning) 58%, var(--line));
+  color: var(--warning);
+}
+
+.debug-flow-strip li.pending {
+  border-color: color-mix(in srgb, var(--clinical) 44%, var(--line));
+  background: color-mix(in srgb, var(--clinical) 8%, transparent);
+}
+
+.debug-flow-strip li.pending > span {
+  border-color: color-mix(in srgb, var(--clinical) 58%, var(--line));
+  color: var(--clinical-strong);
+  animation: debug-stage-pulse 1.2s ease-in-out infinite;
+}
+
+.debug-state-message {
+  display: flex;
+  min-height: 56px;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 11px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--surface) 46%, transparent);
+  color: var(--muted);
+}
+
+.debug-state-message > svg {
+  flex: 0 0 auto;
+  margin-top: 1px;
+}
+
+.debug-state-message > div {
+  min-width: 0;
+  flex: 1;
+}
+
+.debug-state-message strong,
+.debug-state-message span {
+  display: block;
+}
+
+.debug-state-message strong {
+  color: var(--soft);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.debug-state-message span {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.debug-state-message.success {
+  border-color: color-mix(in srgb, var(--robot) 38%, var(--line));
+  color: var(--robot-strong);
+}
+
+.debug-state-message.warning {
+  border-color: color-mix(in srgb, var(--surgeon) 42%, var(--line));
+  color: var(--surgeon-strong);
+}
+
+.debug-state-message.error {
+  border-color: color-mix(in srgb, var(--warning) 46%, var(--line));
+  color: var(--warning);
+}
+
+.debug-state-message.empty {
+  border-style: dashed;
+}
+
+.debug-state-message .button {
+  min-height: 44px;
+  flex: 0 0 auto;
+}
+
+.debug-pipeline-card,
+.debug-vlm-runtime-card,
+.debug-vlm-output-card,
+.debug-endpoint-source-card {
+  display: grid;
+  gap: 12px;
+}
+
+.debug-vlm-skeleton {
+  display: grid;
+  min-height: 124px;
+  align-content: center;
+  gap: 10px;
+}
+
+.debug-vlm-skeleton > span {
+  display: block;
+  height: 14px;
+  border-radius: 999px;
+  background: linear-gradient(90deg, color-mix(in srgb, var(--line) 72%, transparent), color-mix(in srgb, var(--soft) 14%, transparent), color-mix(in srgb, var(--line) 72%, transparent));
+  background-size: 200% 100%;
+  animation: debug-vlm-shimmer 1.35s linear infinite;
+}
+
+.debug-vlm-skeleton > span:nth-child(2) {
+  width: 82%;
+}
+
+.debug-vlm-skeleton > span:nth-child(3) {
+  width: 58%;
+}
+
+.debug-vlm-output {
+  display: grid;
+  gap: 10px;
+}
+
+.debug-vlm-runtime-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.debug-vlm-runtime-actions .button {
+  min-height: 44px;
+}
+
+.debug-vlm-output > code {
+  display: block;
+  max-height: 280px;
+  padding: 12px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--bg) 64%, transparent);
+  color: var(--clinical-strong);
+  font-size: 11px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+}
+
+.debug-empty-state .button {
+  min-height: 44px;
+  margin-top: 12px;
+}
+
+.debug-log-grid .debug-event-card {
+  min-width: 0;
+}
+
+.debug-event-raw summary {
+  min-width: 44px;
+  min-height: 44px;
+}
+
+@keyframes debug-stage-pulse {
+  50% { opacity: 0.52; }
+}
+
+@keyframes debug-vlm-shimmer {
+  to { background-position: -200% 0; }
+}
+
+@media (max-width: 1279px) {
+  .debug-tabs.debug-tab-groups {
+    grid-template-columns: minmax(0, 2fr) minmax(150px, 1fr);
+  }
+
+  .debug-tab-group.individual,
+  .debug-tab-group.utilities {
+    grid-column: 1 / -1;
+  }
+
+  .debug-diagnostic-grid,
+  .debug-log-grid,
+  .debug-stt-controls,
+  .debug-manual-grid.single-scenario {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 900px) {
+  .debug-tabs.debug-tab-groups {
+    grid-template-columns: 1fr;
+  }
+
+  .debug-tab-group.individual,
+  .debug-tab-group.utilities {
+    grid-column: auto;
+  }
+
+  .debug-flow-strip.four {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 620px) {
+  .debug-tab-group.individual > div,
+  .debug-tab-group.scenario > div,
+  .debug-tab-group.utilities > div {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .debug-flow-strip,
+  .debug-flow-strip.four {
+    grid-template-columns: 1fr;
+  }
+
+  .debug-state-message {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+
+  .debug-state-message .button {
+    width: 100%;
+  }
+
+  .debug-vlm-runtime-actions {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .debug-flow-strip li.pending > span,
+  .debug-vlm-skeleton > span {
+    animation-duration: 0.01ms;
+    animation-iteration-count: 1;
+  }
+}

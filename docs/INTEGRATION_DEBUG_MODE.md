@@ -1,6 +1,10 @@
 # Taskplanner 통합 디버그 모드
 
-통합 디버그 모드는 전체 시나리오, BT, Digital Twin, VLM, Surgeon Actor를 실행하지 않고 외부 기관과 ROS 2 입출력 및 개별 로봇 기능만 확인하는 운영 모드다. 조그는 디버그 모드의 리트랙터 수동 기능으로 포함된다.
+통합 디버그 모드는 전체 시나리오, BT, Digital Twin, 시각 schema-v4 VLM,
+Surgeon Actor를 실행하지 않고 외부 기관과 ROS 2 입출력 및 개별 로봇 기능을
+확인하는 운영 모드다. 단, 리트랙터 음성 명령용 text-only VLM은 독립
+micro-test와 음성 통합 시험에서 사용할 수 있다. 조그는 디버그 모드의
+리트랙터 수동 기능으로 포함된다.
 
 ## 실행
 
@@ -32,14 +36,17 @@ Debug Mode의 마이크 캡처는 Ubuntu가 현재 선택한 PipeWire 입력을 
 시작 시 `${XDG_RUNTIME_DIR}/pipewire-0`을 확인하고, UI에는 해당 논리 입력만
 표시한다(예: `Analog Input - Shure MVX2U GEN 2`). Raw ALSA endpoint는 숨기며
 명령 서비스로 직접 선택할 수도 없다. Ubuntu에서 기본 입력을 변경한 뒤에는
-**음성 로그 → 장치 새로고침**을 누르면 되고, USB hotplug 때문에 컨테이너를
+**STT 입력·USB 캡처 → 장치 새로고침**을 누르면 되고, USB hotplug 때문에 컨테이너를
 다시 생성할 필요는 없다.
 
 - 통합/standalone 공용 UI: `http://127.0.0.1:4173`
 - 운영 ROSBridge: `ws://127.0.0.1:9090`
 - Debug ROSBridge: `ws://127.0.0.1:9091`
 - 기본 포트와 ROS 도메인은 `docker/orchestration/debug.env`와 로컬 `.env`에서 바꿀 수 있다.
-- standalone Debug 프로파일은 `webapp`과 `integration-debug`만 시작하며 GPU·모델·perception 서비스를 시작하거나 중지하지 않는다.
+- standalone Debug 프로파일은 `webapp`, `integration-debug`, multicam observer와
+  로컬 NInfer manager/control plane을 시작한다. 모델을 자동 load/unload하지
+  않으며 이미 loaded인 worker를 보존한다. 화면의 **구성 모델 로드**를 명시적으로
+  누른 경우에만 launch에 고정된 managed model의 load를 요청한다.
 - `live`와 `llm-surgeon` 시작 시 Debug sidecar도 같은 Compose 프로젝트에서 자동으로 유지된다.
 
 기존 Taskplanner UI의 상단 **디버그 모드** 버튼 또는 실행 직후 기본 Debug 화면에서 진입한다. 나갈 때 연속 더미 발행을 정지하고 수동 제어를 해제한다.
@@ -105,22 +112,41 @@ Debug 화면을 열 수 있으므로, 신뢰된 통합 시험망에서만 실행
 
 | 토픽 | 타입 | 기본 QoS | 화면에서 확인하는 값 |
 |---|---|---|---|
-| `/sensors/surgeon/sentence` | `std_msgs/msg/String` | reliable / volatile | publisher, 실측 Hz, 최근 문장, freshness |
-| `/synced/cam_1/color/image_raw/compressed` | `sensor_msgs/msg/CompressedImage` | reliable / volatile / depth 20 | publisher, 실측 Hz, bandwidth, freshness |
-| `/synced/cam_2/color/image_raw/compressed` | `sensor_msgs/msg/CompressedImage` | reliable / volatile / depth 20 | publisher, 실측 Hz, bandwidth, freshness |
-| `/synced/cam_3/color/image_raw/compressed` | `sensor_msgs/msg/CompressedImage` | reliable / volatile / depth 20 | publisher, 실측 Hz, bandwidth, freshness |
-| `/synced/cam_4/color/image_raw/compressed` | `sensor_msgs/msg/CompressedImage` | reliable / volatile / depth 20 | publisher, 실측 Hz, bandwidth, freshness |
-| `/synced/flir/color/image_raw/compressed` | `sensor_msgs/msg/CompressedImage` | reliable / volatile / depth 20 | publisher, 실측 Hz, bandwidth, freshness |
+| `/sensors/surgeon/sentence` | `std_msgs/msg/String` | reliable / volatile / depth 20 | publisher, 실측 Hz, 최근 문장, freshness |
+| `/surgery/audio/request_text` | `std_msgs/msg/String` | reliable / volatile / depth 20 | speech adapter가 입장을 허용한 정규화 문장, publisher, 수신 횟수 |
+| `/input/speech/status` | `surgical_msgs/msg/InputSourceStatus` | reliable / volatile / depth 10 | speech adapter 상태, source topic, 최근 수신/허용/거부 횟수와 사유 |
+| `/integration/cv_contract/status` | `std_msgs/msg/String` | reliable / transient local / depth 1 | CV 계약 상태의 publisher, 실측 Hz, 최근 JSON, freshness |
+| `/synced/cam_1/color/image_raw/compressed` | `sensor_msgs/msg/CompressedImage` | reliable / volatile / depth 1 | publisher, 실측 Hz, bandwidth, freshness |
+| `/synced/cam_2/color/image_raw/compressed` | `sensor_msgs/msg/CompressedImage` | reliable / volatile / depth 1 | publisher, 실측 Hz, bandwidth, freshness |
+| `/synced/cam_3/color/image_raw/compressed` | `sensor_msgs/msg/CompressedImage` | reliable / volatile / depth 1 | publisher, 실측 Hz, bandwidth, freshness |
+| `/synced/cam_4/color/image_raw/compressed` | `sensor_msgs/msg/CompressedImage` | reliable / volatile / depth 1 | publisher, 실측 Hz, bandwidth, freshness |
+| `/synced/flir/color/image_raw/compressed` | `sensor_msgs/msg/CompressedImage` | reliable / volatile / depth 1 | publisher, 실측 Hz, bandwidth, freshness |
+| `/simulation/state` | `surgical_msgs/msg/SimulationState` | reliable / volatile / depth 5 | 운영 런타임 정지 interlock과 freshness |
+| `/external/bed_robot_arms/status` | `surgical_interop_msgs/msg/BedRobotArmStateArray` | reliable / volatile / depth 50 | revision, procedure type, 역할별 arm 상태와 freshness |
+| `/integration/debug/virtual/bed_robot_arms/status` | `surgical_interop_msgs/msg/BedRobotArmStateArray` | reliable / volatile / depth 50 | 내장 가상 로봇을 선택했을 때 동일한 상태 계약과 freshness |
 
 상태 화면은 발견된 publisher 노드, 실제 타입, 실제 QoS, 누적 메시지 수, 5초 rolling Hz, 대역폭, 마지막 수신 경과 시간을 보여준다. 타입 불일치, 저주기, stale, publisher 없음은 서로 다른 상태로 표시된다.
 
-## 외부 로봇으로 보내는 명령
+`cv_contract_monitor`와 Debug gateway는 reliable / transient local / depth 1로
+snapshot QoS를 맞춘다. 따라서 gateway가 늦게 시작해도 마지막 CV 계약 상태를 받을
+수 있다. 반면 surgeon sentence와 admitted text 같은 실시간 문자열은 reliable /
+volatile / depth 20을 유지해 과거 발화를 새 세션 명령으로 재생하지 않는다.
 
-| 종단 | 타입 | 디버그 기능 |
-|---|---|---|
-| `/surgery/tool_handover` | `surgical_interop_msgs/action/ExecuteToolHandover` | 도구명·인스턴스·허용된 source/target을 직접 입력해 Goal 실행 |
-| `/surgery/retraction/command` | `surgical_interop_msgs/srv/ExecuteRetractionCommand` | 직접교시, Retraction, 조절, Tool change, 종료 command의 Request admission 확인 |
-| `/external/bed_robot_arms/status` | `surgical_interop_msgs/msg/BedRobotArmStateArray` | retraction arm 배열의 revision, 역할, 상태, 직접교시 여부와 reason code 확인 |
+## 선택 가능한 로봇 종단
+
+| 선택 | Tool Action | Retraction Service | controller status | 용도 |
+|---|---|---|---|---|
+| `external` | `/surgery/tool_handover` | `/surgery/retraction/command` | `/external/bed_robot_arms/status` | 상대 제어기와의 실제 wire contract 시험 |
+| `virtual` | `/integration/debug/virtual/tool_handover` | `/integration/debug/virtual/retraction/command` | `/integration/debug/virtual/bed_robot_arms/status` | 물리 로봇과 상대 Service로 송신하지 않는 로컬 계약 시험 |
+
+두 선택 모두 Action 타입은
+`surgical_interop_msgs/action/ExecuteToolHandover`, Service 타입은
+`surgical_interop_msgs/srv/ExecuteRetractionCommand`, 상태 타입은
+`surgical_interop_msgs/msg/BedRobotArmStateArray`로 동일하다. Debug launch는 전용
+가상 emulator를 별도 이름으로 띄우므로 external 종단을 가로채지 않는다. 브라우저는
+disarmed이고 active command가 없을 때만 `/integration/debug/command`의
+`configure_robot_endpoint_source` op로 선택을 바꿀 수 있다. 전환 시 local
+retraction admission state는 `idle`로 초기화되고 음성 자동 송신은 꺼진다.
 
 리트랙터 제어는 단일 Service Request로만 발행한다. Request는
 `protocol_version`, `source_id`, `command_id`, `command`, `target_side`,
@@ -169,12 +195,12 @@ stale해지면 수동 제어와 쓰기 publisher를 자동 해제한다. Debug �
 
 | 토픽 | 타입 | QoS |
 |---|---|---|
-| `/surgery/context` | `surgical_interop_msgs/msg/SurgeryContext` | reliable / transient local |
-| `/surgery/instruments` | `surgical_interop_msgs/msg/InstrumentStateArray` | reliable / transient local |
-| `/surgery/robots` | `surgical_interop_msgs/msg/RobotStateArray` | reliable / transient local |
-| `/surgery/events` | `surgical_interop_msgs/msg/SurgeryEvent` | reliable / volatile |
-| `/surgery/clinical_observations` | `surgical_interop_msgs/msg/ClinicalObservationArray` | reliable / transient local |
-| `/surgery/health` | `surgical_interop_msgs/msg/SurgeryHealth` | reliable / transient local |
+| `/surgery/context` | `surgical_interop_msgs/msg/SurgeryContext` | reliable / transient local / depth 1 |
+| `/surgery/instruments` | `surgical_interop_msgs/msg/InstrumentStateArray` | reliable / transient local / depth 1 |
+| `/surgery/robots` | `surgical_interop_msgs/msg/RobotStateArray` | reliable / transient local / depth 1 |
+| `/surgery/events` | `surgical_interop_msgs/msg/SurgeryEvent` | reliable / volatile / depth 50 |
+| `/surgery/clinical_observations` | `surgical_interop_msgs/msg/ClinicalObservationArray` | reliable / transient local / depth 1 |
+| `/surgery/health` | `surgical_interop_msgs/msg/SurgeryHealth` | reliable / transient local / depth 1 |
 
 각 토픽은 수동 제어가 활성화된 동안 1회 발행 또는 0.1–10 Hz 연속
 발행을 지원한다. 이미 시작된 연속 발행의 개별 정지와 전체 정지는
@@ -242,12 +268,66 @@ Service 응답은 요청 접수 여부일 뿐 물리 실행·완료를 뜻하지
 
 ## 내부 진단 인터페이스
 
-- `/integration/debug/status` (`std_msgs/msg/String`): UI용 JSON 상태
-- `/integration/debug/events` (`std_msgs/msg/String`): 검증 이벤트 JSON
-- `/integration/debug/heartbeat` (`std_msgs/msg/String`): 현재 Debug 세션 ID를 담은 UI 생존 신호
-- `/integration/debug/command` (`surgical_msgs/srv/IntegrationDebugCommand`): UI 명령 게이트웨이
-- `/integration/debug/readiness` (`std_msgs/msg/String`): Debug sentence publisher 및 로봇 종단 준비 상태
-- `/integration/debug/check_readiness` (`std_srvs/srv/Trigger`): 현재 Debug readiness 질의
+| 방향 | 이름 | 타입 | 실제 QoS/호출 주체 | 의미 |
+|---|---|---|---|---|
+| gateway → browser | `/integration/debug/status` | `std_msgs/msg/String` | reliable / volatile / depth 10 | UI가 소비하는 `taskplanner.integration_debug.status.v1` 전체 snapshot |
+| gateway → ROS | `/integration/debug/events` | `std_msgs/msg/String` | reliable / volatile / depth 50 | 개별 검증 이벤트 JSON; UI는 주로 status의 bounded `recent_events`를 사용 |
+| gateway → browser | `/integration/debug/readiness` | `std_msgs/msg/String` | reliable / volatile / depth 10 | sentence publisher, Tool Action, retraction Service, bed-arm status 네 가지 readiness |
+| browser → gateway | `/integration/debug/heartbeat` | `std_msgs/msg/String` | reliable / volatile / browser queue 1, gateway depth 5 | 현재 Debug 세션 ID를 담은 UI 생존 신호 |
+| browser → gateway | `/integration/debug/command` | `surgical_msgs/srv/IntegrationDebugCommand` | 운영 통합 Debug bridge의 유일한 mutation Service; standalone bridge는 별도로 world-anchor 4개 Trigger도 허용 | arm/disarm, 수동 문장·출력, Action/Service 요청을 서버 interlock 뒤에서 중계 |
+| ROS client → gateway | `/integration/debug/check_readiness` | `std_srvs/srv/Trigger` | Service; 현재 secure browser allowlist에는 없음 | 현재 Debug readiness를 즉시 질의하고 readiness topic에도 발행 |
+
+`status` JSON의 최상위 필드는 `schema`, `stamp_sec`, `session`, `runtime`,
+`inputs`, `endpoints`, `action`, `outputs`, `voice`, `vlm`, `virtual_robot`,
+`asr`, `surgery_record`, `recent_events`다. 운영 interlock 진단에는
+`runtime.operational_running`, `operational_active_robot_task_id`,
+`operational_robot_state`, `operational_cleaner_busy`,
+`operational_state_publishers`, `operational_state_expected_publisher`,
+`operational_state_publisher_trusted`, `operational_state_age_sec`,
+`operational_state_fresh`, `operational_runtime_stopped`를 함께 사용한다.
+리트랙터 해석 상태는 `voice.retraction` 아래의 `mode`, `internal_state`,
+`interpreter_mode`, `interpreter_pending`, `interpreter_pending_age_sec`,
+`allowed_commands`, `service_ready`, `in_flight`, `last_interpretation`,
+`last_rejection_reason`으로 전달된다. Service 응답은 `action`의
+`response_semantics=admission`, `request_accepted`, `result_code`,
+`response_message`로 구분한다.
+
+브라우저는 `/surgery/tool_handover` Action이나
+`/surgery/retraction/command` Service를 직접 호출하지 않는다. 브라우저가 직접
+publish하는 ROS 토픽도 heartbeat 하나뿐이다. 모든 수동 요청은
+`/integration/debug/command`를 통과한 뒤 gateway가 상대 Action/Service client가
+되어 전송한다. 따라서 브라우저 통합 테스트는 아래 다섯 op만 있으면 충분하다:
+status/readiness subscribe, heartbeat advertise/publish, command Service call. 상대
+로봇 계약 테스트는 내장 `virtual` 종단이나 별도 ROS harness의 fake server를
+사용한다.
+
+## 기능별 ROS I/O 시험 표
+
+| 시험 | 시험 입력 | 관찰 출력 | 성공 기준 | 실제 로봇 종단 필요 |
+|---|---|---|---|---|
+| Debug 화면 연결 | `/integration/debug/status`, `/integration/debug/readiness` 구독 | heartbeat advertise 및 주기 발행 | fresh status 수신 후에만 command gate 활성 | 아니요 |
+| Debug 입력 모니터 | config의 sentence/CV/camera 토픽별 단일 안전 sample | status의 `inputs[]` | 타입·publisher·QoS와 `message_count`, rate, age 갱신 | 아니요 |
+| Debug 운영 interlock | `/simulation/state`의 안전 정지 sample | status의 `runtime.operational_*` | trusted publisher, fresh age, stopped 조건이 모두 분리되어 표시 | 아니요 |
+| Debug bed-arm 상태 | 선택한 external 또는 virtual bed status sample | status의 `endpoints[name=bed_robot_arm_status]`, `virtual_robot` | schema/revision/role 검증 및 선택 종단 freshness 갱신 | 내장 virtual 또는 fake publisher만 |
+| Debug 더미 출력 | `/integration/debug/command`의 `publish_once` 또는 `configure_output` | 선택한 `/surgery/*` 공개 토픽 | 서버가 동시 publisher를 거부하고 subscriber/callback에서 dummy marker 확인 | 아니요 |
+| Debug 수동 문장 | command Service의 `publish_voice_command` | `/sensors/surgeon/sentence` | final 문장 1회 및 status의 last sentence 갱신 | 아니요 |
+| Debug 리트랙터 해석 단위 시험 | ROS 없는 interpreter 함수에 final text와 local state 입력 | 폐쇄형 6-command 결과 또는 rejection | side 누락·양측·범위 밖 거리 거부; Service client 호출 0회 | 아니요 |
+| Debug 리트랙터 통합 시험 | `virtual` 선택 + command Service 요청 | 내장 Service가 받은 admission 결과와 Debug status | 정확한 enum/side/metres/command_id; state는 `request_accepted + RESULT_ACCEPTED`일 때만 전이 | 아니요 |
+| Debug Tool Action 통합 시험 | `virtual` 선택 + command Service 요청 | 내장 Action feedback/result와 Debug status | Goal field·command_id 상관, terminal Result 및 watchdog 경계 확인 | 아니요 |
+| Live STT 어댑터 단위 시험 | `/sensors/surgeon/sentence` 완성 String | `/surgery/audio/request_text`, `/input/speech/status` | 공백 정규화, 빈 문장·1초 내 동일 문장 거부, accepted count 1 증가 | 아니요 |
+| Live 리트랙터 경로 통합 시험 | final sentence → `/surgery/audio/request_text`; fake controller status와 fake Service | `/surgeon/bed_robot_arm_group_request` → `/bt/bed_robot_arm_group_command` → Service Request → `/bed_robot_arm_group/status` | VLM/폴백 provenance, 6명령 매핑, 한 Service lane, admission-only state 전이 확인 | fake server만 |
+| Mock 직접 계약 시험 | `fault_action_emulator`의 fake Action/Service와 bed-arm status | Live와 동일 public 종단 | 외부 하드웨어 없이 public wire contract와 실패 주입 검증 | 아니요 |
+
+Live의 리트랙터 음성 경로에서 각 노드가 소유하는 실제 ROS 인터페이스는 다음과
+같다.
+
+| 소유 노드 | 구독/서버 입력 | 발행/client 출력 |
+|---|---|---|
+| `taskplanner_asr` | `/input/asr/control` (`AsrControl` Service) | `/input/asr/runtime_status` String snapshot, 연결 중에만 `/sensors/surgeon/sentence` String |
+| `speech_input_adapter` | `/sensors/surgeon/sentence` String, `/simulation/control_state` String | `/surgery/audio/request_text` String, `/input/speech/status` `InputSourceStatus` |
+| `bed_robot_arm_group_orchestrator` | request/proposal/group status/world/controller status/audio text/control state | `/surgeon/bed_robot_arm_group_request`, `/bt/bed_robot_arm_group_command`, `/bed_robot_arm_group/status`, `/bed_robot_arm_group/voice_normalization_status` |
+| `surgical_interop_execution_bridge` | `/bt/skill_command`, `/bt/bed_robot_arm_group_command`, `/simulation/control_state`, `/external/bed_robot_arms/status` | `/skill/status`, `/skill/events`, `/bed_robot_arm_group/status`; `/surgery/tool_handover` Action client; `/surgery/retraction/command` Service client |
+| 상대 또는 mock controller | `/surgery/tool_handover` Action server, `/surgery/retraction/command` Service server | `/external/bed_robot_arms/status` controller-owned 상태 |
 
 세션 이벤트는 `${TASKPLANNER_RUN_ROOT}/debug/<session-id>/events.jsonl`에 JSONL로 남는다.
 

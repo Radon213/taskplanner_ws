@@ -22,6 +22,8 @@
   <exec_depend>std_srvs</exec_depend>
   <exec_depend>bt_orchestrator</exec_depend>
   <exec_depend>procedure_spec</exec_depend>
+  <exec_depend>simulation_runtime</exec_depend>
+  <exec_depend>surgical_interop_execution</exec_depend>
   <exec_depend>surgical_interop_msgs</exec_depend>
   <exec_depend>surgical_msgs</exec_depend>
 

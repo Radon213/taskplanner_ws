@@ -103,9 +103,9 @@ export interface DebugRetractionVoiceInterpretation {
 
 export interface DebugRetractionVoiceStatus {
   /**
-   * This gate only decides whether a final sentence already received on the
-   * surgeon-sentence topic may be normalized and submitted.  It never owns
-   * microphone capture or the ASR process.
+   * This gate only decides whether a final sentence admitted by the speech
+   * adapter on /surgery/audio/request_text may be normalized and submitted.
+   * It never owns microphone capture or the ASR process.
    */
   mode: "buttons_only" | "voice_and_buttons" | (string & {});
   /** Local Debug bookkeeping derived from Service admission, never robot pose. */
@@ -114,12 +114,61 @@ export interface DebugRetractionVoiceStatus {
   interpreter_mode?: "deterministic" | "vlm_with_fallback" | (string & {});
   /** A final transcript is being interpreted asynchronously; no Service call yet. */
   interpreter_pending?: boolean;
+  interpreter_pending_age_sec?: number | null;
   /** Commands admitted by the shared local policy for the current internal state. */
   allowed_commands: string[];
   service_ready: boolean;
   in_flight: boolean;
   last_interpretation: DebugRetractionVoiceInterpretation;
   last_rejection_reason: string;
+}
+
+export interface DebugVlmStatus {
+  base_url?: string;
+  model_id?: string;
+  manager_reachable?: boolean;
+  catalog_reachable?: boolean;
+  load_state?: string;
+  loaded?: boolean;
+  available?: boolean;
+  runtime_managed?: boolean;
+  probe_pending?: boolean;
+  detail?: string;
+  last_probe_age_sec?: number | null;
+  /** This result is interpretation-only and must never imply Service dispatch. */
+  micro_test?: {
+    state?: string;
+    transcript?: string;
+    interpretation?: Record<string, unknown> | string | null;
+    latency_ms?: number | null;
+    error?: string;
+  };
+}
+
+export interface DebugVirtualRobotStatus {
+  enabled?: boolean;
+  /** Explicit routing source; virtual must never be presented as external. */
+  selected_source?: "external" | "virtual" | (string & {});
+  tool_handover_ready?: boolean;
+  retraction_service_ready?: boolean;
+  external_retraction_service_ready?: boolean;
+  virtual_retraction_service_ready?: boolean;
+  bed_status_ready?: boolean;
+  external_tool_handover_ready?: boolean;
+  virtual_tool_handover_ready?: boolean;
+  external_bed_status_ready?: boolean;
+  virtual_bed_status_ready?: boolean;
+  profile_id?: string;
+  external?: {
+    tool_handover?: string;
+    retraction_service?: string;
+    bed_status?: string;
+  };
+  virtual?: {
+    tool_handover?: string;
+    retraction_service?: string;
+    bed_status?: string;
+  };
 }
 
 export interface DebugOutputStatus {
@@ -317,6 +366,14 @@ export interface IntegrationDebugStatus {
     operational_state?: string | null;
     operational_state_age_sec?: number | null;
     operational_runtime_stopped?: boolean;
+    operational_running?: boolean;
+    operational_active_robot_task_id?: string;
+    operational_robot_state?: string;
+    operational_cleaner_busy?: boolean;
+    operational_state_publishers?: string[];
+    operational_state_expected_publisher?: string;
+    operational_state_publisher_trusted?: boolean;
+    operational_state_fresh?: boolean;
     manual_control_available?: boolean;
     planner_coexistence_allowed?: boolean;
     action_watchdog?: {
@@ -343,6 +400,10 @@ export interface IntegrationDebugStatus {
     };
     retraction?: DebugRetractionVoiceStatus;
   };
+  /** Optional while the backend rolls out isolated VLM diagnostics. */
+  vlm?: DebugVlmStatus;
+  /** Optional while the explicit external/virtual endpoint selector rolls out. */
+  virtual_robot?: DebugVirtualRobotStatus;
   asr: DebugAsrStatus;
   surgery_record: DebugSurgeryRecordStatus;
   recent_events: DebugRecentEvent[];

@@ -1,4 +1,4 @@
-import { FormEvent, KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, KeyboardEvent, lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { AnimatePresence, LayoutGroup } from "framer-motion";
 import * as m from "framer-motion/m";
 import {
@@ -49,7 +49,29 @@ import { runtimeBridgeUrl } from "../../runtimeModes";
 import { silk, statusSwap } from "../../motion-system";
 import type { Language } from "../../utils/display";
 
-type DebugTab = "connection" | "manual" | "output" | "voice" | "record";
+const DebugDiagnosticsPanels = lazy(() => import("./DebugDiagnosticsPanels"));
+const DebugIntegrationPipeline = lazy(() => import("./DebugDiagnosticsPanels").then((module) => ({ default: module.DebugIntegrationPipeline })));
+
+type DebugTab =
+  | "connection"
+  | "stt"
+  | "vlm"
+  | "endpoints"
+  | "tool_voice"
+  | "retractor"
+  | "logs"
+  | "output"
+  | "record";
+
+type DebugTabGroup = "individual" | "scenario" | "observability" | "utilities";
+
+interface DebugTabItem {
+  id: DebugTab;
+  group: DebugTabGroup;
+  label: string;
+  meta: string;
+  icon: typeof Radio;
+}
 
 interface Notice {
   tone: "success" | "error" | "warning" | "info";
@@ -502,6 +524,7 @@ function DebugHeader({
     : status?.session.armed ? CircleStop : Play;
   const manualControlAvailable = status?.runtime.manual_control_available === true;
   const operationalRuntimeStopped = status?.runtime.operational_runtime_stopped === true;
+  const runtimeNetworkLocked = status?.runtime.network.locked_to_runtime === true;
   const availabilityLabel = manualAvailabilityLabel(status);
   const availabilityState = status?.action.recovery_required || status?.session.fault_locked
     ? "FAULT_LOCKED"
@@ -526,7 +549,9 @@ function DebugHeader({
         <StatusBadge state={statusAgeSec !== null && statusAgeSec <= 3 ? "READY" : "STALE"} label={statusAgeSec === null ? "상태 대기" : statusAgeSec < 1 ? "방금 갱신" : `${statusAgeSec.toFixed(1)}초 전`} />
         <StatusBadge
           state={operationalRuntimeStopped ? "READY" : "STALE"}
-          label={operationalRuntimeStopped ? "운영 시나리오 정지 확인" : "운영 시나리오 실행/상태 불명"}
+          label={operationalRuntimeStopped
+            ? runtimeNetworkLocked ? "운영 시나리오 정지 확인" : "Standalone Debug · 플래너 미탐색"
+            : "운영 시나리오 실행/상태 불명"}
         />
         <StatusBadge state={availabilityState} label={availabilityLabel} />
         <button
@@ -858,13 +883,11 @@ function InputStateRow({ row }: { row: DebugInputStatus }) {
 function ConnectionPanel({
   status,
   connected,
-  readiness,
   runCommand,
   notify,
 }: {
   status: IntegrationDebugStatus;
   connected: boolean;
-  readiness: Record<string, unknown> | null;
   runCommand: RunDebugCommand;
   notify: (notice: Notice) => void;
 }) {
@@ -932,27 +955,7 @@ function ConnectionPanel({
           </article>
         </div>
 
-        <aside className="debug-observability-rail" aria-label="명령과 네트워크 상태">
-          <article className="debug-section-card debug-endpoint-card">
-            <div className="debug-section-heading">
-              <div><p>CAPABILITY DISCOVERY</p><h2>로봇 Action·Service</h2></div>
-              <StatusBadge state={Boolean(readiness?.ready) ? "READY" : "WAITING"} label={Boolean(readiness?.ready) ? "전체 Preflight 정상" : "전체 Preflight 미완료"} />
-            </div>
-            <div className="debug-active-action-compact" aria-live="polite">
-              <span>{status.action.response_semantics === "admission" ? "요청 접수" : "실행 상태"}</span>
-              <StatusBadge state={status.action.state} />
-              <strong>{status.action.route || "활성 명령 없음"}</strong>
-            </div>
-            <div className="debug-endpoint-grid">
-              {status.endpoints.map((endpoint) => (
-                <div className="debug-endpoint-row" key={endpoint.endpoint}>
-                  <StatusBadge state={endpoint.ready ? "READY" : "WAITING"} label={endpoint.ready ? "발견" : "대기"} />
-                  <div><strong>{endpoint.name}</strong><code>{endpoint.endpoint}</code></div>
-                  <small>{endpoint.kind}</small>
-                </div>
-              ))}
-            </div>
-          </article>
+        <aside className="debug-observability-rail" aria-label="ROS 네트워크 상태">
           <NetworkPanel connected={connected} notify={notify} runCommand={runCommand} status={status} />
         </aside>
       </div>
@@ -967,6 +970,7 @@ function ManualPanel({
   coexistenceConfirmed,
   setCoexistenceConfirmed,
   manualControlPending,
+  scenario,
 }: {
   status: IntegrationDebugStatus;
   connected: boolean;
@@ -974,6 +978,7 @@ function ManualPanel({
   coexistenceConfirmed: boolean;
   setCoexistenceConfirmed: (confirmed: boolean) => void;
   manualControlPending: boolean;
+  scenario: "tool_voice" | "retractor";
 }) {
   const [instrument, setInstrument] = useState(DEFAULT_TOOL_HANDOVER_OPTION.instrumentId);
   const [instance, setInstance] = useState(DEFAULT_TOOL_HANDOVER_OPTION.instanceIds[0]);
@@ -988,6 +993,7 @@ function ManualPanel({
   const detectedPlannerNodes = status.runtime.detected_planner_nodes ?? [];
   const manualControlAvailable = status.runtime.manual_control_available === true;
   const operationalRuntimeStopped = status.runtime.operational_runtime_stopped === true;
+  const runtimeNetworkLocked = status.runtime.network.locked_to_runtime === true;
   const operationalState = status.runtime.operational_state?.trim() || "UNKNOWN";
   const operationalStateAge = typeof status.runtime.operational_state_age_sec === "number"
     ? formatAge(status.runtime.operational_state_age_sec)
@@ -1075,7 +1081,8 @@ function ManualPanel({
     retractionDisabled || !retractionAllowedCommands.includes(command);
   const admissionOnly = status.action.response_semantics === "admission";
   return (
-    <section className="debug-panel-stack" data-slot="debug-manual-panel">
+    <section className="debug-panel-stack" data-slot={scenario === "retractor" ? "debug-retractor-scenario" : "debug-tool-scenario-controls"}>
+      {scenario === "retractor" ? <Suspense fallback={<div className="debug-section-card debug-vlm-skeleton" role="status"><span /><span /><span /><p className="sr-only">리트랙터 통합 경로를 준비하고 있습니다.</p></div>}><DebugIntegrationPipeline kind="retractor" status={status} /></Suspense> : null}
       <article
         className={`debug-coexistence-card ${operationalRuntimeStopped ? "active" : "warning"}`}
         id="debug-operational-interlock"
@@ -1088,13 +1095,16 @@ function ManualPanel({
         </span>
         <div className="debug-coexistence-copy">
           <strong>{operationalRuntimeStopped
-            ? "운영 시나리오 정지 확인"
+            ? runtimeNetworkLocked ? "운영 시나리오 정지 확인" : "Standalone Debug · 플래너 미탐색"
             : "운영 시나리오 실행/상태 불명"}</strong>
           <span>
-            /simulation/state {operationalState} · {operationalStateAge}
-            {operationalRuntimeStopped
-              ? " · 최신 안전 정지 상태가 확인되었습니다."
-              : " · 최신 안전 정지 상태가 확인될 때까지 모든 새 수동 명령을 차단합니다."}
+            {runtimeNetworkLocked
+              ? `/simulation/state ${operationalState} · ${operationalStateAge}${operationalRuntimeStopped
+                ? " · 최신 안전 정지 상태가 확인되었습니다."
+                : " · 최신 안전 정지 상태가 확인될 때까지 모든 새 수동 명령을 차단합니다."}`
+              : operationalRuntimeStopped
+                ? "운영 런타임과 분리된 Standalone Debug에서 차단 대상 플래너 노드가 탐색되지 않았습니다."
+                : "Standalone Debug에서 차단 대상 플래너 노드가 탐색되어 모든 새 수동 명령을 차단합니다."}
           </span>
           <span>수동 제어: {manualAvailabilityLabel(status)}{operationalRuntimeStopped && !manualControlAvailable ? " · Fault 또는 진행 중 명령 등 남은 안전 조건을 확인하세요." : ""}</span>
           {detectedPlannerNodes.length ? (
@@ -1136,7 +1146,8 @@ function ManualPanel({
         </article>
       ) : null}
 
-      <div className="debug-control-grid debug-manual-grid">
+      <div className="debug-control-grid debug-manual-grid single-scenario">
+        {scenario === "tool_voice" ? (
         <form className="debug-section-card debug-control-card" onSubmit={(event) => void submitTool(event)}>
           <div className="debug-section-heading"><div><p>ACTION</p><h2>도구 전달</h2></div><StatusBadge state={endpointReady("tool_handover") ? "READY" : "WAITING"} label={endpointReady("tool_handover") ? "서버 발견" : "서버 대기"} /></div>
           <label className="debug-field" htmlFor="debug-handover-instrument">
@@ -1185,7 +1196,9 @@ function ManualPanel({
             </p>
           ) : null}
         </form>
+        ) : null}
 
+        {scenario === "retractor" ? (
         <article aria-busy={retractionInFlight || retractionInterpreterPending || retractionVoiceToggleBusy} className="debug-section-card debug-control-card">
           <div className="debug-section-heading"><div><p>SERVICE</p><h2>리트랙터 명령</h2><span>단일 Service · {retractionServiceEndpoint}</span></div><StatusBadge state={retractionServiceReady ? "READY" : "WAITING"} label={retractionServiceReady ? "서비스 발견" : "서비스 대기"} /></div>
           <p className="debug-inline-warning">응답은 요청 접수 여부만 뜻합니다. 실제 물리 동작의 진행·완료·상태는 이 화면에서 판정하지 않습니다.</p>
@@ -1195,7 +1208,7 @@ function ManualPanel({
           </div>
           <div className="debug-voice-ownership-note" data-slot="debug-retraction-voice-ownership" id="debug-retraction-voice-ownership" role="note">
             <Mic size={17} aria-hidden="true" />
-            <div><strong>마이크 캡처는 USB 음성·로그 탭 하나만 사용합니다</strong><span>이 모드는 그 탭이 발행한 확정 문장의 해석·전송 게이트만 바꾸며, 별도 마이크나 ASR 세션을 시작·중지하지 않습니다.</span></div>
+            <div><strong>마이크 캡처는 STT 입력·USB 캡처 기능 하나만 사용합니다</strong><span>이 모드는 그 기능이 발행한 확정 문장의 해석·전송 게이트만 바꾸며, 별도 마이크나 ASR 세션을 시작·중지하지 않습니다.</span></div>
           </div>
           <div aria-atomic="true" aria-live="polite" className="debug-parse-preview" data-slot="debug-retraction-voice-status">
             <span>음성 모드</span><StatusBadge state={retractionVoiceMode === "voice_and_buttons" ? "READY" : "WAITING"} label={retractionVoiceMode === "voice_and_buttons" ? "음성 + 버튼" : "버튼만"} />
@@ -1233,6 +1246,7 @@ function ManualPanel({
             </p>
           ) : null}
         </article>
+        ) : null}
 
         <div className="debug-manual-side">
           <article className="debug-section-card debug-action-card" aria-live="polite">
@@ -1349,7 +1363,7 @@ function OutputPanel({
   );
 }
 
-function VoicePanel({
+function SttPanel({
   status,
   connected,
   runCommand,
@@ -1405,19 +1419,18 @@ function VoicePanel({
     });
   }
 
-  const parse = status.voice.last_parse;
   const asrActive = ["STARTING", "LISTENING", "STOPPING"].includes(status.asr.state);
   const asrStartable = ["STOPPED", "ERROR"].includes(status.asr.state);
   const operationalAsrOwned = status.runtime.network.locked_to_runtime === true;
   const serverUrlValid = isValidWebSocketEndpoint(serverUrl);
   const levelPercent = Math.max(0, Math.min(100, ((status.asr.audio_level_dbfs + 60) / 60) * 100));
   const selectedDevice = status.asr.devices.find((device) => String(device.id) === selectedDeviceId);
-  const recentFinals = [...status.asr.finals].reverse().slice(0, 8);
+  const asrFinals = status.asr.finals ?? [];
+  const recentFinals = [...asrFinals].reverse().slice(0, 8);
   const latestFinalLatency = recentFinals[0]?.response_latency_ms;
   return (
-    <section className="debug-panel-stack" data-slot="debug-voice-panel">
-      <div className="debug-voice-workspace">
-        <div className="debug-voice-controls">
+    <section className="debug-panel-stack" data-slot="debug-stt-panel">
+        <div className="debug-stt-controls">
           <article aria-busy={Boolean(pendingAsrCommand) || ["STARTING", "STOPPING"].includes(status.asr.state)} className="debug-section-card debug-asr-card">
             <div className="debug-section-heading">
               <div><p>USB · PUZZLE ASR</p><h2>마이크 런타임</h2><span>브라우저 WebSpeech가 아닌 호스트 USB 입력을 시험합니다.</span></div>
@@ -1425,7 +1438,7 @@ function VoicePanel({
             </div>
             <div className="debug-voice-ownership-note" data-slot="debug-asr-sole-owner" role="note">
               <Mic size={17} aria-hidden="true" />
-              <div><strong>이 탭이 Debug 마이크 캡처를 단독 소유합니다</strong><span>조그 탭의 리트랙터 ‘음성 + 버튼’은 이 ASR의 확정 문장을 재사용하며 두 번째 오디오 스트림을 열지 않습니다.</span></div>
+              <div><strong>이 기능이 Debug 마이크 캡처를 단독 소유합니다</strong><span>두 통합 시나리오는 이 ASR의 확정 문장을 재사용하며 두 번째 오디오 스트림을 열지 않습니다.</span></div>
             </div>
             <div className="debug-asr-form-grid">
               <label className="debug-field" htmlFor="debug-asr-device">
@@ -1501,14 +1514,10 @@ function VoicePanel({
               <div><dt>캡처 횟수</dt><dd>{status.asr.blocks_captured.toLocaleString()}</dd></div>
               <div><dt>드롭</dt><dd>{(status.asr.input_dropped + status.asr.dropped_chunks).toLocaleString()}</dd></div>
             </dl>
-            <div className="debug-asr-transcript">
-              <div>
-                <span>확정 문장 로그</span>
-                <small title="마지막 오디오 청크 송신 완료부터 final JSON 응답 수신까지의 참고 간격입니다. 스트리밍 계약상 발화 ID와 상관된 서버 처리시간은 아닙니다.">최근 응답 간격 {formatAsrLatency(latestFinalLatency)} · {status.asr.finals.length}건</small>
-              </div>
-              {recentFinals.length ? (
-                <ol>{recentFinals.map((row, index) => <li key={`${row.stamp}-${index}`}><time dateTime={row.stamp}>{formatEventTime(row.stamp)}</time><span>{row.text}</span><data aria-label={`확정 응답 참고 간격 ${formatAsrLatency(row.response_latency_ms)}`} title="마지막 오디오 청크 송신 완료부터 final JSON 응답 수신까지의 참고 간격" value={row.response_latency_ms ?? undefined}>{formatAsrLatency(row.response_latency_ms)}</data></li>)}</ol>
-              ) : <p>아직 확정된 문장이 없습니다.</p>}
+            <div className="debug-parse-preview" data-slot="debug-stt-latest-final">
+              <span>최근 확정 문장</span><strong>{recentFinals[0]?.text || "수신 전 · 마이크를 시작하거나 수동 문장을 발행하세요."}</strong>
+              <span>응답 참고 간격</span><strong>{formatAsrLatency(latestFinalLatency)}</strong>
+              <span>누적 확정</span><strong>{asrFinals.length.toLocaleString()}건 · 전체 목록은 ‘관측 로그’에서 확인</strong>
             </div>
             <code className="debug-topic-code">{status.asr.topic} · std_msgs/msg/String · {status.asr.sample_rate.toLocaleString()} Hz / {status.asr.sample_width_bits} bit</code>
           </article>
@@ -1524,35 +1533,42 @@ function VoicePanel({
             <code className="debug-topic-code">/sensors/surgeon/sentence · std_msgs/msg/String</code>
           </article>
 
-          <article className="debug-section-card">
-            <div className="debug-section-heading"><div><p>DETERMINISTIC ROUTER</p><h2>도구 전달 음성 즉시 실행</h2></div><Shield size={19} aria-hidden="true" /></div>
-            <p className="debug-card-description">VLM·BT 없이 설정된 정확한 도구 전달 문장만 Action으로 변환합니다. 리트랙션 음성 명령은 수동 실행 탭의 별도 ‘음성 + 버튼’ 모드에서만 처리합니다.</p>
-            <button className={status.voice.auto_execute ? "button button-secondary full" : "button button-primary full"} disabled={!connected || !status.session.armed} onClick={() => void runCommand("configure_voice", { enabled: !status.voice.auto_execute })} type="button">{status.voice.auto_execute ? <ToggleRight size={17} aria-hidden="true" /> : <ToggleLeft size={17} aria-hidden="true" />}{status.voice.auto_execute ? "즉시 실행 해제" : "즉시 실행 활성화"}</button>
-            {!status.session.armed ? <p className="debug-inline-warning">화면 상단에서 수동 제어를 먼저 활성화해야 합니다.</p> : null}
-            <div className="debug-parse-preview">
-              <span>최근 문장</span><strong>{status.voice.last_sentence || "수신 전"}</strong>
-              <span>해석</span><StatusBadge state={parse.matched ? "READY" : parse.ambiguous ? "TYPE_MISMATCH" : "WAITING"} label={parse.matched ? String(parse.operation) : parse.ambiguous ? "모호함 · 실행 안 함" : String(parse.reason || "대기")} />
-              {parse.payload ? <code>{JSON.stringify(parse.payload)}</code> : null}
-            </div>
-          </article>
         </div>
+    </section>
+  );
+}
 
-        <article className="debug-section-card debug-event-card">
-          <div className="debug-section-heading"><div><p>SESSION LOG</p><h2>검증 이벤트</h2><span title={status.session.event_log_path}>{status.session.event_log_path}</span></div><span className="debug-meta-pill">최근 {Math.min(status.recent_events.length, 30)}건</span></div>
-          {status.recent_events.length ? (
-            <ol className="debug-event-list">
-              {[...status.recent_events].reverse().slice(0, 30).map((event, index) => (
-                <li key={`${event.stamp}-${event.event_type}-${index}`}>
-                  <time dateTime={event.stamp}>{formatEventTime(event.stamp)}</time>
-                  <strong>{event.event_type}</strong>
-                  <span className="debug-event-summary">{eventSummary(event)}</span>
-                  <details className="debug-event-raw"><summary>원문</summary><code>{JSON.stringify(event.payload, null, 2)}</code></details>
-                </li>
-              ))}
-            </ol>
-          ) : <div className="debug-empty-state"><Activity size={28} aria-hidden="true" /><p>아직 기록된 검증 이벤트가 없습니다.</p></div>}
-        </article>
-      </div>
+function ToolVoiceScenarioPanel({
+  status,
+  connected,
+  runCommand,
+  openStt,
+}: {
+  status: IntegrationDebugStatus;
+  connected: boolean;
+  runCommand: RunDebugCommand;
+  openStt: () => void;
+}) {
+  const parse = status.voice.last_parse;
+  const endpointReady = status.endpoints.find((endpoint) => endpoint.name === "tool_handover")?.ready === true;
+  const hasSentence = Boolean(status.voice.last_sentence);
+  const parseReady = parse.matched === true && parse.operation === "tool_handover";
+  return (
+    <section className="debug-panel-stack" data-slot="debug-tool-voice-scenario">
+      <Suspense fallback={<div className="debug-section-card debug-vlm-skeleton" role="status"><span /><span /><span /><p className="sr-only">도구전달 통합 경로를 준비하고 있습니다.</p></div>}><DebugIntegrationPipeline kind="tool_voice" status={status} /></Suspense>
+
+      <article className="debug-section-card debug-control-card">
+        <div className="debug-section-heading"><div><p>DETERMINISTIC ROUTER</p><h2>도구전달 음성 게이트</h2><span>리트랙터 Text VLM 경로와 분리된 도구 별칭 라우터입니다.</span></div><Shield size={19} aria-hidden="true" /></div>
+        <div className="debug-voice-ownership-note" role="note"><Mic size={17} aria-hidden="true" /><div><strong>마이크는 ‘STT 입력·USB 캡처’ 기능에서만 엽니다</strong><span>이 시나리오는 이미 발행된 final 문장을 재사용하며 별도 캡처를 만들지 않습니다.</span></div></div>
+        <button className={status.voice.auto_execute ? "button button-secondary full" : "button button-primary full"} disabled={!connected || !status.session.armed} onClick={() => void runCommand("configure_voice", { enabled: !status.voice.auto_execute })} type="button">{status.voice.auto_execute ? <ToggleRight size={17} aria-hidden="true" /> : <ToggleLeft size={17} aria-hidden="true" />}{status.voice.auto_execute ? "음성 도구전달 해제" : "음성 도구전달 활성화"}</button>
+        {!status.session.armed ? <p className="debug-inline-warning">화면 상단에서 수동 제어를 먼저 활성화해야 합니다.</p> : null}
+        {!endpointReady ? <p className="debug-field-error" role="alert"><XCircle size={15} aria-hidden="true" />Tool Handover Action 서버가 발견되지 않아 음성 요청을 전송할 수 없습니다.</p> : null}
+        {hasSentence ? (
+          <div className="debug-parse-preview" aria-live="polite"><span>최근 문장</span><strong>{status.voice.last_sentence}</strong><span>해석</span><StatusBadge state={parseReady ? "READY" : parse.ambiguous ? "TYPE_MISMATCH" : "WAITING"} label={parseReady ? String(parse.operation) : parse.ambiguous ? "모호함 · 실행 안 함" : String(parse.reason || "대기")} />{parse.payload ? <code>{JSON.stringify(parse.payload)}</code> : null}</div>
+        ) : (
+          <div className="debug-empty-state"><Headphones size={28} aria-hidden="true" /><p>아직 도구전달 문장이 없습니다. STT 입력에서 마이크를 시작하거나 수동 final 문장을 발행하세요.</p><button className="button button-secondary" onClick={openStt} type="button">STT 입력 열기</button></div>
+        )}
+      </article>
     </section>
   );
 }
@@ -1851,7 +1867,7 @@ export function DebugWorkspace({
   }
 
   function focusManualRequirement(targetId: string) {
-    setActiveTab("manual");
+    setActiveTab((current) => current === "tool_voice" ? "tool_voice" : "retractor");
     window.requestAnimationFrame(() => document.getElementById(targetId)?.focus());
   }
 
@@ -1893,6 +1909,7 @@ export function DebugWorkspace({
   const readyEndpointCount = bridge.status?.endpoints.filter((row) => row.ready).length ?? 0;
   const enabledOutputCount = bridge.status?.outputs.filter((row) => row.enabled).length ?? 0;
   const blockedPlannerCount = blockedNodes.length;
+  const asrFinalCount = bridge.status?.asr.finals?.length ?? 0;
   const statusAgeSec = bridge.statusReceivedAt ? Math.max(0, (Date.now() - bridge.statusReceivedAt) / 1000) : null;
   const activeCommandIsAdmission = bridge.status?.action.response_semantics === "admission";
   const manualControlLabel = bridge.status?.action.recovery_required
@@ -1924,12 +1941,22 @@ export function DebugWorkspace({
             || statusAgeSec > 3
             || bridge.status.runtime.manual_control_available !== true
             || (blockedPlannerCount > 0 && bridge.status.runtime.planner_coexistence_allowed !== true));
-  const tabs: Array<{ id: DebugTab; label: string; meta: string; icon: typeof Radio }> = [
-    { id: "connection", label: "연결·입력", meta: `${readyInputCount}/${bridge.status?.inputs.length ?? 0} 토픽 · ${readyEndpointCount}/${bridge.status?.endpoints.length ?? 0} 종단`, icon: Radio },
-    { id: "manual", label: "조그·수동 실행", meta: bridge.status?.action.recovery_required ? "명령 복구 필요" : bridge.status && !bridge.status.session.armed && bridge.status.runtime.manual_control_available !== true ? manualAvailabilityLabel(bridge.status) : blockedPlannerCount && bridge.status?.runtime.planner_coexistence_allowed === true && !bridge.status?.session.armed ? `공존 확인 필요 · ${blockedPlannerCount}개 노드` : bridge.status?.session.state ?? "상태 대기", icon: Wrench },
-    { id: "output", label: "출력 검증", meta: `${enabledOutputCount}/${bridge.status?.outputs.length ?? 0} 발행`, icon: Send },
-    { id: "voice", label: "USB 음성·로그", meta: bridge.status ? `${bridge.status.asr.state} · 리트랙터 ${bridge.status.voice.retraction?.mode === "voice_and_buttons" ? "음성 ON" : "버튼만"}` : "ASR 상태 대기", icon: Usb },
-    { id: "record", label: "수술기록 API", meta: bridge.status ? `${bridge.status.surgery_record.state} · 이력 ${bridge.status.surgery_record.history.length}건` : "계약 상태 대기", icon: FileText },
+  const tabs: DebugTabItem[] = [
+    { id: "connection", group: "individual", label: "ROS 연결", meta: `${readyInputCount}/${bridge.status?.inputs.length ?? 0} 토픽`, icon: Radio },
+    { id: "stt", group: "individual", label: "STT 입력·USB 캡처", meta: bridge.status ? `${bridge.status.asr.state} · final ${asrFinalCount}건` : "ASR 상태 대기", icon: Usb },
+    { id: "vlm", group: "individual", label: "Text VLM 입·출력", meta: bridge.status?.vlm ? bridge.status.vlm.micro_test?.state || bridge.status.vlm.load_state || "상태 대기" : "optional 상태 대기", icon: Bug },
+    { id: "endpoints", group: "individual", label: "Service·Action 종단", meta: `${readyEndpointCount}/${bridge.status?.endpoints.length ?? 0} 발견`, icon: Cable },
+    { id: "tool_voice", group: "scenario", label: "음성 도구전달", meta: bridge.status?.voice.auto_execute ? "음성 게이트 ON" : "음성 게이트 OFF", icon: Headphones },
+    { id: "retractor", group: "scenario", label: "리트랙터 6개 명령", meta: bridge.status?.action.recovery_required ? "명령 복구 필요" : bridge.status ? `${retractionInternalStateLabel(bridge.status.voice.retraction?.internal_state || "idle")} · ${bridge.status.voice.retraction?.mode === "voice_and_buttons" ? "음성 ON" : "버튼만"}` : "상태 대기", icon: Wrench },
+    { id: "logs", group: "observability", label: "관측 로그", meta: bridge.status ? `이벤트 ${bridge.status.recent_events.length} · STT ${asrFinalCount}` : "로그 대기", icon: Activity },
+    { id: "output", group: "utilities", label: "출력 검증", meta: `${enabledOutputCount}/${bridge.status?.outputs.length ?? 0} 발행`, icon: Send },
+    { id: "record", group: "utilities", label: "수술기록 API", meta: bridge.status ? `${bridge.status.surgery_record.state} · 이력 ${bridge.status.surgery_record.history.length}건` : "계약 상태 대기", icon: FileText },
+  ];
+  const tabGroups: Array<{ id: DebugTabGroup; label: string }> = [
+    { id: "individual", label: "개별 기능" },
+    { id: "scenario", label: "통합 시나리오" },
+    { id: "observability", label: "관측" },
+    { id: "utilities", label: "추가 진단" },
   ];
 
   function handleTabKeyDown(event: KeyboardEvent<HTMLButtonElement>, index: number) {
@@ -1967,43 +1994,50 @@ export function DebugWorkspace({
         <>
           {!bridge.connected ? <div className="debug-disconnected-banner" role="status"><AlertTriangle size={16} aria-hidden="true" /><span>{bridge.transportConnected ? "디버그 상태 heartbeat가 만료되었습니다. 표시된 값은 마지막 수신 상태이며 모든 쓰기 제어는 잠겼습니다." : "ROSBridge 재연결 중입니다. 표시된 값은 마지막 수신 상태이며 모든 쓰기 제어는 잠겼습니다."}</span><button className="runtime-transition-retry" onClick={bridge.retry} type="button">다시 연결</button></div> : null}
           <LayoutGroup id="debug-workspace-tabs">
-            <div className="debug-tabs" role="tablist" aria-label="디버그 모드 기능">
-              {tabs.map((tab, index) => {
-                const Icon = tab.icon;
-                const active = activeTab === tab.id;
-                return (
-                  <button
-                    aria-controls={`debug-panel-${tab.id}`}
-                    aria-selected={active}
-                    className={active ? "active" : ""}
-                    id={`debug-tab-${tab.id}`}
-                    key={tab.id}
-                    onClick={() => setActiveTab(tab.id)}
-                    onKeyDown={(event) => handleTabKeyDown(event, index)}
-                    role="tab"
-                    tabIndex={active ? 0 : -1}
-                    type="button"
-                  >
-                    {active ? (
-                      <m.span
-                        aria-hidden="true"
-                        className="debug-tab-focus"
-                        layoutId="debug-active-tab"
-                        transition={silk.layout.transition}
-                      />
-                    ) : null}
-                    <span className="debug-tab-label"><Icon size={17} aria-hidden="true" />{tab.label}</span>
-                    <small>{tab.meta}</small>
-                  </button>
-                );
-              })}
+            <div className="debug-tabs debug-tab-groups" role="tablist" aria-label="디버그 모드 기능">
+              {tabGroups.map((group) => (
+                <div className={`debug-tab-group ${group.id}`} key={group.id} role="presentation">
+                  <p aria-hidden="true">{group.label}</p>
+                  <div role="presentation">
+                    {tabs.filter((tab) => tab.group === group.id).map((tab) => {
+                      const index = tabs.findIndex((candidate) => candidate.id === tab.id);
+                      const Icon = tab.icon;
+                      const active = activeTab === tab.id;
+                      return (
+                        <button
+                          aria-controls={`debug-panel-${tab.id}`}
+                          aria-selected={active}
+                          className={active ? "active" : ""}
+                          id={`debug-tab-${tab.id}`}
+                          key={tab.id}
+                          onClick={() => setActiveTab(tab.id)}
+                          onKeyDown={(event) => handleTabKeyDown(event, index)}
+                          role="tab"
+                          tabIndex={active ? 0 : -1}
+                          type="button"
+                        >
+                          {active ? <m.span aria-hidden="true" className="debug-tab-focus" layoutId="debug-active-tab" transition={silk.layout.transition} /> : null}
+                          <span className="debug-tab-label"><Icon size={17} aria-hidden="true" />{tab.label}</span>
+                          <small>{tab.meta}</small>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              ))}
             </div>
           </LayoutGroup>
           <main aria-labelledby={`debug-tab-${activeTab}`} className="debug-main" id={`debug-panel-${activeTab}`} role="tabpanel" tabIndex={0}>
-            {activeTab === "connection" ? <ConnectionPanel connected={bridge.connected} status={bridge.status} readiness={bridge.readiness} runCommand={runCommand} notify={setNotice} /> : null}
-            {activeTab === "manual" ? <ManualPanel connected={bridge.connected} status={bridge.status} runCommand={runCommand} coexistenceConfirmed={coexistenceConfirmed} setCoexistenceConfirmed={setCoexistenceConfirmed} manualControlPending={manualControlPending} /> : null}
+            {activeTab === "connection" ? <ConnectionPanel connected={bridge.connected} status={bridge.status} runCommand={runCommand} notify={setNotice} /> : null}
+            {activeTab === "stt" ? <SttPanel connected={bridge.connected} status={bridge.status} runCommand={runCommand} /> : null}
+            {activeTab === "vlm" || activeTab === "endpoints" || activeTab === "logs" ? (
+              <Suspense fallback={<div className="debug-feedback-card" role="status"><LoaderCircle className="debug-spinner" size={28} aria-hidden="true" /><h2>진단 화면을 준비하고 있습니다</h2></div>}>
+                <DebugDiagnosticsPanels connected={bridge.connected} openStt={() => setActiveTab("stt")} readiness={bridge.readiness} runCommand={runCommand} status={bridge.status} tab={activeTab} />
+              </Suspense>
+            ) : null}
+            {activeTab === "tool_voice" ? <><ToolVoiceScenarioPanel connected={bridge.connected} status={bridge.status} runCommand={runCommand} openStt={() => setActiveTab("stt")} /><ManualPanel connected={bridge.connected} status={bridge.status} runCommand={runCommand} coexistenceConfirmed={coexistenceConfirmed} setCoexistenceConfirmed={setCoexistenceConfirmed} manualControlPending={manualControlPending} scenario="tool_voice" /></> : null}
+            {activeTab === "retractor" ? <ManualPanel connected={bridge.connected} status={bridge.status} runCommand={runCommand} coexistenceConfirmed={coexistenceConfirmed} setCoexistenceConfirmed={setCoexistenceConfirmed} manualControlPending={manualControlPending} scenario="retractor" /> : null}
             {activeTab === "output" ? <OutputPanel connected={bridge.connected} status={bridge.status} runCommand={runCommand} /> : null}
-            {activeTab === "voice" ? <VoicePanel connected={bridge.connected} status={bridge.status} runCommand={runCommand} /> : null}
             {activeTab === "record" ? <RecordPanel connected={bridge.connected} status={bridge.status} runCommand={runCommand} notify={setNotice} /> : null}
           </main>
         </>

@@ -31,6 +31,7 @@ RETRACTION_COMMANDS = {
     "stop_retraction",
 }
 RETRACTION_TARGET_SIDES = {"none", "left", "right"}
+MAX_RETRACTION_DISTANCE_M = 0.050
 DEFAULT_ACTION_WATCHDOG_POLICY = {
     "goal_response_timeout_sec": 10.0,
     "feedback_timeout_sec": 30.0,
@@ -360,6 +361,11 @@ def validate_retraction_command(payload: dict[str, Any]) -> dict[str, Any]:
             raise ValueError("adjust_retraction requires target_side left or right")
         if distance_m <= 0.0:
             raise ValueError("adjust_retraction requires distance_m greater than 0")
+        if distance_m > MAX_RETRACTION_DISTANCE_M:
+            raise ValueError(
+                "adjust_retraction requires distance_m at most "
+                f"{MAX_RETRACTION_DISTANCE_M:.3f}"
+            )
     elif target_side != "none" or distance_m != 0.0:
         raise ValueError(
             f"{command} requires target_side none and distance_m 0"

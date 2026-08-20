@@ -40,7 +40,11 @@ def _harness(
     harness = Harness()
     harness._lock = threading.RLock()
     harness._asr_topic = "/sensors/surgeon/sentence"
-    harness._input_stats = {harness._asr_topic: InputStats()}
+    harness._voice_request_topic = "/surgery/audio/request_text"
+    harness._input_stats = {
+        harness._asr_topic: InputStats(),
+        harness._voice_request_topic: InputStats(),
+    }
     harness._last_sentence = ""
     harness._last_voice_parse = {}
     harness._voice_auto_execute = generic_voice
@@ -78,7 +82,7 @@ def _harness(
 def _send_final(harness, text: str = "직접 교시 시작") -> None:
     IntegrationDebugNode._on_string_input(
         harness,
-        harness._asr_topic,
+        harness._voice_request_topic,
         String(data=text),
     )
 
@@ -113,16 +117,29 @@ def test_retraction_voice_gate_dispatches_a_final_sentence_without_asr_ownership
     assert harness._last_retraction_rejection_reason == ""
     assert not hasattr(harness, "_asr")
     assert [name for name, _payload in harness.recorded_events] == [
-        "sentence_received",
+        "admitted_voice_request_received",
         "retraction_voice_interpretation",
         "retraction_voice_dispatch",
     ]
 
 
+def test_raw_stt_is_monitored_but_only_admitted_text_can_dispatch() -> None:
+    harness = _harness(retraction_voice=True)
+
+    IntegrationDebugNode._on_string_input(
+        harness,
+        harness._asr_topic,
+        String(data="직접 교시 시작"),
+    )
+
+    assert harness._input_stats[harness._asr_topic].message_count == 1
+    assert harness.dispatched == []
+    assert harness.recorded_events == []
+
+
 @pytest.mark.parametrize(
     ("settings", "reason"),
     [
-        ({"retraction_voice": False}, "voice_mode_buttons_only"),
         ({"armed": False, "retraction_voice": True}, "manual_control_not_armed"),
         (
             {"retraction_voice": True, "service_ready": False},
@@ -146,14 +163,64 @@ def test_retraction_voice_gate_reports_why_a_final_sentence_is_not_dispatched(
     assert harness._last_retraction_interpretation["command"] == "start_direct_teach"
 
 
-def test_generic_voice_router_cannot_bypass_the_retraction_voice_gate() -> None:
+def test_buttons_only_observes_admitted_stt_without_retractor_interpretation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     harness = _harness(generic_voice=True, retraction_voice=False)
+    harness._last_retraction_interpretation = {"sentinel": "unchanged"}
+    harness._last_retraction_rejection_reason = "unchanged"
+
+    def fail_if_interpreted(*_args, **_kwargs):
+        raise AssertionError("buttons-only mode must not normalize retractor speech")
+
+    monkeypatch.setattr(
+        "integration_debug.node.normalize_retractor_command",
+        fail_if_interpreted,
+    )
 
     _send_final(harness)
 
     assert harness._last_voice_parse["operation"] == "retraction_command"
     assert harness.dispatched == []
-    assert harness._last_retraction_rejection_reason == "voice_mode_buttons_only"
+    assert harness._last_retraction_interpretation == {"sentinel": "unchanged"}
+    assert harness._last_retraction_rejection_reason == "unchanged"
+    assert [name for name, _payload in harness.recorded_events] == [
+        "admitted_voice_request_received"
+    ]
+    admitted_event = harness.recorded_events[0][1]
+    assert admitted_event["retraction_voice_enabled"] is False
+    assert admitted_event["retraction_parse"] is None
+
+
+def test_buttons_only_retractor_gate_keeps_tool_voice_gate_independent() -> None:
+    harness = _harness(generic_voice=True, retraction_voice=False)
+    harness._config = {
+        "voice": {
+            "aliases": {"켈리": "Kelly forceps"},
+            "default_source_location": "tray",
+            "default_target_location": "surgeon",
+        }
+    }
+
+    _send_final(harness, "켈리 주세요")
+
+    assert harness.dispatched == [
+        (
+            "tool_handover",
+            {
+                "instrument_id": "Kelly forceps",
+                "instrument_instance_id": "Kelly forceps#1",
+                "source_location": "tray",
+                "target_location": "surgeon",
+            },
+            "voice",
+        )
+    ]
+    assert harness._last_retraction_interpretation == {}
+    assert [name for name, _payload in harness.recorded_events] == [
+        "admitted_voice_request_received",
+        "voice_dispatch",
+    ]
 
 
 def test_debug_voice_mode_runs_text_vlm_asynchronously_before_dispatch() -> None:

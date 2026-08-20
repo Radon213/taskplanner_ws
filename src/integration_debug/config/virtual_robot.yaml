@@ -1,0 +1,15 @@
+schema: taskplanner.action_emulator.v1
+profile_id: integration_debug_virtual_robot_v1
+routes:
+  tool_handover:
+    available: true
+    default:
+      outcome: success
+      duration_sec: 0.05
+      reason_code: virtual_debug_completed_no_robot_motion
+  retraction_command:
+    available: true
+    default:
+      outcome: success
+      duration_sec: 0.0
+      reason_code: virtual_admission_only_no_robot_motion

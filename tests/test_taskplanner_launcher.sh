@@ -362,6 +362,8 @@ debug_output="$("${ROOT_DIR}/scripts/taskplanner" up debug --dry-run)"
 assert_contains "${debug_output}" \
   "--profile debug up -d webapp"
 assert_contains "${debug_output}" \
+  "--profile debug up -d --wait --wait-timeout 300 ninfer-manager"
+assert_contains "${debug_output}" \
   "--profile debug up -d multicam-observer"
 assert_contains "${debug_output}" \
   "--profile debug up -d --force-recreate integration-debug integration-debug-lan-proxy"
@@ -380,7 +382,7 @@ assert_contains "${debug_build_output}" \
 assert_contains "${debug_build_output}" \
   "rm -f taskplanner-runtime public-rosbridge taskplanner-asr shadow-runner object-perception integration-debug integration-debug-lan-proxy multicam-observer"
 assert_contains "${debug_build_output}" \
-  "colcon\\ build\\ --symlink-install\\ --packages-select\\ surgical_interop_msgs\\ surgical_msgs\\ rosbridge_test_msgs\\ integration_debug"
+  "colcon\\ build\\ --symlink-install\\ --packages-up-to\\ integration_debug"
 
 debug_config="$("${ROOT_DIR}/scripts/taskplanner" config debug)"
 replay_config="$("${ROOT_DIR}/scripts/taskplanner" config replay)"

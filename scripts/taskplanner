@@ -186,7 +186,7 @@ run_serial_workspace_build() {
   fi
 
   if [[ "${mode}" == "debug" ]]; then
-    build_command="colcon build --symlink-install --packages-select surgical_interop_msgs surgical_msgs rosbridge_test_msgs integration_debug --cmake-args -DBUILD_TESTING=OFF && test -f install/setup.bash && test -x install/integration_debug/lib/integration_debug/integration_debug_node"
+    build_command="colcon build --symlink-install --packages-up-to integration_debug --cmake-args -DBUILD_TESTING=OFF && test -f install/setup.bash && test -x install/integration_debug/lib/integration_debug/integration_debug_node"
   else
     build_command="colcon build --symlink-install --cmake-args -DBUILD_TESTING=OFF && test -f install/setup.bash && test -e install/bringup/share/bringup/launch/taskplanner_live.launch.py && test -x install/integration_debug/lib/integration_debug/operational_asr_node"
   fi
@@ -1114,6 +1114,15 @@ case "${action}" in
       run_or_print \
         "${COMPOSE[@]}" --profile debug \
         up -d "${BUILD_ARGS[@]}" webapp
+      # Debug starts only the local NInfer manager/control plane here and never
+      # requests a model load implicitly. An already-loaded worker is preserved;
+      # otherwise the operator can explicitly load the configured model from the
+      # Debug UI. A missing catalog or GPU must not prevent ROS/STT diagnostics.
+      run_best_effort \
+        "NInfer manager did not start; VLM tests remain unavailable while other Debug diagnostics continue" \
+        "${COMPOSE[@]}" --profile debug \
+        up -d "${BUILD_ARGS[@]}" \
+        --wait --wait-timeout "${WAIT_TIMEOUT_SEC}" ninfer-manager
       run_best_effort \
         "multicam observer did not start; core Debug runtime remains available" \
         "${COMPOSE[@]}" --profile debug \
