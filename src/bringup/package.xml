@@ -27,6 +27,7 @@
   <exec_depend>surgical_interop_msgs</exec_depend>
   <exec_depend>surgical_msgs</exec_depend>
   <exec_depend>vlm_node</exec_depend>
+  <exec_depend>voice_command</exec_depend>
 
   <test_depend>python3-pytest</test_depend>
 

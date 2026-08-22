@@ -10,6 +10,7 @@ from __future__ import annotations
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 import json
+import math
 import os
 import re
 import time
@@ -42,6 +43,7 @@ from surgical_msgs.msg import (
     BedRobotArmGroupRequest,
     BedRobotArmGroupState,
     BedRobotArmGroupStatus,
+    VoiceCommandIntent,
     WorldState,
 )
 
@@ -63,13 +65,37 @@ POLICY_ADJUSTMENT = "retraction_adjustment"
 POLICY_TOOL_CHANGE = "tool_change"
 
 # The dedicated six-command path is intentionally separate from the legacy
-# image/VLM proposal schema.  Its source is carried on the existing request
-# envelope and echoed as a small local status event rather than pretending a
-# model was invoked.
+# image/VLM proposal schema.  Free-form speech is resolved upstream into a
+# typed proposal; this router only validates the closed action/slot contract,
+# carries it on the existing request envelope, and emits a small local status
+# event.  It never claims that a model or a physical robot was invoked.
 RETRACTOR_VOICE_NORMALIZER_SOURCE = "retractor_voice_normalizer"
 RETRACTOR_VOICE_NORMALIZATION_STATUS_TOPIC = (
     "/bed_robot_arm_group/voice_normalization_status"
 )
+VOICE_COMMAND_INTENT_TOPIC = "/surgery/voice/intent"
+VOICE_COMMAND_INTENT_SOURCE = "voice_command_intent"
+
+# A String transcript is deliberately not a control contract anymore.  The
+# central voice resolver owns free-form speech interpretation and emits the
+# typed proposal below.  Retaining the old parser behind an explicit opt-in is
+# useful for isolated backwards-compatibility replay, but it must never be on
+# by default alongside the typed subscription: otherwise one utterance can be
+# interpreted twice by two different policies.
+RETRACTOR_LEGACY_RAW_VOICE_PARAMETER = "retractor_legacy_raw_voice_enabled"
+
+_RETRACTOR_TYPED_INTENTS = frozenset(
+    {
+        RetractionCommand.START_DIRECT_TEACH.value,
+        RetractionCommand.FINISH_DIRECT_TEACH.value,
+        RetractionCommand.START_RETRACTION.value,
+        RetractionCommand.ADJUST_RETRACTION.value,
+        RetractionCommand.CHANGE_TOOL.value,
+        RetractionCommand.STOP_RETRACTION.value,
+    }
+)
+_RETRACTOR_COMMAND_INTENT = "retractor_command"
+_VOICE_COMMAND_DISPOSITION_PROPOSE = "propose"
 
 _OPERATION_BY_RETRACTION_COMMAND = {
     RetractionCommand.START_DIRECT_TEACH: OP_START_DIRECT_TEACH,
@@ -131,7 +157,12 @@ class PendingTextVLMInterpretation:
 
 
 class BedRobotArmGroupOrchestrator(Node):
-    """Route tool changes and guarded VLM retraction adjustments."""
+    """Route typed retractor proposals through the existing guarded lane.
+
+    Natural-language interpretation belongs to the central voice resolver.
+    This consumer accepts a closed, auditable proposal or rejects it; the raw
+    ``String`` parser is legacy-only and disabled by default.
+    """
 
     _VOICE_DEDUP_SEC = 1.5
     _RETRACTION_BUSY_STATES = {
@@ -154,6 +185,11 @@ class BedRobotArmGroupOrchestrator(Node):
         self.declare_parameter("bed_robot_status_timeout_sec", 2.0)
         self.declare_parameter("bed_robot_source_max_age_sec", 2.0)
         self.declare_parameter("bed_robot_source_future_tolerance_sec", 0.5)
+        # The central resolver is the only normal speech entry point.  Keep
+        # the pre-existing String parser available strictly for an explicit
+        # compatibility/replay opt-in; enabling it in production together
+        # with /surgery/voice/intent would create a double-dispatch hazard.
+        self.declare_parameter(RETRACTOR_LEGACY_RAW_VOICE_PARAMETER, False)
         self.declare_parameter("retractor_voice_normalization_enabled", True)
         self.declare_parameter(
             "retractor_voice_interpreter_mode", "deterministic"
@@ -190,6 +226,9 @@ class BedRobotArmGroupOrchestrator(Node):
                     "bed_robot_source_future_tolerance_sec"
                 ).value
             ),
+        )
+        self._retractor_legacy_raw_voice_enabled = bool(
+            self.get_parameter(RETRACTOR_LEGACY_RAW_VOICE_PARAMETER).value
         )
         self._retractor_voice_normalization_enabled = bool(
             self.get_parameter("retractor_voice_normalization_enabled").value
@@ -299,6 +338,12 @@ class BedRobotArmGroupOrchestrator(Node):
             self._on_controller_status,
             20,
         )
+        self.create_subscription(
+            VoiceCommandIntent,
+            VOICE_COMMAND_INTENT_TOPIC,
+            self._on_voice_intent,
+            20,
+        )
         self.create_subscription(String, "/surgery/audio/request_text", self._on_voice, 20)
         self.create_subscription(String, "/simulation/control_state", self._on_control, 20)
         self.create_timer(0.2, self._expire_pending_retraction)
@@ -338,6 +383,8 @@ class BedRobotArmGroupOrchestrator(Node):
                 self._bed_robot_source_future_tolerance_sec = max(
                     0.0, float(parameter.value)
                 )
+            elif parameter.name == RETRACTOR_LEGACY_RAW_VOICE_PARAMETER:
+                self._retractor_legacy_raw_voice_enabled = bool(parameter.value)
             elif parameter.name == "retractor_voice_normalization_enabled":
                 self._retractor_voice_normalization_enabled = bool(parameter.value)
             elif parameter.name == "retractor_voice_interpreter_mode":
@@ -616,6 +663,324 @@ class BedRobotArmGroupOrchestrator(Node):
         state = getattr(self, "_retractor_voice_state", RetractionState.IDLE)
         return state if isinstance(state, RetractionState) else RetractionState.IDLE
 
+    @staticmethod
+    def _rejected_typed_retractor_intent(reason: str) -> NormalizedRetractionCommand:
+        """Represent a typed-intent rejection using the existing status shape.
+
+        A rejected :class:`VoiceCommandIntent` must never be converted into a
+        ``BedRobotArmGroupRequest`` merely to report why it was rejected.  The
+        retractor status publisher already has an intentionally non-actuating
+        rejection representation, so use it rather than inventing another
+        control path.
+        """
+
+        return NormalizedRetractionCommand(
+            command=None,
+            target_side=RetractionTargetSide.NONE,
+            distance_m=0.0,
+            confidence=0.0,
+            reason=reason,
+        )
+
+    def _normalize_typed_retractor_intent(
+        self, msg: VoiceCommandIntent
+    ) -> tuple[NormalizedRetractionCommand, str, str]:
+        """Validate one central voice proposal without reinterpreting speech.
+
+        The resolver has already handled free-form language.  This consumer is
+        deliberately a narrow contract adapter: it accepts only an executable
+        retractor proposal, preserves its text/provenance for audit, and
+        rejects every other disposition locally.  In particular, state can
+        filter a proposal but cannot fill in a missing command, target side, or
+        distance.
+        """
+
+        raw_text = str(getattr(msg, "raw_text", "") or "").strip()
+        provenance = str(getattr(msg, "provenance", "") or "").strip()
+        proposal_procedure_id = str(
+            getattr(msg, "procedure_id", "") or ""
+        ).strip()
+        intent = str(getattr(msg, "intent", "") or "").strip().casefold()
+        disposition = str(
+            getattr(msg, "disposition", "") or ""
+        ).strip().casefold()
+        command_value = str(
+            getattr(msg, "retractor_command", "") or ""
+        ).strip().casefold()
+        tool_id = str(getattr(msg, "tool_id", "") or "").strip()
+
+        if intent != _RETRACTOR_COMMAND_INTENT:
+            return (
+                self._rejected_typed_retractor_intent(
+                    "typed_intent_is_not_retractor_command"
+                ),
+                raw_text,
+                provenance,
+            )
+        if disposition != _VOICE_COMMAND_DISPOSITION_PROPOSE:
+            return (
+                self._rejected_typed_retractor_intent(
+                    "typed_intent_disposition_is_not_propose"
+                ),
+                raw_text,
+                provenance,
+            )
+        if bool(getattr(msg, "requires_confirmation", False)):
+            return (
+                self._rejected_typed_retractor_intent(
+                    "typed_intent_requires_confirmation"
+                ),
+                raw_text,
+                provenance,
+            )
+        if command_value not in _RETRACTOR_TYPED_INTENTS:
+            return (
+                self._rejected_typed_retractor_intent(
+                    "typed_intent_command_is_unsupported"
+                ),
+                raw_text,
+                provenance,
+            )
+        if tool_id:
+            return (
+                self._rejected_typed_retractor_intent(
+                    "typed_intent_retractor_command_has_tool_id"
+                ),
+                raw_text,
+                provenance,
+            )
+        if not raw_text:
+            return (
+                self._rejected_typed_retractor_intent(
+                    "typed_intent_raw_text_is_missing"
+                ),
+                raw_text,
+                provenance,
+            )
+        if not provenance:
+            return (
+                self._rejected_typed_retractor_intent(
+                    "typed_intent_provenance_is_missing"
+                ),
+                raw_text,
+                provenance,
+            )
+        # A retractor lifecycle proposal remains unsafe if it was interpreted
+        # against a stale procedure bundle.  Require it to bind to the loaded
+        # spec and, when available, the currently running world.  ``catalog_id``
+        # is intentionally not used here: it is a tool-handover catalog fence,
+        # not a retractor Service field.  Likewise, urgency is never converted
+        # into speed, force, distance, or any other physical parameter.
+        if not proposal_procedure_id:
+            return (
+                self._rejected_typed_retractor_intent(
+                    "typed_intent_procedure_id_is_missing"
+                ),
+                raw_text,
+                provenance,
+            )
+        loaded_procedure_id = str(
+            getattr(getattr(self, "_spec", None), "procedure_id", "") or ""
+        ).strip()
+        if not loaded_procedure_id:
+            return (
+                self._rejected_typed_retractor_intent(
+                    "typed_intent_loaded_procedure_id_is_missing"
+                ),
+                raw_text,
+                provenance,
+            )
+        if proposal_procedure_id != loaded_procedure_id:
+            return (
+                self._rejected_typed_retractor_intent(
+                    "typed_intent_procedure_id_mismatches_loaded_spec"
+                ),
+                raw_text,
+                provenance,
+            )
+        current_world = getattr(self, "_world", None)
+        if current_world is not None:
+            current_procedure_id = str(
+                getattr(current_world, "procedure_id", "") or ""
+            ).strip()
+            if not current_procedure_id:
+                return (
+                    self._rejected_typed_retractor_intent(
+                        "typed_intent_current_procedure_id_is_missing"
+                    ),
+                    raw_text,
+                    provenance,
+                )
+            if proposal_procedure_id != current_procedure_id:
+                return (
+                    self._rejected_typed_retractor_intent(
+                        "typed_intent_procedure_id_mismatches_current_world"
+                    ),
+                    raw_text,
+                    provenance,
+                )
+        if not getattr(self, "_retractor_voice_normalization_enabled", False):
+            return (
+                self._rejected_typed_retractor_intent(
+                    "typed_intent_retractor_voice_is_disabled"
+                ),
+                raw_text,
+                provenance,
+            )
+
+        try:
+            command = RetractionCommand(command_value)
+        except ValueError:  # Defensive against a future enum/schema mismatch.
+            return (
+                self._rejected_typed_retractor_intent(
+                    "typed_intent_command_enum_is_invalid"
+                ),
+                raw_text,
+                provenance,
+            )
+        if command not in allowed_retractor_commands(
+            self._retractor_voice_state_value()
+        ):
+            return (
+                self._rejected_typed_retractor_intent(
+                    "typed_intent_command_not_allowed_in_local_state"
+                ),
+                raw_text,
+                provenance,
+            )
+
+        side_value = str(getattr(msg, "target_side", "") or "").strip().casefold()
+        try:
+            target_side = RetractionTargetSide(side_value)
+        except ValueError:
+            return (
+                self._rejected_typed_retractor_intent(
+                    "typed_intent_target_side_is_invalid"
+                ),
+                raw_text,
+                provenance,
+            )
+        try:
+            distance_m = float(getattr(msg, "distance_m", 0.0))
+        except (TypeError, ValueError):
+            return (
+                self._rejected_typed_retractor_intent(
+                    "typed_intent_distance_is_invalid"
+                ),
+                raw_text,
+                provenance,
+            )
+        if not math.isfinite(distance_m):
+            return (
+                self._rejected_typed_retractor_intent(
+                    "typed_intent_distance_is_not_finite"
+                ),
+                raw_text,
+                provenance,
+            )
+
+        if command == RetractionCommand.ADJUST_RETRACTION:
+            if target_side not in {
+                RetractionTargetSide.LEFT,
+                RetractionTargetSide.RIGHT,
+            }:
+                return (
+                    self._rejected_typed_retractor_intent(
+                        "typed_intent_adjustment_target_side_is_missing"
+                    ),
+                    raw_text,
+                    provenance,
+                )
+            if distance_m <= 0.0 or distance_m > 0.050:
+                return (
+                    self._rejected_typed_retractor_intent(
+                        "typed_intent_adjustment_distance_is_out_of_range"
+                    ),
+                    raw_text,
+                    provenance,
+                )
+        elif target_side != RetractionTargetSide.NONE or distance_m != 0.0:
+            return (
+                self._rejected_typed_retractor_intent(
+                    "typed_intent_nonadjustment_has_physical_slots"
+                ),
+                raw_text,
+                provenance,
+            )
+
+        return (
+            NormalizedRetractionCommand(
+                command=command,
+                target_side=target_side,
+                distance_m=distance_m,
+                # This is not a semantic confidence claim.  The typed
+                # proposal has passed the consumer's contract validation; the
+                # controller/BT still decide whether it can be admitted.
+                confidence=1.0,
+                reason="typed_voice_command_intent",
+            ),
+            raw_text,
+            provenance,
+        )
+
+    def _on_voice_intent(self, msg: VoiceCommandIntent) -> None:
+        """Consume the sole default retractor voice-control contract.
+
+        No VLM, regex, or raw-STT parsing occurs here.  Free-form language is
+        normalized upstream; this adapter only turns an already-grounded,
+        executable typed proposal into the existing guarded Service lane.
+        """
+
+        normalized, raw_text, provenance = self._normalize_typed_retractor_intent(
+            msg
+        )
+        detail = (
+            f"typed_voice_intent:{provenance}"
+            if provenance
+            else "typed_voice_intent"
+        )
+        if normalized.command is None:
+            self._publish_retractor_voice_status(
+                normalized=normalized,
+                interpreter_source=VOICE_COMMAND_INTENT_SOURCE,
+                vlm_invoked=False,
+                stage="typed_intent_rejected",
+                detail=detail,
+            )
+            return
+
+        signature = self._voice_signature(raw_text)
+        if not signature:
+            self._publish_retractor_voice_status(
+                normalized=self._rejected_typed_retractor_intent(
+                    "typed_intent_raw_text_has_no_auditable_tokens"
+                ),
+                interpreter_source=VOICE_COMMAND_INTENT_SOURCE,
+                vlm_invoked=False,
+                stage="typed_intent_rejected",
+                detail=detail,
+            )
+            return
+        now = time.monotonic()
+        recent = self._recent_voice_requests.get(signature)
+        if recent is not None and now - recent[1] <= self._VOICE_DEDUP_SEC:
+            self._publish_retractor_voice_status(
+                normalized=normalized,
+                interpreter_source=VOICE_COMMAND_INTENT_SOURCE,
+                vlm_invoked=False,
+                stage="typed_intent_duplicate_suppressed",
+                detail=detail,
+            )
+            return
+        self._submit_normalized_retractor_request(
+            transcript=raw_text,
+            normalized=normalized,
+            signature=signature,
+            interpreter_source=VOICE_COMMAND_INTENT_SOURCE,
+            vlm_invoked=False,
+            detail=detail,
+        )
+
     def _publish_retractor_voice_status(
         self,
         *,
@@ -775,6 +1140,17 @@ class BedRobotArmGroupOrchestrator(Node):
         self._request_pub.publish(request)
 
     def _on_voice(self, msg: String) -> None:
+        """Handle only an explicit legacy raw-transcript compatibility mode.
+
+        ``/surgery/audio/request_text`` remains available to non-retractor
+        consumers, but this router no longer treats it as an authoritative
+        retractor-control source by default.  The central typed intent topic
+        is the production path; enabling this method is an operator's
+        deliberate replay/migration choice.
+        """
+
+        if not getattr(self, "_retractor_legacy_raw_voice_enabled", False):
+            return
         transcript = str(msg.data or "").strip()
         if not transcript:
             return

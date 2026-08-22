@@ -1,0 +1,69 @@
+{
+  "fixture_schema": "taskplanner.ui_contract_fixture.v1",
+  "synthetic": true,
+  "usage": "SurgiMate dummy scenario 03: multiple surgeon and Mayo tools with all Top-3 prediction frames populated.",
+  "baseline": {
+    "schema_version": "1.1.0",
+    "interface_version": "0.3.0",
+    "procedure_type": "thyroidectomy_demo",
+    "catalog_version": "synthetic-catalog-v1"
+  },
+  "/surgery/context": {
+    "revision": 1301,
+    "procedure_type": "thyroidectomy_demo",
+    "procedure_active": true,
+    "current_phase": "P05",
+    "phase_confidence": 0.89,
+    "phase_uncertain": false,
+    "execution_state": "running",
+    "evidence_status": "DUMMY_ACCEPTED",
+    "safety_flags": []
+  },
+  "/surgery/instruments": {
+    "revision": 1301,
+    "instruments": [
+      { "instrument_id": "T02", "instance_id": "T02#scenario-03", "location_type": "surgeon", "location_id": "surgeon", "holder_role": "surgeon", "state": "handed_over", "visible": true, "confidence": 0.94, "evidence_status": "DUMMY_ACCEPTED" },
+      { "instrument_id": "T03", "instance_id": "T03#scenario-03", "location_type": "surgeon", "location_id": "surgeon", "holder_role": "surgeon", "state": "in_use", "visible": true, "confidence": 0.96, "evidence_status": "DUMMY_ACCEPTED" },
+      { "instrument_id": "T04", "instance_id": "T04#scenario-03", "location_type": "mayo_stand", "location_id": "mayo_stand", "holder_role": "none", "state": "parked_for_reuse", "visible": true, "confidence": 0.92, "evidence_status": "DUMMY_ACCEPTED" },
+      { "instrument_id": "T07", "instance_id": "T07#scenario-03", "location_type": "mayo_stand", "location_id": "mayo_stand", "holder_role": "none", "state": "awaiting_retrieval", "visible": true, "confidence": 0.9, "evidence_status": "DUMMY_ACCEPTED" },
+      { "instrument_id": "T08", "instance_id": "T08#scenario-03", "location_type": "mayo_stand", "location_id": "mayo_stand", "holder_role": "none", "state": "parked_for_reuse", "visible": true, "confidence": 0.87, "evidence_status": "DUMMY_ACCEPTED" }
+    ]
+  },
+  "/surgery/robots": {
+    "revision": 1301,
+    "robots": [
+      { "robot_id": "bed_arm_1", "robot_type": "bed_retraction_arm", "execution_state": "moving_to_target" },
+      { "robot_id": "bed_arm_2", "robot_type": "bed_retraction_arm", "execution_state": "idle" }
+    ]
+  },
+  "/surgery/robot_end_effectors": {
+    "revision": 1301,
+    "end_effectors": [
+      { "robot_id": "humanoid", "end_effector_id": "left_hand", "state": "holding", "instrument_id": "T02", "instance_id": "T02#scenario-03", "confidence": 0.96, "evidence_status": "DUMMY_ACCEPTED" },
+      { "robot_id": "humanoid", "end_effector_id": "right_hand", "state": "holding", "instrument_id": "T03", "instance_id": "T03#scenario-03", "confidence": 0.97, "evidence_status": "DUMMY_ACCEPTED" }
+    ]
+  },
+  "/surgery/tool_predictions": {
+    "revision": 1301,
+    "predictions": [
+      { "rank": 1, "instrument_id": "T04", "instance_id": "", "confidence": 0.72, "stability_sec": 2.2, "source": "dummy", "evidence_status": "DUMMY_ACCEPTED" },
+      { "rank": 2, "instrument_id": "T07", "instance_id": "", "confidence": 0.93, "stability_sec": 1.4, "source": "dummy", "evidence_status": "DUMMY_ACCEPTED" },
+      { "rank": 3, "instrument_id": "T08", "instance_id": "", "confidence": 0.61, "stability_sec": 0.0, "source": "dummy", "evidence_status": "DUMMY_ACCEPTED" }
+    ]
+  },
+  "/surgery/speech": {
+    "revision": 1301,
+    "state": "ready",
+    "available": true,
+    "connected": true,
+    "text": "Bipolar cautery"
+  },
+  "/surgery/health": {
+    "revision": 1301,
+    "healthy": true,
+    "state": "healthy",
+    "unavailable_sources": [],
+    "stale_sources": [],
+    "error_codes": []
+  }
+}

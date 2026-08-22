@@ -200,11 +200,11 @@ for (const rejectedTransitionGuard of [
 }
 
 for (const workspaceRuntimeGuard of [
-  'onMulticamOps={() => navigateWorkspace("multicam")}',
+  'onMonitor={() => navigateWorkspace("monitor")}',
   'setRuntimeMode(runtimeTransition.activeMode)',
 ]) {
   if (!app.includes(workspaceRuntimeGuard)) {
-    violations.push(`Multicam runtime transition guard is missing: ${workspaceRuntimeGuard}`);
+    violations.push(`Observer workspace runtime transition guard is missing: ${workspaceRuntimeGuard}`);
   }
 }
 

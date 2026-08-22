@@ -5,6 +5,7 @@ find_package(ament_cmake REQUIRED)
 find_package(action_msgs REQUIRED)
 find_package(builtin_interfaces REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
+find_package(std_msgs REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "action/ExecuteSkill.action"
@@ -45,6 +46,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/VLMRequestContext.msg"
   "msg/VLMReducerDecision.msg"
   "msg/VLMResult.msg"
+  "msg/VoiceCommandIntent.msg"
   "msg/WorldState.msg"
   "srv/ControlModelRuntime.srv"
   "srv/AsrControl.srv"
@@ -57,7 +59,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/SelectShadowCase.srv"
   "srv/SelectModelProvider.srv"
   "srv/SelectSimulationBundle.srv"
-  DEPENDENCIES action_msgs builtin_interfaces
+  DEPENDENCIES action_msgs builtin_interfaces std_msgs
 )
 
 ament_export_dependencies(rosidl_default_runtime)

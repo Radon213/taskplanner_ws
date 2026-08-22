@@ -25,10 +25,21 @@ if (!bridge.includes("const latencyMissing = final.response_latency_ms === null"
   || !bridge.includes("latencyMissing ? Number.NaN")) {
   violations.push("Missing ASR latency must remain null instead of being coerced to 0 ms");
 }
-for (const operation of ["refresh_devices", "start", "stop"]) {
+for (const operation of ["refresh_devices", "set_route_policy", "start", "stop"]) {
   if (!panel.includes(`onControl("${operation}"`)) {
     violations.push(`Live ASR UI is missing the ${operation} operation`);
   }
+}
+for (const field of ["endpoint_id", "route_policy", "lan_health"]) {
+  if (!bridge.includes(field)) {
+    violations.push(`Live ASR must normalize the ${field} route-status field`);
+  }
+}
+if (!bridge.includes('server_url: ""') || !bridge.includes("route_policy: routePolicy")) {
+  violations.push("Live ASR controls must send a reviewed route policy, never a URL");
+}
+if (bridge.includes("server_url: liveAsrStatus.server_url")) {
+  violations.push("The browser must not echo a status URL back into ASR control");
 }
 if (!panel.includes("!selectedDevice") || !panel.includes("startDisabled")) {
   violations.push("ASR start must require a selected Ubuntu input device");
@@ -47,6 +58,18 @@ if (!panel.includes("!statusFresh || asrActive") || !panel.includes("selectorDis
 if (panel.includes('onChange={(event) => setServer') || panel.includes('type="url"')) {
   violations.push("The backend-authoritative ASR server URL must not be user-editable");
 }
+if (!panel.includes('data-slot="live-asr-route-policy"') || !panel.includes("<fieldset")) {
+  violations.push("Live ASR route selection must use a labeled native fieldset");
+}
+if (!panel.includes('type="radio"') || !panel.includes("routePolicyDisabled")) {
+  violations.push("Live ASR route policies must be explicit, keyboard-accessible choices");
+}
+if (!panel.includes("lanOnlyUnavailable") || !panel.includes("LAN route는 평문 ws://")) {
+  violations.push("LAN-only ASR must fail closed and disclose its trusted-network boundary");
+}
+if (!panel.includes('data-slot="live-asr-route-summary"') || !panel.includes("lanHealthSummary")) {
+  violations.push("Live ASR must visibly distinguish the cached LAN health from capture state");
+}
 if (!panel.includes('aria-live="polite"') || !panel.includes('aria-atomic="true"')) {
   violations.push("Active capture and transcript state must be announced accessibly");
 }
@@ -64,6 +87,14 @@ if (!styles.includes(".live-asr-panel .field select {\n  min-height: 44px")) {
 }
 if (!styles.includes(".live-asr-panel .field select:focus-visible")) {
   violations.push("The ASR device selector needs a visible keyboard focus style");
+}
+if (!styles.includes(".live-asr-route-policy label {\n  display: flex")
+  || !styles.includes("min-height: 52px")
+  || !styles.includes(".live-asr-route-policy input:focus-visible")) {
+  violations.push("ASR route policies need accessible touch targets and keyboard focus");
+}
+if (!styles.includes(".live-asr-route-policy > div {\n    grid-template-columns: 1fr")) {
+  violations.push("ASR route policies must stack on narrow screens");
 }
 if (!styles.includes("@media (prefers-reduced-motion: reduce)") || !styles.includes(".live-asr-state.active svg")) {
   violations.push("Live capture motion must honor reduced-motion preferences");

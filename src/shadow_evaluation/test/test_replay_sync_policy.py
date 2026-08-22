@@ -4,7 +4,8 @@ from types import SimpleNamespace
 
 import pytest
 from builtin_interfaces.msg import Time
-from sensor_msgs.msg import CompressedImage
+from rclpy.serialization import serialize_message
+from sensor_msgs.msg import CameraInfo, CompressedImage, Image
 from std_msgs.msg import String
 from surgical_msgs.msg import VLMHealth, VLMResult
 
@@ -870,6 +871,101 @@ def test_runtime_call_keeps_camera_topics_out_of_stateful_coalescing():
 
     assert "stateful_topics=set(self._json_topic_routes)" in publish_due
     assert "*self._image_topic_routes" not in publish_due
+
+
+def test_replay_publishes_recorded_camera_info_and_raw_depth_by_type():
+    routes = replay_controller.public_replay_typed_routes(
+        source_cam4_camera_info_topic="/recorded/cam4/info",
+        source_cam4_native_depth_compressed_topic=(
+            "/recorded/cam4/depth/compressedDepth"
+        ),
+        source_cam4_aligned_depth_topic="/recorded/cam4/depth",
+        source_cam4_depth_camera_info_topic="",
+    )
+    camera_info = CameraInfo()
+    camera_info.header.frame_id = "cam_4_color_optical_frame"
+    camera_info.width = 1280
+    camera_info.height = 720
+    depth = Image()
+    depth.header.frame_id = "cam_4_color_optical_frame"
+    depth.width = 1280
+    depth.height = 720
+    depth.encoding = "16UC1"
+    depth.step = 2560
+    depth.data = bytes(1280 * 720 * 2)
+    native_depth = CompressedImage()
+    native_depth.header.frame_id = "cam_4_depth_optical_frame"
+    native_depth.format = "16UC1; compressedDepth png"
+    native_depth.data = b"png"
+    due_records = [
+        (
+            "/recorded/cam4/info",
+            serialize_message(camera_info),
+            1.0,
+        ),
+        (
+            "/recorded/cam4/depth/compressedDepth",
+            serialize_message(native_depth),
+            1.0,
+        ),
+        (
+            "/recorded/cam4/depth",
+            serialize_message(depth),
+            1.0,
+        ),
+    ]
+    published: dict[str, list[object]] = {
+        route.source_topic: [] for route in routes
+    }
+    node = InteractiveReplayControllerNode.__new__(
+        InteractiveReplayControllerNode
+    )
+    node._source_time_sec = 1.0
+    node._source = SimpleNamespace(
+        topic_types={
+            route.source_topic: route.message_type for route in routes
+        },
+        pop_due=lambda _source_sec: due_records,
+    )
+    node._image_topic_routes = {}
+    node._image_publishers = {}
+    node._typed_routes = routes
+    node._typed_topic_routes = {
+        route.source_topic: route for route in routes
+    }
+    node._typed_publishers = {
+        route.source_topic: SimpleNamespace(
+            publish=published[route.source_topic].append
+        )
+        for route in routes
+    }
+    node._json_topic_routes = {}
+    node._json_publishers = {}
+    node._transcript_topic = "/surgery/transcript"
+    node._transcript_publisher = SimpleNamespace(publish=lambda _message: None)
+    node._source_flir_topic = "/recorded/flir"
+    node._published_image_count = 0
+    node._published_transcript_count = 0
+    node._coalesced_stateful_count = 0
+    node._last_error = ""
+    node.get_logger = lambda: SimpleNamespace(error=lambda _message: None)
+
+    node._publish_due_records()
+
+    published_info = published["/recorded/cam4/info"]
+    published_native_depth = published[
+        "/recorded/cam4/depth/compressedDepth"
+    ]
+    published_depth = published["/recorded/cam4/depth"]
+    assert len(published_info) == 1
+    assert isinstance(published_info[0], CameraInfo)
+    assert published_info[0].header.frame_id == "cam_4_color_optical_frame"
+    assert len(published_native_depth) == 1
+    assert isinstance(published_native_depth[0], CompressedImage)
+    assert published_native_depth[0].header.frame_id == "cam_4_depth_optical_frame"
+    assert len(published_depth) == 1
+    assert isinstance(published_depth[0], Image)
+    assert published_depth[0].encoding == "16UC1"
 
 
 def test_media_end_drain_waits_then_marks_timeout_explicitly():

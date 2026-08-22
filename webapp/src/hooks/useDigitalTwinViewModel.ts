@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { layouts } from "../layouts";
 import { applyVisualLayout } from "../visualLayouts";
@@ -22,6 +22,7 @@ import {
   displayPhaseName,
   displayToolName,
   elapsedLabel,
+  parseBoundedJson,
   parseEventDetail,
   titleize,
   type Language,
@@ -31,6 +32,11 @@ import { fanOutAnchorPoint, type ScenePoint } from "../utils/stageGeometry";
 import type { OverrideAck } from "./useRosBridge";
 
 export type StagePoint = ScenePoint;
+
+// Keep the browser's VLM status indicator aligned with the runtime's
+// vlm_health_timeout_sec default. A last-known healthy message must not make
+// the operator believe the model is still healthy after its heartbeat stops.
+const VLM_HEALTH_MAX_AGE_MS = 6_000;
 
 export type StageToolTone = "ready" | "active" | "surgeon" | "cleaning" | "recovery" | "danger";
 
@@ -935,7 +941,9 @@ function mayoVlmAssessments(
   const assessments = new Map<string, MayoVlmAssessment>();
   if (!vlmResult.raw_json) return assessments;
   try {
-    const payload = JSON.parse(vlmResult.raw_json) as {
+    const parsed = parseBoundedJson(vlmResult.raw_json);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return assessments;
+    const payload = parsed as {
       mayo?: unknown;
       mayo_retrieve?: unknown;
     };
@@ -1054,12 +1062,8 @@ function layoutWithSelectedMetadata(
 
 function layoutJsonProcedureId(layoutJson: string | undefined): string {
   if (!layoutJson) return "";
-  try {
-    const parsed = JSON.parse(layoutJson) as unknown;
-    return isLayoutBundle(parsed) ? parsed.metadata?.procedure?.id ?? "" : "";
-  } catch {
-    return "";
-  }
+  const parsed = parseBoundedJson(layoutJson);
+  return isLayoutBundle(parsed) ? parsed.metadata?.procedure?.id ?? "" : "";
 }
 
 function placeholderInstrumentStates(metadata: LayoutDisplayMetadata | undefined): InstrumentState[] {
@@ -1089,19 +1093,15 @@ function placeholderInstrumentStates(metadata: LayoutDisplayMetadata | undefined
 function runtimeLayout(bundleName: string, state: SimulationState): LayoutBundle {
   const curated = layouts[bundleName];
   if (state.layout_json) {
-    try {
-      const parsed = JSON.parse(state.layout_json) as unknown;
-      if (isLayoutBundle(parsed)) {
-        const parsedProcedureId = parsed.metadata?.procedure?.id ?? "";
-        if (!bundleName || !parsedProcedureId || parsedProcedureId === bundleName) {
-          return parsed;
-        }
-        const selected = bundleMetadataFor(parsed.metadata, bundleName);
-        const fallback = curated ?? genericProcedureLayout(bundleName, selected?.instruments?.length);
-        return layoutWithSelectedMetadata(fallback, parsed.metadata, bundleName);
+    const parsed = parseBoundedJson(state.layout_json);
+    if (isLayoutBundle(parsed)) {
+      const parsedProcedureId = parsed.metadata?.procedure?.id ?? "";
+      if (!bundleName || !parsedProcedureId || parsedProcedureId === bundleName) {
+        return parsed;
       }
-    } catch {
-      // Fall back to the curated bundle below when ROS sends a partial frame during startup.
+      const selected = bundleMetadataFor(parsed.metadata, bundleName);
+      const fallback = curated ?? genericProcedureLayout(bundleName, selected?.instruments?.length);
+      return layoutWithSelectedMetadata(fallback, parsed.metadata, bundleName);
     }
   }
   if (curated) {
@@ -1957,6 +1957,20 @@ export function useDigitalTwinViewModel({
   stageAspectRatio?: number;
 }) {
   const lastNormalPhaseRef = useRef("");
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  const vlmShouldRun = simulationState.running || ["starting", "running", "finishing"].includes(simulationState.execution_state);
+
+  useEffect(() => {
+    if (!vlmShouldRun || vlmHealthReceivedAt === null) return;
+    const now = Date.now();
+    setNowMs(now);
+    const timer = window.setTimeout(
+      () => setNowMs(Date.now()),
+      Math.max(0, VLM_HEALTH_MAX_AGE_MS - (now - vlmHealthReceivedAt)) + 1,
+    );
+    return () => window.clearTimeout(timer);
+  }, [vlmHealthReceivedAt, vlmShouldRun]);
+
   const viewModel = useMemo(() => {
     const ui = getUiCopy(language);
     const logicalLayout = runtimeLayout(activeBundle, simulationState);
@@ -2718,9 +2732,9 @@ export function useDigitalTwinViewModel({
           };
         });
 
-    const vlmShouldRun =
-      simulationState.running || ["starting", "running", "finishing"].includes(simulationState.execution_state);
     const hasVlmHealth = vlmHealthReceivedAt !== null;
+    const vlmHealthFresh = hasVlmHealth && nowMs - vlmHealthReceivedAt <= VLM_HEALTH_MAX_AGE_MS;
+    const vlmHealthStale = vlmShouldRun && hasVlmHealth && !vlmHealthFresh;
     const vlmConnectionLabel = !vlmShouldRun
       ? hasVlmHealth && vlmHealth.connected
         ? language === "ko"
@@ -2733,15 +2747,20 @@ export function useDigitalTwinViewModel({
         ? language === "ko"
           ? "확인 중"
           : "checking"
-        : vlmHealth.connected
+        : vlmHealthStale
           ? language === "ko"
-            ? "연결됨"
-            : "connected"
-          : language === "ko"
-            ? "끊김"
-            : "disconnected";
+            ? "상태 지연"
+            : "stale"
+          : vlmHealth.connected
+            ? language === "ko"
+              ? "연결됨"
+              : "connected"
+            : language === "ko"
+              ? "끊김"
+              : "disconnected";
     const vlmWaitingForImage =
       vlmShouldRun &&
+      !vlmHealthStale &&
       hasVlmHealth &&
       vlmHealth.connected &&
       !vlmHealth.healthy &&
@@ -2749,29 +2768,36 @@ export function useDigitalTwinViewModel({
         vlmHealth.last_error.trim().toLowerCase() === "no fresh field image");
     const vlmFallbackActive =
       vlmShouldRun &&
+      !vlmHealthStale &&
       !vlmWaitingForImage &&
       (!hasVlmHealth || !vlmHealth.connected || !vlmHealth.healthy);
     const vlmHealthLabel = !vlmShouldRun
       ? language === "ko"
         ? "대기"
         : "idle"
-      : vlmWaitingForImage
+      : vlmHealthStale
         ? language === "ko"
-          ? "영상 입력 대기"
-          : "waiting for image"
-      : vlmFallbackActive
-        ? language === "ko"
-          ? "음성 전용"
-          : "voice only"
-        : language === "ko"
-          ? "정상"
-          : "healthy";
+          ? "상태 지연"
+          : "stale"
+        : vlmWaitingForImage
+          ? language === "ko"
+            ? "영상 입력 대기"
+            : "waiting for image"
+          : vlmFallbackActive
+            ? language === "ko"
+              ? "음성 전용"
+              : "voice only"
+            : language === "ko"
+              ? "정상"
+              : "healthy";
     const vlmClassName =
       !vlmShouldRun || !hasVlmHealth || vlmWaitingForImage
         ? "idle"
-        : vlmHealth.connected && vlmHealth.healthy
-          ? "ok"
-          : "warn";
+        : vlmHealthStale
+          ? "warn"
+          : vlmHealth.connected && vlmHealth.healthy
+            ? "ok"
+            : "warn";
     const vlmStatus = {
       kind: "VLM",
       connection: vlmConnectionLabel,
@@ -2783,11 +2809,15 @@ export function useDigitalTwinViewModel({
         ? language === "ko"
           ? "카메라 프레임이 다시 들어오면 VLM 추론을 자동으로 재개합니다."
           : "VLM inference resumes automatically when the next camera frame arrives."
-        : vlmFallbackActive
-        ? language === "ko"
-          ? "VLM 기능은 일시 중지되지만 명시적 음성 도구 요청은 계속 처리됩니다."
-          : "VLM features are paused; explicit voice tool requests remain available."
-        : "",
+        : vlmHealthStale
+          ? language === "ko"
+            ? "VLM health 신호가 6초 이상 없습니다. 새 상태가 들어올 때까지 VLM 근거를 사용하지 않습니다."
+            : "No VLM health signal for 6 seconds. VLM evidence remains untrusted until a fresh status arrives."
+          : vlmFallbackActive
+            ? language === "ko"
+              ? "VLM 기능은 일시 중지되지만 명시적 음성 도구 요청은 계속 처리됩니다."
+              : "VLM features are paused; explicit voice tool requests remain available."
+            : "",
     };
 
     return {
@@ -2884,6 +2914,8 @@ export function useDigitalTwinViewModel({
     vlmHealthReceivedAt,
     vlmResultReceivedAt,
     stageAspectRatio,
+    nowMs,
+    vlmShouldRun,
   ]);
 
   useEffect(() => {

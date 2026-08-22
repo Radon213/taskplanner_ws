@@ -37,7 +37,7 @@ from .command_models import (
 )
 
 
-PROFILE_SCHEMA_VERSION = 1
+PROFILE_SCHEMA_VERSION = 2
 _CHECKSUM_RE = re.compile(r"^(?:sha256:)?([0-9a-fA-F]{64})$")
 
 _TOP_LEVEL_KEYS = frozenset(
@@ -46,6 +46,7 @@ _TOP_LEVEL_KEYS = frozenset(
         "profile",
         "calibration",
         "robot",
+        "sensor",
         "data",
         "control",
         "side_mapping",
@@ -102,12 +103,23 @@ class RobotSettings:
 
 
 @dataclass(frozen=True, slots=True)
+class SensorSettings:
+    transport: str
+    channel: str
+    bitrate: int
+    sample_rate_hz: float
+    zeroing_policy: str
+
+
+@dataclass(frozen=True, slots=True)
 class ControlSettings:
     teach_friction: float
     normal_friction: float
     custom_gain: object
     force_threshold: float
     force_freshness_timeout_sec: float
+    impedance_target_force_n: float
+    impedance_tolerance_n: float
     stop_policy: str
 
 
@@ -125,6 +137,7 @@ class DraftProfile:
     name: str
     version: str
     procedure_type: str
+    public_procedure_type: str | None
     calibration_revision: str | None
     expected_checksum: str | None
     computed_checksum: str
@@ -170,10 +183,12 @@ class ExecutionProfile:
     name: str
     version: str
     procedure_type: str
+    public_procedure_type: str
     calibration_revision: str
     expected_checksum: str
     computed_checksum: str
     robot: RobotSettings
+    sensor: SensorSettings
     data_directory: Path
     control: ControlSettings
     side_mappings: Mapping[TargetSide, SideMapping]
@@ -341,14 +356,18 @@ def _load_mapping(payload: dict[str, Any]) -> LoadedProfile:
     profile_node = _mapping(payload.get("profile"), "profile")
     _check_keys(
         profile_node,
-        {"name", "version", "procedure_type"},
-        {"name", "version", "procedure_type"},
+        {"name", "version", "procedure_type", "public_procedure_type"},
+        {"name", "version", "procedure_type", "public_procedure_type"},
         "profile",
     )
     name = _nonempty_string(profile_node.get("name"), "profile.name")
     version = _nonempty_string(profile_node.get("version"), "profile.version")
     procedure_type = _nonempty_string(
         profile_node.get("procedure_type"), "profile.procedure_type"
+    )
+    public_procedure_type = _optional_public_procedure_type(
+        profile_node.get("public_procedure_type"),
+        "profile.public_procedure_type",
     )
 
     calibration = _mapping(payload.get("calibration"), "calibration")
@@ -388,6 +407,7 @@ def _load_mapping(payload: dict[str, Any]) -> LoadedProfile:
             name=name,
             version=version,
             procedure_type=procedure_type,
+            public_procedure_type=public_procedure_type,
             calibration_revision=revision,
             expected_checksum=expected_checksum,
             computed_checksum=computed_checksum,
@@ -406,8 +426,11 @@ def _load_mapping(payload: dict[str, Any]) -> LoadedProfile:
             "approved profile requires calibration.expected_checksum",
             field="calibration.expected_checksum",
         )
+    if public_procedure_type is None:
+        raise _missing_calibration("profile.public_procedure_type")
 
     robot = _parse_robot(payload.get("robot"))
+    sensor = _parse_sensor(payload.get("sensor"))
     data_directory = _parse_data(payload.get("data"))
     control = _parse_control(payload.get("control"))
     side_mappings = _parse_side_mappings(payload.get("side_mapping"))
@@ -419,10 +442,12 @@ def _load_mapping(payload: dict[str, Any]) -> LoadedProfile:
         name=name,
         version=version,
         procedure_type=procedure_type,
+        public_procedure_type=public_procedure_type,
         calibration_revision=revision,
         expected_checksum=expected_checksum,
         computed_checksum=computed_checksum,
         robot=robot,
+        sensor=sensor,
         data_directory=data_directory,
         control=control,
         side_mappings=MappingProxyType(side_mappings),
@@ -437,6 +462,10 @@ def _validate_optional_section_shapes(payload: Mapping[str, Any]) -> None:
 
     specs: tuple[tuple[str, set[str]], ...] = (
         ("robot", {"controller_ip", "sdk_version", "timeout_sec"}),
+        (
+            "sensor",
+            {"transport", "channel", "bitrate", "sample_rate_hz", "zeroing_policy"},
+        ),
         ("data", {"directory"}),
         (
             "control",
@@ -445,6 +474,7 @@ def _validate_optional_section_shapes(payload: Mapping[str, Any]) -> None:
                 "custom_gain",
                 "force_threshold",
                 "force_freshness_timeout_sec",
+                "impedance",
                 "stop_policy",
             },
         ),
@@ -469,6 +499,15 @@ def _validate_optional_section_shapes(payload: Mapping[str, Any]) -> None:
                 {"direct_teach", "normal"},
                 set(),
                 "control.friction_compensation",
+            )
+        impedance = control.get("impedance")
+        if impedance is not None:
+            node = _mapping(impedance, "control.impedance")
+            _check_keys(
+                node,
+                {"target_force_n", "tolerance_n"},
+                set(),
+                "control.impedance",
             )
 
     side_mapping = payload.get("side_mapping")
@@ -540,6 +579,16 @@ def _validate_present_draft_values(payload: Mapping[str, Any]) -> None:
         if robot.get("timeout_sec") is not None:
             _positive_float(robot.get("timeout_sec"), "robot.timeout_sec")
 
+    sensor = payload.get("sensor")
+    if isinstance(sensor, Mapping):
+        for field_name in ("transport", "channel", "zeroing_policy"):
+            if sensor.get(field_name) is not None:
+                _nonempty_string(sensor.get(field_name), f"sensor.{field_name}")
+        if sensor.get("bitrate") is not None:
+            _positive_int(sensor.get("bitrate"), "sensor.bitrate")
+        if sensor.get("sample_rate_hz") is not None:
+            _positive_float(sensor.get("sample_rate_hz"), "sensor.sample_rate_hz")
+
     control = payload.get("control")
     if isinstance(control, Mapping):
         friction = control.get("friction_compensation")
@@ -567,6 +616,18 @@ def _validate_present_draft_values(payload: Mapping[str, Any]) -> None:
             )
         if control.get("stop_policy") is not None:
             _stop_policy(control.get("stop_policy"), "control.stop_policy")
+        impedance = control.get("impedance")
+        if isinstance(impedance, Mapping):
+            if impedance.get("target_force_n") is not None:
+                _finite_float(
+                    impedance.get("target_force_n"),
+                    "control.impedance.target_force_n",
+                )
+            if impedance.get("tolerance_n") is not None:
+                _nonnegative_float(
+                    impedance.get("tolerance_n"),
+                    "control.impedance.tolerance_n",
+                )
 
     side_mapping = payload.get("side_mapping")
     if isinstance(side_mapping, Mapping):
@@ -653,6 +714,29 @@ def _parse_robot(value: object) -> RobotSettings:
     )
 
 
+def _parse_sensor(value: object) -> SensorSettings:
+    node = _required_mapping(value, "sensor")
+    fields = {
+        "transport",
+        "channel",
+        "bitrate",
+        "sample_rate_hz",
+        "zeroing_policy",
+    }
+    _check_keys(node, fields, fields, "sensor")
+    return SensorSettings(
+        transport=_nonempty_string(node.get("transport"), "sensor.transport"),
+        channel=_nonempty_string(node.get("channel"), "sensor.channel"),
+        bitrate=_positive_int(node.get("bitrate"), "sensor.bitrate"),
+        sample_rate_hz=_positive_float(
+            node.get("sample_rate_hz"), "sensor.sample_rate_hz"
+        ),
+        zeroing_policy=_nonempty_string(
+            node.get("zeroing_policy"), "sensor.zeroing_policy"
+        ),
+    )
+
+
 def _parse_data(value: object) -> Path:
     node = _required_mapping(value, "data")
     _check_keys(node, {"directory"}, {"directory"}, "data")
@@ -686,6 +770,7 @@ def _parse_control(value: object) -> ControlSettings:
             "custom_gain",
             "force_threshold",
             "force_freshness_timeout_sec",
+            "impedance",
             "stop_policy",
         },
         {
@@ -693,6 +778,7 @@ def _parse_control(value: object) -> ControlSettings:
             "custom_gain",
             "force_threshold",
             "force_freshness_timeout_sec",
+            "impedance",
             "stop_policy",
         },
         "control",
@@ -707,6 +793,13 @@ def _parse_control(value: object) -> ControlSettings:
         "control.friction_compensation",
     )
     custom_gain = _validated_gain(node.get("custom_gain"), "control.custom_gain")
+    impedance = _required_mapping(node.get("impedance"), "control.impedance")
+    _check_keys(
+        impedance,
+        {"target_force_n", "tolerance_n"},
+        {"target_force_n", "tolerance_n"},
+        "control.impedance",
+    )
     return ControlSettings(
         teach_friction=_finite_float(
             friction.get("direct_teach"),
@@ -722,6 +815,14 @@ def _parse_control(value: object) -> ControlSettings:
         force_freshness_timeout_sec=_positive_float(
             node.get("force_freshness_timeout_sec"),
             "control.force_freshness_timeout_sec",
+        ),
+        impedance_target_force_n=_finite_float(
+            impedance.get("target_force_n"),
+            "control.impedance.target_force_n",
+        ),
+        impedance_tolerance_n=_nonnegative_float(
+            impedance.get("tolerance_n"),
+            "control.impedance.tolerance_n",
         ),
         stop_policy=_stop_policy(node.get("stop_policy"), "control.stop_policy"),
     )
@@ -881,6 +982,7 @@ def _draft_readiness_issues(
         issues.append("calibration.expected_checksum is missing")
     sections = (
         "robot",
+        "sensor",
         "data",
         "control",
         "side_mapping",
@@ -911,6 +1013,18 @@ def _optional_checksum(value: object, path: str) -> str | None:
             field=path,
         )
     return "sha256:" + match.group(1).lower()
+
+
+def _optional_public_procedure_type(value: object, path: str) -> str | None:
+    if value is None or value == "":
+        return None
+    normalized = _nonempty_string(value, path)
+    if normalized not in {"thyroidectomy", "nephrectomy"}:
+        raise _schema_error(
+            "public_procedure_type must be thyroidectomy, nephrectomy, or null",
+            path,
+        )
+    return normalized
 
 
 def _validated_gain(value: object, path: str) -> object:
@@ -996,6 +1110,13 @@ def _nonnegative_int(value: object, path: str) -> int:
     return converted
 
 
+def _positive_int(value: object, path: str) -> int:
+    converted = _strict_int(value, path)
+    if converted <= 0:
+        raise _schema_error("value must be positive", path)
+    return converted
+
+
 def _finite_float(value: object, path: str) -> float:
     if isinstance(value, bool) or not isinstance(value, Real):
         raise _schema_error("value must be a real number", path)
@@ -1009,6 +1130,13 @@ def _positive_float(value: object, path: str) -> float:
     converted = _finite_float(value, path)
     if converted <= 0.0:
         raise _schema_error("value must be positive", path)
+    return converted
+
+
+def _nonnegative_float(value: object, path: str) -> float:
+    converted = _finite_float(value, path)
+    if converted < 0.0:
+        raise _schema_error("value must be non-negative", path)
     return converted
 
 
@@ -1101,6 +1229,7 @@ __all__ = [
     "LoadedProfile",
     "PROFILE_SCHEMA_VERSION",
     "RobotSettings",
+    "SensorSettings",
     "SideMapping",
     "ToolChangeWaypoint",
     "canonical_profile_payload",

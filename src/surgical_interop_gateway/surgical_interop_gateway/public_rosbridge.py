@@ -25,8 +25,10 @@ from surgical_interop_gateway.public_bridge_policy import (
     PUBLIC_MAX_CLIENTS,
     PUBLIC_MAX_INCOMING_BYTES,
     PUBLIC_MAX_INCOMING_QUEUE,
+    PUBLIC_MAX_OUTGOING_BINARY_MESSAGES,
     PUBLIC_MAX_OUTGOING_MESSAGE_BYTES,
     PUBLIC_MAX_OUTGOING_QUEUE,
+    PUBLIC_MAX_OUTGOING_STATE_MESSAGE_BYTES,
     PUBLIC_MAX_SUBSCRIPTION_IDS_PER_TOPIC,
     PUBLIC_LOOPBACK_ADDRESS,
     origin_is_allowed,
@@ -40,6 +42,49 @@ from surgical_interop_gateway.public_bridge_policy import (
 
 def _wire_size(message: str | bytes) -> int:
     return len(message) if isinstance(message, bytes) else len(message.encode("utf-8"))
+
+
+def _enqueue_public_outgoing(
+    queue: deque[tuple[str | bytes, bool]],
+    item: tuple[str | bytes, bool],
+) -> bool:
+    """Enqueue one frame without letting latest-only binary data evict state.
+
+    The public gateway publishes its state topics together once per tick. A
+    tiny drop-oldest deque therefore lost valid state even for a fast local
+    browser. Text state frames now have enough room for one complete burst,
+    while binary payloads are coalesced to the newest pending frame. If a slow
+    client fills the entire queue with state, a new binary frame is discarded
+    instead of displacing safety-relevant state.
+    """
+
+    message, binary = item
+    if binary:
+        binary_indexes = [
+            index
+            for index, (_queued_message, queued_binary) in enumerate(queue)
+            if queued_binary
+        ]
+        for index in reversed(binary_indexes[PUBLIC_MAX_OUTGOING_BINARY_MESSAGES - 1 :]):
+            del queue[index]
+        if len(queue) >= PUBLIC_MAX_OUTGOING_QUEUE:
+            return False
+    elif len(queue) >= PUBLIC_MAX_OUTGOING_QUEUE:
+        binary_index = next(
+            (
+                index
+                for index, (_queued_message, queued_binary) in enumerate(queue)
+                if queued_binary
+            ),
+            None,
+        )
+        if binary_index is not None:
+            del queue[binary_index]
+        if len(queue) >= PUBLIC_MAX_OUTGOING_QUEUE:
+            queue.popleft()
+
+    queue.append((message, binary))
+    return True
 
 
 def _bound_public_tornado_settings(settings: dict[str, Any]) -> None:
@@ -226,7 +271,7 @@ def main() -> None:
                 self.close(code=1013, reason="public bridge client limit reached")
                 return
             self._public_outgoing_lock = threading.Lock()
-            self._public_outgoing = deque(maxlen=PUBLIC_MAX_OUTGOING_QUEUE)
+            self._public_outgoing = deque()
             self._public_drain_scheduled = False
             self._public_admitted = True
             super().open(*args, **kwargs)
@@ -271,16 +316,26 @@ def main() -> None:
         def send_message(self, message: bytes | str, compression: str = "none") -> None:
             if not self._public_admitted:
                 return
-            if _wire_size(message) > PUBLIC_MAX_OUTGOING_MESSAGE_BYTES:
+            binary = compression in {"cbor", "cbor-raw"}
+            message_limit = (
+                PUBLIC_MAX_OUTGOING_MESSAGE_BYTES
+                if binary
+                else PUBLIC_MAX_OUTGOING_STATE_MESSAGE_BYTES
+            )
+            if _wire_size(message) > message_limit:
                 self.__class__.node_handle.get_logger().warning(
                     "Dropped oversized public rosbridge message",
                     throttle_duration_sec=5.0,
                 )
                 return
-            binary = compression in {"cbor", "cbor-raw"}
             schedule = False
             with self._public_outgoing_lock:
-                self._public_outgoing.append((message, binary))
+                enqueued = _enqueue_public_outgoing(
+                    self._public_outgoing,
+                    (message, binary),
+                )
+                if not enqueued:
+                    return
                 if not self._public_drain_scheduled:
                     self._public_drain_scheduled = True
                     schedule = True

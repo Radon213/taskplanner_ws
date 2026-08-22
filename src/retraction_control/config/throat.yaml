@@ -1,10 +1,11 @@
 # Non-executable partner-calibration draft.  Null values are intentional and
 # must be replaced by an accepted-upstream review before approval.
-schema_version: 1
+schema_version: 2
 profile:
   name: throat
   version: upstream-unapproved-2026-08-20
-  procedure_type: thyroidectomy
+  procedure_type: throat
+  public_procedure_type: thyroidectomy
 calibration:
   approved: false
   revision: null
@@ -13,6 +14,12 @@ robot:
   controller_ip: 192.168.1.137
   sdk_version: 3.5.0.7
   timeout_sec: null
+sensor:
+  transport: null
+  channel: null
+  bitrate: null
+  sample_rate_hz: null
+  zeroing_policy: null
 data:
   directory: null
 control:
@@ -22,6 +29,9 @@ control:
   custom_gain: null
   force_threshold: null
   force_freshness_timeout_sec: null
+  impedance:
+    target_force_n: null
+    tolerance_n: null
   stop_policy: null
 side_mapping:
   LEFT: null

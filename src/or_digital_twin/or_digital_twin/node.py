@@ -14,6 +14,7 @@ from procedure_spec import (
     discover_prompt_bundle_dirs,
     get_default_spec_dir,
     load_bundle,
+    load_voice_command_catalog,
 )
 import rclpy
 from rcl_interfaces.msg import SetParametersResult
@@ -43,6 +44,7 @@ from surgical_msgs.msg import (
     SurgeonRequest,
     ToolObservation,
     TwinEvent,
+    VoiceCommandIntent,
     VLMInferenceProposal,
     VLMHealth,
     VLMRequestContext,
@@ -105,6 +107,14 @@ class ORDigitalTwinNode(Node):
         self.declare_parameter("vlm_implicit_request_release_sec", 1.5)
         self.declare_parameter("accept_validation_actor_events", False)
         self.declare_parameter("accept_non_override_structured_requests", False)
+        self.declare_parameter(
+            "enable_legacy_raw_tool_handover_compatibility",
+            False,
+        )
+        self.declare_parameter(
+            "enable_legacy_raw_procedure_completion_compatibility",
+            False,
+        )
         self.declare_parameter("evaluation_observation_topic", "")
         self.declare_parameter(
             "allow_shadow_request_capacity_reconciliation",
@@ -150,6 +160,19 @@ class ORDigitalTwinNode(Node):
         self._accept_non_override_structured_requests = bool(
             self.get_parameter("accept_non_override_structured_requests").value
         )
+        # Raw text remains available for observation only.  It cannot become
+        # an action input without one of these explicit migration-only
+        # switches; normal execution starts at /surgery/voice/intent.
+        self._enable_legacy_raw_tool_handover_compatibility = bool(
+            self.get_parameter(
+                "enable_legacy_raw_tool_handover_compatibility"
+            ).value
+        )
+        self._enable_legacy_raw_procedure_completion_compatibility = bool(
+            self.get_parameter(
+                "enable_legacy_raw_procedure_completion_compatibility"
+            ).value
+        )
         self._bed_robot_status_timeout_sec = max(
             0.1,
             float(self.get_parameter("bed_robot_status_timeout_sec").value),
@@ -182,6 +205,9 @@ class ORDigitalTwinNode(Node):
                 self.get_parameter("allow_open_set_phase_bootstrap").value
             ),
         )
+        # Voice tool IDs are procedure-local.  This uses the same shared
+        # catalog helper as the resolver, not a global T-ID alias table.
+        self._voice_command_catalog = load_voice_command_catalog(self._spec_dir)
         self._stamp_all_bed_robot_arm_groups()
         self._prior_scorer = ProcedurePriorScorer(self._twin.spec, compact_procedure_prompt(self._spec_dir))
         self._bundle_metadata_cache = self._build_bundle_metadata()
@@ -320,6 +346,12 @@ class ORDigitalTwinNode(Node):
             self._on_bed_robot_arm_controller_status,
             20,
         )
+        self.create_subscription(
+            VoiceCommandIntent,
+            "/surgery/voice/intent",
+            self._on_voice_command_intent,
+            20,
+        )
         self.create_subscription(String, "/surgery/audio/request_text", self._on_request, 20)
         self.create_subscription(SurgeonRequest, "/surgeon/request", self._on_surgeon_request, 20)
         self.create_subscription(FilteredPhase, "/phase/filtered", self._on_phase, 20)
@@ -335,8 +367,14 @@ class ORDigitalTwinNode(Node):
         for parameter in params:
             if parameter.name == "spec_dir":
                 try:
-                    self._spec_dir = str(parameter.value)
-                    self._twin.reset_spec(load_bundle(self._spec_dir))
+                    next_spec_dir = str(parameter.value)
+                    next_spec = load_bundle(next_spec_dir)
+                    next_voice_catalog = load_voice_command_catalog(
+                        next_spec_dir
+                    )
+                    self._spec_dir = next_spec_dir
+                    self._twin.reset_spec(next_spec)
+                    self._voice_command_catalog = next_voice_catalog
                     self._stamp_all_bed_robot_arm_groups()
                     self._prior_scorer = ProcedurePriorScorer(self._twin.spec, compact_procedure_prompt(self._spec_dir))
                     self._bundle_metadata_cache = self._build_bundle_metadata()
@@ -403,6 +441,14 @@ class ORDigitalTwinNode(Node):
                 self._accept_validation_actor_events = bool(parameter.value)
             elif parameter.name == "accept_non_override_structured_requests":
                 self._accept_non_override_structured_requests = bool(parameter.value)
+            elif parameter.name == "enable_legacy_raw_tool_handover_compatibility":
+                self._enable_legacy_raw_tool_handover_compatibility = bool(
+                    parameter.value
+                )
+            elif parameter.name == "enable_legacy_raw_procedure_completion_compatibility":
+                self._enable_legacy_raw_procedure_completion_compatibility = bool(
+                    parameter.value
+                )
             elif parameter.name == "bed_robot_status_timeout_sec":
                 self._bed_robot_status_timeout_sec = max(
                     0.1, float(parameter.value)
@@ -3046,12 +3092,120 @@ class ORDigitalTwinNode(Node):
         )
         self._publish_world_state()
 
+    def _on_voice_command_intent(self, msg: VoiceCommandIntent) -> None:
+        """Admit only executable, already-grounded tool handover proposals.
+
+        Natural language, ASR repair, and ambiguity handling belong upstream in
+        the voice resolver.  The digital twin receives a closed semantic frame
+        and must never use raw or normalized transcript text to fill a tool
+        slot.  A proposal that needs confirmation, clarification, or repair is
+        observable here but cannot queue a handover.
+        """
+
+        intent = str(getattr(msg, "intent", "") or "").strip().lower()
+        disposition = str(
+            getattr(msg, "disposition", "") or ""
+        ).strip().lower()
+        requires_confirmation = bool(
+            getattr(msg, "requires_confirmation", False)
+        )
+        tool_id = str(getattr(msg, "tool_id", "") or "").strip()
+        raw_text = str(getattr(msg, "raw_text", "") or "")
+        normalized_text = str(getattr(msg, "normalized_text", "") or "")
+        procedure_id = str(getattr(msg, "procedure_id", "") or "").strip()
+        catalog_id = str(getattr(msg, "catalog_id", "") or "").strip()
+        urgency = str(getattr(msg, "urgency", "") or "").strip().lower()
+        provenance = str(getattr(msg, "provenance", "") or "")
+        resolver_reason = str(getattr(msg, "reason", "") or "")
+        active_procedure_id = str(self._twin.spec.procedure_id or "").strip()
+        active_catalog = getattr(self, "_voice_command_catalog", None)
+        active_catalog_id = str(
+            getattr(active_catalog, "catalog_id", "") or ""
+        ).strip()
+        catalog_matches_active_spec = bool(
+            active_catalog_id
+            and str(getattr(active_catalog, "procedure_id", "") or "").strip()
+            == active_procedure_id
+        )
+
+        resolved = ""
+        rejection_reason = ""
+        if intent != "tool_handover":
+            rejection_reason = "intent_not_owned_by_digital_twin_handover_consumer"
+        elif requires_confirmation:
+            rejection_reason = "voice_intent_requires_confirmation"
+        elif disposition != "propose":
+            rejection_reason = f"non_executable_voice_intent_disposition:{disposition or 'missing'}"
+        elif not tool_id:
+            rejection_reason = "missing_canonical_tool_id"
+        elif not catalog_matches_active_spec:
+            rejection_reason = "active_voice_catalog_binding_unavailable"
+        elif procedure_id != active_procedure_id:
+            rejection_reason = "voice_intent_procedure_id_mismatch"
+        elif catalog_id != active_catalog_id:
+            rejection_reason = "voice_intent_catalog_id_mismatch"
+        elif urgency not in {"routine", "urgent"}:
+            rejection_reason = "voice_intent_urgency_is_not_recognized"
+        else:
+            # update_resolved_voice_tool_handover accepts canonical catalogue
+            # IDs only and deliberately receives no transcript text.
+            resolved = self._twin.update_resolved_voice_tool_handover(tool_id)
+            if not resolved:
+                rejection_reason = "unknown_or_unavailable_canonical_tool_id"
+
+        accepted = bool(resolved)
+        if accepted:
+            self._append_tool_history(
+                "_validated_tool_request_history",
+                resolved,
+                self._stamp(),
+            )
+            self._clear_tool_prediction_state()
+
+        self._publish_event(
+            "VoiceCommandIntentObserved",
+            instrument_id=resolved or tool_id,
+            detail={
+                "intent": intent,
+                "disposition": disposition,
+                "requires_confirmation": requires_confirmation,
+                "tool_id": tool_id,
+                "procedure_id": procedure_id,
+                "catalog_id": catalog_id,
+                "resolved_tool": resolved,
+                "accepted": accepted,
+                # Urgency is audit-only.  The handover frame and downstream
+                # action/service receive no speed, force, or timing override.
+                "urgency": urgency,
+                "urgency_applied_to_execution": False,
+                "reason": rejection_reason or resolver_reason or "accepted",
+                "resolver_reason": resolver_reason,
+                # Never persist the transcript on TwinEvent.  The resolver
+                # owns transcript retention; ODT only records whether its
+                # already-grounded proposal carried text for audit triage.
+                "raw_text_present": bool(raw_text),
+                "normalized_text_present": bool(normalized_text),
+                "provenance": provenance,
+            },
+            mode="voice_command_intent",
+        )
+        if accepted:
+            self._publish_world_state()
+
     def _on_request(self, msg: String) -> None:
         resolved = ""
         shadow_assumptions: list[dict] = []
-        completion_requested = self._twin.is_explicit_procedure_completion_request(
-            msg.data
+        completion_requested = bool(
+            getattr(
+                self,
+                "_enable_legacy_raw_procedure_completion_compatibility",
+                False,
+            )
         )
+        if completion_requested:
+            completion_requested = self._twin.is_explicit_procedure_completion_request(
+                msg.data
+            )
         if completion_requested:
             request = SurgeonRequest()
             request.stamp = self._stamp()
@@ -3060,7 +3214,13 @@ class ORDigitalTwinNode(Node):
             request.note = "explicit public voice completion signal"
             self._twin.update_surgeon_request(request)
             self._clear_tool_prediction_state()
-        elif self._twin.is_explicit_voice_tool_request(msg.data):
+        elif bool(
+            getattr(
+                self,
+                "_enable_legacy_raw_tool_handover_compatibility",
+                False,
+            )
+        ) and self._twin.is_explicit_voice_tool_request(msg.data):
             resolved = self._twin.update_explicit_request(msg.data)
             shadow_assumptions = self._twin.drain_shadow_assumption_audit()
             if resolved:

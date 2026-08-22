@@ -95,6 +95,7 @@ def evaluate_readiness(
     perception_backend: str = "local",
     cv_contract_status: dict[str, Any] | None = None,
     cv_contract_age_sec: float = -1.0,
+    require_metric_3d: bool = False,
 ) -> dict[str, Any]:
     checks = {
         "contract_configuration": bool(contract_configuration_valid),
@@ -144,18 +145,51 @@ def evaluate_readiness(
         details["rfdetr_status"] = str(health.get("status", "missing"))
         details["cam4_aligned"] = bool(health.get("cam4_aligned"))
     elif require_perception and normalized_backend == "external":
+        health = rfdetr_health if isinstance(rfdetr_health, dict) else {}
         contract = (
             cv_contract_status if isinstance(cv_contract_status, dict) else {}
         )
-        # The current scaffold deliberately cannot authorize external evidence:
-        # custom IDL, timing, calibration and the adapter have not arrived.
-        # Retain this explicit condition so a future adapter must opt in by
-        # changing the monitor's contract rather than by a topic-name match.
-        perception_ready = (
-            contract.get("schema") == "taskplanner.cv_external_contract.v1"
-            and bool(contract.get("ready_for_external_evidence"))
-            and 0.0 <= float(cv_contract_age_sec) <= float(perception_max_age_sec)
-        )
+        # The PNU bridge deliberately reuses the existing Taskplanner health
+        # topic/schema.  Require its provider identity and semantic readiness,
+        # so a reachable worker or a successful Blood/Hand-only request cannot
+        # accidentally authorize planner-facing Tool evidence.  A valid empty
+        # Tool result remains ready: detection_count is intentionally not a
+        # gate.
+        is_pnu_health = health.get("provider") == "pnu_hand_blood"
+        if is_pnu_health:
+            metric_3d_ready = bool(health.get("metric_3d_ready"))
+            perception_ready = (
+                bool(health.get("connected"))
+                and str(health.get("status", "")).strip().lower() == "ready"
+                and bool(health.get("semantic_ready"))
+                and bool(health.get("cam4_aligned"))
+                and (not require_metric_3d or metric_3d_ready)
+                and 0.0 <= float(rfdetr_age_sec) <= float(perception_max_age_sec)
+            )
+            details["perception_evidence_source"] = "pnu_bridge_health"
+            details["rfdetr_status"] = str(health.get("status", "missing"))
+            details["semantic_ready"] = bool(health.get("semantic_ready"))
+            details["cam4_aligned"] = bool(health.get("cam4_aligned"))
+            details["metric_3d_required"] = bool(require_metric_3d)
+            details["metric_3d_ready"] = metric_3d_ready
+            details["metric_3d_reasons"] = list(
+                health.get("metric_3d_reasons", [])
+                if isinstance(health.get("metric_3d_reasons", []), list)
+                else []
+            )
+            details["empty_detection_result"] = bool(
+                health.get("empty_detection_result")
+            )
+        else:
+            # Retain the generic external-CV authorization path for a future
+            # custom-IDL adapter.  Topic-name presence alone never passes it.
+            perception_ready = (
+                contract.get("schema") == "taskplanner.cv_external_contract.v1"
+                and bool(contract.get("ready_for_external_evidence"))
+                and 0.0 <= float(cv_contract_age_sec)
+                <= float(perception_max_age_sec)
+            )
+            details["perception_evidence_source"] = "cv_contract_monitor"
         checks["perception_input"] = perception_ready
         details["cv_contract_state"] = str(
             contract.get("readiness_state", "missing")
@@ -196,6 +230,7 @@ class IntegrationPreflightNode(Node):
         )
         self.declare_parameter("require_sentence_publisher", True)
         self.declare_parameter("require_perception", False)
+        self.declare_parameter("require_metric_3d", False)
         self.declare_parameter("perception_max_age_sec", 3.0)
         self.declare_parameter("perception_backend", "local")
         self.declare_parameter(
@@ -227,6 +262,9 @@ class IntegrationPreflightNode(Node):
         )
         self._require_perception = bool(
             self.get_parameter("require_perception").value
+        )
+        self._require_metric_3d = bool(
+            self.get_parameter("require_metric_3d").value
         )
         self._perception_backend = str(
             self.get_parameter("perception_backend").value
@@ -474,6 +512,9 @@ class IntegrationPreflightNode(Node):
             perception_backend=self._perception_backend,
             cv_contract_status=self._latest_cv_contract_status,
             cv_contract_age_sec=cv_contract_age_sec,
+            require_metric_3d=bool(
+                getattr(self, "_require_metric_3d", False)
+            ),
         )
         snapshot["details"].update(
             {

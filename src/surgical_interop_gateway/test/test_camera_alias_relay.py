@@ -134,6 +134,7 @@ def test_camera_gate_requires_fresh_matching_active_procedure() -> None:
 
 def test_frame_callback_drops_late_frame_after_world_gate_expires() -> None:
     node = CameraAliasRelay.__new__(CameraAliasRelay)
+    node._publish_flir_while_idle = False
     node._world_running = True
     node._world_procedure_id = "thyroidectomy"
     node._expected_procedure_id = "thyroidectomy"
@@ -142,5 +143,24 @@ def test_frame_callback_drops_late_frame_after_world_gate_expires() -> None:
     node._monotonic = lambda: 5.0
     publisher = _FakePublisher(subscription_count=1)
 
-    assert node._publish_if_active(publisher, object()) is False
+    assert node._publish_if_available("flir", publisher, object()) is False
     assert publisher.messages == []
+
+
+def test_idle_preview_override_applies_only_to_flir() -> None:
+    node = CameraAliasRelay.__new__(CameraAliasRelay)
+    node._publish_flir_while_idle = True
+    node._world_running = False
+    node._world_procedure_id = "thyroidectomy"
+    node._expected_procedure_id = "thyroidectomy"
+    node._world_received_monotonic_sec = 9.0
+    node._world_stale_after_sec = 3.0
+    node._monotonic = lambda: 10.0
+    flir_publisher = _FakePublisher(subscription_count=1)
+    cam4_publisher = _FakePublisher(subscription_count=1)
+    flir_message = object()
+
+    assert node._publish_if_available("flir", flir_publisher, flir_message)
+    assert flir_publisher.messages == [flir_message]
+    assert not node._publish_if_available("cam4", cam4_publisher, object())
+    assert cam4_publisher.messages == []

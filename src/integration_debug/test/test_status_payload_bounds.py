@@ -10,9 +10,11 @@ from surgical_interop_msgs.srv import ExecuteRetractionCommand
 from integration_debug.node import (
     MAX_EVENT_SUMMARY_ITEMS,
     MAX_EVENT_SUMMARY_STRING_CHARS,
+    VIPLAB_STREAM_STATUS_SCHEMA,
     InputStats,
     IntegrationDebugNode,
     _bounded_event_summary,
+    _parse_viplab_stream_status,
 )
 
 
@@ -52,6 +54,65 @@ def test_non_speech_string_input_updates_monitor_only() -> None:
     assert stats.message_count == 1
     assert stats.last_sample.startswith('{"schema"')
     assert harness._last_sentence == "surgeon sentence remains authoritative"
+
+
+def _viplab_stream_status() -> dict[str, object]:
+    return {
+        "schema": VIPLAB_STREAM_STATUS_SCHEMA,
+        "stream_id": "cam_4",
+        "source_topic": "/synced/cam_4/color/image_raw/compressed",
+        "source_stamp": {"sec": 123, "nanosec": 456},
+        "frame_id": "cam_4_color_optical_frame",
+        "format": "rgb8; jpeg compressed bgr8",
+        "measured_hz": 14.95,
+        "payload_bytes": 166_500,
+        "published_count": 4_200,
+        "dropped_count": 2,
+        "qos": {
+            "reliability": "best_effort",
+            "durability": "volatile",
+            "depth": 1,
+        },
+    }
+
+
+def test_viplab_stream_status_parser_is_strict_and_bounded() -> None:
+    payload = _viplab_stream_status()
+    parsed = _parse_viplab_stream_status(json.dumps(payload))
+
+    assert parsed is not None
+    assert parsed["measured_hz"] == 14.95
+    assert parsed["payload_bytes"] == 166_500
+
+    payload["unexpected"] = True
+    assert _parse_viplab_stream_status(json.dumps(payload)) is None
+    assert _parse_viplab_stream_status("not-json") is None
+
+
+def test_viplab_stream_status_drives_reported_camera_rate_without_image_reader() -> None:
+    class Harness:
+        pass
+
+    harness = Harness()
+    harness._lock = threading.RLock()
+    topic = "/synced/cam_4/status"
+    harness._input_stats = {topic: InputStats()}
+    harness._asr_topic = "/sensors/surgeon/sentence"
+    harness._last_sentence = "unchanged"
+
+    IntegrationDebugNode._on_string_input(
+        harness,
+        topic,
+        String(data=json.dumps(_viplab_stream_status(), separators=(",", ":"))),
+    )
+
+    stats = harness._input_stats[topic]
+    assert stats.message_count == 1
+    assert stats.reported_rate_hz == 14.95
+    assert stats.reported_payload_bytes == 166_500
+    assert stats.reported_source_topic.endswith("/image_raw/compressed")
+    assert stats.reported_qos == "best_effort/volatile/keep_last(1)"
+    assert harness._last_sentence == "unchanged"
 
 
 def test_retraction_service_request_uses_the_single_public_contract() -> None:
@@ -154,7 +215,7 @@ def test_manual_session_transitions_publish_status_without_waiting_for_timer() -
         def _execute_command(self, operation, _payload):
             return True, "", f"{operation} accepted"
 
-    for operation in ("arm", "disarm", "reset_fault"):
+    for operation in ("arm", "disarm", "reset_fault", "force_retraction_idle"):
         events: list[str] = []
         harness = Harness()
         harness._record = lambda *_args: events.append("recorded")

@@ -26,6 +26,7 @@ setup(
             "snapshot_bridge = vlm_node.snapshot_bridge:main",
             "rfdetr_perception_bridge = vlm_node.rfdetr_bridge:main",
             "rfdetr_perception_service = vlm_node.rfdetr_service:main",
+            "pnu_perception_bridge = vlm_node.pnu_perception_bridge:main",
         ],
     },
 )

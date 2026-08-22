@@ -647,7 +647,12 @@ class RuntimeController:
                 environment["TASKPLANNER_RUNTIME_EXPECTED_ACTIVE_MODE"] = (
                     active_mode or ""
                 )
-                command = [str(self._launcher), "up", mode, "--no-build"]
+                # The dashboard owns reviewed mode transitions. Ask the
+                # launcher to validate its mode-specific install contract and
+                # rebuild only when artifacts are stale; a blind --no-build
+                # otherwise starts containers with obsolete ROS entry points
+                # and fails later as an opaque rosbridge timeout.
+                command = [str(self._launcher), "up", mode, "--ensure-build"]
                 # Standalone Debug normally refuses to replace an operational
                 # runtime from an arbitrary terminal.  This service is reached
                 # only through the reviewed dashboard transition flow, so the
@@ -856,12 +861,19 @@ class RuntimeControlRequestHandler(BaseHTTPRequestHandler):
         if extra:
             payload = {**payload, **extra}
         encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Content-Length", str(len(encoded)))
-        self.end_headers()
-        self.wfile.write(encoded)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+        except ConnectionError:
+            # The transition continues under host authority even if a browser
+            # times out or navigates away before receiving the HTTP snapshot.
+            # Avoid a misleading server traceback; the client reconciles with
+            # the read-only status endpoint after reconnecting.
+            return
 
 
 class RuntimeControlHttpServer(ThreadingHTTPServer):

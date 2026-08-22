@@ -1,0 +1,127 @@
+{
+  "fixture_schema": "taskplanner.ui_contract_fixture.v1",
+  "synthetic": true,
+  "usage": "Editable SurgiMate dummy replay. UI layout and filtering only; not a clinical record or robot authorization.",
+  "baseline": {
+    "schema_version": "1.1.0",
+    "interface_version": "0.3.0",
+    "procedure_type": "thyroidectomy_demo",
+    "catalog_version": "synthetic-catalog-v1"
+  },
+  "/surgery/gateway_info": {
+    "revision": 1001,
+    "gateway_instance_id": "surgimate-dummy-gateway",
+    "procedure_run_id": "surgimate-dummy-run-001",
+    "schema_version": "1.1.0",
+    "interface_version": "0.3.0",
+    "procedure_type": "thyroidectomy_demo",
+    "procedure_active": true,
+    "catalog_version": "synthetic-catalog-v1"
+  },
+  "/surgery/catalog": {
+    "revision": 1001,
+    "gateway_instance_id": "surgimate-dummy-gateway",
+    "procedure_run_id": "surgimate-dummy-run-001",
+    "schema_version": "1.1.0",
+    "procedure_type": "thyroidectomy_demo",
+    "procedure_active": true,
+    "catalog_version": "synthetic-catalog-v1",
+    "procedure_display_name": "Open Thyroidectomy Demonstration",
+    "phases": [
+      { "ordinal": 1, "phase_id": "P01", "display_name": "Patient positioning and operative-field preparation", "display_name_ko": "환자 체위 및 수술부위 준비", "phase_kind": "normal" },
+      { "ordinal": 2, "phase_id": "P02", "display_name": "Skin incision and flap elevation", "display_name_ko": "피부 절개 및 피판 거상", "phase_kind": "normal" },
+      { "ordinal": 3, "phase_id": "P03", "display_name": "Central-field dissection before fixed retraction", "display_name_ko": "고정 견인 전 중앙 수술야 박리", "phase_kind": "normal" },
+      { "ordinal": 4, "phase_id": "P04", "display_name": "Fixed retraction and exposure establishment", "display_name_ko": "고정 견인 배치 및 노출 확립", "phase_kind": "normal" },
+      { "ordinal": 5, "phase_id": "P05", "display_name": "Retraction-supported target manipulation", "display_name_ko": "견인 유지 하 표적 조직 조작", "phase_kind": "normal" },
+      { "ordinal": 6, "phase_id": "P06", "display_name": "Focal target control and treatment", "display_name_ko": "국소 표적 제어 및 처치", "phase_kind": "normal" },
+      { "ordinal": 7, "phase_id": "P07", "display_name": "Thyroid resection and specimen extraction", "display_name_ko": "갑상선 절제 및 검체 적출", "phase_kind": "normal" },
+      { "ordinal": 8, "phase_id": "P08", "display_name": "Final hemostasis and operative-field inspection", "display_name_ko": "최종 지혈 및 수술야 확인", "phase_kind": "normal" },
+      { "ordinal": 9, "phase_id": "P09", "display_name": "Wound closure", "display_name_ko": "창상 봉합", "phase_kind": "normal" },
+      { "ordinal": 10, "phase_id": "P10", "display_name": "Procedure completion and instrument clearance", "display_name_ko": "수술 종료 및 기구 정리", "phase_kind": "normal" }
+    ],
+    "instruments": [
+      { "instrument_id": "T01", "display_name": "#15 Scalpel", "display_name_ko": "15번 메스" },
+      { "instrument_id": "T02", "display_name": "Adson Forceps", "display_name_ko": "애드슨 포셉" },
+      { "instrument_id": "T03", "display_name": "Allis clamp forceps", "display_name_ko": "알리스 클램프 포셉" },
+      { "instrument_id": "T04", "display_name": "Bovie surgical cautery", "display_name_ko": "보비 전기소작기" },
+      { "instrument_id": "T05", "display_name": "Army navy retractor", "display_name_ko": "아미-네이비 리트랙터" },
+      { "instrument_id": "T07", "display_name": "Bipolar cautery", "display_name_ko": "바이폴라 전기소작기" },
+      { "instrument_id": "T08", "display_name": "Mosquito forceps", "display_name_ko": "모스키토 포셉" },
+      { "instrument_id": "T11", "display_name": "Thyroid retractor (Middeldorpf)", "display_name_ko": "갑상선 리트랙터(미들돌프)" }
+    ]
+  },
+  "/surgery/context": {
+    "revision": 1001,
+    "procedure_type": "thyroidectomy_demo",
+    "procedure_active": true,
+    "current_phase": "P05",
+    "phase_confidence": 0.84,
+    "phase_uncertain": false,
+    "execution_state": "running",
+    "evidence_status": "DUMMY_ACCEPTED",
+    "safety_flags": []
+  },
+  "/surgery/instruments": {
+    "revision": 1001,
+    "instruments": [
+      { "instrument_id": "T03", "instance_id": "T03#dummy-1", "location_type": "surgeon", "location_id": "surgeon", "holder_role": "surgeon", "state": "in_use", "visible": false, "confidence": 0.96, "evidence_status": "DUMMY_ACCEPTED" },
+      { "instrument_id": "T04", "instance_id": "T04#dummy-1", "location_type": "mayo_stand", "location_id": "mayo_stand", "holder_role": "none", "state": "parked_for_reuse", "visible": false, "confidence": 0.91, "evidence_status": "DUMMY_ACCEPTED" },
+      { "instrument_id": "T07", "instance_id": "T07#dummy-1", "location_type": "mayo_stand", "location_id": "mayo_stand", "holder_role": "none", "state": "awaiting_retrieval", "visible": false, "confidence": 0.88, "evidence_status": "DUMMY_ACCEPTED" }
+    ]
+  },
+  "/surgery/robots": {
+    "revision": 1001,
+    "robots": [
+      { "robot_id": "bed_arm_1", "robot_type": "bed_retraction_arm", "execution_state": "idle" },
+      { "robot_id": "bed_arm_2", "robot_type": "bed_retraction_arm", "execution_state": "idle" }
+    ]
+  },
+  "/surgery/robot_end_effectors": {
+    "revision": 1001,
+    "gateway_instance_id": "surgimate-dummy-gateway",
+    "procedure_run_id": "surgimate-dummy-run-001",
+    "schema_version": "1.1.0",
+    "procedure_type": "thyroidectomy_demo",
+    "procedure_active": true,
+    "catalog_version": "synthetic-catalog-v1",
+    "end_effectors": [
+      { "robot_id": "humanoid", "end_effector_id": "left_hand", "state": "holding", "instrument_id": "T02", "instance_id": "T02#dummy-1", "confidence": 0.95, "evidence_status": "DUMMY_ACCEPTED" },
+      { "robot_id": "humanoid", "end_effector_id": "right_hand", "state": "holding", "instrument_id": "T01", "instance_id": "T01#dummy-1", "confidence": 1.0, "evidence_status": "DUMMY_ACCEPTED" }
+    ]
+  },
+  "/surgery/tool_predictions": {
+    "revision": 1001,
+    "gateway_instance_id": "surgimate-dummy-gateway",
+    "procedure_run_id": "surgimate-dummy-run-001",
+    "schema_version": "1.1.0",
+    "procedure_type": "thyroidectomy_demo",
+    "procedure_active": true,
+    "catalog_version": "synthetic-catalog-v1",
+    "predictions": [
+      { "rank": 1, "instrument_id": "T02", "instance_id": "", "confidence": 0.86, "stability_sec": 2.4, "source": "dummy", "evidence_status": "DUMMY_ACCEPTED" },
+      { "rank": 2, "instrument_id": "T04", "instance_id": "", "confidence": 0.72, "stability_sec": 0.0, "source": "dummy", "evidence_status": "DUMMY_ACCEPTED" },
+      { "rank": 3, "instrument_id": "T07", "instance_id": "", "confidence": 0.58, "stability_sec": 0.0, "source": "dummy", "evidence_status": "DUMMY_ACCEPTED" }
+    ]
+  },
+  "/surgery/speech": {
+    "revision": 1001,
+    "gateway_instance_id": "surgimate-dummy-gateway",
+    "procedure_run_id": "surgimate-dummy-run-001",
+    "schema_version": "1.1.0",
+    "procedure_type": "thyroidectomy_demo",
+    "procedure_active": true,
+    "catalog_version": "synthetic-catalog-v1",
+    "state": "listening",
+    "available": true,
+    "connected": true,
+    "text": "Forceps"
+  },
+  "/surgery/health": {
+    "revision": 1001,
+    "healthy": true,
+    "state": "healthy",
+    "unavailable_sources": [],
+    "stale_sources": [],
+    "error_codes": []
+  }
+}

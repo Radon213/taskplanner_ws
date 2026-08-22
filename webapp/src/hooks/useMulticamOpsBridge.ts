@@ -8,35 +8,35 @@ export const MULTICAM_CAMERAS = [
     id: "cam_1",
     label: "CAM 1",
     serial: "339522301105",
-    colorTopic: "/synced/cam_1/color/image_raw/compressed",
-    depthTopic: "/synced/cam_1/depth/image_rect_raw/compressedDepth",
+    colorTopic: "/preview/cam_1/color/image_raw/compressed",
+    depthTopic: null,
   },
   {
     id: "cam_2",
     label: "CAM 2",
     serial: "338522301897",
-    colorTopic: "/synced/cam_2/color/image_raw/compressed",
-    depthTopic: "/synced/cam_2/depth/image_rect_raw/compressedDepth",
+    colorTopic: "/preview/cam_2/color/image_raw/compressed",
+    depthTopic: null,
   },
   {
     id: "cam_3",
     label: "CAM 3",
     serial: "146222253041",
-    colorTopic: "/synced/cam_3/color/image_raw/compressed",
-    depthTopic: "/synced/cam_3/depth/image_rect_raw/compressedDepth",
+    colorTopic: "/preview/cam_3/color/image_raw/compressed",
+    depthTopic: "/preview/cam_3/depth/image_rect_raw/compressedDepth",
   },
   {
     id: "cam_4",
     label: "CAM 4",
     serial: "146222251000",
-    colorTopic: "/synced/cam_4/color/image_raw/compressed",
-    depthTopic: "/synced/cam_4/depth/image_rect_raw/compressedDepth",
+    colorTopic: "/preview/cam_4/color/image_raw/compressed",
+    depthTopic: "/preview/cam_4/depth/image_rect_raw/compressedDepth",
   },
   {
     id: "flir",
     label: "FLIR",
     serial: "25054909",
-    colorTopic: "/synced/flir/color/image_raw/compressed",
+    colorTopic: "/preview/flir/color/image_raw/compressed",
     depthTopic: null,
   },
 ] as const;
@@ -142,20 +142,38 @@ export type WorldActionResult = {
 };
 
 const IMAGE_QUEUE_LENGTH = 1;
+const MAX_MULTICAM_IMAGE_BYTES = 12 * 1024 * 1024;
+const MAX_CAPTURE_STATUS_ITEMS = 64;
+const MAX_CAPTURE_STATUS_STRING_CHARS = 4_096;
+const MAX_WORLD_STATUS_JSON_CHARS = 256 * 1024;
+const MAX_WORLD_STATUS_TAGS = 64;
+const MAX_WORLD_STATUS_RAW_CHARS = 64 * 1024;
+const MAX_STATIC_TF_TRANSFORMS = 512;
+const MAX_OBSERVER_TOPICS = 512;
+const MAX_OBSERVER_TOPIC_NAME_CHARS = 512;
+const MAX_OBSERVER_TOPIC_TYPE_CHARS = 256;
+const MAX_OBSERVER_PAYLOAD_COLLECTION_ITEMS = 512;
+const MAX_OBSERVER_PAYLOAD_OBJECT_KEYS = 512;
+const MAX_OBSERVER_PAYLOAD_STRING_CHARS = 64 * 1024;
+const MAX_OBSERVER_PAYLOAD_DEPTH = 8;
 // `/tf_static` is sent as a retained snapshot by each publisher when a browser
 // subscribes. Keep enough bridge-side messages to merge the snapshots from the
 // world-anchor and multicam publishers instead of retaining only the last one.
 const STATIC_TF_QUEUE_LENGTH = 32;
-// The multicam synchronizer is the rate authority (currently 15 Hz). Do not
-// add a browser-side ROSBridge throttle: render each /synced message received.
+// VIPLab's `/preview/*` writers are the 5 Hz rate authority. Do not add a
+// second browser-side throttle: queue_length=1 pass-through always favors the
+// latest preview frame without requesting raw `/synced/*` traffic.
 const IMAGE_THROTTLE_MS = 0;
-const CAPTURE_STATUS_MAX_AGE_MS = 3_500;
+// The observer readiness gate and the operator-facing CaptureStatus cards must
+// agree on one freshness boundary. Export it so a stale card cannot briefly
+// contradict the header's `connected` state during the grace window.
+export const CAPTURE_STATUS_MAX_AGE_MS = 3_500;
 const TOPIC_DISCOVERY_TIMEOUT_MS = 4_000;
 const OBSERVER_TOPICS_SERVICE = "/multicam_observer/rosapi/topics";
 const IMAGE_QOS = {
   history: "keep_last",
   depth: 1,
-  reliability: "reliable",
+  reliability: "best_effort",
   durability: "volatile",
 } as const;
 const TF_STATIC_QOS = {
@@ -166,6 +184,22 @@ const TF_STATIC_QOS = {
   reliability: "reliable",
   durability: "transient_local",
 } as const;
+
+function isBoundedObserverPayload(value: unknown, depth = 0): boolean {
+  if (depth > MAX_OBSERVER_PAYLOAD_DEPTH) return false;
+  if (typeof value === "string") return value.length <= MAX_OBSERVER_PAYLOAD_STRING_CHARS;
+  if (Array.isArray(value)) {
+    return value.length <= MAX_OBSERVER_PAYLOAD_COLLECTION_ITEMS
+      && value.every((item) => isBoundedObserverPayload(item, depth + 1));
+  }
+  if (value && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>);
+    return entries.length <= MAX_OBSERVER_PAYLOAD_OBJECT_KEYS
+      && entries.every(([key, item]) => key.length <= MAX_OBSERVER_PAYLOAD_STRING_CHARS
+        && isBoundedObserverPayload(item, depth + 1));
+  }
+  return true;
+}
 
 type ObserverServiceResponseMessage = {
   result?: boolean;
@@ -191,8 +225,16 @@ function emptyFrames(): CameraFrames {
   };
 }
 
-function stringArray(value: unknown): string[] {
-  return Array.isArray(value) ? value.map((item) => String(item)) : [];
+function stringArray(value: unknown, limit = MAX_CAPTURE_STATUS_ITEMS): string[] {
+  return Array.isArray(value)
+    ? value.slice(0, limit).map((item) => String(item).slice(0, MAX_CAPTURE_STATUS_STRING_CHARS))
+    : [];
+}
+
+function cameraIdArray(value: unknown): string[] {
+  const known = new Set(MULTICAM_CAMERAS.map((camera) => camera.id));
+  return [...new Set(stringArray(value, MULTICAM_CAMERAS.length * 2))]
+    .filter((camera) => known.has(camera as MulticamCameraId));
 }
 
 function finite(value: unknown): number {
@@ -265,6 +307,16 @@ function decodeCompressedImage(message: unknown, topic: string, previewHz: numbe
   if (typeof raw.data !== "string" && !Array.isArray(raw.data) && !(raw.data instanceof Uint8Array)) {
     return null;
   }
+  const estimatedBytes = typeof raw.data === "string"
+    ? Math.round((raw.data.length * 3) / 4)
+    : raw.data.length;
+  if (
+    !Number.isSafeInteger(estimatedBytes)
+    || estimatedBytes <= 0
+    || estimatedBytes > MAX_MULTICAM_IMAGE_BYTES
+  ) {
+    return null;
+  }
   const format = String(raw.format || "jpeg");
   const bytes = imageBytes(raw.data);
   const imagePayload = format.toLowerCase().includes("compresseddepth")
@@ -293,12 +345,16 @@ function decodeCompressedImage(message: unknown, topic: string, previewHz: numbe
 }
 
 function captureStatusFromMessage(message: unknown): CaptureStatus {
-  const raw = message && typeof message === "object" ? message as Record<string, unknown> : {};
+  const raw = isBoundedObserverPayload(message) && message && typeof message === "object"
+    ? message as Record<string, unknown>
+    : {};
+  const onlineCameras = cameraIdArray(raw.online_cameras);
+  const offlineCameras = cameraIdArray(raw.offline_cameras);
   const coverage = Array.isArray(raw.cameras)
-    ? raw.cameras.map((camera) => {
+    ? raw.cameras.slice(0, MAX_CAPTURE_STATUS_ITEMS).map((camera) => {
       const row = camera && typeof camera === "object" ? camera as Record<string, unknown> : {};
       return {
-        camera_name: String(row.camera_name || ""),
+        camera_name: String(row.camera_name || "").slice(0, MAX_CAPTURE_STATUS_STRING_CHARS),
         processed_frames: finite(row.processed_frames),
         usable_frames: finite(row.usable_frames),
         tags_last_frame: finite(row.tags_last_frame),
@@ -310,13 +366,13 @@ function captureStatusFromMessage(message: unknown): CaptureStatus {
     : [];
   return {
     receivedAt: Date.now(),
-    online_cameras: stringArray(raw.online_cameras),
-    offline_cameras: stringArray(raw.offline_cameras),
-    all_cameras_online: Boolean(raw.all_cameras_online),
+    online_cameras: onlineCameras,
+    offline_cameras: offlineCameras,
+    all_cameras_online: Boolean(raw.all_cameras_online) && onlineCameras.length === MULTICAM_CAMERAS.length,
     uptime_sec: finite(raw.uptime_sec),
     recording: Boolean(raw.recording),
-    session_name: String(raw.session_name || ""),
-    capture_dir: String(raw.capture_dir || ""),
+    session_name: String(raw.session_name || "").slice(0, MAX_CAPTURE_STATUS_STRING_CHARS),
+    capture_dir: String(raw.capture_dir || "").slice(0, MAX_CAPTURE_STATUS_STRING_CHARS),
     elapsed_sec: finite(raw.elapsed_sec),
     calib_bag_uri: String(raw.calib_bag_uri || ""),
     calib_bag_elapsed_sec: finite(raw.calib_bag_elapsed_sec),
@@ -324,37 +380,89 @@ function captureStatusFromMessage(message: unknown): CaptureStatus {
     cameras: coverage,
     multi_cam_frames: finite(raw.multi_cam_frames),
     pair_names: stringArray(raw.pair_names),
-    pair_frames: Array.isArray(raw.pair_frames) ? raw.pair_frames.map(finite) : [],
+    pair_frames: Array.isArray(raw.pair_frames) ? raw.pair_frames.slice(0, MAX_CAPTURE_STATUS_ITEMS).map(finite) : [],
     min_pair_frames: finite(raw.min_pair_frames),
     synced_frames: finite(raw.synced_frames),
     max_sync_skew_ms: finite(raw.max_sync_skew_ms),
     ready_for_calibration: Boolean(raw.ready_for_calibration),
-    hint: String(raw.hint || "capture status를 기다리는 중입니다."),
+    hint: String(raw.hint || "capture status를 기다리는 중입니다.").slice(0, MAX_CAPTURE_STATUS_STRING_CHARS),
     calibrating: Boolean(raw.calibrating),
-    calibration_stage: String(raw.calibration_stage || ""),
+    calibration_stage: String(raw.calibration_stage || "").slice(0, MAX_CAPTURE_STATUS_STRING_CHARS),
     calibration_progress: finite(raw.calibration_progress),
-    extrinsics_json: String(raw.extrinsics_json || ""),
+    extrinsics_json: String(raw.extrinsics_json || "").slice(0, MAX_WORLD_STATUS_RAW_CHARS),
     published_frames: stringArray(raw.published_frames),
   };
 }
 
 function worldStatusFromMessage(message: unknown): WorldAnchorStatus {
   const rawText = String((message as { data?: unknown } | null)?.data || "");
+  if (rawText.length > MAX_WORLD_STATUS_JSON_CHARS) {
+    return {
+      receivedAt: Date.now(),
+      valid: false,
+      collecting: false,
+      reference_frame: "",
+      world_frame: "",
+      min_samples: 0,
+      message: "world anchor status payload가 너무 커서 무시되었습니다.",
+      tags: {},
+      raw: rawText.slice(0, MAX_WORLD_STATUS_RAW_CHARS),
+    };
+  }
   try {
     const raw = JSON.parse(rawText) as Record<string, unknown>;
+    if (!raw || typeof raw !== "object" || Array.isArray(raw) || !isBoundedObserverPayload(raw)) {
+      return {
+        receivedAt: Date.now(),
+        valid: false,
+        collecting: false,
+        reference_frame: "",
+        world_frame: "",
+        min_samples: 0,
+        message: "world anchor status payload가 너무 복잡해서 무시되었습니다.",
+        tags: {},
+        raw: rawText.slice(0, MAX_WORLD_STATUS_RAW_CHARS),
+      };
+    }
     const tags = raw.tags && typeof raw.tags === "object"
-      ? raw.tags as WorldAnchorStatus["tags"]
+      ? Object.fromEntries(
+        Object.entries(raw.tags as Record<string, unknown>)
+          .slice(0, MAX_WORLD_STATUS_TAGS)
+          .map(([id, value]) => {
+            const row = value && typeof value === "object" ? value as Record<string, unknown> : {};
+            const perCamera = row.per_camera && typeof row.per_camera === "object"
+              ? Object.fromEntries(
+                Object.entries(row.per_camera as Record<string, unknown>)
+                  .slice(0, MAX_CAPTURE_STATUS_ITEMS)
+                  .filter(([camera]) => MULTICAM_CAMERAS.some((candidate) => candidate.id === camera))
+                  .map(([camera, sample]) => {
+                    const sampleRow = sample && typeof sample === "object" ? sample as Record<string, unknown> : {};
+                    return [camera.slice(0, MAX_CAPTURE_STATUS_STRING_CHARS), {
+                      count: finite(sampleRow.count),
+                      fresh: Boolean(sampleRow.fresh),
+                    }];
+                  }),
+              )
+              : {};
+            return [id.slice(0, MAX_CAPTURE_STATUS_STRING_CHARS), {
+              role: String(row.role || "").slice(0, MAX_CAPTURE_STATUS_STRING_CHARS),
+              size: finite(row.size),
+              total: finite(row.total),
+              per_camera: perCamera,
+            }];
+          }),
+      ) as WorldAnchorStatus["tags"]
       : {};
     return {
       receivedAt: Date.now(),
       valid: true,
       collecting: Boolean(raw.collecting),
-      reference_frame: String(raw.reference_frame || ""),
-      world_frame: String(raw.world_frame || ""),
+      reference_frame: String(raw.reference_frame || "").slice(0, MAX_CAPTURE_STATUS_STRING_CHARS),
+      world_frame: String(raw.world_frame || "").slice(0, MAX_CAPTURE_STATUS_STRING_CHARS),
       min_samples: finite(raw.min_samples),
-      message: String(raw.message || ""),
+      message: String(raw.message || "").slice(0, MAX_CAPTURE_STATUS_STRING_CHARS),
       tags,
-      raw: rawText,
+      raw: rawText.slice(0, MAX_WORLD_STATUS_RAW_CHARS),
     };
   } catch {
     return {
@@ -364,17 +472,18 @@ function worldStatusFromMessage(message: unknown): WorldAnchorStatus {
       reference_frame: "",
       world_frame: "",
       min_samples: 0,
-      message: rawText || "world anchor status를 기다리는 중입니다.",
+      message: (rawText || "world anchor status를 기다리는 중입니다.").slice(0, MAX_CAPTURE_STATUS_STRING_CHARS),
       tags: {},
-      raw: rawText,
+      raw: rawText.slice(0, MAX_WORLD_STATUS_RAW_CHARS),
     };
   }
 }
 
 function transformsFromMessage(message: unknown): StaticTransform[] {
+  if (!isBoundedObserverPayload(message)) return [];
   const transforms = (message as { transforms?: unknown } | null)?.transforms;
   if (!Array.isArray(transforms)) return [];
-  return transforms.flatMap((item) => {
+  return transforms.slice(0, MAX_STATIC_TF_TRANSFORMS).flatMap((item) => {
     if (!item || typeof item !== "object") return [];
     const raw = item as {
       header?: { frame_id?: unknown };
@@ -384,8 +493,8 @@ function transformsFromMessage(message: unknown): StaticTransform[] {
         rotation?: { x?: unknown; y?: unknown; z?: unknown; w?: unknown };
       };
     };
-    const parentFrame = String(raw.header?.frame_id || "").trim();
-    const childFrame = String(raw.child_frame_id || "").trim();
+    const parentFrame = String(raw.header?.frame_id || "").trim().slice(0, MAX_CAPTURE_STATUS_STRING_CHARS);
+    const childFrame = String(raw.child_frame_id || "").trim().slice(0, MAX_CAPTURE_STATUS_STRING_CHARS);
     if (!parentFrame || !childFrame) return [];
     return [{
       parentFrame,
@@ -452,7 +561,10 @@ function unsubscribeWhileConnected(ros: any, topics: any[]): void {
   });
 }
 
-export function useMulticamOpsBridge(activeView: MulticamView) {
+export function useMulticamOpsBridge(
+  activeView: MulticamView,
+  { observeStaticTf = true }: { observeStaticTf?: boolean } = {},
+) {
   const [url] = useState(multicamBridgeUrl);
   const [retryGeneration, setRetryGeneration] = useState(0);
   const [socketConnected, setSocketConnected] = useState(false);
@@ -518,7 +630,14 @@ export function useMulticamOpsBridge(activeView: MulticamView) {
       settled = true;
       cleanup(handler);
       if (message.result === false) {
-        reject(new Error(String(message.values || "rosapi topic discovery failed")));
+        const detail = typeof message.values === "string"
+          ? message.values.slice(0, MAX_CAPTURE_STATUS_STRING_CHARS)
+          : "rosapi topic discovery failed";
+        reject(new Error(detail || "rosapi topic discovery failed"));
+        return;
+      }
+      if (!isBoundedObserverPayload(message.values)) {
+        reject(new Error("rosapi topic discovery payload가 너무 커서 무시되었습니다."));
         return;
       }
       resolve(
@@ -566,10 +685,13 @@ export function useMulticamOpsBridge(activeView: MulticamView) {
     void callObserverTopics(ros, generation)
       .then((result) => {
         if (observerGenerationRef.current !== generation || rosRef.current !== ros) return;
-        const names = Array.isArray(result.topics) ? result.topics : [];
+        const names = Array.isArray(result.topics) ? result.topics.slice(0, MAX_OBSERVER_TOPICS) : [];
         const types = Array.isArray(result.types) ? result.types : [];
         const next = names
-          .map((name, index) => ({ name: String(name), type: String(types[index] || "unknown") }))
+          .map((name, index) => ({
+            name: String(name).slice(0, MAX_OBSERVER_TOPIC_NAME_CHARS),
+            type: String(types[index] || "unknown").slice(0, MAX_OBSERVER_TOPIC_TYPE_CHARS),
+          }))
           .filter((topic) => topic.name.startsWith("/"))
           .sort((left, right) => left.name.localeCompare(right.name));
         setTopics(next);
@@ -713,6 +835,12 @@ export function useMulticamOpsBridge(activeView: MulticamView) {
     });
     captureTopic.subscribe((message: unknown) => {
       if (!isCurrentGeneration()) return;
+      if (!isBoundedObserverPayload(message)) {
+        captureStatusFreshRef.current = false;
+        setCaptureStatusFresh(false);
+        setConnectionMessage("멀티캠 observer degraded · CaptureStatus payload 무시");
+        return;
+      }
       setCaptureStatus(captureStatusFromMessage(message));
       captureStatusFreshRef.current = true;
       setCaptureStatusFresh(true);
@@ -732,21 +860,29 @@ export function useMulticamOpsBridge(activeView: MulticamView) {
     });
     subscriptions.push(worldTopic);
 
-    const tfTopic = new ROSLIB.Topic({
-      ros,
-      name: "/tf_static",
-      messageType: "tf2_msgs/msg/TFMessage",
-      queue_length: STATIC_TF_QUEUE_LENGTH,
-    });
-    injectQos(tfTopic, TF_STATIC_QOS);
-    tfTopic.subscribe((message: unknown) => {
-      if (!isCurrentGeneration()) return;
-      const additions = transformsFromMessage(message);
-      if (!additions.length) return;
-      for (const transform of additions) tfByChildRef.current.set(transform.childFrame, transform);
-      setTfTransforms([...tfByChildRef.current.values()].sort((left, right) => left.childFrame.localeCompare(right.childFrame)));
-    });
-    subscriptions.push(tfTopic);
+    if (observeStaticTf) {
+      const tfTopic = new ROSLIB.Topic({
+        ros,
+        name: "/tf_static",
+        messageType: "tf2_msgs/msg/TFMessage",
+        queue_length: STATIC_TF_QUEUE_LENGTH,
+      });
+      injectQos(tfTopic, TF_STATIC_QOS);
+      tfTopic.subscribe((message: unknown) => {
+        if (!isCurrentGeneration()) return;
+        const additions = transformsFromMessage(message);
+        if (!additions.length) return;
+        for (const transform of additions) {
+          if (!tfByChildRef.current.has(transform.childFrame) && tfByChildRef.current.size >= MAX_STATIC_TF_TRANSFORMS) {
+            const oldest = tfByChildRef.current.keys().next().value;
+            if (typeof oldest === "string") tfByChildRef.current.delete(oldest);
+          }
+          tfByChildRef.current.set(transform.childFrame, transform);
+        }
+        setTfTransforms([...tfByChildRef.current.values()].sort((left, right) => left.childFrame.localeCompare(right.childFrame)));
+      });
+      subscriptions.push(tfTopic);
+    }
     connectionTimer = window.setTimeout(() => {
       connectionTimer = null;
       if (isCurrentGeneration()) ros.connect(url);
@@ -774,7 +910,7 @@ export function useMulticamOpsBridge(activeView: MulticamView) {
       if (rosRef.current === ros) rosRef.current = null;
       if (typeof ros.close === "function") ros.close();
     };
-  }, [refreshTopics, retryGeneration, url]);
+  }, [observeStaticTf, refreshTopics, retryGeneration, url]);
 
   useEffect(() => {
     const generation = observerGenerationRef.current;
@@ -794,8 +930,15 @@ export function useMulticamOpsBridge(activeView: MulticamView) {
       });
     };
     updateFreshness();
-    const timer = window.setInterval(updateFreshness, 500);
-    return () => window.clearInterval(timer);
+    if (!socketConnected || !captureStatus) return;
+
+    // CaptureStatus freshness only changes at one predictable point: the
+    // configured age boundary after its most recent message. A deadline timer
+    // avoids a permanent 500 ms polling loop while preserving the same
+    // fail-closed transition when the heartbeat expires.
+    const ageMs = Math.max(0, Date.now() - captureStatus.receivedAt);
+    const timer = window.setTimeout(updateFreshness, Math.max(0, CAPTURE_STATUS_MAX_AGE_MS - ageMs) + 1);
+    return () => window.clearTimeout(timer);
   }, [captureStatus, socketConnected]);
 
   useEffect(() => {
@@ -901,6 +1044,7 @@ export function useMulticamOpsBridge(activeView: MulticamView) {
       throttle_rate: isCompressedImage ? IMAGE_THROTTLE_MS : 250,
       queue_length: 1,
     });
+    if (isCompressedImage) injectQos(topic, IMAGE_QOS);
     const samples: number[] = [];
     setSelectedTopicSample(null);
     topic.subscribe((message: unknown) => {

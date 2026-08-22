@@ -60,6 +60,12 @@ from bt_orchestrator.retractor_voice_interpreter import (
     TextOnlyRetractionVLMInterpreter,
 )
 
+from integration_debug.asr_endpoints import (
+    DEFAULT_ASR_ENDPOINT,
+    DEFAULT_CLOUD_SERVER_URL,
+    DEFAULT_LAN_SERVER_URL,
+    resolve_puzzle_asr_endpoint,
+)
 from integration_debug.asr_runtime import AsrMicrophoneRuntime
 from integration_debug.contracts import (
     action_watchdog_reason,
@@ -94,6 +100,25 @@ from integration_debug.retractor_health import (
 
 STATUS_SCHEMA = "taskplanner.integration_debug.status.v1"
 EVENT_SCHEMA = "taskplanner.integration_debug.event.v1"
+VIPLAB_STREAM_STATUS_SCHEMA = "arpa_multicam.stream_status.v1"
+VIPLAB_STREAM_IDS = frozenset(
+    {"cam_1", "cam_2", "cam_3", "cam_3_depth", "cam_4", "cam_4_depth", "flir"}
+)
+VIPLAB_STREAM_STATUS_KEYS = frozenset(
+    {
+        "schema",
+        "stream_id",
+        "source_topic",
+        "source_stamp",
+        "frame_id",
+        "format",
+        "measured_hz",
+        "payload_bytes",
+        "published_count",
+        "dropped_count",
+        "qos",
+    }
+)
 MAX_EVENT_SUMMARY_STRING_CHARS = 2048
 MAX_EVENT_SUMMARY_ITEMS = 32
 RETRACTION_SERVICE_DEFAULT_NAME = "/surgery/retraction/command"
@@ -131,6 +156,75 @@ PUBLIC_OUTPUT_TYPES: dict[str, type[Any]] = {
     "surgical_interop_msgs/msg/ClinicalObservationArray": ClinicalObservationArray,
     "surgical_interop_msgs/msg/SurgeryHealth": SurgeryHealth,
 }
+
+
+def _is_non_negative_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _parse_viplab_stream_status(sample: str) -> dict[str, Any] | None:
+    """Parse the bounded VIPLab health contract without accepting lookalikes."""
+
+    try:
+        payload = json.loads(sample)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict) or frozenset(payload) != VIPLAB_STREAM_STATUS_KEYS:
+        return None
+    if payload.get("schema") != VIPLAB_STREAM_STATUS_SCHEMA:
+        return None
+    stream_id = payload.get("stream_id")
+    source_topic = payload.get("source_topic")
+    if stream_id not in VIPLAB_STREAM_IDS or not isinstance(source_topic, str):
+        return None
+    if not source_topic.startswith("/synced/") or len(source_topic) > 256:
+        return None
+    frame_id = payload.get("frame_id")
+    format_text = payload.get("format")
+    if (
+        not isinstance(frame_id, str)
+        or not frame_id
+        or len(frame_id) > 128
+        or not isinstance(format_text, str)
+        or not format_text
+        or len(format_text) > 128
+    ):
+        return None
+
+    stamp = payload.get("source_stamp")
+    if not isinstance(stamp, dict) or frozenset(stamp) != {"sec", "nanosec"}:
+        return None
+    if not _is_non_negative_int(stamp.get("sec")):
+        return None
+    if not _is_non_negative_int(stamp.get("nanosec")) or stamp["nanosec"] >= 1_000_000_000:
+        return None
+
+    measured_hz = payload.get("measured_hz")
+    if isinstance(measured_hz, bool) or not isinstance(measured_hz, (int, float)):
+        return None
+    measured_hz = float(measured_hz)
+    if not (0.0 <= measured_hz <= 240.0):
+        return None
+    for key in ("payload_bytes", "published_count", "dropped_count"):
+        if not _is_non_negative_int(payload.get(key)):
+            return None
+
+    qos = payload.get("qos")
+    if not isinstance(qos, dict) or frozenset(qos) != {
+        "reliability",
+        "durability",
+        "depth",
+    }:
+        return None
+    if qos.get("reliability") not in {"best_effort", "reliable"}:
+        return None
+    if qos.get("durability") not in {"volatile", "transient_local"}:
+        return None
+    if not _is_non_negative_int(qos.get("depth")) or qos["depth"] < 1:
+        return None
+
+    payload["measured_hz"] = measured_hz
+    return payload
 
 
 def _bounded_event_summary(value: Any) -> Any:
@@ -171,6 +265,12 @@ class InputStats:
     source_delay_sec: float | None = None
     last_sample: str = ""
     message_count: int = 0
+    reported_rate_hz: float | None = None
+    reported_payload_bytes: int | None = None
+    reported_source_topic: str = ""
+    reported_published_count: int | None = None
+    reported_dropped_count: int | None = None
+    reported_qos: str = ""
 
 
 @dataclass(slots=True)
@@ -556,16 +656,25 @@ class IntegrationDebugNode(Node):
         # the live preflight pass before Puzzle ASR is actually connected.
         self._asr_capture_requested = False
         self._manual_sentence_pub: Any | None = None
+        self._asr_cloud_url = os.environ.get("PUZZLE_ASR_URL") or str(
+            asr_config.get(
+                "cloud_server_url",
+                asr_config.get("default_server_url", DEFAULT_CLOUD_SERVER_URL),
+            )
+        )
+        self._asr_lan_url = os.environ.get("PUZZLE_ASR_LAN_URL") or str(
+            asr_config.get("lan_server_url", DEFAULT_LAN_SERVER_URL)
+        )
+        requested_asr_endpoint = os.environ.get("PUZZLE_ASR_ENDPOINT") or str(
+            asr_config.get("default_endpoint", DEFAULT_ASR_ENDPOINT)
+        )
+        self._asr_endpoint, self._asr_server_url = resolve_puzzle_asr_endpoint(
+            requested_asr_endpoint,
+            cloud_url=self._asr_cloud_url,
+            lan_url=self._asr_lan_url,
+        )
         self._asr = AsrMicrophoneRuntime(
-            default_url=os.environ.get(
-                "PUZZLE_ASR_URL",
-                str(
-                    asr_config.get(
-                        "default_server_url",
-                        "wss://arpa.worker-02.puzzle-ai.com",
-                    )
-                ),
-            ),
+            default_url=self._asr_server_url,
             topic=self._asr_topic,
             output_dir=self._session_dir / "asr",
             capture_lock_path=os.environ.get(
@@ -1145,13 +1254,49 @@ class IntegrationDebugNode(Node):
     def _on_string_input(self, topic: str, msg: String) -> None:
         now = time.monotonic()
         text = str(msg.data).strip()
+        stream_status = _parse_viplab_stream_status(text)
+        source_delay: float | None = None
+        if stream_status is not None:
+            stamp = stream_status["source_stamp"]
+            source_sec = float(stamp["sec"]) + float(stamp["nanosec"]) / 1e9
+            try:
+                ros_now_sec = self.get_clock().now().nanoseconds / 1e9
+                source_delay = max(0.0, ros_now_sec - source_sec)
+            except AttributeError:
+                source_delay = None
         with self._lock:
             stats = self._input_stats[topic]
             stats.arrivals.append(now)
             stats.sizes.append((now, len(msg.data.encode("utf-8"))))
             stats.last_received_monotonic = now
-            stats.last_sample = text[:240]
             stats.message_count += 1
+            if stream_status is not None:
+                stats.source_delay_sec = source_delay
+                stats.reported_rate_hz = stream_status["measured_hz"]
+                stats.reported_payload_bytes = stream_status["payload_bytes"]
+                stats.reported_source_topic = stream_status["source_topic"]
+                stats.reported_published_count = stream_status["published_count"]
+                stats.reported_dropped_count = stream_status["dropped_count"]
+                qos = stream_status["qos"]
+                stats.reported_qos = (
+                    f"{qos['reliability']}/{qos['durability']}/"
+                    f"keep_last({qos['depth']})"
+                )
+                stats.last_sample = (
+                    f"{stream_status['stream_id']} · "
+                    f"{stream_status['measured_hz']:.2f} Hz · "
+                    f"{stream_status['payload_bytes']} bytes · "
+                    f"dropped {stream_status['dropped_count']}"
+                )
+            else:
+                stats.last_sample = text[:240]
+                if topic.startswith("/synced/") and topic.endswith("/status"):
+                    stats.reported_rate_hz = None
+                    stats.reported_payload_bytes = None
+                    stats.reported_source_topic = ""
+                    stats.reported_published_count = None
+                    stats.reported_dropped_count = None
+                    stats.reported_qos = ""
         # The Debug monitor also receives structured JSON status topics.  They
         # are not speech: do not parse them as voice commands, overwrite the
         # last surgeon sentence, or append the full JSON every second to the
@@ -1919,7 +2064,7 @@ class IntegrationDebugNode(Node):
                     "result": safe_result,
                 },
             )
-        if operation in {"arm", "disarm", "reset_fault"}:
+        if operation in {"arm", "disarm", "reset_fault", "force_retraction_idle"}:
             # A session transition must be visible before the next periodic
             # status tick so the browser can start or stop its heartbeat from
             # the authoritative server state without an avoidable lockout.
@@ -2021,6 +2166,14 @@ class IntegrationDebugNode(Node):
             # may safely enforce it here.
             self._asr.stop_async()
 
+    def _asr_status_snapshot(self) -> dict[str, Any]:
+        """Return Debug ASR status with its reviewed endpoint identity."""
+
+        with self._auxiliary_lock:
+            snapshot = dict(self._asr.snapshot())
+            snapshot["endpoint_id"] = self._asr_endpoint
+            return snapshot
+
     def _handle_asr_command(
         self, operation: str, payload: dict[str, Any]
     ) -> tuple[bool, str, str, dict[str, Any]]:
@@ -2042,6 +2195,25 @@ class IntegrationDebugNode(Node):
                 if blocked_reason == "manual control is not armed":
                     blocked_reason = "arm manual control before starting the microphone"
                 return False, "", blocked_reason, {}
+            requested_url = str(payload.get("server_url") or "").strip()
+            if requested_url:
+                return (
+                    False,
+                    "",
+                    "server_url override is not allowed; select the cloud or lan ASR route",
+                    self._asr_status_snapshot(),
+                )
+            requested_endpoint = payload.get("endpoint_id")
+            if requested_endpoint is None or not str(requested_endpoint).strip():
+                requested_endpoint = self._asr_endpoint
+            try:
+                endpoint, server_url = resolve_puzzle_asr_endpoint(
+                    requested_endpoint,
+                    cloud_url=self._asr_cloud_url,
+                    lan_url=self._asr_lan_url,
+                )
+            except ValueError as exc:
+                return False, "", str(exc), self._asr_status_snapshot()
             with self._auxiliary_lock:
                 # Consume a previous session's terminal event before creating
                 # readiness for this new session.
@@ -2054,23 +2226,30 @@ class IntegrationDebugNode(Node):
                 try:
                     self._asr.start(
                         device_id=payload.get("device_id"),
-                        server_url=payload.get("server_url"),
+                        server_url=server_url,
                     )
                 except Exception:
                     self._asr_capture_requested = False
                     self._destroy_asr_publisher()
                     raise
+                self._asr_endpoint = endpoint
+                self._asr_server_url = server_url
                 self._asr_capture_requested = True
                 self._sync_asr_publisher(
                     bool(self._asr.snapshot().get("connected", False))
                 )
-            return True, "", "USB microphone ASR session started", self._asr.snapshot()
+            return (
+                True,
+                "",
+                "USB microphone ASR session started",
+                self._asr_status_snapshot(),
+            )
         if operation == "asr_stop":
             with self._auxiliary_lock:
                 self._asr_capture_requested = False
                 self._destroy_asr_publisher()
                 self._asr.stop_async()
-                snapshot = self._asr.snapshot()
+                snapshot = self._asr_status_snapshot()
             return True, "", "USB microphone ASR stop requested", snapshot
         return False, "", "unknown ASR debug operation", {}
 
@@ -2134,6 +2313,8 @@ class IntegrationDebugNode(Node):
         with self._auxiliary_lock:
             for event in self._asr.drain_events():
                 event_type = str(event.get("type", "asr_event"))
+                if event_type.startswith("asr_"):
+                    event = {**event, "endpoint_id": self._asr_endpoint}
                 if event_type == "asr_connection":
                     self._sync_asr_publisher(bool(event.get("connected", False)))
                 elif event_type == "asr_final":
@@ -2236,6 +2417,8 @@ class IntegrationDebugNode(Node):
             return True, "", "fault lock reset"
         if operation in {"recover_action_client", "recover_command_client"}:
             return self._recover_command_client(payload)
+        if operation == "force_retraction_idle":
+            return self._force_retraction_idle(payload)
         if operation == "cancel_active":
             return self._request_cancel()
         if operation == "configure_voice":
@@ -2289,6 +2472,78 @@ class IntegrationDebugNode(Node):
             self._release_output_publishers()
             return True, "", "all debug output publishers stopped"
         return self._dispatch_action(operation, payload, source="ui")
+
+    def _force_retraction_idle(
+        self, payload: dict[str, Any]
+    ) -> tuple[bool, str, str]:
+        """Reset only the Debug-side retraction admission state.
+
+        This operation deliberately sends no robot Action or Service request.
+        The explicit acknowledgement prevents the UI from presenting a local
+        bookkeeping reset as proof that remote motion stopped.
+        """
+
+        if payload.get("remote_motion_stopped_confirmed") is not True:
+            return (
+                False,
+                "",
+                "confirm that remote retraction motion is stopped before forcing Debug idle",
+            )
+
+        pending_interpretation = None
+        with self._lock:
+            if self._active_command_id:
+                return (
+                    False,
+                    self._active_command_id,
+                    "wait for the active command response before forcing Debug idle",
+                )
+            if not bool(self._action_status.get("terminal", True)):
+                return (
+                    False,
+                    "",
+                    "wait for the command lifecycle to become terminal before forcing Debug idle",
+                )
+
+            previous_state = self._retraction_state
+            was_armed = self._armed
+            pending_interpretation = getattr(
+                self, "_pending_retraction_voice_interpretation", None
+            )
+            self._pending_retraction_voice_interpretation = None
+            self._disarm_locked()
+            self._retraction_state = RetractionState.IDLE
+            self._last_retraction_rejection_reason = ""
+            self._last_retraction_interpretation = self._retraction_interpretation(
+                "",
+                normalize_retractor_command("", RetractionState.IDLE),
+                detail="force_retraction_idle",
+            )
+            self._action_status = self._idle_action_status()
+            self._last_error = ""
+
+        if pending_interpretation is not None:
+            pending_interpretation.future.cancel()
+        self._release_manual_publishers()
+        self._record(
+            "retraction_state_forced_idle",
+            {
+                "previous_state": previous_state.value,
+                "state": RetractionState.IDLE.value,
+                "manual_control_was_armed": was_armed,
+                "pending_interpretation_cancelled": (
+                    pending_interpretation is not None
+                ),
+                "remote_motion_stopped_confirmed": True,
+                "robot_command_sent": False,
+            },
+        )
+        return (
+            True,
+            "",
+            "Debug retraction state forced to idle; manual and voice control "
+            "disarmed; no robot command was sent",
+        )
 
     def _recover_command_client(
         self, payload: dict[str, Any]
@@ -3286,11 +3541,26 @@ class IntegrationDebugNode(Node):
                 last_sample = stats.last_sample
                 message_count = stats.message_count
                 source_delay = stats.source_delay_sec
-            rate_hz, window_count = measured_rate(
+                reported_rate_hz = stats.reported_rate_hz
+                reported_payload_bytes = stats.reported_payload_bytes
+                reported_source_topic = stats.reported_source_topic
+                reported_published_count = stats.reported_published_count
+                reported_dropped_count = stats.reported_dropped_count
+                reported_qos = stats.reported_qos
+            monitor_rate_hz, window_count = measured_rate(
                 arrivals, now, self._monitor_window_sec
             )
             recent_sizes = [size for stamp, size in sizes if now - stamp <= self._monitor_window_sec]
-            bandwidth = sum(recent_sizes) / self._monitor_window_sec
+            rate_hz = (
+                reported_rate_hz
+                if reported_rate_hz is not None
+                else monitor_rate_hz
+            )
+            bandwidth = (
+                reported_payload_bytes * rate_hz
+                if reported_payload_bytes is not None
+                else sum(recent_sizes) / self._monitor_window_sec
+            )
             actual_types = [str(value) for value in graph_types.get(topic, [])]
             expected_type = str(config["type"])
             try:
@@ -3337,11 +3607,21 @@ class IntegrationDebugNode(Node):
                     "expected_qos": str(config.get("qos", "")),
                     "expected_hz": expected_hz,
                     "measured_hz": round(rate_hz, 3),
+                    "monitor_hz": round(monitor_rate_hz, 3),
                     "message_count": message_count,
+                    "source_message_count": reported_published_count,
+                    "source_dropped_count": reported_dropped_count,
                     "window_message_count": window_count,
                     "last_age_sec": round(age_sec, 3) if age_sec is not None else None,
                     "source_delay_sec": round(source_delay, 3) if source_delay is not None else None,
                     "bandwidth_bytes_sec": round(bandwidth, 1),
+                    "source_topic": reported_source_topic,
+                    "source_type": (
+                        "sensor_msgs/msg/CompressedImage"
+                        if reported_source_topic
+                        else ""
+                    ),
+                    "source_qos": reported_qos,
                     "last_sample": last_sample,
                     "state": state,
                 }
@@ -3644,7 +3924,7 @@ class IntegrationDebugNode(Node):
             "voice": voice,
             "vlm": self._vlm_status_snapshot(now),
             "virtual_robot": robot_source,
-            "asr": self._asr.snapshot(),
+            "asr": self._asr_status_snapshot(),
             "surgery_record": self._surgery_record.snapshot(),
             "recent_events": recent_events,
         }

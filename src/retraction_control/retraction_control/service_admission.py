@@ -117,6 +117,21 @@ class AdmissionController:
         # ordinary command may be outstanding; STOP alone has a priority path
         # alongside an active/queued command.
         if request.command is not Command.STOP_RETRACTION:
+            worker_fault = str(getattr(self._worker, "fatal_error", "") or "")
+            if worker_fault:
+                self._ledger.record_admission(
+                    request.command_id,
+                    accepted=False,
+                    result_code=int(ResultCode.ERROR),
+                    message="worker_fail_closed",
+                    stage="rejected",
+                )
+                return AdmissionReply(
+                    False,
+                    ResultCode.ERROR,
+                    request.command_id,
+                    "worker_fail_closed",
+                )
             active_id = str(getattr(self._worker, "active_command_id", "") or "")
             pending_count = int(getattr(self._worker, "pending_count", 0) or 0)
             if active_id or pending_count:
@@ -173,17 +188,26 @@ class AdmissionController:
                 SubmitDecision.BUSY: "command_queue_busy",
                 SubmitDecision.STOP_ALREADY_PENDING: "stop_already_pending",
                 SubmitDecision.SHUTTING_DOWN: "controller_shutting_down",
+                SubmitDecision.PERSISTENCE_ERROR: "command_queue_persistence_failed",
             }[submit]
             self._ledger.record_admission(
                 request.command_id,
                 accepted=False,
-                result_code=int(ResultCode.REJECTED),
+                result_code=int(
+                    ResultCode.ERROR
+                    if submit is SubmitDecision.PERSISTENCE_ERROR
+                    else ResultCode.REJECTED
+                ),
                 message=message,
                 stage="rejected",
             )
             return AdmissionReply(
                 False,
-                ResultCode.REJECTED,
+                (
+                    ResultCode.ERROR
+                    if submit is SubmitDecision.PERSISTENCE_ERROR
+                    else ResultCode.REJECTED
+                ),
                 request.command_id,
                 message,
             )

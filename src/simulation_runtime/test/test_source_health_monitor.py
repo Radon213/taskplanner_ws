@@ -1,4 +1,7 @@
+from builtin_interfaces.msg import Time
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, ReliabilityPolicy
 from simulation_runtime.source_health_monitor import (
+    CAMERA_INPUT_QOS_DEPTH,
     DISABLED,
     ERROR,
     MISSING,
@@ -6,12 +9,22 @@ from simulation_runtime.source_health_monitor import (
     RECOVERING,
     STALE,
     STATUS_CHECKPOINT_SEC,
-    SourceTracker,
     SourceHealthMonitor,
+    SourceTracker,
     StatusPublicationGate,
+    camera_input_qos,
 )
-from builtin_interfaces.msg import Time
+
 from surgical_msgs.msg import InputSourceStatus, VLMHealth, VLMResult
+
+
+def test_camera_input_qos_matches_viplab_preview_publishers():
+    qos = camera_input_qos()
+
+    assert qos.history == HistoryPolicy.KEEP_LAST
+    assert qos.depth == CAMERA_INPUT_QOS_DEPTH == 1
+    assert qos.reliability == ReliabilityPolicy.BEST_EFFORT
+    assert qos.durability == DurabilityPolicy.VOLATILE
 
 
 def test_source_requires_two_fresh_samples_after_start_and_recovery():
@@ -226,9 +239,7 @@ def test_checkpoint_publishes_the_latest_diagnostic_counters():
     initial = _status("flir", READY, True, count=1)
     assert node._publish_status_if_due("flir", initial, now_monotonic=50.0)
     quarter_tick = _status("flir", READY, True, count=2, age_sec=0.25)
-    assert not node._publish_status_if_due(
-        "flir", quarter_tick, now_monotonic=50.25
-    )
+    assert not node._publish_status_if_due("flir", quarter_tick, now_monotonic=50.25)
     checkpoint = _status("flir", READY, True, count=9, age_sec=1.0)
     assert node._publish_status_if_due("flir", checkpoint, now_monotonic=51.0)
 
@@ -241,9 +252,7 @@ def test_internal_freshness_evaluation_remains_at_each_quarter_second_tick():
     tracker = SourceTracker("flir", "image", 1.0)
     snapshot_times = []
     original_snapshot = tracker.snapshot
-    tracker.snapshot = lambda now: (
-        snapshot_times.append(now) or original_snapshot(now)
-    )
+    tracker.snapshot = lambda now: snapshot_times.append(now) or original_snapshot(now)
     published = []
     tick_times = iter((60.0, 60.25, 60.5, 60.75))
     node._trackers = {"flir": tracker}

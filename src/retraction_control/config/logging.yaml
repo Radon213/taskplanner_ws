@@ -1,9 +1,11 @@
-schema: retraction_control.logging.v1
-# Launch may override this with another absolute directory.
-data_directory: /tmp/retraction-control
-status_period_sec: 0.5
-diagnostics_period_sec: 1.0
-ledger_filename: command_ledger.sqlite3
-session_directory_name: teaching_sessions
-atomic_fsync: true
-
+schema: retraction_control.runtime.v1
+storage:
+  # Launch may override this with another absolute directory.
+  data_directory: /tmp/retraction-control
+  ledger_filename: command_ledger.sqlite3
+  session_directory_name: teaching_sessions
+  shadow_trace_directory_name: shadow_traces
+  atomic_fsync: true
+publish:
+  status_period_sec: 0.5
+  diagnostics_period_sec: 1.0

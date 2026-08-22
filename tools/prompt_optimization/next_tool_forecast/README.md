@@ -1,10 +1,45 @@
 # Next-tool forecast prompt experiment
 
 This directory is an offline, task-specific experiment for NInfer
-`qwen3.6-35b-a3b`. It does not change `real_vlm.py`, the ROS schema, the
-digital twin, the behavior tree, or robot authority.
+`qwen3.6-35b-a3b`. The evaluators do not change the ROS schema, digital twin,
+behavior tree, or robot authority. One explicit offline builder now produces a
+frozen procedure-level n-gram prompt asset that `real_vlm.py` can read at
+startup; it remains advisory context to the VLM, never a post-model override
+or an execution decision.
 
-## Fixed task definition
+## Runtime frozen n-gram prompt prior
+
+`build_runtime_ngram_prior.py` aggregates only the reviewed 0704 calibration
+cases (`0704_6`–`0704_14`) into
+`src/procedure_spec/procedure_spec/specs/thyroidectomy_demo/tool_handover_ngram_prior.yaml`.
+It predicts the first subsequent *supported* scrub-nurse-to-surgeon handover,
+without a time horizon. The demo inventory has no runtime ID for an unsupported
+handover such as suction; such a transition is excluded as a target and resets
+the n-gram suffix rather than being silently deleted.
+
+The live node loads that file once when its procedure bundle is loaded. For
+each request it performs at most eight dictionary lookups using the
+authoritative phase and public completed-handover history. The VLM receives
+only `{id, match, support, candidates}`. It never receives case IDs,
+timestamps, raw reviewed rows, outcome counts, source paths, or fit metadata.
+The model is explicitly told to rerank those probabilities using the pixels,
+trajectory, and available inventory. No reducer, BT, or robot-action code uses
+the n-gram value directly. Set ROS parameter
+`handover_ngram_prior_enabled:=false` to disable it.
+
+Regenerate after deliberately approving a new calibration set, then verify the
+checked-in asset before use:
+
+```bash
+python3 tools/prompt_optimization/next_tool_forecast/build_runtime_ngram_prior.py
+python3 tools/prompt_optimization/next_tool_forecast/build_runtime_ngram_prior.py --check
+```
+
+## Historical 2–8-second image/ASR benchmark
+
+The fixed task definition below applies only to the historical frame-based
+image/ASR evaluation variants. It is separate from the horizon-free runtime
+frozen n-gram prompt prior above.
 
 At the final image (the causal cutoff), predict the **first confirmed new
 `scrub_nurse -> surgeon` physical handover 2–8 seconds later**. The output is

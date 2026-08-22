@@ -1,0 +1,106 @@
+{
+  "schema": "taskplanner.pnu_live_smoke_input.v1",
+  "captured_at_unix_ns": 1787242109843629598,
+  "source": {
+    "host": "viplab",
+    "camera": "cam_4",
+    "serial": "146222251000",
+    "firmware": "5.15.0.2",
+    "read_only_subscription": true
+  },
+  "capture_policy": {
+    "raw_bytes_persisted": false,
+    "frame_pixels_persisted": false,
+    "only_hash_size_stamp_and_calibration_persisted": true,
+    "pair_max_delta_ns": 80000000
+  },
+  "pair_delta_ns": 62989,
+  "topics": {
+    "rgb": {
+      "name": "/synced/cam_4/color/image_raw/compressed",
+      "type": "sensor_msgs/msg/CompressedImage",
+      "publisher": "multicam_node",
+      "qos": "RELIABLE/VOLATILE"
+    },
+    "color_camera_info": {
+      "name": "/synced/cam_4/color/camera_info",
+      "type": "sensor_msgs/msg/CameraInfo",
+      "publisher": "multicam_node",
+      "qos": "RELIABLE/VOLATILE"
+    },
+    "native_compressed_depth": {
+      "name": "/synced/cam_4/depth/image_rect_raw/compressedDepth",
+      "type": "sensor_msgs/msg/CompressedImage",
+      "publisher": "multicam_node",
+      "qos": "RELIABLE/VOLATILE"
+    },
+    "depth_camera_info": {
+      "name": "/synced/cam_4/depth/camera_info",
+      "type": "sensor_msgs/msg/CameraInfo",
+      "publisher": "multicam_node",
+      "qos": "RELIABLE/VOLATILE"
+    },
+    "depth_to_color_extrinsics": {
+      "name": "/synced/cam_4/extrinsics/depth_to_color",
+      "type": "realsense2_camera_msgs/msg/Extrinsics",
+      "publisher": "multicam_node",
+      "qos": "RELIABLE/TRANSIENT_LOCAL"
+    }
+  },
+  "depth": {
+    "depth_scale_m_per_unit": 0.001,
+    "depth_scale_query": "rs-enumerate-devices -o Depth Units current value",
+    "depth_scale_read_only": true,
+    "aligned_to_color": false,
+    "metric_3d_ready": false,
+    "metric_3d_blocker": "depth_to_color rotation wire order is not validated against the ROS IDL convention"
+  },
+  "messages": {
+    "rgb": {
+      "stamp_ns": 1787242109694530762,
+      "sec": 1787242109,
+      "nanosec": 694530762,
+      "frame_id": "cam_4_color_optical_frame",
+      "format": "rgb8; jpeg compressed bgr8",
+      "encoded_size_bytes": 206750,
+      "encoded_sha256": "12b9e82cf0b38ef79f0f90ef23d0f7367e2f4edc3acf77b9ec05348679bba2b9"
+    },
+    "native_compressed_depth": {
+      "stamp_ns": 1787242109694467773,
+      "sec": 1787242109,
+      "nanosec": 694467773,
+      "frame_id": "cam_4_depth_optical_frame",
+      "format": "16UC1; compressedDepth png",
+      "encoded_size_bytes": 429257,
+      "encoded_sha256": "d06ad640ddb1275bb86a418a5783b0c71cb8546a456014343e48fa6f984d788b"
+    },
+    "color_camera_info": {
+      "stamp_ns": 1787242109694530762,
+      "frame_id": "cam_4_color_optical_frame",
+      "width": 1280,
+      "height": 720,
+      "distortion_model": "plumb_bob",
+      "d": [-0.05711887776851654, 0.07287484407424927, -0.00009082017641048878, 0.0003462864551693201, -0.02320057712495327],
+      "k": [637.9540405273438, 0.0, 640.4014892578125, 0.0, 637.0300903320312, 354.712646484375, 0.0, 0.0, 1.0],
+      "r": [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+      "p": [637.9540405273438, 0.0, 640.4014892578125, 0.0, 0.0, 637.0300903320312, 354.712646484375, 0.0, 0.0, 0.0, 1.0, 0.0]
+    },
+    "depth_camera_info": {
+      "stamp_ns": 1787242109694467773,
+      "frame_id": "cam_4_depth_optical_frame",
+      "width": 1280,
+      "height": 720,
+      "distortion_model": "plumb_bob",
+      "d": [0.0, 0.0, 0.0, 0.0, 0.0],
+      "k": [654.177490234375, 0.0, 637.2731323242188, 0.0, 654.177490234375, 362.49310302734375, 0.0, 0.0, 1.0],
+      "r": [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+      "p": [654.177490234375, 0.0, 637.2731323242188, 0.0, 0.0, 654.177490234375, 362.49310302734375, 0.0, 0.0, 0.0, 1.0, 0.0]
+    },
+    "depth_to_color_extrinsics": {
+      "rotation_wire_order": [0.9999935626983643, -0.0015063914470374584, -0.0032486612908542156, 0.0014905486023053527, 0.999987006187439, -0.004873663652688265, 0.003255960764363408, 0.004868790041655302, 0.9999828338623047],
+      "translation_m": [-0.059281326830387115, -0.000027586851501837373, 0.00048295879969373345],
+      "layout_validated": false,
+      "reason": "VIPLab publisher documents row-major while realsense2_camera_msgs/Extrinsics IDL documents column-major"
+    }
+  }
+}

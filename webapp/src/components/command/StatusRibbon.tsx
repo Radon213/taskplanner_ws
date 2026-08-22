@@ -1,9 +1,12 @@
 import { useState } from "react";
-import { Activity, Bug, Camera, Languages, Radio } from "lucide-react";
+import { Activity, Bug, Languages, Monitor, Radio, ScanLine } from "lucide-react";
 import { SafetyConfirmationDialog } from "../common/SafetyConfirmationDialog";
 import { ProviderModelSelect } from "./ProviderModelSelect";
 import type { Language } from "../../utils/display";
 import type { useDigitalTwinViewModel } from "../../hooks/useDigitalTwinViewModel";
+import type { RuntimeTransitionPhase } from "../../hooks/useRuntimeControl";
+import type { RuntimeAuthorityStatus } from "../../hooks/useRosBridge";
+import { runtimeAuthorityCopy } from "../../utils/runtimeAuthorityCopy";
 import type {
   ModelCatalogEntry,
   ModelProviderStatus,
@@ -24,6 +27,9 @@ function OperatingRoomMark() {
 export function StatusRibbon({
   vm,
   connected,
+  transportConnected,
+  runtimeAuthorityStatus,
+  runtimeTransitionPhase,
   language,
   onLanguageChange,
   modelOptions,
@@ -33,12 +39,17 @@ export function StatusRibbon({
   actionPending,
   onVlmModelChange,
   onVlmRuntimeAction,
+  integratedDebugAvailable,
+  onIntegratedDebug,
   debugModeDisabled,
   onDebugMode,
-  onMulticamOps,
+  onMonitor,
 }: {
   vm: ViewModel;
   connected: boolean;
+  transportConnected: boolean;
+  runtimeAuthorityStatus: RuntimeAuthorityStatus;
+  runtimeTransitionPhase: RuntimeTransitionPhase;
   language: Language;
   onLanguageChange: (language: Language) => void;
   modelOptions: ModelCatalogEntry[];
@@ -51,13 +62,27 @@ export function StatusRibbon({
     selection: ModelSelection,
     command: ModelRuntimeCommand,
   ) => void;
+  integratedDebugAvailable: boolean;
+  onIntegratedDebug: () => void;
   debugModeDisabled: boolean;
   onDebugMode: () => void;
-  onMulticamOps: () => void;
+  onMonitor: () => void;
 }) {
   const [debugConfirmationOpen, setDebugConfirmationOpen] = useState(false);
   const vlmSelectDisabled =
     !connected || Boolean(actionPending) || !modelOptions.some((entry) => entry.selectable);
+  const runtimeHandshakePending = runtimeTransitionPhase === "checking"
+    || runtimeTransitionPhase === "starting";
+  const debugModeChecking = runtimeTransitionPhase === "checking";
+  const debugModeStarting = runtimeTransitionPhase === "starting";
+  const displayedAuthorityStatus: RuntimeAuthorityStatus = runtimeHandshakePending
+    ? runtimeTransitionPhase === "checking" ? "checking" : "connecting"
+    : connected
+      ? "ready"
+      : transportConnected && runtimeAuthorityStatus === "offline"
+        ? "waiting"
+        : runtimeAuthorityStatus;
+  const bridgeFeedback = runtimeAuthorityCopy(displayedAuthorityStatus, language);
 
   return (
     <>
@@ -74,16 +99,29 @@ export function StatusRibbon({
         <div className="ribbon-cluster">
           <nav
             aria-label={language === "ko" ? "작업공간 탐색" : "Workspace navigation"}
-            className="workspace-navigation"
+            className={`workspace-navigation ${integratedDebugAvailable ? "with-integrated-debug" : ""}`}
           >
             <span aria-current="page" className="workspace-navigation-current">
               <Activity aria-hidden="true" size={16} />
               {language === "ko" ? "미션" : "Mission"}
             </span>
-            <button onClick={onMulticamOps} type="button">
-              <Camera aria-hidden="true" size={16} />
-              <span>{language === "ko" ? "멀티캠 관제" : "Multicam Ops"}</span>
+            <button onClick={onMonitor} type="button">
+              <Monitor aria-hidden="true" size={16} />
+              <span>{language === "ko" ? "수술 관제" : "SurgiMate"}</span>
             </button>
+            {integratedDebugAvailable ? (
+              <button
+                aria-label={language === "ko" ? "통합 Debug 관측 열기" : "Open integrated Debug observation"}
+                onClick={onIntegratedDebug}
+                title={language === "ko"
+                  ? "운영 런타임을 유지한 채 인식·토픽·멀티캠 관측을 엽니다."
+                  : "Open perception, topic, and multicamera observation without replacing the operational runtime."}
+                type="button"
+              >
+                <ScanLine aria-hidden="true" size={16} />
+                <span>{language === "ko" ? "통합 관측" : "Integrated Observe"}</span>
+              </button>
+            ) : null}
           </nav>
           <div
             className={`ribbon-model-control ${vm.vlmStatus.className}`}
@@ -105,12 +143,20 @@ export function StatusRibbon({
             <strong>{vm.vlmStatus.health}</strong>
           </div>
           <div className="ribbon-status-actions">
-            <div className={`system-pill ${connected ? "ok" : "warn"}`} role="status">
+            <div
+              aria-atomic="true"
+              aria-label={`${bridgeFeedback.label}. ${bridgeFeedback.detail}`}
+              aria-live="polite"
+              className={`system-pill ${bridgeFeedback.tone}`}
+              data-authority-status={displayedAuthorityStatus}
+              role="status"
+              title={bridgeFeedback.detail}
+            >
               <Radio aria-hidden="true" size={16} />
-              <span>{connected ? vm.ui.rosOnline : vm.ui.rosOffline}</span>
+              <span>{bridgeFeedback.label}</span>
             </div>
             <button
-              aria-describedby={debugModeDisabled ? "debug-mode-lock-reason" : undefined}
+              aria-describedby={debugModeDisabled ? "standalone-debug-lock-reason" : undefined}
               aria-expanded={debugConfirmationOpen}
               aria-haspopup="dialog"
               className="debug-mode-entry"
@@ -118,21 +164,37 @@ export function StatusRibbon({
               onClick={() => setDebugConfirmationOpen(true)}
               title={
                 debugModeDisabled
-                  ? language === "ko"
-                    ? "진행 상태를 보존하려면 먼저 실행을 정지해 주세요."
-                    : "Stop the run before entering standalone Debug mode."
+                  ? debugModeChecking
+                    ? language === "ko"
+                        ? "현재 런타임 상태를 확인하는 동안에는 독립 Debug로 전환할 수 없습니다."
+                      : "Runtime switching is unavailable while the active runtime is being checked."
+                    : debugModeStarting
+                      ? language === "ko"
+                        ? "런타임 전환이 끝날 때까지 독립 Debug로 전환할 수 없습니다."
+                        : "Runtime switching is unavailable until the current transition finishes."
+                      : language === "ko"
+                        ? "진행 상태를 보존하려면 먼저 실행을 정지한 뒤 독립 Debug로 전환해 주세요."
+                        : "Stop the run before entering standalone Debug mode."
                   : undefined
               }
               type="button"
             >
               <Bug aria-hidden="true" size={16} />
-              <span>{language === "ko" ? "디버그 모드" : "Debug Mode"}</span>
+              <span>{language === "ko" ? "독립 Debug" : "Standalone Debug"}</span>
             </button>
             {debugModeDisabled ? (
-              <span className="sr-only" id="debug-mode-lock-reason">
-                {language === "ko"
-                  ? "실행 중이거나 일시정지 또는 시작 처리 중에는 디버그 모드로 전환할 수 없습니다. 먼저 실행을 정지해 주세요."
-                  : "Debug mode is unavailable while running, paused, or starting. Stop the run first."}
+              <span className="sr-only" id="standalone-debug-lock-reason">
+                {debugModeChecking
+                  ? language === "ko"
+                    ? "현재 런타임 상태를 확인하는 동안에는 독립 Debug로 전환할 수 없습니다."
+                    : "Debug mode is unavailable while the active runtime is being checked."
+                  : debugModeStarting
+                    ? language === "ko"
+                    ? "런타임 전환이 끝날 때까지 독립 Debug로 전환할 수 없습니다."
+                      : "Debug mode is unavailable until the current runtime transition finishes."
+                    : language === "ko"
+                      ? "실행 중이거나 일시정지 상태에서는 독립 Debug로 전환할 수 없습니다. 먼저 실행을 정지해 주세요."
+                      : "Debug mode is unavailable while running or paused. Stop the run first."}
               </span>
             ) : null}
             <div className="language-control" aria-label={vm.ui.language} role="group">
@@ -159,10 +221,10 @@ export function StatusRibbon({
       </header>
       <SafetyConfirmationDialog
         closeLabel={language === "ko" ? "닫기" : "Close"}
-        confirmLabel={language === "ko" ? "디버그 런타임 시작" : "Start Debug runtime"}
+        confirmLabel={language === "ko" ? "독립 Debug 런타임 시작" : "Start standalone Debug runtime"}
         description={
           language === "ko"
-            ? "미션 작업공간을 떠나 독립된 엔지니어링 런타임으로 전환합니다. 현재 미션 실행이 정지된 상태에서만 진행할 수 있습니다."
+            ? "미션 작업공간을 떠나 독립된 엔지니어링 런타임으로 전환합니다. 통합 관측 화면과 달리 운영 런타임을 교체하므로, 현재 미션 실행이 정지된 상태에서만 진행할 수 있습니다."
             : "Leave the mission workspace and switch to the isolated engineering runtime. The mission run must be stopped first."
         }
         note={
@@ -173,7 +235,7 @@ export function StatusRibbon({
         onClose={() => setDebugConfirmationOpen(false)}
         onConfirm={onDebugMode}
         open={debugConfirmationOpen}
-        title={language === "ko" ? "디버그 런타임으로 전환할까요?" : "Switch to the Debug runtime?"}
+        title={language === "ko" ? "독립 Debug 런타임으로 전환할까요?" : "Switch to the standalone Debug runtime?"}
       />
     </>
   );

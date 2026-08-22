@@ -106,6 +106,7 @@ export function StageCameraToggleViewport({
   overlays,
   cameraIds = DEFAULT_CAMERA_IDS,
   initialCamera,
+  language = "en",
   liveLabel,
   liveLabels,
   emptyLabel,
@@ -117,6 +118,7 @@ export function StageCameraToggleViewport({
   overlays?: StageCameraFrames;
   cameraIds?: readonly [StageCameraId, StageCameraId];
   initialCamera?: StageCameraId;
+  language?: "ko" | "en";
   liveLabel: string;
   liveLabels?: Partial<Record<StageCameraId, string>>;
   emptyLabel: string;
@@ -141,6 +143,8 @@ export function StageCameraToggleViewport({
   const toggleLabel = cameraIds
     .map((cameraId) => cameraId.toUpperCase())
     .join(" / ");
+  const nextCamera = cameraIds.find((cameraId) => cameraId !== resolvedCamera) ?? cameraIds[0];
+  const nextCameraLabel = nextCamera.toUpperCase();
 
   return (
     <figure
@@ -173,6 +177,16 @@ export function StageCameraToggleViewport({
             </button>
           ))}
         </div>
+        <button
+          className="stage-camera-toggle-compact"
+          type="button"
+          aria-label={language === "ko"
+            ? `${cameraLabel}에서 ${nextCameraLabel}로 전환`
+            : `Switch from ${cameraLabel} to ${nextCameraLabel}`}
+          onClick={() => setActiveCamera(nextCamera)}
+        >
+          <span>{nextCameraLabel}</span>
+        </button>
         <i>{frame ? resolvedLiveLabel : resolvedEmptyLabel}</i>
       </figcaption>
       <CameraCanvas

@@ -12,7 +12,7 @@ import time
 import unittest
 import subprocess
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -113,7 +113,7 @@ class RuntimeControlApiTests(unittest.TestCase):
         self.assertEqual(payload["phase"], "starting")
         self.assertEqual(
             self.commands,
-            [[str(Path(self.tempdir.name) / "scripts" / "taskplanner"), "up", "replay", "--no-build"]],
+            [[str(Path(self.tempdir.name) / "scripts" / "taskplanner"), "up", "replay", "--ensure-build"]],
         )
         self.assertEqual(
             self.environments[0]["TASKPLANNER_RUNTIME_EXPECTED_ACTIVE_MODE"], ""
@@ -154,7 +154,7 @@ class RuntimeControlApiTests(unittest.TestCase):
                 str(Path(self.tempdir.name) / "scripts" / "taskplanner"),
                 "up",
                 "debug",
-                "--no-build",
+                "--ensure-build",
                 "--replace-active",
             ]],
         )
@@ -668,6 +668,34 @@ class RosbridgeRouteProbeTests(unittest.TestCase):
         create_connection.assert_called_once_with(("127.0.0.1", 19091), timeout=0.5)
         self.assertIn(b"GET /custom-shadow HTTP/1.1", connection.sent)
         self.assertIn(b"Host: 127.0.0.1:19091", connection.sent)
+
+
+class RuntimeControlResponseTests(unittest.TestCase):
+    @staticmethod
+    def handler_with_writer(writer):
+        handler = object.__new__(runtime_control.RuntimeControlRequestHandler)
+        handler.send_response = Mock()
+        handler.send_header = Mock()
+        handler.end_headers = Mock()
+        handler.wfile = writer
+        return handler
+
+    def test_client_disconnect_during_response_body_is_quiet(self) -> None:
+        writer = Mock()
+        writer.write.side_effect = BrokenPipeError("client closed")
+        handler = self.handler_with_writer(writer)
+
+        handler._send_json(runtime_control.HTTPStatus.ACCEPTED, {"phase": "starting"})
+
+        writer.write.assert_called_once()
+
+    def test_non_connection_response_errors_are_not_hidden(self) -> None:
+        writer = Mock()
+        writer.write.side_effect = RuntimeError("programming error")
+        handler = self.handler_with_writer(writer)
+
+        with self.assertRaisesRegex(RuntimeError, "programming error"):
+            handler._send_json(runtime_control.HTTPStatus.OK, {"phase": "idle"})
 
 
 if __name__ == "__main__":

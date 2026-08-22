@@ -1,0 +1,146 @@
+{
+  "calibration": {
+    "acceptance": {
+      "accepted": true,
+      "criteria": {
+        "maximum_fit_residual_median_m": 0.006,
+        "maximum_fit_residual_p95_m": 0.015,
+        "maximum_plane_normal_z": -0.8,
+        "maximum_temporal_normal_drift_max_deg": 1.0,
+        "maximum_temporal_normal_drift_p95_deg": 0.75,
+        "maximum_temporal_offset_drift_max_m": 0.003,
+        "maximum_temporal_offset_drift_p95_m": 0.002,
+        "minimum_exact_quartet_count": 20,
+        "minimum_fit_inlier_ratio_at_8mm": 0.8,
+        "minimum_sample_frame_count": 20,
+        "minimum_sample_span_sec": 2.0,
+        "minimum_selected_points_per_frame": 5000,
+        "require_runtime_gate_all_sampled_frames_passed": true
+      },
+      "reasons": []
+    },
+    "calibration_id": "viplab_cam4_146222251000_20260821T045135Z",
+    "created_at_utc": "2026-08-21T04:51:35Z",
+    "fit": {
+      "algorithm": "deterministic_multi_frame_ransac_then_inlier_svd_v1",
+      "first_stamp_ns": 1787287887659867432,
+      "inlier_ratio": 0.854928571429,
+      "inlier_threshold_m": 0.008,
+      "last_stamp_ns": 1787287895266440674,
+      "per_frame_selected_point_count": {
+        "max": 7000,
+        "median": 7000,
+        "min": 7000
+      },
+      "residual_median_m": 0.003280811656,
+      "residual_p95_m": 0.014164174501,
+      "sample_frame_count": 30,
+      "sample_point_count": 210000,
+      "sample_span_sec": 7.606573242,
+      "temporal_normal_drift_deg": {
+        "max": 0.524100283098,
+        "median": 0.214389911646,
+        "p95": 0.396368122171
+      },
+      "temporal_offset_drift_m": {
+        "max": 0.000655529528,
+        "median": 0.000172453132,
+        "p95": 0.000562870294
+      }
+    },
+    "plane": {
+      "equation": "normal_dot_point_plus_offset_equals_zero",
+      "normal": [
+        0.046450707785,
+        0.055576411879,
+        -0.997373347443
+      ],
+      "offset_m": 0.797796943113
+    },
+    "runtime_gate": {
+      "inlier_threshold_m": 0.012,
+      "max_residual_median_m": 0.006,
+      "max_residual_p95_m": 0.02,
+      "min_inlier_ratio": 0.85,
+      "min_sample_count": 5000
+    },
+    "selection": {
+      "depth_range_m": [
+        0.55,
+        1.1
+      ],
+      "erosion_kernel_px": 5,
+      "hsv_bgr_to_hsv_lower": [
+        80,
+        50,
+        45
+      ],
+      "hsv_bgr_to_hsv_upper": [
+        118,
+        255,
+        255
+      ],
+      "max_points_per_frame": 7000,
+      "policy": "bounded_tray_roi_and_hsv_blue_surface; 5px erosion removes JPEG edges; depth range rejects floor/background; dark/metal tools, hands, and non-blue outliers are excluded before RANSAC",
+      "random_seed": 20260821,
+      "roi_polygons_px": [
+        [
+          [
+            485,
+            135
+          ],
+          [
+            890,
+            120
+          ],
+          [
+            900,
+            470
+          ],
+          [
+            490,
+            480
+          ]
+        ]
+      ]
+    },
+    "source": {
+      "aligned_depth_camera_info_topic": "/synced/cam_4/aligned_depth_to_color/camera_info",
+      "aligned_depth_topic": "/synced/cam_4/aligned_depth_to_color/image_raw/compressedDepth",
+      "alignment_id": "viplab-cam4-rgbd-align-v1-6af70cfd906e807f",
+      "camera_info_sha256": "2c2a514fbb42f80baf5afbaf23c75341d009ac6483a63b5ce4c4b69195cc298f",
+      "camera_model": "Intel RealSense D455",
+      "camera_name": "cam_4",
+      "camera_serial": "146222251000",
+      "capture_bag_sha256": "edceb87642eca0f94ec382a8e927cd0c587524bb4b3ba79f462868920a98dda7",
+      "capture_duration_sec": 7.606573242,
+      "color_camera_info_topic": "/synced/cam_4/color/camera_info",
+      "depth_scale_m_per_unit": 0.001,
+      "depth_scale_method": "librealsense_depth_sensor_get_depth_scale_read_only",
+      "distortion_model": "plumb_bob",
+      "exact_quartet_count": 88,
+      "firmware_version": "5.15.0.2",
+      "frame_id": "cam_4_color_optical_frame",
+      "height": 720,
+      "profile": "RGB 1280x720x15; depth 1280x720x15",
+      "recommended_firmware_version": "5.17.0.10",
+      "rgb_topic": "/synced/cam_4/color/image_raw/compressed",
+      "topic_message_counts": {
+        "/synced/cam_4/aligned_depth_to_color/camera_info": 117,
+        "/synced/cam_4/aligned_depth_to_color/image_raw/compressedDepth": 117,
+        "/synced/cam_4/color/camera_info": 117,
+        "/synced/cam_4/color/image_raw/compressed": 115
+      },
+      "usb_type_descriptor": "3.2",
+      "width": 1280
+    },
+    "valid_until_utc": "2026-09-20T04:51:35Z"
+  },
+  "integrity": {
+    "algorithm": "sha256",
+    "canonical_calibration_payload_sha256": "b683ecd5a5382a4ffccfd348ace54e4df91d20781a07eab14df1fbedfd3c1fad"
+  },
+  "schema": "taskplanner.pnu.cam4_support_plane.v1",
+  "scope": "camera_frame_planar_4dof_orientation_prior_only",
+  "support_plane_config_version": "viplab_cam4_146222251000_support_plane_v1_sha256_b683ecd5a5382a4f"
+}

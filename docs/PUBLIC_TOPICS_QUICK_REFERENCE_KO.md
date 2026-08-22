@@ -252,6 +252,9 @@ ros2 topic info /surgery/images/flir/compressed --verbose
 브라우저 UI는 `ws://<Taskplanner 유선 IP>:9092`에 연결한다. 9092는 별도
 512 MiB 제한 컨테이너이며 위 11개 공개 토픽과 두 카메라 alias에 대한
 `subscribe`만 허용한다. publish/service/Action/rosapi는 제공하지 않는다.
+Live, LLM 시연, Replay 모드 모두 같은 주소와 공개 토픽 계약을 유지한다.
+Replay의 내부 ROS graph는 격리 Domain/LOCALHOST에 남고 9092 전용 프록시만
+지정 유선망에 노출된다.
 정확히는 Subscribe capability의 `subscribe`와 `unsubscribe` 연산만 허용하며,
 incoming `fragment`와 그 밖의 알 수 없는 연산은 재조립하지 않고 거부한다.
 WebSocket frame 하나에는 완성된 JSON 요청 하나만 허용한다. UTF-8 기준 64 KiB
@@ -259,6 +262,15 @@ WebSocket frame 하나에는 완성된 JSON 요청 하나만 허용한다. UTF-8
 송신 fragmentation도 비활성화되어 전체 직렬화 결과가 4 MiB를 넘으면 어떤
 fragment frame도 보내지 않고 해당 sample을 폐기한다.
 9090 운영 bridge와 9091 Debug bridge를 UI/UX 팀 주소로 사용하면 안 된다.
+
+Taskplanner 자체의 **대화형 Replay 디지털 트윈 화면**은 별도 운영자 경로다.
+Replay 실행 중 같은 유선망의 신뢰된 PC에서
+`http://<Taskplanner 유선 IP>:4173`으로 접속한다. 이 페이지는 내부적으로
+`ws://<Taskplanner 유선 IP>:9091/shadow`를 사용하며, 4173과 9091은 모두
+지정 유선 NIC와 그 직접 연결 subnet에만 노출된다. 이 경로에는 Replay
+시작·일시정지 같은 조작 기능이 있으므로 외부 UI 팀의 읽기 전용 데이터 연동에는
+사용하지 않고, 그 경우에는 계속 9092 공개 bridge만 사용한다. 내부 9099 포트는
+LAN에 직접 공개하지 않는다.
 
 9092의 외부 접속은 `TASKPLANNER_DEBUG_NETWORK_INTERFACE`로 지정한 유선 NIC와
 그 NIC의 직접 연결 IPv4 subnet으로만 제한된다. 기본 WebSocket Origin 정책도

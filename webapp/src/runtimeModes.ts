@@ -9,7 +9,7 @@ function isRuntimeMode(value: string | null | undefined): value is TaskplannerRu
 
 function configuredDefaultRuntimeMode(): TaskplannerRuntimeMode {
   const configuredMode = import.meta.env.VITE_DEFAULT_RUNTIME_MODE?.trim();
-  return isRuntimeMode(configuredMode) ? configuredMode : "llm";
+  return isRuntimeMode(configuredMode) ? configuredMode : "live";
 }
 
 function scopedStorageKey(prefix: string): string {

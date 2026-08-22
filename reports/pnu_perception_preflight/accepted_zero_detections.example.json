@@ -1,0 +1,98 @@
+{
+  "schema": "taskplanner.pnu_perception.response.v1",
+  "request_id": "example-zero",
+  "generated_unix_ms": 1787253600000,
+  "source": {
+    "rgb": {
+      "stamp_ns": 1787253599000000000,
+      "frame_id": "cam_4_color_optical_frame",
+      "format": "jpeg"
+    }
+  },
+  "accepted_algorithms": [
+    "tool",
+    "blood",
+    "hand"
+  ],
+  "upstream": {
+    "repository": "hanwae-py/hand-blood-tools",
+    "commit": "0f9e93115b8cc1d470398c92e010e3fc6ef1de5d"
+  },
+  "models": {
+    "tool": {
+      "ready": true,
+      "executed": true,
+      "status": "executed",
+      "version": "example",
+      "digest_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "backend": "rfdetr",
+      "error": null
+    },
+    "blood": {
+      "ready": true,
+      "executed": true,
+      "status": "executed",
+      "version": "example",
+      "digest_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "backend": "rfdetr",
+      "error": null
+    },
+    "hand": {
+      "ready": true,
+      "executed": true,
+      "status": "executed",
+      "version": "example",
+      "digest_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "backend": "mediapipe",
+      "error": null
+    }
+  },
+  "latency_ms": {
+    "decode": 1.0,
+    "tool": 12.5,
+    "blood": 13.1,
+    "hand": 4.8,
+    "total": 31.4
+  },
+  "results": {
+    "tool": {
+      "schema": "pnu.tool.2d.v1",
+      "detections": [],
+      "executed": true
+    },
+    "blood": {
+      "schema": "pnu.blood.2d.v1",
+      "detections": [],
+      "executed": true
+    },
+    "hand": {
+      "schema": "pnu.hand.2d.v1",
+      "hands": [],
+      "executed": true
+    }
+  },
+  "metric_3d": {
+    "ready": false,
+    "reasons": [
+      "depth_missing"
+    ]
+  },
+  "depth_evidence": {
+    "received": false,
+    "decoded": false,
+    "alignment_validated": false,
+    "alignment_id": "",
+    "rgb_frame_id": "cam_4_color_optical_frame",
+    "depth_frame_id": "",
+    "rgb_shape_hw": [
+      720,
+      1280
+    ],
+    "depth_shape_hw": null,
+    "depth_scale_m_per_unit": 0.0,
+    "depth_scale_validated": false,
+    "valid_pixels": 0,
+    "valid_ratio": 0.0
+  },
+  "depth_received": false
+}

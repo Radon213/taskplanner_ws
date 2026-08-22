@@ -6,7 +6,10 @@
  */
 
 html {
-  min-width: 320px;
+  /* A classic 15px scrollbar is part of the viewport on the in-app browser.
+     A 320px root minimum therefore created a hidden horizontal scroll range
+     at an otherwise valid 320px viewport. Components own their own minimums. */
+  min-width: 0;
   background: var(--color-page);
   scrollbar-gutter: stable;
 }
@@ -161,6 +164,11 @@ body {
   background: var(--color-page-raised);
 }
 
+.workspace-navigation.with-integrated-debug {
+  min-width: 378px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
 .workspace-navigation :where(button, .workspace-navigation-current) {
   display: inline-flex;
   min-width: 0;
@@ -215,6 +223,11 @@ body {
   color: var(--color-success);
 }
 
+.system-pill.pending {
+  border-color: color-mix(in srgb, var(--color-warning) 46%, var(--color-border));
+  color: var(--color-warning-text);
+}
+
 .system-pill.warn {
   border-color: color-mix(in srgb, var(--color-danger) 40%, var(--color-border));
   color: var(--color-danger);
@@ -232,6 +245,7 @@ body {
   border-color: var(--color-border-strong);
   background: transparent;
   color: var(--color-text-secondary);
+  white-space: nowrap;
 }
 
 .debug-mode-entry:hover:not(:disabled) {
@@ -282,8 +296,24 @@ body {
   color: var(--color-accent-ink);
 }
 
+/* The Debug arm/disarm control must keep one predictable high-contrast
+   surface; the shared gradient dips below AA contrast at its darker stop. */
+.debug-manual-toggle.button-primary {
+  background: var(--color-accent);
+}
+
 .button-primary:hover:not(:disabled) {
   background: color-mix(in srgb, var(--color-accent) 86%, white);
+}
+
+/* Disabled primary actions remain legible instead of relying on opacity over
+   the bright accent gradient. The disabled state is conveyed by the muted
+   surface and locked cursor, while the text still clears WCAG AA contrast. */
+.app-shell.app-shell .button-primary:disabled {
+  border-color: var(--color-border-strong);
+  background: var(--color-surface-muted);
+  color: var(--color-text-secondary);
+  opacity: 1;
 }
 
 .button-secondary {
@@ -296,6 +326,14 @@ body {
   border-color: var(--color-border);
   background: transparent;
   color: var(--color-text-secondary);
+}
+
+/* The legacy actor palette was too dim on the dark A+ surface at compact
+   widths. Keep the state distinction, but use the shared readable text token. */
+.surgeon-area .actor-toggle.active {
+  border-color: var(--color-border-strong);
+  background: var(--color-surface-raised);
+  color: var(--color-text);
 }
 
 .button-stop {
@@ -356,172 +394,6 @@ body {
 .mission-app-shell .runtime-area .field :where(input, select),
 .mission-app-shell .runtime-area .runtime-mode-select select {
   min-height: 44px;
-}
-
-/* Control authority is intentionally descriptive, never an actuation claim. */
-.authority-area {
-  grid-area: authority;
-  min-width: 0;
-}
-
-.authority-strip {
-  display: grid;
-  min-width: 0;
-  grid-template-columns: minmax(210px, 0.72fr) minmax(0, 2.5fr);
-  align-items: stretch;
-  gap: 12px;
-  padding: 12px;
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-card);
-  background: var(--color-surface);
-  box-shadow: var(--shadow-card);
-}
-
-.authority-summary {
-  display: grid;
-  align-content: center;
-  gap: 3px;
-  min-width: 0;
-  padding-inline: 4px 10px;
-}
-
-.authority-summary p,
-.authority-summary h2,
-.authority-summary span,
-.authority-step p,
-.authority-step strong,
-.authority-step small {
-  margin: 0;
-}
-
-.authority-summary p {
-  color: var(--color-accent-strong);
-  font-size: 12px;
-  font-weight: 700;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-}
-
-.authority-summary h2 {
-  color: var(--color-text);
-  font-size: 18px;
-  line-height: 1.3;
-  letter-spacing: -0.01em;
-}
-
-.authority-summary span {
-  overflow: hidden;
-  color: var(--color-text-muted);
-  font-size: 12px;
-  line-height: 1.45;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.authority-chain {
-  display: grid;
-  min-width: 0;
-  grid-template-columns: repeat(6, minmax(128px, 1fr));
-  gap: 6px;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.authority-step {
-  position: relative;
-  display: grid;
-  min-width: 0;
-  min-height: 64px;
-  align-content: center;
-  gap: 3px;
-  padding: 9px 10px 9px 13px;
-  border-radius: var(--radius-inner);
-  background: var(--color-page-raised);
-  isolation: isolate;
-}
-
-.authority-focus {
-  position: absolute;
-  inset: 0;
-  z-index: 0;
-  border: 1px solid color-mix(in srgb, var(--color-accent) 42%, var(--color-border));
-  border-radius: inherit;
-  background: var(--state-selected);
-  box-shadow: var(--shadow-focus);
-  pointer-events: none;
-}
-
-.authority-step[aria-current="step"] :where(p, strong, small) {
-  position: relative;
-  z-index: 1;
-}
-
-.authority-step[aria-current="step"]::before {
-  z-index: 2;
-}
-
-.authority-step::before {
-  position: absolute;
-  inset-block: 10px;
-  inset-inline-start: 5px;
-  width: 3px;
-  border-radius: 3px;
-  background: var(--color-text-disabled);
-  content: "";
-}
-
-.authority-step p {
-  color: var(--color-text-muted);
-  font-size: 12px;
-  font-weight: 700;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-}
-
-.authority-step strong {
-  overflow: hidden;
-  color: var(--color-text-secondary);
-  font-size: 12px;
-  line-height: 1.3;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.authority-step small {
-  display: -webkit-box;
-  overflow: hidden;
-  color: var(--color-text-muted);
-  font-size: 12px;
-  line-height: 1.25;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 2;
-}
-
-.authority-step.ready::before,
-.authority-step.active::before {
-  background: var(--color-success);
-}
-
-.authority-step.ready strong,
-.authority-step.active strong {
-  color: var(--color-success-text);
-}
-
-.authority-step.advisory::before {
-  background: var(--color-warning);
-}
-
-.authority-step.advisory strong {
-  color: var(--color-warning-text);
-}
-
-.authority-step.blocked::before {
-  background: var(--color-danger);
-}
-
-.authority-step.blocked strong {
-  color: var(--color-danger-text);
 }
 
 .ops-checkline,
@@ -622,17 +494,8 @@ body {
   font-size: max(12px, 100%);
 }
 
-.authority-step.external::before {
-  background: var(--color-accent);
-}
-
-.authority-step.external strong {
-  color: var(--color-accent-strong);
-}
-
 .mission-layout {
   grid-template-areas:
-    "authority"
     "stage"
     "surgeon"
     "runtime"
@@ -641,7 +504,6 @@ body {
 
 .mission-layout.live-stage-expanded {
   grid-template-areas:
-    "authority"
     "stage"
     "runtime"
     "timeline";
@@ -769,16 +631,21 @@ body {
 .switchable-stage-camera figcaption {
   position: relative;
   z-index: 2;
+  min-height: 48px;
+  align-items: center;
 }
 
 .stage-camera-toggle {
   position: relative;
+  height: 48px;
+  min-width: 94px;
   overflow: visible;
 }
 
 .stage-camera-toggle button {
   position: relative;
-  top: -15px;
+  top: 0;
+  height: 44px;
   min-height: 44px;
   padding: 0 4px;
   background: transparent;
@@ -804,6 +671,54 @@ body {
 
 .stage-camera-toggle button:focus-visible {
   outline-offset: -2px;
+}
+
+.stage-camera-toggle-compact {
+  display: none;
+}
+
+/* The embedded camera cards become narrower than two independent 44px
+   controls at compact board scales. Keep the segmented selector while it
+   fits; below that point expose one full-size, non-overlapping switch action. */
+@container (max-width: 210px) {
+  .switchable-stage-camera figcaption {
+    grid-template-columns: minmax(0, auto) minmax(94px, 1fr);
+    gap: 4px;
+    padding-inline: 2px;
+  }
+
+  .switchable-stage-camera figcaption > i {
+    display: none;
+  }
+}
+
+@container (max-width: 150px) {
+  .switchable-stage-camera figcaption {
+    grid-template-columns: minmax(0, 1fr);
+    padding-inline: 1px;
+    place-items: center;
+  }
+
+  .switchable-stage-camera .stage-camera-source-label,
+  .switchable-stage-camera .stage-camera-toggle {
+    display: none;
+  }
+
+  .switchable-stage-camera .stage-camera-toggle-compact {
+    display: inline-flex;
+    width: 44px;
+    height: 44px;
+    align-items: center;
+    justify-content: center;
+    padding: 0 3px;
+    border: 1px solid color-mix(in srgb, var(--color-accent) 32%, var(--color-border));
+    border-radius: var(--radius-inner);
+    background: var(--color-page-raised);
+    color: var(--color-accent-strong);
+    font-size: 10px;
+    font-weight: 700;
+    line-height: 1;
+  }
 }
 
 /* Multicam and engineering workspaces always expose their full content. */
@@ -947,16 +862,12 @@ body {
      The detailed event timeline remains available in compact layouts. */
   .mission-layout {
     grid-template-columns: minmax(600px, 1.58fr) minmax(250px, 0.48fr) minmax(300px, 0.56fr);
-    grid-template-areas:
-      "authority authority authority"
-      "stage surgeon runtime";
+    grid-template-areas: "stage surgeon runtime";
   }
 
   .mission-layout.live-stage-expanded {
     grid-template-columns: minmax(0, 1fr) minmax(300px, 0.56fr);
-    grid-template-areas:
-      "authority authority"
-      "stage runtime";
+    grid-template-areas: "stage runtime";
   }
 
   .timeline-area {
@@ -992,6 +903,27 @@ body {
   }
 }
 
+@media (min-width: 1280px) and (max-width: 1439px) {
+  /* The middle column is only 250px at common 1366px laptop widths. Giving
+     the model picker its own row preserves the selected model and load state
+     instead of collapsing the copy column to zero pixels. */
+  .llm-surgeon-dock .llm-control-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .llm-surgeon-dock .public-gesture-status {
+    grid-template-areas:
+      "icon label"
+      "icon state"
+      "icon detail";
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .llm-surgeon-dock .public-gesture-status > strong {
+    justify-self: start;
+  }
+}
+
 @media (min-width: 1440px) and (min-height: 850px) {
   .mission-app-shell {
     display: grid;
@@ -1001,7 +933,7 @@ body {
   }
 
   .mission-layout {
-    grid-template-rows: auto minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr);
   }
 
   .ops-app-shell,
@@ -1023,25 +955,14 @@ body {
     grid-template-columns: auto minmax(280px, 1fr) auto;
   }
 
-  .authority-strip {
+}
+
+@media (max-width: 1479px) {
+  /* Below 1480px the brand column plus the three control groups leaves the
+     Debug entry narrower than its label. Keep the breakpoint continuous with
+     the intermediate layout instead of allowing a truncated safety action. */
+  .top-ribbon {
     grid-template-columns: 1fr;
-  }
-
-  .authority-summary {
-    padding-inline: 2px;
-  }
-
-  .authority-chain {
-    overflow-x: auto;
-    padding-bottom: 4px;
-    scroll-snap-type: x proximity;
-    scrollbar-width: thin;
-    -webkit-overflow-scrolling: touch;
-  }
-
-  .authority-step {
-    min-width: 148px;
-    scroll-snap-align: start;
   }
 }
 
@@ -1066,6 +987,26 @@ body {
   }
 }
 
+@media (max-width: 1100px) {
+  /* Keep the command ribbon readable on 10–13 inch layouts. At this width
+     the three-column cluster leaves the Debug action narrower than its label,
+     which makes a safety-relevant entry point look truncated. */
+  .ribbon-cluster {
+    grid-template-columns: 1fr;
+  }
+
+  .workspace-navigation,
+  .ribbon-model-control,
+  .ribbon-status-actions {
+    width: 100%;
+  }
+
+  .ribbon-status-actions {
+    justify-content: flex-start;
+    flex-wrap: wrap;
+  }
+}
+
 @media (max-width: 760px) {
   .app-shell,
   .ops-app-shell,
@@ -1078,7 +1019,6 @@ body {
   }
 
   .top-ribbon,
-  .authority-strip,
   .dock,
   .stage-card,
   .timeline-panel,
@@ -1098,6 +1038,18 @@ body {
     display: none;
   }
 
+  /* Live adds the read-only integrated-observation entry. Keep all three
+     44px targets within a phone viewport instead of retaining the desktop
+     378px three-column minimum. */
+  .workspace-navigation.with-integrated-debug {
+    min-width: 0;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .workspace-navigation.with-integrated-debug > :last-child {
+    grid-column: 1 / -1;
+  }
+
   .system-pill,
   .debug-mode-entry {
     flex: 1 1 150px;
@@ -1108,24 +1060,24 @@ body {
   }
 
   .stage-area {
-    overflow-x: auto;
+    /* Keep the board readable without creating a hidden 720px desktop canvas
+       inside a phone-sized column. The previous horizontal scroller clipped
+       the board and made the adjacent content appear to overlap. */
+    overflow-x: hidden;
     border-radius: var(--radius-card);
-    overscroll-behavior-inline: contain;
-    scroll-snap-type: x proximity;
-    scrollbar-width: thin;
-    -webkit-overflow-scrolling: touch;
+    overscroll-behavior-inline: none;
+    scroll-snap-type: none;
   }
 
   .stage-area > .stage-card {
-    width: 720px;
-    min-width: 720px;
-    scroll-snap-align: start;
+    width: 100%;
+    min-width: 0;
   }
 
   .stage-area .foxglove-board {
-    height: 520px;
-    min-height: 520px;
-    aspect-ratio: 1.55 / 1;
+    height: clamp(470px, 135vw, 520px);
+    min-height: 470px;
+    aspect-ratio: 1 / 1.22;
   }
 
   .model-trigger-copy small,
@@ -1161,10 +1113,6 @@ body {
     display: none;
   }
 
-  .authority-summary span {
-    white-space: normal;
-  }
-
   .safety-dialog-backdrop {
     align-items: end;
     padding: 12px;
@@ -1181,6 +1129,40 @@ body {
 @media (max-width: 520px) {
   .top-ribbon {
     gap: 12px;
+  }
+
+  .ops-observer-endpoint code {
+    display: flex;
+    min-height: 44px;
+    align-items: center;
+    padding-block: 6px;
+    overflow-wrap: anywhere;
+    line-height: 1.35;
+    text-overflow: clip;
+    white-space: normal;
+  }
+
+  /* The decision tabs need their own row on the narrowest screens. Keeping
+     them beside the panel title squeezed the three 44px targets into a
+     100px strip and pushed the Raw tab outside the viewport. */
+  .observability-panel-decision .panel-title-row.compact {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 8px;
+    margin-bottom: 10px;
+  }
+
+  .observability-panel-decision .tab-switch {
+    display: grid;
+    width: 100%;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    overflow: visible;
+  }
+
+  .observability-panel-decision .tab-switch button {
+    min-width: 0;
+    justify-content: center;
+    padding-inline: 4px;
   }
 
   .brand-mark {
@@ -1204,16 +1186,24 @@ body {
     flex: 1 1 0;
   }
 
-  .authority-summary h2 {
-    font-size: 17px;
-  }
-
   .safety-dialog-actions {
     grid-template-columns: 1fr;
   }
 
   .safety-dialog-close {
     order: 2;
+  }
+}
+
+@media (max-width: 480px) {
+  .ribbon-status-actions {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .ribbon-status-actions > :where(.system-pill, .debug-mode-entry, .language-control) {
+    min-width: 0;
+    width: 100%;
   }
 }
 
@@ -1233,5 +1223,15 @@ body {
     --color-border: rgb(220 235 250 / 42%);
     --color-border-strong: rgb(231 242 252 / 62%);
     --color-text-muted: var(--color-text-muted-high-contrast);
+  }
+}
+
+/* The Mission canvas is intentionally capped at the authored FHD height.
+   Without this guard, a 4K viewport stretches the fixed 1920px layout to
+   100dvh, leaving a very tall empty stage card below the actual board. */
+@media (min-width: 1920px) and (min-height: 1200px) {
+  .mission-app-shell {
+    height: min(1080px, 100dvh);
+    min-height: 0;
   }
 }

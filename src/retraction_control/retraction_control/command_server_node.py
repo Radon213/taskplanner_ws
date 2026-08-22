@@ -9,6 +9,7 @@ import time
 from typing import Any
 
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
+from ament_index_python.packages import get_package_share_directory
 import rclpy
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
@@ -19,13 +20,20 @@ from surgical_interop_msgs.srv import ExecuteRetractionCommand
 from .adapters import ForceTorqueSample, SingleOwnerGuard
 from .adapters.clock import SystemClock
 from .adapters.fake import CallTrace, FakeAft200Adapter, FakeIndyDcp3Adapter
+from .adapters.shadow import ShadowIndyDcp3Adapter
 from .command_executor import CommandExecutor
 from .controller_backend import ControllerBackend
 from .diagnostics import public_arm_state
 from .profile_loader import ExecutionProfile, load_profile
 from .runtime import CommandLedger, CommandWorker
+from .runtime_config import (
+    RuntimeSettings,
+    load_runtime_config,
+    validate_data_directory,
+)
 from .service_admission import AdmissionController
 from .teaching_session import TeachingSessionRepository
+from .trace_artifact import ShadowTraceRepository
 
 
 SERVICE_NAME = "/surgery/retraction/command"
@@ -55,7 +63,7 @@ def _wall_time_message(nanoseconds: int) -> Any:
 
 
 def _public_arm_layout(profile: ExecutionProfile) -> tuple[tuple[str, str], ...]:
-    expected_roles = _EXPECTED_PUBLIC_ROLES.get(profile.procedure_type)
+    expected_roles = _EXPECTED_PUBLIC_ROLES.get(profile.public_procedure_type)
     if expected_roles is None:
         raise ValueError(
             "approved execution profile procedure_type must be thyroidectomy or "
@@ -72,7 +80,8 @@ def _public_arm_layout(profile: ExecutionProfile) -> tuple[tuple[str, str], ...]
     if frozenset(by_role) != expected_roles:
         raise ValueError(
             "profile side mappings do not match the existing public bed-arm "
-            f"layout for {profile.procedure_type}: expected {sorted(expected_roles)}"
+            "layout for "
+            f"{profile.public_procedure_type}: expected {sorted(expected_roles)}"
         )
     if len(set(by_role.values())) != len(by_role):
         raise ValueError("public bed-arm roles must map to distinct arm IDs")
@@ -85,16 +94,37 @@ class RetractionCommandServer(Node):
     def __init__(self) -> None:
         super().__init__("retraction_command_server")
         self._callback_group = ReentrantCallbackGroup()
+        default_runtime_config = (
+            Path(get_package_share_directory("retraction_control"))
+            / "config"
+            / "logging.yaml"
+        )
+        self.declare_parameter(
+            "runtime_config_path", str(default_runtime_config)
+        )
+        runtime_config_path = _absolute_path(
+            self.get_parameter("runtime_config_path").value,
+            parameter="runtime_config_path",
+        )
+        self._runtime_settings: RuntimeSettings = load_runtime_config(
+            runtime_config_path
+        )
         self.declare_parameter("profile_path", "")
         self.declare_parameter("adapter_mode", "fake")
-        self.declare_parameter("data_directory", "/tmp/retraction-control")
+        self.declare_parameter(
+            "data_directory", str(self._runtime_settings.data_directory)
+        )
         self.declare_parameter("allow_motion", False)
         self.declare_parameter("sdk_license_path", "")
         self.declare_parameter("expected_ros_domain_id", 0)
         self.declare_parameter("allowed_source_ids", ["taskplanner"])
         self.declare_parameter("max_pending_commands", 8)
-        self.declare_parameter("status_period_sec", 0.5)
-        self.declare_parameter("diagnostics_period_sec", 1.0)
+        self.declare_parameter(
+            "status_period_sec", self._runtime_settings.status_period_sec
+        )
+        self.declare_parameter(
+            "diagnostics_period_sec", self._runtime_settings.diagnostics_period_sec
+        )
         self.declare_parameter("shutdown_timeout_sec", 10.0)
         self.declare_parameter(
             "source_revision",
@@ -136,9 +166,8 @@ class RetractionCommandServer(Node):
                 "the version-pinned IndyDCP3 and AFT200 backends are approved"
             )
 
-        data_directory = _absolute_path(
-            self.get_parameter("data_directory").value,
-            parameter="data_directory",
+        data_directory = validate_data_directory(
+            str(self.get_parameter("data_directory").value)
         )
         if self._adapter_mode == "hardware" and data_directory != loaded.data_directory:
             raise RuntimeError(
@@ -154,11 +183,18 @@ class RetractionCommandServer(Node):
             str(mapping.arm_id): tuple(0.0 for _ in range(mapping.joint_slice.size))
             for mapping in loaded.side_mappings.values()
         }
-        robot = FakeIndyDcp3Adapter(
-            trace=self._trace,
-            clock=self._clock_adapter,
-            joint_positions=joint_positions,
-        )
+        if self._adapter_mode == "shadow":
+            robot = ShadowIndyDcp3Adapter(
+                trace=self._trace,
+                clock=self._clock_adapter,
+                observed_joint_positions=joint_positions,
+            )
+        else:
+            robot = FakeIndyDcp3Adapter(
+                trace=self._trace,
+                clock=self._clock_adapter,
+                joint_positions=joint_positions,
+            )
         force_sensor = FakeAft200Adapter(
             trace=self._trace,
             clock=self._clock_adapter,
@@ -166,7 +202,9 @@ class RetractionCommandServer(Node):
         self._fake_force_sensor = force_sensor
         self._refresh_fake_samples()
 
-        sessions = TeachingSessionRepository(data_directory / "teaching_sessions")
+        sessions = TeachingSessionRepository(
+            data_directory / self._runtime_settings.session_directory_name
+        )
         owner_guard = SingleOwnerGuard(data_directory / "controller.lock")
         executor = CommandExecutor(
             robot=robot,
@@ -179,16 +217,36 @@ class RetractionCommandServer(Node):
             clock=self._clock_adapter,
             owner_guard=owner_guard,
             calibration_metadata={"adapter_mode": self._adapter_mode},
+            execution_mode=self._adapter_mode,
         )
         self._backend = ControllerBackend(executor)
-        self._ledger = CommandLedger(data_directory / "command_ledger.sqlite3")
-        interrupted = self._ledger.mark_interrupted()
-        self._backend.start()
-        if interrupted:
-            self._backend.state_machine.fail(
-                "execution_state_unknown_after_restart:" + ",".join(interrupted),
-                fatal=True,
+        ledger: CommandLedger | None = None
+        backend_started = False
+        try:
+            # Establish single-process adapter authority before touching the
+            # shared recovery ledger.  A losing process must not relabel the
+            # active owner's nonterminal command as interrupted.
+            self._backend.start()
+            backend_started = True
+            ledger = CommandLedger(
+                data_directory / self._runtime_settings.ledger_filename
             )
+            interrupted = ledger.mark_interrupted()
+            if interrupted:
+                self._backend.state_machine.fail(
+                    "execution_state_unknown_after_restart:" + ",".join(interrupted),
+                    fatal=True,
+                )
+        except BaseException:
+            if ledger is not None:
+                ledger.close()
+            if backend_started:
+                try:
+                    self._backend.shutdown()
+                except BaseException:
+                    pass
+            raise
+        self._ledger = ledger
 
         self._worker = CommandWorker(
             self._backend.execute_runtime,
@@ -225,6 +283,15 @@ class RetractionCommandServer(Node):
         self._last_worker_stage = "idle"
         self._last_worker_message = ""
         self._last_health: Any | None = None
+        self._trace_artifact_error = ""
+        self._last_terminal_command_trace_count = 0
+        self._shadow_traces = (
+            ShadowTraceRepository(
+                data_directory / self._runtime_settings.shadow_trace_directory_name
+            )
+            if self._adapter_mode == "shadow"
+            else None
+        )
         self._status_timer = self.create_timer(
             float(self.get_parameter("status_period_sec").value),
             self._publish_status,
@@ -275,12 +342,57 @@ class RetractionCommandServer(Node):
         response.message = reply.message
         return response
 
-    def _on_worker_stage(self, _command_id: str, stage: str, message: str) -> None:
+    def _on_worker_stage(self, command_id: str, stage: str, message: str) -> None:
+        if stage in {"running", "stopping"}:
+            self._trace.set_command_context(command_id)
+        if stage in {"completed", "failed", "canceled"}:
+            try:
+                with self._stage_lock:
+                    self._last_terminal_command_trace_count = len(
+                        self._trace.records_for(command_id)
+                    )
+                self._save_shadow_trace(command_id, stage, message)
+            finally:
+                self._trace.clear_command_context()
         with self._stage_lock:
             self._last_worker_stage = str(stage)
             self._last_worker_message = str(message)
 
+    def _save_shadow_trace(self, command_id: str, stage: str, message: str) -> None:
+        repository = self._shadow_traces
+        if repository is None:
+            return
+        outcome = self._backend.last_outcome
+        if outcome is not None and outcome.command_id != command_id:
+            outcome = None
+        try:
+            repository.save(
+                command_id=command_id,
+                command=outcome.command if outcome is not None else None,
+                profile_name=self._profile.name,
+                profile_version=self._profile.version,
+                profile_checksum=self._profile.checksum,
+                source_revision=str(self.get_parameter("source_revision").value),
+                target_planner=self._backend.executor.target_planner.identity.as_dict(),
+                terminal_stage=stage,
+                terminal_code=outcome.code if outcome is not None else stage,
+                terminal_message=message,
+                calls=self._trace.records_for(command_id),
+            )
+            self._trace_artifact_error = ""
+        except Exception as exc:
+            self._trace_artifact_error = f"{type(exc).__name__}: {exc}"
+            try:
+                self._backend.state_machine.fail(
+                    "shadow_trace_write_failed:" + self._trace_artifact_error,
+                    fatal=True,
+                )
+            except Exception:
+                pass
+
     def _status_reason(self, public_state: str, health: Any | None) -> str:
+        if self._adapter_mode == "shadow":
+            return "shadow_record_only"
         outcome = self._backend.last_outcome
         if outcome is not None and not outcome.success:
             return str(outcome.code or "execution_failed")
@@ -297,6 +409,8 @@ class RetractionCommandServer(Node):
         snapshot = self._backend.snapshot()
         health = self._last_health
         state = public_arm_state(snapshot.state.state)
+        if self._adapter_mode == "shadow":
+            state = "unknown"
         if health is not None and not health.robot_connected:
             state = "unknown"
         if health is not None and health.controller_fault_code:
@@ -306,7 +420,7 @@ class RetractionCommandServer(Node):
         message.stamp = _wall_time_message(self._next_wall_time_ns())
         self._status_revision += 1
         message.revision = self._status_revision
-        message.procedure_type = self._profile.procedure_type
+        message.procedure_type = self._profile.public_procedure_type
         for arm_id, role_instance_id in self._arm_layout:
             arm = BedRobotArmState()
             arm.arm_id = arm_id
@@ -344,9 +458,15 @@ class RetractionCommandServer(Node):
         status = DiagnosticStatus()
         status.name = "retraction_control/controller"
         status.hardware_id = (
-            "synthetic-fake" if self._adapter_mode in {"fake", "shadow"} else "unconfigured"
+            "record-only-shadow"
+            if self._adapter_mode == "shadow"
+            else "synthetic-fake"
+            if self._adapter_mode == "fake"
+            else "unconfigured"
         )
         healthy = bool(health is not None and health.healthy and not health_error)
+        if self._adapter_mode == "shadow":
+            healthy = False
         status.level = (
             DiagnosticStatus.OK
             if healthy
@@ -355,9 +475,12 @@ class RetractionCommandServer(Node):
             else DiagnosticStatus.WARN
         )
         status.message = (
-            "ready"
+            "shadow_record_only"
+            if self._adapter_mode == "shadow" and not self._trace_artifact_error
+            else "ready"
             if healthy
             else health_error
+            or self._trace_artifact_error
             or last_error_message
             or "controller_not_ready"
         )
@@ -365,7 +488,9 @@ class RetractionCommandServer(Node):
             "adapter_mode": self._adapter_mode,
             "profile_name": self._profile.name,
             "profile_checksum": self._profile.checksum,
+            "runtime_config_checksum": self._runtime_settings.checksum,
             "procedure_type": self._profile.procedure_type,
+            "public_procedure_type": self._profile.public_procedure_type,
             "internal_state": snapshot.state.state.value,
             "state_revision": snapshot.state.revision,
             "active_command_id": snapshot.state.active_command_id or "",
@@ -373,15 +498,26 @@ class RetractionCommandServer(Node):
             "worker_stage": worker_stage,
             "worker_message": worker_message,
             "pending_count": self._worker.pending_count,
+            "worker_fatal_error": self._worker.fatal_error,
+            "worker_notification_errors": len(self._worker.notification_errors),
             "last_error_code": last_error_code,
             "last_error_message": last_error_message,
             "last_terminal_outcome": outcome.status.value if outcome else "",
             "last_terminal_code": outcome.code if outcome else "",
+            "last_terminal_command_id": outcome.command_id if outcome else "",
+            "last_terminal_command_trace_count": (
+                self._last_terminal_command_trace_count
+            ),
             "last_affected_arm_id": outcome.affected_arm_id if outcome else "",
             "robot_connected": health.robot_connected if health else False,
             "sensor_available": health.sensor_available if health else False,
             "stale_sensor_ids": ",".join(health.stale_sensor_ids) if health else "",
             "trace_call_count": len(self._trace.records),
+            "execution_evidence": (
+                "record_only" if self._adapter_mode == "shadow" else "synthetic"
+            ),
+            "physical_completion_confirmed": False,
+            "shadow_trace_error": self._trace_artifact_error,
         }
         status.values = [self._key_value(key, value) for key, value in values.items()]
         message = DiagnosticArray()

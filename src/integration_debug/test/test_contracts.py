@@ -253,11 +253,11 @@ def test_debug_config_exposes_exact_public_contract() -> None:
         ("/surgery/audio/request_text", "std_msgs/msg/String"),
         ("/input/speech/status", "surgical_msgs/msg/InputSourceStatus"),
         ("/integration/cv_contract/status", "std_msgs/msg/String"),
-        ("/synced/cam_1/color/image_raw/compressed", "sensor_msgs/msg/CompressedImage"),
-        ("/synced/cam_2/color/image_raw/compressed", "sensor_msgs/msg/CompressedImage"),
-        ("/synced/cam_3/color/image_raw/compressed", "sensor_msgs/msg/CompressedImage"),
-        ("/synced/cam_4/color/image_raw/compressed", "sensor_msgs/msg/CompressedImage"),
-        ("/synced/flir/color/image_raw/compressed", "sensor_msgs/msg/CompressedImage"),
+        ("/synced/cam_1/status", "std_msgs/msg/String"),
+        ("/synced/cam_2/status", "std_msgs/msg/String"),
+        ("/synced/cam_3/status", "std_msgs/msg/String"),
+        ("/synced/cam_4/status", "std_msgs/msg/String"),
+        ("/synced/flir/status", "std_msgs/msg/String"),
     }
     assert {(row["topic"], row["type"], row["qos"]) for row in config["outputs"]} == {
         ("/surgery/context", "surgical_interop_msgs/msg/SurgeryContext", "snapshot"),

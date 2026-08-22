@@ -1,0 +1,99 @@
+{
+  "schema": "taskplanner.pnu_debug_all_model_live_acceptance.v1",
+  "observed_at": "2026-08-21T11:27:09+09:00",
+  "scope": "live_viplab_cam4_to_local_all_model_worker_to_isolated_debug_ros_outputs",
+  "isolated": true,
+  "existing_runtime_restarted": false,
+  "robot_motion_or_authority_enabled": false,
+  "tool_artifact": {
+    "drive_folder_id": "1E42Cpgg8CbFRtnA8DuFbYeBT5IWx_G_h",
+    "drive_file_id": "13JW_AVPgiJZ_XdWmOReSeSCg2d35wHSC",
+    "drive_title": "checkpoint_best_regular.pth",
+    "local_filename": "cam4_rfdetr_seg_small_regular_resume_e13_best.pth",
+    "size_bytes": 133941485,
+    "sha256": "253617aa5337fec219d694ca50537e4867fb8c403ce60f3a6945bbe15fecf430",
+    "mode": "0600",
+    "zip_integrity": "PASS"
+  },
+  "worker": {
+    "global_ready": true,
+    "ready_algorithms": [
+      "tool",
+      "blood",
+      "hand"
+    ],
+    "ram_gib": 2.411,
+    "vram_mib": 1604
+  },
+  "camera_input": {
+    "camera": "cam4",
+    "exact_synchronized_quartets": 8,
+    "source_stamp_exact_match_within_each_quartet": true,
+    "quartet_topics": [
+      "/synced/cam_4/color/image_raw/compressed",
+      "/synced/cam_4/color/camera_info",
+      "/synced/cam_4/aligned_depth_to_color/image_raw/compressedDepth",
+      "/synced/cam_4/aligned_depth_to_color/camera_info"
+    ]
+  },
+  "inference": {
+    "requested_algorithms": [
+      "tool",
+      "blood",
+      "hand"
+    ],
+    "executed_algorithms": [
+      "tool",
+      "blood",
+      "hand"
+    ],
+    "metric_3d_ready": true,
+    "tool": {
+      "executed": true,
+      "detection_count": 1,
+      "class_name": "Allis Forceps",
+      "confidence": 0.71,
+      "z_m": 0.806,
+      "position_valid": true,
+      "orientation_valid": false,
+      "status_flags": [
+        "SUPPORT_PLANE_UNVALIDATED"
+      ]
+    },
+    "blood": {
+      "executed": true,
+      "detection_count": 0
+    },
+    "hand": {
+      "executed": true,
+      "detection_count": 2
+    }
+  },
+  "overlay": {
+    "topic": "/surgery/images/cam4/detection_overlay/compressed",
+    "format": "webp",
+    "width": 1280,
+    "height": 720,
+    "alpha_channel_used": true,
+    "ephemeral_composite_evidence": "/tmp/pnu-debug-all-model-live-composite.png",
+    "evidence_copied_into_repository": false
+  },
+  "latency_ms": {
+    "render_encode": 12.402,
+    "inference": 85.482,
+    "source_to_output": 109.142
+  },
+  "acceptance": {
+    "all_models_ready_and_executed": "PASS",
+    "cam4_metric_3d": "PASS",
+    "debug_overlay": "PASS",
+    "accuracy_or_checkpoint_parity": "NOT_CLAIMED"
+  },
+  "cleanup": {
+    "isolated_worker_stopped": true,
+    "isolated_bridge_stopped": true,
+    "port_8020_free": true,
+    "temporary_services_cleaned": true,
+    "existing_runtime_not_modified_by_test": true
+  }
+}

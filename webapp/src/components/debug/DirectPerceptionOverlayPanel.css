@@ -1,0 +1,343 @@
+.debug-direct-perception-card {
+  display: grid;
+  min-width: 0;
+  gap: 14px;
+}
+
+.debug-direct-perception-card > .debug-section-heading {
+  margin-bottom: 0;
+}
+
+.debug-direct-perception-state,
+.debug-direct-perception-preview,
+.debug-direct-perception-raster-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.05em;
+  white-space: nowrap;
+}
+
+.debug-direct-perception-state {
+  min-height: 32px;
+  padding: 6px 9px;
+}
+
+.debug-direct-perception-state.live,
+.debug-direct-perception-preview.live,
+.debug-direct-perception-raster-badge.live {
+  border-color: color-mix(in srgb, var(--reuse) 46%, var(--line));
+  background: color-mix(in srgb, var(--reuse) 12%, var(--ops-canvas));
+  color: var(--color-success-text);
+}
+
+.debug-direct-perception-state.stale,
+.debug-direct-perception-preview.stale,
+.debug-direct-perception-raster-badge.stale {
+  border-color: color-mix(in srgb, var(--surgeon) 46%, var(--line));
+  background: color-mix(in srgb, var(--surgeon) 12%, var(--ops-canvas));
+  color: var(--surgeon-strong);
+}
+
+.debug-direct-perception-state.error,
+.debug-direct-perception-preview.missing,
+.debug-direct-perception-preview.error,
+.debug-direct-perception-raster-badge.error {
+  border-color: color-mix(in srgb, var(--warning) 48%, var(--line));
+  background: color-mix(in srgb, var(--warning) 12%, var(--ops-canvas));
+  color: var(--color-danger-text);
+}
+
+.debug-direct-perception-state.waiting,
+.debug-direct-perception-preview.disabled,
+.debug-direct-perception-raster-badge.waiting {
+  background: color-mix(in srgb, var(--surface-2) 56%, transparent);
+  color: var(--muted);
+}
+
+.debug-direct-perception-figure {
+  display: grid;
+  min-width: 0;
+  gap: 7px;
+  margin: 0;
+}
+
+.debug-direct-perception-viewport {
+  position: relative;
+  min-width: 0;
+  /* The server contract is one 1920 × 540 (32:9) CAM3+CAM4 raster. */
+  aspect-ratio: 1920 / 540;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: linear-gradient(135deg, color-mix(in srgb, var(--surface-2) 72%, transparent), var(--ops-canvas));
+}
+
+.debug-direct-perception-final-frame {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.debug-direct-perception-raster-badge {
+  position: absolute;
+  top: 9px;
+  right: 9px;
+  padding: 5px 7px;
+  background: color-mix(in srgb, var(--ops-canvas) 90%, transparent);
+}
+
+.debug-direct-perception-empty {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 7px;
+  padding: 24px;
+  color: var(--muted);
+  text-align: center;
+}
+
+.debug-direct-perception-empty strong,
+.debug-direct-perception-status-empty strong {
+  color: var(--soft);
+  font-size: 12px;
+}
+
+.debug-direct-perception-empty span,
+.debug-direct-perception-status-empty span {
+  max-width: min(680px, 100%);
+  overflow-wrap: anywhere;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 9px;
+  line-height: 1.4;
+}
+
+.debug-direct-perception-figure figcaption {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 3px 8px;
+  color: var(--muted);
+  font-size: 9px;
+}
+
+.debug-direct-perception-figure figcaption span {
+  display: inline-flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 4px;
+}
+
+.debug-direct-perception-figure figcaption strong,
+.debug-direct-perception-status-card p,
+.debug-direct-perception-camera-status p {
+  color: var(--soft);
+  font-size: 8px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+}
+
+.debug-direct-perception-figure figcaption code,
+.debug-direct-perception-output-facts code,
+.debug-direct-perception-base-facts code {
+  min-width: 0;
+  color: var(--clinical-strong);
+  overflow-wrap: anywhere;
+}
+
+.debug-direct-perception-status-card {
+  display: grid;
+  min-width: 0;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--surface-2) 36%, transparent);
+}
+
+.debug-direct-perception-status-card > header,
+.debug-direct-perception-camera-status > header {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.debug-direct-perception-status-card p,
+.debug-direct-perception-camera-status p {
+  margin: 0;
+}
+
+.debug-direct-perception-status-card h3,
+.debug-direct-perception-camera-status h3 {
+  margin: 3px 0 0;
+  color: var(--soft);
+  font-size: 14px;
+}
+
+.debug-direct-perception-output-facts,
+.debug-direct-perception-base-facts {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: repeat(auto-fit, minmax(124px, 1fr));
+  gap: 7px;
+  margin: 0;
+}
+
+.debug-direct-perception-output-facts > div,
+.debug-direct-perception-base-facts > div {
+  min-width: 0;
+}
+
+.debug-direct-perception-output-facts dt,
+.debug-direct-perception-base-facts dt {
+  color: var(--muted);
+  font-size: 8px;
+  font-weight: 800;
+  letter-spacing: 0.05em;
+}
+
+.debug-direct-perception-output-facts dd,
+.debug-direct-perception-base-facts dd {
+  min-width: 0;
+  margin: 3px 0 0;
+  overflow-wrap: anywhere;
+  color: var(--soft);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.debug-direct-perception-camera-status-grid {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.debug-direct-perception-camera-status {
+  display: grid;
+  min-width: 0;
+  gap: 9px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--ops-canvas) 76%, transparent);
+}
+
+.debug-direct-perception-camera-status.stale {
+  border-color: color-mix(in srgb, var(--surgeon) 42%, var(--line));
+}
+
+.debug-direct-perception-camera-status.missing {
+  border-color: color-mix(in srgb, var(--warning) 42%, var(--line));
+}
+
+.debug-direct-perception-layer-status-list {
+  display: grid;
+  min-width: 0;
+  gap: 5px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.debug-direct-perception-layer-status-list li {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(86px, 0.8fr) minmax(104px, 1fr) minmax(0, 1.4fr);
+  gap: 6px;
+  align-items: center;
+  padding: 6px 7px;
+  border: 1px solid color-mix(in srgb, var(--line) 82%, transparent);
+  border-radius: calc(var(--radius-sm) - 2px);
+  color: var(--muted);
+  font-size: 9px;
+}
+
+.debug-direct-perception-layer-status-list li.live {
+  color: var(--color-success-text);
+}
+
+.debug-direct-perception-layer-status-list li.stale,
+.debug-direct-perception-layer-status-list li.missing {
+  color: var(--surgeon-strong);
+}
+
+.debug-direct-perception-layer-status-list li.disabled {
+  color: var(--muted);
+}
+
+.debug-direct-perception-layer-name {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 4px;
+  color: var(--soft);
+  font-weight: 800;
+}
+
+.debug-direct-perception-status-empty {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  gap: 9px;
+  padding: 10px;
+  border: 1px dashed var(--line);
+  border-radius: var(--radius-sm);
+  color: var(--muted);
+}
+
+.debug-direct-perception-status-empty > div {
+  display: grid;
+  gap: 2px;
+}
+
+.debug-direct-perception-note {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+@media (max-width: 980px) {
+  .debug-direct-perception-camera-status-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 640px) {
+  .debug-direct-perception-card > .debug-section-heading,
+  .debug-direct-perception-status-card > header,
+  .debug-direct-perception-camera-status > header {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .debug-direct-perception-output-facts,
+  .debug-direct-perception-base-facts,
+  .debug-direct-perception-layer-status-list li {
+    grid-template-columns: 1fr;
+  }
+
+  .debug-direct-perception-state,
+  .debug-direct-perception-preview,
+  .debug-direct-perception-raster-badge {
+    max-width: 100%;
+    white-space: normal;
+  }
+
+  .debug-direct-perception-figure figcaption {
+    display: grid;
+    grid-template-columns: 1fr;
+  }
+}

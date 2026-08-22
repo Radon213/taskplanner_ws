@@ -3,9 +3,11 @@ from integration_debug.bridge_policy import (
     DEBUG_CAPABILITY_CLASS_NAMES,
     DEBUG_MULTICAM_SERVICES_ALLOWLIST,
     DEBUG_MULTICAM_SUBSCRIBE_ALLOWLIST,
+    DEBUG_PERCEPTION_SUBSCRIBE_ALLOWLIST,
     DEBUG_ROSAPI_SERVICES_ALLOWLIST,
     DEBUG_ROSAPI_TOPICS_GLOB,
     DEBUG_SERVICES_ALLOWLIST,
+    DEBUG_TF_SUBSCRIBE_ALLOWLIST,
     DEBUG_TOPICS_ALLOWLIST,
     DEBUG_TOPICS_PUBLISH_ALLOWLIST,
     DEBUG_TOPICS_SUBSCRIBE_ALLOWLIST,
@@ -38,6 +40,10 @@ def test_debug_rosbridge_policy_is_exact_and_has_only_readonly_rosapi_topics() -
     ) == ["/integration/debug/heartbeat"]
     assert restricted["topics_sub_glob"] == list(DEBUG_TOPICS_SUBSCRIBE_ALLOWLIST)
     assert set(DEBUG_MULTICAM_SUBSCRIBE_ALLOWLIST).issubset(restricted["topics_sub_glob"])
+    assert set(DEBUG_TF_SUBSCRIBE_ALLOWLIST).issubset(restricted["topics_sub_glob"])
+    assert set(DEBUG_PERCEPTION_SUBSCRIBE_ALLOWLIST).issubset(
+        restricted["topics_sub_glob"]
+    )
     assert restricted["topics_glob"] == list(DEBUG_TOPICS_ALLOWLIST)
     assert restricted["services_glob"] == list(DEBUG_SERVICES_ALLOWLIST)
     assert set(DEBUG_MULTICAM_SERVICES_ALLOWLIST).issubset(restricted["services_glob"])
@@ -48,6 +54,14 @@ def test_debug_rosbridge_policy_is_exact_and_has_only_readonly_rosapi_topics() -
         pattern for pattern in restricted["services_glob"] if pattern.startswith("/rosapi")
     } == {"/rosapi/topics"}
     assert restricted["max_message_size"] == 1_000_000
+
+
+def test_debug_tf_topics_are_exact_read_only_subscriptions() -> None:
+    restricted = restrict_debug_rosbridge_protocol({})
+    assert DEBUG_TF_SUBSCRIBE_ALLOWLIST == ("/tf_static", "/tf")
+    assert set(DEBUG_TF_SUBSCRIBE_ALLOWLIST).issubset(restricted["topics_sub_glob"])
+    assert set(DEBUG_TF_SUBSCRIBE_ALLOWLIST).isdisjoint(restricted["topics_pub_glob"])
+    assert "/tf*" not in restricted["topics_sub_glob"]
 
 
 def test_debug_rosbridge_policy_cannot_be_widened_by_input_parameters() -> None:
@@ -76,6 +90,46 @@ def test_debug_rosbridge_policy_excludes_live_runtime_endpoints() -> None:
     }
     assert denied_topics.isdisjoint(restricted["topics_glob"])
     assert "/integration/check_readiness" not in restricted["services_glob"]
+
+
+def test_debug_perception_surface_is_exactly_read_only() -> None:
+    restricted = restrict_debug_rosbridge_protocol({})
+    expected = {
+        "/surgery/perception/cam4/semantics/json",
+        "/surgery/perception/cam4/mayo_tool_observations",
+        "/surgery/perception/cam4/observations",
+        "/surgery/perception/cam4/tool_poses",
+        "/surgery/perception/cam4/hand_keypoints",
+        "/surgery/perception/cam4/blood_semantics/json",
+        "/surgery/perception/rfdetr/diagnostics/json",
+        "/surgery/perception/rfdetr/health",
+        "/perception/debug/final_overlay/compressed",
+        "/perception/debug/final_overlay/status",
+    }
+
+    assert set(DEBUG_PERCEPTION_SUBSCRIBE_ALLOWLIST) == expected
+    assert expected.issubset(restricted["topics_sub_glob"])
+    assert expected.isdisjoint(restricted["topics_pub_glob"])
+    assert "/surgery/*" not in restricted["topics_sub_glob"]
+    assert "/surgery/images/cam4/detection_overlay/compressed" not in expected
+    assert "/perception/cam_4/debug/hand/compressed" not in expected
+
+
+def test_debug_multicam_preview_patterns_remain_read_only() -> None:
+    restricted = restrict_debug_rosbridge_protocol({})
+    assert "/preview/*" in DEBUG_MULTICAM_SUBSCRIBE_ALLOWLIST
+    assert "/preview/*" in restricted["topics_sub_glob"]
+    assert "/preview/*" not in restricted["topics_pub_glob"]
+
+
+def test_browser_multicam_policies_are_preview_only() -> None:
+    debug_restricted = restrict_debug_rosbridge_protocol({})
+    observer_restricted = restrict_multicam_observer_rosbridge_protocol({})
+    for restricted in (debug_restricted, observer_restricted):
+        assert "/preview/*" in restricted["topics_sub_glob"]
+        assert "/camera/*" not in restricted["topics_sub_glob"]
+        assert "/flir_camera/*" not in restricted["topics_sub_glob"]
+        assert "/synced/*" not in restricted["topics_sub_glob"]
 
 
 def test_operational_debug_policy_denies_world_anchor_mutations() -> None:

@@ -10,6 +10,7 @@ import {
   Play,
   Radio,
   RefreshCw,
+  RotateCcw,
   Shield,
   ShieldAlert,
   XCircle,
@@ -19,6 +20,7 @@ import {
   type DebugCommandResponse,
   type IntegrationDebugStatus,
 } from "../../hooks/useIntegrationDebugBridge";
+import { SafetyConfirmationDialog } from "../common/SafetyConfirmationDialog";
 
 type DiagnosticTab = "vlm" | "endpoints" | "logs";
 
@@ -76,6 +78,73 @@ function sourceLabel(source: string | undefined, invoked: boolean | undefined): 
   if (source === "text_vlm") return "Text VLM · 원문 근거 재검증 완료";
   if (source === "deterministic_fallback") return invoked ? "Text VLM 호출 후 결정론 폴백" : "결정론 폴백 · VLM 미호출";
   return invoked ? `${source} · VLM 호출됨` : source;
+}
+
+export function ForceRetractionIdleControl({
+  blockedReason,
+  disabled,
+  internalState,
+  internalStateLabel,
+  pending,
+  onReset,
+}: {
+  blockedReason: "" | "idle" | "recovery" | "busy" | "unavailable";
+  disabled: boolean;
+  internalState: string;
+  internalStateLabel: string;
+  pending: boolean;
+  onReset: () => void;
+}) {
+  const [confirmationOpen, setConfirmationOpen] = useState(false);
+  const hint = blockedReason === "idle"
+    ? "현재 Debug 로컬 상태가 이미 IDLE입니다."
+    : blockedReason === "recovery"
+      ? "먼저 요청 접수 불확실성 복구 절차를 완료해야 합니다."
+      : blockedReason === "busy"
+        ? "진행 중인 Action 또는 Service 응답이 끝난 뒤 초기화할 수 있습니다."
+        : blockedReason === "unavailable"
+          ? "현재 연결 또는 제어 전환이 끝난 뒤 초기화할 수 있습니다."
+          : "로봇 명령은 보내지 않고 Debug 로컬 상태만 IDLE로 바꾸며, 수동 제어와 리트랙터 음성 전송은 자동 해제합니다.";
+
+  useEffect(() => {
+    if (internalState === "idle") setConfirmationOpen(false);
+  }, [internalState]);
+
+  return (
+    <>
+      <div className="debug-state-message warning" data-slot="debug-force-retraction-idle" role="note">
+        <RotateCcw size={18} aria-hidden="true" />
+        <div>
+          <strong>Debug 로컬 상태 강제 초기화</strong>
+          <span id="debug-force-retraction-idle-description">{hint}</span>
+        </div>
+        <button
+          aria-describedby="debug-force-retraction-idle-description"
+          aria-expanded={confirmationOpen}
+          aria-haspopup="dialog"
+          className="button button-secondary"
+          disabled={disabled}
+          onClick={() => setConfirmationOpen(true)}
+          type="button"
+        >
+          {pending
+            ? <LoaderCircle className="debug-spinner" size={16} aria-hidden="true" />
+            : <RotateCcw size={16} aria-hidden="true" />}
+          {pending ? "초기화 중" : "IDLE로 강제 초기화"}
+        </button>
+      </div>
+      <SafetyConfirmationDialog
+        closeLabel="취소"
+        confirmLabel="IDLE로 강제 초기화"
+        description={`현재 ${internalStateLabel} 상태를 지우고 Debug 로컬 상태를 IDLE로 되돌립니다.`}
+        note="로봇이나 외부 Service에는 Stop 또는 다른 명령을 보내지 않습니다. 상대 로봇이 이미 정지했거나 가상 서버를 사용 중임을 확인한 경우에만 실행하세요. 수동 제어와 리트랙터 음성 전송은 자동 해제됩니다."
+        onClose={() => setConfirmationOpen(false)}
+        onConfirm={onReset}
+        open={confirmationOpen}
+        title="Debug 상태를 IDLE로 초기화할까요?"
+      />
+    </>
+  );
 }
 
 export function DebugIntegrationPipeline({ status, kind }: {

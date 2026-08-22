@@ -92,6 +92,61 @@ def test_prior_falls_back_to_authoritative_simulation_phase() -> None:
     assert evidence["current_phase"] == "P04"
 
 
+def test_actor_log_context_injects_only_the_frozen_ngram_prior_result() -> None:
+    node = _node()
+
+    class _Scorer:
+        def score(self, _evidence):
+            return {"phase": [], "tool": [], "evidence": {}}
+
+        def score_open_set(self, _evidence):
+            return {"phase": [], "tool": [], "evidence": {}}
+
+    class _NgramPrior:
+        def __init__(self) -> None:
+            self.received = None
+
+        def predict(self, *, phase_id, completed_handovers):
+            self.received = (phase_id, completed_handovers)
+            return {
+                "id": "thyroidectomy_demo_handover_ngram_calibration_v1",
+                "match": "phase+last2",
+                "support": 12,
+                "candidates": [["T07", 0.583], ["T04", 0.333]],
+            }
+
+    ngram_prior = _NgramPrior()
+    node._actor_log_prior_evidence = lambda **_kwargs: {
+        "current_phase": "P04",
+        "speech": [],
+        "observed_signals": [],
+        "skill_status": [],
+    }
+    node._prior_scorer = _Scorer()
+    node._procedure_prompt = {"id": "thyroidectomy_demo_prompt_v4"}
+    node._handover_ngram_prior = ngram_prior
+    node._public_digital_twin_context = lambda: {
+        "completed_handovers": [{"tool": "T05", "at": 1.0}],
+    }
+    node._public_perception_context = lambda: {}
+    node._bed_robot_arm_group_state_rows = lambda: []
+    node._pending_bed_robot_arm_group_request_context = lambda: None
+
+    context = node._assemble_actor_log_context_dict()
+
+    assert ngram_prior.received == (
+        "P04",
+        [{"tool": "T05", "at": 1.0}],
+    )
+    assert context["frozen_ngram_prior"] == {
+        "id": "thyroidectomy_demo_handover_ngram_calibration_v1",
+        "match": "phase+last2",
+        "support": 12,
+        "candidates": [["T07", 0.583], ["T04", 0.333]],
+    }
+    assert "candidates" in context  # Internal reducer data remains separate.
+
+
 def test_public_evidence_uses_ros_source_time_when_available() -> None:
     node = _node()
     node.get_clock = lambda: SimpleNamespace(
@@ -351,6 +406,14 @@ def test_actor_log_request_context_handles_dense_detector_rows_at_runtime_budget
                 for index in range(30)
             ],
         },
+        "frozen_ngram_prior": {
+            "id": "thyroidectomy_demo_handover_ngram_calibration_v1",
+            "match": "phase+last2",
+            "support": 12,
+            "candidates": [["T07", 0.583], ["T04", 0.333]],
+            "training_case_ids": ["0704_6", "0704_7"],
+            "raw_counts": {"T07": 7, "T04": 4},
+        },
     }
     static_chars = 14_360
 
@@ -372,6 +435,12 @@ def test_actor_log_request_context_handles_dense_detector_rows_at_runtime_budget
     assert request_context["digital_twin"]["forecast_inventory"][
         "available"
     ] == [["T02", 1]]
+    assert request_context["frozen_ngram_prior"] == {
+        "id": "thyroidectomy_demo_handover_ngram_calibration_v1",
+        "match": "phase+last2",
+        "support": 12,
+        "candidates": [["T07", 0.583], ["T04", 0.333]],
+    }
 
 
 def test_model_context_excludes_ranked_feedback_but_keeps_public_evidence() -> None:
@@ -402,6 +471,16 @@ def test_model_context_excludes_ranked_feedback_but_keeps_public_evidence() -> N
             "phase": [["P03", 0.95]],
             "tool": [["T02", 0.9]],
         },
+        "frozen_ngram_prior": {
+            "id": "thyroidectomy_demo_handover_ngram_calibration_v1",
+            "match": "phase+last2",
+            "support": 12,
+            "candidates": [["T07", 0.583], ["T04", 0.333]],
+            "fit_partition": "development_calibration",
+            "case_id": "0704_6",
+            "time_sec": 123.4,
+            "raw_counts": {"T07": 7, "T04": 4},
+        },
     }
 
     model_context = actor_log_model_context(context)
@@ -430,6 +509,14 @@ def test_model_context_excludes_ranked_feedback_but_keeps_public_evidence() -> N
         "mayo_reusable": [],
         "unavailable_for_next_handover": [],
     }
+    assert model_context["frozen_ngram_prior"] == {
+        "id": "thyroidectomy_demo_handover_ngram_calibration_v1",
+        "match": "phase+last2",
+        "support": 12,
+        "candidates": [["T07", 0.583], ["T04", 0.333]],
+    }
+    assert "0704_" not in compact_prompt_json(model_context)
+    assert "raw_counts" not in compact_prompt_json(model_context)
 
 
 def test_forecast_constraints_separate_current_tools_from_handover_supply() -> None:

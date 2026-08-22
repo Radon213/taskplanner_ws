@@ -1,0 +1,197 @@
+{
+  "schema": "taskplanner.pnu_live_rgbd_acceptance.v1",
+  "observed_at": "2026-08-21T04:41:03+09:00",
+  "scope": "live_viplab_cam4_to_local_pnu_worker_to_isolated_taskplanner_ros_outputs",
+  "raw_images_persisted": false,
+  "existing_runtime_restarted": false,
+  "robot_motion_or_authority_enabled": false,
+  "upstream": {
+    "repository": "hanwae-py/hand-blood-tools",
+    "commit": "0f9e93115b8cc1d470398c92e010e3fc6ef1de5d"
+  },
+  "camera": {
+    "id": "cam4",
+    "serial": "146222251000",
+    "rgb_topic": "/synced/cam_4/color/image_raw/compressed",
+    "color_camera_info_topic": "/synced/cam_4/color/camera_info",
+    "aligned_depth_topic": "/synced/cam_4/aligned_depth_to_color/image_raw/compressedDepth",
+    "aligned_depth_camera_info_topic": "/synced/cam_4/aligned_depth_to_color/camera_info",
+    "frame_id": "cam_4_color_optical_frame",
+    "width": 1280,
+    "height": 720,
+    "source_rate_hz": 15.0,
+    "depth_encoding": "16UC1; compressedDepth png",
+    "depth_scale_m_per_unit": 0.001,
+    "alignment_id": "viplab-cam4-rgbd-align-v1-6af70cfd906e807f",
+    "alignment_validated": true,
+    "qos": "RELIABLE/VOLATILE/KEEP_LAST(20)"
+  },
+  "worker": {
+    "image": "taskplanner-pnu-perception:0.1.0",
+    "image_id": "sha256:b7983b0a23c56c1b74efb525de905e9e7bcbd89c1de67451da9e5bc7681b1846",
+    "image_inspect_size_bytes": 5212781343,
+    "docker_virtual_size_gb": 15.1,
+    "bridge_source_sha256": "4ec6cc3ab569c7723c345ff2569894d7c04df27bebce33a94173436385a80597",
+    "endpoint": "http://127.0.0.1:8020",
+    "requested_algorithms": [
+      "blood",
+      "hand"
+    ],
+    "model_digests": {
+      "blood": "f4967b2b8c7ab63921f8aa9b2ea0a4e3324243a9b98253da3ea4b9ecd6df6f75",
+      "hand": "fbc2a30080c3c557093b5ddfc334698132eb341044ccee322ccf8bcf3607cde1"
+    },
+    "tool_model": {
+      "present": false,
+      "expected_size_bytes": 133941485,
+      "expected_sha256": "253617aa5337fec219d694ca50537e4867fb8c403ce60f3a6945bbe15fecf430",
+      "status": "access_requested_pending"
+    }
+  },
+  "actual_detection": {
+    "source_stamp_ns": 1787253331292249512,
+    "source_stamp_correlated_across_outputs": true,
+    "metric_3d_ready": true,
+    "depth_valid_pixels": 718810,
+    "depth_valid_ratio": 0.77995877,
+    "blood": {
+      "executed": true,
+      "detection_count": 1,
+      "confidence": 0.504395,
+      "bbox_xyxy_px": [
+        554.5,
+        151.75,
+        740.0,
+        442.0
+      ],
+      "centroid_xy_px": [
+        663.942,
+        274.042
+      ],
+      "centroid_associated_depth_m": 0.792
+    },
+    "hand": {
+      "executed": true,
+      "depth_source": "real",
+      "detection_count": 0
+    },
+    "latency_ms": {
+      "decode": 9.12,
+      "algorithm_sum": 27.362,
+      "source_to_output": 39.146
+    }
+  },
+  "direct_worker_validation": {
+    "http_status": 200,
+    "accepted": true,
+    "zero_detections_accepted": true,
+    "metric_3d_required_and_ready": true,
+    "valid_depth_ratio": 0.77996962,
+    "latency_ms": {
+      "decode": 8.623,
+      "blood": 23.215,
+      "hand": 6.58,
+      "total": 38.445,
+      "http_round_trip": 40.0
+    }
+  },
+  "steady_soak_default_15_hz": {
+    "duration_sec": 20.0,
+    "input_frames": 299,
+    "executed_frames": 262,
+    "processed_rate_hz": 13.1,
+    "dropped_frames": 37,
+    "drop_rate_hz": 1.85,
+    "depth_missing_frames": 0,
+    "metric_3d_ready_frames": 262,
+    "http_error_count": 0,
+    "timeout_count": 0,
+    "failure_count": 0,
+    "source_to_output_latency_ms": {
+      "p50": 28.104,
+      "p95": 30.203,
+      "max": 33.782
+    },
+    "resources": {
+      "worker_cpu_percent_p50": 140.8,
+      "worker_ram_mib_p50": 2089.98,
+      "worker_vram_mib": 1412.0
+    }
+  },
+  "rate_cap_20_hz_rejected": {
+    "duration_sec": 15.0,
+    "input_rate_hz": 14.867,
+    "processed_rate_hz": 10.533,
+    "drop_rate_hz": 4.333,
+    "depth_missing_frames": 0,
+    "metric_3d_ready_frames": 158,
+    "error_count": 0,
+    "decision": "keep_default_15_hz"
+  },
+  "source_health_monitor": {
+    "camera_reader_qos": "RELIABLE/VOLATILE/KEEP_LAST(20)",
+    "isolated_live_duration_sec": 20.0,
+    "cam4_state": "READY",
+    "cam4_healthy": true,
+    "received_count": 403,
+    "accepted_count": 403,
+    "rejected_count": 0,
+    "dropped_count": 0,
+    "age_sec": 0.0949,
+    "operational_runtime_has_fix": false
+  },
+  "storage": {
+    "filesystem_available_bytes": 894155292672,
+    "model_root_bytes_without_tool": 142783577
+  },
+  "verification": {
+    "pnu_worker_pytest_passed": 78,
+    "vlm_node_pytest_passed": 230,
+    "source_health_pytest_passed": 12,
+    "bringup_live_and_shadow_pytest_passed": 40,
+    "simulation_contract_and_preflight_pytest_passed": 53,
+    "shadow_evaluation_pytest_passed": 135,
+    "launcher_shell_suite": "PASS",
+    "preflight_self_test": "PASS",
+    "isolated_colcon_packages_built": [
+      "hand_keypoint_interfaces",
+      "model_provider_registry",
+      "procedure_spec",
+      "surgical_msgs",
+      "surgical_perception_msgs",
+      "vlm_node"
+    ],
+    "local_compose_render": "PASS",
+    "remote_compose_render": "PASS",
+    "unified_image_compose_render": "PASS"
+  },
+  "downstream": {
+    "tool_compatibility_path": "PNU Tool -> CAM4 semantics and Mayo observation -> RealVLM/Digital Twin -> world state -> guarded BT",
+    "thyroidectomy_mapped_classes": "7/8",
+    "thyroidectomy_demo_mapped_classes": "8/8",
+    "typed_tool_pose_consumer": false,
+    "hand_keypoint_consumer": false,
+    "blood_semantics_consumer": false,
+    "motion_authority": false
+  },
+  "acceptance": {
+    "cam4_aligned_depth": "PASS",
+    "blood_live_execution_and_metric_depth": "PASS",
+    "hand_live_execution_real_depth_path": "PASS_EMPTY_SCENE",
+    "tool_core_synthetic_3d": "PASS",
+    "tool_live_model": "BLOCKED_CHECKPOINT_ACCESS",
+    "local_worker_transport": "PASS",
+    "remote_worker_configuration_and_auth_tests": "PASS_NOT_LIVE_DEPLOYED",
+    "cam4_source_health": "PASS_ISOLATED_PENDING_RUNTIME_REBUILD",
+    "full_operational_taskplanner_cutover": "PENDING_REBUILD_AND_RECREATE",
+    "accuracy_or_checkpoint_parity": "NOT_CLAIMED",
+    "robot_control": "DISABLED_FAIL_CLOSED"
+  },
+  "cleanup": {
+    "isolated_worker_stopped": true,
+    "isolated_bridge_stopped": true,
+    "port_8020_free": true,
+    "gpu_returned_to_baseline": true,
+    "existing_runtime_not_modified_by_test": true
+  }
+}

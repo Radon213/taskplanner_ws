@@ -12,6 +12,8 @@ def test_launch_is_native_ros_and_fail_safe_by_default():
     assert 'default_value="rmw_cyclonedds_cpp"' in source
     assert 'default_value="fake"' in source
     assert '"config", "fake.yaml"' in source
+    assert '"config", "logging.yaml"' in source
+    assert '"runtime_config_path": runtime_config_path' in source
     assert 'DeclareLaunchArgument("allow_motion", default_value="false")' in source
     assert "rosbridge" not in source.casefold()
     assert "jupyter" not in source.casefold()

@@ -1,0 +1,53 @@
+{
+  "fixture_schema": "taskplanner.ui_contract_fixture.v1",
+  "synthetic": true,
+  "usage": "SurgiMate dummy scenario 01: preparation stage with no detected tools or predictions.",
+  "baseline": {
+    "schema_version": "1.1.0",
+    "interface_version": "0.3.0",
+    "procedure_type": "thyroidectomy_demo",
+    "catalog_version": "synthetic-catalog-v1"
+  },
+  "/surgery/context": {
+    "revision": 1101,
+    "procedure_type": "thyroidectomy_demo",
+    "procedure_active": true,
+    "current_phase": "P01",
+    "phase_confidence": 0.98,
+    "phase_uncertain": false,
+    "execution_state": "running",
+    "evidence_status": "DUMMY_ACCEPTED",
+    "safety_flags": []
+  },
+  "/surgery/instruments": {
+    "revision": 1101,
+    "instruments": []
+  },
+  "/surgery/robots": {
+    "revision": 1101,
+    "robots": []
+  },
+  "/surgery/robot_end_effectors": {
+    "revision": 1101,
+    "end_effectors": []
+  },
+  "/surgery/tool_predictions": {
+    "revision": 1101,
+    "predictions": []
+  },
+  "/surgery/speech": {
+    "revision": 1101,
+    "state": "listening",
+    "available": true,
+    "connected": true,
+    "text": ""
+  },
+  "/surgery/health": {
+    "revision": 1101,
+    "healthy": true,
+    "state": "healthy",
+    "unavailable_sources": [],
+    "stale_sources": [],
+    "error_codes": []
+  }
+}

@@ -19,6 +19,18 @@ from urllib.request import urlopen
 
 
 ROOT = Path(__file__).resolve().parents[1]
+WEBAPP_BASE_URL = "http://127.0.0.1:4173"
+WEBAPP_STATIC_PROBES = (
+    ("/", "text/html", b'id="root"'),
+    ("/src/App.tsx", "text/javascript", None),
+    ("/src/hooks/useRosBridge.ts", "text/javascript", None),
+)
+WEBAPP_MAX_PROBE_BYTES = 512 * 1024
+RUNTIME_STATUS_PATH = "/api/runtime/status"
+RUNTIME_STATUS_MAX_BYTES = 128 * 1024
+RUNTIME_STATUS_MAX_MESSAGE_CHARS = 4_096
+RUNTIME_PHASES = frozenset({"idle", "starting", "failed"})
+RUNTIME_MODES = frozenset({"live", "llm-surgeon", "replay", "debug"})
 MEMORY_PATTERN = re.compile(r"^\s*([0-9]+(?:\.[0-9]+)?)\s*([KMGT]?i?B)\b", re.IGNORECASE)
 MEMORY_MULTIPLIERS = {
     "B": 1,
@@ -58,12 +70,88 @@ def run(command: list[str], *, timeout: float = 600.0) -> subprocess.CompletedPr
     )
 
 
-def web_ready() -> bool:
-    try:
-        with urlopen("http://127.0.0.1:4173", timeout=2.0) as response:
-            return 200 <= response.status < 500
-    except (OSError, URLError):
+def _read_probe_body(response: object, *, limit: int) -> bytes:
+    body = response.read(limit + 1)
+    if len(body) > limit:
+        raise ValueError("response exceeds readiness size limit")
+    return body
+
+
+def _response_content_type(response: object) -> str:
+    return str(response.headers.get("Content-Type", "")).partition(";")[0].strip().lower()
+
+
+def _valid_runtime_status(payload: object) -> bool:
+    if not isinstance(payload, dict):
         return False
+    required = {"phase", "active_mode", "requested_mode", "retryable"}
+    if not required.issubset(payload):
+        return False
+    message = payload.get("message")
+    active_mode = payload["active_mode"]
+    requested_mode = payload["requested_mode"]
+    return (
+        isinstance(payload["phase"], str)
+        and payload["phase"] in RUNTIME_PHASES
+        and (
+            active_mode is None
+            or (isinstance(active_mode, str) and active_mode in RUNTIME_MODES)
+        )
+        and (
+            requested_mode is None
+            or (isinstance(requested_mode, str) and requested_mode in RUNTIME_MODES)
+        )
+        and type(payload["retryable"]) is bool
+        and (
+            message is None
+            or (
+                isinstance(message, str)
+                and len(message) <= RUNTIME_STATUS_MAX_MESSAGE_CHARS
+            )
+        )
+    )
+
+
+def web_readiness() -> tuple[bool, str]:
+    """Validate the browser entry, critical transforms, and runtime proxy contract."""
+
+    try:
+        for path, expected_type, marker in WEBAPP_STATIC_PROBES:
+            with urlopen(f"{WEBAPP_BASE_URL}{path}", timeout=2.0) as response:
+                if response.status != 200:
+                    return False, f"{path}: HTTP {response.status}"
+                content_type = _response_content_type(response)
+                if content_type != expected_type:
+                    return False, f"{path}: unexpected content type {content_type or 'missing'}"
+                body = _read_probe_body(response, limit=WEBAPP_MAX_PROBE_BYTES)
+                if not body:
+                    return False, f"{path}: empty response"
+                if marker is not None and marker not in body:
+                    return False, f"{path}: app root marker missing"
+
+        with urlopen(
+            f"{WEBAPP_BASE_URL}{RUNTIME_STATUS_PATH}", timeout=2.0
+        ) as response:
+            if response.status != 200:
+                return False, f"{RUNTIME_STATUS_PATH}: HTTP {response.status}"
+            content_type = _response_content_type(response)
+            if content_type != "application/json":
+                return False, (
+                    f"{RUNTIME_STATUS_PATH}: unexpected content type "
+                    f"{content_type or 'missing'}"
+                )
+            body = _read_probe_body(response, limit=RUNTIME_STATUS_MAX_BYTES)
+            payload = json.loads(body.decode("utf-8"))
+            if not _valid_runtime_status(payload):
+                return False, f"{RUNTIME_STATUS_PATH}: invalid runtime status schema"
+        return True, ""
+    except (OSError, URLError, UnicodeError, ValueError):
+        return False, "readiness request failed"
+
+
+def web_ready() -> bool:
+    ready, _ = web_readiness()
+    return ready
 
 
 def running_services() -> list[str]:
@@ -211,15 +299,17 @@ def summarize_memory_growth(
     }
 
 
-def wait_until_ready(timeout_sec: float) -> tuple[bool, list[str]]:
+def wait_until_ready(timeout_sec: float) -> tuple[bool, list[str], str]:
     deadline = time.monotonic() + timeout_sec
     last_services: list[str] = []
+    last_web_error = "web readiness not checked"
     while time.monotonic() < deadline:
         last_services = running_services()
-        if web_ready() and {"webapp", "taskplanner-runtime"}.issubset(last_services):
-            return True, last_services
+        web_is_ready, last_web_error = web_readiness()
+        if web_is_ready and {"webapp", "taskplanner-runtime"}.issubset(last_services):
+            return True, last_services, ""
         time.sleep(1.0)
-    return False, last_services
+    return False, last_services, last_web_error
 
 
 def main() -> int:
@@ -249,13 +339,18 @@ def main() -> int:
                 [str(ROOT / "scripts" / "taskplanner"), "up", "llm-surgeon", "--no-build"],
                 timeout=args.startup_timeout_sec + 120,
             )
-            ready, services = wait_until_ready(args.startup_timeout_sec) if up.returncode == 0 else (False, [])
+            ready, services, web_error = (
+                wait_until_ready(args.startup_timeout_sec)
+                if up.returncode == 0
+                else (False, [], "launcher failed before readiness checks")
+            )
             row = {
                 "iteration": iteration,
                 "ready": ready,
                 "up_return_code": up.returncode,
                 "startup_sec": round(time.monotonic() - started, 3),
                 "services": services,
+                "web_error": web_error,
             }
             restart_rows.append(row)
             if not ready:
@@ -272,7 +367,11 @@ def main() -> int:
                 [str(ROOT / "scripts" / "taskplanner"), "up", "llm-surgeon", "--no-build"],
                 timeout=args.startup_timeout_sec + 120,
             )
-            ready, _ = wait_until_ready(args.startup_timeout_sec) if up.returncode == 0 else (False, [])
+            ready, _, web_error = (
+                wait_until_ready(args.startup_timeout_sec)
+                if up.returncode == 0
+                else (False, [], "launcher failed before readiness checks")
+            )
             if not ready:
                 failure = True
                 (output_dir / "soak-start.log").write_text(up.stdout, encoding="utf-8")
@@ -281,12 +380,17 @@ def main() -> int:
                 soak_duration = args.soak_hours * 3600.0
                 while time.monotonic() - soak_started < soak_duration:
                     services = running_services()
-                    healthy = web_ready() and {"webapp", "taskplanner-runtime"}.issubset(services)
+                    web_is_ready, web_error = web_readiness()
+                    healthy = web_is_ready and {
+                        "webapp",
+                        "taskplanner-runtime",
+                    }.issubset(services)
                     soak_rows.append(
                         {
                             "sampled_at_utc": datetime.now(timezone.utc).isoformat(),
                             "elapsed_sec": round(time.monotonic() - soak_started, 3),
                             "healthy": healthy,
+                            "web_error": web_error,
                             "services": services,
                             "containers": memory_samples(),
                         }
@@ -308,7 +412,14 @@ def main() -> int:
     with (output_dir / "restart_cycles.csv").open("w", encoding="utf-8", newline="") as stream:
         writer = csv.DictWriter(
             stream,
-            fieldnames=["iteration", "ready", "up_return_code", "startup_sec", "services"],
+            fieldnames=[
+                "iteration",
+                "ready",
+                "up_return_code",
+                "startup_sec",
+                "services",
+                "web_error",
+            ],
         )
         writer.writeheader()
         for row in restart_rows:
@@ -320,6 +431,7 @@ def main() -> int:
             "sampled_at_utc",
             "elapsed_sec",
             "healthy",
+            "web_error",
             "services",
             "container",
             "memory",
@@ -336,6 +448,7 @@ def main() -> int:
                         "sampled_at_utc": sample.get("sampled_at_utc", ""),
                         "elapsed_sec": sample.get("elapsed_sec", ""),
                         "healthy": sample.get("healthy", ""),
+                        "web_error": sample.get("web_error", ""),
                         "services": ",".join(sample.get("services", [])),
                         **container,
                     }

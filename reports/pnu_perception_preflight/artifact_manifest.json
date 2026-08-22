@@ -1,0 +1,160 @@
+{
+  "schema": "taskplanner.pnu_artifact_manifest.v1",
+  "observed_at": "2026-08-21T01:06:04+09:00",
+  "updated_at": "2026-08-21T11:29:25+09:00",
+  "upstream": {
+    "repository": "https://github.com/hanwae-py/hand-blood-tools",
+    "commit": "0f9e93115b8cc1d470398c92e010e3fc6ef1de5d"
+  },
+  "policy": {
+    "download_root": "/home/arl/.local/share/taskplanner/models/pnu_hand_blood",
+    "overwrite_existing": false,
+    "google_drive_confirmation_bypass": false,
+    "license_review_required_before_redistribution": true
+  },
+  "artifacts": [
+    {
+      "id": "hand_mediapipe_hand_landmarker_float16_v1",
+      "algorithm": "hand",
+      "filename": "hand_landmarker.task",
+      "required_for_live": true,
+      "published_url": "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task",
+      "pinned_download_url": "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+      "expected_size_bytes": 7819105,
+      "expected_sha256": "fbc2a30080c3c557093b5ddfc334698132eb341044ccee322ccf8bcf3607cde1",
+      "download_status": "downloaded_public_direct_https",
+      "local": {
+        "path": "/home/arl/.local/share/taskplanner/models/pnu_hand_blood/hand_landmarker.task",
+        "size_bytes": 7819105,
+        "sha256": "fbc2a30080c3c557093b5ddfc334698132eb341044ccee322ccf8bcf3607cde1"
+      },
+      "runtime_validation": {
+        "image": "taskplanner-rfdetr-perception:unified-compat",
+        "mediapipe_version": "0.10.18",
+        "network": "none",
+        "gpu": false,
+        "result": "HandLandmarker.create_from_options PASS with CPU XNNPACK"
+      },
+      "license": {
+        "status": "review_required_for_model_asset",
+        "mediapipe_source_code_license": "Apache-2.0",
+        "model_bundle_embedded_license": null,
+        "note": "The .task ZIP contains two TFLite files and no LICENSE. Apache-2.0 is confirmed for MediaPipe source and sample code, but explicit redistribution terms for this downloaded model bundle were not found in the artifact or download response."
+      }
+    },
+    {
+      "id": "tool_cam4_rfdetr_seg_small_regular_resume_e13_best",
+      "algorithm": "tool",
+      "filename": "cam4_rfdetr_seg_small_regular_resume_e13_best.pth",
+      "required_for_live": true,
+      "published_url": "https://drive.google.com/drive/folders/1E42Cpgg8CbFRtnA8DuFbYeBT5IWx_G_h",
+      "drive_source": {
+        "folder_id": "1E42Cpgg8CbFRtnA8DuFbYeBT5IWx_G_h",
+        "file_id": "13JW_AVPgiJZ_XdWmOReSeSCg2d35wHSC",
+        "title": "checkpoint_best_regular.pth",
+        "reported_size_bytes": 133941485
+      },
+      "expected_size_bytes": 133941485,
+      "expected_sha256": "253617aa5337fec219d694ca50537e4867fb8c403ce60f3a6945bbe15fecf430",
+      "expected_values_source": "components/tool_runtime_v1_6/MANIFEST.json at upstream commit",
+      "download_status": "downloaded_after_access_granted",
+      "drive_access_history": [
+        {
+          "observed_at": "2026-08-21T01:36:31+09:00",
+          "browser_session": "existing_signed_in_chrome",
+          "result": "access_permission_required",
+          "access_request_sent": false,
+          "login_or_permission_bypassed": false,
+          "historical": true
+        },
+        {
+          "observed_at": "2026-08-21T11:29:25+09:00",
+          "result": "access_granted_and_download_completed",
+          "access_request_previously_sent": true,
+          "login_or_permission_bypassed": false,
+          "historical_blocker_resolved": true
+        }
+      ],
+      "local": {
+        "path": "/home/arl/.local/share/taskplanner/models/pnu_hand_blood/cam4_rfdetr_seg_small_regular_resume_e13_best.pth",
+        "size_bytes": 133941485,
+        "sha256": "253617aa5337fec219d694ca50537e4867fb8c403ce60f3a6945bbe15fecf430",
+        "mode": "0600",
+        "container_check": "PyTorch ZIP archive; unzip -t passed"
+      },
+      "runtime_validation": {
+        "worker_global_ready": true,
+        "ready_algorithms": [
+          "tool",
+          "blood",
+          "hand"
+        ],
+        "isolated_live_acceptance": "debug_all_model_live_acceptance.v1.json",
+        "accuracy_or_checkpoint_parity_validated": false
+      },
+      "viplab_search": {
+        "observed_at": "2026-08-21T01:17:30+09:00",
+        "host": "viplab",
+        "read_only": true,
+        "criteria": [
+          "exact filename cam4_rfdetr_seg_small_regular_resume_e13_best.pth",
+          "exact expected size 133941485 bytes, which also covers a renamed byte-identical file"
+        ],
+        "searched_roots": [
+          "/home/viplab",
+          "/home",
+          "/opt",
+          "/srv",
+          "/mnt",
+          "/media",
+          "root filesystem excluding virtual filesystems and Docker/containerd stores"
+        ],
+        "bounded_timeout_sec": 60,
+        "candidates_found": 0,
+        "sha256_checked": false,
+        "sha256_not_checked_reason": "no exact-name or exact-size candidate",
+        "copied_to_local": false
+      },
+      "license": {
+        "status": "not_approved",
+        "source_bundle_license": "Apache-2.0",
+        "checkpoint_rights": "pending_owner_and_external_delivery_review",
+        "note": "The upstream third-party/data review explicitly leaves fine-tuned checkpoint ownership and external delivery scope pending; the source bundle license is not treated as checkpoint approval."
+      }
+    },
+    {
+      "id": "blood_rfdetr_seg_small",
+      "algorithm": "blood",
+      "filename": "blood_detection.pth",
+      "required_for_live": true,
+      "published_url": "https://drive.google.com/file/d/1Srkw_3K3Feb7FyTy7kNv-eCF0Ev-W773/view",
+      "expected_size_bytes": 133788164,
+      "expected_sha256": "f4967b2b8c7ab63921f8aa9b2ea0a4e3324243a9b98253da3ea4b9ecd6df6f75",
+      "expected_values_source": "size from anonymous Google Drive viewer itemJson; SHA256 recorded from the first accepted public gdown download because upstream supplies no checksum",
+      "checksum_authority": "local_first_download_not_provider_published",
+      "viewer_reported_mime_type": "application/x-zip",
+      "download_status": "downloaded_public_gdown_confirmation_flow",
+      "local": {
+        "path": "/home/arl/.local/share/taskplanner/models/pnu_hand_blood/blood_detection.pth",
+        "size_bytes": 133788164,
+        "sha256": "f4967b2b8c7ab63921f8aa9b2ea0a4e3324243a9b98253da3ea4b9ecd6df6f75",
+        "container_check": "PyTorch ZIP archive; unzip -t passed; pickle was not executed"
+      },
+      "runtime_validation": {
+        "image": "taskplanner-rfdetr-perception:unified-compat",
+        "installed_rfdetr_version": "1.9.0",
+        "checkpoint_rfdetr_version": "1.10.0.dev0",
+        "checkpoint_model_name": "RFDETRSegSmall",
+        "torch_weights_only_load": "PASS",
+        "rfdetr_from_checkpoint_cpu_network_none": "PASS",
+        "compatibility_warning": "checkpoint args omit num_queries and group_detr; RF-DETR 1.9 used flat-slice fallback and warned that grouped query structure may be scrambled if training used group_detr greater than 1",
+        "output_parity_validated": false
+      },
+      "license": {
+        "status": "unknown",
+        "checkpoint_rights": "not_stated_in_repository_or_drive_viewer",
+        "note": "Do not redistribute or deploy beyond the approved test host until the provider supplies checkpoint license/ownership terms and an authoritative SHA256."
+      }
+    }
+  ]
+}

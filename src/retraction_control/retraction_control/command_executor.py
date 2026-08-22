@@ -29,6 +29,12 @@ from .teaching_session import (
     TeachingSessionRecorder,
     TeachingSessionRepository,
 )
+from .target_planner import (
+    CallableTargetPlanner,
+    LastSampleTargetPlanner,
+    TargetPlanner,
+    TargetPlannerIdentity,
+)
 
 if TYPE_CHECKING:
     from .command_models import CommandRequest
@@ -198,11 +204,14 @@ class CommandExecutor:
         clock: Clock | None = None,
         owner_guard: SingleOwnerGuard | None = None,
         calibration_metadata: Mapping[str, Any] | None = None,
+        execution_mode: str = "fake",
+        target_planner: TargetPlanner | None = None,
         target_calculator: Callable[
             [tuple[JointStateSample, ...], tuple[ForceTorqueSample, ...]],
             tuple[Mapping[str, Sequence[float]], Mapping[str, Sequence[float]]],
         ]
         | None = None,
+        target_planner_identity: TargetPlannerIdentity | None = None,
     ) -> None:
         if force_freshness_timeout_ns is None:
             force_freshness_timeout_ns = _value(
@@ -234,7 +243,27 @@ class CommandExecutor:
         self.clock = clock or SystemClock()
         self.owner_guard = owner_guard
         self.calibration_metadata = dict(calibration_metadata or {})
-        self.target_calculator = target_calculator or self._last_sample_targets
+        normalized_mode = str(execution_mode).strip().lower()
+        if normalized_mode not in {"fake", "shadow", "hardware"}:
+            raise ValueError("execution_mode must be fake, shadow, or hardware")
+        if target_planner is not None and target_calculator is not None:
+            raise ValueError("provide target_planner or target_calculator, not both")
+        if target_calculator is not None:
+            if target_planner_identity is None:
+                raise ValueError(
+                    "an injected target_calculator requires a checksum-bound identity"
+                )
+            target_planner = CallableTargetPlanner(
+                target_planner_identity, target_calculator
+            )
+        elif target_planner_identity is not None:
+            raise ValueError(
+                "target_planner_identity is only valid with target_calculator"
+            )
+        self.execution_mode = normalized_mode
+        self.target_planner = target_planner or LastSampleTargetPlanner()
+        if self.execution_mode == "hardware" and self.target_planner.identity.synthetic:
+            raise ValueError("synthetic target planner is forbidden in hardware mode")
 
         self._execute_lock = threading.Lock()
         self._state_lock = threading.RLock()
@@ -647,6 +676,21 @@ class CommandExecutor:
         cleanup_errors: Sequence[str] = (),
         details: Mapping[str, Any] | None = None,
     ) -> ExecutionOutcome:
+        outcome_details = {
+            "execution_mode": self.execution_mode,
+            "evidence_level": (
+                "physical"
+                if self.execution_mode == "hardware"
+                else "record_only"
+                if self.execution_mode == "shadow"
+                else "synthetic"
+            ),
+            "physical_completion_confirmed": bool(
+                self.execution_mode == "hardware"
+                and status is ExecutionStatus.SUCCEEDED
+            ),
+        }
+        outcome_details.update(details or {})
         return ExecutionOutcome(
             status=status,
             code=str(code),
@@ -660,7 +704,7 @@ class CommandExecutor:
             target_side=int(target_side),
             session_id=str(session_id),
             cleanup_errors=tuple(cleanup_errors),
-            details=details or {},
+            details=outcome_details,
         )
 
     def _failed_outcome(
@@ -747,6 +791,7 @@ class CommandExecutor:
             robot_id=self.robot_id,
             controller_id=self.controller_id,
             source_revision=self.source_revision,
+            target_planner=self.target_planner.identity.as_dict(),
             calibration=calibration,
         )
         recorder = TeachingSessionRecorder(metadata)
@@ -817,13 +862,18 @@ class CommandExecutor:
             )
         self.robot.set_friction_compensation(_value(self.profile, "normal_friction"))
         self.force_sensor.end_recording()
-        targets, target_forces = self.target_calculator(
+        target_plan = self.target_planner.plan(
             recorder.joint_samples, recorder.force_samples
         )
+        if target_plan.identity != self.target_planner.identity:
+            raise _ExecutionRejected(
+                "target_planner_identity_changed",
+                "target planner identity changed while teaching was active",
+            )
         session = recorder.finish(
             completed_at_ns=self.clock.wall_time_ns(),
-            target_joint_positions=targets,
-            target_force_n=target_forces,
+            target_joint_positions=target_plan.joint_positions,
+            target_force_n=target_plan.force_targets_n,
             normally_completed=True,
         )
         self.sessions.save(session)
@@ -832,19 +882,6 @@ class CommandExecutor:
         with self._state_lock:
             self._state = ExecutorState.TAUGHT_READY
         return session.session_id
-
-    @staticmethod
-    def _last_sample_targets(
-        joint_samples: tuple[JointStateSample, ...],
-        force_samples: tuple[ForceTorqueSample, ...],
-    ) -> tuple[dict[str, tuple[float, ...]], dict[str, tuple[float, ...]]]:
-        joints: dict[str, tuple[float, ...]] = {}
-        forces: dict[str, tuple[float, ...]] = {}
-        for sample in joint_samples:
-            joints[sample.arm_id] = sample.positions
-        for sample in force_samples:
-            forces[sample.sensor_id] = sample.force_n
-        return joints, forces
 
     def _start_retraction(
         self,
@@ -881,16 +918,19 @@ class CommandExecutor:
                 requested_session_id,
                 expected_profile_name=self._profile_name,
                 expected_profile_checksum=self._profile_checksum,
+                expected_target_planner_checksum=self.target_planner.identity.checksum,
             )
         if self._latest_session_id:
             return self.sessions.load(
                 self._latest_session_id,
                 expected_profile_name=self._profile_name,
                 expected_profile_checksum=self._profile_checksum,
+                expected_target_planner_checksum=self.target_planner.identity.checksum,
             )
         return self.sessions.latest_valid(
             expected_profile_name=self._profile_name,
             expected_profile_checksum=self._profile_checksum,
+            expected_target_planner_checksum=self.target_planner.identity.checksum,
         )
 
     def _adjust_retraction(

@@ -18,11 +18,13 @@ from typing import Any
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 from procedure_spec import (
     BedRobotArmGroupNormalizationError,
+    FrozenHandoverNgramPrior,
     ProcedurePriorScorer,
     compact_procedure_prompt,
     get_default_spec_dir,
     infer_retraction_direction,
     load_bundle,
+    load_frozen_handover_ngram_prior,
     normalize_retraction_request,
 )
 import requests
@@ -401,6 +403,45 @@ def actor_log_model_context(context: dict[str, Any]) -> dict[str, Any]:
     model_context.pop("previous", None)
     model_context.pop("procedure_prompt_id", None)
 
+    # The learned artifact may carry fit metadata and raw outcome counts on
+    # disk. Only its compact, aggregated distribution is model-visible; case
+    # IDs, timestamps, labels, paths, and other provenance never cross this
+    # boundary.
+    ngram_prior = model_context.get("frozen_ngram_prior")
+    if isinstance(ngram_prior, dict):
+        compact_candidates: list[list[Any]] = []
+        raw_candidates = ngram_prior.get("candidates", [])
+        if isinstance(raw_candidates, list):
+            for row in raw_candidates[:4]:
+                if (
+                    not isinstance(row, (list, tuple))
+                    or len(row) != 2
+                    or not isinstance(row[0], str)
+                    or not row[0].strip()
+                    or isinstance(row[1], bool)
+                    or not isinstance(row[1], (int, float))
+                    or not math.isfinite(float(row[1]))
+                    or not 0.0 <= float(row[1]) <= 1.0
+                ):
+                    continue
+                compact_candidates.append([row[0], round(float(row[1]), 3)])
+        support = ngram_prior.get("support")
+        compact_prior: dict[str, Any] = {}
+        if isinstance(ngram_prior.get("id"), str) and ngram_prior["id"].strip():
+            compact_prior["id"] = ngram_prior["id"]
+        if isinstance(ngram_prior.get("match"), str) and ngram_prior["match"].strip():
+            compact_prior["match"] = ngram_prior["match"]
+        if isinstance(support, int) and not isinstance(support, bool) and support > 0:
+            compact_prior["support"] = support
+        if compact_candidates:
+            compact_prior["candidates"] = compact_candidates
+        if {"id", "match", "support", "candidates"}.issubset(compact_prior):
+            model_context["frozen_ngram_prior"] = compact_prior
+        else:
+            model_context.pop("frozen_ngram_prior", None)
+    else:
+        model_context.pop("frozen_ngram_prior", None)
+
     visual = model_context.get("visual_input")
     if isinstance(visual, dict):
         compact_visual = {
@@ -609,6 +650,7 @@ def actor_log_request_context(
         "visual_input",
         "observable_perception",
         "forecast_constraints",
+        "frozen_ngram_prior",
         "pending_bed_robot_arm_group_request",
     ):
         if key in model_context:
@@ -745,6 +787,8 @@ def actor_log_request_context(
             if isinstance((rows := evidence.get(key)), list) and rows
         }
         minimal = {"evidence_window": latest_evidence}
+        if "frozen_ngram_prior" in model_context:
+            minimal["frozen_ngram_prior"] = model_context["frozen_ngram_prior"]
         for rows in latest_evidence.values():
             for row in rows:
                 if isinstance(row, dict) and "text" in row:
@@ -1651,6 +1695,7 @@ class RealVLMNode(Node):
         self.declare_parameter("require_field_image", True)
         self.declare_parameter("context_mode", "world")
         self.declare_parameter("open_set_phase_bootstrap_observations", 0)
+        self.declare_parameter("handover_ngram_prior_enabled", True)
 
         self._prompt_builder = PromptBuilder()
         self._active = False
@@ -2058,6 +2103,10 @@ class RealVLMNode(Node):
             0,
             int(param_value("open_set_phase_bootstrap_observations")),
         )
+        self._handover_ngram_prior_enabled = bool(
+            param_value("handover_ngram_prior_enabled")
+        )
+        self._handover_ngram_prior: FrozenHandoverNgramPrior | None = None
         if self._context_mode != "actor_log" and self._response_mode == "live":
             self.get_logger().warning(
                 "live VLM context is restricted to public evidence; "
@@ -2067,6 +2116,11 @@ class RealVLMNode(Node):
         if self._context_mode == "actor_log":
             self._procedure_prompt = compact_procedure_prompt(self._spec_dir)
             self._prior_scorer = ProcedurePriorScorer(self._spec, self._procedure_prompt)
+            if self._handover_ngram_prior_enabled:
+                self._handover_ngram_prior = load_frozen_handover_ngram_prior(
+                    self._spec,
+                    self._spec_dir,
+                )
             if self._task_profile == VLM_TASK_PROFILE_TOOL_FORECAST_ONLY:
                 self._system_prompt = self._tool_forecast_only_system_prompt()
                 self._developer_instruction = (
@@ -2133,9 +2187,9 @@ class RealVLMNode(Node):
         )
         return (
             "You interpret public, externally observable evidence for a surgical task planner. "
-            "Each image is a labeled composite: left FLIR surgical field, right CAM4 Mayo/hand context. Read panels independently; never copy tools across panels and do not assume a fixed pixel position, appearance, crop, or start phase. "
+            "Each image is a labeled composite: left FLIR surgical field, right CAM4 Mayo/hand context. Read panels independently; never copy tools across panels and do not assume a fixed appearance, crop, or start phase. "
             "Object detections are optional suggestions. Inspect pixels independently and let clear visual evidence outweigh missing or conflicting detector rows. "
-            "First inspect the left surgical field for visible anatomy, target tissue, instrument-to-tissue interaction, manipulation, and immediate tissue or field response. Independently inspect hand gestures and Mayo contents in the right panel. Then infer phase and next-request tool from visible anatomy/activity, public speech, public skill/twin events, and the procedure context. "
+            "First inspect the left surgical field for visible anatomy, target tissue, instrument-to-tissue interaction, manipulation, and immediate tissue or field response. Independently inspect the upper-right surgeon hand gesture and Mayo contents in the right panel. Gesture evidence is pixel-only: do not let speech, phase, tool predictions, or history fill in missing hand evidence. Then infer phase and next-request tool from visible anatomy/activity, public speech, public skill/twin events, and the procedure context. "
             "Use no hidden actor state, private plans, ground truth, or replay annotation. Previous predictions and procedure order are weak temporal priors, not facts. "
             "Your output is evidence with confidence only. It never authorizes handover, recovery, cleanup, ownership, lifecycle changes, or robot action; the digital twin validates facts and the Behavior Tree applies policy. "
             "Compare all phases: open_set is unanchored; temporal_prior favors current/next but never excludes strong later visual evidence. "
@@ -2151,8 +2205,8 @@ class RealVLMNode(Node):
             self._procedure_prompt,
         )
         return (
-            "You solve one task only: forecast the next additional surgical instrument "
-            "likely to be requested for handover within 2-8 seconds. "
+            "You solve one task only: forecast the first subsequent additional surgical "
+            "instrument likely to be requested for handover, regardless of elapsed time. "
             "The image is a labeled composite with the FLIR surgical field and CAM4 "
             "Mayo/hand context. Object detections are optional suggestions; inspect the "
             "pixels independently. Use only public image evidence, public speech, public "
@@ -2177,6 +2231,11 @@ class RealVLMNode(Node):
             "Predict before a gesture or spoken request whenever the public trajectory "
             "supports it. Match completed_handover and tool_request history against all "
             "procedure chains, then combine that prior with visible operative activity. "
+            "When frozen_ngram_prior is present, it is a fixed aggregate statistic from "
+            "past reviewed demonstrations matched by public phase and completed-handover "
+            "suffix. It is advisory only: use its candidate probabilities as one prior, "
+            "never copy its first candidate mechanically, and never treat it as a request "
+            "or authority to act. "
             "forecast_constraints is public DT context: currently_in_use and prepositioned "
             "are not additional handovers; available_for_next_handover is eligible stock; "
             "mayo_reusable is eligible only when imminent reuse is supported. A tool may "
@@ -2197,12 +2256,12 @@ class RealVLMNode(Node):
             "\"sum\":\"one compact English clinical observation\",\"bed_robot_arm_group\":null}. "
             "All numbers in that shape are structural placeholders, not defaults to copy. Use exact runtime ids and numeric confidence 0.0-1.0. phase and tool must each be arrays of 1-4 [id,confidence] pairs. Never use one flat pair. "
             "Perform these independent passes before combining evidence: "
-            "GESTURE: inspect every visible hand in the right CAM4 Mayo/surgeon-hand panel. request_tool requires a substantially visible empty receiving palm with several relaxed, uncurled fingers, extended or held available toward the working team. Orientation, motion, glove color, and exact image position are irrelevant. An operating hand does not cancel a separate requesting hand. Reject cropped fragments, dorsal-only hands, gripping, tissue manipulation, bracing/traction, severe blur, and patient/bystander hands. If the visual request is clear, emit [\"request_tool\",\"\",\"open_receive\",confidence] even without speech. Never infer its tool id from a nearby, held, Mayo, predicted, or procedure-prior tool. "
+            "GESTURE: inspect only the upper-right surgeon hand in CAM4. Emit request_tool only when it is clearly open, empty, and held out/upward. If it holds anything or is unclear, occluded, or cropped, emit [\"\",\"\",\"\",0.0]. Ignore all other cues, objects, and people. For a positive emit [\"request_tool\",\"\",\"open_receive\",confidence]; never infer its tool id. "
             "MAYO: scan the complete hand/Mayo image in the right CAM4 panel, including edges and occlusions. Emit one row per distinct visible instrument instance and preserve duplicates. Identify by visible morphology such as rings, hinge, shaft, jaws, blade, insulation/cable, or lumen; omit unidentifiable silhouettes instead of guessing from procedure likelihood. Detector rows may support a match but their absence does not erase clear pixels. Never copy instruments from the surgical-field image in the left FLIR panel, speech, candidates, memory, or procedure order into mayo. recover/reuse is only an advisory observation: use reuse when public evidence supports near-term reuse; otherwise keep recover confidence low. mayo_retrieve is at most the strongest advisory candidate. "
             "CLINICAL SUMMARY: sum is one compact English sentence about the left field: visible instrument, specific anatomy/tissue, manipulation, and immediate effect. If obscured, say so. Never invent injury, preserved anatomy, hemostasis, or completion; omit panel names, Mayo, request, phase id/name, forecasts, and reasoning. "
             "PHASE/NEXT TOOL: compare left-field pixels with every cue/exclusion/group/role. temporal_prior is a preference, not a candidate filter. Persistent anatomy/activity outranks public speech/events and priors; an exchange alone never proves phase. "
             "phase_start_floor limits phase only, never tool/intent. Not ground truth; use allowed_normal_phase_ids, never earlier. Interrupts need visible evidence. "
-            "NEXT-TOOL FORECAST: tool is only a calibrated 2-8 second forecast of a new handover, not a label for the tool currently in use; it answers which additional instrument the assistant should prepare next and does not inventory visible instruments. Predict early: do not wait for a hand gesture or spoken request. Choose the most plausible near-term additional tool from visible task trajectory, broad procedure-role transitions, and public histories. Explicitly distinguish instruments already held or prepositioned. Unless public evidence specifically supports another instance, an already active type must stay below 0.65; forecast a plausible unused tool instead. forecast_constraints restates public DT context, not ground truth: currently_in_use lists surgeon-held tools and counts, prepositioned lists robot-held tools, and available_for_next_handover lists separate supply. It is derived from digital_twin.forecast_inventory.available: rack_available unused stock plus mayo_reuse surgeon-used tools expected later when trajectory supports imminent reuse. A tool type may appear in available and unavailable when separate instances exist, but a forecast must have available count >0. This evidence never authorizes action. Do not suppress uncertain visual evidence because of DT context; the reducer and BT, not the VLM, validate availability and decide action. digital_twin.tool_requests and completed_handovers are oldest-to-newest public histories. Independently of your phase candidate, match the longest suffix against every procedure chain; prefer the next primary item when pixels agree and alternatives only with support. Do not choose the next tool solely from your phase output. With no history, entry_handover is a weak preparation prior, not a confirmed request; keep every weak candidate below 0.65. Speech naming a tool is the current request; forecast the following handover instead. Do not memorize case timing. Procedure start/continue/finish speech is not a request. "
+            "NEXT-TOOL FORECAST: tool is only a horizon-free forecast of the first subsequent new handover, regardless of elapsed time, not a label for the tool currently in use; it answers which additional instrument the assistant should prepare next and does not inventory visible instruments. Predict before a hand gesture or spoken request when the trajectory supports it. Choose the most plausible subsequent additional tool from visible task trajectory, broad procedure-role transitions, and public histories. Explicitly distinguish instruments already held or prepositioned. Unless public evidence specifically supports another instance, an already active type must stay below 0.65; forecast a plausible unused tool instead. forecast_constraints restates public DT context, not ground truth: currently_in_use lists surgeon-held tools and counts, prepositioned lists robot-held tools, and available_for_next_handover lists separate supply. It is derived from digital_twin.forecast_inventory.available: rack_available unused stock plus mayo_reuse surgeon-used tools expected later when trajectory supports imminent reuse. A tool type may appear in available and unavailable when separate instances exist, but a forecast must have available count >0. This evidence never authorizes action. Do not suppress uncertain visual evidence because of DT context; the reducer and BT, not the VLM, validate availability and decide action. digital_twin.tool_requests and completed_handovers are oldest-to-newest public histories. Independently of your phase candidate, match the longest suffix against every procedure chain; prefer the next primary item when pixels agree and alternatives only with support. frozen_ngram_prior is an advisory aggregate phase/history statistic: rerank its probabilities using pixels and forecast_constraints; it is not a request, decision, or output to copy. Do not choose the next tool solely from your phase output or the n-gram prior. With no history, entry_handover is a weak preparation prior, not a confirmed request; keep every weak candidate below 0.65. Speech naming a tool is the current request; forecast the following handover instead. Do not memorize case timing. Procedure start/continue/finish speech is not a request. "
             "INTENT: only current public speech or an observed request signal naming a runtime instrument may produce [\"handover\",tool_id,confidence]. Match obvious ASR near-homophones and Korean/English transliterations to the listed runtime tool names, but do not turn procedure-start, continue, phase, anatomy, or completion speech into a tool request. A visual open hand without a named tool remains gesture evidence with intent [\"none\",\"\",0.0]. "
             "BED RETRACTION: null unless a pending public fine-adjustment request has direction evidence. Copy request_id, adjustment_mode, target_retractor_id, and surgeon_view exactly. For single, emit one of up/down/left/right with axis none. For multi, emit direction none with axis left_right or up_down. Preserve grounded distance text. Never propose tool change or any non-retraction operation. "
             "UNCERTAINTY: calculate u independently on every frame: 0.00-0.25 clear, 0.26-0.45 for usable adjacent-phase ambiguity, 0.46-0.79 weak/conflicting, and 0.80-1.00 only when the relevant view is unusable. Do not copy the structural 0.50 value. "
@@ -2259,6 +2318,7 @@ class RealVLMNode(Node):
                 "require_field_image",
                 "context_mode",
                 "open_set_phase_bootstrap_observations",
+                "handover_ngram_prior_enabled",
             }:
                 reload_required = True
         if reload_required:
@@ -4281,6 +4341,13 @@ class RealVLMNode(Node):
         if open_set_phase_search:
             previous = {"phase": [], "tool": []}
         digital_twin = self._public_digital_twin_context()
+        frozen_ngram_prior = None
+        handover_ngram_prior = getattr(self, "_handover_ngram_prior", None)
+        if handover_ngram_prior is not None:
+            frozen_ngram_prior = handover_ngram_prior.predict(
+                phase_id=evidence.get("current_phase", ""),
+                completed_handovers=digital_twin.get("completed_handovers", []),
+            )
         context = {
             "proc": self._spec.procedure_id,
             "procedure_prompt_id": str(self._procedure_prompt.get("id", "")) if isinstance(self._procedure_prompt, dict) else "",
@@ -4315,6 +4382,8 @@ class RealVLMNode(Node):
             "candidates": candidates,
             "previous": previous,
         }
+        if frozen_ngram_prior is not None:
+            context["frozen_ngram_prior"] = frozen_ngram_prior
         phase_start_floor = explicit_phase_start_floor_context(
             getattr(self, "_phase_bootstrap_id", ""),
             explicit_start_phase=bool(

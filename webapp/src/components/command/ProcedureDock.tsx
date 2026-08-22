@@ -1,14 +1,15 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { AnimatePresence, useReducedMotion } from "framer-motion";
 import * as m from "framer-motion/m";
 import { GitBranch, Pause, Play, RadioTower, RotateCcw, Square, Wifi } from "lucide-react";
 
 import { SafetyConfirmationDialog } from "../common/SafetyConfirmationDialog";
-import type { ControlCommand } from "../../hooks/useRosBridge";
+import type { ControlCommand, RuntimeAuthorityStatus } from "../../hooks/useRosBridge";
 import type { useDigitalTwinViewModel } from "../../hooks/useDigitalTwinViewModel";
 import type { RuntimeTransitionStatus } from "../../hooks/useRuntimeControl";
 import { shimmer, statusSwap } from "../../motion-system";
 import type { TaskplannerRuntimeMode } from "../../runtimeModes";
+import { runtimeAuthorityCopy } from "../../utils/runtimeAuthorityCopy";
 
 type ViewModel = ReturnType<typeof useDigitalTwinViewModel>;
 type MissionRuntimeMode = Exclude<TaskplannerRuntimeMode, "debug">;
@@ -25,6 +26,7 @@ export function ProcedureDock({
   startPhase,
   setStartPhase,
   connected,
+  runtimeAuthorityStatus,
   actionPending,
   actionMessage,
   runtimeMessage,
@@ -46,6 +48,7 @@ export function ProcedureDock({
   startPhase: string;
   setStartPhase: (phaseId: string) => void;
   connected: boolean;
+  runtimeAuthorityStatus: RuntimeAuthorityStatus;
   actionPending: string;
   actionMessage: string;
   runtimeMessage: string;
@@ -59,10 +62,29 @@ export function ProcedureDock({
   const [resetConfirmationOpen, setResetConfirmationOpen] = useState(false);
   const reducedMotion = useReducedMotion();
   const runtimeSwitchPending = runtimeTransition.phase === "starting";
+  const runtimeSwitchStartedAtRef = useRef<number | null>(null);
+  const [runtimeSwitchNow, setRuntimeSwitchNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!runtimeSwitchPending) {
+      runtimeSwitchStartedAtRef.current = null;
+      return;
+    }
+    if (runtimeSwitchStartedAtRef.current === null) {
+      runtimeSwitchStartedAtRef.current = Date.now();
+    }
+    setRuntimeSwitchNow(Date.now());
+    const timer = window.setInterval(() => setRuntimeSwitchNow(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, [runtimeSwitchPending]);
+  const runtimeSwitchElapsedSec = runtimeSwitchPending && runtimeSwitchStartedAtRef.current !== null
+    ? Math.max(0, Math.floor((runtimeSwitchNow - runtimeSwitchStartedAtRef.current) / 1_000))
+    : 0;
+  const runtimeSwitchDelayed = runtimeSwitchElapsedSec >= 10;
+  const runtimeStatusChecking = runtimeTransition.phase === "checking";
   const startInFlight = executionState === "starting" || actionPending.toLowerCase().includes("starting");
   const commandBusy = Boolean(actionPending);
-  const runtimeModeLocked = runtimeSwitchPending || isRunning || isPaused || startInFlight || commandBusy;
-  const disabled = !connected || !bundle || runtimeSwitchPending;
+  const runtimeModeLocked = runtimeStatusChecking || runtimeSwitchPending || isRunning || isPaused || startInFlight || commandBusy;
+  const disabled = !connected || !bundle || runtimeStatusChecking || runtimeSwitchPending;
   const formDisabled = disabled || commandBusy;
   const phaseSelectDisabled = disabled || commandBusy || isRunning || startInFlight;
   const startDisabled = disabled || commandBusy || !runtimeReady || isRunning || startInFlight;
@@ -70,16 +92,38 @@ export function ProcedureDock({
     disabled || commandBusy || startInFlight || !canPauseResume;
   const resetDisabled = disabled || commandBusy || startInFlight;
   const stopDisabled =
-    !connected || runtimeSwitchPending || (!isRunning && !isPaused && !startInFlight && !commandBusy);
+    !connected || runtimeStatusChecking || runtimeSwitchPending || (!isRunning && !isPaused && !startInFlight && !commandBusy);
   const statusMessage = vm.runtime.statusMessage;
   const trimmedActionMessage = actionMessage.trim();
+  const authorityFeedback = runtimeAuthorityCopy(runtimeAuthorityStatus, vm.language);
+  const authorityNeedsAttention = !connected && (
+    runtimeAuthorityStatus === "invalid" ||
+    runtimeAuthorityStatus === "stale" ||
+    runtimeAuthorityStatus === "offline"
+  );
+  const isBridgeLifecycleMessage =
+    trimmedActionMessage === "ROS bridge connected." ||
+    trimmedActionMessage === "ROS bridge connected. Waiting for fresh runtime state..." ||
+    trimmedActionMessage === "Connecting to ROS bridge..." ||
+    trimmedActionMessage === "ROS bridge disconnected. Reconnecting..." ||
+    trimmedActionMessage === "ROS bridge error. Retrying connection..." ||
+    trimmedActionMessage === "Fresh runtime state did not arrive. Reconnecting to the ROS bridge..." ||
+    trimmedActionMessage === "Runtime state heartbeat expired. Waiting for a fresh state..." ||
+    trimmedActionMessage === "Runtime state payload was invalid. Waiting for a valid state..." ||
+    trimmedActionMessage === "Replay state payload was invalid. Waiting for a valid state...";
+  const displayedActionMessage = authorityNeedsAttention
+    ? authorityFeedback.detail
+    : trimmedActionMessage;
   const shouldShowActionMessage =
-    Boolean(trimmedActionMessage) &&
-    trimmedActionMessage !== "Ready." &&
-    trimmedActionMessage !== "ROS bridge connected." &&
-    trimmedActionMessage !== runtimeMessage;
+    authorityNeedsAttention || (
+      Boolean(displayedActionMessage) &&
+      displayedActionMessage !== "Ready." &&
+      !isBridgeLifecycleMessage &&
+      displayedActionMessage !== runtimeMessage
+    );
   const actionMessageTone =
-    /failed|error|cannot|unknown|unsupported|offline|timed out|paused;/i.test(trimmedActionMessage)
+    authorityNeedsAttention ||
+    /failed|error|cannot|unknown|unsupported|offline|timed out|expired|invalid|paused;|실패|오류|거부|거절|차단|만료|잠갔|끊어졌|유효하지/i.test(displayedActionMessage)
       ? "error"
       : actionPending
         ? "pending"
@@ -115,9 +159,13 @@ export function ProcedureDock({
         ? "자동 시작 서비스를 확인하는 중입니다."
         : "Checking the runtime starter."
       : runtimeTransition.phase === "starting"
-        ? vm.language === "ko"
-          ? `${selectedRuntimeMode.label}을 시작하는 중입니다. ROS 연결이 자동으로 재개됩니다.`
-          : `Starting ${selectedRuntimeMode.label}. ROS will reconnect automatically.`
+        ? runtimeSwitchDelayed
+          ? vm.language === "ko"
+            ? `${selectedRuntimeMode.label} 기동 응답을 ${runtimeSwitchElapsedSec}초째 기다리는 중입니다. 런처가 응답할 때까지 새 전환을 요청하지 않습니다.`
+            : `Waiting ${runtimeSwitchElapsedSec}s for ${selectedRuntimeMode.label} to respond. No duplicate transition will be requested.`
+          : vm.language === "ko"
+            ? `${selectedRuntimeMode.label} 시작 중입니다. ROS 연결이 자동으로 재개됩니다.`
+            : `Starting ${selectedRuntimeMode.label}. ROS will reconnect automatically.`
         : runtimeTransition.phase === "blocked"
           ? apiTransitionMessage || (vm.language === "ko"
             ? "현재 실행 상태를 안전하게 확인할 수 없어 런타임 전환이 차단되었습니다."
@@ -168,8 +216,13 @@ export function ProcedureDock({
         </div>
 
       {shouldShowActionMessage ? (
-        <div className={["dock-action-message", actionMessageTone].join(" ")}>
-          {trimmedActionMessage}
+        <div
+          aria-atomic="true"
+          aria-live={actionMessageTone === "error" ? "assertive" : "polite"}
+          className={["dock-action-message", actionMessageTone].join(" ")}
+          role={actionMessageTone === "error" ? "alert" : "status"}
+        >
+          {displayedActionMessage}
         </div>
       ) : null}
 
@@ -227,7 +280,11 @@ export function ProcedureDock({
           <small className="runtime-mode-detail">{selectedRuntimeMode.detail}</small>
           {runtimeModeLocked ? (
             <small className="runtime-mode-lock-note" id="runtime-mode-lock-note" role="status">
-              {commandBusy
+              {runtimeStatusChecking
+                ? vm.language === "ko"
+                  ? "자동 시작 서비스의 현재 런타임을 확인한 뒤 모드 변경을 활성화합니다."
+                  : "Runtime switching will be enabled after the starter confirms the active runtime."
+                : commandBusy
                 ? vm.language === "ko"
                   ? "현재 제어 요청의 결과를 확인할 때까지 실행 모드를 바꿀 수 없습니다."
                   : "Runtime switching is locked until the current control request finishes."

@@ -1,18 +1,25 @@
 # Synthetic profile for fake/shadow tests only.  None of these values are
 # approved for Neuromeka, AFT200, HIL, or patient-adjacent operation.
-schema_version: 1
+schema_version: 2
 profile:
   name: synthetic_fake
   version: 1.0.0
-  procedure_type: nephrectomy
+  procedure_type: synthetic
+  public_procedure_type: nephrectomy
 calibration:
   approved: true
   revision: synthetic-test-only
-  expected_checksum: sha256:334ac70d2d35557f842ff6c45d9756f6de88e89c73726ed58afb8a30c15709c5
+  expected_checksum: sha256:77615c7459f49e71d30e71562225fc23a4c32b49bcb6ff06bc479a20bd54b847
 robot:
   controller_ip: 127.0.0.1
   sdk_version: fake
   timeout_sec: 1.0
+sensor:
+  transport: synthetic
+  channel: fake0
+  bitrate: 1000000
+  sample_rate_hz: 1000.0
+  zeroing_policy: synthetic_zero
 data:
   directory: /tmp/retraction-control
 control:
@@ -23,6 +30,9 @@ control:
     synthetic: [0.0]
   force_threshold: 1.0
   force_freshness_timeout_sec: 1.0
+  impedance:
+    target_force_n: 0.0
+    tolerance_n: 1.0
   stop_policy: hold
 side_mapping:
   LEFT:

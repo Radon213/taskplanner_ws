@@ -1,3 +1,4 @@
+import errno
 import json
 
 import pytest
@@ -24,6 +25,12 @@ def _metadata(session_id: str = "teach-command-1") -> TeachingSessionMetadata:
         robot_id="robot-test",
         controller_id="controller-test",
         source_revision="test-revision",
+        target_planner={
+            "name": "synthetic-test-planner",
+            "version": "1.0.0",
+            "checksum": "sha256:" + "b" * 64,
+            "synthetic": True,
+        },
         calibration={"approved": True, "sensor": "cal-test"},
     )
 
@@ -73,6 +80,7 @@ def test_session_round_trip_is_directory_atomic_and_checksum_bound(tmp_path):
     assert manifest["normally_completed"] is True
     assert manifest["joint_sample_count"] == 2
     assert manifest["force_sample_count"] == 2
+    assert manifest["target_planner"]["synthetic"] is True
     assert len(manifest["manifest_sha256"]) == 64
 
     loaded = repository.load(
@@ -151,3 +159,46 @@ def test_recorder_rejects_non_monotonic_samples_and_post_finish_writes():
     with pytest.raises(TeachingSessionError) as closed:
         recorder.record_joint(JointStateSample(21, "arm_1", (0.0,)))
     assert closed.value.code == "recorder_closed"
+
+
+def test_repository_rejects_symlink_root(tmp_path):
+    real = tmp_path / "real"
+    real.mkdir()
+    linked = tmp_path / "linked"
+    linked.symlink_to(real, target_is_directory=True)
+    repository = TeachingSessionRepository(linked.absolute())
+
+    with pytest.raises(TeachingSessionError) as raised:
+        repository.save(_session())
+
+    assert raised.value.code == "data_directory_symlink"
+
+
+def test_fsync_failure_leaves_no_committed_or_partial_session(tmp_path, monkeypatch):
+    repository = TeachingSessionRepository((tmp_path / "sessions").resolve())
+
+    def fail_fsync(_fd):
+        raise OSError(errno.ENOSPC, "simulated disk full")
+
+    monkeypatch.setattr("retraction_control.teaching_session.os.fsync", fail_fsync)
+    with pytest.raises(TeachingSessionError) as raised:
+        repository.save(_session())
+
+    assert raised.value.code == "session_write_failed"
+    assert not repository.session_path("teach-command-1").exists()
+    assert not list(repository.root.glob(".*.tmp-*"))
+
+
+def test_target_planner_mismatch_rejects_an_otherwise_valid_session(tmp_path):
+    repository = TeachingSessionRepository((tmp_path / "sessions").resolve())
+    repository.save(_session())
+
+    with pytest.raises(SessionProfileMismatchError) as raised:
+        repository.load(
+            "teach-command-1",
+            expected_profile_name="synthetic",
+            expected_profile_checksum="sha256:" + "a" * 64,
+            expected_target_planner_checksum="sha256:" + "c" * 64,
+        )
+
+    assert raised.value.code == "target_planner_checksum_mismatch"

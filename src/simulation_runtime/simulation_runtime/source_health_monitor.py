@@ -7,16 +7,21 @@ Receipt time is monotonic so replay clock jumps cannot hide a dead publisher.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import math
 import time
+from dataclasses import dataclass
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import (
+    DurabilityPolicy,
+    HistoryPolicy,
+    QoSProfile,
+    ReliabilityPolicy,
+)
 from sensor_msgs.msg import CompressedImage
-from surgical_msgs.msg import InputSourceStatus, VLMHealth, VLMResult
 
+from surgical_msgs.msg import InputSourceStatus, VLMHealth, VLMResult
 
 MISSING = "MISSING"
 RECOVERING = "RECOVERING"
@@ -26,6 +31,18 @@ ERROR = "ERROR"
 DISABLED = "DISABLED"
 
 STATUS_CHECKPOINT_SEC = 1.0
+CAMERA_INPUT_QOS_DEPTH = 1
+
+
+def camera_input_qos() -> QoSProfile:
+    """Match the latest-frame-only VIPLab operator preview contract."""
+
+    return QoSProfile(
+        history=HistoryPolicy.KEEP_LAST,
+        depth=CAMERA_INPUT_QOS_DEPTH,
+        reliability=ReliabilityPolicy.BEST_EFFORT,
+        durability=DurabilityPolicy.VOLATILE,
+    )
 
 
 def status_semantic_signature(status: InputSourceStatus) -> tuple[object, ...]:
@@ -185,9 +202,7 @@ class SourceHealthMonitor(Node):
         self.declare_parameter("enable_cam4", True)
         self.declare_parameter("enable_vlm", True)
 
-        recovery_samples = max(
-            1, int(self.get_parameter("recovery_samples").value)
-        )
+        recovery_samples = max(1, int(self.get_parameter("recovery_samples").value))
         camera_stale = max(
             0.1, float(self.get_parameter("camera_stale_after_sec").value)
         )
@@ -238,13 +253,13 @@ class SourceHealthMonitor(Node):
             CompressedImage,
             str(self.get_parameter("flir_topic").value),
             lambda message: self._on_image("flir", message),
-            qos_profile_sensor_data,
+            camera_input_qos(),
         )
         self.create_subscription(
             CompressedImage,
             str(self.get_parameter("cam4_topic").value),
             lambda message: self._on_image("cam4", message),
-            qos_profile_sensor_data,
+            camera_input_qos(),
         )
         self.create_subscription(
             VLMResult,
@@ -321,7 +336,7 @@ class SourceHealthMonitor(Node):
         if source_stamp is not None:
             total_nanoseconds = max(
                 0,
-                int(round(source_stamp * 1_000_000_000)),
+                round(source_stamp * 1_000_000_000),
             )
             whole, nanoseconds = divmod(
                 total_nanoseconds,
@@ -351,10 +366,8 @@ class SourceHealthMonitor(Node):
             return False
         try:
             self._status_publishers[source].publish(status)
-        except Exception as exc:  # pragma: no cover - defensive ROS boundary
-            self.get_logger().error(
-                f"Unable to publish {source} input status: {exc}"
-            )
+        except Exception as exc:  # noqa: BLE001 - defensive ROS boundary
+            self.get_logger().error(f"Unable to publish {source} input status: {exc}")
             return False
         gate.commit(source, status, now_monotonic)
         return True

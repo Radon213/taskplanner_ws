@@ -10,15 +10,23 @@ from rclpy.qos import DurabilityPolicy, ReliabilityPolicy
 from surgical_msgs.srv import AsrControl
 
 from integration_debug.operational_asr_node import (
+    ASR_ENDPOINT_CLOUD,
+    ASR_ENDPOINT_LAN,
+    ASR_ROUTE_POLICY_AUTO,
     CONTROL_SERVICE,
+    DEFAULT_LAN_SERVER_URL,
     NODE_NAME,
     SENTENCE_TOPIC,
     STATUS_SCHEMA,
     STATUS_TOPIC,
     OperationalAsrNode,
     _absolute_topic_name,
+    _bounded_float,
     _json_dumps,
+    resolve_puzzle_asr_endpoint,
 )
+from integration_debug.asr_health_monitor import LAN_HEALTH_READY
+from integration_debug.asr_endpoints import validate_asr_route_policy
 
 
 class FakeRuntime:
@@ -74,13 +82,46 @@ class FakeRuntime:
         return events
 
 
+class FakeHealthMonitor:
+    def __init__(self, **kwargs) -> None:
+        self.kwargs = kwargs
+        self.start_calls = 0
+        self.close_calls = 0
+        self.state = LAN_HEALTH_READY
+        self.latency_ms = 4.2
+        self.last_error = ""
+
+    def start(self) -> None:
+        self.start_calls += 1
+
+    def close(self) -> bool:
+        self.close_calls += 1
+        return True
+
+    def snapshot(self):
+        return {
+            "enabled": True,
+            "state": self.state,
+            "method": "websocket_handshake",
+            "age_ms": 10.0,
+            "latency_ms": self.latency_ms if self.state == LAN_HEALTH_READY else None,
+            "consecutive_failures": 0 if self.state == LAN_HEALTH_READY else 1,
+            "last_error": self.last_error,
+        }
+
+
 @pytest.fixture
 def node(monkeypatch):
+    monkeypatch.setenv("PUZZLE_ASR_ENDPOINT", ASR_ENDPOINT_CLOUD)
     monkeypatch.setenv("PUZZLE_ASR_URL", "wss://asr.example.test/v1")
+    monkeypatch.delenv("PUZZLE_ASR_LAN_URL", raising=False)
     monkeypatch.setenv("TASKPLANNER_ASR_CAPTURE_LOCK", "/tmp/test-asr.lock")
     monkeypatch.delenv("SENTENCE_INPUT_TOPIC", raising=False)
     rclpy.init(args=[])
-    created = OperationalAsrNode(runtime_factory=FakeRuntime)
+    created = OperationalAsrNode(
+        runtime_factory=FakeRuntime,
+        health_monitor_factory=FakeHealthMonitor,
+    )
     try:
         yield created
     finally:
@@ -90,17 +131,23 @@ def node(monkeypatch):
             rclpy.shutdown()
 
 
-def request(operation, *, device_id=-1, server_url=""):
+def request(operation, *, device_id=-1, server_url="", route_policy=""):
     value = AsrControl.Request()
     value.operation = operation
     value.device_id = device_id
     value.server_url = server_url
+    value.route_policy = route_policy
     return value
 
 
-def invoke(node, operation, *, device_id=-1, server_url=""):
+def invoke(node, operation, *, device_id=-1, server_url="", route_policy=""):
     return node._handle_control(
-        request(operation, device_id=device_id, server_url=server_url),
+        request(
+            operation,
+            device_id=device_id,
+            server_url=server_url,
+            route_policy=route_policy,
+        ),
         AsrControl.Response(),
     )
 
@@ -123,6 +170,10 @@ def test_fixed_contract_and_json_safe_status(node) -> None:
     assert status["schema"] == STATUS_SCHEMA == "taskplanner.asr.status.v1"
     assert isinstance(status["stamp_sec"], float)
     assert status["asr"]["artifacts_enabled"] is False
+    assert status["asr"]["endpoint_id"] == ASR_ENDPOINT_CLOUD
+    assert status["asr"]["route_policy"] == ASR_ENDPOINT_CLOUD
+    assert status["asr"]["lan_health"]["state"] == LAN_HEALTH_READY
+    assert node._lan_monitor.start_calls == 1
     with pytest.raises(ValueError):
         _json_dumps({"invalid": math.nan})
     assert _absolute_topic_name("/sensors/surgeon/sentence") == SENTENCE_TOPIC
@@ -130,6 +181,123 @@ def test_fixed_contract_and_json_safe_status(node) -> None:
         _absolute_topic_name("sensors/surgeon/sentence")
     with pytest.raises(Exception):
         _absolute_topic_name("/sensors//sentence")
+
+
+def test_endpoint_resolver_allows_only_cloud_and_lan() -> None:
+    assert resolve_puzzle_asr_endpoint(
+        "cloud", cloud_url="wss://asr.example.test/v1"
+    ) == (ASR_ENDPOINT_CLOUD, "wss://asr.example.test/v1")
+    assert resolve_puzzle_asr_endpoint(
+        "lan", lan_url="ws://192.168.1.5:1196/"
+    ) == (ASR_ENDPOINT_LAN, DEFAULT_LAN_SERVER_URL)
+    with pytest.raises(ValueError, match="cloud.*lan"):
+        resolve_puzzle_asr_endpoint("unapproved")
+
+
+def test_route_policy_allows_auto_but_no_unreviewed_value() -> None:
+    assert validate_asr_route_policy("AUTO") == ASR_ROUTE_POLICY_AUTO
+    with pytest.raises(ValueError, match="cloud.*lan.*auto"):
+        validate_asr_route_policy("nearest-server")
+
+
+def test_lan_monitor_tuning_rejects_non_finite_environment_values() -> None:
+    assert _bounded_float("0.01", default=1.0, minimum=0.2) == 0.2
+    assert _bounded_float("nan", default=1.0, minimum=0.2) == 1.0
+    assert _bounded_float("inf", default=1.0, minimum=0.2) == 1.0
+
+
+def test_lan_endpoint_is_selected_before_microphone_start(monkeypatch) -> None:
+    monkeypatch.setenv("PUZZLE_ASR_ENDPOINT", ASR_ENDPOINT_LAN)
+    monkeypatch.setenv("PUZZLE_ASR_URL", "wss://asr.example.test/v1")
+    monkeypatch.setenv("PUZZLE_ASR_LAN_URL", DEFAULT_LAN_SERVER_URL)
+    monkeypatch.setenv("TASKPLANNER_ASR_CAPTURE_LOCK", "/tmp/test-asr-lan.lock")
+    rclpy.init(args=[])
+    created = OperationalAsrNode(
+        runtime_factory=FakeRuntime,
+        health_monitor_factory=FakeHealthMonitor,
+    )
+    try:
+        assert created._endpoint == ASR_ENDPOINT_LAN
+        assert created._server_url == DEFAULT_LAN_SERVER_URL
+        response = invoke(created, "start")
+        assert response.accepted is True
+        assert created._runtime.start_calls == [
+            {"device_id": None, "server_url": DEFAULT_LAN_SERVER_URL}
+        ]
+        status = json.loads(response.result_json)
+        assert status["asr"]["endpoint_id"] == ASR_ENDPOINT_LAN
+    finally:
+        created.close()
+        created.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+def test_auto_policy_uses_cached_ready_lan_without_start_time_probe(node) -> None:
+    configured = invoke(node, "set_route_policy", route_policy=ASR_ROUTE_POLICY_AUTO)
+    assert configured.accepted is True
+    assert node._lan_monitor.start_calls == 1
+    assert node._runtime.start_calls == []
+
+    started = invoke(node, "start")
+    assert started.accepted is True
+    assert node._runtime.start_calls == [
+        {"device_id": None, "server_url": DEFAULT_LAN_SERVER_URL}
+    ]
+    status = json.loads(started.result_json)["asr"]
+    assert status["route_policy"] == ASR_ROUTE_POLICY_AUTO
+    assert status["endpoint_id"] == ASR_ENDPOINT_LAN
+    assert status["selection_reason"] == "lan_ready"
+
+
+def test_auto_policy_falls_back_to_cloud_from_cached_lan_failure(node) -> None:
+    node._lan_monitor.state = "UNAVAILABLE"
+    node._lan_monitor.last_error = "TimeoutError: timed out"
+
+    configured = invoke(node, "set_route_policy", route_policy=ASR_ROUTE_POLICY_AUTO)
+    assert configured.accepted is True
+    started = invoke(node, "start")
+
+    assert started.accepted is True
+    assert node._runtime.start_calls == [
+        {"device_id": None, "server_url": "wss://asr.example.test/v1"}
+    ]
+    status = json.loads(started.result_json)["asr"]
+    assert status["endpoint_id"] == ASR_ENDPOINT_CLOUD
+    assert status["selection_reason"] == "lan_unavailable_fallback"
+    assert status["lan_health"]["state"] == "UNAVAILABLE"
+
+
+def test_forced_lan_blocks_microphone_when_monitor_is_unhealthy(node) -> None:
+    node._lan_monitor.state = "UNAVAILABLE"
+    node._lan_monitor.last_error = "TimeoutError: timed out"
+
+    configured = invoke(node, "set_route_policy", route_policy=ASR_ENDPOINT_LAN)
+    assert configured.accepted is True
+    rejected = invoke(node, "start")
+
+    assert rejected.accepted is False
+    assert "microphone was not opened" in rejected.message
+    assert node._runtime.start_calls == []
+    assert node._sentence_pub is None
+
+
+def test_route_policy_cannot_change_during_microphone_session(node) -> None:
+    assert invoke(node, "start").accepted is True
+
+    rejected = invoke(node, "set_route_policy", route_policy=ASR_ROUTE_POLICY_AUTO)
+
+    assert rejected.accepted is False
+    assert "cannot change" in rejected.message
+    assert node._route_policy == ASR_ENDPOINT_CLOUD
+
+
+def test_route_policy_rejects_unreviewed_value_without_changing_route(node) -> None:
+    rejected = invoke(node, "set_route_policy", route_policy="nearest-server")
+
+    assert rejected.accepted is False
+    assert "cloud', 'lan', or 'auto" in rejected.message
+    assert node._route_policy == ASR_ENDPOINT_CLOUD
 
 
 def test_start_uses_default_device_and_rejects_endpoint_override(node) -> None:
@@ -219,6 +387,7 @@ def test_refresh_no_input_is_successful_and_shutdown_is_idempotent(node) -> None
     assert node.close() is True
     assert node.close() is True
     assert node._runtime.close_calls == 1
+    assert node._lan_monitor.close_calls == 1
     assert node._sentence_pub is None
 
 

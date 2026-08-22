@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#081425" />
+    <title>SurgiMate · Robot Monitoring</title>
+    <link rel="icon" href="/favicon.svg" />
+    <link rel="stylesheet" href="/monitor/styles.css?v=20260821-2" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="topbar">
+        <section class="phase" aria-label="현재 수술 단계">
+          <div class="phase-copy"><small>—</small><strong>Waiting for catalog</strong><span></span></div>
+          <div class="phase-track" aria-hidden="true"></div>
+        </section>
+        <section class="time-panel"><time id="clock">14:32</time><span>ELAPSED TIME</span><strong id="elapsed">01:24:05</strong></section>
+        <section class="procedure">
+          <div><strong>Thyroidectomy</strong><dl><dt>TARGET SITE</dt><dd>Right Lobectomy</dd><dt>APPROACH</dt><dd>BABA</dd></dl></div>
+          <div class="surgeon"><button class="settings-profile-trigger" type="button" data-settings-trigger aria-label="교수 프로필에서 연결 설정 열기" aria-haspopup="dialog" aria-controls="settings-dialog" aria-expanded="false"><img src="assets/figma/surgeon-prof-sung.png" alt="Prof. Sung" /></button><span><strong>Prof. Sung</strong><small>ENT</small></span></div>
+        </section>
+      </header>
+
+      <section class="surgical-view">
+        <img class="surgery-image" src="assets/figma/raw-14.png" alt="수술 부위 카메라 화면" />
+        <div class="image-vignette"></div>
+        <div class="view-tabs" role="tablist" aria-label="카메라 보기">
+          <button class="active" role="tab" aria-selected="true" data-view="overview"><img class="view-tab-icon" src="assets/figma/ui/overview-tab-icon.svg" alt="" />OVERVIEW</button>
+          <span class="view-tab-divider" aria-hidden="true"></span>
+          <button role="tab" aria-selected="false" data-view="focus"><img class="view-tab-icon" src="assets/figma/ui/field-focus-tab-icon.svg" alt="" />FIELD FOCUS</button>
+        </div>
+
+        <article class="tool-card previous" aria-label="Mayo stand instruments"><header><small>MAYO</small><span class="flow-count"></span></header><div class="flow-list" aria-label="Mayo stand instrument list" tabindex="0"><div class="flow-empty">NONE</div></div></article>
+        <article class="tool-card current" aria-label="Surgeon instruments in use"><span class="in-use">IN USE</span><div class="flow-list" aria-label="Surgeon instrument list" tabindex="0"><div class="flow-empty">NONE</div></div></article>
+
+        <article class="arm-card arm-1">
+          <span class="task-label retrieve-label">RETRIEVE</span>
+          <header><b>L</b><span class="status idle"><i></i>IDLE</span></header><p class="arm-label"><img class="arm-hand-icon" src="assets/figma/ui/arm-hand-icon.svg" alt="" /><span>ARM 1</span></p><h2>NONE</h2>
+        </article>
+        <article class="arm-card arm-2 active-card">
+          <span class="task-label deliver-label">DELIVER</span>
+          <header><b>R</b><span class="status idle"><i></i>IDLE</span></header><p class="arm-label"><img class="arm-hand-icon" src="assets/figma/ui/arm-hand-icon.svg" alt="" /><span>ARM 2</span></p><h2>NONE</h2>
+        </article>
+
+        <section class="focus-only focus-info" aria-label="Field Focus 수술 정보">
+          <span>PROCEDURE&nbsp;&nbsp; <strong>Thyroidectomy</strong></span><span>CURRENT TIME&nbsp;&nbsp; <strong id="focus-clock">14:32</strong></span><span>ELAPSED TIME&nbsp;&nbsp; <strong id="focus-elapsed">01:24:05</strong></span><span class="focus-doctor"><button class="settings-profile-trigger" type="button" data-settings-trigger aria-label="교수 프로필에서 연결 설정 열기" aria-haspopup="dialog" aria-controls="settings-dialog" aria-expanded="false"><img src="assets/figma/surgeon-prof-sung.png" alt="Prof. Sung" /></button><strong>Prof. Sung</strong>&nbsp; ENT</span>
+        </section>
+        <section class="focus-only bed-map" aria-label="수술대 주변 위치"><div class="bed-grid"><div class="bed">BED</div><img class="map-inactive" src="assets/figma/ui/map-inactive.svg" alt="" /><img class="map-arm arm12" src="assets/figma/ui/map-arm12.svg" alt="" /><img class="map-arm arm34 a" src="assets/figma/ui/map-arm34.svg" alt="" /><img class="map-arm arm34 b" src="assets/figma/ui/map-arm34.svg" alt="" /><img class="map-surgeon" src="assets/figma/ui/map-surgeon.svg" alt="" /></div><div class="map-legend"><span><i></i>ARM 1,2</span><span><i></i>ARM 3,4</span><span><i></i>SURGEON</span></div></section>
+        <article class="focus-only focus-arm focus-arm-1"><header><b>L</b><span class="status idle"><i></i>IDLE</span></header><p class="arm-label"><img class="arm-hand-icon" src="assets/figma/ui/arm-hand-icon.svg" alt="" /><span>ARM 1</span></p><h2>NONE</h2></article>
+        <article class="focus-only focus-arm focus-arm-2"><header><b>R</b><span class="status idle"><i></i>IDLE</span></header><p class="arm-label"><img class="arm-hand-icon" src="assets/figma/ui/arm-hand-icon.svg" alt="" /><span>ARM 2</span></p><h2>NONE</h2></article>
+        <article class="focus-only focus-predicted"><small>1st Predicted</small><strong>NONE</strong></article>
+      </section>
+
+      <section class="control-dock" aria-label="로봇 제어 패널">
+        <article class="dock-card arm-control arm3-control">
+          <section class="dock-arm-summary" role="button" tabindex="0" data-direct-teaching-arm="3" aria-label="ARM 3 Direct Teaching 모드 전환" aria-pressed="false" aria-busy="false">
+            <span class="direct-teaching-label" aria-hidden="true">DIRECT<br />TEACHING</span>
+            <div class="dock-arm-summary-card">
+              <span class="status idle"><i></i>IDLE</span>
+              <p class="arm-label"><img class="dock-arm-icon dock-arm-icon-normal" src="assets/figma/ui/dock-arm3-icon.svg" alt="" /><img class="dock-arm-icon dock-arm-icon-teaching" src="assets/figma/ui/dock-arm-teaching-icon.svg" alt="" /><span>ARM 3</span></p>
+              <h3>Retraction</h3>
+              <span class="toggle" aria-hidden="true"></span>
+            </div>
+          </section>
+          <section class="dock-settings"><label>CURRENT TOOL</label><button class="select-button"><span>ARMY 15mm</span><img src="assets/figma/ui/dropdown-icon.svg" alt="" /></button><div class="force-row"><label>FORCE</label><div class="stepper"><button aria-label="Force 증가"><img src="assets/figma/ui/plus-icon.svg" alt="" /></button><strong>12</strong><button aria-label="Force 감소"><img src="assets/figma/ui/minus-icon.svg" alt="" /></button></div></div></section>
+        </article>
+
+        <article class="dock-card arm-control arm4-control">
+          <section class="dock-arm-summary" role="button" tabindex="0" data-direct-teaching-arm="4" aria-label="ARM 4 Direct Teaching 모드 전환" aria-pressed="false" aria-busy="false">
+            <span class="direct-teaching-label" aria-hidden="true">DIRECT<br />TEACHING</span>
+            <div class="dock-arm-summary-card">
+              <span class="status idle"><i></i>IDLE</span>
+              <p class="arm-label"><img class="dock-arm-icon dock-arm-icon-normal" src="assets/figma/ui/dock-arm4-icon.svg" alt="" /><img class="dock-arm-icon dock-arm-icon-teaching" src="assets/figma/ui/dock-arm-teaching-icon.svg" alt="" /><span>ARM 4</span></p>
+              <h3>Suction</h3>
+              <span class="toggle" aria-hidden="true"></span>
+            </div>
+          </section>
+          <section class="dock-settings suction-settings"><label>SUCTION TARGET</label><button class="select-button">Bleeding</button><label>SUCTION LEVEL</label><div class="level-control"><button>LOW</button><button class="active">MEDIUM</button><button>HIGH</button></div></section>
+        </article>
+
+        <article class="dock-card predicted-dock">
+          <nav class="rank-tabs" aria-label="예측 순위"><button class="active">1</button><button>2</button><button>3</button></nav>
+          <button class="prediction-arrow prev-arrow" aria-label="이전"><img src="assets/figma/ui/prediction-arrow.svg" alt="" /></button>
+          <section class="prediction-mini empty"><strong>NONE</strong></section>
+          <section class="prediction-mini empty"><strong>NONE</strong></section>
+          <section class="prediction-mini empty"><strong>NONE</strong></section>
+          <button class="prediction-arrow next-arrow" aria-label="다음"><img src="assets/figma/ui/prediction-arrow.svg" alt="" /></button>
+        </article>
+
+        <article class="dock-card voice-card"><div class="mic" aria-hidden="true"><img src="assets/figma/ui/microphone-icon.svg" alt="" /></div><strong>Listening...</strong><span class="listening"><img src="assets/figma/ui/listening-dot-1.svg" alt="" /><img src="assets/figma/ui/listening-dot-2.svg" alt="" /><img src="assets/figma/ui/listening-dot-3.svg" alt="" /></span></article>
+      </section>
+      <div class="connection" role="status" aria-live="polite" hidden><i></i><span>SIMULATION</span><strong>LOCAL DATA</strong></div>
+      <div id="settings-dialog" class="settings-overlay" hidden>
+        <section class="settings-panel" role="dialog" aria-modal="true" aria-labelledby="settings-title" tabindex="-1">
+          <header>
+            <div><small>SURGIMATE</small><h2 id="settings-title">CONNECTION SETTINGS</h2></div>
+            <button type="button" class="settings-close" data-settings-close aria-label="설정 닫기">×</button>
+          </header>
+          <form id="settings-form" novalidate>
+            <fieldset class="settings-mode">
+              <legend>DATA SOURCE</legend>
+              <label><input type="radio" name="connection-mode" value="ros" /><span><b>SERVER</b><small>ROS Bridge 실시간 데이터</small></span></label>
+              <label><input type="radio" name="connection-mode" value="dummy" /><span><b>DUMMY DATA</b><small>로컬 JSON 테스트 데이터</small></span></label>
+            </fieldset>
+
+            <div class="settings-fields" data-mode-fields="ros">
+              <label for="bridge-url">ROS BRIDGE ADDRESS</label>
+              <input id="bridge-url" name="bridgeUrl" type="text" inputmode="url" autocomplete="off" spellcheck="false" placeholder="ws://192.168.0.10:9092" />
+              <small>ws:// 또는 wss:// 주소를 입력해 주세요.</small>
+
+              <label for="throttle-rate">CAMERA THROTTLE RATE</label>
+              <div class="number-field"><input id="throttle-rate" name="throttleRateMs" type="number" min="100" max="5000" step="10" /><span>ms</span></div>
+              <small>Overview와 Field Focus가 공유하는 FLIR 영상의 최소 전달 간격입니다. 기본 100ms는 최대 10 FPS입니다.</small>
+            </div>
+
+            <div class="settings-fields dummy-file" data-mode-fields="dummy">
+              <label for="dummy-file-input">DUMMY DATA FILE</label>
+              <div class="dummy-file-control">
+                <input id="dummy-file-input" type="file" accept=".json,application/json" />
+                <label for="dummy-file-input">BROWSE JSON</label>
+                <code id="dummy-data-file" data-url="/monitor/dummy-data.json">/monitor/dummy-data.json</code>
+              </div>
+              <small>UI_PUBLIC_CONTRACT_FIXTURE.json 형식의 512KB 이하 JSON을 선택해 주세요. 선택 파일은 브라우저에 저장되지 않습니다.</small>
+            </div>
+
+            <fieldset class="settings-mode camera-fit-mode">
+              <legend>CAMERA FIT</legend>
+              <label><input type="radio" name="camera-fit" value="contain" /><span><b>CONTAIN</b><small>원본 비율로 영상 전체 표시</small></span></label>
+              <label><input type="radio" name="camera-fit" value="cover" /><span><b>COVER</b><small>화면을 채우고 가장자리 자르기</small></span></label>
+            </fieldset>
+
+            <p id="settings-error" class="settings-error" role="alert" aria-live="assertive"></p>
+            <footer>
+              <button id="settings-reset" class="secondary" type="button">DEFAULT</button>
+              <button id="diagnostics-download" class="secondary" type="button" title="현재 브라우저 세션의 연결 진단 로그를 JSON으로 저장합니다.">DOWNLOAD LOG</button>
+              <button id="settings-disconnect" class="secondary danger" type="button" disabled>DISCONNECT</button>
+              <span></span>
+              <button class="secondary" type="button" data-settings-close>CANCEL</button>
+              <button class="primary" type="submit">APPLY</button>
+            </footer>
+          </form>
+        </section>
+      </div>
+    </main>
+    <script src="/monitor/runtime-config.js"></script>
+    <script type="module" src="/monitor/app.js"></script>
+  </body>
+</html>

@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from integration_debug.multicam_backpressure import (
     LatestPerTopicScheduler,
     rosbridge_topic_key,
@@ -113,3 +115,14 @@ def test_completing_another_topic_does_not_drop_an_inflight_topics_latest() -> N
     assert scheduler.complete("/camera/1") == []
     assert scheduler.pending_count == 1
     assert scheduler.complete("/camera/0") == [("/camera/0", "latest-0")]
+
+
+def test_secure_debug_rosbridge_uses_the_same_topic_fair_scheduler() -> None:
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "integration_debug"
+        / "secure_rosbridge.py"
+    ).read_text(encoding="utf-8")
+    assert "LatestPerTopicScheduler" in source
+    assert "rosbridge_topic_key(message)" in source
+    assert "_pending_large_writes" not in source

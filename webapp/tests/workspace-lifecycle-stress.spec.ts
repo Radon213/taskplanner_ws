@@ -38,9 +38,9 @@ function debugStatus(connection: number): Record<string, unknown> {
       ros_domain_id: "0",
       rmw_implementation: "rmw_fastrtps_cpp",
       discovery_range: "LOCALHOST",
-      blocked_nodes: [],
-      operational_runtime_stopped: true,
-      manual_control_available: true,
+      blocked_nodes: ["taskplanner-runtime"],
+      operational_runtime_stopped: false,
+      manual_control_available: false,
       planner_coexistence_allowed: false,
       network: {
         primary_interface: "eth0",
@@ -54,6 +54,7 @@ function debugStatus(connection: number): Record<string, unknown> {
         settings_path: "/tmp/debug-network.json",
         restart_supported: true,
         restart_scheduled: false,
+        locked_to_runtime: true,
       },
     },
     inputs: [],
@@ -70,7 +71,7 @@ function debugStatus(connection: number): Record<string, unknown> {
     },
     outputs: [],
     voice: { auto_execute: false, last_sentence: "", last_parse: {} },
-    asr: { state: "STOPPED" },
+    asr: { available: false, state: "STOPPED", devices: [], finals: [] },
     surgery_record: { state: "IDLE", history: [] },
     recent_events: [],
   };
@@ -256,8 +257,8 @@ async function installStressStubs(page: Page) {
     retryable: boolean;
   } = {
     phase: "idle",
-    active_mode: "llm-surgeon",
-    requested_mode: "llm-surgeon",
+    active_mode: "live",
+    requested_mode: "live",
     message: "Selected runtime is ready.",
     retryable: false,
   };
@@ -317,7 +318,23 @@ async function installStressStubs(page: Page) {
               filtered_phase: "P03",
               running: false,
               execution_state: "idle",
-              instrument_states: [{ instrument_id: "grasper" }],
+              instrument_states: [{
+                instrument_id: "grasper",
+                home_location_type: "rack",
+                home_location_id: "grasper",
+                location_type: "rack",
+                location_id: "grasper",
+                owner: "none",
+                status: "available",
+                confidence: 0.9,
+                cleanliness_state: "sterile",
+                contaminated: false,
+                lifecycle_stage: "home_rack",
+                reserved_for: "",
+                last_holder: "none",
+                next_required_transition: "",
+                visual_anchor_id: "grasper",
+              }],
             },
           }));
         } else if (kind === "debug" && message.topic === "/integration/debug/status") {
@@ -397,7 +414,7 @@ async function installStressStubs(page: Page) {
   };
 }
 
-test("returns browser and ROS resources to baseline after 30 workspace cycles", async ({ page }, testInfo) => {
+test("returns browser and ROS resources to baseline after 30 integrated observation cycles", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "fhd", "The 30-cycle lifecycle stress only needs one viewport.");
   test.setTimeout(180_000);
   await installBrowserResourceAudit(page);
@@ -405,7 +422,7 @@ test("returns browser and ROS resources to baseline after 30 workspace cycles", 
   await page.goto("/");
 
   const missionHeading = page.getByRole("heading", { name: "수술실 디지털 트윈" });
-  const startButton = page.getByRole("button", { name: "시작", exact: true });
+  const startButton = page.getByRole("button", { name: "수술 시작", exact: true });
   await expect(missionHeading).toBeVisible();
   await expect(startButton).toBeEnabled();
   await page.waitForTimeout(650);
@@ -415,23 +432,18 @@ test("returns browser and ROS resources to baseline after 30 workspace cycles", 
   expect(baseline.activeResizeObservers).toBeGreaterThanOrEqual(1);
 
   for (let cycle = 1; cycle <= 30; cycle += 1) {
-    await page.getByRole("button", { name: "디버그 모드" }).click();
-    await page.getByRole("button", { name: "디버그 런타임 시작" }).click();
+    await page.getByRole("button", { name: "통합 Debug 관측 열기" }).click();
     await expect(page.getByRole("heading", { name: "디버그 모드" })).toBeVisible();
-    await expect(page.getByRole("button", { name: "수동 제어 활성화" })).toBeEnabled();
+    await expect(page.getByRole("button", { name: "수동 제어 잠김" })).toBeDisabled();
     if (cycle % 10 === 0) {
       const connectionCount = bridge.connectionCount("debug");
       await bridge.closeLatest("debug");
       await expect.poll(() => bridge.connectionCount("debug"), { timeout: 4_000 })
         .toBe(connectionCount + 1);
-      await expect(page.getByRole("button", { name: "수동 제어 활성화" })).toBeEnabled();
+      await expect(page.getByRole("button", { name: "수동 제어 잠김" })).toBeDisabled();
     }
-    await page.getByRole("button", { name: "운영 화면으로" }).click();
-    await expect(missionHeading).toBeVisible();
-    await expect(startButton).toBeEnabled();
-
-    await page.getByRole("button", { name: "멀티캠 관제" }).click();
-    await expect(page.getByRole("heading", { name: "멀티캠 관제 콘솔" })).toBeVisible();
+    await page.getByRole("tab", { name: /^멀티캠 관제/ }).click();
+    await expect(page.locator('[data-slot="debug-multicam-ops"]')).toBeVisible();
     await expect(page.getByText(/멀티캠 observer ready · CaptureStatus fresh/)).toBeVisible();
     await page.getByRole("tab", { name: "Depth" }).click();
     await page.getByRole("tab", { name: "Color" }).click();
@@ -442,7 +454,7 @@ test("returns browser and ROS resources to baseline after 30 workspace cycles", 
         .toBe(connectionCount + 1);
       await expect(page.getByText(/멀티캠 observer ready · CaptureStatus fresh/)).toBeVisible();
     }
-    await page.getByRole("button", { name: "미션 화면" }).click();
+    await page.getByRole("button", { name: "운영 화면으로" }).click();
     await expect(missionHeading).toBeVisible();
     await expect(startButton).toBeEnabled();
 
@@ -471,7 +483,5 @@ test("returns browser and ROS resources to baseline after 30 workspace cycles", 
 
   const final = await resourceSnapshot(page);
   expect(final.createdWebSockets - final.closedWebSockets).toBe(final.activeWebSockets);
-  expect(bridge.transitions).toHaveLength(60);
-  expect(bridge.transitions.filter((mode) => mode === "debug")).toHaveLength(30);
-  expect(bridge.transitions.filter((mode) => mode === "llm-surgeon")).toHaveLength(30);
+  expect(bridge.transitions).toEqual([]);
 });

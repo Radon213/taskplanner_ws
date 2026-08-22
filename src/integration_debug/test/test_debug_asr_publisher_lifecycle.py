@@ -3,6 +3,11 @@ from types import MethodType
 
 import pytest
 
+from integration_debug.asr_endpoints import (
+    ASR_ENDPOINT_CLOUD,
+    ASR_ENDPOINT_LAN,
+    DEFAULT_LAN_SERVER_URL,
+)
 from integration_debug.node import IntegrationDebugNode
 
 
@@ -21,13 +26,15 @@ class _FakeAsrRuntime:
         self.events = []
         self.fail_start = fail_start
         self.stop_calls = 0
+        self.start_calls = []
 
     def snapshot(self):
         return {"state": self.state, "connected": self.connected}
 
-    def start(self, **_kwargs) -> None:
+    def start(self, **kwargs) -> None:
         if self.fail_start:
             raise RuntimeError("test microphone start failure")
+        self.start_calls.append(kwargs)
         self.state = "LISTENING"
 
     def stop_async(self) -> None:
@@ -57,6 +64,10 @@ def _harness(*, fail_start: bool = False, network_locked: bool = False):
     harness._asr_capture_requested = False
     harness._manual_sentence_pub = None
     harness._asr = _FakeAsrRuntime(fail_start=fail_start)
+    harness._asr_endpoint = ASR_ENDPOINT_CLOUD
+    harness._asr_server_url = "wss://arpa.worker-02.puzzle-ai.com"
+    harness._asr_cloud_url = harness._asr_server_url
+    harness._asr_lan_url = DEFAULT_LAN_SERVER_URL
     harness._network_locked_to_runtime = network_locked
     harness._surgery_record = _FakeSurgeryRecordRuntime()
     harness._lock = threading.RLock()
@@ -87,6 +98,7 @@ def _harness(*, fail_start: bool = False, network_locked: bool = False):
         "_destroy_manual_sentence_publisher",
         "_release_manual_publishers",
         "_drain_auxiliary_events",
+        "_asr_status_snapshot",
     ):
         setattr(
             harness,
@@ -157,6 +169,56 @@ def test_debug_asr_start_failure_clears_readiness_publisher() -> None:
     assert harness._asr_capture_requested is False
     assert harness._asr_sentence_pub is None
     assert harness.created_publishers == []
+
+
+def test_debug_asr_selects_only_the_reviewed_lan_route_before_capture() -> None:
+    harness = _harness()
+
+    accepted, _command_id, _message, snapshot = (
+        IntegrationDebugNode._handle_asr_command(
+            harness, "asr_start", {"endpoint_id": ASR_ENDPOINT_LAN}
+        )
+    )
+
+    assert accepted is True
+    assert harness._asr_endpoint == ASR_ENDPOINT_LAN
+    assert harness._asr.start_calls == [
+        {"device_id": None, "server_url": DEFAULT_LAN_SERVER_URL}
+    ]
+    assert snapshot["endpoint_id"] == ASR_ENDPOINT_LAN
+
+
+def test_debug_asr_rejects_browser_websocket_url_override() -> None:
+    harness = _harness()
+
+    accepted, _command_id, message, snapshot = (
+        IntegrationDebugNode._handle_asr_command(
+            harness,
+            "asr_start",
+            {"server_url": "wss://unapproved.example.test/collect"},
+        )
+    )
+
+    assert accepted is False
+    assert "override is not allowed" in message
+    assert snapshot["endpoint_id"] == ASR_ENDPOINT_CLOUD
+    assert harness._asr.start_calls == []
+    assert harness._asr_capture_requested is False
+
+
+def test_debug_asr_rejects_unreviewed_endpoint_identifier() -> None:
+    harness = _harness()
+
+    accepted, _command_id, message, snapshot = (
+        IntegrationDebugNode._handle_asr_command(
+            harness, "asr_start", {"endpoint_id": "third-party"}
+        )
+    )
+
+    assert accepted is False
+    assert "cloud" in message and "lan" in message
+    assert snapshot["endpoint_id"] == ASR_ENDPOINT_CLOUD
+    assert harness._asr.start_calls == []
 
 
 def test_manual_authority_release_stops_hidden_microphone_stream() -> None:

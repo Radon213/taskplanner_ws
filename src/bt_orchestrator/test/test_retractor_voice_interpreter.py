@@ -79,10 +79,30 @@ def test_text_vlm_interpreter_uses_closed_json_result() -> None:
     context = json.loads(captured["body"]["messages"][1]["content"])
     assert context["allowed_commands"] == [
         "adjust_retraction",
-        "change_tool",
         "stop_retraction",
     ]
     assert context["default_adjustment_distance_m"] == 0.05
+
+
+def test_text_vlm_idle_context_exposes_tool_change() -> None:
+    captured = {}
+
+    def request_json(_url, body, _timeout_sec, _headers):
+        captured["body"] = body
+        return _response(
+            '{"v":"1","command":"change_tool",'
+            '"target_side":"none","distance_m":0}'
+        )
+
+    result = TextOnlyRetractionVLMInterpreter(
+        base_url="http://127.0.0.1:8080",
+        model_id="qwen3.6-35b-a3b",
+        request_json=request_json,
+    ).interpret("Tool change", RetractionState.IDLE)
+
+    context = json.loads(captured["body"]["messages"][1]["content"])
+    assert context["allowed_commands"] == ["change_tool", "start_direct_teach"]
+    assert result.normalized.command == RetractionCommand.CHANGE_TOOL
 
 
 def test_text_vlm_grounded_single_side_adjustment_uses_documented_default() -> None:
@@ -142,7 +162,7 @@ def test_text_vlm_grounded_single_side_adjustment_uses_documented_default() -> N
         ),
         (
             "장비 다른 걸로 바꿔줘",
-            RetractionState.RETRACTION_ACTIVE,
+            RetractionState.IDLE,
             '{"v":"1","command":"change_tool",'
             '"target_side":"none","distance_m":0}',
             RetractionCommand.CHANGE_TOOL,
@@ -320,15 +340,28 @@ def test_text_vlm_cannot_invent_command_intent_for_unrelated_stt() -> None:
 
 
 @pytest.mark.parametrize(
-    ("transcript", "model_command", "target_side", "distance_m"),
+    ("transcript", "state", "model_command", "target_side", "distance_m"),
     [
-        ("봉합은 여기서 끝내", "stop_retraction", "none", 0.0),
-        ("장비 상태 알려줘", "change_tool", "none", 0.0),
-        ("오른쪽 절개 부위 5cm", "adjust_retraction", "right", 0.05),
+        (
+            "봉합은 여기서 끝내",
+            RetractionState.RETRACTION_ACTIVE,
+            "stop_retraction",
+            "none",
+            0.0,
+        ),
+        ("장비 상태 알려줘", RetractionState.IDLE, "change_tool", "none", 0.0),
+        (
+            "오른쪽 절개 부위 5cm",
+            RetractionState.RETRACTION_ACTIVE,
+            "adjust_retraction",
+            "right",
+            0.05,
+        ),
     ],
 )
 def test_text_vlm_rejects_state_constrained_but_unrelated_hallucination(
     transcript: str,
+    state: RetractionState,
     model_command: str,
     target_side: str,
     distance_m: float,
@@ -346,7 +379,7 @@ def test_text_vlm_rejects_state_constrained_but_unrelated_hallucination(
                 }
             )
         ),
-    ).interpret(transcript, RetractionState.RETRACTION_ACTIVE)
+    ).interpret(transcript, state)
 
     assert result.interpreter_source == "deterministic_fallback"
     assert result.normalized.command is None

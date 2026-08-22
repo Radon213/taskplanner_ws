@@ -142,6 +142,25 @@ def test_websocket_url_rejects_all_inline_credential_channels() -> None:
         assert secret not in str(raised.value)
 
 
+def test_zip_transport_config_uses_server_vad_and_handoff_keywords() -> None:
+    client = asr_runtime.AsrWsClient(
+        url="wss://asr.example.test/v1",
+        websockets_module=object(),
+        on_final=lambda _text: None,
+        on_partial=lambda _text: None,
+        on_connection=lambda _connected: None,
+        on_error=lambda _message: None,
+    )
+
+    config = client._config()["config"]
+
+    assert config["use_vad"] is True
+    assert config["use_timestamp"] is False
+    keywords = {row["keyword"]: row["sensitivity"] for row in config["keywords"]}
+    assert keywords["Malleable"] == 8
+    assert keywords["직접 교시"] == 9
+
+
 def test_final_response_reports_uncorrelated_latest_pcm_interval(monkeypatch) -> None:
     finals = []
     metadata = []
@@ -520,9 +539,10 @@ def test_runtime_uses_native_capture_but_feeds_and_records_wire_format(
             "latency_correlated": False,
         }
     )
-    client.kwargs["on_final"]("Bovie please")
+    client.kwargs["on_final"]("Alice and mass")
     final = runtime.snapshot()["finals"][-1]
-    assert final["text"] == "Bovie please"
+    assert final["text"] == "Allis and 메스"
+    assert final["postprocess_corrections"] == 2
     assert final["response_latency_ms"] == 184.2
     assert final["latency_correlated"] is False
 

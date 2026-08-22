@@ -1,0 +1,97 @@
+{
+  "schema": "taskplanner.perception_compatibility_result.v1",
+  "generated_at": "2026-08-21T00:19:17+09:00",
+  "status": "pass",
+  "gpu_inference_run": false,
+  "base_image": {
+    "reference": "pytorch/pytorch:2.8.0-cuda12.9-cudnn9-runtime",
+    "digest": "sha256:e05438443ae3c407e8d04447091a959dbb6757b6290b128770c3c787d4bd442b"
+  },
+  "existing_image": {
+    "tag": "taskplanner-rfdetr-perception:0.1.0",
+    "image_id": "sha256:437d1a6bde734088d561da8ff22375a08e56c65b45dc977902301c418258726c",
+    "logical_size_bytes": 5089151834
+  },
+  "unified_image": {
+    "tag": "taskplanner-rfdetr-perception:unified-compat",
+    "image_id": "sha256:2cdf1a6ab64cd6fc77ac47a1b3f911e1b6e8fa9d1e832a87c5201af3b383b60d",
+    "logical_size_bytes": 5212690932,
+    "incremental_logical_bytes": 123539098
+  },
+  "service_cmd": {
+    "existing": [
+      "python",
+      "-m",
+      "vlm_node.rfdetr_service",
+      "--host",
+      "127.0.0.1",
+      "--port",
+      "8010"
+    ],
+    "unified": [
+      "python",
+      "-m",
+      "vlm_node.rfdetr_service",
+      "--host",
+      "127.0.0.1",
+      "--port",
+      "8010"
+    ],
+    "identical": true
+  },
+  "resolved_versions": {
+    "fastapi": "0.141.1",
+    "jax": "0.7.1",
+    "jaxlib": "0.7.1",
+    "mediapipe": "0.10.18",
+    "ml-dtypes": "0.5.4",
+    "numpy": "1.26.4",
+    "opencv-contrib-python": "4.11.0.86",
+    "protobuf": "4.25.9",
+    "rfdetr": "1.9.0",
+    "scipy": "1.17.1",
+    "sentencepiece": "0.2.2",
+    "sounddevice": "0.5.6",
+    "supervision": "0.29.1",
+    "torch": "2.8.0+cu129",
+    "torchvision": "0.23.0+cu129",
+    "transformers": "5.15.0",
+    "uvicorn": "0.52.0"
+  },
+  "opencv": {
+    "providers": [
+      "opencv-contrib-python==4.11.0.86"
+    ],
+    "single_provider": true,
+    "cv2_runtime": "4.11.0",
+    "known_metadata_gap": "supervision 0.29.1 requires opencv-python by distribution name; opencv-contrib-python supplies the exercised API"
+  },
+  "imports": {
+    "taskplanner_rfdetr_service": "pass",
+    "rfdetr_small_api": "pass",
+    "rfdetr_seg_small_api": "pass",
+    "mediapipe_hand_tasks_api": "pass",
+    "opencv_encode_decode": "pass",
+    "supervision_detections": "pass"
+  },
+  "upstream": {
+    "repository": "https://github.com/hanwae-py/hand-blood-tools",
+    "expected_commit": "0f9e93115b8cc1d470398c92e010e3fc6ef1de5d",
+    "actual_commit": "0f9e93115b8cc1d470398c92e010e3fc6ef1de5d",
+    "hand_mono_depth_imports_lazy": true,
+    "hand_real_depth_helper": "pass",
+    "tool_core_import_and_nms": "pass",
+    "blood_core_import_and_mask": "pass",
+    "tool_cpu_unit_tests": {
+      "passed": 9,
+      "failed": 0
+    }
+  },
+  "not_verified": [
+    "Taskplanner, Tool, and Blood checkpoint deserialization because model files were not present",
+    "checkpoint output parity",
+    "GPU inference, latency, and VRAM",
+    "MediaPipe hand_landmarker.task asset creation and frame inference",
+    "aligned-depth and CameraInfo runtime integration"
+  ]
+}

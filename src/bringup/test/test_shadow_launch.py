@@ -1,12 +1,18 @@
 import importlib.util
 import json
 from pathlib import Path
+import sys
+
+_SRC_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(_SRC_ROOT / "simulation_runtime"))
+sys.path.insert(0, str(_SRC_ROOT / "bringup"))
 
 from launch import LaunchContext
 from launch.actions import DeclareLaunchArgument
 from launch.utilities import perform_substitutions
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
+from launch_ros.utilities import evaluate_parameters
 import pytest
 import yaml
 
@@ -46,8 +52,20 @@ def test_shadow_launch_exposes_strict_replay_controls():
     assert "require_vlm" in arguments
     assert arguments["require_vlm"][0].text == "false"
     assert "rfdetr_preflight_timeout_sec" in arguments
+    assert "perception_backend" in arguments
+    assert "perception_provider" in arguments
+    assert "perception_location" in arguments
+    assert "perception_endpoint" in arguments
+    assert "pnu_allow_insecure_remote_http" in arguments
+    assert "pnu_depth_scale_m_per_unit" in arguments
+    assert "pnu_depth_scale_validated" in arguments
+    assert "pnu_expected_tool_support_plane_config_version" in arguments
     assert "trace_root" in arguments
     assert "fault_scenario_path" in arguments
+    assert "publish_shared_state" in arguments
+    assert "publish_shared_free_text" in arguments
+    assert arguments["publish_shared_state"][0].text == "true"
+    assert arguments["publish_shared_free_text"][0].text == "false"
     assert arguments["source_cam4_topic"][0].text == (
         "/surgery/cam4/color/image/compressed"
     )
@@ -59,7 +77,77 @@ def test_shadow_launch_exposes_strict_replay_controls():
         and entity.node_executable == "rfdetr_perception_bridge"
     ]
     assert len(bridges) == 1
-    assert bridges[0].condition is None
+    assert bridges[0].condition is not None
+    context = LaunchContext()
+    context.launch_configurations.update(
+        {
+            "perception_provider": "builtin_rfdetr",
+            "enable_rfdetr_perception": "true",
+        }
+    )
+    assert bridges[0].condition.evaluate(context) is True
+    pnu_bridges = [
+        entity
+        for entity in description.entities
+        if isinstance(entity, Node)
+        and entity.node_executable == "pnu_perception_bridge"
+    ]
+    assert len(pnu_bridges) == 1
+    assert pnu_bridges[0].condition is not None
+    assert pnu_bridges[0].condition.evaluate(context) is False
+    context.launch_configurations["perception_provider"] = "pnu_hand_blood"
+    assert bridges[0].condition.evaluate(context) is False
+    assert pnu_bridges[0].condition.evaluate(context) is True
+    pnu_parameters = {
+        "".join(part.text for part in key): value
+        for key, value in pnu_bridges[0]._Node__parameters[0].items()
+    }
+    assert {
+        "service_url",
+        "rgb_input_topic",
+        "color_camera_info_topic",
+        "depth_input_topic",
+        "depth_camera_info_topic",
+        "cam4_semantics_topic",
+        "cam4_mayo_observation_topic",
+        "diagnostics_topic",
+        "health_topic",
+        "requested_algorithms",
+        "expected_model_digests_json",
+        "expected_tool_support_plane_config_version",
+        "api_token_file",
+        "allow_insecure_remote_http",
+        "allow_unauthenticated_remote",
+        "depth_scale_m_per_unit",
+        "depth_scale_validated",
+    }.issubset(pnu_parameters)
+    context.launch_configurations["perception_provider"] = "disabled"
+    assert bridges[0].condition.evaluate(context) is False
+    assert pnu_bridges[0].condition.evaluate(context) is False
+
+    cv_monitor = next(
+        entity
+        for entity in description.entities
+        if isinstance(entity, Node)
+        and entity.node_executable == "cv_contract_monitor"
+    )
+    monitor_parameters = {
+        "".join(part.text for part in key): value
+        for key, value in cv_monitor._Node__parameters[0].items()
+    }
+    assert {
+        "perception_backend",
+        "perception_provider",
+        "perception_location",
+        "perception_endpoint",
+        "cam4_rgb_topic",
+        "cam4_camera_info_topic",
+        "cam4_native_depth_compressed_topic",
+        "cam4_depth_camera_info_topic",
+        "cam4_depth_to_color_extrinsics_topic",
+        "cam4_aligned_depth_compressed_topic",
+        "cam4_aligned_depth_camera_info_topic",
+    }.issubset(monitor_parameters)
 
     fault_injectors = [
         entity
@@ -109,6 +197,49 @@ def test_shadow_launch_exposes_strict_replay_controls():
         "fault_action_emulator",
         "surgical_interop_execution_bridge",
     }
+
+    public_gateway = next(
+        entity
+        for entity in description.entities
+        if isinstance(entity, Node)
+        and entity.node_executable == "surgical_interop_gateway"
+    )
+    assert public_gateway.condition is not None
+    context = LaunchContext()
+    context.launch_configurations.update(
+        {
+            "default_bundle": "thyroidectomy_demo",
+            "publish_shared_state": "true",
+            "publish_shared_free_text": "false",
+        }
+    )
+    public_parameters = evaluate_parameters(
+        context,
+        public_gateway._Node__parameters,
+    )[0]
+    assert public_parameters == {
+        "default_bundle": "thyroidectomy_demo",
+        "publish_free_text": False,
+    }
+
+    voice_resolver = next(
+        entity
+        for entity in description.entities
+        if isinstance(entity, Node)
+        and entity.node_package == "voice_command"
+        and entity.node_executable == "voice_intent_resolver"
+    )
+    voice_parameters = {
+        "".join(part.text for part in key): value
+        for key, value in voice_resolver._Node__parameters[0].items()
+    }
+    context.launch_configurations["spec_dir"] = "/tmp/test-procedure-bundle"
+    assert perform_substitutions(
+        context, voice_parameters["procedure_bundle"]
+    ) == "/tmp/test-procedure-bundle"
+    assert perform_substitutions(
+        context, voice_parameters["selector_mode"]
+    ).startswith("deterministic")
 
 
 def test_shadow_spec_dir_follows_default_bundle(monkeypatch):
@@ -463,6 +594,10 @@ def _preflight_context(tmp_path: Path, *, require_vlm: bool) -> LaunchContext:
         "trace_root": str(tmp_path),
         "trace_path": "",
         "rfdetr_service_url": "http://127.0.0.1:8010",
+        "perception_endpoint": "http://127.0.0.1:8010",
+        "perception_provider": "builtin_rfdetr",
+        "perception_location": "local",
+        "perception_backend": "local",
         "rfdetr_preflight_timeout_sec": "1.0",
         "enable_rfdetr_perception": "true",
     }
@@ -532,3 +667,42 @@ def test_optional_vlm_preflight_reports_degraded_and_continues(
 
     assert any("[DEGRADED]" in message for message in messages)
     assert any("connection refused" in message for message in messages)
+
+
+def test_disabled_shadow_perception_skips_bridge_and_worker_preflight(
+    tmp_path,
+    monkeypatch,
+):
+    module = _load_shadow_launch_module()
+
+    def unexpected_call(*_args, **_kwargs):
+        raise AssertionError("disabled perception must not probe RF-DETR")
+
+    monkeypatch.setattr(module, "find_ros_executable", unexpected_call)
+    monkeypatch.setattr(module, "fetch_rfdetr_health", unexpected_call)
+    monkeypatch.setattr(
+        module,
+        "read_build_marker",
+        lambda: {"shadow_contract": module.SHADOW_CONTRACT_VERSION},
+    )
+    context = _preflight_context(tmp_path, require_vlm=True)
+    context.launch_configurations.update(
+        {
+            "perception_provider": "disabled",
+            "perception_location": "local",
+            "perception_endpoint": "",
+            "perception_backend": "disabled",
+        }
+    )
+
+    actions = module._shadow_preflight(context)
+    messages = [
+        "".join(
+            part.text if hasattr(part, "text") else str(part)
+            for part in action.msg
+        )
+        for action in actions
+        if action.__class__.__name__ == "LogInfo"
+    ]
+    assert any("provider=disabled" in message for message in messages)
+    assert any("bridge=disabled" in message for message in messages)

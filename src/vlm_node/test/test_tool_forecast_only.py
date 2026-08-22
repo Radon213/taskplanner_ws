@@ -43,11 +43,15 @@ def test_tool_only_prompt_reuses_exact_normal_procedure_context() -> None:
 
 
 def test_tool_only_instruction_has_only_forecast_response_fields() -> None:
-    prompt = _demo_node()._tool_forecast_only_developer_instruction()
+    node = _demo_node()
+    prompt = node._tool_forecast_only_developer_instruction()
+    system = node._tool_forecast_only_system_prompt()
 
     assert '{"tool":[["Txx",0.0]],"u":0.0}' in prompt
     assert "Emit no phase, intent, gesture, Mayo, summary" in prompt
-    assert "2-8 seconds" not in prompt or "2-8" in _demo_node()._tool_forecast_only_system_prompt()
+    assert "frozen_ngram_prior" in prompt
+    assert "regardless of elapsed time" in system
+    assert "2-8" not in system
 
 
 def test_tool_only_response_is_adapted_without_fabricated_observations() -> None:

@@ -20,13 +20,15 @@ RUNTIME_CONTROL_PID_FILE="${RUNTIME_DIR}/runtime-control.pid"
 RUNTIME_CONTROL_LOG_FILE="${RUNTIME_DIR}/runtime-control.log"
 RUNTIME_CONTROL_LAUNCH_LOG_FILE="${RUNTIME_DIR}/runtime-control-launch.log"
 export TASKPLANNER_RUNTIME_CONTROL_TOKEN_FILE="${RUNTIME_CONTROL_TOKEN_FILE}"
+RUNTIME_FAILURE_CLEANUP_ARMED=false
+RUNTIME_FAILURE_CLEANUP_SERVICES=()
 
 usage() {
   cat <<'EOF'
 Taskplanner deployment launcher
 
 Usage:
-  scripts/taskplanner up <live|llm-surgeon|replay|debug> [--dry-run] [--build] [--replace-active]
+  scripts/taskplanner up [live|llm-surgeon|replay|debug] [--dry-run] [--build|--ensure-build] [--replace-active]
   scripts/taskplanner down [--dry-run]
   scripts/taskplanner status
   scripts/taskplanner runtime-control [--dry-run]
@@ -37,15 +39,24 @@ Usage:
 Commands:
   up       Start the selected runtime plus webapp, ROS bridge/model registry,
            and unloaded vLLM/NInfer control planes. Live/replay start RF-DETR
-           only when PERCEPTION_BACKEND=local.
+           only when the selected provider is builtin_rfdetr and its location
+           is local. PERCEPTION_BACKEND remains a legacy compatibility alias.
+           Standalone Debug starts the read-only PNU worker only for a local
+           selection; a remote selection runs only the local ROS adapter.
            Live starts the USB microphone ASR sidecar before the planner and
            waits for its ROS status publisher; llm-surgeon does not start it.
-           Live and llm-surgeon keep the integrated Debug sidecar available in
-           the same UI; manual control unlocks only while the operational
-           scenario reports a trusted, fresh stopped state.
+           Omitting a runtime selects Live, the actual external-integration
+           profile. Live requires the integrated Debug observation sidecar in
+           the same UI; it must pass its bridge and status checks before Live
+           is marked ready. LLM Surgeon and Replay do not start that sidecar
+           or the external multicamera observer by default. Manual Debug
+           control unlocks only while the operational scenario reports a
+           trusted, fresh stopped state.
            --replace-active permits an explicit reviewed transition from an
            operational runtime into standalone Debug Mode.
            Reuses install/ and node_modules unless --build is supplied.
+           --ensure-build validates the selected runtime's install contract
+           first and performs the scoped serialized build only when stale.
   down     Stop and remove every Taskplanner Compose profile.
   status   Show containers from every Taskplanner profile.
   runtime-control
@@ -62,6 +73,7 @@ Environment:
 
 Examples:
   cp .env.example .env
+  scripts/taskplanner up              # Live external integration (default)
   scripts/taskplanner up live
   scripts/taskplanner up live --build
   scripts/taskplanner up replay --dry-run
@@ -124,6 +136,22 @@ run_best_effort() {
   fi
 }
 
+cleanup_failed_runtime_start() {
+  local exit_code=$?
+  trap - EXIT
+  if [[ "${RUNTIME_FAILURE_CLEANUP_ARMED}" == "true" && "${DRY_RUN}" != "true" ]]; then
+    printf 'warning: runtime startup failed; removing partial runtime services\n' >&2
+    set +e
+    "${COMPOSE[@]}" "${ALL_PROFILE_ARGS[@]}" \
+      stop "${RUNTIME_FAILURE_CLEANUP_SERVICES[@]}"
+    "${COMPOSE[@]}" "${ALL_PROFILE_ARGS[@]}" \
+      rm -f "${RUNTIME_FAILURE_CLEANUP_SERVICES[@]}"
+    clear_active_runtime_mode
+    set -e
+  fi
+  exit "${exit_code}"
+}
+
 acquire_launcher_lock() {
   if [[ "${DRY_RUN}" == "true" ]]; then
     return 0
@@ -180,13 +208,13 @@ run_serial_workspace_build() {
   local mode="$1"
   local build_command
   local -a build_profile_args=(--profile "${mode}" --profile dev)
-  if mode_uses_integrated_debug_sidecar "${mode}" &&
+  if mode_requires_integrated_debug_observer "${mode}" &&
       [[ "${INTEGRATED_DEBUG_ENABLED:-true}" == "true" ]]; then
     build_profile_args+=(--profile debug)
   fi
 
   if [[ "${mode}" == "debug" ]]; then
-    build_command="colcon build --symlink-install --packages-up-to integration_debug --cmake-args -DBUILD_TESTING=OFF && test -f install/setup.bash && test -x install/integration_debug/lib/integration_debug/integration_debug_node"
+    build_command="colcon build --symlink-install --packages-up-to integration_debug vlm_node hand_keypoint_interfaces surgical_perception_msgs --cmake-args -DBUILD_TESTING=OFF && test -f install/setup.bash && test -x install/integration_debug/lib/integration_debug/integration_debug_node && test -x install/vlm_node/lib/vlm_node/pnu_perception_bridge && test -f install/hand_keypoint_interfaces/share/ament_index/resource_index/packages/hand_keypoint_interfaces && test -f install/surgical_perception_msgs/share/ament_index/resource_index/packages/surgical_perception_msgs"
   else
     build_command="colcon build --symlink-install --cmake-args -DBUILD_TESTING=OFF && test -f install/setup.bash && test -e install/bringup/share/bringup/launch/taskplanner_live.launch.py && test -x install/integration_debug/lib/integration_debug/operational_asr_node"
   fi
@@ -204,8 +232,128 @@ run_serial_workspace_build() {
     taskplanner-dev bash -lc "${build_command}"
 
   if [[ "${DRY_RUN}" != "true" ]]; then
+    if [[ "${mode}" == "debug" ]]; then
+      record_debug_install_contract
+    fi
     printf 'Taskplanner workspace build complete (%s)\n' "${mode}"
   fi
+}
+
+debug_install_contract_fingerprint() {
+  python3 - "${ROOT_DIR}" <<'PY'
+import hashlib
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1]).resolve()
+package_roots = (
+    root / "src" / "integration_debug",
+    root / "src" / "vlm_node",
+    root / "src" / "hand_keypoint_interfaces",
+    root / "src" / "surgical_perception_msgs",
+)
+ignored_directories = {
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    "__pycache__",
+    "build",
+    "install",
+    "log",
+}
+
+digest = hashlib.sha256()
+for package_root in package_roots:
+    if not package_root.is_dir():
+        raise SystemExit(f"required Debug source package is missing: {package_root}")
+    for path in sorted(package_root.rglob("*")):
+        if not path.is_file() or any(part in ignored_directories for part in path.parts):
+            continue
+        if path.suffix in {".pyc", ".pyo"}:
+            continue
+        digest.update(path.relative_to(root).as_posix().encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+print(digest.hexdigest())
+PY
+}
+
+debug_install_contract_file() {
+  printf '%s\n' "${ROOT_DIR}/install/.taskplanner-debug-install-contract-v1"
+}
+
+record_debug_install_contract() {
+  local contract_file expected_fingerprint temporary_file
+  contract_file="$(debug_install_contract_file)"
+  expected_fingerprint="$(debug_install_contract_fingerprint)" ||
+    die "could not fingerprint the Debug source contract after build"
+  temporary_file="${contract_file}.tmp.$$"
+  if ! printf '%s\n' "${expected_fingerprint}" >"${temporary_file}" ||
+      ! mv -f "${temporary_file}" "${contract_file}"; then
+    rm -f "${temporary_file}"
+    die "could not record the Debug install contract after build: ${contract_file}"
+  fi
+}
+
+debug_install_contract_matches_source() {
+  local contract_file expected_fingerprint recorded_fingerprint
+  contract_file="$(debug_install_contract_file)"
+  if [[ ! -s "${contract_file}" ]]; then
+    printf 'Debug install contract is missing: %s\n' "${contract_file}" >&2
+    return 1
+  fi
+  expected_fingerprint="$(debug_install_contract_fingerprint)" || {
+    printf 'Debug source contract could not be fingerprinted\n' >&2
+    return 1
+  }
+  IFS= read -r recorded_fingerprint <"${contract_file}" || true
+  if [[ "${recorded_fingerprint}" != "${expected_fingerprint}" ]]; then
+    printf 'Debug install contract no longer matches the current source tree\n' >&2
+    return 1
+  fi
+}
+
+verify_runtime_install_contract() {
+  local mode="$1"
+  local debug_pnu_enabled="${2:-false}"
+  if [[ "${BUILD_REQUESTED}" == "true" ]]; then
+    return 0
+  fi
+  local check_command
+  if [[ "${mode}" == "debug" ]]; then
+    if [[ "${DRY_RUN}" != "true" ]] && ! debug_install_contract_matches_source; then
+      return 1
+    fi
+    check_command="source /opt/ros/jazzy/setup.bash && source /opt/btops_ws/install/setup.bash && source /workspaces/taskplanner_ws/install/setup.bash && test -x /workspaces/taskplanner_ws/install/integration_debug/lib/integration_debug/integration_debug_node && ros2 pkg prefix integration_debug >/dev/null"
+    if [[ "${debug_pnu_enabled}" == "true" ]]; then
+      check_command+=" && test -x /workspaces/taskplanner_ws/install/vlm_node/lib/vlm_node/pnu_perception_bridge && ros2 pkg prefix vlm_node >/dev/null && ros2 pkg prefix hand_keypoint_interfaces >/dev/null && ros2 pkg prefix surgical_perception_msgs >/dev/null && python3 -c 'from hand_keypoint_interfaces.msg import HandKeypoints; from surgical_perception_msgs.msg import ToolPoseArray; import vlm_node.pnu_perception_bridge'"
+    fi
+  else
+    check_command="source /opt/ros/jazzy/setup.bash && source /opt/btops_ws/install/setup.bash && source /workspaces/taskplanner_ws/install/setup.bash && test -x /workspaces/taskplanner_ws/install/voice_command/lib/voice_command/voice_intent_resolver && ros2 pkg prefix voice_command >/dev/null && python3 -c 'from surgical_msgs.msg import VoiceCommandIntent; import voice_command.node; from bt_orchestrator.bed_robot_arm_group_orchestrator import BedRobotArmGroupOrchestrator; from or_digital_twin.node import ORDigitalTwinNode'"
+  fi
+  if ! run_or_print \
+      "${COMPOSE[@]}" --profile dev run --rm --no-deps -T \
+      --user "$(id -u):$(id -g)" \
+      -e HOME=/tmp/taskplanner-install-check \
+      taskplanner-dev bash -lc "${check_command}"; then
+    return 1
+  fi
+}
+
+ensure_runtime_install_contract() {
+  local mode="$1"
+  local debug_pnu_enabled="${2:-false}"
+  if verify_runtime_install_contract "${mode}" "${debug_pnu_enabled}"; then
+    return 0
+  fi
+  if [[ "${ENSURE_BUILD}" == "true" ]]; then
+    printf 'runtime install is stale or incomplete; rebuilding the selected %s runtime before startup\n' \
+      "${mode}" >&2
+    BUILD_REQUESTED=true
+    return 0
+  fi
+  die "runtime install is stale or incomplete; rerun the launcher with --build"
 }
 
 ninfer_manager_command() {
@@ -466,12 +614,182 @@ print(
 ' "${profile}" "${service}" "${key}" "${fallback}"
 }
 
+validate_compose_mounted_token_files() {
+  local profile="$1"
+  local service="$2"
+  local container_path="$3"
+  local peer_service="${4:-}"
+  local peer_container_path="${5:-}"
+  local mount_target="/run/taskplanner/perception"
+  local validation_error
+
+  if ! validation_error="$(
+    "${COMPOSE[@]}" --profile "${profile}" config --format json |
+      python3 -c '
+import json
+import hmac
+import stat
+import sys
+from pathlib import Path, PurePosixPath
+
+(
+    service,
+    container_path,
+    mount_target,
+    peer_service,
+    peer_container_path,
+) = sys.argv[1:]
+
+
+def fail(message: str) -> None:
+    raise SystemExit(message)
+
+
+config = json.load(sys.stdin)
+
+
+def validated_token_bytes(service_name: str, configured_path: str) -> bytes:
+    if not configured_path.startswith("/"):
+        fail("token path must be absolute")
+    if ".." in configured_path.split("/"):
+        fail("token path must not contain path traversal")
+
+    path = PurePosixPath(configured_path)
+    target = PurePosixPath(mount_target)
+    try:
+        relative = path.relative_to(target)
+    except ValueError:
+        fail(f"token path must be beneath {mount_target}")
+    if not relative.parts:
+        fail("token path must identify a file beneath the perception mount")
+
+    volumes = (
+        config.get("services", {}).get(service_name, {}).get("volumes", [])
+    )
+    mounts = [
+        volume
+        for volume in volumes
+        if volume.get("type") == "bind"
+        and volume.get("target") == mount_target
+    ]
+    if len(mounts) != 1:
+        fail(
+            f"{service_name} must define exactly one bind mount at "
+            f"{mount_target}"
+        )
+
+    source = Path(mounts[0]["source"])
+    try:
+        resolved_source = source.resolve(strict=True)
+    except (OSError, RuntimeError):
+        fail(
+            f"perception token mount source is unavailable for {service_name}"
+        )
+    if not resolved_source.is_dir():
+        fail(
+            f"perception token mount source is not a directory for "
+            f"{service_name}"
+        )
+
+    candidate = source.joinpath(*relative.parts)
+    try:
+        resolved_candidate = candidate.resolve(strict=True)
+    except (OSError, RuntimeError):
+        fail(f"configured token file does not exist for {service_name}")
+    try:
+        resolved_candidate.relative_to(resolved_source)
+    except ValueError:
+        fail(
+            f"configured token file escapes the perception mount for "
+            f"{service_name}"
+        )
+
+    try:
+        metadata = resolved_candidate.stat()
+    except OSError:
+        fail(f"configured token file cannot be inspected for {service_name}")
+    if not stat.S_ISREG(metadata.st_mode):
+        fail(f"configured token path is not a regular file for {service_name}")
+    if metadata.st_size > 4096:
+        fail(f"configured token file exceeds 4096 bytes for {service_name}")
+
+    try:
+        payload = resolved_candidate.read_bytes()
+    except OSError:
+        fail(f"configured token file cannot be read for {service_name}")
+    if not payload or len(payload) > 4096 or b"\x00" in payload:
+        fail(
+            f"configured token file must contain 1..4096 text bytes for "
+            f"{service_name}"
+        )
+    try:
+        token = payload.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        fail(f"configured token file is not valid UTF-8 for {service_name}")
+    if not token or any(character.isspace() for character in token):
+        fail(
+            "configured token file must contain exactly one non-whitespace "
+            f"UTF-8 token for {service_name}"
+        )
+    return token.encode("utf-8")
+
+
+client_token = validated_token_bytes(service, container_path)
+if peer_service:
+    if not peer_container_path:
+        fail("peer token path is missing")
+    worker_token = validated_token_bytes(peer_service, peer_container_path)
+    if not hmac.compare_digest(client_token, worker_token):
+        fail("local PNU client and worker token files do not match")
+' \
+        "${service}" "${container_path}" "${mount_target}" \
+        "${peer_service}" "${peer_container_path}" 2>&1
+  )"; then
+    die "PNU token preflight failed: ${validation_error}"
+  fi
+}
+
+validate_pnu_model_digest_pins() {
+  local profile="$1"
+  local consumer_service="$2"
+  local location="$3"
+  local requested_algorithms="$4"
+  local validation_error
+  local -a preflight_args=(
+    python3 "${ROOT_DIR}/tools/pnu_live_preflight.py"
+    compose-model-pins
+    --consumer-service "${consumer_service}"
+    --worker-service pnu-perception
+    --algorithms "${requested_algorithms}"
+  )
+
+  # For a local worker, hash the files that Compose will expose through its
+  # read-only /models bind before any running Taskplanner service is stopped.
+  # A remote worker has no local model mount to inspect; its bridge still gets
+  # the same mandatory exact pins and rejects a different advertised identity.
+  if [[ "${location}" == "local" && "${DRY_RUN}" != "true" ]]; then
+    preflight_args+=(--verify-local-files)
+  fi
+  if ! validation_error="$(
+    "${COMPOSE[@]}" --profile "${profile}" config --format json |
+      "${preflight_args[@]}" 2>&1
+  )"; then
+    die "PNU model digest preflight failed: ${validation_error}"
+  fi
+  if [[ "${DRY_RUN}" == "true" ]]; then
+    print_command \
+      pnu-model-digest-preflight \
+      "${consumer_service}" "${location}" "${requested_algorithms}"
+  fi
+}
+
 wait_for_websocket_endpoint() {
   local host="$1"
   local port="$2"
   local path="$3"
   local label="$4"
   local timeout_sec="${5:-${WAIT_TIMEOUT_SEC}}"
+  local owner_container_id="${6:-}"
   if [[ "${DRY_RUN}" == "true" ]]; then
     printf '+ wait-for-websocket %q %q %q %q\n' \
       "${host}" "${port}" "${path}" "${label}"
@@ -480,20 +798,40 @@ wait_for_websocket_endpoint() {
   [[ "${port}" =~ ^[0-9]+$ ]] || die "${label} port is not numeric: ${port}"
   (( port >= 1 && port <= 65535 )) || die "${label} port is invalid: ${port}"
   [[ "${path}" == /* ]] || die "${label} websocket path must start with /"
-  python3 - "${host}" "${port}" "${path}" "${timeout_sec}" "${label}" <<'PY'
+  python3 - "${host}" "${port}" "${path}" "${timeout_sec}" "${label}" "${owner_container_id}" <<'PY'
 import base64
 import os
 import socket
+import subprocess
 import sys
 import time
 
-host, port_raw, path, timeout_raw, label = sys.argv[1:]
+host, port_raw, path, timeout_raw, label, owner_container_id = sys.argv[1:]
 port = int(port_raw)
 timeout = max(1.0, float(timeout_raw))
 deadline = time.monotonic() + timeout
 last_error = "endpoint did not accept a websocket handshake"
 
 while time.monotonic() < deadline:
+    if owner_container_id:
+        try:
+            inspected = subprocess.run(
+                [
+                    "docker",
+                    "inspect",
+                    "--format",
+                    "{{.State.Running}}",
+                    owner_container_id,
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=0.75,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise SystemExit(f"{label} owner state could not be checked: {error}")
+        if inspected.returncode != 0 or inspected.stdout.strip() != "true":
+            raise SystemExit(f"{label} owner container exited before the endpoint became ready")
     try:
         key = base64.b64encode(os.urandom(16)).decode("ascii")
         request = (
@@ -528,7 +866,7 @@ PY
 
 wait_for_mode_rosbridge() {
   local mode="$1"
-  local router_port
+  local router_port runtime_service owner_container_id=""
   router_port="$(
     compose_environment_value \
       "${mode}" webapp VITE_ROSBRIDGE_TAILSCALE_PORT 9091
@@ -536,26 +874,43 @@ wait_for_mode_rosbridge() {
   local websocket_path="/"
   case "${mode}" in
     live)
+      runtime_service="taskplanner-runtime"
       websocket_path="$(
         compose_environment_value \
           "${mode}" webapp VITE_ROSBRIDGE_LIVE_TAILSCALE_PATH /live
       )"
       ;;
     llm-surgeon)
+      runtime_service="taskplanner-runtime"
       websocket_path="$(
         compose_environment_value \
           "${mode}" webapp VITE_ROSBRIDGE_LLM_TAILSCALE_PATH /llm
       )"
       ;;
     replay)
+      runtime_service="shadow-runner"
       websocket_path="$(
         compose_environment_value \
           "${mode}" webapp VITE_ROSBRIDGE_SHADOW_TAILSCALE_PATH /shadow
       )"
       ;;
+    debug)
+      runtime_service="integration-debug"
+      ;;
   esac
+  local timeout_sec="${TASKPLANNER_ROSBRIDGE_WAIT_TIMEOUT_SEC:-30}"
+  [[ "${timeout_sec}" =~ ^[0-9]+$ && "${timeout_sec}" -ge 1 ]] ||
+    die "TASKPLANNER_ROSBRIDGE_WAIT_TIMEOUT_SEC must be a positive integer"
+  if [[ "${DRY_RUN}" != "true" ]]; then
+    owner_container_id="$(
+      "${COMPOSE[@]}" --profile "${mode}" ps -q "${runtime_service}"
+    )"
+    [[ -n "${owner_container_id}" ]] ||
+      die "${mode} runtime container is unavailable before ROS bridge readiness"
+  fi
   wait_for_websocket_endpoint \
-    127.0.0.1 "${router_port}" "${websocket_path}" "${mode} ROS bridge router"
+    127.0.0.1 "${router_port}" "${websocket_path}" \
+    "${mode} ROS bridge router" "${timeout_sec}" "${owner_container_id}"
 }
 
 wait_for_multicam_observer() {
@@ -895,9 +1250,16 @@ assert_debug_runtime_is_exclusive() {
   fi
 }
 
-mode_uses_integrated_debug_sidecar() {
+mode_requires_integrated_debug_observer() {
   case "$1" in
-    live|llm-surgeon) return 0 ;;
+    live) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+mode_uses_multicam_observer() {
+  case "$1" in
+    live|debug) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -934,26 +1296,12 @@ prepare_debug_surgery_record_secret() {
   fi
 }
 
-prepare_optional_integrated_debug() {
-  local user_runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
-  local pipewire_socket="${TASKPLANNER_PIPEWIRE_SOCKET:-${user_runtime_dir}/pipewire-0}"
-  local api_key_file="${PUZZLE_SURGERY_RECORD_API_KEY_FILE:-${HOME}/.config/taskplanner/secrets/puzzle-surgery-record-api-key}"
-  export TASKPLANNER_PIPEWIRE_SOCKET="${pipewire_socket}"
-  export PUZZLE_SURGERY_RECORD_API_KEY_FILE="${api_key_file}"
-
-  local unavailable=()
-  [[ -S "${pipewire_socket}" ]] || unavailable+=("PipeWire socket ${pipewire_socket}")
-  if [[ ! -f "${api_key_file}" || ! -s "${api_key_file}" ]]; then
-    unavailable+=("surgery-record key ${api_key_file}")
-  elif [[ "$(stat -c '%a' "${api_key_file}")" != "600" ]]; then
-    unavailable+=("surgery-record key mode must be 600")
-  fi
-  if (( ${#unavailable[@]} > 0 )); then
-    printf 'warning: optional integrated Debug sidecar skipped: %s\n' \
-      "$(IFS='; '; printf '%s' "${unavailable[*]}")" >&2
-    return 1
-  fi
-  return 0
+prepare_required_integrated_debug_observer() {
+  # Live never silently drops the observation plane.  Its audio/record
+  # dependencies are already part of the reviewed integration deployment, so
+  # fail before any Compose service is stopped if they are unavailable.
+  prepare_debug_audio_runtime
+  prepare_debug_surgery_record_secret
 }
 
 action="${1:-help}"
@@ -961,6 +1309,7 @@ shift || true
 DRY_RUN=false
 BUILD_ARGS=()
 BUILD_REQUESTED=false
+ENSURE_BUILD=false
 REPLACE_ACTIVE_RUNTIME=false
 
 case "${action}" in
@@ -969,9 +1318,12 @@ case "${action}" in
     ;;
 
   up)
-    mode="${1:-}"
+    mode="live"
+    if (($#)) && [[ "$1" != --* ]]; then
+      mode="$1"
+      shift
+    fi
     validate_mode "${mode}"
-    shift
     while (($#)); do
       case "$1" in
         --dry-run) DRY_RUN=true ;;
@@ -984,6 +1336,9 @@ case "${action}" in
           BUILD_ARGS=()
           BUILD_REQUESTED=false
           export WEBAPP_INSTALL_ON_START=false
+          ;;
+        --ensure-build)
+          ENSURE_BUILD=true
           ;;
         --replace-active) REPLACE_ACTIVE_RUNTIME=true ;;
         -h|--help)
@@ -1013,24 +1368,45 @@ case "${action}" in
     if [[ "${mode}" == "debug" ]]; then
       prepare_debug_audio_runtime
       prepare_debug_surgery_record_secret
-    elif mode_uses_integrated_debug_sidecar "${mode}"; then
-      if prepare_optional_integrated_debug; then
-        INTEGRATED_DEBUG_ENABLED=true
-      fi
+    elif mode_requires_integrated_debug_observer "${mode}"; then
+      prepare_required_integrated_debug_observer
+      INTEGRATED_DEBUG_ENABLED=true
     fi
-    if mode_uses_integrated_debug_sidecar "${mode}"; then
+    if mode_requires_integrated_debug_observer "${mode}"; then
       # These are operational safety invariants, not user-tunable launcher
       # defaults. Shell overrides must not move the sidecar off the runtime DDS
-      # domain or permit arming beside an active planner.
+      # domain, permit arming beside an active planner, or create a second PNU
+      # bridge that competes with the operational runtime for output ownership.
       export TASKPLANNER_DEBUG_LOCK_TO_RUNTIME_NETWORK=true
       export TASKPLANNER_DEBUG_ALLOW_PLANNER_COEXISTENCE=false
+      export ENABLE_PNU_DEBUG_PERCEPTION=false
+    fi
+    if [[ "${mode}" == "live" || "${mode}" == "replay" ]]; then
+      # Operational PNU readiness means all three pinned models. Keep this an
+      # invariant even if a shell override is used for a separate Debug test.
+      export PNU_WORKER_REQUIRED_ALGORITHMS=tool,blood,hand
     fi
     compose_base
     all_profiles
+    trap cleanup_failed_runtime_start EXIT
     public_rosbridge_enabled="false"
     perception_backend="local"
+    perception_provider=""
+    perception_location=""
+    perception_endpoint=""
+    perception_selection_source="explicit_axes"
     local_rfdetr_enabled="false"
-    if [[ "${mode}" == "live" || "${mode}" == "llm-surgeon" ]]; then
+    local_object_perception_enabled="false"
+    local_pnu_perception_enabled="false"
+    pnu_client_api_token_file=""
+    pnu_worker_api_token_file=""
+    pnu_allow_unauthenticated_remote="false"
+    pnu_requested_algorithms="tool,blood,hand"
+    debug_pnu_enabled="false"
+    perception_mode_enabled="false"
+    perception_consumer_service="taskplanner-runtime"
+    if [[ "${mode}" == "live" || "${mode}" == "llm-surgeon" || \
+        "${mode}" == "replay" ]]; then
       public_rosbridge_enabled="$(
         compose_environment_value \
           "${mode}" public-rosbridge ENABLE_PUBLIC_ROSBRIDGE true
@@ -1041,22 +1417,216 @@ case "${action}" in
       esac
     fi
     if [[ "${mode}" == "live" || "${mode}" == "replay" ]]; then
+      perception_mode_enabled="true"
+    elif [[ "${mode}" == "debug" ]]; then
+      debug_pnu_enabled="$(
+        compose_environment_value \
+          "${mode}" integration-debug ENABLE_PNU_DEBUG_PERCEPTION false
+      )"
+      case "${debug_pnu_enabled}" in
+        true|false) ;;
+        *) die "ENABLE_PNU_DEBUG_PERCEPTION must resolve to true or false" ;;
+      esac
+      if [[ "${debug_pnu_enabled}" == "true" ]]; then
+        perception_mode_enabled="true"
+        perception_consumer_service="integration-debug"
+      fi
+    fi
+    if [[ "${perception_mode_enabled}" == "true" ]]; then
       perception_backend="$(
         compose_environment_value \
-          "${mode}" taskplanner-runtime PERCEPTION_BACKEND local
+          "${mode}" "${perception_consumer_service}" PERCEPTION_BACKEND local
       )"
       case "${perception_backend}" in
         local|external|disabled) ;;
         *) die "PERCEPTION_BACKEND must resolve to local, external, or disabled" ;;
       esac
+      perception_provider="$(
+        compose_environment_value \
+          "${mode}" "${perception_consumer_service}" PERCEPTION_PROVIDER ""
+      )"
+      perception_location="$(
+        compose_environment_value \
+          "${mode}" "${perception_consumer_service}" PERCEPTION_LOCATION ""
+      )"
+      if [[ -z "${perception_provider}" ]]; then
+        perception_selection_source="legacy_backend"
+        [[ -z "${perception_location}" ]] || \
+          die "PERCEPTION_LOCATION requires PERCEPTION_PROVIDER when using the legacy PERCEPTION_BACKEND fallback"
+        case "${perception_backend}" in
+          local)
+            perception_provider="builtin_rfdetr"
+            perception_location="local"
+            ;;
+          external)
+            perception_provider="pnu_hand_blood"
+            perception_location="remote"
+            ;;
+          disabled)
+            perception_provider="disabled"
+            perception_location="local"
+            ;;
+        esac
+      else
+        case "${perception_provider}" in
+          builtin_rfdetr|pnu_hand_blood|disabled) ;;
+          *) die "PERCEPTION_PROVIDER must resolve to builtin_rfdetr, pnu_hand_blood, or disabled" ;;
+        esac
+        perception_location="${perception_location:-local}"
+        case "${perception_location}" in
+          local|remote) ;;
+          *) die "PERCEPTION_LOCATION must resolve to local or remote" ;;
+        esac
+      fi
+      perception_endpoint="$(
+        compose_environment_value \
+          "${mode}" "${perception_consumer_service}" PERCEPTION_ENDPOINT ""
+      )"
+      if [[ "${perception_provider}" != "disabled" && \
+          -z "${perception_endpoint}" ]]; then
+        if [[ "${perception_provider}" == "pnu_hand_blood" ]]; then
+          perception_endpoint="$(
+            compose_environment_value \
+              "${mode}" "${perception_consumer_service}" PNU_SERVICE_URL ""
+          )"
+          if [[ -z "${perception_endpoint}" && \
+              "${perception_selection_source}" == "legacy_backend" ]]; then
+            perception_endpoint="$(
+              compose_environment_value \
+                "${mode}" "${perception_consumer_service}" RFDETR_SERVICE_URL ""
+            )"
+          fi
+          if [[ -z "${perception_endpoint}" && \
+              "${perception_location}" == "local" ]]; then
+            perception_endpoint="http://127.0.0.1:8020"
+          fi
+        else
+          perception_endpoint="$(
+            compose_environment_value \
+              "${mode}" "${perception_consumer_service}" RFDETR_SERVICE_URL \
+              "http://127.0.0.1:8010"
+          )"
+        fi
+      fi
+      perception_selection_error="$(
+        PYTHONPATH="${ROOT_DIR}/src/simulation_runtime${PYTHONPATH:+:${PYTHONPATH}}" \
+          python3 - \
+            "${perception_provider}" \
+            "${perception_location}" \
+            "${perception_endpoint}" 2>&1 <<'PY' || true
+import sys
+
+from simulation_runtime.cv_contract import (
+    resolve_perception_selection,
+    validate_perception_endpoint,
+)
+
+provider, location, endpoint = sys.argv[1:]
+try:
+    selection = resolve_perception_selection(
+        provider=provider,
+        location=location,
+    )
+    validate_perception_endpoint(endpoint, selection)
+except ValueError as exc:
+    print(exc)
+PY
+      )"
+      [[ -z "${perception_selection_error}" ]] || \
+        die "${perception_selection_error}"
+      if [[ "${mode}" == "debug" && \
+          "${perception_provider}" != "pnu_hand_blood" ]]; then
+        die "standalone Debug perception supports only PERCEPTION_PROVIDER=pnu_hand_blood"
+      fi
+      if [[ "${perception_provider}" == "pnu_hand_blood" ]]; then
+        if [[ "${mode}" == "debug" ]]; then
+          pnu_requested_algorithms="$(
+            compose_environment_value \
+              "${mode}" "${perception_consumer_service}" \
+              PNU_DEBUG_REQUESTED_ALGORITHMS "tool,blood,hand"
+          )"
+        fi
+        pnu_client_api_token_file="$(
+          compose_environment_value \
+            "${mode}" "${perception_consumer_service}" PNU_CLIENT_API_TOKEN_FILE ""
+        )"
+        pnu_worker_api_token_file="$(
+          compose_environment_value \
+            "${mode}" pnu-perception PNU_API_TOKEN_FILE ""
+        )"
+        pnu_allow_unauthenticated_remote="$(
+          compose_environment_value \
+            "${mode}" "${perception_consumer_service}" \
+            PNU_ALLOW_UNAUTHENTICATED_REMOTE false
+        )"
+        pnu_allow_insecure_remote_http="$(
+          compose_environment_value \
+            "${mode}" "${perception_consumer_service}" \
+            PNU_ALLOW_INSECURE_REMOTE_HTTP false
+        )"
+        case "${pnu_allow_insecure_remote_http}" in
+          true|false) ;;
+          *) die "PNU_ALLOW_INSECURE_REMOTE_HTTP must resolve to true or false" ;;
+        esac
+        case "${pnu_allow_unauthenticated_remote}" in
+          true|false) ;;
+          *) die "PNU_ALLOW_UNAUTHENTICATED_REMOTE must resolve to true or false" ;;
+        esac
+        if [[ "${perception_location}" == "remote" && \
+            "${perception_endpoint,,}" != https://* && \
+            "${pnu_allow_insecure_remote_http}" != "true" ]]; then
+          die "remote PNU perception requires an HTTPS endpoint unless PNU_ALLOW_INSECURE_REMOTE_HTTP=true for isolated trusted-LAN development"
+        fi
+        if [[ "${perception_location}" == "remote" && \
+            "${pnu_allow_unauthenticated_remote}" != "true" ]]; then
+          [[ -n "${pnu_client_api_token_file}" ]] || \
+            die "remote PNU perception requires PNU_CLIENT_API_TOKEN_FILE unless PNU_ALLOW_UNAUTHENTICATED_REMOTE=true"
+        fi
+        if [[ "${perception_location}" == "remote" && \
+            -n "${pnu_client_api_token_file}" ]]; then
+          validate_compose_mounted_token_files \
+            "${mode}" "${perception_consumer_service}" \
+            "${pnu_client_api_token_file}"
+        fi
+        if [[ "${perception_location}" == "local" ]]; then
+          if [[ ( -n "${pnu_client_api_token_file}" && \
+                  -z "${pnu_worker_api_token_file}" ) || \
+                ( -z "${pnu_client_api_token_file}" && \
+                  -n "${pnu_worker_api_token_file}" ) ]]; then
+            die "local PNU authentication requires both client and worker token paths, or neither"
+          fi
+          if [[ -n "${pnu_client_api_token_file}" ]]; then
+            validate_compose_mounted_token_files \
+              "${mode}" \
+              "${perception_consumer_service}" \
+              "${pnu_client_api_token_file}" \
+              pnu-perception "${pnu_worker_api_token_file}"
+          fi
+        fi
+        validate_pnu_model_digest_pins \
+          "${mode}" \
+          "${perception_consumer_service}" \
+          "${perception_location}" \
+          "${pnu_requested_algorithms}"
+      fi
       local_rfdetr_enabled="$(
         compose_environment_value \
-          "${mode}" taskplanner-runtime ENABLE_RFDETR_PERCEPTION true
+          "${mode}" "${perception_consumer_service}" \
+          ENABLE_RFDETR_PERCEPTION true
       )"
       case "${local_rfdetr_enabled}" in
         true|false) ;;
         *) die "ENABLE_RFDETR_PERCEPTION must resolve to true or false" ;;
       esac
+      if [[ "${perception_provider}" == "builtin_rfdetr" && \
+          "${perception_location}" == "local" && \
+          "${local_rfdetr_enabled}" == "true" ]]; then
+        local_object_perception_enabled="true"
+      fi
+      if [[ "${perception_provider}" == "pnu_hand_blood" && \
+          "${perception_location}" == "local" ]]; then
+        local_pnu_perception_enabled="true"
+      fi
     fi
 
     if [[ "${DRY_RUN}" != "true" ]]; then
@@ -1067,6 +1637,12 @@ case "${action}" in
         "${COMPOSE[@]}" --profile "${mode}" config --quiet
       fi
     fi
+
+    # Dashboard-triggered transitions use --ensure-build. Its preflight is
+    # intentionally before any active runtime marker is cleared or service is
+    # stopped, so an obsolete install cannot turn into a delayed rosbridge
+    # timeout after the transition has crossed its safety boundary.
+    ensure_runtime_install_contract "${mode}" "${debug_pnu_enabled}"
 
     if mode_uses_operational_asr_sidecar "${mode}"; then
       prepare_operational_asr_run_root
@@ -1084,9 +1660,11 @@ case "${action}" in
       debug_reset_services=(
         taskplanner-runtime
         public-rosbridge
+        public-rosbridge-lan-proxy
         taskplanner-asr
         shadow-runner
         object-perception
+        pnu-perception
         integration-debug
         integration-debug-lan-proxy
       )
@@ -1095,7 +1673,19 @@ case "${action}" in
         # a serialized build; ordinary mode switches keep it warm.
         debug_reset_services+=(multicam-observer)
       fi
+      RUNTIME_FAILURE_CLEANUP_SERVICES=(
+        taskplanner-runtime
+        public-rosbridge
+        public-rosbridge-lan-proxy
+        taskplanner-asr
+        shadow-runner
+        object-perception
+        pnu-perception
+        integration-debug
+        integration-debug-lan-proxy
+      )
       verify_runtime_control_transition_interlock
+      RUNTIME_FAILURE_CLEANUP_ARMED=true
       # Preserve the old marker through preflight failures. Clear it only
       # after the final stopped-state gate, immediately before the stop.
       clear_active_runtime_mode
@@ -1127,6 +1717,15 @@ case "${action}" in
         "multicam observer did not start; core Debug runtime remains available" \
         "${COMPOSE[@]}" --profile debug \
         up -d "${BUILD_ARGS[@]}" multicam-observer
+      if [[ "${local_pnu_perception_enabled}" == "true" ]]; then
+        # Load the Debug-selected PNU model set before the ROS bridge
+        # begins consuming live CAM4 frames. No planner or motion service is
+        # started in this branch.
+        run_best_effort \
+          "Debug PNU worker did not start; overlay health will remain degraded" \
+          "${COMPOSE[@]}" --profile debug \
+          up -d "${BUILD_ARGS[@]}" pnu-perception
+      fi
       run_or_print \
         "${COMPOSE[@]}" --profile debug \
         up -d --force-recreate \
@@ -1134,12 +1733,21 @@ case "${action}" in
       run_or_print \
         "${COMPOSE[@]}" --profile debug \
         up -d "${BUILD_ARGS[@]}" integration-debug-tailscale-proxy
+      if [[ "${local_pnu_perception_enabled}" == "true" ]]; then
+        run_best_effort \
+          "Debug PNU Tool/Blood/Hand worker is not healthy; ROS diagnostics remain available" \
+          "${COMPOSE[@]}" --profile debug \
+          up -d "${BUILD_ARGS[@]}" \
+          --wait --wait-timeout "${OPTIONAL_WAIT_TIMEOUT_SEC}" \
+          pnu-perception
+      fi
       if [[ "${DRY_RUN}" != "true" ]]; then
         "${COMPOSE[@]}" --profile debug ps
       fi
       wait_for_mode_rosbridge "${mode}"
       wait_for_mode_semantic_ready "${mode}"
       write_active_runtime_mode "${mode}"
+      RUNTIME_FAILURE_CLEANUP_ARMED=false
       run_best_effort \
         "multicam observer is unavailable; camera monitoring remains degraded" \
         wait_for_multicam_observer "${mode}"
@@ -1153,15 +1761,19 @@ case "${action}" in
     runtime_reset_services=(
       taskplanner-runtime
       public-rosbridge
+      public-rosbridge-lan-proxy
       taskplanner-asr
       shadow-runner
     )
-    if [[ ! ( ( "${mode}" == "live" || "${mode}" == "replay" ) && \
-        "${perception_backend}" == "local" && \
-        "${local_rfdetr_enabled}" == "true" ) ]]; then
+    if [[ "${local_object_perception_enabled}" != "true" ]]; then
       # The HTTP-only detector can stay warm between Live and Replay, but modes
       # that do not own local perception must release its GPU allocation.
       runtime_reset_services+=(object-perception)
+    fi
+    if [[ "${local_pnu_perception_enabled}" != "true" ]]; then
+      # The PNU worker follows the same placement invariant: a remote
+      # selection must never leave a stale local worker accepting frames.
+      runtime_reset_services+=(pnu-perception)
     fi
     # Never carry an armed/manual Debug session across an operational runtime
     # restart. Recreate the sidecar only after the new runtime is running, so
@@ -1170,12 +1782,25 @@ case "${action}" in
       integration-debug
       integration-debug-lan-proxy
     )
-    if [[ "${BUILD_REQUESTED}" == "true" ]]; then
-      # The observer is mode-independent and normally stays warm, but it must
-      # not read the symlink-install tree while colcon replaces that tree.
+    if [[ "${BUILD_REQUESTED}" == "true" ]] || ! mode_uses_multicam_observer "${mode}"; then
+      # Keep the external camera observer out of simulated/replay modes. A
+      # build also stops it briefly so it cannot read the symlink-install tree
+      # while colcon replaces that tree.
       runtime_reset_services+=(multicam-observer)
     fi
+    RUNTIME_FAILURE_CLEANUP_SERVICES=(
+      taskplanner-runtime
+      public-rosbridge
+      public-rosbridge-lan-proxy
+      taskplanner-asr
+      shadow-runner
+      object-perception
+      pnu-perception
+      integration-debug
+      integration-debug-lan-proxy
+    )
     verify_runtime_control_transition_interlock
+    RUNTIME_FAILURE_CLEANUP_ARMED=true
     # Preserve the old marker through preflight failures. Clear it only after
     # the final controller-authorized stopped-state check and immediately
     # before stopping the old runtime.
@@ -1217,10 +1842,12 @@ case "${action}" in
       --wait --wait-timeout "${WAIT_TIMEOUT_SEC}" \
       vllm-manager ninfer-manager webapp
 
-    run_best_effort \
-      "multicam observer did not start; core runtime remains available" \
-      "${COMPOSE[@]}" --profile "${mode}" \
-      up -d "${BUILD_ARGS[@]}" multicam-observer
+    if mode_uses_multicam_observer "${mode}"; then
+      run_best_effort \
+        "multicam observer did not start; core runtime remains available" \
+        "${COMPOSE[@]}" --profile "${mode}" \
+        up -d "${BUILD_ARGS[@]}" multicam-observer
+    fi
 
     if mode_uses_operational_asr_sidecar "${mode}"; then
       # Health means the dedicated ROS node has advertised its status topic.
@@ -1233,9 +1860,7 @@ case "${action}" in
         taskplanner-asr
     fi
 
-    if [[ ( "${mode}" == "live" || "${mode}" == "replay" ) && \
-        "${perception_backend}" == "local" && \
-        "${local_rfdetr_enabled}" == "true" ]]; then
+    if [[ "${local_object_perception_enabled}" == "true" ]]; then
       # RF-DETR is optional and has an independent health contract. Start its
       # warm-up before the ROS runtime so GPU/model initialization overlaps the
       # bridge launch instead of adding serial mode-switch latency.
@@ -1243,6 +1868,14 @@ case "${action}" in
         "optional object perception did not start; continuing with ROS and voice inputs" \
         "${COMPOSE[@]}" --profile "${mode}" \
         up -d "${BUILD_ARGS[@]}" object-perception
+    fi
+    if [[ "${local_pnu_perception_enabled}" == "true" ]]; then
+      # Start model loading before the ROS adapter so the latest-only input
+      # queue cannot accumulate camera frames during CUDA warm-up.
+      run_best_effort \
+        "optional PNU perception did not start; ROS health will remain degraded" \
+        "${COMPOSE[@]}" --profile "${mode}" \
+        up -d "${BUILD_ARGS[@]}" pnu-perception
     fi
 
     if [[ "${mode}" == "replay" ]]; then
@@ -1263,17 +1896,31 @@ case "${action}" in
         "${COMPOSE[@]}" --profile "${mode}" \
         up -d --force-recreate \
         --wait --wait-timeout "${WAIT_TIMEOUT_SEC}" public-rosbridge
+      # Keep the public browser surface separate from the operator/debug LAN
+      # proxy. This route exposes only the read-only 9092 sidecar on the wired
+      # interface and is available in Live, LLM Surgeon, and Replay.
+      run_or_print \
+        "${COMPOSE[@]}" --profile "${mode}" \
+        up -d --force-recreate public-rosbridge-lan-proxy
     fi
 
     if [[ "${INTEGRATED_DEBUG_ENABLED}" == "true" ]]; then
-      # Start this only after the operational runtime. It exposes monitoring on
-      # 9091 and unlocks manual commands only from a trusted, fresh stopped
-      # /simulation/state; the operational container itself may remain running.
+      # Start the required Live observation plane only after the operational
+      # runtime. It exposes monitoring on 9091 and unlocks manual commands
+      # only from a trusted, fresh stopped /simulation/state; the operational
+      # container itself may remain running.
       run_or_print \
         "${COMPOSE[@]}" --profile "${mode}" --profile debug \
         up -d "${BUILD_ARGS[@]}" --force-recreate \
-        integration-debug integration-debug-lan-proxy
+        integration-debug
     fi
+
+    # This is a path router for LAN dashboard clients, not the Debug runtime.
+    # Keep it available for every reviewed runtime so remote LLM/Replay UI
+    # traffic still reaches its own bridge while their Debug sidecar stays off.
+    run_or_print \
+      "${COMPOSE[@]}" --profile "${mode}" \
+      up -d --force-recreate integration-debug-lan-proxy
 
     # One Tailnet-permitted loopback port routes each selected runtime by
     # websocket path. It is intentionally separate from the LAN proxy and
@@ -1283,9 +1930,7 @@ case "${action}" in
       up -d "${BUILD_ARGS[@]}" \
       integration-debug-tailscale-proxy
 
-    if [[ ( "${mode}" == "live" || "${mode}" == "replay" ) && \
-        "${perception_backend}" == "local" && \
-        "${local_rfdetr_enabled}" == "true" ]]; then
+    if [[ "${local_object_perception_enabled}" == "true" ]]; then
       run_best_effort \
         "optional object perception is not healthy; continuing with ROS and voice inputs" \
         "${COMPOSE[@]}" --profile "${mode}" \
@@ -1293,16 +1938,31 @@ case "${action}" in
         --wait --wait-timeout "${OPTIONAL_WAIT_TIMEOUT_SEC}" \
         object-perception
     fi
+    if [[ "${local_pnu_perception_enabled}" == "true" ]]; then
+      run_best_effort \
+        "optional PNU perception is not healthy; ROS health will remain degraded" \
+        "${COMPOSE[@]}" --profile "${mode}" \
+        up -d "${BUILD_ARGS[@]}" \
+        --wait --wait-timeout "${OPTIONAL_WAIT_TIMEOUT_SEC}" \
+        pnu-perception
+    fi
 
     if [[ "${DRY_RUN}" != "true" ]]; then
       "${COMPOSE[@]}" "${runtime_profile_args[@]}" ps
     fi
     wait_for_mode_rosbridge "${mode}"
     wait_for_mode_semantic_ready "${mode}"
+    if [[ "${INTEGRATED_DEBUG_ENABLED}" == "true" ]]; then
+      wait_for_mode_rosbridge debug
+      wait_for_mode_semantic_ready debug
+    fi
     write_active_runtime_mode "${mode}"
-    run_best_effort \
-      "multicam observer is unavailable; camera monitoring remains degraded" \
-      wait_for_multicam_observer "${mode}"
+    RUNTIME_FAILURE_CLEANUP_ARMED=false
+    if mode_uses_multicam_observer "${mode}"; then
+      run_best_effort \
+        "multicam observer is unavailable; camera monitoring remains degraded" \
+        wait_for_multicam_observer "${mode}"
+    fi
     ;;
 
   down)
@@ -1380,12 +2040,12 @@ case "${action}" in
     validate_mode "${mode}"
     (($# == 1)) || die "config takes exactly one mode"
     compose_env_args "${mode}"
-    if mode_uses_integrated_debug_sidecar "${mode}"; then
+    if mode_requires_integrated_debug_observer "${mode}"; then
       export TASKPLANNER_DEBUG_LOCK_TO_RUNTIME_NETWORK=true
       export TASKPLANNER_DEBUG_ALLOW_PLANNER_COEXISTENCE=false
     fi
     compose_base
-    if mode_uses_integrated_debug_sidecar "${mode}"; then
+    if mode_requires_integrated_debug_observer "${mode}"; then
       "${COMPOSE[@]}" --profile "${mode}" --profile debug config
     else
       "${COMPOSE[@]}" --profile "${mode}" config

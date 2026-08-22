@@ -19,11 +19,12 @@ from retraction_control.profile_loader import (
 
 def approved_profile_payload() -> dict[str, object]:
     payload: dict[str, object] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "profile": {
             "name": "synthetic-test-profile",
             "version": "1.0.0",
             "procedure_type": "synthetic",
+            "public_procedure_type": "nephrectomy",
         },
         "calibration": {
             "approved": True,
@@ -35,12 +36,20 @@ def approved_profile_payload() -> dict[str, object]:
             "sdk_version": "3.5.0.7",
             "timeout_sec": 1.0,
         },
+        "sensor": {
+            "transport": "synthetic",
+            "channel": "fake0",
+            "bitrate": 1000000,
+            "sample_rate_hz": 1000.0,
+            "zeroing_policy": "synthetic_zero",
+        },
         "data": {"directory": "/tmp/retraction-control-test"},
         "control": {
             "friction_compensation": {"direct_teach": 0.0, "normal": 1.0},
             "custom_gain": {"kp": [1.0, 2.0], "kd": [0.1, 0.2]},
             "force_threshold": 2.0,
             "force_freshness_timeout_sec": 0.1,
+            "impedance": {"target_force_n": 0.0, "tolerance_n": 0.5},
             "stop_policy": "hold",
         },
         "side_mapping": {
@@ -122,11 +131,12 @@ def test_checksum_binds_all_content_except_expected_checksum_field() -> None:
 
 def test_unapproved_null_filled_profile_loads_only_as_draft() -> None:
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "profile": {
             "name": "throat-draft",
             "version": "0.0.0-draft",
             "procedure_type": "throat",
+            "public_procedure_type": "thyroidectomy",
         },
         "calibration": {
             "approved": False,
@@ -134,12 +144,14 @@ def test_unapproved_null_filled_profile_loads_only_as_draft() -> None:
             "expected_checksum": None,
         },
         "robot": {},
+        "sensor": {},
         "data": {"directory": None},
         "control": {
             "friction_compensation": None,
             "custom_gain": None,
             "force_threshold": None,
             "force_freshness_timeout_sec": None,
+            "impedance": {"target_force_n": None, "tolerance_n": None},
             "stop_policy": None,
         },
         "side_mapping": {"LEFT": None, "RIGHT": None},
@@ -187,11 +199,12 @@ def test_unknown_schema_key_is_rejected_for_draft_and_approved_profiles() -> Non
 
 def test_non_null_draft_values_are_still_strictly_validated() -> None:
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
         "profile": {
             "name": "draft",
             "version": "draft-1",
             "procedure_type": "synthetic",
+            "public_procedure_type": None,
         },
         "calibration": {"approved": False},
         "limits": {"single_jog_mm": "unknown", "cumulative_jog_mm": None},

@@ -11,7 +11,9 @@ action_watchdog:
 
 asr:
   topic: /sensors/surgeon/sentence
-  default_server_url: wss://arpa.worker-02.puzzle-ai.com
+  default_endpoint: cloud
+  cloud_server_url: wss://arpa.worker-02.puzzle-ai.com
+  lan_server_url: ws://192.168.1.5:1196/
 
 surgery_record:
   input_dir: /surgery-record-inputs
@@ -36,45 +38,45 @@ inputs:
   - name: speech_input_status
     topic: /input/speech/status
     type: surgical_msgs/msg/InputSourceStatus
-    expected_hz: 1.0
+    expected_hz: 15.0
     stale_after_sec: 3.0
     qos: reliable_volatile
   - name: external_cv_contract
     topic: /integration/cv_contract/status
     type: std_msgs/msg/String
-    expected_hz: 1.0
+    expected_hz: 15.0
     stale_after_sec: 3.0
     qos: reliable_transient_local
   - name: cam1_camera
-    topic: /synced/cam_1/color/image_raw/compressed
-    type: sensor_msgs/msg/CompressedImage
+    topic: /synced/cam_1/status
+    type: std_msgs/msg/String
     expected_hz: 15.0
     stale_after_sec: 3.0
-    qos: reliable_volatile
+    qos: reliable_transient_local
   - name: cam2_camera
-    topic: /synced/cam_2/color/image_raw/compressed
-    type: sensor_msgs/msg/CompressedImage
+    topic: /synced/cam_2/status
+    type: std_msgs/msg/String
     expected_hz: 15.0
     stale_after_sec: 3.0
-    qos: reliable_volatile
+    qos: reliable_transient_local
   - name: cam3_camera
-    topic: /synced/cam_3/color/image_raw/compressed
-    type: sensor_msgs/msg/CompressedImage
+    topic: /synced/cam_3/status
+    type: std_msgs/msg/String
     expected_hz: 15.0
     stale_after_sec: 3.0
-    qos: reliable_volatile
+    qos: reliable_transient_local
   - name: cam4_camera
-    topic: /synced/cam_4/color/image_raw/compressed
-    type: sensor_msgs/msg/CompressedImage
-    expected_hz: 15.0
+    topic: /synced/cam_4/status
+    type: std_msgs/msg/String
+    expected_hz: 1.0
     stale_after_sec: 3.0
-    qos: reliable_volatile
+    qos: reliable_transient_local
   - name: flir_camera
-    topic: /synced/flir/color/image_raw/compressed
-    type: sensor_msgs/msg/CompressedImage
-    expected_hz: 15.0
+    topic: /synced/flir/status
+    type: std_msgs/msg/String
+    expected_hz: 1.0
     stale_after_sec: 3.0
-    qos: reliable_volatile
+    qos: reliable_transient_local
 
 outputs:
   - topic: /surgery/context

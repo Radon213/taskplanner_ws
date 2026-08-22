@@ -26,6 +26,10 @@ _TERMINAL_STAGES = frozenset(
 _ALL_STAGES = _NONTERMINAL_STAGES | _TERMINAL_STAGES
 
 
+class LedgerError(RuntimeError):
+    """Durable command ledger could not be opened or verified."""
+
+
 def canonical_request_fingerprint(fields: Mapping[str, Any]) -> str:
     """Return a stable digest without persisting the request's raw values."""
 
@@ -79,33 +83,74 @@ class CommandLedger:
         self.path = Path(path)
         if not self.path.is_absolute():
             raise ValueError("command ledger path must be absolute")
+        if self.path.is_symlink() or self.path.parent.is_symlink():
+            raise LedgerError("command ledger path must not traverse a symlink")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        self._connection = sqlite3.connect(
-            self.path,
-            timeout=5.0,
-            check_same_thread=False,
-            isolation_level=None,
-        )
-        with self._lock:
-            self._connection.execute("PRAGMA journal_mode=WAL")
-            self._connection.execute("PRAGMA synchronous=FULL")
-            self._connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS commands (
-                    command_id TEXT PRIMARY KEY,
-                    fingerprint TEXT NOT NULL,
-                    stage TEXT NOT NULL,
-                    admission_accepted INTEGER NOT NULL DEFAULT 0,
-                    admission_result_code INTEGER NOT NULL DEFAULT 255,
-                    admission_message TEXT NOT NULL DEFAULT '',
-                    result_code TEXT NOT NULL DEFAULT '',
-                    message TEXT NOT NULL DEFAULT '',
-                    created_ns INTEGER NOT NULL,
-                    updated_ns INTEGER NOT NULL
-                )
-                """
+        self._closed = False
+        try:
+            self._connection = sqlite3.connect(
+                self.path,
+                timeout=5.0,
+                check_same_thread=False,
+                isolation_level=None,
             )
+            with self._lock:
+                self._connection.execute("PRAGMA journal_mode=WAL")
+                self._connection.execute("PRAGMA synchronous=FULL")
+                self._connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS commands (
+                        command_id TEXT PRIMARY KEY,
+                        fingerprint TEXT NOT NULL,
+                        stage TEXT NOT NULL,
+                        admission_accepted INTEGER NOT NULL DEFAULT 0,
+                        admission_result_code INTEGER NOT NULL DEFAULT 255,
+                        admission_message TEXT NOT NULL DEFAULT '',
+                        result_code TEXT NOT NULL DEFAULT '',
+                        message TEXT NOT NULL DEFAULT '',
+                        created_ns INTEGER NOT NULL,
+                        updated_ns INTEGER NOT NULL
+                    )
+                    """
+                )
+                self.verify_integrity()
+        except LedgerError:
+            connection = getattr(self, "_connection", None)
+            if connection is not None:
+                connection.close()
+            raise
+        except (OSError, sqlite3.Error) as exc:
+            connection = getattr(self, "_connection", None)
+            if connection is not None:
+                connection.close()
+            raise LedgerError(f"command ledger is unavailable or corrupt: {exc}") from exc
+
+    def verify_integrity(self) -> None:
+        with self._lock:
+            result = self._connection.execute("PRAGMA quick_check").fetchone()
+            if result != ("ok",):
+                raise LedgerError(f"command ledger integrity check failed: {result!r}")
+            columns = {
+                str(row[1])
+                for row in self._connection.execute(
+                    "PRAGMA table_info(commands)"
+                ).fetchall()
+            }
+            required = {
+                "command_id",
+                "fingerprint",
+                "stage",
+                "admission_accepted",
+                "admission_result_code",
+                "admission_message",
+                "result_code",
+                "message",
+                "created_ns",
+                "updated_ns",
+            }
+            if not required.issubset(columns):
+                raise LedgerError("command ledger schema is incomplete")
 
     def record_admission(
         self,
@@ -271,7 +316,9 @@ class CommandLedger:
 
     def close(self) -> None:
         with self._lock:
-            self._connection.close()
+            if not self._closed:
+                self._connection.close()
+                self._closed = True
 
     def __enter__(self) -> "CommandLedger":
         return self
@@ -314,6 +361,7 @@ class SubmitDecision(str, Enum):
     BUSY = "busy"
     STOP_ALREADY_PENDING = "stop_already_pending"
     SHUTTING_DOWN = "shutting_down"
+    PERSISTENCE_ERROR = "persistence_error"
 
 
 class CommandWorker:
@@ -341,6 +389,8 @@ class CommandWorker:
         self._shutdown = False
         self._active_command_id = ""
         self._stop_requested = threading.Event()
+        self._fatal_error = ""
+        self._notification_errors: list[str] = []
         self._thread = threading.Thread(
             target=self._run,
             name=thread_name,
@@ -361,6 +411,16 @@ class CommandWorker:
     def stop_requested(self) -> bool:
         return self._stop_requested.is_set()
 
+    @property
+    def fatal_error(self) -> str:
+        with self._condition:
+            return self._fatal_error
+
+    @property
+    def notification_errors(self) -> tuple[str, ...]:
+        with self._condition:
+            return tuple(self._notification_errors)
+
     def start(self) -> None:
         self._thread.start()
 
@@ -371,19 +431,26 @@ class CommandWorker:
             if command.is_stop:
                 if self._stop_pending:
                     return SubmitDecision.STOP_ALREADY_PENDING
-                self._stop_requested.set()
-                self._stop_pending = True
                 priority = 0
             else:
                 if len(self._items) >= self._max_pending:
                     return SubmitDecision.BUSY
                 priority = 10
+            try:
+                self._ledger.update(command.command_id, "queued")
+            except Exception as exc:
+                self._fatal_error = f"queue_persistence_failed:{type(exc).__name__}:{exc}"
+                self._shutdown = True
+                self._condition.notify_all()
+                return SubmitDecision.PERSISTENCE_ERROR
+            if command.is_stop:
+                self._stop_requested.set()
+                self._stop_pending = True
             self._sequence += 1
             heapq.heappush(
                 self._items,
                 _QueueItem(priority, self._sequence, command),
             )
-            self._ledger.update(command.command_id, "queued")
             self._condition.notify()
         self._notify(command.command_id, "queued", "")
         return SubmitDecision.QUEUED
@@ -397,12 +464,19 @@ class CommandWorker:
             self._stop_pending = False
             self._condition.notify_all()
         for command in pending:
-            self._ledger.update(
-                command.command_id,
-                "canceled",
-                result_code="controller_shutting_down",
-                message="queued command was not executed during shutdown",
-            )
+            try:
+                self._ledger.update(
+                    command.command_id,
+                    "canceled",
+                    result_code="controller_shutting_down",
+                    message="queued command was not executed during shutdown",
+                )
+            except Exception as exc:
+                with self._condition:
+                    self._fatal_error = (
+                        "shutdown_persistence_failed:"
+                        f"{type(exc).__name__}:{exc}"
+                    )
             self._notify(
                 command.command_id,
                 "canceled",
@@ -415,7 +489,13 @@ class CommandWorker:
 
     def _notify(self, command_id: str, stage: str, message: str) -> None:
         if self._on_stage is not None:
-            self._on_stage(command_id, stage, message)
+            try:
+                self._on_stage(command_id, stage, message)
+            except Exception as exc:
+                with self._condition:
+                    self._notification_errors.append(
+                        f"{command_id}:{stage}:{type(exc).__name__}:{exc}"
+                    )
 
     def _take(self) -> RuntimeCommand | None:
         with self._condition:
@@ -440,7 +520,17 @@ class CommandWorker:
             if command is None:
                 return
             stage = "stopping" if command.is_stop else "running"
-            self._ledger.update(command.command_id, stage)
+            try:
+                self._ledger.update(command.command_id, stage)
+            except Exception as exc:
+                with self._condition:
+                    self._fatal_error = (
+                        "running_persistence_failed:"
+                        f"{type(exc).__name__}:{exc}"
+                    )
+                    self._shutdown = True
+                self._finish_active(command)
+                return
             self._notify(command.command_id, stage, "")
             try:
                 report = self._executor(command, self._stop_requested)
@@ -457,11 +547,35 @@ class CommandWorker:
                 if report.success
                 else "failed"
             )
-            self._ledger.update(
-                command.command_id,
-                terminal_stage,
-                result_code=report.result_code,
-                message=report.message,
-            )
+            try:
+                self._ledger.update(
+                    command.command_id,
+                    terminal_stage,
+                    result_code=report.result_code,
+                    message=report.message,
+                )
+            except Exception as exc:
+                with self._condition:
+                    self._fatal_error = (
+                        "terminal_persistence_failed:"
+                        f"{type(exc).__name__}:{exc}"
+                    )
+                    self._shutdown = True
+                self._finish_active(command)
+                return
             self._notify(command.command_id, terminal_stage, report.message)
             self._finish_active(command)
+
+
+__all__ = [
+    "CommandLedger",
+    "CommandWorker",
+    "ExecutionReport",
+    "LedgerDecision",
+    "LedgerError",
+    "LedgerRecord",
+    "LedgerReservation",
+    "RuntimeCommand",
+    "SubmitDecision",
+    "canonical_request_fingerprint",
+]

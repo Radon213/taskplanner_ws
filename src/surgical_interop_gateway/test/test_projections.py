@@ -1042,6 +1042,36 @@ def test_public_speech_redacts_text_by_default_but_keeps_typed_metadata():
     assert message.evidence_status == "GATEWAY_OBSERVED_REDACTED"
 
 
+def test_public_speech_uses_replay_input_status_when_operational_asr_is_absent():
+    node = _speech_projection_test_node(publish_free_text=True)
+    node._asr_status = None
+    node._input_statuses = {
+        "speech_input": SimpleNamespace(
+            received_monotonic_sec=3.0,
+            message=SimpleNamespace(
+                source_id="recorded_transcript:0704_6:run-1",
+                state="READY",
+                healthy=True,
+            ),
+        )
+    }
+
+    message = node._speech_message(
+        stamp=Time(sec=20),
+        revision=4,
+        procedure_type="thyroidectomy",
+        procedure_active=True,
+    )
+
+    assert message.available is True
+    assert message.connected is True
+    assert message.state == message.STATE_READY
+    assert message.source == "recorded_transcript:0704_6:run-1"
+    assert message.text == "보비 주세요"
+    assert message.utterance_sequence == 3
+    assert message.latency_available is False
+
+
 def test_public_speech_rejects_unreviewed_free_form_latency_basis():
     node = _speech_projection_test_node(publish_free_text=False)
     node._asr_status.message["asr"]["finals"][0]["latency_basis"] = (

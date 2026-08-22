@@ -196,6 +196,37 @@ def test_process_lock_rejects_second_owner_until_first_releases(tmp_path):
     second.release()
 
 
+def test_process_lock_refuses_symlink_without_modifying_target(tmp_path):
+    target = tmp_path / "must-not-be-truncated"
+    target.write_text("preserve-me", encoding="utf-8")
+    lock_path = tmp_path / "controller.lock"
+    lock_path.symlink_to(target)
+
+    guard = SingleOwnerGuard(lock_path.absolute())
+    with pytest.raises(OwnershipError, match="symlink"):
+        guard.acquire()
+    assert target.read_text(encoding="utf-8") == "preserve-me"
+
+
+def test_process_lock_releases_fd_when_fsync_fails(tmp_path, monkeypatch):
+    lock_path = (tmp_path / "controller.lock").resolve()
+    first = SingleOwnerGuard(lock_path)
+
+    def fail_fsync(_fd):
+        raise OSError("simulated persistence failure")
+
+    monkeypatch.setattr("retraction_control.adapters.os.fsync", fail_fsync)
+    with pytest.raises(OSError, match="persistence failure"):
+        first.acquire()
+    assert not first.acquired
+
+    monkeypatch.undo()
+    second = SingleOwnerGuard(lock_path)
+    second.acquire()
+    assert second.acquired
+    second.release()
+
+
 def test_production_shells_are_inert_and_fail_closed_without_backends():
     robot = IndyDcp3Adapter()
     sensor = Aft200Adapter()

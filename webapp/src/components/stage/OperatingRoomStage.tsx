@@ -287,9 +287,9 @@ function voiceAgeLabel(occurredAt: number | undefined, nowMs: number, language: 
 
 function PhaseStepper({ steps, label }: { steps: StagePhaseStep[]; label: string }) {
   return (
-    <div className="phase-stepper" aria-label={label}>
+    <div className="phase-stepper" aria-label={label} role="list">
       {steps.map((step, index) => (
-        <div className={`phase-step ${step.state}`} key={step.id}>
+        <div className={`phase-step ${step.state}`} key={step.id} role="listitem">
           <span>{index + 1}</span>
           <strong>{step.label}</strong>
         </div>
@@ -331,6 +331,18 @@ export function OperatingRoomStage({
     vm.language === "ko" ? "인식 결과 대기" : "Waiting for detections";
   const perceptionEnabled = Boolean(
     perceptionHealth?.received && perceptionHealth.enabled,
+  );
+  // Raw CAM4/FLIR frames can continue while the perception publisher is
+  // stalled. Only call the preview "Detected" when a current derived frame
+  // or overlay is actually available; otherwise keep the raw camera label so
+  // the operator is not told that stale detector output is present.
+  const cam4PerceptionVisible = perceptionEnabled && Boolean(
+    perceptionOverlayFrames?.cam4 ||
+      (!cameraFrames?.cam4 && perceptionCameraFrames?.cam4),
+  );
+  const flirPerceptionVisible = perceptionEnabled && Boolean(
+    perceptionOverlayFrames?.flir ||
+      (!cameraFrames?.flir && perceptionCameraFrames?.flir),
   );
   const surgeonRequestConfirmed = systemSurgeonRequest.confirmed;
   const confirmedRequestTool = systemSurgeonRequest.requestedTool
@@ -537,9 +549,10 @@ export function OperatingRoomStage({
             }
             cameraIds={["cam2", "flir"]}
             initialCamera="flir"
+            language={vm.language}
             liveLabel={cameraLiveLabel}
             liveLabels={{
-              flir: perceptionEnabled
+              flir: flirPerceptionVisible
                 ? recognitionLiveLabel
                 : cameraLiveLabel,
             }}
@@ -641,9 +654,10 @@ export function OperatingRoomStage({
           }
           cameraIds={["cam3", "cam4"]}
           initialCamera="cam3"
+          language={vm.language}
           liveLabel={cameraLiveLabel}
           liveLabels={{
-            cam4: perceptionEnabled
+            cam4: cam4PerceptionVisible
               ? recognitionLiveLabel
               : cameraLiveLabel,
           }}

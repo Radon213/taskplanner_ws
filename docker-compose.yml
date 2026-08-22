@@ -125,11 +125,12 @@ services:
     volumes:
       - .:/workspaces/taskplanner_ws
       - taskplanner_web_node_modules:/workspaces/taskplanner_ws/webapp/node_modules
+      - ${PNU_SECRET_ROOT:-${HOME}/.config/taskplanner/perception}:/run/taskplanner/perception:ro
     environment:
       ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}
       ROS_AUTOMATIC_DISCOVERY_RANGE: ${ROS_AUTOMATIC_DISCOVERY_RANGE:-LOCALHOST}
       RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}
-      CYCLONEDDS_URI: ${CYCLONEDDS_URI:-}
+      CYCLONEDDS_URI: ${TASKPLANNER_CONTAINER_CYCLONEDDS_URI-${CYCLONEDDS_URI:-}}
       INPUT_PROFILE: ${INPUT_PROFILE:-simulation}
       EXECUTION_BACKEND: ${EXECUTION_BACKEND:-mock}
       TASKPLANNER_DEFAULT_BUNDLE: ${TASKPLANNER_DEFAULT_BUNDLE:-thyroidectomy}
@@ -186,11 +187,25 @@ services:
       NINFER_PROVIDER_MANAGED: ${NINFER_PROVIDER_MANAGED:-true}
       NINFER_MANAGER_ENABLED: ${NINFER_MANAGER_ENABLED:-true}
       ENABLE_RFDETR_PERCEPTION: ${ENABLE_RFDETR_PERCEPTION:-true}
-      # Own exactly one perception backend.  "external" reserves the CV-team
-      # output names and suppresses the local RF-DETR bridge.
+      # Empty new-axis values preserve the legacy backend and endpoint aliases.
+      PERCEPTION_PROVIDER: ${PERCEPTION_PROVIDER:-}
+      PERCEPTION_LOCATION: ${PERCEPTION_LOCATION:-}
+      PERCEPTION_ENDPOINT: ${PERCEPTION_ENDPOINT:-}
       PERCEPTION_BACKEND: ${PERCEPTION_BACKEND:-local}
       REQUIRE_PERCEPTION_ON_START: ${REQUIRE_PERCEPTION_ON_START:-false}
       RFDETR_SERVICE_URL: ${RFDETR_SERVICE_URL:-http://127.0.0.1:8010}
+      PNU_SERVICE_URL: ${PNU_SERVICE_URL:-}
+      PNU_CLIENT_API_TOKEN_FILE: ${PNU_CLIENT_API_TOKEN_FILE:-}
+      PNU_ALLOW_INSECURE_REMOTE_HTTP: ${PNU_ALLOW_INSECURE_REMOTE_HTTP:-false}
+      PNU_ALLOW_UNAUTHENTICATED_REMOTE: ${PNU_ALLOW_UNAUTHENTICATED_REMOTE:-false}
+      PNU_EXPECTED_MODEL_DIGESTS_JSON: ${PNU_EXPECTED_MODEL_DIGESTS_JSON:-{}}
+      PNU_EXPECTED_TOOL_SUPPORT_PLANE_CONFIG_VERSION: ${PNU_EXPECTED_TOOL_SUPPORT_PLANE_CONFIG_VERSION:-}
+      PNU_TOOL_SUPPORT_PLANE_NORMAL: ${PNU_TOOL_SUPPORT_PLANE_NORMAL:-}
+      PNU_DEPTH_SCALE_M_PER_UNIT: ${PNU_DEPTH_SCALE_M_PER_UNIT:-0.0}
+      PNU_DEPTH_SCALE_VALIDATED: ${PNU_DEPTH_SCALE_VALIDATED:-false}
+      PNU_DEPTH_ALIGNMENT_VALIDATED: ${PNU_DEPTH_ALIGNMENT_VALIDATED:-false}
+      PNU_DEPTH_ALIGNMENT_ID: ${PNU_DEPTH_ALIGNMENT_ID:-}
+      PNU_REQUIRE_METRIC_3D_ON_START: ${PNU_REQUIRE_METRIC_3D_ON_START:-false}
       RFDETR_PREFLIGHT_TIMEOUT_SEC: ${RFDETR_PREFLIGHT_TIMEOUT_SEC:-2.0}
       FLIR_INPUT_TOPIC: ${FLIR_INPUT_TOPIC:-/synced/flir/color/image_raw/compressed}
       CAM4_INPUT_TOPIC: ${CAM4_INPUT_TOPIC:-/synced/cam_4/color/image_raw/compressed}
@@ -202,7 +217,11 @@ services:
       CV_CAM4_RGB_TOPIC: ${CV_CAM4_RGB_TOPIC:-/synced/cam_4/color/image_raw/compressed}
       CV_CAM4_RGB_ALIAS_TOPIC: ${CV_CAM4_RGB_ALIAS_TOPIC:-/surgery/images/cam4/compressed}
       CV_CAM4_CAMERA_INFO_TOPIC: ${CV_CAM4_CAMERA_INFO_TOPIC:-/synced/cam_4/color/camera_info}
-      CV_CAM4_ALIGNED_DEPTH_TOPIC: ${CV_CAM4_ALIGNED_DEPTH_TOPIC:-/synced/cam_4/depth/image_rect_raw}
+      CV_CAM4_NATIVE_DEPTH_COMPRESSED_TOPIC: ${CV_CAM4_NATIVE_DEPTH_COMPRESSED_TOPIC:-/synced/cam_4/depth/image_rect_raw/compressedDepth}
+      CV_CAM4_DEPTH_CAMERA_INFO_TOPIC: ${CV_CAM4_DEPTH_CAMERA_INFO_TOPIC:-/synced/cam_4/depth/camera_info}
+      CV_CAM4_DEPTH_TO_COLOR_EXTRINSICS_TOPIC: ${CV_CAM4_DEPTH_TO_COLOR_EXTRINSICS_TOPIC:-/synced/cam_4/extrinsics/depth_to_color}
+      CV_CAM4_ALIGNED_DEPTH_COMPRESSED_TOPIC: ${CV_CAM4_ALIGNED_DEPTH_COMPRESSED_TOPIC:-/synced/cam_4/aligned_depth_to_color/image_raw/compressedDepth}
+      CV_CAM4_ALIGNED_DEPTH_CAMERA_INFO_TOPIC: ${CV_CAM4_ALIGNED_DEPTH_CAMERA_INFO_TOPIC:-/synced/cam_4/aligned_depth_to_color/camera_info}
       CV_HANDOVER_TRAY_RGB_TOPIC: ${CV_HANDOVER_TRAY_RGB_TOPIC:-/surgery/images/tray/compressed}
       CV_HANDOVER_TRAY_CAMERA_INFO_TOPIC: ${CV_HANDOVER_TRAY_CAMERA_INFO_TOPIC:-/surgery/cameras/tray/color/camera_info}
       CV_HANDOVER_TRAY_ALIGNED_DEPTH_TOPIC: ${CV_HANDOVER_TRAY_ALIGNED_DEPTH_TOPIC:-/surgery/cameras/tray/aligned_depth}
@@ -217,10 +236,10 @@ services:
       - replay
     build:
       context: .
-      dockerfile: docker/rfdetr-perception/Dockerfile
+      dockerfile: ${PERCEPTION_DOCKERFILE:-docker/rfdetr-perception/Dockerfile}
       args:
         RFDETR_BASE_IMAGE: ${RFDETR_BASE_IMAGE:-pytorch/pytorch:2.8.0-cuda12.9-cudnn9-runtime@sha256:e05438443ae3c407e8d04447091a959dbb6757b6290b128770c3c787d4bd442b}
-    image: taskplanner-rfdetr-perception:0.1.0
+    image: ${PERCEPTION_IMAGE:-taskplanner-rfdetr-perception:0.1.0}
     restart: "no"
     network_mode: host
     ipc: host
@@ -258,6 +277,88 @@ services:
       retries: 6
       start_period: 180s
 
+  pnu-perception:
+    profiles:
+      - live
+      - replay
+      - debug
+    build:
+      context: .
+      dockerfile: ${PNU_DOCKERFILE:-docker/pnu-perception/Dockerfile}
+      args:
+        PNU_BASE_IMAGE: ${PNU_BASE_IMAGE:-taskplanner-rfdetr-perception:unified-compat}
+    image: ${PNU_IMAGE:-taskplanner-pnu-perception:0.1.0}
+    restart: "no"
+    # Run as the workspace operator so private 0600 model assets stay private;
+    # cap_drop=ALL intentionally removes root's DAC override capability.
+    user: "${TASKPLANNER_UID:-1000}:${TASKPLANNER_GID:-1000}"
+    network_mode: host
+    ipc: host
+    gpus: all
+    stop_grace_period: 30s
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,nosuid,size=2g
+    volumes:
+      - ${PNU_UPSTREAM_ROOT:-${HOME}/.local/share/taskplanner/models/pnu_hand_blood/upstream/hand-blood-tools-0f9e93115b8c}:/opt/hand-blood-tools:ro
+      - ${PNU_MODEL_ROOT:-${HOME}/.local/share/taskplanner/models/pnu_hand_blood}:/models:ro
+      - ${PNU_SECRET_ROOT:-${HOME}/.config/taskplanner/perception}:/run/taskplanner/perception:ro
+      - ./config/pnu_perception:/config/pnu_perception:ro
+    environment:
+      PNU_UPSTREAM_ROOT: /opt/hand-blood-tools
+      PNU_EXPECTED_UPSTREAM_COMMIT: ${PNU_EXPECTED_UPSTREAM_COMMIT:-0f9e93115b8cc1d470398c92e010e3fc6ef1de5d}
+      PNU_TOOL_CHECKPOINT: /models/${PNU_TOOL_CHECKPOINT_REL:-cam4_rfdetr_seg_small_regular_resume_e13_best.pth}
+      PNU_BLOOD_CHECKPOINT: /models/${PNU_BLOOD_CHECKPOINT_REL:-blood_detection.pth}
+      PNU_HAND_MODEL: /models/${PNU_HAND_MODEL_REL:-hand_landmarker.task}
+      PNU_TOOL_ONTOLOGY: /opt/hand-blood-tools/components/tool_runtime_v1_6/algorithm/model/ontology.json
+      PNU_HOST: ${PNU_BIND_HOST:-127.0.0.1}
+      PNU_PORT: ${PNU_PORT:-8020}
+      PNU_API_TOKEN_FILE: ${PNU_WORKER_API_TOKEN_FILE:-}
+      PNU_DEVICE_POLICY: ${PNU_DEVICE_POLICY:-cuda_required}
+      PNU_OPTIMIZE_RFDETR: ${PNU_OPTIMIZE_RFDETR:-true}
+      PNU_TOOL_THRESHOLD: ${PNU_TOOL_THRESHOLD:-0.30}
+      PNU_BLOOD_THRESHOLD: ${PNU_BLOOD_THRESHOLD:-0.50}
+      PNU_MAX_HANDS: ${PNU_MAX_HANDS:-2}
+      PNU_MAX_TOTAL_RLE_COUNTS: ${PNU_MAX_TOTAL_RLE_COUNTS:-1000000}
+      PNU_MAX_RESPONSE_JSON_BYTES: ${PNU_MAX_RESPONSE_JSON_BYTES:-16777216}
+      PNU_MAX_INGRESS_READ_SEC: ${PNU_MAX_INGRESS_READ_SEC:-1.0}
+      # Scope Docker readiness to the configured consumer set. Standalone Debug,
+      # Live, and Replay all require Tool/Blood/Hand by default; keeping this
+      # parameterized preserves explicit test isolation without changing the
+      # worker's global health payload.
+      PNU_HEALTH_REQUIRED_ALGORITHMS: ${PNU_WORKER_REQUIRED_ALGORITHMS:-tool,blood,hand}
+      PNU_TOOL_SUPPORT_PLANE_NORMAL: ${PNU_TOOL_SUPPORT_PLANE_NORMAL:-0.046450707785,0.055576411879,-0.997373347443}
+      PNU_TOOL_SUPPORT_PLANE_OFFSET_M: ${PNU_TOOL_SUPPORT_PLANE_OFFSET_M:-0.797796943113}
+      PNU_TOOL_SUPPORT_PLANE_CONFIG_VERSION: ${PNU_TOOL_SUPPORT_PLANE_CONFIG_VERSION:-viplab_cam4_146222251000_support_plane_v1_sha256_b683ecd5a5382a4f}
+      PNU_TOOL_SUPPORT_PLANE_INLIER_RATIO: ${PNU_TOOL_SUPPORT_PLANE_INLIER_RATIO:-0.854928571429}
+      PNU_TOOL_SUPPORT_PLANE_RESIDUAL_P95_M: ${PNU_TOOL_SUPPORT_PLANE_RESIDUAL_P95_M:-0.014164174501}
+      PNU_TOOL_SUPPORT_PLANE_VALIDATED: ${PNU_TOOL_SUPPORT_PLANE_VALIDATED:-false}
+      PNU_TOOL_SUPPORT_PLANE_ARTIFACT: ${PNU_TOOL_SUPPORT_PLANE_ARTIFACT:-}
+      PNU_TOOL_SUPPORT_PLANE_ARTIFACT_SHA256: ${PNU_TOOL_SUPPORT_PLANE_ARTIFACT_SHA256:-}
+      PNU_TOOL_SUPPORT_PLANE_CAMERA_SERIAL: ${PNU_TOOL_SUPPORT_PLANE_CAMERA_SERIAL:-}
+      PNU_TOOL_SUPPORT_PLANE_CAMERA_PROFILE: ${PNU_TOOL_SUPPORT_PLANE_CAMERA_PROFILE:-}
+      PNU_TOOL_SUPPORT_PLANE_FIRMWARE_VERSION: ${PNU_TOOL_SUPPORT_PLANE_FIRMWARE_VERSION:-}
+      PNU_TOOL_SUPPORT_PLANE_MAX_AGE_DAYS: ${PNU_TOOL_SUPPORT_PLANE_MAX_AGE_DAYS:-30}
+    command:
+      - --host
+      - ${PNU_BIND_HOST:-127.0.0.1}
+      - --port
+      - ${PNU_PORT:-8020}
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import json,os,urllib.request; h=os.environ.get('PNU_HOST','127.0.0.1'); h='127.0.0.1' if h in {'0.0.0.0','::'} else h; h=f'[{h}]' if ':' in h and not h.startswith('[') else h; p=json.load(urllib.request.urlopen(f'http://{h}:{os.environ.get(\"PNU_PORT\",\"8020\")}/v1/health',timeout=2)); required=[v.strip() for v in os.environ.get('PNU_HEALTH_REQUIRED_ALGORITHMS','tool,blood,hand').split(',') if v.strip()]; models=p.get('models',{}); raise SystemExit(0 if required and len(required)==len(set(required)) and set(required)<={'tool','blood','hand'} and all(isinstance(models.get(v),dict) and models[v].get('ready') is True for v in required) else 1)"
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 180s
+
   shadow-runner:
     profiles:
       - replay
@@ -279,6 +380,7 @@ services:
       - ${SHADOW_DATASET_ROOT:-${HOME}/.local/share/taskplanner/datasets/shadow}:/datasets/shadow:ro
       - ${TASKPLANNER_ANNOTATION_ROOT:-./annotations/observable_tool_events}:/datasets/annotations/observable_tool_events:ro
       - ${TASKPLANNER_RUN_ROOT:-${HOME}/.local/share/taskplanner/runs}:/taskplanner-runs
+      - ${PNU_SECRET_ROOT:-${HOME}/.config/taskplanner/perception}:/run/taskplanner/perception:ro
     environment:
       HOME: /tmp/taskplanner-shadow
       ROS_DOMAIN_ID: ${SHADOW_ROS_DOMAIN_ID:-71}
@@ -308,16 +410,41 @@ services:
       NINFER_PROVIDER_ENABLED: ${NINFER_PROVIDER_ENABLED:-true}
       NINFER_PROVIDER_MANAGED: ${NINFER_PROVIDER_MANAGED:-true}
       NINFER_MANAGER_ENABLED: ${NINFER_MANAGER_ENABLED:-true}
-      # shadow-runner uses host networking, so loopback reaches the host service.
-      # host.docker.internal remains registered for non-host-network overrides.
+      ENABLE_RFDETR_PERCEPTION: ${ENABLE_RFDETR_PERCEPTION:-true}
+      PERCEPTION_PROVIDER: ${PERCEPTION_PROVIDER:-}
+      PERCEPTION_LOCATION: ${PERCEPTION_LOCATION:-}
+      PERCEPTION_ENDPOINT: ${PERCEPTION_ENDPOINT:-}
+      PERCEPTION_BACKEND: ${PERCEPTION_BACKEND:-local}
+      # Legacy endpoint alias. Remote placement requires PERCEPTION_ENDPOINT.
       RFDETR_SERVICE_URL: ${RFDETR_SERVICE_URL:-http://127.0.0.1:8010}
+      PNU_SERVICE_URL: ${PNU_SERVICE_URL:-}
+      PNU_CLIENT_API_TOKEN_FILE: ${PNU_CLIENT_API_TOKEN_FILE:-}
+      PNU_ALLOW_INSECURE_REMOTE_HTTP: ${PNU_ALLOW_INSECURE_REMOTE_HTTP:-false}
+      PNU_ALLOW_UNAUTHENTICATED_REMOTE: ${PNU_ALLOW_UNAUTHENTICATED_REMOTE:-false}
+      PNU_EXPECTED_MODEL_DIGESTS_JSON: ${PNU_EXPECTED_MODEL_DIGESTS_JSON:-{}}
+      PNU_EXPECTED_TOOL_SUPPORT_PLANE_CONFIG_VERSION: ${PNU_EXPECTED_TOOL_SUPPORT_PLANE_CONFIG_VERSION:-}
+      PNU_TOOL_SUPPORT_PLANE_NORMAL: ${PNU_TOOL_SUPPORT_PLANE_NORMAL:-}
+      PNU_DEPTH_SCALE_M_PER_UNIT: ${PNU_DEPTH_SCALE_M_PER_UNIT:-0.0}
+      PNU_DEPTH_SCALE_VALIDATED: ${PNU_DEPTH_SCALE_VALIDATED:-false}
+      PNU_DEPTH_ALIGNMENT_VALIDATED: ${PNU_DEPTH_ALIGNMENT_VALIDATED:-false}
+      PNU_DEPTH_ALIGNMENT_ID: ${PNU_DEPTH_ALIGNMENT_ID:-}
       RFDETR_PREFLIGHT_TIMEOUT_SEC: ${RFDETR_PREFLIGHT_TIMEOUT_SEC:-2.0}
+      CV_CONTRACT_STATUS_TOPIC: ${CV_CONTRACT_STATUS_TOPIC:-/integration/cv_contract/status}
+      CV_CAM4_RGB_TOPIC: ${CV_CAM4_RGB_TOPIC:-/synced/cam_4/color/image_raw/compressed}
+      CV_CAM4_CAMERA_INFO_TOPIC: ${CV_CAM4_CAMERA_INFO_TOPIC:-/synced/cam_4/color/camera_info}
+      CV_CAM4_NATIVE_DEPTH_COMPRESSED_TOPIC: ${CV_CAM4_NATIVE_DEPTH_COMPRESSED_TOPIC:-/synced/cam_4/depth/image_rect_raw/compressedDepth}
+      CV_CAM4_DEPTH_CAMERA_INFO_TOPIC: ${CV_CAM4_DEPTH_CAMERA_INFO_TOPIC:-/synced/cam_4/depth/camera_info}
+      CV_CAM4_DEPTH_TO_COLOR_EXTRINSICS_TOPIC: ${CV_CAM4_DEPTH_TO_COLOR_EXTRINSICS_TOPIC:-/synced/cam_4/extrinsics/depth_to_color}
+      CV_CAM4_ALIGNED_DEPTH_COMPRESSED_TOPIC: ${CV_CAM4_ALIGNED_DEPTH_COMPRESSED_TOPIC:-/synced/cam_4/aligned_depth_to_color/image_raw/compressedDepth}
+      CV_CAM4_ALIGNED_DEPTH_CAMERA_INFO_TOPIC: ${CV_CAM4_ALIGNED_DEPTH_CAMERA_INFO_TOPIC:-/synced/cam_4/aligned_depth_to_color/camera_info}
       TASKPLANNER_SHADOW_TRACE_ROOT: /taskplanner-runs/shadow
       SHADOW_CASE_ID: ${SHADOW_CASE_ID:-0704_6}
       SHADOW_BUNDLE_ID: ${SHADOW_BUNDLE_ID:-thyroidectomy_demo}
       SHADOW_REQUIRE_VLM: ${SHADOW_REQUIRE_VLM:-false}
       SHADOW_REPLAY_MODE: ${SHADOW_REPLAY_MODE:-elastic_demo}
       SHADOW_REPLAY_RATE: ${SHADOW_REPLAY_RATE:-1.0}
+      PUBLISH_SHARED_STATE: ${PUBLISH_SHARED_STATE:-true}
+      PUBLISH_SHARED_FREE_TEXT: ${PUBLISH_SHARED_FREE_TEXT:-false}
       ROSBRIDGE_SHADOW_PORT: ${ROSBRIDGE_SHADOW_PORT:-9099}
     depends_on:
       vllm-manager:
@@ -326,6 +453,8 @@ services:
         condition: service_healthy
       webapp:
         condition: service_started
+    # ros2 launch rejects an empty `name:=` token. Optional perception routes
+    # are therefore expanded inside the container only when configured.
     command: >
       bash -lc "if [ ! -f install/setup.bash ] || [ ! -e install/bringup/share/bringup/launch/taskplanner_shadow.launch.py ]; then
         echo 'Taskplanner install/setup.bash is missing; rerun launcher with --build' >&2;
@@ -343,12 +472,27 @@ services:
       require_vlm:=$${SHADOW_REQUIRE_VLM}
       replay_mode:=$${SHADOW_REPLAY_MODE}
       replay_rate:=$${SHADOW_REPLAY_RATE}
-      enable_rfdetr_perception:=true
+      enable_rfdetr_perception:=$${ENABLE_RFDETR_PERCEPTION}
+      perception_backend:=$${PERCEPTION_BACKEND}
+      $${PERCEPTION_PROVIDER:+perception_provider:=$${PERCEPTION_PROVIDER}}
+      $${PERCEPTION_LOCATION:+perception_location:=$${PERCEPTION_LOCATION}}
+      $${PERCEPTION_ENDPOINT:+perception_endpoint:=$${PERCEPTION_ENDPOINT}}
       rfdetr_service_url:=$${RFDETR_SERVICE_URL}
+      $${PNU_SERVICE_URL:+pnu_service_url:=$${PNU_SERVICE_URL}}
+      cv_contract_status_topic:=$${CV_CONTRACT_STATUS_TOPIC}
+      cv_cam4_rgb_topic:=$${CV_CAM4_RGB_TOPIC}
+      cv_cam4_camera_info_topic:=$${CV_CAM4_CAMERA_INFO_TOPIC}
+      cv_cam4_native_depth_compressed_topic:=$${CV_CAM4_NATIVE_DEPTH_COMPRESSED_TOPIC}
+      cv_cam4_depth_camera_info_topic:=$${CV_CAM4_DEPTH_CAMERA_INFO_TOPIC}
+      cv_cam4_depth_to_color_extrinsics_topic:=$${CV_CAM4_DEPTH_TO_COLOR_EXTRINSICS_TOPIC}
+      cv_cam4_aligned_depth_compressed_topic:=$${CV_CAM4_ALIGNED_DEPTH_COMPRESSED_TOPIC}
+      cv_cam4_aligned_depth_camera_info_topic:=$${CV_CAM4_ALIGNED_DEPTH_CAMERA_INFO_TOPIC}
       vlm_base_url:=$${VLM_BASE_URL}
       vlm_provider_id:=$${VLM_PROVIDER_ID}
       vlm_model_id:=$${VLM_MODEL_ID}
       vlm_api_mode:=$${VLM_API_MODE}
+      publish_shared_state:=$${PUBLISH_SHARED_STATE}
+      publish_shared_free_text:=$${PUBLISH_SHARED_FREE_TEXT}
       enable_rosbridge:=true
       rosbridge_port:=$${ROSBRIDGE_SHADOW_PORT}"
 
@@ -387,9 +531,20 @@ services:
       ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}
       ROS_AUTOMATIC_DISCOVERY_RANGE: ${ROS_AUTOMATIC_DISCOVERY_RANGE:-LOCALHOST}
       RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}
-      CYCLONEDDS_URI: ${CYCLONEDDS_URI:-}
+      CYCLONEDDS_URI: ${TASKPLANNER_CONTAINER_CYCLONEDDS_URI-${CYCLONEDDS_URI:-}}
       TASKPLANNER_RUN_ROOT: /taskplanner-runs
+      # Select only a reviewed route.  The node refuses arbitrary service-time
+      # server_url overrides even though both endpoints use the same protocol.
+      PUZZLE_ASR_ENDPOINT: ${PUZZLE_ASR_ENDPOINT:-cloud}
       PUZZLE_ASR_URL: ${PUZZLE_ASR_URL:-wss://arpa.worker-02.puzzle-ai.com}
+      PUZZLE_ASR_LAN_URL: ${PUZZLE_ASR_LAN_URL:-ws://192.168.1.5:1196/}
+      # Live-only policy: blank follows PUZZLE_ASR_ENDPOINT.  auto continuously
+      # monitors the LAN WebSocket and chooses cloud only before a new session.
+      PUZZLE_ASR_ROUTE_POLICY: ${PUZZLE_ASR_ROUTE_POLICY:-}
+      PUZZLE_ASR_LAN_HEALTH_INTERVAL_SEC: ${PUZZLE_ASR_LAN_HEALTH_INTERVAL_SEC:-1.0}
+      PUZZLE_ASR_LAN_HEALTH_FAILURE_INTERVAL_SEC: ${PUZZLE_ASR_LAN_HEALTH_FAILURE_INTERVAL_SEC:-0.5}
+      PUZZLE_ASR_LAN_HEALTH_TIMEOUT_SEC: ${PUZZLE_ASR_LAN_HEALTH_TIMEOUT_SEC:-0.5}
+      PUZZLE_ASR_LAN_HEALTH_STALE_AFTER_SEC: ${PUZZLE_ASR_LAN_HEALTH_STALE_AFTER_SEC:-2.0}
       SENTENCE_INPUT_TOPIC: ${SENTENCE_INPUT_TOPIC:-/sensors/surgeon/sentence}
       TASKPLANNER_ASR_CAPTURE_LOCK: ${TASKPLANNER_ASR_CAPTURE_LOCK:-/taskplanner-runs/asr/microphone.lock}
     healthcheck:
@@ -447,11 +602,12 @@ services:
     volumes:
       - .:/workspaces/taskplanner_ws
       - taskplanner_web_node_modules:/workspaces/taskplanner_ws/webapp/node_modules
+      - ${PNU_SECRET_ROOT:-${HOME}/.config/taskplanner/perception}:/run/taskplanner/perception:ro
     environment:
       ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}
       ROS_AUTOMATIC_DISCOVERY_RANGE: ${ROS_AUTOMATIC_DISCOVERY_RANGE:-LOCALHOST}
       RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}
-      CYCLONEDDS_URI: ${CYCLONEDDS_URI:-}
+      CYCLONEDDS_URI: ${TASKPLANNER_CONTAINER_CYCLONEDDS_URI-${CYCLONEDDS_URI:-}}
       ROSBRIDGE_PORT: ${ROSBRIDGE_PORT:-9090}
       ROSBRIDGE_ADDRESS: ${ROSBRIDGE_ADDRESS:-127.0.0.1}
       ROSBRIDGE_SERVICE_TIMEOUT: ${ROSBRIDGE_SERVICE_TIMEOUT:-30.0}
@@ -511,11 +667,25 @@ services:
       NINFER_PROVIDER_MANAGED: ${NINFER_PROVIDER_MANAGED:-true}
       NINFER_MANAGER_ENABLED: ${NINFER_MANAGER_ENABLED:-true}
       ENABLE_RFDETR_PERCEPTION: ${ENABLE_RFDETR_PERCEPTION:-true}
-      # Own exactly one perception backend. `external` reserves CV-team topic
-      # ownership and prevents a second local RF-DETR publisher.
+      # Empty new-axis values preserve the legacy backend and endpoint aliases.
+      PERCEPTION_PROVIDER: ${PERCEPTION_PROVIDER:-}
+      PERCEPTION_LOCATION: ${PERCEPTION_LOCATION:-}
+      PERCEPTION_ENDPOINT: ${PERCEPTION_ENDPOINT:-}
       PERCEPTION_BACKEND: ${PERCEPTION_BACKEND:-local}
       REQUIRE_PERCEPTION_ON_START: ${REQUIRE_PERCEPTION_ON_START:-false}
       RFDETR_SERVICE_URL: ${RFDETR_SERVICE_URL:-http://127.0.0.1:8010}
+      PNU_SERVICE_URL: ${PNU_SERVICE_URL:-}
+      PNU_CLIENT_API_TOKEN_FILE: ${PNU_CLIENT_API_TOKEN_FILE:-}
+      PNU_ALLOW_INSECURE_REMOTE_HTTP: ${PNU_ALLOW_INSECURE_REMOTE_HTTP:-false}
+      PNU_ALLOW_UNAUTHENTICATED_REMOTE: ${PNU_ALLOW_UNAUTHENTICATED_REMOTE:-false}
+      PNU_EXPECTED_MODEL_DIGESTS_JSON: ${PNU_EXPECTED_MODEL_DIGESTS_JSON:-{}}
+      PNU_EXPECTED_TOOL_SUPPORT_PLANE_CONFIG_VERSION: ${PNU_EXPECTED_TOOL_SUPPORT_PLANE_CONFIG_VERSION:-}
+      PNU_TOOL_SUPPORT_PLANE_NORMAL: ${PNU_TOOL_SUPPORT_PLANE_NORMAL:-}
+      PNU_DEPTH_SCALE_M_PER_UNIT: ${PNU_DEPTH_SCALE_M_PER_UNIT:-0.0}
+      PNU_DEPTH_SCALE_VALIDATED: ${PNU_DEPTH_SCALE_VALIDATED:-false}
+      PNU_DEPTH_ALIGNMENT_VALIDATED: ${PNU_DEPTH_ALIGNMENT_VALIDATED:-false}
+      PNU_DEPTH_ALIGNMENT_ID: ${PNU_DEPTH_ALIGNMENT_ID:-}
+      PNU_REQUIRE_METRIC_3D_ON_START: ${PNU_REQUIRE_METRIC_3D_ON_START:-false}
       RFDETR_PREFLIGHT_TIMEOUT_SEC: ${RFDETR_PREFLIGHT_TIMEOUT_SEC:-2.0}
       FLIR_INPUT_TOPIC: ${FLIR_INPUT_TOPIC:-/synced/flir/color/image_raw/compressed}
       CAM4_INPUT_TOPIC: ${CAM4_INPUT_TOPIC:-/synced/cam_4/color/image_raw/compressed}
@@ -525,7 +695,11 @@ services:
       CV_CAM4_RGB_TOPIC: ${CV_CAM4_RGB_TOPIC:-/synced/cam_4/color/image_raw/compressed}
       CV_CAM4_RGB_ALIAS_TOPIC: ${CV_CAM4_RGB_ALIAS_TOPIC:-/surgery/images/cam4/compressed}
       CV_CAM4_CAMERA_INFO_TOPIC: ${CV_CAM4_CAMERA_INFO_TOPIC:-/synced/cam_4/color/camera_info}
-      CV_CAM4_ALIGNED_DEPTH_TOPIC: ${CV_CAM4_ALIGNED_DEPTH_TOPIC:-/synced/cam_4/depth/image_rect_raw}
+      CV_CAM4_NATIVE_DEPTH_COMPRESSED_TOPIC: ${CV_CAM4_NATIVE_DEPTH_COMPRESSED_TOPIC:-/synced/cam_4/depth/image_rect_raw/compressedDepth}
+      CV_CAM4_DEPTH_CAMERA_INFO_TOPIC: ${CV_CAM4_DEPTH_CAMERA_INFO_TOPIC:-/synced/cam_4/depth/camera_info}
+      CV_CAM4_DEPTH_TO_COLOR_EXTRINSICS_TOPIC: ${CV_CAM4_DEPTH_TO_COLOR_EXTRINSICS_TOPIC:-/synced/cam_4/extrinsics/depth_to_color}
+      CV_CAM4_ALIGNED_DEPTH_COMPRESSED_TOPIC: ${CV_CAM4_ALIGNED_DEPTH_COMPRESSED_TOPIC:-/synced/cam_4/aligned_depth_to_color/image_raw/compressedDepth}
+      CV_CAM4_ALIGNED_DEPTH_CAMERA_INFO_TOPIC: ${CV_CAM4_ALIGNED_DEPTH_CAMERA_INFO_TOPIC:-/synced/cam_4/aligned_depth_to_color/camera_info}
       CV_HANDOVER_TRAY_RGB_TOPIC: ${CV_HANDOVER_TRAY_RGB_TOPIC:-/surgery/images/tray/compressed}
       CV_HANDOVER_TRAY_CAMERA_INFO_TOPIC: ${CV_HANDOVER_TRAY_CAMERA_INFO_TOPIC:-/surgery/cameras/tray/color/camera_info}
       CV_HANDOVER_TRAY_ALIGNED_DEPTH_TOPIC: ${CV_HANDOVER_TRAY_ALIGNED_DEPTH_TOPIC:-/surgery/cameras/tray/aligned_depth}
@@ -538,6 +712,9 @@ services:
       # Camera aliases are demand-driven and forward compressed payloads only
       # while a subscriber is matched, avoiding idle duplicate DDS traffic.
       PUBLISH_CAMERA_ALIASES: ${PUBLISH_CAMERA_ALIASES:-true}
+      # Default is fail-closed. The reviewed Live demo env may opt in to an
+      # idle FLIR preview without opening CAM4 or any control capability.
+      PUBLISH_FLIR_WHILE_IDLE: ${PUBLISH_FLIR_WHILE_IDLE:-false}
     depends_on:
       vllm-manager:
         condition: service_healthy
@@ -545,6 +722,8 @@ services:
         condition: service_healthy
       webapp:
         condition: service_started
+    # Keep optional perception routes out of argv when unset; an empty
+    # `perception_endpoint:=` makes ros2 launch fail before runtime readiness.
     command: >
       bash -lc "if [ ! -f install/setup.bash ] || [ ! -e install/bringup/share/bringup/launch/taskplanner_live.launch.py ]; then
         echo 'Taskplanner install/setup.bash is missing; rerun launcher with --build' >&2;
@@ -552,15 +731,16 @@ services:
       fi &&
       source install/setup.bash &&
       if [ '${INPUT_PROFILE:-simulation}' = 'external' ]; then
-        exec ros2 launch bringup taskplanner_live.launch.py default_bundle:=$${TASKPLANNER_DEFAULT_BUNDLE:-thyroidectomy} publish_shared_state:=$${PUBLISH_SHARED_STATE:-true} publish_shared_free_text:=$${PUBLISH_SHARED_FREE_TEXT:-false} publish_camera_aliases:=$${PUBLISH_CAMERA_ALIASES:-true} perception_backend:=$${PERCEPTION_BACKEND:-local};
+        exec ros2 launch bringup taskplanner_live.launch.py default_bundle:=$${TASKPLANNER_DEFAULT_BUNDLE:-thyroidectomy} publish_shared_state:=$${PUBLISH_SHARED_STATE:-true} publish_shared_free_text:=$${PUBLISH_SHARED_FREE_TEXT:-false} publish_camera_aliases:=$${PUBLISH_CAMERA_ALIASES:-true} publish_flir_while_idle:=$${PUBLISH_FLIR_WHILE_IDLE:-false} perception_backend:=$${PERCEPTION_BACKEND:-local} $${PERCEPTION_PROVIDER:+perception_provider:=$${PERCEPTION_PROVIDER}} $${PERCEPTION_LOCATION:+perception_location:=$${PERCEPTION_LOCATION}} $${PERCEPTION_ENDPOINT:+perception_endpoint:=$${PERCEPTION_ENDPOINT}} rfdetr_service_url:=$${RFDETR_SERVICE_URL:-http://127.0.0.1:8010} $${PNU_SERVICE_URL:+pnu_service_url:=$${PNU_SERVICE_URL}};
       else
-        exec ros2 launch bringup taskplanner_mock.launch.py default_bundle:=$${TASKPLANNER_DEFAULT_BUNDLE:-thyroidectomy} publish_shared_free_text:=$${PUBLISH_SHARED_FREE_TEXT:-false} enable_rosbridge:=true rosbridge_port:=${ROSBRIDGE_PORT:-9090} rosbridge_address:=${ROSBRIDGE_ADDRESS:-127.0.0.1} input_profile:=${INPUT_PROFILE:-simulation} execution_backend:=${EXECUTION_BACKEND:-mock} speech_input_mode:=${SPEECH_INPUT_MODE:-utterance} sentence_input_topic:=${SENTENCE_INPUT_TOPIC:-/sensors/surgeon/sentence} speech_min_confidence:=${SPEECH_MIN_CONFIDENCE:-0.55} speech_max_age_sec:=${SPEECH_MAX_AGE_SEC:-3.0} speech_source_timeout_sec:=${SPEECH_SOURCE_TIMEOUT_SEC:-5.0} vlm_mode:=${VLM_MODE:-real} vlm_base_url:=${VLM_BASE_URL:-http://127.0.0.1:8001} vlm_provider_id:=${VLM_PROVIDER_ID:-vllm} vlm_model_id:=${VLM_MODEL_ID:-unsloth/gemma-4-E4B-it-NVFP4} vlm_api_mode:=${VLM_API_MODE:-openai_compat} vlm_publish_period_sec:=${VLM_PUBLISH_PERIOD_SEC:-1.0} vlm_image_stale_sec:=${VLM_IMAGE_STALE_SEC:-3.0} vlm_max_output_tokens:=${VLM_MAX_OUTPUT_TOKENS:-320} vlm_generation_seed:=${VLM_GENERATION_SEED:-0} vlm_response_format:=${VLM_RESPONSE_FORMAT:-json_schema} vlm_reasoning_effort:=${VLM_REASONING_EFFORT:-none} vlm_context_mode:=${VLM_CONTEXT_MODE:-actor_log} surgeon_actor_mode:=${SURGEON_ACTOR_MODE:-llm} actor_base_url:=${ACTOR_BASE_URL:-http://127.0.0.1:1234} actor_provider_id:=${ACTOR_PROVIDER_ID:-auto} actor_model_id:=${ACTOR_MODEL_ID:-google/gemma-4-12b-qat} actor_response_format:=${ACTOR_RESPONSE_FORMAT:-json_schema} actor_reasoning_effort:=${ACTOR_REASONING_EFFORT:-none} enable_rfdetr_perception:=${ENABLE_RFDETR_PERCEPTION:-true} perception_backend:=${PERCEPTION_BACKEND:-local} rfdetr_service_url:=${RFDETR_SERVICE_URL:-http://127.0.0.1:8010} flir_input_topic:=${FLIR_INPUT_TOPIC:-/synced/flir/color/image_raw/compressed} cam4_input_topic:=${CAM4_INPUT_TOPIC:-/synced/cam_4/color/image_raw/compressed} field_image_topic:=${SEGMENTED_FLIR_TOPIC:-/surgery/images/field/compressed} cam4_semantics_topic:=${CAM4_SEMANTICS_TOPIC:-/surgery/perception/cam4/semantics/json} cv_contract_status_topic:=${CV_CONTRACT_STATUS_TOPIC:-/integration/cv_contract/status} cv_cam4_rgb_topic:=${CV_CAM4_RGB_TOPIC:-/synced/cam_4/color/image_raw/compressed} cv_cam4_rgb_alias_topic:=${CV_CAM4_RGB_ALIAS_TOPIC:-/surgery/images/cam4/compressed} cv_cam4_camera_info_topic:=${CV_CAM4_CAMERA_INFO_TOPIC:-/synced/cam_4/color/camera_info} cv_cam4_aligned_depth_topic:=${CV_CAM4_ALIGNED_DEPTH_TOPIC:-/synced/cam_4/depth/image_rect_raw} cv_handover_tray_rgb_topic:=${CV_HANDOVER_TRAY_RGB_TOPIC:-/surgery/images/tray/compressed} cv_handover_tray_camera_info_topic:=${CV_HANDOVER_TRAY_CAMERA_INFO_TOPIC:-/surgery/cameras/tray/color/camera_info} cv_handover_tray_aligned_depth_topic:=${CV_HANDOVER_TRAY_ALIGNED_DEPTH_TOPIC:-/surgery/cameras/tray/aligned_depth} enable_no_image_camera:=${ENABLE_NO_IMAGE_CAMERA:-true} enable_synthetic_scene_camera:=${ENABLE_SYNTHETIC_SCENE_CAMERA:-false} $${FIELD_SNAPSHOT_URL:+field_snapshot_url:=$${FIELD_SNAPSHOT_URL}};
+        exec ros2 launch bringup taskplanner_mock.launch.py default_bundle:=$${TASKPLANNER_DEFAULT_BUNDLE:-thyroidectomy} publish_shared_free_text:=$${PUBLISH_SHARED_FREE_TEXT:-false} enable_rosbridge:=true rosbridge_port:=${ROSBRIDGE_PORT:-9090} rosbridge_address:=${ROSBRIDGE_ADDRESS:-127.0.0.1} input_profile:=${INPUT_PROFILE:-simulation} execution_backend:=${EXECUTION_BACKEND:-mock} speech_input_mode:=${SPEECH_INPUT_MODE:-utterance} sentence_input_topic:=${SENTENCE_INPUT_TOPIC:-/sensors/surgeon/sentence} speech_min_confidence:=${SPEECH_MIN_CONFIDENCE:-0.55} speech_max_age_sec:=${SPEECH_MAX_AGE_SEC:-3.0} speech_source_timeout_sec:=${SPEECH_SOURCE_TIMEOUT_SEC:-5.0} vlm_mode:=${VLM_MODE:-real} vlm_base_url:=${VLM_BASE_URL:-http://127.0.0.1:8001} vlm_provider_id:=${VLM_PROVIDER_ID:-vllm} vlm_model_id:=${VLM_MODEL_ID:-unsloth/gemma-4-E4B-it-NVFP4} vlm_api_mode:=${VLM_API_MODE:-openai_compat} vlm_publish_period_sec:=${VLM_PUBLISH_PERIOD_SEC:-1.0} vlm_image_stale_sec:=${VLM_IMAGE_STALE_SEC:-3.0} vlm_max_output_tokens:=${VLM_MAX_OUTPUT_TOKENS:-320} vlm_generation_seed:=${VLM_GENERATION_SEED:-0} vlm_response_format:=${VLM_RESPONSE_FORMAT:-json_schema} vlm_reasoning_effort:=${VLM_REASONING_EFFORT:-none} vlm_context_mode:=${VLM_CONTEXT_MODE:-actor_log} surgeon_actor_mode:=${SURGEON_ACTOR_MODE:-llm} actor_base_url:=${ACTOR_BASE_URL:-http://127.0.0.1:1234} actor_provider_id:=${ACTOR_PROVIDER_ID:-auto} actor_model_id:=${ACTOR_MODEL_ID:-google/gemma-4-12b-qat} actor_response_format:=${ACTOR_RESPONSE_FORMAT:-json_schema} actor_reasoning_effort:=${ACTOR_REASONING_EFFORT:-none} enable_rfdetr_perception:=${ENABLE_RFDETR_PERCEPTION:-true} perception_backend:=${PERCEPTION_BACKEND:-local} $${PERCEPTION_PROVIDER:+perception_provider:=$${PERCEPTION_PROVIDER}} $${PERCEPTION_LOCATION:+perception_location:=$${PERCEPTION_LOCATION}} $${PERCEPTION_ENDPOINT:+perception_endpoint:=$${PERCEPTION_ENDPOINT}} rfdetr_service_url:=${RFDETR_SERVICE_URL:-http://127.0.0.1:8010} $${PNU_SERVICE_URL:+pnu_service_url:=$${PNU_SERVICE_URL}} flir_input_topic:=${FLIR_INPUT_TOPIC:-/synced/flir/color/image_raw/compressed} cam4_input_topic:=${CAM4_INPUT_TOPIC:-/synced/cam_4/color/image_raw/compressed} field_image_topic:=${SEGMENTED_FLIR_TOPIC:-/surgery/images/field/compressed} cam4_semantics_topic:=${CAM4_SEMANTICS_TOPIC:-/surgery/perception/cam4/semantics/json} cv_contract_status_topic:=${CV_CONTRACT_STATUS_TOPIC:-/integration/cv_contract/status} cv_cam4_rgb_topic:=${CV_CAM4_RGB_TOPIC:-/synced/cam_4/color/image_raw/compressed} cv_cam4_rgb_alias_topic:=${CV_CAM4_RGB_ALIAS_TOPIC:-/surgery/images/cam4/compressed} cv_cam4_camera_info_topic:=${CV_CAM4_CAMERA_INFO_TOPIC:-/synced/cam_4/color/camera_info} cv_cam4_native_depth_compressed_topic:=${CV_CAM4_NATIVE_DEPTH_COMPRESSED_TOPIC:-/synced/cam_4/depth/image_rect_raw/compressedDepth} cv_cam4_depth_camera_info_topic:=${CV_CAM4_DEPTH_CAMERA_INFO_TOPIC:-/synced/cam_4/depth/camera_info} cv_cam4_depth_to_color_extrinsics_topic:=${CV_CAM4_DEPTH_TO_COLOR_EXTRINSICS_TOPIC:-/synced/cam_4/extrinsics/depth_to_color} cv_cam4_aligned_depth_compressed_topic:=${CV_CAM4_ALIGNED_DEPTH_COMPRESSED_TOPIC:-/synced/cam_4/aligned_depth_to_color/image_raw/compressedDepth} cv_cam4_aligned_depth_camera_info_topic:=${CV_CAM4_ALIGNED_DEPTH_CAMERA_INFO_TOPIC:-/synced/cam_4/aligned_depth_to_color/camera_info} cv_handover_tray_rgb_topic:=${CV_HANDOVER_TRAY_RGB_TOPIC:-/surgery/images/tray/compressed} cv_handover_tray_camera_info_topic:=${CV_HANDOVER_TRAY_CAMERA_INFO_TOPIC:-/surgery/cameras/tray/color/camera_info} cv_handover_tray_aligned_depth_topic:=${CV_HANDOVER_TRAY_ALIGNED_DEPTH_TOPIC:-/surgery/cameras/tray/aligned_depth} enable_no_image_camera:=${ENABLE_NO_IMAGE_CAMERA:-true} enable_synthetic_scene_camera:=${ENABLE_SYNTHETIC_SCENE_CAMERA:-false} $${FIELD_SNAPSHOT_URL:+field_snapshot_url:=$${FIELD_SNAPSHOT_URL}};
       fi"
 
   public-rosbridge:
     profiles:
       - live
       - llm-surgeon
+      - replay
     image: taskplanner-ws:dev
     restart: unless-stopped
     stop_signal: SIGINT
@@ -582,10 +762,14 @@ services:
     volumes:
       - .:/workspaces/taskplanner_ws:ro
     environment:
-      ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}
-      ROS_AUTOMATIC_DISCOVERY_RANGE: ${ROS_AUTOMATIC_DISCOVERY_RANGE:-LOCALHOST}
+      # Replay deliberately runs in an isolated DDS domain. The mode env maps
+      # this sidecar onto that same domain without widening native DDS discovery.
+      ROS_DOMAIN_ID: ${PUBLIC_ROS_DOMAIN_ID:-${ROS_DOMAIN_ID:-0}}
+      ROS_AUTOMATIC_DISCOVERY_RANGE: ${PUBLIC_ROS_AUTOMATIC_DISCOVERY_RANGE:-${ROS_AUTOMATIC_DISCOVERY_RANGE:-LOCALHOST}}
       RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}
-      CYCLONEDDS_URI: ${CYCLONEDDS_URI:-}
+      # The non-colon fallback preserves an explicitly empty replay value so a
+      # host LAN Cyclone profile cannot leak into the isolated shadow graph.
+      CYCLONEDDS_URI: ${PUBLIC_CYCLONEDDS_URI-${TASKPLANNER_CONTAINER_CYCLONEDDS_URI-${CYCLONEDDS_URI:-}}}
       ROS_LOG_DIR: /tmp/ros-logs
       PUBLIC_ROSBRIDGE_ALLOWED_ORIGINS: ${PUBLIC_ROSBRIDGE_ALLOWED_ORIGINS:-}
       PUBLIC_ROSBRIDGE_PORT: ${PUBLIC_ROSBRIDGE_PORT:-9092}
@@ -705,6 +889,7 @@ services:
       - ${TASKPLANNER_RUN_ROOT:-${HOME}/.local/share/taskplanner/runs}:/taskplanner-runs
       - ${TASKPLANNER_SURGERY_RECORD_SOURCE_DIR:-../taskplanner_ws/reports/surgery_records/0704_6_17_clinical_prompt_v1}:/surgery-record-inputs:ro
       - ${PUZZLE_SURGERY_RECORD_API_KEY_FILE:-${HOME}/.config/taskplanner/secrets/puzzle-surgery-record-api-key}:/run/taskplanner-secrets/puzzle-surgery-record-api-key:ro
+      - ${PNU_SECRET_ROOT:-${HOME}/.config/taskplanner/perception}:/run/taskplanner/perception:ro
       # Follow Ubuntu's PipeWire-selected logical input instead of exposing
       # stale/raw ALSA endpoints captured when the container was created.
       - ${TASKPLANNER_PIPEWIRE_SOCKET:-/run/user/1000/pipewire-0}:/run/taskplanner-pipewire/pipewire-0
@@ -713,7 +898,7 @@ services:
       ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}
       ROS_AUTOMATIC_DISCOVERY_RANGE: ${ROS_AUTOMATIC_DISCOVERY_RANGE:-SUBNET}
       RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}
-      CYCLONEDDS_URI: ${CYCLONEDDS_URI:-}
+      CYCLONEDDS_URI: ${TASKPLANNER_CONTAINER_CYCLONEDDS_URI-${CYCLONEDDS_URI:-}}
       # Keep Debug behind the loopback path router. 9091 remains the external
       # endpoint while this sidecar owns its isolated upstream socket.
       ROSBRIDGE_DEBUG_PORT: ${ROSBRIDGE_DEBUG_UPSTREAM_PORT:-9093}
@@ -728,6 +913,7 @@ services:
       # they cannot escape the planner's fail-closed node detection domain.
       TASKPLANNER_DEBUG_LOCK_TO_RUNTIME_NETWORK: ${TASKPLANNER_DEBUG_LOCK_TO_RUNTIME_NETWORK:-false}
       TASKPLANNER_DEBUG_ALLOW_PLANNER_COEXISTENCE: ${TASKPLANNER_DEBUG_ALLOW_PLANNER_COEXISTENCE:-false}
+      TASKPLANNER_DEBUG_ROBOT_ENDPOINT_SOURCE: ${TASKPLANNER_DEBUG_ROBOT_ENDPOINT_SOURCE:-virtual}
       # Live/LLM select a separate bridge executable whose allowlist omits all
       # world-anchor mutation services. Standalone Debug keeps the explicit
       # operator policy.
@@ -738,8 +924,37 @@ services:
       RETRACTOR_VOICE_VLM_MODEL_ID: ${RETRACTOR_VOICE_VLM_MODEL_ID:-qwen3.6-35b-a3b}
       RETRACTOR_VOICE_VLM_API_KEY: ${RETRACTOR_VOICE_VLM_API_KEY:-${VLM_API_KEY:-}}
       RETRACTOR_VOICE_VLM_TIMEOUT_SEC: ${RETRACTOR_VOICE_VLM_TIMEOUT_SEC:-2.0}
+      # Standalone Debug may own one read-only PNU ROS adapter without starting
+      # any planner or motion node. Operational sidecars leave this disabled.
+      ENABLE_PNU_DEBUG_PERCEPTION: ${ENABLE_PNU_DEBUG_PERCEPTION:-false}
+      PERCEPTION_PROVIDER: ${PERCEPTION_PROVIDER:-disabled}
+      PERCEPTION_LOCATION: ${PERCEPTION_LOCATION:-local}
+      PERCEPTION_ENDPOINT: ${PERCEPTION_ENDPOINT:-}
+      PNU_SERVICE_URL: ${PNU_SERVICE_URL:-}
+      PNU_CLIENT_API_TOKEN_FILE: ${PNU_CLIENT_API_TOKEN_FILE:-}
+      PNU_ALLOW_INSECURE_REMOTE_HTTP: ${PNU_ALLOW_INSECURE_REMOTE_HTTP:-false}
+      PNU_ALLOW_UNAUTHENTICATED_REMOTE: ${PNU_ALLOW_UNAUTHENTICATED_REMOTE:-false}
+      PNU_DEBUG_REQUESTED_ALGORITHMS: ${PNU_DEBUG_REQUESTED_ALGORITHMS:-tool,blood,hand}
+      PNU_EXPECTED_MODEL_DIGESTS_JSON: ${PNU_EXPECTED_MODEL_DIGESTS_JSON:-{}}
+      PNU_EXPECTED_TOOL_SUPPORT_PLANE_CONFIG_VERSION: ${PNU_EXPECTED_TOOL_SUPPORT_PLANE_CONFIG_VERSION:-}
+      PNU_TOOL_SUPPORT_PLANE_NORMAL: ${PNU_TOOL_SUPPORT_PLANE_NORMAL:-}
+      PNU_DEPTH_SCALE_M_PER_UNIT: ${PNU_DEPTH_SCALE_M_PER_UNIT:-0.0}
+      PNU_DEPTH_SCALE_VALIDATED: ${PNU_DEPTH_SCALE_VALIDATED:-false}
+      PNU_DEPTH_ALIGNMENT_VALIDATED: ${PNU_DEPTH_ALIGNMENT_VALIDATED:-false}
+      PNU_DEPTH_ALIGNMENT_ID: ${PNU_DEPTH_ALIGNMENT_ID:-}
+      PNU_DEBUG_MAX_RATE_HZ: ${PNU_DEBUG_MAX_RATE_HZ:-5.0}
+      CV_CAM4_RGB_TOPIC: ${CV_CAM4_RGB_TOPIC:-/synced/cam_4/color/image_raw/compressed}
+      CV_CAM4_CAMERA_INFO_TOPIC: ${CV_CAM4_CAMERA_INFO_TOPIC:-/synced/cam_4/color/camera_info}
+      CV_CAM4_ALIGNED_DEPTH_COMPRESSED_TOPIC: ${CV_CAM4_ALIGNED_DEPTH_COMPRESSED_TOPIC:-/synced/cam_4/aligned_depth_to_color/image_raw/compressedDepth}
+      CV_CAM4_ALIGNED_DEPTH_CAMERA_INFO_TOPIC: ${CV_CAM4_ALIGNED_DEPTH_CAMERA_INFO_TOPIC:-/synced/cam_4/aligned_depth_to_color/camera_info}
+      CAM4_OVERLAY_TOPIC: ${CAM4_OVERLAY_TOPIC:-/surgery/images/cam4/detection_overlay/compressed}
+      CAM4_POSE_OVERLAY_TOPIC: ${CAM4_POSE_OVERLAY_TOPIC:-/surgery/images/cam4/pose_overlay/compressed}
       TASKPLANNER_SURGERY_RECORD_INPUT_DIR: /surgery-record-inputs
+      # Standalone Debug may select only these same reviewed ASR routes.
+      # The browser sends an endpoint identifier, never a free-form URL.
+      PUZZLE_ASR_ENDPOINT: ${PUZZLE_ASR_ENDPOINT:-cloud}
       PUZZLE_ASR_URL: ${PUZZLE_ASR_URL:-wss://arpa.worker-02.puzzle-ai.com}
+      PUZZLE_ASR_LAN_URL: ${PUZZLE_ASR_LAN_URL:-ws://192.168.1.5:1196/}
       TASKPLANNER_ASR_CAPTURE_LOCK: ${TASKPLANNER_ASR_CAPTURE_LOCK:-/taskplanner-runs/asr/microphone.lock}
       PUZZLE_SURGERY_RECORD_ENDPOINT: ${PUZZLE_SURGERY_RECORD_ENDPOINT:-https://dev.puzzle-ai.com:6627/api/v1/surgery/img_texts}
       PUZZLE_SURGERY_RECORD_API_KEY_FILE: /run/taskplanner-secrets/puzzle-surgery-record-api-key
@@ -758,9 +973,44 @@ services:
       rosbridge_executable:=$${TASKPLANNER_DEBUG_ROSBRIDGE_EXECUTABLE}
       run_root:=$${TASKPLANNER_RUN_ROOT}"
 
+  webapp-lan-proxy:
+    # This service has no profile on purpose: starting `webapp` directly must
+    # also expose the dashboard on the reviewed wired-LAN address. Keeping the
+    # proxy separate from Debug/Replay prevents mode transitions from dropping
+    # existing LAN browser sessions while Vite remains loopback-only.
+    image: taskplanner-ws:dev
+    restart: unless-stopped
+    user: "${TASKPLANNER_UID:-1000}:${TASKPLANNER_GID:-1000}"
+    working_dir: /workspaces/taskplanner_ws
+    network_mode: host
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+    volumes:
+      - .:/workspaces/taskplanner_ws:ro
+    command:
+      - python3
+      - scripts/taskplanner_debug_lan_proxy.py
+      - --bind-address
+      - ${TASKPLANNER_WEBAPP_LAN_ADDRESS:-192.168.1.4}
+      - --allow-network
+      - ${TASKPLANNER_WEBAPP_LAN_NETWORK:-192.168.1.0/24}
+      - --route
+      - ${WEBAPP_PORT:-4173}=127.0.0.1:${WEBAPP_PORT:-4173}
+
   integration-debug-lan-proxy:
     profiles:
+      # This is the LAN path router for the shared browser surface. It is
+      # independent from the integration-debug runtime, so LLM Surgeon keeps
+      # the router even though it does not start the Debug observer.
+      - live
+      - llm-surgeon
       - debug
+      - replay
     image: taskplanner-ws:dev
     restart: unless-stopped
     user: "${TASKPLANNER_UID:-1000}:${TASKPLANNER_GID:-1000}"
@@ -781,9 +1031,32 @@ services:
       - --interface
       - ${TASKPLANNER_DEBUG_NETWORK_INTERFACE:-enp13s0}
       - --route
-      - ${WEBAPP_PORT:-4173}=127.0.0.1:${WEBAPP_PORT:-4173}
-      - --route
       - ${ROSBRIDGE_DEBUG_PORT:-9091}=127.0.0.1:${ROSBRIDGE_DEBUG_PORT:-9091}
+
+  public-rosbridge-lan-proxy:
+    profiles:
+      - live
+      - llm-surgeon
+      - replay
+    image: taskplanner-ws:dev
+    restart: unless-stopped
+    user: "${TASKPLANNER_UID:-1000}:${TASKPLANNER_GID:-1000}"
+    working_dir: /workspaces/taskplanner_ws
+    network_mode: host
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+    volumes:
+      - .:/workspaces/taskplanner_ws:ro
+    command:
+      - python3
+      - scripts/taskplanner_debug_lan_proxy.py
+      - --interface
+      - ${TASKPLANNER_DEBUG_NETWORK_INTERFACE:-enp13s0}
       - --route
       - ${PUBLIC_ROSBRIDGE_PORT:-9092}=127.0.0.1:${PUBLIC_ROSBRIDGE_PORT:-9092}
 
@@ -845,12 +1118,17 @@ services:
         TASKPLANNER_BUILD_SHA: ${TASKPLANNER_BUILD_SHA:-unknown}
         TASKPLANNER_SHADOW_CONTRACT_VERSION: ${TASKPLANNER_SHADOW_CONTRACT_VERSION:-shadow-rfdetr-preflight-v1}
     image: taskplanner-ws:dev
-    restart: "no"
+    # The dashboard is the reviewed mode-transition surface. Keep it available
+    # when Vite exits, while explicit `docker compose stop` still stays stopped.
+    restart: unless-stopped
     working_dir: /workspaces/taskplanner_ws/webapp
     # The Vite server stays loopback-only on the host. Host networking lets its
     # server-side proxy reach the loopback-only runtime-control service without
     # opening that control service on a Docker or Tailnet interface.
     network_mode: host
+    depends_on:
+      webapp-lan-proxy:
+        condition: service_started
     volumes:
       - .:/workspaces/taskplanner_ws
       - taskplanner_web_node_modules:/workspaces/taskplanner_ws/webapp/node_modules
@@ -862,7 +1140,9 @@ services:
       VITE_ROSBRIDGE_PORT: ${ROSBRIDGE_PORT:-9090}
       # Runtime status is authoritative. Keep this fallback mode-independent so
       # switching ROS profiles does not restart the dashboard that requested it.
-      VITE_DEFAULT_RUNTIME_MODE: ${TASKPLANNER_WEBAPP_FALLBACK_MODE:-llm}
+      # A browser with no authoritative status begins on the real external
+      # integration surface, not the synthetic LLM demonstration.
+      VITE_DEFAULT_RUNTIME_MODE: ${TASKPLANNER_WEBAPP_FALLBACK_MODE:-live}
       VITE_ROSBRIDGE_LIVE_URL: ${VITE_ROSBRIDGE_LIVE_URL:-}
       VITE_ROSBRIDGE_LIVE_PORT: ${ROSBRIDGE_LIVE_PORT:-9090}
       VITE_ROSBRIDGE_LIVE_TAILSCALE_PORT: ${VITE_ROSBRIDGE_LIVE_TAILSCALE_PORT:-9091}
@@ -876,12 +1156,35 @@ services:
       VITE_ROSBRIDGE_SHADOW_PORT: ${ROSBRIDGE_SHADOW_PORT:-9099}
       VITE_ROSBRIDGE_DEBUG_URL: ${VITE_ROSBRIDGE_DEBUG_URL:-}
       VITE_ROSBRIDGE_DEBUG_PORT: ${ROSBRIDGE_DEBUG_PORT:-9091}
-      VITE_EXTERNAL_CAM1_TOPIC: ${VITE_EXTERNAL_CAM1_TOPIC:-/synced/cam_1/color/image_raw/compressed}
-      VITE_EXTERNAL_CAM2_TOPIC: ${VITE_EXTERNAL_CAM2_TOPIC:-/synced/cam_2/color/image_raw/compressed}
-      VITE_EXTERNAL_CAM3_TOPIC: ${VITE_EXTERNAL_CAM3_TOPIC:-/synced/cam_3/color/image_raw/compressed}
-      VITE_EXTERNAL_CAM4_TOPIC: ${VITE_EXTERNAL_CAM4_TOPIC:-/synced/cam_4/color/image_raw/compressed}
-      VITE_EXTERNAL_FLIR_TOPIC: ${VITE_EXTERNAL_FLIR_TOPIC:-/synced/flir/color/image_raw/compressed}
+      VITE_EXTERNAL_CAM1_TOPIC: ${VITE_EXTERNAL_CAM1_TOPIC:-/preview/cam_1/color/image_raw/compressed}
+      VITE_EXTERNAL_CAM2_TOPIC: ${VITE_EXTERNAL_CAM2_TOPIC:-/preview/cam_2/color/image_raw/compressed}
+      VITE_EXTERNAL_CAM3_TOPIC: ${VITE_EXTERNAL_CAM3_TOPIC:-/preview/cam_3/color/image_raw/compressed}
+      VITE_EXTERNAL_CAM4_TOPIC: ${VITE_EXTERNAL_CAM4_TOPIC:-/preview/cam_4/color/image_raw/compressed}
+      VITE_EXTERNAL_FLIR_TOPIC: ${VITE_EXTERNAL_FLIR_TOPIC:-/preview/flir/color/image_raw/compressed}
       WEBAPP_INSTALL_ON_START: ${WEBAPP_INSTALL_ON_START:-false}
+    healthcheck:
+      # Verify the fixed port, critical Vite transforms, and authenticated
+      # host-control proxy. This is read-only and never invokes a transition.
+      test:
+        - CMD
+        - python3
+        - -c
+        - >-
+          import json,urllib.request;
+          ui=[urllib.request.urlopen('http://127.0.0.1:4173'+path,timeout=2) for path in ('/','/src/App.tsx','/src/hooks/useRosBridge.ts')];
+          ui_bodies=[response.read(524289) for response in ui];
+          runtime=urllib.request.urlopen('http://127.0.0.1:4173/api/runtime/status',timeout=2);
+          runtime_body=runtime.read(131073);
+          state=json.loads(runtime_body.decode('utf-8'));
+          modes={'live','llm-surgeon','replay','debug'};
+          valid_ui=all(response.status == 200 for response in ui) and [response.headers.get_content_type() for response in ui] == ['text/html','text/javascript','text/javascript'] and all(0 < len(body) <= 524288 for body in ui_bodies) and b'id="root"' in ui_bodies[0];
+          valid_state=runtime.status == 200 and runtime.headers.get_content_type() == 'application/json' and 0 < len(runtime_body) <= 131072 and isinstance(state,dict) and {'phase','active_mode','requested_mode','retryable'} <= state.keys() and state.get('phase') in {'idle','starting','failed'} and (state.get('active_mode') is None or state.get('active_mode') in modes) and (state.get('requested_mode') is None or state.get('requested_mode') in modes) and type(state.get('retryable')) is bool and (state.get('message') is None or isinstance(state.get('message'),str) and len(state.get('message')) <= 4096);
+          raise SystemExit(0 if valid_ui and valid_state else 1)
+      interval: 5s
+      start_interval: 1s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
     command: >
       bash -lc "
         if [ \"$${WEBAPP_INSTALL_ON_START:-false}\" = 'true' ]; then

@@ -367,7 +367,7 @@ the Internet. Any broader or untrusted native-DDS deployment requires ROS 2/DDS
 Security governance, permissions, and identity provisioning.
 
 The operator bridge on `127.0.0.1:9090` remains local and is not the partner
-endpoint. Live and LLM demonstration profiles start a dedicated
+endpoint. Live, LLM demonstration, and interactive Replay profiles start a dedicated
 `public-rosbridge` sidecar on loopback `127.0.0.1:9092` (or the deployment's
 `PUBLIC_ROSBRIDGE_PORT`); the existing LAN proxy exposes the same host port only
 on `TASKPLANNER_DEBUG_NETWORK_INTERFACE` and
@@ -376,6 +376,19 @@ browser therefore connects to `ws://<wired-host-ip>:9092`. The sidecar also
 rejects every direct non-loopback TCP peer before WebSocket upgrade. This
 second gate is required on hosts where a VPN/Tailscale rule DNATs a virtual
 address to loopback; only the designated wired proxy may reach the sidecar.
+Replay keeps its ROS graph isolated on the configured shadow Domain while the
+sidecar joins that same Domain; native Replay DDS discovery remains local-only.
+The public WebSocket contract and URL therefore stay unchanged across those
+three modes.
+
+The Taskplanner-owned interactive Replay dashboard is a separate trusted-
+operator surface. During Replay, a browser on the directly connected wired
+subnet may open `http://<wired-host-ip>:4173`; that page resolves its ROS
+connection through `ws://<wired-host-ip>:9091/shadow`. Both listeners are
+interface-bound LAN proxies, while the underlying web server, path router, and
+shadow bridge remain loopback-only. Port 9099 is never exposed directly. This
+operator path can invoke Replay controls and must not be given to a read-only
+partner UI; partner UIs continue to use the 9092 contract above.
 
 Port 9092 registers only the Subscribe capability (`subscribe` and `unsubscribe`
 operations), uses an exact allowlist for the eleven public topics and two camera

@@ -16,6 +16,7 @@ from urllib.parse import urlsplit
 
 SIOCGIFADDR = 0x8915
 SIOCGIFNETMASK = 0x891B
+SERVER_CLOSE_TIMEOUT_SEC = 1.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -259,10 +260,21 @@ async def forward_connection(
 async def close_servers(servers: list[asyncio.AbstractServer]) -> None:
     for server in servers:
         server.close()
-    await asyncio.gather(
-        *(server.wait_closed() for server in servers),
-        return_exceptions=True,
+    if not servers:
+        return
+
+    # Python may keep wait_closed() pending while long-lived WebSocket clients
+    # drain.  Do not let that strand the proxy without listeners after a
+    # transient interface-address change; the accepted connections finish in
+    # their own forward_connection tasks.
+    waiters = [asyncio.create_task(server.wait_closed()) for server in servers]
+    _done, pending = await asyncio.wait(
+        waiters,
+        timeout=SERVER_CLOSE_TIMEOUT_SEC,
     )
+    for waiter in pending:
+        waiter.cancel()
+    await asyncio.gather(*waiters, return_exceptions=True)
 
 
 async def run_proxy(

@@ -25,6 +25,7 @@ class AdapterCall:
     method: str
     args: tuple[Any, ...]
     kwargs: tuple[tuple[str, Any], ...]
+    command_id: str = ""
 
 
 class CallTrace:
@@ -34,6 +35,13 @@ class CallTrace:
         self.clock = clock or FakeClock()
         self._records: list[AdapterCall] = []
         self._lock = threading.Lock()
+        self._context = threading.local()
+
+    def set_command_context(self, command_id: str) -> None:
+        self._context.command_id = str(command_id).strip()
+
+    def clear_command_context(self) -> None:
+        self._context.command_id = ""
 
     def record(
         self,
@@ -50,6 +58,7 @@ class CallTrace:
                 method=str(method),
                 args=tuple(args),
                 kwargs=tuple(sorted(kwargs.items())),
+                command_id=str(getattr(self._context, "command_id", "")),
             )
             self._records.append(call)
             return call
@@ -69,6 +78,12 @@ class CallTrace:
 
     def as_tuples(self) -> tuple[tuple[str, str], ...]:
         return tuple((record.component, record.method) for record in self.records)
+
+    def records_for(self, command_id: str) -> tuple[AdapterCall, ...]:
+        normalized = str(command_id).strip()
+        return tuple(
+            record for record in self.records if record.command_id == normalized
+        )
 
     def clear(self) -> None:
         with self._lock:

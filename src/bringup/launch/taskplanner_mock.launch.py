@@ -18,6 +18,8 @@ from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
 
+from bringup.perception_config import resolve_launch_perception
+
 
 def _bed_robot_contract_configuration(context):
     bundle_id = LaunchConfiguration("default_bundle").perform(context).strip()
@@ -37,19 +39,6 @@ def _bed_robot_contract_configuration(context):
             procedure_type,
         ),
     ]
-
-
-def _validate_perception_backend(context):
-    """Fail before launch if the ownership cut-over mode is misspelled."""
-
-    backend = LaunchConfiguration("perception_backend").perform(context)
-    normalized = str(backend).strip().casefold()
-    if normalized not in {"local", "external", "disabled"}:
-        raise RuntimeError(
-            "perception_backend must be local, external, or disabled; "
-            f"received {backend!r}"
-        )
-    return []
 
 
 def generate_launch_description() -> LaunchDescription:
@@ -87,6 +76,14 @@ def generate_launch_description() -> LaunchDescription:
     retractor_voice_vlm_timeout_sec = LaunchConfiguration(
         "retractor_voice_vlm_timeout_sec"
     )
+    voice_command_selector_mode = LaunchConfiguration("voice_command_selector_mode")
+    voice_command_selector_endpoint = LaunchConfiguration(
+        "voice_command_selector_endpoint"
+    )
+    voice_command_selector_model = LaunchConfiguration("voice_command_selector_model")
+    voice_command_selector_timeout_sec = LaunchConfiguration(
+        "voice_command_selector_timeout_sec"
+    )
     vlm_mode = LaunchConfiguration("vlm_mode")
     vlm_base_url = LaunchConfiguration("vlm_base_url")
     vlm_provider_id = LaunchConfiguration("vlm_provider_id")
@@ -112,7 +109,32 @@ def generate_launch_description() -> LaunchDescription:
     field_snapshot_url = LaunchConfiguration("field_snapshot_url")
     enable_rfdetr_perception = LaunchConfiguration("enable_rfdetr_perception")
     perception_backend = LaunchConfiguration("perception_backend")
-    rfdetr_service_url = LaunchConfiguration("rfdetr_service_url")
+    perception_provider = LaunchConfiguration("perception_provider")
+    perception_location = LaunchConfiguration("perception_location")
+    perception_endpoint = LaunchConfiguration("perception_endpoint")
+    pnu_api_token_file = LaunchConfiguration("pnu_api_token_file")
+    pnu_allow_insecure_remote_http = LaunchConfiguration(
+        "pnu_allow_insecure_remote_http"
+    )
+    pnu_allow_unauthenticated_remote = LaunchConfiguration(
+        "pnu_allow_unauthenticated_remote"
+    )
+    pnu_expected_model_digests_json = LaunchConfiguration(
+        "pnu_expected_model_digests_json"
+    )
+    pnu_expected_tool_support_plane_config_version = LaunchConfiguration(
+        "pnu_expected_tool_support_plane_config_version"
+    )
+    pnu_depth_scale_m_per_unit = LaunchConfiguration(
+        "pnu_depth_scale_m_per_unit"
+    )
+    pnu_depth_scale_validated = LaunchConfiguration(
+        "pnu_depth_scale_validated"
+    )
+    pnu_depth_alignment_validated = LaunchConfiguration(
+        "pnu_depth_alignment_validated"
+    )
+    pnu_depth_alignment_id = LaunchConfiguration("pnu_depth_alignment_id")
     flir_input_topic = LaunchConfiguration("flir_input_topic")
     cam4_input_topic = LaunchConfiguration("cam4_input_topic")
     field_image_topic = LaunchConfiguration("field_image_topic")
@@ -125,11 +147,28 @@ def generate_launch_description() -> LaunchDescription:
     preflight_require_perception = LaunchConfiguration(
         "preflight_require_perception"
     )
+    preflight_require_metric_3d = LaunchConfiguration(
+        "preflight_require_metric_3d"
+    )
     cv_contract_status_topic = LaunchConfiguration("cv_contract_status_topic")
     cv_cam4_rgb_topic = LaunchConfiguration("cv_cam4_rgb_topic")
     cv_cam4_rgb_alias_topic = LaunchConfiguration("cv_cam4_rgb_alias_topic")
     cv_cam4_camera_info_topic = LaunchConfiguration("cv_cam4_camera_info_topic")
-    cv_cam4_aligned_depth_topic = LaunchConfiguration("cv_cam4_aligned_depth_topic")
+    cv_cam4_native_depth_compressed_topic = LaunchConfiguration(
+        "cv_cam4_native_depth_compressed_topic"
+    )
+    cv_cam4_depth_camera_info_topic = LaunchConfiguration(
+        "cv_cam4_depth_camera_info_topic"
+    )
+    cv_cam4_depth_to_color_extrinsics_topic = LaunchConfiguration(
+        "cv_cam4_depth_to_color_extrinsics_topic"
+    )
+    cv_cam4_aligned_depth_compressed_topic = LaunchConfiguration(
+        "cv_cam4_aligned_depth_compressed_topic"
+    )
+    cv_cam4_aligned_depth_camera_info_topic = LaunchConfiguration(
+        "cv_cam4_aligned_depth_camera_info_topic"
+    )
     cv_handover_tray_rgb_topic = LaunchConfiguration("cv_handover_tray_rgb_topic")
     cv_handover_tray_camera_info_topic = LaunchConfiguration(
         "cv_handover_tray_camera_info_topic"
@@ -223,14 +262,17 @@ def generate_launch_description() -> LaunchDescription:
             "'.lower() == 'true')",
         ]
     )
-    local_rfdetr_perception_enabled = PythonExpression(
+    builtin_rfdetr_adapter_enabled = PythonExpression(
         [
             "'",
-            perception_backend,
-            "' == 'local' and '",
+            perception_provider,
+            "' == 'builtin_rfdetr' and '",
             enable_rfdetr_perception,
             "'.lower() in ('true', '1', 'yes')",
         ]
+    )
+    pnu_adapter_enabled = PythonExpression(
+        ["'", perception_provider, "' == 'pnu_hand_blood'"]
     )
     mock_direct_contract_enabled = PythonExpression(
         [
@@ -344,6 +386,20 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument(
                 "retractor_voice_vlm_timeout_sec", default_value="2.0"
             ),
+            DeclareLaunchArgument(
+                "voice_command_selector_mode",
+                default_value="deterministic",
+                choices=("deterministic", "openai_compatible", "openai"),
+                description=(
+                    "Bounded candidate selector for natural-language voice "
+                    "resolution; it never receives execution authority."
+                ),
+            ),
+            DeclareLaunchArgument("voice_command_selector_endpoint", default_value=""),
+            DeclareLaunchArgument("voice_command_selector_model", default_value=""),
+            DeclareLaunchArgument(
+                "voice_command_selector_timeout_sec", default_value="0.35"
+            ),
             DeclareLaunchArgument("vlm_mode", default_value="real"),
             DeclareLaunchArgument("vlm_base_url", default_value="http://127.0.0.1:8001"),
             DeclareLaunchArgument("vlm_provider_id", default_value="vllm"),
@@ -380,8 +436,123 @@ def generate_launch_description() -> LaunchDescription:
                 ),
             ),
             DeclareLaunchArgument(
+                "perception_provider",
+                default_value=EnvironmentVariable(
+                    "PERCEPTION_PROVIDER",
+                    default_value="",
+                ),
+                description=(
+                    "Explicit provider axis: builtin_rfdetr, pnu_hand_blood, or "
+                    "disabled. Empty preserves PERCEPTION_BACKEND compatibility."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "perception_location",
+                default_value=EnvironmentVariable(
+                    "PERCEPTION_LOCATION",
+                    default_value="",
+                ),
+                description=(
+                    "Worker placement: local or remote. It requires an explicit "
+                    "perception_provider; no automatic failover is performed."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "perception_endpoint",
+                default_value=EnvironmentVariable(
+                    "PERCEPTION_ENDPOINT",
+                    default_value="",
+                ),
+                description=(
+                    "Single HTTP(S) worker endpoint. Empty preserves the legacy "
+                    "rfdetr_service_url/RFDETR_SERVICE_URL alias."
+                ),
+            ),
+            DeclareLaunchArgument(
                 "rfdetr_service_url",
-                default_value="http://127.0.0.1:8010",
+                default_value=EnvironmentVariable(
+                    "RFDETR_SERVICE_URL",
+                    default_value="http://127.0.0.1:8010",
+                ),
+            ),
+            DeclareLaunchArgument(
+                "pnu_service_url",
+                default_value=EnvironmentVariable(
+                    "PNU_SERVICE_URL",
+                    default_value="",
+                ),
+                description=(
+                    "Optional PNU Hand/Tool/Blood worker alias. Local PNU "
+                    "selection defaults to http://127.0.0.1:8020; remote "
+                    "selection requires an explicit non-loopback endpoint."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "pnu_api_token_file",
+                default_value=EnvironmentVariable(
+                    "PNU_CLIENT_API_TOKEN_FILE",
+                    default_value="",
+                ),
+            ),
+            DeclareLaunchArgument(
+                "pnu_allow_insecure_remote_http",
+                default_value=EnvironmentVariable(
+                    "PNU_ALLOW_INSECURE_REMOTE_HTTP",
+                    default_value="false",
+                ),
+                description=(
+                    "Development-only opt-in for HTTP to a non-loopback PNU "
+                    "worker. Remote endpoints require HTTPS by default."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "pnu_allow_unauthenticated_remote",
+                default_value=EnvironmentVariable(
+                    "PNU_ALLOW_UNAUTHENTICATED_REMOTE",
+                    default_value="false",
+                ),
+            ),
+            DeclareLaunchArgument(
+                "pnu_expected_model_digests_json",
+                default_value=EnvironmentVariable(
+                    "PNU_EXPECTED_MODEL_DIGESTS_JSON",
+                    default_value="{}",
+                ),
+            ),
+            DeclareLaunchArgument(
+                "pnu_expected_tool_support_plane_config_version",
+                default_value=EnvironmentVariable(
+                    "PNU_EXPECTED_TOOL_SUPPORT_PLANE_CONFIG_VERSION",
+                    default_value="",
+                ),
+            ),
+            DeclareLaunchArgument(
+                "pnu_depth_scale_m_per_unit",
+                default_value=EnvironmentVariable(
+                    "PNU_DEPTH_SCALE_M_PER_UNIT",
+                    default_value="0.0",
+                ),
+            ),
+            DeclareLaunchArgument(
+                "pnu_depth_scale_validated",
+                default_value=EnvironmentVariable(
+                    "PNU_DEPTH_SCALE_VALIDATED",
+                    default_value="false",
+                ),
+            ),
+            DeclareLaunchArgument(
+                "pnu_depth_alignment_validated",
+                default_value=EnvironmentVariable(
+                    "PNU_DEPTH_ALIGNMENT_VALIDATED",
+                    default_value="false",
+                ),
+            ),
+            DeclareLaunchArgument(
+                "pnu_depth_alignment_id",
+                default_value=EnvironmentVariable(
+                    "PNU_DEPTH_ALIGNMENT_ID",
+                    default_value="",
+                ),
             ),
             DeclareLaunchArgument(
                 "flir_input_topic",
@@ -413,6 +584,10 @@ def generate_launch_description() -> LaunchDescription:
                 default_value="false",
             ),
             DeclareLaunchArgument(
+                "preflight_require_metric_3d",
+                default_value="false",
+            ),
+            DeclareLaunchArgument(
                 "cv_contract_status_topic",
                 default_value="/integration/cv_contract/status",
             ),
@@ -429,8 +604,33 @@ def generate_launch_description() -> LaunchDescription:
                 default_value="/synced/cam_4/color/camera_info",
             ),
             DeclareLaunchArgument(
-                "cv_cam4_aligned_depth_topic",
-                default_value="/synced/cam_4/depth/image_rect_raw",
+                "cv_cam4_aligned_depth_compressed_topic",
+                default_value=(
+                    "/synced/cam_4/aligned_depth_to_color/"
+                    "image_raw/compressedDepth"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "cv_cam4_aligned_depth_camera_info_topic",
+                default_value=(
+                    "/synced/cam_4/aligned_depth_to_color/camera_info"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "cv_cam4_native_depth_compressed_topic",
+                default_value=(
+                    "/synced/cam_4/depth/image_rect_raw/compressedDepth"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "cv_cam4_depth_camera_info_topic",
+                default_value="/synced/cam_4/depth/camera_info",
+            ),
+            DeclareLaunchArgument(
+                "cv_cam4_depth_to_color_extrinsics_topic",
+                default_value=(
+                    "/synced/cam_4/extrinsics/depth_to_color"
+                ),
             ),
             DeclareLaunchArgument(
                 "cv_handover_tray_rgb_topic",
@@ -444,7 +644,7 @@ def generate_launch_description() -> LaunchDescription:
                 "cv_handover_tray_aligned_depth_topic",
                 default_value="/surgery/cameras/tray/aligned_depth",
             ),
-            OpaqueFunction(function=_validate_perception_backend),
+            OpaqueFunction(function=resolve_launch_perception),
             Node(
                 package="surgical_interop_gateway",
                 executable="surgical_interop_gateway",
@@ -489,6 +689,31 @@ def generate_launch_description() -> LaunchDescription:
                 ],
                 output="screen",
             ),
+            # The sole normal text-to-command boundary.  It understands
+            # natural Korean paraphrases but publishes proposal-only typed
+            # intents; Digital Twin and BT retain execution authority.
+            Node(
+                package="voice_command",
+                executable="voice_intent_resolver",
+                name="voice_command_resolver",
+                parameters=[
+                    {
+                        "input_topic": "/surgery/audio/request_text",
+                        "output_topic": "/surgery/voice/intent",
+                        # Bind aliases to this exact ProcedureSpec bundle;
+                        # never fall back to a global T-ID vocabulary.
+                        "procedure_bundle": spec_dir,
+                        "selector_mode": voice_command_selector_mode,
+                        "selector_endpoint": voice_command_selector_endpoint,
+                        "selector_model": voice_command_selector_model,
+                        "selector_timeout_sec": ParameterValue(
+                            voice_command_selector_timeout_sec,
+                            value_type=float,
+                        ),
+                    }
+                ],
+                output="screen",
+            ),
             Node(
                 package="simulation_runtime",
                 executable="source_health_monitor",
@@ -528,11 +753,28 @@ def generate_launch_description() -> LaunchDescription:
                 parameters=[
                     {
                         "perception_backend": perception_backend,
+                        "perception_provider": perception_provider,
+                        "perception_location": perception_location,
+                        "perception_endpoint": perception_endpoint,
                         "status_topic": cv_contract_status_topic,
                         "cam4_rgb_topic": cv_cam4_rgb_topic,
                         "cam4_rgb_alias_topic": cv_cam4_rgb_alias_topic,
                         "cam4_camera_info_topic": cv_cam4_camera_info_topic,
-                        "cam4_aligned_depth_topic": cv_cam4_aligned_depth_topic,
+                        "cam4_native_depth_compressed_topic": (
+                            cv_cam4_native_depth_compressed_topic
+                        ),
+                        "cam4_depth_camera_info_topic": (
+                            cv_cam4_depth_camera_info_topic
+                        ),
+                        "cam4_depth_to_color_extrinsics_topic": (
+                            cv_cam4_depth_to_color_extrinsics_topic
+                        ),
+                        "cam4_aligned_depth_compressed_topic": (
+                            cv_cam4_aligned_depth_compressed_topic
+                        ),
+                        "cam4_aligned_depth_camera_info_topic": (
+                            cv_cam4_aligned_depth_camera_info_topic
+                        ),
                         "handover_tray_rgb_topic": cv_handover_tray_rgb_topic,
                         "handover_tray_camera_info_topic": (
                             cv_handover_tray_camera_info_topic
@@ -548,10 +790,10 @@ def generate_launch_description() -> LaunchDescription:
                 package="vlm_node",
                 executable="rfdetr_perception_bridge",
                 name="rfdetr_perception_bridge",
-                condition=IfCondition(local_rfdetr_perception_enabled),
+                condition=IfCondition(builtin_rfdetr_adapter_enabled),
                 parameters=[
                     {
-                        "service_url": rfdetr_service_url,
+                        "service_url": perception_endpoint,
                         "flir_input_topic": flir_input_topic,
                         "cam4_input_topic": cam4_input_topic,
                         "flir_output_topic": field_image_topic,
@@ -559,6 +801,67 @@ def generate_launch_description() -> LaunchDescription:
                         "cam4_semantics_topic": cam4_semantics_topic,
                         "max_rate_hz": 15.0,
                         "segmented_output_rate_hz": 2.0,
+                    }
+                ],
+                output="screen",
+            ),
+            Node(
+                package="vlm_node",
+                executable="pnu_perception_bridge",
+                name="pnu_perception_bridge",
+                condition=IfCondition(pnu_adapter_enabled),
+                parameters=[
+                    {
+                        "service_url": perception_endpoint,
+                        "rgb_input_topic": cv_cam4_rgb_topic,
+                        "color_camera_info_topic": cv_cam4_camera_info_topic,
+                        "depth_input_topic": (
+                            cv_cam4_aligned_depth_compressed_topic
+                        ),
+                        "depth_camera_info_topic": (
+                            cv_cam4_aligned_depth_camera_info_topic
+                        ),
+                        "cam4_overlay_topic": cam4_overlay_image_topic,
+                        "cam4_semantics_topic": cam4_semantics_topic,
+                        "cam4_mayo_observation_topic": (
+                            "/surgery/perception/cam4/mayo_tool_observations"
+                        ),
+                        "diagnostics_topic": (
+                            "/surgery/perception/rfdetr/diagnostics/json"
+                        ),
+                        "health_topic": "/surgery/perception/rfdetr/health",
+                        "expected_model_digests_json": ParameterValue(
+                            pnu_expected_model_digests_json,
+                            value_type=str,
+                        ),
+                        "expected_tool_support_plane_config_version": ParameterValue(
+                            pnu_expected_tool_support_plane_config_version,
+                            value_type=str,
+                        ),
+                        "api_token_file": pnu_api_token_file,
+                        "allow_insecure_remote_http": ParameterValue(
+                            pnu_allow_insecure_remote_http,
+                            value_type=bool,
+                        ),
+                        "allow_unauthenticated_remote": ParameterValue(
+                            pnu_allow_unauthenticated_remote,
+                            value_type=bool,
+                        ),
+                        "depth_scale_m_per_unit": ParameterValue(
+                            pnu_depth_scale_m_per_unit,
+                            value_type=float,
+                        ),
+                        "depth_scale_validated": ParameterValue(
+                            pnu_depth_scale_validated,
+                            value_type=bool,
+                        ),
+                        "depth_alignment_validated": ParameterValue(
+                            pnu_depth_alignment_validated,
+                            value_type=bool,
+                        ),
+                        "depth_alignment_id": pnu_depth_alignment_id,
+                        "requested_algorithms": ["tool", "blood", "hand"],
+                        "max_rate_hz": 15.0,
                     }
                 ],
                 output="screen",
@@ -860,6 +1163,10 @@ def generate_launch_description() -> LaunchDescription:
                         "require_sentence_publisher": True,
                         "require_perception": ParameterValue(
                             preflight_require_perception,
+                            value_type=bool,
+                        ),
+                        "require_metric_3d": ParameterValue(
+                            preflight_require_metric_3d,
                             value_type=bool,
                         ),
                         "perception_backend": perception_backend,

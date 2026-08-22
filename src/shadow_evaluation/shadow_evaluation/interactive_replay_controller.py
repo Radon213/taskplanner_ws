@@ -25,7 +25,7 @@ from rclpy.qos import (
 from rclpy.serialization import deserialize_message
 import rosbag2_py
 from rosgraph_msgs.msg import Clock
-from sensor_msgs.msg import CompressedImage
+from sensor_msgs.msg import CameraInfo, CompressedImage, Image
 from std_msgs.msg import String
 from surgical_interop_msgs.msg import BedRobotArmStateArray
 from surgical_msgs.msg import (
@@ -81,6 +81,26 @@ NORMALIZED_CAMERA_TOPICS = {
     "flir": "/surgery/images/flir/compressed",
 }
 FIELD_IMAGE_COMPATIBILITY_TOPIC = "/surgery/images/field/compressed"
+VIPLAB_CAM4_COLOR_IMAGE_TOPIC = "/synced/cam_4/color/image_raw/compressed"
+VIPLAB_CAM4_COLOR_CAMERA_INFO_TOPIC = "/synced/cam_4/color/camera_info"
+VIPLAB_CAM4_NATIVE_DEPTH_COMPRESSED_TOPIC = (
+    "/synced/cam_4/depth/image_rect_raw/compressedDepth"
+)
+VIPLAB_CAM4_ALIGNED_DEPTH_TOPIC = "/synced/cam_4/depth/image_rect_raw"
+VIPLAB_CAM4_DEPTH_CAMERA_INFO_TOPIC = "/synced/cam_4/depth/camera_info"
+VIPLAB_CAM4_DEPTH_TO_COLOR_EXTRINSICS_TOPIC = (
+    "/synced/cam_4/extrinsics/depth_to_color"
+)
+REALSENSE_EXTRINSICS_MESSAGE_TYPE = (
+    "realsense2_camera_msgs/msg/Extrinsics"
+)
+REPLAY_INPUT_CAPABILITIES_TOPIC = "/shadow/replay/input_capabilities/json"
+REPLAY_INPUT_CAPABILITIES_SCHEMA = "taskplanner.shadow_replay_inputs.v1"
+REPLAY_TYPED_MESSAGE_CLASSES = {
+    "sensor_msgs/msg/CameraInfo": CameraInfo,
+    "sensor_msgs/msg/CompressedImage": CompressedImage,
+    "sensor_msgs/msg/Image": Image,
+}
 NORMALIZED_BBOX_TOPIC = "/surgery/perception/cam4/tools/bboxes/json"
 NORMALIZED_SEGMENTATION_TOPIC = (
     "/surgery/perception/cam4/tools/segmentation/json"
@@ -138,6 +158,16 @@ class ShadowCaseAsset:
     bag_path: Path
     request_events_path: Path
     phase_events_path: Path
+
+
+@dataclass(frozen=True, slots=True)
+class ReplayTypedRoute:
+    """One typed bag input that is conditionally exposed to perception."""
+
+    key: str
+    source_topic: str
+    output_topic: str
+    message_type: str
 
 
 def _versioned_jsonl_key(path: Path) -> tuple[int, str]:
@@ -677,6 +707,7 @@ def public_replay_topic_routes(
     source_bbox_topic: str,
     source_segmentation_topic: str,
     field_image_topic: str = FIELD_IMAGE_COMPATIBILITY_TOPIC,
+    viplab_cam4_image_topic: str = VIPLAB_CAM4_COLOR_IMAGE_TOPIC,
 ) -> tuple[dict[str, tuple[str, ...]], dict[str, str]]:
     """Build the strict public-input routes without evaluation topics."""
 
@@ -684,9 +715,14 @@ def public_replay_topic_routes(
         str(source_cam1_topic): (NORMALIZED_CAMERA_TOPICS["cam1"],),
         str(source_cam2_topic): (NORMALIZED_CAMERA_TOPICS["cam2"],),
         str(source_cam3_topic): (NORMALIZED_CAMERA_TOPICS["cam3"],),
-        str(source_cam4_topic): (
-            NORMALIZED_CAMERA_TOPICS["cam4"],
-            str(field_image_topic),
+        str(source_cam4_topic): tuple(
+            dict.fromkeys(
+                (
+                    NORMALIZED_CAMERA_TOPICS["cam4"],
+                    str(field_image_topic),
+                    str(viplab_cam4_image_topic),
+                )
+            )
         ),
         str(source_flir_topic): (NORMALIZED_CAMERA_TOPICS["flir"],),
     }
@@ -695,6 +731,201 @@ def public_replay_topic_routes(
         str(source_segmentation_topic): NORMALIZED_SEGMENTATION_TOPIC,
     }
     return image_routes, json_routes
+
+
+def public_replay_typed_routes(
+    *,
+    source_cam4_camera_info_topic: str,
+    source_cam4_native_depth_compressed_topic: str,
+    source_cam4_aligned_depth_topic: str,
+    source_cam4_depth_camera_info_topic: str,
+) -> tuple[ReplayTypedRoute, ...]:
+    """Map optional recorded CAM4 geometry streams to the VIPLab contract."""
+
+    candidates = (
+        ReplayTypedRoute(
+            key="cam4_color_camera_info",
+            source_topic=str(source_cam4_camera_info_topic).strip(),
+            output_topic=VIPLAB_CAM4_COLOR_CAMERA_INFO_TOPIC,
+            message_type="sensor_msgs/msg/CameraInfo",
+        ),
+        ReplayTypedRoute(
+            key="cam4_native_depth_compressed",
+            source_topic=str(
+                source_cam4_native_depth_compressed_topic
+            ).strip(),
+            output_topic=VIPLAB_CAM4_NATIVE_DEPTH_COMPRESSED_TOPIC,
+            message_type="sensor_msgs/msg/CompressedImage",
+        ),
+        ReplayTypedRoute(
+            key="cam4_aligned_depth_raw",
+            source_topic=str(source_cam4_aligned_depth_topic).strip(),
+            output_topic=VIPLAB_CAM4_ALIGNED_DEPTH_TOPIC,
+            message_type="sensor_msgs/msg/Image",
+        ),
+        ReplayTypedRoute(
+            key="cam4_depth_camera_info",
+            source_topic=str(source_cam4_depth_camera_info_topic).strip(),
+            output_topic=VIPLAB_CAM4_DEPTH_CAMERA_INFO_TOPIC,
+            message_type="sensor_msgs/msg/CameraInfo",
+        ),
+    )
+    return tuple(route for route in candidates if route.source_topic)
+
+
+def replay_input_capabilities(
+    *,
+    case_id: str,
+    bag_path: str,
+    source_topic_types: dict[str, str],
+    source_message_counts: dict[str, int],
+    source_cam4_image_topic: str,
+    typed_routes: tuple[ReplayTypedRoute, ...],
+    source_cam4_depth_to_color_extrinsics_topic: str = "",
+    alignment_validated: bool = False,
+    depth_to_color_extrinsics_validated: bool = False,
+    depth_to_color_extrinsics_layout_validated: bool = False,
+    depth_units_validated: bool = False,
+    source_error: str = "",
+) -> dict[str, Any]:
+    """Describe recorded perception inputs without inventing absent geometry."""
+
+    routes = (
+        ReplayTypedRoute(
+            key="cam4_rgb",
+            source_topic=str(source_cam4_image_topic).strip(),
+            output_topic=VIPLAB_CAM4_COLOR_IMAGE_TOPIC,
+            message_type="sensor_msgs/msg/CompressedImage",
+        ),
+        *typed_routes,
+    )
+    streams: dict[str, dict[str, Any]] = {}
+    for route in routes:
+        observed_type = str(
+            source_topic_types.get(route.source_topic, "")
+        ).strip()
+        message_count = max(
+            0,
+            int(source_message_counts.get(route.source_topic, 0)),
+        )
+        if source_error:
+            status = "source_error"
+        elif not observed_type:
+            status = "missing"
+        elif observed_type != route.message_type:
+            status = "type_mismatch"
+        elif message_count <= 0:
+            status = "empty"
+        else:
+            status = "available"
+        streams[route.key] = {
+            "available": status == "available",
+            "status": status,
+            "source_topic": route.source_topic,
+            "source_type": observed_type,
+            "message_count": message_count,
+            "output_topic": route.output_topic,
+            "output_type": route.message_type,
+        }
+
+    extrinsics_source_topic = str(
+        source_cam4_depth_to_color_extrinsics_topic
+    ).strip()
+    extrinsics_source_type = str(
+        source_topic_types.get(extrinsics_source_topic, "")
+    ).strip()
+    extrinsics_message_count = max(
+        0,
+        int(source_message_counts.get(extrinsics_source_topic, 0)),
+    )
+    extrinsics_source_present = bool(
+        extrinsics_source_topic
+        and extrinsics_source_type == REALSENSE_EXTRINSICS_MESSAGE_TYPE
+        and extrinsics_message_count > 0
+        and not source_error
+    )
+    if source_error:
+        extrinsics_status = "source_error"
+    elif not extrinsics_source_type:
+        extrinsics_status = "missing"
+    elif extrinsics_source_type != REALSENSE_EXTRINSICS_MESSAGE_TYPE:
+        extrinsics_status = "type_mismatch"
+    elif extrinsics_message_count <= 0:
+        extrinsics_status = "empty"
+    else:
+        extrinsics_status = "present_not_replayed"
+    extrinsics_layout_validated = bool(
+        depth_to_color_extrinsics_layout_validated
+    )
+    extrinsics_transform_validated = bool(
+        depth_to_color_extrinsics_validated
+        and extrinsics_source_present
+        and extrinsics_layout_validated
+    )
+
+    required_3d_keys = (
+        "cam4_rgb",
+        "cam4_color_camera_info",
+        "cam4_aligned_depth_raw",
+        "cam4_depth_camera_info",
+    )
+    required_3d_streams_present = all(
+        streams.get(key, {}).get("available", False)
+        for key in required_3d_keys
+    )
+    geometry_gates = {
+        "color_camera_info_available": streams.get(
+            "cam4_color_camera_info", {}
+        ).get("available", False),
+        "depth_camera_info_available": streams.get(
+            "cam4_depth_camera_info", {}
+        ).get("available", False),
+        # Native compressedDepth uses the depth optical frame on the observed
+        # VIPLab rig. It must never be promoted to aligned raw depth merely by
+        # remapping its topic name.
+        "alignment_validated": bool(alignment_validated),
+        "depth_to_color_extrinsics_source_present": (
+            extrinsics_source_present
+        ),
+        "depth_to_color_extrinsics_layout_validated": (
+            extrinsics_layout_validated
+        ),
+        "depth_to_color_extrinsics_validated": (
+            extrinsics_transform_validated
+        ),
+        "depth_units_validated": bool(depth_units_validated),
+    }
+    return {
+        "schema": REPLAY_INPUT_CAPABILITIES_SCHEMA,
+        "case_id": str(case_id),
+        "bag_path": str(bag_path),
+        "source_error": str(source_error),
+        "streams": streams,
+        # Taskplanner deliberately does not depend on
+        # realsense2_camera_msgs. Preserve exact bag metadata as evidence but
+        # do not advertise or reinterpret an extrinsics message whose observed
+        # producer has a row-major/column-major contract ambiguity.
+        "depth_to_color_extrinsics": {
+            "source_topic": extrinsics_source_topic,
+            "source_type": extrinsics_source_type,
+            "message_count": extrinsics_message_count,
+            "source_present": extrinsics_source_present,
+            "status": extrinsics_status,
+            "output_topic": VIPLAB_CAM4_DEPTH_TO_COLOR_EXTRINSICS_TOPIC,
+            "output_type": REALSENSE_EXTRINSICS_MESSAGE_TYPE,
+            "output_advertised": False,
+            "layout_validated": extrinsics_layout_validated,
+            "transform_validated": extrinsics_transform_validated,
+        },
+        # This is transport presence only. Alignment, units and calibration
+        # remain separate validation gates before any metric pose is valid.
+        "required_3d_streams_present": required_3d_streams_present,
+        "geometry_gates": geometry_gates,
+        "metric_3d_ready": (
+            required_3d_streams_present
+            and all(geometry_gates.values())
+        ),
+    }
 
 
 def advance_replay_elapsed(
@@ -1141,6 +1372,8 @@ class FilteredBagSource:
         self.reader: rosbag2_py.SequentialReader | None = None
         self.start_ns = 0
         self.duration_ns = 0
+        self.topic_types: dict[str, str] = {}
+        self.message_counts: dict[str, int] = {}
         self.next_record: tuple[str, Any, int] | None = None
         self.open()
 
@@ -1170,6 +1403,18 @@ class FilteredBagSource:
         metadata = reader.get_metadata()
         self.start_ns = int(metadata.starting_time.nanoseconds)
         self.duration_ns = int(metadata.duration.nanoseconds)
+        self.topic_types = {
+            str(topic.name): str(topic.type)
+            for topic in reader.get_all_topics_and_types()
+        }
+        self.message_counts = {}
+        for row in getattr(metadata, "topics_with_message_count", ()):
+            topic_metadata = getattr(row, "topic_metadata", None)
+            topic_name = str(getattr(topic_metadata, "name", ""))
+            if topic_name:
+                self.message_counts[topic_name] = int(
+                    getattr(row, "message_count", 0)
+                )
         reader.set_filter(rosbag2_py.StorageFilter(topics=self.topics))
         if seek_sec > 0.0:
             reader.seek(self.start_ns + int(seek_sec * 1_000_000_000.0))
@@ -1227,6 +1472,26 @@ class InteractiveReplayControllerNode(Node):
         )
         self.declare_parameter("source_cam4_topic", "")
         self.declare_parameter(
+            "source_cam4_camera_info_topic",
+            "/surgery/cam4/color/camera_info",
+        )
+        self.declare_parameter(
+            "source_cam4_native_depth_compressed_topic",
+            "/surgery/cam4/depth/image_rect_raw/compressedDepth",
+        )
+        self.declare_parameter(
+            "source_cam4_aligned_depth_topic",
+            "/surgery/cam4/depth/image_rect_raw",
+        )
+        self.declare_parameter(
+            "source_cam4_depth_camera_info_topic",
+            "/surgery/cam4/depth/camera_info",
+        )
+        self.declare_parameter(
+            "source_cam4_depth_to_color_extrinsics_topic",
+            "/surgery/cam4/extrinsics/depth_to_color",
+        )
+        self.declare_parameter(
             "source_cam1_topic",
             "/surgery/cam1/color/image/compressed",
         )
@@ -1283,6 +1548,16 @@ class InteractiveReplayControllerNode(Node):
         self.declare_parameter("ground_truth_events_path", "")
         self.declare_parameter("ground_truth_phase_path", "")
         self.declare_parameter("annotation_cases_root", "")
+        self.declare_parameter("aligned_depth_validated", False)
+        self.declare_parameter(
+            "depth_to_color_extrinsics_validated",
+            False,
+        )
+        self.declare_parameter(
+            "depth_to_color_extrinsics_layout_validated",
+            False,
+        )
+        self.declare_parameter("depth_units_validated", False)
         self.declare_parameter("auto_start", False)
 
         self._lock = threading.RLock()
@@ -1388,6 +1663,48 @@ class InteractiveReplayControllerNode(Node):
             ),
             field_image_topic=self._output_image_topic,
         )
+        self._typed_routes = public_replay_typed_routes(
+            source_cam4_camera_info_topic=str(
+                self.get_parameter("source_cam4_camera_info_topic").value
+            ),
+            source_cam4_native_depth_compressed_topic=str(
+                self.get_parameter(
+                    "source_cam4_native_depth_compressed_topic"
+                ).value
+            ),
+            source_cam4_aligned_depth_topic=str(
+                self.get_parameter("source_cam4_aligned_depth_topic").value
+            ),
+            source_cam4_depth_camera_info_topic=str(
+                self.get_parameter(
+                    "source_cam4_depth_camera_info_topic"
+                ).value
+            ),
+        )
+        self._typed_topic_routes = {
+            route.source_topic: route for route in self._typed_routes
+        }
+        self._aligned_depth_validated = bool(
+            self.get_parameter("aligned_depth_validated").value
+        )
+        self._depth_to_color_extrinsics_validated = bool(
+            self.get_parameter(
+                "depth_to_color_extrinsics_validated"
+            ).value
+        )
+        self._source_cam4_depth_to_color_extrinsics_topic = str(
+            self.get_parameter(
+                "source_cam4_depth_to_color_extrinsics_topic"
+            ).value
+        ).strip()
+        self._depth_to_color_extrinsics_layout_validated = bool(
+            self.get_parameter(
+                "depth_to_color_extrinsics_layout_validated"
+            ).value
+        )
+        self._depth_units_validated = bool(
+            self.get_parameter("depth_units_validated").value
+        )
         self._transcript_topic = str(
             self.get_parameter("transcript_topic").value
         )
@@ -1492,6 +1809,7 @@ class InteractiveReplayControllerNode(Node):
         )
 
         self._source: FilteredBagSource | None = None
+        self._input_capabilities: dict[str, Any] = {}
         self._state = "loading"
         self._run_id = ""
         self._last_error = ""
@@ -1549,16 +1867,29 @@ class InteractiveReplayControllerNode(Node):
             depth=64,
             reliability=ReliabilityPolicy.RELIABLE,
         )
+        camera_info_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=20,
+            reliability=ReliabilityPolicy.RELIABLE,
+        )
+        self._reliable_geometry_qos = camera_info_qos
         self._clock_publisher = self.create_publisher(Clock, "/clock", 10)
         self._image_publishers = {
             output_topic: self.create_publisher(
                 CompressedImage,
                 output_topic,
-                image_qos,
+                (
+                    camera_info_qos
+                    if output_topic == VIPLAB_CAM4_COLOR_IMAGE_TOPIC
+                    else image_qos
+                ),
             )
             for output_topics in self._image_topic_routes.values()
             for output_topic in output_topics
         }
+        # Optional geometry publishers are created only after the bag proves
+        # that the exact source topic and message type are present.
+        self._typed_publishers: dict[str, Any] = {}
         self._json_publishers = {
             source_topic: self.create_publisher(
                 String,
@@ -1585,6 +1916,11 @@ class InteractiveReplayControllerNode(Node):
         self._ground_truth_publisher = self.create_publisher(
             String,
             "/shadow/ground_truth/state",
+            state_qos,
+        )
+        self._input_capabilities_publisher = self.create_publisher(
+            String,
+            REPLAY_INPUT_CAPABILITIES_TOPIC,
             state_qos,
         )
         self.create_subscription(
@@ -1656,12 +1992,91 @@ class InteractiveReplayControllerNode(Node):
         if bool(self.get_parameter("auto_start").value) and self._source:
             self._start(reset=True)
 
+    def _sync_typed_publishers(self) -> None:
+        streams = self._input_capabilities.get("streams", {})
+        active_sources = {
+            route.source_topic
+            for route in self._typed_routes
+            if streams.get(route.key, {}).get("available", False)
+        }
+        for source_topic in tuple(self._typed_publishers):
+            if source_topic not in active_sources:
+                publisher = self._typed_publishers.pop(source_topic)
+                self.destroy_publisher(publisher)
+        for route in self._typed_routes:
+            if (
+                route.source_topic not in active_sources
+                or route.source_topic in self._typed_publishers
+            ):
+                continue
+            qos = (
+                self._reliable_geometry_qos
+                if (
+                    route.message_type == "sensor_msgs/msg/CameraInfo"
+                    or route.key == "cam4_native_depth_compressed"
+                )
+                else qos_profile_sensor_data
+            )
+            self._typed_publishers[route.source_topic] = self.create_publisher(
+                REPLAY_TYPED_MESSAGE_CLASSES[route.message_type],
+                route.output_topic,
+                qos,
+            )
+
+    def _refresh_input_capabilities(self, *, source_error: str = "") -> None:
+        source_topic_types = (
+            self._source.topic_types if self._source is not None else {}
+        )
+        source_message_counts = (
+            self._source.message_counts if self._source is not None else {}
+        )
+        self._input_capabilities = replay_input_capabilities(
+            case_id=self._case_id,
+            bag_path=self._bag_path,
+            source_topic_types=source_topic_types,
+            source_message_counts=source_message_counts,
+            source_cam4_image_topic=self._source_cam4_topic,
+            typed_routes=self._typed_routes,
+            source_cam4_depth_to_color_extrinsics_topic=(
+                self._source_cam4_depth_to_color_extrinsics_topic
+            ),
+            alignment_validated=self._aligned_depth_validated,
+            depth_to_color_extrinsics_validated=(
+                self._depth_to_color_extrinsics_validated
+            ),
+            depth_to_color_extrinsics_layout_validated=(
+                self._depth_to_color_extrinsics_layout_validated
+            ),
+            depth_units_validated=self._depth_units_validated,
+            source_error=source_error,
+        )
+        self._sync_typed_publishers()
+        message = String()
+        message.data = json.dumps(
+            self._input_capabilities,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        self._input_capabilities_publisher.publish(message)
+
+        unavailable = [
+            f"{key}={stream['status']}"
+            for key, stream in self._input_capabilities["streams"].items()
+            if not stream["available"]
+        ]
+        if unavailable and not source_error:
+            self.get_logger().warning(
+                "shadow replay perception inputs unavailable: "
+                + ", ".join(unavailable)
+            )
+
     def _load_source(self, seek_sec: float = 0.0) -> None:
         try:
             self._source = FilteredBagSource(
                 self._bag_path,
                 [
                     *self._image_topic_routes,
+                    *self._typed_topic_routes,
                     *self._json_topic_routes,
                     self._transcript_topic,
                 ],
@@ -1673,6 +2088,7 @@ class InteractiveReplayControllerNode(Node):
             self._effective_playback_rate = 0.0
             self._last_error = ""
             self._force_state_publish = True
+            self._refresh_input_capabilities()
             self.get_logger().info(
                 f"loaded shadow case {self._case_id} "
                 f"({self._source.duration_sec:.3f}s)"
@@ -1682,6 +2098,7 @@ class InteractiveReplayControllerNode(Node):
             self._state = "error"
             self._last_error = str(exc)
             self._force_state_publish = True
+            self._refresh_input_capabilities(source_error=self._last_error)
             self._publish_runtime_control("stop")
             self.get_logger().error(self._last_error)
 
@@ -1879,6 +2296,7 @@ class InteractiveReplayControllerNode(Node):
             "coalesced_stateful_count": (
                 self._coalesced_stateful_count
             ),
+            "input_capabilities": self._input_capabilities,
             "expected_vlm_count": len(self._expected_vlm_slots),
             "completed_vlm_count": self._completed_vlm_count(),
             "failed_vlm_count": self._failed_vlm_count(),
@@ -2086,6 +2504,7 @@ class InteractiveReplayControllerNode(Node):
                     asset.bag_path,
                     [
                         *self._image_topic_routes,
+                        *self._typed_topic_routes,
                         *self._json_topic_routes,
                         self._transcript_topic,
                     ],
@@ -2116,6 +2535,7 @@ class InteractiveReplayControllerNode(Node):
                 self._last_error = ""
                 self._force_state_publish = True
                 self._last_ground_truth_key = ""
+                self._refresh_input_capabilities()
                 self._publish_discontinuous_clock()
                 self._publish_ground_truth(force=True)
                 self._publish_runtime_control("reset")
@@ -2578,6 +2998,16 @@ class InteractiveReplayControllerNode(Node):
                         self._image_publishers[output_topic].publish(image)
                     if topic == self._source_flir_topic:
                         self._published_image_count += 1
+                elif topic in self._typed_topic_routes:
+                    route = self._typed_topic_routes[topic]
+                    observed_type = self._source.topic_types.get(topic, "")
+                    if observed_type != route.message_type:
+                        continue
+                    payload = deserialize_message(
+                        serialized,
+                        REPLAY_TYPED_MESSAGE_CLASSES[route.message_type],
+                    )
+                    self._typed_publishers[topic].publish(payload)
                 elif topic in self._json_topic_routes:
                     payload = deserialize_message(serialized, String)
                     self._json_publishers[topic].publish(payload)

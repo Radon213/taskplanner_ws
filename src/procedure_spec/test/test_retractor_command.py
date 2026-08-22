@@ -30,12 +30,12 @@ from procedure_spec import (
         ),
         (
             "tool chage",
-            RetractionState.RETRACTION_ACTIVE,
+            RetractionState.IDLE,
             RetractionCommand.CHANGE_TOOL,
         ),
         (
             "이제 툴 바꿔",
-            RetractionState.RETRACTION_ACTIVE,
+            RetractionState.IDLE,
             RetractionCommand.CHANGE_TOOL,
         ),
         (
@@ -243,6 +243,7 @@ def test_state_narrows_candidates_and_unknown_fails_closed() -> None:
 def test_allowed_commands_define_the_closed_state_machine_surface() -> None:
     assert allowed_retractor_commands("idle") == {
         RetractionCommand.START_DIRECT_TEACH,
+        RetractionCommand.CHANGE_TOOL,
     }
     assert allowed_retractor_commands("taught_ready") == {
         RetractionCommand.START_DIRECT_TEACH,
@@ -250,7 +251,6 @@ def test_allowed_commands_define_the_closed_state_machine_surface() -> None:
     }
     assert allowed_retractor_commands("retraction_active") == {
         RetractionCommand.ADJUST_RETRACTION,
-        RetractionCommand.CHANGE_TOOL,
         RetractionCommand.STOP_RETRACTION,
     }
     assert allowed_retractor_commands(RetractionState.UNKNOWN) == frozenset()
@@ -258,6 +258,13 @@ def test_allowed_commands_define_the_closed_state_machine_surface() -> None:
 
 def test_state_transitions_only_after_service_admission() -> None:
     state = RetractionState.IDLE
+    state = apply_retractor_service_admission(
+        state,
+        RetractionCommand.CHANGE_TOOL,
+        request_accepted=True,
+    )
+    assert state == RetractionState.IDLE
+
     state = apply_retractor_service_admission(
         state,
         RetractionCommand.START_DIRECT_TEACH,
@@ -291,16 +298,38 @@ def test_state_transitions_only_after_service_admission() -> None:
     assert state == RetractionState.RETRACTION_ACTIVE
     state = apply_retractor_service_admission(
         state,
-        RetractionCommand.CHANGE_TOOL,
-        request_accepted=True,
-    )
-    assert state == RetractionState.RETRACTION_ACTIVE
-    state = apply_retractor_service_admission(
-        state,
         RetractionCommand.STOP_RETRACTION,
         request_accepted=True,
     )
-    assert state == RetractionState.TAUGHT_READY
+    assert state == RetractionState.IDLE
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        RetractionState.DIRECT_TEACHING,
+        RetractionState.TAUGHT_READY,
+        RetractionState.RETRACTION_ACTIVE,
+        RetractionState.UNKNOWN,
+    ],
+)
+def test_tool_change_is_allowed_only_while_idle(state: RetractionState) -> None:
+    normalized = normalize_retractor_command("Tool change", state)
+
+    assert normalized.command is None
+    assert normalized.reason == (
+        "state_unknown"
+        if state is RetractionState.UNKNOWN
+        else f"command_not_allowed_in_{state.value}"
+    )
+    assert (
+        apply_retractor_service_admission(
+            state,
+            RetractionCommand.CHANGE_TOOL,
+            request_accepted=True,
+        )
+        is state
+    )
 
 
 @pytest.mark.parametrize(

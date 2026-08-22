@@ -63,6 +63,7 @@ _ALLOWED_COMMANDS: dict[RetractionState, frozenset[RetractionCommand]] = {
     RetractionState.IDLE: frozenset(
         {
             RetractionCommand.START_DIRECT_TEACH,
+            RetractionCommand.CHANGE_TOOL,
         }
     ),
     RetractionState.DIRECT_TEACHING: frozenset(
@@ -79,7 +80,6 @@ _ALLOWED_COMMANDS: dict[RetractionState, frozenset[RetractionCommand]] = {
     RetractionState.RETRACTION_ACTIVE: frozenset(
         {
             RetractionCommand.ADJUST_RETRACTION,
-            RetractionCommand.CHANGE_TOOL,
             RetractionCommand.STOP_RETRACTION,
         }
     ),
@@ -93,6 +93,10 @@ _ACCEPTED_TRANSITIONS: dict[
         RetractionState.IDLE,
         RetractionCommand.START_DIRECT_TEACH,
     ): RetractionState.DIRECT_TEACHING,
+    (
+        RetractionState.IDLE,
+        RetractionCommand.CHANGE_TOOL,
+    ): RetractionState.IDLE,
     (
         RetractionState.DIRECT_TEACHING,
         RetractionCommand.FINISH_DIRECT_TEACH,
@@ -108,7 +112,7 @@ _ACCEPTED_TRANSITIONS: dict[
     (
         RetractionState.RETRACTION_ACTIVE,
         RetractionCommand.STOP_RETRACTION,
-    ): RetractionState.TAUGHT_READY,
+    ): RetractionState.IDLE,
 }
 
 _DIRECT_TEACH_TERMS = (

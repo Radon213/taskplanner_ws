@@ -4240,6 +4240,60 @@ class ORDigitalTwin:
         self._record_event("ExplicitRequestUpdated", {"text": request_text, "resolved_tool": resolved})
         return resolved
 
+    def update_resolved_voice_tool_handover(self, tool_id: str) -> str:
+        """Queue an already-grounded tool handover without parsing language.
+
+        The public voice boundary owns natural-language interpretation.  This
+        method accepts only a canonical procedure instrument ID; in particular,
+        it intentionally does not inspect a transcript or resolve aliases.
+        Keeping that boundary here prevents a raw transcript from changing a
+        resolved tool, selecting an additional instance, or otherwise becoming
+        an execution input after the resolver has made its proposal.
+        """
+
+        instrument_id = str(tool_id or "").strip()
+        if instrument_id not in self.spec.list_instrument_ids():
+            self._record_event(
+                "ResolvedVoiceToolHandoverRejected",
+                {
+                    "tool_id": instrument_id,
+                    "reason": "unknown_canonical_tool_id",
+                },
+            )
+            return ""
+
+        # Do not pass raw utterance text into _enqueue_surgeon_request: that
+        # legacy helper recognizes phrases such as "one more".  A typed
+        # VoiceCommandIntent currently has no additional-instance slot, so the
+        # resolver's canonical tool ID is the complete semantic input here.
+        self._enqueue_surgeon_request(
+            event_type="voice_request",
+            instrument_id=instrument_id,
+            voice_text="",
+            note="typed_voice_command_intent",
+            ready_for_handover=True,
+        )
+
+        queued = any(
+            cue.instrument_id == instrument_id
+            and cue.event_type in ACTIVE_REQUEST_INTENTS
+            for cue in self.state.surgeon_request_queue
+        )
+        self._recompute_transient_state()
+        self._record_event(
+            "ResolvedVoiceToolHandoverUpdated",
+            {
+                "tool_id": instrument_id,
+                "accepted": queued,
+                "reason": (
+                    "canonical_tool_handover_queued"
+                    if queued
+                    else "tool_inventory_unavailable"
+                ),
+            },
+        )
+        return instrument_id if queued else ""
+
     def explicit_request_voice_backed(self) -> bool:
         cue = self._active_request_cue()
         if cue is None or cue.event_type not in ACTIVE_REQUEST_INTENTS:

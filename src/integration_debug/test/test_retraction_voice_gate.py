@@ -444,8 +444,41 @@ def test_service_admission_advances_only_the_local_debug_state() -> None:
     assert harness._action_status["terminal"] is True
     assert events[0][0] == "retraction_service_response"
 
+    harness._active_command_id = "debug-command-2"
+    harness._active_route = "retraction_service"
+    harness._action_status = {
+        "command": "stop_retraction",
+        "source": "voice",
+        "started_monotonic": time.monotonic() - 0.1,
+    }
+    IntegrationDebugNode._finish_retraction_service_admission(
+        harness,
+        "debug-command-2",
+        request_accepted=True,
+        result_code=0,
+        state="accepted",
+        reason_code="RESULT_ACCEPTED",
+        response_message="accepted for controller admission",
+    )
 
-def test_direct_retraction_dispatch_rejects_an_out_of_order_command_before_transport() -> None:
+    assert harness._retraction_state is RetractionState.IDLE
+    assert events[-1][0] == "retraction_service_response"
+    assert events[-1][1]["command"] == "stop_retraction"
+
+
+@pytest.mark.parametrize(
+    ("state", "command"),
+    [
+        (RetractionState.IDLE, "start_retraction"),
+        (RetractionState.DIRECT_TEACHING, "change_tool"),
+        (RetractionState.TAUGHT_READY, "change_tool"),
+        (RetractionState.RETRACTION_ACTIVE, "change_tool"),
+    ],
+)
+def test_direct_retraction_dispatch_rejects_a_state_disallowed_command_before_transport(
+    state: RetractionState,
+    command: str,
+) -> None:
     class FakeRetractionClient:
         def __init__(self) -> None:
             self.calls = 0
@@ -467,7 +500,7 @@ def test_direct_retraction_dispatch_rejects_an_out_of_order_command_before_trans
     harness._armed = True
     harness._fault_locked = False
     harness._retraction_voice_auto_dispatch = False
-    harness._retraction_state = RetractionState.IDLE
+    harness._retraction_state = state
     harness._last_retraction_rejection_reason = ""
     harness._retraction_service_name = "/surgery/retraction/command"
     harness._retraction_client = FakeRetractionClient()
@@ -476,7 +509,7 @@ def test_direct_retraction_dispatch_rejects_an_out_of_order_command_before_trans
         harness,
         "retraction_command",
         {
-            "command": "start_retraction",
+            "command": command,
             "target_side": "none",
             "distance_m": 0.0,
         },
@@ -485,14 +518,14 @@ def test_direct_retraction_dispatch_rejects_an_out_of_order_command_before_trans
 
     assert accepted is False
     assert command_id == ""
-    assert "start_retraction is not allowed in Debug retraction state idle" == message
+    assert f"{command} is not allowed in Debug retraction state {state.value}" == message
     assert harness._last_retraction_rejection_reason == (
         "retraction_command_not_allowed_in_debug_state"
     )
     assert harness._retraction_client.calls == 0
 
 
-def test_concurrent_retraction_dispatch_reserves_only_one_service_request() -> None:
+def test_concurrent_idle_tool_change_dispatch_reserves_only_one_service_request() -> None:
     class DeferredFuture:
         def add_done_callback(self, _callback) -> None:
             # Keep the request in flight so a competing stale UI/API request
@@ -546,7 +579,7 @@ def test_concurrent_retraction_dispatch_reserves_only_one_service_request() -> N
             harness,
             "retraction_command",
             {
-                "command": "start_direct_teach",
+                "command": "change_tool",
                 "target_side": "none",
                 "distance_m": 0.0,
             },
@@ -566,7 +599,7 @@ def test_concurrent_retraction_dispatch_reserves_only_one_service_request() -> N
     assert any(message == "another command is active" for _, _, message in results)
     assert harness._retraction_client.calls == 1
     assert harness._active_route == "retraction_service"
-    assert harness._action_status["command"] == "start_direct_teach"
+    assert harness._action_status["command"] == "change_tool"
 
 
 def test_voice_dispatch_rechecks_arm_gate_before_reserving_service_call() -> None:
@@ -738,3 +771,113 @@ def test_retraction_service_recovery_resets_debug_state_after_confirmed_remote_c
             },
         )
     ]
+
+
+def test_force_retraction_idle_is_local_only_and_disarms_voice_authority() -> None:
+    class PendingFuture:
+        def __init__(self) -> None:
+            self.cancelled = False
+
+        def cancel(self) -> None:
+            self.cancelled = True
+
+    class PendingInterpretation:
+        def __init__(self) -> None:
+            self.future = PendingFuture()
+
+    class Harness:
+        pass
+
+    events: list[tuple[str, dict[str, object]]] = []
+    pending = PendingInterpretation()
+    harness = Harness()
+    harness._lock = threading.RLock()
+    harness._active_command_id = ""
+    harness._action_status = {"terminal": True}
+    harness._armed = True
+    harness._voice_auto_execute = True
+    harness._retraction_voice_auto_dispatch = True
+    harness._retraction_voice_generation = 8
+    harness._acknowledged_blocked_nodes = {"/planner"}
+    harness._retraction_state = RetractionState.RETRACTION_ACTIVE
+    harness._last_retraction_rejection_reason = "old_reason"
+    harness._last_retraction_interpretation = {"command": "stop_retraction"}
+    harness._last_error = "old_error"
+    harness._pending_retraction_voice_interpretation = pending
+    harness._disarm_locked = IntegrationDebugNode._disarm_locked.__get__(harness)
+    harness._retraction_interpretation = (
+        IntegrationDebugNode._retraction_interpretation
+    )
+    harness._idle_action_status = IntegrationDebugNode._idle_action_status
+    harness._release_manual_publishers = lambda: None
+    harness._record = lambda event_type, payload: events.append((event_type, payload))
+
+    accepted, command_id, message = IntegrationDebugNode._force_retraction_idle(
+        harness,
+        {"remote_motion_stopped_confirmed": True},
+    )
+
+    assert accepted is True
+    assert command_id == ""
+    assert message.endswith("no robot command was sent")
+    assert harness._retraction_state is RetractionState.IDLE
+    assert harness._armed is False
+    assert harness._voice_auto_execute is False
+    assert harness._retraction_voice_auto_dispatch is False
+    assert harness._retraction_voice_generation == 9
+    assert harness._pending_retraction_voice_interpretation is None
+    assert pending.future.cancelled is True
+    assert harness._last_retraction_rejection_reason == ""
+    assert harness._last_retraction_interpretation["detail"] == (
+        "force_retraction_idle"
+    )
+    assert harness._action_status["state"] == "idle"
+    assert events == [
+        (
+            "retraction_state_forced_idle",
+            {
+                "previous_state": "retraction_active",
+                "state": "idle",
+                "manual_control_was_armed": True,
+                "pending_interpretation_cancelled": True,
+                "remote_motion_stopped_confirmed": True,
+                "robot_command_sent": False,
+            },
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    ("payload", "active_command_id", "message_fragment"),
+    [
+        ({}, "", "confirm that remote retraction motion is stopped"),
+        (
+            {"remote_motion_stopped_confirmed": True},
+            "debug-command-active",
+            "wait for the active command response",
+        ),
+    ],
+)
+def test_force_retraction_idle_fails_closed_before_reset(
+    payload: dict[str, object],
+    active_command_id: str,
+    message_fragment: str,
+) -> None:
+    class Harness:
+        pass
+
+    harness = Harness()
+    harness._lock = threading.RLock()
+    harness._active_command_id = active_command_id
+    harness._action_status = {"terminal": not bool(active_command_id)}
+    harness._retraction_state = RetractionState.RETRACTION_ACTIVE
+
+    accepted, command_id, message = IntegrationDebugNode._force_retraction_idle(
+        harness,
+        payload,
+    )
+
+    assert accepted is False
+    assert command_id == active_command_id
+    assert message_fragment in message
+    assert harness._retraction_state is RetractionState.RETRACTION_ACTIVE

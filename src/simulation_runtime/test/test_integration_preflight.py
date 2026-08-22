@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import pytest
+
 import simulation_runtime.integration_preflight as preflight_module
 from simulation_runtime.integration_preflight import (
     IntegrationPreflightNode,
@@ -165,6 +167,101 @@ def test_external_perception_requires_fresh_explicit_adapter_authorization() -> 
         cv_contract_age_sec=0.1,
     )
     assert result["ready"] is True
+
+
+def test_external_pnu_accepts_fresh_executed_empty_tool_result() -> None:
+    result = _snapshot(
+        require_perception=True,
+        perception_backend="external",
+        rfdetr_health={
+            "provider": "pnu_hand_blood",
+            "connected": True,
+            "status": "ready",
+            "semantic_ready": True,
+            "cam4_aligned": True,
+            "empty_detection_result": True,
+            "detection_count": 0,
+        },
+        rfdetr_age_sec=0.2,
+    )
+    assert result["ready"] is True
+    assert result["details"]["perception_evidence_source"] == (
+        "pnu_bridge_health"
+    )
+    assert result["details"]["empty_detection_result"] is True
+
+
+def test_external_pnu_can_require_metric_depth_readiness_independently() -> None:
+    health = {
+        "provider": "pnu_hand_blood",
+        "connected": True,
+        "status": "ready",
+        "semantic_ready": True,
+        "cam4_aligned": True,
+        "metric_3d_ready": False,
+        "metric_3d_reasons": ["depth_scale_unvalidated"],
+    }
+    rejected = _snapshot(
+        require_perception=True,
+        require_metric_3d=True,
+        perception_backend="external",
+        rfdetr_health=health,
+        rfdetr_age_sec=0.2,
+    )
+    assert rejected["ready"] is False
+    assert rejected["missing"] == ["perception_input"]
+    assert rejected["details"]["metric_3d_required"] is True
+    assert rejected["details"]["metric_3d_reasons"] == [
+        "depth_scale_unvalidated"
+    ]
+
+    health["metric_3d_ready"] = True
+    health["metric_3d_reasons"] = []
+    accepted = _snapshot(
+        require_perception=True,
+        require_metric_3d=True,
+        perception_backend="external",
+        rfdetr_health=health,
+        rfdetr_age_sec=0.2,
+    )
+    assert accepted["ready"] is True
+    assert accepted["details"]["metric_3d_ready"] is True
+
+
+@pytest.mark.parametrize(
+    ("health_override", "age_sec"),
+    [
+        ({"status": "partial_ready", "semantic_ready": False}, 0.2),
+        ({"connected": False}, 0.2),
+        ({}, 5.0),
+    ],
+)
+def test_external_pnu_rejects_partial_disconnected_or_stale_results(
+    health_override: dict[str, object], age_sec: float
+) -> None:
+    health = {
+        "provider": "pnu_hand_blood",
+        "connected": True,
+        "status": "ready",
+        "semantic_ready": True,
+        "cam4_aligned": True,
+        "empty_detection_result": False,
+    }
+    health.update(health_override)
+    result = _snapshot(
+        require_perception=True,
+        perception_backend="external",
+        rfdetr_health=health,
+        rfdetr_age_sec=age_sec,
+        cv_contract_status={
+            "schema": "taskplanner.cv_external_contract.v1",
+            "readiness_state": "READY",
+            "ready_for_external_evidence": True,
+        },
+        cv_contract_age_sec=0.1,
+    )
+    assert result["ready"] is False
+    assert result["missing"] == ["perception_input"]
 
 
 def test_contract_configuration_mismatch_fails_closed() -> None:

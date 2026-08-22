@@ -1,0 +1,66 @@
+{
+  "fixture_schema": "taskplanner.ui_contract_fixture.v1",
+  "synthetic": true,
+  "usage": "SurgiMate dummy scenario 05: degraded health, FLIR stale, speech unavailable, and a robot fault.",
+  "baseline": {
+    "schema_version": "1.1.0",
+    "interface_version": "0.3.0",
+    "procedure_type": "thyroidectomy_demo",
+    "catalog_version": "synthetic-catalog-v1"
+  },
+  "/surgery/context": {
+    "revision": 1501,
+    "procedure_type": "thyroidectomy_demo",
+    "procedure_active": true,
+    "current_phase": "P08",
+    "phase_confidence": 0.78,
+    "phase_uncertain": false,
+    "execution_state": "running",
+    "evidence_status": "DUMMY_DEGRADED",
+    "safety_flags": ["FLIR_STALE"]
+  },
+  "/surgery/instruments": {
+    "revision": 1501,
+    "instruments": [
+      { "instrument_id": "T04", "instance_id": "T04#scenario-05", "location_type": "surgeon", "location_id": "surgeon", "holder_role": "surgeon", "state": "in_use", "visible": false, "confidence": 0.83, "evidence_status": "DUMMY_DEGRADED" },
+      { "instrument_id": "T07", "instance_id": "T07#scenario-05", "location_type": "mayo_stand", "location_id": "mayo_stand", "holder_role": "none", "state": "parked_for_reuse", "visible": false, "confidence": 0.76, "evidence_status": "DUMMY_DEGRADED" }
+    ]
+  },
+  "/surgery/robots": {
+    "revision": 1501,
+    "robots": [
+      { "robot_id": "bed_arm_1", "robot_type": "bed_retraction_arm", "execution_state": "protective_stop" },
+      { "robot_id": "bed_arm_2", "robot_type": "bed_retraction_arm", "execution_state": "offline" }
+    ]
+  },
+  "/surgery/robot_end_effectors": {
+    "revision": 1501,
+    "end_effectors": [
+      { "robot_id": "humanoid", "end_effector_id": "left_hand", "state": "unknown", "instrument_id": "", "instance_id": "", "confidence": 0.5, "evidence_status": "DUMMY_DEGRADED" },
+      { "robot_id": "humanoid", "end_effector_id": "right_hand", "state": "holding", "instrument_id": "T04", "instance_id": "T04#scenario-05", "confidence": 0.82, "evidence_status": "DUMMY_DEGRADED" }
+    ]
+  },
+  "/surgery/tool_predictions": {
+    "revision": 1501,
+    "predictions": [
+      { "rank": 1, "instrument_id": "T08", "instance_id": "", "confidence": 0.69, "stability_sec": 0.8, "source": "dummy", "evidence_status": "DUMMY_DEGRADED" },
+      { "rank": 2, "instrument_id": "T07", "instance_id": "", "confidence": 0.63, "stability_sec": 0.0, "source": "dummy", "evidence_status": "DUMMY_DEGRADED" },
+      { "rank": 3, "instrument_id": "T11", "instance_id": "", "confidence": 0.55, "stability_sec": 0.0, "source": "dummy", "evidence_status": "DUMMY_DEGRADED" }
+    ]
+  },
+  "/surgery/speech": {
+    "revision": 1501,
+    "state": "error",
+    "available": false,
+    "connected": false,
+    "text": ""
+  },
+  "/surgery/health": {
+    "revision": 1501,
+    "healthy": false,
+    "state": "degraded",
+    "unavailable_sources": ["speech"],
+    "stale_sources": ["flir"],
+    "error_codes": ["FLIR_STALE", "SPEECH_UNAVAILABLE"]
+  }
+}

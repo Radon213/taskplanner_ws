@@ -13,8 +13,10 @@ import type {
   SpeechUtterance,
 } from "../../types";
 import type {
+  RuntimeAuthorityStatus,
   ShadowReplayMode,
 } from "../../hooks/useRosBridge";
+import { runtimeAuthorityCopy } from "../../utils/runtimeAuthorityCopy";
 import { type Language } from "../../utils/display";
 import { MOTION_DURATION, SILK_EASE } from "../../motion-system";
 import {
@@ -114,6 +116,7 @@ export function ShadowReplayDock({
   state,
   transcript,
   connected,
+  runtimeAuthorityStatus,
   actionPending,
   groundTruth,
   onCaseChange,
@@ -124,13 +127,16 @@ export function ShadowReplayDock({
   state: ShadowReplayState;
   transcript: SpeechUtterance[];
   connected: boolean;
+  runtimeAuthorityStatus: RuntimeAuthorityStatus;
   actionPending: string;
   groundTruth: ShadowGroundTruthState;
   onCaseChange: (caseId: string) => void;
   onConfigure: (mode: ShadowReplayMode, playbackRate: number) => void;
 }) {
+  const normalizedReplayState = state.state.trim().toLowerCase();
+  const replayLoading = normalizedReplayState === "loading";
   const disabled =
-    !connected || Boolean(actionPending) || state.running || state.paused;
+    !connected || Boolean(actionPending) || state.running || state.paused || replayLoading;
   const mode =
     state.mode === "realtime_1x" ? "realtime_1x" : "elastic_demo";
   const latestTranscript = transcript[0]?.utterance_id ?? "";
@@ -156,6 +162,18 @@ export function ShadowReplayDock({
     confidence: groundTruth.active ? 1 : 0,
     requestedTool: "",
   };
+  const authorityFeedback = runtimeAuthorityCopy(runtimeAuthorityStatus, language);
+  const replayStatusNote = !connected
+    ? authorityFeedback.detail
+    : normalizedReplayState === "loading"
+      ? language === "ko"
+        ? "재생 케이스를 불러오는 중입니다. 로드가 끝나면 시작할 수 있습니다."
+        : "The Replay case is loading. You can start once loading finishes."
+      : !state.loaded
+        ? language === "ko"
+          ? "재생 케이스가 아직 로드되지 않았습니다. 케이스를 선택하면 기록 데이터를 불러옵니다."
+          : "No Replay case is loaded yet. Select a case to load the recorded data."
+        : "";
 
   return (
     <aside className="dock surgeon-dock llm-surgeon-dock shadow-replay-dock">
@@ -168,6 +186,17 @@ export function ShadowReplayDock({
         </div>
         <Film size={18} />
       </div>
+      {replayStatusNote ? (
+        <p
+          className="shadow-replay-status-note"
+          data-slot="shadow-replay-status"
+          data-authority-status={runtimeAuthorityStatus}
+          role={authorityFeedback.tone === "warn" ? "alert" : "status"}
+          aria-live={authorityFeedback.tone === "warn" ? "assertive" : "polite"}
+        >
+          {replayStatusNote}
+        </p>
+      ) : null}
 
       <label className="shadow-case-picker">
         <span>{language === "ko" ? "재생 케이스" : "Replay case"}</span>

@@ -13,6 +13,7 @@ import fcntl
 import math
 import os
 from pathlib import Path
+import stat
 from typing import Any, Protocol, Sequence, runtime_checkable
 
 
@@ -128,14 +129,30 @@ class SingleOwnerGuard:
     def acquire(self) -> None:
         if self._fd is not None:
             return
+        if self.path.is_symlink() or self.path.parent.is_symlink():
+            raise OwnershipError(
+                f"hardware authority lock must not be a symlink: {self.path}"
+            )
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(
-            self.path,
-            os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0),
-            0o600,
-        )
+        flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(self.path, flags, 0o600)
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                raise OwnershipError(
+                    f"hardware authority lock must not be a symlink: {self.path}"
+                ) from exc
+            raise
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise OwnershipError(
+                    f"hardware authority lock must be a regular file: {self.path}"
+                )
+            os.ftruncate(fd, 0)
+            os.write(fd, f"pid={os.getpid()}\n".encode("ascii"))
+            os.fsync(fd)
         except OSError as exc:
             os.close(fd)
             if exc.errno in {errno.EACCES, errno.EAGAIN}:
@@ -143,9 +160,9 @@ class SingleOwnerGuard:
                     f"hardware authority is already owned: {self.path}"
                 ) from exc
             raise
-        os.ftruncate(fd, 0)
-        os.write(fd, f"pid={os.getpid()}\n".encode("ascii"))
-        os.fsync(fd)
+        except BaseException:
+            os.close(fd)
+            raise
         self._fd = fd
 
     def release(self) -> None:
@@ -235,6 +252,7 @@ from .fake import (
     FakeRobotAdapter,
 )
 from .indy_dcp3 import IndyDcp3Adapter
+from .shadow import ShadowIndyDcp3Adapter
 
 
 __all__ = [
@@ -262,5 +280,6 @@ __all__ = [
     "OwnershipError",
     "RobotAdapter",
     "SingleOwnerGuard",
+    "ShadowIndyDcp3Adapter",
     "SystemClock",
 ]

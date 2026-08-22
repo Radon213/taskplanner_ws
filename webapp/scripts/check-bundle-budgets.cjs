@@ -42,7 +42,12 @@ function findKeyByName(name) {
 
 const rows = [];
 rows.push(check("Mission entry", "index.html", 220_000, 66_000));
-rows.push(check("Debug workspace", "src/components/debug/DebugWorkspace.tsx", 95_000, 26_000));
+// The Debug bridge keeps a fail-closed runtime/status and command-response
+// validator in its lazy chunk. Keep the raw ceiling explicit while retaining
+// the tighter transfer-size guard for the operator's initial load.
+// The TF tab itself (including Three.js) remains deferred. Reserve only this
+// small amount of entry wiring for its read-only lazy route.
+rows.push(check("Debug workspace", "src/components/debug/DebugWorkspace.tsx", 101_000, 27_000));
 rows.push(check("Multicam workspace", "src/components/multicam/MulticamOpsWorkspace.tsx", 55_000, 19_000));
 rows.push(check("Deferred motion features", "src/motion-features.ts", 95_000, 31_000));
 
@@ -75,6 +80,7 @@ for (const [label, name, rawBudget, gzipBudget] of [
   ["React vendor", "react-vendor", 145_000, 47_000],
   ["ROS vendor", "ros-vendor", 70_000, 20_000],
   ["Icon vendor", "icons-vendor", 30_000, 11_000],
+  ["Runtime safety core", "runtime-core", 100_000, 30_000],
   ["Deferred Three.js vendor", "three-vendor", 620_000, 160_000],
 ]) {
   const key = findKeyByName(name);
@@ -113,6 +119,10 @@ if (eagerGzip > 155_000) {
 const threeKey = findKeyByName("three-vendor");
 if (threeKey && eagerKeys.has(threeKey)) {
   violations.push("Three.js must remain outside the initial Mission bundle.");
+}
+const runtimeCoreKey = findKeyByName("runtime-core");
+if (runtimeCoreKey && manifest[runtimeCoreKey]?.imports?.includes("index.html")) {
+  violations.push("Runtime safety core must not statically import the Mission entry.");
 }
 if (!entry?.dynamicImports?.includes("src/motion-features.ts")) {
   violations.push("Motion feature definitions must remain dynamically loaded.");

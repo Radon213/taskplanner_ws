@@ -515,6 +515,33 @@ class SurgicalInteropGateway(Node):
         with self._lock:
             self._asr_status = self._cache(payload)
 
+    @staticmethod
+    def _replay_speech_status(message: Any) -> dict[str, Any]:
+        """Adapt the replay speech-input status to the public ASR shape.
+
+        Replay deliberately has no microphone/operational ASR node. Its
+        timestamped transcript adapter publishes ``InputSourceStatus`` instead
+        of the operational JSON status on ``/input/asr/runtime_status``. Keep
+        the operational status authoritative when present, but allow the
+        reviewed replay source to satisfy the same availability gate.
+        """
+
+        state = str(getattr(message, "state", "")).strip().casefold()
+        healthy = bool(getattr(message, "healthy", False))
+        available = healthy and state in {
+            "ready",
+            "listening",
+            "recording",
+            "running",
+            "connected",
+        }
+        return {
+            "available": available,
+            "connected": available,
+            "state": state,
+            "finals": [],
+        }
+
     def _on_bed_robot_arm_status(self, message: BedRobotArmStateArray) -> None:
         revision = int(message.revision)
         source_stamp_sec = (
@@ -743,13 +770,23 @@ class SurgicalInteropGateway(Node):
         with self._lock:
             speech = self._speech_text
             status = self._asr_status
+            replay_status = getattr(self, "_input_statuses", {}).get("speech_input")
+        using_replay_status = status is None and replay_status is not None
+        if using_replay_status:
+            status = replay_status
         if status is None or not freshness_from_receipt(
             status.received_monotonic_sec,
             self._monotonic(),
             self._health_stale_after_sec,
         ).fresh:
             return message
-        asr = status.message.get("asr", {})
+        if using_replay_status:
+            asr = self._replay_speech_status(status.message)
+            source_id = str(getattr(status.message, "source_id", "")).strip()
+            if source_id:
+                message.source = source_id
+        else:
+            asr = status.message.get("asr", {})
         message.connected = bool(asr.get("connected", False))
         message.state = self._public_asr_state(asr.get("state"))
         message.available = bool(asr.get("available", False)) and message.connected

@@ -1,0 +1,20 @@
+record_type,ordinal,id,display_name,display_name_ko,possible_next_ids,expected_instrument_ids,category,inventory_count
+procedure,,thyroidectomy_demo,Open Thyroidectomy Demonstration,갑상선절제술(시연),,,,
+phase,1,P01,Patient positioning and operative-field preparation,환자 체위 및 수술부위 준비,P02,,,
+phase,2,P02,Skin incision and flap elevation,피부 절개 및 피판 거상,P03,T04|T02,,
+phase,3,P03,Central-field dissection before fixed retraction,고정 견인 전 중앙 수술야 박리,P04,T02|T04|T07|T05|T11|T03,,
+phase,4,P04,Fixed retraction and exposure establishment,고정 견인 배치 및 노출 확립,P05,T05|T02|T03|T11,,
+phase,5,P05,Retraction-supported target manipulation,견인 유지 하 표적 조직 조작,P06,T02|T07|T08|T03|T04,,
+phase,6,P06,Focal target control and treatment,국소 표적 제어 및 처치,P07,T08|T07|T04|T03,,
+phase,7,P07,Thyroid resection and specimen extraction,갑상선 절제 및 검체 적출,P08,T02|T04,,
+phase,8,P08,Final hemostasis and operative-field inspection,최종 지혈 및 수술야 확인,P09,T04|T07,,
+phase,9,P09,Wound closure,창상 봉합,P10,,,
+phase,10,P10,Procedure completion and instrument clearance,수술 종료 및 기구 정리,,,,
+instrument,,T01,#15 Scalpel,15번 메스,,,cutting,1
+instrument,,T02,Adson forceps,애드슨 포셉,,,grasping,2
+instrument,,T03,Allis clamp forceps,알리스 클램프 포셉,,,vessel_control,2
+instrument,,T04,Bovie surgical cautery,보비 전기소작기,,,hemostasis,1
+instrument,,T05,Army navy retractor,아미-네이비 리트랙터,,,exposure,2
+instrument,,T07,Bipolar cautery,바이폴라 전기소작기,,,hemostasis,1
+instrument,,T08,Mosquito forceps,모스키토 포셉,,,vessel_control,1
+instrument,,T11,Thyroid retractor (Middeldorpf),갑상선 리트랙터(미들돌프),,,exposure,2

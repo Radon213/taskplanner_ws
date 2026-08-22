@@ -67,6 +67,17 @@ class _BlockingReader:
         return b""
 
 
+class _HangingServer:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+    async def wait_closed(self) -> None:
+        await asyncio.Event().wait()
+
+
 class RoutePolicyTests(unittest.TestCase):
     def test_parse_and_group_require_one_default_and_unique_paths(self) -> None:
         default = proxy.parse_route("9091=127.0.0.1:9093")
@@ -102,6 +113,12 @@ class RoutePolicyTests(unittest.TestCase):
 
 
 class AsyncRouteTests(unittest.IsolatedAsyncioTestCase):
+    async def test_server_close_timeout_does_not_strand_rebind_loop(self) -> None:
+        server = _HangingServer()
+        with mock.patch.object(proxy, "SERVER_CLOSE_TIMEOUT_SEC", 0.01):
+            await asyncio.wait_for(proxy.close_servers([server]), timeout=0.2)
+        self.assertTrue(server.closed)
+
     async def test_fragmented_header_is_completed_before_routing(self) -> None:
         reader = asyncio.StreamReader()
         pending = asyncio.create_task(

@@ -17,7 +17,7 @@ import type {
   SurgeonLLMDecision,
 } from "../../types";
 import { MOTION_DURATION, SILK_EASE } from "../../motion-system";
-import { type Language } from "../../utils/display";
+import { parseBoundedJson, type Language } from "../../utils/display";
 
 type ViewModel = ReturnType<typeof useDigitalTwinViewModel>;
 type SpeechLogItem = {
@@ -34,7 +34,11 @@ const SPEECH_LOG_LIMIT = 24;
 function parseActorPayload(rawJson: string): { nextDwellSec: number | null; reasonCode: string } {
   if (!rawJson) return { nextDwellSec: null, reasonCode: "" };
   try {
-    const payload = JSON.parse(rawJson) as { next_dwell_sec?: unknown; reason_code?: unknown };
+    const parsed = parseBoundedJson(rawJson);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return { nextDwellSec: null, reasonCode: "" };
+    }
+    const payload = parsed as { next_dwell_sec?: unknown; reason_code?: unknown };
     const nextDwellSec = Number(payload.next_dwell_sec);
     return {
       nextDwellSec: Number.isFinite(nextDwellSec) ? nextDwellSec : null,
@@ -48,7 +52,11 @@ function parseActorPayload(rawJson: string): { nextDwellSec: number | null; reas
 function parseOverlay(rawJson: string): { heldTool: string; mayoTools: string[] } {
   if (!rawJson) return { heldTool: "", mayoTools: [] };
   try {
-    const payload = JSON.parse(rawJson) as { held_tool?: unknown; mayo?: unknown };
+    const parsed = parseBoundedJson(rawJson);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return { heldTool: "", mayoTools: [] };
+    }
+    const payload = parsed as { held_tool?: unknown; mayo?: unknown };
     return {
       heldTool: String(payload.held_tool || ""),
       mayoTools: Array.isArray(payload.mayo) ? payload.mayo.map((item) => String(item)).filter(Boolean) : [],
@@ -58,12 +66,20 @@ function parseOverlay(rawJson: string): { heldTool: string; mayoTools: string[] 
   }
 }
 
-function relativeAgeLabel(atMs: number, nowMs: number): string {
+function relativeAgeLabel(atMs: number, nowMs: number, language: Language): string {
   const elapsedSec = Math.max(0, Math.floor((nowMs - atMs) / 1000));
+  if (language === "ko") {
+    if (elapsedSec < 2) return "방금";
+    if (elapsedSec < 60) return `${elapsedSec}초 전`;
+    const elapsedMin = Math.floor(elapsedSec / 60);
+    if (elapsedMin < 60) return `${elapsedMin}분 전`;
+    return `${Math.floor(elapsedMin / 60)}시간 전`;
+  }
   if (elapsedSec < 2) return "now";
   if (elapsedSec < 60) return `${elapsedSec}s ago`;
   const elapsedMin = Math.floor(elapsedSec / 60);
-  return `${elapsedMin}m ago`;
+  if (elapsedMin < 60) return `${elapsedMin}m ago`;
+  return `${Math.floor(elapsedMin / 60)}h ago`;
 }
 
 export function SurgeonIntentDock({
@@ -71,6 +87,7 @@ export function SurgeonIntentDock({
   language,
   llmDecision,
   actorEnabled,
+  actorEnabledKnown,
   modelOptions,
   providerStatuses,
   modelCatalogStatus,
@@ -86,6 +103,7 @@ export function SurgeonIntentDock({
   language: Language;
   llmDecision: SurgeonLLMDecision;
   actorEnabled: boolean;
+  actorEnabledKnown: boolean;
   modelOptions: ModelCatalogEntry[];
   providerStatuses: ModelProviderStatus[];
   modelCatalogStatus: string;
@@ -104,9 +122,10 @@ export function SurgeonIntentDock({
   const [nowMs, setNowMs] = useState(Date.now());
   const lastSpeechSignatureRef = useRef("");
   const speechLogListRef = useRef<HTMLDivElement>(null);
+  const hasSpeechLog = speechLog.length > 0;
   const payload = parseActorPayload(llmDecision.raw_json);
   const overlay = parseOverlay(llmDecision.overlay_json);
-  const controlsDisabled = !connected || Boolean(actionPending);
+  const controlsDisabled = !connected || !actorEnabledKnown || Boolean(actionPending);
   const modelDisabled =
     controlsDisabled || !modelOptions.some((entry) => entry.selectable);
   const phaseLabel = llmDecision.hidden_phase ? vm.displayPhaseName(llmDecision.hidden_phase) : vm.ui.none;
@@ -129,13 +148,14 @@ export function SurgeonIntentDock({
     : llmDecision.reject_reason || (language === "ko" ? "대기" : "waiting");
 
   useEffect(() => {
+    if (!hasSpeechLog) return;
     const timer = window.setInterval(() => {
       const nextNow = Date.now();
       setNowMs(nextNow);
       setSpeechLog((current) => current.filter((item) => nextNow - item.atMs <= SPEECH_LOG_TTL_MS));
     }, 1000);
     return () => window.clearInterval(timer);
-  }, []);
+  }, [hasSpeechLog]);
 
   useEffect(() => {
     const speech = llmDecision.speech.trim();
@@ -164,20 +184,28 @@ export function SurgeonIntentDock({
       <div className="dock-header">
         <div>
           <p className="section-kicker">{language === "ko" ? "LLM 집도의" : "LLM Surgeon"}</p>
-          <h2>{actorEnabled ? (language === "ko" ? "활성" : "Active") : language === "ko" ? "비활성" : "Off"}</h2>
+          <h2>{!actorEnabledKnown
+            ? language === "ko" ? "확인 중" : "Checking"
+            : actorEnabled
+              ? language === "ko" ? "활성" : "Active"
+              : language === "ko" ? "비활성" : "Off"}</h2>
         </div>
         <UserRound size={18} />
       </div>
 
       <div className="llm-control-row">
         <button
-          className={`actor-toggle ${actorEnabled ? "active" : ""}`}
+          className={`actor-toggle ${actorEnabledKnown && actorEnabled ? "active" : ""}`}
           disabled={controlsDisabled}
           onClick={() => onActorEnabledChange(!actorEnabled)}
           type="button"
         >
-          {actorEnabled ? <Power size={16} /> : <PowerOff size={16} />}
-          {actorEnabled ? (language === "ko" ? "켜짐" : "On") : language === "ko" ? "꺼짐" : "Off"}
+          {actorEnabledKnown && actorEnabled ? <Power size={16} /> : <PowerOff size={16} />}
+          {!actorEnabledKnown
+            ? language === "ko" ? "상태 확인 중" : "Checking status"
+            : actorEnabled
+              ? language === "ko" ? "켜짐" : "On"
+              : language === "ko" ? "꺼짐" : "Off"}
         </button>
         <label className="field compact model-select-field">
           <span>{vm.ui.model}</span>
@@ -266,7 +294,7 @@ export function SurgeonIntentDock({
                 <div>
                   <strong>{item.text}</strong>
                   <small>
-                    {relativeAgeLabel(item.atMs, nowMs)}
+                    {relativeAgeLabel(item.atMs, nowMs, language)}
                     {item.action ? ` · ${item.action}` : ""}
                     {item.tool ? ` · ${vm.displayToolName(item.tool)}` : ""}
                   </small>

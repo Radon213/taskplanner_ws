@@ -1,6 +1,9 @@
 string operation
 int32 device_id
 string server_url
+# Used only with operation="set_route_policy".  Accepted values are the
+# reviewed policy identifiers cloud, lan, and auto; it is never a URL.
+string route_policy
 ---
 bool accepted
 string message

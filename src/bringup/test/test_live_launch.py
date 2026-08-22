@@ -1,5 +1,10 @@
 import importlib.util
 from pathlib import Path
+import sys
+
+_SRC_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(_SRC_ROOT / "simulation_runtime"))
+sys.path.insert(0, str(_SRC_ROOT / "bringup"))
 
 from launch import LaunchContext
 from launch.actions import (
@@ -11,6 +16,7 @@ from launch.actions import (
 from launch_ros.actions import Node
 from launch_ros.utilities import evaluate_parameters
 from launch.utilities import perform_substitutions
+import pytest
 
 
 def _load_launch_module(filename: str):
@@ -44,6 +50,13 @@ def test_base_launch_conditions_mock_execution_servers() -> None:
         "retractor_voice_vlm_model_id",
         "enable_rfdetr_perception",
         "perception_backend",
+        "perception_provider",
+        "perception_location",
+        "perception_endpoint",
+        "pnu_allow_insecure_remote_http",
+        "pnu_depth_scale_m_per_unit",
+        "pnu_depth_scale_validated",
+        "pnu_expected_tool_support_plane_config_version",
         "cv_contract_status_topic",
         "cv_cam4_rgb_topic",
         "cv_handover_tray_rgb_topic",
@@ -121,7 +134,46 @@ def test_base_launch_conditions_mock_execution_servers() -> None:
     assert rosapi_nodes[0].condition is not None
 
 
-def test_perception_backend_keeps_local_and_external_publishers_exclusive() -> None:
+def test_voice_intent_resolver_is_bound_to_the_active_procedure_bundle() -> None:
+    module = _load_launch_module("taskplanner_mock.launch.py")
+    description = module.generate_launch_description()
+    resolver = next(
+        entity
+        for entity in description.entities
+        if isinstance(entity, Node)
+        and entity.node_package == "voice_command"
+        and entity.node_executable == "voice_intent_resolver"
+    )
+    parameters = {
+        _parameter_name(key): value
+        for key, value in resolver._Node__parameters[0].items()
+    }
+
+    assert {
+        "input_topic",
+        "output_topic",
+        "procedure_bundle",
+        "selector_mode",
+        "selector_endpoint",
+        "selector_model",
+        "selector_timeout_sec",
+    }.issubset(parameters)
+    context = LaunchContext()
+    context.launch_configurations.update(
+        {
+            "spec_dir": "/tmp/test-procedure-bundle",
+            "voice_command_selector_mode": "deterministic",
+        }
+    )
+    assert perform_substitutions(context, parameters["procedure_bundle"]) == (
+        "/tmp/test-procedure-bundle"
+    )
+    assert perform_substitutions(context, parameters["selector_mode"]) == (
+        "deterministic"
+    )
+
+
+def test_perception_provider_keeps_one_local_ros_adapter() -> None:
     module = _load_launch_module("taskplanner_mock.launch.py")
     description = module.generate_launch_description()
     rfdetr = next(
@@ -129,6 +181,12 @@ def test_perception_backend_keeps_local_and_external_publishers_exclusive() -> N
         for entity in description.entities
         if isinstance(entity, Node)
         and entity.node_executable == "rfdetr_perception_bridge"
+    )
+    pnu = next(
+        entity
+        for entity in description.entities
+        if isinstance(entity, Node)
+        and entity.node_executable == "pnu_perception_bridge"
     )
     monitor = next(
         entity
@@ -142,20 +200,141 @@ def test_perception_backend_keeps_local_and_external_publishers_exclusive() -> N
     }
     assert {
         "perception_backend",
+        "perception_provider",
+        "perception_location",
+        "perception_endpoint",
         "status_topic",
         "cam4_rgb_topic",
         "cam4_camera_info_topic",
-        "cam4_aligned_depth_topic",
+        "cam4_native_depth_compressed_topic",
+        "cam4_depth_camera_info_topic",
+        "cam4_depth_to_color_extrinsics_topic",
+        "cam4_aligned_depth_compressed_topic",
+        "cam4_aligned_depth_camera_info_topic",
         "handover_tray_rgb_topic",
     }.issubset(parameters)
 
     context = LaunchContext()
     context.launch_configurations.update(
-        {"perception_backend": "local", "enable_rfdetr_perception": "true"}
+        {
+            "perception_provider": "builtin_rfdetr",
+            "perception_location": "local",
+            "enable_rfdetr_perception": "true",
+        }
     )
     assert rfdetr.condition.evaluate(context) is True
-    context.launch_configurations["perception_backend"] = "external"
+    assert pnu.condition.evaluate(context) is False
+    context.launch_configurations["perception_location"] = "remote"
+    assert rfdetr.condition.evaluate(context) is True
+    context.launch_configurations["perception_provider"] = "pnu_hand_blood"
     assert rfdetr.condition.evaluate(context) is False
+    assert pnu.condition.evaluate(context) is True
+    pnu_parameters = {
+        _parameter_name(key): value
+        for key, value in pnu._Node__parameters[0].items()
+    }
+    assert {
+        "service_url",
+        "rgb_input_topic",
+        "color_camera_info_topic",
+        "depth_input_topic",
+        "depth_camera_info_topic",
+        "cam4_semantics_topic",
+        "cam4_mayo_observation_topic",
+        "diagnostics_topic",
+        "health_topic",
+        "requested_algorithms",
+        "expected_model_digests_json",
+        "expected_tool_support_plane_config_version",
+        "api_token_file",
+        "allow_insecure_remote_http",
+        "allow_unauthenticated_remote",
+        "depth_scale_m_per_unit",
+        "depth_scale_validated",
+    }.issubset(pnu_parameters)
+    context.launch_configurations["perception_provider"] = "disabled"
+    assert rfdetr.condition.evaluate(context) is False
+    assert pnu.condition.evaluate(context) is False
+
+
+def test_perception_launch_aliases_and_remote_endpoint_are_resolved() -> None:
+    module = _load_launch_module("taskplanner_mock.launch.py")
+    context = LaunchContext()
+    context.launch_configurations.update(
+        {
+            "perception_provider": "",
+            "perception_location": "",
+            "perception_endpoint": "",
+            "perception_backend": "local",
+            "rfdetr_service_url": "http://127.0.0.1:8010",
+        }
+    )
+    for action in module.resolve_launch_perception(context):
+        action.visit(context)
+    assert context.launch_configurations["perception_provider"] == "builtin_rfdetr"
+    assert context.launch_configurations["perception_location"] == "local"
+    assert context.launch_configurations["perception_endpoint"] == (
+        "http://127.0.0.1:8010"
+    )
+
+    context = LaunchContext()
+    context.launch_configurations.update(
+        {
+            "perception_provider": "builtin_rfdetr",
+            "perception_location": "remote",
+            "perception_endpoint": "http://192.168.1.20:8010",
+            "perception_backend": "local",
+            "rfdetr_service_url": "http://127.0.0.1:8010",
+        }
+    )
+    for action in module.resolve_launch_perception(context):
+        action.visit(context)
+    assert context.launch_configurations["perception_location"] == "remote"
+    assert context.launch_configurations["perception_endpoint"] == (
+        "http://192.168.1.20:8010"
+    )
+
+
+def test_pnu_provider_resolves_its_versioned_worker_without_rfdetr_bridge() -> None:
+    module = _load_launch_module("taskplanner_mock.launch.py")
+    context = LaunchContext()
+    context.launch_configurations.update(
+        {
+            "perception_provider": "pnu_hand_blood",
+            "perception_location": "remote",
+            "perception_endpoint": "https://192.168.1.20:8020",
+            "perception_backend": "local",
+            "rfdetr_service_url": "http://127.0.0.1:8010",
+            "pnu_service_url": "",
+        }
+    )
+    for action in module.resolve_launch_perception(context):
+        action.visit(context)
+    assert context.launch_configurations["perception_provider"] == "pnu_hand_blood"
+    assert context.launch_configurations["perception_location"] == "remote"
+    assert context.launch_configurations["perception_endpoint"] == (
+        "https://192.168.1.20:8020"
+    )
+
+
+def test_local_pnu_provider_has_a_distinct_loopback_default() -> None:
+    module = _load_launch_module("taskplanner_mock.launch.py")
+    context = LaunchContext()
+    context.launch_configurations.update(
+        {
+            "perception_provider": "pnu_hand_blood",
+            "perception_location": "local",
+            "perception_endpoint": "",
+            "perception_backend": "local",
+            "rfdetr_service_url": "http://127.0.0.1:8010",
+            "pnu_service_url": "",
+        }
+    )
+    for action in module.resolve_launch_perception(context):
+        action.visit(context)
+    assert context.launch_configurations["perception_endpoint"] == (
+        "http://127.0.0.1:8020"
+    )
 
 
 def test_rosbridge_process_restarts_after_failure() -> None:
@@ -409,6 +588,28 @@ def test_live_launch_wraps_external_runtime_contract() -> None:
         arguments["perception_backend"]._LaunchConfiguration__variable_name[0].text
         == "perception_backend"
     )
+    assert (
+        arguments["perception_provider"]._LaunchConfiguration__variable_name[0].text
+        == "perception_provider"
+    )
+    assert (
+        arguments["perception_location"]._LaunchConfiguration__variable_name[0].text
+        == "perception_location"
+    )
+    assert (
+        arguments["perception_endpoint"]._LaunchConfiguration__variable_name[0].text
+        == "perception_endpoint"
+    )
+    assert (
+        arguments["rfdetr_service_url"]._LaunchConfiguration__variable_name[0].text
+        == "perception_endpoint"
+    )
+    assert (
+        arguments[
+            "pnu_allow_insecure_remote_http"
+        ]._LaunchConfiguration__variable_name[0].text
+        == "pnu_allow_insecure_remote_http"
+    )
     assert arguments["surgeon_actor_mode"] == "none"
     assert arguments["require_integration_preflight"] == "true"
     assert arguments["vlm_mode"].name[0].text == "VLM_MODE"
@@ -418,6 +619,13 @@ def test_live_launch_wraps_external_runtime_contract() -> None:
     )
     assert (
         arguments["preflight_require_perception"].default_value[0].text
+        == "false"
+    )
+    assert arguments["preflight_require_metric_3d"].name[0].text == (
+        "PNU_REQUIRE_METRIC_3D_ON_START"
+    )
+    assert (
+        arguments["preflight_require_metric_3d"].default_value[0].text
         == "false"
     )
 
@@ -453,6 +661,30 @@ def test_live_retractor_text_vlm_inherits_the_loaded_vlm_endpoint(
     ) == "test-key"
 
 
+def test_live_voice_selector_inherits_the_loaded_vlm_endpoint(monkeypatch) -> None:
+    monkeypatch.delenv("VOICE_COMMAND_SELECTOR_ENDPOINT", raising=False)
+    monkeypatch.delenv("VOICE_COMMAND_SELECTOR_MODEL", raising=False)
+    monkeypatch.setenv("VLM_BASE_URL", "http://127.0.0.1:8080")
+    monkeypatch.setenv("VLM_MODEL_ID", "qwen3.6-35b-a3b")
+
+    module = _load_launch_module("taskplanner_live.launch.py")
+    description = module.generate_launch_description()
+    include = next(
+        entity
+        for entity in description.entities
+        if isinstance(entity, IncludeLaunchDescription)
+    )
+    arguments = dict(include.launch_arguments)
+    context = LaunchContext()
+
+    assert perform_substitutions(
+        context, [arguments["voice_command_selector_endpoint"]]
+    ) == "http://127.0.0.1:8080/v1/chat/completions"
+    assert perform_substitutions(
+        context, [arguments["voice_command_selector_model"]]
+    ) == "qwen3.6-35b-a3b"
+
+
 def test_live_public_contract_is_enabled_and_loop_safe_by_default() -> None:
     module = _load_launch_module("taskplanner_live.launch.py")
     description = module.generate_launch_description()
@@ -469,6 +701,10 @@ def test_live_public_contract_is_enabled_and_loop_safe_by_default() -> None:
         "publish_shared_free_text"
     ]._DeclareLaunchArgument__default_value
     assert perform_substitutions(context, free_text_default) == "false"
+    idle_flir_default = declared[
+        "publish_flir_while_idle"
+    ]._DeclareLaunchArgument__default_value
+    assert perform_substitutions(context, idle_flir_default) == "false"
 
     nodes = {
         entity.node_executable: entity
@@ -497,6 +733,7 @@ def test_live_public_contract_is_enabled_and_loop_safe_by_default() -> None:
     assert included_arguments["publish_shared_state"].perform(context) == "false"
     context.launch_configurations["publish_shared_free_text"] = "true"
     assert included_arguments["publish_shared_free_text"].perform(context) == "true"
+    context.launch_configurations["publish_flir_while_idle"] = "false"
 
     alias_parameters = evaluate_parameters(
         context, nodes["camera_alias_relay"]._Node__parameters
@@ -504,3 +741,4 @@ def test_live_public_contract_is_enabled_and_loop_safe_by_default() -> None:
     assert alias_parameters["flir_public_topic"] == "/surgery/images/flir/compressed"
     assert alias_parameters["cam4_public_topic"] == "/surgery/images/cam4/compressed"
     assert alias_parameters["default_bundle"] == "thyroidectomy_demo"
+    assert alias_parameters["publish_flir_while_idle"] is False

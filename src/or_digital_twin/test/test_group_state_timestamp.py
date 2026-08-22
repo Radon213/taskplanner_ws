@@ -1044,10 +1044,11 @@ def test_voice_request_bypasses_only_vlm_and_phase_inference_guards():
     assert twin.handover_allowed() is False
 
 
-def test_transcript_callback_creates_request_without_structured_actor_message():
+def test_legacy_raw_transcript_compatibility_can_create_request_when_enabled():
     node = ORDigitalTwinNode.__new__(ORDigitalTwinNode)
     node._twin = ORDigitalTwin(_thyroid_spec())
     node._tool_predict_stability = {}
+    node._enable_legacy_raw_tool_handover_compatibility = True
     published_events = []
     published_world_states = []
     node._publish_event = lambda event_type, **kwargs: published_events.append(
@@ -1066,7 +1067,7 @@ def test_transcript_callback_creates_request_without_structured_actor_message():
     assert published_world_states == [True]
 
 
-def test_transcript_callback_starts_cleanup_for_explicit_completion_signal():
+def test_legacy_raw_transcript_compatibility_can_start_cleanup_when_enabled():
     node = ORDigitalTwinNode.__new__(ORDigitalTwinNode)
     node._twin = ORDigitalTwin(_thyroid_spec())
     node._twin.state.running = True
@@ -1079,6 +1080,7 @@ def test_transcript_callback_starts_cleanup_for_explicit_completion_signal():
         confidence=1.0,
     )
     node._tool_predict_stability = {}
+    node._enable_legacy_raw_procedure_completion_compatibility = True
     published_events = []
     published_world_states = []
     node._stamp = lambda: SurgeonRequest().stamp

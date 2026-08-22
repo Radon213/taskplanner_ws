@@ -10,11 +10,18 @@ operator dashboard.
 ## Current Baseline
 
 - Runtime startup is explicit through the `live`, `llm-surgeon`, and `replay`
-  deployment profiles. Provider catalogs start without loading generative model
-  weights.
+  deployment profiles; `scripts/taskplanner up` defaults to `live`, the actual
+  external-integration profile. Live keeps its required read-only Debug
+  observation sidecar running, while LLM Surgeon and Replay do not start camera
+  observation by default. Provider catalogs start without loading generative
+  model weights.
 - Explicit voice tool requests remain operational when the VLM is absent or
   unhealthy. VLM-dependent phase inference, next-tool prediction, and
   mid-procedure Mayo classification remain fail-closed.
+- Spoken commands use an open-natural-language / closed-typed-intent contract:
+  the resolver may understand Korean paraphrases, but Digital Twin and BT own
+  validation and execution. See
+  [`docs/VOICE_COMMAND_CONTRACT.md`](docs/VOICE_COMMAND_CONTRACT.md).
 - The LLM surgeon actor starts only in the `llm-surgeon` validation profile and
   generates public test stimuli such as speech, hand extension, Mayo placement,
   and procedure progress.
@@ -109,7 +116,8 @@ clinical/tool evidence model.
 
 The operator dashboard shows request-correlated speech, VLM interpretation, BT
 validation, retraction Service admission, and controller-owned retraction-arm
-status at <http://127.0.0.1:4173/>.
+status at <http://127.0.0.1:4173/> locally and
+<http://192.168.1.4:4173/> on the reviewed wired LAN.
 
 ## External Dependency
 
@@ -294,11 +302,13 @@ Open:
 
 ```text
 http://127.0.0.1:4173
+http://192.168.1.4:4173
 ```
 
 외부 기관과 전체 플래너 없이 ROS 입출력, 수동 Action/Service, 리트랙터
 조그, 더미 공개 토픽, 텍스트·마이크 문장을 확인할 때는 통합 **디버그
-모드**를 사용한다. Debug UI는 기본적으로 `http://127.0.0.1:4174`, 전용
+모드**를 사용한다. 같은 UI를 `http://127.0.0.1:4173` 또는 유선 LAN의
+`http://192.168.1.4:4173`에서 사용하며, 전용
 ROSBridge는 `ws://127.0.0.1:9091`에서 열린다. 종단 목록, 안전 동작 및
 상대 기관 확인 절차는
 [`docs/INTEGRATION_DEBUG_MODE.md`](docs/INTEGRATION_DEBUG_MODE.md)를 따른다.

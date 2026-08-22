@@ -1,0 +1,53 @@
+{
+  "fixture_schema": "taskplanner.ui_contract_fixture.v1",
+  "synthetic": true,
+  "usage": "SurgiMate dummy scenario 06: procedure idle with all dynamic rows explicitly empty.",
+  "baseline": {
+    "schema_version": "1.1.0",
+    "interface_version": "0.3.0",
+    "procedure_type": "thyroidectomy_demo",
+    "catalog_version": "synthetic-catalog-v1"
+  },
+  "/surgery/context": {
+    "revision": 1601,
+    "procedure_type": "thyroidectomy_demo",
+    "procedure_active": false,
+    "current_phase": "",
+    "phase_confidence": 0.0,
+    "phase_uncertain": false,
+    "execution_state": "idle",
+    "evidence_status": "DUMMY_IDLE",
+    "safety_flags": []
+  },
+  "/surgery/instruments": {
+    "revision": 1601,
+    "instruments": []
+  },
+  "/surgery/robots": {
+    "revision": 1601,
+    "robots": []
+  },
+  "/surgery/robot_end_effectors": {
+    "revision": 1601,
+    "end_effectors": []
+  },
+  "/surgery/tool_predictions": {
+    "revision": 1601,
+    "predictions": []
+  },
+  "/surgery/speech": {
+    "revision": 1601,
+    "state": "unavailable",
+    "available": false,
+    "connected": false,
+    "text": ""
+  },
+  "/surgery/health": {
+    "revision": 1601,
+    "healthy": true,
+    "state": "idle",
+    "unavailable_sources": [],
+    "stale_sources": [],
+    "error_codes": []
+  }
+}

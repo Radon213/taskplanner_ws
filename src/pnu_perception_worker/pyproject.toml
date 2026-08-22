@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "taskplanner-pnu-perception-worker"
+version = "0.1.0"
+description = "Versioned binary Hand/Tool/Blood inference boundary for Taskplanner"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+  "fastapi>=0.141,<0.142",
+  "mediapipe==0.10.18",
+  "numpy>=1.26,<2",
+  "opencv-contrib-python>=4.11,<4.12",
+  "python-multipart>=0.0.32,<0.1",
+  "rfdetr==1.9.0",
+  "torch>=2.8,<2.9",
+  "torchvision>=0.23,<0.24",
+  "uvicorn>=0.52,<0.53",
+]
+
+[project.scripts]
+pnu-perception-worker = "pnu_perception_worker.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["pnu_perception_worker*"]
+
+[tool.pytest.ini_options]
+testpaths = ["test"]

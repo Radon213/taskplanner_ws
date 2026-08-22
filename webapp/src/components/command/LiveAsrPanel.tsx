@@ -12,7 +12,7 @@ import {
 import type { LiveAsrControlResult, LiveAsrStatus } from "../../types";
 import type { Language } from "../../utils/display";
 
-type LiveAsrOperation = "refresh_devices" | "start" | "stop";
+type LiveAsrOperation = "refresh_devices" | "set_route_policy" | "start" | "stop";
 
 function formatLatency(value: number | null | undefined, language: Language): string {
   return typeof value === "number" && Number.isFinite(value)
@@ -47,6 +47,43 @@ function formatDeviceMessage(status: LiveAsrStatus, language: Language): string 
   return "Ubuntu 마이크 입력 상태를 확인한 뒤 새로고침하세요.";
 }
 
+function routePolicyLabel(policy: LiveAsrStatus["route_policy"], language: Language): string {
+  if (language !== "ko") {
+    if (policy === "lan") return "LAN only";
+    if (policy === "auto") return "Auto · prefer LAN";
+    return "Cloud only";
+  }
+  if (policy === "lan") return "LAN만";
+  if (policy === "auto") return "자동 · LAN 우선";
+  return "클라우드만";
+}
+
+function lanHealthSummary(status: LiveAsrStatus, language: Language): string {
+  const health = status.lan_health;
+  const age = health.age_ms === null ? "" : ` · ${(health.age_ms / 1000).toFixed(1)}${language === "ko" ? "초 전" : "s ago"}`;
+  if (health.state === "READY") {
+    const latency = health.latency_ms === null ? "" : ` · ${health.latency_ms.toFixed(1)} ms`;
+    return language === "ko" ? `LAN 준비됨${latency}${age}` : `LAN ready${latency}${age}`;
+  }
+  if (health.state === "CHECKING") return language === "ko" ? "LAN 상태 확인 중" : "Checking LAN";
+  if (health.state === "UNAVAILABLE") return language === "ko" ? `LAN 미준비${age}` : `LAN unavailable${age}`;
+  if (health.state === "STALE") return language === "ko" ? "LAN 상태가 오래되었습니다" : "LAN status is stale";
+  return language === "ko" ? "LAN 상태 대기 중" : "Waiting for LAN status";
+}
+
+function routeSelectionSummary(status: LiveAsrStatus, language: Language): string {
+  const endpoint = status.endpoint_id === "lan" ? "LAN" : language === "ko" ? "클라우드" : "Cloud";
+  const active = ["STARTING", "LISTENING", "STOPPING"].includes(status.state);
+  if (status.route_policy === "auto" && status.endpoint_id === "cloud") {
+    return language === "ko" ? "LAN 미준비 → 클라우드 대체" : "LAN unavailable → Cloud fallback";
+  }
+  if (status.route_policy === "lan" && status.lan_health.state !== "READY") {
+    return language === "ko" ? "LAN 미준비 · ASR 시작 차단" : "LAN unavailable · ASR start blocked";
+  }
+  if (active) return language === "ko" ? `현재 세션: ${endpoint}` : `Current session: ${endpoint}`;
+  return language === "ko" ? `다음 세션: ${endpoint}` : `Next session: ${endpoint}`;
+}
+
 export function LiveAsrPanel({
   status,
   statusReceivedAt,
@@ -62,7 +99,11 @@ export function LiveAsrPanel({
   pendingOperation: string;
   controlMessage: string;
   language: Language;
-  onControl: (operation: LiveAsrOperation, deviceId?: number) => Promise<LiveAsrControlResult>;
+  onControl: (
+    operation: LiveAsrOperation,
+    deviceId?: number,
+    routePolicy?: LiveAsrStatus["route_policy"],
+  ) => Promise<LiveAsrControlResult>;
 }) {
   const preferredDeviceId = status.device_id
     ?? status.devices.find((device) => device.default)?.id
@@ -72,9 +113,17 @@ export function LiveAsrPanel({
   const [nowMs, setNowMs] = useState(() => Date.now());
 
   useEffect(() => {
-    const timer = window.setInterval(() => setNowMs(Date.now()), 1000);
-    return () => window.clearInterval(timer);
-  }, []);
+    if (statusReceivedAt === null) return;
+
+    // The panel only needs one repaint: when the last heartbeat crosses the
+    // five-second freshness boundary. Avoid a permanent 1 Hz rerender loop
+    // while the panel is mounted but no ASR status has ever arrived.
+    const now = Date.now();
+    setNowMs(now);
+    const untilStale = Math.max(0, 5_000 - (now - statusReceivedAt));
+    const timer = window.setTimeout(() => setNowMs(Date.now()), untilStale + 1);
+    return () => window.clearTimeout(timer);
+  }, [statusReceivedAt]);
 
   useEffect(() => {
     if (status.devices.some((device) => device.id === selectedDeviceId)) return;
@@ -87,19 +136,45 @@ export function LiveAsrPanel({
   const asrActive = ["STARTING", "LISTENING", "STOPPING"].includes(status.state);
   const listening = status.state === "LISTENING";
   const statusFresh = statusReceivedAt !== null && nowMs - statusReceivedAt <= 5000;
+  const statusStale = statusReceivedAt !== null && !statusFresh;
+  const statusAwaiting = statusReceivedAt === null;
+  const lanOnlyUnavailable = status.route_policy === "lan" && status.lan_health.state !== "READY";
   const startDisabled = !connected
     || !statusFresh
     || !status.available
     || !selectedDevice
+    || lanOnlyUnavailable
     || asrActive
     || Boolean(pendingOperation);
   const stopDisabled = !connected || !asrActive || Boolean(pendingOperation);
   const refreshDisabled = !connected || !statusFresh || asrActive || Boolean(pendingOperation);
   const selectorDisabled = !connected || !statusFresh || asrActive || Boolean(pendingOperation);
+  const routePolicyDisabled = !connected || !statusFresh || asrActive || Boolean(pendingOperation);
   const levelPercent = Math.max(0, Math.min(100, ((status.audio_level_dbfs + 60) / 60) * 100));
   const statusLabel = language === "ko"
-    ? listening ? "마이크 캡처 중" : asrActive ? "ASR 전환 중" : status.state === "ERROR" ? "ASR 오류" : "ASR 정지"
-    : listening ? "Microphone capturing" : asrActive ? "ASR transitioning" : status.state === "ERROR" ? "ASR error" : "ASR stopped";
+    ? statusStale
+      ? "상태 지연"
+      : statusAwaiting
+        ? "상태 대기"
+        : listening
+          ? "마이크 캡처 중"
+          : asrActive
+            ? "ASR 전환 중"
+            : status.state === "ERROR"
+              ? "ASR 오류"
+              : "ASR 정지"
+    : statusStale
+      ? "Status stale"
+      : statusAwaiting
+        ? "Waiting for status"
+        : listening
+          ? "Microphone capturing"
+          : asrActive
+            ? "ASR transitioning"
+            : status.state === "ERROR"
+              ? "ASR error"
+              : "ASR stopped";
+  const stateTone = statusStale ? "stale" : listening ? "active" : "idle";
 
   return (
     <section className={`live-asr-panel ${listening ? "capturing" : ""}`} data-slot="live-asr-panel" aria-labelledby="live-asr-title">
@@ -108,11 +183,50 @@ export function LiveAsrPanel({
           <p className="section-kicker">USB ASR</p>
           <h3 id="live-asr-title">{language === "ko" ? "수술실 음성 입력" : "Operating-room speech"}</h3>
         </div>
-        <div className={`live-asr-state ${listening ? "active" : "idle"}`} aria-live="polite" aria-atomic="true">
+        <div
+          aria-atomic="true"
+          aria-live="polite"
+          className={`live-asr-state ${stateTone}`}
+          data-status-fresh={statusFresh}
+        >
           {pendingOperation ? <LoaderCircle className="live-asr-spinner" size={17} aria-hidden="true" /> : listening ? <Mic size={17} aria-hidden="true" /> : <MicOff size={17} aria-hidden="true" />}
           <span>{pendingOperation ? (language === "ko" ? "요청 처리 중" : "Applying request") : statusLabel}</span>
         </div>
       </div>
+
+      <fieldset className="live-asr-route-policy" data-slot="live-asr-route-policy" disabled={routePolicyDisabled}>
+        <legend>{language === "ko" ? "ASR 전송 경로" : "ASR transport route"}</legend>
+        <div>
+          {(["cloud", "lan", "auto"] as const).map((policy) => (
+            <label className={status.route_policy === policy ? "selected" : ""} key={policy}>
+              <input
+                checked={status.route_policy === policy}
+                name="live-asr-route-policy"
+                onChange={() => void onControl("set_route_policy", -1, policy)}
+                type="radio"
+                value={policy}
+              />
+              <span>
+                <strong>{routePolicyLabel(policy, language)}</strong>
+                <small>{policy === "cloud" ? "worker-02 · TLS" : policy === "lan" ? "192.168.1.5:1196" : language === "ko" ? "LAN 장애 시 클라우드" : "Cloud if LAN is unavailable"}</small>
+              </span>
+            </label>
+          ))}
+        </div>
+      </fieldset>
+
+      <div className={`live-asr-route-summary ${status.lan_health.state.toLowerCase()}`} data-slot="live-asr-route-summary">
+        <Server size={15} aria-hidden="true" />
+        <div>
+          <strong>{routeSelectionSummary(status, language)}</strong>
+          <span>{lanHealthSummary(status, language)}</span>
+        </div>
+      </div>
+      {status.route_policy !== "cloud" ? (
+        <p className="live-asr-route-warning">
+          {language === "ko" ? "LAN route는 평문 ws://입니다. 신뢰된 유선망에서만 사용하세요." : "The LAN route uses plaintext ws://. Use it only on a trusted wired network."}
+        </p>
+      ) : null}
 
       <div className="live-asr-controls">
         <label className="field live-asr-device-field" htmlFor="live-asr-device">

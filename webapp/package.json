@@ -5,13 +5,16 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build && node scripts/check-bundle-budgets.cjs",
+    "build": "tsc -b && node scripts/check-dev-server-contract.mjs && vite build && node scripts/check-bundle-budgets.cjs && node scripts/check-monitor-bundle.cjs",
     "check:domain-hardcoding": "node scripts/check-domain-hardcoding.cjs",
     "check:debug-safety": "node scripts/check-debug-safety.cjs",
     "check:live-asr-ui": "node scripts/check-live-asr-ui.cjs",
     "check:frontend-performance": "node scripts/check-frontend-performance.cjs",
+    "check:monitor-bundle": "node scripts/check-monitor-bundle.cjs",
     "check:design-system": "node scripts/check-design-system.cjs",
+    "check:dev-server-contract": "node scripts/check-dev-server-contract.mjs",
     "check:rosbridge-image-backpressure": "node scripts/check-rosbridge-image-backpressure.cjs",
+    "test:monitor": "node --test monitor/test/*.test.js",
     "test:e2e": "playwright test",
     "preview": "vite preview"
   },
@@ -21,6 +24,7 @@
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "roslib": "^1.4.1",
+    "roslib-monitor": "npm:roslib@2.1.0",
     "three": "^0.185.1"
   },
   "devDependencies": {

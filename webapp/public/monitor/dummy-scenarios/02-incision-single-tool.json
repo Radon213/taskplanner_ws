@@ -1,0 +1,84 @@
+{
+  "fixture_schema": "taskplanner.ui_contract_fixture.v1",
+  "synthetic": true,
+  "usage": "SurgiMate dummy scenario 02: incision stage with one surgeon tool, one Mayo tool, and one prediction.",
+  "baseline": {
+    "schema_version": "1.1.0",
+    "interface_version": "0.3.0",
+    "procedure_type": "thyroidectomy_demo",
+    "catalog_version": "synthetic-catalog-v1"
+  },
+  "/surgery/context": {
+    "revision": 1201,
+    "procedure_type": "thyroidectomy_demo",
+    "procedure_active": true,
+    "current_phase": "P02",
+    "phase_confidence": 0.93,
+    "phase_uncertain": false,
+    "execution_state": "running",
+    "evidence_status": "DUMMY_ACCEPTED",
+    "safety_flags": []
+  },
+  "/surgery/instruments": {
+    "revision": 1201,
+    "instruments": [
+      {
+        "instrument_id": "T01",
+        "instance_id": "T01#scenario-02",
+        "location_type": "surgeon",
+        "location_id": "surgeon",
+        "holder_role": "surgeon",
+        "state": "in_use",
+        "visible": true,
+        "confidence": 0.97,
+        "evidence_status": "DUMMY_ACCEPTED"
+      },
+      {
+        "instrument_id": "T02",
+        "instance_id": "T02#scenario-02",
+        "location_type": "mayo_stand",
+        "location_id": "mayo_stand",
+        "holder_role": "none",
+        "state": "parked_for_reuse",
+        "visible": true,
+        "confidence": 0.9,
+        "evidence_status": "DUMMY_ACCEPTED"
+      }
+    ]
+  },
+  "/surgery/robots": {
+    "revision": 1201,
+    "robots": [
+      { "robot_id": "bed_arm_1", "robot_type": "bed_retraction_arm", "execution_state": "retracting" },
+      { "robot_id": "bed_arm_2", "robot_type": "bed_retraction_arm", "execution_state": "direct_teach" }
+    ]
+  },
+  "/surgery/robot_end_effectors": {
+    "revision": 1201,
+    "end_effectors": [
+      { "robot_id": "humanoid", "end_effector_id": "left_hand", "state": "empty", "instrument_id": "", "instance_id": "", "confidence": 1.0, "evidence_status": "DUMMY_ACCEPTED" },
+      { "robot_id": "humanoid", "end_effector_id": "right_hand", "state": "holding", "instrument_id": "T01", "instance_id": "T01#scenario-02", "confidence": 0.99, "evidence_status": "DUMMY_ACCEPTED" }
+    ]
+  },
+  "/surgery/tool_predictions": {
+    "revision": 1201,
+    "predictions": [
+      { "rank": 1, "instrument_id": "T04", "instance_id": "", "confidence": 0.88, "stability_sec": 1.7, "source": "dummy", "evidence_status": "DUMMY_ACCEPTED" }
+    ]
+  },
+  "/surgery/speech": {
+    "revision": 1201,
+    "state": "ready",
+    "available": true,
+    "connected": true,
+    "text": "Scalpel"
+  },
+  "/surgery/health": {
+    "revision": 1201,
+    "healthy": true,
+    "state": "healthy",
+    "unavailable_sources": [],
+    "stale_sources": [],
+    "error_codes": []
+  }
+}

@@ -1,0 +1,44 @@
+ARG RFDETR_BASE_IMAGE=pytorch/pytorch:2.8.0-cuda12.9-cudnn9-runtime@sha256:e05438443ae3c407e8d04447091a959dbb6757b6290b128770c3c787d4bd442b
+FROM ${RFDETR_BASE_IMAGE}
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/opt/taskplanner
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        libglib2.0-0 \
+        libgl1 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY docker/rfdetr-perception/constraints-unified.txt /tmp/constraints-unified.txt
+COPY docker/rfdetr-perception/requirements-unified.txt /tmp/requirements-unified.txt
+
+# MediaPipe pulls opencv-contrib-python while supervision pulls opencv-python.
+# Both distributions install the same ``cv2`` package, so a normal resolver
+# leaves overlapping files.  Resolve all dependencies first, remove the two
+# non-canonical providers, then reinstall the one canonical provider last.
+# This intentionally leaves one packaging-metadata warning from supervision;
+# compatibility_check.py proves that the contrib wheel supplies the API that
+# supervision and Taskplanner use and rejects every other pip-check failure.
+RUN python -m pip install --no-cache-dir \
+        --constraint /tmp/constraints-unified.txt \
+        --requirement /tmp/requirements-unified.txt \
+    && python -m pip uninstall --yes opencv-python opencv-python-headless \
+    && python -m pip install --no-cache-dir --no-deps --force-reinstall \
+        opencv-contrib-python==4.11.0.86
+
+WORKDIR /opt/taskplanner
+COPY src/vlm_node/vlm_node /opt/taskplanner/vlm_node
+COPY docker/rfdetr-perception/compatibility_check.py \
+    /opt/taskplanner/compatibility_check.py
+
+# CPU/import-only build gate.  Checkpoints are deliberately not copied into
+# the image; deployment mounts them read-only and can invoke the same checker
+# with --checkpoint arguments before enabling a provider.
+RUN python /opt/taskplanner/compatibility_check.py \
+        --profile unified \
+        --import-taskplanner-service
+
+CMD ["python", "-m", "vlm_node.rfdetr_service", "--host", "127.0.0.1", "--port", "8010"]

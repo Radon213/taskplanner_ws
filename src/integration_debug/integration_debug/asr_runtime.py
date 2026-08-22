@@ -21,8 +21,10 @@ import subprocess
 import threading
 import time
 from typing import Any
-from urllib.parse import urlparse
 import wave
+
+from integration_debug.asr_endpoints import validate_websocket_url
+from integration_debug.puzzle_asr_postprocess import KEYWORDS, correct
 
 
 SAMPLE_RATE = 16_000
@@ -31,37 +33,10 @@ SAMPLE_WIDTH = 2
 CHUNK_FRAMES = 4_096
 CHUNK_BYTES = CHUNK_FRAMES * SAMPLE_WIDTH * CHANNELS
 DEFAULT_BLOCK_FRAMES = 1_600
-DEFAULT_KEYWORDS: tuple[tuple[str, int], ...] = (
-    ("nephrectomy", 7),
-    # Demo retractor command vocabulary.  Supplying both Korean phrases and
-    # common English renderings helps the remote STT preserve the terms that
-    # distinguish the six closed Service commands.
-    ("직접 교시", 9),
-    ("direct teach", 9),
-    ("리트랙션", 9),
-    ("retraction", 9),
-    ("retractor", 8),
-    ("툴 체인지", 9),
-    ("tool change", 9),
-    ("왼쪽", 8),
-    ("오른쪽", 8),
-    ("5 센티미터", 8),
-    ("Bovie", 7),
-    ("Army", 7),
-    ("Metzenbaum", 7),
-    ("Allis", 7),
-    ("gauze", 7),
-    ("forcep", 7),
-    ("Mosquito", 7),
-    ("Kelly", 7),
-    ("scissor", 7),
-    ("bipolar", 7),
-    ("Adson", 7),
-    ("suction", 7),
-    ("Thunderbeat", 7),
-    ("Debakey forcep", 7),
-    ("Peanut", 7),
-)
+# The new Puzzle AI handoff owns instrument vocabulary and lexical correction.
+# Keep this public alias for existing callers/tests that inspect the transport
+# configuration directly.
+DEFAULT_KEYWORDS = KEYWORDS
 
 PIPEWIRE_DEFAULT_SOURCE = "@DEFAULT_AUDIO_SOURCE@"
 PIPEWIRE_CAPTURE_NAMES = frozenset({"default", "pipewire"})
@@ -91,20 +66,6 @@ def _optional_audio_modules() -> tuple[Any | None, Any | None, Any | None, str]:
     except Exception as exc:
         return None, None, None, f"ASR dependency unavailable: {exc}"
     return np, sd, websockets, ""
-
-
-def validate_websocket_url(value: Any) -> str:
-    url = str(value or "").strip()
-    parsed = urlparse(url)
-    if parsed.scheme not in {"ws", "wss"} or not parsed.hostname:
-        raise ValueError("ASR server URL must use ws:// or wss://")
-    if parsed.username or parsed.password:
-        raise ValueError("ASR credentials must not be embedded in the server URL")
-    if parsed.query or parsed.fragment or "?" in url or "#" in url:
-        raise ValueError(
-            "ASR server URL must not include query parameters or fragments"
-        )
-    return url
 
 
 def _parse_wpctl_properties(output: str) -> dict[str, str]:
@@ -361,7 +322,13 @@ class Pcm16MonoResampler:
 
 
 class AsrWsClient:
-    """Thread-backed WebSocket client for 16 kHz mono signed PCM."""
+    """ZIP-derived Puzzle AI transport for 16 kHz mono signed PCM.
+
+    The received protocol is preserved (server VAD, keyword configuration,
+    ``partial``/``is_final`` JSON and EOF flush).  Bounded buffering,
+    terminal-frame padding and final-only callbacks are Taskplanner safety
+    guards around that protocol.
+    """
 
     def __init__(
         self,
@@ -532,7 +499,10 @@ class AsrWsClient:
             self._run_task = None
 
     def _config(self) -> dict[str, Any]:
-        config: dict[str, Any] = {"use_vad": True, "use_timestamp": True}
+        # Match the received ZIP protocol. Sentence boundaries remain a
+        # server-VAD decision; timestamps are not part of the external text
+        # input contract.
+        config: dict[str, Any] = {"use_vad": True, "use_timestamp": False}
         if self._keywords:
             config["keywords"] = [
                 {"keyword": keyword, "sensitivity": sensitivity}
@@ -1073,7 +1043,8 @@ class AsrMicrophoneRuntime:
             self._pending_final_metadata = dict(metadata)
 
     def _on_final(self, text: str) -> None:
-        normalized = text.strip()
+        normalized, corrections = correct(text.strip())
+        normalized = normalized.strip()
         if not normalized:
             return
         with self._lock:
@@ -1086,6 +1057,7 @@ class AsrMicrophoneRuntime:
             row = {
                 "stamp": _utc_now(),
                 "text": normalized,
+                "postprocess_corrections": len(corrections),
                 **metadata,
             }
             self._partial_text = ""

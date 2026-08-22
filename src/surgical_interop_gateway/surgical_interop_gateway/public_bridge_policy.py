@@ -66,7 +66,13 @@ PUBLIC_MAX_CLIENTS = 8
 PUBLIC_MAX_INCOMING_BYTES = 64 * 1024
 PUBLIC_MAX_INCOMING_QUEUE = 32
 PUBLIC_MAX_OUTGOING_MESSAGE_BYTES = 4 * 1024 * 1024
-PUBLIC_MAX_OUTGOING_QUEUE = 4
+# One gateway publish tick emits the reviewed state snapshot topics as a burst.
+# Keep enough bounded headroom for the complete burst plus one latest binary
+# frame; a four-item queue silently discarded gateway/context snapshots under
+# normal load and made a healthy monitor oscillate into HEALTH WARN.
+PUBLIC_MAX_OUTGOING_STATE_MESSAGE_BYTES = 256 * 1024
+PUBLIC_MAX_OUTGOING_QUEUE = 16
+PUBLIC_MAX_OUTGOING_BINARY_MESSAGES = 1
 
 
 def parse_allowed_origins(raw: str) -> tuple[str, ...]:

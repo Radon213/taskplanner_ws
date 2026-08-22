@@ -14,7 +14,6 @@ import asyncio
 from importlib import util as importlib_util
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
-from threading import Lock
 from types import ModuleType
 from typing import Any, Callable
 
@@ -24,15 +23,18 @@ from integration_debug.bridge_policy import (
     restrict_debug_rosbridge_protocol,
     restrict_operational_debug_rosbridge_protocol,
 )
+from integration_debug.multicam_backpressure import (
+    LatestPerTopicScheduler,
+    rosbridge_topic_key,
+)
 
 
 # Tornado schedules one coroutine for every outgoing rosbridge message.  A
 # browser that is only slightly slower than five full-rate camera publishers
-# can therefore retain an unbounded series of encoded images.  Keep a very
-# small number of large writes in flight and drop only newer image-sized
-# payloads while the socket drains.  ROS subscription queue_length=1 then
-# supplies the newest frame on the next available write; small TF/status and
-# service messages are never dropped by this gate.
+# can therefore retain an unbounded series of encoded images. Keep a very
+# small number of large writes in flight and retain only the latest waiting
+# image per topic. Small TF/status and service messages are never scheduled
+# through this gate.
 _LARGE_MESSAGE_BYTES = 64 * 1024
 _MAX_PENDING_LARGE_WRITES = 2
 
@@ -81,9 +83,33 @@ def _run(policy_restrictor: PolicyRestrictor) -> None:
 
     class BackpressureRosbridgeWebSocket(upstream.RosbridgeWebSocket):
         def open(self, *args: str, **kwargs: str) -> None:
-            self._large_write_lock = Lock()
-            self._pending_large_writes = 0
+            self._large_write_scheduler = LatestPerTopicScheduler[tuple[Any, bool]](
+                _MAX_PENDING_LARGE_WRITES
+            )
             super().open(*args, **kwargs)
+
+        def _submit_large_write(
+            self,
+            topic: str,
+            payload: tuple[Any, bool],
+        ) -> None:
+            message, binary = payload
+            cls = self.__class__
+            event_loop = cls.event_loop
+            if event_loop is None:
+                raise RuntimeError("rosbridge event loop was not initialized")
+            future = asyncio.run_coroutine_threadsafe(
+                self.prewrite_message(message, binary),
+                event_loop,
+            )
+
+            def drain_next(_future: Any) -> None:
+                for next_topic, next_payload in self._large_write_scheduler.complete(
+                    topic
+                ):
+                    self._submit_large_write(next_topic, next_payload)
+
+            future.add_done_callback(drain_next)
 
         def send_message(self, message: Any, compression: str = "none") -> None:
             cls = self.__class__
@@ -96,23 +122,19 @@ def _run(policy_restrictor: PolicyRestrictor) -> None:
             except TypeError:
                 message_size = 0
             is_large = message_size >= _LARGE_MESSAGE_BYTES
-            if is_large:
-                with self._large_write_lock:
-                    if self._pending_large_writes >= _MAX_PENDING_LARGE_WRITES:
-                        return
-                    self._pending_large_writes += 1
-
             binary = compression in {"cbor", "cbor-raw"} or not isinstance(message, str)
-            future = asyncio.run_coroutine_threadsafe(
+            if is_large:
+                topic = rosbridge_topic_key(message)
+                for scheduled_topic, payload in self._large_write_scheduler.offer(
+                    topic, (message, binary)
+                ):
+                    self._submit_large_write(scheduled_topic, payload)
+                return
+
+            asyncio.run_coroutine_threadsafe(
                 self.prewrite_message(message, binary),
                 event_loop,
             )
-            if is_large:
-                def release_large_write(_future: Any) -> None:
-                    with self._large_write_lock:
-                        self._pending_large_writes = max(0, self._pending_large_writes - 1)
-
-                future.add_done_callback(release_large_write)
 
     upstream.RosbridgeWebSocket = BackpressureRosbridgeWebSocket
 

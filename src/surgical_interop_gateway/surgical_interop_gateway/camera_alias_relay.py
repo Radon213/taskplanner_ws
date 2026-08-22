@@ -131,6 +131,12 @@ class CameraAliasRelay(Node):
         self._world_running = False
         self._world_procedure_id = ""
         self._world_received_monotonic_sec: float | None = None
+        # Explicit demo-only escape hatch for a read-only FLIR preview. The
+        # default remains fail-closed; Live enables this through its reviewed
+        # mode environment while CAM4 keeps the active-procedure gate.
+        self._publish_flir_while_idle = bool(
+            self.declare_parameter("publish_flir_while_idle", False).value
+        )
 
         requested = (
             CameraAliasBinding(
@@ -227,27 +233,40 @@ class CameraAliasRelay(Node):
             stale_after_sec=self._world_stale_after_sec,
         )
 
-    def _publish_if_active(self, publisher: Any, message: CompressedImage) -> bool:
+    def _alias_available(self, name: str) -> bool:
+        return bool(
+            self._procedure_active()
+            or (name == "flir" and self._publish_flir_while_idle)
+        )
+
+    def _publish_if_available(
+        self,
+        name: str,
+        publisher: Any,
+        message: CompressedImage,
+    ) -> bool:
         # Check the run gate again in the frame callback. This closes the
         # interval between WorldState expiry and the next reconciliation tick.
-        if not self._procedure_active():
+        if not self._alias_available(name):
             return False
         return publish_when_requested(publisher, message)
 
     def _reconcile_source_demand(self) -> None:
         """Match native subscriptions to current public alias demand."""
 
-        procedure_active = self._procedure_active()
         for name, binding in self._active_bindings.items():
             publisher = self._alias_publishers[name]
-            requested = procedure_active and publisher.get_subscription_count() > 0
+            requested = (
+                self._alias_available(name)
+                and publisher.get_subscription_count() > 0
+            )
             subscription = self._source_subscriptions.get(name)
             if requested and subscription is None:
                 self._source_subscriptions[name] = self.create_subscription(
                     CompressedImage,
                     binding.source_topic,
-                    lambda message, output=publisher: self._publish_if_active(
-                        output, message
+                    lambda message, alias=name, output=publisher: (
+                        self._publish_if_available(alias, output, message)
                     ),
                     self._qos,
                 )

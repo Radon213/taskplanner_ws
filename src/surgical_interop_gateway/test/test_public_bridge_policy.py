@@ -1,3 +1,4 @@
+from collections import deque
 import json
 
 import pytest
@@ -16,8 +17,10 @@ from surgical_interop_gateway.public_bridge_policy import (
     PUBLIC_MAX_CLIENTS,
     PUBLIC_MAX_INCOMING_BYTES,
     PUBLIC_MAX_INCOMING_QUEUE,
+    PUBLIC_MAX_OUTGOING_BINARY_MESSAGES,
     PUBLIC_MAX_OUTGOING_MESSAGE_BYTES,
     PUBLIC_MAX_OUTGOING_QUEUE,
+    PUBLIC_MAX_OUTGOING_STATE_MESSAGE_BYTES,
     PUBLIC_MAX_SUBSCRIPTION_IDS_PER_TOPIC,
     PUBLIC_EVENT_QOS,
     PUBLIC_REJECTED_OPERATION,
@@ -35,6 +38,7 @@ from surgical_interop_gateway.public_bridge_policy import (
 from surgical_interop_gateway.public_rosbridge import (
     _bound_public_tornado_settings,
     _build_public_rosbridge_protocol,
+    _enqueue_public_outgoing,
     _set_public_contract_header,
 )
 
@@ -281,11 +285,51 @@ def test_public_bridge_resource_limits_are_small_and_finite() -> None:
     assert PUBLIC_MAX_INCOMING_BYTES == 64 * 1024
     assert PUBLIC_MAX_INCOMING_QUEUE == 32
     assert PUBLIC_MAX_OUTGOING_MESSAGE_BYTES == 4 * 1024 * 1024
-    assert PUBLIC_MAX_OUTGOING_QUEUE == 4
+    assert PUBLIC_MAX_OUTGOING_STATE_MESSAGE_BYTES == 256 * 1024
+    assert PUBLIC_MAX_OUTGOING_QUEUE == 16
+    assert PUBLIC_MAX_OUTGOING_BINARY_MESSAGES == 1
 
     tornado_settings = {"websocket_max_message_size": 500_000_000}
     _bound_public_tornado_settings(tornado_settings)
     assert tornado_settings["websocket_max_message_size"] == 64 * 1024
+
+
+def test_public_outgoing_queue_preserves_state_burst_and_latest_binary() -> None:
+    outgoing: deque[tuple[str | bytes, bool]] = deque()
+    assert _enqueue_public_outgoing(outgoing, (b"camera-1", True))
+    for index, topic in enumerate(PUBLIC_STATE_TOPICS):
+        assert _enqueue_public_outgoing(outgoing, (f"state-{index}:{topic}", False))
+    assert _enqueue_public_outgoing(outgoing, (b"camera-2", True))
+    assert _enqueue_public_outgoing(outgoing, (b"camera-3", True))
+
+    state_frames = [message for message, binary in outgoing if not binary]
+    binary_frames = [message for message, binary in outgoing if binary]
+    assert len(state_frames) == len(PUBLIC_STATE_TOPICS)
+    assert binary_frames == [b"camera-3"]
+    assert len(outgoing) <= PUBLIC_MAX_OUTGOING_QUEUE
+
+
+def test_public_outgoing_queue_never_evicts_state_for_binary() -> None:
+    outgoing = deque(
+        (f"state-{index}", False)
+        for index in range(PUBLIC_MAX_OUTGOING_QUEUE)
+    )
+    before = list(outgoing)
+
+    assert not _enqueue_public_outgoing(outgoing, (b"camera", True))
+    assert list(outgoing) == before
+
+
+def test_public_outgoing_queue_drops_oldest_state_only_when_state_full() -> None:
+    outgoing = deque(
+        (f"state-{index}", False)
+        for index in range(PUBLIC_MAX_OUTGOING_QUEUE)
+    )
+
+    assert _enqueue_public_outgoing(outgoing, ("state-new", False))
+    assert len(outgoing) == PUBLIC_MAX_OUTGOING_QUEUE
+    assert outgoing[0] == ("state-1", False)
+    assert outgoing[-1] == ("state-new", False)
 
 
 def test_malformed_64k_json_repeated_100_times_cannot_accumulate() -> None:

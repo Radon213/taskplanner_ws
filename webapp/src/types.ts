@@ -182,6 +182,18 @@ export type LiveAsrFinal = {
   latency_correlated: boolean;
 };
 
+export type LiveAsrRoutePolicy = "cloud" | "lan" | "auto";
+
+export type LiveAsrLanHealth = {
+  enabled: boolean;
+  state: "UNKNOWN" | "CHECKING" | "READY" | "UNAVAILABLE" | "STALE" | string;
+  method: string;
+  age_ms: number | null;
+  latency_ms: number | null;
+  consecutive_failures: number;
+  last_error: string;
+};
+
 export type LiveAsrStatus = {
   schema: "taskplanner.asr.status.v1";
   stamp_sec: number;
@@ -205,6 +217,10 @@ export type LiveAsrStatus = {
   sample_rate: number;
   channels: number;
   sample_width_bits: number;
+  endpoint_id: "cloud" | "lan" | string;
+  route_policy: LiveAsrRoutePolicy;
+  selection_reason: string;
+  lan_health: LiveAsrLanHealth;
 };
 
 export type LiveAsrControlResult = {

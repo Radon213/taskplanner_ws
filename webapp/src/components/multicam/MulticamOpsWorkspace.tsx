@@ -1,4 +1,12 @@
-import { memo, useEffect, useMemo, useRef, useState, type PointerEvent } from "react";
+import {
+  memo,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type PointerEvent,
+} from "react";
 import { LayoutGroup } from "framer-motion";
 import * as m from "framer-motion/m";
 import * as THREE from "three";
@@ -25,6 +33,7 @@ import {
 
 import {
   MULTICAM_CAMERAS,
+  CAPTURE_STATUS_MAX_AGE_MS,
   type CameraFrame,
   type CameraFrames,
   type CaptureStatus,
@@ -46,6 +55,7 @@ type FramePose = {
   parentFrame: string | null;
   position: Vec3;
   rotation: Quaternion;
+  source: TfTransformSource;
 };
 
 type Vec3 = { x: number; y: number; z: number };
@@ -53,6 +63,18 @@ type Quaternion = { x: number; y: number; z: number; w: number };
 type TfPointerDrag = { id: number; x: number; y: number; mode: "orbit" | "pan" };
 type TfViewPreset = { id: string; label: string; azimuth: number; elevation: number; description: string };
 type TfModelStatus = "loading" | "ready" | "error";
+
+/**
+ * Static and dynamic messages share the ROS TFMessage wire shape. The source
+ * remains explicit all the way into the scene so a moving `/tf` frame is never
+ * presented as a calibration/static transform.
+ */
+export type TfTransformSource = "static" | "dynamic";
+export type TfSceneTransform = StaticTransform & {
+  source?: TfTransformSource;
+  receivedAt?: number;
+  sourceStamp?: string;
+};
 
 const IDENTITY: Quaternion = { x: 0, y: 0, z: 0, w: 1 };
 const ORIGIN: Vec3 = { x: 0, y: 0, z: 0 };
@@ -72,8 +94,16 @@ const TF_VIEW_PRESETS: TfViewPreset[] = [
 function useClock(intervalMs = 1_000): number {
   const [now, setNow] = useState(Date.now());
   useEffect(() => {
-    const timer = window.setInterval(() => setNow(Date.now()), intervalMs);
-    return () => window.clearInterval(timer);
+    const refreshWhenVisible = () => {
+      if (document.visibilityState === "visible") setNow(Date.now());
+    };
+    refreshWhenVisible();
+    const timer = window.setInterval(refreshWhenVisible, intervalMs);
+    document.addEventListener("visibilitychange", refreshWhenVisible);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", refreshWhenVisible);
+    };
   }, [intervalMs]);
   return now;
 }
@@ -183,14 +213,15 @@ function inverseQuaternion(value: Quaternion): Quaternion {
   return { x: -normalized.x, y: -normalized.y, z: -normalized.z, w: normalized.w };
 }
 
-function buildFramePoses(transforms: StaticTransform[]): FramePose[] {
+function buildFramePoses(transforms: readonly TfSceneTransform[]): FramePose[] {
   if (!transforms.length) return [];
   const byChild = new Map(transforms.map((transform) => [transform.childFrame, transform]));
   const parents = new Set(transforms.map((transform) => transform.parentFrame));
   const roots = [...parents].filter((frame) => !byChild.has(frame));
   const poses = new Map<string, FramePose>();
   for (const root of roots) {
-    poses.set(root, { frame: root, parentFrame: null, position: ORIGIN, rotation: IDENTITY });
+    const rootSource = transforms.find((transform) => transform.parentFrame === root)?.source ?? "static";
+    poses.set(root, { frame: root, parentFrame: null, position: ORIGIN, rotation: IDENTITY, source: rootSource });
   }
   if (!poses.size) {
     poses.set(transforms[0].parentFrame, {
@@ -198,6 +229,7 @@ function buildFramePoses(transforms: StaticTransform[]): FramePose[] {
       parentFrame: null,
       position: ORIGIN,
       rotation: IDENTITY,
+      source: transforms[0].source ?? "static",
     });
   }
   for (let pass = 0; pass < transforms.length + 1; pass += 1) {
@@ -213,6 +245,7 @@ function buildFramePoses(transforms: StaticTransform[]): FramePose[] {
         parentFrame: transform.parentFrame,
         position,
         rotation,
+        source: transform.source ?? "static",
       });
       changed = true;
     }
@@ -227,6 +260,7 @@ function buildFramePoses(transforms: StaticTransform[]): FramePose[] {
         parentFrame: transform.parentFrame,
         position: { x: orphanIndex * 0.28, y: -0.35, z: 0 },
         rotation: transform.rotation,
+        source: transform.source ?? "static",
       });
     }
   }
@@ -253,7 +287,14 @@ function isOperationalFrame(frame: string): boolean {
   return /^(world|tag\d+|cam_[1-4]_color_optical_frame|humanoid|bed_|mayo|surgeon)/i.test(frame);
 }
 
-const TfScene = memo(function TfScene({ transforms }: { transforms: StaticTransform[] }) {
+export const TfScene = memo(function TfScene({
+  transforms,
+  showTransformTree = true,
+}: {
+  transforms: readonly TfSceneTransform[];
+  /** Debug's TF tab renders static and dynamic lists separately below the scene. */
+  showTransformTree?: boolean;
+}) {
   const viewportRef = useRef<HTMLDivElement>(null);
   const labelLayerRef = useRef<HTMLDivElement>(null);
   const pointerRef = useRef<TfPointerDrag | null>(null);
@@ -274,6 +315,8 @@ const TfScene = memo(function TfScene({ transforms }: { transforms: StaticTransf
   const [showAllFrames, setShowAllFrames] = useState(true);
   const [showModel, setShowModel] = useState(true);
   const [modelStatus, setModelStatus] = useState<TfModelStatus>("loading");
+  const staticTransformCount = transforms.filter((transform) => (transform.source ?? "static") === "static").length;
+  const dynamicTransformCount = transforms.length - staticTransformCount;
   const allPoses = useMemo(() => buildFramePoses(transforms), [transforms]);
   const referenceFrame = useMemo(() => {
     if (allPoses.some((pose) => pose.frame === "humanoid")) return "humanoid";
@@ -370,49 +413,64 @@ const TfScene = memo(function TfScene({ transforms }: { transforms: StaticTransf
       camera.updateProjectionMatrix();
       renderSceneRef.current();
     };
-    const observer = new ResizeObserver(resize);
-    observer.observe(viewport);
+    const resizeObserver = new ResizeObserver(resize);
+    resizeObserver.observe(viewport);
     resize();
 
-    const loader = new GLTFLoader();
-    loader.load(
-      TF_MODEL_URL,
-      (gltf) => {
-        if (disposed) {
+    const loadModel = () => {
+      const loader = new GLTFLoader();
+      loader.load(
+        TF_MODEL_URL,
+        (gltf) => {
+          if (disposed) {
+            gltf.scene.traverse((object) => {
+              if (!(object instanceof THREE.Mesh)) return;
+              object.geometry.dispose();
+              const materials = Array.isArray(object.material) ? object.material : [object.material];
+              for (const material of materials) material.dispose();
+            });
+            return;
+          }
+          modelRef.current = gltf.scene;
+          gltf.scene.name = "humanoid-tray-tag1";
+          let meshCount = 0;
           gltf.scene.traverse((object) => {
             if (!(object instanceof THREE.Mesh)) return;
-            object.geometry.dispose();
+            meshCount += 1;
+            object.frustumCulled = true;
             const materials = Array.isArray(object.material) ? object.material : [object.material];
-            for (const material of materials) material.dispose();
+            for (const material of materials) {
+              if ("roughness" in material && typeof material.roughness === "number") material.roughness = Math.max(0.42, material.roughness);
+            }
           });
-          return;
-        }
-        modelRef.current = gltf.scene;
-        gltf.scene.name = "humanoid-tray-tag1";
-        let meshCount = 0;
-        gltf.scene.traverse((object) => {
-          if (!(object instanceof THREE.Mesh)) return;
-          meshCount += 1;
-          object.frustumCulled = true;
-          const materials = Array.isArray(object.material) ? object.material : [object.material];
-          for (const material of materials) {
-            if ("roughness" in material && typeof material.roughness === "number") material.roughness = Math.max(0.42, material.roughness);
-          }
-        });
-        modelMeshCountRef.current = meshCount;
-        setModelStatus("ready");
-      },
-      undefined,
-      (error) => {
-        if (disposed) return;
-        console.error("TF model load failed", error);
-        setModelStatus("error");
-      },
-    );
+          modelMeshCountRef.current = meshCount;
+          setModelStatus("ready");
+        },
+        undefined,
+        (error) => {
+          if (disposed) return;
+          console.error("TF model load failed", error);
+          setModelStatus("error");
+        },
+      );
+    };
+    let modelObserver: IntersectionObserver | null = null;
+    if ("IntersectionObserver" in window) {
+      modelObserver = new IntersectionObserver((entries) => {
+        if (!entries.some((entry) => entry.isIntersecting)) return;
+        modelObserver?.disconnect();
+        modelObserver = null;
+        loadModel();
+      }, { rootMargin: "0px" });
+      modelObserver.observe(viewport);
+    } else {
+      loadModel();
+    }
 
     return () => {
       disposed = true;
-      observer.disconnect();
+      resizeObserver.disconnect();
+      modelObserver?.disconnect();
       if (modelRef.current) {
         modelRef.current.traverse((object) => {
           if (!(object instanceof THREE.Mesh)) return;
@@ -635,9 +693,11 @@ const TfScene = memo(function TfScene({ transforms }: { transforms: StaticTransf
     <section className="ops-card ops-tf-card" aria-labelledby="ops-tf-heading">
       <header className="ops-card-heading">
         <div>
-          <p>TF_STATIC</p>
+          <p>{dynamicTransformCount ? "TF · STATIC + DYNAMIC" : "TF_STATIC"}</p>
           <h2 id="ops-tf-heading">공간 좌표계</h2>
-          <span>{transforms.length ? `${transforms.length}개 고정 변환 · ${referenceFrame || "기준"} 기준 · 모든 프레임 XYZ 축 · tag1 모델 정합` : "고정 변환 대기"}</span>
+          <span>{transforms.length
+            ? `${staticTransformCount}개 고정 · ${dynamicTransformCount}개 동적 변환 · ${referenceFrame || "기준"} 기준 · 모든 프레임 XYZ 축 · tag1 모델 정합`
+            : "고정·동적 변환 대기"}</span>
         </div>
         <div className="ops-heading-actions">
           <span aria-live="polite" className={`ops-model-chip ${modelStatus === "error" ? "error" : modelStatus === "ready" && tagPose ? "ready" : "loading"}`} role="status">
@@ -649,13 +709,13 @@ const TfScene = memo(function TfScene({ transforms }: { transforms: StaticTransf
         </div>
       </header>
       <div className="ops-tf-toolbar" role="toolbar" aria-label="좌표계 보기 방향">
-        {TF_VIEW_PRESETS.map((preset) => <button aria-pressed={activeViewPreset === preset.id} className="ops-button ops-tf-view-button" key={preset.id} onClick={() => applyViewPreset(preset)} title={preset.description} type="button">{preset.label}</button>)}
-        <button className="ops-button ops-tf-fit-button" onClick={resetView} title="휴머노이드 원점으로 전체 맞춤" type="button">전체 맞춤</button>
+        {TF_VIEW_PRESETS.map((preset) => <button aria-label={preset.description} aria-pressed={activeViewPreset === preset.id} className="ops-button ops-tf-view-button" key={preset.id} onClick={() => applyViewPreset(preset)} title={preset.description} type="button">{preset.label}</button>)}
+        <button aria-label="휴머노이드 원점으로 전체 맞춤" className="ops-button ops-tf-fit-button" onClick={resetView} title="휴머노이드 원점으로 전체 맞춤" type="button">전체 맞춤</button>
       </div>
       <div
         ref={viewportRef}
         className="ops-tf-canvas"
-        aria-label="휴머노이드 기준 tf_static 고정 좌표계와 tag1 기준 컬러 모델 3차원 보기. 모든 프레임의 X Y Z 축이 표시되며 휴머노이드 기준축은 모델 앞에 항상 표시됩니다. 좌클릭 드래그로 회전하고 Shift 또는 가운데나 오른쪽 드래그로 이동하며 휠로 확대합니다."
+        aria-label="휴머노이드 또는 수신된 기준 프레임 기준 좌표계와 tag1 기준 컬러 모델 3차원 보기. 정적 tf_static과 동적 tf 프레임은 별도 색상으로 표시되며, 모든 프레임의 X Y Z 축이 표시됩니다. 좌클릭 드래그로 회전하고 Shift 또는 가운데나 오른쪽 드래그로 이동하며 휠로 확대합니다."
         aria-describedby="ops-tf-controls-help"
         aria-keyshortcuts="ArrowLeft ArrowRight ArrowUp ArrowDown Home"
         onPointerDown={onPointerDown}
@@ -675,13 +735,14 @@ const TfScene = memo(function TfScene({ transforms }: { transforms: StaticTransf
           if (event.key === "Home") resetView();
         }}
       >
-        {!poses.length && <div className="ops-tf-empty">/tf_static 수신을 기다리는 중입니다.</div>}
+        {!poses.length && <div className="ops-tf-empty">/tf_static 또는 /tf 수신을 기다리는 중입니다.</div>}
         <div ref={labelLayerRef} className="ops-tf-label-layer" aria-hidden="true">
           {poses.map((pose) => (
             <span
               className={[
                 pose.frame === referenceFrame ? "reference" : "",
                 pose.frame === "world" || /^tag\d+$/i.test(pose.frame) ? "anchor" : isOperationalFrame(pose.frame) ? "operational" : "",
+                pose.source === "dynamic" ? "dynamic" : "static",
               ].filter(Boolean).join(" ")}
               data-tf-frame={pose.frame}
               key={pose.frame}
@@ -689,15 +750,15 @@ const TfScene = memo(function TfScene({ transforms }: { transforms: StaticTransf
           ))}
         </div>
       </div>
-      <div className="ops-tf-legend" id="ops-tf-controls-help" aria-label="좌표 축 범례"><span className="axis-x">X</span><span className="axis-y">Y</span><span className="axis-z">Z</span><span>모든 프레임의 로컬 축 · humanoid 기준축은 모델 앞에 항상 표시 · 컬러 모델은 tag1 원점 정합 · 좌클릭 회전 · Shift/가운데/오른쪽 드래그 이동 · 휠 확대 · 방향키 회전 · Home/더블클릭 전체 맞춤</span></div>
-      <div className="ops-tf-tree" aria-label="고정 좌표계 목록">
+      <div className="ops-tf-legend" id="ops-tf-controls-help" aria-label="좌표 축 범례"><span className="axis-x">X</span><span className="axis-y">Y</span><span className="axis-z">Z</span><span className="static">STATIC /tf_static</span><span className="dynamic">DYNAMIC /tf</span><span>모든 프레임의 로컬 축 · 상대 변환만 표시하며 world·robot 정합은 별도 보정 증거가 필요 · 컬러 모델은 tag1 원점 정합 · 좌클릭 회전 · Shift/가운데/오른쪽 드래그 이동 · 휠 확대 · 방향키 회전 · Home/더블클릭 전체 맞춤</span></div>
+      {showTransformTree ? <div className="ops-tf-tree" aria-label="좌표계 목록">
         {transforms.length ? transforms.map((transform) => (
           <div key={transform.childFrame} className={isOperationalFrame(transform.childFrame) ? "operational" : ""}>
             <code>{transform.parentFrame}</code><span>→</span><code>{transform.childFrame}</code>
-            <small>{transform.translation.x.toFixed(3)}, {transform.translation.y.toFixed(3)}, {transform.translation.z.toFixed(3)} m</small>
+            <small><b className={(transform.source ?? "static") === "dynamic" ? "dynamic" : "static"}>{(transform.source ?? "static") === "dynamic" ? "DYNAMIC /tf" : "STATIC /tf_static"}</b> · {transform.translation.x.toFixed(3)}, {transform.translation.y.toFixed(3)}, {transform.translation.z.toFixed(3)} m</small>
           </div>
-        )) : <p>아직 받은 고정 변환이 없습니다. `world_anchor_node` 및 multicam launch 상태를 확인하세요.</p>}
-      </div>
+        )) : <p>아직 받은 변환이 없습니다. `/tf_static` 또는 `/tf` 발행 상태를 확인하세요.</p>}
+      </div> : null}
     </section>
   );
 });
@@ -717,7 +778,13 @@ function CameraGrid({
 }) {
   const cameras = view === "depth" ? MULTICAM_CAMERAS.filter((camera) => camera.depthTopic) : MULTICAM_CAMERAS;
   return (
-    <div className="ops-camera-grid" aria-label={view === "color" ? "동기화 컬러 카메라" : "동기화 깊이 카메라"}>
+    <div
+      aria-label={view === "color" ? "동기화 컬러 카메라" : "동기화 깊이 카메라"}
+      aria-labelledby={`multicam-tab-${view}`}
+      className="ops-camera-grid"
+      id="multicam-camera-panel"
+      role="tabpanel"
+    >
       {cameras.map((camera) => {
         const frame = frames[camera.id];
         const streamLive = isRecent(frame, now);
@@ -795,8 +862,21 @@ function DepthPreview({ cameraLabel, frame, presentation }: { cameraLabel: strin
   return <canvas ref={canvasRef} aria-label={`${cameraLabel} 동기화 깊이 가시화 프리뷰`} role="img" />;
 }
 
-function CaptureStatusPanel({ status, colorFrames, now }: { status: CaptureStatus | null; colorFrames: CameraFrames; now: number }) {
-  const fresh = Boolean(status && now - status.receivedAt < 3_000);
+function CaptureStatusPanel({ language, status, colorFrames, now }: { language: Language; status: CaptureStatus | null; colorFrames: CameraFrames; now: number }) {
+  const fresh = Boolean(status && now - status.receivedAt <= CAPTURE_STATUS_MAX_AGE_MS);
+  const lastStatusPrefix = language === "ko" ? "마지막 상태" : "Last status";
+  const freshWaitLabel = language === "ko" ? "새 상태 대기" : "waiting for fresh status";
+  const statusDetail = (detail: string): string => {
+    if (!status) return language === "ko" ? "수신 대기" : "Waiting for status";
+    return fresh ? detail : `${lastStatusPrefix} · ${formatAge(status.receivedAt, now)} · ${freshWaitLabel}`;
+  };
+  const statusToneFor = (tone: "ok" | "warn" | "idle"): "ok" | "warn" | "idle" => {
+    if (!status) return "idle";
+    return fresh ? tone : "warn";
+  };
+  const columnLabels = language === "ko"
+    ? { camera: "카메라", config: "설정 ID", driver: "드라이버/USB 수신", preview: "프리뷰", alignment: "정합 상태" }
+    : { camera: "Camera", config: "Config ID", driver: "Driver / USB", preview: "Preview", alignment: "Alignment" };
   return (
     <section className="ops-card ops-capture-card" aria-labelledby="ops-capture-heading">
       <header className="ops-card-heading">
@@ -808,30 +888,42 @@ function CaptureStatusPanel({ status, colorFrames, now }: { status: CaptureStatu
         <span className={`ops-status-dot ${statusTone(Boolean(status?.all_cameras_online), Boolean(status) && !fresh)}`}>{status?.all_cameras_online && fresh ? "5/5 ONLINE" : "CHECK"}</span>
       </header>
       <div className="ops-kpi-grid">
-        <Metric icon={Camera} label="온라인 카메라" value={`${status?.online_cameras.length || 0}/5`} detail={status?.offline_cameras.length ? `오프라인: ${status.offline_cameras.join(", ")}` : "동기화 입력 정상"} tone={status?.all_cameras_online ? "ok" : "warn"} />
-        <Metric icon={Gauge} label="최근 동기화" value={status ? status.synced_frames.toLocaleString() : "—"} detail={status ? `최대 skew ${status.max_sync_skew_ms.toFixed(1)} ms` : "수신 대기"} tone={status && status.max_sync_skew_ms < 50 ? "ok" : "warn"} />
-        <Metric icon={Activity} label="캡처 세션" value={status?.recording ? "REC" : "IDLE"} detail={status?.recording ? `${status.session_name || "이름 없음"} · ${formatDuration(status.elapsed_sec)}` : "현재 녹화 중이 아님"} tone={status?.recording ? "ok" : "idle"} />
-        <Metric icon={Workflow} label="보정 준비" value={status?.ready_for_calibration ? "READY" : "HOLD"} detail={status?.hint || "상태 대기"} tone={status?.ready_for_calibration ? "ok" : "idle"} />
+        <Metric icon={Camera} label="온라인 카메라" value={`${status?.online_cameras.length || 0}/5`} detail={statusDetail(status?.offline_cameras.length ? `오프라인: ${status.offline_cameras.join(", ")}` : "동기화 입력 정상")} tone={statusToneFor(status?.all_cameras_online ? "ok" : "warn")} />
+        <Metric icon={Gauge} label="최근 동기화" value={status ? status.synced_frames.toLocaleString() : "—"} detail={statusDetail(status ? `최대 skew ${status.max_sync_skew_ms.toFixed(1)} ms` : "수신 대기")} tone={statusToneFor(status && status.max_sync_skew_ms < 50 ? "ok" : "warn")} />
+        <Metric icon={Activity} label="캡처 세션" value={status?.recording ? "REC" : "IDLE"} detail={statusDetail(status?.recording ? `${status.session_name || "이름 없음"} · ${formatDuration(status.elapsed_sec)}` : "현재 녹화 중이 아님")} tone={statusToneFor(status?.recording ? "ok" : "idle")} />
+        <Metric icon={Workflow} label="보정 준비" value={status?.ready_for_calibration ? "READY" : "HOLD"} detail={statusDetail(status?.hint || "상태 대기")} tone={statusToneFor(status?.ready_for_calibration ? "ok" : "idle")} />
       </div>
       <div className="ops-inventory-note"><CircleAlert size={16} /><span><strong>USB 판정 기준:</strong> launch inventory의 카메라 ID/serial과 드라이버가 실제로 내보낸 `capture_status`·동기화 프레임을 함께 확인합니다. 케이블 링크 속도·포트 재열거 같은 물리 USB 상세는 원격 `cam_watch`/`preflight.sh`의 별도 검사 항목입니다.</span></div>
       <div className="ops-inventory-table-wrap">
         <table className="ops-table">
-          <thead><tr><th>카메라</th><th>설정 ID</th><th>드라이버/USB 수신</th><th>프리뷰</th><th>정합 상태</th></tr></thead>
+          <thead><tr><th>{columnLabels.camera}</th><th>{columnLabels.config}</th><th>{columnLabels.driver}</th><th>{columnLabels.preview}</th><th>{columnLabels.alignment}</th></tr></thead>
           <tbody>{MULTICAM_CAMERAS.map((camera) => {
             const frame = colorFrames[camera.id];
             const coverage = status?.cameras.find((item) => item.camera_name === camera.id);
             const driverOnline = Boolean(status?.online_cameras.includes(camera.id));
+            const frameFresh = Boolean(frame && now - frame.receivedAt < 3_000);
+            const driverLabel = !status
+              ? "not reported"
+              : fresh
+                ? driverOnline ? "driver online" : "not reported"
+                : `${lastStatusPrefix} · ${driverOnline ? "driver online" : "not reported"}`;
+            const previewLabel = frame
+              ? `${frame.previewHz.toFixed(1)} Hz · ${formatAge(frame.receivedAt, now)}`
+              : "수신 전";
+            const coverageLabel = coverage
+              ? `${coverage.detect_rate_hz.toFixed(1)} Hz tag · ${Math.round(coverage.area_coverage * 100)}%`
+              : "coverage 대기";
             return <tr key={camera.id}>
-              <th scope="row">{camera.label}</th>
-              <td><code>{camera.serial}</code></td>
-              <td><span className={`ops-inline-status ${driverOnline ? "ok" : "warn"}`}>{driverOnline ? "driver online" : "not reported"}</span></td>
-              <td>{frame ? `${frame.previewHz.toFixed(1)} Hz · ${formatAge(frame.receivedAt, now)}` : "수신 전"}</td>
-              <td>{coverage ? `${coverage.detect_rate_hz.toFixed(1)} Hz tag · ${Math.round(coverage.area_coverage * 100)}%` : "coverage 대기"}</td>
+              <th data-label={columnLabels.camera} scope="row">{camera.label}</th>
+              <td data-label={columnLabels.config}><code>{camera.serial}</code></td>
+              <td data-label={columnLabels.driver}><span className={`ops-inline-status ${fresh && driverOnline ? "ok" : "warn"}`}>{driverLabel}</span></td>
+              <td data-label={columnLabels.preview}><span className={`ops-inline-status ${frameFresh ? "ok" : "warn"}`}>{previewLabel}</span></td>
+              <td data-label={columnLabels.alignment}><span className={`ops-inline-status ${fresh && coverage ? "ok" : "warn"}`}>{fresh ? coverageLabel : coverage ? `${lastStatusPrefix} · ${coverageLabel}` : coverageLabel}</span></td>
             </tr>;
           })}</tbody>
         </table>
       </div>
-      {status?.capture_dir ? <p className="ops-path"><span>저장 위치</span><code>{status.capture_dir}</code></p> : null}
+      {status?.capture_dir ? <p className="ops-path"><span>저장 위치</span><code aria-label="캡처 저장 위치" tabIndex={0}>{status.capture_dir}</code></p> : null}
     </section>
   );
 }
@@ -860,10 +952,10 @@ function WorldAnchorPanel({
           <h2 id="ops-world-heading">World Anchor</h2>
           <span>{status ? `${formatAge(status.receivedAt, now)} · ${status.reference_frame || "reference 대기"} → ${status.world_frame || "world 대기"}` : "world_anchor_node status 대기"}</span>
         </div>
-        <span className={`ops-status-dot ${statusTone(Boolean(status?.collecting), stale)}`}>{status?.collecting ? "COLLECTING" : stale ? "STALE" : "IDLE"}</span>
+        <span className={`ops-status-dot ${statusTone(Boolean(status?.collecting), stale)}`}>{stale ? "STALE" : status?.collecting ? "COLLECTING" : "IDLE"}</span>
       </header>
-      <p className="ops-world-message">{status?.message || "world_anchor_node의 상태 메시지를 기다리는 중입니다."}</p>
-      <div className="ops-world-tags">
+      <p className={`ops-world-message ${stale ? "is-stale" : ""}`}>{status ? stale ? `마지막 상태 · ${status.message || "상태 메시지 없음"} · 새 상태 대기` : status.message || "상태 메시지 없음" : "world_anchor_node의 상태 메시지를 기다리는 중입니다."}</p>
+      <div className={`ops-world-tags ${stale ? "is-stale" : ""}`}>
         {Object.entries(status?.tags || {}).map(([id, tag]) => <article key={id}><span>TAG {id} · {tag.role || "role 미지정"}</span><strong>{tag.total ?? 0}<small> samples</small></strong><p>{Object.entries(tag.per_camera || {}).map(([camera, value]) => `${camera}: ${value.count ?? 0}${value.fresh ? "" : " (stale)"}`).join(" · ") || "카메라 샘플 대기"}</p></article>)}
         {!status?.tags || !Object.keys(status.tags).length ? <p className="ops-empty-inline">태그 샘플 상태 대기</p> : null}
       </div>
@@ -911,7 +1003,11 @@ function TopicInspector({
       <div className="ops-topic-controls"><input aria-label="토픽 필터" onChange={(event) => setFilter(event.target.value)} placeholder="토픽 또는 타입 필터" value={filter} /><select aria-label="검사할 ROS 토픽" onChange={(event) => onSelect(event.target.value)} value={selectedTopic}><option value="">토픽 선택</option>{topics.map((topic) => <option key={topic.name} value={topic.name}>{topic.name}</option>)}</select></div>
       <div className="ops-topic-workspace">
         <div className="ops-topic-list" role="list" aria-label="발견된 ROS 토픽">
-          {visible.map((topic) => <button key={topic.name} className={topic.name === selectedTopic ? "selected" : ""} onClick={() => onSelect(topic.name)} role="listitem" type="button"><code>{topic.name}</code><span>{topic.type}</span></button>)}
+          {visible.map((topic) => (
+            <div key={topic.name} role="listitem">
+              <button className={topic.name === selectedTopic ? "selected" : ""} onClick={() => onSelect(topic.name)} type="button"><code>{topic.name}</code><span>{topic.type}</span></button>
+            </div>
+          ))}
           {!visible.length ? <p>일치하는 토픽이 없습니다.</p> : null}
         </div>
         <div className="ops-topic-preview">
@@ -924,98 +1020,177 @@ function TopicInspector({
   );
 }
 
-export function MulticamOpsWorkspace({ language, onExit }: { language: Language; onExit: () => void }) {
+export function MulticamOpsWorkspace({
+  language,
+  onExit,
+  embedded = false,
+}: {
+  language: Language;
+  onExit?: () => void;
+  embedded?: boolean;
+}) {
+  const mainId = embedded ? "debug-multicam-main" : "multicam-main";
+  // A standalone workspace replaces its navigation trigger, so restore
+  // keyboard/screen-reader focus to its landmark. Embedded Debug keeps focus
+  // on the outer roving tab; moving it into this inner region would break
+  // arrow-key tab navigation.
+  useEffect(() => {
+    if (embedded) return;
+    const focusFrame = window.requestAnimationFrame(() => {
+      document.getElementById(mainId)?.focus({ preventScroll: true });
+    });
+    return () => window.cancelAnimationFrame(focusFrame);
+  }, [embedded, mainId]);
   const [view, setView] = useState<MulticamView>("color");
   const [depthPresentation, setDepthPresentation] = useState<DepthPresentation>("visualized");
-  const bridge = useMulticamOpsBridge(view);
+  // The Debug TF tab owns its own `/tf_static` + `/tf` subscriptions through
+  // the Debug bridge. Do not keep a duplicate static-transform subscription in
+  // the embedded multicam observer.
+  const bridge = useMulticamOpsBridge(view, { observeStaticTf: !embedded });
   const now = useClock();
+  const handleViewKeyDown = (event: ReactKeyboardEvent<HTMLButtonElement>, current: MulticamView) => {
+    const options: MulticamView[] = ["color", "depth"];
+    const currentIndex = options.indexOf(current);
+    const nextIndex = event.key === "ArrowRight"
+      ? (currentIndex + 1) % options.length
+      : event.key === "ArrowLeft"
+        ? (currentIndex - 1 + options.length) % options.length
+        : event.key === "Home"
+          ? 0
+          : event.key === "End"
+            ? options.length - 1
+            : null;
+    if (nextIndex === null) return;
+    event.preventDefault();
+    const next = options[nextIndex];
+    setView(next);
+    window.requestAnimationFrame(() => document.getElementById(`multicam-tab-${next}`)?.focus());
+  };
   const activeFrames = view === "color" ? bridge.colorFrames : bridge.depthFrames;
   const freshFrameCount = Object.values(activeFrames).filter(
     (frame) => frame && now - frame.receivedAt <= 3_000,
   ).length;
 
-  return (
-    <div className="app-shell ops-app-shell" data-slot="multicam-ops-workspace">
-      <a className="skip-link" href="#multicam-main">
-        {language === "ko" ? "멀티캠 본문으로 이동" : "Skip to multicamera content"}
-      </a>
-      <header className="ops-header">
-        <div className="ops-brand"><button className="ops-back-button" onClick={onExit} type="button"><ArrowLeft size={18} />{language === "ko" ? "미션 화면" : "Mission"}</button><div><p>ARPA MULTICAM · ROS 2 OPERATIONS</p><h1>멀티캠 관제 콘솔</h1><span>동기화 영상, 고정 TF, Capture 상태 및 World Anchor를 하나의 ROSBridge 세션에서 확인합니다.</span></div></div>
-        <div className="ops-connection"><div className="ops-observer-signals" aria-label="멀티캠 observer 상태"><div className={`ops-connection-state ${bridge.socketConnected ? "ok" : "warn"}`}><Radio size={16} /><span>Transport {bridge.socketConnected ? "연결" : "대기"}</span></div><div className={`ops-connection-state ${bridge.captureTopicDiscovered ? "ok" : "warn"}`}><Activity size={16} /><span>Graph topic {bridge.captureTopicDiscovered ? "발견" : "미발견"}</span></div><div className={`ops-connection-state ${bridge.captureStatusFresh ? "ok" : "warn"}`}><Gauge size={16} /><span>CaptureStatus {bridge.captureStatusFresh ? "fresh" : bridge.captureStatus ? "stale" : "대기"}</span></div></div><div className="ops-observer-endpoint"><code title={bridge.url}>{bridge.url}</code><button className="ops-icon-button" onClick={bridge.retry} type="button" title="멀티캠 observer 재연결" aria-label="멀티캠 observer 재연결"><RefreshCw size={16} /></button></div><small aria-live="polite">{bridge.connectionMessage} · {view} frame fresh {freshFrameCount}/{view === "color" ? 5 : 4}</small></div>
-      </header>
+  const observerConnection = (
+    <div className="ops-connection">
+      <div className="ops-observer-signals" aria-label="멀티캠 observer 상태">
+        <div className={`ops-connection-state ${bridge.socketConnected ? "ok" : "warn"}`}><Radio size={16} /><span>Transport {bridge.socketConnected ? "연결" : "대기"}</span></div>
+        <div className={`ops-connection-state ${bridge.captureTopicDiscovered ? "ok" : "warn"}`}><Activity size={16} /><span>Graph topic {bridge.captureTopicDiscovered ? "발견" : "미발견"}</span></div>
+        <div className={`ops-connection-state ${bridge.captureStatusFresh ? "ok" : "warn"}`}><Gauge size={16} /><span>CaptureStatus {bridge.captureStatusFresh ? "fresh" : bridge.captureStatus ? "stale" : "대기"}</span></div>
+      </div>
+      <div className="ops-observer-endpoint"><code title={bridge.url}>{bridge.url}</code><button className="ops-icon-button" onClick={bridge.retry} type="button" title="멀티캠 observer 재연결" aria-label="멀티캠 observer 재연결"><RefreshCw size={16} /></button></div>
+      <small aria-live="polite">{bridge.connectionMessage} · {view} frame fresh {freshFrameCount}/{view === "color" ? 5 : 4}</small>
+    </div>
+  );
 
-      {!bridge.connected ? <p className="ops-disconnected-banner"><CircleAlert size={16} />전용 멀티캠 observer가 ready 상태가 아닙니다. 실행 중인 모드는 유지되며, fresh CaptureStatus 확인 전에는 관측 내용을 신뢰하지 않습니다.</p> : null}
+  const readinessBoundary = !bridge.connected ? <p aria-live="polite" className="ops-disconnected-banner" data-slot="multicam-readiness-boundary" role="status"><CircleAlert aria-hidden="true" size={16} />전용 멀티캠 observer가 ready 상태가 아닙니다. 실행 중인 모드는 유지되며, fresh CaptureStatus 확인 전에는 관측 내용을 신뢰하지 않습니다.</p> : null;
 
-      <main className="ops-layout" id="multicam-main" tabIndex={-1}>
-        <section className="ops-card ops-preview-card" aria-labelledby="ops-preview-heading">
-          <header className="ops-card-heading">
-            <div><p>SYNCED PREVIEW</p><h2 id="ops-preview-heading">주요 동기화 뷰</h2><span>{view === "color" ? "5개 /synced color stream · 토픽 수신 프레임을 원본 그대로 표시" : depthPresentation === "visualized" ? "D455 4대의 /synced compressedDepth stream · 원본 거리값을 화면 대비로만 가시화" : "D455 4대의 /synced compressedDepth stream · 토픽 원본 PNG 표시 · FLIR은 depth 센서가 없습니다."}</span></div>
-            <div className="ops-preview-actions">
-              <LayoutGroup id="multicam-view-tabs">
-                <div className="ops-segmented" role="tablist" aria-label="영상 유형">
-                  {(["color", "depth"] as const).map((option) => {
-                    const active = view === option;
-                    const Icon = option === "color" ? Eye : Box;
+  const consoleBody = (
+    <div className={`ops-layout${embedded ? " ops-embedded-layout" : ""}`}>
+      <section className="ops-card ops-preview-card" aria-labelledby="ops-preview-heading">
+        <header className="ops-card-heading">
+          <div><p>SYNCED PREVIEW</p><h2 id="ops-preview-heading">주요 동기화 뷰</h2><span>{view === "color" ? "5개 /synced color stream · 토픽 수신 프레임을 원본 그대로 표시" : depthPresentation === "visualized" ? "D455 4대의 /synced compressedDepth stream · 원본 거리값을 화면 대비로만 가시화" : "D455 4대의 /synced compressedDepth stream · 토픽 원본 PNG 표시 · FLIR은 depth 센서가 없습니다."}</span></div>
+          <div className="ops-preview-actions">
+            <LayoutGroup id={`multicam-view-tabs-${embedded ? "debug" : "workspace"}`}>
+              <div className="ops-segmented" role="tablist" aria-label="영상 유형">
+                {(["color", "depth"] as const).map((option) => {
+                  const active = view === option;
+                  const Icon = option === "color" ? Eye : Box;
+                  return (
+                    <button
+                      aria-controls="multicam-camera-panel"
+                      aria-selected={active}
+                      className={active ? "active" : ""}
+                      id={`multicam-tab-${option}`}
+                      key={option}
+                      onClick={() => setView(option)}
+                      onKeyDown={(event) => handleViewKeyDown(event, option)}
+                      role="tab"
+                      tabIndex={active ? 0 : -1}
+                      type="button"
+                    >
+                      {active ? (
+                        <m.span
+                          aria-hidden="true"
+                          className="ops-segment-focus"
+                          layoutId={`multicam-active-view-${embedded ? "debug" : "workspace"}`}
+                          transition={silk.layout.transition}
+                        />
+                      ) : null}
+                      <span className="ops-segment-label"><Icon size={15} />{option === "color" ? "Color" : "Depth"}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            </LayoutGroup>
+            {view === "depth" ? (
+              <LayoutGroup id={`multicam-depth-presentation-${embedded ? "debug" : "workspace"}`}>
+                <div className="ops-segmented ops-depth-presentation" aria-label="Depth 표시 방식" role="group">
+                  {(["visualized", "raw"] as const).map((option) => {
+                    const active = depthPresentation === option;
                     return (
                       <button
-                        aria-selected={active}
+                        aria-pressed={active}
                         className={active ? "active" : ""}
                         key={option}
-                        onClick={() => setView(option)}
-                        role="tab"
+                        onClick={() => setDepthPresentation(option)}
                         type="button"
                       >
                         {active ? (
                           <m.span
                             aria-hidden="true"
                             className="ops-segment-focus"
-                            layoutId="multicam-active-view"
+                            layoutId={`multicam-active-depth-presentation-${embedded ? "debug" : "workspace"}`}
                             transition={silk.layout.transition}
                           />
                         ) : null}
-                        <span className="ops-segment-label"><Icon size={15} />{option === "color" ? "Color" : "Depth"}</span>
+                        <span className="ops-segment-label">{option === "visualized" ? "가시화" : "원본 PNG"}</span>
                       </button>
                     );
                   })}
                 </div>
               </LayoutGroup>
-              {view === "depth" ? (
-                <LayoutGroup id="multicam-depth-presentation">
-                  <div className="ops-segmented ops-depth-presentation" aria-label="Depth 표시 방식" role="group">
-                    {(["visualized", "raw"] as const).map((option) => {
-                      const active = depthPresentation === option;
-                      return (
-                        <button
-                          aria-pressed={active}
-                          className={active ? "active" : ""}
-                          key={option}
-                          onClick={() => setDepthPresentation(option)}
-                          type="button"
-                        >
-                          {active ? (
-                            <m.span
-                              aria-hidden="true"
-                              className="ops-segment-focus"
-                              layoutId="multicam-active-depth-presentation"
-                              transition={silk.layout.transition}
-                            />
-                          ) : null}
-                          <span className="ops-segment-label">{option === "visualized" ? "가시화" : "원본 PNG"}</span>
-                        </button>
-                      );
-                    })}
-                  </div>
-                </LayoutGroup>
-              ) : null}
-            </div>
-          </header>
-          <CameraGrid captureStatus={bridge.captureStatus} depthPresentation={depthPresentation} frames={activeFrames} now={now} view={view} />
-        </section>
-        <TfScene transforms={bridge.tfTransforms} />
-        <WorldAnchorPanel now={now} pending={bridge.worldActionPending} result={bridge.worldActionResult} status={bridge.worldStatus} />
-        <CaptureStatusPanel colorFrames={bridge.colorFrames} now={now} status={bridge.captureStatus} />
-        <TopicInspector now={now} onRefresh={bridge.refreshTopics} onSelect={bridge.setSelectedTopic} sample={bridge.selectedTopicSample} selectedTopic={bridge.selectedTopic} selectedType={bridge.selectedTopicType} topicError={bridge.topicError} topics={bridge.topics} />
-      </main>
+            ) : null}
+          </div>
+        </header>
+        <CameraGrid captureStatus={bridge.captureStatus} depthPresentation={depthPresentation} frames={activeFrames} now={now} view={view} />
+      </section>
+      {!embedded ? <TfScene transforms={bridge.tfTransforms} /> : null}
+      <WorldAnchorPanel now={now} pending={bridge.worldActionPending} result={bridge.worldActionResult} status={bridge.worldStatus} />
+      <CaptureStatusPanel colorFrames={bridge.colorFrames} language={language} now={now} status={bridge.captureStatus} />
+      <TopicInspector now={now} onRefresh={bridge.refreshTopics} onSelect={bridge.setSelectedTopic} sample={bridge.selectedTopicSample} selectedTopic={bridge.selectedTopic} selectedType={bridge.selectedTopicType} topicError={bridge.topicError} topics={bridge.topics} />
+    </div>
+  );
+
+  if (embedded) {
+    return (
+      <section className="ops-embedded-workspace" data-slot="debug-multicam-ops" id={mainId} tabIndex={-1} aria-labelledby="debug-multicam-heading">
+        <header className="ops-card ops-embedded-header">
+          <div className="ops-card-heading">
+            <div><p>DEBUG · MULTICAM OBSERVER</p><h2 id="debug-multicam-heading">멀티캠 관제</h2><span>동기화 영상, Capture 상태, World Anchor를 read-only observer로 확인합니다. TF·3D 모델은 개별 기능의 TF 탭에서 확인합니다.</span></div>
+          </div>
+          {observerConnection}
+        </header>
+        {readinessBoundary}
+        {consoleBody}
+      </section>
+    );
+  }
+
+  return (
+    <div className="app-shell ops-app-shell" data-slot="multicam-ops-workspace">
+      <a className="skip-link" href={`#${mainId}`}>
+        {language === "ko" ? "멀티캠 본문으로 이동" : "Skip to multicamera content"}
+      </a>
+      <header className="ops-header">
+        <div className="ops-brand"><button className="ops-back-button" onClick={() => onExit?.()} type="button"><ArrowLeft size={18} />{language === "ko" ? "미션 화면" : "Mission"}</button><div><p>ARPA MULTICAM · ROS 2 OPERATIONS</p><h1>멀티캠 관제 콘솔</h1><span>동기화 영상, 고정 TF, Capture 상태 및 World Anchor를 하나의 ROSBridge 세션에서 확인합니다.</span></div></div>
+        {observerConnection}
+      </header>
+
+      {readinessBoundary}
+      <main id={mainId} tabIndex={-1}>{consoleBody}</main>
     </div>
   );
 }
+
+export default MulticamOpsWorkspace;

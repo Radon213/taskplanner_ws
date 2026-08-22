@@ -390,15 +390,14 @@ def test_detector_independent_prompt_separates_pose_and_tool_identity() -> None:
         RealVLMNode
     )._actor_log_developer_instruction()
 
-    assert "inspect every visible hand" in instruction
-    assert "substantially visible empty receiving palm" in instruction
-    assert "Orientation, motion, glove color, and exact image position are irrelevant" in instruction
-    assert "operating hand does not cancel a separate requesting hand" in instruction
-    assert "cropped fragments" in instruction
-    assert "dorsal-only hands" in instruction
-    assert "patient/bystander hands" in instruction
-    assert 'emit ["request_tool","","open_receive",confidence]' in instruction
-    assert "Never infer its tool id" in instruction
+    assert "inspect only the upper-right surgeon hand in CAM4" in instruction
+    assert "clearly open, empty, and held out/upward" in instruction
+    assert "If it holds anything" in instruction
+    assert "unclear, occluded, or cropped" in instruction
+    assert 'emit ["","","",0.0]' in instruction
+    assert "Ignore all other cues, objects, and people" in instruction
+    assert 'For a positive emit ["request_tool","","open_receive",confidence]' in instruction
+    assert "never infer its tool id" in instruction
     assert 'intent ["none","",0.0]' in instruction
     assert "gesture always has exactly four values" in instruction
     assert 'no request is exactly ["","","",0.0]' in instruction
@@ -445,13 +444,13 @@ def test_next_tool_prompt_encourages_calibrated_proactive_forecast() -> None:
         RealVLMNode
     )._actor_log_developer_instruction()
 
-    assert "calibrated 2-8 second forecast" in instruction
-    assert "forecast of a new handover" in instruction
+    assert "horizon-free forecast of the first subsequent new handover" in instruction
+    assert "regardless of elapsed time" in instruction
     assert "not a label for the tool currently in use" in instruction
     assert "which additional instrument the assistant should prepare next" in instruction
     assert "does not inventory visible instruments" in instruction
-    assert "do not wait for a hand gesture or spoken request" in instruction
-    assert "most plausible near-term additional tool" in instruction
+    assert "Predict before a hand gesture or spoken request" in instruction
+    assert "most plausible subsequent additional tool" in instruction
     assert "visible task trajectory" in instruction
     assert "broad procedure-role transitions" in instruction
     assert "distinguish instruments already held" in instruction
@@ -471,7 +470,9 @@ def test_next_tool_prompt_encourages_calibrated_proactive_forecast() -> None:
     assert "match the longest suffix" in instruction
     assert "against every procedure chain" in instruction
     assert "Independently of your phase candidate" in instruction
-    assert "Do not choose the next tool solely from your phase output" in instruction
+    assert "frozen_ngram_prior" in instruction
+    assert "advisory aggregate phase/history statistic" in instruction
+    assert "Do not choose the next tool solely from your phase output or the n-gram prior" in instruction
 
 
 def test_demo_procedure_context_exposes_recurring_chains_and_alternatives() -> None:
@@ -524,7 +525,7 @@ def test_actor_log_prompt_separates_current_tools_from_next_handover() -> None:
     )._actor_log_developer_instruction()
 
     assert "currently_in_use lists surgeon-held tools and counts" in instruction
-    assert "tool is only a calibrated 2-8 second forecast" in instruction
+    assert "tool is only a horizon-free forecast" in instruction
     assert "available_for_next_handover" in instruction
     assert "the reducer and BT, not the VLM, validate availability" in instruction
 
@@ -535,7 +536,7 @@ def test_actor_log_prompt_is_camera_agnostic_and_token_bounded() -> None:
     system_prompt = node._actor_log_system_prompt()
     developer_prompt = node._actor_log_developer_instruction()
 
-    assert "do not assume a fixed pixel position" in system_prompt
+    assert "upper-right surgeon hand gesture" in system_prompt
     assert "ground truth" in system_prompt
     assert "Procedure context:" in system_prompt
     assert "temporal_prior favors current/next" in system_prompt

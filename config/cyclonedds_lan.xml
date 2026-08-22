@@ -7,9 +7,13 @@
         <NetworkInterface name="enp13s0" multicast="true" />
       </Interfaces>
       <AllowMulticast>true</AllowMulticast>
-      <MaxMessageSize>65500B</MaxMessageSize>
-      <!-- Keep DDS/UDP datagrams below a 1500-byte Ethernet MTU after RTPS,
-           UDP and IP headers so large camera samples avoid IP fragmentation. -->
+      <!-- MaxMessageSize limits the complete UDP payload after Cyclone packs
+           one or more DDSI fragments. 1450 bytes leaves IPv4/UDP headroom on
+           a 1500-byte Ethernet MTU; apply the same profile to every LAN writer. -->
+      <MaxMessageSize>1450B</MaxMessageSize>
+      <MaxRexmitMessageSize>1450B</MaxRexmitMessageSize>
+      <!-- Keep individual DDSI fragments small enough to fit with RTPS
+           submessage overhead inside the payload ceiling above. -->
       <FragmentSize>1344B</FragmentSize>
     </General>
     <Discovery>
@@ -27,6 +31,12 @@
     <Internal>
       <SocketReceiveBufferSize max="64MB" />
       <SocketSendBufferSize max="64MB" />
+      <!-- A single participant receives five preview JPEG streams plus the
+           1920x540 final overlay.  The Cyclone default of four incomplete
+           BEST_EFFORT samples is too small when large frames are fragmented;
+           keep a bounded pool so one delayed sample does not stall every
+           following latest-frame stream. -->
+      <DefragUnreliableMaxSamples>64</DefragUnreliableMaxSamples>
       <Watermarks>
         <WhcHigh>4MB</WhcHigh>
       </Watermarks>

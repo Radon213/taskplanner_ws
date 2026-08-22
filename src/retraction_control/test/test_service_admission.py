@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 import time
 
@@ -167,4 +168,30 @@ def test_fast_physical_result_cannot_be_overwritten_by_admission_write(tmp_path)
     assert record.result_code == "fake_completed"
     assert controller.admit(_wire()).request_accepted
     assert worker.shutdown()
+    ledger.close()
+
+
+def test_concurrent_duplicate_admission_queues_exactly_once(tmp_path):
+    worker = StubWorker()
+    ledger, controller = _controller(tmp_path, worker)
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        replies = tuple(pool.map(lambda _index: controller.admit(_wire()), range(64)))
+
+    assert all(reply.request_accepted for reply in replies)
+    assert sum(not reply.duplicate for reply in replies) == 1
+    assert len(worker.commands) == 1
+    ledger.close()
+
+
+def test_worker_persistence_fault_is_reported_as_admission_error(tmp_path):
+    class FaultedWorker(StubWorker):
+        fatal_error = "terminal_persistence_failed"
+
+    worker = FaultedWorker()
+    ledger, controller = _controller(tmp_path, worker)
+    reply = controller.admit(_wire())
+    assert not reply.request_accepted
+    assert reply.result_code is ResultCode.ERROR
+    assert reply.message == "worker_fail_closed"
+    assert worker.commands == []
     ledger.close()

@@ -68,6 +68,7 @@ from surgical_msgs.msg import (
     BedRobotArmGroupRequest,
     BedRobotArmGroupState,
     BedRobotArmGroupStatus,
+    VoiceCommandIntent,
     WorldState,
 )
 
@@ -152,6 +153,9 @@ def _router(
     router._seen_request_ids = set()
     router._dispatched_request_ids = set()
     router._recent_voice_requests = {}
+    # Existing raw-transcript cases below are compatibility tests.  Production
+    # construction defaults this off; typed voice intents are the normal path.
+    router._retractor_legacy_raw_voice_enabled = True
     router._retractor_voice_normalization_enabled = True
     router._retractor_voice_interpreter_mode = "deterministic"
     router._retractor_voice_state = RetractionState.IDLE
@@ -707,6 +711,166 @@ def _dispatch_normalized_voice(router, transcript: str) -> BedRobotArmGroupComma
     return router._command_pub.messages[-1]
 
 
+def _typed_retractor_intent(
+    *,
+    retractor_command: str = "start_direct_teach",
+    raw_text: str = "교시 시작",
+    intent: str = "retractor_command",
+    disposition: str = "propose",
+    requires_confirmation: bool = False,
+    target_side: str = "none",
+    distance_m: float = 0.0,
+    tool_id: str = "",
+    procedure_id: str = "nephrectomy",
+    catalog_id: str = "",
+    urgency: str = "",
+    provenance: str = "voice_intent_resolver.v1",
+) -> VoiceCommandIntent:
+    """Generated-message fixture for the typed voice-control boundary."""
+
+    message = VoiceCommandIntent()
+    message.intent = intent
+    message.retractor_command = retractor_command
+    message.raw_text = raw_text
+    message.normalized_text = raw_text
+    message.procedure_id = procedure_id
+    message.catalog_id = catalog_id
+    message.disposition = disposition
+    message.requires_confirmation = requires_confirmation
+    message.target_side = target_side
+    message.distance_m = distance_m
+    message.tool_id = tool_id
+    message.urgency = urgency
+    message.provenance = provenance
+    return message
+
+
+def test_typed_natural_teach_start_reaches_retractor_service_lane() -> None:
+    router = _router("nephrectomy", "P02")
+    router._retractor_legacy_raw_voice_enabled = False
+
+    # The free-form phrase did not need to contain "직접".  That semantic
+    # expansion belongs to the central resolver; this consumer only accepts
+    # its explicit, typed proposal.
+    router._on_voice_intent(
+        _typed_retractor_intent(raw_text="자 이제 교시를 시작해보자")
+    )
+
+    request = router._request_pub.messages[-1]
+    assert request.operation == "start_direct_teach"
+    assert request.voice_text == "자 이제 교시를 시작해보자"
+    assert request.source.endswith(":voice_command_intent")
+    router._on_group_request(request)
+
+    command = router._command_pub.messages[-1]
+    assert command.operation == "start_direct_teach"
+    assert command.rationale.startswith(
+        "retractor_voice_normalizer:voice_command_intent"
+    )
+
+
+def test_raw_string_and_generic_missing_voice_intents_do_not_trigger_retractor(
+) -> None:
+    router = _router("nephrectomy", "P02")
+    router._retractor_legacy_raw_voice_enabled = False
+
+    # Raw STT is no longer an action input.  It is consumed by the central
+    # resolver, which will publish a typed clarify/no-command instead.
+    for transcript in ("교시 시작", "도구 줘", "자 이제 시작해보자"):
+        router._on_voice(SimpleNamespace(data=transcript))
+    assert router._request_pub.messages == []
+
+    # A missing object must stay a clarification; no state-based filling or
+    # next-tool guess is allowed in the BT adapter.
+    router._on_voice_intent(
+        _typed_retractor_intent(
+            intent="",
+            retractor_command="",
+            raw_text="도구 줘",
+            disposition="clarify",
+        )
+    )
+    # Confirmation-required proposals are equally non-actuating here.
+    router._on_voice_intent(
+        _typed_retractor_intent(
+            raw_text="교시 시작",
+            requires_confirmation=True,
+        )
+    )
+
+    assert router._request_pub.messages == []
+    statuses = [
+        json.loads(item.data) for item in router._retractor_voice_status_pub.messages
+    ]
+    assert [item["stage"] for item in statuses] == [
+        "typed_intent_rejected",
+        "typed_intent_rejected",
+    ]
+    assert statuses[0]["reason"] == "typed_intent_is_not_retractor_command"
+    assert statuses[1]["reason"] == "typed_intent_requires_confirmation"
+
+
+def test_typed_retractor_intent_rejects_wrong_slots_and_local_state() -> None:
+    router = _router("nephrectomy", "P02")
+    router._retractor_legacy_raw_voice_enabled = False
+
+    # A lifecycle command cannot smuggle a physical slot through the typed
+    # schema, and a start-retraction command is disallowed before teach is
+    # admitted into the local state machine.
+    router._on_voice_intent(
+        _typed_retractor_intent(target_side="left", distance_m=0.01)
+    )
+    router._on_voice_intent(
+        _typed_retractor_intent(
+            retractor_command="start_retraction",
+            raw_text="견인 시작",
+        )
+    )
+
+    assert router._request_pub.messages == []
+    statuses = [
+        json.loads(item.data) for item in router._retractor_voice_status_pub.messages
+    ]
+    assert statuses[0]["reason"] == "typed_intent_nonadjustment_has_physical_slots"
+    assert statuses[1]["reason"] == "typed_intent_command_not_allowed_in_local_state"
+
+
+@pytest.mark.parametrize(
+    ("procedure_id", "world_procedure_id", "expected_reason"),
+    [
+        ("", None, "typed_intent_procedure_id_is_missing"),
+        (
+            "thyroidectomy",
+            None,
+            "typed_intent_procedure_id_mismatches_loaded_spec",
+        ),
+        (
+            "nephrectomy",
+            "thyroidectomy",
+            "typed_intent_procedure_id_mismatches_current_world",
+        ),
+    ],
+)
+def test_typed_retractor_intent_rejects_stale_or_unbound_procedure(
+    procedure_id: str,
+    world_procedure_id: str | None,
+    expected_reason: str,
+) -> None:
+    router = _router("nephrectomy", "P02")
+    router._retractor_legacy_raw_voice_enabled = False
+    if world_procedure_id is not None:
+        router._world.procedure_id = world_procedure_id
+
+    router._on_voice_intent(
+        _typed_retractor_intent(procedure_id=procedure_id)
+    )
+
+    assert router._request_pub.messages == []
+    status = json.loads(router._retractor_voice_status_pub.messages[-1].data)
+    assert status["stage"] == "typed_intent_rejected"
+    assert status["reason"] == expected_reason
+
+
 def _service_admission(
     router,
     command: BedRobotArmGroupCommand,
@@ -753,22 +917,22 @@ def test_six_retractor_voice_commands_dispatch_through_one_service_lane() -> Non
     _service_admission(router, adjustment, accepted=True)
     assert router._retractor_voice_state == RetractionState.RETRACTION_ACTIVE
 
+    retraction_stop = _dispatch_normalized_voice(router, "Retraction 종료")
+    assert retraction_stop.operation == "stop_retraction"
+    _service_admission(router, retraction_stop, accepted=True)
+    assert router._retractor_voice_state == RetractionState.IDLE
+
     tool_change = _dispatch_normalized_voice(router, "Tool change")
     assert tool_change.operation == "change_end_effector"
     assert tool_change.target_tool_id == ""
     _service_admission(router, tool_change, accepted=True)
-    assert router._retractor_voice_state == RetractionState.RETRACTION_ACTIVE
-
-    retraction_stop = _dispatch_normalized_voice(router, "Retraction 종료")
-    assert retraction_stop.operation == "stop_retraction"
-    _service_admission(router, retraction_stop, accepted=True)
-    assert router._retractor_voice_state == RetractionState.TAUGHT_READY
+    assert router._retractor_voice_state == RetractionState.IDLE
 
     event = json.loads(router._retractor_voice_status_pub.messages[-1].data)
     assert event["stage"] == "service_admitted"
     assert event["interpreter_source"] == "deterministic"
     assert event["vlm_invoked"] is False
-    assert event["state"] == "taught_ready"
+    assert event["state"] == "idle"
 
 
 def test_voice_state_does_not_advance_for_non_admission_status() -> None:
@@ -844,7 +1008,7 @@ class _FailingExecutor:
         ),
         (
             "장비 다른 걸로 바꿔줘",
-            RetractionState.RETRACTION_ACTIVE,
+            RetractionState.IDLE,
             RetractionCommand.CHANGE_TOOL,
             "change_end_effector",
         ),

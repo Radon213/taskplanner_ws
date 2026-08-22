@@ -16,6 +16,7 @@ def generate_launch_description() -> LaunchDescription:
     ros_domain_id = LaunchConfiguration("ros_domain_id")
     rmw_implementation = LaunchConfiguration("rmw_implementation")
     profile_path = LaunchConfiguration("profile_path")
+    runtime_config_path = LaunchConfiguration("runtime_config_path")
     adapter_mode = LaunchConfiguration("adapter_mode")
     data_directory = LaunchConfiguration("data_directory")
     allow_motion = LaunchConfiguration("allow_motion")
@@ -31,6 +32,12 @@ def generate_launch_description() -> LaunchDescription:
                 "profile_path",
                 default_value=PathJoinSubstitution(
                     [FindPackageShare("retraction_control"), "config", "fake.yaml"]
+                ),
+            ),
+            DeclareLaunchArgument(
+                "runtime_config_path",
+                default_value=PathJoinSubstitution(
+                    [FindPackageShare("retraction_control"), "config", "logging.yaml"]
                 ),
             ),
             DeclareLaunchArgument(
@@ -71,6 +78,7 @@ def generate_launch_description() -> LaunchDescription:
                 parameters=[
                     {
                         "profile_path": profile_path,
+                        "runtime_config_path": runtime_config_path,
                         "adapter_mode": adapter_mode,
                         "data_directory": data_directory,
                         "allow_motion": ParameterValue(allow_motion, value_type=bool),

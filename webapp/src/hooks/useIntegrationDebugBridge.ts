@@ -1,9 +1,15 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import ROSLIB from "roslib";
 
-const DEBUG_STATUS_MAX_AGE_MS = 3000;
+// Keep the bridge expiry and Debug UI's age badge/write lock on one contract.
+// Exported so a future heartbeat change cannot silently split the two gates.
+export const DEBUG_STATUS_MAX_AGE_MS = 3000;
 const DEBUG_COMMAND_TIMEOUT_MS = 10000;
-
+const MAX_DEBUG_STATUS_JSON_CHARS = 512 * 1024;
+const MAX_DEBUG_STATUS_COLLECTION_ITEMS = 512;
+const MAX_DEBUG_STATUS_OBJECT_KEYS = 512;
+const MAX_DEBUG_STATUS_STRING_CHARS = 16 * 1024;
+const MAX_DEBUG_COMMAND_RESULT_JSON_CHARS = 128 * 1024;
 interface RosConnection {
   close: () => void;
   idCounter?: number;
@@ -20,6 +26,26 @@ interface RosTopicHandle {
   publish: (message: unknown) => void;
 }
 
+export interface DebugReadOnlyTopicSpec {
+  name: string;
+  messageType: string;
+  compression?: "cbor";
+  throttleRate?: number;
+  queueLength?: number;
+  reliability?: "reliable" | "best_effort";
+  /**
+   * `/tf_static` is the one Debug observer stream that must receive retained
+   * samples from every publisher.  Keep the default volatile so ordinary
+   * image/diagnostic streams cannot accidentally request retained history.
+   */
+  durability?: "volatile" | "transient_local";
+}
+
+export type DebugReadOnlyTopicSubscriber = (
+  spec: DebugReadOnlyTopicSpec,
+  onMessage: (message: unknown) => void,
+) => () => void;
+
 export type DebugSessionState = "MONITOR_ONLY" | "ARMED" | "BUSY" | "FAULT_LOCKED";
 
 export interface DebugInputStatus {
@@ -33,11 +59,17 @@ export interface DebugInputStatus {
   expected_qos: string;
   expected_hz: number;
   measured_hz: number;
+  monitor_hz?: number;
   message_count: number;
+  source_message_count?: number | null;
+  source_dropped_count?: number | null;
   window_message_count: number;
   last_age_sec: number | null;
   source_delay_sec: number | null;
   bandwidth_bytes_sec: number;
+  source_topic?: string;
+  source_type?: string;
+  source_qos?: string;
   last_sample: string;
   state: string;
 }
@@ -244,6 +276,8 @@ export interface DebugAsrStatus {
   available: boolean;
   dependency_error: string;
   state: "UNAVAILABLE" | "STOPPED" | "STARTING" | "LISTENING" | "STOPPING" | "ERROR";
+  /** Reviewed ASR route selected for this Debug microphone session. */
+  endpoint_id: "cloud" | "lan";
   server_url: string;
   topic: string;
   device_id: number | null;
@@ -416,11 +450,63 @@ export interface DebugCommandResponse {
   result: Record<string, unknown>;
 }
 
+const DEBUG_SESSION_STATES = new Set<DebugSessionState>(["MONITOR_ONLY", "ARMED", "BUSY", "FAULT_LOCKED"]);
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function isBoundedDebugPayload(value: unknown, depth = 0): boolean {
+  if (depth > 8) return false;
+  if (typeof value === "string") return value.length <= MAX_DEBUG_STATUS_STRING_CHARS;
+  if (Array.isArray(value)) {
+    return value.length <= MAX_DEBUG_STATUS_COLLECTION_ITEMS
+      && value.every((item) => isBoundedDebugPayload(item, depth + 1));
+  }
+  if (isRecord(value)) {
+    const entries = Object.entries(value);
+    return entries.length <= MAX_DEBUG_STATUS_OBJECT_KEYS
+      && entries.every(([key, item]) => key.length <= MAX_DEBUG_STATUS_STRING_CHARS
+        && isBoundedDebugPayload(item, depth + 1));
+  }
+  return true;
+}
+
+function hasRequiredDebugStatusShape(value: unknown): value is IntegrationDebugStatus {
+  if (!isRecord(value) || value.schema !== "taskplanner.integration_debug.status.v1") return false;
+  const session = value.session;
+  const runtime = value.runtime;
+  const network = isRecord(runtime) ? runtime.network : null;
+  const action = value.action;
+  const voice = value.voice;
+  const asr = value.asr;
+  const surgeryRecord = value.surgery_record;
+  return isRecord(session)
+    && typeof value.stamp_sec === "number" && Number.isFinite(value.stamp_sec) && value.stamp_sec >= 0
+    && typeof session.session_id === "string" && session.session_id.trim().length > 0
+    && typeof session.state === "string" && DEBUG_SESSION_STATES.has(session.state as DebugSessionState)
+    && typeof session.armed === "boolean" && typeof session.fault_locked === "boolean"
+    && typeof session.last_error === "string" && typeof session.event_log_path === "string"
+    && isRecord(runtime)
+    && Array.isArray(runtime.blocked_nodes) && runtime.blocked_nodes.every((node) => typeof node === "string")
+    && isRecord(network) && Array.isArray(network.addresses)
+    && isRecord(action) && typeof action.state === "string"
+    && typeof action.progress === "number" && Number.isFinite(action.progress) && action.progress >= 0 && action.progress <= 1
+    && typeof action.success === "boolean" && typeof action.terminal === "boolean" && typeof action.recovery_required === "boolean"
+    && isRecord(voice) && typeof voice.auto_execute === "boolean"
+    && typeof voice.last_sentence === "string" && isRecord(voice.last_parse)
+    && isRecord(asr) && typeof asr.available === "boolean" && typeof asr.state === "string"
+    && Array.isArray(asr.devices) && Array.isArray(asr.finals)
+    && isRecord(surgeryRecord) && typeof surgeryRecord.state === "string"
+    && Array.isArray(surgeryRecord.history) && Array.isArray(value.inputs)
+    && Array.isArray(value.endpoints) && Array.isArray(value.outputs) && Array.isArray(value.recent_events);
+}
+
 function parseStatus(raw: unknown): IntegrationDebugStatus | null {
-  if (typeof raw !== "string") return null;
+  if (typeof raw !== "string" || raw.length > MAX_DEBUG_STATUS_JSON_CHARS) return null;
   try {
-    const value = JSON.parse(raw) as Partial<IntegrationDebugStatus>;
-    if (value.schema !== "taskplanner.integration_debug.status.v1") return null;
+    const value = JSON.parse(raw) as unknown;
+    if (!isBoundedDebugPayload(value) || !hasRequiredDebugStatusShape(value)) return null;
 
     const endpoints = Array.isArray(value.endpoints)
       ? value.endpoints.filter((endpoint) => {
@@ -438,6 +524,7 @@ function parseStatus(raw: unknown): IntegrationDebugStatus | null {
           success: false,
           terminal: true,
           reason_code: "",
+          recovery_required: false,
         }
       : value.action;
 
@@ -445,7 +532,7 @@ function parseStatus(raw: unknown): IntegrationDebugStatus | null {
       ...value,
       endpoints,
       action,
-    } as IntegrationDebugStatus;
+    };
   } catch {
     return null;
   }
@@ -525,6 +612,7 @@ export function useIntegrationDebugBridge(url: string) {
   const bridgeGenerationRef = useRef(0);
   const commandReadyGenerationRef = useRef(0);
   const statusReceivedAtRef = useRef(0);
+  const statusStampSecRef = useRef<number | null>(null);
   const pendingCommandCancelsRef = useRef(new Set<(reason: string) => void>());
   const [transportConnected, setTransportConnected] = useState(false);
   const [connected, setConnected] = useState(false);
@@ -542,6 +630,7 @@ export function useIntegrationDebugBridge(url: string) {
     bridgeGenerationRef.current = generation;
     commandReadyGenerationRef.current = 0;
     statusReceivedAtRef.current = 0;
+    statusStampSecRef.current = null;
     for (const cancel of Array.from(pendingCommandCancelsRef.current)) {
       cancel("디버그 ROSBridge 연결이 변경되어 대기 중인 명령을 취소했습니다.");
     }
@@ -550,11 +639,11 @@ export function useIntegrationDebugBridge(url: string) {
     setStatus(null);
     setReadiness(null);
     setConnectionError("");
-
     const ros = new ROSLIB.Ros();
     rosRef.current = ros;
     const isCurrentGeneration = () =>
       !disposed && bridgeGenerationRef.current === generation && rosRef.current === ros;
+
     const statusTopic = new ROSLIB.Topic({
       ros,
       name: "/integration/debug/status",
@@ -616,8 +705,33 @@ export function useIntegrationDebugBridge(url: string) {
     statusTopic.subscribe((message: { data?: unknown }) => {
       if (!isCurrentGeneration()) return;
       const parsed = parseStatus(message.data);
-      if (!parsed) return;
+      if (!parsed) {
+        setConnectionError("디버그 상태 스냅샷이 유효하지 않습니다.");
+        invalidateCommandReadiness(
+          "디버그 상태 스냅샷이 유효하지 않아 쓰기 제어를 잠갔습니다.",
+        );
+        return;
+      }
       const receivedAt = Date.now();
+      if (
+        statusStampSecRef.current !== null
+        && parsed.stamp_sec + 0.001 < statusStampSecRef.current
+      ) {
+        setConnectionError("디버그 상태 스냅샷의 시각이 이전 상태보다 뒤로 갔습니다.");
+        invalidateCommandReadiness(
+          "디버그 상태 스냅샷 순서가 역전되어 쓰기 제어를 잠갔습니다.",
+        );
+        return;
+      }
+      const payloadAgeMs = receivedAt - parsed.stamp_sec * 1_000;
+      if (payloadAgeMs > DEBUG_STATUS_MAX_AGE_MS * 2 || payloadAgeMs < -60_000) {
+        setConnectionError("디버그 상태 스냅샷의 시각이 현재 연결과 맞지 않습니다.");
+        invalidateCommandReadiness(
+          "디버그 상태 스냅샷이 오래되었거나 시각이 유효하지 않아 쓰기 제어를 잠갔습니다.",
+        );
+        return;
+      }
+      statusStampSecRef.current = parsed.stamp_sec;
       statusReceivedAtRef.current = receivedAt;
       commandReadyGenerationRef.current = generation;
       setStatus(parsed);
@@ -626,10 +740,10 @@ export function useIntegrationDebugBridge(url: string) {
     });
     readinessTopic.subscribe((message: { data?: unknown }) => {
       if (!isCurrentGeneration()) return;
-      if (typeof message.data !== "string") return;
+      if (typeof message.data !== "string" || message.data.length > MAX_DEBUG_STATUS_JSON_CHARS) return;
       try {
         const value = JSON.parse(message.data) as Record<string, unknown>;
-        setReadiness(value);
+        setReadiness(isBoundedDebugPayload(value) ? value : null);
       } catch {
         setReadiness(null);
       }
@@ -637,11 +751,14 @@ export function useIntegrationDebugBridge(url: string) {
     const connectionTimer = window.setTimeout(() => {
       if (isCurrentGeneration()) ros.connect(url);
     }, 0);
+    // The command path checks this same age synchronously before every write;
+    // this slower repaint only updates the visible lock when a heartbeat dies.
     const freshnessTimer = window.setInterval(() => {
       if (!isCurrentGeneration()) return;
+      const now = Date.now();
       if (
         commandReadyGenerationRef.current === generation &&
-        Date.now() - statusReceivedAtRef.current > DEBUG_STATUS_MAX_AGE_MS
+        now - statusReceivedAtRef.current > DEBUG_STATUS_MAX_AGE_MS
       ) {
         invalidateCommandReadiness(
           "디버그 상태 heartbeat가 만료되어 대기 중인 명령을 취소했습니다.",
@@ -657,13 +774,18 @@ export function useIntegrationDebugBridge(url: string) {
       if (bridgeGenerationRef.current === generation) {
         commandReadyGenerationRef.current = 0;
         statusReceivedAtRef.current = 0;
+        statusStampSecRef.current = null;
         setTransportConnected(false);
         setConnected(false);
         for (const cancel of Array.from(pendingCommandCancelsRef.current)) {
           cancel("디버그 ROSBridge 연결이 변경되어 대기 중인 명령을 취소했습니다.");
         }
       }
-      cleanupDebugTopics(ros, [statusTopic, readinessTopic], heartbeatTopic);
+      cleanupDebugTopics(
+        ros,
+        [statusTopic, readinessTopic],
+        heartbeatTopic,
+      );
       heartbeatTopicRef.current = null;
       if (rosRef.current === ros) rosRef.current = null;
       try {
@@ -678,13 +800,17 @@ export function useIntegrationDebugBridge(url: string) {
     async (operation: string, payload: Record<string, unknown> = {}): Promise<DebugCommandResponse> => {
       const ros = rosRef.current;
       const generation = bridgeGenerationRef.current;
+      const statusFreshNow = () =>
+        Date.now() - statusReceivedAtRef.current <= DEBUG_STATUS_MAX_AGE_MS;
       if (
         !ros ||
         !ros.isConnected ||
         !connected ||
-        commandReadyGenerationRef.current !== generation
+        commandReadyGenerationRef.current !== generation ||
+        !statusFreshNow() ||
+        pendingCommandCancelsRef.current.size > 0
       ) {
-        throw new Error("디버그 상태 heartbeat를 기다리고 있어 쓰기 제어가 잠겼습니다.");
+        throw new Error("디버그 제어가 잠겼습니다.");
       }
       return new Promise<DebugCommandResponse>((resolve, reject) => {
         let settled = false;
@@ -702,7 +828,8 @@ export function useIntegrationDebugBridge(url: string) {
           generation === bridgeGenerationRef.current &&
           commandReadyGenerationRef.current === generation &&
           rosRef.current === ros &&
-          ros.isConnected;
+          ros.isConnected &&
+          statusFreshNow();
         const handler = (message: unknown) => {
           if (!isCurrentCommand()) {
             cancel("디버그 ROSBridge 연결이 변경되어 이전 명령 응답을 무시했습니다.");
@@ -712,20 +839,30 @@ export function useIntegrationDebugBridge(url: string) {
           settled = true;
           cleanup(handler);
           const response = message && typeof message === "object"
-            ? message as { result?: boolean; values?: Record<string, unknown> | string }
+            ? message as { result?: unknown; values?: Record<string, unknown> | string }
             : {};
-          if (response.result === false) {
-            reject(new Error(String(response.values || "디버그 명령이 거부되었습니다.")));
+          if (response.result !== true) {
+            reject(new Error(String(response.values || "디버그 명령 응답을 확인할 수 없습니다.")));
             return;
           }
-          const raw = response.values && typeof response.values === "object"
-            ? response.values
-            : {};
+          if (!response.values || typeof response.values !== "object" || Array.isArray(response.values)) {
+            reject(new Error("디버그 명령 응답 형식이 유효하지 않습니다."));
+            return;
+          }
+          const raw = response.values;
+          if (typeof raw.accepted !== "boolean"
+            || typeof raw.command_id !== "string"
+            || typeof raw.message !== "string") {
+            reject(new Error("디버그 명령 응답의 수락 형식이 유효하지 않습니다."));
+            return;
+          }
           let result: Record<string, unknown> = {};
-          if (typeof raw.result_json === "string" && raw.result_json) {
+          if (typeof raw.result_json === "string"
+            && raw.result_json
+            && raw.result_json.length <= MAX_DEBUG_COMMAND_RESULT_JSON_CHARS) {
             try {
               const parsed = JSON.parse(raw.result_json) as unknown;
-              if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+              if (isBoundedDebugPayload(parsed) && parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
                 result = parsed as Record<string, unknown>;
               }
             } catch {
@@ -733,9 +870,9 @@ export function useIntegrationDebugBridge(url: string) {
             }
           }
           const commandResponse = {
-            accepted: Boolean(raw.accepted),
-            command_id: String(raw.command_id ?? ""),
-            message: String(raw.message ?? ""),
+            accepted: raw.accepted,
+            command_id: raw.command_id,
+            message: raw.message,
             result,
           };
           if (commandResponse.accepted) {
@@ -794,6 +931,31 @@ export function useIntegrationDebugBridge(url: string) {
     return () => window.clearInterval(heartbeat);
   }, [connected, status?.session.armed, status?.session.session_id]);
 
+  const subscribeReadOnlyTopic = useCallback<DebugReadOnlyTopicSubscriber>((spec, onMessage) => {
+    const ros = rosRef.current;
+    const generation = bridgeGenerationRef.current;
+    if (!ros || !ros.isConnected) return () => {};
+    let disposed = false;
+    let unsubscribe = () => {};
+    const guardedMessage = (message: unknown) => {
+      if (
+        rosRef.current === ros
+        && bridgeGenerationRef.current === generation
+        && ros.isConnected
+      ) onMessage(message);
+    };
+    void import("../utils/debugReadOnlyTopicSubscription").then(({ subscribeDebugReadOnlyTopic }) => {
+      if (disposed || rosRef.current !== ros || bridgeGenerationRef.current !== generation) return;
+      unsubscribe = subscribeDebugReadOnlyTopic(ros, spec, guardedMessage);
+    }).catch(() => {
+      // The panel remains fail-closed if its deferred read-only transport cannot load.
+    });
+    return () => {
+      disposed = true;
+      unsubscribe();
+    };
+  }, [connectionNonce, transportConnected]);
+
   const retry = useCallback(() => {
     setReconnecting(true);
     setConnectionNonce((value) => value + 1);
@@ -808,6 +970,7 @@ export function useIntegrationDebugBridge(url: string) {
     status,
     readiness,
     statusReceivedAt,
+    subscribeReadOnlyTopic,
     command,
     retry,
   };

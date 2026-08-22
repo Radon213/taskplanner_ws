@@ -1,0 +1,12 @@
+# Opt-in compatibility profile for the existing Taskplanner RF-DETR service
+# plus hand-blood-tools@0f9e93115b8cc1d470398c92e010e3fc6ef1de5d.
+#
+# PyTorch and torchvision are supplied by the digest-pinned CUDA 12.9 base
+# image.  Do not add the upstream cu118 or Hand-only torch 2.11 pins here.
+fastapi==0.141.1
+mediapipe==0.10.18
+numpy==1.26.4
+opencv-contrib-python==4.11.0.86
+rfdetr==1.9.0
+supervision==0.29.1
+uvicorn==0.52.0

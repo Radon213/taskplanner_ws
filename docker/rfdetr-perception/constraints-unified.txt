@@ -1,0 +1,25 @@
+# Compatibility constraints for the opt-in Hand/Tool/Blood image.
+#
+# Keep the Taskplanner CUDA/PyTorch/RF-DETR baseline intact.  NumPy and OpenCV
+# are the only intentional baseline changes: MediaPipe 0.10.18 does not support
+# NumPy 2, and the normal MediaPipe install otherwise leaves multiple wheels
+# owning the same ``cv2`` package.
+fastapi==0.141.1
+jax==0.7.1
+jaxlib==0.7.1
+mediapipe==0.10.18
+ml-dtypes==0.5.4
+numpy==1.26.4
+opencv-contrib-python==4.11.0.86
+opencv-python==4.11.0.86
+opencv-python-headless==4.11.0.86
+protobuf==4.25.9
+rfdetr==1.9.0
+scipy==1.17.1
+sentencepiece==0.2.2
+sounddevice==0.5.6
+supervision==0.29.1
+torch==2.8.0
+torchvision==0.23.0
+transformers==5.15.0
+uvicorn==0.52.0

@@ -45,6 +45,35 @@
   padding: 18px;
 }
 
+.ops-embedded-workspace {
+  display: grid;
+  gap: 12px;
+}
+
+.ops-embedded-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.ops-embedded-header > .ops-card-heading {
+  flex: 1 1 360px;
+  margin-bottom: 0;
+}
+
+.ops-embedded-header > .ops-connection {
+  flex: 1 1 440px;
+}
+
+.ops-embedded-workspace > .ops-disconnected-banner {
+  margin: 0;
+}
+
+.ops-embedded-layout {
+  margin-top: 0;
+}
+
 .ops-header,
 .ops-card,
 .ops-disconnected-banner {
@@ -550,6 +579,11 @@
   color: var(--soft);
 }
 
+.ops-tf-label-layer span.dynamic {
+  color: var(--clinical-strong);
+  font-weight: 800;
+}
+
 .ops-tf-label-layer span.anchor {
   color: var(--clinical-strong);
   font-weight: 800;
@@ -650,6 +684,10 @@
 .ops-tf-legend .axis-x { color: var(--tf-axis-x); }
 .ops-tf-legend .axis-y { color: var(--tf-axis-y); }
 .ops-tf-legend .axis-z { color: var(--tf-axis-z); }
+.ops-tf-legend .static,
+.ops-tf-tree b.static { color: var(--robot-strong); }
+.ops-tf-legend .dynamic,
+.ops-tf-tree b.dynamic { color: var(--clinical-strong); }
 
 .ops-tf-tree {
   display: grid;
@@ -841,6 +879,11 @@
   white-space: nowrap;
 }
 
+.ops-path code:focus-visible {
+  outline: 2px solid var(--robot);
+  outline-offset: 2px;
+}
+
 .ops-world-message {
   min-height: 54px;
   margin: 0;
@@ -851,6 +894,12 @@
   color: var(--soft);
   font-size: 13px;
   line-height: 1.5;
+}
+
+.ops-world-message.is-stale {
+  border-color: color-mix(in srgb, var(--warning) 42%, var(--line));
+  background: color-mix(in srgb, var(--warning) 7%, transparent);
+  color: var(--surgeon-strong);
 }
 
 .ops-world-tags {
@@ -865,6 +914,14 @@
   border: 1px solid var(--line);
   border-radius: calc(var(--radius) - 2px);
   background: rgba(8, 12, 14, 0.2);
+}
+
+.ops-world-tags.is-stale article {
+  border-color: color-mix(in srgb, var(--warning) 34%, var(--line));
+}
+
+.ops-world-tags.is-stale strong {
+  color: var(--surgeon-strong);
 }
 
 .ops-world-tags span {
@@ -1089,10 +1146,10 @@
 }
 
 @media (max-width: 1100px) {
-  .ops-header,
   .ops-layout { grid-template-columns: 1fr; }
 
-  .ops-header { align-items: stretch; flex-direction: column; }
+  .ops-header,
+  .ops-embedded-header { align-items: stretch; flex-direction: column; }
   .ops-connection { min-width: 0; }
   .ops-tf-card,
   .ops-world-card { min-height: 0; }
@@ -1114,6 +1171,71 @@
   .ops-tf-canvas { height: 280px; }
   .ops-tf-toolbar { grid-template-columns: repeat(4, minmax(44px, 1fr)); }
   .ops-tf-fit-button { grid-column: span 2; }
+}
+
+@media (max-width: 900px) {
+  /* The inventory has five useful fields, but a fixed 840px table is not
+     readable on a phone or a narrow tablet. Keep the table semantics and
+     present each camera as a labelled data card instead of requiring a
+     horizontal swipe. */
+  .ops-inventory-table-wrap {
+    overflow: visible;
+  }
+
+  .ops-table {
+    display: block;
+    min-width: 0;
+  }
+
+  .ops-table thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+
+  .ops-table tbody,
+  .ops-table tr,
+  .ops-table th,
+  .ops-table td {
+    display: block;
+    width: 100%;
+  }
+
+  .ops-table tr {
+    padding: 8px 0;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .ops-table tbody tr:last-child {
+    border-bottom: 0;
+  }
+
+  .ops-table th,
+  .ops-table td {
+    display: grid;
+    grid-template-columns: minmax(92px, 0.42fr) minmax(0, 1fr);
+    gap: 10px;
+    align-items: baseline;
+    padding: 6px 10px;
+    border-bottom: 0;
+  }
+
+  .ops-table th::before,
+  .ops-table td::before {
+    color: var(--muted);
+    content: attr(data-label);
+    font-size: 11px;
+    font-weight: 700;
+  }
+
+  .ops-table code {
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
 }
 
 @media (max-width: 520px) {
@@ -1289,6 +1411,11 @@ button {
 .system-pill.ok {
   border-color: rgba(112, 221, 209, 0.34);
   color: var(--robot);
+}
+
+.system-pill.pending {
+  border-color: color-mix(in srgb, var(--color-warning) 46%, var(--line));
+  color: var(--color-warning-text);
 }
 
 .system-pill.idle {
@@ -3509,6 +3636,7 @@ button {
     auto
     auto
     auto
+    auto
     minmax(180px, 1fr)
     auto
     auto;
@@ -3517,6 +3645,18 @@ button {
 
 .llm-surgeon-dock.shadow-replay-dock > * {
   grid-column: 1;
+}
+
+.shadow-replay-status-note {
+  margin: 0 0 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: rgba(255, 255, 255, 0.035);
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
 }
 
 .shadow-case-picker {
@@ -9019,6 +9159,12 @@ textarea {
   color: var(--robot-strong);
 }
 
+.live-asr-state.stale {
+  border-color: rgba(255, 184, 108, 0.5);
+  background: rgba(255, 184, 108, 0.1);
+  color: var(--warning);
+}
+
 .live-asr-state.active svg {
   animation: live-asr-pulse 1.8s ease-in-out infinite;
 }
@@ -9027,6 +9173,120 @@ textarea {
   display: grid;
   min-width: 0;
   gap: 10px;
+}
+
+.live-asr-route-policy {
+  display: grid;
+  min-width: 0;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.live-asr-route-policy > legend {
+  padding: 0;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.live-asr-route-policy > div {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.live-asr-route-policy label {
+  display: flex;
+  min-width: 0;
+  min-height: 52px;
+  align-items: center;
+  gap: 8px;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.025);
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.live-asr-route-policy label.selected {
+  border-color: rgba(105, 193, 255, 0.55);
+  background: rgba(105, 193, 255, 0.1);
+  color: var(--soft);
+}
+
+.live-asr-route-policy input {
+  width: 16px;
+  height: 16px;
+  flex: 0 0 auto;
+  margin: 0;
+  accent-color: var(--robot);
+}
+
+.live-asr-route-policy input:focus-visible {
+  outline: 2px solid rgba(105, 193, 255, 0.78);
+  outline-offset: 2px;
+}
+
+.live-asr-route-policy label > span,
+.live-asr-route-summary > div {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.live-asr-route-policy strong,
+.live-asr-route-summary strong {
+  color: currentColor;
+  font-size: 11px;
+  line-height: 1.2;
+}
+
+.live-asr-route-policy small,
+.live-asr-route-summary span {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.live-asr-route-policy:disabled label {
+  cursor: not-allowed;
+  opacity: 0.62;
+}
+
+.live-asr-route-summary {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--soft);
+}
+
+.live-asr-route-summary.ready svg {
+  color: var(--robot-strong);
+}
+
+.live-asr-route-summary.unavailable,
+.live-asr-route-summary.stale {
+  border-color: rgba(255, 184, 108, 0.3);
+}
+
+.live-asr-route-warning {
+  margin: -4px 0 0;
+  color: var(--warning);
+  font-size: 10px;
+  line-height: 1.35;
 }
 
 .live-asr-device-field small {
@@ -10310,6 +10570,63 @@ textarea {
     padding: 10px;
   }
 
+  /* The six-column input monitor is useful on desktop, but a 920px
+     diagnostic table is not a usable phone layout. Preserve the table
+     semantics while presenting each topic as a labelled data card. */
+  .debug-input-table-scroll {
+    overflow-x: visible;
+  }
+
+  .debug-input-table {
+    display: block;
+    min-width: 0;
+  }
+
+  .debug-input-table thead {
+    display: none;
+  }
+
+  .debug-input-table tbody,
+  .debug-input-table tr,
+  .debug-input-table td {
+    display: block;
+    width: 100%;
+  }
+
+  .debug-input-table tr {
+    padding: 8px 0;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .debug-input-table tbody tr:last-child {
+    border-bottom: 0;
+  }
+
+  .debug-input-table td {
+    display: grid;
+    grid-template-columns: minmax(78px, 0.36fr) minmax(0, 1fr);
+    gap: 8px;
+    align-items: baseline;
+    padding: 5px 8px;
+    border-bottom: 0;
+  }
+
+  .debug-input-table td::before {
+    color: var(--muted);
+    content: attr(data-label);
+    font-size: 10px;
+    font-weight: 700;
+  }
+
+  .debug-input-table td code,
+  .debug-input-table td span,
+  .debug-input-table td strong,
+  .debug-input-table td small {
+    min-width: 0;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+
   .debug-tabs,
   .debug-manual-grid,
   .debug-manual-side,
@@ -10438,6 +10755,24 @@ textarea {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
+}
+
+.debug-asr-form-grid-single {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.debug-section-heading > .debug-asr-heading-actions {
+  align-items: flex-end;
+  flex-direction: row;
+  gap: 8px;
+}
+
+.debug-asr-endpoint-selector {
+  min-width: 256px;
+}
+
+.debug-asr-endpoint-selector button {
+  min-height: 44px;
 }
 
 .debug-asr-live {
@@ -10786,7 +11121,22 @@ textarea {
 }
 
 @media (max-width: 620px) {
+  .debug-section-heading > .debug-asr-heading-actions {
+    width: 100%;
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .debug-asr-endpoint-selector {
+    width: 100%;
+    min-width: 0;
+  }
+
   .live-asr-actions {
+    grid-template-columns: 1fr;
+  }
+
+  .live-asr-route-policy > div {
     grid-template-columns: 1fr;
   }
 
@@ -10853,7 +11203,7 @@ textarea {
 /* Integration Debug information architecture --------------------------- */
 
 .debug-tabs.debug-tab-groups {
-  grid-template-columns: minmax(0, 4fr) minmax(0, 2fr) minmax(132px, 1fr) minmax(0, 2fr);
+  grid-template-columns: minmax(0, 5fr) minmax(0, 2fr) minmax(132px, 1fr) minmax(0, 2fr);
   align-items: stretch;
   gap: 6px;
   padding: 6px;
@@ -10888,7 +11238,7 @@ textarea {
 }
 
 .debug-tab-group.individual > div {
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(6, minmax(0, 1fr));
 }
 
 .debug-tab-group.scenario > div,

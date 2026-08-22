@@ -1,11 +1,42 @@
 export type Language = "ko" | "en";
 
-export function parseEventDetail(detail: string): Record<string, unknown> {
-  try {
-    return detail ? (JSON.parse(detail) as Record<string, unknown>) : {};
-  } catch {
-    return {};
+const MAX_EVENT_DETAIL_JSON_CHARS = 64 * 1024;
+const MAX_BOUNDED_JSON_COLLECTION_ITEMS = 256;
+const MAX_BOUNDED_JSON_OBJECT_KEYS = 512;
+const MAX_BOUNDED_JSON_STRING_CHARS = 64 * 1024;
+const MAX_BOUNDED_JSON_DEPTH = 8;
+
+function isBoundedJsonValue(value: unknown, depth = 0): boolean {
+  if (depth > MAX_BOUNDED_JSON_DEPTH) return false;
+  if (typeof value === "string") return value.length <= MAX_BOUNDED_JSON_STRING_CHARS;
+  if (Array.isArray(value)) {
+    return value.length <= MAX_BOUNDED_JSON_COLLECTION_ITEMS
+      && value.every((item) => isBoundedJsonValue(item, depth + 1));
   }
+  if (value && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>);
+    return entries.length <= MAX_BOUNDED_JSON_OBJECT_KEYS
+      && entries.every(([key, item]) => key.length <= MAX_BOUNDED_JSON_STRING_CHARS
+        && isBoundedJsonValue(item, depth + 1));
+  }
+  return true;
+}
+
+export function parseBoundedJson(raw: string, maxChars = MAX_EVENT_DETAIL_JSON_CHARS): unknown | null {
+  if (!raw || raw.length > maxChars) return null;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    return isBoundedJsonValue(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+export function parseEventDetail(detail: string): Record<string, unknown> {
+  const parsed = parseBoundedJson(detail);
+  return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+    ? parsed as Record<string, unknown>
+    : {};
 }
 
 export function titleize(value: string): string {

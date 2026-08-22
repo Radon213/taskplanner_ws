@@ -8,21 +8,30 @@ micro-test와 음성 통합 시험에서 사용할 수 있다. 조그는 디버�
 
 ## 실행
 
-시연용 운영 런타임과 통합해서 사용할 때는 평소와 같이 운영 모드를 시작한다.
+기본 실행은 실제 외부 통합을 위한 Live 모드다. 인자를 생략해도 같은 모드가
+시작된다.
 
 ```bash
-scripts/taskplanner up live --build
+scripts/taskplanner up --build       # 최초 build가 필요한 경우
+scripts/taskplanner up               # 이후 기본 Live 기동
 ```
 
 이 명령은 운영 런타임, 단일 Web UI와 함께 같은 `taskplanner_ws` Compose
-프로젝트의 `integration-debug` 및 유선 LAN 프록시를 시작한다. UI 상단의
-**디버그 모드** 버튼으로 화면만 전환하며 별도 4174 UI를 실행하지 않는다.
-Debug 화면은 운영 시나리오의 실행 여부와 관계없이 입력·토픽·Action 상태를
-계속 모니터링한다. 수동 제어와 쓰기 명령은 `/simulation/state`에서 최신
+프로젝트의 `integration-debug` 관측 sidecar와 유선 LAN 경로 라우터를 반드시
+시작한다. PipeWire 입력 또는 수술기록 API key 파일이 없으면, 관측 plane 없이
+Live를 조용히 시작하지 않고 기동 전에 실패한다. UI 상단의 **통합 관측**은 이
+sidecar의 Debug 작업공간을 열 뿐 운영 런타임을 교체하지 않는다. 별도 4174 UI도
+실행하지 않는다. Debug 화면은 운영 시나리오의 실행 여부와 관계없이
+입력·토픽·Action 상태를 계속 모니터링한다. 수동 제어와 쓰기 명령은 `/simulation/state`에서 최신
 안전 정지 상태(`idle`, `halted`, `completed`, `terminated`)를 확인한 동안에만
 허용하고, 시나리오가 실행 중이거나
 상태가 없거나 오래되었으면 fail-closed로 거부한다. 따라서 운영 컨테이너를
 내릴 필요 없이 운영 화면에서 시나리오를 정지한 뒤 같은 UI에서 시험할 수 있다.
+
+**독립 Debug** 버튼은 통합 관측과 다른 엔지니어링 런타임 전환이다. 이 버튼은
+현재 미션 실행이 완전히 정지된 상태에서만 확인 대화상자를 거쳐 Live/LLM/Replay
+core를 standalone `debug` 프로파일로 교체한다. 반대로 **통합 관측**에서
+**운영 화면**으로 돌아오면 core·카메라·인식 worker·ASR은 그대로 유지된다.
 
 전체 운영 런타임을 실행하지 않는 개별 기능 시험은 다음 standalone 명령을
 사용한다. 같은 4173 UI를 사용하며, 이미 `taskplanner-runtime` 또는
@@ -39,7 +48,7 @@ Debug Mode의 마이크 캡처는 Ubuntu가 현재 선택한 PipeWire 입력을 
 **STT 입력·USB 캡처 → 장치 새로고침**을 누르면 되고, USB hotplug 때문에 컨테이너를
 다시 생성할 필요는 없다.
 
-- 통합/standalone 공용 UI: `http://127.0.0.1:4173`
+- 통합/standalone 공용 UI: 로컬 `http://127.0.0.1:4173`, 유선 LAN `http://192.168.1.4:4173`
 - 운영 ROSBridge: `ws://127.0.0.1:9090`
 - Debug ROSBridge: `ws://127.0.0.1:9091`
 - 기본 포트와 ROS 도메인은 `docker/orchestration/debug.env`와 로컬 `.env`에서 바꿀 수 있다.
@@ -47,9 +56,82 @@ Debug Mode의 마이크 캡처는 Ubuntu가 현재 선택한 PipeWire 입력을 
   로컬 NInfer manager/control plane을 시작한다. 모델을 자동 load/unload하지
   않으며 이미 loaded인 worker를 보존한다. 화면의 **구성 모델 로드**를 명시적으로
   누른 경우에만 launch에 고정된 managed model의 load를 요청한다.
-- `live`와 `llm-surgeon` 시작 시 Debug sidecar도 같은 Compose 프로젝트에서 자동으로 유지된다.
+- `live`는 `integration-debug`와 multicam observer를 필수 관측 sidecar로
+  시작하고, Debug ROSBridge readiness까지 확인한 뒤에만 Live를 ready로 기록한다.
+  Live의 운영 PNU worker가 인식과 overlay를 소유하므로 Debug 쪽 PNU worker는
+  중복 기동하지 않는다.
+- `llm-surgeon`과 `replay`는 외부 카메라 observer와 `integration-debug`를
+  자동 기동하지 않는다. 두 모드는 자체 ROSBridge를 LAN/Tailnet 경로 라우터로
+  계속 제공하지만, 그것은 Debug 관측 runtime을 의미하지 않는다.
 
-기존 Taskplanner UI의 상단 **디버그 모드** 버튼 또는 실행 직후 기본 Debug 화면에서 진입한다. 나갈 때 연속 더미 발행을 정지하고 수동 제어를 해제한다.
+Live UI의 **통합 관측**에서 Debug 작업공간으로 진입한다. standalone Debug는
+런처로 명시적으로 시작하거나 상단 **독립 Debug** 전환을 사용한다. Debug
+작업공간을 나갈 때 연속 더미 발행을 정지하고 수동 제어를 해제한다.
+
+### PNU CAM4 인식 오버레이
+
+standalone `debug` 프로파일은 Taskplanner/BT/DT/로봇 실행 계층 없이
+`debug_pnu_perception_bridge` 하나를 추가로 실행한다. 기본값은 이 PC에서 파일과
+SHA-256을 검증한 local worker의 `tool,blood,hand` 전체를 요청하며, Docker readiness도
+같은 세 모델 모두 `ready=true`여야 통과한다. worker의 원본 `/v1/health`가 전역
+`status=ready`가 아니면 overlay health는 준비 상태로 승격되지 않는다.
+
+입력은 VIPLab CAM4의 실제 RGB, color CameraInfo, depth-to-color 정렬
+`compressedDepth`, 정렬 CameraInfo 네 토픽이다. 검증된 현재 D455 계약에 한해
+`0.001 m/unit`과 alignment provenance를 사용한다. 결과가 0건이어도 worker가 해당
+알고리즘을 실제 실행했다면 같은 source stamp의 투명 overlay frame을 발행한다.
+Debug UI는 health/diagnostics의 실행 모델과 0건 상태를 함께 표시하므로 “파이프라인이
+멈춤”과 “현재 기물이 검출되지 않음”을 구분할 수 있다.
+
+Debug 브라우저가 구독할 수 있는 인식 토픽은 exact read-only allowlist다.
+
+| 화면 증거 | ROS 토픽 |
+|---|---|
+| CAM4 PNU overlay | `/surgery/images/cam4/detection_overlay/compressed` |
+| Tool 자세축 overlay | `/surgery/images/cam4/pose_overlay/compressed` |
+| Tool별 위치·quaternion·유효성 | `/surgery/perception/cam4/tool_poses` |
+| 모델·요청·latency 진단 | `/surgery/perception/rfdetr/diagnostics/json` |
+| 세 모델 준비, 최근 frame 상태 | `/surgery/perception/rfdetr/health` |
+| Blood 요약 | `/surgery/perception/cam4/blood_semantics/json` |
+| Hand keypoints | `/surgery/perception/cam4/hand_keypoints` |
+
+이 토픽들은 publish allowlist에 들어가지 않으며 Debug 브라우저는 인식 결과를
+변조할 수 없다. PNU adapter도 카메라를 구독하고 관찰 결과만 발행하며 planner,
+Action, Service 또는 물리 로봇 명령을 시작하지 않는다.
+
+외부 PC worker를 쓸 때는 Taskplanner PC에서 다음처럼 명시한다. remote 선택은
+local `pnu-perception` 컨테이너를 중지한 채 시작하지 않으며, endpoint 실패 시
+local로 자동 fallback하지 않는다.
+
+```bash
+ENABLE_PNU_DEBUG_PERCEPTION=true \
+PERCEPTION_PROVIDER=pnu_hand_blood \
+PERCEPTION_LOCATION=remote \
+PERCEPTION_ENDPOINT=https://PNU_WORKER_DNS_NAME:8443 \
+PNU_SECRET_ROOT=/absolute/path/to/perception-secret \
+PNU_CLIENT_API_TOKEN_FILE=/run/taskplanner/perception/token \
+scripts/taskplanner up debug --build
+```
+
+원격 endpoint는 기본적으로 HTTPS여야 한다. TLS proxy 전의 격리된 신뢰 유선
+LAN 시험에서만 `http://WORKER_LAN_IP:8020`과
+`PNU_ALLOW_INSECURE_REMOTE_HTTP=true`를 함께 사용한다. 이 전송 예외는 별도
+bearer 인증 요구를 해제하지 않는다.
+
+세 모델 경로나 digest를 바꿀 때는 worker readiness와 bridge의
+`PNU_EXPECTED_MODEL_DIGESTS_JSON`을 함께 검토한다. 일시적으로 인식 계층을 완전히
+빼려면 `ENABLE_PNU_DEBUG_PERCEPTION=false scripts/taskplanner up debug`를 사용한다.
+
+## LLM Surgeon·Replay와 LAN 경로
+
+`scripts/taskplanner up llm-surgeon`과 `scripts/taskplanner up replay`는
+데모/재생용 core만 시작한다. 두 모드에는 Live의 외부 카메라 observer,
+`integration-debug` 관측 sidecar, 운영 ASR가 포함되지 않는다. 따라서 실제
+VIPLab 입력과 CAM4 인식 overlay를 확인하려면 Live를 사용해야 한다.
+
+모든 모드의 브라우저와 ROSBridge 원격 접속은 같은 LAN/Tailnet 경로 라우터를
+사용한다. 이 공유 router는 Debug node가 아니며, LLM Surgeon·Replay에서도
+각 모드 자신의 bridge로만 요청을 전달한다.
 
 ## LAN 및 DDS Discovery 설정
 
@@ -82,20 +164,28 @@ Debug sidecar에 적용된다. 데이터셋 replay/shadow는 외부 통합 참�
 `enp13s0`이다. 케이블이나 IPv4 주소가 없을 때 Wi-Fi 주소로 대체하지 않고
 `유선 IP 없음`을 표시하므로, 상대 기관 LAN을 연결한 뒤 유선 주소가 실제로
 할당됐는지 확인할 수 있다. `SUBNET` 배포는 같은 인터페이스를 지정한
-`CYCLONEDDS_URI` 프로파일을 사용한다. 프로파일의 `FragmentSize=1344B`는
-1500-byte Ethernet MTU에서 RTPS/UDP/IP 헤더까지 포함한 datagram이 MTU 아래에
-머물도록 해 대용량 카메라 sample의 IP fragmentation을 피한다. 설정한 NIC가
-호스트에 없으면 UI만 열린 채 DDS가 다른 NIC로 빠지는 상태를 허용하지 않고
-Debug ROS 런타임 시작을 거부한다.
+`CYCLONEDDS_URI` 프로파일을 사용한다. 프로파일은 DDSI fragment를 `1344B`로
+나누고, 여러 fragment를 한 UDP payload로 다시 묶는 상한도
+`MaxMessageSize=1450B`와 `MaxRexmitMessageSize=1450B`로 제한한다. 따라서
+1500-byte Ethernet MTU에서 IPv4/UDP header 여유를 남기며 대용량 카메라 sample의
+IP fragmentation을 피한다. 이 효과는 writer가 같은 profile을 사용할 때
+보장되므로 VIPLab에도 동일 payload 상한을 적용해야 한다. 설정한 NIC가 호스트에
+없으면 UI만 열린 채 DDS가 다른 NIC로 빠지는 상태를 허용하지 않고 Debug ROS
+런타임 시작을 거부한다.
 
-Debug 프로파일은 localhost 전용 UI·ROSBridge를 그대로 유지하면서
-`integration-debug-lan-proxy`를 함께 시작한다. 프록시는
-`TASKPLANNER_DEBUG_NETWORK_INTERFACE`에 현재 할당된 IPv4에만 같은 포트를
-열고, 해당 인터페이스의 직접 연결 서브넷에서 들어온 TCP 연결만 localhost
-종단으로 전달한다. 따라서 다른 PC에서는 화면에 표시된 주소를 사용해
-`http://<유선-IP>:<WEBAPP_PORT>/`로 접속할 수 있고, 브라우저는 같은 호스트의
-`ROSBRIDGE_DEBUG_PORT`로 자동 연결한다. 유선 IPv4가 바뀌면 리스너도 자동으로
-다시 바인딩한다.
+`webapp`은 Vite를 localhost에만 유지하면서 프로필 비종속
+`webapp-lan-proxy`를 필수 의존성으로 시작한다. 프록시는 기본적으로
+`192.168.1.4:4173`만 열고 `192.168.1.0/24`에서 들어온 TCP 연결만 localhost
+종단으로 전달한다. 따라서 `webapp`을 직접 시작하거나 Live, LLM Surgeon,
+Replay, Debug 모드 사이를 전환해도 LAN UI 주소는 유지된다. 주소와 허용
+서브넷은 각각 `TASKPLANNER_WEBAPP_LAN_ADDRESS`,
+`TASKPLANNER_WEBAPP_LAN_NETWORK`로만 명시적으로 변경할 수 있다.
+
+`integration-debug-lan-proxy`는 Live, LLM Surgeon, Replay, standalone Debug와
+독립적으로 선택한 유선 인터페이스의 `ROSBRIDGE_DEBUG_PORT` 경로만 노출한다.
+유선 IPv4가 바뀌면 이 ROS
+리스너는 자동으로 다시 바인딩되며, 재시작되어도 4173 UI 연결에는 영향을 주지
+않는다.
 
 Tailnet에서 허용된 TCP는 호스트의 loopback으로 전달되므로, Tailscale IPv4
 접속도 같은 `ROSBRIDGE_DEBUG_PORT`의 loopback 경로 라우터를 통과한다. `/`는
@@ -116,16 +206,25 @@ Debug 화면을 열 수 있으므로, 신뢰된 통합 시험망에서만 실행
 | `/surgery/audio/request_text` | `std_msgs/msg/String` | reliable / volatile / depth 20 | speech adapter가 입장을 허용한 정규화 문장, publisher, 수신 횟수 |
 | `/input/speech/status` | `surgical_msgs/msg/InputSourceStatus` | reliable / volatile / depth 10 | speech adapter 상태, source topic, 최근 수신/허용/거부 횟수와 사유 |
 | `/integration/cv_contract/status` | `std_msgs/msg/String` | reliable / transient local / depth 1 | CV 계약 상태의 publisher, 실측 Hz, 최근 JSON, freshness |
-| `/synced/cam_1/color/image_raw/compressed` | `sensor_msgs/msg/CompressedImage` | reliable / volatile / depth 1 | publisher, 실측 Hz, bandwidth, freshness |
-| `/synced/cam_2/color/image_raw/compressed` | `sensor_msgs/msg/CompressedImage` | reliable / volatile / depth 1 | publisher, 실측 Hz, bandwidth, freshness |
-| `/synced/cam_3/color/image_raw/compressed` | `sensor_msgs/msg/CompressedImage` | reliable / volatile / depth 1 | publisher, 실측 Hz, bandwidth, freshness |
-| `/synced/cam_4/color/image_raw/compressed` | `sensor_msgs/msg/CompressedImage` | reliable / volatile / depth 1 | publisher, 실측 Hz, bandwidth, freshness |
-| `/synced/flir/color/image_raw/compressed` | `sensor_msgs/msg/CompressedImage` | reliable / volatile / depth 1 | publisher, 실측 Hz, bandwidth, freshness |
+| `/synced/cam_1/status` | `std_msgs/msg/String` | reliable / transient local / depth 1 | 원본 RGB publisher, 소스 실측 Hz·payload·누적 발행/드롭, 원본 QoS, freshness |
+| `/synced/cam_2/status` | `std_msgs/msg/String` | reliable / transient local / depth 1 | 원본 RGB publisher, 소스 실측 Hz·payload·누적 발행/드롭, 원본 QoS, freshness |
+| `/synced/cam_3/status` | `std_msgs/msg/String` | reliable / transient local / depth 1 | 원본 RGB publisher, 소스 실측 Hz·payload·누적 발행/드롭, 원본 QoS, freshness |
+| `/synced/cam_4/status` | `std_msgs/msg/String` | reliable / transient local / depth 1 | 원본 RGB publisher, 소스 실측 Hz·payload·누적 발행/드롭, 원본 QoS, freshness |
+| `/synced/flir/status` | `std_msgs/msg/String` | reliable / transient local / depth 1 | 원본 RGB publisher, 소스 실측 Hz·payload·누적 발행/드롭, 원본 QoS, freshness |
 | `/simulation/state` | `surgical_msgs/msg/SimulationState` | reliable / volatile / depth 5 | 운영 런타임 정지 interlock과 freshness |
 | `/external/bed_robot_arms/status` | `surgical_interop_msgs/msg/BedRobotArmStateArray` | reliable / volatile / depth 50 | revision, procedure type, 역할별 arm 상태와 freshness |
 | `/integration/debug/virtual/bed_robot_arms/status` | `surgical_interop_msgs/msg/BedRobotArmStateArray` | reliable / volatile / depth 50 | 내장 가상 로봇을 선택했을 때 동일한 상태 계약과 freshness |
 
-상태 화면은 발견된 publisher 노드, 실제 타입, 실제 QoS, 누적 메시지 수, 5초 rolling Hz, 대역폭, 마지막 수신 경과 시간을 보여준다. 타입 불일치, 저주기, stale, publisher 없음은 서로 다른 상태로 표시된다.
+상태 화면은 작은 status 토픽의 publisher와 monitor 수신률뿐 아니라, status 안의
+원본 publisher 실측 Hz, payload 크기, 누적 발행/드롭 및 원본 QoS를 구분해
+표시한다. 따라서 Debug gateway가 15 Hz JPEG 다섯 개를 다시 구독하지 않고도
+타입 불일치, 저주기, stale, publisher 없음 상태를 서로 다르게 판정한다.
+
+멀티캠 화면 자체는 `/preview/cam_*`와 `/preview/flir`의 5 Hz pass-through
+CompressedImage만 구독한다. 인식 화면은 1.7이 합성한
+`/perception/debug/final_overlay/compressed` 한 장과
+`/perception/debug/final_overlay/status`만 구독하며, 브라우저에서 여러 JPEG
+레이어를 exact-stamp로 다시 합성하지 않는다.
 
 `cv_contract_monitor`와 Debug gateway는 reliable / transient local / depth 1로
 snapshot QoS를 맞춘다. 따라서 gateway가 늦게 시작해도 마지막 CV 계약 상태를 받을
@@ -234,6 +333,13 @@ publisher가 존재한다는 이유만으로 입력 준비 완료로 보지 않�
 실제로 연결된 `LISTENING` 상태일 때만 readiness를 만족한다. LAN 프록시는
 인증 경계가 아니므로 마이크와 전사 원문은 신뢰된 격리 시험망에서만 사용한다.
 
+ASR 세션이 멈춰 있을 때만 화면의 **클라우드** 또는 **LAN 192.168.1.5** route를
+선택할 수 있다. 이 선택은 `cloud`/`lan` 식별자만 Debug backend로 전달하며, 브라우저가
+임의 `ws://`·`wss://` URL을 전달하는 것은 허용하지 않는다. 기본 route와 각 route의
+배포 주소는 `PUZZLE_ASR_ENDPOINT`, `PUZZLE_ASR_URL`, `PUZZLE_ASR_LAN_URL`로
+시작 시 설정하고, 현재 선택은 status의 `asr.endpoint_id`로 확인한다. LAN route는
+평문 `ws://`이므로 신뢰된 유선 시험망에서만 사용한다.
+
 Debug 컨테이너는 raw `/dev/snd` 대신 호스트 PipeWire socket을 사용하고 Ubuntu의 현재 기본 입력 한 개만 노출한다. 장치 새로고침 후 시작하며, 화면에서 캡처 레벨, WebSocket 연결, 전송·응답·드롭 수, 최근 확정 문장을 확인한다. PipeWire가 16 kHz mono를 직접 제공하지 않으면 런타임이 사용 가능한 포맷으로 캡처해 16 kHz mono signed PCM으로 변환한다. 종료 시 남은 PCM은 서버의 8,192-byte 프레임 계약에 맞춰 silence padding한 뒤 EOF를 보낸다.
 
 각 확정 문장의 `response_latency_ms`는 마지막 PCM 청크 송신이 완료된 monotonic
@@ -291,6 +397,12 @@ Service 응답은 요청 접수 여부일 뿐 물리 실행·완료를 뜻하지
 `last_rejection_reason`으로 전달된다. Service 응답은 `action`의
 `response_semantics=admission`, `request_accepted`, `result_code`,
 `response_message`로 구분한다.
+
+리트랙터 패널의 `force_retraction_idle`은 Debug 내부 admission 상태만
+`idle`로 초기화하는 복구용 UI 명령이다. 진행 중 Action/Service 요청이 없어야
+하며 `remote_motion_stopped_confirmed=true` 확인이 필요하다. 실행 시 수동 제어와
+리트랙터 음성 전송 권한을 해제하고, 외부 Service 또는 로봇에는 어떤 명령도
+보내지 않는다. 따라서 상대 로봇의 정지나 물리 상태를 증명하는 기능이 아니다.
 
 브라우저는 `/surgery/tool_handover` Action이나
 `/surgery/retraction/command` Service를 직접 호출하지 않는다. 브라우저가 직접

@@ -1,10 +1,10 @@
 """Observational monitor for the pending VIPLab/CV-team interface.
 
-Only standard ROS image messages are subscribed today.  Custom CV result
-messages are inspected through the ROS graph by their fully-qualified type
-name, which permits a useful preflight without claiming an unavailable IDL is
-compatible.  The monitor never republishes camera data, CV evidence, pose data
-or dummy samples.
+Large VIPLab RGB-D payloads are represented by retained, bounded stream-status
+messages so this observer does not become another LAN image reader.  CameraInfo
+and other small calibration messages remain directly validated.  Custom CV
+result messages are inspected through the ROS graph by fully-qualified type.
+The monitor never republishes camera data, CV evidence, pose data or dummies.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ import json
 import math
 import time
 from typing import Any, Callable
+from urllib.parse import urlsplit
 
 import rclpy
 from ament_index_python.packages import PackageNotFoundError, get_package_prefix
@@ -34,8 +35,117 @@ from .cv_contract import (
     CV_CONTRACT_VERSION,
     EXTERNAL_OUTPUT_ENDPOINTS,
     endpoint_by_key,
-    normalize_perception_backend,
+    resolve_perception_selection,
+    validate_perception_endpoint,
 )
+
+
+VIPLAB_STREAM_STATUS_SCHEMA = "arpa_multicam.stream_status.v1"
+VIPLAB_STREAM_STATUS_KEYS = frozenset(
+    {
+        "schema",
+        "stream_id",
+        "source_topic",
+        "source_stamp",
+        "frame_id",
+        "format",
+        "measured_hz",
+        "payload_bytes",
+        "published_count",
+        "dropped_count",
+        "qos",
+    }
+)
+
+
+def _non_negative_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def validate_viplab_stream_status(
+    message: Any,
+    *,
+    expected_stream_id: str,
+    expected_source_topic: str,
+    compressed_depth: bool,
+) -> tuple[bool, list[str], dict[str, Any]]:
+    """Validate the exact small status that stands in for one large stream."""
+
+    errors: list[str] = []
+    try:
+        payload = json.loads(str(getattr(message, "data", "")))
+    except (TypeError, ValueError):
+        payload = None
+    if not isinstance(payload, dict):
+        return False, ["invalid_stream_status_json"], {}
+    if frozenset(payload) != VIPLAB_STREAM_STATUS_KEYS:
+        errors.append("stream_status_keys_mismatch")
+    if payload.get("schema") != VIPLAB_STREAM_STATUS_SCHEMA:
+        errors.append("stream_status_schema_mismatch")
+    if payload.get("stream_id") != expected_stream_id:
+        errors.append("stream_status_id_mismatch")
+    if payload.get("source_topic") != expected_source_topic:
+        errors.append("stream_status_source_topic_mismatch")
+
+    stamp = payload.get("source_stamp")
+    if (
+        not isinstance(stamp, dict)
+        or frozenset(stamp) != {"sec", "nanosec"}
+        or not _non_negative_int(stamp.get("sec"))
+        or not _non_negative_int(stamp.get("nanosec"))
+        or int(stamp.get("nanosec", 1_000_000_000)) >= 1_000_000_000
+    ):
+        errors.append("invalid_stream_status_stamp")
+        source_stamp_sec = None
+    else:
+        source_stamp_sec = float(stamp["sec"]) + float(stamp["nanosec"]) / 1e9
+
+    frame_id = payload.get("frame_id")
+    format_text = payload.get("format")
+    if not isinstance(frame_id, str) or not frame_id or len(frame_id) > 128:
+        errors.append("invalid_stream_status_frame_id")
+    if not isinstance(format_text, str) or not format_text or len(format_text) > 128:
+        errors.append("invalid_stream_status_format")
+    elif compressed_depth and "compresseddepth" not in format_text.casefold():
+        errors.append("format_is_not_compressed_depth")
+
+    measured_hz = payload.get("measured_hz")
+    if (
+        isinstance(measured_hz, bool)
+        or not isinstance(measured_hz, (int, float))
+        or not 0.0 <= float(measured_hz) <= 240.0
+    ):
+        errors.append("invalid_stream_status_rate")
+    for key in ("payload_bytes", "published_count", "dropped_count"):
+        if not _non_negative_int(payload.get(key)):
+            errors.append(f"invalid_stream_status_{key}")
+
+    qos = payload.get("qos")
+    if not isinstance(qos, dict) or frozenset(qos) != {
+        "reliability",
+        "durability",
+        "depth",
+    }:
+        errors.append("invalid_stream_status_qos")
+    elif (
+        qos.get("reliability") not in {"best_effort", "reliable"}
+        or qos.get("durability") not in {"volatile", "transient_local"}
+        or not _non_negative_int(qos.get("depth"))
+        or int(qos.get("depth", 0)) < 1
+    ):
+        errors.append("invalid_stream_status_qos")
+
+    return not errors, errors, {
+        "source_stamp_sec": source_stamp_sec,
+        "frame_id": frame_id if isinstance(frame_id, str) else "",
+        "format": format_text if isinstance(format_text, str) else "",
+        "payload_bytes": payload.get("payload_bytes"),
+        "measured_hz": payload.get("measured_hz"),
+        "published_count": payload.get("published_count"),
+        "dropped_count": payload.get("dropped_count"),
+        "transport": "compressedDepth" if compressed_depth else "compressedImage",
+        "evidence_transport": "retained_stream_status",
+    }
 
 
 def qos_contract_state(expected: str, actual: dict[str, Any]) -> str:
@@ -119,6 +229,52 @@ def validate_compressed_image(message: Any) -> tuple[bool, list[str], dict[str, 
         "source_stamp_sec": _stamp_sec(message),
         "frame_id": _frame_id(message),
     }
+
+
+def validate_compressed_depth(
+    message: Any,
+) -> tuple[bool, list[str], dict[str, Any]]:
+    """Validate the observed native compressedDepth wire contract only."""
+
+    valid, errors, details = validate_compressed_image(message)
+    format_text = str(getattr(message, "format", "")).strip()
+    if "compresseddepth" not in format_text.casefold():
+        errors.append("format_is_not_compressed_depth")
+    details = {
+        **details,
+        "transport": "compressedDepth",
+        "alignment_state": "NATIVE_DEPTH_FRAME_NOT_COLOR_ALIGNED",
+        "depth_units_policy": "UNVERIFIED_NO_LIVE_SCALE_CONTRACT",
+    }
+    return not errors and valid, errors, details
+
+
+def validate_aligned_compressed_depth(
+    message: Any,
+) -> tuple[bool, list[str], dict[str, Any]]:
+    """Validate the CAM4 RGB-aligned compressedDepth transport claim.
+
+    This validates the wire format and color optical frame only.  Metric use
+    remains gated in the PNU bridge by paired CameraInfo, dimensions, stamps
+    and the serial-specific live depth scale.
+    """
+
+    valid, errors, details = validate_compressed_image(message)
+    format_text = str(getattr(message, "format", "")).strip()
+    frame_id = _frame_id(message)
+    if "compresseddepth" not in format_text.casefold():
+        errors.append("format_is_not_compressed_depth")
+    if "16uc1" not in format_text.casefold():
+        errors.append("format_is_not_16uc1")
+    if frame_id != "cam_4_color_optical_frame":
+        errors.append("frame_is_not_cam4_color_optical_frame")
+    details = {
+        **details,
+        "transport": "compressedDepth",
+        "alignment_state": "RGB_ALIGNED_CAM4_COLOR_OPTICAL_FRAME",
+        "depth_units_policy": "REQUIRES_VALIDATED_LIVE_SENSOR_SCALE",
+    }
+    return not errors and valid, errors, details
 
 
 def validate_camera_info(message: Any) -> tuple[bool, list[str], dict[str, Any]]:
@@ -278,10 +434,14 @@ class CvContractMonitor(Node):
     def __init__(self) -> None:
         super().__init__("cv_contract_monitor")
         self.declare_parameter("perception_backend", "local")
+        self.declare_parameter("perception_provider", "")
+        self.declare_parameter("perception_location", "")
+        self.declare_parameter("perception_endpoint", "")
         self.declare_parameter("status_topic", "/integration/cv_contract/status")
         self.declare_parameter(
             "cam4_rgb_topic", "/synced/cam_4/color/image_raw/compressed"
         )
+        self.declare_parameter("cam4_rgb_status_topic", "/synced/cam_4/status")
         self.declare_parameter(
             "cam4_rgb_alias_topic", "/surgery/images/cam4/compressed"
         )
@@ -290,7 +450,31 @@ class CvContractMonitor(Node):
             "/synced/cam_4/color/camera_info",
         )
         self.declare_parameter(
-            "cam4_aligned_depth_topic", "/synced/cam_4/depth/image_rect_raw"
+            "cam4_depth_camera_info_topic",
+            "/synced/cam_4/depth/camera_info",
+        )
+        self.declare_parameter(
+            "cam4_native_depth_compressed_topic",
+            "/synced/cam_4/depth/image_rect_raw/compressedDepth",
+        )
+        self.declare_parameter(
+            "cam4_native_depth_status_topic",
+            "/synced/cam_4/depth/status",
+        )
+        self.declare_parameter(
+            "cam4_depth_to_color_extrinsics_topic",
+            "/synced/cam_4/extrinsics/depth_to_color",
+        )
+        self.declare_parameter(
+            "cam4_aligned_depth_compressed_topic",
+            (
+                "/synced/cam_4/aligned_depth_to_color/"
+                "image_raw/compressedDepth"
+            ),
+        )
+        self.declare_parameter(
+            "cam4_aligned_depth_camera_info_topic",
+            "/synced/cam_4/aligned_depth_to_color/camera_info",
         )
         self.declare_parameter(
             "handover_tray_rgb_topic", "/surgery/images/tray/compressed"
@@ -304,8 +488,23 @@ class CvContractMonitor(Node):
             "/surgery/cameras/tray/aligned_depth",
         )
 
-        self._backend = normalize_perception_backend(
-            self.get_parameter("perception_backend").value
+        self._perception = resolve_perception_selection(
+            provider=self.get_parameter("perception_provider").value,
+            location=self.get_parameter("perception_location").value,
+            legacy_backend=self.get_parameter("perception_backend").value,
+        )
+        self._backend = self._perception.legacy_backend
+        endpoint_value = str(
+            self.get_parameter("perception_endpoint").value
+        ).strip()
+        if (
+            not endpoint_value
+            and self._perception.source == "legacy_backend"
+            and self._perception.provider == "builtin_rfdetr"
+        ):
+            endpoint_value = "http://127.0.0.1:8010"
+        self._perception_endpoint = validate_perception_endpoint(
+            endpoint_value, self._perception
         )
         self._trackers = {
             "cam4_rgb": InputTracker(
@@ -321,12 +520,48 @@ class CvContractMonitor(Node):
                 endpoint_by_key("cam4_camera_info").qos,
                 "provider_and_calibration_pending",
             ),
-            "cam4_aligned_depth": InputTracker(
-                "cam4_aligned_depth",
-                str(self.get_parameter("cam4_aligned_depth_topic").value),
-                "sensor_msgs/msg/Image",
-                "BEST_EFFORT/VOLATILE/KEEP_LAST(5)",
-                "provider_encoding_units_and_sync_policy_pending",
+            "cam4_depth_camera_info": InputTracker(
+                "cam4_depth_camera_info",
+                str(self.get_parameter("cam4_depth_camera_info_topic").value),
+                "sensor_msgs/msg/CameraInfo",
+                endpoint_by_key("cam4_depth_camera_info").qos,
+                "calibration_version_and_depth_to_color_extrinsics_pending",
+            ),
+            "cam4_native_depth_compressed": InputTracker(
+                "cam4_native_depth_compressed",
+                str(
+                    self.get_parameter(
+                        "cam4_native_depth_compressed_topic"
+                    ).value
+                ),
+                "sensor_msgs/msg/CompressedImage",
+                endpoint_by_key("cam4_native_depth_compressed").qos,
+                (
+                    "native_depth_optical_frame; align_depth_disabled; "
+                    "registration_pending"
+                ),
+            ),
+            "cam4_aligned_depth_compressed": InputTracker(
+                "cam4_aligned_depth_compressed",
+                str(
+                    self.get_parameter(
+                        "cam4_aligned_depth_compressed_topic"
+                    ).value
+                ),
+                "sensor_msgs/msg/CompressedImage",
+                endpoint_by_key("cam4_aligned_depth_compressed").qos,
+                "paired_camera_info_dimensions_stamps_and_scale_gate_pending",
+            ),
+            "cam4_aligned_depth_camera_info": InputTracker(
+                "cam4_aligned_depth_camera_info",
+                str(
+                    self.get_parameter(
+                        "cam4_aligned_depth_camera_info_topic"
+                    ).value
+                ),
+                "sensor_msgs/msg/CameraInfo",
+                endpoint_by_key("cam4_aligned_depth_camera_info").qos,
+                "must_match_cam4_color_camera_info",
             ),
             "handover_tray_rgb": InputTracker(
                 "handover_tray_rgb",
@@ -356,25 +591,31 @@ class CvContractMonitor(Node):
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.VOLATILE,
         )
-        synced_rgb_qos = QoSProfile(
-            history=HistoryPolicy.KEEP_LAST,
-            depth=20,
-            reliability=ReliabilityPolicy.RELIABLE,
-            durability=DurabilityPolicy.VOLATILE,
-        )
         tray_info_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
             depth=5,
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.VOLATILE,
         )
+        stream_status_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
         self.create_subscription(
-            CompressedImage,
-            self._trackers["cam4_rgb"].topic,
+            String,
+            str(self.get_parameter("cam4_rgb_status_topic").value),
             lambda message: self._trackers["cam4_rgb"].observe(
-                message, validate_compressed_image
+                message,
+                lambda sample: validate_viplab_stream_status(
+                    sample,
+                    expected_stream_id="cam_4",
+                    expected_source_topic=self._trackers["cam4_rgb"].topic,
+                    compressed_depth=False,
+                ),
             ),
-            synced_rgb_qos,
+            stream_status_qos,
         )
         self.create_subscription(
             CameraInfo,
@@ -385,12 +626,38 @@ class CvContractMonitor(Node):
             synced_info_qos,
         )
         self.create_subscription(
-            Image,
-            self._trackers["cam4_aligned_depth"].topic,
-            lambda message: self._trackers["cam4_aligned_depth"].observe(
-                message, validate_depth_image
+            CameraInfo,
+            self._trackers["cam4_depth_camera_info"].topic,
+            lambda message: self._trackers["cam4_depth_camera_info"].observe(
+                message, validate_camera_info
             ),
-            qos_profile_sensor_data,
+            synced_info_qos,
+        )
+        self.create_subscription(
+            String,
+            str(self.get_parameter("cam4_native_depth_status_topic").value),
+            lambda message: self._trackers[
+                "cam4_native_depth_compressed"
+            ].observe(
+                message,
+                lambda sample: validate_viplab_stream_status(
+                    sample,
+                    expected_stream_id="cam_4_depth",
+                    expected_source_topic=self._trackers[
+                        "cam4_native_depth_compressed"
+                    ].topic,
+                    compressed_depth=True,
+                ),
+            ),
+            stream_status_qos,
+        )
+        self.create_subscription(
+            CameraInfo,
+            self._trackers["cam4_aligned_depth_camera_info"].topic,
+            lambda message: self._trackers[
+                "cam4_aligned_depth_camera_info"
+            ].observe(message, validate_camera_info),
+            synced_info_qos,
         )
         self.create_subscription(
             CompressedImage,
@@ -474,16 +741,30 @@ class CvContractMonitor(Node):
                 entry["node"] == "rfdetr_perception_bridge"
                 for entry in observed
             )
+            pnu_adapter_present = any(
+                entry["node"] == "pnu_perception_bridge"
+                for entry in observed
+            )
             if not observed:
                 state = "WAITING_FOR_EXTERNAL_PUBLISHER"
             elif len(observed) > 1:
                 state = "AMBIGUOUS_PUBLISHERS"
             elif observed_types != [endpoint.message_type]:
                 state = "TYPE_MISMATCH"
-            elif local_rfdetr_present and self._backend == "local":
+            elif (
+                local_rfdetr_present
+                and self._perception.provider == "builtin_rfdetr"
+            ):
                 state = "LOCAL_BACKEND_OWNS_COMPATIBILITY_TOPIC"
+            elif (
+                pnu_adapter_present
+                and self._perception.provider == "pnu_hand_blood"
+            ):
+                state = "PNU_ADAPTER_OWNS_COMPATIBILITY_TOPIC"
             elif local_rfdetr_present:
                 state = "LOCAL_BACKEND_COLLISION"
+            elif pnu_adapter_present:
+                state = "PNU_ADAPTER_COLLISION"
             elif "MISMATCH" in qos_states:
                 state = "QOS_MISMATCH"
             elif "UNVERIFIABLE_DEPTH" in qos_states:
@@ -525,13 +806,56 @@ class CvContractMonitor(Node):
             "state": "ALIAS_NOT_SAMPLED_TO_AVOID_DOUBLE_COUNTING",
             "policy_state": "SCENARIO_AND_DEMAND_GATED_BY_TASKPLANNER",
         }
+        extrinsics_contract = endpoint_by_key(
+            "cam4_depth_to_color_extrinsics"
+        )
+        extrinsics_topic = str(
+            self.get_parameter(
+                "cam4_depth_to_color_extrinsics_topic"
+            ).value
+        )
+        extrinsics_publishers = self._publisher_info(extrinsics_topic)
+        extrinsics_types = sorted(
+            {entry["type"] for entry in extrinsics_publishers}
+        )
+        extrinsics_qos = [
+            qos_contract_state(extrinsics_contract.qos, publisher)
+            for publisher in extrinsics_publishers
+        ]
+        if not extrinsics_publishers:
+            extrinsics_state = "WAITING_FOR_PUBLISHER"
+        elif len(extrinsics_publishers) > 1:
+            extrinsics_state = "AMBIGUOUS_PUBLISHERS"
+        elif extrinsics_types != [extrinsics_contract.message_type]:
+            extrinsics_state = "TYPE_MISMATCH"
+        elif "MISMATCH" in extrinsics_qos:
+            extrinsics_state = "QOS_MISMATCH"
+        elif "UNVERIFIABLE_DEPTH" in extrinsics_qos:
+            extrinsics_state = "QOS_UNVERIFIABLE_DEPTH"
+        else:
+            extrinsics_state = "OBSERVED_LAYOUT_UNVALIDATED"
+        inputs["cam4_depth_to_color_extrinsics"] = {
+            "topic": extrinsics_topic,
+            "expected_type": extrinsics_contract.message_type,
+            "expected_qos": extrinsics_contract.qos,
+            "publisher_count": len(extrinsics_publishers),
+            "publishers": extrinsics_publishers,
+            "qos_verification": extrinsics_qos,
+            "state": extrinsics_state,
+            "sample_values_consumed": False,
+            "layout_validated": False,
+            "pending_reason": extrinsics_contract.pending_reason,
+        }
         idl = self._external_idl_state()
-        if self._backend == "external":
-            readiness_state = "PENDING_EXTERNAL_IDL_AND_ADAPTER"
-        elif self._backend == "disabled":
+        if self._perception.provider == "pnu_hand_blood":
+            readiness_state = "PNU_ALIGNED_DEPTH_3D_ADAPTER_AWAITING_HEALTH"
+            adapter_state = "PNU_HTTP_ADAPTER_IMPLEMENTED_3D_FAIL_CLOSED"
+        elif self._perception.provider == "disabled":
             readiness_state = "DISABLED"
+            adapter_state = "DISABLED"
         else:
             readiness_state = "LOCAL_BACKEND_ACTIVE_EXTERNAL_CONTRACT_MONITORED"
+            adapter_state = "BUILTIN_RFDETR_ADAPTER_ACTIVE"
         return {
             "schema": CV_CONTRACT_SCHEMA,
             "contract_version": CV_CONTRACT_VERSION,
@@ -540,12 +864,20 @@ class CvContractMonitor(Node):
                 6,
             ),
             "perception_backend": self._backend,
+            "perception_provider": self._perception.provider,
+            "perception_location": self._perception.location,
+            "perception_selection_source": self._perception.source,
+            "perception_worker_origin": self._perception_worker_origin(),
             "readiness_state": readiness_state,
+            # Runtime authorization for PNU comes from the versioned bridge
+            # health message, not this observational custom-IDL monitor.
             "ready_for_external_evidence": False,
-            "adapter_state": "NOT_IMPLEMENTED_PENDING_EXTERNAL_IDL",
+            "adapter_state": adapter_state,
             "policy_pending": {
                 "rgb_depth_skew_limit": True,
                 "source_stale_timeout": True,
+                "depth_units_scale": True,
+                "depth_to_color_extrinsics_layout": True,
                 "tf_tree_and_calibration": True,
                 "ontology_version_and_tool_mapping": True,
             },
@@ -560,6 +892,17 @@ class CvContractMonitor(Node):
                 "handover_tray_semantics": "handover_tray_not_mayo",
             },
         }
+
+    def _perception_worker_origin(self) -> str:
+        """Return only the non-secret worker origin for operator diagnostics."""
+
+        if not self._perception_endpoint:
+            return ""
+        parsed = urlsplit(self._perception_endpoint)
+        hostname = parsed.hostname or ""
+        rendered_host = f"[{hostname}]" if ":" in hostname else hostname
+        rendered_port = f":{parsed.port}" if parsed.port is not None else ""
+        return f"{parsed.scheme}://{rendered_host}{rendered_port}"
 
     def _publish_status(self) -> None:
         message = String()

@@ -22,10 +22,18 @@ from shadow_evaluation.interactive_replay_controller import (
     NORMALIZED_BBOX_TOPIC,
     NORMALIZED_CAMERA_TOPICS,
     NORMALIZED_SEGMENTATION_TOPIC,
+    VIPLAB_CAM4_ALIGNED_DEPTH_TOPIC,
+    VIPLAB_CAM4_COLOR_CAMERA_INFO_TOPIC,
+    VIPLAB_CAM4_COLOR_IMAGE_TOPIC,
+    VIPLAB_CAM4_DEPTH_CAMERA_INFO_TOPIC,
+    VIPLAB_CAM4_DEPTH_TO_COLOR_EXTRINSICS_TOPIC,
+    VIPLAB_CAM4_NATIVE_DEPTH_COMPRESSED_TOPIC,
     _is_no_input_vlm_health,
     advance_replay_elapsed,
     advance_replay_source_time,
+    public_replay_typed_routes,
     public_replay_topic_routes,
+    replay_input_capabilities,
     replay_clock_publish_due,
 )
 from shadow_evaluation.reference_reconciler import (
@@ -357,6 +365,7 @@ def test_public_replay_routes_only_raw_cameras_and_public_perception_json():
         "/recorded/cam4": (
             NORMALIZED_CAMERA_TOPICS["cam4"],
             FIELD_IMAGE_COMPATIBILITY_TOPIC,
+            VIPLAB_CAM4_COLOR_IMAGE_TOPIC,
         ),
         "/recorded/flir": (NORMALIZED_CAMERA_TOPICS["flir"],),
     }
@@ -370,6 +379,178 @@ def test_public_replay_routes_only_raw_cameras_and_public_perception_json():
         for topic in all_source_topics
         for token in ("ground_truth", "evaluation", "annotation")
     )
+
+
+def test_public_replay_geometry_routes_match_viplab_contract():
+    routes = public_replay_typed_routes(
+        source_cam4_camera_info_topic="/recorded/cam4/info",
+        source_cam4_native_depth_compressed_topic=(
+            "/recorded/cam4/depth/compressedDepth"
+        ),
+        source_cam4_aligned_depth_topic="/recorded/cam4/depth",
+        source_cam4_depth_camera_info_topic="/recorded/cam4/depth_info",
+    )
+
+    assert [route.key for route in routes] == [
+        "cam4_color_camera_info",
+        "cam4_native_depth_compressed",
+        "cam4_aligned_depth_raw",
+        "cam4_depth_camera_info",
+    ]
+    assert [route.output_topic for route in routes] == [
+        VIPLAB_CAM4_COLOR_CAMERA_INFO_TOPIC,
+        VIPLAB_CAM4_NATIVE_DEPTH_COMPRESSED_TOPIC,
+        VIPLAB_CAM4_ALIGNED_DEPTH_TOPIC,
+        VIPLAB_CAM4_DEPTH_CAMERA_INFO_TOPIC,
+    ]
+    assert [route.message_type for route in routes] == [
+        "sensor_msgs/msg/CameraInfo",
+        "sensor_msgs/msg/CompressedImage",
+        "sensor_msgs/msg/Image",
+        "sensor_msgs/msg/CameraInfo",
+    ]
+
+
+def test_replay_capabilities_report_recorded_info_without_inventing_depth():
+    routes = public_replay_typed_routes(
+        source_cam4_camera_info_topic="/recorded/cam4/info",
+        source_cam4_native_depth_compressed_topic=(
+            "/recorded/cam4/depth/compressedDepth"
+        ),
+        source_cam4_aligned_depth_topic="/recorded/cam4/depth",
+        source_cam4_depth_camera_info_topic="/recorded/cam4/depth_info",
+    )
+    capabilities = replay_input_capabilities(
+        case_id="0704_6",
+        bag_path="/datasets/shadow/0704_6",
+        source_topic_types={
+            "/recorded/cam4/rgb": "sensor_msgs/msg/CompressedImage",
+            "/recorded/cam4/info": "sensor_msgs/msg/CameraInfo",
+        },
+        source_message_counts={
+            "/recorded/cam4/rgb": 1937,
+            "/recorded/cam4/info": 1937,
+        },
+        source_cam4_image_topic="/recorded/cam4/rgb",
+        typed_routes=routes,
+    )
+
+    assert capabilities["streams"]["cam4_rgb"]["available"]
+    assert capabilities["streams"]["cam4_color_camera_info"]["available"]
+    assert (
+        capabilities["streams"]["cam4_native_depth_compressed"]["status"]
+        == "missing"
+    )
+    assert capabilities["streams"]["cam4_aligned_depth_raw"]["status"] == "missing"
+    assert capabilities["streams"]["cam4_depth_camera_info"]["status"] == "missing"
+    assert not capabilities["required_3d_streams_present"]
+    assert capabilities["geometry_gates"] == {
+        "color_camera_info_available": True,
+        "depth_camera_info_available": False,
+        "alignment_validated": False,
+        "depth_to_color_extrinsics_source_present": False,
+        "depth_to_color_extrinsics_layout_validated": False,
+        "depth_to_color_extrinsics_validated": False,
+        "depth_units_validated": False,
+    }
+    assert capabilities["depth_to_color_extrinsics"] == {
+        "source_topic": "",
+        "source_type": "",
+        "message_count": 0,
+        "source_present": False,
+        "status": "missing",
+        "output_topic": VIPLAB_CAM4_DEPTH_TO_COLOR_EXTRINSICS_TOPIC,
+        "output_type": "realsense2_camera_msgs/msg/Extrinsics",
+        "output_advertised": False,
+        "layout_validated": False,
+        "transform_validated": False,
+    }
+    assert not capabilities["metric_3d_ready"]
+
+
+def test_native_compressed_depth_is_not_promoted_to_aligned_depth():
+    routes = public_replay_typed_routes(
+        source_cam4_camera_info_topic="/recorded/cam4/info",
+        source_cam4_native_depth_compressed_topic=(
+            "/recorded/cam4/depth/compressedDepth"
+        ),
+        source_cam4_aligned_depth_topic="/recorded/cam4/aligned_depth",
+        source_cam4_depth_camera_info_topic="/recorded/cam4/depth_info",
+    )
+    capabilities = replay_input_capabilities(
+        case_id="fixture",
+        bag_path="/bag",
+        source_topic_types={
+            "/recorded/cam4/rgb": "sensor_msgs/msg/CompressedImage",
+            "/recorded/cam4/info": "sensor_msgs/msg/CameraInfo",
+            "/recorded/cam4/depth/compressedDepth": (
+                "sensor_msgs/msg/CompressedImage"
+            ),
+        },
+        source_message_counts={
+            "/recorded/cam4/rgb": 1,
+            "/recorded/cam4/info": 1,
+            "/recorded/cam4/depth/compressedDepth": 1,
+        },
+        source_cam4_image_topic="/recorded/cam4/rgb",
+        typed_routes=routes,
+    )
+
+    assert capabilities["streams"]["cam4_native_depth_compressed"][
+        "available"
+    ]
+    assert capabilities["streams"]["cam4_aligned_depth_raw"]["status"] == "missing"
+    assert not capabilities["geometry_gates"]["alignment_validated"]
+    assert not capabilities["required_3d_streams_present"]
+    assert not capabilities["metric_3d_ready"]
+
+
+def test_extrinsics_presence_does_not_bypass_layout_validation():
+    routes = public_replay_typed_routes(
+        source_cam4_camera_info_topic="/recorded/cam4/info",
+        source_cam4_native_depth_compressed_topic="",
+        source_cam4_aligned_depth_topic="/recorded/cam4/aligned_depth",
+        source_cam4_depth_camera_info_topic="/recorded/cam4/depth_info",
+    )
+    source_types = {
+        "/recorded/cam4/rgb": "sensor_msgs/msg/CompressedImage",
+        "/recorded/cam4/info": "sensor_msgs/msg/CameraInfo",
+        "/recorded/cam4/aligned_depth": "sensor_msgs/msg/Image",
+        "/recorded/cam4/depth_info": "sensor_msgs/msg/CameraInfo",
+        "/recorded/cam4/extrinsics": (
+            "realsense2_camera_msgs/msg/Extrinsics"
+        ),
+    }
+    capabilities = replay_input_capabilities(
+        case_id="fixture",
+        bag_path="/bag",
+        source_topic_types=source_types,
+        source_message_counts={topic: 1 for topic in source_types},
+        source_cam4_image_topic="/recorded/cam4/rgb",
+        typed_routes=routes,
+        source_cam4_depth_to_color_extrinsics_topic=(
+            "/recorded/cam4/extrinsics"
+        ),
+        alignment_validated=True,
+        depth_to_color_extrinsics_validated=True,
+        depth_to_color_extrinsics_layout_validated=False,
+        depth_units_validated=True,
+    )
+
+    diagnostic = capabilities["depth_to_color_extrinsics"]
+    assert diagnostic["source_present"]
+    assert diagnostic["status"] == "present_not_replayed"
+    assert not diagnostic["output_advertised"]
+    assert not diagnostic["layout_validated"]
+    assert not diagnostic["transform_validated"]
+    assert capabilities["required_3d_streams_present"]
+    assert not capabilities["geometry_gates"][
+        "depth_to_color_extrinsics_layout_validated"
+    ]
+    assert not capabilities["geometry_gates"][
+        "depth_to_color_extrinsics_validated"
+    ]
+    assert not capabilities["metric_3d_ready"]
 
 
 def test_time_conversion_is_nanosecond_stable():

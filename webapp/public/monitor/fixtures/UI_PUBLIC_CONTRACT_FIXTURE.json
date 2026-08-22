@@ -1,0 +1,41 @@
+{
+  "fixture_schema": "taskplanner.ui_contract_fixture.v1",
+  "synthetic": true,
+  "usage": "UI layout and filtering only. This file is not a clinical record or robot authorization.",
+  "baseline": {
+    "schema_version": "1.1.0",
+    "interface_version": "0.3.0",
+    "procedure_type": "thyroidectomy_demo",
+    "catalog_version": "synthetic-catalog-v1"
+  },
+  "/surgery/context": {
+    "revision": 1001,
+    "procedure_type": "thyroidectomy_demo",
+    "procedure_active": true,
+    "current_phase": "P05",
+    "phase_confidence": 0.84,
+    "phase_uncertain": false,
+    "execution_state": "running",
+    "evidence_status": "DT_ACCEPTED",
+    "safety_flags": []
+  },
+  "/surgery/instruments": {
+    "revision": 1001,
+    "instruments": [
+      { "instrument_id": "T03", "instance_id": "T03#1", "location_type": "surgeon", "location_id": "surgeon", "holder_role": "surgeon", "state": "in_use", "visible": false, "confidence": 0.96, "evidence_status": "DT_ACCEPTED" },
+      { "instrument_id": "T04", "instance_id": "T04#1", "location_type": "mayo_stand", "location_id": "mayo_stand", "holder_role": "none", "state": "parked_for_reuse", "visible": false, "confidence": 0.91, "evidence_status": "DT_ACCEPTED" },
+      { "instrument_id": "T07", "instance_id": "T07#1", "location_type": "mayo_stand", "location_id": "mayo_stand", "holder_role": "none", "state": "awaiting_retrieval", "visible": false, "confidence": 0.88, "evidence_status": "DT_ACCEPTED" }
+    ]
+  },
+  "/surgery/tool_predictions": {
+    "revision": 1001,
+    "schema_version": "1.1.0",
+    "procedure_type": "thyroidectomy_demo",
+    "procedure_active": true,
+    "predictions": [
+      { "rank": 1, "instrument_id": "T02", "instance_id": "", "confidence": 0.86, "stability_sec": 2.4, "source": "digital_twin", "evidence_status": "DT_ACCEPTED" },
+      { "rank": 2, "instrument_id": "T04", "instance_id": "", "confidence": 0.72, "stability_sec": 0.0, "source": "digital_twin", "evidence_status": "DT_ACCEPTED" },
+      { "rank": 3, "instrument_id": "T07", "instance_id": "", "confidence": 0.58, "stability_sec": 0.0, "source": "digital_twin", "evidence_status": "DT_ACCEPTED" }
+    ]
+  }
+}

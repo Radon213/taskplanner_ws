@@ -1,4 +1,4 @@
-import { useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import { AnimatePresence, useReducedMotion } from "framer-motion";
 import * as m from "framer-motion/m";
 import { BrainCircuit, Code2, ListTree, RadioTower } from "lucide-react";
@@ -17,7 +17,7 @@ import type {
   WorldState,
 } from "../../types";
 import { MOTION_DURATION, SILK_EASE } from "../../motion-system";
-import { type Language } from "../../utils/display";
+import { parseBoundedJson, type Language } from "../../utils/display";
 
 type ViewModel = ReturnType<typeof useDigitalTwinViewModel>;
 type TabId = "bt" | "vlm" | "raw";
@@ -66,10 +66,20 @@ function compactIdentifier(value: string): string {
 function vlmInputImageLabel(
   imageSource: string,
   sizeBytes: number,
+  receivedAt: number,
+  nowMs: number,
   language: Language,
 ): string {
   const source = String(imageSource || "");
   const sizeLabel = `${Math.max(1, Math.round(sizeBytes / 1024))} KB`;
+  const ageMs = Math.max(0, nowMs - receivedAt);
+  const ageLabel = ageMs < 1_000
+    ? language === "ko" ? "방금" : "just now"
+    : `${(ageMs / 1_000).toFixed(1)}${language === "ko" ? "초" : "s"}`;
+  const ageSuffix = ageMs < 1_000 ? "" : language === "ko" ? " 전" : " ago";
+  const freshnessLabel = ageMs > 3_000
+    ? language === "ko" ? "오래된 프레임" : "stale frame"
+    : language === "ko" ? "마지막 수신" : "last received";
   const isComposite = source.startsWith("flir_cam4_");
   const isRawFallback = source.endsWith("raw_fallback");
 
@@ -79,7 +89,7 @@ function vlmInputImageLabel(
       : isRawFallback
         ? "원본 FLIR 폴백"
         : "RF-DETR 분할 FLIR";
-    return `${viewLabel} · ${sizeLabel}`;
+    return `${viewLabel} · ${sizeLabel} · ${freshnessLabel} ${ageLabel}${ageSuffix}`;
   }
 
   const viewLabel = isComposite
@@ -87,7 +97,7 @@ function vlmInputImageLabel(
     : isRawFallback
       ? "Raw FLIR fallback"
       : "RF-DETR segmented FLIR";
-  return `${viewLabel} · ${sizeLabel}`;
+  return `${viewLabel} · ${sizeLabel} · ${freshnessLabel} ${ageLabel}${ageSuffix}`;
 }
 
 function BedRobotArmTraceCard({
@@ -141,7 +151,9 @@ function BedRobotArmTraceCard({
 function parseVlmToolLabel(vlmResult: VLMResult, displayToolName: (toolId: string) => string, noneLabel: string): string {
   if (!vlmResult.raw_json) return noneLabel;
   try {
-    const payload = JSON.parse(vlmResult.raw_json) as { tool?: unknown };
+    const parsed = parseBoundedJson(vlmResult.raw_json);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return noneLabel;
+    const payload = parsed as { tool?: unknown };
     const rawTool = payload.tool;
     if (Array.isArray(rawTool) && Array.isArray(rawTool[0])) {
       const first = rawTool[0] as unknown[];
@@ -168,7 +180,9 @@ function parseVlmMayoLabel(
 ): string {
   if (!vlmResult.raw_json) return noneLabel;
   try {
-    const payload = JSON.parse(vlmResult.raw_json) as { mayo?: unknown };
+    const parsed = parseBoundedJson(vlmResult.raw_json);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return noneLabel;
+    const payload = parsed as { mayo?: unknown };
     if (!Array.isArray(payload.mayo)) return noneLabel;
     const rows = payload.mayo.flatMap((row) => {
       if (!Array.isArray(row) || row.length < 3) return [];
@@ -226,7 +240,17 @@ export function ObservabilityPanel({
   const timelineStripRef = useRef<HTMLDivElement>(null);
   const followLatestRef = useRef(true);
   const [followLatest, setFollowLatest] = useState(true);
+  const [nowMs, setNowMs] = useState(() => Date.now());
   const prefersReducedMotion = useReducedMotion();
+  const hasVlmImage = Boolean(vlmImage);
+
+  useEffect(() => {
+    if (!hasVlmImage) return;
+    setNowMs(Date.now());
+    const timer = window.setInterval(() => setNowMs(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, [hasVlmImage]);
+
   const sourceHealthRows = useMemo(
     () =>
       [
@@ -618,6 +642,8 @@ export function ObservabilityPanel({
                       ? vlmInputImageLabel(
                           vlmHealth.image_source,
                           vlmImage.sizeBytes,
+                          vlmImage.receivedAt,
+                          nowMs,
                           language,
                         )
                       : language === "ko"

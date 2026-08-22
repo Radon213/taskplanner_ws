@@ -1,0 +1,151 @@
+.surgimate-monitor-workspace {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  width: 100vw;
+  height: 100dvh;
+  overflow: hidden;
+  background: var(--color-page);
+}
+
+.surgimate-monitor-frame {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  background: var(--color-page);
+}
+
+.surgimate-monitor-frame[data-state="loading"] {
+  visibility: hidden;
+}
+
+.surgimate-monitor-return-zone {
+  position: fixed;
+  top: 0;
+  left: 0;
+  z-index: 4;
+  width: 76px;
+  height: 76px;
+}
+
+.surgimate-monitor-return {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  display: inline-flex;
+  min-width: 44px;
+  min-height: 44px;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  padding: 0 12px;
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-control);
+  background: var(--color-surface-raised);
+  box-shadow: var(--shadow-elevated);
+  color: var(--color-text);
+  font-size: 13px;
+  font-weight: 700;
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(-8px);
+  transition:
+    opacity var(--duration-fast) var(--ease-default),
+    transform var(--duration-fast) var(--ease-default);
+}
+
+.surgimate-monitor-return-zone:hover .surgimate-monitor-return,
+.surgimate-monitor-return:focus-visible {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateY(0);
+}
+
+.surgimate-monitor-return:focus-visible,
+.surgimate-monitor-feedback button:focus-visible {
+  outline: 3px solid color-mix(in srgb, var(--color-accent) 84%, white);
+  outline-offset: 3px;
+}
+
+.surgimate-monitor-feedback {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 12px;
+  padding: 24px;
+  background: var(--color-page);
+  color: var(--color-text);
+  text-align: center;
+}
+
+.surgimate-monitor-feedback h1,
+.surgimate-monitor-feedback p {
+  margin: 0;
+}
+
+.surgimate-monitor-feedback h1 {
+  font-size: 20px;
+  line-height: 1.35;
+}
+
+.surgimate-monitor-feedback p {
+  max-width: 520px;
+  color: var(--color-text-muted);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.surgimate-monitor-feedback-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.surgimate-monitor-feedback button {
+  display: inline-flex;
+  min-width: 44px;
+  min-height: 44px;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  padding: 0 14px;
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-control);
+  background: var(--color-surface-raised);
+  color: var(--color-text);
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.surgimate-monitor-skeleton {
+  width: min(520px, 78vw);
+  height: 18px;
+  border-radius: var(--radius-control);
+  background: var(--skeleton-base);
+}
+
+.surgimate-monitor-skeleton.wide {
+  width: min(680px, 86vw);
+  height: 26px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .surgimate-monitor-return {
+    transition-duration: 0.01ms;
+  }
+}
+
+@media (hover: none), (pointer: coarse) {
+  .surgimate-monitor-return {
+    opacity: 0.92;
+    pointer-events: auto;
+    transform: translateY(0);
+  }
+}

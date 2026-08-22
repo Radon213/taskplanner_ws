@@ -17,9 +17,10 @@ from types import MappingProxyType
 from typing import Any, Iterable, Mapping, Sequence
 
 from .adapters import ForceTorqueSample, JointStateSample
+from .target_planner import TargetPlannerIdentity
 
 
-SESSION_SCHEMA_VERSION = 1
+SESSION_SCHEMA_VERSION = 2
 _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _JOINT_FILE = "joint_samples.csv"
 _FORCE_FILE = "force_samples.csv"
@@ -139,6 +140,7 @@ class TeachingSessionMetadata:
     robot_id: str
     controller_id: str
     source_revision: str
+    target_planner: Mapping[str, Any]
     calibration: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -156,6 +158,13 @@ class TeachingSessionMetadata:
             "source_revision",
         ):
             object.__setattr__(self, name, _required_text(getattr(self, name), name))
+        try:
+            planner = TargetPlannerIdentity.from_mapping(self.target_planner)
+        except (TypeError, ValueError) as exc:
+            raise SessionValidationError(
+                "invalid_target_planner", f"invalid target planner identity: {exc}"
+            ) from exc
+        object.__setattr__(self, "target_planner", _freeze_mapping(planner.as_dict()))
         object.__setattr__(self, "calibration", _freeze_mapping(self.calibration))
 
 
@@ -229,7 +238,12 @@ class TeachingSession:
                 "a valid teaching session requires computed joint and force targets",
             )
 
-    def validate_for_profile(self, profile_name: str, profile_checksum: str) -> None:
+    def validate_for_profile(
+        self,
+        profile_name: str,
+        profile_checksum: str,
+        target_planner_checksum: str | None = None,
+    ) -> None:
         self.validate_complete()
         if self.metadata.profile_name != str(profile_name):
             raise SessionProfileMismatchError(
@@ -241,6 +255,13 @@ class TeachingSession:
             raise SessionProfileMismatchError(
                 "profile_checksum_mismatch",
                 "session profile checksum does not match the active profile",
+            )
+        if target_planner_checksum is not None and (
+            self.metadata.target_planner["checksum"] != str(target_planner_checksum)
+        ):
+            raise SessionProfileMismatchError(
+                "target_planner_checksum_mismatch",
+                "session target planner checksum does not match the active planner",
             )
 
 
@@ -352,8 +373,13 @@ class TeachingSessionRepository:
             raise ValueError("teaching session data directory must be absolute")
 
     def _ensure_root(self) -> None:
+        if self.root.is_symlink():
+            raise TeachingSessionError(
+                "data_directory_symlink",
+                f"teaching session data directory must not be a symlink: {self.root}",
+            )
         self.root.mkdir(parents=True, exist_ok=True)
-        if not self.root.is_dir():
+        if not self.root.is_dir() or self.root.is_symlink():
             raise TeachingSessionError(
                 "data_directory_invalid", f"not a directory: {self.root}"
             )
@@ -411,6 +437,7 @@ class TeachingSessionRepository:
         *,
         expected_profile_name: str | None = None,
         expected_profile_checksum: str | None = None,
+        expected_target_planner_checksum: str | None = None,
     ) -> TeachingSession:
         path = self.session_path(session_id)
         if not path.is_dir() or path.is_symlink():
@@ -444,12 +471,18 @@ class TeachingSessionRepository:
             )
         if expected_profile_name is not None and expected_profile_checksum is not None:
             session.validate_for_profile(
-                expected_profile_name, expected_profile_checksum
+                expected_profile_name,
+                expected_profile_checksum,
+                expected_target_planner_checksum,
             )
         return session
 
     def latest_valid(
-        self, *, expected_profile_name: str, expected_profile_checksum: str
+        self,
+        *,
+        expected_profile_name: str,
+        expected_profile_checksum: str,
+        expected_target_planner_checksum: str | None = None,
     ) -> TeachingSession:
         if not self.root.is_dir():
             raise TeachingSessionError(
@@ -464,6 +497,7 @@ class TeachingSessionRepository:
                     path.name,
                     expected_profile_name=expected_profile_name,
                     expected_profile_checksum=expected_profile_checksum,
+                    expected_target_planner_checksum=expected_target_planner_checksum,
                 )
             except TeachingSessionError:
                 continue
@@ -543,6 +577,7 @@ def _manifest_dict(
             "controller_id": session.metadata.controller_id,
         },
         "source_revision": session.metadata.source_revision,
+        "target_planner": dict(session.metadata.target_planner),
         "calibration": dict(session.metadata.calibration),
         "joint_sample_count": len(session.joint_samples),
         "force_sample_count": len(session.force_samples),
@@ -615,6 +650,7 @@ def _session_from_payloads(
             robot_id=str(robot["robot_id"]),
             controller_id=str(robot["controller_id"]),
             source_revision=str(manifest["source_revision"]),
+            target_planner=manifest["target_planner"],
             calibration=manifest.get("calibration", {}),
         )
         session = TeachingSession(

@@ -9,14 +9,14 @@ const source = fs.readFileSync(
 const violations = [];
 
 for (const topic of [
-  "/synced/cam_1/color/image_raw/compressed",
-  "/synced/cam_2/color/image_raw/compressed",
-  "/synced/cam_3/color/image_raw/compressed",
-  "/synced/cam_4/color/image_raw/compressed",
-  "/synced/flir/color/image_raw/compressed",
+  "/preview/cam_1/color/image_raw/compressed",
+  "/preview/cam_2/color/image_raw/compressed",
+  "/preview/cam_3/color/image_raw/compressed",
+  "/preview/cam_4/color/image_raw/compressed",
+  "/preview/flir/color/image_raw/compressed",
 ]) {
   if (!source.includes(topic)) {
-    violations.push(`Live camera fallback must use synchronized source ${topic}`);
+    violations.push(`Live camera fallback must use the rate-limited preview source ${topic}`);
   }
 }
 
@@ -26,18 +26,18 @@ if (!source.includes("const ROSBRIDGE_IMAGE_QUEUE_LENGTH = 1;")) {
 if (!source.includes('const ROSBRIDGE_IMAGE_COMPRESSION = "cbor";')) {
   violations.push("CompressedImage subscriptions must use binary CBOR transport");
 }
-if (!source.includes("const CAMERA_FRAME_THROTTLE_MS = 100;")) {
-  violations.push("Browser camera previews must be capped at 10 FPS");
+if (!source.includes("const CAMERA_FRAME_THROTTLE_MS = 180;")) {
+  violations.push("Mission camera previews must not exceed the 5 Hz preview-plane budget");
 }
 for (const qosContract of [
   'history: "keep_last"',
   "depth: 1",
-  'reliability: "reliable"',
+  'reliability: "best_effort"',
   'durability: "volatile"',
-  "requireReliableImageSubscription(topic)",
+  "configurePreviewImageSubscription(topic)",
 ]) {
   if (!source.includes(qosContract)) {
-    violations.push(`Synchronized physical cameras must request QoS: ${qosContract}`);
+    violations.push(`Physical preview cameras must request QoS: ${qosContract}`);
   }
 }
 
