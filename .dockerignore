@@ -6,12 +6,21 @@ webapp/node_modules/
 webapp/dist/
 webapp/tsconfig.tsbuildinfo
 reports/taskplanner_validation_assets/
+# Release bundles and test evidence are host artifacts, not image inputs.
+# `reports/release` alone can exceed the complete source tree by orders of
+# magnitude, so letting it enter the context makes every cached build slow.
+reports/release/
+reports/**/rendered/
+test_outputs/
 annotated_bags/
 annotations/clinical_video/cases/
 annotations/observable_tool_events/cases/
 annotations/observable_tool_events/proposals/
 annotations/observable_tool_events/reports/
 output/
+webapp/output/
+webapp/.playwright-cli/
+webapp/coverage/
 unsloth_compiled_cache/
 tools/real_surgery_annotation/web_interaction_review/rfdetr_overlays/
 tools/real_surgery_annotation/web_interaction_review/phase_catalogs/

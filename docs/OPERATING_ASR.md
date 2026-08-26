@@ -28,10 +28,12 @@ ASR 프로세스가 올라왔다는 것만으로 수술 시나리오가 준비�
 운영 ASR은 Puzzle AI 전송이 실제로 연결된 세션에서만 최종 문장 publisher를
 유지하며, live 런타임의 `/integration/readiness`는
 `/sensors/surgeon/sentence` publisher가 없으면 fail-closed 상태를 유지한다.
-같이 실행되는 통합 Debug sidecar의 `asr_start`는 명시적으로 거부된다. Debug
-ASR이 이 publisher 조건을 대신 만족한 뒤 시나리오 시작과 함께 중지되는 경로를
-차단하기 위한 것으로, 운영 화면의 **수술실 음성 입력**에서 장치를 새로고침하고
-ASR을 시작해야 한다. Debug의 장치 새로고침과 중지는 계속 사용할 수 있다.
+같이 실행되는 통합 Debug sidecar의 `asr_start`는 운영 런타임이 실제로 실행
+중이거나 최신 정지 상태를 확인할 수 없을 때 거부된다. 운영 런타임이 신뢰할 수
+있는 최신 정지 상태라면 수동 제어를 활성화한 Debug 화면에서도 standalone ASR을
+시작할 수 있다. 운영 화면과 Debug는 공유 캡처 lock으로 동시에 마이크를 열지
+않으며, 운영 런타임이 다시 실행되면 운영 화면의 **수술실 음성 입력**을
+사용해야 한다. Debug의 장치 새로고침과 중지는 계속 사용할 수 있다.
 
 `scripts/taskplanner up llm-surgeon`은 `taskplanner-asr`를 시작하지 않는다.
 다른 모드로 전환하거나 `scripts/taskplanner down`을 실행하면 이전 운영 ASR도
@@ -68,8 +70,9 @@ artifact를 저장하지 않으며 상태와 확정 문장만 ROS로 전달한�
 운영과 standalone Debug ASR은 `/taskplanner-runs/asr/microphone.lock`을
 공유한다. 한 쪽이 캡처 중이면 다른 쪽은 마이크를 열 수 없으며, 강제로 lock
 파일을 지워 동시 캡처를 우회해서는 안 된다. 소유 프로세스가 종료되면 advisory
-lock이 해제된다. live에 포함된 통합 Debug sidecar는 이 lock 충돌에 의존하지
-않고 Debug `asr_start` 자체를 거부한다.
+lock이 해제된다. live에 포함된 통합 Debug sidecar는 운영 상태가 실행 중이거나
+불명확할 때 `asr_start`를 거부하고, 최신 정지 상태일 때만 이 공유 lock을 통해
+Debug 캡처를 허용한다.
 
 ## 환경 계약
 

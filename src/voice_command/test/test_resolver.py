@@ -11,6 +11,8 @@ from voice_command.contracts import (
     DISPOSITION_PROPOSE,
     DISPOSITION_REJECT,
     INTENT_RETRACTOR_COMMAND,
+    INTENT_PROCEDURE_START,
+    INTENT_PROCEDURE_STOP,
     INTENT_TOOL_HANDOVER,
     TARGET_SIDE_NONE,
 )
@@ -19,6 +21,7 @@ from voice_command.selector import CandidateSelection
 
 
 _ALIASES = {
+    "T02": ("t02", "adson forceps", "adson", "애드슨"),
     "T04": ("보비", "bovie"),
     "T05": ("아미 네이비", "아미"),
 }
@@ -40,6 +43,7 @@ def resolver() -> VoiceIntentResolver:
     [
         ("보비 줘", "routine"),
         ("보비를 주세요", "routine"),
+        ("보비 전달", "routine"),
         ("보비 내놔", "routine"),
         ("보비 내놔 빨리", "urgent"),
         ("보비 서둘러", "urgent"),
@@ -66,6 +70,51 @@ def test_natural_explicit_tool_handover_is_grounded(
 
 
 @pytest.mark.parametrize(
+    "utterance, tool_id",
+    [
+        ("보비 부탁합니다", "T04"),
+        ("보비 부탁드립니다", "T04"),
+        ("Bovie handover", "T04"),
+        ("Bovie hand over", "T04"),
+        ("Adson forceps 부탁합니다", "T02"),
+        ("애드슨 부탁드립니다", "T02"),
+        ("Adson handover", "T02"),
+        ("T02 hand over", "T02"),
+    ],
+)
+def test_explicit_formal_or_english_handover_is_grounded(
+    resolver: VoiceIntentResolver,
+    utterance: str,
+    tool_id: str,
+) -> None:
+    proposal = resolver.resolve(utterance)
+
+    assert proposal.disposition == DISPOSITION_PROPOSE
+    assert proposal.intent == INTENT_TOOL_HANDOVER
+    assert proposal.tool_id == tool_id
+    assert proposal.requires_confirmation is False
+
+
+@pytest.mark.parametrize(
+    "utterance",
+    [
+        "보비 부탁합니다라고 말했어요",
+        "회의에서 보비 부탁합니다라는 표현을 쓰세요",
+        "we call this Bovie handover training",
+        "Bovie handover is disabled",
+        "is this a Bovie handover",
+    ],
+)
+def test_formal_handover_words_in_background_speech_do_not_propose(
+    resolver: VoiceIntentResolver,
+    utterance: str,
+) -> None:
+    proposal = resolver.resolve(utterance)
+
+    assert not proposal.is_executable_proposal
+
+
+@pytest.mark.parametrize(
     "utterance",
     [
         "교시 시작",
@@ -86,6 +135,57 @@ def test_natural_direct_teach_start_is_short_and_grounded(
     assert proposal.target_side == TARGET_SIDE_NONE
     assert proposal.distance_m == 0.0
     assert proposal.requires_confirmation is False
+
+
+@pytest.mark.parametrize(
+    "utterance, intent",
+    [
+        ("갑상선 절제술 시작", INTENT_PROCEDURE_START),
+        ("갑상선 수술 시작", INTENT_PROCEDURE_START),
+        ("thyroidectomy 시작", INTENT_PROCEDURE_START),
+        ("thyroidectomy 스타트", INTENT_PROCEDURE_START),
+        ("갑상선절제술 시작하겠습니다", INTENT_PROCEDURE_START),
+        ("thyroidectomy 시작하겠습니다", INTENT_PROCEDURE_START),
+        ("갑상선 절제술 종료", INTENT_PROCEDURE_STOP),
+        ("갑상선 수술 종료", INTENT_PROCEDURE_STOP),
+        ("thyroidectomy 종료", INTENT_PROCEDURE_STOP),
+        ("thyroidectomy 스탑", INTENT_PROCEDURE_STOP),
+        ("수술 종료", INTENT_PROCEDURE_STOP),
+        ("갑상선절제술 종료하겠습니다", INTENT_PROCEDURE_STOP),
+        ("갑상선절제술 마무리하겠습니다", INTENT_PROCEDURE_STOP),
+        ("갑상선절제술 끝내겠습니다", INTENT_PROCEDURE_STOP),
+    ],
+)
+def test_explicit_active_procedure_lifecycle_is_grounded(
+    resolver: VoiceIntentResolver,
+    utterance: str,
+    intent: str,
+) -> None:
+    proposal = resolver.resolve(utterance)
+
+    assert proposal.disposition == DISPOSITION_PROPOSE
+    assert proposal.intent == intent
+    assert proposal.procedure_id == _PROCEDURE_ID
+    assert proposal.requires_confirmation is False
+
+
+@pytest.mark.parametrize(
+    "utterance",
+    [
+        "갑상선절제술 시작할까요?",
+        "갑상선절제술 시작하지 마",
+        "오늘 갑상선절제술 시작하겠습니다 라고 말했어",
+        "시작하겠습니다",
+        "수술 시작",
+    ],
+)
+def test_procedure_lifecycle_requires_a_short_nonnegated_command(
+    resolver: VoiceIntentResolver,
+    utterance: str,
+) -> None:
+    proposal = resolver.resolve(utterance)
+
+    assert proposal.disposition != DISPOSITION_PROPOSE
 
 
 @pytest.mark.parametrize("utterance", ["직접 교실 시작", "교시시 시작"])
@@ -287,6 +387,126 @@ def test_catalog_loader_scopes_aliases_to_active_procedure() -> None:
     assert thyroid.catalog_id != nephrectomy.catalog_id
 
 
+@pytest.mark.parametrize(
+    "utterance",
+    ["아미 네이비 줘", "Army navy retractor please", "갑상선 리트랙터 주세요"],
+)
+def test_demo_catalog_does_not_turn_bed_arm_retractors_into_handover_intents(
+    utterance: str,
+) -> None:
+    specs = (
+        Path(__file__).resolve().parents[2]
+        / "procedure_spec"
+        / "procedure_spec"
+        / "specs"
+    )
+    demo = load_voice_command_catalog(specs / "thyroidectomy_demo")
+    resolver = VoiceIntentResolver(
+        tool_aliases=demo.tool_aliases,
+        procedure_id=demo.procedure_id,
+        catalog_id=demo.catalog_id,
+        retractor_commands=demo.retractor_commands,
+        retractor_max_distance_m=demo.retractor_max_distance_m,
+        retractor_require_explicit_unit=demo.retractor_require_explicit_unit,
+    )
+
+    proposal = resolver.resolve(utterance)
+
+    assert "T05" not in demo.tool_aliases
+    assert "T11" not in demo.tool_aliases
+    assert proposal.disposition == DISPOSITION_NO_COMMAND
+    assert proposal.intent != INTENT_TOOL_HANDOVER
+    assert proposal.tool_id == ""
+
+
+@pytest.mark.parametrize(
+    "utterance, command, target_side, distance_m",
+    [
+        ("직접 교시 시작", "start_direct_teach", "none", 0.0),
+        ("직접 교시 종료", "finish_direct_teach", "none", 0.0),
+        ("리트랙션 시작", "start_retraction", "none", 0.0),
+        (
+            "오른쪽 리트랙션을 1 센치 더 당겨줘",
+            "adjust_retraction",
+            "right",
+            0.01,
+        ),
+        ("도구 교체", "change_tool", "none", 0.0),
+        ("리트랙션 종료", "stop_retraction", "none", 0.0),
+    ],
+)
+def test_demo_catalog_resolves_all_six_typed_retractor_commands(
+    utterance: str,
+    command: str,
+    target_side: str,
+    distance_m: float,
+) -> None:
+    specs = (
+        Path(__file__).resolve().parents[2]
+        / "procedure_spec"
+        / "procedure_spec"
+        / "specs"
+    )
+    demo = load_voice_command_catalog(specs / "thyroidectomy_demo")
+    resolver = VoiceIntentResolver(
+        tool_aliases=demo.tool_aliases,
+        procedure_id=demo.procedure_id,
+        catalog_id=demo.catalog_id,
+        retractor_commands=demo.retractor_commands,
+        retractor_max_distance_m=demo.retractor_max_distance_m,
+        retractor_require_explicit_unit=demo.retractor_require_explicit_unit,
+    )
+
+    proposal = resolver.resolve(utterance)
+
+    assert demo.retractor_commands == (
+        "start_direct_teach",
+        "finish_direct_teach",
+        "start_retraction",
+        "adjust_retraction",
+        "change_tool",
+        "stop_retraction",
+    )
+    assert proposal.disposition == DISPOSITION_PROPOSE
+    assert proposal.intent == INTENT_RETRACTOR_COMMAND
+    assert proposal.retractor_command == command
+    assert proposal.target_side == target_side
+    assert proposal.distance_m == pytest.approx(distance_m)
+    assert proposal.tool_id == ""
+
+
+@pytest.mark.parametrize(
+    "utterance",
+    [
+        "리트랙션 시작할까요?",
+        "도구 교체하지 마",
+        "리트랙션을 1 센치 더 당겨줘",
+        "오른쪽 리트랙션 더 당겨줘",
+        "오른쪽 리트랙션을 4 센치 더 당겨줘",
+    ],
+)
+def test_demo_catalog_retractor_questions_negation_and_ungrounded_adjustment_fail_closed(
+    utterance: str,
+) -> None:
+    specs = (
+        Path(__file__).resolve().parents[2]
+        / "procedure_spec"
+        / "procedure_spec"
+        / "specs"
+    )
+    demo = load_voice_command_catalog(specs / "thyroidectomy_demo")
+    resolver = VoiceIntentResolver(
+        tool_aliases=demo.tool_aliases,
+        procedure_id=demo.procedure_id,
+        catalog_id=demo.catalog_id,
+        retractor_commands=demo.retractor_commands,
+        retractor_max_distance_m=demo.retractor_max_distance_m,
+        retractor_require_explicit_unit=demo.retractor_require_explicit_unit,
+    )
+
+    assert resolver.resolve(utterance).disposition != DISPOSITION_PROPOSE
+
+
 def test_catalog_hash_is_deterministic_and_alias_changes_are_visible() -> None:
     left = {"T02": ("애드슨", "adson"), "T01": ("메스",)}
     reordered = {"T01": ("메스",), "T02": ("adson", "애드슨")}
@@ -294,6 +514,24 @@ def test_catalog_hash_is_deterministic_and_alias_changes_are_visible() -> None:
 
     assert voice_catalog_id_for("case", left) == voice_catalog_id_for("case", reordered)
     assert voice_catalog_id_for("case", left) != voice_catalog_id_for("case", changed)
+    assert voice_catalog_id_for(
+        "case",
+        left,
+        retractor_commands=("start_retraction", "stop_retraction"),
+    ) == voice_catalog_id_for(
+        "case",
+        reordered,
+        retractor_commands=("stop_retraction", "start_retraction"),
+    )
+    assert voice_catalog_id_for(
+        "case",
+        left,
+        retractor_commands=("start_retraction",),
+    ) != voice_catalog_id_for(
+        "case",
+        left,
+        retractor_commands=("start_retraction", "stop_retraction"),
+    )
 
 
 def test_ambiguous_bundle_aliases_are_dropped_not_guessed() -> None:

@@ -128,10 +128,10 @@ Check inside Docker:
 
 ```bash
 docker compose exec -T taskplanner-runtime bash -lc \
-'source install/setup.bash && ros2 topic info -v /surgery/images/field/image_raw'
+'source install/docker/setup.bash && ros2 topic info -v /surgery/images/field/image_raw'
 
 docker compose exec -T taskplanner-runtime bash -lc \
-'source install/setup.bash && timeout 10 ros2 topic hz /surgery/images/field/image_raw'
+'source install/docker/setup.bash && timeout 10 ros2 topic hz /surgery/images/field/image_raw'
 ```
 
 If Docker still discovers the publisher but receives no samples, avoid spending
@@ -179,7 +179,7 @@ Check that Docker now publishes compressed images:
 
 ```bash
 docker compose exec -T taskplanner-runtime bash -lc \
-'source install/setup.bash && ros2 topic hz /surgery/images/field/compressed'
+'source install/docker/setup.bash && ros2 topic hz /surgery/images/field/compressed'
 ```
 
 ## VLM Input Contract

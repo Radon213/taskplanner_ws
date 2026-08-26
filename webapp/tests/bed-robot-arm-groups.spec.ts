@@ -28,10 +28,6 @@ function simulationEvent(
 const RETRACTION_REQUEST_ID = "req-retraction-adjust-001";
 
 const FIXTURE_EVENTS = [
-  simulationEvent("SurgeonRequestObserved", "observed", {
-    requested_tool: "yankauer_suction",
-    voice_text: "Yankauer suction please",
-  }, "yankauer_suction"),
   simulationEvent("BedRobotArmGroupRequestObserved", "pending", {
     request_id: RETRACTION_REQUEST_ID,
     group_id: "retraction",
@@ -63,6 +59,10 @@ const FIXTURE_EVENTS = [
     operation: "adjust_retraction",
     state: "retracting",
   }),
+  simulationEvent("SurgeonRequestObserved", "observed", {
+    requested_tool: "yankauer_suction",
+    voice_text: "Yankauer suction please",
+  }, "yankauer_suction"),
   // A stale legacy suction-arm event must never create a card or trace.
   simulationEvent("BedRobotArmGroupRequestObserved", "pending", {
     request_id: "req-legacy-suction-arm",
@@ -212,14 +212,56 @@ test("shows only document-defined retraction arms while preserving clinical suct
 
   await expect(page.getByText("석션 로봇암")).toHaveCount(0);
   await expect(page.getByText("suction_arm")).toHaveCount(0);
-  // Landscape monitoring intentionally conceals the timeline, but the clinical
-  // suction evidence must remain available in the mounted observability feed.
-  await expect(page.locator(".timeline-area").getByText(/Yankauer suction/i).first()).toBeAttached();
+  // The removed hidden timeline must not be remounted just to retain evidence;
+  // the lightweight stage projection still exposes the latest clinical request.
+  await expect(
+    page.locator(".surgeon-evidence-overlay").getByText(/Yankauer suction/i),
+  ).toBeVisible();
 
   const traceRegion = page.getByRole("region", { name: "리트랙션 로봇암 요청 추적" });
   await expect(traceRegion.locator(`[data-bed-arm-request-id="${RETRACTION_REQUEST_ID}"]`)).toHaveCount(1);
   await expect(traceRegion.locator('[data-bed-arm-request-id="req-legacy-suction-arm"]')).toHaveCount(0);
   await expect(traceRegion.locator("[data-bed-arm-trace-step]")).toHaveCount(5);
+});
+
+test("accepts the inguinal demo two-arm Army-Navy controller layout", async ({ page }) => {
+  const inguinalSimulationState = {
+    ...SIMULATION_STATE,
+    procedure_id: "inguinal_hernia_repair_demo",
+    active_bundle: "inguinal_hernia_repair_demo",
+    filtered_phase: "P02",
+  };
+  const inguinalStatus = {
+    ...BED_ROBOT_ARM_STATUS,
+    procedure_type: "inguinal_hernia_repair",
+    arms: [
+      {
+        arm_id: "arm_1",
+        role: "retraction",
+        role_instance_id: "left_army_navy",
+        state: "retracting",
+        direct_teach_active: false,
+        reason_code: "ok",
+      },
+      {
+        arm_id: "arm_2",
+        role: "retraction",
+        role_instance_id: "right_army_navy",
+        state: "standby",
+        direct_teach_active: false,
+        reason_code: "ok",
+      },
+    ],
+  };
+  await installRosbridgeFixture(page, {
+    simulationMessages: [{ delayMs: 0, message: inguinalSimulationState }],
+    bedRobotStatusMessages: [{ delayMs: 0, message: inguinalStatus }],
+  });
+  await page.goto("/");
+
+  await expect(page.locator("[data-bed-robot-arm-id]")).toHaveCount(2);
+  await expect(page.locator('[data-bed-robot-arm-id="arm_1"]')).toContainText("left_army_navy");
+  await expect(page.locator('[data-bed-robot-arm-id="arm_2"]')).toContainText("right_army_navy");
 });
 
 test("keeps retraction arm cards and traces responsive", async ({ page }) => {

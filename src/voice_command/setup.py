@@ -22,6 +22,7 @@ setup(
     entry_points={
         "console_scripts": [
             "voice_intent_resolver = voice_command.node:main",
+            "vlm_function_admission_gate = voice_command.vlm_function_gate:main",
         ],
     },
 )

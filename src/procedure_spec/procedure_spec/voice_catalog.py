@@ -21,12 +21,15 @@ from .loader import load_bundle
 
 @dataclass(frozen=True)
 class VoiceCommandCatalog:
-    """Unambiguous aliases for requestable instruments in one bundle."""
+    """Procedure-local vocabulary admitted by the central voice resolver."""
 
     procedure_id: str
     catalog_id: str
     tool_aliases: dict[str, tuple[str, ...]]
     ambiguous_aliases: dict[str, tuple[str, ...]]
+    retractor_commands: tuple[str, ...]
+    retractor_max_distance_m: float
+    retractor_require_explicit_unit: bool
     bundle_path: str
 
 
@@ -41,8 +44,12 @@ def normalize_voice_alias(value: object) -> str:
 def voice_catalog_id_for(
     procedure_id: str,
     tool_aliases: Mapping[str, Sequence[str]],
+    *,
+    retractor_commands: Sequence[str] = (),
+    retractor_max_distance_m: float = 0.0,
+    retractor_require_explicit_unit: bool = True,
 ) -> str:
-    """Return a stable, full SHA-256 procedure/alias binding ID.
+    """Return a stable, full SHA-256 procedure/voice-vocabulary binding ID.
 
     The exact preimage is UTF-8 JSON generated with ``ensure_ascii=False``,
     ``sort_keys=True``, and compact separators for a mapping containing the
@@ -63,6 +70,22 @@ def voice_catalog_id_for(
             for tool_id, aliases in sorted(tool_aliases.items())
         ],
     }
+    normalized_retractor_commands = sorted(
+        {
+            str(command).strip()
+            for command in retractor_commands
+            if str(command).strip()
+        }
+    )
+    # Preserve the historical tool-only preimage for bundles that do not expose
+    # a retractor voice lane.  When commands are present, bind them into the same
+    # catalog fence used by the producer and Digital Twin consumer.
+    if normalized_retractor_commands:
+        payload["retractor_commands"] = normalized_retractor_commands
+        payload["retractor_adjustment_policy"] = {
+            "max_distance_m": float(retractor_max_distance_m),
+            "require_explicit_unit": bool(retractor_require_explicit_unit),
+        }
     serialized = json.dumps(
         payload,
         ensure_ascii=False,
@@ -85,8 +108,9 @@ def load_voice_command_catalog(bundle_dir: str | Path) -> VoiceCommandCatalog:
     spec = load_bundle(bundle_path)
     aliases_by_tool: dict[str, list[str]] = {}
     alias_owners: dict[str, set[str]] = {}
+    scenario_policy = spec.get_scenario_policy()
     for instrument in spec.bundle.instruments:
-        if not instrument.requestable:
+        if not scenario_policy.check_instrument_request(instrument.id).allowed:
             continue
         tool_id = str(instrument.id).strip()
         aliases = [
@@ -114,17 +138,41 @@ def load_voice_command_catalog(bundle_dir: str | Path) -> VoiceCommandCatalog:
     safe_aliases = {
         tool_id: aliases for tool_id, aliases in safe_aliases.items() if aliases
     }
-    if not safe_aliases:
-        raise ValueError(
-            f"procedure bundle {bundle_path} has no unambiguous requestable tool aliases"
-        )
     procedure_id = str(spec.bundle.procedure_id).strip()
     if not procedure_id:
         raise ValueError(f"procedure bundle {bundle_path} has an empty procedure_id")
+    retractor_commands: tuple[str, ...] = ()
+    retractor_max_distance_m = 0.0
+    retractor_require_explicit_unit = True
+    bed_robot_arm_groups = spec.get_bed_robot_arm_group_spec()
+    if bed_robot_arm_groups is not None:
+        retractor_commands = tuple(
+            dict.fromkeys(
+                str(command).strip()
+                for group in bed_robot_arm_groups.groups
+                if scenario_policy.check_group_enabled(group.id).allowed
+                and group.id == "retraction"
+                for command in group.allowed_voice_commands
+                if str(command).strip()
+            )
+        )
+        retractor_max_distance_m = float(bed_robot_arm_groups.max_distance_mm) / 1000.0
+        retractor_require_explicit_unit = bool(
+            bed_robot_arm_groups.require_explicit_unit
+        )
     return VoiceCommandCatalog(
         procedure_id=procedure_id,
-        catalog_id=voice_catalog_id_for(procedure_id, safe_aliases),
+        catalog_id=voice_catalog_id_for(
+            procedure_id,
+            safe_aliases,
+            retractor_commands=retractor_commands,
+            retractor_max_distance_m=retractor_max_distance_m,
+            retractor_require_explicit_unit=retractor_require_explicit_unit,
+        ),
         tool_aliases=safe_aliases,
         ambiguous_aliases=ambiguous,
+        retractor_commands=retractor_commands,
+        retractor_max_distance_m=retractor_max_distance_m,
+        retractor_require_explicit_unit=retractor_require_explicit_unit,
         bundle_path=str(bundle_path),
     )

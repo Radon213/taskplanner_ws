@@ -182,8 +182,10 @@ safety / invariant guard
 - robot right hand에는 하나의 handover/preposition tool만 허용한다.
 - robot left hand에는 하나의 recovery/cleaning tool만 허용한다.
 - contaminated tool은 rack으로 직접 복귀하지 않는다.
-- procedure completion 중 오른손에 예측 대기 도구가 남아 있으면
-  `return_unused_preposition`으로 정리한다.
+- `return_unused_preposition`은 명시적으로 요청된 새 도구가 현재 준비
+  도구와 다르거나, system top-1이 다른 도구로 바뀐 채 2초 이상 유지될
+  때만 `robot -> mayo`로 실행한다. 진행 중 외부 Tool Action이 있으면
+  terminal 결과 반영 전에는 새 반납 명령을 보내지 않는다.
 
 ### Bed-mounted retraction arm
 
@@ -225,7 +227,8 @@ correct / proposed / evaluable
 
 ## 10. 검증 명령
 
-ROS build:
+Host-side ROS build (managed containers use the isolated `install/docker/`
+overlay through `scripts/taskplanner`):
 
 ```bash
 source /opt/ros/jazzy/setup.bash

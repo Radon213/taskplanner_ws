@@ -28,8 +28,7 @@
             </ForceSuccess>
           </Sequence>
 
-          <Sequence name="VisualImplicitRequest">
-            <IsPhaseCertain />
+          <Sequence name="DirectHandHandoverSignal">
             <Inverter>
               <HasExplicitRequest />
             </Inverter>
@@ -41,7 +40,7 @@
             <ConfigureHumanoidCommand
               decision="implicit_request"
               mode="implicit_request"
-              rationale="BT accepted stable visual open-palm evidence"
+              rationale="BT accepted stable CAM4 Right Open_Palm PALM_UP signal"
             />
             <ForceSuccess>
               <Sequence name="ImplicitHandover">
@@ -89,26 +88,6 @@
                 <ShouldDispatchDecision />
                 <EmitBTDecision />
                 <PublishSkillCommand />
-              </Sequence>
-            </ForceSuccess>
-          </Sequence>
-
-          <Sequence name="Safety">
-            <Inverter>
-              <IsPhaseCertain />
-            </Inverter>
-            <Inverter>
-              <NeedsRecovery />
-            </Inverter>
-            <SetIdleDecision
-              decision="hold"
-              action=""
-              rationale="phase uncertain; observing without robot motion"
-            />
-            <ForceSuccess>
-              <Sequence name="SafetyDecision">
-                <ShouldDispatchDecision />
-                <EmitBTDecision />
               </Sequence>
             </ForceSuccess>
           </Sequence>

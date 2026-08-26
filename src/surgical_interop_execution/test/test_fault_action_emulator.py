@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from types import SimpleNamespace
 import time
@@ -13,6 +14,11 @@ from surgical_interop_execution.fault_action_emulator import (
     validate_retraction_command,
     valid_tool_transition,
 )
+from surgical_interop_execution.controller_contract import (
+    EIR_NUC_CAPABILITY_POLICY_ID,
+    VIRTUAL_EMULATOR_CAPABILITY_POLICY_ID,
+    validate_tool_handover_fields,
+)
 from surgical_interop_msgs.srv import ExecuteRetractionCommand
 
 
@@ -21,10 +27,35 @@ def test_only_reviewed_tool_transitions_are_accepted():
     assert valid_tool_transition("tray", "surgeon")
     assert valid_tool_transition("robot", "surgeon")
     assert valid_tool_transition("robot", "tray")
+    assert valid_tool_transition("robot", "mayo")
     assert valid_tool_transition("mayo", "robot")
     assert valid_tool_transition("mayo", "tray")
     assert not valid_tool_transition("surgeon", "robot")
     assert not valid_tool_transition("mayo", "surgeon")
+
+
+def test_eir_capability_policy_rejects_unknown_tool_before_action_execution():
+    assert validate_tool_handover_fields(
+        instrument_id="Bovie surgical cautery",
+        instrument_instance_id="Bovie surgical cautery#1",
+        source_location="tray",
+        target_location="surgeon",
+        capability_policy_id=EIR_NUC_CAPABILITY_POLICY_ID,
+    ) == ""
+    assert validate_tool_handover_fields(
+        instrument_id="Allis clamp forceps",
+        instrument_instance_id="Allis clamp forceps#1",
+        source_location="tray",
+        target_location="surgeon",
+        capability_policy_id=EIR_NUC_CAPABILITY_POLICY_ID,
+    ) == "instrument_not_supported_by_capability_policy"
+    assert validate_tool_handover_fields(
+        instrument_id="",
+        instrument_instance_id="",
+        source_location="tray",
+        target_location="surgeon",
+        capability_policy_id=EIR_NUC_CAPABILITY_POLICY_ID,
+    ) == "missing_instrument_identity"
 
 
 def test_profile_sequence_is_deterministic(tmp_path: Path):
@@ -103,13 +134,6 @@ def _command(**overrides):
             "invalid_command",
         ),
         (
-            {
-                "target_side": ExecuteRetractionCommand.Request.TARGET_NONE,
-            },
-            ExecuteRetractionCommand.Response.RESULT_INVALID_PARAMETER,
-            "adjust_requires_left_or_right_target",
-        ),
-        (
             {"distance_m": 0.0},
             ExecuteRetractionCommand.Response.RESULT_INVALID_PARAMETER,
             "invalid_adjust_distance_m",
@@ -127,7 +151,7 @@ def test_retraction_command_contract_rejects_invalid_request_fields(
     assert validate_retraction_command(_command(**overrides)) == (result_code, reason)
 
 
-def test_retraction_command_contract_accepts_adjust_and_parameterless_forms():
+def test_retraction_command_contract_accepts_adjust_and_preconfigured_tool_change():
     assert validate_retraction_command(_command()) == (
         ExecuteRetractionCommand.Response.RESULT_ACCEPTED,
         "",
@@ -138,7 +162,53 @@ def test_retraction_command_contract_accepts_adjust_and_parameterless_forms():
             target_side=ExecuteRetractionCommand.Request.TARGET_NONE,
             distance_m=0.0,
         )
+    ) == (
+        ExecuteRetractionCommand.Response.RESULT_ACCEPTED,
+        "",
+    )
+
+
+@pytest.mark.parametrize(
+    "target_side",
+    [
+        ExecuteRetractionCommand.Request.TARGET_NONE,
+        ExecuteRetractionCommand.Request.TARGET_LEFT,
+        ExecuteRetractionCommand.Request.TARGET_RIGHT,
+    ],
+)
+def test_retraction_command_contract_accepts_finish_with_optional_target_side(
+    target_side,
+):
+    assert validate_retraction_command(
+        _command(
+            command=ExecuteRetractionCommand.Request.COMMAND_FINISH_DIRECT_TEACH,
+            target_side=target_side,
+            distance_m=0.0,
+        )
     ) == (ExecuteRetractionCommand.Response.RESULT_ACCEPTED, "")
+
+
+def test_retraction_command_contract_accepts_bilateral_adjustment() -> None:
+    assert validate_retraction_command(
+        _command(
+            # TARGET_NONE (0) means both arms for an adjustment.
+            target_side=ExecuteRetractionCommand.Request.TARGET_NONE,
+            distance_m=0.001,
+        )
+    ) == (ExecuteRetractionCommand.Response.RESULT_ACCEPTED, "")
+
+
+def test_retraction_command_contract_rejects_unknown_finish_target() -> None:
+    assert validate_retraction_command(
+        _command(
+            command=ExecuteRetractionCommand.Request.COMMAND_FINISH_DIRECT_TEACH,
+            target_side=3,
+            distance_m=0.0,
+        )
+    ) == (
+        ExecuteRetractionCommand.Response.RESULT_INVALID_PARAMETER,
+        "command_does_not_accept_target_or_distance",
+    )
 
 
 def _bare_emulator(outcome: Outcome) -> FaultActionEmulator:
@@ -201,6 +271,114 @@ def test_bed_robot_status_revisions_are_monotonic_across_checkpoints():
     assert all(message.procedure_type == "thyroidectomy" for message in published)
     assert all(len(message.arms) == 1 for message in published)
     assert all(message.arms[0].state == "standby" for message in published)
+
+
+def test_inguinal_status_uses_two_army_navy_retraction_roles():
+    emulator = FaultActionEmulator.__new__(FaultActionEmulator)
+    published = []
+    emulator._bed_robot_revision = 0
+    emulator._procedure_type = "inguinal_hernia_repair"
+    emulator._bed_robot_status_pub = SimpleNamespace(publish=published.append)
+    emulator.get_clock = lambda: SimpleNamespace(
+        now=lambda: SimpleNamespace(
+            to_msg=lambda: SimpleNamespace(sec=11, nanosec=0)
+        )
+    )
+
+    emulator._publish_bed_robot_status()
+
+    assert len(published) == 1
+    assert published[0].procedure_type == "inguinal_hernia_repair"
+    assert {
+        (arm.arm_id, arm.role_instance_id)
+        for arm in published[0].arms
+    } == {
+        ("arm_1", "left_army_navy"),
+        ("arm_2", "right_army_navy"),
+    }
+
+
+@pytest.mark.parametrize(
+    ("topic", "contract_id"),
+    [
+        ("", "taskplanner-virtual-eir-nuc.v1"),
+        ("/integration/virtual/surgery/controller_contract", ""),
+    ],
+)
+def test_missing_controller_contract_metadata_does_not_block_emulator_endpoints(
+    topic,
+    contract_id,
+):
+    emulator = FaultActionEmulator.__new__(FaultActionEmulator)
+    emulator._servers = ["tool-action", "retraction-service"]
+    emulator._controller_contract_topic = topic
+    emulator._controller_contract_id = contract_id
+    warnings = []
+    emulator.get_logger = lambda: SimpleNamespace(warning=warnings.append)
+    emulator.create_publisher = lambda *_args: (_ for _ in ()).throw(
+        AssertionError("missing optional metadata created a publisher")
+    )
+    emulator.create_timer = lambda *_args: (_ for _ in ()).throw(
+        AssertionError("missing optional metadata created a timer")
+    )
+
+    emulator._start_controller_contract_diagnostics()
+
+    assert emulator._servers == ["tool-action", "retraction-service"]
+    assert emulator._controller_contract_pub is None
+    assert emulator._controller_contract_timer is None
+    assert warnings
+
+
+def test_invalid_controller_contract_topic_is_nonfatal_diagnostics() -> None:
+    emulator = FaultActionEmulator.__new__(FaultActionEmulator)
+    emulator._servers = ["tool-action", "retraction-service"]
+    emulator._controller_contract_topic = "not a ROS topic"
+    emulator._controller_contract_id = "taskplanner-virtual-eir-nuc.v1"
+    warnings = []
+    emulator.get_logger = lambda: SimpleNamespace(warning=warnings.append)
+    emulator.create_publisher = lambda *_args: (_ for _ in ()).throw(
+        ValueError("invalid topic")
+    )
+
+    emulator._start_controller_contract_diagnostics()
+
+    assert emulator._servers == ["tool-action", "retraction-service"]
+    assert emulator._controller_contract_pub is None
+    assert emulator._controller_contract_timer is None
+    assert warnings == ["controller contract diagnostics disabled: ValueError"]
+
+
+def test_configured_controller_contract_diagnostics_still_publish() -> None:
+    emulator = FaultActionEmulator.__new__(FaultActionEmulator)
+    published = []
+    publisher = SimpleNamespace(publish=published.append)
+    timer = object()
+    emulator._controller_contract_topic = (
+        "/integration/virtual/surgery/controller_contract"
+    )
+    emulator._controller_contract_id = "taskplanner-virtual-eir-nuc.v1"
+    emulator._robot_endpoint_source = "virtual"
+    emulator._virtual_endpoint_mode = True
+    emulator._tool_handover_endpoint = (
+        "/integration/virtual/surgery/tool_handover"
+    )
+    emulator._retraction_service_name = (
+        "/integration/virtual/surgery/retraction/command"
+    )
+    emulator._capability_policy_id = VIRTUAL_EMULATOR_CAPABILITY_POLICY_ID
+    emulator.get_logger = lambda: SimpleNamespace(warning=lambda _message: None)
+    emulator.create_publisher = lambda *_args: publisher
+    emulator.create_timer = lambda *_args: timer
+
+    emulator._start_controller_contract_diagnostics()
+
+    assert emulator._controller_contract_pub is publisher
+    assert emulator._controller_contract_timer is timer
+    assert len(published) == 1
+    assert json.loads(published[0].data)["contract_id"] == (
+        "taskplanner-virtual-eir-nuc.v1"
+    )
 
 
 def test_retraction_service_is_immediate_admission_not_physical_result():

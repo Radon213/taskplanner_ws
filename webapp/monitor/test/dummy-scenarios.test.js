@@ -89,6 +89,11 @@ test("all public Dummy scenarios are safe public-contract fixtures and replay su
   );
 
   const bundledFixture = validateDummyFixture(await readJson(BUNDLED_FIXTURE_URL));
+  const rackToolIds = new Set(
+    bundledFixture[PUBLIC_TOPIC_NAMES.catalog].instruments.map(({ instrument_id: instrumentId }) => instrumentId),
+  );
+  assert.ok(!rackToolIds.has("T05"), "Army-Navy retractor must not appear in the demo rack catalog");
+  assert.ok(!rackToolIds.has("T11"), "thyroid retractor must not appear in the demo rack catalog");
   for (const name of scenarioNames) {
     const raw = await readJson(new URL(name, SCENARIO_DIRECTORY));
 
@@ -126,6 +131,9 @@ test("all public Dummy scenarios are safe public-contract fixtures and replay su
     assert.ok(Array.isArray(replay.patch.instrumentFlow?.inUse), `${name}: In Use rows`);
     assert.ok(Array.isArray(replay.patch.instrumentFlow?.mayo), `${name}: Mayo rows`);
     assert.ok(Array.isArray(replay.patch.predictions), `${name}: prediction rows`);
+    for (const prediction of replay.patch.predictions) {
+      assert.ok(rackToolIds.has(prediction.toolId), `${name}: prediction must be a rack-catalog instrument`);
+    }
   }
 });
 

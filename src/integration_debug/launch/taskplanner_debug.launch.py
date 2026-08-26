@@ -24,7 +24,7 @@ from simulation_runtime.cv_contract import (
 )
 
 
-_PNU_ALGORITHMS = ("tool", "blood", "hand")
+_PNU_ALGORITHMS = ("tool", "blood")
 
 
 def _configuration(context, name: str) -> str:
@@ -50,7 +50,7 @@ def _requested_pnu_algorithms(context) -> list[str]:
     ):
         raise RuntimeError(
             "pnu_requested_algorithms must be a unique, nonempty CSV subset of "
-            "tool,blood,hand"
+            "tool,blood"
         )
     requested_set = set(requested)
     return [name for name in _PNU_ALGORITHMS if name in requested_set]
@@ -132,9 +132,6 @@ def _launch_debug_pnu_bridge(context):
                     "cam4_tool_pose_topic": (
                         "/surgery/perception/cam4/tool_poses"
                     ),
-                    "cam4_hand_keypoints_topic": (
-                        "/surgery/perception/cam4/hand_keypoints"
-                    ),
                     "cam4_blood_semantics_topic": (
                         "/surgery/perception/cam4/blood_semantics/json"
                     ),
@@ -211,6 +208,9 @@ def generate_launch_description() -> LaunchDescription:
     retraction_voice_vlm_timeout_sec = LaunchConfiguration(
         "retraction_voice_vlm_timeout_sec"
     )
+    retraction_state_machine_bypass_default_bundles = LaunchConfiguration(
+        "retraction_state_machine_bypass_default_bundles"
+    )
 
     rosbridge = ExecuteProcess(
         condition=IfCondition(enable_rosbridge),
@@ -240,7 +240,10 @@ def generate_launch_description() -> LaunchDescription:
                 "input_mode": "sentence_text",
                 "sentence_input_topic": "/sensors/surgeon/sentence",
                 "output_topic": "/surgery/audio/request_text",
-                "status_topic": "/input/speech/status",
+                # The operational runtime owns /input/speech/status.  Keep the
+                # Debug adapter heartbeat separate so its UI cannot combine a
+                # live adapter's stale/accepted counts with this isolated path.
+                "status_topic": "/integration/debug/speech/status",
                 "sentence_source_id": "integration_debug_asr_sentence",
                 "sentence_dedupe_sec": 1.0,
             }
@@ -364,6 +367,20 @@ def generate_launch_description() -> LaunchDescription:
                 ),
             ),
             DeclareLaunchArgument(
+                "retraction_state_machine_bypass_default_bundles",
+                default_value=EnvironmentVariable(
+                    "RETRACTION_STATE_MACHINE_BYPASS_DEFAULT_BUNDLES",
+                    default_value=(
+                        "thyroidectomy_demo,inguinal_hernia_repair_demo"
+                    ),
+                ),
+                description=(
+                    "CSV bundle allow-list whose Debug retraction voice "
+                    "software state-order admission starts bypassed for "
+                    "either selected endpoint."
+                ),
+            ),
+            DeclareLaunchArgument(
                 "enable_pnu_perception",
                 default_value=EnvironmentVariable(
                     "ENABLE_PNU_DEBUG_PERCEPTION", default_value="false"
@@ -423,7 +440,7 @@ def generate_launch_description() -> LaunchDescription:
                 "pnu_requested_algorithms",
                 default_value=EnvironmentVariable(
                     "PNU_DEBUG_REQUESTED_ALGORITHMS",
-                    default_value="tool,blood,hand",
+                    default_value="tool,blood",
                 ),
                 description=(
                     "Exact PNU model subset for Debug; unavailable models must "
@@ -587,6 +604,9 @@ def generate_launch_description() -> LaunchDescription:
                                 retraction_voice_vlm_timeout_sec,
                                 value_type=float,
                             )
+                        ),
+                        "retraction_state_machine_bypass_default_bundles": (
+                            retraction_state_machine_bypass_default_bundles
                         ),
                     }
                 ],

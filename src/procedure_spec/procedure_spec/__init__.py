@@ -36,6 +36,15 @@ from .prior import ProcedurePriorScorer
 from .prompt_bundle import discover_prompt_bundle_dirs, has_procedure_prompt
 from .procedure_prompt import compact_procedure_prompt, load_procedure_prompt
 from .query_api import ProcedureSpec
+from .scenario_policy import (
+    DEFAULT_SCENARIO_RUNTIME_REQUIREMENTS,
+    PRESERVED_RUNTIME_INTERLOCKS,
+    SCENARIO_RUNTIME_REQUIREMENT_KEYS,
+    ScenarioPolicy,
+    ScenarioPolicyDecision,
+    ScenarioRuntimeRequirements,
+    resolve_scenario_runtime_requirements,
+)
 from .voice_catalog import (
     VoiceCommandCatalog,
     load_voice_command_catalog,
@@ -57,11 +66,17 @@ __all__ = [
     "DistanceNormalization",
     "ProcedurePriorScorer",
     "ProcedureSpec",
+    "PRESERVED_RUNTIME_INTERLOCKS",
+    "DEFAULT_SCENARIO_RUNTIME_REQUIREMENTS",
+    "SCENARIO_RUNTIME_REQUIREMENT_KEYS",
     "VoiceCommandCatalog",
     "RetractionCommand",
     "RetractionNormalization",
     "RetractionState",
     "RetractionTargetSide",
+    "ScenarioPolicy",
+    "ScenarioPolicyDecision",
+    "ScenarioRuntimeRequirements",
     "allowed_retractor_commands",
     "apply_retractor_service_admission",
     "compact_procedure_prompt",
@@ -79,6 +94,7 @@ __all__ = [
     "normalize_retractor_adjustment_parameters",
     "normalize_retractor_command",
     "normalize_voice_alias",
+    "resolve_scenario_runtime_requirements",
     "validate_retraction_distance_proposal",
     "voice_catalog_id_for",
 ]

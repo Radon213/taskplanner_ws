@@ -3,8 +3,8 @@
   "synthetic": true,
   "usage": "UI layout and filtering only. This file is not a clinical record or robot authorization.",
   "baseline": {
-    "schema_version": "1.1.0",
-    "interface_version": "0.3.0",
+    "schema_version": "1.2.0",
+    "interface_version": "0.4.0",
     "procedure_type": "thyroidectomy_demo",
     "catalog_version": "synthetic-catalog-v1"
   },
@@ -29,13 +29,13 @@
   },
   "/surgery/tool_predictions": {
     "revision": 1001,
-    "schema_version": "1.1.0",
+    "schema_version": "1.2.0",
     "procedure_type": "thyroidectomy_demo",
     "procedure_active": true,
     "predictions": [
-      { "rank": 1, "instrument_id": "T02", "instance_id": "", "confidence": 0.86, "stability_sec": 2.4, "source": "digital_twin", "evidence_status": "DT_ACCEPTED" },
-      { "rank": 2, "instrument_id": "T04", "instance_id": "", "confidence": 0.72, "stability_sec": 0.0, "source": "digital_twin", "evidence_status": "DT_ACCEPTED" },
-      { "rank": 3, "instrument_id": "T07", "instance_id": "", "confidence": 0.58, "stability_sec": 0.0, "source": "digital_twin", "evidence_status": "DT_ACCEPTED" }
+      { "rank": 1, "instrument_id": "T02", "instance_id": "", "confidence": 0.60, "stability_sec": 2.4, "source": "digital_twin", "evidence_status": "DT_ACCEPTED" },
+      { "rank": 2, "instrument_id": "T04", "instance_id": "", "confidence": 0.25, "stability_sec": 0.0, "source": "digital_twin", "evidence_status": "DT_ACCEPTED" },
+      { "rank": 3, "instrument_id": "T07", "instance_id": "", "confidence": 0.15, "stability_sec": 0.0, "source": "digital_twin", "evidence_status": "DT_ACCEPTED" }
     ]
   }
 }

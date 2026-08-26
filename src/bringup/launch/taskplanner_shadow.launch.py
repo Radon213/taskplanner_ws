@@ -31,6 +31,7 @@ from launch.substitutions import (
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
+from procedure_spec import get_default_spec_dir, load_bundle
 import yaml
 
 from bringup.perception_config import resolve_launch_perception
@@ -44,20 +45,18 @@ _SAFE_RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 def _bed_robot_contract_configuration(context: Any) -> list[Any]:
     bundle_id = LaunchConfiguration("default_bundle").perform(context).strip()
-    if bundle_id in {"thyroidectomy", "thyroidectomy_demo"}:
-        procedure_type = "thyroidectomy"
-    elif bundle_id == "nephrectomy":
-        procedure_type = "nephrectomy"
-    else:
-        procedure_type = ""
+    spec_dir = str(context.launch_configurations.get("spec_dir", "")).strip()
+    if not spec_dir:
+        spec_dir = str(get_default_spec_dir().parent / bundle_id)
+    runtime = load_bundle(spec_dir).get_scenario_runtime_requirements()
     return [
         SetLaunchConfiguration(
             "bed_robot_contract_enabled",
-            "true" if procedure_type else "false",
+            "true" if runtime.bed_robot_contract_enabled else "false",
         ),
         SetLaunchConfiguration(
             "bed_robot_contract_procedure_type",
-            procedure_type,
+            runtime.procedure_type,
         ),
     ]
 
@@ -1217,6 +1216,7 @@ def generate_launch_description() -> LaunchDescription:
                 parameters=[
                     {
                         "default_bundle": default_bundle,
+                        "spec_dir": spec_dir,
                         "publish_free_text": ParameterValue(
                             publish_shared_free_text,
                             value_type=bool,
@@ -1563,7 +1563,7 @@ def generate_launch_description() -> LaunchDescription:
                             value_type=bool,
                         ),
                         "depth_alignment_id": pnu_depth_alignment_id,
-                        "requested_algorithms": ["tool", "blood", "hand"],
+                        "requested_algorithms": ["tool", "blood"],
                         "max_source_age_sec": 315360000.0,
                         "max_rate_hz": 15.0,
                     }
@@ -1675,13 +1675,11 @@ def generate_launch_description() -> LaunchDescription:
                         "vlm_mode": "real",
                         "phase_authority": "reducer",
                         "tool_predict_evidence_confidence_threshold": 0.5,
-                        "tool_predict_stability_sec": 3.0,
-                        "vlm_implicit_request_confidence_threshold": 0.8,
-                        "vlm_implicit_request_stability_sec": 0.7,
-                        "vlm_implicit_request_release_sec": 1.5,
+                        "tool_predict_confidence_threshold": 0.55,
+                        "tool_predict_stability_sec": 0.30,
+                        "hand_mapping_operator_approved": False,
                         "accept_validation_actor_events": False,
                         "accept_non_override_structured_requests": False,
-                        "allow_shadow_request_capacity_reconciliation": True,
                         "allow_shadow_type_instance_requests": ParameterValue(
                             allow_type_instance_assumption,
                             value_type=bool,

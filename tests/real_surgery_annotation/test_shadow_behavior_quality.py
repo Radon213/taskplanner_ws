@@ -625,7 +625,7 @@ class ShadowBehaviorQualityTest(unittest.TestCase):
             episode["dt_request_fact_to_bt_acceptance_latency_sec"],
         )
 
-    def test_pipeline_latency_preserves_early_visual_fact_as_zero_delay(
+    def test_pipeline_latency_preserves_early_direct_hand_fact_as_zero_delay(
         self,
     ) -> None:
         trace = [
@@ -695,7 +695,7 @@ class ShadowBehaviorQualityTest(unittest.TestCase):
         ])
         self.assertEqual(1, pipeline["early_dt_request_fact_count"])
         self.assertEqual(
-            "visual_implicit_request",
+            "direct_hand_handover_signal",
             episode["dt_request_fact_source"],
         )
 

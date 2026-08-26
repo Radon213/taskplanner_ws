@@ -337,6 +337,32 @@ async function installStressStubs(page: Page) {
               }],
             },
           }));
+        } else if (kind === "mission" && message.topic === "/integration/readiness") {
+          socket.send(JSON.stringify({
+            op: "publish",
+            topic: message.topic,
+            msg: {
+              data: JSON.stringify({
+                schema: "taskplanner.integration_readiness.v1",
+                stamp_sec: Date.now() / 1_000,
+                ready: true,
+                checks: {
+                  contract_configuration: true,
+                  surgeon_sentence_publisher: true,
+                  tool_handover_action_server: true,
+                  retraction_command_service: true,
+                  perception_input: true,
+                },
+                missing: [],
+                details: {
+                  active_bundle: "thyroidectomy_v1",
+                  procedure_type: "thyroidectomy",
+                  robot_endpoint_source: "virtual",
+                  retraction_state_machine_suppressed: true,
+                },
+              }),
+            },
+          }));
         } else if (kind === "debug" && message.topic === "/integration/debug/status") {
           socket.send(JSON.stringify({
             op: "publish",

@@ -18,10 +18,17 @@ type AuthorityCopyRow = readonly [
 const AUTHORITY_COPY: Record<RuntimeAuthorityStatus, AuthorityCopyRow> = {
   ready: [
     "ok",
-    "ROS 제어 준비",
-    "ROS 브리지와 최신 런타임 상태를 확인했습니다. 제어 요청을 보낼 수 있습니다.",
-    "ROS control ready",
-    "The bridge and a fresh runtime state are verified. Controls are available.",
+    "ROS 런타임 연결됨",
+    "ROS 브리지와 최신 런타임 상태를 확인했습니다. 실제 통합 시작 전에는 별도 통합 점검이 필요합니다.",
+    "ROS runtime connected",
+    "The bridge and a fresh runtime state are verified. Live integration still needs its separate start check.",
+  ],
+  blocked: [
+    "warn",
+    "ROS 연결 차단됨",
+    "표시된 실행 모드와 실행 중인 런타임 계약이 달라 ROS 관측·제어 연결을 의도적으로 차단했습니다. ‘현재 모드 시작’으로 검증된 전환을 수행하세요.",
+    "ROS connection blocked",
+    "The running runtime contract does not match the displayed mode, so ROS observation and controls are deliberately blocked. Use Start displayed mode for a reviewed transition.",
   ],
   checking: [
     "pending",

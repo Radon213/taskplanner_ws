@@ -1,0 +1,80 @@
+.operation-hand-handover-popup {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 6px 9px;
+  padding: 12px;
+  border: 1px solid color-mix(in srgb, var(--color-warning) 58%, var(--color-border));
+  border-radius: var(--radius-card);
+  background: var(--color-surface-raised);
+  box-shadow: var(--shadow-card);
+  color: var(--color-warning-text);
+  animation: hand-handover-signal-in var(--duration-fast) var(--ease-silk) both;
+}
+
+.operation-hand-handover-popup > svg {
+  margin-top: 2px;
+}
+
+.operation-hand-handover-popup > div {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.operation-hand-handover-popup span,
+.operation-hand-handover-popup small {
+  color: var(--color-text-muted);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.25;
+}
+
+.operation-hand-handover-popup strong {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--color-text);
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.surgeon-evidence-stack .stage-hand-handover-popup {
+  gap: 4px 7px;
+  padding: 7px 8px;
+}
+
+.surgeon-evidence-stack .stage-hand-handover-popup > div {
+  gap: 1px;
+}
+
+.surgeon-evidence-stack .stage-hand-handover-popup span,
+.surgeon-evidence-stack .stage-hand-handover-popup small {
+  font-size: 9px;
+  line-height: 1.15;
+}
+
+.surgeon-evidence-stack .stage-hand-handover-popup strong {
+  font-size: 12px;
+  line-height: 1.15;
+}
+
+@keyframes hand-handover-signal-in {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .operation-hand-handover-popup {
+    animation: none;
+  }
+}

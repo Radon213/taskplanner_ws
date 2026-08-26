@@ -44,11 +44,17 @@ class Command(IntEnum):
 
 
 class TargetSide(IntEnum):
-    """Values defined by ``ExecuteRetractionCommand.srv``."""
+    """Wire values defined by ``ExecuteRetractionCommand.srv``.
+
+    The peer contract deliberately uses ``TARGET_NONE`` (0) for a bilateral
+    adjustment.  ``BOTH`` is retained as a semantic alias for callers that
+    already express the intent explicitly; it is not a fourth wire value.
+    """
 
     NONE = 0
     LEFT = 1
     RIGHT = 2
+    BOTH = 0
 
 
 class ResultCode(IntEnum):
@@ -339,10 +345,14 @@ class CommandRequest:
         distance_m = _wire_float(self.distance_m, field_name="distance_m")
 
         if command is Command.ADJUST_RETRACTION:
-            if target_side not in (TargetSide.LEFT, TargetSide.RIGHT):
+            if target_side not in (
+                TargetSide.LEFT,
+                TargetSide.RIGHT,
+                TargetSide.NONE,  # TARGET_NONE (0) means both arms
+            ):
                 raise CommandValidationError(
                     ErrorCode.TARGET_SIDE_REQUIRED,
-                    "adjust_retraction requires LEFT or RIGHT target_side",
+                    "adjust_retraction requires LEFT, RIGHT, or TARGET_NONE (both)",
                     field="target_side",
                 )
             if distance_m <= 0.0:
@@ -351,7 +361,7 @@ class CommandRequest:
                     "adjust_retraction requires a positive distance_m",
                     field="distance_m",
                 )
-        else:
+        elif command is not Command.FINISH_DIRECT_TEACH:
             if target_side is not TargetSide.NONE:
                 raise CommandValidationError(
                     ErrorCode.TARGET_SIDE_NOT_ALLOWED,
@@ -364,6 +374,14 @@ class CommandRequest:
                     f"{command.name} requires distance_m 0.0",
                     field="distance_m",
                 )
+        elif distance_m != 0.0:
+            # Direct-teach completion may optionally identify the arm being
+            # completed, but it never carries a physical distance.
+            raise CommandValidationError(
+                ErrorCode.DISTANCE_NOT_ALLOWED,
+                "FINISH_DIRECT_TEACH requires distance_m 0.0",
+                field="distance_m",
+            )
 
         object.__setattr__(self, "protocol_version", protocol_version)
         object.__setattr__(self, "source_id", source_id)
@@ -449,6 +467,9 @@ COMMAND_STOP_RETRACTION = Command.STOP_RETRACTION
 TARGET_NONE = TargetSide.NONE
 TARGET_LEFT = TargetSide.LEFT
 TARGET_RIGHT = TargetSide.RIGHT
+# ``TARGET_NONE`` is the peer wire representation of a bilateral adjustment;
+# keep this alias for semantic/internal callers, not as a distinct wire value.
+TARGET_BOTH = TargetSide.BOTH
 
 
 def validate_request(request: CommandRequest | object) -> CommandRequest:
@@ -487,6 +508,7 @@ __all__ = [
     "SUPPORTED_PROTOCOL_VERSION",
     "StateTransitionError",
     "TargetSide",
+    "TARGET_BOTH",
     "TARGET_LEFT",
     "TARGET_NONE",
     "TARGET_RIGHT",

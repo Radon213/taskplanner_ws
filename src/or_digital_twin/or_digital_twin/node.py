@@ -3,24 +3,38 @@
 from __future__ import annotations
 
 from collections import deque
+import copy
 from dataclasses import asdict
 import json
+import math
+import os
 from pathlib import Path
+import threading
 import time
+import uuid
 
+from hand_keypoint_interfaces.msg import HandFacingArray, HandGestureArray
 from procedure_spec import (
     ProcedurePriorScorer,
     compact_procedure_prompt,
     discover_prompt_bundle_dirs,
     get_default_spec_dir,
     load_bundle,
+    load_frozen_handover_ngram_prior,
     load_voice_command_catalog,
 )
 import rclpy
 from rcl_interfaces.msg import SetParametersResult
+from rclpy.clock import Clock, ClockType
 from rclpy.node import Node
+from rclpy.qos import (
+    DurabilityPolicy,
+    HistoryPolicy,
+    QoSProfile,
+    ReliabilityPolicy,
+)
 from std_msgs.msg import String
-from surgical_interop_msgs.msg import BedRobotArmStateArray
+from surgical_interop_msgs.msg import BedRobotArmStateArray, GatewayInfo
 from surgical_msgs.msg import (
     BedRobotArmGroupActionProposal,
     BedRobotArmGroupCommand,
@@ -53,15 +67,85 @@ from surgical_msgs.msg import (
     WorldState,
 )
 
-from .twin import ORDigitalTwin
+from .hand_handover_gate import (
+    ContinuousHandHandoverGate,
+    ExactStampHandJoiner,
+    FrameDisposition,
+    HandFrameEvidence,
+    HandPerceptionPins,
+    classify_hand_frame,
+    stamp_key,
+    stamp_key_sec,
+    validate_hand_health,
+)
 from .models import RankedToolPredictionBelief
+from .twin import ORDigitalTwin
+from .voice_intent_receipt import (
+    GatewayLeaseAuthority,
+    VoiceIntentReceiptDraft,
+    VoiceIntentReceiptKey,
+    VoiceIntentReceiptLedger,
+    voice_intent_fingerprint,
+)
 
 
 WORLD_STATE_MAINTENANCE_PERIOD_SEC = 0.5
+HAND_HANDOVER_WATCHDOG_PERIOD_SEC = 0.1
 WORLD_STATE_IDLE_CHECKPOINT_SEC = 2.0
 WORLD_STATE_KNOWN_INACTIVE = frozenset(
     {"idle", "halted", "completed", "terminated"}
 )
+
+
+def _normalize_ranked_tool_distribution(
+    rows: list[tuple[str, float]],
+    *,
+    limit: int = 3,
+) -> list[tuple[str, float]]:
+    """Normalize unique candidates into display-stable percentage points."""
+
+    scores: dict[str, float] = {}
+    order: dict[str, int] = {}
+    for index, (raw_tool_id, raw_score) in enumerate(rows):
+        tool_id = str(raw_tool_id).strip()
+        try:
+            score = float(raw_score)
+        except (TypeError, ValueError):
+            continue
+        if not tool_id or not math.isfinite(score) or score < 0.0:
+            continue
+        order.setdefault(tool_id, index)
+        scores[tool_id] = max(scores.get(tool_id, 0.0), min(1.0, score))
+    ranked = sorted(
+        scores,
+        key=lambda tool_id: (-scores[tool_id], order[tool_id], tool_id),
+    )[: max(0, int(limit))]
+    if not ranked:
+        return []
+    total = sum(scores[tool_id] for tool_id in ranked)
+    raw_units = [
+        (
+            scores[tool_id] / total * 100.0
+            if total > 0.0
+            else 100.0 / len(ranked)
+        )
+        for tool_id in ranked
+    ]
+    units = [int(math.floor(value)) for value in raw_units]
+    remainder = 100 - sum(units)
+    allocation_order = sorted(
+        range(len(ranked)),
+        key=lambda index: (
+            -(raw_units[index] - units[index]),
+            index,
+        ),
+    )
+    for index in allocation_order[:remainder]:
+        units[index] += 1
+    return [
+        (tool_id, unit / 100.0)
+        for tool_id, unit in zip(ranked, units, strict=True)
+    ]
 
 
 class ORDigitalTwinNode(Node):
@@ -100,11 +184,72 @@ class ORDigitalTwinNode(Node):
         self.declare_parameter("mayo_reuse_suppress_threshold", 0.5)
         self.declare_parameter("mayo_stability_sec", 5.0)
         self.declare_parameter("tool_predict_evidence_confidence_threshold", 0.5)
-        self.declare_parameter("tool_predict_confidence_threshold", 0.8)
-        self.declare_parameter("tool_predict_stability_sec", 3.0)
-        self.declare_parameter("vlm_implicit_request_confidence_threshold", 0.8)
-        self.declare_parameter("vlm_implicit_request_stability_sec", 0.7)
-        self.declare_parameter("vlm_implicit_request_release_sec", 1.5)
+        self.declare_parameter("tool_predict_confidence_threshold", 0.55)
+        self.declare_parameter("tool_predict_stability_sec", 0.30)
+        self.declare_parameter(
+            "hand_gesture_topic",
+            "/perception/cam_4/hand/gestures",
+        )
+        self.declare_parameter(
+            "hand_facing_topic",
+            "/perception/cam_4/hand/facing",
+        )
+        self.declare_parameter(
+            "hand_health_topic",
+            "/perception/cam_4/hand/health",
+        )
+        self.declare_parameter("hand_handover_dwell_sec", 0.300)
+        self.declare_parameter("hand_handover_release_sec", 0.500)
+        self.declare_parameter("hand_handover_max_positive_gap_sec", 0.200)
+        self.declare_parameter("hand_handover_max_source_age_sec", 0.500)
+        self.declare_parameter("hand_handover_future_tolerance_sec", 0.500)
+        self.declare_parameter("hand_handover_health_timeout_sec", 2.0)
+        self.declare_parameter("hand_handover_observation_timeout_sec", 0.400)
+        self.declare_parameter("hand_handover_minimum_positive_samples", 4)
+        self.declare_parameter("hand_handover_minimum_gesture_score", 0.5)
+        self.declare_parameter("hand_handover_minimum_handedness_score", 0.5)
+        self.declare_parameter("hand_handover_minimum_palm_up_score", 0.0)
+        self.declare_parameter("hand_mapping_operator_approved", False)
+        self.declare_parameter(
+            "hand_expected_source_frame_id",
+            "cam_4_color_optical_frame",
+        )
+        self.declare_parameter(
+            "hand_expected_gesture_model_name",
+            "VIPLab Top-View Landmark Gesture Classifier",
+        )
+        self.declare_parameter(
+            "hand_expected_gesture_model_version",
+            "landmark-geometry-v2-world-closed",
+        )
+        self.declare_parameter(
+            "hand_expected_gesture_model_sha256",
+            "258ed1676863df9317fb084a446a2ae9645c1f4acc468a4c4ad92979cf0ef821",
+        )
+        self.declare_parameter(
+            "hand_expected_facing_estimator_name",
+            "VIPLab CAM4 Depth Palm-Facing Estimator",
+        )
+        self.declare_parameter(
+            "hand_expected_facing_estimator_version",
+            "depth-palm-normal-v1",
+        )
+        self.declare_parameter(
+            "hand_expected_facing_spec_sha256",
+            "45c61773790b8510f373bd9f0940ce1189567e7f4e74ff3c0d6c5b5ee3785b37",
+        )
+        self.declare_parameter(
+            "hand_expected_calibration_version",
+            "cam4_live_aprilgrid_depth_workplane_20260822",
+        )
+        self.declare_parameter(
+            "hand_expected_handedness_mapping_version",
+            "cam4_forced_right_camera_constraint_v1_pending_live_check",
+        )
+        self.declare_parameter(
+            "hand_expected_depth_registration_backend",
+            "cuda_cabi_v1",
+        )
         self.declare_parameter("accept_validation_actor_events", False)
         self.declare_parameter("accept_non_override_structured_requests", False)
         self.declare_parameter(
@@ -116,15 +261,36 @@ class ORDigitalTwinNode(Node):
             False,
         )
         self.declare_parameter("evaluation_observation_topic", "")
-        self.declare_parameter(
-            "allow_shadow_request_capacity_reconciliation",
-            False,
-        )
         self.declare_parameter("allow_shadow_type_instance_requests", False)
         self.declare_parameter("allow_open_set_phase_bootstrap", False)
         self.declare_parameter("bed_robot_status_timeout_sec", 2.0)
         self.declare_parameter("bed_robot_source_max_age_sec", 2.0)
         self.declare_parameter("bed_robot_source_future_tolerance_sec", 0.5)
+        self.declare_parameter("cam4_mayo_observation_max_age_sec", 2.0)
+        self.declare_parameter(
+            "cam4_mayo_observation_future_tolerance_sec",
+            0.5,
+        )
+        # Live uses a typed ASR envelope.  Debug/replay can explicitly retain
+        # the legacy String path by leaving this false in its launch profile.
+        self.declare_parameter("require_voice_intent_source_metadata", False)
+        self.declare_parameter("voice_intent_max_age_sec", 3.0)
+        self.declare_parameter("voice_intent_future_tolerance_sec", 1.0)
+        self.declare_parameter("voice_intent_dedupe_retention_sec", 120.0)
+        self.declare_parameter("voice_gateway_info_timeout_sec", 3.0)
+        default_voice_receipt_dir = str(
+            os.environ.get("TASKPLANNER_EXECUTION_STATE_DIR", "") or ""
+        ).strip() or f"/tmp/taskplanner-odt-voice-receipts-{os.getuid()}"
+        self.declare_parameter(
+            "voice_intent_receipt_ledger_path",
+            os.environ.get(
+                "TASKPLANNER_ODT_VOICE_RECEIPT_LEDGER_PATH",
+                (
+                    f"{default_voice_receipt_dir}/"
+                    "odt_voice_intent_receipts.sqlite3"
+                ),
+            ),
+        )
         self._spec_dir = str(self.get_parameter("spec_dir").value)
         self._vlm_recent_event_count = max(1, int(self.get_parameter("vlm_recent_event_count").value))
         self._validation_mode = str(self.get_parameter("validation_mode").value)
@@ -143,16 +309,121 @@ class ORDigitalTwinNode(Node):
         )
         self._tool_predict_threshold = float(self.get_parameter("tool_predict_confidence_threshold").value)
         self._tool_predict_stability_sec = max(0.1, float(self.get_parameter("tool_predict_stability_sec").value))
-        self._vlm_implicit_request_threshold = float(
-            self.get_parameter("vlm_implicit_request_confidence_threshold").value
-        )
-        self._vlm_implicit_request_stability_sec = max(
+        self._hand_gesture_topic = str(
+            self.get_parameter("hand_gesture_topic").value
+        ).strip()
+        self._hand_facing_topic = str(
+            self.get_parameter("hand_facing_topic").value
+        ).strip()
+        self._hand_health_topic = str(
+            self.get_parameter("hand_health_topic").value
+        ).strip()
+        self._hand_health_timeout_sec = max(
             0.1,
-            float(self.get_parameter("vlm_implicit_request_stability_sec").value),
+            float(self.get_parameter("hand_handover_health_timeout_sec").value),
         )
-        self._vlm_implicit_request_release_sec = max(
+        self._hand_observation_timeout_sec = max(
             0.1,
-            float(self.get_parameter("vlm_implicit_request_release_sec").value),
+            float(
+                self.get_parameter(
+                    "hand_handover_observation_timeout_sec"
+                ).value
+            ),
+        )
+        self._hand_minimum_gesture_score = max(
+            0.0,
+            min(
+                1.0,
+                float(
+                    self.get_parameter(
+                        "hand_handover_minimum_gesture_score"
+                    ).value
+                ),
+            ),
+        )
+        self._hand_minimum_handedness_score = max(
+            0.0,
+            min(
+                1.0,
+                float(
+                    self.get_parameter(
+                        "hand_handover_minimum_handedness_score"
+                    ).value
+                ),
+            ),
+        )
+        self._hand_minimum_palm_up_score = max(
+            -1.0,
+            min(
+                1.0,
+                float(
+                    self.get_parameter(
+                        "hand_handover_minimum_palm_up_score"
+                    ).value
+                ),
+            ),
+        )
+        self._hand_mapping_operator_approved = bool(
+            self.get_parameter("hand_mapping_operator_approved").value
+        )
+        self._hand_perception_pins = HandPerceptionPins(
+            source_frame_id=str(
+                self.get_parameter("hand_expected_source_frame_id").value
+            ),
+            gesture_model_name=str(
+                self.get_parameter("hand_expected_gesture_model_name").value
+            ),
+            gesture_model_version=str(
+                self.get_parameter("hand_expected_gesture_model_version").value
+            ),
+            gesture_model_sha256=str(
+                self.get_parameter("hand_expected_gesture_model_sha256").value
+            ),
+            facing_estimator_name=str(
+                self.get_parameter("hand_expected_facing_estimator_name").value
+            ),
+            facing_estimator_version=str(
+                self.get_parameter("hand_expected_facing_estimator_version").value
+            ),
+            facing_spec_sha256=str(
+                self.get_parameter("hand_expected_facing_spec_sha256").value
+            ),
+            calibration_version=str(
+                self.get_parameter("hand_expected_calibration_version").value
+            ),
+            handedness_mapping_version=str(
+                self.get_parameter(
+                    "hand_expected_handedness_mapping_version"
+                ).value
+            ),
+            depth_registration_backend=str(
+                self.get_parameter(
+                    "hand_expected_depth_registration_backend"
+                ).value
+            ),
+        )
+        self._hand_handover_gate = ContinuousHandHandoverGate(
+            dwell_sec=float(
+                self.get_parameter("hand_handover_dwell_sec").value
+            ),
+            release_sec=float(
+                self.get_parameter("hand_handover_release_sec").value
+            ),
+            max_positive_gap_sec=float(
+                self.get_parameter("hand_handover_max_positive_gap_sec").value
+            ),
+            max_source_age_sec=float(
+                self.get_parameter("hand_handover_max_source_age_sec").value
+            ),
+            future_tolerance_sec=float(
+                self.get_parameter("hand_handover_future_tolerance_sec").value
+            ),
+            max_receipt_silence_sec=self._hand_observation_timeout_sec,
+            minimum_positive_samples=int(
+                self.get_parameter(
+                    "hand_handover_minimum_positive_samples"
+                ).value
+            ),
         )
         self._accept_validation_actor_events = bool(
             self.get_parameter("accept_validation_actor_events").value
@@ -189,13 +460,70 @@ class ORDigitalTwinNode(Node):
                 ).value
             ),
         )
-        self._twin = ORDigitalTwin(
-            load_bundle(self._spec_dir),
-            allow_shadow_request_capacity_reconciliation=bool(
+        self._cam4_mayo_observation_max_age_sec = max(
+            0.1,
+            float(
                 self.get_parameter(
-                    "allow_shadow_request_capacity_reconciliation"
+                    "cam4_mayo_observation_max_age_sec"
                 ).value
             ),
+        )
+        self._cam4_mayo_observation_future_tolerance_sec = max(
+            0.0,
+            float(
+                self.get_parameter(
+                    "cam4_mayo_observation_future_tolerance_sec"
+                ).value
+            ),
+        )
+        self._require_voice_intent_source_metadata = bool(
+            self.get_parameter("require_voice_intent_source_metadata").value
+        )
+        self._voice_intent_max_age_sec = max(
+            0.0,
+            float(self.get_parameter("voice_intent_max_age_sec").value),
+        )
+        self._voice_intent_future_tolerance_sec = max(
+            0.0,
+            float(
+                self.get_parameter(
+                    "voice_intent_future_tolerance_sec"
+                ).value
+            ),
+        )
+        self._voice_intent_dedupe_retention_sec = max(
+            1.0,
+            float(
+                self.get_parameter(
+                    "voice_intent_dedupe_retention_sec"
+                ).value
+            ),
+        )
+        self._voice_intent_receipt_ledger = VoiceIntentReceiptLedger(
+            str(
+                self.get_parameter(
+                    "voice_intent_receipt_ledger_path"
+                ).value
+            )
+        )
+        self._voice_gateway_info_timeout_sec = max(
+            0.1,
+            float(
+                self.get_parameter("voice_gateway_info_timeout_sec").value
+            ),
+        )
+        self._voice_gateway_authority = GatewayLeaseAuthority(
+            timeout_sec=self._voice_gateway_info_timeout_sec
+        )
+        # Gateway epoch updates, lease expiry, and one complete gated
+        # admission share this lock.  This makes the exact lease checked for a
+        # first writer remain authoritative through reducer mutation and the
+        # durable receipt commit, even under a multi-threaded executor.
+        self._voice_gated_admission_lock = threading.RLock()
+        self._voice_gated_mutation_dirty = False
+        self._voice_gated_mutation_fatal = False
+        self._twin = ORDigitalTwin(
+            load_bundle(self._spec_dir),
             allow_shadow_type_instance_requests=bool(
                 self.get_parameter(
                     "allow_shadow_type_instance_requests"
@@ -210,9 +538,14 @@ class ORDigitalTwinNode(Node):
         self._voice_command_catalog = load_voice_command_catalog(self._spec_dir)
         self._stamp_all_bed_robot_arm_groups()
         self._prior_scorer = ProcedurePriorScorer(self._twin.spec, compact_procedure_prompt(self._spec_dir))
+        self._handover_ngram_prior = load_frozen_handover_ngram_prior(
+            self._twin.spec,
+            self._spec_dir,
+        )
         self._bundle_metadata_cache = self._build_bundle_metadata()
         self._important_events: deque[SimulationEvent] = deque(maxlen=self._vlm_recent_event_count)
         self._validated_tool_request_history: deque[dict] = deque(maxlen=12)
+        self._recent_voice_intent_ids: dict[str, float] = {}
         self._completed_handover_history: deque[dict] = deque(maxlen=12)
         self._latest_outward_signal: SurgeonOutwardSignal | None = None
         self._vlm_health_by_topic: dict[str, tuple[VLMHealth, float]] = {}
@@ -221,6 +554,12 @@ class ORDigitalTwinNode(Node):
             str, tuple[int, int, float]
         ] = {}
         self._visual_runtime_epoch_floor = 0
+        self._visual_runtime_source_stamp_floor_sec = 0.0
+        self._cam4_mayo_source_epoch_floor = 0
+        self._cam4_mayo_admission_by_channel: dict[
+            str, tuple[int, int, float]
+        ] = {}
+        self._accepted_cam4_mayo_episodes: set[str] = set()
         self._last_lifecycle_control_signature: tuple[str, str] | None = None
         self._last_world_emit_signature: tuple | None = None
         self._last_world_emit_monotonic = 0.0
@@ -233,9 +572,11 @@ class ORDigitalTwinNode(Node):
         self._tool_prediction_last_sample_by_source: dict[
             str, tuple[float, str]
         ] = {}
-        self._vlm_implicit_request_stability: dict[str, dict] = {}
-        self._vlm_implicit_request_episode_tool = ""
-        self._vlm_implicit_request_release_since: float | None = None
+        self._hand_handover_joiner = ExactStampHandJoiner(max_pending=32)
+        self._hand_health_payload: dict | None = None
+        self._hand_health_received_monotonic = 0.0
+        self._hand_health_ready = False
+        self._hand_health_reason = "hand_health_missing"
         self._pending_bed_robot_arm_group_requests: dict[str, BedRobotArmGroupRequest] = {}
         self._bed_robot_status_received_monotonic = 0.0
         self._bed_robot_status_source_stamp_ns: int | None = None
@@ -278,6 +619,36 @@ class ORDigitalTwinNode(Node):
             )
         self.create_subscription(VLMResult, "/vlm/result", self._on_vlm_result, 20)
         self.create_subscription(VLMResult, "/vlm_real/result", self._on_vlm_result, 20)
+        hand_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+        hand_health_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.create_subscription(
+            HandGestureArray,
+            self._hand_gesture_topic,
+            self._on_hand_gesture,
+            hand_qos,
+        )
+        self.create_subscription(
+            HandFacingArray,
+            self._hand_facing_topic,
+            self._on_hand_facing,
+            hand_qos,
+        )
+        self.create_subscription(
+            String,
+            self._hand_health_topic,
+            self._on_hand_health,
+            hand_health_qos,
+        )
         self.create_subscription(
             InputSourceStatus,
             "/input/flir/status",
@@ -346,6 +717,18 @@ class ORDigitalTwinNode(Node):
             self._on_bed_robot_arm_controller_status,
             20,
         )
+        voice_gateway_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.create_subscription(
+            GatewayInfo,
+            "/surgery/gateway_info",
+            self._on_voice_gateway_info,
+            voice_gateway_qos,
+        )
         self.create_subscription(
             VoiceCommandIntent,
             "/surgery/voice/intent",
@@ -360,6 +743,24 @@ class ORDigitalTwinNode(Node):
         self.create_timer(
             WORLD_STATE_MAINTENANCE_PERIOD_SEC,
             self._on_world_state_timer,
+        )
+        self._voice_gateway_watchdog_clock = Clock(
+            clock_type=ClockType.STEADY_TIME
+        )
+        self._voice_gateway_watchdog_timer = self.create_timer(
+            min(
+                0.5,
+                max(0.1, self._voice_gateway_info_timeout_sec / 4.0),
+            ),
+            self._on_voice_gateway_watchdog,
+            clock=self._voice_gateway_watchdog_clock,
+        )
+        # Health is latched at 1 Hz, while gesture/facing frames arrive near
+        # 15 Hz. Keep their leases separate and withdraw a vanished live hand
+        # signal within the bounded 0.4 s observation lease (+ one 0.1 s tick).
+        self.create_timer(
+            HAND_HANDOVER_WATCHDOG_PERIOD_SEC,
+            self._on_hand_handover_watchdog,
         )
         self._publish_world_state()
 
@@ -377,15 +778,20 @@ class ORDigitalTwinNode(Node):
                     self._voice_command_catalog = next_voice_catalog
                     self._stamp_all_bed_robot_arm_groups()
                     self._prior_scorer = ProcedurePriorScorer(self._twin.spec, compact_procedure_prompt(self._spec_dir))
+                    self._handover_ngram_prior = load_frozen_handover_ngram_prior(
+                        self._twin.spec,
+                        self._spec_dir,
+                    )
                     self._bundle_metadata_cache = self._build_bundle_metadata()
                     self._important_events.clear()
                     self._validated_tool_request_history.clear()
+                    self._recent_voice_intent_ids.clear()
                     self._completed_handover_history.clear()
                     self._mayo_retrieve_stability.clear()
                     self._mayo_reuse_stability.clear()
                     self._tool_predict_stability.clear()
                     self._tool_prediction_last_sample_by_source.clear()
-                    self._clear_vlm_implicit_request_state()
+                    self._reset_hand_handover_state()
                     self._advance_visual_runtime_epoch()
                     self._pending_bed_robot_arm_group_requests.clear()
                     self._reset_bed_robot_controller_freshness()
@@ -425,18 +831,9 @@ class ORDigitalTwinNode(Node):
                     0.5,
                     float(parameter.value),
                 )
-            elif parameter.name == "vlm_implicit_request_confidence_threshold":
-                self._vlm_implicit_request_threshold = float(parameter.value)
-            elif parameter.name == "vlm_implicit_request_stability_sec":
-                self._vlm_implicit_request_stability_sec = max(
-                    0.1,
-                    float(parameter.value),
-                )
-            elif parameter.name == "vlm_implicit_request_release_sec":
-                self._vlm_implicit_request_release_sec = max(
-                    0.1,
-                    float(parameter.value),
-                )
+            elif parameter.name == "hand_mapping_operator_approved":
+                self._hand_mapping_operator_approved = bool(parameter.value)
+                self._refresh_hand_health_admission()
             elif parameter.name == "accept_validation_actor_events":
                 self._accept_validation_actor_events = bool(parameter.value)
             elif parameter.name == "accept_non_override_structured_requests":
@@ -461,6 +858,45 @@ class ORDigitalTwinNode(Node):
                 self._bed_robot_source_future_tolerance_sec = max(
                     0.0, float(parameter.value)
                 )
+            elif parameter.name == "cam4_mayo_observation_max_age_sec":
+                self._cam4_mayo_observation_max_age_sec = max(
+                    0.1, float(parameter.value)
+                )
+            elif (
+                parameter.name
+                == "cam4_mayo_observation_future_tolerance_sec"
+            ):
+                self._cam4_mayo_observation_future_tolerance_sec = max(
+                    0.0, float(parameter.value)
+                )
+            elif parameter.name == "require_voice_intent_source_metadata":
+                self._require_voice_intent_source_metadata = bool(parameter.value)
+            elif parameter.name == "voice_intent_max_age_sec":
+                self._voice_intent_max_age_sec = max(0.0, float(parameter.value))
+            elif parameter.name == "voice_intent_future_tolerance_sec":
+                self._voice_intent_future_tolerance_sec = max(
+                    0.0, float(parameter.value)
+                )
+            elif parameter.name == "voice_intent_dedupe_retention_sec":
+                self._voice_intent_dedupe_retention_sec = max(
+                    1.0, float(parameter.value)
+                )
+            elif parameter.name == "voice_intent_receipt_ledger_path":
+                return SetParametersResult(
+                    successful=False,
+                    reason=(
+                        "voice_intent_receipt_ledger_path is immutable after "
+                        "startup"
+                    ),
+                )
+            elif parameter.name == "voice_gateway_info_timeout_sec":
+                return SetParametersResult(
+                    successful=False,
+                    reason=(
+                        "voice_gateway_info_timeout_sec is immutable after "
+                        "startup"
+                    ),
+                )
         return SetParametersResult(successful=True)
 
     def _stamp(self):
@@ -477,6 +913,224 @@ class ORDigitalTwinNode(Node):
     def _on_vlm_health(self, topic: str, msg: VLMHealth) -> None:
         self._vlm_health_by_topic[topic] = (msg, time.monotonic())
         self._publish_world_state_if_dirty()
+
+    def _refresh_hand_health_admission(self) -> bool:
+        payload = getattr(self, "_hand_health_payload", None)
+        ready, reason = validate_hand_health(
+            payload,
+            pins=self._hand_perception_pins,
+            operator_mapping_approved=bool(
+                getattr(self, "_hand_mapping_operator_approved", False)
+            ),
+        )
+        received_at = float(
+            getattr(self, "_hand_health_received_monotonic", 0.0)
+        )
+        if (
+            ready
+            and (
+                received_at <= 0.0
+                or time.monotonic() - received_at
+                > float(getattr(self, "_hand_health_timeout_sec", 2.0))
+            )
+        ):
+            ready = False
+            reason = "hand_health_stale"
+        previous_ready = bool(getattr(self, "_hand_health_ready", False))
+        previous_reason = str(
+            getattr(self, "_hand_health_reason", "hand_health_missing")
+        )
+        self._hand_health_ready = ready
+        self._hand_health_reason = reason
+        if not ready:
+            gate = getattr(self, "_hand_handover_gate", None)
+            if gate is not None:
+                gate.withdraw(preserve_episode=True)
+            self._withdraw_hand_handover_evidence()
+        if ready != previous_ready or reason != previous_reason:
+            self._publish_reducer_decision_event(
+                input_type="hand_perception_health",
+                input_id="cam4_right_hand",
+                input_source="cam4_hand_perception",
+                accepted=ready,
+                reason=reason,
+                detail={
+                    "gesture_topic": self._hand_gesture_topic,
+                    "facing_topic": self._hand_facing_topic,
+                    "health_topic": self._hand_health_topic,
+                    "mapping_operator_approved": bool(
+                        self._hand_mapping_operator_approved
+                    ),
+                },
+            )
+        return ready
+
+    def _on_hand_health(self, msg: String) -> None:
+        try:
+            payload = json.loads(str(msg.data))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = None
+        self._hand_health_payload = payload if isinstance(payload, dict) else None
+        self._hand_health_received_monotonic = time.monotonic()
+        self._refresh_hand_health_admission()
+        self._publish_world_state_if_dirty()
+
+    def _on_hand_gesture(self, msg: HandGestureArray) -> None:
+        pair = self._hand_handover_joiner.add_gesture(msg)
+        if pair is not None:
+            self._on_hand_observation_pair(*pair)
+
+    def _on_hand_facing(self, msg: HandFacingArray) -> None:
+        pair = self._hand_handover_joiner.add_facing(msg)
+        if pair is not None:
+            self._on_hand_observation_pair(*pair)
+
+    def _on_hand_observation_pair(
+        self,
+        gesture_msg: HandGestureArray,
+        facing_msg: HandFacingArray,
+    ) -> None:
+        key = stamp_key(gesture_msg)
+        if key is None:
+            return
+        evidence = classify_hand_frame(
+            gesture_msg,
+            facing_msg,
+            pins=self._hand_perception_pins,
+            minimum_gesture_score=self._hand_minimum_gesture_score,
+            minimum_handedness_score=self._hand_minimum_handedness_score,
+            minimum_palm_up_score=self._hand_minimum_palm_up_score,
+        )
+        if not self._refresh_hand_health_admission():
+            evidence = HandFrameEvidence(
+                stamp_key_sec(key),
+                FrameDisposition.UNKNOWN,
+                self._hand_health_reason,
+            )
+        state = self._twin.state
+        if not bool(state.running) or str(state.execution_state) != "running":
+            self._suspend_hand_handover_state()
+            return
+        update = self._hand_handover_gate.observe(
+            evidence,
+            source_now_sec=self._stamp_sec(self._stamp()),
+            receipt_monotonic=time.monotonic(),
+        )
+        self._apply_hand_handover_update(update, evidence)
+
+    def _apply_hand_handover_update(self, update, evidence) -> None:
+        state = self._twin.state
+        before = (
+            bool(state.implicit_request_visible),
+            str(state.implicit_request_hand_pose),
+            float(state.implicit_request_confidence),
+            float(state.implicit_request_stability_sec),
+            int(state.implicit_request_generation),
+        )
+        if update.active:
+            state.implicit_request_visible = True
+            # A hand shape cannot identify an instrument. Selection remains a
+            # separate reducer/BT decision: prepared right-hand tool first,
+            # otherwise the independently stabilized next-tool prediction.
+            state.implicit_request_tool = ""
+            state.implicit_request_hand_pose = "open_receive"
+            state.implicit_request_confidence = max(
+                0.0, min(1.0, float(update.confidence))
+            )
+            state.implicit_request_stability_sec = max(
+                0.0, float(update.stability_sec)
+            )
+            state.implicit_request_generation = max(
+                int(state.implicit_request_generation),
+                int(update.generation),
+            )
+        else:
+            self._withdraw_hand_handover_evidence()
+        if update.rising_edge and update.active:
+            input_id = (
+                f"cam4_hand_handover:{update.generation}:"
+                f"{evidence.source_stamp_sec:.9f}"
+            )
+            detail = {
+                "handedness": "Right",
+                "hand_shape": "Open_Palm",
+                "facing": "PALM_UP",
+                "duration_sec": round(float(update.stability_sec), 3),
+                "confidence": round(float(update.confidence), 3),
+                "hand_index_frame_local": int(evidence.hand_index),
+                "gesture_score": round(float(evidence.gesture_score), 3),
+                "handedness_score": round(
+                    float(evidence.handedness_score), 3
+                ),
+                "palm_up_score": round(float(evidence.palm_up_score), 3),
+                "request_created": False,
+                "tool_resolved": False,
+            }
+            self._publish_reducer_decision_event(
+                input_type="hand_handover_signal",
+                input_id=input_id,
+                input_source="cam4_hand_perception",
+                accepted=True,
+                reason="right_open_palm_palm_up_300ms",
+                affected_tool="",
+                detail=detail,
+            )
+            self._publish_event(
+                "HandHandoverSignalAccepted",
+                detail={
+                    "source": "cam4_hand_perception",
+                    **detail,
+                },
+                target_owner="surgeon",
+                mode="evidence_only",
+            )
+        after = (
+            bool(state.implicit_request_visible),
+            str(state.implicit_request_hand_pose),
+            float(state.implicit_request_confidence),
+            float(state.implicit_request_stability_sec),
+            int(state.implicit_request_generation),
+        )
+        if after != before:
+            self._publish_world_state_if_dirty()
+
+    def _withdraw_hand_handover_evidence(self) -> None:
+        state = self._twin.state
+        state.implicit_request_visible = False
+        state.implicit_request_tool = ""
+        state.implicit_request_hand_pose = ""
+        state.implicit_request_confidence = 0.0
+        state.implicit_request_stability_sec = 0.0
+
+    def _reset_hand_handover_state(self) -> None:
+        joiner = getattr(self, "_hand_handover_joiner", None)
+        if joiner is not None:
+            joiner.clear()
+        gate = getattr(self, "_hand_handover_gate", None)
+        if gate is not None:
+            gate.reset_all()
+        self._withdraw_hand_handover_evidence()
+        if hasattr(self._twin.state, "implicit_request_generation"):
+            self._twin.state.implicit_request_generation = 0
+
+    def _suspend_hand_handover_state(self) -> None:
+        """Withdraw direct-hand authority until a fresh release is observed."""
+
+        joiner = getattr(self, "_hand_handover_joiner", None)
+        if joiner is not None:
+            joiner.clear()
+        gate = getattr(self, "_hand_handover_gate", None)
+        if gate is not None:
+            gate.inhibit_until_release()
+        self._withdraw_hand_handover_evidence()
+
+    def _expire_hand_handover_evidence(self) -> None:
+        self._refresh_hand_health_admission()
+        update = self._hand_handover_gate.expire(
+            receipt_monotonic=time.monotonic()
+        )
+        if update is not None:
+            self._withdraw_hand_handover_evidence()
 
     def _on_input_source_status(self, msg: InputSourceStatus) -> None:
         source_id = str(msg.source_id or "").strip().lower()
@@ -514,6 +1168,17 @@ class ORDigitalTwinNode(Node):
             int(getattr(self, "_visual_runtime_epoch_floor", 0)),
         ) + 1
         getattr(self, "_visual_admission_by_channel", {}).clear()
+        getattr(self, "_cam4_mayo_admission_by_channel", {}).clear()
+        getattr(self, "_accepted_cam4_mayo_episodes", set()).clear()
+        # CAM4 owns an independent process epoch, so the shared VLM runtime
+        # counter cannot order it.  A source-time floor at each lifecycle edge
+        # prevents an in-flight frame from the preceding run crossing reset.
+        try:
+            self._visual_runtime_source_stamp_floor_sec = self._stamp_sec(
+                self._stamp()
+            )
+        except Exception:
+            self._visual_runtime_source_stamp_floor_sec = time.time()
 
     def _reject_visual_evidence(
         self,
@@ -634,6 +1299,134 @@ class ORDigitalTwinNode(Node):
         )
         return True
 
+    @staticmethod
+    def _cam4_mayo_episode_metadata(
+        message: ToolObservation,
+    ) -> tuple[float, str] | None:
+        """Decode the bridge-authored uninterrupted visibility episode.
+
+        The correlation is deliberately redundant with the typed epoch and
+        sequence.  A producer cannot change only one field and turn an old
+        continuous detection into a new post-handover appearance.
+        """
+
+        correlation_id = str(getattr(message, "correlation_id", ""))
+        parts = correlation_id.split(":", 5)
+        if len(parts) != 6 or parts[:2] != ["cam4-rfdetr-mayo", "v2"]:
+            return None
+        try:
+            encoded_epoch = int(parts[2])
+            encoded_sequence = int(parts[3])
+            episode_started_ns = int(parts[4])
+        except (TypeError, ValueError):
+            return None
+        source_epoch = int(getattr(message, "source_epoch", 0))
+        source_sequence = int(getattr(message, "source_sequence", 0))
+        instrument_name = str(getattr(message, "instrument_id", "")).strip()
+        if (
+            encoded_epoch <= 0
+            or encoded_sequence <= 0
+            or episode_started_ns <= 0
+            or encoded_epoch != source_epoch
+            or encoded_sequence != source_sequence
+            or parts[5].strip() != instrument_name
+        ):
+            return None
+        stamp_ns = int(getattr(message.stamp, "sec", 0)) * 1_000_000_000 + int(
+            getattr(message.stamp, "nanosec", 0)
+        )
+        if stamp_ns <= 0 or episode_started_ns > stamp_ns:
+            return None
+        episode_id = (
+            f"{source_epoch}:{episode_started_ns}:{instrument_name.casefold()}"
+        )
+        return episode_started_ns / 1_000_000_000.0, episode_id
+
+    def _admit_cam4_mayo_observation(
+        self,
+        message: ToolObservation,
+        *,
+        channel: str,
+        source: str,
+    ) -> bool:
+        """Fence the independent CAM4 process against replay and stale time."""
+
+        source_epoch = max(0, int(getattr(message, "source_epoch", 0)))
+        source_sequence = max(0, int(getattr(message, "source_sequence", 0)))
+        stamp_sec = self._stamp_sec(getattr(message, "stamp", None))
+
+        def reject(reason: str) -> bool:
+            self._reject_visual_evidence(
+                channel=channel,
+                source=source,
+                reason=reason,
+                message=message,
+            )
+            return False
+
+        if source_epoch <= 0:
+            return reject("missing_cam4_source_epoch")
+        if source_sequence <= 0:
+            return reject("missing_cam4_source_sequence")
+        if not math.isfinite(stamp_sec) or stamp_sec <= 0.0:
+            return reject("missing_cam4_source_stamp")
+        try:
+            now_sec = self._stamp_sec(self._stamp())
+        except Exception:
+            now_sec = time.time()
+        source_age_sec = now_sec - stamp_sec
+        if source_age_sec > float(
+            getattr(self, "_cam4_mayo_observation_max_age_sec", 2.0)
+        ):
+            return reject("stale_cam4_source_stamp")
+        if source_age_sec < -float(
+            getattr(
+                self,
+                "_cam4_mayo_observation_future_tolerance_sec",
+                0.5,
+            )
+        ):
+            return reject("future_cam4_source_stamp")
+        if stamp_sec < float(
+            getattr(self, "_visual_runtime_source_stamp_floor_sec", 0.0)
+        ):
+            return reject("cam4_source_precedes_runtime_epoch")
+
+        epoch_floor = max(
+            0,
+            int(getattr(self, "_cam4_mayo_source_epoch_floor", 0)),
+        )
+        if source_epoch < epoch_floor:
+            return reject("stale_cam4_source_epoch")
+        tracker = getattr(self, "_cam4_mayo_admission_by_channel", None)
+        if tracker is None:
+            tracker = {}
+            self._cam4_mayo_admission_by_channel = tracker
+        if source_epoch > epoch_floor:
+            self._cam4_mayo_source_epoch_floor = source_epoch
+            tracker.clear()
+            getattr(self, "_accepted_cam4_mayo_episodes", set()).clear()
+
+        previous = tracker.get(channel)
+        if previous is not None:
+            previous_epoch, previous_sequence, previous_stamp = previous
+            if source_epoch < previous_epoch:
+                return reject("stale_cam4_source_epoch")
+            if source_epoch == previous_epoch and source_sequence <= previous_sequence:
+                return reject(
+                    "duplicate_cam4_source_sequence"
+                    if source_sequence == previous_sequence
+                    else "out_of_order_cam4_source_sequence"
+                )
+            if source_epoch == previous_epoch and stamp_sec <= previous_stamp:
+                return reject(
+                    "duplicate_cam4_source_stamp"
+                    if abs(stamp_sec - previous_stamp) <= 1e-9
+                    else "out_of_order_cam4_source_stamp"
+                )
+        tracker[channel] = (source_epoch, source_sequence, stamp_sec)
+        return True
+
     def _on_perception_health(self, msg: String) -> None:
         try:
             payload = json.loads(msg.data)
@@ -693,7 +1486,6 @@ class ORDigitalTwinNode(Node):
             self._clear_tool_prediction_state()
             self._mayo_retrieve_stability.clear()
             self._mayo_reuse_stability.clear()
-            self._clear_vlm_implicit_request_state()
             if (
                 not getattr(self, "_vlm_evidence_blocked", False)
                 and hasattr(self._twin, "clear_perception_evidence")
@@ -703,14 +1495,38 @@ class ORDigitalTwinNode(Node):
         if hasattr(self._twin, "set_safety_flag"):
             self._twin.set_safety_flag("vlm_unhealthy", unhealthy)
 
-    def _bundle_metadata_payload(self, spec) -> dict:
-        requestable_instruments = [
-            instrument.id for instrument in spec.bundle.instruments if getattr(instrument, "requestable", True)
+    def _instrument_metadata_payload(self, spec) -> list[dict]:
+        requestable_instruments = spec.list_requestable_instrument_ids()
+        requestable_set = set(requestable_instruments)
+        return [
+            {
+                "id": instrument.id,
+                "display_name": instrument.display_name,
+                "display_name_ko": instrument.display_name_ko,
+                "aliases": list(instrument.aliases),
+                "category": instrument.category,
+                "inventory_count": int(getattr(instrument, "inventory_count", 1)),
+                "role": instrument.role,
+                "handover_profile": instrument.handover_profile,
+                "requestable": instrument.id in requestable_set,
+                "home_location_id": spec.get_initial_location(instrument.id) or "",
+                "home_location_type": (
+                    spec.get_initial_location_type(instrument.id) or ""
+                ),
+            }
+            for instrument in spec.bundle.instruments
         ]
+
+    def _bundle_metadata_payload(self, spec) -> dict:
+        requestable_instruments = spec.list_requestable_instrument_ids()
         return {
             "id": spec.bundle.procedure_id,
             "display_name": spec.bundle.procedure_display_name,
             "display_name_ko": spec.bundle.procedure_display_name_ko,
+            "target_site": spec.bundle.procedure_target_site,
+            "target_site_ko": spec.bundle.procedure_target_site_ko,
+            "approach": spec.bundle.procedure_approach,
+            "approach_ko": spec.bundle.procedure_approach_ko,
             "default_phase_id": spec.default_phase_id,
             "normal_phase_ids": list(spec.normal_phase_ids),
             "interrupt_phase_ids": list(spec.interrupt_phase_ids),
@@ -723,20 +1539,7 @@ class ORDigitalTwinNode(Node):
                 }
                 for phase in spec.bundle.phases
             ],
-            "instruments": [
-                {
-                    "id": instrument.id,
-                    "display_name": instrument.display_name,
-                    "display_name_ko": instrument.display_name_ko,
-                    "aliases": list(instrument.aliases),
-                    "category": instrument.category,
-                    "inventory_count": int(getattr(instrument, "inventory_count", 1)),
-                    "role": instrument.role,
-                    "handover_profile": instrument.handover_profile,
-                    "requestable": bool(getattr(instrument, "requestable", True)),
-                }
-                for instrument in spec.bundle.instruments
-            ],
+            "instruments": self._instrument_metadata_payload(spec),
         }
 
     def _build_bundle_metadata(self) -> list[dict]:
@@ -797,6 +1600,9 @@ class ORDigitalTwinNode(Node):
             for item in state.ranked_tool_predictions
         )
         return (
+            bool(state.running),
+            str(state.execution_state),
+            str(state.procedure_run_id),
             (
                 bool(getattr(retraction, "connected", False)),
                 str(getattr(retraction, "state", "unknown")),
@@ -826,10 +1632,19 @@ class ORDigitalTwinNode(Node):
         self._expire_stale_vlm_evidence(
             self._stamp_sec(self._stamp()),
         )
+        self._expire_hand_handover_evidence()
         self._refresh_vlm_safety_flags()
         return bool(
             bed_expired
             or self._world_maintenance_signature() != before
+        )
+
+    def _voice_world_publish_blocked(self) -> bool:
+        """Keep an uncommitted or unrestorable voice mutation non-public."""
+
+        return bool(
+            getattr(self, "_voice_gated_mutation_dirty", False)
+            or getattr(self, "_voice_gated_mutation_fatal", False)
         )
 
     def _world_state_emit_due(
@@ -862,6 +1677,8 @@ class ORDigitalTwinNode(Node):
         )
 
     def _on_world_state_timer(self) -> None:
+        if self._voice_world_publish_blocked():
+            return
         self._run_time_based_maintenance()
         signature = self._world_maintenance_signature()
         if self._world_state_emit_due(
@@ -870,7 +1687,17 @@ class ORDigitalTwinNode(Node):
         ):
             self._emit_world_state()
 
+    def _on_hand_handover_watchdog(self) -> None:
+        if self._voice_world_publish_blocked():
+            return
+        before = self._world_maintenance_signature()
+        self._expire_hand_handover_evidence()
+        if self._world_maintenance_signature() != before:
+            self._emit_world_state()
+
     def _publish_world_state_if_dirty(self) -> None:
+        if self._voice_world_publish_blocked():
+            return
         self._run_time_based_maintenance()
         signature = self._world_maintenance_signature()
         if (
@@ -882,17 +1709,27 @@ class ORDigitalTwinNode(Node):
     def _publish_world_state(self) -> None:
         """Run maintenance and immediately emit a semantic state edge."""
 
+        if self._voice_world_publish_blocked():
+            return
         self._run_time_based_maintenance()
         self._emit_world_state()
 
     def _emit_world_state(self) -> None:
+        if self._voice_world_publish_blocked():
+            return
         # Normalization may update public fields outside the compact cadence
         # signature. Run it only on an actual emission so an inactive skipped
         # checkpoint cannot hide an untracked semantic mutation.
+        if (
+            not bool(self._twin.state.running)
+            or str(self._twin.state.execution_state) != "running"
+        ):
+            self._suspend_hand_handover_state()
         self._twin.normalize_for_publish()
         world = WorldState()
         world.stamp = self._stamp()
         world.procedure_id = self._twin.state.procedure_id
+        world.procedure_run_id = self._twin.state.procedure_run_id
         world.running = bool(self._twin.state.running)
         world.execution_state = self._twin.state.execution_state
         world.filtered_phase = self._twin.state.filtered_phase
@@ -1037,6 +1874,7 @@ class ORDigitalTwinNode(Node):
         simulation = SimulationState()
         simulation.stamp = world.stamp
         simulation.procedure_id = self._twin.state.procedure_id
+        simulation.procedure_run_id = self._twin.state.procedure_run_id
         simulation.active_bundle = self._twin.state.procedure_id
         simulation.running = bool(self._twin.state.running)
         simulation.execution_state = self._twin.state.execution_state
@@ -1085,6 +1923,9 @@ class ORDigitalTwinNode(Node):
         simulation.recent_events = list(self._twin.state.recent_event_types)
         simulation.instrument_states = list(world.instrument_states)
         simulation.bed_robot_arm_groups = list(world.bed_robot_arm_groups)
+        requestable_instruments = (
+            self._twin.spec.list_requestable_instrument_ids()
+        )
         simulation.layout_json = json.dumps(
             {
                 "entities": [
@@ -1108,16 +1949,16 @@ class ORDigitalTwinNode(Node):
                         "id": self._twin.spec.bundle.procedure_id,
                         "display_name": self._twin.spec.bundle.procedure_display_name,
                         "display_name_ko": self._twin.spec.bundle.procedure_display_name_ko,
+                        "target_site": self._twin.spec.bundle.procedure_target_site,
+                        "target_site_ko": self._twin.spec.bundle.procedure_target_site_ko,
+                        "approach": self._twin.spec.bundle.procedure_approach,
+                        "approach_ko": self._twin.spec.bundle.procedure_approach_ko,
                     },
                     "display_catalog": self._twin.spec.bundle.display_catalog,
                     "normal_phase_ids": list(self._twin.spec.normal_phase_ids),
                     "interrupt_phase_ids": list(self._twin.spec.interrupt_phase_ids),
                     "default_phase_id": self._twin.spec.default_phase_id,
-                    "requestable_instruments": [
-                        instrument.id
-                        for instrument in self._twin.spec.bundle.instruments
-                        if getattr(instrument, "requestable", True)
-                    ],
+                    "requestable_instruments": requestable_instruments,
                     "phases": [
                         {
                             "id": phase.id,
@@ -1126,20 +1967,9 @@ class ORDigitalTwinNode(Node):
                         }
                         for phase in self._twin.spec.bundle.phases
                     ],
-                    "instruments": [
-                        {
-                            "id": instrument.id,
-                            "display_name": instrument.display_name,
-                            "display_name_ko": instrument.display_name_ko,
-                            "aliases": list(instrument.aliases),
-                            "category": instrument.category,
-                            "inventory_count": int(getattr(instrument, "inventory_count", 1)),
-                            "role": instrument.role,
-                            "handover_profile": instrument.handover_profile,
-                            "requestable": bool(getattr(instrument, "requestable", True)),
-                        }
-                        for instrument in self._twin.spec.bundle.instruments
-                    ],
+                    "instruments": self._instrument_metadata_payload(
+                        self._twin.spec
+                    ),
                     "bundles": self._bundle_metadata_cache,
                 },
             },
@@ -1939,31 +2769,8 @@ class ORDigitalTwinNode(Node):
             self._twin.state.ranked_tool_predictions = []
 
     def _expire_stale_vlm_evidence(self, now_sec: float) -> None:
-        """Withdraw visual facts even when the VLM stops publishing."""
-
+        """Withdraw VLM-owned tool evidence when the VLM stops publishing."""
         self._clear_stale_tool_prediction(now_sec)
-        state = self._twin.state
-        if not state.implicit_request_visible:
-            if self._vlm_implicit_request_release_since is not None:
-                self._release_vlm_implicit_request_episode(now_sec)
-            return
-
-        tracking_key = state.implicit_request_tool or "__unresolved__"
-        entry = self._vlm_implicit_request_stability.get(tracking_key)
-        max_gap_sec = getattr(self, "_vlm_evidence_max_gap_sec", 2.5)
-        last_received = (
-            float(entry.get("last_received", entry.get("last_seen", now_sec)))
-            if entry is not None
-            else None
-        )
-        if (
-            last_received is None
-            or (
-                now_sec >= last_received
-                and now_sec - last_received > max_gap_sec
-            )
-        ):
-            self._release_vlm_implicit_request_episode(now_sec)
 
     def _clear_tool_prediction_state(self) -> None:
         self._tool_predict_stability.clear()
@@ -2010,167 +2817,23 @@ class ORDigitalTwinNode(Node):
         tracker[source_key] = (now_sec, signature)
         return "accepted"
 
-    def _clear_vlm_implicit_request_state(self) -> None:
-        self._vlm_implicit_request_stability.clear()
-        self._vlm_implicit_request_episode_tool = ""
-        self._vlm_implicit_request_release_since = None
-        state = self._twin.state
-        state.implicit_request_visible = False
-        state.implicit_request_tool = ""
-        state.implicit_request_hand_pose = ""
-        state.implicit_request_confidence = 0.0
-        state.implicit_request_stability_sec = 0.0
-
-    def _release_vlm_implicit_request_episode(self, now_sec: float) -> None:
-        self._vlm_implicit_request_stability.clear()
-        state = self._twin.state
-        state.implicit_request_visible = False
-        state.implicit_request_tool = ""
-        state.implicit_request_hand_pose = ""
-        state.implicit_request_confidence = 0.0
-        state.implicit_request_stability_sec = 0.0
-        if not self._vlm_implicit_request_episode_tool:
-            self._vlm_implicit_request_release_since = None
-            return
-        if self._vlm_implicit_request_release_since is None:
-            self._vlm_implicit_request_release_since = now_sec
-            return
-        if (
-            now_sec - self._vlm_implicit_request_release_since
-            >= self._vlm_implicit_request_release_sec
-        ):
-            self._vlm_implicit_request_episode_tool = ""
-            self._vlm_implicit_request_release_since = None
-
-    def _requestable_instrument(self, tool_id: str) -> bool:
-        return any(
-            instrument.id == tool_id
-            and bool(getattr(instrument, "requestable", True))
-            for instrument in self._twin.spec.bundle.instruments
-        )
-
-    def _handle_vlm_implicit_request(
-        self,
-        payload: dict,
-        msg: VLMResult,
-        now_sec: float,
-        received_sec: float | None = None,
-    ) -> None:
-        """Validate visual gesture evidence without creating a surgeon request."""
-
-        event_type = str(msg.gesture_event_type).strip().lower()
-        hand_pose = str(msg.gesture_hand_pose).strip().lower()
-        try:
-            confidence = float(msg.gesture_confidence)
-        except (TypeError, ValueError):
-            confidence = 0.0
-        raw_tool = str(msg.gesture_requested_tool).strip()
-        tool_id = self._twin.spec.resolve_instrument_alias(raw_tool) or raw_tool
-        is_visual_request = bool(
-            event_type in {"request_tool", "handover"}
-            and hand_pose == "open_receive"
-            and confidence > 0.0
-        )
-        if not is_visual_request:
-            self._release_vlm_implicit_request_episode(now_sec)
-            return
-
-        self._vlm_implicit_request_release_since = None
-        tracking_key = tool_id or "__unresolved__"
-        input_id = f"implicit_request:{tracking_key}:{now_sec:.3f}"
-        if tool_id and not self._requestable_instrument(tool_id):
-            self._vlm_implicit_request_stability.pop(tracking_key, None)
-            self._release_vlm_implicit_request_episode(now_sec)
-            self._publish_reducer_decision_event(
-                input_type="vlm_implicit_request",
-                input_id=input_id,
-                input_source=msg.source,
-                accepted=False,
-                reason="implicit_request_tool_not_requestable",
-                affected_tool=tool_id,
-                detail={"confidence": confidence, "hand_pose": hand_pose},
-            )
-            return
-
-        state = self._twin.state
-        if not bool(state.running) or str(state.execution_state) != "running":
-            self._release_vlm_implicit_request_episode(now_sec)
-            self._publish_reducer_decision_event(
-                input_type="vlm_implicit_request",
-                input_id=input_id,
-                input_source=msg.source,
-                accepted=False,
-                reason="implicit_request_runtime_not_running",
-                affected_tool=tool_id,
-                detail={
-                    "confidence": confidence,
-                    "execution_state": str(state.execution_state),
-                },
-            )
-            return
-
-        for tracked_tool in list(self._vlm_implicit_request_stability):
-            if tracked_tool != tracking_key:
-                self._vlm_implicit_request_stability.pop(tracked_tool, None)
-        _, duration = self._update_stability(
-            self._vlm_implicit_request_stability,
-            tool_id=tracking_key,
-            confidence=confidence,
-            threshold=0.01,
-            stability_sec=0.0,
-            now_sec=now_sec,
-            received_sec=received_sec,
-        )
-
-        if self._vlm_implicit_request_episode_tool != tracking_key:
-            self._vlm_implicit_request_episode_tool = tracking_key
-            state.implicit_request_generation += 1
-        state.implicit_request_visible = True
-        state.implicit_request_tool = tool_id
-        state.implicit_request_hand_pose = hand_pose
-        state.implicit_request_confidence = max(0.0, min(1.0, confidence))
-        state.implicit_request_stability_sec = max(0.0, duration)
-        self._publish_reducer_decision_event(
-            input_type="vlm_implicit_request",
-            input_id=input_id,
-            input_source=msg.source,
-            accepted=True,
-            reason="verified_visual_open_palm_evidence",
-            affected_tool=tool_id,
-            detail={
-                "confidence": confidence,
-                "duration_sec": round(duration, 3),
-                "detector_required": False,
-                "policy_ready": bool(
-                    tool_id
-                    and confidence >= self._vlm_implicit_request_threshold
-                    and duration >= self._vlm_implicit_request_stability_sec
-                ),
-                "tool_resolved": bool(tool_id),
-                "request_created": False,
-            },
-        )
-        self._publish_event(
-            "VLMGestureEvidenceVerified",
-            instrument_id=tool_id,
-            detail={
-                "source": "vlm_visual_gesture",
-                "confidence": confidence,
-                "hand_pose": hand_pose,
-                "duration_sec": round(duration, 3),
-            },
-            target_owner="surgeon",
-            mode="evidence_only",
-        )
-
     def _vlm_tool_rows(self, payload: dict) -> list[list]:
         raw = payload.get("tool", [])
-        if str(payload.get("v", "")) in {"3", "4"}:
-            return [
-                [str(item[0]), float(item[1])]
-                for item in raw
-                if isinstance(item, list) and len(item) == 2 and str(item[0])
-            ]
+        if str(payload.get("v", "")) in {"3", "4", "5", "6"}:
+            rows: list[list] = []
+            if not isinstance(raw, list):
+                return rows
+            for item in raw:
+                if not isinstance(item, list) or len(item) != 2 or not str(item[0]):
+                    continue
+                try:
+                    confidence = float(item[1])
+                except (TypeError, ValueError):
+                    continue
+                if not math.isfinite(confidence):
+                    continue
+                rows.append([str(item[0]), confidence])
+            return rows
         if isinstance(raw, list) and len(raw) == 2 and str(raw[0]):
             return [[str(raw[0]), float(raw[1])]]
         return []
@@ -2187,7 +2850,8 @@ class ORDigitalTwinNode(Node):
             for tool_id, confidence in vlm_rows
             if str(tool_id)
         }
-        prior_result = self._prior_scorer.score(self._runtime_prior_evidence())
+        runtime_evidence = self._runtime_prior_evidence()
+        prior_result = self._prior_scorer.score(runtime_evidence)
         prior = prior_result.get("tool", [])
         prior_evidence = prior_result.get("evidence", {})
         path_forecast = (
@@ -2200,10 +2864,51 @@ class ORDigitalTwinNode(Node):
             for item in prior
             if isinstance(item, list) and len(item) == 2 and str(item[0])
         }
-        # Procedure priors may nudge observed VLM candidates, but must never
-        # invent an action candidate that the current perception result did not
-        # propose.
-        candidates = set(vlm_scores)
+        ngram_result = None
+        ngram_prior = getattr(self, "_handover_ngram_prior", None)
+        if ngram_prior is not None:
+            ngram_result = ngram_prior.predict(
+                phase_id=runtime_evidence.get("current_phase", ""),
+                completed_handovers=runtime_evidence.get(
+                    "completed_handovers", []
+                ),
+            )
+        ngram_scores = {
+            self._twin.spec.resolve_instrument_alias(str(item[0]))
+            or str(item[0]): float(item[1])
+            for item in (
+                ngram_result.get("candidates", [])
+                if isinstance(ngram_result, dict)
+                else []
+            )
+            if isinstance(item, list) and len(item) == 2 and str(item[0])
+        }
+
+        # The final reducer hard-gates every source against current inventory
+        # and the procedure's requestable contract.  This is deliberately
+        # stricter than retaining a visually suggested but unavailable tool:
+        # ranked_tool_predictions is consumed by implicit handover policy.
+        handover_lifecycles = {
+            "home_rack",
+            "returned_home",
+            "mayo_reuse",
+            "prepositioned_right",
+        }
+        available_types = {
+            tool_id
+            for tool_id in self._twin.get_available_instruments()
+            if any(
+                str(getattr(state, "lifecycle_stage", ""))
+                in handover_lifecycles
+                for state in self._twin._instances_for_type(tool_id)
+            )
+        }
+        eligible_ids = [
+            instrument_id
+            for instrument_id in self._twin.spec.list_requestable_instrument_ids()
+            if instrument_id in available_types
+        ]
+        eligible = set(eligible_ids)
         path_tool = self._twin.spec.resolve_instrument_alias(
             str(path_forecast.get("tool", ""))
         ) or str(path_forecast.get("tool", ""))
@@ -2211,28 +2916,11 @@ class ORDigitalTwinNode(Node):
             0.0,
             min(1.0, float(path_forecast.get("confidence", 0.0) or 0.0)),
         )
-        path_instances = self._twin._instances_for_type(path_tool) if path_tool else []
-        path_lifecycles = {
-            str(getattr(state, "lifecycle_stage", "") or "")
-            for state in path_instances
-        }
-        path_available = bool(
-            path_lifecycles.intersection(
-                {"home_rack", "returned_home", "mayo_reuse", "prepositioned_right"}
-            )
-        )
-        if (
-            path_tool
-            and path_confidence >= self._tool_predict_evidence_threshold
-            and path_available
-        ):
-            candidates.add(path_tool)
+        path_available = path_tool in eligible
         fused_scores: dict[str, float] = {}
         candidate_lifecycles: dict[str, list[str]] = {}
-        for tool_id in sorted(candidates):
+        for tool_id in eligible_ids:
             instances = self._twin._instances_for_type(tool_id)
-            if not instances:
-                continue
             candidate_lifecycles[tool_id] = sorted(
                 {
                     str(getattr(state, "lifecycle_stage", "") or "")
@@ -2241,16 +2929,25 @@ class ORDigitalTwinNode(Node):
             )
             vlm_score = max(0.0, min(1.0, float(vlm_scores.get(tool_id, 0.0))))
             prior_score = max(0.0, min(1.0, float(prior_scores.get(tool_id, 0.0))))
+            ngram_score = max(
+                0.0,
+                min(1.0, float(ngram_scores.get(tool_id, 0.0))),
+            )
             remaining = 1.0 - vlm_score
             prior_nudge = 0.15 * prior_score * remaining
+            # Frozen 0704 n-gram is a bounded ranking prior.  Alone it cannot
+            # satisfy the 0.5 evidence threshold, so it can prepare a ranking
+            # but cannot independently accrue action-policy readiness.
+            ngram_nudge = 0.25 * ngram_score * remaining
             agreement_nudge = (
                 0.05 * remaining
-                if vlm_score >= 0.35 and prior_score >= 0.35
+                if vlm_score >= 0.35
+                and max(prior_score, ngram_score) >= 0.35
                 else 0.0
             )
             fused_scores[tool_id] = min(
                 1.0,
-                vlm_score + prior_nudge + agreement_nudge,
+                max(0.001, vlm_score + prior_nudge + ngram_nudge + agreement_nudge),
             )
             if tool_id == path_tool and path_available:
                 fused_scores[tool_id] = max(
@@ -2261,33 +2958,19 @@ class ORDigitalTwinNode(Node):
             return "", 0.0, {
                 "vlm": vlm_scores,
                 "prior": prior_scores,
+                "ngram": ngram_scores,
                 "candidate_lifecycles": candidate_lifecycles,
                 "fused": {},
+                "ranked_distribution": [],
+                "eligible_candidates": eligible_ids,
+                "degraded": True,
+                "degraded_reason": "fewer_than_three_eligible_tools",
                 "procedure_path_forecast": path_forecast,
                 "path_available": path_available,
             }
-
-        eligible_scores: dict[str, float] = {}
-        for tool_id, confidence in fused_scores.items():
-            if confidence >= self._tool_predict_evidence_threshold:
-                eligible_scores[tool_id] = confidence
-        if not eligible_scores:
-            self._tool_predict_stability.clear()
-            return "", 0.0, {
-                "vlm": vlm_scores,
-                "prior": prior_scores,
-                "candidate_lifecycles": candidate_lifecycles,
-                "fused": fused_scores,
-                "durations_sec": {
-                    tool_id: 0.0 for tool_id in fused_scores
-                },
-                "procedure_path_forecast": path_forecast,
-                "path_available": path_available,
-            }
-
         selected_tool, selected_confidence = max(
-            eligible_scores.items(),
-            key=lambda item: item[1],
+            fused_scores.items(),
+            key=lambda item: (item[1], -eligible_ids.index(item[0])),
         )
         # Readiness measures continuity of the current top candidate. A
         # different winner invalidates the previous candidate's preparation
@@ -2295,21 +2978,41 @@ class ORDigitalTwinNode(Node):
         for tracked_tool in list(self._tool_predict_stability):
             if tracked_tool != selected_tool:
                 self._tool_predict_stability.pop(tracked_tool, None)
-        _, selected_duration = self._update_stability(
-            self._tool_predict_stability,
-            tool_id=selected_tool,
-            confidence=selected_confidence,
-            threshold=self._tool_predict_evidence_threshold,
-            stability_sec=self._tool_predict_stability_sec,
-            now_sec=now_sec,
-            received_sec=received_sec,
-        )
+        if selected_confidence >= self._tool_predict_evidence_threshold:
+            entry = self._tool_predict_stability.get(selected_tool)
+            if entry is not None and not bool(entry.get("evidence_ready", True)):
+                self._tool_predict_stability.pop(selected_tool, None)
+            _, selected_duration = self._update_stability(
+                self._tool_predict_stability,
+                tool_id=selected_tool,
+                confidence=selected_confidence,
+                threshold=self._tool_predict_evidence_threshold,
+                stability_sec=self._tool_predict_stability_sec,
+                now_sec=now_sec,
+                received_sec=received_sec,
+            )
+            self._tool_predict_stability[selected_tool]["evidence_ready"] = True
+        else:
+            selected_duration = 0.0
+            self._tool_predict_stability[selected_tool] = {
+                "first_seen": now_sec,
+                "last_seen": now_sec,
+                "last_received": (
+                    now_sec if received_sec is None else received_sec
+                ),
+                "confidence": selected_confidence,
+                "evidence_ready": False,
+            }
         durations = {
             tool_id: (
                 selected_duration if tool_id == selected_tool else 0.0
             )
             for tool_id in fused_scores
         }
+        ranked_distribution = _normalize_ranked_tool_distribution(
+            list(fused_scores.items()),
+            limit=3,
+        )
         vlm_top = max(vlm_scores.items(), key=lambda item: item[1])[0] if vlm_scores else ""
         prior_top = max(prior_scores.items(), key=lambda item: item[1])[0] if prior_scores else ""
         strong_new_consensus = bool(
@@ -2320,8 +3023,21 @@ class ORDigitalTwinNode(Node):
         return selected_tool, selected_confidence, {
             "vlm": vlm_scores,
             "prior": prior_scores,
+            "ngram": ngram_scores,
             "candidate_lifecycles": candidate_lifecycles,
             "fused": fused_scores,
+            "ranked_distribution": ranked_distribution,
+            "eligible_candidates": eligible_ids,
+            "filtered_candidates": sorted(
+                (set(vlm_scores) | set(prior_scores) | set(ngram_scores))
+                - eligible
+            ),
+            "degraded": len(eligible_ids) < 3,
+            "degraded_reason": (
+                "fewer_than_three_eligible_tools"
+                if len(eligible_ids) < 3
+                else ""
+            ),
             "durations_sec": durations,
             "selected": selected_tool,
             "selected_duration_sec": durations.get(selected_tool, 0.0),
@@ -2362,45 +3078,21 @@ class ORDigitalTwinNode(Node):
             )
             return
 
-        legacy_v2 = bool(
-            str(payload.get("v", "")) == "2"
-            and "real_vlm" not in str(msg.source)
+        # Legacy/replay rows pass through the same inventory and ranking gate
+        # as live schema-v4 output.  No public system-final path may bypass the
+        # exact-three/availability contract merely because its wire shape is
+        # older.
+        tool_id, confidence, fusion_detail = self._fused_tool_prediction(
+            payload,
+            now_sec,
+            received_sec,
         )
-        if legacy_v2:
-            raw_tool = payload.get("tool", ["", 0.0])
-            if not isinstance(raw_tool, list) or len(raw_tool) != 2:
-                self._clear_stale_tool_prediction(now_sec)
-                return
-            tool_id = self._twin.spec.resolve_instrument_alias(str(raw_tool[0])) or str(raw_tool[0])
-            try:
-                confidence = float(raw_tool[1])
-            except (TypeError, ValueError):
-                self._clear_stale_tool_prediction(now_sec)
-                return
-            fusion_detail = {"legacy_v2": True, "tool": tool_id, "confidence": confidence}
-        else:
-            tool_id, confidence, fusion_detail = self._fused_tool_prediction(
-                payload,
-                now_sec,
-                received_sec,
-            )
         if not tool_id:
             self._clear_stale_tool_prediction(now_sec)
             return
-        if legacy_v2:
-            _, duration = self._update_stability(
-                self._tool_predict_stability,
-                tool_id=tool_id,
-                confidence=confidence,
-                threshold=self._tool_predict_evidence_threshold,
-                stability_sec=self._tool_predict_stability_sec,
-                now_sec=now_sec,
-                received_sec=received_sec,
-            )
-        else:
-            duration = float(
-                fusion_detail.get("selected_duration_sec", 0.0)
-            )
+        duration = float(
+            fusion_detail.get("selected_duration_sec", 0.0)
+        )
         policy_ready = bool(
             confidence >= self._tool_predict_threshold
             and duration >= self._tool_predict_stability_sec
@@ -2410,20 +3102,22 @@ class ORDigitalTwinNode(Node):
         self._twin.state.predicted_tool = tool_id
         self._twin.state.predicted_tool_confidence = confidence
         self._twin.state.predicted_tool_stability_sec = duration
-        if legacy_v2:
-            ranked_rows = [(tool_id, confidence)]
-        else:
-            ranked_rows = sorted(
-                (
-                    (candidate_id, float(candidate_confidence))
+        ranked_rows = [
+            (str(candidate_id), float(candidate_probability))
+            for candidate_id, candidate_probability in fusion_detail.get(
+                "ranked_distribution", []
+            )
+        ]
+        if not ranked_rows:
+            ranked_rows = _normalize_ranked_tool_distribution(
+                [
+                    (str(candidate_id), float(candidate_confidence))
                     for candidate_id, candidate_confidence in fusion_detail.get(
                         "fused", {}
                     ).items()
-                    if float(candidate_confidence)
-                    >= self._tool_predict_evidence_threshold
-                ),
-                key=lambda item: (-item[1], item[0]),
-            )[:3]
+                ],
+                limit=3,
+            )
         self._twin.state.ranked_tool_predictions = [
             RankedToolPredictionBelief(
                 rank=rank,
@@ -2488,23 +3182,35 @@ class ORDigitalTwinNode(Node):
             ),
         ):
             return
-        if str(msg.schema_version) not in {"2", "3", "4"}:
+        if str(msg.schema_version) not in {"2", "3", "4", "5", "6"}:
             return
         try:
             payload = json.loads(msg.raw_json)
         except json.JSONDecodeError:
             return
-        if not isinstance(payload, dict) or str(payload.get("v", "")) not in {"2", "3", "4"}:
+        if not isinstance(payload, dict) or str(payload.get("v", "")) not in {
+            "2",
+            "3",
+            "4",
+            "5",
+            "6",
+        }:
+            return
+        if "gesture" in payload or "sg" in payload:
+            self._publish_reducer_decision_event(
+                input_type="vlm_result",
+                input_id=str(getattr(msg, "correlation_id", "")),
+                input_source=source,
+                accepted=False,
+                reason="vlm_hand_fields_forbidden",
+                detail={"forbidden_fields": [
+                    field for field in ("gesture", "sg") if field in payload
+                ]},
+            )
             return
         now_sec = self._stamp_sec(msg.stamp)
         received_sec = self._stamp_sec(self._stamp())
         self._handle_vlm_tool_prediction(
-            payload,
-            msg,
-            now_sec,
-            received_sec,
-        )
-        self._handle_vlm_implicit_request(
             payload,
             msg,
             now_sec,
@@ -2520,8 +3226,21 @@ class ORDigitalTwinNode(Node):
                 confidence = float(item[2])
             except (TypeError, ValueError):
                 continue
-            if tool_id and decision in {"recover", "reuse"}:
-                mayo_rows[tool_id] = (decision, confidence)
+            if not tool_id or decision not in {"recover", "reuse"}:
+                continue
+            current_state = self._twin.get_instrument_state(
+                tool_id,
+                allowed_lifecycles={"mayo_reuse", "mayo_recovery"},
+            )
+            if not self._is_canonical_mayo_policy_state(current_state):
+                # Do not accumulate an off-Mayo proposal and later apply it
+                # after a placement update.  Policy evidence starts only once
+                # the current DT snapshot independently confirms Mayo.
+                self._mayo_retrieve_stability.pop(tool_id, None)
+                self._mayo_reuse_stability.pop(tool_id, None)
+                self._twin.clear_mayo_policy_evidence(tool_id)
+                continue
+            mayo_rows[tool_id] = (decision, confidence)
 
         retrieve = payload.get("mayo_retrieve", ["", 0.0])
         if isinstance(retrieve, list) and len(retrieve) == 2:
@@ -2533,7 +3252,15 @@ class ORDigitalTwinNode(Node):
                 retrieve_confidence = float(retrieve[1])
             except (TypeError, ValueError):
                 retrieve_confidence = 0.0
-            if retrieve_tool and retrieve_tool not in mayo_rows:
+            current_state = self._twin.get_instrument_state(
+                retrieve_tool,
+                allowed_lifecycles={"mayo_reuse", "mayo_recovery"},
+            ) if retrieve_tool else None
+            if retrieve_tool and not self._is_canonical_mayo_policy_state(current_state):
+                self._mayo_retrieve_stability.pop(retrieve_tool, None)
+                self._mayo_reuse_stability.pop(retrieve_tool, None)
+                self._twin.clear_mayo_policy_evidence(retrieve_tool)
+            elif retrieve_tool and retrieve_tool not in mayo_rows:
                 mayo_rows[retrieve_tool] = ("recover", retrieve_confidence)
 
         observed_tools = set(mayo_rows)
@@ -2560,6 +3287,11 @@ class ORDigitalTwinNode(Node):
                 tool_id,
                 allowed_lifecycles={"mayo_reuse", "mayo_recovery"},
             )
+            if not self._is_canonical_mayo_policy_state(current_state):
+                self._mayo_retrieve_stability.pop(tool_id, None)
+                self._mayo_reuse_stability.pop(tool_id, None)
+                self._twin.clear_mayo_policy_evidence(tool_id)
+                continue
             instance_id = current_state.instance_id if current_state else tool_id
             proposal_id = (
                 f"mayo_policy:{instance_id}:{decision}:"
@@ -2601,6 +3333,16 @@ class ORDigitalTwinNode(Node):
                     tracker.pop(tracked_tool, None)
                     self._twin.clear_mayo_policy_evidence(tracked_tool)
         self._publish_world_state()
+
+    @staticmethod
+    def _is_canonical_mayo_policy_state(state) -> bool:
+        return bool(
+            state is not None
+            and str(getattr(state, "lifecycle_stage", ""))
+            in {"mayo_reuse", "mayo_recovery"}
+            and str(getattr(state, "location_type", "")) == "mayo_stand"
+            and str(getattr(state, "location_id", "")) == "mayo_stand"
+        )
 
     def _on_observation(self, msg: ToolObservation) -> None:
         source = (
@@ -2650,13 +3392,41 @@ class ORDigitalTwinNode(Node):
             f"{'cam4' if is_cam4_detector else 'vlm'}_tool:"
             f"{resolved_tool}:{msg.location_type}:{msg.location_id}"
         )
-        if not self._admit_visual_evidence(
+        placement_episode_started_sec: float | None = None
+        placement_episode_id = ""
+        if is_cam4_detector:
+            if not self._admit_cam4_mayo_observation(
+                msg,
+                channel=admission_channel,
+                source=resolved_source,
+            ):
+                return
+            episode_metadata = self._cam4_mayo_episode_metadata(msg)
+            if episode_metadata is None:
+                self._reject_visual_evidence(
+                    channel=admission_channel,
+                    source=resolved_source,
+                    reason="invalid_cam4_presence_episode",
+                    message=msg,
+                )
+                return
+            placement_episode_started_sec, placement_episode_id = (
+                episode_metadata
+            )
+            if placement_episode_id in getattr(
+                self,
+                "_accepted_cam4_mayo_episodes",
+                set(),
+            ):
+                # Renewals keep source freshness visible to admission, but an
+                # already-consumed physical placement episode is idempotent.
+                return
+        elif not self._admit_visual_evidence(
             msg,
             channel=admission_channel,
             source=resolved_source,
             require_epoch=(
-                not is_cam4_detector
-                and str(getattr(self, "_vlm_mode", "mock"))
+                str(getattr(self, "_vlm_mode", "mock"))
                 in {"real", "dual"}
                 and "real_vlm" in resolved_source
             ),
@@ -2676,7 +3446,22 @@ class ORDigitalTwinNode(Node):
             msg,
             source=resolved_source,
             proposal_id=proposal_id,
+            placement_episode_started_sec=placement_episode_started_sec,
+            placement_episode_id=placement_episode_id,
         )
+        if is_cam4_detector and placement_episode_id:
+            # One uninterrupted visibility episode gets exactly one reducer
+            # decision, whether accepted or rejected. Renewals are freshness
+            # heartbeats, not repeated world mutations or audit events.
+            consumed_episodes = getattr(
+                self,
+                "_accepted_cam4_mayo_episodes",
+                None,
+            )
+            if consumed_episodes is None:
+                consumed_episodes = set()
+                self._accepted_cam4_mayo_episodes = consumed_episodes
+            consumed_episodes.add(placement_episode_id)
         if result:
             proposed_lifecycle = str(result.get("proposed_lifecycle", ""))
             self._publish_vlm_inference_proposal(
@@ -3092,6 +3877,178 @@ class ORDigitalTwinNode(Node):
         )
         self._publish_world_state()
 
+    @staticmethod
+    def _voice_gateway_stamp_ns(message: GatewayInfo) -> int:
+        stamp = getattr(message, "stamp", None)
+        return int(getattr(stamp, "sec", 0)) * 1_000_000_000 + int(
+            getattr(stamp, "nanosec", 0)
+        )
+
+    def _voice_gated_lock(self):
+        lock = getattr(self, "_voice_gated_admission_lock", None)
+        if lock is None:
+            # Production initializes this before subscriptions.  The fallback
+            # keeps pure callback fixtures made with __new__ safe as well.
+            lock = threading.RLock()
+            self._voice_gated_admission_lock = lock
+        return lock
+
+    def _on_voice_gateway_info(self, message: GatewayInfo) -> None:
+        with self._voice_gated_lock():
+            authority = getattr(self, "_voice_gateway_authority", None)
+            if authority is None:
+                return
+            now_stamp = self._stamp()
+            now_ns = int(
+                getattr(now_stamp, "sec", 0)
+            ) * 1_000_000_000 + int(getattr(now_stamp, "nanosec", 0))
+            authority.observe(
+                gateway_instance_id=str(
+                    getattr(message, "gateway_instance_id", "") or ""
+                ),
+                procedure_run_id=str(
+                    getattr(message, "procedure_run_id", "") or ""
+                ),
+                procedure_type=str(
+                    getattr(message, "procedure_type", "") or ""
+                ),
+                catalog_version=str(
+                    getattr(message, "catalog_version", "") or ""
+                ),
+                schema_version=str(
+                    getattr(message, "schema_version", "") or ""
+                ),
+                interface_version=str(
+                    getattr(message, "interface_version", "") or ""
+                ),
+                procedure_active=bool(
+                    getattr(message, "procedure_active", False)
+                ),
+                revision=int(getattr(message, "revision", 0)),
+                source_stamp_ns=self._voice_gateway_stamp_ns(message),
+                now_ns=now_ns,
+                received_monotonic=time.monotonic(),
+                expected_procedure_type=str(
+                    self._twin.spec.procedure_id or ""
+                ).strip(),
+            )
+
+    def _on_voice_gateway_watchdog(self) -> None:
+        with self._voice_gated_lock():
+            authority = getattr(self, "_voice_gateway_authority", None)
+            if authority is not None:
+                authority.expire(now_monotonic=time.monotonic())
+
+    def _gated_voice_scope_rejection_reason(
+        self, msg: VoiceCommandIntent
+    ) -> str:
+        authority = getattr(self, "_voice_gateway_authority", None)
+        if authority is None:
+            return "gateway_lease_unavailable"
+        return authority.rejection_reason(
+            gateway_instance_id=str(
+                getattr(msg, "gateway_instance_id", "") or ""
+            ),
+            procedure_run_id=str(
+                getattr(msg, "procedure_run_id", "") or ""
+            ),
+            twin_procedure_run_id=str(
+                getattr(self._twin.state, "procedure_run_id", "") or ""
+            ),
+            expected_procedure_type=str(
+                self._twin.spec.procedure_id or ""
+            ),
+            now_monotonic=time.monotonic(),
+        )
+
+    def _voice_intent_source_rejection_reason(
+        self, msg: VoiceCommandIntent
+    ) -> str:
+        """Validate the immutable ASR envelope on Live execution paths.
+
+        This intentionally runs at the Digital Twin as a second boundary.
+        ROS topic typing alone cannot prove that a proposal came from the
+        admitted ASR stream, and resolving a legacy ``String`` at receipt time
+        would otherwise launder stale or replayed speech into a fresh intent.
+        """
+
+        if not bool(
+            getattr(self, "_require_voice_intent_source_metadata", False)
+        ):
+            return ""
+        utterance_id = str(getattr(msg, "utterance_id", "") or "").strip()
+        source = str(getattr(msg, "source", "") or "").strip()
+        if not utterance_id:
+            return "voice_intent_missing_utterance_id"
+        if not source:
+            return "voice_intent_missing_source"
+        if not bool(getattr(msg, "source_is_final", False)):
+            return "voice_intent_source_not_final"
+        header = getattr(msg, "header", None)
+        stamp = getattr(header, "stamp", None)
+        if stamp is None:
+            return "voice_intent_missing_source_timestamp"
+        # Do not use ``_stamp_sec`` here: its general Twin helper substitutes
+        # the local clock for a zero stamp, which is appropriate for some
+        # state observations but would launder an absent ASR source time.
+        try:
+            source_sec = float(stamp.sec) + float(stamp.nanosec) / 1_000_000_000.0
+        except (AttributeError, TypeError, ValueError):
+            source_sec = 0.0
+        if source_sec <= 0.0:
+            return "voice_intent_missing_source_timestamp"
+        now_stamp = self._stamp()
+        try:
+            now_sec = (
+                float(now_stamp.sec)
+                + float(now_stamp.nanosec) / 1_000_000_000.0
+            )
+        except (AttributeError, TypeError, ValueError):
+            now_sec = 0.0
+        if now_sec <= 0.0:
+            return "voice_intent_unavailable_local_clock"
+        age_sec = now_sec - source_sec
+        if age_sec > float(
+            getattr(self, "_voice_intent_max_age_sec", 3.0)
+        ):
+            return f"voice_intent_stale:{age_sec:.3f}s"
+        if age_sec < -float(
+            getattr(self, "_voice_intent_future_tolerance_sec", 1.0)
+        ):
+            return f"voice_intent_future_timestamp:{-age_sec:.3f}s"
+
+        now_monotonic = time.monotonic()
+        retention_sec = max(
+            1.0,
+            float(getattr(self, "_voice_intent_dedupe_retention_sec", 120.0)),
+        )
+        seen = getattr(self, "_recent_voice_intent_ids", None)
+        if seen is None:
+            seen = {}
+            self._recent_voice_intent_ids = seen
+        cutoff = now_monotonic - retention_sec
+        expired = [
+            key for key, seen_at in seen.items() if seen_at < cutoff
+        ]
+        for key in expired:
+            seen.pop(key, None)
+        gateway_instance_id = str(
+            getattr(msg, "gateway_instance_id", "") or ""
+        ).strip()
+        function_request_id = str(
+            getattr(msg, "function_request_id", "") or ""
+        ).strip()
+        scope_prefix = (
+            gateway_instance_id
+            if gateway_instance_id and function_request_id
+            else "legacy"
+        )
+        replay_key = f"{scope_prefix}:{source}:{utterance_id}"
+        if replay_key in seen:
+            return "voice_intent_duplicate_utterance_id"
+        seen[replay_key] = now_monotonic
+        return ""
+
     def _on_voice_command_intent(self, msg: VoiceCommandIntent) -> None:
         """Admit only executable, already-grounded tool handover proposals.
 
@@ -3101,6 +4058,373 @@ class ORDigitalTwinNode(Node):
         slot.  A proposal that needs confirmation, clarification, or repair is
         observable here but cannot queue a handover.
         """
+
+        function_request_id = str(
+            getattr(msg, "function_request_id", "") or ""
+        ).strip()
+        if function_request_id:
+            self._on_gated_voice_command_intent(msg)
+            return
+
+        instrument_id, detail, mode = self._process_voice_command_intent(
+            msg
+        )
+        self._publish_event(
+            "VoiceCommandIntentObserved",
+            instrument_id=instrument_id,
+            detail=detail,
+            mode=mode,
+        )
+
+    @staticmethod
+    def _voice_intent_receipt_fingerprint(
+        msg: VoiceCommandIntent,
+    ) -> str:
+        header = getattr(msg, "header", None)
+        stamp = getattr(header, "stamp", None)
+        return voice_intent_fingerprint(
+            {
+                "utterance_id": getattr(msg, "utterance_id", ""),
+                "source_stamp_sec": getattr(stamp, "sec", 0),
+                "source_stamp_nanosec": getattr(stamp, "nanosec", 0),
+                "source": getattr(msg, "source", ""),
+                "source_is_final": getattr(msg, "source_is_final", False),
+                "source_speaker_role": getattr(
+                    msg, "source_speaker_role", ""
+                ),
+                "source_has_confidence": getattr(
+                    msg, "source_has_confidence", False
+                ),
+                "source_confidence": getattr(
+                    msg, "source_confidence", 0.0
+                ),
+                "procedure_id": getattr(msg, "procedure_id", ""),
+                "catalog_id": getattr(msg, "catalog_id", ""),
+                "intent": getattr(msg, "intent", ""),
+                "tool_id": getattr(msg, "tool_id", ""),
+                "retractor_command": getattr(
+                    msg, "retractor_command", ""
+                ),
+                "target_side": getattr(msg, "target_side", ""),
+                "distance_m": getattr(msg, "distance_m", 0.0),
+                "urgency": getattr(msg, "urgency", ""),
+                "provenance": getattr(msg, "provenance", ""),
+                "requires_confirmation": getattr(
+                    msg, "requires_confirmation", False
+                ),
+                "disposition": getattr(msg, "disposition", ""),
+                "reason": getattr(msg, "reason", ""),
+                # raw_text, normalized_text, and evidence_spans are omitted
+                # by construction and also ignored by the pure hasher.
+            }
+        )
+
+    def _capture_gated_voice_reducer_state(self) -> dict[str, object]:
+        """Snapshot every in-memory object a gated admission may mutate."""
+
+        return {
+            "twin": copy.deepcopy(self._twin.__dict__),
+            "validated_tool_request_history": copy.deepcopy(
+                getattr(self, "_validated_tool_request_history", deque())
+            ),
+            "tool_predict_stability": copy.deepcopy(
+                getattr(self, "_tool_predict_stability", {})
+            ),
+            "tool_prediction_last_sample_by_source": copy.deepcopy(
+                getattr(
+                    self,
+                    "_tool_prediction_last_sample_by_source",
+                    {},
+                )
+            ),
+            "recent_voice_intent_ids": copy.deepcopy(
+                getattr(self, "_recent_voice_intent_ids", {})
+            ),
+        }
+
+    def _restore_gated_voice_reducer_state(
+        self, snapshot: dict[str, object]
+    ) -> None:
+        """Restore a failed first writer without replacing the Twin object."""
+
+        twin_state = snapshot["twin"]
+        if not isinstance(twin_state, dict):
+            raise TypeError("invalid gated voice Twin snapshot")
+        self._twin.__dict__.clear()
+        self._twin.__dict__.update(twin_state)
+        self._validated_tool_request_history = snapshot[
+            "validated_tool_request_history"
+        ]
+        self._tool_predict_stability = snapshot["tool_predict_stability"]
+        self._tool_prediction_last_sample_by_source = snapshot[
+            "tool_prediction_last_sample_by_source"
+        ]
+        self._recent_voice_intent_ids = snapshot[
+            "recent_voice_intent_ids"
+        ]
+
+    def _voice_receipt_first_writer(
+        self,
+        *,
+        ledger: VoiceIntentReceiptLedger,
+        key: VoiceIntentReceiptKey,
+        utterance_id: str,
+        fingerprint: str,
+        build_receipt,
+    ):
+        """Commit a first writer or roll its reducer mutation back in full."""
+
+        mutation_snapshot: dict[str, object] | None = None
+
+        def guarded_build_receipt() -> VoiceIntentReceiptDraft:
+            nonlocal mutation_snapshot
+            # World-state timers and direct publications check this before
+            # maintenance/normalization, so no reducer edge can escape while
+            # the SQLite transaction is still rollback-capable.
+            self._voice_gated_mutation_dirty = True
+            mutation_snapshot = self._capture_gated_voice_reducer_state()
+            return build_receipt()
+
+        try:
+            result = ledger.first_writer(
+                key=key,
+                utterance_id=utterance_id,
+                fingerprint_sha256=fingerprint,
+                build_receipt=guarded_build_receipt,
+            )
+        except BaseException as first_writer_error:
+            restore_error: BaseException | None = None
+            receipt_state_ambiguous = False
+            if mutation_snapshot is not None:
+                try:
+                    self._restore_gated_voice_reducer_state(
+                        mutation_snapshot
+                    )
+                except BaseException as error:
+                    restore_error = error
+                    self._voice_gated_mutation_fatal = True
+                try:
+                    # SQLite normally leaves no row after a failed pre-COMMIT
+                    # sync/transaction.  If a lower-level COMMIT reports an
+                    # error after making the row visible, or the connection is
+                    # too damaged to prove absence, stop this admission path
+                    # permanently for the process instead of replaying an ACK
+                    # whose reducer mutation was rolled back.
+                    receipt_state_ambiguous = ledger.lookup(key) is not None
+                except BaseException:
+                    receipt_state_ambiguous = True
+                if receipt_state_ambiguous:
+                    self._voice_gated_mutation_fatal = True
+            self._voice_gated_mutation_dirty = False
+            if restore_error is not None:
+                raise RuntimeError(
+                    "gated voice reducer rollback failed; world publication "
+                    "is latched fail-closed"
+                ) from restore_error
+            if receipt_state_ambiguous:
+                raise RuntimeError(
+                    "gated voice receipt commit outcome is ambiguous; world "
+                    "publication is latched fail-closed"
+                ) from first_writer_error
+            raise
+        self._voice_gated_mutation_dirty = False
+        return result
+
+    def _on_gated_voice_command_intent(
+        self, msg: VoiceCommandIntent
+    ) -> None:
+        with self._voice_gated_lock():
+            self._on_gated_voice_command_intent_locked(msg)
+
+    def _on_gated_voice_command_intent_locked(
+        self, msg: VoiceCommandIntent
+    ) -> None:
+        """Apply/replay one durable first-writer receipt for a VLM function.
+
+        Exact retries intentionally bypass source freshness, transient dedupe,
+        and reducer mutation.  A different payload under the same scoped key
+        is a collision: the immutable first receipt is re-emitted and the
+        conflicting payload is never evaluated.
+        """
+
+        if bool(getattr(self, "_voice_gated_mutation_fatal", False)):
+            instrument_id, detail, mode = self._process_voice_command_intent(
+                msg,
+                forced_rejection_reason=(
+                    "gated_voice_intent_reducer_rollback_fatal"
+                ),
+                publish_world_state_on_accept=False,
+            )
+            self._publish_event(
+                "VoiceCommandIntentObserved",
+                instrument_id=instrument_id,
+                detail=detail,
+                mode=mode,
+            )
+            return
+
+        gateway_instance_id = str(
+            getattr(msg, "gateway_instance_id", "") or ""
+        ).strip()
+        procedure_run_id = str(
+            getattr(msg, "procedure_run_id", "") or ""
+        ).strip()
+        function_request_id = str(
+            getattr(msg, "function_request_id", "") or ""
+        ).strip()
+        utterance_id = str(
+            getattr(msg, "utterance_id", "") or ""
+        ).strip()
+        missing = [
+            field_name
+            for field_name, value in (
+                ("gateway_instance_id", gateway_instance_id),
+                ("procedure_run_id", procedure_run_id),
+                ("function_request_id", function_request_id),
+                ("utterance_id", utterance_id),
+            )
+            if not value
+        ]
+        if missing:
+            instrument_id, detail, mode = self._process_voice_command_intent(
+                msg,
+                forced_rejection_reason=(
+                    "gated_voice_intent_missing_scope:"
+                    + ",".join(missing)
+                ),
+            )
+            self._publish_event(
+                "VoiceCommandIntentObserved",
+                instrument_id=instrument_id,
+                detail=detail,
+                mode=mode,
+            )
+            return
+
+        ledger = getattr(self, "_voice_intent_receipt_ledger", None)
+        if ledger is None:
+            instrument_id, detail, mode = self._process_voice_command_intent(
+                msg,
+                forced_rejection_reason=(
+                    "gated_voice_intent_receipt_ledger_unavailable"
+                ),
+            )
+            self._publish_event(
+                "VoiceCommandIntentObserved",
+                instrument_id=instrument_id,
+                detail=detail,
+                mode=mode,
+            )
+            return
+
+        key = VoiceIntentReceiptKey(
+            gateway_instance_id,
+            procedure_run_id,
+            function_request_id,
+        )
+        fingerprint = self._voice_intent_receipt_fingerprint(msg)
+
+        def receipt_draft(
+            forced_rejection_reason: str,
+        ) -> VoiceIntentReceiptDraft:
+            instrument_id, detail, mode = self._process_voice_command_intent(
+                msg,
+                forced_rejection_reason=forced_rejection_reason,
+                publish_world_state_on_accept=False,
+            )
+            # Persist the fully augmented event detail.  Replaying it later is
+            # therefore byte-equivalent apart from the new TwinEvent stamp.
+            stored_detail = self._augment_event_detail(
+                "VoiceCommandIntentObserved",
+                detail,
+                instrument_id=instrument_id,
+                mode=mode,
+            )
+            return VoiceIntentReceiptDraft(
+                instrument_id=instrument_id,
+                mode=mode,
+                detail=stored_detail,
+                accepted=bool(detail.get("accepted", False)),
+            )
+
+        scope_rejection_reason = self._gated_voice_scope_rejection_reason(msg)
+        if scope_rejection_reason:
+            result = self._voice_receipt_first_writer(
+                ledger=ledger,
+                key=key,
+                utterance_id=utterance_id,
+                fingerprint=fingerprint,
+                build_receipt=lambda: receipt_draft(
+                    scope_rejection_reason
+                ),
+            )
+            receipt = result.receipt
+            if receipt.accepted:
+                # An earlier accepted first writer is immutable, but it must
+                # not be replayed after timeout, idle, epoch change, or scope
+                # poisoning. Emit only the current fail-closed rejection.
+                instrument_id, detail, mode = (
+                    self._process_voice_command_intent(
+                        msg,
+                        forced_rejection_reason=scope_rejection_reason,
+                        publish_world_state_on_accept=False,
+                    )
+                )
+                self._publish_event(
+                    "VoiceCommandIntentObserved",
+                    instrument_id=instrument_id,
+                    detail=detail,
+                    mode=mode,
+                )
+            else:
+                self._publish_event(
+                    "VoiceCommandIntentObserved",
+                    instrument_id=receipt.instrument_id,
+                    detail=receipt.detail(),
+                    mode=receipt.mode,
+                )
+            return
+
+        def build_receipt() -> VoiceIntentReceiptDraft:
+            # Recheck inside the first-writer transaction. This closes the
+            # small window in a multi-threaded executor where a gateway
+            # timeout/scope callback could race the preflight above.
+            return receipt_draft(
+                self._gated_voice_scope_rejection_reason(msg)
+            )
+
+        result = self._voice_receipt_first_writer(
+            ledger=ledger,
+            key=key,
+            utterance_id=utterance_id,
+            fingerprint=fingerprint,
+            build_receipt=build_receipt,
+        )
+        # For both exact duplicates and collisions, result.receipt is always
+        # the immutable first writer.  This is the durable ACK the upstream
+        # gate can safely correlate; collision data is not reflected into it.
+        receipt = result.receipt
+        if result.is_new and receipt.accepted:
+            # Reducer mutation happened while constructing the first writer.
+            # Publish public state only after the receipt commit, then publish
+            # the receipt ACK. A crash can therefore never expose an ACK ahead
+            # of its durable first-writer record.
+            self._publish_world_state()
+        self._publish_event(
+            "VoiceCommandIntentObserved",
+            instrument_id=receipt.instrument_id,
+            detail=receipt.detail(),
+            mode=receipt.mode,
+        )
+
+    def _process_voice_command_intent(
+        self,
+        msg: VoiceCommandIntent,
+        *,
+        forced_rejection_reason: str = "",
+        publish_world_state_on_accept: bool = True,
+    ) -> tuple[str, dict, str]:
+        """Validate and, on acceptance, mutate the handover reducer once."""
 
         intent = str(getattr(msg, "intent", "") or "").strip().lower()
         disposition = str(
@@ -3116,7 +4440,21 @@ class ORDigitalTwinNode(Node):
         catalog_id = str(getattr(msg, "catalog_id", "") or "").strip()
         urgency = str(getattr(msg, "urgency", "") or "").strip().lower()
         provenance = str(getattr(msg, "provenance", "") or "")
+        function_request_id = str(
+            getattr(msg, "function_request_id", "") or ""
+        ).strip()
+        gateway_instance_id = str(
+            getattr(msg, "gateway_instance_id", "") or ""
+        ).strip()
+        procedure_run_id = str(
+            getattr(msg, "procedure_run_id", "") or ""
+        ).strip()
         resolver_reason = str(getattr(msg, "reason", "") or "")
+        source_rejection_reason = (
+            ""
+            if forced_rejection_reason
+            else self._voice_intent_source_rejection_reason(msg)
+        )
         active_procedure_id = str(self._twin.spec.procedure_id or "").strip()
         active_catalog = getattr(self, "_voice_command_catalog", None)
         active_catalog_id = str(
@@ -3130,7 +4468,11 @@ class ORDigitalTwinNode(Node):
 
         resolved = ""
         rejection_reason = ""
-        if intent != "tool_handover":
+        if forced_rejection_reason:
+            rejection_reason = forced_rejection_reason
+        elif source_rejection_reason:
+            rejection_reason = source_rejection_reason
+        elif intent != "tool_handover":
             rejection_reason = "intent_not_owned_by_digital_twin_handover_consumer"
         elif requires_confirmation:
             rejection_reason = "voice_intent_requires_confirmation"
@@ -3154,6 +4496,11 @@ class ORDigitalTwinNode(Node):
                 rejection_reason = "unknown_or_unavailable_canonical_tool_id"
 
         accepted = bool(resolved)
+        request_generation = (
+            int(self._twin.state.surgeon_request_generation)
+            if accepted
+            else 0
+        )
         if accepted:
             self._append_tool_history(
                 "_validated_tool_request_history",
@@ -3161,36 +4508,45 @@ class ORDigitalTwinNode(Node):
                 self._stamp(),
             )
             self._clear_tool_prediction_state()
+            if publish_world_state_on_accept:
+                self._publish_world_state()
 
-        self._publish_event(
-            "VoiceCommandIntentObserved",
-            instrument_id=resolved or tool_id,
-            detail={
-                "intent": intent,
-                "disposition": disposition,
-                "requires_confirmation": requires_confirmation,
-                "tool_id": tool_id,
-                "procedure_id": procedure_id,
-                "catalog_id": catalog_id,
-                "resolved_tool": resolved,
-                "accepted": accepted,
-                # Urgency is audit-only.  The handover frame and downstream
-                # action/service receive no speed, force, or timing override.
-                "urgency": urgency,
-                "urgency_applied_to_execution": False,
-                "reason": rejection_reason or resolver_reason or "accepted",
-                "resolver_reason": resolver_reason,
-                # Never persist the transcript on TwinEvent.  The resolver
-                # owns transcript retention; ODT only records whether its
-                # already-grounded proposal carried text for audit triage.
-                "raw_text_present": bool(raw_text),
-                "normalized_text_present": bool(normalized_text),
-                "provenance": provenance,
-            },
-            mode="voice_command_intent",
-        )
-        if accepted:
-            self._publish_world_state()
+        detail = {
+            "intent": intent,
+            "disposition": disposition,
+            "requires_confirmation": requires_confirmation,
+            "tool_id": tool_id,
+            "procedure_id": procedure_id,
+            "catalog_id": catalog_id,
+            "resolved_tool": resolved,
+            "accepted": accepted,
+            # This is the exact reducer-assigned generation consumed by the
+            # downstream handover path. Rejected observations must never
+            # correlate a spoken turn with an executable request.
+            "request_generation": request_generation,
+            # Urgency is audit-only. The handover frame and downstream
+            # action/service receive no speed, force, or timing override.
+            "urgency": urgency,
+            "urgency_applied_to_execution": False,
+            "reason": rejection_reason or resolver_reason or "accepted",
+            "resolver_reason": resolver_reason,
+            # Never persist the transcript on TwinEvent. The resolver owns
+            # transcript retention; ODT records only presence for audit.
+            "raw_text_present": bool(raw_text),
+            "normalized_text_present": bool(normalized_text),
+            "provenance": provenance,
+            "function_request_id": function_request_id,
+            "gateway_instance_id": gateway_instance_id,
+            "procedure_run_id": procedure_run_id,
+            "utterance_id": str(
+                getattr(msg, "utterance_id", "") or ""
+            ).strip(),
+            "source": str(getattr(msg, "source", "") or "").strip(),
+            "source_is_final": bool(
+                getattr(msg, "source_is_final", False)
+            ),
+        }
+        return resolved or tool_id, detail, "voice_command_intent"
 
     def _on_request(self, msg: String) -> None:
         resolved = ""
@@ -3397,9 +4753,11 @@ class ORDigitalTwinNode(Node):
             self._advance_visual_runtime_epoch()
         if command in {"start", "start_runtime"}:
             self._pending_bed_robot_arm_group_requests.clear()
-            self._clear_vlm_implicit_request_state()
+            self._recent_voice_intent_ids.clear()
+            self._reset_hand_handover_state()
             self._clear_tool_histories()
             self._twin.reset_spec(self._twin.spec, seed_from_perception=False)
+            self._twin.state.procedure_run_id = uuid.uuid4().hex
             self._reset_bed_robot_controller_freshness()
             self._stamp_all_bed_robot_arm_groups()
             self._phase_entered_ros_sec = self._stamp_sec(self._stamp())
@@ -3408,18 +4766,19 @@ class ORDigitalTwinNode(Node):
                 self._phase_entered_ros_sec = self._stamp_sec(self._stamp())
             self._twin.set_execution_state(True, "running")
         elif command == "pause":
-            self._clear_vlm_implicit_request_state()
+            self._suspend_hand_handover_state()
             self._twin.set_execution_state(True, "paused")
         elif command == "resume":
             self._twin.set_execution_state(True, "running")
         elif command == "stop":
             self._pending_bed_robot_arm_group_requests.clear()
-            self._clear_vlm_implicit_request_state()
+            self._reset_hand_handover_state()
             self._twin.set_execution_state(False, "halted")
         elif command == "reset":
             self._last_lifecycle_control_signature = None
             self._pending_bed_robot_arm_group_requests.clear()
-            self._clear_vlm_implicit_request_state()
+            self._recent_voice_intent_ids.clear()
+            self._reset_hand_handover_state()
             self._clear_tool_histories()
             self._twin.reset_runtime()
             self._reset_bed_robot_controller_freshness()
@@ -3427,6 +4786,14 @@ class ORDigitalTwinNode(Node):
             self._phase_entered_ros_sec = self._stamp_sec(self._stamp())
             self._twin.set_execution_state(False, "idle")
         self._publish_world_state()
+
+    def destroy_node(self):
+        with self._voice_gated_lock():
+            ledger = getattr(self, "_voice_intent_receipt_ledger", None)
+            if ledger is not None:
+                ledger.close()
+                self._voice_intent_receipt_ledger = None
+        return super().destroy_node()
 
 
 def main() -> None:

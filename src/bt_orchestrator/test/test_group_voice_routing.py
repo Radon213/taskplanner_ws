@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -7,8 +8,10 @@ import time
 
 import pytest
 
+from builtin_interfaces.msg import Time
 from procedure_spec import (
     NormalizedRetractionCommand,
+    ProcedureSpec,
     RetractionCommand,
     RetractionState,
     RetractionTargetSide,
@@ -107,13 +110,22 @@ def _controller_status(
     status.procedure_type = (
         "thyroidectomy"
         if procedure in {"thyroidectomy", "thyroidectomy_demo"}
+        else "inguinal_hernia_repair"
+        if procedure == "inguinal_hernia_repair_demo"
         else procedure
     )
-    role_layout = (
-        [(thyroid_arm_id, "army_navy")]
-        if status.procedure_type == "thyroidectomy"
-        else [("arm_1", "left_malleable"), ("arm_2", "right_malleable")]
-    )
+    if status.procedure_type == "thyroidectomy":
+        role_layout = [(thyroid_arm_id, "army_navy")]
+    elif status.procedure_type == "inguinal_hernia_repair":
+        role_layout = [
+            ("arm_1", "left_army_navy"),
+            ("arm_2", "right_army_navy"),
+        ]
+    else:
+        role_layout = [
+            ("arm_1", "left_malleable"),
+            ("arm_2", "right_malleable"),
+        ]
     for arm_id, role_instance_id in role_layout:
         arm = BedRobotArmState()
         arm.arm_id = arm_id
@@ -153,6 +165,11 @@ def _router(
     router._seen_request_ids = set()
     router._dispatched_request_ids = set()
     router._recent_voice_requests = {}
+    router._recent_typed_voice_intent_ids = {}
+    router._require_voice_intent_source_metadata = False
+    router._voice_intent_max_age_sec = 3.0
+    router._voice_intent_future_tolerance_sec = 1.0
+    router._voice_intent_dedupe_retention_sec = 120.0
     # Existing raw-transcript cases below are compatibility tests.  Production
     # construction defaults this off; typed voice intents are the normal path.
     router._retractor_legacy_raw_voice_enabled = True
@@ -163,6 +180,8 @@ def _router(
     router._normalized_retractor_commands = {}
     router._normalized_retractor_command_requests = {}
     router._normalized_retractor_sources = {}
+    router._normalized_retractor_function_scopes = {}
+    router._normalized_retractor_request_messages = {}
     router._pending_text_vlm_interpretations = {}
     router._command_pub = _CapturePublisher()
     router._request_pub = _CapturePublisher()
@@ -725,6 +744,9 @@ def _typed_retractor_intent(
     catalog_id: str = "",
     urgency: str = "",
     provenance: str = "voice_intent_resolver.v1",
+    function_request_id: str = "",
+    gateway_instance_id: str = "",
+    procedure_run_id: str = "",
 ) -> VoiceCommandIntent:
     """Generated-message fixture for the typed voice-control boundary."""
 
@@ -742,6 +764,9 @@ def _typed_retractor_intent(
     message.tool_id = tool_id
     message.urgency = urgency
     message.provenance = provenance
+    message.function_request_id = function_request_id
+    message.gateway_instance_id = gateway_instance_id
+    message.procedure_run_id = procedure_run_id
     return message
 
 
@@ -767,6 +792,87 @@ def test_typed_natural_teach_start_reaches_retractor_service_lane() -> None:
     assert command.rationale.startswith(
         "retractor_voice_normalizer:voice_command_intent"
     )
+
+
+def test_vlm_function_request_id_is_preserved_into_retractor_lane() -> None:
+    router = _router("nephrectomy", "P02")
+    router._retractor_legacy_raw_voice_enabled = False
+    # Adjustment is admissible only after retraction is active.  This test is
+    # about preserving the VLM function identity through an otherwise valid
+    # typed request, so establish the corresponding local admission state.
+    router._retractor_voice_state = RetractionState.RETRACTION_ACTIVE
+
+    router._on_voice_intent(
+        _typed_retractor_intent(
+            retractor_command="adjust_retraction",
+            raw_text="왼쪽 견인기를 5밀리미터 조정해줘",
+            target_side="left",
+            distance_m=0.005,
+            function_request_id="function:gateway-1:run-1:u-1",
+            gateway_instance_id="gateway-1",
+            procedure_run_id="run-1",
+        )
+    )
+
+    request = router._request_pub.messages[-1]
+    status = json.loads(router._retractor_voice_status_pub.messages[-1].data)
+    assert request.request_id == "function:gateway-1:run-1:u-1"
+    assert status["request_id"] == request.request_id
+    assert status["function_request_id"] == request.request_id
+    assert status["gateway_instance_id"] == "gateway-1"
+    assert status["procedure_run_id"] == "run-1"
+
+
+def test_live_typed_retractor_intent_requires_fresh_final_asr_metadata() -> None:
+    router = _router("nephrectomy", "P02")
+    router._retractor_legacy_raw_voice_enabled = False
+    router._require_voice_intent_source_metadata = True
+    router._stamp = lambda: Time(sec=101)
+
+    legacy = _typed_retractor_intent(raw_text="교시 시작")
+    router._on_voice_intent(legacy)
+    assert router._request_pub.messages == []
+    assert json.loads(router._retractor_voice_status_pub.messages[-1].data)[
+        "reason"
+    ] == "typed_intent_missing_utterance_id"
+
+    accepted = _typed_retractor_intent(raw_text="교시 시작")
+    accepted.header.stamp = Time(sec=100)
+    accepted.utterance_id = "asr-100-1"
+    accepted.source = "taskplanner_asr:cloud"
+    accepted.source_is_final = True
+    router._on_voice_intent(accepted)
+    assert len(router._request_pub.messages) == 1
+
+    replay = _typed_retractor_intent(raw_text="교시 시작")
+    replay.header.stamp = Time(sec=100)
+    replay.utterance_id = "asr-100-1"
+    replay.source = "taskplanner_asr:cloud"
+    replay.source_is_final = True
+    router._on_voice_intent(replay)
+    assert len(router._request_pub.messages) == 1
+    assert json.loads(router._retractor_voice_status_pub.messages[-1].data)[
+        "reason"
+    ] == "typed_intent_duplicate_utterance_id"
+
+
+def test_live_typed_retractor_intent_fails_closed_without_local_clock() -> None:
+    router = _router("nephrectomy", "P02")
+    router._retractor_legacy_raw_voice_enabled = False
+    router._require_voice_intent_source_metadata = True
+    router._stamp = lambda: Time()
+
+    intent = _typed_retractor_intent(raw_text="교시 시작")
+    intent.header.stamp = Time(sec=0, nanosec=500_000_000)
+    intent.utterance_id = "asr-half-second"
+    intent.source = "taskplanner_asr:cloud"
+    intent.source_is_final = True
+    router._on_voice_intent(intent)
+
+    assert router._request_pub.messages == []
+    assert json.loads(router._retractor_voice_status_pub.messages[-1].data)[
+        "reason"
+    ] == "typed_intent_unavailable_local_clock"
 
 
 def test_raw_string_and_generic_missing_voice_intents_do_not_trigger_retractor(
@@ -835,6 +941,272 @@ def test_typed_retractor_intent_rejects_wrong_slots_and_local_state() -> None:
     assert statuses[1]["reason"] == "typed_intent_command_not_allowed_in_local_state"
 
 
+def test_virtual_state_machine_suppression_is_limited_to_typed_voice_source() -> None:
+    router = _router("nephrectomy", "P02")
+    router._robot_endpoint_source = "virtual"
+    router._retraction_endpoint_source = "virtual"
+    router._suppress_retraction_state_machine = True
+
+    assert router._retraction_state_machine_suppressed_for_source(
+        "voice_command_intent"
+    )
+    assert not router._retraction_state_machine_suppressed_for_source(
+        "deterministic"
+    )
+    assert not router._retraction_state_machine_suppressed_for_source(
+        "legacy_raw_voice"
+    )
+
+    router._retraction_endpoint_source = "external"
+    assert not router._retraction_state_machine_suppressed_for_source(
+        "voice_command_intent"
+    )
+
+
+def test_state_machine_suppression_follows_independent_retraction_route() -> None:
+    router = _router("nephrectomy", "P02")
+    router._suppress_retraction_state_machine = True
+
+    router._robot_endpoint_source = "external"
+    router._retraction_endpoint_source = "virtual"
+    assert router._retraction_state_machine_suppressed()
+
+    router._robot_endpoint_source = "virtual"
+    router._retraction_endpoint_source = "external"
+    assert not router._retraction_state_machine_suppressed()
+
+
+@pytest.mark.parametrize(
+    "procedure_id",
+    ("thyroidectomy_demo", "inguinal_hernia_repair_demo"),
+)
+def test_demo_state_machine_suppression_survives_external_route(
+    procedure_id: str,
+) -> None:
+    router = _router(procedure_id, "P03")
+    router._robot_endpoint_source = "external"
+    router._retraction_endpoint_source = "external"
+    router._suppress_retraction_state_machine = True
+
+    assert router._retraction_state_machine_suppressed()
+
+
+def test_external_workflow_suppression_uses_policy_not_bundle_name() -> None:
+    router = _router("nephrectomy", "P02")
+    runtime = replace(
+        router._spec.get_scenario_runtime_requirements(),
+        retraction_workflow_state_enforced=False,
+    )
+    router._spec.bundle.scenario_policy = replace(
+        router._spec.bundle.scenario_policy,
+        runtime_requirements=runtime,
+    )
+    router._spec = ProcedureSpec(router._spec.bundle)
+    router._robot_endpoint_source = "external"
+    router._retraction_endpoint_source = "external"
+    router._suppress_retraction_state_machine = True
+
+    assert router._retraction_state_machine_suppressed()
+
+
+def test_virtual_voice_status_marks_source_and_state_machine_bypass() -> None:
+    router = _router("nephrectomy", "P02")
+    router._robot_endpoint_source = "virtual"
+    router._retraction_endpoint_source = "virtual"
+    router._suppress_retraction_state_machine = True
+    normalized = NormalizedRetractionCommand(
+        command=RetractionCommand.START_RETRACTION,
+        target_side=RetractionTargetSide.NONE,
+        distance_m=0.0,
+        confidence=1.0,
+        reason="typed_voice_command_intent",
+    )
+
+    router._publish_retractor_voice_status(
+        normalized=normalized,
+        interpreter_source="voice_command_intent",
+        vlm_invoked=False,
+        stage="submitted",
+        detail="virtual integration test",
+    )
+
+    payload = json.loads(router._retractor_voice_status_pub.messages[-1].data)
+    assert payload["robot_endpoint_source"] == "virtual"
+    assert payload["retraction_endpoint_source"] == "virtual"
+    assert payload["retraction_state_machine_suppressed"] is True
+
+
+def test_virtual_typed_voice_can_dispatch_out_of_sequence_but_raw_sources_cannot() -> None:
+    typed_router = _router("nephrectomy", "P02", with_controller_status=False)
+    typed_router._robot_endpoint_source = "virtual"
+    typed_router._require_bed_robot_status = False
+    typed_router._suppress_retraction_state_machine = True
+    typed_router._retractor_legacy_raw_voice_enabled = False
+
+    typed_router._on_voice_intent(
+        _typed_retractor_intent(
+            retractor_command="start_retraction",
+            raw_text="견인 시작",
+        )
+    )
+    typed_request = typed_router._request_pub.messages[-1]
+    typed_router._on_group_request(typed_request)
+
+    assert typed_router._command_pub.messages[-1].operation == "start_retraction"
+
+    for source in ("deterministic", "legacy_raw_voice"):
+        raw_router = _router("nephrectomy", "P02", with_controller_status=False)
+        raw_router._robot_endpoint_source = "virtual"
+        raw_router._require_bed_robot_status = False
+        raw_router._suppress_retraction_state_machine = True
+        raw_router._submit_normalized_retractor_request(
+            transcript="견인 시작",
+            normalized=NormalizedRetractionCommand(
+                command=RetractionCommand.START_RETRACTION,
+                target_side=RetractionTargetSide.NONE,
+                distance_m=0.0,
+                confidence=1.0,
+                reason="test",
+            ),
+            signature=f"out-of-sequence-{source}",
+            interpreter_source=source,
+            vlm_invoked=False,
+            detail="test",
+        )
+        raw_router._on_group_request(raw_router._request_pub.messages[-1])
+
+        assert raw_router._command_pub.messages == []
+
+
+def test_typed_voice_cannot_bypass_retraction_operation_capability() -> None:
+    """Lifecycle wire names still require the spec's retraction capability."""
+
+    router = _router("thyroidectomy", "P04", with_controller_status=False)
+    router._robot_endpoint_source = "virtual"
+    router._require_bed_robot_status = False
+    router._suppress_retraction_state_machine = True
+    router._retractor_legacy_raw_voice_enabled = False
+
+    router._on_voice_intent(
+        _typed_retractor_intent(
+            procedure_id="thyroidectomy",
+            retractor_command="start_direct_teach",
+            raw_text="직접 교시 시작",
+        )
+    )
+    request = router._request_pub.messages[-1]
+    router._on_group_request(request)
+
+    assert router._command_pub.messages == []
+    rejected = router._status_pub.messages[-1]
+    assert rejected.success is False
+    assert rejected.error_code == "bt_guard_rejected"
+    assert "not allowed" in rejected.message
+
+
+@pytest.mark.parametrize(
+    "retractor_command, raw_text, target_side, distance_m, expected_operation",
+    [
+        ("start_direct_teach", "직접 교시 시작", "none", 0.0, "start_direct_teach"),
+        (
+            "finish_direct_teach",
+            "직접 교시 종료",
+            "none",
+            0.0,
+            "finish_direct_teach",
+        ),
+        ("start_retraction", "리트랙션 시작", "none", 0.0, "start_retraction"),
+        (
+            "adjust_retraction",
+            "오른쪽 리트랙션을 1 센치 더 당겨줘",
+            "right",
+            0.01,
+            "retraction",
+        ),
+        ("stop_retraction", "리트랙션 종료", "none", 0.0, "stop_retraction"),
+    ],
+)
+def test_thyroid_demo_typed_voice_dispatches_five_retraction_service_commands(
+    retractor_command: str,
+    raw_text: str,
+    target_side: str,
+    distance_m: float,
+    expected_operation: str,
+) -> None:
+    allowed_router = _router(
+        "thyroidectomy_demo", "P03", with_controller_status=False
+    )
+    allowed_router._robot_endpoint_source = "virtual"
+    allowed_router._require_bed_robot_status = False
+    allowed_router._suppress_retraction_state_machine = True
+    allowed_router._retractor_legacy_raw_voice_enabled = False
+
+    allowed_router._on_voice_intent(
+        _typed_retractor_intent(
+            procedure_id="thyroidectomy_demo",
+            retractor_command=retractor_command,
+            raw_text=raw_text,
+            target_side=target_side,
+            distance_m=distance_m,
+        )
+    )
+    allowed_router._on_group_request(allowed_router._request_pub.messages[-1])
+
+    assert allowed_router._command_pub.messages[-1].operation == expected_operation
+
+
+def test_thyroid_demo_change_tool_dispatches_preconfigured_service_command() -> None:
+    router = _router(
+        "thyroidectomy_demo", "P03", with_controller_status=False
+    )
+    router._robot_endpoint_source = "virtual"
+    router._require_bed_robot_status = False
+    router._suppress_retraction_state_machine = True
+    router._retractor_legacy_raw_voice_enabled = False
+
+    router._on_voice_intent(
+        _typed_retractor_intent(
+            procedure_id="thyroidectomy_demo",
+            retractor_command="change_tool",
+            raw_text="도구 교체",
+        )
+    )
+    assert router._request_pub.messages[-1].operation == "change_end_effector"
+    router._on_group_request(router._request_pub.messages[-1])
+    dispatched = router._command_pub.messages[-1]
+    assert dispatched.operation == "change_end_effector"
+    assert dispatched.arm_id == ""
+    assert dispatched.target_tool_id == ""
+
+
+def test_thyroid_demo_cannot_mount_without_explicit_transition_capability() -> None:
+    router = _router("thyroidectomy_demo", "P04", with_controller_status=False)
+    router._robot_endpoint_source = "virtual"
+    router._require_bed_robot_status = False
+    request = _request(
+        operation="change_end_effector",
+        voice_text="아미로 교체해줘",
+        procedure="thyroidectomy_demo",
+        phase_id="P04",
+    )
+    request.arm_id = "arm_1"
+    request.target_tool_id = "army_navy_retractor"
+    request.adjustment_mode = ""
+    request.target_retractor_id = ""
+    request.direction_frame = ""
+
+    assert "not allowed" in router._request_guard_reason(request)
+
+    # Proving the second guard separately prevents a future change from
+    # treating the pre-mounted profile as a phase-authorized mount operation.
+    group = router._spec.get_bed_robot_arm_group_spec().groups[0]
+    group.allowed_operations.append("change_end_effector")
+    router._group_states["retraction"].state = "standby"
+    assert router._request_guard_reason(request) == (
+        "requested tool transition is not allowed for the current procedure phase"
+    )
+
+
 @pytest.mark.parametrize(
     ("procedure_id", "world_procedure_id", "expected_reason"),
     [
@@ -889,7 +1261,7 @@ def _service_admission(
     router._on_group_status(status)
 
 
-def test_six_retractor_voice_commands_dispatch_through_one_service_lane() -> None:
+def test_retraction_voice_commands_dispatch_through_one_service_lane() -> None:
     router = _router("nephrectomy", "P02")
 
     direct_start = _dispatch_normalized_voice(router, "직접 교시 시작")
@@ -922,17 +1294,49 @@ def test_six_retractor_voice_commands_dispatch_through_one_service_lane() -> Non
     _service_admission(router, retraction_stop, accepted=True)
     assert router._retractor_voice_state == RetractionState.IDLE
 
-    tool_change = _dispatch_normalized_voice(router, "Tool change")
-    assert tool_change.operation == "change_end_effector"
-    assert tool_change.target_tool_id == ""
-    _service_admission(router, tool_change, accepted=True)
-    assert router._retractor_voice_state == RetractionState.IDLE
-
     event = json.loads(router._retractor_voice_status_pub.messages[-1].data)
     assert event["stage"] == "service_admitted"
     assert event["interpreter_source"] == "deterministic"
     assert event["vlm_invoked"] is False
     assert event["state"] == "idle"
+
+
+def test_inguinal_demo_routes_sheet_phrase_to_army_navy_and_disables_tool_change(
+) -> None:
+    router = _router(
+        "inguinal_hernia_repair_demo",
+        "P02",
+        state_name="retracting",
+    )
+    router._retractor_voice_state = RetractionState.RETRACTION_ACTIVE
+
+    adjustment = _dispatch_normalized_voice(
+        router,
+        "아미를 오른쪽으로 1센치 더 당겨줘",
+    )
+    assert adjustment.operation == "retraction"
+    assert adjustment.target_retractor_id == "right_army_navy"
+    assert adjustment.direction == "right"
+    assert adjustment.distance_mm == pytest.approx(10.0)
+
+    tool_router = _router(
+        "inguinal_hernia_repair_demo",
+        "P02",
+        state_name="idle",
+    )
+    tool_router._retractor_voice_state = RetractionState.IDLE
+    before_commands = len(tool_router._command_pub.messages)
+    tool_change_message = String()
+    tool_change_message.data = "아미 도구로 교체해줘"
+    tool_router._on_voice(tool_change_message)
+    tool_change_request = tool_router._request_pub.messages[-1]
+    tool_router._on_group_request(tool_change_request)
+
+    assert len(tool_router._command_pub.messages) == before_commands
+    rejected = tool_router._status_pub.messages[-1]
+    assert rejected.success is False
+    assert rejected.error_code == "bt_guard_rejected"
+    assert "not allowed" in rejected.message
 
 
 def test_voice_state_does_not_advance_for_non_admission_status() -> None:

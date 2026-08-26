@@ -68,18 +68,41 @@ def parse_args() -> argparse.Namespace:
 
 
 def _runtime_tool_mapping() -> dict[str, str]:
-    """Map observable-tool catalog IDs to runtime Txx IDs for this bundle."""
+    """Map only requestable observable tools to runtime Txx IDs.
+
+    The frozen prior models future scrub-nurse-to-surgeon handovers.  A tool
+    can be present in the procedure inventory yet deliberately unavailable for
+    a new handover (for example, a field-deployed, surgeon-owned Allis).  It
+    must then form a history boundary, rather than leaking into a generated
+    candidate or joining the transitions on either side of it.
+    """
 
     prompt = load_yaml(PROCEDURE_PROMPT_PATH)
     raw_tools = prompt.get("tools")
     if not isinstance(raw_tools, Mapping):
         raise RuntimeNgramPriorBuildError("procedure prompt has no tools mapping")
     runtime_ids = {str(tool_id) for tool_id in raw_tools}
+    raw_requestable = prompt.get("requestable_tools")
+    if not isinstance(raw_requestable, list):
+        raise RuntimeNgramPriorBuildError(
+            "procedure prompt has no requestable_tools list"
+        )
+    requestable_ids = {str(tool_id).strip() for tool_id in raw_requestable}
+    if not requestable_ids or "" in requestable_ids:
+        raise RuntimeNgramPriorBuildError(
+            "procedure prompt requestable_tools must contain runtime IDs"
+        )
+    unknown_requestable = sorted(requestable_ids - runtime_ids)
+    if unknown_requestable:
+        raise RuntimeNgramPriorBuildError(
+            "procedure prompt requestable_tools contains unknown runtime IDs: "
+            + ", ".join(unknown_requestable)
+        )
     refs = tool_ref_mapping()  # Runtime Txx -> observable catalog ID.
     result = {
         observable_id: runtime_id
         for runtime_id, observable_id in refs.items()
-        if runtime_id in runtime_ids
+        if runtime_id in requestable_ids
     }
     if not result:
         raise RuntimeNgramPriorBuildError("no observable-to-runtime tool mapping")

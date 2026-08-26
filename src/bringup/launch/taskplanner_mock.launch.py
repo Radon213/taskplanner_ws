@@ -17,26 +17,66 @@ from launch.substitutions import (
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
+from procedure_spec import get_default_spec_dir, load_bundle
 
 from bringup.perception_config import resolve_launch_perception
+from bringup.runtime_core_launch import build_bt_engine_actions
 
 
 def _bed_robot_contract_configuration(context):
     bundle_id = LaunchConfiguration("default_bundle").perform(context).strip()
-    if bundle_id in {"thyroidectomy", "thyroidectomy_demo"}:
-        procedure_type = "thyroidectomy"
-    elif bundle_id == "nephrectomy":
-        procedure_type = "nephrectomy"
-    else:
-        procedure_type = ""
+    spec_dir = str(context.launch_configurations.get("spec_dir", "")).strip()
+    if not spec_dir:
+        spec_dir = str(get_default_spec_dir().parent / bundle_id)
+    runtime = load_bundle(spec_dir).get_scenario_runtime_requirements()
     return [
         SetLaunchConfiguration(
             "bed_robot_contract_enabled",
-            "true" if procedure_type else "false",
+            "true" if runtime.bed_robot_contract_enabled else "false",
         ),
         SetLaunchConfiguration(
             "bed_robot_contract_procedure_type",
-            procedure_type,
+            runtime.procedure_type,
+        ),
+        SetLaunchConfiguration(
+            "tool_handover_contract_enabled",
+            "true" if runtime.tool_handover_action_required else "false",
+        ),
+        SetLaunchConfiguration(
+            "procedure_image_vlm_enabled",
+            "true" if runtime.image_vlm_enabled else "false",
+        ),
+        SetLaunchConfiguration(
+            "procedure_dialogue_vlm_enabled",
+            "true" if runtime.dialogue_vlm_enabled else "false",
+        ),
+        SetLaunchConfiguration(
+            "procedure_perception_enabled",
+            "true" if runtime.perception_enabled else "false",
+        ),
+        SetLaunchConfiguration(
+            "voice_intent_resolver_enabled",
+            "true" if runtime.voice_intent_resolver_enabled else "false",
+        ),
+        SetLaunchConfiguration(
+            "procedure_surgeon_actor_enabled",
+            "true" if runtime.surgeon_actor_enabled else "false",
+        ),
+        SetLaunchConfiguration(
+            "procedure_phase_inference_enabled",
+            "true" if runtime.phase_inference_enabled else "false",
+        ),
+        SetLaunchConfiguration(
+            "retraction_workflow_state_enforced",
+            "true" if runtime.retraction_workflow_state_enforced else "false",
+        ),
+        SetLaunchConfiguration(
+            "retractor_legacy_raw_voice_enabled",
+            (
+                "true"
+                if runtime.legacy_raw_retractor_voice_enabled
+                else "false"
+            ),
         ),
     ]
 
@@ -53,17 +93,114 @@ def generate_launch_description() -> LaunchDescription:
     input_profile = LaunchConfiguration("input_profile")
     execution_backend = LaunchConfiguration("execution_backend")
     execution_contract = LaunchConfiguration("execution_contract")
+    robot_endpoint_source = LaunchConfiguration(
+        "robot_endpoint_source", default="external"
+    )
+    retraction_endpoint_source = LaunchConfiguration(
+        "retraction_endpoint_source", default=robot_endpoint_source
+    )
+    enable_runtime_route_control = LaunchConfiguration(
+        "enable_runtime_route_control"
+    )
+    external_controller_contract_id = LaunchConfiguration(
+        "external_controller_contract_id"
+    )
+    external_capability_policy_id = LaunchConfiguration(
+        "external_capability_policy_id"
+    )
+    controller_contract_max_age_sec = LaunchConfiguration(
+        "controller_contract_max_age_sec"
+    )
+    dispatch_readiness_max_age_sec = LaunchConfiguration(
+        "dispatch_readiness_max_age_sec"
+    )
+    asr_runtime_status_topic = LaunchConfiguration("asr_runtime_status_topic")
+    require_asr_runtime_status = LaunchConfiguration("require_asr_runtime_status")
+    asr_runtime_status_max_age_sec = LaunchConfiguration(
+        "asr_runtime_status_max_age_sec"
+    )
+    asr_runtime_status_source_future_tolerance_sec = LaunchConfiguration(
+        "asr_runtime_status_source_future_tolerance_sec"
+    )
     bed_robot_contract_enabled = LaunchConfiguration(
         "bed_robot_contract_enabled"
     )
     bed_robot_contract_procedure_type = LaunchConfiguration(
         "bed_robot_contract_procedure_type"
     )
+    tool_handover_contract_enabled = LaunchConfiguration(
+        "tool_handover_contract_enabled"
+    )
+    procedure_image_vlm_enabled = LaunchConfiguration(
+        "procedure_image_vlm_enabled"
+    )
+    procedure_dialogue_vlm_enabled = LaunchConfiguration(
+        "procedure_dialogue_vlm_enabled"
+    )
+    procedure_perception_enabled = LaunchConfiguration(
+        "procedure_perception_enabled"
+    )
+    voice_intent_resolver_enabled = LaunchConfiguration(
+        "voice_intent_resolver_enabled"
+    )
+    procedure_surgeon_actor_enabled = LaunchConfiguration(
+        "procedure_surgeon_actor_enabled"
+    )
+    procedure_phase_inference_enabled = LaunchConfiguration(
+        "procedure_phase_inference_enabled"
+    )
+    retractor_legacy_raw_voice_enabled = LaunchConfiguration(
+        "retractor_legacy_raw_voice_enabled"
+    )
     speech_input_mode = LaunchConfiguration("speech_input_mode")
+    speech_input_topic = LaunchConfiguration("speech_input_topic")
     sentence_input_topic = LaunchConfiguration("sentence_input_topic")
+    effective_speech_source_topic = PythonExpression(
+        [
+            "'",
+            speech_input_topic,
+            "' if '",
+            speech_input_mode,
+            "'.strip().lower() == 'utterance' else '",
+            sentence_input_topic,
+            "'",
+        ]
+    )
+    speech_output_mode = LaunchConfiguration("speech_output_mode")
+    speech_typed_output_topic = LaunchConfiguration("speech_typed_output_topic")
+    enable_tts_echo_guard = LaunchConfiguration("enable_tts_echo_guard")
+    tts_playback_status_topic = LaunchConfiguration(
+        "tts_playback_status_topic"
+    )
+    tts_echo_tail_sec = LaunchConfiguration("tts_echo_tail_sec")
+    tts_echo_similarity_threshold = LaunchConfiguration(
+        "tts_echo_similarity_threshold"
+    )
     speech_min_confidence = LaunchConfiguration("speech_min_confidence")
     speech_max_age_sec = LaunchConfiguration("speech_max_age_sec")
     speech_source_timeout_sec = LaunchConfiguration("speech_source_timeout_sec")
+    voice_command_input_mode = LaunchConfiguration("voice_command_input_mode")
+    voice_command_input_topic = LaunchConfiguration("voice_command_input_topic")
+    voice_command_output_topic = LaunchConfiguration("voice_command_output_topic")
+    vlm_function_gate_enabled = LaunchConfiguration(
+        "vlm_function_gate_enabled"
+    )
+    vlm_function_gate_ledger_path = LaunchConfiguration(
+        "vlm_function_gate_ledger_path"
+    )
+    voice_intent_require_source_metadata = LaunchConfiguration(
+        "voice_intent_require_source_metadata"
+    )
+    voice_intent_max_age_sec = LaunchConfiguration("voice_intent_max_age_sec")
+    voice_intent_future_tolerance_sec = LaunchConfiguration(
+        "voice_intent_future_tolerance_sec"
+    )
+    voice_intent_dedupe_retention_sec = LaunchConfiguration(
+        "voice_intent_dedupe_retention_sec"
+    )
+    hand_mapping_operator_approved = LaunchConfiguration(
+        "hand_mapping_operator_approved"
+    )
     retractor_voice_normalization_enabled = LaunchConfiguration(
         "retractor_voice_normalization_enabled"
     )
@@ -97,6 +234,15 @@ def generate_launch_description() -> LaunchDescription:
     vlm_response_mode = LaunchConfiguration("vlm_response_mode")
     vlm_context_mode = LaunchConfiguration("vlm_context_mode")
     vlm_image_stale_sec = LaunchConfiguration("vlm_image_stale_sec")
+    vlm_require_source_frame_timestamp = LaunchConfiguration(
+        "vlm_require_source_frame_timestamp"
+    )
+    vlm_model_input_max_source_lag_sec = LaunchConfiguration(
+        "vlm_model_input_max_source_lag_sec"
+    )
+    vlm_model_input_max_source_future_skew_sec = LaunchConfiguration(
+        "vlm_model_input_max_source_future_skew_sec"
+    )
     surgeon_actor_mode = LaunchConfiguration("surgeon_actor_mode")
     actor_base_url = LaunchConfiguration("actor_base_url")
     actor_provider_id = LaunchConfiguration("actor_provider_id")
@@ -137,15 +283,55 @@ def generate_launch_description() -> LaunchDescription:
     pnu_depth_alignment_id = LaunchConfiguration("pnu_depth_alignment_id")
     flir_input_topic = LaunchConfiguration("flir_input_topic")
     cam4_input_topic = LaunchConfiguration("cam4_input_topic")
+    cam3_input_topic = LaunchConfiguration("cam3_input_topic")
     field_image_topic = LaunchConfiguration("field_image_topic")
+    rfdetr_flir_output_topic = LaunchConfiguration(
+        "rfdetr_flir_output_topic"
+    )
+    composite_image_topic = LaunchConfiguration("composite_image_topic")
+    flir_overlay_image_topic = LaunchConfiguration("flir_overlay_image_topic")
     cam4_overlay_image_topic = LaunchConfiguration("cam4_overlay_image_topic")
+    cam3_overlay_image_topic = LaunchConfiguration("cam3_overlay_image_topic")
     cam4_semantics_topic = LaunchConfiguration("cam4_semantics_topic")
+    cam3_tool_observations_topic = LaunchConfiguration(
+        "cam3_tool_observations_topic"
+    )
+    cam4_tool_observations_topic = LaunchConfiguration(
+        "cam4_tool_observations_topic"
+    )
+    rfdetr_bridge_cam3_tool_observations_topic = LaunchConfiguration(
+        "rfdetr_bridge_cam3_tool_observations_topic"
+    )
+    rfdetr_bridge_cam4_tool_observations_topic = LaunchConfiguration(
+        "rfdetr_bridge_cam4_tool_observations_topic"
+    )
+    cam3_tool_observations_expected_model_version = LaunchConfiguration(
+        "cam3_tool_observations_expected_model_version"
+    )
+    cam4_tool_observations_expected_model_version = LaunchConfiguration(
+        "cam4_tool_observations_expected_model_version"
+    )
+    allow_legacy_cam4_semantics_fallback = LaunchConfiguration(
+        "allow_legacy_cam4_semantics_fallback"
+    )
     require_field_image = LaunchConfiguration("require_field_image")
+    require_rfdetr_applied_field_image = LaunchConfiguration(
+        "require_rfdetr_applied_field_image"
+    )
+    require_rfdetr_cam4_overlay = LaunchConfiguration(
+        "require_rfdetr_cam4_overlay"
+    )
     require_integration_preflight = LaunchConfiguration(
         "require_integration_preflight"
     )
     preflight_require_perception = LaunchConfiguration(
         "preflight_require_perception"
+    )
+    preflight_require_rfdetr_tool_observations = LaunchConfiguration(
+        "preflight_require_rfdetr_tool_observations"
+    )
+    rfdetr_vlm_request_context_topic = LaunchConfiguration(
+        "rfdetr_vlm_request_context_topic"
     )
     preflight_require_metric_3d = LaunchConfiguration(
         "preflight_require_metric_3d"
@@ -182,6 +368,8 @@ def generate_launch_description() -> LaunchDescription:
     mock_vlm_enabled = PythonExpression(
         [
             "'",
+            procedure_image_vlm_enabled,
+            "'.lower() == 'true' and '",
             input_profile,
             "' == 'simulation' and ('",
             vlm_mode,
@@ -191,11 +379,23 @@ def generate_launch_description() -> LaunchDescription:
         ]
     )
     real_vlm_enabled = PythonExpression(
-        ["'", vlm_mode, "' == 'real' or '", vlm_mode, "' == 'dual'"]
+        [
+            "('",
+            procedure_image_vlm_enabled,
+            "'.lower() == 'true' or '",
+            procedure_dialogue_vlm_enabled,
+            "'.lower() == 'true') and ('",
+            vlm_mode,
+            "' == 'real' or '",
+            vlm_mode,
+            "' == 'dual')",
+        ]
     )
     rule_surgeon_actor_enabled = PythonExpression(
         [
             "'",
+            procedure_surgeon_actor_enabled,
+            "'.lower() == 'true' and '",
             input_profile,
             "' == 'simulation' and '",
             surgeon_actor_mode,
@@ -205,6 +405,8 @@ def generate_launch_description() -> LaunchDescription:
     llm_surgeon_actor_enabled = PythonExpression(
         [
             "'",
+            procedure_surgeon_actor_enabled,
+            "'.lower() == 'true' and '",
             input_profile,
             "' == 'simulation' and '",
             surgeon_actor_mode,
@@ -214,6 +416,8 @@ def generate_launch_description() -> LaunchDescription:
     no_image_camera_enabled = PythonExpression(
         [
             "'",
+            procedure_image_vlm_enabled,
+            "'.lower() == 'true' and '",
             input_profile,
             "' == 'simulation' and '",
             enable_no_image_camera,
@@ -223,6 +427,8 @@ def generate_launch_description() -> LaunchDescription:
     synthetic_scene_camera_enabled = PythonExpression(
         [
             "'",
+            procedure_image_vlm_enabled,
+            "'.lower() == 'true' and '",
             input_profile,
             "' == 'simulation' and '",
             enable_synthetic_scene_camera,
@@ -265,6 +471,8 @@ def generate_launch_description() -> LaunchDescription:
     builtin_rfdetr_adapter_enabled = PythonExpression(
         [
             "'",
+            procedure_perception_enabled,
+            "'.lower() == 'true' and '",
             perception_provider,
             "' == 'builtin_rfdetr' and '",
             enable_rfdetr_perception,
@@ -272,17 +480,133 @@ def generate_launch_description() -> LaunchDescription:
         ]
     )
     pnu_adapter_enabled = PythonExpression(
-        ["'", perception_provider, "' == 'pnu_hand_blood'"]
+        [
+            "'",
+            procedure_perception_enabled,
+            "'.lower() == 'true' and '",
+            perception_provider,
+            "' == 'pnu_hand_blood'",
+        ]
     )
-    mock_direct_contract_enabled = PythonExpression(
+    virtual_robot_endpoint_enabled = PythonExpression(
+        [
+            "'",
+            robot_endpoint_source,
+            "'.strip().lower() == 'virtual'",
+        ]
+    )
+    virtual_retraction_endpoint_enabled = PythonExpression(
+        [
+            "'",
+            retraction_endpoint_source,
+            "'.strip().lower() == 'virtual'",
+        ]
+    )
+    retraction_state_machine_suppression_enabled = PythonExpression(
+        [
+            "'",
+            retraction_endpoint_source,
+            "'.strip().lower() == 'virtual' or '",
+            LaunchConfiguration("retraction_workflow_state_enforced"),
+            "'.strip().lower() != 'true'",
+        ]
+    )
+    robot_contract_emulator_enabled = PythonExpression(
+        [
+            "'",
+            execution_contract,
+            "' == 'direct' and '",
+            execution_backend,
+            "' == 'mock' and '",
+            bed_robot_contract_enabled,
+            "'.lower() == 'true' and '",
+            robot_endpoint_source,
+            "'.strip().lower() != 'virtual'",
+        ]
+    )
+    tool_handover_endpoint = PythonExpression(
+        [
+            "'/integration/virtual/surgery/tool_handover' if '",
+            robot_endpoint_source,
+            "'.strip().lower() == 'virtual' else '/surgery/tool_handover'",
+        ]
+    )
+    retraction_service_name = PythonExpression(
+        [
+            "'/integration/virtual/surgery/retraction/command' if '",
+            retraction_endpoint_source,
+            "'.strip().lower() == 'virtual' else '/surgery/retraction/command'",
+        ]
+    )
+    controller_contract_topic = PythonExpression(
+        [
+            "'/integration/virtual/surgery/controller_contract' if '",
+            robot_endpoint_source,
+            "'.strip().lower() == 'virtual' else '/surgery/controller_contract'",
+        ]
+    )
+    expected_controller_contract_id = PythonExpression(
+        [
+            "'taskplanner-virtual-eir-nuc.v1' if '",
+            robot_endpoint_source,
+            "'.strip().lower() == 'virtual' else '",
+            external_controller_contract_id,
+            "'",
+        ]
+    )
+    expected_capability_policy_id = PythonExpression(
+        [
+            "'taskplanner-virtual-full-inventory.v1' if '",
+            robot_endpoint_source,
+            "'.strip().lower() == 'virtual' else '",
+            external_capability_policy_id,
+            "'",
+        ]
+    )
+    # This switch keeps the dispatch-time integration-readiness lease armed.
+    # Controller-contract payloads are route diagnostics only and must not be
+    # reintroduced as a launch-selectable admission requirement.
+    dispatch_admission_lease_required = PythonExpression(
+        [
+            "'",
+            robot_endpoint_source,
+            "'.strip().lower() == 'virtual' or '",
+            execution_backend,
+            "'.strip().lower() == 'external'",
+        ]
+    )
+    physical_stop_confirmation_required = PythonExpression(
+        [
+            "'",
+            robot_endpoint_source,
+            "'.strip().lower() == 'external' and '",
+            execution_backend,
+            "'.strip().lower() == 'external'",
+        ]
+    )
+    # Unlike the selected-route parameter above, this is the fixed safety
+    # requirement for the external family after a stopped runtime switch.
+    # A Live process may begin on virtual and later select external, so it
+    # must not inherit virtual's ``False`` value for the external contract.
+    external_physical_stop_confirmation_required = PythonExpression(
         [
             "'",
             execution_backend,
-            "' == 'mock' and '",
-            execution_contract,
-            "' == 'direct' and '",
-            bed_robot_contract_enabled,
-            "'.lower() == 'true'",
+            "'.strip().lower() == 'external'",
+        ]
+    )
+    emulator_contract_id = PythonExpression(
+        [
+            "'taskplanner-virtual-eir-nuc.v1' if '",
+            robot_endpoint_source,
+            "'.strip().lower() == 'virtual' else 'taskplanner-generic-emulator.v1'",
+        ]
+    )
+    emulator_capability_policy_id = PythonExpression(
+        [
+            "'taskplanner-virtual-full-inventory.v1' if '",
+            robot_endpoint_source,
+            "'.strip().lower() == 'virtual' else 'taskplanner-generic-emulator.v1'",
         ]
     )
     robot_contract_profile = PathJoinSubstitution(
@@ -357,15 +681,203 @@ def generate_launch_description() -> LaunchDescription:
                     "retained only for humanoid compatibility."
                 ),
             ),
+            DeclareLaunchArgument(
+                "robot_endpoint_source",
+                default_value="external",
+                choices=("external", "virtual"),
+                description=(
+                    "Launch-lifetime robot endpoint source. virtual uses only "
+                    "the isolated /integration/virtual/* emulator namespace."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "retraction_endpoint_source",
+                default_value=robot_endpoint_source,
+                choices=("external", "virtual"),
+                description=(
+                    "Independent retraction Service source. It defaults to "
+                    "robot_endpoint_source for legacy all-real/all-virtual runs."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "enable_runtime_route_control",
+                default_value="false",
+                description=(
+                    "Enable the stopped-only Live Action/Service route "
+                    "coordinator. taskplanner_live sets this true."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "external_controller_contract_id",
+                default_value=EnvironmentVariable(
+                    "TASKPLANNER_EXTERNAL_CONTROLLER_CONTRACT_ID",
+                    default_value="eir-nuc-tool-handover.real.v1",
+                ),
+                description=(
+                    "Expected external controller manifest ID for route diagnostics; "
+                    "it is not an integration-preflight or dispatch admission gate."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "external_capability_policy_id",
+                default_value=EnvironmentVariable(
+                    "TASKPLANNER_EXTERNAL_CAPABILITY_POLICY_ID",
+                    default_value="eir-nuc-tool-handover.v1",
+                ),
+                description=(
+                    "Exact reviewed handover capability policy expected from the "
+                    "external controller manifest."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "controller_contract_max_age_sec",
+                default_value="3.0",
+                description=(
+                    "Legacy compatibility setting for controller diagnostics only; "
+                    "it never authorizes or blocks dispatch."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "dispatch_readiness_max_age_sec",
+                default_value=EnvironmentVariable(
+                    "TASKPLANNER_DISPATCH_READINESS_MAX_AGE_SEC",
+                    default_value="3.0",
+                ),
+                description=(
+                    "Maximum age of /integration/readiness at the dispatch edge. "
+                    "This is independent of controller-contract telemetry."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "asr_runtime_status_topic",
+                default_value="/input/asr/runtime_status",
+                description=(
+                    "Operational ASR status lease. Live requires a fresh, "
+                    "execution-capable payload in addition to the typed input "
+                    "publisher."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "require_asr_runtime_status",
+                default_value="false",
+                description=(
+                    "Require a fresh taskplanner.asr.status.v1 status. Live "
+                    "sets this true; Debug/replay keeps an explicit opt-in."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "asr_runtime_status_max_age_sec",
+                default_value="3.0",
+            ),
+            DeclareLaunchArgument(
+                "asr_runtime_status_source_future_tolerance_sec",
+                default_value="0.5",
+            ),
             OpaqueFunction(function=_bed_robot_contract_configuration),
             DeclareLaunchArgument("speech_input_mode", default_value="utterance"),
+            DeclareLaunchArgument(
+                "speech_input_topic",
+                default_value="/sensors/speech/utterance",
+            ),
             DeclareLaunchArgument(
                 "sentence_input_topic",
                 default_value="/sensors/surgeon/sentence",
             ),
+            DeclareLaunchArgument(
+                "speech_output_mode",
+                default_value="sentence_text",
+                choices=("sentence_text", "typed_utterance"),
+                description=(
+                    "sentence_text is Debug/replay compatibility; "
+                    "typed_utterance preserves final ASR metadata."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "speech_typed_output_topic",
+                default_value="/surgery/audio/admitted_utterance",
+            ),
+            DeclareLaunchArgument(
+                "enable_tts_echo_guard",
+                default_value="false",
+                description=(
+                    "Suppress typed ASR transcripts that match locally audible "
+                    "TTS playback. Live enables this; mock/replay stays opt-in."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "tts_playback_status_topic",
+                default_value="/tts/playback_status",
+            ),
+            DeclareLaunchArgument("tts_echo_tail_sec", default_value="0.8"),
+            DeclareLaunchArgument(
+                "tts_echo_similarity_threshold",
+                default_value="0.88",
+            ),
             DeclareLaunchArgument("speech_min_confidence", default_value="0.55"),
             DeclareLaunchArgument("speech_max_age_sec", default_value="3.0"),
             DeclareLaunchArgument("speech_source_timeout_sec", default_value="5.0"),
+            DeclareLaunchArgument(
+                "voice_command_input_mode",
+                default_value="sentence_text",
+                choices=("sentence_text", "utterance"),
+            ),
+            DeclareLaunchArgument(
+                "voice_command_input_topic",
+                default_value="/surgery/audio/request_text",
+            ),
+            DeclareLaunchArgument(
+                "voice_command_output_topic",
+                default_value="/surgery/voice/intent",
+            ),
+            DeclareLaunchArgument(
+                "vlm_function_gate_enabled",
+                default_value="false",
+                description=(
+                    "Join the exact VLM function call, typed ASR turn, and "
+                    "resolver proposal before publishing an executable intent."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "vlm_function_gate_ledger_path",
+                default_value="/tmp/taskplanner-vlm-function-gate.sqlite3",
+            ),
+            DeclareLaunchArgument(
+                "voice_intent_require_source_metadata",
+                default_value="false",
+            ),
+            DeclareLaunchArgument("voice_intent_max_age_sec", default_value="3.0"),
+            DeclareLaunchArgument(
+                "voice_intent_future_tolerance_sec", default_value="1.0"
+            ),
+            DeclareLaunchArgument(
+                "voice_intent_dedupe_retention_sec", default_value="120.0"
+            ),
+            DeclareLaunchArgument(
+                "hand_mapping_operator_approved",
+                default_value="false",
+                description=(
+                    "Explicit operator record that the pinned CAM4 Right/palm "
+                    "mapping passed its live check. False keeps handover fail-closed."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "enable_voice_procedure_control",
+                default_value="false",
+                description=(
+                    "Permit validated typed voice lifecycle proposals to use "
+                    "the normal integration-preflight-gated simulation control path."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "voice_procedure_accept_missing_confidence",
+                default_value="false",
+                description=(
+                    "Permit a final typed ASR lifecycle command when its "
+                    "source explicitly reports that calibrated confidence is "
+                    "unavailable. Live opts in; supplied low confidence is "
+                    "still rejected."
+                ),
+            ),
             DeclareLaunchArgument(
                 "retractor_voice_normalization_enabled", default_value="true"
             ),
@@ -413,6 +925,15 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("vlm_response_mode", default_value="live"),
             DeclareLaunchArgument("vlm_context_mode", default_value="actor_log"),
             DeclareLaunchArgument("vlm_image_stale_sec", default_value="3.0"),
+            DeclareLaunchArgument(
+                "vlm_require_source_frame_timestamp", default_value="false"
+            ),
+            DeclareLaunchArgument(
+                "vlm_model_input_max_source_lag_sec", default_value="0.0"
+            ),
+            DeclareLaunchArgument(
+                "vlm_model_input_max_source_future_skew_sec", default_value="1.0"
+            ),
             DeclareLaunchArgument("surgeon_actor_mode", default_value="llm"),
             DeclareLaunchArgument("actor_base_url", default_value="http://127.0.0.1:1234"),
             DeclareLaunchArgument("actor_provider_id", default_value="auto"),
@@ -563,18 +1084,118 @@ def generate_launch_description() -> LaunchDescription:
                 default_value="/surgery/images/cam4/compressed",
             ),
             DeclareLaunchArgument(
+                "cam3_input_topic",
+                default_value=EnvironmentVariable(
+                    "CAM3_INPUT_TOPIC",
+                    default_value="",
+                ),
+                description=(
+                    "Optional CAM3 RGB input for the local RF-DETR camera "
+                    "model. When set, it shares CAM4's checkpoint and model "
+                    "instance."
+                ),
+            ),
+            DeclareLaunchArgument(
                 "field_image_topic",
                 default_value="/surgery/images/field/compressed",
+            ),
+            DeclareLaunchArgument(
+                "rfdetr_flir_output_topic",
+                default_value="/surgery/images/field/compressed",
+                description=(
+                    "RF-DETR segmented FLIR raster for local operator "
+                    "display. This is independent from the real VLM's raw "
+                    "visual input topic."
+                ),
+            ),
+            # Debug/mock keep the established public default.  Live overrides
+            # this with its local RF-DETR-only model-ready image.
+            DeclareLaunchArgument(
+                "composite_image_topic",
+                default_value="/surgery/images/vlm/composite/compressed",
+            ),
+            DeclareLaunchArgument(
+                "flir_overlay_image_topic",
+                default_value=(
+                    "/surgery/images/flir/segmentation_overlay/compressed"
+                ),
             ),
             DeclareLaunchArgument(
                 "cam4_overlay_image_topic",
                 default_value="/surgery/images/cam4/detection_overlay/compressed",
             ),
             DeclareLaunchArgument(
+                "cam3_overlay_image_topic",
+                default_value=EnvironmentVariable(
+                    "CAM3_RFDETR_OVERLAY_TOPIC",
+                    default_value=(
+                        "/taskplanner/internal/rfdetr/cam3/"
+                        "detection_overlay/compressed"
+                    ),
+                ),
+                description="Optional local CAM3 RF-DETR transparent overlay.",
+            ),
+            DeclareLaunchArgument(
                 "cam4_semantics_topic",
                 default_value="",
             ),
+            DeclareLaunchArgument(
+                "cam3_tool_observations_topic",
+                default_value="",
+                description=(
+                    "Optional typed CAM3 RF-DETR ToolObservation2DArray "
+                    "input for the real VLM."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "cam4_tool_observations_topic",
+                default_value="",
+                description=(
+                    "Optional typed CAM4 RF-DETR ToolObservation2DArray "
+                    "input for the real VLM."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "rfdetr_bridge_cam3_tool_observations_topic",
+                default_value=(
+                    "/taskplanner/internal/rfdetr/cam_3/tool/observations"
+                ),
+                description=(
+                    "Local HTTP RF-DETR bridge output. Keep distinct from the "
+                    "authoritative typed observation input."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "rfdetr_bridge_cam4_tool_observations_topic",
+                default_value=(
+                    "/taskplanner/internal/rfdetr/cam_4/tool/observations"
+                ),
+                description=(
+                    "Local HTTP RF-DETR bridge output. Keep distinct from the "
+                    "authoritative typed observation input."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "cam3_tool_observations_expected_model_version",
+                default_value="",
+            ),
+            DeclareLaunchArgument(
+                "cam4_tool_observations_expected_model_version",
+                default_value="",
+            ),
+            DeclareLaunchArgument(
+                "allow_legacy_cam4_semantics_fallback",
+                default_value="true",
+            ),
             DeclareLaunchArgument("require_field_image", default_value="false"),
+            DeclareLaunchArgument(
+                "require_rfdetr_applied_field_image",
+                default_value="false",
+            ),
+            DeclareLaunchArgument(
+                "require_rfdetr_cam4_overlay",
+                default_value="false",
+            ),
             DeclareLaunchArgument(
                 "require_integration_preflight",
                 default_value="false",
@@ -582,6 +1203,22 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument(
                 "preflight_require_perception",
                 default_value="false",
+            ),
+            DeclareLaunchArgument(
+                "preflight_require_rfdetr_tool_observations",
+                default_value="false",
+                description=(
+                    "Require fresh typed CAM3/CAM4 RF-DETR tool observations "
+                    "for integration-start admission."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "rfdetr_vlm_request_context_topic",
+                default_value="/context/vlm_request_context",
+                description=(
+                    "Read-only VLM request-context topic used only to display "
+                    "optional CAM3/CAM4 visual-alignment status."
+                ),
             ),
             DeclareLaunchArgument(
                 "preflight_require_metric_3d",
@@ -653,6 +1290,7 @@ def generate_launch_description() -> LaunchDescription:
                 parameters=[
                     {
                         "default_bundle": default_bundle,
+                        "spec_dir": spec_dir,
                         "publish_free_text": ParameterValue(
                             publish_shared_free_text,
                             value_type=bool,
@@ -661,19 +1299,7 @@ def generate_launch_description() -> LaunchDescription:
                 ],
                 output="screen",
             ),
-            Node(
-                package="btops_gateway",
-                executable="btops_gateway",
-                name="btops_gateway",
-                output="screen",
-            ),
-            Node(
-                package="auto_apms_behavior_tree",
-                executable="tree_executor",
-                name="tree_executor",
-                parameters=[{"tick_rate": 0.1, "groot2_port": 0, "state_change_logger": True}],
-                output="screen",
-            ),
+            *build_bt_engine_actions(),
             Node(
                 package="simulation_runtime",
                 executable="speech_input_adapter",
@@ -681,7 +1307,16 @@ def generate_launch_description() -> LaunchDescription:
                 parameters=[
                     {
                         "input_mode": speech_input_mode,
+                        "input_topic": speech_input_topic,
                         "sentence_input_topic": sentence_input_topic,
+                        "output_mode": speech_output_mode,
+                        "typed_output_topic": speech_typed_output_topic,
+                        "enable_tts_echo_guard": enable_tts_echo_guard,
+                        "tts_playback_status_topic": tts_playback_status_topic,
+                        "tts_echo_tail_sec": tts_echo_tail_sec,
+                        "tts_echo_similarity_threshold": (
+                            tts_echo_similarity_threshold
+                        ),
                         "min_confidence": speech_min_confidence,
                         "max_age_sec": speech_max_age_sec,
                         "source_timeout_sec": speech_source_timeout_sec,
@@ -696,10 +1331,24 @@ def generate_launch_description() -> LaunchDescription:
                 package="voice_command",
                 executable="voice_intent_resolver",
                 name="voice_command_resolver",
+                condition=IfCondition(voice_intent_resolver_enabled),
                 parameters=[
                     {
-                        "input_topic": "/surgery/audio/request_text",
-                        "output_topic": "/surgery/voice/intent",
+                        "input_mode": voice_command_input_mode,
+                        "input_topic": voice_command_input_topic,
+                        "output_topic": voice_command_output_topic,
+                        "typed_input_max_age_sec": ParameterValue(
+                            voice_intent_max_age_sec,
+                            value_type=float,
+                        ),
+                        "typed_input_max_future_skew_sec": ParameterValue(
+                            voice_intent_future_tolerance_sec,
+                            value_type=float,
+                        ),
+                        "typed_input_dedupe_retention_sec": ParameterValue(
+                            voice_intent_dedupe_retention_sec,
+                            value_type=float,
+                        ),
                         # Bind aliases to this exact ProcedureSpec bundle;
                         # never fall back to a global T-ID vocabulary.
                         "procedure_bundle": spec_dir,
@@ -708,6 +1357,36 @@ def generate_launch_description() -> LaunchDescription:
                         "selector_model": voice_command_selector_model,
                         "selector_timeout_sec": ParameterValue(
                             voice_command_selector_timeout_sec,
+                            value_type=float,
+                        ),
+                    }
+                ],
+                output="screen",
+            ),
+            Node(
+                package="voice_command",
+                executable="vlm_function_admission_gate",
+                name="vlm_function_admission_gate",
+                condition=IfCondition(vlm_function_gate_enabled),
+                parameters=[
+                    {
+                        "ledger_path": vlm_function_gate_ledger_path,
+                        "proposal_topic": "/surgery/voice/proposal",
+                        "admitted_speech_topic": (
+                            "/surgery/audio/admitted_utterance"
+                        ),
+                        "vlm_reply_topic": "/vlm/humanoid_reply",
+                        "intent_output_topic": "/surgery/voice/intent",
+                        "reply_output_topic": "/tts/admitted_reply",
+                        "gateway_topic": "/surgery/gateway_info",
+                        "tts_status_topic": "/tts/playback_status",
+                        "twin_event_topic": "/twin/events",
+                        "retractor_status_topic": (
+                            "/bed_robot_arm_group/voice_normalization_status"
+                        ),
+                        "retry_period_sec": 0.5,
+                        "input_max_age_sec": ParameterValue(
+                            voice_intent_max_age_sec,
                             value_type=float,
                         ),
                     }
@@ -738,7 +1417,13 @@ def generate_launch_description() -> LaunchDescription:
                         ),
                         "enable_vlm": ParameterValue(
                             PythonExpression(
-                                ["'", vlm_mode, "' in ('real', 'dual')"]
+                                [
+                                    "'",
+                                    procedure_image_vlm_enabled,
+                                    "'.lower() == 'true' and '",
+                                    vlm_mode,
+                                    "' in ('real', 'dual')",
+                                ]
                             ),
                             value_type=bool,
                         ),
@@ -796,9 +1481,18 @@ def generate_launch_description() -> LaunchDescription:
                         "service_url": perception_endpoint,
                         "flir_input_topic": flir_input_topic,
                         "cam4_input_topic": cam4_input_topic,
-                        "flir_output_topic": field_image_topic,
+                        "cam3_input_topic": cam3_input_topic,
+                        "flir_output_topic": rfdetr_flir_output_topic,
+                        "flir_overlay_topic": flir_overlay_image_topic,
                         "cam4_overlay_topic": cam4_overlay_image_topic,
+                        "cam3_overlay_topic": cam3_overlay_image_topic,
                         "cam4_semantics_topic": cam4_semantics_topic,
+                        "cam3_tool_observations_topic": (
+                            rfdetr_bridge_cam3_tool_observations_topic
+                        ),
+                        "cam4_tool_observations_topic": (
+                            rfdetr_bridge_cam4_tool_observations_topic
+                        ),
                         "max_rate_hz": 15.0,
                         "segmented_output_rate_hz": 2.0,
                     }
@@ -860,7 +1554,7 @@ def generate_launch_description() -> LaunchDescription:
                             value_type=bool,
                         ),
                         "depth_alignment_id": pnu_depth_alignment_id,
-                        "requested_algorithms": ["tool", "blood", "hand"],
+                        "requested_algorithms": ["tool", "blood"],
                         "max_rate_hz": 15.0,
                     }
                 ],
@@ -911,7 +1605,15 @@ def generate_launch_description() -> LaunchDescription:
                 executable="snapshot_bridge",
                 name="field_snapshot_bridge",
                 condition=IfCondition(
-                    PythonExpression(["'", field_snapshot_url, "' != ''"])
+                    PythonExpression(
+                        [
+                            "'",
+                            procedure_image_vlm_enabled,
+                            "'.lower() == 'true' and '",
+                            field_snapshot_url,
+                            "' != ''",
+                        ]
+                    )
                 ),
                 parameters=[
                     {
@@ -944,13 +1646,54 @@ def generate_launch_description() -> LaunchDescription:
                         "response_mode": vlm_response_mode,
                         "context_mode": vlm_context_mode,
                         "image_stale_sec": vlm_image_stale_sec,
+                        "require_source_frame_timestamp": ParameterValue(
+                            vlm_require_source_frame_timestamp,
+                            value_type=bool,
+                        ),
+                        "model_input_max_source_lag_sec": ParameterValue(
+                            vlm_model_input_max_source_lag_sec,
+                            value_type=float,
+                        ),
+                        "model_input_max_source_future_skew_sec": ParameterValue(
+                            vlm_model_input_max_source_future_skew_sec,
+                            value_type=float,
+                        ),
                         "field_image_topic": field_image_topic,
                         "raw_field_image_topic": flir_input_topic,
                         "cam4_image_topic": cam4_input_topic,
                         "cam4_overlay_image_topic": cam4_overlay_image_topic,
+                        "composite_image_topic": composite_image_topic,
                         "cam4_semantics_topic": cam4_semantics_topic,
+                        "cam3_tool_observations_topic": (
+                            cam3_tool_observations_topic
+                        ),
+                        "cam4_tool_observations_topic": (
+                            cam4_tool_observations_topic
+                        ),
+                        "cam3_tool_observations_expected_model_version": (
+                            cam3_tool_observations_expected_model_version
+                        ),
+                        "cam4_tool_observations_expected_model_version": (
+                            cam4_tool_observations_expected_model_version
+                        ),
+                        "allow_legacy_cam4_semantics_fallback": ParameterValue(
+                            allow_legacy_cam4_semantics_fallback,
+                            value_type=bool,
+                        ),
                         "require_field_image": ParameterValue(
                             require_field_image,
+                            value_type=bool,
+                        ),
+                        "enable_text_only_dialogue": ParameterValue(
+                            procedure_dialogue_vlm_enabled,
+                            value_type=bool,
+                        ),
+                        "require_rfdetr_applied_field_image": ParameterValue(
+                            require_rfdetr_applied_field_image,
+                            value_type=bool,
+                        ),
+                        "require_rfdetr_cam4_overlay": ParameterValue(
+                            require_rfdetr_cam4_overlay,
                             value_type=bool,
                         ),
                         "output_prefix": PythonExpression(
@@ -1004,7 +1747,15 @@ def generate_launch_description() -> LaunchDescription:
                 executable="phase_estimator",
                 name="phase_estimator",
                 condition=IfCondition(
-                    PythonExpression(["'", validation_mode, "' != 'bt_twin'"])
+                    PythonExpression(
+                        [
+                            "'",
+                            procedure_phase_inference_enabled,
+                            "'.lower() == 'true' and '",
+                            validation_mode,
+                            "' != 'bt_twin'",
+                        ]
+                    )
                 ),
                 parameters=[{"spec_dir": spec_dir}],
                 output="screen",
@@ -1017,12 +1768,47 @@ def generate_launch_description() -> LaunchDescription:
                     {
                         "spec_dir": spec_dir,
                         "validation_mode": validation_mode,
-                        "vlm_mode": vlm_mode,
+                        "vlm_mode": PythonExpression(
+                            [
+                                "'",
+                                vlm_mode,
+                                "' if '",
+                                procedure_image_vlm_enabled,
+                                "'.lower() == 'true' else 'disabled'",
+                            ]
+                        ),
                         "tool_predict_evidence_confidence_threshold": 0.5,
-                        "tool_predict_stability_sec": 3.0,
-                        "vlm_implicit_request_confidence_threshold": 0.8,
-                        "vlm_implicit_request_stability_sec": 0.7,
-                        "vlm_implicit_request_release_sec": 1.5,
+                        "tool_predict_confidence_threshold": 0.55,
+                        "tool_predict_stability_sec": 0.30,
+                        "hand_handover_dwell_sec": 0.300,
+                        "hand_handover_release_sec": 0.500,
+                        "hand_handover_max_positive_gap_sec": 0.200,
+                        "hand_handover_observation_timeout_sec": 0.400,
+                        "hand_handover_minimum_positive_samples": 4,
+                        "hand_handover_minimum_palm_up_score": 0.0,
+                        "hand_expected_source_frame_id": (
+                            "cam_4_color_optical_frame"
+                        ),
+                        "hand_mapping_operator_approved": ParameterValue(
+                            hand_mapping_operator_approved,
+                            value_type=bool,
+                        ),
+                        "require_voice_intent_source_metadata": ParameterValue(
+                            voice_intent_require_source_metadata,
+                            value_type=bool,
+                        ),
+                        "voice_intent_max_age_sec": ParameterValue(
+                            voice_intent_max_age_sec,
+                            value_type=float,
+                        ),
+                        "voice_intent_future_tolerance_sec": ParameterValue(
+                            voice_intent_future_tolerance_sec,
+                            value_type=float,
+                        ),
+                        "voice_intent_dedupe_retention_sec": ParameterValue(
+                            voice_intent_dedupe_retention_sec,
+                            value_type=float,
+                        ),
                         "accept_validation_actor_events": False,
                         "phase_authority": PythonExpression(
                             ["'legacy_estimator' if '", validation_mode, "' == 'demo' else 'reducer'"]
@@ -1069,7 +1855,7 @@ def generate_launch_description() -> LaunchDescription:
                 package="surgical_interop_execution",
                 executable="fault_action_emulator",
                 name="robot_contract_emulator",
-                condition=IfCondition(mock_direct_contract_enabled),
+                condition=IfCondition(robot_contract_emulator_enabled),
                 parameters=[
                     {
                         "profile_path": robot_contract_profile,
@@ -1077,6 +1863,59 @@ def generate_launch_description() -> LaunchDescription:
                             bed_robot_contract_procedure_type,
                             value_type=str,
                         ),
+                        "robot_endpoint_source": robot_endpoint_source,
+                        "tool_handover_endpoint": tool_handover_endpoint,
+                        # This emulator owns only the public external family.
+                        # The isolated virtual emulator below owns its own pair.
+                        "retraction_service_name": "/surgery/retraction/command",
+                        "controller_contract_topic": controller_contract_topic,
+                        "controller_contract_id": emulator_contract_id,
+                        "capability_policy_id": emulator_capability_policy_id,
+                        "publish_bed_robot_status": ParameterValue(
+                            PythonExpression(
+                                [
+                                    "not ('",
+                                    retraction_endpoint_source,
+                                    "'.strip().lower() == 'virtual')",
+                                ]
+                            ),
+                            value_type=bool,
+                        ),
+                    }
+                ],
+                output="screen",
+            ),
+            # Keep the isolated virtual server available even when Live began
+            # on the external controller. It never binds a public /surgery/*
+            # name, so stopped-only UI route changes cannot shadow a partner
+            # controller or emit physical motion.
+            Node(
+                package="surgical_interop_execution",
+                executable="fault_action_emulator",
+                name="virtual_robot_contract_emulator",
+                condition=IfCondition(direct_execution_bridge_enabled),
+                parameters=[
+                    {
+                        "profile_path": robot_contract_profile,
+                        "procedure_type": ParameterValue(
+                            bed_robot_contract_procedure_type,
+                            value_type=str,
+                        ),
+                        "robot_endpoint_source": "virtual",
+                        "tool_handover_endpoint": (
+                            "/integration/virtual/surgery/tool_handover"
+                        ),
+                        "retraction_service_name": (
+                            "/integration/virtual/surgery/retraction/command"
+                        ),
+                        "controller_contract_topic": (
+                            "/integration/virtual/surgery/controller_contract"
+                        ),
+                        "controller_contract_id": "taskplanner-virtual-eir-nuc.v1",
+                        "capability_policy_id": (
+                            "taskplanner-virtual-full-inventory.v1"
+                        ),
+                        "publish_bed_robot_status": False,
                     }
                 ],
                 output="screen",
@@ -1089,11 +1928,92 @@ def generate_launch_description() -> LaunchDescription:
                 parameters=[
                     {
                         "spec_dir": spec_dir,
-                        "tool_handover_endpoint": "/surgery/tool_handover",
-                        "retraction_service_name": "/surgery/retraction/command",
+                        "robot_endpoint_source": robot_endpoint_source,
+                        "retraction_endpoint_source": retraction_endpoint_source,
+                        "retraction_state_machine_suppressed": ParameterValue(
+                            retraction_state_machine_suppression_enabled,
+                            value_type=bool,
+                        ),
+                        "enable_runtime_route_control": ParameterValue(
+                            enable_runtime_route_control,
+                            value_type=bool,
+                        ),
+                        "direct_hand_dispatch_ledger_path": EnvironmentVariable(
+                            "TASKPLANNER_DIRECT_HAND_LEDGER_PATH",
+                            default_value=(
+                                "/tmp/taskplanner-direct-hand-dispatch.sqlite3"
+                            ),
+                        ),
+                        "direct_hand_state_max_age_sec": 1.0,
+                        "tool_handover_endpoint": tool_handover_endpoint,
+                        # Both endpoint families are declared up front.  The
+                        # stopped-only coordinator selects these reviewed
+                        # pairs atomically; it never accepts endpoint text
+                        # from the browser.
+                        "external_tool_handover_endpoint": (
+                            "/surgery/tool_handover"
+                        ),
+                        "virtual_tool_handover_endpoint": (
+                            "/integration/virtual/surgery/tool_handover"
+                        ),
+                        "tool_handover_enabled": ParameterValue(
+                            tool_handover_contract_enabled,
+                            value_type=bool,
+                        ),
+                        "retraction_service_name": retraction_service_name,
+                        "external_retraction_service_name": (
+                            "/surgery/retraction/command"
+                        ),
+                        "virtual_retraction_service_name": (
+                            "/integration/virtual/surgery/retraction/command"
+                        ),
                         "bed_robot_status_endpoint": "/external/bed_robot_arms/status",
                         "require_bed_robot_status": ParameterValue(
-                            bed_robot_contract_enabled,
+                            PythonExpression(["False"]), value_type=bool
+                        ),
+                        "require_dispatch_admission_lease": ParameterValue(
+                            dispatch_admission_lease_required,
+                            value_type=bool,
+                        ),
+                        "controller_contract_topic": controller_contract_topic,
+                        "external_controller_contract_topic": (
+                            "/surgery/controller_contract"
+                        ),
+                        "virtual_controller_contract_topic": (
+                            "/integration/virtual/surgery/controller_contract"
+                        ),
+                        "expected_controller_contract_id": (
+                            expected_controller_contract_id
+                        ),
+                        "external_expected_controller_contract_id": (
+                            external_controller_contract_id
+                        ),
+                        "virtual_expected_controller_contract_id": (
+                            "taskplanner-virtual-eir-nuc.v1"
+                        ),
+                        "expected_capability_policy_id": (
+                            expected_capability_policy_id
+                        ),
+                        "external_expected_capability_policy_id": (
+                            external_capability_policy_id
+                        ),
+                        "virtual_expected_capability_policy_id": (
+                            "taskplanner-virtual-full-inventory.v1"
+                        ),
+                        "external_require_bed_robot_status": False,
+                        "external_require_physical_stop_confirmation": (
+                            ParameterValue(
+                                external_physical_stop_confirmation_required,
+                                value_type=bool,
+                            )
+                        ),
+                        "integration_readiness_topic": "/integration/readiness",
+                        "admission_lease_max_age_sec": ParameterValue(
+                            dispatch_readiness_max_age_sec,
+                            value_type=float,
+                        ),
+                        "require_physical_stop_confirmation": ParameterValue(
+                            physical_stop_confirmation_required,
                             value_type=bool,
                         ),
                         "server_wait_timeout_sec": 3.0,
@@ -1124,6 +2044,10 @@ def generate_launch_description() -> LaunchDescription:
                             retractor_voice_normalization_enabled,
                             value_type=bool,
                         ),
+                        "retractor_legacy_raw_voice_enabled": ParameterValue(
+                            retractor_legacy_raw_voice_enabled,
+                            value_type=bool,
+                        ),
                         "retractor_voice_interpreter_mode": retractor_voice_interpreter_mode,
                         "retractor_voice_vlm_base_url": retractor_voice_vlm_base_url,
                         "retractor_voice_vlm_model_id": retractor_voice_vlm_model_id,
@@ -1131,6 +2055,31 @@ def generate_launch_description() -> LaunchDescription:
                         "retractor_voice_vlm_timeout_sec": ParameterValue(
                             retractor_voice_vlm_timeout_sec,
                             value_type=float,
+                        ),
+                        "require_voice_intent_source_metadata": ParameterValue(
+                            voice_intent_require_source_metadata,
+                            value_type=bool,
+                        ),
+                        "voice_intent_max_age_sec": ParameterValue(
+                            voice_intent_max_age_sec,
+                            value_type=float,
+                        ),
+                        "voice_intent_future_tolerance_sec": ParameterValue(
+                            voice_intent_future_tolerance_sec,
+                            value_type=float,
+                        ),
+                        "voice_intent_dedupe_retention_sec": ParameterValue(
+                            voice_intent_dedupe_retention_sec,
+                            value_type=float,
+                        ),
+                        "robot_endpoint_source": robot_endpoint_source,
+                        "retraction_endpoint_source": retraction_endpoint_source,
+                        "require_bed_robot_status": ParameterValue(
+                            PythonExpression(["False"]), value_type=bool
+                        ),
+                        "suppress_retraction_state_machine": ParameterValue(
+                            retraction_state_machine_suppression_enabled,
+                            value_type=bool,
                         ),
                     }
                 ],
@@ -1143,9 +2092,45 @@ def generate_launch_description() -> LaunchDescription:
                 condition=IfCondition(require_integration_preflight),
                 parameters=[
                     {
+                        # Count the actual admitted source. A typed Live ASR
+                        # route must never be satisfied by an unrelated legacy
+                        # /sensors/surgeon/sentence publisher.
                         "sentence_topic": sentence_input_topic,
-                        "tool_handover_action_name": "/surgery/tool_handover",
-                        "retraction_service_name": "/surgery/retraction/command",
+                        "speech_source_topic": effective_speech_source_topic,
+                        "asr_runtime_status_topic": asr_runtime_status_topic,
+                        "require_asr_runtime_status": ParameterValue(
+                            require_asr_runtime_status,
+                            value_type=bool,
+                        ),
+                        "asr_runtime_status_max_age_sec": ParameterValue(
+                            asr_runtime_status_max_age_sec,
+                            value_type=float,
+                        ),
+                        "asr_runtime_status_source_future_tolerance_sec": (
+                            ParameterValue(
+                                asr_runtime_status_source_future_tolerance_sec,
+                                value_type=float,
+                            )
+                        ),
+                        "spec_dir": spec_dir,
+                        "tool_handover_action_name": tool_handover_endpoint,
+                        "external_tool_handover_action_name": (
+                            "/surgery/tool_handover"
+                        ),
+                        "virtual_tool_handover_action_name": (
+                            "/integration/virtual/surgery/tool_handover"
+                        ),
+                        "require_tool_handover_action_server": ParameterValue(
+                            tool_handover_contract_enabled,
+                            value_type=bool,
+                        ),
+                        "retraction_service_name": retraction_service_name,
+                        "external_retraction_service_name": (
+                            "/surgery/retraction/command"
+                        ),
+                        "virtual_retraction_service_name": (
+                            "/integration/virtual/surgery/retraction/command"
+                        ),
                         "require_retraction_service": ParameterValue(
                             bed_robot_contract_enabled,
                             value_type=bool,
@@ -1157,13 +2142,101 @@ def generate_launch_description() -> LaunchDescription:
                             value_type=str,
                         ),
                         "require_bed_robot_arm_status": ParameterValue(
-                            bed_robot_contract_enabled,
+                            PythonExpression(["False"]), value_type=bool
+                        ),
+                        "robot_endpoint_source": robot_endpoint_source,
+                        "retraction_endpoint_source": retraction_endpoint_source,
+                        "enable_runtime_route_control": ParameterValue(
+                            enable_runtime_route_control,
+                            value_type=bool,
+                        ),
+                        # Controller contracts remain bridge/controller
+                        # telemetry; integration-start admission is based on
+                        # discovery of the selected Action and Service only.
+                        "require_controller_contract": False,
+                        "controller_contract_topic": controller_contract_topic,
+                        "external_controller_contract_topic": (
+                            "/surgery/controller_contract"
+                        ),
+                        "virtual_controller_contract_topic": (
+                            "/integration/virtual/surgery/controller_contract"
+                        ),
+                        "expected_controller_contract_id": (
+                            expected_controller_contract_id
+                        ),
+                        "external_expected_controller_contract_id": (
+                            external_controller_contract_id
+                        ),
+                        "virtual_expected_controller_contract_id": (
+                            "taskplanner-virtual-eir-nuc.v1"
+                        ),
+                        "expected_capability_policy_id": (
+                            expected_capability_policy_id
+                        ),
+                        "external_expected_capability_policy_id": (
+                            external_capability_policy_id
+                        ),
+                        "virtual_expected_capability_policy_id": (
+                            "taskplanner-virtual-full-inventory.v1"
+                        ),
+                        "external_require_bed_robot_arm_status": False,
+                        "external_require_physical_stop_confirmation": (
+                            ParameterValue(
+                                external_physical_stop_confirmation_required,
+                                value_type=bool,
+                            )
+                        ),
+                        "controller_contract_max_age_sec": ParameterValue(
+                            controller_contract_max_age_sec,
+                            value_type=float,
+                        ),
+                        "require_physical_stop_confirmation": ParameterValue(
+                            physical_stop_confirmation_required,
+                            value_type=bool,
+                        ),
+                        "retraction_state_machine_suppressed": ParameterValue(
+                            retraction_state_machine_suppression_enabled,
                             value_type=bool,
                         ),
                         "require_sentence_publisher": True,
                         "require_perception": ParameterValue(
-                            preflight_require_perception,
+                            PythonExpression(
+                                [
+                                    "'",
+                                    procedure_perception_enabled,
+                                    "'.lower() == 'true' and '",
+                                    preflight_require_perception,
+                                    "'.lower() in ('true', '1', 'yes')",
+                                ]
+                            ),
                             value_type=bool,
+                        ),
+                        "require_rfdetr_tool_observations": ParameterValue(
+                            PythonExpression(
+                                [
+                                    "'",
+                                    procedure_perception_enabled,
+                                    "'.lower() == 'true' and '",
+                                    preflight_require_rfdetr_tool_observations,
+                                    "'.lower() in ('true', '1', 'yes')",
+                                ]
+                            ),
+                            value_type=bool,
+                        ),
+                        "cam3_tool_observations_topic": (
+                            cam3_tool_observations_topic
+                        ),
+                        "cam4_tool_observations_topic": (
+                            cam4_tool_observations_topic
+                        ),
+                        "cam3_tool_observations_expected_model_version": (
+                            cam3_tool_observations_expected_model_version
+                        ),
+                        "cam4_tool_observations_expected_model_version": (
+                            cam4_tool_observations_expected_model_version
+                        ),
+                        "rfdetr_vlm_request_context_topic": (
+                            rfdetr_vlm_request_context_topic
                         ),
                         "require_metric_3d": ParameterValue(
                             preflight_require_metric_3d,
@@ -1188,6 +2261,37 @@ def generate_launch_description() -> LaunchDescription:
                         "require_integration_preflight": ParameterValue(
                             require_integration_preflight,
                             value_type=bool,
+                        ),
+                        "enable_runtime_route_control": ParameterValue(
+                            enable_runtime_route_control,
+                            value_type=bool,
+                        ),
+                        "enable_voice_procedure_control": ParameterValue(
+                            LaunchConfiguration("enable_voice_procedure_control"),
+                            value_type=bool,
+                        ),
+                        "voice_intent_topic": "/surgery/voice/intent",
+                        "voice_procedure_min_confidence": ParameterValue(
+                            speech_min_confidence,
+                            value_type=float,
+                        ),
+                        "voice_procedure_accept_missing_confidence": ParameterValue(
+                            LaunchConfiguration(
+                                "voice_procedure_accept_missing_confidence"
+                            ),
+                            value_type=bool,
+                        ),
+                        "voice_procedure_max_age_sec": ParameterValue(
+                            voice_intent_max_age_sec,
+                            value_type=float,
+                        ),
+                        "voice_procedure_max_future_skew_sec": ParameterValue(
+                            voice_intent_future_tolerance_sec,
+                            value_type=float,
+                        ),
+                        "voice_procedure_dedupe_retention_sec": ParameterValue(
+                            voice_intent_dedupe_retention_sec,
+                            value_type=float,
                         ),
                     }
                 ],

@@ -5,7 +5,10 @@ routes:
     available: true
     default:
       outcome: success
-      duration_sec: 0.05
+      # Keep the virtual handover observable in the operating-room UI.  The
+      # previous 50 ms completion was shorter than a normal browser refresh and
+      # made the full action progression effectively invisible.
+      duration_sec: 4.0
       reason_code: virtual_debug_completed_no_robot_motion
   retraction_command:
     available: true

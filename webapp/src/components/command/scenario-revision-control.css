@@ -1,0 +1,195 @@
+.scenario-revision-control {
+  display: grid;
+  min-width: 0;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-card);
+  background: color-mix(in srgb, var(--color-surface-raised) 82%, transparent);
+  box-shadow: var(--shadow-card);
+}
+
+.scenario-revision-header {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.scenario-revision-summary dt,
+.scenario-revision-feedback,
+.scenario-revision-authority {
+  color: var(--color-text-muted);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.3;
+}
+
+.scenario-revision-header strong {
+  color: var(--color-text);
+  font-size: 13px;
+  line-height: 1.2;
+}
+
+.scenario-revision-header > svg {
+  flex: 0 0 auto;
+  color: var(--color-accent-strong);
+}
+
+.scenario-revision-control[data-phase="failed"] .scenario-revision-header > svg {
+  color: var(--color-danger);
+}
+
+.scenario-revision-control[data-phase="applied"] .scenario-revision-header > svg {
+  color: var(--color-success);
+}
+
+.scenario-revision-spinner {
+  animation: scenario-revision-spin 0.9s linear infinite;
+}
+
+.scenario-revision-summary {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+  margin: 0;
+}
+
+.scenario-revision-summary > div {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+  padding: 7px 8px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-inner);
+  background: color-mix(in srgb, var(--color-page-raised) 56%, transparent);
+}
+
+.scenario-revision-summary dt,
+.scenario-revision-summary dd {
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.scenario-revision-summary dd {
+  color: var(--color-text-secondary);
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1.25;
+}
+
+.scenario-revision-disposition,
+.scenario-revision-feedback,
+.scenario-revision-authority {
+  min-width: 0;
+  padding: 8px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-inner);
+  background: color-mix(in srgb, var(--color-page-raised) 46%, transparent);
+}
+
+.scenario-revision-disposition,
+.scenario-revision-authority {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 7px;
+}
+
+.scenario-revision-disposition {
+  color: var(--color-success-text);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1.35;
+}
+
+.scenario-revision-disposition[data-changed="true"] {
+  color: var(--color-warning-text);
+}
+
+.scenario-revision-disposition > svg,
+.scenario-revision-authority > svg {
+  margin-top: 1px;
+}
+
+.scenario-revision-disposition[data-changed="true"] > svg,
+.scenario-revision-authority > svg {
+  color: var(--color-warning);
+}
+
+.scenario-revision-disposition[data-changed="false"] > svg {
+  color: var(--color-success);
+}
+
+.scenario-revision-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.scenario-revision-actions .button {
+  min-width: 0;
+  min-height: 44px;
+  border-radius: var(--radius-inner);
+  font-size: 12px;
+}
+
+.scenario-revision-feedback {
+  overflow-wrap: anywhere;
+}
+
+.scenario-revision-feedback.pending {
+  border-color: color-mix(in srgb, var(--color-accent) 44%, var(--color-border));
+  color: var(--color-accent-strong);
+}
+
+.scenario-revision-feedback.changed {
+  border-color: color-mix(in srgb, var(--color-warning) 42%, var(--color-border));
+  color: var(--color-warning-text);
+}
+
+.scenario-revision-feedback.unchanged,
+.scenario-revision-feedback.applied {
+  border-color: color-mix(in srgb, var(--color-success) 44%, var(--color-border));
+  color: var(--color-success-text);
+}
+
+.scenario-revision-feedback.failed {
+  border-color: color-mix(in srgb, var(--color-danger) 52%, var(--color-border));
+  color: var(--color-danger-text);
+}
+
+.scenario-revision-authority span {
+  min-width: 0;
+  color: var(--color-text-secondary);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+@keyframes scenario-revision-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (max-width: 460px) {
+  .scenario-revision-actions {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .scenario-revision-control *,
+  .scenario-revision-spinner {
+    animation-duration: 0.01ms;
+    animation-iteration-count: 1;
+    transition-duration: 0.01ms;
+  }
+}

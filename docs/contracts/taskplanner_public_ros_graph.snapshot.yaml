@@ -1,0 +1,263 @@
+schema_version: taskplanner.public_ros_graph.snapshot.v1
+snapshot:
+  kind: validation_snapshot
+  runtime_authority: false
+  runtime_consumers: []
+  purpose: >-
+    Review-only snapshot of the ROS graph implemented by taskplanner_mock and
+    taskplanner_live. Launch files and node implementations remain authoritative.
+  sources:
+    - src/bringup/bringup/runtime_core_launch.py
+    - src/bringup/launch/taskplanner_mock.launch.py
+    - src/bringup/launch/taskplanner_live.launch.py
+    - src/surgical_interop_gateway/surgical_interop_gateway/node.py
+    - src/surgical_interop_gateway/surgical_interop_gateway/camera_alias_relay.py
+    - src/surgical_interop_execution/surgical_interop_execution/virtual_endpoints.py
+    - src/surgical_interop_execution/surgical_interop_execution/bridge.py
+    - src/simulation_runtime/simulation_runtime/integration_preflight.py
+
+profiles:
+  mock_base:
+    launch_file: src/bringup/launch/taskplanner_mock.launch.py
+    nodes:
+      - {package: surgical_interop_gateway, executable: surgical_interop_gateway, name: surgical_interop_gateway, conditional: true}
+      - {package: btops_gateway, executable: btops_gateway, name: btops_gateway, conditional: false}
+      - {package: auto_apms_behavior_tree, executable: tree_executor, name: tree_executor, conditional: false}
+      - {package: simulation_runtime, executable: speech_input_adapter, name: speech_input_adapter, conditional: false}
+      - {package: voice_command, executable: voice_intent_resolver, name: voice_command_resolver, conditional: true}
+      - {package: voice_command, executable: vlm_function_admission_gate, name: vlm_function_admission_gate, conditional: true}
+      - {package: simulation_runtime, executable: source_health_monitor, name: source_health_monitor, conditional: false}
+      - {package: simulation_runtime, executable: cv_contract_monitor, name: cv_contract_monitor, conditional: false}
+      - {package: vlm_node, executable: rfdetr_perception_bridge, name: rfdetr_perception_bridge, conditional: true}
+      - {package: vlm_node, executable: pnu_perception_bridge, name: pnu_perception_bridge, conditional: true}
+      - {package: vlm_node, executable: mock_vlm, name: mock_vlm_node, conditional: true}
+      - {package: vlm_node, executable: synthetic_scene_camera, name: synthetic_scene_camera, conditional: true}
+      - {package: vlm_node, executable: no_image_camera, name: no_image_camera, conditional: true}
+      - {package: vlm_node, executable: snapshot_bridge, name: field_snapshot_bridge, conditional: true}
+      - {package: vlm_node, executable: real_vlm, name: real_vlm_node, conditional: true}
+      - {package: simulation_runtime, executable: surgeon_actor, name: surgeon_actor, conditional: true}
+      - {package: simulation_runtime, executable: llm_surgeon_actor, name: surgeon_actor, conditional: true}
+      - {package: phase_estimator, executable: phase_estimator, name: phase_estimator, conditional: true}
+      - {package: or_digital_twin, executable: or_digital_twin, name: or_digital_twin, conditional: false}
+      - {package: skill_execution, executable: mock_skill_server, name: mock_skill_server, conditional: true}
+      - {package: skill_execution, executable: skill_action_bridge, name: skill_action_bridge, conditional: true}
+      - {package: surgical_interop_execution, executable: fault_action_emulator, name: robot_contract_emulator, conditional: true}
+      - {package: surgical_interop_execution, executable: fault_action_emulator, name: virtual_robot_contract_emulator, conditional: true}
+      - {package: surgical_interop_execution, executable: surgical_interop_execution_bridge, name: surgical_interop_execution_bridge, conditional: true}
+      - {package: bt_orchestrator, executable: decision_bridge, name: bt_decision_bridge, conditional: false}
+      - {package: bt_orchestrator, executable: bed_robot_arm_group_orchestrator, name: bed_robot_arm_group_orchestrator, conditional: true}
+      - {package: simulation_runtime, executable: integration_preflight, name: integration_preflight, conditional: true}
+      - {package: simulation_runtime, executable: simulation_manager, name: simulation_manager, conditional: false}
+      - {package: rosapi, executable: rosapi_node, name: rosapi, conditional: true}
+    ros_processes:
+      - package: rosbridge_server
+        executable: rosbridge_websocket
+        conditional: true
+        respawn: true
+        respawn_delay_sec: 5.0
+
+  live:
+    launch_file: src/bringup/launch/taskplanner_live.launch.py
+    includes:
+      - src/bringup/launch/taskplanner_mock.launch.py
+    overlay_nodes:
+      - {package: surgical_interop_gateway, executable: camera_alias_relay, name: surgical_camera_alias_relay, conditional: true}
+
+# Complete default endpoint bindings exposed by the two launch descriptions.
+# This section is intentionally a snapshot, not input to runtime composition.
+launch_endpoint_binding_snapshot:
+  mock_base:
+    topics:
+      speech_input_adapter:
+        input_topic: /sensors/speech/utterance
+        sentence_input_topic: /sensors/surgeon/sentence
+        typed_output_topic: /surgery/audio/admitted_utterance
+        tts_playback_status_topic: /tts/playback_status
+      voice_command_resolver:
+        input_topic: /surgery/audio/request_text
+        output_topic: /surgery/voice/intent
+      vlm_function_admission_gate:
+        proposal_topic: /surgery/voice/proposal
+        admitted_speech_topic: /surgery/audio/admitted_utterance
+        vlm_reply_topic: /vlm/humanoid_reply
+        intent_output_topic: /surgery/voice/intent
+        reply_output_topic: /tts/admitted_reply
+        gateway_topic: /surgery/gateway_info
+        tts_status_topic: /tts/playback_status
+        twin_event_topic: /twin/events
+        retractor_status_topic: /bed_robot_arm_group/voice_normalization_status
+      source_health_monitor:
+        flir_topic: /surgery/images/flir/compressed
+        cam4_topic: /surgery/images/cam4/compressed
+        vlm_result_topic: /vlm/result
+        vlm_health_topic: /vlm/health
+      cv_contract_monitor:
+        status_topic: /integration/cv_contract/status
+        cam4_rgb_topic: /synced/cam_4/color/image_raw/compressed
+        cam4_rgb_alias_topic: /surgery/images/cam4/compressed
+        cam4_camera_info_topic: /synced/cam_4/color/camera_info
+        cam4_native_depth_compressed_topic: /synced/cam_4/depth/image_rect_raw/compressedDepth
+        cam4_depth_camera_info_topic: /synced/cam_4/depth/camera_info
+        cam4_depth_to_color_extrinsics_topic: /synced/cam_4/extrinsics/depth_to_color
+        cam4_aligned_depth_compressed_topic: /synced/cam_4/aligned_depth_to_color/image_raw/compressedDepth
+        cam4_aligned_depth_camera_info_topic: /synced/cam_4/aligned_depth_to_color/camera_info
+        handover_tray_rgb_topic: /surgery/images/tray/compressed
+        handover_tray_camera_info_topic: /surgery/cameras/tray/color/camera_info
+        handover_tray_aligned_depth_topic: /surgery/cameras/tray/aligned_depth
+      rfdetr_perception_bridge:
+        flir_input_topic: /surgery/images/flir/compressed
+        cam4_input_topic: /surgery/images/cam4/compressed
+        flir_output_topic: /surgery/images/field/compressed
+        flir_overlay_topic: /surgery/images/flir/segmentation_overlay/compressed
+        cam4_overlay_topic: /surgery/images/cam4/detection_overlay/compressed
+        cam3_overlay_topic: /taskplanner/internal/rfdetr/cam3/detection_overlay/compressed
+        cam3_tool_observations_topic: /taskplanner/internal/rfdetr/cam_3/tool/observations
+        cam4_tool_observations_topic: /taskplanner/internal/rfdetr/cam_4/tool/observations
+      pnu_perception_bridge:
+        rgb_input_topic: /synced/cam_4/color/image_raw/compressed
+        color_camera_info_topic: /synced/cam_4/color/camera_info
+        depth_input_topic: /synced/cam_4/aligned_depth_to_color/image_raw/compressedDepth
+        depth_camera_info_topic: /synced/cam_4/aligned_depth_to_color/camera_info
+        cam4_overlay_topic: /surgery/images/cam4/detection_overlay/compressed
+        cam4_mayo_observation_topic: /surgery/perception/cam4/mayo_tool_observations
+        diagnostics_topic: /surgery/perception/rfdetr/diagnostics/json
+        health_topic: /surgery/perception/rfdetr/health
+      no_image_camera:
+        image_topic: /surgery/images/field/compressed
+      real_vlm_node:
+        field_image_topic: /surgery/images/field/compressed
+        raw_field_image_topic: /surgery/images/flir/compressed
+        cam4_image_topic: /surgery/images/cam4/compressed
+        cam4_overlay_image_topic: /surgery/images/cam4/detection_overlay/compressed
+        composite_image_topic: /surgery/images/vlm/composite/compressed
+      robot_contract_emulator:
+        controller_contract_topic: /surgery/controller_contract
+      virtual_robot_contract_emulator:
+        controller_contract_topic: /integration/virtual/surgery/controller_contract
+      surgical_interop_execution_bridge:
+        bed_robot_status_endpoint: /external/bed_robot_arms/status
+        controller_contract_topic: /surgery/controller_contract
+        external_controller_contract_topic: /surgery/controller_contract
+        virtual_controller_contract_topic: /integration/virtual/surgery/controller_contract
+        integration_readiness_topic: /integration/readiness
+      integration_preflight:
+        sentence_topic: /sensors/surgeon/sentence
+        speech_source_topic: /sensors/speech/utterance
+        asr_runtime_status_topic: /input/asr/runtime_status
+        bed_robot_arm_status_topic: /external/bed_robot_arms/status
+        controller_contract_topic: /surgery/controller_contract
+        external_controller_contract_topic: /surgery/controller_contract
+        virtual_controller_contract_topic: /integration/virtual/surgery/controller_contract
+        rfdetr_vlm_request_context_topic: /context/vlm_request_context
+        cv_contract_status_topic: /integration/cv_contract/status
+      simulation_manager:
+        voice_intent_topic: /surgery/voice/intent
+    services:
+      robot_contract_emulator:
+        retraction_service_name: /surgery/retraction/command
+      virtual_robot_contract_emulator:
+        retraction_service_name: /integration/virtual/surgery/retraction/command
+      surgical_interop_execution_bridge:
+        retraction_service_name: /surgery/retraction/command
+        external_retraction_service_name: /surgery/retraction/command
+        virtual_retraction_service_name: /integration/virtual/surgery/retraction/command
+      integration_preflight:
+        retraction_service_name: /surgery/retraction/command
+        external_retraction_service_name: /surgery/retraction/command
+        virtual_retraction_service_name: /integration/virtual/surgery/retraction/command
+    actions:
+      mock_skill_server:
+        action_name: /skill/execute
+      skill_action_bridge:
+        action_name: /skill/execute
+      robot_contract_emulator:
+        tool_handover_endpoint: /surgery/tool_handover
+      virtual_robot_contract_emulator:
+        tool_handover_endpoint: /integration/virtual/surgery/tool_handover
+      surgical_interop_execution_bridge:
+        tool_handover_endpoint: /surgery/tool_handover
+        external_tool_handover_endpoint: /surgery/tool_handover
+        virtual_tool_handover_endpoint: /integration/virtual/surgery/tool_handover
+      integration_preflight:
+        tool_handover_action_name: /surgery/tool_handover
+        external_tool_handover_action_name: /surgery/tool_handover
+        virtual_tool_handover_action_name: /integration/virtual/surgery/tool_handover
+
+  live_include_arguments:
+    topics:
+      speech_input_topic: /sensors/surgeon/utterance
+      speech_typed_output_topic: /surgery/audio/admitted_utterance
+      tts_playback_status_topic: /tts/playback_status
+      voice_command_input_topic: /surgery/audio/admitted_utterance
+      voice_command_output_topic: /surgery/voice/proposal
+      asr_runtime_status_topic: /input/asr/runtime_status
+      flir_input_topic: /synced/flir/color/image_raw/compressed
+      cam4_input_topic: /synced/cam_4/color/image_raw/compressed
+      cam3_input_topic: /synced/cam_3/color/image_raw/compressed
+      field_image_topic: /synced/flir/color/image_raw/compressed
+      rfdetr_flir_output_topic: /taskplanner/internal/rfdetr/flir/segmented/compressed
+      flir_overlay_image_topic: /taskplanner/internal/rfdetr/flir/segmentation_overlay/compressed
+      cam4_overlay_image_topic: /taskplanner/internal/rfdetr/cam4/detection_overlay/compressed
+      cam3_overlay_image_topic: /taskplanner/internal/rfdetr/cam3/detection_overlay/compressed
+      composite_image_topic: /taskplanner/internal/vlm/model_visual/compressed
+      cam4_semantics_topic: /surgery/perception/cam4/semantics/json
+      cam3_tool_observations_topic: /perception/cam_3/tool/observations
+      cam4_tool_observations_topic: /perception/cam_4/tool/observations
+      rfdetr_bridge_cam3_tool_observations_topic: /taskplanner/internal/rfdetr/cam_3/tool/observations
+      rfdetr_bridge_cam4_tool_observations_topic: /taskplanner/internal/rfdetr/cam_4/tool/observations
+      rfdetr_vlm_request_context_topic: /context/vlm_request_context
+      cv_contract_status_topic: /integration/cv_contract/status
+      cv_cam4_rgb_topic: /synced/cam_4/color/image_raw/compressed
+      cv_cam4_rgb_alias_topic: /surgery/images/cam4/compressed
+      cv_cam4_camera_info_topic: /synced/cam_4/color/camera_info
+      cv_cam4_native_depth_compressed_topic: /synced/cam_4/depth/image_rect_raw/compressedDepth
+      cv_cam4_depth_camera_info_topic: /synced/cam_4/depth/camera_info
+      cv_cam4_depth_to_color_extrinsics_topic: /synced/cam_4/extrinsics/depth_to_color
+      cv_cam4_aligned_depth_compressed_topic: /synced/cam_4/aligned_depth_to_color/image_raw/compressedDepth
+      cv_cam4_aligned_depth_camera_info_topic: /synced/cam_4/aligned_depth_to_color/camera_info
+      cv_handover_tray_rgb_topic: /surgery/images/tray/compressed
+      cv_handover_tray_camera_info_topic: /surgery/cameras/tray/color/camera_info
+      cv_handover_tray_aligned_depth_topic: /surgery/cameras/tray/aligned_depth
+  live_overlay:
+    topics:
+      surgical_camera_alias_relay:
+        flir_source_topic: /synced/flir/color/image_raw/compressed
+        flir_public_topic: /surgery/images/flir/compressed
+        cam4_source_topic: /synced/cam_4/color/image_raw/compressed
+        cam4_public_topic: /surgery/images/cam4/compressed
+
+public_interfaces:
+  topics:
+    - {name: /surgery/gateway_info, type: surgical_interop_msgs/msg/GatewayInfo, visibility: public_read_only, owner: surgical_interop_gateway}
+    - {name: /surgery/catalog, type: surgical_interop_msgs/msg/ProcedureCatalog, visibility: public_read_only, owner: surgical_interop_gateway}
+    - {name: /surgery/context, type: surgical_interop_msgs/msg/SurgeryContext, visibility: public_read_only, owner: surgical_interop_gateway}
+    - {name: /surgery/instruments, type: surgical_interop_msgs/msg/InstrumentStateArray, visibility: public_read_only, owner: surgical_interop_gateway}
+    - {name: /surgery/robots, type: surgical_interop_msgs/msg/RobotStateArray, visibility: public_read_only, owner: surgical_interop_gateway}
+    - {name: /surgery/robot_end_effectors, type: surgical_interop_msgs/msg/RobotEndEffectorStateArray, visibility: public_read_only, owner: surgical_interop_gateway}
+    - {name: /surgery/tool_predictions, type: surgical_interop_msgs/msg/ToolPredictionArray, visibility: public_read_only, owner: surgical_interop_gateway}
+    - {name: /surgery/speech, type: surgical_interop_msgs/msg/SpeechRecognitionState, visibility: public_read_only, owner: surgical_interop_gateway}
+    - {name: /surgery/clinical_observations, type: surgical_interop_msgs/msg/ClinicalObservationArray, visibility: public_read_only, owner: surgical_interop_gateway}
+    - {name: /surgery/health, type: surgical_interop_msgs/msg/SurgeryHealth, visibility: public_read_only, owner: surgical_interop_gateway}
+    - {name: /surgery/events, type: surgical_interop_msgs/msg/SurgeryEvent, visibility: public_read_only, owner: surgical_interop_gateway}
+    - {name: /surgery/images/flir/compressed, type: sensor_msgs/msg/CompressedImage, visibility: public_read_only, owner: surgical_camera_alias_relay}
+    - {name: /surgery/images/cam4/compressed, type: sensor_msgs/msg/CompressedImage, visibility: public_read_only, owner: surgical_camera_alias_relay}
+    - {name: /sensors/surgeon/utterance, type: surgical_msgs/msg/SpeechUtterance, visibility: trusted_external_input, owner: taskplanner_asr}
+    - {name: /input/asr/runtime_status, type: std_msgs/msg/String, visibility: trusted_external_input, owner: taskplanner_asr}
+    - {name: /synced/flir/color/image_raw/compressed, type: sensor_msgs/msg/CompressedImage, visibility: trusted_external_input, owner: external_camera_runtime}
+    - {name: /synced/cam_4/color/image_raw/compressed, type: sensor_msgs/msg/CompressedImage, visibility: trusted_external_input, owner: external_camera_runtime}
+    - {name: /perception/cam_3/tool/observations, type: surgical_perception_msgs/msg/ToolObservation2DArray, visibility: trusted_external_input, owner: external_rfdetr_1_7}
+    - {name: /perception/cam_4/tool/observations, type: surgical_perception_msgs/msg/ToolObservation2DArray, visibility: trusted_external_input, owner: external_rfdetr_1_7}
+    - {name: /surgery/controller_contract, type: std_msgs/msg/String, visibility: trusted_external_telemetry, owner: external_controller}
+    - {name: /external/bed_robot_arms/status, type: surgical_interop_msgs/msg/BedRobotArmStateArray, visibility: trusted_external_telemetry, owner: external_controller}
+    - {name: /integration/readiness, type: std_msgs/msg/String, visibility: local_admission_lease, owner: integration_preflight}
+    - {name: /integration/execution_route/state, type: std_msgs/msg/String, visibility: local_route_projection, owner: surgical_interop_execution_bridge}
+    - {name: /context/vlm_request_context, type: surgical_msgs/msg/VLMRequestContext, visibility: local_model_context, owner: real_vlm_node}
+  services:
+    - {name: /surgery/retraction/command, type: surgical_interop_msgs/srv/ExecuteRetractionCommand, visibility: trusted_external_control, owner: external_controller}
+    - {name: /integration/virtual/surgery/retraction/command, type: surgical_interop_msgs/srv/ExecuteRetractionCommand, visibility: isolated_virtual_control, owner: virtual_robot_contract_emulator}
+    - {name: /integration/execution_route/command, type: surgical_msgs/srv/IntegrationDebugCommand, visibility: local_stopped_route_control, owner: surgical_interop_execution_bridge}
+    - {name: /integration/execution_route/preflight_ack, type: surgical_msgs/srv/IntegrationDebugCommand, visibility: local_route_application_barrier, owner: integration_preflight}
+  actions:
+    - {name: /surgery/tool_handover, type: surgical_interop_msgs/action/ExecuteToolHandover, visibility: trusted_external_control, owner: external_controller}
+    - {name: /integration/virtual/surgery/tool_handover, type: surgical_interop_msgs/action/ExecuteToolHandover, visibility: isolated_virtual_control, owner: virtual_robot_contract_emulator}
+    - {name: /skill/execute, type: surgical_msgs/action/ExecuteSkill, visibility: legacy_mock_only, owner: mock_skill_server}

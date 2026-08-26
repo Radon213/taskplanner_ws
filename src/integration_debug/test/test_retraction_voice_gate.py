@@ -12,6 +12,7 @@ from procedure_spec import (
     RetractionState,
     RetractionTargetSide,
 )
+from surgical_msgs.msg import SimulationState
 from std_msgs.msg import String
 
 from integration_debug.node import InputStats, IntegrationDebugNode
@@ -392,7 +393,7 @@ def test_retraction_voice_configuration_never_touches_microphone_runtime() -> No
     harness._asr = NoMicrophoneAccess()
     harness._retraction_voice_auto_dispatch = False
     harness._retraction_voice_generation = 0
-    harness._manual_write_block_reason = lambda: ""
+    harness._manual_write_block_reason = lambda *_args: ""
 
     accepted, _command_id, message = IntegrationDebugNode._configure_retraction_voice(
         harness, {"enabled": True}
@@ -407,6 +408,207 @@ def test_retraction_voice_configuration_never_touches_microphone_runtime() -> No
     )
     assert accepted is False
     assert message == "enabled must be a boolean"
+
+
+def test_debug_state_machine_bypass_requires_manual_authority_and_is_session_scoped() -> None:
+    class Harness:
+        pass
+
+    events: list[tuple[str, dict[str, object]]] = []
+    harness = Harness()
+    harness._lock = threading.RLock()
+    harness._retraction_state_machine_bypass_enabled = False
+    harness._retraction_voice_generation = 4
+    harness._active_command_id = ""
+    harness._retraction_state = RetractionState.IDLE
+    harness._manual_write_block_reason = lambda *_args: ""
+    harness._record = lambda event_type, payload: events.append((event_type, payload))
+
+    accepted, _command_id, message = (
+        IntegrationDebugNode._configure_retraction_state_machine_bypass(
+            harness, {"enabled": True}
+        )
+    )
+
+    assert accepted is True
+    assert "disabled for Debug" in message
+    assert harness._retraction_state_machine_bypass_enabled is True
+    assert harness._retraction_voice_generation == 5
+    assert events[-1] == (
+        "retraction_state_machine_bypass_changed",
+        {
+            "enabled": True,
+            "previous_enabled": False,
+            "state": "idle",
+            "debug_only": True,
+        },
+    )
+
+    accepted, _command_id, message = (
+        IntegrationDebugNode._configure_retraction_state_machine_bypass(
+            harness, {"enabled": False}
+        )
+    )
+
+    assert accepted is True
+    assert "gate enabled" in message
+    assert harness._retraction_state_machine_bypass_enabled is False
+    assert harness._retraction_voice_generation == 6
+
+
+@pytest.mark.parametrize(
+    "bundle",
+    ["thyroidectomy_demo", "inguinal_hernia_repair_demo"],
+)
+@pytest.mark.parametrize("endpoint_source", ["external", "virtual"])
+def test_demo_bundle_start_defaults_retraction_voice_admission_to_bypassed(
+    bundle: str,
+    endpoint_source: str,
+) -> None:
+    class Harness:
+        pass
+
+    events: list[tuple[str, dict[str, object]]] = []
+    harness = Harness()
+    harness._lock = threading.RLock()
+    harness._operational_state_received = False
+    harness._operational_state_received_monotonic = 0.0
+    harness._operational_active_bundle = ""
+    harness._operational_running = False
+    harness._robot_endpoint_source = endpoint_source
+    harness._operational_execution_state = "unknown"
+    harness._operational_active_robot_task_id = ""
+    harness._operational_robot_state = "unknown"
+    harness._operational_cleaner_busy = False
+    harness._retraction_state_machine_bypass_default_bundles = frozenset(
+        {"thyroidectomy_demo", "inguinal_hernia_repair_demo"}
+    )
+    harness._retraction_state_machine_bypass_enabled = False
+    harness._retraction_voice_generation = 2
+    harness._record = lambda event_type, payload: events.append(
+        (event_type, payload)
+    )
+    harness._default_retraction_state_machine_bypass_for_bundle = (
+        IntegrationDebugNode._default_retraction_state_machine_bypass_for_bundle.__get__(
+            harness
+        )
+    )
+
+    state = SimulationState()
+    state.procedure_id = bundle
+    state.active_bundle = bundle
+    state.running = True
+    state.execution_state = "running"
+    IntegrationDebugNode._on_operational_state(harness, state)
+
+    assert harness._retraction_state_machine_bypass_enabled is True
+    assert harness._retraction_voice_generation == 3
+    assert IntegrationDebugNode._debug_retraction_allowed_commands(
+        harness, RetractionState.IDLE
+    ) == frozenset(RetractionCommand)
+    assert events[-1] == (
+        "retraction_state_machine_bypass_default_applied",
+        {
+            "active_bundle": bundle,
+            "enabled": True,
+            "previous_enabled": False,
+            "bundle_changed": True,
+            "simulation_started": True,
+            "software_admission_only": True,
+        },
+    )
+
+
+def test_demo_bundle_default_can_be_disabled_until_the_next_start() -> None:
+    class Harness:
+        pass
+
+    harness = Harness()
+    harness._lock = threading.RLock()
+    harness._operational_state_received = True
+    harness._operational_state_received_monotonic = 0.0
+    harness._operational_active_bundle = "thyroidectomy_demo"
+    harness._operational_running = True
+    harness._robot_endpoint_source = "virtual"
+    harness._operational_execution_state = "running"
+    harness._operational_active_robot_task_id = ""
+    harness._operational_robot_state = "idle"
+    harness._operational_cleaner_busy = False
+    harness._retraction_state_machine_bypass_default_bundles = frozenset(
+        {"thyroidectomy_demo", "inguinal_hernia_repair_demo"}
+    )
+    harness._retraction_state_machine_bypass_enabled = False
+    harness._retraction_voice_generation = 7
+    harness._record = lambda *_args: None
+    harness._default_retraction_state_machine_bypass_for_bundle = (
+        IntegrationDebugNode._default_retraction_state_machine_bypass_for_bundle.__get__(
+            harness
+        )
+    )
+
+    state = SimulationState()
+    state.procedure_id = "thyroidectomy_demo"
+    state.active_bundle = "thyroidectomy_demo"
+    state.execution_state = "running"
+    state.running = True
+    IntegrationDebugNode._on_operational_state(harness, state)
+    assert harness._retraction_state_machine_bypass_enabled is False
+    assert harness._retraction_voice_generation == 7
+
+    state.running = False
+    state.execution_state = "stopped"
+    IntegrationDebugNode._on_operational_state(harness, state)
+    state.running = True
+    state.execution_state = "running"
+    IntegrationDebugNode._on_operational_state(harness, state)
+
+    assert harness._retraction_state_machine_bypass_enabled is True
+    assert harness._retraction_voice_generation == 8
+
+
+@pytest.mark.parametrize("endpoint_source", ["external", "virtual"])
+def test_non_demo_bundle_never_auto_bypasses_retraction_route(
+    endpoint_source: str,
+) -> None:
+    class Harness:
+        pass
+
+    events: list[tuple[str, dict[str, object]]] = []
+    harness = Harness()
+    harness._lock = threading.RLock()
+    harness._operational_state_received = False
+    harness._operational_state_received_monotonic = 0.0
+    harness._operational_active_bundle = ""
+    harness._operational_running = False
+    harness._operational_execution_state = "unknown"
+    harness._operational_active_robot_task_id = ""
+    harness._operational_robot_state = "unknown"
+    harness._operational_cleaner_busy = False
+    harness._robot_endpoint_source = endpoint_source
+    harness._retraction_state_machine_bypass_default_bundles = frozenset(
+        {"thyroidectomy_demo", "inguinal_hernia_repair_demo"}
+    )
+    harness._retraction_state_machine_bypass_enabled = False
+    harness._retraction_voice_generation = 5
+    harness._record = lambda event_type, payload: events.append(
+        (event_type, payload)
+    )
+    harness._default_retraction_state_machine_bypass_for_bundle = (
+        IntegrationDebugNode._default_retraction_state_machine_bypass_for_bundle.__get__(
+            harness
+        )
+    )
+
+    state = SimulationState()
+    state.procedure_id = "thyroidectomy"
+    state.active_bundle = "thyroidectomy"
+    state.running = True
+    state.execution_state = "running"
+    IntegrationDebugNode._on_operational_state(harness, state)
+
+    assert harness._retraction_state_machine_bypass_enabled is False
+    assert harness._retraction_voice_generation == 5
+    assert events[-1][1]["enabled"] is False
 
 
 def test_service_admission_advances_only_the_local_debug_state() -> None:
@@ -495,7 +697,7 @@ def test_direct_retraction_dispatch_rejects_a_state_disallowed_command_before_tr
 
     harness = Harness()
     harness._lock = threading.RLock()
-    harness._manual_write_block_reason = lambda: ""
+    harness._manual_write_block_reason = lambda *_args: ""
     harness._active_command_id = ""
     harness._armed = True
     harness._fault_locked = False
@@ -525,6 +727,215 @@ def test_direct_retraction_dispatch_rejects_a_state_disallowed_command_before_tr
     assert harness._retraction_client.calls == 0
 
 
+def test_tool_action_rechecks_operational_gate_after_server_readiness() -> None:
+    class DeferredFuture:
+        def add_done_callback(self, _callback) -> None:
+            return None
+
+    class FlippingToolClient:
+        def __init__(self) -> None:
+            self.readiness_checks = 0
+            self.transport_calls = 0
+            self.operational_state_flipped = False
+
+        def server_is_ready(self) -> bool:
+            self.readiness_checks += 1
+            self.operational_state_flipped = True
+            return True
+
+        def send_goal_async(self, _goal, **_kwargs):
+            self.transport_calls += 1
+            return DeferredFuture()
+
+    class Harness:
+        pass
+
+    harness = Harness()
+    harness._lock = threading.RLock()
+    harness._network_locked_to_runtime = True
+    harness._armed = True
+    harness._fault_locked = False
+    harness._manual_control_scope = "all"
+    harness._active_command_id = ""
+    harness._robot_endpoint_source = "virtual"
+    harness._tool_client = FlippingToolClient()
+    gate_checks = []
+
+    def operational_status():
+        gate_checks.append("snapshot")
+        allowed = not harness._tool_client.operational_state_flipped
+        return {
+            "intervention_allowed": allowed,
+            "intervention_block_reason": (
+                ""
+                if allowed
+                else "pause or stop the operational scenario before manual control"
+            ),
+        }
+
+    harness._operational_runtime_status = operational_status
+    harness._manual_write_block_reason = (
+        IntegrationDebugNode._manual_write_block_reason.__get__(harness)
+    )
+
+    accepted, command_id, message = IntegrationDebugNode._dispatch_action(
+        harness,
+        "tool_handover",
+        {
+            "instrument_id": "Adson forceps",
+            "source_location": "tray",
+            "target_location": "robot",
+        },
+        source="ui",
+    )
+
+    assert accepted is False
+    assert command_id == ""
+    assert message == "pause or stop the operational scenario before manual control"
+    assert gate_checks == ["snapshot", "snapshot"]
+    assert harness._tool_client.readiness_checks == 1
+    assert harness._tool_client.transport_calls == 0
+    assert harness._active_command_id == ""
+
+
+def test_retraction_service_rechecks_operational_gate_after_readiness() -> None:
+    class DeferredFuture:
+        def add_done_callback(self, _callback) -> None:
+            return None
+
+    class FlippingRetractionClient:
+        def __init__(self) -> None:
+            self.readiness_checks = 0
+            self.transport_calls = 0
+            self.publisher_identity_flipped = False
+
+        def service_is_ready(self) -> bool:
+            self.readiness_checks += 1
+            self.publisher_identity_flipped = True
+            return True
+
+        def call_async(self, _request):
+            self.transport_calls += 1
+            return DeferredFuture()
+
+    class Harness:
+        pass
+
+    harness = Harness()
+    harness._lock = threading.RLock()
+    harness._network_locked_to_runtime = True
+    harness._armed = True
+    harness._fault_locked = False
+    harness._manual_control_scope = "all"
+    harness._retraction_service_name = "/surgery/retraction/command"
+    harness._retraction_client = FlippingRetractionClient()
+    harness._active_command_id = ""
+    harness._retraction_voice_auto_dispatch = False
+    harness._retraction_state = RetractionState.IDLE
+    harness._last_retraction_rejection_reason = ""
+    harness._build_retraction_service_request = (
+        IntegrationDebugNode._build_retraction_service_request.__get__(harness)
+    )
+    gate_checks = []
+
+    def operational_status():
+        gate_checks.append("snapshot")
+        allowed = not harness._retraction_client.publisher_identity_flipped
+        return {
+            "intervention_allowed": allowed,
+            "intervention_block_reason": (
+                ""
+                if allowed
+                else "operational runtime state publisher is not trusted"
+            ),
+        }
+
+    harness._operational_runtime_status = operational_status
+    harness._manual_write_block_reason = (
+        IntegrationDebugNode._manual_write_block_reason.__get__(harness)
+    )
+
+    accepted, command_id, message = IntegrationDebugNode._dispatch_action(
+        harness,
+        "retraction_command",
+        {
+            "command": "start_direct_teach",
+            "target_side": "none",
+            "distance_m": 0.0,
+        },
+        source="ui",
+    )
+
+    assert accepted is False
+    assert command_id == ""
+    assert message == "operational runtime state publisher is not trusted"
+    assert gate_checks == ["snapshot", "snapshot"]
+    assert harness._retraction_client.readiness_checks == 1
+    assert harness._retraction_client.transport_calls == 0
+    assert harness._active_command_id == ""
+
+
+def test_debug_state_machine_bypass_allows_out_of_order_service_request() -> None:
+    class DeferredFuture:
+        def add_done_callback(self, _callback) -> None:
+            return None
+
+    class FakeRetractionClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        @staticmethod
+        def service_is_ready() -> bool:
+            return True
+
+        def call_async(self, _request):
+            self.calls += 1
+            return DeferredFuture()
+
+    class Harness:
+        pass
+
+    harness = Harness()
+    harness._lock = threading.RLock()
+    harness._manual_write_block_reason = lambda *_args: ""
+    harness._active_command_id = ""
+    harness._active_route = ""
+    harness._active_goal_handle = None
+    harness._action_status = {}
+    harness._armed = True
+    harness._fault_locked = False
+    harness._retraction_voice_auto_dispatch = False
+    harness._retraction_state_machine_bypass_enabled = True
+    harness._retraction_state = RetractionState.IDLE
+    harness._last_retraction_rejection_reason = ""
+    harness._retraction_service_name = "/surgery/retraction/command"
+    harness._retraction_client = FakeRetractionClient()
+    harness._record = lambda *_args: None
+    harness._build_retraction_service_request = (
+        IntegrationDebugNode._build_retraction_service_request.__get__(harness)
+    )
+    harness._start_action_locked = IntegrationDebugNode._start_action_locked.__get__(
+        harness
+    )
+
+    accepted, command_id, message = IntegrationDebugNode._dispatch_action(
+        harness,
+        "retraction_command",
+        {
+            "command": "start_retraction",
+            "target_side": "none",
+            "distance_m": 0.0,
+        },
+        source="ui",
+    )
+
+    assert accepted is True
+    assert command_id
+    assert message == "retraction Service request submitted"
+    assert harness._retraction_client.calls == 1
+    assert harness._action_status["command"] == "start_retraction"
+
+
 def test_concurrent_idle_tool_change_dispatch_reserves_only_one_service_request() -> None:
     class DeferredFuture:
         def add_done_callback(self, _callback) -> None:
@@ -548,7 +959,7 @@ def test_concurrent_idle_tool_change_dispatch_reserves_only_one_service_request(
 
     harness = Harness()
     harness._lock = threading.RLock()
-    harness._manual_write_block_reason = lambda: ""
+    harness._manual_write_block_reason = lambda *_args: ""
     harness._active_command_id = ""
     harness._armed = True
     harness._fault_locked = False
@@ -629,7 +1040,7 @@ def test_voice_dispatch_rechecks_arm_gate_before_reserving_service_call() -> Non
     harness._retraction_service_name = "/surgery/retraction/command"
     harness._retraction_client = FakeRetractionClient()
 
-    def disarm_during_initial_graph_check() -> str:
+    def disarm_during_initial_graph_check(*_args) -> str:
         harness._armed = False
         return ""
 
@@ -673,7 +1084,7 @@ def test_service_submit_exception_releases_slot_without_changing_state() -> None
     harness._armed = True
     harness._fault_locked = False
     harness._retraction_voice_auto_dispatch = False
-    harness._manual_write_block_reason = lambda: ""
+    harness._manual_write_block_reason = lambda *_args: ""
     harness._active_command_id = ""
     harness._active_route = ""
     harness._active_goal_handle = None
@@ -711,7 +1122,6 @@ def test_service_submit_exception_releases_slot_without_changing_state() -> None
     assert harness._action_status["request_accepted"] is False
     assert harness._action_status["success"] is False
     assert [event_type for event_type, _payload in events] == [
-        "command_started",
         "retraction_service_submit_failed",
     ]
 

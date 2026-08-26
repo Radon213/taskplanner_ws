@@ -5,6 +5,7 @@ status_period_sec: 1.0
 heartbeat_timeout_sec: 6.0
 action_watchdog:
   goal_response_timeout_sec: 10.0
+  change_tool_response_timeout_sec: 120.0
   feedback_timeout_sec: 30.0
   max_duration_sec: 300.0
   server_loss_grace_sec: 5.0
@@ -35,10 +36,10 @@ inputs:
     expected_hz: 0.0
     stale_after_sec: 0.0
     qos: reliable_volatile
-  - name: speech_input_status
-    topic: /input/speech/status
+  - name: debug_speech_adapter_status
+    topic: /integration/debug/speech/status
     type: surgical_msgs/msg/InputSourceStatus
-    expected_hz: 15.0
+    expected_hz: 1.0
     stale_after_sec: 3.0
     qos: reliable_volatile
   - name: external_cv_contract
@@ -112,6 +113,12 @@ blocked_nodes:
 
 voice:
   request_topic: /surgery/audio/request_text
+  # Demo-bundle Debug-only software admission default for either selected
+  # endpoint. Service validation, limits, controller admission, and E-stop
+  # remain authoritative downstream.
+  retraction_state_machine_bypass_default_bundles:
+    - thyroidectomy_demo
+    - inguinal_hernia_repair_demo
   default_source_location: tray
   default_target_location: surgeon
   aliases:

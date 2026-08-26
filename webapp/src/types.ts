@@ -106,12 +106,28 @@ export type WorldState = {
   predicted_tool: string;
   predicted_tool_confidence: number;
   predicted_tool_stability_sec: number;
+  /** Reducer-accepted ranked next-tool evidence; rank 1 remains mirrored above. */
+  ranked_tool_predictions: RankedToolPrediction[];
   surgeon_request_tool: string;
   surgeon_request_instance_id?: string;
   surgeon_request_generation?: number;
   surgeon_request_additional_instance_assumed?: boolean;
   explicit_request_voice_backed: boolean;
+  /** Reducer-authoritative direct hand-perception gate; never inferred in the browser. */
+  implicit_request_visible: boolean;
+  implicit_request_tool: string;
+  implicit_request_hand_pose: string;
+  implicit_request_confidence: number;
+  implicit_request_stability_sec: number;
+  implicit_request_generation: number;
   bed_robot_arms: BedRobotArmState[];
+};
+
+export type RankedToolPrediction = {
+  rank: number;
+  instrument_id: string;
+  confidence: number;
+  stability_sec: number;
 };
 
 export type SimulationEvent = {
@@ -197,17 +213,23 @@ export type LiveAsrLanHealth = {
 export type LiveAsrStatus = {
   schema: "taskplanner.asr.status.v1";
   stamp_sec: number;
+  node_instance_id: string;
+  node_started_at_sec: number;
+  source_revision: string;
   available: boolean;
   dependency_error: string;
   state: "UNAVAILABLE" | "STOPPED" | "STARTING" | "LISTENING" | "STOPPING" | "ERROR" | string;
   server_url: string;
   topic: string;
+  output_mode: string;
+  output_topic: string;
   device_id: number | null;
   device_name: string;
   devices: LiveAsrDevice[];
   device_status: string;
   device_message: string;
   connected: boolean;
+  recording_active: boolean;
   audio_level_dbfs: number;
   peak_level_dbfs: number;
   elapsed_sec: number;
@@ -321,6 +343,30 @@ export type SkillStatus = {
   remaining_sec: number;
 };
 
+/**
+ * Observer-only transport evidence. `dispatch_submitted` means the local ROS
+ * client submitted an Action/Service call; it does not mean the remote device
+ * received it or completed physical work.
+ */
+export type ExecutionTrace = {
+  stamp?: RosTime;
+  sequence: number;
+  command_id: string;
+  route: string;
+  transport: "action" | "service" | string;
+  endpoint: string;
+  stage: string;
+  dispatch_submitted: boolean;
+  terminal: boolean;
+  evidence: string;
+  reason_code: string;
+  /** Typed copy of the controller-facing retraction Service payload. */
+  retraction_command: number;
+  retraction_target_side: number;
+  retraction_distance_m: number;
+  receivedAt: number;
+};
+
 export type VLMHealth = {
   connected: boolean;
   healthy: boolean;
@@ -366,10 +412,6 @@ export type VLMResult = {
   observed_location_ids: string[];
   observed_location_types: string[];
   observed_confidences: number[];
-  gesture_event_type: string;
-  gesture_requested_tool: string;
-  gesture_hand_pose: string;
-  gesture_confidence: number;
   uncertainty: number;
 };
 
@@ -420,6 +462,8 @@ export type CompressedImageFrame = {
   format: string;
   topic: string;
   frameId: string;
+  /** Source ROS header time when the publisher supplied a valid timestamp. */
+  sourceStampSec?: number;
   sizeBytes: number;
   receivedAt: number;
 };
@@ -466,11 +510,29 @@ export type DisplayCatalog = {
   events?: Record<string, DisplayCatalogEntry>;
 };
 
+export type LayoutInstrumentMetadata = {
+  id: string;
+  display_name?: string;
+  display_name_ko?: string;
+  aliases?: string[];
+  category?: string;
+  inventory_count?: number;
+  role?: string;
+  handover_profile?: string;
+  requestable?: boolean;
+  home_location_id?: string;
+  home_location_type?: string;
+};
+
 export type LayoutDisplayMetadata = {
   procedure?: {
     id: string;
     display_name?: string;
     display_name_ko?: string;
+    target_site?: string;
+    target_site_ko?: string;
+    approach?: string;
+    approach_ko?: string;
   };
   default_phase_id?: string;
   phases?: Array<{
@@ -480,23 +542,17 @@ export type LayoutDisplayMetadata = {
   }>;
   normal_phase_ids?: string[];
   interrupt_phase_ids?: string[];
-  instruments?: Array<{
-    id: string;
-    display_name?: string;
-    display_name_ko?: string;
-    aliases?: string[];
-    category?: string;
-    inventory_count?: number;
-    role?: string;
-    handover_profile?: string;
-    requestable?: boolean;
-  }>;
+  instruments?: LayoutInstrumentMetadata[];
   requestable_instruments?: string[];
   display_catalog?: DisplayCatalog;
   bundles?: Array<{
     id: string;
     display_name?: string;
     display_name_ko?: string;
+    target_site?: string;
+    target_site_ko?: string;
+    approach?: string;
+    approach_ko?: string;
     default_phase_id?: string;
     requestable_instruments?: string[];
     phases?: Array<{
@@ -506,17 +562,7 @@ export type LayoutDisplayMetadata = {
     }>;
     normal_phase_ids?: string[];
     interrupt_phase_ids?: string[];
-    instruments?: Array<{
-      id: string;
-      display_name?: string;
-      display_name_ko?: string;
-      aliases?: string[];
-      category?: string;
-      inventory_count?: number;
-      role?: string;
-      handover_profile?: string;
-      requestable?: boolean;
-    }>;
+    instruments?: LayoutInstrumentMetadata[];
   }>;
 };
 

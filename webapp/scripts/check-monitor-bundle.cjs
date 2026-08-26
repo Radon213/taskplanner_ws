@@ -101,8 +101,17 @@ for (const key of manifestKeys) {
 const totals = {
   all: { raw: 0, gzip: 0 },
   js: { raw: 0, gzip: 0 },
+  hls: { raw: 0, gzip: 0 },
   css: { raw: 0, gzip: 0 },
 };
+const hlsManifestKeys = [...manifestKeys].filter((key) =>
+  String(manifest[key]?.src || key).includes("node_modules/hls.js/"));
+const hlsFiles = new Set(hlsManifestKeys.map((key) => manifest[key]?.file).filter(Boolean));
+if (hlsManifestKeys.length !== 1) {
+  violations.push(`Monitor must contain exactly one HLS engine chunk (found ${hlsManifestKeys.length})`);
+} else if (!(monitorEntry?.dynamicImports ?? []).includes(hlsManifestKeys[0])) {
+  violations.push("Monitor HLS engine must remain a TV-only dynamic import");
+}
 
 for (const file of graphFiles) {
   const size = sizeFor(file);
@@ -113,14 +122,26 @@ for (const file of graphFiles) {
     bucket.raw += size.raw;
     bucket.gzip += size.gzip;
   }
+  if (hlsFiles.has(file)) {
+    totals.hls.raw += size.raw;
+    totals.hls.gzip += size.gzip;
+  }
 }
 
 function enforce(label, actual, maximum) {
   if (actual > maximum) violations.push(`${label}: ${actual} bytes exceeds ${maximum}`);
 }
 
-enforce("Monitor JavaScript raw", totals.js.raw, 450_000);
-enforce("Monitor JavaScript gzip", totals.js.gzip, 150_000);
+const baseJavaScript = {
+  raw: totals.js.raw - totals.hls.raw,
+  gzip: totals.js.gzip - totals.hls.gzip,
+};
+enforce("Monitor base JavaScript raw", baseJavaScript.raw, 450_000);
+enforce("Monitor base JavaScript gzip", baseJavaScript.gzip, 150_000);
+enforce("Monitor lazy HLS engine raw", totals.hls.raw, 380_000);
+enforce("Monitor lazy HLS engine gzip", totals.hls.gzip, 125_000);
+enforce("Monitor TV JavaScript raw", totals.js.raw, 800_000);
+enforce("Monitor TV JavaScript gzip", totals.js.gzip, 250_000);
 enforce("Monitor CSS raw", totals.css.raw, 50_000);
 enforce("Monitor CSS gzip", totals.css.gzip, 15_000);
 enforce("Monitor entry graph raw", totals.all.raw, 8_000_000);
@@ -151,7 +172,9 @@ if (!fs.existsSync(monitorRosClientPath)) {
 }
 
 console.log("Monitor bundle budget (raw / gzip bytes):");
-console.log(`- JavaScript: ${totals.js.raw} / ${totals.js.gzip}`);
+console.log(`- Base JavaScript: ${baseJavaScript.raw} / ${baseJavaScript.gzip}`);
+console.log(`- Lazy HLS engine: ${totals.hls.raw} / ${totals.hls.gzip}`);
+console.log(`- TV JavaScript total: ${totals.js.raw} / ${totals.js.gzip}`);
 console.log(`- CSS: ${totals.css.raw} / ${totals.css.gzip}`);
 console.log(`- Entry graph: ${totals.all.raw} / ${totals.all.gzip} (${graphFiles.size} files)`);
 

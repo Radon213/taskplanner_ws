@@ -5,7 +5,6 @@ import {
   Boxes,
   CheckCircle2,
   Droplets,
-  Hand,
   Layers3,
   Radar,
   ScanLine,
@@ -28,7 +27,6 @@ import {
   DEBUG_PERCEPTION_FINAL_OVERLAY_STATUS_TOPIC,
   DEBUG_PERCEPTION_FINAL_OVERLAY_TOPIC,
   DEBUG_PERCEPTION_BLOOD_SEMANTICS_TOPIC,
-  DEBUG_PERCEPTION_HAND_KEYPOINTS_TOPIC,
   DEBUG_PERCEPTION_HEALTH_TOPIC,
   DEBUG_PERCEPTION_TOOL_POSES_TOPIC,
 } from "../../utils/debugPerceptionContract";
@@ -67,14 +65,6 @@ const POSE_MODE_LABELS = [
 ] as const;
 const POSE_VALIDITY_LABELS = ["INVALID", "VALID", "DEGRADED", "STALE"] as const;
 const DOF_LABELS = ["X", "Y", "Z", "ROLL", "PITCH", "YAW"] as const;
-const HAND_JOINT_LABELS = [
-  "WRIST",
-  "THUMB CMC", "THUMB MCP", "THUMB IP", "THUMB TIP",
-  "INDEX MCP", "INDEX PIP", "INDEX DIP", "INDEX TIP",
-  "MIDDLE MCP", "MIDDLE PIP", "MIDDLE DIP", "MIDDLE TIP",
-  "RING MCP", "RING PIP", "RING DIP", "RING TIP",
-  "PINKY MCP", "PINKY PIP", "PINKY DIP", "PINKY TIP",
-] as const;
 
 function signedNumber(value: number, digits = 3): string {
   const rounded = Math.abs(value) < 0.5 * 10 ** -digits ? 0 : value;
@@ -203,13 +193,10 @@ export function DebugPerceptionPanel({ subscribeTopic }: DebugPerceptionPanelPro
     health,
     diagnostics,
     toolPoseEvidence,
-    handEvidence,
     bloodEvidence,
     toolPoseDetail,
-    handDetail,
     bloodDetail,
     toolPoseContractError,
-    handContractError,
     bloodContractError,
     evidenceState,
     evidenceDetail,
@@ -298,13 +285,6 @@ export function DebugPerceptionPanel({ subscribeTopic }: DebugPerceptionPanelPro
           : positionOnlyCount > 0
             ? `위치만 ${positionOnlyCount}건`
             : "사용 가능한 Tool 자세 없음";
-  const exactHandEvidence = evidenceUsable
-    && handEvidence
-    && usableDiagnostics
-    && handEvidence.result.sourceStampKey === usableDiagnostics.sourceStampKey
-    && handEvidence.result.frameId === usableDiagnostics.frameId
-    ? handEvidence
-    : null;
   const exactBloodEvidence = evidenceUsable
     && bloodEvidence
     && usableDiagnostics
@@ -312,16 +292,8 @@ export function DebugPerceptionPanel({ subscribeTopic }: DebugPerceptionPanelPro
     && bloodEvidence.result.frameId === usableDiagnostics.frameId
     ? bloodEvidence
     : null;
-  const hands = exactHandEvidence?.result.hands ?? [];
-  const handDepthSource = exactHandEvidence?.result.depthSource ?? null;
   const bloodInstances = exactBloodEvidence?.result.detections ?? [];
-  const handTone = handContractError ? "error" : exactHandEvidence ? "success" : "empty";
   const bloodTone = bloodContractError ? "error" : exactBloodEvidence ? "success" : "empty";
-  const handTitle = handContractError
-    ? "Hand 증거 계약 불일치"
-    : exactHandEvidence
-      ? hands.length === 0 ? "실행 완료 · Hand 0건" : `Hand ${hands.length}건 검토 가능`
-      : "HandKeypoints 대기";
   const bloodTitle = bloodContractError
     ? "Blood 증거 계약 불일치"
     : exactBloodEvidence
@@ -376,7 +348,7 @@ export function DebugPerceptionPanel({ subscribeTopic }: DebugPerceptionPanelPro
             <dl className="debug-perception-contract-grid" aria-label="PNU 인식 실행 계약">
               <div>
                 <dt>PROVIDER</dt>
-                <dd>{health?.provider === "pnu_hand_blood" ? "PNU hand-blood-tools" : "대기"}</dd>
+                <dd>{health?.provider === "pnu_hand_blood" ? "PNU tool/blood worker" : "대기"}</dd>
                 <dd className="debug-perception-contract-detail">
                   {health ? `${health.status} · ${ageLabel(health.receivedAt, now)}` : "health 수신 전"}
                 </dd>
@@ -588,97 +560,6 @@ export function DebugPerceptionPanel({ subscribeTopic }: DebugPerceptionPanelPro
       </article>
 
       <div className="debug-perception-semantic-grid">
-        <article className="debug-section-card debug-semantic-evidence-card" data-slot="debug-hand-evidence">
-          <div className="debug-section-heading">
-            <div>
-              <p>HAND KEYPOINTS · CAMERA FRAME</p>
-              <h2>손 21-joint · palm 자세</h2>
-              <span>Typed HandKeypoints를 health/diagnostics와 exact source stamp로 결합합니다.</span>
-            </div>
-            <span className={cn("debug-perception-state-badge", handTone)} data-slot="debug-hand-state">
-              {handTone === "success"
-                ? <CheckCircle2 size={16} aria-hidden="true" />
-                : handTone === "empty"
-                  ? <Radar size={16} aria-hidden="true" />
-                  : <AlertTriangle size={16} aria-hidden="true" />}
-              {handTitle}
-            </span>
-          </div>
-          <div className={cn("debug-state-message", handTone)} role={handContractError ? "alert" : "status"}>
-            {handTone === "success"
-              ? <CheckCircle2 size={19} aria-hidden="true" />
-              : <AlertTriangle size={19} aria-hidden="true" />}
-            <div><strong>{handTitle}</strong><span>{handDetail}</span></div>
-          </div>
-          <p className="debug-semantic-monitor-boundary">
-            Hand 3D joint와 palm pose는 CAM4 optical frame의 monitor-only 증거입니다. Robot/world/TCP pose나 Taskplanner 실행 권한이 아닙니다.
-          </p>
-          {exactHandEvidence ? (
-            <dl className="debug-semantic-meta" aria-label="HandKeypoints 프레임 메타데이터">
-              <div><dt>COUNT</dt><dd>{hands.length}</dd></div>
-              <div><dt>DEPTH SOURCE</dt><dd>{exactHandEvidence.result.depthSource.toUpperCase()}</dd></div>
-              <div><dt>FRAME</dt><dd><code>{exactHandEvidence.result.frameId}</code></dd></div>
-              <div><dt>SOURCE STAMP</dt><dd><code>{exactHandEvidence.result.sourceStampKey}</code></dd></div>
-            </dl>
-          ) : null}
-          {exactHandEvidence && hands.length === 0 ? (
-            <div className="debug-semantic-empty" data-slot="debug-hand-empty" role="status">
-              <Hand size={22} aria-hidden="true" />
-              <div><strong>정상 empty result</strong><span>Hand 모델은 exact stamp에서 실행됐고 검출은 0건입니다.</span></div>
-            </div>
-          ) : null}
-          {hands.length ? (
-            <ol className="debug-hand-list" data-slot="debug-hand-list">
-              {hands.map((hand) => {
-                const validDepthCount = hand.joints.filter((joint) => joint.validDepth).length;
-                return (
-                  <li className="debug-hand-card" key={hand.handIndex}>
-                    <header>
-                      <div><span>HAND {hand.handIndex}</span><h3>{hand.hasHandedness ? hand.handednessLabel : "Handedness 미분류"}</h3></div>
-                      <strong>{hand.hasHandedness ? probabilityLabel(hand.handednessScore) : "—"}</strong>
-                    </header>
-                    <dl className="debug-hand-summary">
-                      <div><dt>VALID DEPTH</dt><dd>{validDepthCount} / 21</dd></div>
-                      <div><dt>PALM 6D</dt><dd className={hand.hasPalm6d ? "ready" : "waiting"}>{hand.hasPalm6d ? "AVAILABLE" : "UNAVAILABLE"}</dd></div>
-                      <div><dt>DEPTH SOURCE</dt><dd>{handDepthSource?.toUpperCase() ?? "—"}</dd></div>
-                    </dl>
-                    {hand.palm6d ? (
-                      <div className="debug-hand-palm" data-slot="debug-hand-palm">
-                        <div><span>TRANSLATION · m</span><code>X {signedNumber(hand.palm6d.translation.x)} · Y {signedNumber(hand.palm6d.translation.y)} · Z {signedNumber(hand.palm6d.translation.z)}</code></div>
-                        <div><span>QUATERNION · x y z w</span><code>{signedNumber(hand.palm6d.orientation.x, 4)} · {signedNumber(hand.palm6d.orientation.y, 4)} · {signedNumber(hand.palm6d.orientation.z, 4)} · {signedNumber(hand.palm6d.orientation.w, 4)}</code></div>
-                      </div>
-                    ) : null}
-                    <details className="debug-hand-details">
-                      <summary>21-joint · rotation matrix 상세</summary>
-                      {hand.palm6d ? (
-                        <div className="debug-hand-rotation" aria-label={`Hand ${hand.handIndex} palm rotation matrix`}>
-                          <span>PALM ROTATION · ROW-MAJOR 3×3</span>
-                          {[0, 1, 2].map((row) => (
-                            <code key={row}>
-                              {hand.palm6d?.rotationMatrix.slice(row * 3, row * 3 + 3).map((value) => signedNumber(value, 4)).join("  ")}
-                            </code>
-                          ))}
-                        </div>
-                      ) : null}
-                      <ol className="debug-hand-joints" data-slot="debug-hand-joints">
-                        {hand.joints.map((joint) => (
-                          <li data-depth-valid={joint.validDepth ? "true" : "false"} key={joint.index}>
-                            <div><strong>{joint.index}. {HAND_JOINT_LABELS[joint.index]}</strong><span>score {probabilityLabel(joint.score)}</span></div>
-                            <code>UV {joint.u.toFixed(1)}, {joint.v.toFixed(1)} px</code>
-                            {joint.validDepth
-                              ? <code>XYZ {signedNumber(joint.x)}, {signedNumber(joint.y)}, {signedNumber(joint.z)} m</code>
-                              : <span>3D depth invalid · XYZ 사용 금지</span>}
-                          </li>
-                        ))}
-                      </ol>
-                    </details>
-                  </li>
-                );
-              })}
-            </ol>
-          ) : null}
-        </article>
-
         <article className="debug-section-card debug-semantic-evidence-card" data-slot="debug-blood-evidence">
           <div className="debug-section-heading">
             <div>
@@ -854,19 +735,18 @@ export function DebugPerceptionPanel({ subscribeTopic }: DebugPerceptionPanelPro
           <dl className="debug-perception-kpis">
             <div><dt><ScanLine size={15} aria-hidden="true" />Tool</dt><dd>{usableDiagnostics?.toolDetectionCount ?? "—"}</dd></div>
             <div><dt><Droplets size={15} aria-hidden="true" />Blood</dt><dd>{usableDiagnostics?.bloodDetectionCount ?? "—"}</dd></div>
-            <div><dt><Hand size={15} aria-hidden="true" />Hand</dt><dd>{usableDiagnostics?.handCount ?? "—"}</dd></div>
             <div><dt><Layers3 size={15} aria-hidden="true" />Total</dt><dd>{usableDiagnostics?.instanceCount ?? "—"}</dd></div>
           </dl>
           {executedZero ? (
             <p className="debug-perception-zero-note" data-slot="debug-perception-executed-zero">
-              <CheckCircle2 size={15} aria-hidden="true" /> 모델은 실행됐습니다. 현재 장면에서 검출된 Tool, Blood, Hand가 없습니다.
+              <CheckCircle2 size={15} aria-hidden="true" /> 모델은 실행됐습니다. 현재 장면에서 검출된 Tool, Blood가 없습니다.
             </p>
           ) : null}
           {usableDiagnostics ? (
             <p className="debug-perception-reason" data-slot="debug-perception-overlay-status">
               Server final overlay {usableDiagnostics.overlayStatus.toUpperCase() || "UNKNOWN"}
               {usableDiagnostics.overlayPublished
-                ? ` · Drawn T ${usableDiagnostics.overlayDrawnToolCount} / B ${usableDiagnostics.overlayDrawnBloodCount} / H ${usableDiagnostics.overlayDrawnHandCount}`
+                ? ` · Drawn T ${usableDiagnostics.overlayDrawnToolCount} / B ${usableDiagnostics.overlayDrawnBloodCount}`
                 : " · 새 오버레이 미발행"}
               {usableDiagnostics.overlayTruncated ? " · TRUNCATED" : ""}
             </p>
@@ -915,7 +795,6 @@ export function DebugPerceptionPanel({ subscribeTopic }: DebugPerceptionPanelPro
             <div><dt>FINAL RASTER</dt><dd><code>{DEBUG_PERCEPTION_FINAL_OVERLAY_TOPIC}</code></dd></div>
             <div><dt>FINAL STATUS</dt><dd><code>{DEBUG_PERCEPTION_FINAL_OVERLAY_STATUS_TOPIC}</code></dd></div>
             <div><dt>TOOL POSES</dt><dd><code>{DEBUG_PERCEPTION_TOOL_POSES_TOPIC}</code></dd></div>
-            <div><dt>HAND JOINTS</dt><dd><code>{DEBUG_PERCEPTION_HAND_KEYPOINTS_TOPIC}</code></dd></div>
             <div><dt>BLOOD DATA</dt><dd><code>{DEBUG_PERCEPTION_BLOOD_SEMANTICS_TOPIC}</code></dd></div>
             <div><dt>HEALTH</dt><dd><code>{DEBUG_PERCEPTION_HEALTH_TOPIC}</code></dd></div>
             <div><dt>DIAGNOSTICS</dt><dd><code>{DEBUG_PERCEPTION_DIAGNOSTICS_TOPIC}</code></dd></div>

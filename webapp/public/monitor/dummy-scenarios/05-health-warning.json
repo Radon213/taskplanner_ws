@@ -3,8 +3,8 @@
   "synthetic": true,
   "usage": "SurgiMate dummy scenario 05: degraded health, FLIR stale, speech unavailable, and a robot fault.",
   "baseline": {
-    "schema_version": "1.1.0",
-    "interface_version": "0.3.0",
+    "schema_version": "1.2.0",
+    "interface_version": "0.4.0",
     "procedure_type": "thyroidectomy_demo",
     "catalog_version": "synthetic-catalog-v1"
   },
@@ -45,7 +45,7 @@
     "predictions": [
       { "rank": 1, "instrument_id": "T08", "instance_id": "", "confidence": 0.69, "stability_sec": 0.8, "source": "dummy", "evidence_status": "DUMMY_DEGRADED" },
       { "rank": 2, "instrument_id": "T07", "instance_id": "", "confidence": 0.63, "stability_sec": 0.0, "source": "dummy", "evidence_status": "DUMMY_DEGRADED" },
-      { "rank": 3, "instrument_id": "T11", "instance_id": "", "confidence": 0.55, "stability_sec": 0.0, "source": "dummy", "evidence_status": "DUMMY_DEGRADED" }
+      { "rank": 3, "instrument_id": "T04", "instance_id": "", "confidence": 0.55, "stability_sec": 0.0, "source": "dummy", "evidence_status": "DUMMY_DEGRADED" }
     ]
   },
   "/surgery/speech": {

@@ -14,10 +14,19 @@ import json
 import re
 from typing import Mapping, Sequence
 
-from procedure_spec import normalize_voice_alias
+from procedure_spec import (
+    NormalizedRetractionCommand,
+    RetractionCommand,
+    RetractionState,
+    RetractionTargetSide,
+    normalize_retractor_command,
+    normalize_voice_alias,
+)
 
 from .contracts import (
     DISPOSITION_PROPOSE,
+    INTENT_PROCEDURE_START,
+    INTENT_PROCEDURE_STOP,
     INTENT_RETRACTOR_COMMAND,
     INTENT_TOOL_HANDOVER,
     VoiceIntentProposal,
@@ -51,6 +60,13 @@ _HANDOVER_CUES = (
     "please",
     "quickly",
     "urgent",
+)
+_STANDALONE_FORMAL_HANDOVER_CUES = (
+    "부탁합니다",
+    "부탁드립니다",
+    "부탁드려요",
+    "handover",
+    "hand over",
 )
 _URGENCY_CUES = ("빨리", "quickly", "urgent", "서둘러")
 _SELECTOR_ONLY_TOOL_CUES = ("부탁",)
@@ -116,6 +132,55 @@ _DIRECT_TEACH_REPAIR_TERMS = ("직접 교실", "직접교실", "교시시")
 _DIRECT_TEACH_START_CUES = ("시작", "개시", "start", "begin", "activate")
 _DIRECT_TEACH_FINISH_CUES = ("종료", "끝", "완료", "마쳐", "마치", "stop", "finish", "end")
 
+# This is a small reviewed vocabulary, not a procedure-name classifier.  The
+# resolver only admits a lifecycle phrase when its spoken name matches the
+# currently bound procedure.  It deliberately never turns a bare "start" or
+# "stop" into a runtime command.
+_PROCEDURE_SPOKEN_ALIASES = {
+    "thyroidectomy": ("갑상선절제술", "갑상선 수술", "thyroidectomy"),
+    "thyroidectomy_demo": ("갑상선절제술", "갑상선 수술", "thyroidectomy"),
+}
+# Generic ``수술`` is intentionally stop-only. It admits the reviewed phrase
+# "수술 종료" without also allowing an ambiguous bare "수술 시작".
+_PROCEDURE_STOP_ONLY_ALIASES = {
+    "thyroidectomy": ("수술",),
+    "thyroidectomy_demo": ("수술",),
+}
+_PROCEDURE_START_CUES = ("시작", "개시", "스타트", "start", "begin")
+_PROCEDURE_STOP_CUES = (
+    "종료",
+    "마무리",
+    "끝내",
+    "스탑",
+    "stop",
+    "finish",
+    "end",
+)
+
+# The two operator-driven demonstration bundles intentionally allow one terse,
+# reviewed bilateral fine-adjustment command.  It is kept as an exact phrase
+# set so an arbitrary mention of "pull" cannot acquire a distance or target.
+_DEMO_BARE_BILATERAL_ADJUSTMENT_PROCEDURES = frozenset(
+    {"thyroidectomy_demo", "inguinal_hernia_repair_demo"}
+)
+_DEMO_BARE_BILATERAL_ADJUSTMENT_PHRASES = frozenset(
+    {"더당겨", "더당겨줘", "좀더당겨줘", "조금더당겨줘"}
+)
+_DEMO_BARE_BILATERAL_ADJUSTMENT_DISTANCE_M = 0.005
+
+# Thyroidectomy operators may use the reviewed shorthand ``1 cm 더 당겨줘``.
+# Keep this narrowly anchored to a single explicit mm/cm distance plus the
+# pull verb; only this procedure supplies the omitted target/direction as the
+# right retractor moving right.
+_THYROID_DEFAULT_RIGHT_ADJUSTMENT_RE = re.compile(
+    r"^\s*(?:\d+(?:[.,]\d+)?|\.\d+)\s*"
+    r"(?:mm|cm|㎜|㎝|밀\s*리(?:\s*미\s*터)?|미\s*리|"
+    r"센\s*티(?:\s*미\s*터)?|센\s*치(?:\s*미\s*터)?|씨\s*엠)\s*"
+    r"(?:만큼\s*)?(?:더\s*)?당(?:겨|기(?:어)?)\s*"
+    r"(?:줘|주세요|요)?\s*[.!?]?\s*$",
+    re.IGNORECASE,
+)
+
 
 def normalize_text(value: object) -> str:
     """Normalize matching text without mutating the raw STT transcript.
@@ -172,6 +237,8 @@ class _Candidate:
     intent: str
     tool_id: str = ""
     retractor_command: str = ""
+    target_side: str = "none"
+    distance_m: float = 0.0
     provenance: str = "deterministic_alias"
     requires_confirmation: bool = False
     selector_required: bool = False
@@ -187,6 +254,8 @@ class _Candidate:
             "intent": self.intent,
             "tool_id": self.tool_id,
             "retractor_command": self.retractor_command,
+            "target_side": self.target_side,
+            "distance_m": self.distance_m,
             "evidence_spans": list(self.evidence_spans),
         }
 
@@ -203,6 +272,8 @@ class _Candidate:
             intent=self.intent,
             tool_id=self.tool_id,
             retractor_command=self.retractor_command,
+            target_side=self.target_side,
+            distance_m=self.distance_m,
             urgency=self.urgency,
             provenance=f"{self.provenance}|{selector_provenance}",
             requires_confirmation=self.requires_confirmation,
@@ -221,6 +292,9 @@ class VoiceIntentResolver:
         tool_aliases: Mapping[str, Sequence[str]] | None = None,
         procedure_id: str = "",
         catalog_id: str = "",
+        retractor_commands: Sequence[str] | None = None,
+        retractor_max_distance_m: float = 0.0,
+        retractor_require_explicit_unit: bool = True,
         selector: CandidateSelector | None = None,
         allow_selector_natural_variants: bool = False,
     ) -> None:
@@ -228,6 +302,39 @@ class VoiceIntentResolver:
         self._tool_aliases = self._validate_aliases(source)
         self._procedure_id = str(procedure_id).strip()
         self._catalog_id = str(catalog_id).strip()
+        supported_retractor_commands = {
+            command.value for command in RetractionCommand
+        }
+        requested_retractor_commands = tuple(
+            dict.fromkeys(
+                str(command).strip()
+                for command in (retractor_commands or ())
+                if str(command).strip()
+            )
+        )
+        unsupported_retractor_commands = sorted(
+            set(requested_retractor_commands) - supported_retractor_commands
+        )
+        if unsupported_retractor_commands:
+            raise ValueError(
+                "unsupported procedure retractor commands: "
+                + ", ".join(unsupported_retractor_commands)
+            )
+        self._retractor_commands = frozenset(requested_retractor_commands)
+        self._retractor_max_distance_m = max(
+            0.0,
+            float(retractor_max_distance_m),
+        )
+        self._retractor_require_explicit_unit = bool(
+            retractor_require_explicit_unit
+        )
+        if (
+            RetractionCommand.ADJUST_RETRACTION.value in self._retractor_commands
+            and self._retractor_max_distance_m <= 0.0
+        ):
+            raise ValueError(
+                "adjust_retraction requires a positive procedure max distance"
+            )
         self._tool_catalog_bound = bool(
             self._procedure_id and self._catalog_id and self._tool_aliases
         )
@@ -268,22 +375,155 @@ class VoiceIntentResolver:
             )
 
         compact = normalized.replace(" ", "")
+        procedure_control = _match_procedure_control(
+            compact,
+            procedure_id=self._procedure_id,
+        )
+        procedure_aliases = (
+            *_procedure_aliases_for(self._procedure_id),
+            *_procedure_stop_only_aliases_for(self._procedure_id),
+        )
+        mentions_active_procedure = any(
+            normalize_text(alias).replace(" ", "") in compact
+            for alias in procedure_aliases
+        )
+        has_procedure_lifecycle_cue = bool(
+            _matched_terms(
+                normalized,
+                compact,
+                (*_PROCEDURE_START_CUES, *_PROCEDURE_STOP_CUES),
+            )
+        )
+        if mentions_active_procedure and has_procedure_lifecycle_cue:
+            if _has_question(raw, normalized, compact):
+                return VoiceIntentProposal.reject(
+                    raw,
+                    normalized,
+                    reason="procedure_control_question_not_executable",
+                    evidence_spans=("question",),
+                )
+            if _has_negation(normalized, compact):
+                return VoiceIntentProposal.reject(
+                    raw,
+                    normalized,
+                    reason="procedure_control_negated",
+                    evidence_spans=("negation",),
+                )
+            if procedure_control is None:
+                return VoiceIntentProposal.reject(
+                    raw,
+                    normalized,
+                    reason="procedure_control_not_a_standalone_command",
+                    evidence_spans=tuple(procedure_aliases),
+                )
         tool_matches = (
             self._find_tool_matches(normalized)
             if self._tool_catalog_bound
             else {}
         )
+        demo_bare_bilateral_adjustment = bool(
+            self._procedure_id
+            in _DEMO_BARE_BILATERAL_ADJUSTMENT_PROCEDURES
+            and RetractionCommand.ADJUST_RETRACTION.value
+            in self._retractor_commands
+            and compact in _DEMO_BARE_BILATERAL_ADJUSTMENT_PHRASES
+        )
+        thyroid_default_right_adjustment = bool(
+            self._procedure_id == "thyroidectomy_demo"
+            and RetractionCommand.ADJUST_RETRACTION.value
+            in self._retractor_commands
+            and _THYROID_DEFAULT_RIGHT_ADJUSTMENT_RE.fullmatch(raw)
+        )
+        normalized_retractor = None
+        if self._retractor_commands:
+            if thyroid_default_right_adjustment:
+                normalized_retractor = normalize_retractor_command(
+                    f"오른쪽 리트랙션 {raw}",
+                    RetractionState.UNKNOWN,
+                    enforce_state=False,
+                )
+                if normalized_retractor.command is not None:
+                    normalized_retractor = replace(
+                        normalized_retractor,
+                        target_side=RetractionTargetSide.RIGHT,
+                        reason=(
+                            "normalized_adjust_retraction_thyroid_default_right_"
+                            "explicit_adjustment_distance"
+                        ),
+                    )
+            elif demo_bare_bilateral_adjustment:
+                normalized_retractor = NormalizedRetractionCommand(
+                    command=RetractionCommand.ADJUST_RETRACTION,
+                    target_side=RetractionTargetSide.BOTH,
+                    distance_m=_DEMO_BARE_BILATERAL_ADJUSTMENT_DISTANCE_M,
+                    confidence=1.0,
+                    reason="normalized_adjust_retraction_demo_default_bilateral_5mm",
+                )
+            else:
+                normalized_retractor = normalize_retractor_command(
+                    raw,
+                    RetractionState.UNKNOWN,
+                    enforce_state=False,
+                )
+        catalog_retractor_normalized = (
+            normalized_retractor
+            if normalized_retractor is not None
+            and normalized_retractor.command is not None
+            and normalized_retractor.command.value in self._retractor_commands
+            and normalized_retractor.command
+            not in {
+                RetractionCommand.START_DIRECT_TEACH,
+                RetractionCommand.FINISH_DIRECT_TEACH,
+            }
+            else None
+        )
+        catalog_retractor_rejection_reason = ""
+        catalog_retractor_candidate = catalog_retractor_normalized
+        if (
+            catalog_retractor_normalized is not None
+            and catalog_retractor_normalized.command
+            is RetractionCommand.ADJUST_RETRACTION
+        ):
+            if (
+                self._retractor_require_explicit_unit
+                and not demo_bare_bilateral_adjustment
+                and "explicit_adjustment_distance"
+                not in catalog_retractor_normalized.reason
+            ):
+                catalog_retractor_rejection_reason = (
+                    "adjustment_requires_explicit_distance_unit"
+                )
+            elif (
+                catalog_retractor_normalized.distance_m
+                > self._retractor_max_distance_m + 1e-12
+            ):
+                catalog_retractor_rejection_reason = (
+                    "adjustment_exceeds_procedure_distance_limit"
+                )
+            if catalog_retractor_rejection_reason:
+                catalog_retractor_candidate = None
         direct_terms = _matched_direct_teach_terms(normalized)
         repair_terms = _matched_direct_teach_repair_terms(normalized)
         has_generic_tool = bool(_matched_terms(normalized, compact, _GENERIC_TOOL_TERMS))
         handover_cues = _matched_terms(normalized, compact, _HANDOVER_CUES)
+        standalone_formal_handover_cues = (
+            _match_standalone_formal_tool_handover(compact, next(iter(tool_matches.values())))
+            if len(tool_matches) == 1
+            else ()
+        )
+        explicit_handover_cues = tuple(
+            _dedupe((*handover_cues, *standalone_formal_handover_cues))
+        )
         has_direct_start = bool(_matched_terms(normalized, compact, _DIRECT_TEACH_START_CUES))
         has_direct_finish = bool(_matched_terms(normalized, compact, _DIRECT_TEACH_FINISH_CUES))
         command_context = bool(
             tool_matches
             or direct_terms
             or repair_terms
-            or (has_generic_tool and handover_cues)
+            or catalog_retractor_normalized is not None
+            or catalog_retractor_candidate is not None
+            or standalone_formal_handover_cues
+            or (has_generic_tool and explicit_handover_cues)
         )
 
         if command_context and _has_question(raw, normalized, compact):
@@ -299,6 +539,14 @@ class VoiceIntentResolver:
                 normalized,
                 reason="negated_command",
                 evidence_spans=("negation",),
+            )
+        if catalog_retractor_rejection_reason:
+            return VoiceIntentProposal.reject(
+                raw,
+                normalized,
+                reason=catalog_retractor_rejection_reason,
+                intent=INTENT_RETRACTOR_COMMAND,
+                evidence_spans=("adjust_retraction",),
             )
         if tool_matches:
             disallowed_actions = _matched_terms(
@@ -318,7 +566,41 @@ class VoiceIntentResolver:
                 )
 
         candidates: list[_Candidate] = []
-        if tool_matches and handover_cues:
+        if procedure_control is not None:
+            action, evidence = procedure_control
+            candidates.append(
+                _Candidate(
+                    candidate_id=f"{action}:{self._procedure_id}",
+                    intent=(
+                        INTENT_PROCEDURE_START
+                        if action == "procedure_start"
+                        else INTENT_PROCEDURE_STOP
+                    ),
+                    provenance="deterministic_procedure_control_alias",
+                    reason=f"grounded_{action}",
+                    evidence_spans=evidence,
+                )
+            )
+        if catalog_retractor_candidate is not None:
+            command = catalog_retractor_candidate.command
+            assert command is not None
+            candidates.append(
+                _Candidate(
+                    candidate_id=f"retractor_command:{command.value}",
+                    intent=INTENT_RETRACTOR_COMMAND,
+                    retractor_command=command.value,
+                    target_side=catalog_retractor_candidate.target_side.value,
+                    distance_m=float(catalog_retractor_candidate.distance_m),
+                    provenance="deterministic_procedure_retractor_catalog",
+                    reason=catalog_retractor_candidate.reason,
+                    evidence_spans=(command.value,),
+                )
+            )
+        if (
+            catalog_retractor_candidate is None
+            and tool_matches
+            and explicit_handover_cues
+        ):
             if len(tool_matches) > 1:
                 return VoiceIntentProposal.reject(
                     raw,
@@ -342,14 +624,31 @@ class VoiceIntentResolver:
                     # Audit language only; it never represents robot speed,
                     # force, distance, or a bypass of downstream policy.
                     urgency="urgent" if urgency else "routine",
-                    evidence_spans=tuple(_dedupe((*aliases, *handover_cues))),
+                    evidence_spans=tuple(
+                        _dedupe((*aliases, *explicit_handover_cues))
+                    ),
                 )
             )
-        elif has_generic_tool and handover_cues:
+        elif (
+            catalog_retractor_candidate is None
+            and has_generic_tool
+            and explicit_handover_cues
+        ):
             return VoiceIntentProposal.clarify_tool(
                 raw,
                 normalized,
-                evidence_spans=tuple(_dedupe((*_matched_terms(normalized, compact, _GENERIC_TOOL_TERMS), *handover_cues))),
+                evidence_spans=tuple(
+                    _dedupe(
+                        (
+                            *_matched_terms(
+                                normalized,
+                                compact,
+                                _GENERIC_TOOL_TERMS,
+                            ),
+                            *explicit_handover_cues,
+                        )
+                    )
+                ),
                 reason=(
                     "tool_catalog_unavailable"
                     if not self._tool_catalog_bound
@@ -358,8 +657,9 @@ class VoiceIntentResolver:
             )
         elif (
             self._allow_selector_natural_variants
+            and catalog_retractor_candidate is None
             and tool_matches
-            and not handover_cues
+            and not explicit_handover_cues
         ):
             if len(tool_matches) > 1:
                 return VoiceIntentProposal.reject(
@@ -426,7 +726,17 @@ class VoiceIntentResolver:
                 intent=INTENT_RETRACTOR_COMMAND,
                 evidence_spans=tuple(_dedupe((*direct_terms, *repair_terms))),
             )
-        if direct_terms and canonical_start_shape:
+        start_direct_teach_allowed = (
+            not self._retractor_commands
+            or RetractionCommand.START_DIRECT_TEACH.value
+            in self._retractor_commands
+        )
+        finish_direct_teach_allowed = (
+            not self._retractor_commands
+            or RetractionCommand.FINISH_DIRECT_TEACH.value
+            in self._retractor_commands
+        )
+        if direct_terms and canonical_start_shape and start_direct_teach_allowed:
             candidates.append(
                 _Candidate(
                     candidate_id="retractor_command:start_direct_teach",
@@ -437,7 +747,11 @@ class VoiceIntentResolver:
                     evidence_spans=tuple(_dedupe((*direct_terms, "시작"))),
                 )
             )
-        elif direct_terms and canonical_finish_shape:
+        elif (
+            direct_terms
+            and canonical_finish_shape
+            and finish_direct_teach_allowed
+        ):
             candidates.append(
                 _Candidate(
                     candidate_id="retractor_command:finish_direct_teach",
@@ -448,7 +762,7 @@ class VoiceIntentResolver:
                     evidence_spans=tuple(_dedupe((*direct_terms, "종료"))),
                 )
             )
-        elif repair_terms and repair_start_shape:
+        elif repair_terms and repair_start_shape and start_direct_teach_allowed:
             candidates.append(
                 _Candidate(
                     candidate_id="retractor_command:start_direct_teach",
@@ -460,7 +774,11 @@ class VoiceIntentResolver:
                     evidence_spans=tuple(_dedupe((*repair_terms, "시작"))),
                 )
             )
-        elif repair_terms and repair_finish_shape:
+        elif (
+            repair_terms
+            and repair_finish_shape
+            and finish_direct_teach_allowed
+        ):
             candidates.append(
                 _Candidate(
                     candidate_id="retractor_command:finish_direct_teach",
@@ -475,6 +793,7 @@ class VoiceIntentResolver:
         elif (
             self._allow_selector_natural_variants
             and direct_terms
+            and start_direct_teach_allowed
             and not has_direct_start
             and not has_direct_finish
             and _is_selector_only_direct_teach_request(compact)
@@ -595,6 +914,63 @@ def _candidate_by_id(
     )
 
 
+def _procedure_aliases_for(procedure_id: str) -> tuple[str, ...]:
+    """Return only reviewed aliases for the currently bound procedure."""
+
+    return tuple(_PROCEDURE_SPOKEN_ALIASES.get(str(procedure_id).casefold(), ()))
+
+
+def _procedure_stop_only_aliases_for(procedure_id: str) -> tuple[str, ...]:
+    """Return reviewed aliases that may pause, but can never start, a run."""
+
+    return tuple(
+        _PROCEDURE_STOP_ONLY_ALIASES.get(str(procedure_id).casefold(), ())
+    )
+
+
+def _match_procedure_control(
+    compact: str,
+    *,
+    procedure_id: str,
+) -> tuple[str, tuple[str, ...]] | None:
+    """Match one short, explicit lifecycle command for the active procedure.
+
+    Long surrounding speech, a question, and a negation are rejected by the
+    caller.  This routine only accepts an alias plus one terminal action, so
+    background discussion cannot start or stop a scenario by accident.
+    """
+
+    prefixes = r"(?:(?:자|이제|그럼|그러면|좀|한번|한번만|우리|바로|지금))*"
+    particle = r"(?:을|를|은|는|이|가|도|만|좀)?"
+    filler = r"(?:(?:바로|지금|좀|한번|한번만))*"
+    start = (
+        r"(?:시작(?:하(?:겠습니다|겠어요|자|죠)?|해(?:보자|요|줘|주세요)?|합니다|할게(?:요)?)?"
+        r"|개시(?:하(?:겠습니다|겠어요|자)?|해(?:보자|요)?|합니다)?|스타트|start|begin)"
+    )
+    stop = (
+        r"(?:종료(?:하(?:겠습니다|겠어요|자|죠)?|해(?:보자|요)?|합니다|할게(?:요)?)?"
+        r"|마무리(?:하(?:겠습니다|겠어요|자|죠)?|해(?:보자|요)?|합니다|할게(?:요)?)?"
+        r"|끝내(?:겠습니다|겠어요|자|요|다)?|스탑|stop|finish|end)"
+    )
+    for alias in _procedure_aliases_for(procedure_id):
+        compact_alias = normalize_text(alias).replace(" ", "")
+        if not compact_alias:
+            continue
+        base = rf"{prefixes}{re.escape(compact_alias)}{particle}{filler}"
+        if re.fullmatch(base + start, compact):
+            return "procedure_start", (alias, "시작")
+        if re.fullmatch(base + stop, compact):
+            return "procedure_stop", (alias, "종료")
+    for alias in _procedure_stop_only_aliases_for(procedure_id):
+        compact_alias = normalize_text(alias).replace(" ", "")
+        if not compact_alias:
+            continue
+        base = rf"{prefixes}{re.escape(compact_alias)}{particle}{filler}"
+        if re.fullmatch(base + stop, compact):
+            return "procedure_stop", (alias, "종료")
+    return None
+
+
 def _matched_terms(text: str, compact: str, terms: Sequence[str]) -> tuple[str, ...]:
     return tuple(term for term in terms if _contains_term(text, compact, term))
 
@@ -690,6 +1066,42 @@ def _is_direct_teach_command_shape(
             compact,
         )
     )
+
+
+def _match_standalone_formal_tool_handover(
+    compact: str,
+    aliases: Sequence[str],
+) -> tuple[str, ...]:
+    """Match only a complete alias-bound formal handover request.
+
+    Formal Korean endings and the English ``handover`` noun are intentionally
+    excluded from the general substring cue list.  They occur frequently in
+    quoted speech, training descriptions, questions, and status messages.  A
+    deterministic request is therefore created only when the entire utterance
+    is one recognized tool alias, an optional Korean object particle/``좀``,
+    and exactly one reviewed terminal cue.
+    """
+
+    korean_particle_and_filler = r"(?:을|를)?(?:좀)?"
+    korean_cues = _STANDALONE_FORMAL_HANDOVER_CUES[:3]
+    english_cues = _STANDALONE_FORMAL_HANDOVER_CUES[3:]
+    for alias in aliases:
+        compact_alias = normalize_text(alias).replace(" ", "")
+        if not compact_alias:
+            continue
+        for cue in korean_cues:
+            compact_cue = normalize_text(cue).replace(" ", "")
+            if re.fullmatch(
+                rf"{re.escape(compact_alias)}{korean_particle_and_filler}"
+                rf"{re.escape(compact_cue)}",
+                compact,
+            ):
+                return (cue,)
+        for cue in english_cues:
+            compact_cue = normalize_text(cue).replace(" ", "")
+            if compact == f"{compact_alias}{compact_cue}":
+                return (cue,)
+    return ()
 
 
 def _is_selector_only_tool_request(

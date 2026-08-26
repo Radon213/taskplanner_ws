@@ -126,16 +126,6 @@ class AuditVlmDatasetTest(unittest.TestCase):
                 media_time=6.0,
             ),
             make_master(
-                example_id="intent-1",
-                task_type="request_intent",
-                target={
-                    "intent": "receive_unspecified_tool",
-                    "requested_tool": None,
-                },
-                cutoff=12.0,
-                media_time=12.0,
-            ),
-            make_master(
                 example_id="phase-1",
                 task_type="current_phase",
                 target={"phase_id": "P04", "state": "transition"},
@@ -178,9 +168,9 @@ class AuditVlmDatasetTest(unittest.TestCase):
 
         self.assertTrue(report["ok"])
         self.assertEqual(0, report["summary"]["error_count"])
-        self.assertEqual(5, report["summary"]["master_rows"])
+        self.assertEqual(4, report["summary"]["master_rows"])
         self.assertEqual(
-            4,
+            3,
             report["summary"]["authority_tier_counts"][
                 "authorized_silver"
             ],
@@ -192,6 +182,21 @@ class AuditVlmDatasetTest(unittest.TestCase):
         self.assertTrue(report["checks"]["causal_inputs_only"])
         warning_codes = {item["code"] for item in report["warnings"]}
         self.assertIn("authority_draft_silver_present", warning_codes)
+
+    def test_visual_hand_task_is_forbidden(self) -> None:
+        row = make_master(
+            example_id="legacy-request",
+            task_type="request_intent",
+            target={"intent": "receive_unspecified_tool"},
+        )
+
+        report = audit_dataset([row])
+
+        self.assertFalse(report["ok"])
+        self.assertIn(
+            "visual_hand_task_forbidden",
+            {item["code"] for item in report["errors"]},
+        )
 
     def test_detects_split_and_future_information_leakage(self) -> None:
         first = make_master(

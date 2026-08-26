@@ -62,20 +62,75 @@ class PhaseGuardPolicy:
 
 @dataclass(slots=True)
 class ActionGuardPolicy:
-    block_handover_when_phase_uncertain: bool
+    """Admission evidence that must remain fail-closed.
+
+    Scenario choices used to live beside this field. New code must query
+    :class:`ScenarioPolicy` through ``ProcedureSpec.get_scenario_policy()``.
+    """
+
     require_multi_evidence_for_handover: bool
-    allow_prepositioning_when_uncertain: bool
-    explicit_request_priority: bool
 
 
 @dataclass(slots=True)
 class HumanoidPolicy:
+    """Legacy compatibility view of the authored scenario behavior."""
+
     handover_arm: str
     recovery_arm: str
     require_cleaning_after_surgeon_use: bool
     allow_anticipatory_hold: bool
     voice_override_preempts_preposition: bool
-    direct_return_to_rack_for_unused_prepositioned_tool: bool
+    return_unused_preposition_to_mayo: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ScenarioRuntimeRequirements:
+    """Scenario-selected runtime capabilities, never motion authorization.
+
+    These values describe which runtime lanes the authored procedure wants and
+    whether Taskplanner should enforce its local retraction workflow ordering.
+    Controller admission, endpoint validation, stopped-route changes, preflight
+    ACKs, freshness, provenance, and idempotency remain independent fail-closed
+    checks in their owning runtime components.
+    """
+
+    procedure_type: str = ""
+    tool_handover_action_required: bool = True
+    retraction_service_required: bool = False
+    bed_robot_status_required: bool = False
+    image_vlm_enabled: bool = True
+    dialogue_vlm_enabled: bool = False
+    perception_enabled: bool = True
+    rfdetr_tool_observations_required: bool = False
+    voice_intent_resolver_enabled: bool = False
+    surgeon_actor_enabled: bool = True
+    phase_inference_enabled: bool = True
+    retraction_workflow_state_enforced: bool = True
+    legacy_raw_retractor_voice_enabled: bool = False
+
+    @property
+    def bed_robot_contract_enabled(self) -> bool:
+        return bool(self.procedure_type and self.retraction_service_required)
+
+
+@dataclass(frozen=True, slots=True)
+class ScenarioPolicySpec:
+    """Authored scenario choices, kept separate from safety interlocks.
+
+    These values describe what a procedure demonstration chooses to do.  They
+    do not authorize motion and must never replace controller, Service
+    admission, stopped-state, freshness, idempotency, or preflight checks.
+    """
+
+    handover_arm: str = "right"
+    recovery_arm: str = "left"
+    require_cleaning_after_surgeon_use: bool = True
+    allow_anticipatory_hold: bool = True
+    voice_override_preempts_preposition: bool = True
+    allow_prepositioning_when_uncertain: bool = False
+    explicit_request_priority: bool = True
+    unused_preposition_destination: str = "mayo"
+    runtime_requirements: ScenarioRuntimeRequirements | None = None
 
 
 @dataclass(slots=True)
@@ -86,6 +141,8 @@ class BedRobotArmGroupSpec:
     enabled: bool
     initial_end_effector_profile: str
     allowed_operations: list[str] = field(default_factory=list)
+    allowed_voice_commands: list[str] = field(default_factory=list)
+    voice_command_policy_configured: bool = False
 
 
 @dataclass(slots=True)
@@ -168,21 +225,11 @@ class MockObservation:
 
 
 @dataclass(slots=True)
-class MockSurgeonGesture:
-    event_type: str
-    requested_tool: str = ""
-    hand_pose: str = ""
-    confidence: float = 0.0
-    note: str = ""
-
-
-@dataclass(slots=True)
 class MockPerceptionStage:
     name: str
     duration_ticks: int
     phase_hypotheses: list[MockPhaseHypothesis] = field(default_factory=list)
     observations: list[MockObservation] = field(default_factory=list)
-    surgeon_gesture: MockSurgeonGesture | None = None
     scene_summary: str = ""
     uncertainty: float = 0.0
     explicit_request: str = ""
@@ -219,6 +266,10 @@ class ProcedureBundle:
     procedure_id: str
     procedure_display_name: str
     procedure_display_name_ko: str
+    procedure_target_site: str = ""
+    procedure_target_site_ko: str = ""
+    procedure_approach: str = ""
+    procedure_approach_ko: str = ""
     default_phase_id: str = ""
     normal_phase_ids: list[str] = field(default_factory=list)
     interrupt_phase_ids: list[str] = field(default_factory=list)
@@ -233,6 +284,7 @@ class ProcedureBundle:
     phase_guard: PhaseGuardPolicy | None = None
     action_guard: ActionGuardPolicy | None = None
     humanoid_policy: HumanoidPolicy | None = None
+    scenario_policy: ScenarioPolicySpec | None = None
     bed_robot_arm_groups: BedRobotArmProcedureSpec | None = None
     simulation_entities: list[SimulationEntity] = field(default_factory=list)
     simulation_anchors: list[SimulationAnchor] = field(default_factory=list)

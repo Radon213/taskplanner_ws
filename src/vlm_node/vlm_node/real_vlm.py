@@ -36,9 +36,16 @@ from rclpy.clock import Clock, ClockType
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.parameter import Parameter
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import (
+    DurabilityPolicy,
+    QoSProfile,
+    ReliabilityPolicy,
+    qos_profile_sensor_data,
+)
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
+from surgical_perception_msgs.msg import ToolObservation2DArray
+from surgical_interop_msgs.msg import GatewayInfo
 from surgical_msgs.msg import (
     BedRobotArmGroupActionProposal,
     BedRobotArmGroupCommand,
@@ -47,12 +54,14 @@ from surgical_msgs.msg import (
     BTContextSnapshot,
     BTDecision,
     EventDigest,
+    HumanoidReply,
     ModelCatalogEntry,
     ModelProviderStatus,
     PhaseEvidence,
     SkillStatus,
     SimulationState,
-    SurgeonGestureEvidence,
+    SpeechUtterance,
+    TTSPlaybackStatus,
     ToolObservation,
     TwinEvent,
     VLMHealth,
@@ -70,7 +79,13 @@ from surgical_msgs.srv import (
 from .common import compact_json
 from .lmstudio_client import LMStudioClient
 from .prompt_builder import PromptBuilder
-from .rfdetr_contract import parse_cam4_semantics_json
+from .reply_outbox import ReplyCollisionError, ReplyEnvelope, ReplyOutbox
+from .rfdetr_contract import (
+    RFDETR_FLIR_SEGMENTED_FRAME_MARKER,
+    frame_id_has_rfdetr_marker,
+    parse_cam4_semantics_json,
+    summarize_rfdetr_tool_observations,
+)
 from .schema import (
     SchemaValidationError,
     compact_vlm_json_schema,
@@ -107,7 +122,6 @@ ACTOR_LOG_CONTEXT_MAX_CHARS = 2800
 ACTOR_LOG_MIN_RUNTIME_CHARS = 512
 ACTOR_LOG_EVIDENCE_LIMITS = {
     "speech": 4,
-    "observed_signals": 6,
     "skill_status": 4,
 }
 ACTOR_LOG_EVENT_LIMIT = 4
@@ -118,6 +132,10 @@ HANDOVER_SKILL_ACTIONS = {
     "pick_up_from_mayo_and_handover",
     "put_down_and_handover",
 }
+NINFER_DIALOGUE_HANDOVER_MIN_CONFIDENCE = 0.5
+NINFER_IGNORED_DIALOGUE_EXTENSION_FIELDS = frozenset(
+    {"phase_alt", "tool_alt"}
+)
 
 
 def compact_prompt_json(data: dict[str, Any]) -> str:
@@ -129,6 +147,69 @@ def compact_prompt_json(data: dict[str, Any]) -> str:
         separators=(",", ":"),
         sort_keys=True,
     )
+
+
+def normalize_ranked_tool_distribution(
+    rows: list[list[Any]],
+    *,
+    limit: int = 3,
+) -> list[list[Any]]:
+    """Return unique ranked tool rows as a display-stable probability mass.
+
+    The public stage rounds probabilities to integer percentages while the
+    monitor uses one decimal place.  Allocating whole percentage points with a
+    largest-remainder pass makes both views add to 100 (and keeps the wire
+    values at a deterministic sum of 1.0) instead of exposing 99/101 rounding
+    artifacts to the operator.
+    """
+
+    scores: dict[str, float] = {}
+    order: dict[str, int] = {}
+    for index, row in enumerate(rows):
+        if not isinstance(row, list) or len(row) < 2:
+            continue
+        tool_id = str(row[0]).strip()
+        if not tool_id or isinstance(row[1], bool):
+            continue
+        try:
+            confidence = float(row[1])
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(confidence) or confidence < 0.0:
+            continue
+        order.setdefault(tool_id, index)
+        scores[tool_id] = max(scores.get(tool_id, 0.0), min(1.0, confidence))
+    ranked = sorted(
+        scores,
+        key=lambda tool_id: (-scores[tool_id], order[tool_id], tool_id),
+    )[: max(0, int(limit))]
+    if not ranked:
+        return []
+    total = sum(scores[tool_id] for tool_id in ranked)
+    raw_units = [
+        (
+            scores[tool_id] / total * 100.0
+            if total > 0.0
+            else 100.0 / len(ranked)
+        )
+        for tool_id in ranked
+    ]
+    units = [int(math.floor(value)) for value in raw_units]
+    remainder = 100 - sum(units)
+    allocation_order = sorted(
+        range(len(ranked)),
+        key=lambda index: (
+            -(raw_units[index] - units[index]),
+            index,
+        ),
+    )
+    for index in allocation_order[:remainder]:
+        units[index] += 1
+    probabilities = [unit / 100.0 for unit in units]
+    return [
+        [tool_id, probability]
+        for tool_id, probability in zip(ranked, probabilities, strict=True)
+    ]
 
 
 def compact_tool_forecast_json_schema() -> dict[str, Any]:
@@ -153,7 +234,7 @@ def compact_tool_forecast_json_schema() -> dict[str, Any]:
                     "maxItems": 2,
                 },
                 "minItems": 1,
-                "maxItems": 4,
+                "maxItems": 3,
             },
             "u": {
                 "type": "number",
@@ -164,6 +245,122 @@ def compact_tool_forecast_json_schema() -> dict[str, Any]:
         "required": ["tool", "u"],
         "additionalProperties": False,
     }
+
+
+def _repair_ninfer_dialogue_envelope(
+    payload: dict[str, Any],
+    *,
+    claimed_turn_id: str,
+) -> dict[str, Any]:
+    """Repair only transport-owned omissions before strict validation.
+
+    NInfer does not support constrained JSON decoding. Keep the public schema
+    strict, but adapt dialogue transport metadata at the provider boundary.
+    Without a claimed turn all dialogue output is suppressed. With a claim,
+    omission means null and existing objects inherit only system-owned fields.
+
+    A high-confidence handover intent may be promoted to the equivalent typed
+    function call. This does not itself admit an action: the downstream gate
+    still requires the independent resolver proposal for the same utterance,
+    exact tool arguments, active run scope, and TTL. Function-bound speech is
+    delayed until that independent admission is accepted.
+
+    Explicit non-empty turn ids and model-owned content remain untouched so a
+    stale turn, unsupported function, or malformed reply still fails closed.
+    The only semantic promotion is the bounded handover intent described above;
+    delivery metadata is runtime-owned and may be completed or delayed.
+    """
+
+    if str(payload.get("v", "")) not in {"5", "6"}:
+        return payload
+
+    repaired = dict(payload)
+    # NInfer occasionally emits explanatory alternatives beside the canonical
+    # fields. They carry no downstream authority and are discarded explicitly;
+    # every other unknown field still reaches strict schema validation.
+    for field in NINFER_IGNORED_DIALOGUE_EXTENSION_FIELDS:
+        repaired.pop(field, None)
+    dialogue_fields = ("function_call", "humanoid_reply")
+    for field in dialogue_fields:
+        if field not in repaired:
+            repaired[field] = None
+
+    clean_turn_id = str(claimed_turn_id or "").strip()
+    if not clean_turn_id:
+        repaired["function_call"] = None
+        repaired["humanoid_reply"] = None
+        return repaired
+
+    raw_reply = repaired.get("humanoid_reply")
+    if isinstance(raw_reply, str):
+        reply_text = " ".join(raw_reply.split())[:240]
+        if reply_text and reply_text.lower() not in {"null", "none"}:
+            repaired["humanoid_reply"] = {
+                "turn_id": clean_turn_id,
+                "text": reply_text,
+            }
+        else:
+            repaired["humanoid_reply"] = None
+
+    if repaired.get("function_call") is None:
+        intent = repaired.get("intent")
+        if isinstance(intent, list) and len(intent) == 3:
+            intent_name = str(intent[0] or "").strip().lower()
+            intent_tool_id = str(intent[1] or "").strip()
+            intent_confidence = intent[2]
+            try:
+                confidence = float(intent_confidence)
+            except (TypeError, ValueError):
+                confidence = -1.0
+            if (
+                not isinstance(intent_confidence, bool)
+                and math.isfinite(confidence)
+                and NINFER_DIALOGUE_HANDOVER_MIN_CONFIDENCE
+                <= confidence
+                <= 1.0
+                and intent_name == "handover"
+                and intent_tool_id
+            ):
+                repaired["function_call"] = {
+                    "turn_id": clean_turn_id,
+                    "name": "request_tool_handover",
+                    "arguments": {"tool_id": intent_tool_id},
+                }
+
+    for field in dialogue_fields:
+        value = repaired.get(field)
+        if not isinstance(value, dict):
+            continue
+        supplied_turn_id = value.get("turn_id")
+        turn_id_is_missing = "turn_id" not in value
+        turn_id_is_blank = supplied_turn_id is None or (
+            isinstance(supplied_turn_id, str) and not supplied_turn_id.strip()
+        )
+        if not turn_id_is_missing and not turn_id_is_blank:
+            continue
+        bound_value = dict(value)
+        bound_value["turn_id"] = clean_turn_id
+        repaired[field] = bound_value
+
+    reply = repaired.get("humanoid_reply")
+    if isinstance(reply, dict):
+        normalized_reply = dict(reply)
+        if "speak" not in normalized_reply or normalized_reply["speak"] is None:
+            normalized_reply["speak"] = True
+        function_present = isinstance(repaired.get("function_call"), dict)
+        timing = normalized_reply.get("timing")
+        if timing is None or (
+            isinstance(timing, str) and not timing.strip()
+        ):
+            normalized_reply["timing"] = (
+                "on_function_accepted" if function_present else "immediate"
+            )
+        elif function_present and str(timing).strip() == "immediate":
+            # Delivery timing is runtime policy, not model authority. Delaying
+            # the acknowledgement is safer than speaking before admission.
+            normalized_reply["timing"] = "on_function_accepted"
+        repaired["humanoid_reply"] = normalized_reply
+    return repaired
 
 
 def normalize_tool_forecast_raw_text(
@@ -181,8 +378,8 @@ def normalize_tool_forecast_raw_text(
         raise SchemaValidationError("tool-only response requires 'tool' and 'u'")
 
     raw_rows = payload["tool"]
-    if not isinstance(raw_rows, list) or not 1 <= len(raw_rows) <= 4:
-        raise SchemaValidationError("'tool' must contain 1-4 [tool_id, confidence] rows")
+    if not isinstance(raw_rows, list) or not 1 <= len(raw_rows) <= 3:
+        raise SchemaValidationError("'tool' must contain 1-3 [tool_id, confidence] rows")
     rows: list[list[Any]] = []
     seen: set[str] = set()
     for item in raw_rows:
@@ -221,7 +418,6 @@ def normalize_tool_forecast_raw_text(
         "phase": [],
         "tool": rows,
         "intent": ["none", "", 0.0],
-        "gesture": ["", "", "", 0.0],
         "mayo": [],
         "mayo_retrieve": ["", 0.0],
         "u": uncertainty,
@@ -403,6 +599,16 @@ def actor_log_model_context(context: dict[str, Any]) -> dict[str, Any]:
     model_context.pop("previous", None)
     model_context.pop("procedure_prompt_id", None)
 
+    evidence = model_context.get("evidence_window")
+    if isinstance(evidence, dict):
+        model_context["evidence_window"] = {
+            key: evidence[key]
+            for key in ACTOR_LOG_EVIDENCE_LIMITS
+            if key in evidence
+        }
+    else:
+        model_context.pop("evidence_window", None)
+
     # The learned artifact may carry fit metadata and raw outcome counts on
     # disk. Only its compact, aggregated distribution is model-visible; case
     # IDs, timestamps, labels, paths, and other provenance never cross this
@@ -478,14 +684,45 @@ def actor_log_model_context(context: dict[str, Any]) -> dict[str, Any]:
     if isinstance(perception, dict):
         compact_perception = {
             key: perception[key]
-            for key in ("source", "ground_truth", "tool_request", "tools")
+            for key in (
+                "schema",
+                "source",
+                "ground_truth",
+                "mask_rle_forwarded_to_vlm",
+                "flir_reference_stamp_sec",
+                "max_source_skew_sec",
+                "tools",
+            )
             if key in perception
         }
-        alignment = perception.get("alignment")
-        if isinstance(alignment, dict) and alignment.get("status"):
-            compact_perception["alignment"] = {
-                "status": alignment["status"],
-            }
+        # A fresh typed detector row remains useful as a *view-local* fact
+        # even when the FLIR panel is absent or cannot be pixel-paired. Keep
+        # freshness and visual-pairing diagnostics separate so a compact VLM
+        # request cannot turn that fact into a false no-detection result.
+        for status_key, allowed_keys in (
+            ("freshness", ("status", "received_age_sec")),
+            (
+                "visual_alignment",
+                ("status", "detector_stamp_sec", "offset_sec"),
+            ),
+        ):
+            raw_statuses = perception.get(status_key)
+            if not isinstance(raw_statuses, dict):
+                continue
+            bounded_statuses: dict[str, dict[str, Any]] = {}
+            for view_name in ("cam_3", "cam_4"):
+                raw_status = raw_statuses.get(view_name)
+                if not isinstance(raw_status, dict):
+                    continue
+                bounded_status = {
+                    key: raw_status[key]
+                    for key in allowed_keys
+                    if key in raw_status and raw_status[key] is not None
+                }
+                if bounded_status.get("status"):
+                    bounded_statuses[view_name] = bounded_status
+            if bounded_statuses:
+                compact_perception[status_key] = bounded_statuses
         tool_rows = perception.get("tools")
         if isinstance(tool_rows, list):
             compact_tools = []
@@ -508,6 +745,68 @@ def actor_log_model_context(context: dict[str, Any]) -> dict[str, Any]:
                 if compact_row:
                     compact_tools.append(compact_row)
             compact_perception["tools"] = compact_tools
+        detection_views = perception.get("tool_detection_views")
+        if isinstance(detection_views, list):
+            compact_views: list[dict[str, Any]] = []
+            for view in detection_views[:2]:
+                if not isinstance(view, dict):
+                    continue
+                compact_view = {
+                    key: view[key]
+                    for key in (
+                        "view",
+                        "source_stamp_sec",
+                        "sequence",
+                        "model_version",
+                        "ontology_version",
+                        "detection_status",
+                        "truncated",
+                    )
+                    if key in view and view[key] is not None
+                }
+                for status_key, allowed_keys in (
+                    ("freshness", ("status", "received_age_sec")),
+                    (
+                        "visual_alignment",
+                        ("status", "detector_stamp_sec", "offset_sec"),
+                    ),
+                ):
+                    raw_status = view.get(status_key)
+                    if not isinstance(raw_status, dict):
+                        continue
+                    bounded_status = {
+                        key: raw_status[key]
+                        for key in allowed_keys
+                        if key in raw_status and raw_status[key] is not None
+                    }
+                    if bounded_status.get("status"):
+                        compact_view[status_key] = bounded_status
+                compact_instances: list[dict[str, Any]] = []
+                instances = view.get("instances")
+                if isinstance(instances, list):
+                    for instance in instances[:12]:
+                        if not isinstance(instance, dict):
+                            continue
+                        compact_instance = {
+                            key: instance[key]
+                            for key in (
+                                "tool_id",
+                                "class_name",
+                                "confidence",
+                                "bbox_xyxy_norm",
+                                "center_uv_norm",
+                                "observation_point_uv_norm",
+                                "image_region",
+                                "depth_m",
+                            )
+                            if key in instance and instance[key] is not None
+                        }
+                        if compact_instance:
+                            compact_instances.append(compact_instance)
+                compact_view["instances"] = compact_instances
+                if compact_view:
+                    compact_views.append(compact_view)
+            compact_perception["tool_detection_views"] = compact_views
         model_context["observable_perception"] = compact_perception
 
     digital_twin = model_context.get("digital_twin")
@@ -570,7 +869,12 @@ def bound_actor_log_context(
     bounded.pop("phases", None)
     bounded.pop("tools", None)
 
-    evidence = dict(bounded.get("evidence_window", {}))
+    raw_evidence = bounded.get("evidence_window", {})
+    evidence = {
+        key: raw_evidence[key]
+        for key in ACTOR_LOG_EVIDENCE_LIMITS
+        if isinstance(raw_evidence, dict) and key in raw_evidence
+    }
     for key, limit in ACTOR_LOG_EVIDENCE_LIMITS.items():
         rows = evidence.get(key, [])
         if isinstance(rows, list):
@@ -589,13 +893,11 @@ def bound_actor_log_context(
         digital_twin["tool_requests"] = tool_requests[-8:]
     bounded["digital_twin"] = digital_twin
 
-    # Preserve the newest externally observable request cue until the end.
-    # Old skill/event rows are less useful to the visual observer than current
-    # speech and hand-request evidence.
+    # Preserve the newest admitted speech cue until the end. Old skill/event
+    # rows are less useful to the visual observer than current speech evidence.
     shrink_order = (
         (evidence, "skill_status"),
         (digital_twin, "events"),
-        (evidence, "observed_signals"),
         (evidence, "speech"),
     )
     while len(compact_prompt_json(actor_log_model_context(bounded))) > max_chars:
@@ -609,6 +911,131 @@ def bound_actor_log_context(
         if not removed:
             break
     return bounded
+
+
+def _minimal_typed_tool_detection_context(
+    perception: dict[str, Any],
+    *,
+    max_views: int = 2,
+) -> dict[str, Any]:
+    """Keep usable CAM3/CAM4 location facts when a Live prompt is tight.
+
+    This is deliberately a *typed* reduction, not a detector-image fallback.
+    A single highest-confidence box per view together with its freshness and
+    source provenance is more useful to the VLM than a long ambient ASR
+    transcript, while remaining below the smallest supported runtime budget.
+    """
+
+    if (
+        perception.get("schema")
+        != "taskplanner.rfdetr_multiview_tool_context.v1"
+        or perception.get("source") != "rfdetr_tool_observation_2d"
+        or perception.get("ground_truth") is not False
+        or perception.get("mask_rle_forwarded_to_vlm") is not False
+    ):
+        return {}
+
+    compact: dict[str, Any] = {
+        key: perception[key]
+        for key in (
+            "schema",
+            "source",
+            "ground_truth",
+            "mask_rle_forwarded_to_vlm",
+            "flir_reference_stamp_sec",
+            "max_source_skew_sec",
+        )
+        if key in perception
+    }
+    for status_key in ("freshness", "visual_alignment"):
+        raw_statuses = perception.get(status_key)
+        if not isinstance(raw_statuses, dict):
+            continue
+        bounded_statuses: dict[str, dict[str, Any]] = {}
+        for view_name in ("cam_3", "cam_4"):
+            raw_status = raw_statuses.get(view_name)
+            if not isinstance(raw_status, dict):
+                continue
+            allowed = (
+                ("status", "received_age_sec")
+                if status_key == "freshness"
+                else ("status", "detector_stamp_sec", "offset_sec")
+            )
+            status = {
+                key: raw_status[key]
+                for key in allowed
+                if key in raw_status and raw_status[key] is not None
+            }
+            if status.get("status"):
+                bounded_statuses[view_name] = status
+        if bounded_statuses:
+            compact[status_key] = bounded_statuses
+
+    views: list[dict[str, Any]] = []
+    raw_views = perception.get("tool_detection_views")
+    if isinstance(raw_views, list):
+        for raw_view in raw_views[: max(0, int(max_views))]:
+            if not isinstance(raw_view, dict):
+                continue
+            view = {
+                key: raw_view[key]
+                for key in (
+                    "view",
+                    "source_stamp_sec",
+                    "sequence",
+                    "model_version",
+                    "ontology_version",
+                    "detection_status",
+                    "truncated",
+                    "freshness",
+                    "visual_alignment",
+                )
+                if key in raw_view and raw_view[key] is not None
+            }
+            raw_instances = raw_view.get("instances")
+            instances: list[dict[str, Any]] = []
+            if isinstance(raw_instances, list):
+                for raw_instance in raw_instances[:1]:
+                    if not isinstance(raw_instance, dict):
+                        continue
+                    instance = {
+                        key: raw_instance[key]
+                        for key in (
+                            "tool_id",
+                            "class_name",
+                            "confidence",
+                            "bbox_xyxy_norm",
+                            "center_uv_norm",
+                            "observation_point_uv_norm",
+                            "image_region",
+                            "depth_m",
+                        )
+                        if key in raw_instance and raw_instance[key] is not None
+                    }
+                    if instance:
+                        instances.append(instance)
+            view["instances"] = instances
+            if view.get("view") and view.get("detection_status"):
+                views.append(view)
+    compact["tool_detection_views"] = views
+    # A one-view emergency reduction must not claim a second view is present
+    # without its matching typed row.  Keep the status maps paired with the
+    # exact views that crossed the bounded prompt boundary.
+    included_views = {
+        str(view.get("view", ""))
+        for view in views
+        if str(view.get("view", "")) in {"cam_3", "cam_4"}
+    }
+    for status_key in ("freshness", "visual_alignment"):
+        statuses = compact.get(status_key)
+        if not isinstance(statuses, dict):
+            continue
+        compact[status_key] = {
+            view_name: status
+            for view_name, status in statuses.items()
+            if view_name in included_views
+        }
+    return compact
 
 
 def actor_log_request_context(
@@ -626,6 +1053,7 @@ def actor_log_request_context(
         )
     bounded = bound_actor_log_context(context, max_chars=available_chars)
     model_context = actor_log_model_context(bounded)
+    pending_dialogue_turn = model_context.get("pending_dialogue_turn")
     if len(compact_prompt_json(model_context)) <= available_chars:
         return model_context
 
@@ -641,7 +1069,7 @@ def actor_log_request_context(
         "phase_search_mode": model_context.get("phase_search_mode", ""),
         "evidence_window": {
             key: rows[-1:]
-            for key in ("speech", "observed_signals", "skill_status")
+            for key in ("speech", "skill_status")
             if isinstance((rows := evidence.get(key)), list) and rows
         },
     }
@@ -652,6 +1080,7 @@ def actor_log_request_context(
         "forecast_constraints",
         "frozen_ngram_prior",
         "pending_bed_robot_arm_group_request",
+        "pending_dialogue_turn",
     ):
         if key in model_context:
             minimal[key] = model_context[key]
@@ -668,6 +1097,23 @@ def actor_log_request_context(
             )
             if key in digital_twin
         }
+
+    # Do this before shrinking structured perception.  Ambient or accidental
+    # long-form speech is a weaker VLM cue than a fresh bounded RF-DETR box,
+    # and should never evict CAM3/CAM4 typed location evidence from a request.
+    for key, text_keys in (
+        ("speech", ("text",)),
+        ("skill_status", ("detail", "message", "text")),
+    ):
+        rows = evidence.get(key)
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            for text_key in text_keys:
+                if text_key in row:
+                    row[text_key] = str(row[text_key])[:160]
 
     minimal_twin = minimal.get("digital_twin", {})
     if (
@@ -708,29 +1154,44 @@ def actor_log_request_context(
         while tools and len(compact_prompt_json(minimal)) > available_chars:
             tools.pop()
 
+    detection_views = perception.get("tool_detection_views")
+    if isinstance(detection_views, list):
+        # Each view is confidence-sorted by the typed contract.  Drop the
+        # weakest remaining row first, while retaining the view's alignment
+        # state so a tight prompt never turns missing detector evidence into a
+        # false absence claim.
+        while len(compact_prompt_json(minimal)) > available_chars:
+            candidates = [
+                view.get("instances")
+                for view in detection_views
+                if isinstance(view, dict)
+                and isinstance(view.get("instances"), list)
+                # Preserve one actual typed location fact per observed view.
+                # The final budget fallback can reduce whole views if needed,
+                # but must not silently turn a fresh detection into an empty
+                # detector frame.
+                and len(view.get("instances")) > 1
+            ]
+            if not candidates:
+                break
+            min(candidates, key=len).pop()
+
     if len(compact_prompt_json(minimal)) > available_chars:
         visual.pop("sources", None)
 
     if len(compact_prompt_json(minimal)) > available_chars and perception:
-        request = perception.get("tool_request")
         alignment = perception.get("alignment")
-        reduced_perception = {
-            key: perception[key]
-            for key in ("source", "ground_truth")
-            if key in perception
-        }
+        reduced_perception = _minimal_typed_tool_detection_context(perception)
+        if not reduced_perception:
+            reduced_perception = {
+                key: perception[key]
+                for key in ("source", "ground_truth")
+                if key in perception
+            }
         if isinstance(alignment, dict) and alignment.get("status"):
             reduced_perception["alignment"] = {
                 "status": alignment["status"]
             }
-        if isinstance(request, dict):
-            reduced_request = {
-                key: request[key]
-                for key in ("state", "requested", "confidence")
-                if key in request and request[key] is not None
-            }
-            if reduced_request:
-                reduced_perception["tool_request"] = reduced_request
         minimal["observable_perception"] = reduced_perception
 
     if len(compact_prompt_json(minimal)) > available_chars and visual:
@@ -759,10 +1220,7 @@ def actor_log_request_context(
 
     # Keep the newest public cue but bound free-form ASR and status text. Exact
     # transcripts remain on their ROS topic and in trace logs for auditing.
-    for key, text_keys in (
-        ("speech", ("text",)),
-        ("observed_signals", ("speech_text", "detail", "text")),
-    ):
+    for key, text_keys in (("speech", ("text",)),):
         rows = evidence.get(key)
         if not isinstance(rows, list):
             continue
@@ -779,26 +1237,56 @@ def actor_log_request_context(
         minimal.pop(key, None)
 
     if len(compact_prompt_json(minimal)) > available_chars:
-        # This final form still preserves the newest externally visible cue and
-        # is valid JSON rather than a lossy string slice.
+        # This final form prefers actual typed detector location evidence over
+        # a transcript.  It remains valid JSON rather than a lossy string
+        # slice, and keeps the CAM3/CAM4 facts that are supplied to the VLM.
         latest_evidence = {
             key: rows[-1:]
-            for key in ("speech", "observed_signals")
+            for key in ("speech",)
             if isinstance((rows := evidence.get(key)), list) and rows
         }
-        minimal = {"evidence_window": latest_evidence}
-        if "frozen_ngram_prior" in model_context:
+        typed_perception = _minimal_typed_tool_detection_context(perception)
+        minimal = (
+            {"observable_perception": typed_perception}
+            if typed_perception
+            else {"evidence_window": latest_evidence}
+        )
+        if isinstance(pending_dialogue_turn, dict):
+            minimal["pending_dialogue_turn"] = pending_dialogue_turn
+        if (
+            typed_perception
+            and len(compact_prompt_json({**minimal, "evidence_window": latest_evidence}))
+            <= available_chars
+        ):
+            minimal["evidence_window"] = latest_evidence
+        if not typed_perception and "frozen_ngram_prior" in model_context:
             minimal["frozen_ngram_prior"] = model_context["frozen_ngram_prior"]
         for rows in latest_evidence.values():
             for row in rows:
                 if isinstance(row, dict) and "text" in row:
                     row["text"] = str(row["text"])[:80]
     if len(compact_prompt_json(minimal)) > available_chars:
-        minimal = {"evidence_window": {}}
+        typed_perception = _minimal_typed_tool_detection_context(
+            perception,
+            max_views=1,
+        )
+        if isinstance(pending_dialogue_turn, dict):
+            minimal = {"pending_dialogue_turn": pending_dialogue_turn}
+            perception_only = {"observable_perception": typed_perception}
+            if typed_perception and len(
+                compact_prompt_json({**minimal, **perception_only})
+            ) <= available_chars:
+                minimal.update(perception_only)
+        else:
+            minimal = (
+                {"observable_perception": typed_perception}
+                if typed_perception
+                else {"evidence_window": {}}
+            )
     return minimal
 PUBLIC_REQUEST_MAX_AGE_SEC = 6.0
 DEFAULT_CAM4_CROP_XYWH_NORM = (0.32, 0.18, 0.62, 0.78)
-# A side-by-side FLIR + CAM4 frame needs enough pixels for the Mayo/hand
+# A side-by-side FLIR + CAM4 frame needs enough pixels for the Mayo
 # context to remain useful.  This stays bounded below the single-view limit.
 DEFAULT_MULTIVIEW_IMAGE_MAX_SIDE_PX = 1024
 MAX_PUBLIC_PERCEPTION_INSTANCES = 24
@@ -809,9 +1297,10 @@ CAM4_MAYO_MIN_CONFIDENCE = 0.65
 CAM4_MAYO_MIN_STABLE_SAMPLES = 3
 CAM4_MAYO_MIN_STABLE_DURATION_SEC = 0.25
 CAM4_MAYO_STABILITY_WINDOW_SEC = 0.75
-CAM4_VISUAL_GESTURE_MIN_CONFIDENCE = 0.35
+CANONICAL_MAYO_POLICY_LOCATION = "mayo_stand"
 INFERENCE_TRIGGER_PERIODIC_LIVE = "periodic_live"
 INFERENCE_TRIGGER_SPEECH = "speech"
+DIALOGUE_AUTOMATIC_ATTEMPT_LIMIT = 2
 INFERENCE_TRIGGER_REPLAY_FRAME = "replay_frame"
 INFERENCE_TRIGGER_SOURCE_FRAME = "source_frame_live"
 INFERENCE_TRIGGER_FORCED = "forced"
@@ -955,7 +1444,13 @@ class InferenceFailure:
 
 
 class InferenceBackpressure:
-    """Run one inference while retaining only the newest pending request."""
+    """Run one inference while retaining one highest-priority pending request.
+
+    Visual frame triggers are intentionally coalesced to the newest frame, but
+    a queued speech trigger represents a FIFO dialogue obligation and must not
+    be overwritten by the next camera frame.  Forced operator work remains the
+    only trigger with a higher priority than speech.
+    """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -968,16 +1463,51 @@ class InferenceBackpressure:
     def _normalize_trigger(trigger: str) -> str:
         return str(trigger or INFERENCE_TRIGGER_FORCED).strip()
 
+    @staticmethod
+    def _trigger_priority(trigger: str) -> int:
+        normalized = InferenceBackpressure._normalize_trigger(trigger)
+        if normalized == INFERENCE_TRIGGER_FORCED:
+            return 3
+        if normalized == INFERENCE_TRIGGER_SPEECH:
+            return 2
+        if normalized == INFERENCE_TRIGGER_PERIODIC_LIVE:
+            return 0
+        return 1
+
+    def _replace_pending(self, normalized: str) -> InferenceAdmission:
+        """Merge one trigger into the occupied pending slot under the lock."""
+
+        if not self._pending_trigger:
+            self._pending_trigger = normalized
+            return InferenceAdmission("queued", normalized)
+        self._coalesced_count += 1
+        if self._trigger_priority(normalized) < self._trigger_priority(
+            self._pending_trigger
+        ):
+            return InferenceAdmission("preserved", self._pending_trigger)
+        self._pending_trigger = normalized
+        return InferenceAdmission("coalesced", normalized)
+
     def queue(self, trigger: str) -> InferenceAdmission:
-        """Queue work without executing it in the producer callback."""
+        """Queue work without letting frame churn erase dialogue work."""
 
         normalized = self._normalize_trigger(trigger)
         with self._lock:
-            disposition = "coalesced" if self._pending_trigger else "queued"
+            return self._replace_pending(normalized)
+
+    def queue_if_empty(self, trigger: str) -> InferenceAdmission:
+        """Queue work unless an equal- or higher-priority trigger is pending."""
+
+        normalized = self._normalize_trigger(trigger)
+        with self._lock:
             if self._pending_trigger:
-                self._coalesced_count += 1
+                if self._trigger_priority(normalized) > self._trigger_priority(
+                    self._pending_trigger
+                ):
+                    return self._replace_pending(normalized)
+                return InferenceAdmission("preserved", self._pending_trigger)
             self._pending_trigger = normalized
-            return InferenceAdmission(disposition, normalized)
+            return InferenceAdmission("queued", normalized)
 
     def begin(self) -> str | None:
         """Claim queued work for the single inference consumer."""
@@ -991,7 +1521,7 @@ class InferenceBackpressure:
             return self._current_trigger
 
     def request(self, trigger: str) -> InferenceAdmission:
-        """Start immediately when idle, otherwise replace pending work."""
+        """Start immediately when idle, otherwise merge pending work."""
 
         normalized = self._normalize_trigger(trigger)
         with self._lock:
@@ -1000,11 +1530,7 @@ class InferenceBackpressure:
                 self._current_trigger = normalized
                 self._pending_trigger = ""
                 return InferenceAdmission("started", normalized)
-            disposition = "coalesced" if self._pending_trigger else "queued"
-            if self._pending_trigger:
-                self._coalesced_count += 1
-            self._pending_trigger = normalized
-            return InferenceAdmission(disposition, normalized)
+            return self._replace_pending(normalized)
 
     def complete(self, *, drop_pending: bool = False) -> str | None:
         with self._lock:
@@ -1029,8 +1555,14 @@ class InferenceBackpressure:
             else ""
         )
         with self._lock:
-            if not self._pending_trigger and normalized_fallback:
-                self._pending_trigger = normalized_fallback
+            if normalized_fallback:
+                if not self._pending_trigger:
+                    self._pending_trigger = normalized_fallback
+                elif self._trigger_priority(
+                    normalized_fallback
+                ) > self._trigger_priority(self._pending_trigger):
+                    self._coalesced_count += 1
+                    self._pending_trigger = normalized_fallback
             self._in_flight = False
             self._current_trigger = ""
             return self._pending_trigger
@@ -1047,6 +1579,226 @@ class InferenceBackpressure:
                 "pending_trigger": self._pending_trigger,
                 "coalesced_count": self._coalesced_count,
             }
+
+
+@dataclass(frozen=True, slots=True)
+class DialogueTurn:
+    """One admitted final speech turn that may produce one humanoid reply."""
+
+    epoch: int
+    procedure_run_id: str
+    utterance_id: str
+    turn_id: str
+    text: str
+    received_at: float
+    speaker_role: str = ""
+    language: str = ""
+    source: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class DialogueClaim:
+    turn_id: str
+    correlation_id: str
+    epoch: int
+
+
+def stable_dialogue_reply_id(
+    procedure_run_id: str,
+    utterance_id: str,
+    *,
+    gateway_instance_id: str = "",
+) -> str:
+    """Return the durable logical-turn key used by the TTS outbox.
+
+    A VLM process epoch is intentionally excluded: the same admitted ASR
+    utterance redelivered after a VLM restart must still map to one audible
+    reply within the procedure run.
+    """
+
+    material = json.dumps(
+        {
+            "gateway_instance_id": str(gateway_instance_id or "").strip(),
+            "procedure_run_id": str(procedure_run_id or "").strip(),
+            "utterance_id": str(utterance_id or "").strip(),
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return "humanoid-reply:" + hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+class DialogueTurnGate:
+    """FIFO admission plus an in-process at-most-once reply commit gate.
+
+    Visual inference triggers may be coalesced, but admitted speech turns are
+    never coalesced. A model result can commit only the FIFO head claimed by
+    its own inference correlation id. Invalid results release the claim while
+    keeping the turn pending for a later frame.
+    """
+
+    def __init__(self, *, epoch: int = 0, max_committed: int = 0) -> None:
+        self._lock = threading.Lock()
+        self._epoch = max(0, int(epoch))
+        self._pending: deque[DialogueTurn] = deque()
+        self._pending_ids: set[str] = set()
+        self._claim: DialogueClaim | None = None
+        self._claim_attempts: dict[str, int] = {}
+        self._committed: dict[str, str] = {}
+        # Zero keeps the complete current-run ledger. Gateway/run changes reset
+        # the gate, so this stays naturally bounded by one procedure.
+        self._max_committed = max(0, int(max_committed))
+
+    @property
+    def epoch(self) -> int:
+        with self._lock:
+            return self._epoch
+
+    @staticmethod
+    def _turn_id(epoch: int, procedure_run_id: str, utterance_id: str) -> str:
+        run_scope = str(procedure_run_id or "no-run").strip() or "no-run"
+        return f"{max(0, int(epoch))}:{run_scope}:{utterance_id}"
+
+    def enqueue(
+        self,
+        *,
+        utterance_id: str,
+        text: str,
+        procedure_run_id: str = "",
+        received_at: float = 0.0,
+        speaker_role: str = "",
+        language: str = "",
+        source: str = "",
+    ) -> DialogueTurn | None:
+        clean_utterance_id = str(utterance_id or "").strip()
+        clean_text = " ".join(str(text or "").split())[:240]
+        if not clean_utterance_id or not clean_text:
+            return None
+        with self._lock:
+            turn_id = self._turn_id(
+                self._epoch,
+                procedure_run_id,
+                clean_utterance_id,
+            )
+            if turn_id in self._pending_ids or turn_id in self._committed:
+                return None
+            turn = DialogueTurn(
+                epoch=self._epoch,
+                procedure_run_id=str(procedure_run_id or "").strip(),
+                utterance_id=clean_utterance_id,
+                turn_id=turn_id,
+                text=clean_text,
+                received_at=float(received_at or 0.0),
+                speaker_role=str(speaker_role or "").strip(),
+                language=str(language or "").strip(),
+                source=str(source or "").strip(),
+            )
+            self._pending.append(turn)
+            self._pending_ids.add(turn_id)
+            return turn
+
+    def next_pending(self) -> DialogueTurn | None:
+        with self._lock:
+            return self._pending[0] if self._pending else None
+
+    def claim(self, *, turn_id: str, correlation_id: str) -> DialogueTurn | None:
+        clean_turn_id = str(turn_id or "").strip()
+        clean_correlation_id = str(correlation_id or "").strip()
+        if not clean_turn_id or not clean_correlation_id:
+            return None
+        with self._lock:
+            if not self._pending:
+                return None
+            turn = self._pending[0]
+            if turn.epoch != self._epoch or turn.turn_id != clean_turn_id:
+                return None
+            if self._claim is not None:
+                if (
+                    self._claim.turn_id == clean_turn_id
+                    and self._claim.correlation_id == clean_correlation_id
+                    and self._claim.epoch == self._epoch
+                ):
+                    return turn
+                return None
+            self._claim = DialogueClaim(
+                turn_id=clean_turn_id,
+                correlation_id=clean_correlation_id,
+                epoch=self._epoch,
+            )
+            self._claim_attempts[clean_turn_id] = (
+                self._claim_attempts.get(clean_turn_id, 0) + 1
+            )
+            return turn
+
+    def attempt_count(self, turn_id: str) -> int:
+        clean_turn_id = str(turn_id or "").strip()
+        with self._lock:
+            return max(0, int(self._claim_attempts.get(clean_turn_id, 0)))
+
+    def release(self, *, correlation_id: str) -> bool:
+        clean_correlation_id = str(correlation_id or "").strip()
+        with self._lock:
+            if (
+                self._claim is None
+                or self._claim.correlation_id != clean_correlation_id
+            ):
+                return False
+            self._claim = None
+            return True
+
+    def commit(
+        self,
+        *,
+        turn_id: str,
+        correlation_id: str,
+        reply: str | None,
+        valid: bool,
+    ) -> bool:
+        clean_turn_id = str(turn_id or "").strip()
+        clean_correlation_id = str(correlation_id or "").strip()
+        clean_reply = " ".join(str(reply or "").split())
+        with self._lock:
+            claim = self._claim
+            if claim is None:
+                return False
+            if claim.correlation_id != clean_correlation_id:
+                return False
+            if (
+                claim.epoch != self._epoch
+                or claim.turn_id != clean_turn_id
+                or not self._pending
+                or self._pending[0].turn_id != clean_turn_id
+            ):
+                self._claim = None
+                return False
+            if not valid or not clean_reply:
+                self._claim = None
+                return False
+            if clean_turn_id in self._committed:
+                self._claim = None
+                return False
+            self._pending.popleft()
+            self._pending_ids.discard(clean_turn_id)
+            self._claim = None
+            self._claim_attempts.pop(clean_turn_id, None)
+            self._committed[clean_turn_id] = clean_reply[:240]
+            while (
+                self._max_committed > 0
+                and len(self._committed) > self._max_committed
+            ):
+                oldest = next(iter(self._committed))
+                self._committed.pop(oldest, None)
+            return True
+
+    def reset(self, *, epoch: int) -> None:
+        with self._lock:
+            self._epoch = max(0, int(epoch))
+            self._pending.clear()
+            self._pending_ids.clear()
+            self._claim = None
+            self._claim_attempts.clear()
+            self._committed.clear()
 
 
 class InferenceFailureBackoff:
@@ -1175,6 +1927,37 @@ def source_frame_is_fresh(
     if max_lag_sec <= 0.0:
         return True
     return now_sec - image_stamp_sec <= max_lag_sec + 1.0e-9
+
+
+def source_frame_timestamp_rejection_reason(
+    now_sec: float,
+    image_stamp_sec: float,
+    max_lag_sec: float,
+    max_future_skew_sec: float,
+) -> str:
+    """Return a fail-closed reason for a Live camera source timestamp.
+
+    ``source_frame_is_fresh`` above is retained for replay compatibility: a
+    replay source clock can legitimately reset and has historically treated a
+    future image as fresh.  Live input cannot make that assumption.  It must
+    have a finite, positive source stamp within both stale and future bounds.
+    """
+
+    values = (now_sec, image_stamp_sec, max_lag_sec, max_future_skew_sec)
+    if not all(math.isfinite(float(value)) for value in values):
+        return "non_finite_source_timestamp"
+    if float(now_sec) <= 0.0:
+        return "unavailable_source_clock"
+    if float(image_stamp_sec) <= 0.0:
+        return "missing_source_timestamp"
+    if float(max_lag_sec) <= 0.0:
+        return "invalid_source_max_lag"
+    age_sec = float(now_sec) - float(image_stamp_sec)
+    if age_sec > float(max_lag_sec) + 1.0e-9:
+        return f"stale_source_frame:{age_sec:.3f}s"
+    if age_sec < -max(0.0, float(max_future_skew_sec)) - 1.0e-9:
+        return f"future_source_frame:{-age_sec:.3f}s"
+    return ""
 
 
 def should_use_open_set_phase_bootstrap(
@@ -1370,28 +2153,28 @@ def compose_flir_cam4_for_model(
     cam4_overlay_bytes: bytes | None = None,
     cam4_overlay_mime_type: str = "",
 ) -> tuple[bytes, str]:
-    """Build one bounded, labeled FLIR-left/CAM4-right model image."""
+    """Build one bounded, labeled FLIR-left/CAM4-right model image.
 
-    del flir_mime_type, cam4_mime_type, cam4_overlay_mime_type
+    RF-DETR is intentionally *not* painted into this image.  The model gets
+    its CAM3/CAM4 tool boxes through the bounded typed observation context, so
+    a rendered overlay cannot silently become an unversioned detector-input
+    proxy.  The optional overlay arguments remain accepted for API stability
+    with old callers, but are deliberately ignored.
+    """
+
+    del (
+        flir_mime_type,
+        cam4_mime_type,
+        cam4_overlay_bytes,
+        cam4_overlay_mime_type,
+    )
     limit = max(320, int(max_side_px or 0))
     with (
         Image.open(BytesIO(flir_bytes)) as flir_source,
         Image.open(BytesIO(cam4_bytes)) as cam4_source,
     ):
         flir = flir_source.convert("RGB")
-        cam4 = cam4_source.convert("RGBA")
-        if cam4_overlay_bytes:
-            # RF-DETR publishes a transparent CAM4 overlay so the browser can
-            # compose it cheaply. Reuse the exact same observed overlay in the
-            # model image rather than silently dropping detector evidence.
-            with Image.open(BytesIO(cam4_overlay_bytes)) as overlay_source:
-                cam4_overlay = overlay_source.convert("RGBA")
-            if cam4_overlay.size != cam4.size:
-                cam4_overlay = cam4_overlay.resize(
-                    cam4.size,
-                    Image.Resampling.NEAREST,
-                )
-            cam4 = Image.alpha_composite(cam4, cam4_overlay)
+        cam4 = cam4_source.convert("RGB")
         cam4_crop = crop_image_normalized(
             cam4.convert("RGB"),
             cam4_crop_xywh_norm,
@@ -1400,7 +2183,7 @@ def compose_flir_cam4_for_model(
         label_height = max(24, min(42, canvas_width // 32))
         # Both observed views use their native aspect ratio at one shared
         # height.  The former fixed-width split letterboxed CAM4 below its
-        # frame, reducing the Mayo/hand evidence that reaches the VLM.
+        # frame, reducing the Mayo evidence that reaches the VLM.
         flir_aspect = flir.width / max(flir.height, 1)
         cam4_aspect = cam4_crop.width / max(cam4_crop.height, 1)
         content_height = max(
@@ -1440,11 +2223,7 @@ def compose_flir_cam4_for_model(
         draw.text((10, 5), "FLIR surgical field", fill="white", font=font)
         draw.text(
             (flir_width + 10, 5),
-            (
-                "CAM4 Mayo / hand + RFDETR"
-                if cam4_overlay_bytes
-                else "CAM4 Mayo / surgeon hand"
-            ),
+            "CAM4 Mayo instruments",
             fill="white",
             font=font,
         )
@@ -1654,12 +2433,17 @@ class RealVLMNode(Node):
         self.declare_parameter("response_mode", "live")
         self.declare_parameter("source_time_triggered_live", True)
         self.declare_parameter("model_input_max_source_lag_sec", 0.0)
+        self.declare_parameter("require_source_frame_timestamp", False)
+        self.declare_parameter("model_input_max_source_future_skew_sec", 1.0)
         self.declare_parameter("replay_response_path", "")
         self.declare_parameter("output_prefix", "/vlm")
         self.declare_parameter("context_prefix", "/context")
         self.declare_parameter("field_image_topic", "/surgery/images/field/compressed")
         self.declare_parameter("raw_field_image_topic", "")
         self.declare_parameter("cam4_image_topic", "")
+        # Retained only so existing launch files can continue to route the
+        # operator overlay. RealVLM no longer subscribes to or composites this
+        # raster; typed ToolObservation2DArray is the detector contract.
         self.declare_parameter("cam4_overlay_image_topic", "")
         self.declare_parameter("tray_image_topic", "/surgery/images/tray/compressed")
         self.declare_parameter("synthetic_image_topic", "/surgery/images/synthetic/compressed")
@@ -1680,6 +2464,15 @@ class RealVLMNode(Node):
         self.declare_parameter("perception_bboxes_topic", "")
         self.declare_parameter("perception_segmentation_topic", "")
         self.declare_parameter("cam4_semantics_topic", "")
+        # These typed arrays are the primary instrument-location evidence for
+        # Live VLM.  They carry RF-DETR boxes as structured data, not an
+        # annotated image.  The legacy CAM4 semantic summary remains an
+        # explicit fallback for older Debug/replay deployments.
+        self.declare_parameter("cam3_tool_observations_topic", "")
+        self.declare_parameter("cam4_tool_observations_topic", "")
+        self.declare_parameter("cam3_tool_observations_expected_model_version", "")
+        self.declare_parameter("cam4_tool_observations_expected_model_version", "")
+        self.declare_parameter("allow_legacy_cam4_semantics_fallback", True)
         self.declare_parameter("perception_stale_sec", 3.0)
         self.declare_parameter("perception_image_max_skew_sec", 0.2)
         self.declare_parameter(
@@ -1693,9 +2486,24 @@ class RealVLMNode(Node):
             DEFAULT_MULTIVIEW_IMAGE_MAX_SIDE_PX,
         )
         self.declare_parameter("require_field_image", True)
+        self.declare_parameter("enable_text_only_dialogue", False)
+        self.declare_parameter("require_rfdetr_applied_field_image", False)
+        # Deprecated visual-admission flag. It is accepted for Debug/replay
+        # compatibility but never makes an overlay VLM detector evidence.
+        self.declare_parameter("require_rfdetr_cam4_overlay", False)
         self.declare_parameter("context_mode", "world")
         self.declare_parameter("open_set_phase_bootstrap_observations", 0)
         self.declare_parameter("handover_ngram_prior_enabled", True)
+        self.declare_parameter(
+            "tts_reply_outbox_path",
+            os.environ.get(
+                "TASKPLANNER_TTS_REPLY_OUTBOX_PATH",
+                f"/tmp/taskplanner-vlm-reply-outbox-{os.getuid()}.sqlite3",
+            ),
+        )
+        self.declare_parameter("tts_playback_status_topic", "/tts/playback_status")
+        self.declare_parameter("tts_reply_retry_period_sec", 1.0)
+        self.declare_parameter("gateway_info_timeout_sec", 3.0)
 
         self._prompt_builder = PromptBuilder()
         self._active = False
@@ -1716,11 +2524,11 @@ class RealVLMNode(Node):
         self._perception_generation = 0
         self._current_visual_input: dict[str, Any] = {}
         self._current_image_input_error = ""
+        self._last_source_frame_rejection = ""
         self._current_perception_reference_stamp_sec: float | None = None
         self._last_good_raw = ""
         self._last_good_payload: dict[str, Any] | None = None
         self._replay_payload: dict[str, Any] | None = None
-        self._recent_observed_signals: deque[dict[str, Any]] = deque(maxlen=12)
         self._recent_speech: deque[dict[str, Any]] = deque(maxlen=10)
         self._recent_skill_statuses: deque[dict[str, Any]] = deque(maxlen=8)
         self._latest_bed_robot_arm_group_request: BedRobotArmGroupRequest | None = None
@@ -1745,6 +2553,9 @@ class RealVLMNode(Node):
         # strictly newer than delayed results from its previous process.
         self._model_input_epoch = max(1, time.time_ns())
         self._vlm_result_sequence = 0
+        self._gateway_instance_id = ""
+        self._procedure_run_id = ""
+        self._dialogue_turn_gate = DialogueTurnGate(epoch=self._model_input_epoch)
         self._last_submitted_model_input_key = ""
         self._exact_duplicate_suppressed_count = 0
         self._fast_cam4_mayo_published_tools: set[str] = set()
@@ -1755,11 +2566,10 @@ class RealVLMNode(Node):
         self._oracle_tick = 0
         self._developer_instruction = (
             "Return exactly one valid JSON object and nothing else. "
-            "All object keys must be double-quoted strings: \"v\", \"ph\", \"to\", \"sg\", \"u\", \"sum\". "
+            "All object keys must be double-quoted strings: \"v\", \"ph\", \"to\", \"u\", \"sum\". "
             "Never omit quotes around keys. Never use true/false/null. "
             "Confidence values and u must be numeric floats between 0.0 and 1.0, not strings and not booleans. "
             "Use exact tool ids and location ids from context. "
-            "If gesture is absent, sg must be exactly [\"\",\"\",\"\",0.0]. "
             "If the image is black, blank, or text-only, keep the current context phase at low confidence, emit no tool observations, and set u to 1.0."
         )
 
@@ -1774,6 +2584,25 @@ class RealVLMNode(Node):
         )
         self._load_parameters()
         self.add_on_set_parameters_callback(self._on_parameters_changed)
+        self._reply_outbox = ReplyOutbox(
+            str(self.get_parameter("tts_reply_outbox_path").value)
+        )
+        self._reply_retry_period_sec = float(
+            self.get_parameter("tts_reply_retry_period_sec").value
+        )
+        if self._reply_retry_period_sec < 0.2:
+            self._reply_outbox.close()
+            raise ValueError("tts_reply_retry_period_sec must be at least 0.2")
+        self._gateway_info_timeout_sec = float(
+            self.get_parameter("gateway_info_timeout_sec").value
+        )
+        if self._gateway_info_timeout_sec <= 0.0:
+            self._reply_outbox.close()
+            raise ValueError("gateway_info_timeout_sec must be positive")
+        self._gateway_info_last_seen_monotonic: float | None = None
+        self._gateway_info_last_instance_id = ""
+        self._gateway_info_last_revision = -1
+        self._gateway_info_last_source_stamp_ns = 0
 
         self._phase_summary_pub = self.create_publisher(String, self._topic(self._context_prefix, "phase_summary"), 10)
         self._tool_summary_pub = self.create_publisher(String, self._topic(self._context_prefix, "tool_lifecycle_summary"), 10)
@@ -1781,6 +2610,15 @@ class RealVLMNode(Node):
         self._bt_snapshot_pub = self.create_publisher(BTContextSnapshot, self._topic(self._context_prefix, "bt_context_snapshot"), 10)
         self._request_context_pub = self.create_publisher(VLMRequestContext, self._topic(self._context_prefix, "vlm_request_context"), 10)
         self._result_pub = self.create_publisher(VLMResult, self._topic(self._output_prefix, "result"), 10)
+        self._humanoid_reply_pub = self.create_publisher(
+            HumanoidReply,
+            self._topic(self._output_prefix, "humanoid_reply"),
+            QoSProfile(
+                depth=64,
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            ),
+        )
         self._model_raw_result_pub = self.create_publisher(
             VLMResult,
             self._topic(self._output_prefix, "model_raw_result"),
@@ -1789,7 +2627,6 @@ class RealVLMNode(Node):
         self._health_pub = self.create_publisher(VLMHealth, self._topic(self._output_prefix, "health"), 10)
         self._phase_pub = self.create_publisher(PhaseEvidence, self._topic(self._output_prefix, "phase_evidence"), 10)
         self._tool_pub = self.create_publisher(ToolObservation, self._topic(self._output_prefix, "tool_observations"), 30)
-        self._gesture_pub = self.create_publisher(SurgeonGestureEvidence, self._topic(self._output_prefix, "surgeon_gesture_evidence"), 10)
         self._composite_image_pub = self.create_publisher(
             CompressedImage,
             self._composite_image_topic,
@@ -1848,6 +2685,35 @@ class RealVLMNode(Node):
             callback_group=state_group,
         )
         self.create_subscription(
+            GatewayInfo,
+            "/surgery/gateway_info",
+            self._on_gateway_info,
+            QoSProfile(
+                depth=1,
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            ),
+            callback_group=state_group,
+        )
+        self.create_subscription(
+            TTSPlaybackStatus,
+            str(self.get_parameter("tts_playback_status_topic").value),
+            self._on_tts_playback_status,
+            QoSProfile(
+                depth=32,
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            ),
+            callback_group=state_group,
+        )
+        self.create_subscription(
+            SpeechUtterance,
+            "/surgery/audio/admitted_utterance",
+            self._on_speech_utterance,
+            20,
+            callback_group=state_group,
+        )
+        self.create_subscription(
             String,
             "/surgery/audio/request_text",
             self._on_request_text,
@@ -1891,14 +2757,6 @@ class RealVLMNode(Node):
                 qos_profile_sensor_data,
                 callback_group=visual_group,
             )
-        if self._cam4_overlay_image_topic:
-            self.create_subscription(
-                CompressedImage,
-                self._cam4_overlay_image_topic,
-                self._make_image_cb("cam4_overlay"),
-                qos_profile_sensor_data,
-                callback_group=visual_group,
-            )
         self.create_subscription(
             CompressedImage,
             self._tray_image_topic,
@@ -1929,12 +2787,34 @@ class RealVLMNode(Node):
                 20,
                 callback_group=visual_group,
             )
-        if self._cam4_semantics_topic:
+        if (
+            self._allow_legacy_cam4_semantics_fallback
+            and self._cam4_semantics_topic
+        ):
             self.create_subscription(
                 String,
                 self._cam4_semantics_topic,
                 self._make_perception_cb("cam4_semantics"),
                 20,
+                callback_group=visual_group,
+            )
+        if self._cam3_tool_observations_topic:
+            self.create_subscription(
+                ToolObservation2DArray,
+                self._cam3_tool_observations_topic,
+                self._make_rfdetr_tool_observation_cb("cam_3"),
+                # The upstream may publish perception as reliable or sensor
+                # best-effort. A best-effort request is compatible with both
+                # and is correct for newest-frame location evidence.
+                qos_profile_sensor_data,
+                callback_group=visual_group,
+            )
+        if self._cam4_tool_observations_topic:
+            self.create_subscription(
+                ToolObservation2DArray,
+                self._cam4_tool_observations_topic,
+                self._make_rfdetr_tool_observation_cb("cam_4"),
+                qos_profile_sensor_data,
                 callback_group=visual_group,
             )
         self.create_subscription(
@@ -1956,6 +2836,18 @@ class RealVLMNode(Node):
             self._publish_period_sec,
             self._tick,
             callback_group=self._inference_callback_group,
+            clock=Clock(clock_type=ClockType.STEADY_TIME),
+        )
+        self._reply_retry_timer = self.create_timer(
+            self._reply_retry_period_sec,
+            self._republish_pending_humanoid_replies,
+            callback_group=state_group,
+            clock=Clock(clock_type=ClockType.STEADY_TIME),
+        )
+        self._gateway_info_watchdog_timer = self.create_timer(
+            min(0.5, max(0.1, self._gateway_info_timeout_sec / 4.0)),
+            self._on_gateway_info_watchdog,
+            callback_group=state_group,
             clock=Clock(clock_type=ClockType.STEADY_TIME),
         )
         self._inference_worker = threading.Thread(
@@ -2030,6 +2922,21 @@ class RealVLMNode(Node):
             0.0,
             float(param_value("model_input_max_source_lag_sec")),
         )
+        self._require_source_frame_timestamp = bool(
+            param_value("require_source_frame_timestamp")
+        )
+        self._model_input_max_source_future_skew_sec = max(
+            0.0,
+            float(param_value("model_input_max_source_future_skew_sec")),
+        )
+        if (
+            self._require_source_frame_timestamp
+            and self._model_input_max_source_lag_sec <= 0.0
+        ):
+            raise ValueError(
+                "require_source_frame_timestamp needs "
+                "model_input_max_source_lag_sec > 0"
+            )
         self._replay_response_path = str(param_value("replay_response_path"))
         self._output_prefix = str(param_value("output_prefix")).rstrip("/")
         self._context_prefix = str(param_value("context_prefix")).rstrip("/")
@@ -2076,6 +2983,21 @@ class RealVLMNode(Node):
         self._cam4_semantics_topic = str(
             param_value("cam4_semantics_topic")
         ).strip()
+        self._cam3_tool_observations_topic = str(
+            param_value("cam3_tool_observations_topic")
+        ).strip()
+        self._cam4_tool_observations_topic = str(
+            param_value("cam4_tool_observations_topic")
+        ).strip()
+        self._cam3_tool_observations_expected_model_version = str(
+            param_value("cam3_tool_observations_expected_model_version")
+        ).strip()
+        self._cam4_tool_observations_expected_model_version = str(
+            param_value("cam4_tool_observations_expected_model_version")
+        ).strip()
+        self._allow_legacy_cam4_semantics_fallback = bool(
+            param_value("allow_legacy_cam4_semantics_fallback")
+        )
         self._perception_stale_sec = max(
             0.0,
             float(param_value("perception_stale_sec")),
@@ -2098,6 +3020,15 @@ class RealVLMNode(Node):
             int(param_value("multiview_image_max_side_px")),
         )
         self._require_field_image = bool(param_value("require_field_image"))
+        self._enable_text_only_dialogue = bool(
+            param_value("enable_text_only_dialogue")
+        )
+        self._require_rfdetr_applied_field_image = bool(
+            param_value("require_rfdetr_applied_field_image")
+        )
+        self._require_rfdetr_cam4_overlay = bool(
+            param_value("require_rfdetr_cam4_overlay")
+        )
         self._context_mode = str(param_value("context_mode")).strip().lower()
         self._open_set_phase_bootstrap_observations = max(
             0,
@@ -2130,7 +3061,7 @@ class RealVLMNode(Node):
             else:
                 self._system_prompt = self._actor_log_system_prompt()
                 self._developer_instruction = self._actor_log_developer_instruction()
-                self._json_schema = compact_vlm_json_schema("4")
+                self._json_schema = compact_vlm_json_schema("6")
         else:
             if self._task_profile != VLM_TASK_PROFILE_FULL:
                 raise ValueError(
@@ -2172,11 +3103,10 @@ class RealVLMNode(Node):
     def _world_developer_instruction(self) -> str:
         return (
             "Return exactly one valid JSON object and nothing else. "
-            "All object keys must be double-quoted strings: \"v\", \"ph\", \"to\", \"sg\", \"u\", \"sum\". "
+            "All object keys must be double-quoted strings: \"v\", \"ph\", \"to\", \"u\", \"sum\". "
             "Never omit quotes around keys. Never use true/false/null. "
             "Confidence values and u must be numeric floats between 0.0 and 1.0, not strings and not booleans. "
             "Use exact tool ids and location ids from context. "
-            "If gesture is absent, sg must be exactly [\"\",\"\",\"\",0.0]. "
             "If the image is black, blank, or text-only, keep the current context phase at low confidence, emit no tool observations, and set u to 1.0."
         )
 
@@ -2187,14 +3117,14 @@ class RealVLMNode(Node):
         )
         return (
             "You interpret public, externally observable evidence for a surgical task planner. "
-            "Each image is a labeled composite: left FLIR surgical field, right CAM4 Mayo/hand context. Read panels independently; never copy tools across panels and do not assume a fixed appearance, crop, or start phase. "
-            "Object detections are optional suggestions. Inspect pixels independently and let clear visual evidence outweigh missing or conflicting detector rows. "
-            "First inspect the left surgical field for visible anatomy, target tissue, instrument-to-tissue interaction, manipulation, and immediate tissue or field response. Independently inspect the upper-right surgeon hand gesture and Mayo contents in the right panel. Gesture evidence is pixel-only: do not let speech, phase, tool predictions, or history fill in missing hand evidence. Then infer phase and next-request tool from visible anatomy/activity, public speech, public skill/twin events, and the procedure context. "
+            "Each image is a labeled composite: left FLIR surgical field and, when enabled, right CAM4 Mayo context. Read panels independently; never copy tools across panels and do not assume a fixed appearance, crop, or start phase. "
+            "When observable_perception.tool_detection_views is present, it contains accepted typed RF-DETR CAM3/CAM4 tool boxes: view-relative class, confidence, normalized box/center, and sometimes depth. It is structured location evidence, not an annotated image. Use a row whose freshness.status is fresh to locate a visible tool within that named camera view, even if visual_alignment says the FLIR panel is unavailable or misaligned; that alignment only says whether it pixel-pairs with this request's FLIR image. Never treat a 2D region/depth as a world pose, ownership, Mayo placement, handover, or authority. Missing or stale views are unknown—not zero detections. Inspect raw pixels independently and let clear visual evidence outweigh conflicting detector rows. "
+            "Inspect the left surgical field for visible anatomy, target tissue, instrument-to-tissue interaction, manipulation, and immediate tissue or field response. Independently inspect only instrument contents in any right Mayo panel. Then infer phase and next-request tool from visible anatomy/activity, public speech, public skill/twin events, and the procedure context. "
             "Use no hidden actor state, private plans, ground truth, or replay annotation. Previous predictions and procedure order are weak temporal priors, not facts. "
             "Your output is evidence with confidence only. It never authorizes handover, recovery, cleanup, ownership, lifecycle changes, or robot action; the digital twin validates facts and the Behavior Tree applies policy. "
             "Compare all phases: open_set is unanchored; temporal_prior favors current/next but never excludes strong later visual evidence. "
-            "A currently held, visible, or Mayo tool is not automatically the next requested tool. A visible open-hand request may have unknown tool identity. "
-            "Return exactly one schema-v4 JSON object and no other text. "
+            "A currently held, visible, or Mayo tool is not automatically the next requested tool. "
+            "Return exactly one schema-v6 JSON object and no other text. "
             "Procedure context keys: phases contain id/name/allowed next/tools, positive and exclusion cues, optional tool roles, ordered chain paths and alt transitions; handover contains procedure-wide primary and alternative request paths; groups describe coarse adjacent states; tools contain runtime id/name/role. "
             f"Procedure context: {json.dumps(procedure_context, separators=(',', ':'))}"
         )
@@ -2207,13 +3137,17 @@ class RealVLMNode(Node):
         return (
             "You solve one task only: forecast the first subsequent additional surgical "
             "instrument likely to be requested for handover, regardless of elapsed time. "
-            "The image is a labeled composite with the FLIR surgical field and CAM4 "
-            "Mayo/hand context. Object detections are optional suggestions; inspect the "
-            "pixels independently. Use only public image evidence, public speech, public "
+            "The image is a labeled composite with the FLIR surgical field and optional CAM4 "
+            "Mayo context. Typed RF-DETR CAM3/CAM4 tool boxes, when present in "
+            "observable_perception.tool_detection_views, are fresh view-relative location "
+            "suggestions rather than pixels or world state. visual_alignment only "
+            "describes FLIR pairing and does not invalidate a fresh named-view row; "
+            "inspect raw pixels independently. "
+            "Use only public image evidence, public speech, public "
             "skill/twin events, and the procedure context. Never use hidden actor state, "
             "private plans, ground truth, replay annotation, or case timing. "
             "The current instrument, visible inventory, Mayo contents, a spoken current "
-            "request, and an open hand are context but are not themselves the next-tool "
+            "request are context but are not themselves the next-tool "
             "answer. Return only ranked forecast candidates and uncertainty. "
             "Procedure context keys and values are exactly the same as the normal VLM: "
             "phases contain ids, cues, tool roles and chains; handover contains primary "
@@ -2226,9 +3160,12 @@ class RealVLMNode(Node):
         return (
             "Return exactly one JSON object and no other text: "
             "{\"tool\":[[\"Txx\",0.0]],\"u\":0.0}. "
-            "tool must contain 1-4 unique [runtime_tool_id,confidence] candidates ranked "
-            "highest first. Use exact ids from the supplied procedure context. "
-            "Predict before a gesture or spoken request whenever the public trajectory "
+            "When forecast_constraints contains at least three eligible tools, tool must "
+            "contain exactly three unique [runtime_tool_id,probability] candidates ranked "
+            "highest first and their probabilities must sum to 1.0. If fewer than three "
+            "tools are eligible, emit all eligible tools and set u to at least 0.80. "
+            "Use exact ids from the supplied procedure context. "
+            "Predict before a spoken request whenever the public trajectory "
             "supports it. Match completed_handover and tool_request history against all "
             "procedure chains, then combine that prior with visible operative activity. "
             "When frozen_ngram_prior is present, it is a fixed aggregate statistic from "
@@ -2244,31 +3181,31 @@ class RealVLMNode(Node):
             "start, phase, anatomy, continue, and finish speech are not tool requests. "
             "Use calibrated confidence even when uncertain rather than copying a current "
             "tool. u is overall forecast uncertainty from 0.0 to 1.0. Emit no phase, "
-            "intent, gesture, Mayo, summary, lifecycle, or robot-action fields."
+            "intent, Mayo, summary, lifecycle, or robot-action fields."
         )
 
     def _actor_log_developer_instruction(self) -> str:
         return (
             "Emit exactly this JSON shape, with nested candidate pairs: "
-            "{\"v\":\"4\",\"phase\":[[\"Pxx\",0.0]],\"tool\":[[\"Txx\",0.0]],"
-            "\"intent\":[\"none\",\"\",0.0],\"gesture\":[\"\",\"\",\"\",0.0],"
+            "{\"v\":\"6\",\"phase\":[[\"Pxx\",0.0]],\"tool\":[[\"Txx\",0.0]],"
+            "\"intent\":[\"none\",\"\",0.0],"
             "\"mayo\":[],\"mayo_retrieve\":[\"\",0.0],\"u\":0.50,"
-            "\"sum\":\"one compact English clinical observation\",\"bed_robot_arm_group\":null}. "
-            "All numbers in that shape are structural placeholders, not defaults to copy. Use exact runtime ids and numeric confidence 0.0-1.0. phase and tool must each be arrays of 1-4 [id,confidence] pairs. Never use one flat pair. "
-            "Perform these independent passes before combining evidence: "
-            "GESTURE: inspect only the upper-right surgeon hand in CAM4. Emit request_tool only when it is clearly open, empty, and held out/upward. If it holds anything or is unclear, occluded, or cropped, emit [\"\",\"\",\"\",0.0]. Ignore all other cues, objects, and people. For a positive emit [\"request_tool\",\"\",\"open_receive\",confidence]; never infer its tool id. "
-            "MAYO: scan the complete hand/Mayo image in the right CAM4 panel, including edges and occlusions. Emit one row per distinct visible instrument instance and preserve duplicates. Identify by visible morphology such as rings, hinge, shaft, jaws, blade, insulation/cable, or lumen; omit unidentifiable silhouettes instead of guessing from procedure likelihood. Detector rows may support a match but their absence does not erase clear pixels. Never copy instruments from the surgical-field image in the left FLIR panel, speech, candidates, memory, or procedure order into mayo. recover/reuse is only an advisory observation: use reuse when public evidence supports near-term reuse; otherwise keep recover confidence low. mayo_retrieve is at most the strongest advisory candidate. "
+            "\"sum\":\"one compact English clinical observation\",\"bed_robot_arm_group\":null,"
+            "\"function_call\":null,\"humanoid_reply\":null}. "
+            "IDs:0-1. phase:1-4 pairs. tool:3 eligible unique pairs,sum1; fewer:all,u>=.8. No unavailable/non-requestable ids or flat pairs. "
+            "Independent passes: "
+            "MAYO: scan only instrument contents in the right CAM4 panel. Emit one row per distinct visible instrument instance and preserve duplicates. Identify by visible morphology such as rings, hinge, shaft, jaws, blade, insulation/cable, or lumen; omit unidentifiable silhouettes instead of guessing from procedure likelihood. Detector rows may support a match but their absence does not erase clear pixels. Never copy instruments from the surgical-field image in the left FLIR panel, speech, candidates, memory, or procedure order into mayo. recover/reuse is only an advisory observation: use reuse when public evidence supports near-term reuse; otherwise keep recover confidence low. mayo_retrieve is at most the strongest advisory candidate. "
             "CLINICAL SUMMARY: sum is one compact English sentence about the left field: visible instrument, specific anatomy/tissue, manipulation, and immediate effect. If obscured, say so. Never invent injury, preserved anatomy, hemostasis, or completion; omit panel names, Mayo, request, phase id/name, forecasts, and reasoning. "
             "PHASE/NEXT TOOL: compare left-field pixels with every cue/exclusion/group/role. temporal_prior is a preference, not a candidate filter. Persistent anatomy/activity outranks public speech/events and priors; an exchange alone never proves phase. "
             "phase_start_floor limits phase only, never tool/intent. Not ground truth; use allowed_normal_phase_ids, never earlier. Interrupts need visible evidence. "
-            "NEXT-TOOL FORECAST: tool is only a horizon-free forecast of the first subsequent new handover, regardless of elapsed time, not a label for the tool currently in use; it answers which additional instrument the assistant should prepare next and does not inventory visible instruments. Predict before a hand gesture or spoken request when the trajectory supports it. Choose the most plausible subsequent additional tool from visible task trajectory, broad procedure-role transitions, and public histories. Explicitly distinguish instruments already held or prepositioned. Unless public evidence specifically supports another instance, an already active type must stay below 0.65; forecast a plausible unused tool instead. forecast_constraints restates public DT context, not ground truth: currently_in_use lists surgeon-held tools and counts, prepositioned lists robot-held tools, and available_for_next_handover lists separate supply. It is derived from digital_twin.forecast_inventory.available: rack_available unused stock plus mayo_reuse surgeon-used tools expected later when trajectory supports imminent reuse. A tool type may appear in available and unavailable when separate instances exist, but a forecast must have available count >0. This evidence never authorizes action. Do not suppress uncertain visual evidence because of DT context; the reducer and BT, not the VLM, validate availability and decide action. digital_twin.tool_requests and completed_handovers are oldest-to-newest public histories. Independently of your phase candidate, match the longest suffix against every procedure chain; prefer the next primary item when pixels agree and alternatives only with support. frozen_ngram_prior is an advisory aggregate phase/history statistic: rerank its probabilities using pixels and forecast_constraints; it is not a request, decision, or output to copy. Do not choose the next tool solely from your phase output or the n-gram prior. With no history, entry_handover is a weak preparation prior, not a confirmed request; keep every weak candidate below 0.65. Speech naming a tool is the current request; forecast the following handover instead. Do not memorize case timing. Procedure start/continue/finish speech is not a request. "
-            "INTENT: only current public speech or an observed request signal naming a runtime instrument may produce [\"handover\",tool_id,confidence]. Match obvious ASR near-homophones and Korean/English transliterations to the listed runtime tool names, but do not turn procedure-start, continue, phase, anatomy, or completion speech into a tool request. A visual open hand without a named tool remains gesture evidence with intent [\"none\",\"\",0.0]. "
-            "BED RETRACTION: null unless a pending public fine-adjustment request has direction evidence. Copy request_id, adjustment_mode, target_retractor_id, and surgeon_view exactly. For single, emit one of up/down/left/right with axis none. For multi, emit direction none with axis left_right or up_down. Preserve grounded distance text. Never propose tool change or any non-retraction operation. "
+            "NEXT-TOOL FORECAST: tool is only a horizon-free forecast of the first subsequent new handover, regardless of elapsed time, not a label for the tool currently in use; it answers which additional instrument the assistant should prepare next and does not inventory visible instruments. Predict before a spoken request. Select the most plausible subsequent additional tool from visible task trajectory, broad procedure-role transitions, and public history; distinguish instruments already held or prepositioned. Unless public evidence specifically supports another instance, an already active type must stay below 0.65; forecast a plausible unused tool instead. forecast_constraints is public DT context: currently_in_use lists surgeon-held tools and counts; prepositioned is robot-held; available_for_next_handover comes from digital_twin.forecast_inventory.available: rack_available unused stock plus mayo_reuse surgeon-used tools expected later when trajectory supports imminent reuse. A tool type may appear in available and unavailable, but a forecast must have available count >0. This evidence never authorizes action; the reducer and BT, not the VLM, validate availability. Independently of your phase candidate, match the longest suffix against every procedure chain. frozen_ngram_prior is an advisory aggregate phase/history statistic, not a request. Do not choose the next tool solely from your phase output or the n-gram prior. No-history entry_handover is not a confirmed request; keep every weak candidate below 0.65. Spoken tool is the current request, so forecast the following one. Do not memorize case timing. "
+            "INTENT: only current admitted public speech naming a runtime instrument may produce [\"handover\",tool_id,confidence]. Match obvious ASR near-homophones and Korean/English transliterations to the listed runtime tool names, but do not turn procedure-start, continue, phase, anatomy, or completion speech into a tool request. "
+            "DIALOGUE: Only pending_dialogue_turn may be answered; speech history never may. Null pending means both new fields are null. Otherwise copy turn_id exactly and emit one concise same-language speak=true reply. Questions use null function_call and immediate timing. Supported direct requests only: request_tool_handover with arguments exactly {tool_id}, or adjust_retraction with arguments exactly {command:'adjust_retraction',target_side:'left|right|both',distance_m:positive meters}. Use only slots explicit in the pending utterance and procedure rules; otherwise ask an immediate clarification with null function_call. Pair valid calls with on_function_accepted future wording and never claim completion. For a Korean request_tool_handover with grounded tool_id T07, use exactly the reply text 바이폴라 전달드리겠습니다. Tool retrieval is not a dialogue function because the current typed execution contract cannot correlate it safely; return an immediate clarification with null function_call instead. "
+            "BED RETRACTION: null unless a pending public fine-adjustment request has direction evidence. Copy request_id, adjustment_mode, target_retractor_id, and surgeon_view exactly. For thyroidectomy_demo only, a terse explicit-distance request with target_retractor_id right_malleable and no spoken direction uses the reviewed default direction right. For single, emit one of up/down/left/right with axis none. For multi, emit direction none with axis left_right or up_down. Preserve grounded distance text. Never propose tool change or any non-retraction operation. "
             "UNCERTAINTY: calculate u independently on every frame: 0.00-0.25 clear, 0.26-0.45 for usable adjacent-phase ambiguity, 0.46-0.79 weak/conflicting, and 0.80-1.00 only when the relevant view is unusable. Do not copy the structural 0.50 value. "
-            "STRICT STRUCTURE CHECK: gesture always has exactly four values. A positive is [\"request_tool\",\"\",\"open_receive\",0.85]; no request is exactly [\"\",\"\",\"\",0.0]. Never emit [\"open_receive\",\"\",0.85], [\"none\",\"\",0.0], or any three-value gesture. "
             "mayo is always an array of three-value rows: [[\"Txx\",\"reuse\",0.80]], never [\"Txx\"], [\"tool name\"], or [\"tool name (Txx)\"]. Empty Mayo is []. "
             "phase and tool use two-value rows: [[\"Pxx\",0.80]] and [[\"Txx\",0.70]], never flat pairs. Pxx/Txx are shape placeholders only; replace them with exact ids and never emit xx. "
-            "Final audit: gesture and mayo must come only from the hand/Mayo pixels; phase/tool may combine public evidence; output only JSON."
+            "Final audit: mayo must come only from Mayo pixels; phase/tool may combine public evidence; output only JSON."
         )
 
     def _on_parameters_changed(self, params):
@@ -2298,6 +3235,8 @@ class RealVLMNode(Node):
                 "response_mode",
                 "source_time_triggered_live",
                 "model_input_max_source_lag_sec",
+                "require_source_frame_timestamp",
+                "model_input_max_source_future_skew_sec",
                 "replay_response_path",
                 "cam4_dynamic_crop",
                 "require_cam4_image",
@@ -2316,6 +3255,9 @@ class RealVLMNode(Node):
                 "image_max_side_px",
                 "multiview_image_max_side_px",
                 "require_field_image",
+                "enable_text_only_dialogue",
+                "require_rfdetr_applied_field_image",
+                "require_rfdetr_cam4_overlay",
                 "context_mode",
                 "open_set_phase_bootstrap_observations",
                 "handover_ngram_prior_enabled",
@@ -2330,7 +3272,6 @@ class RealVLMNode(Node):
                     self._recent_events.clear()
                     self._last_good_raw = ""
                     self._last_good_payload = None
-                    self._recent_observed_signals.clear()
                     self._recent_speech.clear()
                     self._recent_skill_statuses.clear()
                     self._latest_bed_robot_arm_group_request = None
@@ -2581,12 +3522,28 @@ class RealVLMNode(Node):
                 data=bytes(msg.data),
                 mime_type=mime_type,
             )
+            rejection = self._source_frame_timestamp_rejection(sample)
+            if rejection:
+                self._last_source_frame_rejection = f"{label}:{rejection}"
+                self.get_logger().warning(
+                    f"dropped {label} image: {rejection}",
+                    throttle_duration_sec=2.0,
+                )
+                return
             self._latest_images[label] = sample
             self._image_buffers.setdefault(
                 label,
                 deque(maxlen=IMAGE_PAIR_BUFFER_LENGTH),
             ).append(sample)
-            if label in {"field", "raw_field", "cam4", "cam4_overlay"}:
+            trigger_labels = {"field", "raw_field", "cam4"}
+            if bool(
+                getattr(self, "_require_rfdetr_applied_field_image", False)
+            ):
+                # Store raw frames for exact source-time composition, but do
+                # not let an unprocessed camera arrival schedule Live VLM
+                # inference ahead of the locally rendered RF-DETR panel.
+                trigger_labels.difference_update({"raw_field", "cam4"})
+            if label in trigger_labels:
                 self._visual_frame_generation += 1
                 if self._response_mode == "replay":
                     self._maybe_trigger_replay_image_tick()
@@ -2595,12 +3552,36 @@ class RealVLMNode(Node):
 
         return _cb
 
+    def _source_frame_timestamp_rejection(
+        self,
+        sample: ImageSample,
+        *,
+        now_sec: float | None = None,
+    ) -> str:
+        if not bool(getattr(self, "_require_source_frame_timestamp", False)):
+            return ""
+        now = self._causal_now_sec() if now_sec is None else float(now_sec)
+        return source_frame_timestamp_rejection_reason(
+            now,
+            image_sample_stamp_sec(sample),
+            float(getattr(self, "_model_input_max_source_lag_sec", 0.0)),
+            float(
+                getattr(
+                    self,
+                    "_model_input_max_source_future_skew_sec",
+                    1.0,
+                )
+            ),
+        )
+
     def _queue_source_time_live_frame(self, sample: ImageSample) -> None:
         if (
             not getattr(self, "_source_time_triggered_live", False)
             or self._response_mode != "live"
             or not self._active
         ):
+            return
+        if self._source_frame_timestamp_rejection(sample):
             return
         stamp_sec = image_sample_stamp_sec(sample)
         with self._source_live_trigger_lock:
@@ -2726,6 +3707,9 @@ class RealVLMNode(Node):
             wakeup.set()
         if worker is not None and worker is not threading.current_thread():
             worker.join(timeout=2.0)
+        reply_outbox = getattr(self, "_reply_outbox", None)
+        if reply_outbox is not None:
+            reply_outbox.close()
         return super().destroy_node()
 
     def _reset_source_time_live_trigger(self, *, reset_stamp: bool) -> None:
@@ -2788,6 +3772,42 @@ class RealVLMNode(Node):
 
         return _cb
 
+    def _make_rfdetr_tool_observation_cb(self, view: str):
+        """Store a bounded typed RF-DETR frame for source-time alignment.
+
+        The upstream message contains mask RLE and other high-volume fields.
+        ``summarize_rfdetr_tool_observations`` projects it before it reaches
+        either the request context or a VLM prompt, and rejects a message whose
+        declared view/model provenance does not match this subscription.
+        """
+
+        kind = f"rfdetr_{view}_tools"
+        expected_model_version = str(
+            getattr(
+                self,
+                f"_{view.replace('_', '')}_tool_observations_expected_model_version",
+                "",
+            )
+        ).strip()
+
+        def _cb(msg: ToolObservation2DArray) -> None:
+            summary = summarize_rfdetr_tool_observations(
+                msg,
+                expected_view=view,
+                expected_model_version=expected_model_version,
+                max_instances=self._perception_max_instances,
+            )
+            if not summary:
+                return
+            sample = (self._causal_now_sec(), summary)
+            self._latest_perception[kind] = sample
+            self._perception_buffers.setdefault(
+                kind,
+                deque(maxlen=PERCEPTION_PAIR_BUFFER_LENGTH),
+            ).append(sample)
+
+        return _cb
+
     def _publish_fast_cam4_mayo_observations(
         self,
         summary: dict[str, Any],
@@ -2830,13 +3850,6 @@ class RealVLMNode(Node):
                 > CAM4_MAYO_STABILITY_WINDOW_SEC
             ):
                 published.discard(tool_id)
-
-        request = summary.get("tool_request", {})
-        if (
-            isinstance(request, dict)
-            and str(request.get("state", "")) == "request"
-        ):
-            return
 
         enriched = self._enrich_cam4_tool_stability(
             summary,
@@ -2939,12 +3952,76 @@ class RealVLMNode(Node):
         self._track_authoritative_phase()
         self._publish_context_summaries()
 
+    def _activate_lifecycle(self, start_phase_id: str = "") -> None:
+        """Activate once for an admitted execution lifecycle.
+
+        ``/simulation/control_state`` is an event topic, so a VLM process that
+        comes up between the manager's start publications must be able to
+        reconcile from the authoritative, continuously-published simulation
+        state.  Keep the initialization in one place so that recovery has the
+        same dedupe and evidence boundary as the normal control path.
+        """
+
+        if self._active:
+            return
+        self._reset_model_input_dedupe(advance_epoch=True)
+        self._reset_public_evidence()
+        self._last_replay_image_stamp_sec = None
+        self._last_periodic_live_image_stamp_sec = None
+        self._last_submitted_live_image_stamp_sec = None
+        self._reset_source_time_live_trigger(reset_stamp=True)
+        self._reset_fast_cam4_mayo_observations()
+        self._phase_bootstrap_observation_count = 0
+        self._phase_bootstrap_explicit = bool(
+            start_phase_id and start_phase_id in self._spec.phase_ids
+        )
+        self._phase_bootstrap_id = (
+            start_phase_id
+            if start_phase_id in self._spec.phase_ids
+            else self._spec.default_phase_id
+        )
+        self._last_authoritative_phase = self._phase_bootstrap_id
+        self._active = True
+
+    def _stop_lifecycle(self) -> None:
+        """Deactivate once when authoritative execution has conclusively ended."""
+
+        if not self._active:
+            return
+        self._reset_model_input_dedupe(advance_epoch=True)
+        self._active = False
+        self._inference_backpressure.clear_pending()
+        self._last_replay_image_stamp_sec = None
+        self._last_periodic_live_image_stamp_sec = None
+        self._last_submitted_live_image_stamp_sec = None
+        self._reset_source_time_live_trigger(reset_stamp=True)
+        self._reset_fast_cam4_mayo_observations()
+
     def _on_simulation(self, msg: SimulationState) -> None:
         active_bundle = str(getattr(msg, "active_bundle", "") or "")
         if active_bundle and active_bundle != self._last_simulation_bundle:
             self._last_simulation_bundle = active_bundle
             self._reset_public_evidence()
         self._simulation = msg
+        execution_state = str(
+            getattr(msg, "execution_state", "") or ""
+        ).strip().lower()
+        if (
+            bool(getattr(msg, "running", False))
+            and execution_state == "running"
+        ):
+            # The state is authoritative and emitted continuously.  It is only
+            # a recovery path for a missed transient start event; it does not
+            # infer a start from an intermediate or unknown state.
+            self._activate_lifecycle(
+                str(getattr(msg, "filtered_phase", "") or "")
+            )
+        elif (
+            not bool(getattr(msg, "running", False))
+            and execution_state
+            in {"idle", "stopped", "completed", "error", "failed"}
+        ):
+            self._stop_lifecycle()
         self._track_authoritative_phase()
         self._publish_context_summaries()
 
@@ -2998,12 +4075,240 @@ class RealVLMNode(Node):
         self._bt_snapshot_pub.publish(self._bt_snapshot_msg())
         self._publish_context_summaries()
 
-    def _append_public_speech(self, text: str) -> bool:
+    @staticmethod
+    def _reply_envelope_from_message(msg: HumanoidReply) -> ReplyEnvelope:
+        return ReplyEnvelope(
+            stamp_sec=int(msg.stamp.sec),
+            stamp_nanosec=int(msg.stamp.nanosec),
+            source=str(msg.source),
+            source_epoch=int(msg.source_epoch),
+            source_sequence=int(msg.source_sequence),
+            correlation_id=str(msg.correlation_id),
+            schema_version=str(msg.schema_version),
+            gateway_instance_id=str(msg.gateway_instance_id),
+            procedure_run_id=str(msg.procedure_run_id),
+            utterance_id=str(msg.utterance_id),
+            turn_id=str(msg.turn_id),
+            reply_id=str(msg.reply_id),
+            text=str(msg.text),
+            kind=str(msg.kind),
+            timing=str(msg.timing),
+            speak=bool(msg.speak),
+            function_call_name=str(msg.function_call_name),
+            function_arguments_json=str(msg.function_arguments_json),
+            function_request_id=str(msg.function_request_id),
+            valid=bool(msg.valid),
+            validation_error=str(msg.validation_error),
+        )
+
+    @staticmethod
+    def _reply_message_from_envelope(envelope: ReplyEnvelope) -> HumanoidReply:
+        msg = HumanoidReply()
+        msg.stamp.sec = envelope.stamp_sec
+        msg.stamp.nanosec = envelope.stamp_nanosec
+        msg.source = envelope.source
+        msg.source_epoch = envelope.source_epoch
+        msg.source_sequence = envelope.source_sequence
+        msg.correlation_id = envelope.correlation_id
+        msg.schema_version = envelope.schema_version
+        msg.gateway_instance_id = envelope.gateway_instance_id
+        msg.procedure_run_id = envelope.procedure_run_id
+        msg.utterance_id = envelope.utterance_id
+        msg.turn_id = envelope.turn_id
+        msg.reply_id = envelope.reply_id
+        msg.text = envelope.text
+        msg.kind = envelope.kind
+        msg.timing = envelope.timing
+        msg.speak = envelope.speak
+        msg.function_call_name = envelope.function_call_name
+        msg.function_arguments_json = envelope.function_arguments_json
+        msg.function_request_id = envelope.function_request_id
+        msg.valid = envelope.valid
+        msg.validation_error = envelope.validation_error
+        return msg
+
+    def _on_tts_playback_status(self, msg: TTSPlaybackStatus) -> None:
+        reply_outbox = getattr(self, "_reply_outbox", None)
+        if reply_outbox is None:
+            return
+        try:
+            reply_outbox.mark_acked(
+                str(msg.reply_id or "").strip(),
+                str(msg.state or "").strip(),
+            )
+        except ValueError:
+            # Other internal TTS producers (for example fixed feedback) have
+            # no VLM outbox row and may use states outside this ACK contract.
+            return
+        except Exception as exc:
+            self.get_logger().error(
+                f"VLM reply outbox ACK persistence failed: {exc.__class__.__name__}"
+            )
+
+    def _republish_pending_humanoid_replies(self) -> None:
+        gateway_instance_id = str(
+            getattr(self, "_gateway_instance_id", "") or ""
+        ).strip()
+        active_run = str(getattr(self, "_procedure_run_id", "") or "").strip()
+        reply_outbox = getattr(self, "_reply_outbox", None)
+        if not gateway_instance_id or not active_run or reply_outbox is None:
+            return
+        try:
+            pending = reply_outbox.pending_for_scope(
+                gateway_instance_id,
+                active_run,
+                limit=64,
+            )
+        except Exception as exc:
+            self.get_logger().error(
+                f"VLM reply outbox recovery failed: {exc.__class__.__name__}"
+            )
+            return
+        for envelope in pending:
+            self._humanoid_reply_pub.publish(
+                self._reply_message_from_envelope(envelope)
+            )
+
+    def _on_gateway_info(self, msg: GatewayInfo) -> None:
+        gateway_instance_id = str(msg.gateway_instance_id or "").strip()
+        raw_procedure_run_id = str(msg.procedure_run_id or "").strip()
+        source_age_sec = self._gateway_info_source_age_sec(msg)
+        revision = int(msg.revision)
+        source_stamp_ns = self._gateway_stamp_ns(msg)
+        if source_age_sec is None:
+            self._fence_gateway_info("stale_or_invalid_gateway_heartbeat")
+            return
+        if not gateway_instance_id or (
+            bool(msg.procedure_active) and not raw_procedure_run_id
+        ):
+            self._fence_gateway_info("malformed_gateway_scope")
+            return
+        if (
+            gateway_instance_id
+            == getattr(self, "_gateway_info_last_instance_id", "")
+            and (
+                revision <= getattr(self, "_gateway_info_last_revision", -1)
+                or source_stamp_ns
+                <= getattr(self, "_gateway_info_last_source_stamp_ns", 0)
+            )
+        ):
+            return
+        self._gateway_info_last_instance_id = gateway_instance_id
+        self._gateway_info_last_revision = revision
+        self._gateway_info_last_source_stamp_ns = source_stamp_ns
+        self._gateway_info_last_seen_monotonic = (
+            time.monotonic() - max(0.0, source_age_sec)
+        )
+        procedure_run_id = (
+            raw_procedure_run_id if bool(msg.procedure_active) else ""
+        )
+        previous_scope = (
+            str(getattr(self, "_gateway_instance_id", "")),
+            str(getattr(self, "_procedure_run_id", "")),
+        )
+        next_scope = (gateway_instance_id, procedure_run_id)
+        self._gateway_instance_id = gateway_instance_id
+        self._procedure_run_id = procedure_run_id
+        reply_outbox = getattr(self, "_reply_outbox", None)
+        if previous_scope != next_scope and reply_outbox is not None:
+            try:
+                reply_outbox.mark_stale_outside_scope(
+                    gateway_instance_id if procedure_run_id else "",
+                    procedure_run_id,
+                )
+            except Exception as exc:
+                self.get_logger().error(
+                    "VLM reply outbox scope transition failed: "
+                    f"{exc.__class__.__name__}"
+                )
+        if previous_scope != ("", "") and previous_scope != next_scope:
+            # A delayed reply from a previous gateway process/procedure must
+            # never be spoken in the new run.
+            self._reset_model_input_dedupe(advance_epoch=True)
+            self._reset_public_evidence()
+        if procedure_run_id:
+            self._republish_pending_humanoid_replies()
+
+    def _on_gateway_info_watchdog(self) -> None:
+        """Fence dialogue and durable replies when the gateway heartbeat dies."""
+
+        last_seen = getattr(self, "_gateway_info_last_seen_monotonic", None)
+        if last_seen is None:
+            return
+        if time.monotonic() - float(last_seen) <= self._gateway_info_timeout_sec:
+            return
+
+        self._fence_gateway_info("gateway_heartbeat_timeout")
+
+    @staticmethod
+    def _gateway_stamp_ns(msg: GatewayInfo) -> int:
+        return int(msg.stamp.sec) * 1_000_000_000 + int(msg.stamp.nanosec)
+
+    def _gateway_info_source_age_sec(self, msg: GatewayInfo) -> float | None:
+        source_stamp_ns = self._gateway_stamp_ns(msg)
+        revision = int(msg.revision)
+        now_ns = int(self.get_clock().now().nanoseconds)
+        if revision <= 0 or source_stamp_ns <= 0 or now_ns <= 0:
+            return None
+        age_sec = float(now_ns - source_stamp_ns) / 1_000_000_000.0
+        if age_sec > self._gateway_info_timeout_sec or age_sec < -1.0:
+            return None
+        return age_sec
+
+    def _fence_gateway_info(self, reason: str) -> None:
+        if (
+            str(getattr(self, "_gateway_instance_id", "")) == ""
+            and str(getattr(self, "_procedure_run_id", "")) == ""
+            and self._gateway_info_last_seen_monotonic is None
+        ):
+            return
+
+        # Clear the receipt first so the watchdog is edge-triggered. A later
+        # heartbeat, even with the same gateway/run IDs, establishes a new
+        # authority boundary rather than silently continuing the stale one.
+        self._gateway_info_last_seen_monotonic = None
+        previous_scope = (
+            str(getattr(self, "_gateway_instance_id", "")),
+            str(getattr(self, "_procedure_run_id", "")),
+        )
+        self._gateway_instance_id = ""
+        self._procedure_run_id = ""
+        reply_outbox = getattr(self, "_reply_outbox", None)
+        if reply_outbox is not None:
+            try:
+                reply_outbox.mark_stale_outside_scope("", "")
+            except Exception as exc:
+                self.get_logger().error(
+                    "VLM reply outbox gateway-timeout fence failed: "
+                    f"{exc.__class__.__name__}"
+                )
+        if previous_scope != ("", ""):
+            self._reset_model_input_dedupe(advance_epoch=True)
+            self._reset_public_evidence()
+            self.get_logger().error(
+                "GatewayInfo authority unavailable; VLM dialogue and TTS outbox "
+                f"fenced ({reason})"
+            )
+
+    def _append_public_speech(
+        self,
+        text: str,
+        *,
+        utterance_id: str = "",
+        responded: bool | None = None,
+    ) -> bool:
         clean = str(text or "").strip()
         if not clean:
             return False
+        clean_utterance_id = str(utterance_id or "").strip()
         now = round(self._causal_now_sec(), 2)
-        if self._recent_speech:
+        if clean_utterance_id and any(
+            str(row.get("utterance_id", "")) == clean_utterance_id
+            for row in self._recent_speech
+            if isinstance(row, dict)
+        ):
+            return False
+        if not clean_utterance_id and self._recent_speech:
             last = self._recent_speech[-1]
             try:
                 last_age = now - float(last.get("at", 0.0))
@@ -3011,37 +4316,57 @@ class RealVLMNode(Node):
                 last_age = 999.0
             if str(last.get("text", "")) == clean[:240] and last_age <= 1.0:
                 return False
-        self._recent_speech.append({"text": clean[:240], "at": now})
+        row: dict[str, Any] = {"text": clean[:240], "at": now}
+        if clean_utterance_id:
+            row["utterance_id"] = clean_utterance_id
+        if responded is not None:
+            row["responded"] = bool(responded)
+        self._recent_speech.append(row)
         return True
 
-    def _append_public_signal(
-        self,
-        *,
-        signal_type: str,
-        tool_id: str = "",
-        hand_pose: str = "",
-        speech_text: str = "",
-    ) -> None:
-        if signal_type in {"advance_phase", "advance_phase_cue"}:
+    def _on_speech_utterance(self, msg: SpeechUtterance) -> None:
+        """Create one reply obligation from one admitted final ASR turn."""
+
+        utterance_id = str(msg.utterance_id or "").strip()
+        text = " ".join(str(msg.text or "").split())
+        speaker_role = str(msg.speaker_role or "").strip().lower()
+        if (
+            not bool(msg.is_final)
+            or not utterance_id
+            or not text
+            or (speaker_role and speaker_role != "surgeon")
+            or not str(
+                getattr(self, "_gateway_instance_id", "") or ""
+            ).strip()
+            or not str(getattr(self, "_procedure_run_id", "") or "").strip()
+        ):
             return
-        signal: dict[str, Any] = {}
-        if signal_type in {
-            "request_tool",
-            "voice_request",
-            "place_on_mayo",
-            "continue_using",
-            "small_talk",
-            "request_procedure_completion",
-            "complete_procedure",
-        }:
-            signal["type"] = signal_type
-        if hand_pose:
-            signal["hand"] = hand_pose
-        if tool_id:
-            signal["tool"] = tool_id
-        if signal:
-            signal["at"] = round(self._causal_now_sec(), 2)
-            self._recent_observed_signals.append(signal)
+        observation_stamp = msg.end_stamp
+        if int(observation_stamp.sec) == 0 and int(observation_stamp.nanosec) == 0:
+            observation_stamp = msg.stamp
+        received_at = (
+            float(observation_stamp.sec)
+            + float(observation_stamp.nanosec) / 1_000_000_000.0
+        )
+        if received_at <= 0.0:
+            received_at = self._causal_now_sec()
+        turn = self._dialogue_turn_gate.enqueue(
+            utterance_id=utterance_id,
+            text=text,
+            procedure_run_id=str(getattr(self, "_procedure_run_id", "")),
+            received_at=received_at,
+            speaker_role=speaker_role,
+            language=str(msg.language or "").strip(),
+            source=str(msg.source or "").strip(),
+        )
+        if turn is None:
+            return
+        self._append_public_speech(
+            turn.text,
+            utterance_id=turn.utterance_id,
+            responded=False,
+        )
+        self._trigger_inference_for_public_speech()
 
     def _ingest_public_twin_event(self, msg: TwinEvent, detail: dict[str, Any]) -> None:
         event_type = str(msg.event_type or "")
@@ -3086,10 +4411,15 @@ class RealVLMNode(Node):
             if str(msg.target_retractor_id) not in {
                 "left_malleable",
                 "right_malleable",
+                "left_army_navy",
+                "right_army_navy",
             }:
                 return
         elif str(msg.adjustment_mode) == "multi":
-            if str(msg.target_retractor_id) != "both_malleable":
+            if str(msg.target_retractor_id) not in {
+                "both_malleable",
+                "both_army_navy",
+            }:
                 return
         else:
             return
@@ -3219,26 +4549,7 @@ class RealVLMNode(Node):
             # idempotent: resetting the epoch here would discard every
             # in-flight live inference whose latency exceeds the heartbeat
             # period.
-            if self._active:
-                return
-            self._reset_model_input_dedupe(advance_epoch=True)
-            self._reset_public_evidence()
-            self._last_replay_image_stamp_sec = None
-            self._last_periodic_live_image_stamp_sec = None
-            self._last_submitted_live_image_stamp_sec = None
-            self._reset_source_time_live_trigger(reset_stamp=True)
-            self._reset_fast_cam4_mayo_observations()
-            self._phase_bootstrap_observation_count = 0
-            self._phase_bootstrap_explicit = bool(
-                start_phase_id and start_phase_id in self._spec.phase_ids
-            )
-            self._phase_bootstrap_id = (
-                start_phase_id
-                if start_phase_id in self._spec.phase_ids
-                else self._spec.default_phase_id
-            )
-            self._last_authoritative_phase = self._phase_bootstrap_id
-            self._active = True
+            self._activate_lifecycle(start_phase_id)
         elif command == "pause":
             self._reset_model_input_dedupe(advance_epoch=True)
             self._active = False
@@ -3248,14 +4559,7 @@ class RealVLMNode(Node):
             self._reset_model_input_dedupe(advance_epoch=True)
             self._active = True
         elif command == "stop":
-            self._reset_model_input_dedupe(advance_epoch=True)
-            self._active = False
-            self._inference_backpressure.clear_pending()
-            self._last_replay_image_stamp_sec = None
-            self._last_periodic_live_image_stamp_sec = None
-            self._last_submitted_live_image_stamp_sec = None
-            self._reset_source_time_live_trigger(reset_stamp=True)
-            self._reset_fast_cam4_mayo_observations()
+            self._stop_lifecycle()
         elif command == "reset":
             self._last_lifecycle_control_signature = None
             self._reset_model_input_dedupe(advance_epoch=True)
@@ -3285,11 +4589,20 @@ class RealVLMNode(Node):
                 max(0, int(getattr(self, "_model_input_epoch", 0))) + 1
             )
             self._vlm_result_sequence = 0
+            dialogue_gate = getattr(self, "_dialogue_turn_gate", None)
+            if dialogue_gate is not None:
+                dialogue_gate.reset(epoch=self._model_input_epoch)
             failure_backoff = getattr(self, "_transport_failure_backoff", None)
             if failure_backoff is not None:
                 failure_backoff.record_success()
             self._reset_inference_failure_log_throttle()
         self._last_submitted_model_input_key = ""
+
+    def _release_dialogue_claim(self, correlation_id: str) -> bool:
+        dialogue_gate = getattr(self, "_dialogue_turn_gate", None)
+        if dialogue_gate is None:
+            return False
+        return dialogue_gate.release(correlation_id=correlation_id)
 
     def _next_visual_evidence_metadata(
         self,
@@ -3370,7 +4683,6 @@ class RealVLMNode(Node):
         self._phase_entered_wall_sec = self._causal_now_sec()
 
     def _reset_transient_public_evidence(self) -> None:
-        self._recent_observed_signals.clear()
         self._recent_speech.clear()
         self._recent_skill_statuses.clear()
 
@@ -3438,7 +4750,20 @@ class RealVLMNode(Node):
         )
         self._tool_summary_pub.publish(tool_summary)
 
-    def _assemble_context(self) -> tuple[VLMRequestContext, dict[str, Any]]:
+    def _assemble_context(
+        self,
+        *,
+        perception_reference_stamp_sec: float | None = None,
+    ) -> tuple[VLMRequestContext, dict[str, Any]]:
+        """Build the bounded context used by the default Live VLM request.
+
+        The typed CAM3/CAM4 RF-DETR projection belongs in this exact request
+        context, not only in the actor-log prompt variant.  The optional
+        reference timestamp lets inference bind the detector facts to the
+        model frame it is about to submit, while periodic observability uses
+        the newest fresh view-local observations without inventing alignment.
+        """
+
         assert self._world is not None
         assert self._simulation is not None
         active_tools: list[str] = []
@@ -3490,7 +4815,7 @@ class RealVLMNode(Node):
             },
             "rq": {
                 "exp": self._world.explicit_request_tool,
-                "sg": self._world.surgeon_request_tool,
+                "surgeon": self._world.surgeon_request_tool,
                 "intent": self._world.surgeon_intent,
             },
             "hands": {
@@ -3524,6 +4849,12 @@ class RealVLMNode(Node):
                 "why": bt_snapshot.decision_reason or bt_snapshot.rationale,
                 "blk": bt_snapshot.blocking_guard,
             },
+            # This is a typed projection from ToolObservation2DArray, never a
+            # detector raster.  It contains bounded box/point/depth metadata
+            # only; masks and overlay/image bytes are rejected upstream.
+            "observable_perception": self._public_perception_context(
+                perception_reference_stamp_sec
+            ),
         }
 
         msg = VLMRequestContext()
@@ -3594,11 +4925,7 @@ class RealVLMNode(Node):
                 "mayo_reuse": [],
                 "unavailable": [],
             }
-        requestable = {
-            str(instrument.id)
-            for instrument in self._spec.bundle.instruments
-            if bool(getattr(instrument, "requestable", True))
-        }
+        requestable = set(self._spec.list_requestable_instrument_ids())
         counts = {
             tool_id: {
                 "rack_available": 0,
@@ -3635,6 +4962,10 @@ class RealVLMNode(Node):
                 lifecycle == "mayo_reuse"
                 and owner in {"", "none"}
                 and future_use_expected
+                and str(getattr(instrument, "location_type", "") or "")
+                == CANONICAL_MAYO_POLICY_LOCATION
+                and str(getattr(instrument, "location_id", "") or "")
+                == CANONICAL_MAYO_POLICY_LOCATION
             ):
                 bucket = "mayo_reuse"
             else:
@@ -3744,12 +5075,6 @@ class RealVLMNode(Node):
                 + self._perception_image_max_skew_sec
             ):
                 continue
-            request = sample.get("tool_request", {})
-            if (
-                isinstance(request, dict)
-                and str(request.get("state", "")) == "request"
-            ):
-                continue
             for row in sample.get("tools", []):
                 if not isinstance(row, dict):
                     continue
@@ -3763,6 +5088,9 @@ class RealVLMNode(Node):
                     )
 
         enriched = dict(summary)
+        # Retire the legacy detector-derived request field before this summary
+        # can enter the VLM context. Dedicated perception owns that signal.
+        enriched.pop("tool_request", None)
         enriched_tools: list[dict[str, Any]] = []
         for row in summary.get("tools", []):
             if not isinstance(row, dict):
@@ -3780,6 +5108,160 @@ class RealVLMNode(Node):
         enriched["tools"] = enriched_tools
         return enriched
 
+    def _structured_rfdetr_tool_context(
+        self,
+        *,
+        reference_stamp_sec: float | None,
+        now: float,
+    ) -> dict[str, Any] | None:
+        """Return fresh typed CAM3/CAM4 tool boxes and pairing diagnostics.
+
+        This is intentionally a context projection rather than a Digital Twin
+        mutation. A 2D image region can help the VLM identify where a visible
+        tool is in its *named view*, but cannot prove ownership, Mayo
+        placement, or a world/TCP pose. In particular, a fresh CAM3/CAM4
+        observation is not discarded merely because the FLIR image is absent
+        or timestamp-misaligned: that would erase current view-local location
+        evidence. ``visual_alignment`` is therefore diagnostic only and is
+        separate from fresh detector availability.
+        """
+
+        configured_topics = {
+            "cam_3": str(
+                getattr(self, "_cam3_tool_observations_topic", "")
+            ).strip(),
+            "cam_4": str(
+                getattr(self, "_cam4_tool_observations_topic", "")
+            ).strip(),
+        }
+        configured_views = [
+            view for view, topic in configured_topics.items() if topic
+        ]
+        if not configured_views:
+            return None
+
+        per_view_limit = max(
+            1,
+            int(getattr(self, "_perception_max_instances", 0))
+            // max(1, len(configured_views)),
+        )
+        freshness: dict[str, dict[str, Any]] = {}
+        visual_alignment: dict[str, dict[str, Any]] = {}
+        views: list[dict[str, Any]] = []
+        for view in configured_views:
+            payload = self._closest_perception_sample(
+                f"rfdetr_{view}_tools",
+                reference_stamp_sec=reference_stamp_sec,
+                stamp_key="source_stamp_sec",
+            )
+            if payload is None:
+                freshness[view] = {"status": "missing"}
+                visual_alignment[view] = {
+                    "status": "not_compared_no_fresh_detector",
+                }
+                continue
+            received_monotonic, summary = payload
+            received_age_sec = max(0.0, now - received_monotonic)
+            if received_age_sec > self._perception_stale_sec:
+                freshness[view] = {
+                    "status": "stale",
+                    "received_age_sec": round(received_age_sec, 3),
+                }
+                visual_alignment[view] = {
+                    "status": "not_compared_stale_detector",
+                }
+                continue
+            summary_stamp_sec = _finite_float(
+                summary.get("source_stamp_sec")
+            )
+            freshness[view] = {
+                "status": "fresh",
+                "received_age_sec": round(received_age_sec, 3),
+            }
+            if summary_stamp_sec is None:
+                visual_alignment[view] = {
+                    "status": "not_compared_missing_source_timestamp",
+                }
+            elif reference_stamp_sec is None:
+                visual_alignment[view] = {
+                    "status": "not_compared_no_flir_reference",
+                    "detector_stamp_sec": round(summary_stamp_sec, 6),
+                }
+            else:
+                offset_sec = float(summary_stamp_sec) - float(
+                    reference_stamp_sec
+                )
+                visual_alignment[view] = {
+                    "status": (
+                        "aligned"
+                        if abs(offset_sec)
+                        <= self._perception_image_max_skew_sec + 1.0e-9
+                        else "misaligned"
+                    ),
+                    "detector_stamp_sec": round(summary_stamp_sec, 6),
+                    "offset_sec": round(offset_sec, 6),
+                }
+
+            instances: list[dict[str, Any]] = []
+            raw_instances = summary.get("instances", [])
+            if isinstance(raw_instances, list):
+                for raw_instance in raw_instances[:per_view_limit]:
+                    if not isinstance(raw_instance, dict):
+                        continue
+                    instance = dict(raw_instance)
+                    # The detector label may be a clinical name rather than a
+                    # procedure runtime ID.  Only add an ID when the procedure
+                    # aliases resolve it; never invent one from a class index.
+                    tool_id = self._canonical_tool_id(
+                        instance.get("class_name", "")
+                    )
+                    if tool_id:
+                        instance["tool_id"] = tool_id
+                    instances.append(instance)
+            source_truncated = bool(summary.get("truncated", False))
+            view_truncated = source_truncated or (
+                len(raw_instances) > len(instances)
+                if isinstance(raw_instances, list)
+                else False
+            )
+            bounded_view: dict[str, Any] = {
+                "view": view,
+                "sequence": int(summary.get("sequence", 0)),
+                "model_version": str(summary.get("model_version", ""))[:80],
+                "ontology_version": str(
+                    summary.get("ontology_version", "")
+                )[:80],
+                "instances": instances,
+                "detection_status": str(
+                    summary.get("detection_status", "")
+                )[:40],
+                "truncated": view_truncated,
+                "freshness": dict(freshness[view]),
+                "visual_alignment": dict(visual_alignment[view]),
+            }
+            if summary_stamp_sec is not None:
+                bounded_view["source_stamp_sec"] = round(
+                    summary_stamp_sec,
+                    6,
+                )
+            views.append(bounded_view)
+
+        return {
+            "schema": "taskplanner.rfdetr_multiview_tool_context.v1",
+            "source": "rfdetr_tool_observation_2d",
+            "ground_truth": False,
+            "flir_reference_stamp_sec": (
+                round(float(reference_stamp_sec), 6)
+                if reference_stamp_sec is not None
+                else None
+            ),
+            "max_source_skew_sec": self._perception_image_max_skew_sec,
+            "tool_detection_views": views,
+            "freshness": freshness,
+            "visual_alignment": visual_alignment,
+            "mask_rle_forwarded_to_vlm": False,
+        }
+
     def _public_perception_context(
         self,
         image_stamp_sec: float | None = None,
@@ -3794,9 +5276,23 @@ class RealVLMNode(Node):
                 None,
             )
         )
-        cam4_semantics_topic = str(
-            getattr(self, "_cam4_semantics_topic", "")
-        ).strip()
+        structured_context = self._structured_rfdetr_tool_context(
+            reference_stamp_sec=reference_stamp_sec,
+            now=now,
+        )
+        if structured_context is not None:
+            return structured_context
+        cam4_semantics_topic = (
+            str(getattr(self, "_cam4_semantics_topic", "")).strip()
+            if bool(
+                getattr(
+                    self,
+                    "_allow_legacy_cam4_semantics_fallback",
+                    True,
+                )
+            )
+            else ""
+        )
         if cam4_semantics_topic:
             payload = self._closest_perception_sample(
                 "cam4_semantics",
@@ -4110,7 +5606,7 @@ class RealVLMNode(Node):
     def _canonicalize_payload_ids(self, payload: dict[str, Any]) -> dict[str, Any]:
         canonical = json.loads(json.dumps(payload))
         version = str(canonical.get("v", ""))
-        if version in {"3", "4"}:
+        if version in {"3", "4", "5", "6"}:
             canonical["phase"] = [
                 [phase_id, float(row[1])]
                 for row in canonical.get("phase", [])
@@ -4162,56 +5658,21 @@ class RealVLMNode(Node):
                 and (tool_id := self._canonical_tool_id(row[0]))
             ]
 
-        intent_key = "intent" if version in {"2", "3", "4"} else "sg"
-        intent = canonical.get(intent_key, ["none", "", 0.0] if intent_key == "intent" else ["", "", "", 0.0])
-        if intent_key == "intent" and isinstance(intent, list) and len(intent) == 3:
+        if version in {"2", "3", "4", "5", "6"}:
+            intent = canonical.get("intent", ["none", "", 0.0])
+        else:
+            intent = None
+        if isinstance(intent, list) and len(intent) == 3:
             intent_type = self._canonical_intent_type(intent[0])
             intent_tool = self._canonical_tool_id(intent[1])
             if intent_type == "none" or not intent_tool:
-                canonical[intent_key] = ["none", "", 0.0]
+                canonical["intent"] = ["none", "", 0.0]
             else:
-                canonical[intent_key] = [
+                canonical["intent"] = [
                     intent_type,
                     intent_tool,
                     float(intent[2]),
                 ]
-        elif intent_key == "sg" and isinstance(intent, list) and len(intent) == 4:
-            event_type = self._canonical_intent_type(intent[0])
-            intent_tool = self._canonical_tool_id(intent[1])
-            if event_type == "none" or not intent_tool:
-                canonical[intent_key] = ["", "", "", 0.0]
-            else:
-                canonical[intent_key] = [
-                    event_type,
-                    intent_tool,
-                    str(intent[2]),
-                    float(intent[3]),
-                ]
-        if version == "4":
-            gesture = canonical.get("gesture", ["", "", "", 0.0])
-            if isinstance(gesture, list) and len(gesture) == 4:
-                gesture_type = self._canonical_intent_type(gesture[0])
-                gesture_tool = self._canonical_tool_id(gesture[1])
-                hand_pose = str(gesture[2]).strip().lower()
-                try:
-                    confidence = float(gesture[3])
-                except (TypeError, ValueError):
-                    confidence = 0.0
-                if (
-                    gesture_type in {"handover", "request_tool"}
-                    and hand_pose == "open_receive"
-                    and confidence > 0.0
-                ):
-                    canonical["gesture"] = [
-                        "request_tool",
-                        gesture_tool,
-                        "open_receive",
-                        confidence,
-                    ]
-                else:
-                    canonical["gesture"] = ["", "", "", 0.0]
-            else:
-                canonical["gesture"] = ["", "", "", 0.0]
 
         mayo_rows = []
         for row in canonical.get("mayo", []):
@@ -4233,6 +5694,41 @@ class RealVLMNode(Node):
             canonical.get("mayo", []),
             canonical.get("mayo_retrieve", ["", 0.0]),
         )
+        if version in {"5", "6"} and isinstance(canonical.get("function_call"), dict):
+            function_call = dict(canonical["function_call"])
+            function_name = str(function_call.get("name", "")).strip()
+            arguments = function_call.get("arguments", {})
+            if not isinstance(arguments, dict):
+                arguments = {}
+            if function_name == "request_tool_handover":
+                tool_id = self._canonical_tool_id(arguments.get("tool_id", ""))
+                if tool_id:
+                    function_call["arguments"] = {"tool_id": tool_id}
+                    canonical["function_call"] = function_call
+                else:
+                    canonical["function_call"] = None
+            elif function_name == "adjust_retraction":
+                command = str(arguments.get("command", "")).strip()
+                target_side = str(arguments.get("target_side", "")).strip().lower()
+                raw_distance = arguments.get("distance_m")
+                if (
+                    command == "adjust_retraction"
+                    and target_side in {"left", "right", "both"}
+                    and isinstance(raw_distance, (int, float))
+                    and not isinstance(raw_distance, bool)
+                    and math.isfinite(float(raw_distance))
+                    and float(raw_distance) > 0.0
+                ):
+                    function_call["arguments"] = {
+                        "command": command,
+                        "distance_m": float(raw_distance),
+                        "target_side": target_side,
+                    }
+                    canonical["function_call"] = function_call
+                else:
+                    canonical["function_call"] = None
+            else:
+                canonical["function_call"] = None
         return canonical
 
     def _actor_log_prior_evidence(
@@ -4243,10 +5739,6 @@ class RealVLMNode(Node):
         speech_rows = self._fresh_rows(
             self._recent_speech,
             max_age_sec=35.0 if open_set_phase_search else 18.0,
-        )
-        observed_signals = self._fresh_rows(
-            self._recent_observed_signals,
-            max_age_sec=35.0 if open_set_phase_search else 8.0,
         )
         skill_statuses = self._fresh_rows(
             self._recent_skill_statuses,
@@ -4280,8 +5772,9 @@ class RealVLMNode(Node):
             mayo_tools = [
                 instrument.instrument_id
                 for instrument in self._world.instrument_states
-                if instrument.location_type == "mayo"
-                or instrument.lifecycle_stage in {"mayo_reuse", "mayo_recovery"}
+                if instrument.lifecycle_stage in {"mayo_reuse", "mayo_recovery"}
+                and instrument.location_type == CANONICAL_MAYO_POLICY_LOCATION
+                and instrument.location_id == CANONICAL_MAYO_POLICY_LOCATION
             ]
         return {
             "current_phase": current_phase,
@@ -4296,11 +5789,23 @@ class RealVLMNode(Node):
             "speech": speech_rows,
             "speech_tools": self._tools_from_public_speech([row for row in speech_rows if isinstance(row, dict)]),
             "recent_tools": recent_tools,
-            "observed_signals": observed_signals,
             "skill_status": skill_statuses,
             "mayo_tools": mayo_tools,
             "hand_tools": hand_tools,
             "events": public_events,
+        }
+
+    @staticmethod
+    def _dialogue_turn_context(turn: DialogueTurn | None) -> dict[str, Any] | None:
+        if turn is None:
+            return None
+        return {
+            "turn_id": turn.turn_id,
+            "utterance_id": turn.utterance_id,
+            "text": turn.text,
+            "speaker_role": turn.speaker_role or "surgeon",
+            "language": turn.language,
+            "reply_required": True,
         }
 
     def _fresh_rows(self, rows: deque[dict[str, Any]], *, max_age_sec: float) -> list[dict[str, Any]]:
@@ -4348,6 +5853,11 @@ class RealVLMNode(Node):
                 phase_id=evidence.get("current_phase", ""),
                 completed_handovers=digital_twin.get("completed_handovers", []),
             )
+        dialogue_gate = getattr(self, "_dialogue_turn_gate", None)
+        pending_dialogue_turn = (
+            dialogue_gate.next_pending() if dialogue_gate is not None else None
+        )
+        requestable = set(self._spec.list_requestable_instrument_ids())
         context = {
             "proc": self._spec.procedure_id,
             "procedure_prompt_id": str(self._procedure_prompt.get("id", "")) if isinstance(self._procedure_prompt, dict) else "",
@@ -4362,15 +5872,17 @@ class RealVLMNode(Node):
                 {
                     "id": instrument.id,
                     "role": instrument.role,
-                    "requestable": bool(getattr(instrument, "requestable", True)),
+                    "requestable": instrument.id in requestable,
                 }
                 for instrument in self._spec.bundle.instruments
             ],
             "evidence_window": {
                 "speech": list(evidence.get("speech", [])),
-                "observed_signals": list(evidence.get("observed_signals", [])),
                 "skill_status": list(evidence.get("skill_status", [])),
             },
+            "pending_dialogue_turn": self._dialogue_turn_context(
+                pending_dialogue_turn
+            ),
             "visual_input": dict(self._current_visual_input),
             "observable_perception": self._public_perception_context(),
             "digital_twin": digital_twin,
@@ -4401,7 +5913,7 @@ class RealVLMNode(Node):
 
     def _primary_payload_phase(self, payload: dict[str, Any]) -> str:
         version = str(payload.get("v", ""))
-        rows = payload.get("phase", []) if version in {"2", "3", "4"} else payload.get("ph", [])
+        rows = payload.get("phase", []) if version in {"2", "3", "4", "5", "6"} else payload.get("ph", [])
         raw_phase = ""
         if version == "2" and isinstance(rows, list) and len(rows) == 2:
             raw_phase = rows[0]
@@ -4414,6 +5926,8 @@ class RealVLMNode(Node):
         if sample is None:
             return None
         if now - sample.received_monotonic > self._image_stale_sec:
+            return None
+        if self._source_frame_timestamp_rejection(sample, now_sec=now):
             return None
         return sample
 
@@ -4428,7 +5942,13 @@ class RealVLMNode(Node):
         return [
             sample
             for sample in samples
-            if now - sample.received_monotonic <= self._image_stale_sec
+            if (
+                now - sample.received_monotonic <= self._image_stale_sec
+                and not self._source_frame_timestamp_rejection(
+                    sample,
+                    now_sec=now,
+                )
+            )
         ]
 
     def _fresh_multiview_pair(
@@ -4503,20 +6023,55 @@ class RealVLMNode(Node):
         perception_enabled = bool(
             getattr(self, "_perception_enabled", True)
         )
-        segmented_field = (
+        require_rfdetr_field = bool(
+            getattr(self, "_require_rfdetr_applied_field_image", False)
+        )
+        segmented_candidate = (
             self._fresh_image("field", now)
             if perception_enabled
             else None
         )
-        raw_field = self._fresh_image("raw_field", now)
+        field_provenance_error = ""
+        segmented_field = segmented_candidate
+        if require_rfdetr_field:
+            if not perception_enabled:
+                segmented_field = None
+                field_provenance_error = (
+                    "local RF-DETR applied FLIR image is required but "
+                    "perception is disabled"
+                )
+            elif segmented_candidate is None:
+                segmented_field = None
+                field_provenance_error = (
+                    "missing fresh local RF-DETR applied FLIR image"
+                )
+            elif not frame_id_has_rfdetr_marker(
+                segmented_candidate.frame_id,
+                RFDETR_FLIR_SEGMENTED_FRAME_MARKER,
+            ):
+                segmented_field = None
+                field_provenance_error = (
+                    "field image lacks the local RF-DETR segmentation "
+                    "provenance marker"
+                )
+
+        raw_field = (
+            None
+            if require_rfdetr_field
+            else self._fresh_image("raw_field", now)
+        )
         field = segmented_field or raw_field
-        if field is None and not self._raw_field_image_topic:
+        if (
+            field is None
+            and not require_rfdetr_field
+            and not self._raw_field_image_topic
+        ):
             # Simulation/no-image configurations may intentionally publish
             # their raw visual stream on the legacy field topic.
             field = self._fresh_image("field", now)
         self._current_image_input_error = ""
         if field is None:
-            self._current_image_input_error = (
+            self._current_image_input_error = field_provenance_error or (
                 "missing fresh FLIR image (segmented and raw fallback unavailable)"
             )
             self._current_perception_reference_stamp_sec = None
@@ -4528,6 +6083,9 @@ class RealVLMNode(Node):
                 "cam4_image_forwarded_to_vlm": False,
                 "cam4_detector_overlay_forwarded_to_vlm": False,
                 "detector_advisory": perception_enabled,
+                "rfdetr_applied_field_required": require_rfdetr_field,
+                "rfdetr_cam4_overlay_required": False,
+                "structured_rfdetr_tool_observations": True,
                 "input_error": self._current_image_input_error,
             }
             return [], "missing(flir_visual)", None
@@ -4550,50 +6108,7 @@ class RealVLMNode(Node):
             if cam4_skew_sec <= self._multiview_max_skew_sec + 1.0e-9:
                 cam4 = nearest_cam4
 
-        # The transparent RF-DETRSmall overlay carries the rendered CAM4
-        # instrument and hand-request evidence. It must refer to the selected
-        # raw CAM4 source frame; otherwise the model sees the raw pixels and
-        # the metadata explicitly records the fallback.
-        cam4_overlay: ImageSample | None = None
-        cam4_overlay_skew_sec: float | None = None
-        cam4_overlay_fallback_reason = ""
-        if cam4 is not None:
-            if not perception_enabled:
-                cam4_overlay_fallback_reason = (
-                    "RF-DETR perception is disabled; raw CAM4 pixels forwarded"
-                )
-            elif not self._cam4_overlay_image_topic:
-                cam4_overlay_fallback_reason = (
-                    "CAM4 RF-DETR overlay topic is not configured"
-                )
-            else:
-                cam4_overlay_samples = self._fresh_images("cam4_overlay", now)
-                if not cam4_overlay_samples:
-                    cam4_overlay_fallback_reason = (
-                        "fresh CAM4 RF-DETR overlay is unavailable"
-                    )
-                else:
-                    nearest_overlay = min(
-                        cam4_overlay_samples,
-                        key=lambda sample: abs(
-                            image_sample_stamp_sec(sample)
-                            - image_sample_stamp_sec(cam4)
-                        ),
-                    )
-                    cam4_overlay_skew_sec = abs(
-                        image_sample_stamp_sec(nearest_overlay)
-                        - image_sample_stamp_sec(cam4)
-                    )
-                    if (
-                        cam4_overlay_skew_sec
-                        <= self._perception_image_max_skew_sec + 1.0e-9
-                    ):
-                        cam4_overlay = nearest_overlay
-                    else:
-                        cam4_overlay_fallback_reason = (
-                            "CAM4 RF-DETR overlay is outside the perception "
-                            "alignment window"
-                        )
+        cam4_fallback_reason = ""
 
         image_max_side_px = self._image_max_side_px
         if cam4 is not None:
@@ -4635,8 +6150,7 @@ class RealVLMNode(Node):
             }
         ]
         cam4_forwarded = False
-        cam4_overlay_forwarded = cam4_overlay is not None
-        cam4_fallback_reason = ""
+        cam4_overlay_forwarded = False
         image_layout = "flir_only"
         model_image: ModelImage | None = None
         image_source = ""
@@ -4649,14 +6163,6 @@ class RealVLMNode(Node):
                     cam4.mime_type,
                     cam4_crop_xywh_norm=self._current_cam4_crop(cam4),
                     max_side_px=image_max_side_px,
-                    cam4_overlay_bytes=(
-                        cam4_overlay.data if cam4_overlay is not None else None
-                    ),
-                    cam4_overlay_mime_type=(
-                        cam4_overlay.mime_type
-                        if cam4_overlay is not None
-                        else ""
-                    ),
                 )
             except (OSError, ValueError) as exc:
                 cam4_fallback_reason = (
@@ -4665,10 +6171,7 @@ class RealVLMNode(Node):
                 )
             else:
                 model_image = ModelImage(
-                    label=(
-                        "Synchronized FLIR surgical field + CAM4 Mayo/"
-                        "surgeon-hand context"
-                    ),
+                    label="Synchronized FLIR surgical field + CAM4 Mayo instruments",
                     data=composite_bytes,
                     mime_type=composite_mime,
                     stamp_sec=field.stamp_sec,
@@ -4682,7 +6185,7 @@ class RealVLMNode(Node):
                 )
                 sources.append(
                     {
-                        "role": "cam4_mayo_hand_crop",
+                        "role": "cam4_mayo_instrument_crop",
                         "topic": self._cam4_image_topic,
                         "stamp_sec": round(
                             image_sample_stamp_sec(cam4),
@@ -4696,35 +6199,13 @@ class RealVLMNode(Node):
                         ),
                     }
                 )
-                if cam4_overlay is not None:
-                    sources.append(
-                        {
-                            "role": "cam4_rfdetr_small_overlay",
-                            "topic": self._cam4_overlay_image_topic,
-                            "stamp_sec": round(
-                                image_sample_stamp_sec(cam4_overlay),
-                                9,
-                            ),
-                            "frame_id": cam4_overlay.frame_id,
-                            "offset_sec": round(
-                                image_sample_stamp_sec(cam4_overlay)
-                                - image_sample_stamp_sec(field),
-                                9,
-                            ),
-                            "cam4_offset_sec": round(
-                                image_sample_stamp_sec(cam4_overlay)
-                                - image_sample_stamp_sec(cam4),
-                                9,
-                            ),
-                        }
-                    )
                 cam4_forwarded = True
                 image_layout = "flir_left_cam4_right"
-        elif cam4_skew_sec is not None:
+        elif cam4_skew_sec is not None and not cam4_fallback_reason:
             cam4_fallback_reason = (
                 "CAM4 frame is outside the multiview synchronization window"
             )
-        else:
+        elif not cam4_fallback_reason:
             cam4_fallback_reason = "CAM4 frame is unavailable"
 
         if model_image is None:
@@ -4759,7 +6240,7 @@ class RealVLMNode(Node):
         ]
         if self._require_cam4_image and not cam4_forwarded:
             self._current_image_input_error = (
-                "missing synchronized raw CAM4 Mayo/hand image"
+                "missing synchronized raw CAM4 Mayo image"
             )
         if cam4_forwarded:
             flir_preprocessing = (
@@ -4767,11 +6248,7 @@ class RealVLMNode(Node):
                 if using_segmented_field
                 else "raw FLIR fallback"
             )
-            cam4_preprocessing = (
-                "RFDETRSmall CAM4 bbox/hand overlay"
-                if cam4_overlay_forwarded
-                else "raw CAM4 Mayo/hand fallback"
-            )
+            cam4_preprocessing = "raw CAM4 Mayo instrument pixels"
             preprocessing = (
                 "single side-by-side composite: "
                 f"{flir_preprocessing} + {cam4_preprocessing}"
@@ -4800,14 +6277,15 @@ class RealVLMNode(Node):
             "cam4_detector_overlay_forwarded_to_vlm": (
                 cam4_overlay_forwarded
             ),
-            "cam4_detector_overlay_alignment_skew_sec": (
-                round(cam4_overlay_skew_sec, 9)
-                if cam4_overlay_skew_sec is not None
-                else None
-            ),
             "detector_advisory": perception_enabled,
+            "rfdetr_applied_field_required": require_rfdetr_field,
+            "rfdetr_cam4_overlay_required": False,
+            "structured_rfdetr_tool_observations": True,
             "cam4_fallback_reason": cam4_fallback_reason,
-            "cam4_overlay_fallback_reason": cam4_overlay_fallback_reason,
+            "cam4_overlay_fallback_reason": (
+                "not used for VLM; typed CAM3/CAM4 RF-DETR observations "
+                "supply detector evidence"
+            ),
             "input_error": self._current_image_input_error,
         }
         return images, image_source, model_image
@@ -4866,7 +6344,6 @@ class RealVLMNode(Node):
                         0.97,
                     ]
                 )
-            gesture = ["", "", "", 0.0]
             uncertainty = 0.34 if self._world.phase_uncertain else 0.08
             summary = (
                 f"phase={self._world.filtered_phase}; "
@@ -4877,7 +6354,6 @@ class RealVLMNode(Node):
                 "v": "1",
                 "ph": phases,
                 "to": observations,
-                "sg": gesture,
                 "u": uncertainty,
                 "sum": summary,
             }
@@ -4896,14 +6372,6 @@ class RealVLMNode(Node):
             for observation in stage.observations
             if observation.visible
         ]
-        gesture = ["", "", "", 0.0]
-        if stage.surgeon_gesture is not None:
-            gesture = [
-                stage.surgeon_gesture.event_type,
-                stage.surgeon_gesture.requested_tool,
-                stage.surgeon_gesture.hand_pose,
-                round(float(stage.surgeon_gesture.confidence), 3),
-            ]
         uncertainty = float(stage.uncertainty)
         current_request = self._world.surgeon_request_tool or self._world.explicit_request_tool or "none"
         summary = (
@@ -4916,7 +6384,6 @@ class RealVLMNode(Node):
             "v": "1",
             "ph": phases,
             "to": observations,
-            "sg": gesture,
             "u": uncertainty,
             "sum": summary,
         }
@@ -4933,19 +6400,15 @@ class RealVLMNode(Node):
             str(row.get("id", ""))
             for row in digital_twin_tools
             if isinstance(row, dict)
-            and (
-                str(row.get("lt", "")) == "mayo"
-                or str(row.get("lc", "")) in {"mayo_reuse", "mayo_recovery"}
-            )
+            and str(row.get("lc", "")) in {"mayo_reuse", "mayo_recovery"}
+            and str(row.get("lt", "")) == CANONICAL_MAYO_POLICY_LOCATION
+            and str(row.get("loc", "")) == CANONICAL_MAYO_POLICY_LOCATION
             and str(row.get("id", ""))
         ]
         speech = evidence_window.get("speech", []) if isinstance(evidence_window, dict) else []
         speech_rows = speech if isinstance(speech, list) else []
         requested_tool = self._tool_from_public_speech([row for row in speech_rows if isinstance(row, dict)])
-        observed_signals = evidence_window.get("observed_signals", []) if isinstance(evidence_window, dict) else []
-        latest_signal = observed_signals[-1] if isinstance(observed_signals, list) and observed_signals else {}
-        has_request_signal = isinstance(latest_signal, dict) and str(latest_signal.get("type", "")) in {"request_tool", "voice_request"}
-        intent_type = "handover" if requested_tool and has_request_signal else "none"
+        intent_type = "handover" if requested_tool else "none"
         candidates = context_dict.get("candidates", {}) if isinstance(context_dict, dict) else {}
         phase_rows = list(candidates.get("phase", [])) if isinstance(candidates, dict) else []
         tool_rows = list(candidates.get("tool", [])) if isinstance(candidates, dict) else []
@@ -4976,7 +6439,7 @@ class RealVLMNode(Node):
         if recover_candidates:
             mayo_retrieve = [recover_candidates[0][0], recover_candidates[0][1]]
         return {
-            "v": "4",
+            "v": "6",
             "phase": phase_rows[:4],
             "tool": tool_rows[:4],
             "intent": [intent_type, requested_tool if intent_type != "none" else "", 0.7 if intent_type != "none" else 0.0],
@@ -4985,6 +6448,8 @@ class RealVLMNode(Node):
             "u": 0.55,
             "sum": "actor-log fallback",
             "bed_robot_arm_group": self._fallback_bed_robot_arm_group_proposal(),
+            "function_call": None,
+            "humanoid_reply": None,
         }
 
     def _fallback_bed_robot_arm_group_proposal(self) -> dict[str, Any] | None:
@@ -4995,10 +6460,22 @@ class RealVLMNode(Node):
         turns into an explicit invalid proposal and therefore no group action.
         """
         request = self._latest_bed_robot_arm_group_request
-        if request is None or not infer_retraction_direction(request.voice_text):
+        if request is None:
+            return None
+        spoken_direction = infer_retraction_direction(request.voice_text)
+        thyroid_default_right = bool(
+            not spoken_direction
+            and str(request.procedure_id) == "thyroidectomy_demo"
+            and str(request.adjustment_mode) == "single"
+            and str(request.target_retractor_id) == "right_malleable"
+        )
+        if not spoken_direction and not thyroid_default_right:
             return None
         try:
-            normalized = normalize_retraction_request(request.voice_text)
+            normalized = normalize_retraction_request(
+                request.voice_text,
+                vlm_direction="RIGHT" if thyroid_default_right else "",
+            )
         except BedRobotArmGroupNormalizationError:
             return None
         return {
@@ -5099,20 +6576,13 @@ class RealVLMNode(Node):
         return []
 
     def _stabilize_actor_log_payload(self, payload: dict[str, Any], context_dict: dict[str, Any]) -> dict[str, Any]:
-        if str(payload.get("v", "")) not in {"3", "4"}:
+        if str(payload.get("v", "")) not in {"3", "4", "5", "6"}:
             return payload
         stabilized = dict(payload)
         evidence_window = context_dict.get("evidence_window", {}) if isinstance(context_dict, dict) else {}
-        visual = evidence_window.get("visual", {}) if isinstance(evidence_window, dict) else {}
         speech = evidence_window.get("speech", []) if isinstance(evidence_window, dict) else []
         speech_rows = speech if isinstance(speech, list) else []
-        observed_signals = evidence_window.get("observed_signals", []) if isinstance(evidence_window, dict) else []
-        latest_signal = observed_signals[-1] if isinstance(observed_signals, list) and observed_signals else {}
         requested_tool = self._tool_from_public_speech([row for row in speech_rows if isinstance(row, dict)])
-        has_request_signal = isinstance(latest_signal, dict) and str(latest_signal.get("type", "")) in {
-            "request_tool",
-            "voice_request",
-        }
 
         model_phase_rows = [
             [str(row[0]), float(row[1])]
@@ -5132,80 +6602,118 @@ class RealVLMNode(Node):
         ]
         # An explicit request is handled independently by the speech/intent
         # path. It is not a next-tool forecast and must not overwrite one.
-        stabilized["tool"] = self._merge_ranked_rows(
-            model_tool_rows,
-            [],
-            limit=4,
-        )
-
-        visual_input = (
-            context_dict.get("visual_input", {})
+        # On live actor-log requests, forecast_constraints is the authoritative
+        # public inventory boundary.  Remove unavailable/non-requestable model
+        # guesses, then fill missing valid candidates from the frozen 0704
+        # n-gram and authored procedure prior.  A tiny baseline is used only to
+        # make every otherwise-unranked *eligible* tool representable; it can
+        # never introduce a tool outside the current handover inventory.
+        forecast_constraints = (
+            context_dict.get("forecast_constraints")
             if isinstance(context_dict, dict)
-            else {}
+            else None
         )
-        direct_cam4 = bool(
-            isinstance(visual_input, dict)
-            and visual_input.get("cam4_image_forwarded_to_vlm")
-        )
-        gesture = stabilized.get("gesture", ["", "", "", 0.0])
-        if not isinstance(gesture, list) or len(gesture) != 4:
-            gesture = ["", "", "", 0.0]
-        gesture_type = self._canonical_intent_type(gesture[0])
-        gesture_tool = self._canonical_tool_id(gesture[1])
-        gesture_pose = str(gesture[2]).strip().lower()
-        try:
-            gesture_confidence = float(gesture[3])
-        except (TypeError, ValueError):
-            gesture_confidence = 0.0
-        if (
-            direct_cam4
-            and gesture_type in {"handover", "request_tool"}
-            and gesture_pose == "open_receive"
-            and gesture_confidence >= CAM4_VISUAL_GESTURE_MIN_CONFIDENCE
-        ):
-            stabilized["gesture"] = [
-                "request_tool",
-                gesture_tool,
-                "open_receive",
-                round(max(0.0, min(1.0, gesture_confidence)), 3),
+        if isinstance(forecast_constraints, dict):
+            requestable_ids = {
+                self._canonical_tool_id(row.get("id", ""))
+                for row in context_dict.get("tools", [])
+                if isinstance(row, dict)
+                and bool(row.get("requestable", False))
+                and self._canonical_tool_id(row.get("id", ""))
+            }
+            eligible_ids: list[str] = []
+            for row in forecast_constraints.get(
+                "available_for_next_handover", []
+            ):
+                if not isinstance(row, list) or len(row) < 2:
+                    continue
+                tool_id = self._canonical_tool_id(row[0])
+                try:
+                    available_count = int(row[1])
+                except (TypeError, ValueError):
+                    continue
+                if (
+                    available_count > 0
+                    and tool_id in requestable_ids
+                    and tool_id not in eligible_ids
+                ):
+                    eligible_ids.append(tool_id)
+            eligible = set(eligible_ids)
+            primary_rows = [
+                [tool_id, confidence]
+                for raw_tool_id, confidence in model_tool_rows
+                if (tool_id := self._canonical_tool_id(raw_tool_id)) in eligible
             ]
+            primary_floor = min(
+                (float(row[1]) for row in primary_rows),
+                default=2.0,
+            )
+            fallback_scale = min(1.0, max(0.001, primary_floor * 0.5))
+
+            def fallback_row(row: list[Any]) -> list[Any]:
+                try:
+                    score = float(row[1])
+                except (TypeError, ValueError):
+                    score = 0.0
+                return [
+                    self._canonical_tool_id(row[0]),
+                    max(0.001, min(1.0, score) * fallback_scale),
+                ]
+
+            fallback_rows: list[list[Any]] = []
+            frozen_prior = context_dict.get("frozen_ngram_prior", {})
+            if isinstance(frozen_prior, dict):
+                fallback_rows.extend(
+                    fallback_row(row)
+                    for row in frozen_prior.get("candidates", [])
+                    if isinstance(row, list)
+                    and len(row) >= 2
+                    and self._canonical_tool_id(row[0]) in eligible
+                )
+            procedure_candidates = context_dict.get("candidates", {})
+            if isinstance(procedure_candidates, dict):
+                fallback_rows.extend(
+                    fallback_row(row)
+                    for row in procedure_candidates.get("tool", [])
+                    if isinstance(row, list)
+                    and len(row) >= 2
+                    and self._canonical_tool_id(row[0]) in eligible
+                )
+            fallback_rows.extend(
+                [tool_id, 0.001] for tool_id in eligible_ids
+            )
+            stabilized["tool"] = normalize_ranked_tool_distribution(
+                self._merge_ranked_rows(
+                    primary_rows,
+                    fallback_rows,
+                    limit=3,
+                ),
+                limit=3,
+            )
+            if len(eligible_ids) < 3:
+                try:
+                    current_uncertainty = float(stabilized.get("u", 1.0))
+                except (TypeError, ValueError):
+                    current_uncertainty = 1.0
+                stabilized["u"] = round(
+                    max(0.8, min(1.0, current_uncertainty)),
+                    3,
+                )
         else:
-            stabilized["gesture"] = ["", "", "", 0.0]
+            # Replay/unit contexts created before forecast_constraints keep
+            # their evidence values, but the public ranking is bounded to the
+            # new maximum of three rows.
+            stabilized["tool"] = self._merge_ranked_rows(
+                model_tool_rows,
+                [],
+                limit=3,
+            )
 
         intent = stabilized.get("intent", ["none", "", 0.0])
         if not isinstance(intent, list) or len(intent) < 3:
             intent = ["none", "", 0.0]
         if requested_tool:
             intent = ["handover", requested_tool, max(0.72, min(1.0, float(intent[2]) if len(intent) > 2 else 0.0))]
-        elif has_request_signal:
-            signal_tool = self._canonical_tool_id(
-                latest_signal.get("tool", "")
-                if isinstance(latest_signal, dict)
-                else ""
-            )
-            if signal_tool:
-                intent = [
-                    "handover",
-                    signal_tool,
-                    max(
-                        0.72,
-                        min(
-                            1.0,
-                            float(intent[2]) if len(intent) > 2 else 0.0,
-                        ),
-                    ),
-                ]
-            else:
-                intent = ["none", "", 0.0]
-        elif (
-            stabilized["gesture"][0] == "request_tool"
-            and stabilized["gesture"][1]
-        ):
-            intent = [
-                "handover",
-                stabilized["gesture"][1],
-                stabilized["gesture"][3],
-            ]
         else:
             intent = ["none", "", 0.0]
         stabilized["intent"] = [str(intent[0]), str(intent[1]), round(max(0.0, min(1.0, float(intent[2]))), 3)]
@@ -5213,12 +6721,97 @@ class RealVLMNode(Node):
             stabilized,
             context_dict,
         )
+        self._retain_mayo_policy_for_current_stand(stabilized, context_dict)
         self._suppress_non_mayo_recovery_candidates(stabilized, context_dict)
 
         stabilized["sum"] = normalize_clinical_analysis(
             stabilized.get("sum", "")
         )
         return stabilized
+
+    def _current_mayo_policy_tool_ids(
+        self,
+        context_dict: dict[str, Any],
+    ) -> set[str]:
+        """Return only DT instances physically confirmed on canonical Mayo.
+
+        A CAM4/RF-DETR observation is allowed to establish a later DT location,
+        but the same VLM response must not both move a tool to Mayo and make a
+        reuse/recovery policy decision for it.  This keeps policy evidence
+        dependent on the pre-inference public DT fact.
+        """
+
+        digital_twin = (
+            context_dict.get("digital_twin", {})
+            if isinstance(context_dict, dict)
+            else {}
+        )
+        tools = digital_twin.get("tools", []) if isinstance(digital_twin, dict) else []
+        if not isinstance(tools, list):
+            return set()
+        current_tool_ids: set[str] = set()
+        for row in tools:
+            if not isinstance(row, dict):
+                continue
+            tool_id = self._canonical_tool_id(row.get("id", ""))
+            if (
+                tool_id
+                and str(row.get("lc", "")) in {"mayo_reuse", "mayo_recovery"}
+                and str(row.get("lt", "")) == CANONICAL_MAYO_POLICY_LOCATION
+                and str(row.get("loc", "")) == CANONICAL_MAYO_POLICY_LOCATION
+            ):
+                current_tool_ids.add(tool_id)
+        return current_tool_ids
+
+    def _retain_mayo_policy_for_current_stand(
+        self,
+        payload: dict[str, Any],
+        context_dict: dict[str, Any],
+    ) -> None:
+        """Fail closed unless the exact tool was already on the Mayo stand."""
+
+        current_mayo_tool_ids = self._current_mayo_policy_tool_ids(context_dict)
+        retained_rows: list[list[Any]] = []
+        for row in payload.get("mayo", []):
+            if not isinstance(row, list) or len(row) < 3:
+                continue
+            tool_id = self._canonical_tool_id(row[0])
+            disposition = str(row[1]).strip().lower()
+            try:
+                confidence = float(row[2])
+            except (TypeError, ValueError):
+                continue
+            if (
+                not tool_id
+                or tool_id not in current_mayo_tool_ids
+                or disposition not in {"recover", "reuse"}
+                or not math.isfinite(confidence)
+            ):
+                continue
+            retained_rows.append(
+                [
+                    tool_id,
+                    disposition,
+                    round(max(0.0, min(1.0, confidence)), 4),
+                ]
+            )
+        payload["mayo"] = retained_rows
+
+        recovery_tools = {
+            str(row[0])
+            for row in retained_rows
+            if str(row[1]) == "recover"
+        }
+        retrieve = payload.get("mayo_retrieve", ["", 0.0])
+        retrieve_tool = (
+            self._canonical_tool_id(retrieve[0])
+            if isinstance(retrieve, list) and len(retrieve) >= 2
+            else ""
+        )
+        if retrieve_tool not in recovery_tools:
+            payload["mayo_retrieve"] = ["", 0.0]
+        else:
+            payload["mayo_retrieve"] = [retrieve_tool, retrieve[1]]
 
     def _corroborate_mayo_with_cam4_semantics(
         self,
@@ -5335,11 +6928,6 @@ class RealVLMNode(Node):
                     ),
                 }
 
-        request = perception.get("tool_request", {}) if aligned else {}
-        active_hand_request = bool(
-            isinstance(request, dict)
-            and request.get("state") == "request"
-        )
         digital_twin = (
             context_dict.get("digital_twin", {})
             if isinstance(context_dict, dict)
@@ -5375,8 +6963,7 @@ class RealVLMNode(Node):
             if (
                 tool_id in field_tools
                 and (
-                    active_hand_request
-                    or not bool(evidence["stable"])
+                    not bool(evidence["stable"])
                     or float(evidence["confidence"])
                     < CAM4_MAYO_MIN_CONFIDENCE
                 )
@@ -5398,7 +6985,6 @@ class RealVLMNode(Node):
             evidence = detected[tool_id]
             if (
                 count <= 0
-                or active_hand_request
                 or not bool(evidence["stable"])
                 or float(evidence["confidence"])
                 < CAM4_MAYO_MIN_CONFIDENCE
@@ -5437,6 +7023,9 @@ class RealVLMNode(Node):
         payload: dict[str, Any],
         context_dict: dict[str, Any],
     ) -> None:
+        # The DT fact is the hard admission boundary.  Keep this guard here in
+        # addition to the stabilizer call so direct callers cannot bypass it.
+        self._retain_mayo_policy_for_current_stand(payload, context_dict)
         candidates = (
             context_dict.get("candidates", {})
             if isinstance(context_dict, dict)
@@ -5513,21 +7102,6 @@ class RealVLMNode(Node):
             >= CAM4_MAYO_MIN_CONFIDENCE
         }
         stable_cam4_tools.discard("")
-        visual_input = (
-            context_dict.get("visual_input", {})
-            if isinstance(context_dict, dict)
-            else {}
-        )
-        if (
-            isinstance(visual_input, dict)
-            and visual_input.get("cam4_image_forwarded_to_vlm")
-        ):
-            stable_cam4_tools.update(
-                self._canonical_tool_id(row[0])
-                for row in payload.get("mayo", [])
-                if isinstance(row, list) and row
-            )
-            stable_cam4_tools.discard("")
         blocked_tools = {
             str(hands.get(key, ""))
             for key in ("rh", "lh", "pre")
@@ -5579,26 +7153,43 @@ class RealVLMNode(Node):
             mayo_rows.append(row)
         payload["mayo"] = mayo_rows
 
+        recovery_tools = {
+            str(row[0])
+            for row in mayo_rows
+            if len(row) >= 2 and str(row[1]) == "recover"
+        }
         retrieve = payload.get("mayo_retrieve", ["", 0.0])
-        if isinstance(retrieve, list) and retrieve and str(retrieve[0]) in blocked_tools:
+        if (
+            not isinstance(retrieve, list)
+            or not retrieve
+            or str(retrieve[0]) in blocked_tools
+            or str(retrieve[0]) not in recovery_tools
+        ):
             payload["mayo_retrieve"] = ["", 0.0]
 
     def _run_model(
         self,
         context_json: str,
         images: list[tuple[str, bytes, str]],
+        claimed_dialogue_turn_id: str = "",
     ) -> tuple[str, dict[str, Any] | None, float, str, int, str]:
         retries_used = 0
         if self._response_mode == "replay":
             if self._replay_payload is None:
                 raise RuntimeError("response_mode=replay requires replay_response_path")
             raw = json.dumps(self._replay_payload, separators=(",", ":"), sort_keys=True)
-            normalized_raw, payload = self._normalize_model_raw_text(raw)
+            normalized_raw, payload = self._normalize_model_raw_text(
+                raw,
+                claimed_dialogue_turn_id=claimed_dialogue_turn_id,
+            )
             return normalized_raw, payload, 0.0, "replay", retries_used, ""
         if self._response_mode == "oracle":
             payload = self._fallback_payload(json.loads(context_json))
             raw = json.dumps(payload, separators=(",", ":"), sort_keys=True)
-            normalized_raw, payload = self._normalize_model_raw_text(raw)
+            normalized_raw, payload = self._normalize_model_raw_text(
+                raw,
+                claimed_dialogue_turn_id=claimed_dialogue_turn_id,
+            )
             return normalized_raw, payload, 0.0, "oracle", retries_used, ""
 
         last_error = ""
@@ -5619,10 +7210,16 @@ class RealVLMNode(Node):
                         "tool/u JSON object with nested candidate rows."
                     )
                 else:
+                    context_mode = getattr(self, "_context_mode", "")
+                    schema_version = (
+                        "6"
+                        if context_mode == "actor_log"
+                        else ("1" if context_mode == "world" else "4")
+                    )
                     developer_prompt += (
                         " Previous response failed schema validation: "
                         f"{validation_error}. Correct that field and re-emit the complete "
-                        "schema-v4 JSON object only; do not simplify any array shape."
+                        f"schema-v{schema_version} JSON object only; do not simplify any array shape."
                     )
             try:
                 response = self._client.request_json(
@@ -5642,7 +7239,8 @@ class RealVLMNode(Node):
                 )
                 last_raw_text = response.raw_text
                 normalized_raw, payload = self._normalize_model_raw_text(
-                    response.raw_text
+                    response.raw_text,
+                    claimed_dialogue_turn_id=claimed_dialogue_turn_id,
                 )
                 return normalized_raw, payload, response.latency_sec, response.mode, attempt, ""
             except (requests.RequestException, SchemaValidationError, json.JSONDecodeError, RuntimeError, ValueError) as exc:  # type: ignore[name-defined]
@@ -5675,12 +7273,31 @@ class RealVLMNode(Node):
     def _normalize_model_raw_text(
         self,
         raw_text: str,
+        *,
+        claimed_dialogue_turn_id: str = "",
     ) -> tuple[str, dict[str, Any]]:
         if (
             getattr(self, "_task_profile", VLM_TASK_PROFILE_FULL)
             == VLM_TASK_PROFILE_TOOL_FORECAST_ONLY
         ):
             return normalize_tool_forecast_raw_text(raw_text)
+        if (
+            str(getattr(self, "_response_mode", "")).strip().lower() == "live"
+            and str(getattr(self, "_provider_id", "")).strip().lower()
+            == "ninfer"
+            and str(getattr(self, "_context_mode", "")).strip().lower()
+            == "actor_log"
+        ):
+            payload = _repair_ninfer_dialogue_envelope(
+                parse_json_payload(raw_text),
+                claimed_turn_id=claimed_dialogue_turn_id,
+            )
+            raw_text = json.dumps(
+                payload,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
         return normalize_raw_text(raw_text)
 
     def _cacheable_payload(
@@ -5688,11 +7305,21 @@ class RealVLMNode(Node):
         raw_json: str,
         payload: dict[str, Any],
     ) -> tuple[str, dict[str, Any]]:
-        """Remove one-shot group commands from temporal phase/tool memory."""
-        if str(payload.get("v", "")) != "4" or payload.get("bed_robot_arm_group") is None:
+        """Remove one-shot commands and speech from temporal phase/tool memory."""
+        version = str(payload.get("v", ""))
+        has_one_shot = payload.get("bed_robot_arm_group") is not None
+        if version in {"5", "6"}:
+            has_one_shot = has_one_shot or any(
+                payload.get(key) is not None
+                for key in ("function_call", "humanoid_reply")
+            )
+        if version not in {"4", "5", "6"} or not has_one_shot:
             return raw_json, payload
         cache_payload = dict(payload)
         cache_payload["bed_robot_arm_group"] = None
+        if version in {"5", "6"}:
+            cache_payload["function_call"] = None
+            cache_payload["humanoid_reply"] = None
         return (
             json.dumps(cache_payload, separators=(",", ":"), sort_keys=True),
             cache_payload,
@@ -5819,17 +7446,24 @@ class RealVLMNode(Node):
         if model_image is not None:
             context_stamp.sec = int(model_image.stamp_sec)
             context_stamp.nanosec = int(model_image.stamp_nanosec)
+        submitted_dialogue_turn_id = ""
         if self._context_mode == "actor_log":
             context_dict = self._assemble_actor_log_context_dict()
             static_prompt_chars = len(self._system_prompt) + len(
                 self._developer_instruction
             )
-            request_context_json = compact_prompt_json(
-                actor_log_request_context(
-                    context_dict,
-                    static_prompt_chars=static_prompt_chars,
-                )
+            model_context_dict = actor_log_request_context(
+                context_dict,
+                static_prompt_chars=static_prompt_chars,
             )
+            pending_dialogue_turn = model_context_dict.get(
+                "pending_dialogue_turn"
+            )
+            if isinstance(pending_dialogue_turn, dict):
+                submitted_dialogue_turn_id = str(
+                    pending_dialogue_turn.get("turn_id", "")
+                ).strip()
+            request_context_json = compact_prompt_json(model_context_dict)
             request_context_msg = self._actor_log_request_context_msg(
                 context_dict,
                 request_context_json,
@@ -5840,12 +7474,27 @@ class RealVLMNode(Node):
         else:
             if self._world is None or self._simulation is None:
                 return
-            request_context, context_dict = self._assemble_context()
+            request_context, context_dict = self._assemble_context(
+                perception_reference_stamp_sec=model_image_stamp_sec,
+            )
             context_dict["visual_input"] = dict(self._current_visual_input)
             request_context.compact_json = compact_json(context_dict)
             request_context.stamp = context_stamp
             request_context_json = request_context.compact_json
             context_stamp = request_context.stamp
+        dialogue_text_only = bool(
+            getattr(self, "_enable_text_only_dialogue", False)
+            and submitted_dialogue_turn_id
+            and inference_trigger == INFERENCE_TRIGGER_SPEECH
+            and not images
+        )
+        if dialogue_text_only:
+            # A spoken turn may use the same model without manufacturing
+            # visual evidence.  The result is confined below to the dialogue
+            # envelope; phase, tool, Mayo, and action proposals are never
+            # published from this image-free request.
+            self._current_image_input_error = ""
+            image_source = "dialogue_text_only"
         prompt_chars = len(self._system_prompt) + len(self._developer_instruction) + len(request_context_json)
         raw_json = ""
         payload: dict[str, Any] | None = None
@@ -5871,6 +7520,7 @@ class RealVLMNode(Node):
         if (
             self._response_mode == "live"
             and self._require_field_image
+            and not dialogue_text_only
             and not is_model_ready_visual_source(image_source)
         ):
             self._publish_health(
@@ -5909,11 +7559,23 @@ class RealVLMNode(Node):
             )
             return
         self._last_submitted_model_input_key = model_input_key
+        if self._context_mode != "actor_log":
+            # Publish the exact compact context that is about to be submitted
+            # so the operations UI exposes the same typed RF-DETR facts the
+            # Live VLM receives.  This remains a read-only observer topic.
+            self._request_context_pub.publish(request_context)
         (
             source_epoch,
             source_sequence,
             correlation_id,
         ) = self._next_visual_evidence_metadata(model_input_key)
+        if submitted_dialogue_turn_id:
+            claimed_turn = self._dialogue_turn_gate.claim(
+                turn_id=submitted_dialogue_turn_id,
+                correlation_id=correlation_id,
+            )
+            if claimed_turn is None:
+                submitted_dialogue_turn_id = ""
         if model_image_stamp_sec is not None:
             self._last_submitted_live_image_stamp_sec = model_image_stamp_sec
         self._publish_model_ready_image(model_image)
@@ -5921,6 +7583,7 @@ class RealVLMNode(Node):
             raw_json, payload, latency_sec, mode, parse_retry_count, last_error = self._run_model(
                 request_context_json,
                 images,
+                submitted_dialogue_turn_id,
             )
         except Exception as exc:  # pragma: no cover - safety net
             last_error = str(exc)
@@ -5947,6 +7610,7 @@ class RealVLMNode(Node):
                 healthy=False,
                 connected=connected,
             )
+            self._release_dialogue_claim(correlation_id)
             return
         if source_epoch != max(
             0,
@@ -5963,6 +7627,7 @@ class RealVLMNode(Node):
                 healthy=False,
                 connected=connected,
             )
+            self._release_dialogue_claim(correlation_id)
             return
         if self._response_mode == "live" and (
             payload is None
@@ -5981,8 +7646,10 @@ class RealVLMNode(Node):
                 connected=connected,
                 output_chars=len(raw_json),
             )
+            self._release_dialogue_claim(correlation_id)
             return
         if payload is None:
+            self._release_dialogue_claim(correlation_id)
             return
         failure_backoff = getattr(self, "_transport_failure_backoff", None)
         if failure_backoff is not None:
@@ -5999,6 +7666,27 @@ class RealVLMNode(Node):
             if self._response_mode == "live"
             else mode
         )
+        if dialogue_text_only:
+            self._publish_humanoid_reply(
+                payload,
+                observation_stamp=context_stamp,
+                source_epoch=source_epoch,
+                source_sequence=source_sequence,
+                correlation_id=correlation_id,
+                claimed_turn_id=submitted_dialogue_turn_id,
+            )
+            self._publish_health(
+                image_source=image_source,
+                latency_sec=latency_sec,
+                prompt_chars=prompt_chars,
+                output_chars=len(model_raw_json),
+                parse_retry_count=parse_retry_count,
+                last_error="",
+                mode=f"dialogue_text_only:{mode}",
+                healthy=True,
+                connected=connected,
+            )
+            return
         if mode not in {"last_good", "oracle_fallback"}:
             self._publish_model_raw_result(
                 payload,
@@ -6026,6 +7714,20 @@ class RealVLMNode(Node):
                 payload,
             )
 
+        dialogue_reply_committed = self._publish_humanoid_reply(
+            payload,
+            observation_stamp=context_stamp,
+            source_epoch=source_epoch,
+            source_sequence=source_sequence,
+            correlation_id=correlation_id,
+            claimed_turn_id=submitted_dialogue_turn_id,
+        )
+        if str(payload.get("v", "")) in {"5", "6"} and not dialogue_reply_committed:
+            payload = dict(payload)
+            payload["function_call"] = None
+            payload["humanoid_reply"] = None
+            raw_json = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+
         self._publish_vlm_outputs(
             payload,
             raw_json,
@@ -6051,6 +7753,241 @@ class RealVLMNode(Node):
             self._phase_bootstrap_observation_count += 1
         if self._response_mode == "oracle":
             self._oracle_tick += 1
+
+    def _mark_dialogue_responded(self, utterance_id: str) -> None:
+        clean_id = str(utterance_id or "").strip()
+        if not clean_id:
+            return
+        for row in list(self._recent_speech):
+            if (
+                isinstance(row, dict)
+                and str(row.get("utterance_id", "")) == clean_id
+            ):
+                row["responded"] = True
+
+    def _queue_dialogue_followup(
+        self,
+        turn_id: str,
+        *,
+        retry_invalid: bool,
+    ) -> bool:
+        """Queue one bounded retry or the next FIFO turn without a hot loop."""
+
+        clean_turn_id = str(turn_id or "").strip()
+        pending = self._dialogue_turn_gate.next_pending()
+        if pending is None:
+            return False
+        if retry_invalid:
+            if pending.turn_id != clean_turn_id:
+                return False
+            if (
+                self._dialogue_turn_gate.attempt_count(clean_turn_id)
+                >= DIALOGUE_AUTOMATIC_ATTEMPT_LIMIT
+            ):
+                return False
+            # Permit one identical-context retry. Without this reset, the
+            # exact-input suppressor would discard it before a new claim.
+            self._last_submitted_model_input_key = ""
+        admission = self._inference_backpressure.queue_if_empty(
+            INFERENCE_TRIGGER_SPEECH
+        )
+        return admission.disposition in {"queued", "coalesced"}
+
+    def _publish_humanoid_reply(
+        self,
+        payload: dict[str, Any],
+        *,
+        observation_stamp,
+        source_epoch: int,
+        source_sequence: int,
+        correlation_id: str,
+        claimed_turn_id: str,
+    ) -> bool:
+        """Commit and publish at most one reply for the claimed speech turn."""
+
+        clean_claimed_turn_id = str(claimed_turn_id or "").strip()
+        if not clean_claimed_turn_id:
+            return False
+        turn = self._dialogue_turn_gate.next_pending()
+        reply_payload = payload.get("humanoid_reply")
+        function_call = payload.get("function_call")
+        if (
+            str(payload.get("v", "")) not in {"5", "6"}
+            or turn is None
+            or turn.turn_id != clean_claimed_turn_id
+            or not isinstance(reply_payload, dict)
+        ):
+            self._dialogue_turn_gate.commit(
+                turn_id=clean_claimed_turn_id,
+                correlation_id=correlation_id,
+                reply=None,
+                valid=False,
+            )
+            self._queue_dialogue_followup(
+                clean_claimed_turn_id,
+                retry_invalid=True,
+            )
+            return False
+
+        reply_turn_id = str(reply_payload.get("turn_id", "")).strip()
+        reply_text = " ".join(str(reply_payload.get("text", "")).split())[:240]
+        timing = str(reply_payload.get("timing", "")).strip()
+        speak = reply_payload.get("speak") is True
+        function_call_name = ""
+        function_arguments_json = ""
+        function_request_id = ""
+        function_is_valid = function_call is None
+        if isinstance(function_call, dict):
+            function_call_name = str(function_call.get("name", "")).strip()
+            function_turn_id = str(function_call.get("turn_id", "")).strip()
+            function_is_valid = bool(
+                function_call_name
+                in {"request_tool_handover", "adjust_retraction"}
+                and function_turn_id == clean_claimed_turn_id
+                and timing in {"on_function_accepted", "on_function_completed"}
+            )
+            if function_is_valid:
+                function_arguments_json = json.dumps(
+                    function_call.get("arguments", {}),
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                function_request_id = (
+                    stable_dialogue_reply_id(
+                        turn.procedure_run_id,
+                        turn.utterance_id,
+                        gateway_instance_id=str(
+                            getattr(self, "_gateway_instance_id", "") or ""
+                        ),
+                    )
+                    + ":function"
+                )
+        elif timing != "immediate":
+            function_is_valid = False
+
+        valid = bool(
+            reply_turn_id == clean_claimed_turn_id
+            and reply_text
+            and speak
+            and function_is_valid
+        )
+        if not valid:
+            self._dialogue_turn_gate.commit(
+                turn_id=reply_turn_id,
+                correlation_id=correlation_id,
+                reply=reply_text,
+                valid=False,
+            )
+            self._queue_dialogue_followup(
+                clean_claimed_turn_id,
+                retry_invalid=True,
+            )
+            return False
+
+        message = HumanoidReply()
+        message.stamp = observation_stamp
+        self._set_visual_evidence_metadata(
+            message,
+            source=f"real_vlm:{self._spec.procedure_id}:dialogue",
+            source_epoch=source_epoch,
+            source_sequence=source_sequence,
+            correlation_id=correlation_id,
+        )
+        message.schema_version = str(payload.get("v", "6"))
+        message.gateway_instance_id = str(
+            getattr(self, "_gateway_instance_id", "") or ""
+        ).strip()
+        message.procedure_run_id = turn.procedure_run_id
+        message.utterance_id = turn.utterance_id
+        message.turn_id = turn.turn_id
+        message.reply_id = stable_dialogue_reply_id(
+            turn.procedure_run_id,
+            turn.utterance_id,
+            gateway_instance_id=message.gateway_instance_id,
+        )
+        message.text = reply_text
+        message.kind = "acknowledgement" if function_call_name else "answer"
+        message.timing = timing
+        message.speak = True
+        message.function_call_name = function_call_name
+        message.function_arguments_json = function_arguments_json
+        message.function_request_id = function_request_id
+        message.valid = True
+        message.validation_error = ""
+
+        reply_outbox = getattr(self, "_reply_outbox", None)
+        if reply_outbox is not None:
+            try:
+                reply_outbox.enqueue(
+                    self._reply_envelope_from_message(message)
+                )
+            except ReplyCollisionError:
+                # A durable first writer from this logical ASR turn already
+                # owns the audible result (typically after VLM restart). Mark
+                # the in-memory turn answered without publishing a second
+                # model variant; the pending first writer is retried by timer.
+                committed = self._dialogue_turn_gate.commit(
+                    turn_id=reply_turn_id,
+                    correlation_id=correlation_id,
+                    reply=reply_text,
+                    valid=True,
+                )
+                if committed:
+                    self._mark_dialogue_responded(turn.utterance_id)
+                    if self._dialogue_turn_gate.next_pending() is not None:
+                        self._queue_dialogue_followup(
+                            turn.turn_id,
+                            retry_invalid=False,
+                        )
+                return committed
+            except Exception as exc:
+                self.get_logger().error(
+                    "VLM reply outbox enqueue failed: "
+                    f"{exc.__class__.__name__}"
+                )
+                self._dialogue_turn_gate.release(
+                    correlation_id=correlation_id
+                )
+                self._queue_dialogue_followup(
+                    clean_claimed_turn_id,
+                    retry_invalid=True,
+                )
+                return False
+
+        if not self._dialogue_turn_gate.commit(
+            turn_id=reply_turn_id,
+            correlation_id=correlation_id,
+            reply=reply_text,
+            valid=True,
+        ):
+            if reply_outbox is not None:
+                try:
+                    reply_outbox.mark_stale(
+                        message.reply_id,
+                        reason="dialogue_commit_rejected",
+                    )
+                except Exception as exc:
+                    self.get_logger().error(
+                        "VLM reply outbox stale transition failed: "
+                        f"{exc.__class__.__name__}"
+                    )
+            self._queue_dialogue_followup(
+                clean_claimed_turn_id,
+                retry_invalid=True,
+            )
+            return False
+
+        self._humanoid_reply_pub.publish(message)
+        self._mark_dialogue_responded(turn.utterance_id)
+
+        # Several utterances can arrive before the latest-frame worker begins.
+        # Their inference triggers may coalesce, but their FIFO entries must not.
+        if self._dialogue_turn_gate.next_pending() is not None:
+            self._queue_dialogue_followup(
+                turn.turn_id,
+                retry_invalid=False,
+            )
+        return True
 
     def _validate_bed_robot_arm_group_proposal(
         self,
@@ -6145,7 +8082,7 @@ class RealVLMNode(Node):
         source_sequence: int = 0,
         correlation_id: str = "",
     ) -> None:
-        if str(payload.get("v", "")) != "4":
+        if str(payload.get("v", "")) not in {"4", "5", "6"}:
             return
         request = self._latest_bed_robot_arm_group_request
         if request is None:
@@ -6164,7 +8101,7 @@ class RealVLMNode(Node):
             source_sequence=source_sequence,
             correlation_id=correlation_id,
         )
-        message.schema_version = "4"
+        message.schema_version = str(payload.get("v", "4"))
         message.raw_json = raw_json
         command = BedRobotArmGroupCommand()
         command.stamp = stamp
@@ -6359,8 +8296,7 @@ class RealVLMNode(Node):
         schema_version = str(payload.get("v", "1"))
         phase_rows: list[list[Any]]
         observed_rows: list[list[Any]]
-        gesture_row: list[Any]
-        if schema_version in {"3", "4"}:
+        if schema_version in {"3", "4", "5", "6"}:
             phase_rows = [
                 [str(item[0]), float(item[1])]
                 for item in payload.get("phase", [])
@@ -6380,15 +8316,6 @@ class RealVLMNode(Node):
                 and len(item) == 3
                 and str(item[0])
             ]
-            if schema_version == "4":
-                gesture = payload.get("gesture", ["", "", "", 0.0])
-                gesture_row = (
-                    list(gesture)
-                    if isinstance(gesture, list) and len(gesture) == 4
-                    else ["", "", "", 0.0]
-                )
-            else:
-                gesture_row = ["", "", "", 0.0]
         elif schema_version == "2":
             phase = payload.get("phase", ["", 0.0])
             phase_rows = (
@@ -6410,12 +8337,6 @@ class RealVLMNode(Node):
                 and len(item) == 3
                 and str(item[0])
             ]
-            intent = payload.get("intent", ["none", "", 0.0])
-            gesture_row = (
-                [str(intent[0]), str(intent[1]), "", float(intent[2])]
-                if isinstance(intent, list) and len(intent) >= 3
-                else ["none", "", "", 0.0]
-            )
         else:
             phase_rows = [
                 list(item)
@@ -6427,12 +8348,6 @@ class RealVLMNode(Node):
                 for item in payload.get("to", [])
                 if isinstance(item, list) and len(item) == 4
             ]
-            gesture = payload.get("sg", ["", "", "", 0.0])
-            gesture_row = (
-                list(gesture)
-                if isinstance(gesture, list) and len(gesture) == 4
-                else ["", "", "", 0.0]
-            )
 
         result = VLMResult()
         result.stamp = observation_stamp
@@ -6465,10 +8380,6 @@ class RealVLMNode(Node):
         result.observed_confidences = [
             float(item[3]) for item in observed_rows
         ]
-        result.gesture_event_type = str(gesture_row[0])
-        result.gesture_requested_tool = str(gesture_row[1])
-        result.gesture_hand_pose = str(gesture_row[2])
-        result.gesture_confidence = float(gesture_row[3])
         result.uncertainty = float(payload.get("u", 0.0))
         publisher.publish(result)
 
@@ -6492,7 +8403,7 @@ class RealVLMNode(Node):
     ) -> None:
         stamp = observation_stamp
         schema_version = str(payload.get("v", "1"))
-        if schema_version in {"3", "4"}:
+        if schema_version in {"3", "4", "5", "6"}:
             phase_rows = [
                 [str(item[0]), float(item[1])]
                 for item in payload.get("phase", [])
@@ -6503,15 +8414,6 @@ class RealVLMNode(Node):
                 for item in payload.get("mayo", [])
                 if isinstance(item, list) and len(item) == 3 and str(item[0])
             ]
-            if schema_version == "4":
-                gesture = payload.get("gesture", ["", "", "", 0.0])
-                gesture_row = (
-                    list(gesture)
-                    if isinstance(gesture, list) and len(gesture) == 4
-                    else ["", "", "", 0.0]
-                )
-            else:
-                gesture_row = ["", "", "", 0.0]
             uncertainty = float(payload.get("u", 0.0))
             summary = str(payload.get("sum", ""))
         elif schema_version == "2":
@@ -6521,17 +8423,11 @@ class RealVLMNode(Node):
                 for item in payload.get("mayo", [])
                 if str(item[0])
             ]
-            intent = payload.get("intent", ["", "", 0.0])
-            intent_type = str(intent[0])
-            gesture_type = "request_tool" if intent_type in {"handover", "request_tool"} else intent_type
-            hand_pose = "open_receive" if gesture_type == "request_tool" else ""
-            gesture_row = [gesture_type, str(intent[1]), hand_pose, float(intent[2])]
             uncertainty = float(payload.get("u", 0.0))
             summary = str(payload.get("sum", ""))
         else:
             phase_rows = list(payload["ph"])
             observed_rows = list(payload["to"])
-            gesture_row = list(payload["sg"])
             uncertainty = float(payload.get("u", 0.0))
             summary = str(payload.get("sum", ""))
 
@@ -6546,9 +8442,6 @@ class RealVLMNode(Node):
             for item in observed_rows
             if item and self._canonical_tool_id(item[0])
         ]
-        if len(gesture_row) >= 2:
-            gesture_row[1] = self._canonical_tool_id(gesture_row[1])
-
         phase_evidence = PhaseEvidence()
         phase_evidence.stamp = stamp
         evidence_source = f"real_vlm:{self._spec.procedure_id}:{mode}"
@@ -6588,24 +8481,6 @@ class RealVLMNode(Node):
             observation.visible = True
             self._tool_pub.publish(observation)
 
-        gesture = SurgeonGestureEvidence()
-        gesture.stamp = stamp
-        self._set_visual_evidence_metadata(
-            gesture,
-            source=evidence_source,
-            source_epoch=source_epoch,
-            source_sequence=source_sequence,
-            correlation_id=correlation_id,
-        )
-        gesture.procedure_id = self._spec.procedure_id
-        gesture.phase_id = phase_evidence.phase_ids[0] if phase_evidence.phase_ids else ""
-        gesture.event_type = str(gesture_row[0])
-        gesture.requested_tool = str(gesture_row[1])
-        gesture.hand_pose = str(gesture_row[2])
-        gesture.confidence = float(gesture_row[3])
-        gesture.note = summary
-        self._gesture_pub.publish(gesture)
-
         result = VLMResult()
         result.stamp = stamp
         self._set_visual_evidence_metadata(
@@ -6624,10 +8499,6 @@ class RealVLMNode(Node):
         result.observed_location_ids = [item[1] for item in observed_rows]
         result.observed_location_types = [item[2] for item in observed_rows]
         result.observed_confidences = [float(item[3]) for item in observed_rows]
-        result.gesture_event_type = gesture.event_type
-        result.gesture_requested_tool = gesture.requested_tool
-        result.gesture_hand_pose = gesture.hand_pose
-        result.gesture_confidence = gesture.confidence
         result.uncertainty = uncertainty
         self._result_pub.publish(result)
 

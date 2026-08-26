@@ -117,6 +117,18 @@ def test_multi_axis_follows_execute_retraction_adjustment_contract() -> None:
     assert error == ""
 
 
+def test_multi_axis_accepts_army_navy_bilateral_target() -> None:
+    error = _validate(
+        _multi_proposal(target_retractor_id="both_army_navy"),
+        _request(
+            "양쪽으로 10 mm씩 당겨줘",
+            adjustment_mode="multi",
+            target_retractor_id="both_army_navy",
+        ),
+    )
+    assert error == ""
+
+
 def test_proposal_cannot_change_adjustment_target() -> None:
     error = _validate(
         _single_proposal(target_retractor_id="right_malleable"),

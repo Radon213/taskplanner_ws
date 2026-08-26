@@ -21,6 +21,16 @@ def _base_v4() -> dict:
     }
 
 
+def _base_v1() -> dict:
+    return {
+        "v": "1",
+        "ph": [["P04", 0.91]],
+        "to": [["T05", "surgeon_hand", "surgeon_hand", 0.88]],
+        "u": 0.09,
+        "sum": "tool ownership is visible",
+    }
+
+
 def _retraction_proposal(**overrides) -> dict:
     proposal = {
         "request_id": "req-123",
@@ -45,35 +55,41 @@ def _retraction_proposal(**overrides) -> dict:
 def test_v4_accepts_null_optional_group_proposal() -> None:
     normalized = validate_payload(_base_v4())
     assert normalized["v"] == "4"
-    assert normalized["gesture"] == ["", "", "", 0.0]
+    assert "gesture" not in normalized
     assert normalized["bed_robot_arm_group"] is None
 
 
-def test_v4_preserves_visual_only_open_palm_evidence() -> None:
+def test_v4_constrained_schema_bounds_tool_forecast_to_three_rows() -> None:
+    schema = compact_vlm_json_schema("4")
+
+    assert schema["properties"]["phase"]["maxItems"] == 4
+    assert schema["properties"]["tool"]["maxItems"] == 3
+
+
+def test_v4_rejects_retired_gesture_output() -> None:
     payload = _base_v4()
     payload["gesture"] = ["request_tool", "T05", "open_receive", 0.86]
 
-    normalized = validate_payload(payload)
-
-    assert normalized["gesture"] == [
-        "request_tool",
-        "T05",
-        "open_receive",
-        0.86,
-    ]
+    with pytest.raises(SchemaValidationError, match="no longer accepts"):
+        validate_payload(payload)
 
 
-def test_v4_allows_visual_request_before_tool_identity_is_resolved() -> None:
-    payload = _base_v4()
-    payload["gesture"] = ["request_tool", "", "open_receive", 0.79]
+def test_v1_explicitly_rejects_legacy_sg_output() -> None:
+    payload = _base_v1()
+    payload["sg"] = ["request_tool", "T05", "open_receive", 0.86]
 
-    normalized = validate_payload(payload)
+    with pytest.raises(
+        SchemaValidationError,
+        match=r"schema v1 .* retired VLM hand output fields: sg",
+    ):
+        validate_payload(payload)
 
-    assert normalized["gesture"] == [
-        "request_tool",
-        "",
-        "open_receive",
-        0.79,
+
+def test_v1_preserves_surgeon_hand_tool_location_ontology() -> None:
+    normalized = validate_payload(_base_v1())
+
+    assert normalized["to"] == [
+        ["T05", "surgeon_hand", "surgeon_hand", 0.88]
     ]
 
 
@@ -144,6 +160,19 @@ def test_v4_accepts_single_execute_retraction_adjustment_fields() -> None:
     assert normalized["direction_frame"] == "surgeon_view"
     assert normalized["direction"] == "up"
     assert normalized["axis"] == "none"
+
+
+def test_v4_accepts_bilateral_army_navy_retraction_target() -> None:
+    payload = _base_v4()
+    payload["bed_robot_arm_group"] = _retraction_proposal(
+        target_retractor_id="both_army_navy",
+    )
+
+    normalized = validate_payload(payload)["bed_robot_arm_group"]
+
+    assert normalized["adjustment_mode"] == "multi"
+    assert normalized["target_retractor_id"] == "both_army_navy"
+    assert normalized["axis"] == "left_right"
 
 
 @pytest.mark.parametrize(
@@ -249,7 +278,6 @@ def test_v1_through_v3_remain_supported() -> None:
             "v": "1",
             "ph": [["P01", 0.8]],
             "to": [],
-            "sg": ["", "", "", 0.0],
             "u": 0.2,
             "sum": "ok",
         }

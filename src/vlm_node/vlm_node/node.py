@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections import deque
 import json
 import random
 from time import perf_counter
@@ -23,8 +22,6 @@ from surgical_msgs.msg import (
     PhaseEvidence,
     PerceptionScene,
     SimulationState,
-    SurgeonGestureEvidence,
-    SurgeonOutwardSignal,
     ToolObservation,
     VLMHealth,
     VLMResult,
@@ -43,7 +40,6 @@ class MockVLMNode(Node):
         self._rng = random.Random(7)
         self._phase_pub = self.create_publisher(PhaseEvidence, "/vlm/phase_evidence", 20)
         self._obs_pub = self.create_publisher(ToolObservation, "/vlm/tool_observations", 50)
-        self._gesture_pub = self.create_publisher(SurgeonGestureEvidence, "/vlm/surgeon_gesture_evidence", 20)
         self._result_pub = self.create_publisher(VLMResult, "/vlm/result", 10)
         self._health_pub = self.create_publisher(VLMHealth, "/vlm/health", 10)
         self._bed_group_proposal_pub = self.create_publisher(
@@ -52,26 +48,20 @@ class MockVLMNode(Node):
             20,
         )
         self._seen_bed_group_request_ids: set[str] = set()
-        self._tool_location_history: dict[str, deque[str]] = {}
         self._latest_state: SimulationState | None = None
         self._latest_scene: PerceptionScene | None = None
-        self._latest_outward_signal: SurgeonOutwardSignal | None = None
         self._state_phase_id = ""
         self._state_phase_ticks = 0
         self._state_stage_index = 0
         self._state_stage_ticks = 0
         self._delivered_by_phase: dict[str, set[str]] = {}
-        self._completion_request_emitted = False
-        self._completion_confirm_emitted = False
         self.declare_parameter("perception_scene_observations", True)
         self.declare_parameter("state_backed_observations", False)
-        self.declare_parameter("scripted_gestures_enabled", False)
         self.declare_parameter("bed_robot_arm_group_proposals_enabled", True)
         self._load_spec(self._spec_dir)
         self.add_on_set_parameters_callback(self._on_parameters_changed)
         self.create_subscription(String, "/simulation/control_state", self._on_control, 20)
         self.create_subscription(PerceptionScene, "/simulation/perception_scene", self._on_scene, 20)
-        self.create_subscription(SurgeonOutwardSignal, "/surgeon/outward_signal", self._on_outward_signal, 20)
         self.create_subscription(SimulationState, "/simulation/state", self._on_state, 20)
         self.create_subscription(
             BedRobotArmGroupRequest,
@@ -100,10 +90,15 @@ class MockVLMNode(Node):
             if msg.target_retractor_id not in {
                 "left_malleable",
                 "right_malleable",
+                "left_army_navy",
+                "right_army_navy",
             }:
                 return
         elif msg.adjustment_mode == "multi":
-            if msg.target_retractor_id != "both_malleable":
+            if msg.target_retractor_id not in {
+                "both_malleable",
+                "both_army_navy",
+            }:
                 return
         else:
             return
@@ -191,36 +186,18 @@ class MockVLMNode(Node):
             self._timer.cancel()
         self._timer = self.create_timer(self._period_sec, self._publish)
         self._tick = 0
-        self._tool_location_history = {}
         self._state_phase_id = ""
         self._state_phase_ticks = 0
         self._state_stage_index = 0
         self._state_stage_ticks = 0
         self._delivered_by_phase = {}
-        self._completion_request_emitted = False
-        self._completion_confirm_emitted = False
         self._seen_bed_group_request_ids.clear()
-
-    def _terminal_normal_phase_id(self) -> str:
-        normal_phase_ids = list(getattr(self._spec, "normal_phase_ids", []))
-        if normal_phase_ids:
-            return normal_phase_ids[-1]
-        return self._spec.phase_ids[-1] if self._spec.phase_ids else ""
-
-    def _is_late_normal_phase(self, phase_id: str) -> bool:
-        normal_phase_ids = list(getattr(self._spec, "normal_phase_ids", []))
-        if not normal_phase_ids or phase_id not in normal_phase_ids:
-            return False
-        return normal_phase_ids.index(phase_id) >= max(0, len(normal_phase_ids) - 2)
 
     def _state_backed_observations_enabled(self) -> bool:
         return bool(self.get_parameter("state_backed_observations").value)
 
     def _perception_scene_observations_enabled(self) -> bool:
         return bool(self.get_parameter("perception_scene_observations").value)
-
-    def _scripted_gestures_enabled(self) -> bool:
-        return bool(self.get_parameter("scripted_gestures_enabled").value)
 
     def _on_parameters_changed(self, params):
         for parameter in params:
@@ -342,183 +319,6 @@ class MockVLMNode(Node):
     def _clamp(value: float, low: float, high: float) -> float:
         return max(low, min(high, value))
 
-    def _remember_observations(self, observations) -> None:
-        for observation in observations:
-            history = self._tool_location_history.setdefault(observation.instrument_id, deque(maxlen=4))
-            history.append(observation.location_type)
-
-    def _tool_recently_in(self, instrument_id: str, location_types: set[str]) -> bool:
-        history = self._tool_location_history.get(instrument_id)
-        if not history:
-            return False
-        return any(location in location_types for location in history)
-
-    def _score_request_gesture(self, stage, gesture, observation_by_tool):
-        tool_observation = observation_by_tool.get(gesture.requested_tool)
-        phase_id = stage.phase_hypotheses[0].phase_id if stage.phase_hypotheses else self._spec.default_phase_id
-        expected_tools = set(self._spec.get_expected_instruments(phase_id))
-
-        score = float(gesture.confidence or 0.42)
-        factors: list[str] = []
-        if gesture.hand_pose == "open_receive":
-            score += 0.14
-            factors.append("open hand cue")
-        if tool_observation is not None:
-            if tool_observation.location_type in {"tray_slot", "mayo_reuse_zone", "mayo_stand"}:
-                score += 0.18
-                factors.append("tool staged and reachable")
-            if tool_observation.location_type in {"mayo_recovery_zone", "return_zone", "surgical_field"}:
-                score -= 0.28
-                factors.append("tool not in requestable holding area")
-        if gesture.requested_tool in expected_tools:
-            score += 0.12
-            factors.append("phase expects tool")
-        if stage.phase_hypotheses and float(stage.phase_hypotheses[0].confidence) >= 0.84:
-            score += 0.06
-            factors.append("stable phase context")
-        if stage.uncertainty >= 0.35:
-            score -= 0.06
-            factors.append("phase uncertain")
-        return self._clamp(score, 0.05, 0.99), factors
-
-    def _score_return_gesture(self, stage, gesture, observation_by_tool):
-        tool_observation = observation_by_tool.get(gesture.requested_tool)
-        phase_id = stage.phase_hypotheses[0].phase_id if stage.phase_hypotheses else self._spec.default_phase_id
-        expected_tools = set(self._spec.get_expected_instruments(phase_id))
-
-        score = float(gesture.confidence or 0.45)
-        factors: list[str] = []
-        if gesture.hand_pose == "present_return":
-            score += 0.16
-            factors.append("returning hand cue")
-        if tool_observation is not None:
-            if tool_observation.location_type == "mayo_recovery_zone":
-                score += 0.34
-                factors.append("tool placed in mayo recovery zone")
-            elif tool_observation.location_type == "return_zone":
-                score += 0.28
-                factors.append("tool presented in return zone")
-            elif tool_observation.location_type == "surgical_field":
-                score += 0.08
-                factors.append("tool still active in field")
-            elif tool_observation.location_type == "mayo_reuse_zone":
-                score -= 0.18
-                factors.append("tool parked for reuse")
-        if gesture.requested_tool not in expected_tools:
-            score += 0.12
-            factors.append("phase no longer expects tool")
-        if self._is_late_normal_phase(phase_id):
-            score += 0.08
-            factors.append("late-phase exchange context")
-        if self._tool_recently_in(gesture.requested_tool, {"surgical_field", "surgeon_hand", "return_zone"}):
-            score += 0.14
-            factors.append("recent surgeon-side use")
-        if stage.uncertainty >= 0.35:
-            score -= 0.05
-            factors.append("phase uncertain")
-        return self._clamp(score, 0.05, 0.99), factors
-
-    def _infer_contextual_return(self, stage, observation_by_tool):
-        phase_id = stage.phase_hypotheses[0].phase_id if stage.phase_hypotheses else self._spec.default_phase_id
-        expected_tools = set(self._spec.get_expected_instruments(phase_id))
-        best_candidate = None
-        best_score = 0.0
-        best_factors: list[str] = []
-
-        for tool_id, observation in observation_by_tool.items():
-            if observation.location_type not in {"mayo_recovery_zone", "return_zone"}:
-                continue
-            score = 0.42 + float(observation.confidence) * 0.28
-            factors = ["context-only return inference"]
-            if observation.location_type == "mayo_recovery_zone":
-                score += 0.24
-                factors.append("recovery zone placement")
-            if tool_id not in expected_tools:
-                score += 0.08
-                factors.append("tool not expected in current phase")
-            if self._tool_recently_in(tool_id, {"surgical_field", "surgeon_hand"}):
-                score += 0.12
-                factors.append("recent field use")
-            if score > best_score:
-                best_score = score
-                best_candidate = tool_id
-                best_factors = factors
-
-        if best_candidate is None:
-            return None
-        return {
-            "event_type": "return_tool",
-            "requested_tool": best_candidate,
-            "hand_pose": "context_recovery_inference",
-            "confidence": self._clamp(best_score, 0.05, 0.99),
-            "note": f"VLM inferred retrieval need from {', '.join(best_factors)}.",
-        }
-
-    def _publish_gesture(self, stage, stamp) -> None:
-        observation_by_tool = {
-            observation.instrument_id: observation
-            for observation in stage.observations
-            if observation.visible
-        }
-        gesture = stage.surgeon_gesture
-        gesture_payload = None
-
-        if gesture is not None:
-            if gesture.event_type == "request_tool":
-                confidence, factors = self._score_request_gesture(stage, gesture, observation_by_tool)
-            elif gesture.event_type == "return_tool":
-                confidence, factors = self._score_return_gesture(stage, gesture, observation_by_tool)
-            else:
-                confidence, factors = float(gesture.confidence), []
-            note = gesture.note or stage.scene_summary
-            if factors:
-                note = f"{note} Context: {', '.join(factors)}."
-            gesture_payload = {
-                "event_type": gesture.event_type,
-                "requested_tool": gesture.requested_tool,
-                "hand_pose": gesture.hand_pose,
-                "confidence": confidence,
-                "note": note,
-            }
-        else:
-            gesture_payload = self._infer_contextual_return(stage, observation_by_tool)
-
-        if gesture_payload is None:
-            return
-
-        noisy_event_type = str(gesture_payload["event_type"])
-        noisy_tool = str(gesture_payload["requested_tool"])
-        noisy_hand_pose = str(gesture_payload["hand_pose"])
-        noisy_note = str(gesture_payload["note"])
-        noisy_confidence = self._clamp(
-            float(gesture_payload["confidence"]) + self._rng.uniform(-0.16, 0.12),
-            0.05,
-            0.99,
-        )
-
-        base_hand_pose = str(gesture_payload["hand_pose"])
-
-        if self._rng.random() < 0.18:
-            noisy_event_type = ""
-            noisy_tool = ""
-            noisy_hand_pose = "occluded"
-            noisy_note = f"hand cue partially occluded during {stage.name}"
-            noisy_confidence = self._clamp(noisy_confidence * 0.35, 0.05, 0.45)
-        elif self._rng.random() < 0.14:
-            noisy_hand_pose = f"uncertain_{base_hand_pose}"
-            noisy_confidence = self._clamp(noisy_confidence * 0.62, 0.05, 0.75)
-
-        evidence = SurgeonGestureEvidence()
-        evidence.stamp = stamp
-        evidence.procedure_id = self._spec.procedure_id
-        evidence.phase_id = stage.phase_hypotheses[0].phase_id if stage.phase_hypotheses else ""
-        evidence.event_type = noisy_event_type
-        evidence.requested_tool = noisy_tool
-        evidence.hand_pose = noisy_hand_pose
-        evidence.confidence = float(noisy_confidence)
-        evidence.note = noisy_note
-        self._gesture_pub.publish(evidence)
-
     def _publish(self) -> None:
         if not self._active:
             self._publish_health(
@@ -565,10 +365,6 @@ class MockVLMNode(Node):
             observation.visible = observation_spec.visible
             self._obs_pub.publish(observation)
 
-        self._remember_observations(visible_observations)
-        if self._scripted_gestures_enabled():
-            self._publish_gesture(stage, evidence.stamp)
-
         raw_json = json.dumps(
             {
                 "v": "mock-1",
@@ -586,7 +382,6 @@ class MockVLMNode(Node):
                     ]
                     for observation in visible_observations
                 ],
-                "sg": ["", "", "", 0.0],
                 "u": round(float(evidence.uncertainty), 3),
                 "sum": evidence.scene_summary,
             },
@@ -601,7 +396,6 @@ class MockVLMNode(Node):
             phase_ids=list(evidence.phase_ids),
             phase_confidences=list(evidence.phase_confidences),
             observations=visible_observations,
-            gesture=None,
             uncertainty=float(evidence.uncertainty),
         )
         self._publish_health(
@@ -648,22 +442,6 @@ class MockVLMNode(Node):
         evidence.uncertainty = float(stage.uncertainty)
         self._phase_pub.publish(evidence)
 
-        self._remember_observations(visible_observations)
-
-        completion_gesture = self._completion_gesture_from_state(state)
-        evidence_msg = None
-        if completion_gesture is not None:
-            evidence_msg = SurgeonGestureEvidence()
-            evidence_msg.stamp = stamp
-            evidence_msg.procedure_id = self._spec.procedure_id
-            evidence_msg.phase_id = state.filtered_phase
-            evidence_msg.event_type = completion_gesture["event_type"]
-            evidence_msg.requested_tool = ""
-            evidence_msg.hand_pose = completion_gesture["hand_pose"]
-            evidence_msg.confidence = float(completion_gesture["confidence"])
-            evidence_msg.note = completion_gesture["note"]
-            self._gesture_pub.publish(evidence_msg)
-
         raw_json = json.dumps(
             {
                 "v": "mock-1",
@@ -682,12 +460,6 @@ class MockVLMNode(Node):
                     ]
                     for observation in visible_observations
                 ],
-                "sg": [
-                    evidence_msg.event_type if evidence_msg is not None else "",
-                    evidence_msg.requested_tool if evidence_msg is not None else "",
-                    evidence_msg.hand_pose if evidence_msg is not None else "",
-                    round(float(evidence_msg.confidence), 3) if evidence_msg is not None else 0.0,
-                ],
                 "u": round(float(evidence.uncertainty), 3),
                 "sum": evidence.scene_summary,
             },
@@ -702,7 +474,6 @@ class MockVLMNode(Node):
             phase_ids=list(evidence.phase_ids),
             phase_confidences=list(evidence.phase_confidences),
             observations=visible_observations,
-            gesture=evidence_msg,
             uncertainty=float(evidence.uncertainty),
         )
         self._publish_health(
@@ -725,38 +496,6 @@ class MockVLMNode(Node):
             uncertainty = min(uncertainty, 0.14)
         ranked = sorted(phase_scores.items(), key=lambda item: item[1], reverse=True)
         return [item[0] for item in ranked], [float(item[1]) for item in ranked], uncertainty
-
-    def _gesture_from_scene(self, scene: PerceptionScene, stamp) -> SurgeonGestureEvidence | None:
-        if not scene.surgeon_signal_type:
-            return None
-        event_type = scene.surgeon_signal_type
-        if event_type == "voice_request":
-            event_type = "request_tool"
-        if event_type == "place_on_mayo_recovery":
-            event_type = "return_tool"
-        if event_type not in {
-            "request_tool",
-            "return_tool",
-            "request_procedure_completion",
-            "complete_procedure",
-        }:
-            return None
-        confidence = self._clamp(0.88 + self._rng.uniform(-0.08, 0.06), 0.55, 0.98)
-        hand_pose = scene.surgeon_hand_pose or "observed_signal"
-        if self._rng.random() < 0.08:
-            hand_pose = "occluded"
-            confidence = self._clamp(confidence * 0.45, 0.10, 0.50)
-            event_type = ""
-        evidence = SurgeonGestureEvidence()
-        evidence.stamp = stamp
-        evidence.procedure_id = self._spec.procedure_id
-        evidence.phase_id = scene.surgeon_signal_phase
-        evidence.event_type = event_type
-        evidence.requested_tool = scene.surgeon_signal_tool
-        evidence.hand_pose = hand_pose
-        evidence.confidence = float(confidence)
-        evidence.note = scene.scene_summary or "Mock VLM observed surgeon outward signal."
-        return evidence
 
     def _publish_from_scene(self, scene: PerceptionScene) -> None:
         started_at = perf_counter()
@@ -795,10 +534,6 @@ class MockVLMNode(Node):
         evidence.uncertainty = float(uncertainty)
         self._phase_pub.publish(evidence)
 
-        self._remember_observations(visible_observations)
-        gesture = self._gesture_from_scene(scene, stamp)
-        if gesture is not None:
-            self._gesture_pub.publish(gesture)
         raw_json = json.dumps(
             {
                 "v": "mock-2",
@@ -817,12 +552,6 @@ class MockVLMNode(Node):
                     ]
                     for observation in visible_observations
                 ],
-                "sg": [
-                    gesture.event_type if gesture is not None else "",
-                    gesture.requested_tool if gesture is not None else "",
-                    gesture.hand_pose if gesture is not None else "",
-                    round(float(gesture.confidence), 3) if gesture is not None else 0.0,
-                ],
                 "u": round(float(evidence.uncertainty), 3),
                 "sum": evidence.scene_summary,
             },
@@ -837,7 +566,6 @@ class MockVLMNode(Node):
             phase_ids=list(evidence.phase_ids),
             phase_confidences=list(evidence.phase_confidences),
             observations=visible_observations,
-            gesture=gesture,
             uncertainty=float(evidence.uncertainty),
         )
         self._publish_health(
@@ -858,7 +586,6 @@ class MockVLMNode(Node):
         phase_ids: list[str],
         phase_confidences: list[float],
         observations: list[ToolObservation],
-        gesture: SurgeonGestureEvidence | None,
         uncertainty: float,
     ) -> None:
         result = VLMResult()
@@ -873,10 +600,6 @@ class MockVLMNode(Node):
         result.observed_location_ids = [observation.location_id for observation in observations]
         result.observed_location_types = [observation.location_type for observation in observations]
         result.observed_confidences = [float(observation.confidence) for observation in observations]
-        result.gesture_event_type = gesture.event_type if gesture is not None else ""
-        result.gesture_requested_tool = gesture.requested_tool if gesture is not None else ""
-        result.gesture_hand_pose = gesture.hand_pose if gesture is not None else ""
-        result.gesture_confidence = float(gesture.confidence) if gesture is not None else 0.0
         result.uncertainty = float(uncertainty)
         self._result_pub.publish(result)
 
@@ -902,57 +625,6 @@ class MockVLMNode(Node):
         health.last_error = last_error
         health.last_mode = mode
         self._health_pub.publish(health)
-
-    def _cleanup_pending_in_state(self, state: SimulationState) -> bool:
-        if (
-            state.cleaner_busy
-            or state.left_hand_tool
-            or state.right_hand_tool
-            or state.prepositioned_tool
-            or state.pending_transition_tools
-            or state.active_recovery_tools
-            or state.active_robot_task_id
-        ):
-            return True
-        for instrument in state.instrument_states:
-            if instrument.lifecycle_stage not in {"home_rack", "returned_home"}:
-                return True
-        return False
-
-    def _completion_gesture_from_state(self, state: SimulationState) -> dict[str, object] | None:
-        terminal_phase = self._terminal_normal_phase_id()
-        if state.filtered_phase != terminal_phase:
-            self._completion_request_emitted = False
-            self._completion_confirm_emitted = False
-            return None
-        # State-backed VLM acts like a camera recognizer: after a stable terminal
-        # phase view, it infers the surgeon's completion request. The twin
-        # reducer, not the VLM, decides whether that request can change runtime state.
-        if (
-            state.execution_state == "running"
-            and self._state_phase_ticks >= max(3, int(self._spec.get_phase_min_duration(terminal_phase)))
-            and not self._completion_request_emitted
-        ):
-            self._completion_request_emitted = True
-            return {
-                "event_type": "request_procedure_completion",
-                "hand_pose": "terminal_phase_done_signal",
-                "confidence": 0.94,
-                "note": "VLM observes the surgeon signaling that the terminal phase is complete and cleanup should begin.",
-            }
-        if (
-            state.execution_state == "finishing"
-            and not self._cleanup_pending_in_state(state)
-            and not self._completion_confirm_emitted
-        ):
-            self._completion_confirm_emitted = True
-            return {
-                "event_type": "complete_procedure",
-                "hand_pose": "final_completion_confirmation",
-                "confidence": 0.96,
-                "note": "VLM observes final surgeon confirmation after all instruments returned home.",
-            }
-        return None
 
     def _on_control(self, msg: String) -> None:
         command = msg.data.strip().partition(":")[0].strip().lower()
@@ -993,16 +665,12 @@ class MockVLMNode(Node):
             self._active = False
             self._latest_state = None
             self._latest_scene = None
-            self._latest_outward_signal = None
             self._tick = 0
-            self._tool_location_history = {}
             self._state_phase_id = ""
             self._state_phase_ticks = 0
             self._state_stage_index = 0
             self._state_stage_ticks = 0
             self._delivered_by_phase = {}
-            self._completion_request_emitted = False
-            self._completion_confirm_emitted = False
             self._seen_bed_group_request_ids.clear()
 
     def _on_scene(self, msg: PerceptionScene) -> None:
@@ -1015,9 +683,6 @@ class MockVLMNode(Node):
             self._active = True
         elif msg.execution_state in {"idle", "halted", "completed", "paused"}:
             self._active = False
-
-    def _on_outward_signal(self, msg: SurgeonOutwardSignal) -> None:
-        self._latest_outward_signal = msg
 
     def _on_state(self, msg: SimulationState) -> None:
         self._latest_state = msg

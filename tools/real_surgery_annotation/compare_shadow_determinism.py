@@ -56,8 +56,6 @@ def _project_payload(layer: str, payload: dict[str, Any]) -> Any:
             "raw_json": payload.get("raw_json"),
             "phase_ids": payload.get("phase_ids"),
             "predicted_tool_id": payload.get("predicted_tool_id"),
-            "gesture_event_type": payload.get("gesture_event_type"),
-            "gesture_requested_tool": payload.get("gesture_requested_tool"),
         }
     if layer == "reducer_fused":
         running = bool(payload.get("running"))

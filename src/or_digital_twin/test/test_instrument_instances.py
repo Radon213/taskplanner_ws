@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from or_digital_twin.models import (
+    ActiveRobotTask,
     LIFECYCLE_HOME_RACK,
     LIFECYCLE_MAYO_RECOVERY,
     LIFECYCLE_MAYO_REUSE,
@@ -17,13 +18,23 @@ from surgical_msgs.msg import FilteredPhase, TwinEvent
 
 
 def _demo_spec():
-    return load_bundle(
+    spec = load_bundle(
         Path(__file__).parents[2]
         / "procedure_spec"
         / "procedure_spec"
         / "specs"
         / "thyroidectomy_demo"
     )
+    # The reviewed Production demo now has one physical Adson.  This suite is
+    # about duplicate-instance mechanics, so give its isolated fixture a
+    # second instance instead of making production inventory serve as test
+    # scaffolding.
+    next(
+        instrument
+        for instrument in spec.bundle.instruments
+        if instrument.id == "T02"
+    ).inventory_count = 2
+    return spec
 
 
 def _event(event_type: str, tool_id: str, **detail) -> TwinEvent:
@@ -75,6 +86,17 @@ def test_inventory_count_creates_stable_instance_ids_and_keeps_type_ids() -> Non
 def test_one_more_is_a_distinct_generation_and_handover_instance() -> None:
     twin = ORDigitalTwin(_demo_spec())
 
+    # This test specifically exercises the case where the first physical
+    # instance is already committed to the surgeon and a second one is
+    # requested. Production inventory is intentionally not mutated for it.
+    twin._set_lifecycle(
+        twin.instrument_states["T02#1"],
+        LIFECYCLE_SURGEON_OWNED,
+        location_type="surgeon_hand",
+        location_id="surgeon_hand",
+        confidence=1.0,
+    )
+
     assert twin.update_explicit_request("Adson") == "T02"
     first_generation = twin.state.surgeon_request_generation
     assert twin.update_explicit_request("Adson 하나 더") == "T02"
@@ -82,7 +104,10 @@ def test_one_more_is_a_distinct_generation_and_handover_instance() -> None:
     assert [cue.instance_id for cue in queued] == ["T02#1", "T02#2"]
     assert queued[1].generation > first_generation
 
-    assert _handover_active_request(twin) == "T02#1"
+    # T02#1 is part of the authored initial layout and is already held by the
+    # surgeon. It satisfies the first cue without another robot handover.
+    assert twin._request_cue_committed(queued[0]) is True
+    assert twin._dequeue_active_request("already_surgeon_owned") is True
     assert twin.state.surgeon_request_instance_id == "T02#2"
     assert _handover_active_request(twin) == "T02#2"
     assert twin.instrument_states["T02#1"].lifecycle_stage == (
@@ -111,6 +136,9 @@ def test_explicit_request_prefers_same_type_prepositioned_instance() -> None:
 
     assert twin.update_explicit_request("Adson") == "T02"
     assert twin.state.surgeon_request_instance_id == "T02#1"
+    twin.normalize_for_publish()
+
+    assert prepositioned.next_required_transition == ""
 
 
 def test_return_unused_preposition_targets_physical_instance_with_duplicate_type() -> None:
@@ -143,15 +171,21 @@ def test_return_unused_preposition_targets_physical_instance_with_duplicate_type
     started.instance_id = "T02#2"
     twin.apply_event(started)
     returned = _event(
-        "PredictedToolReturnedToRack",
+        "UnusedPrepositionReturned",
         "T02",
         instrument_instance_id="T02#2",
+        target_lifecycle_stage=LIFECYCLE_MAYO_REUSE,
     )
     returned.instance_id = "T02#2"
+    returned.source_location_id = "robot_right_hand"
+    returned.source_location_type = "robot_right_hand"
+    returned.target_location_id = "mayo_stand"
+    returned.target_location_type = "mayo_stand"
     twin.apply_event(returned)
 
     assert handed_over.lifecycle_stage == LIFECYCLE_SURGEON_OWNED
-    assert prepositioned.lifecycle_stage == LIFECYCLE_RETURNED_HOME
+    assert prepositioned.lifecycle_stage == LIFECYCLE_MAYO_REUSE
+    assert prepositioned.location_id == "mayo_stand"
     assert twin.state.right_hand_tool_instance_id == ""
 
 
@@ -195,7 +229,7 @@ def test_legacy_return_task_prefers_prepositioned_duplicate_instance() -> None:
 
 def test_preposition_is_not_rejected_only_for_phase_expected_list_mismatch() -> None:
     twin = ORDigitalTwin(_demo_spec())
-    twin.set_initial_phase("P03")
+    twin.set_initial_phase("P06")
     expected_types = set(twin.get_expected_instruments())
     state = next(
         candidate
@@ -246,11 +280,123 @@ def test_conflicting_explicit_request_still_releases_preposition() -> None:
     assert state.next_required_transition == "return_unused_preposition"
 
 
+def test_finishing_or_completed_alone_does_not_release_preposition() -> None:
+    for execution_state in ("finishing", "completed"):
+        twin = ORDigitalTwin(_demo_spec())
+        state = next(
+            candidate
+            for candidate in twin.instrument_states.values()
+            if candidate.lifecycle_stage == LIFECYCLE_HOME_RACK
+        )
+        twin._set_lifecycle(
+            state,
+            LIFECYCLE_PREPOSITIONED_RIGHT,
+            location_type="robot_right_hand",
+            location_id="robot_right_hand",
+            confidence=1.0,
+        )
+        twin.state.execution_state = execution_state
+
+        assert twin._derive_next_required_transition(state) == ""
+
+
+def test_right_hand_belief_mismatch_alone_does_not_release_preposition() -> None:
+    twin = ORDigitalTwin(_demo_spec())
+    state = next(
+        candidate
+        for candidate in twin.instrument_states.values()
+        if candidate.lifecycle_stage == LIFECYCLE_HOME_RACK
+    )
+    other_tool = next(
+        candidate.instrument_id
+        for candidate in twin.instrument_states.values()
+        if candidate.instrument_id != state.instrument_id
+    )
+    twin.state.execution_state = "running"
+    twin.state.running = True
+    twin._set_lifecycle(
+        state,
+        LIFECYCLE_PREPOSITIONED_RIGHT,
+        location_type="robot_right_hand",
+        location_id="robot_right_hand",
+        confidence=1.0,
+    )
+    twin.state.right_hand_tool = other_tool
+
+    assert twin._derive_next_required_transition(state) == ""
+
+
+def test_extend_hand_implicit_intent_does_not_release_preposition() -> None:
+    twin = ORDigitalTwin(_demo_spec())
+    state = next(
+        candidate
+        for candidate in twin.instrument_states.values()
+        if candidate.lifecycle_stage == LIFECYCLE_HOME_RACK
+    )
+    other_tool = next(
+        candidate.instrument_id
+        for candidate in twin.instrument_states.values()
+        if candidate.instrument_id != state.instrument_id
+    )
+    twin.state.execution_state = "running"
+    twin.state.running = True
+    twin._set_lifecycle(
+        state,
+        LIFECYCLE_PREPOSITIONED_RIGHT,
+        location_type="robot_right_hand",
+        location_id="robot_right_hand",
+        confidence=1.0,
+    )
+    twin.state.surgeon_intent = "extend_hand_for_handover"
+    twin.state.surgeon_request_tool = other_tool
+    twin.state.explicit_request_tool = other_tool
+    twin.state.surgeon_request_generation = 1
+
+    assert twin._derive_next_required_transition(state) == ""
+
+
+def test_explicit_replacement_waits_for_active_tool_action_terminal() -> None:
+    twin = ORDigitalTwin(_demo_spec())
+    state = next(
+        candidate
+        for candidate in twin.instrument_states.values()
+        if candidate.lifecycle_stage == LIFECYCLE_HOME_RACK
+    )
+    other_tool = next(
+        candidate.instrument_id
+        for candidate in twin.instrument_states.values()
+        if candidate.instrument_id != state.instrument_id
+    )
+    twin.state.execution_state = "running"
+    twin.state.running = True
+    twin._set_lifecycle(
+        state,
+        LIFECYCLE_PREPOSITIONED_RIGHT,
+        location_type="robot_right_hand",
+        location_id="robot_right_hand",
+        confidence=1.0,
+    )
+    assert twin.update_explicit_request(other_tool) == other_tool
+    twin.state.active_robot_task = ActiveRobotTask(
+        task_id="other-tool-action",
+        task_type="prepare_tool",
+        instrument_id=other_tool,
+    )
+
+    twin.normalize_for_publish()
+    assert state.next_required_transition == ""
+    assert twin.state.surgeon_request_generation > 0
+
+    twin.state.active_robot_task = None
+    twin.normalize_for_publish()
+    assert state.next_required_transition == "return_unused_preposition"
+
+
 def test_mayo_reuse_and_recovery_are_instance_scoped() -> None:
     twin = ORDigitalTwin(_demo_spec())
     twin.set_initial_phase("P09")
-    first = twin.instrument_states["T05#1"]
-    second = twin.instrument_states["T05#2"]
+    first = twin.instrument_states["T02#1"]
+    second = twin.instrument_states["T02#2"]
     for state in (first, second):
         twin._set_lifecycle(
             state,
@@ -273,7 +419,7 @@ def test_mayo_reuse_and_recovery_are_instance_scoped() -> None:
         confidence=0.9,
         stability_sec=5.0,
         source="test",
-        proposal_id="test:T05#1",
+        proposal_id="test:T02#1",
         stamp_sec=10.0,
     )
 
@@ -290,9 +436,9 @@ def test_default_mayo_policy_never_forces_recovery_from_capacity() -> None:
     twin.state.running = True
     twin.state.execution_state = "running"
     selected = [
-        twin.instrument_states["T01#1"],
-        twin.instrument_states["T02#1"],
+        twin.instrument_states["T02#2"],
         twin.instrument_states["T03#1"],
+        twin.instrument_states["T04#1"],
     ]
     for state in selected:
         twin._set_lifecycle(
@@ -312,10 +458,10 @@ def test_default_mayo_policy_never_forces_recovery_from_capacity() -> None:
     assert twin.state.active_recovery_tool_instances == []
 
 
-def test_phase_transition_requires_two_t05_instances_and_never_regresses() -> None:
+def test_phase_transition_requires_two_t02_instances_and_never_regresses() -> None:
     twin = ORDigitalTwin(
         _demo_spec(),
-        phase_transition_required_counts={("P03", "P04"): {"T05": 2}},
+        phase_transition_required_counts={("P03", "P04"): {"T02": 2}},
     )
     now = [100.0]
     twin._monotonic_sec = lambda: now[0]
@@ -330,7 +476,7 @@ def test_phase_transition_requires_two_t05_instances_and_never_regresses() -> No
         )
 
     twin._set_lifecycle(
-        twin.instrument_states["T05#1"],
+        twin.instrument_states["T02#1"],
         LIFECYCLE_SURGEON_OWNED,
         location_type="surgical_field",
         location_id="operative_field",
@@ -342,7 +488,7 @@ def test_phase_transition_requires_two_t05_instances_and_never_regresses() -> No
     assert twin.state.filtered_phase == "P03"
 
     twin._set_lifecycle(
-        twin.instrument_states["T05#2"],
+        twin.instrument_states["T02#2"],
         LIFECYCLE_SURGEON_OWNED,
         location_type="surgical_field",
         location_id="operative_field",

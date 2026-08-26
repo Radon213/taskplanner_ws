@@ -6,4 +6,7 @@ from surgical_msgs.msg import WorldState
 
 
 def should_allow_handover(world: WorldState) -> bool:
-    return bool(world.handover_allowed and not world.phase_uncertain and not world.recovery_required)
+    # Phase uncertainty is observation metadata only.  The authoritative
+    # handover decision already includes the remaining runtime guards, and a
+    # low-confidence phase must not reintroduce a second veto here.
+    return bool(world.handover_allowed and not world.recovery_required)

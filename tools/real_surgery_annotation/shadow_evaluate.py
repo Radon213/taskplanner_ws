@@ -115,6 +115,9 @@ SCORING_ROLE_DEFAULTS = {
         "physical": False,
         "reuse": False,
     },
+    # Historical human-review masks may still mark a visible hand pose with
+    # this role.  It is reference metadata only: no runtime VLM output is
+    # consumed and every scoring dimension remains disabled.
     "gesture_target": {
         "action": False,
         "latency": False,
@@ -743,15 +746,9 @@ def _vlm_prediction(record: dict[str, Any]) -> dict[str, Any]:
             if isinstance(confidences, list) and confidences:
                 phase_confidence = _float(confidences[0])
     if not tool_id:
-        tool_id = _clean(
-            payload.get("predicted_tool_id")
-            or payload.get("gesture_requested_tool")
-        )
+        tool_id = _clean(payload.get("predicted_tool_id"))
         tool_confidence = _float(
-            payload.get(
-                "predicted_tool_confidence",
-                payload.get("gesture_confidence", 0.0),
-            )
+            payload.get("predicted_tool_confidence", 0.0)
         )
 
     return {
@@ -3493,12 +3490,12 @@ def _world_request_fact_signatures(
     )
     if implicit_tool and predicted_tool and implicit_tool != predicted_tool:
         return signatures
-    visual_target = implicit_tool or predicted_tool
-    if visual_target:
+    direct_hand_target = implicit_tool or predicted_tool
+    if direct_hand_target:
         signatures.add(
             (
-                "visual_implicit_request",
-                visual_target,
+                "direct_hand_handover_signal",
+                direct_hand_target,
                 int(payload.get("implicit_request_generation", 0) or 0),
             )
         )

@@ -3,8 +3,8 @@
   "synthetic": true,
   "usage": "SurgiMate dummy scenario 04: uncertain phase, multiple Mayo retrieval states, and two predictions.",
   "baseline": {
-    "schema_version": "1.1.0",
-    "interface_version": "0.3.0",
+    "schema_version": "1.2.0",
+    "interface_version": "0.4.0",
     "procedure_type": "thyroidectomy_demo",
     "catalog_version": "synthetic-catalog-v1"
   },
@@ -46,7 +46,7 @@
     "revision": 1401,
     "predictions": [
       { "rank": 1, "instrument_id": "T08", "instance_id": "", "confidence": 0.81, "stability_sec": 1.8, "source": "dummy", "evidence_status": "DUMMY_ACCEPTED" },
-      { "rank": 2, "instrument_id": "T11", "instance_id": "", "confidence": 0.67, "stability_sec": 0.0, "source": "dummy", "evidence_status": "DUMMY_ACCEPTED" }
+      { "rank": 2, "instrument_id": "T04", "instance_id": "", "confidence": 0.67, "stability_sec": 0.0, "source": "dummy", "evidence_status": "DUMMY_ACCEPTED" }
     ]
   },
   "/surgery/speech": {

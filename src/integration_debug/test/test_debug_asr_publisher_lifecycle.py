@@ -53,7 +53,13 @@ class _FakeSurgeryRecordRuntime:
         return []
 
 
-def _harness(*, fail_start: bool = False, network_locked: bool = False):
+def _harness(
+    *,
+    fail_start: bool = False,
+    network_locked: bool = False,
+    operational_stopped: bool | None = False,
+    operational_intervention_allowed: bool | None = None,
+):
     class Harness:
         pass
 
@@ -69,6 +75,14 @@ def _harness(*, fail_start: bool = False, network_locked: bool = False):
     harness._asr_cloud_url = harness._asr_server_url
     harness._asr_lan_url = DEFAULT_LAN_SERVER_URL
     harness._network_locked_to_runtime = network_locked
+    harness._operational_runtime_status = lambda: {
+        "stopped": operational_stopped,
+        "intervention_allowed": (
+            operational_stopped
+            if operational_intervention_allowed is None
+            else operational_intervention_allowed
+        ),
+    }
     harness._surgery_record = _FakeSurgeryRecordRuntime()
     harness._lock = threading.RLock()
     harness._output_states = {}
@@ -99,6 +113,7 @@ def _harness(*, fail_start: bool = False, network_locked: bool = False):
         "_release_manual_publishers",
         "_drain_auxiliary_events",
         "_asr_status_snapshot",
+        "_debug_asr_owned_by_operational_runtime",
     ):
         setattr(
             harness,
@@ -250,3 +265,53 @@ def test_integrated_debug_cannot_satisfy_live_preflight_with_debug_asr() -> None
     assert harness._asr.state == "STOPPED"
     assert harness._asr_capture_requested is False
     assert harness._asr_sentence_pub is None
+
+
+def test_debug_asr_remains_locked_without_stopped_operational_evidence() -> None:
+    harness = _harness(network_locked=True, operational_stopped=None)
+
+    accepted, _command_id, message, _snapshot = (
+        IntegrationDebugNode._handle_asr_command(harness, "asr_start", {})
+    )
+
+    assert accepted is False
+    assert "live operating-screen ASR controls" in message
+    assert harness._asr.start_calls == []
+
+
+def test_debug_asr_is_allowed_when_locked_network_has_stopped_operational_runtime() -> None:
+    harness = _harness(network_locked=True, operational_stopped=True)
+
+    accepted, _command_id, _message, snapshot = (
+        IntegrationDebugNode._handle_asr_command(
+            harness, "asr_start", {"endpoint_id": ASR_ENDPOINT_LAN}
+        )
+    )
+
+    assert accepted is True
+    assert snapshot["endpoint_id"] == ASR_ENDPOINT_LAN
+    assert harness._asr.start_calls == [
+        {"device_id": None, "server_url": DEFAULT_LAN_SERVER_URL}
+    ]
+    assert harness._asr_capture_requested is True
+
+
+def test_debug_asr_is_allowed_when_locked_network_has_paused_idle_runtime() -> None:
+    harness = _harness(
+        network_locked=True,
+        operational_stopped=False,
+        operational_intervention_allowed=True,
+    )
+
+    accepted, _command_id, _message, snapshot = (
+        IntegrationDebugNode._handle_asr_command(
+            harness, "asr_start", {"endpoint_id": ASR_ENDPOINT_LAN}
+        )
+    )
+
+    assert accepted is True
+    assert snapshot["endpoint_id"] == ASR_ENDPOINT_LAN
+    assert harness._asr.start_calls == [
+        {"device_id": None, "server_url": DEFAULT_LAN_SERVER_URL}
+    ]
+    assert harness._asr_capture_requested is True

@@ -21,6 +21,7 @@ from surgical_interop_execution.mappings import (
     RETRACTION_COMMAND_START_RETRACTION,
     RETRACTION_COMMAND_STOP_RETRACTION,
     RETRACTION_TARGET_LEFT,
+    RETRACTION_TARGET_BOTH,
     RETRACTION_TARGET_NONE,
     RETRACTION_TARGET_RIGHT,
     InternalGroupCommand,
@@ -84,14 +85,14 @@ def test_prepared_handover_aliases_map_to_robot_to_surgeon(action):
     assert request.target_location == "surgeon"
 
 
-def test_unused_prepared_tool_maps_to_robot_to_tray():
+def test_unused_prepared_tool_maps_to_robot_to_mayo():
     request = map_skill_to_tool_handover(
         _skill("return_unused_preposition"),
         instrument_name="Bovie surgical cautery",
         instrument_instance_id="Bovie surgical cautery#1",
     )
     assert request.source_location == "robot"
-    assert request.target_location == "tray"
+    assert request.target_location == "mayo"
 
 
 @pytest.mark.parametrize("action", ["retrieve_from_mayo", "tool_retrieve"])
@@ -185,6 +186,14 @@ def test_handover_request_redacts_internal_policy_fields():
     assert "arm" not in public_fields
     assert "source_location_id" not in public_fields
     assert "target_location_id" not in public_fields
+
+
+def test_dispatch_ledger_can_check_replay_before_voice_cancels_active_work():
+    ledger = DispatchLedger(max_entries=4)
+    assert not ledger.is_reserved("voice-1", explicit_request_generation=17)
+    assert ledger.reserve("voice-1", explicit_request_generation=17)
+    assert ledger.is_reserved("voice-1")
+    assert ledger.is_reserved("different-id", explicit_request_generation=17)
 
 
 @pytest.mark.parametrize(
@@ -284,8 +293,41 @@ def test_right_retraction_move_maps_to_right_target_side():
     assert request.target_side == RETRACTION_TARGET_RIGHT
 
 
+@pytest.mark.parametrize(
+    ("target_retractor_id", "target_side"),
+    [
+        ("left_army_navy", RETRACTION_TARGET_LEFT),
+        ("right_army_navy", RETRACTION_TARGET_RIGHT),
+        ("both_army_navy", RETRACTION_TARGET_BOTH),
+    ],
+)
+def test_inguinal_army_navy_adjustment_maps_to_service_side(
+    target_retractor_id,
+    target_side,
+):
+    request = map_group_command(
+        _group(
+            OPERATION_RETRACTION,
+            target_retractor_id=target_retractor_id,
+            direction=(
+                "none"
+                if target_side == RETRACTION_TARGET_BOTH
+                else "left"
+                if target_side == RETRACTION_TARGET_LEFT
+                else "right"
+            ),
+            adjustment_mode=(
+                "multi" if target_side == RETRACTION_TARGET_BOTH else "single"
+            ),
+            axis="left_right" if target_side == RETRACTION_TARGET_BOTH else "none",
+        )
+    )
+
+    assert request.target_side == target_side
+
+
 def test_multi_axis_retraction_is_rejected_instead_of_losing_information():
-    with pytest.raises(MappingFailure, match="unsupported_retraction_adjustment_mode"):
+    with pytest.raises(MappingFailure, match="unsupported_bilateral_retraction_axis"):
         map_group_command(
             _group(
                 OPERATION_RETRACTION,
@@ -297,22 +339,81 @@ def test_multi_axis_retraction_is_rejected_instead_of_losing_information():
         )
 
 
-def test_end_effector_change_maps_to_generic_single_service_command():
+def test_bilateral_lateral_retraction_maps_to_both_service_target() -> None:
     request = map_group_command(
         _group(
-            OPERATION_CHANGE_END_EFFECTOR,
-            arm_id="arm_2",
-            target_tool_id="army_navy_retractor",
+            OPERATION_RETRACTION,
+            adjustment_mode="multi",
+            target_retractor_id="both_malleable",
+            direction="none",
+            axis="left_right",
+            distance_mm=1.0,
+        )
+    )
+
+    assert request == RetractionCommandRequest(
+        command_id="group-1",
+        command=RETRACTION_COMMAND_ADJUST_RETRACTION,
+        target_side=RETRACTION_TARGET_BOTH,
+        distance_m=0.001,
+    )
+
+
+def test_end_effector_change_is_rejected_when_v1_cannot_preserve_identity():
+    with pytest.raises(
+        MappingFailure, match="retraction_v1_profile_identity_unsupported"
+    ):
+        map_group_command(
+            _group(
+                OPERATION_CHANGE_END_EFFECTOR,
+                arm_id="arm_2",
+                target_tool_id="army_navy_retractor",
+                direction="",
+                distance_mm=0.0,
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("arm_id", "target_side"),
+    [
+        ("", RETRACTION_TARGET_NONE),
+        ("arm_1", RETRACTION_TARGET_LEFT),
+        ("arm_2", RETRACTION_TARGET_RIGHT),
+    ],
+)
+def test_finish_direct_teach_projects_optional_arm_to_target_side(
+    arm_id, target_side
+):
+    request = map_group_command(
+        _group(
+            OPERATION_FINISH_DIRECT_TEACH,
+            arm_id=arm_id,
             direction="",
             distance_mm=0.0,
         )
     )
+
     assert request == RetractionCommandRequest(
         command_id="group-1",
-        command=RETRACTION_COMMAND_CHANGE_TOOL,
-        target_side=RETRACTION_TARGET_NONE,
+        command=RETRACTION_COMMAND_FINISH_DIRECT_TEACH,
+        target_side=target_side,
         distance_m=0.0,
     )
+
+
+def test_finish_direct_teach_rejects_unknown_arm_selector():
+    with pytest.raises(
+        MappingFailure, match="unsupported_finish_direct_teach_target_arm"
+    ):
+        map_group_command(
+            _group(
+                OPERATION_FINISH_DIRECT_TEACH,
+                arm_id="arm_unknown",
+                direction="",
+                distance_mm=0.0,
+            )
+        )
 
 
 def test_suction_group_is_explicitly_rejected_at_public_boundary():
@@ -359,22 +460,36 @@ def test_basic_retraction_lifecycle_operations_map_to_parameterless_service_comm
     )
 
 
+def test_preconfigured_tool_change_maps_without_inventing_profile_identity():
+    request = map_group_command(
+        _group(OPERATION_CHANGE_END_EFFECTOR, direction="", distance_mm=0.0)
+    )
+    assert request == RetractionCommandRequest(
+        command_id="group-1",
+        command=RETRACTION_COMMAND_CHANGE_TOOL,
+        target_side=RETRACTION_TARGET_NONE,
+        distance_m=0.0,
+    )
+
+
 def test_single_adjustment_requires_an_explicit_service_target():
     with pytest.raises(MappingFailure, match="unsupported_retraction_target"):
         map_group_command(_group(OPERATION_RETRACTION, target_retractor_id=""))
 
 
-def test_tool_change_does_not_project_unrepresented_arm_or_tool_fields():
-    request = map_group_command(
-        _group(
-            OPERATION_CHANGE_END_EFFECTOR,
-            arm_id="left_arm",
-            target_tool_id="wide_retractor",
-            direction="",
-            distance_mm=0.0,
+def test_tool_change_never_discards_unrepresented_arm_or_tool_fields():
+    with pytest.raises(
+        MappingFailure, match="retraction_v1_profile_identity_unsupported"
+    ):
+        map_group_command(
+            _group(
+                OPERATION_CHANGE_END_EFFECTOR,
+                arm_id="left_arm",
+                target_tool_id="wide_retractor",
+                direction="",
+                distance_mm=0.0,
+            )
         )
-    )
-    assert request.command == RETRACTION_COMMAND_CHANGE_TOOL
 
 
 def test_retraction_requires_a_positive_finite_distance():
@@ -433,6 +548,141 @@ def test_dispatch_ledger_suppresses_a_reissued_explicit_request_generation():
     assert ledger.reserve("command-1", explicit_request_generation=12)
     assert not ledger.reserve("command-2", explicit_request_generation=12)
     assert ledger.reserve("command-3", explicit_request_generation=13)
+
+
+@pytest.mark.parametrize(
+    ("first_leg", "second_leg"),
+    [
+        (("mayo", "robot"), ("robot", "surgeon")),
+        (("robot", "tray"), ("tray", "surgeon")),
+    ],
+)
+def test_dispatch_ledger_allows_distinct_semantic_legs_in_one_generation(
+    first_leg,
+    second_leg,
+):
+    ledger = DispatchLedger(max_entries=8)
+
+    assert ledger.reserve(
+        "leg-1",
+        explicit_request_generation=21,
+        semantic_leg=first_leg,
+    )
+    assert not ledger.reserve(
+        "leg-1-replay",
+        explicit_request_generation=21,
+        semantic_leg=first_leg,
+    )
+    assert ledger.is_reserved(
+        "other-command-id",
+        explicit_request_generation=21,
+        semantic_leg=first_leg,
+    )
+    assert not ledger.is_reserved(
+        "leg-2",
+        explicit_request_generation=21,
+        semantic_leg=second_leg,
+    )
+    assert ledger.reserve(
+        "leg-2",
+        explicit_request_generation=21,
+        semantic_leg=second_leg,
+    )
+    assert not ledger.reserve(
+        "leg-2-replay",
+        explicit_request_generation=21,
+        semantic_leg=second_leg,
+    )
+
+
+def test_dispatch_ledger_fences_rebased_and_original_legs_as_one_generation() -> None:
+    ledger = DispatchLedger(max_entries=8)
+
+    assert ledger.reserve(
+        "voice-rebased",
+        explicit_request_generation=88,
+        semantic_leg=("tray", "surgeon"),
+        alternative_semantic_legs=(("robot", "surgeon"),),
+    )
+    assert not ledger.reserve(
+        "delayed-effective",
+        explicit_request_generation=88,
+        semantic_leg=("tray", "surgeon"),
+    )
+    assert not ledger.reserve(
+        "delayed-original",
+        explicit_request_generation=88,
+        semantic_leg=("robot", "surgeon"),
+    )
+    assert ledger.reserve(
+        "next-generation",
+        explicit_request_generation=89,
+        semantic_leg=("robot", "surgeon"),
+    )
+
+
+def test_dispatch_ledger_alternative_reservation_is_atomic_on_conflict() -> None:
+    ledger = DispatchLedger(max_entries=8)
+    assert ledger.reserve(
+        "existing-original",
+        explicit_request_generation=55,
+        semantic_leg=("robot", "surgeon"),
+    )
+
+    assert not ledger.reserve(
+        "conflicting-rebase",
+        explicit_request_generation=55,
+        semantic_leg=("tray", "surgeon"),
+        alternative_semantic_legs=(("robot", "surgeon"),),
+    )
+    # A failed multi-leg reservation consumes neither its command ID nor the
+    # otherwise-free effective leg.
+    assert ledger.reserve(
+        "conflicting-rebase",
+        explicit_request_generation=55,
+        semantic_leg=("tray", "surgeon"),
+    )
+
+
+def test_dispatch_ledger_evicts_logical_alternative_legs_together() -> None:
+    ledger = DispatchLedger(max_entries=2)
+    assert ledger.reserve(
+        "logical-pair",
+        explicit_request_generation=61,
+        semantic_leg=("tray", "surgeon"),
+        alternative_semantic_legs=(("robot", "surgeon"),),
+    )
+    assert ledger.reserve(
+        "second-group",
+        explicit_request_generation=62,
+        semantic_leg=("tray", "robot"),
+    )
+    assert ledger.is_reserved(
+        "pair-effective",
+        explicit_request_generation=61,
+        semantic_leg=("tray", "surgeon"),
+    )
+    assert ledger.is_reserved(
+        "pair-original",
+        explicit_request_generation=61,
+        semantic_leg=("robot", "surgeon"),
+    )
+
+    assert ledger.reserve(
+        "third-group",
+        explicit_request_generation=63,
+        semantic_leg=("robot", "tray"),
+    )
+    assert not ledger.is_reserved(
+        "pair-effective-after-eviction",
+        explicit_request_generation=61,
+        semantic_leg=("tray", "surgeon"),
+    )
+    assert not ledger.is_reserved(
+        "pair-original-after-eviction",
+        explicit_request_generation=61,
+        semantic_leg=("robot", "surgeon"),
+    )
 
 
 def test_dispatch_ledger_is_bounded_and_evicts_old_ids():

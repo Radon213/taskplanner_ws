@@ -50,6 +50,8 @@ COMMAND_STOP_RETRACTION = 6
 TARGET_NONE = 0
 TARGET_LEFT = 1
 TARGET_RIGHT = 2
+# The peer Service uses TARGET_NONE (0) to request a bilateral adjustment.
+TARGET_BOTH = TARGET_NONE
 
 
 class ExecutorState(str, Enum):
@@ -482,8 +484,9 @@ class CommandExecutor:
                     request, stop_requested
                 )
             elif command == COMMAND_ADJUST_RETRACTION:
-                affected_arm_id = str(
-                    _value(self._resolve_side(target_side), "arm_id", "")
+                planned_adjustments = self._plan_adjustments(request)
+                affected_arm_id = ",".join(
+                    plan.arm_id for plan in planned_adjustments
                 )
                 affected_arm_id, distance_mm = self._adjust_retraction(
                     request, stop_requested
@@ -639,7 +642,7 @@ class CommandExecutor:
                 self._check_admission_state(command)
             self._require_motion_ready()
             if command == COMMAND_ADJUST_RETRACTION:
-                self._plan_adjustment(request)
+                self._plan_adjustments(request)
             if command == COMMAND_CHANGE_TOOL and not tuple(
                 _value(self.profile, "tool_change_waypoints", ())
             ):
@@ -938,42 +941,66 @@ class CommandExecutor:
         request: object,
         stop_requested: StopSignal | Callable[[], bool] | None,
     ) -> tuple[str, float]:
-        plan = self._plan_adjustment(request)
-        force = self.force_sensor.latest_sample(
-            str(plan.sensor_id)
-        )
-        self._validate_force_freshness(force)
-        self._raise_if_stopped(stop_requested)
-        self.robot.jog_tcp(
-            plan.arm_id,
-            axis=plan.axis,
-            distance_mm=plan.signed_distance_mm,
-            frame=plan.frame,
-        )
-        self._confirm_controller_settled()
-        self._cumulative_jog_mm[plan.arm_id] = plan.cumulative_distance_mm
-        return plan.arm_id, plan.distance_mm
+        plans = self._plan_adjustments(request)
+        if not plans:  # pragma: no cover - defensive; planning is fail-closed.
+            raise _ExecutionRejected("invalid_adjustment", "no adjustment plan")
+
+        # Validate every sensor before issuing the first jog.  This prevents a
+        # bilateral request from moving one arm when the other arm has stale or
+        # missing force data.
+        for plan in plans:
+            force = self.force_sensor.latest_sample(str(plan.sensor_id))
+            self._validate_force_freshness(force)
+        for plan in plans:
+            self._raise_if_stopped(stop_requested)
+            self.robot.jog_tcp(
+                plan.arm_id,
+                axis=plan.axis,
+                distance_mm=plan.signed_distance_mm,
+                frame=plan.frame,
+            )
+            self._confirm_controller_settled()
+            self._cumulative_jog_mm[plan.arm_id] = plan.cumulative_distance_mm
+        # ``distance_mm`` is the per-arm distance.  For BOTH the same value is
+        # deliberately reported once; affected_arm_id identifies both arms.
+        return ",".join(plan.arm_id for plan in plans), plans[0].distance_mm
 
     def _plan_adjustment(self, request: object) -> ForceJogPlan:
+        plans = self._plan_adjustments(request)
+        if len(plans) != 1:
+            raise _ExecutionRejected(
+                "bilateral_plan_requires_multi_execution",
+                "BOTH target requires the bilateral execution path",
+            )
+        return plans[0]
+
+    def _plan_adjustments(self, request: object) -> tuple[ForceJogPlan, ...]:
         side = _enum_int(_value(request, "target_side", TARGET_NONE), "target_side")
-        if side not in {TARGET_LEFT, TARGET_RIGHT}:
+        if side not in {TARGET_NONE, TARGET_LEFT, TARGET_RIGHT}:
             raise _ExecutionRejected(
-                "invalid_target_side", "adjust retraction requires LEFT or RIGHT"
+                "invalid_target_side",
+                "adjust retraction requires TARGET_NONE (both), LEFT, or RIGHT",
             )
-        mapping = self._resolve_side(side)
-        arm_id = str(_value(mapping, "arm_id", ""))
-        previous = self._cumulative_jog_mm.get(arm_id, 0.0)
-        try:
-            return plan_force_jog(
-                self.profile,  # type: ignore[arg-type]
-                side,
-                _value(request, "distance_m"),
-                previous_cumulative_mm=previous,
-            )
-        except RetractionControlError as exc:
-            raise _ExecutionRejected(
-                _error_code(exc, "invalid_adjustment"), str(exc)
-            ) from exc
+        sides = (TARGET_LEFT, TARGET_RIGHT) if side == TARGET_BOTH else (side,)
+        plans: list[ForceJogPlan] = []
+        for target in sides:
+            mapping = self._resolve_side(target)
+            arm_id = str(_value(mapping, "arm_id", ""))
+            previous = self._cumulative_jog_mm.get(arm_id, 0.0)
+            try:
+                plans.append(
+                    plan_force_jog(
+                        self.profile,  # type: ignore[arg-type]
+                        target,
+                        _value(request, "distance_m"),
+                        previous_cumulative_mm=previous,
+                    )
+                )
+            except RetractionControlError as exc:
+                raise _ExecutionRejected(
+                    _error_code(exc, "invalid_adjustment"), str(exc)
+                ) from exc
+        return tuple(plans)
 
     def _change_tool(
         self, stop_requested: StopSignal | Callable[[], bool] | None

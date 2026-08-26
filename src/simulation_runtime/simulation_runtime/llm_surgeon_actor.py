@@ -305,11 +305,9 @@ class LLMSurgeonActorNode(Node):
         self._rng = random.Random(self._seed)
         self._current_phase_id = self._spec.default_phase_id
         self._tool_ids = self._spec.list_instrument_ids()
-        self._requestable_tool_ids = [
-            instrument.id
-            for instrument in self._spec.bundle.instruments
-            if bool(getattr(instrument, "requestable", True))
-        ]
+        self._requestable_tool_ids = (
+            self._spec.list_requestable_instrument_ids()
+        )
         self._phase_ids = list(self._spec.phase_ids)
         self._procedure_prompt = compact_procedure_prompt(self._spec_dir)
         self._reset_bed_robot_arm_group_states()
@@ -1542,6 +1540,7 @@ class LLMSurgeonActorNode(Node):
         }
 
     def _build_system_prompt(self) -> str:
+        requestable = set(self._spec.list_requestable_instrument_ids())
         phases = [
             {
                 "id": phase.id,
@@ -1565,7 +1564,7 @@ class LLMSurgeonActorNode(Node):
                 "id": instrument.id,
                 "name": instrument.display_name,
                 "role": instrument.role,
-                "requestable": bool(getattr(instrument, "requestable", True)),
+                "requestable": instrument.id in requestable,
             }
             for instrument in self._spec.bundle.instruments
         ]

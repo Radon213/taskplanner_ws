@@ -204,7 +204,7 @@ command 권한으로 사용하지 않는다.
 Taskplanner runtime 안에서 다음 명령으로 latched 상태를 한 번 받는다.
 
 ```bash
-source /workspaces/taskplanner_ws/install/setup.bash
+source /workspaces/taskplanner_ws/install/docker/setup.bash
 ros2 topic echo /integration/cv_contract/status --once
 ```
 

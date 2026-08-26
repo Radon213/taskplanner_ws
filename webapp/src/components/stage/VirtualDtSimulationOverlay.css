@@ -1,0 +1,181 @@
+.virtual-dt-simulation-overlay {
+  display: grid;
+  min-width: 0;
+  gap: 5px;
+  padding: 7px;
+  border: 1px solid color-mix(in srgb, var(--robot) 42%, var(--line));
+  border-radius: calc(var(--radius) - 1px);
+  background: color-mix(in srgb, var(--surface-2) 82%, transparent);
+  color: var(--text);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--robot) 8%, transparent);
+}
+
+.virtual-dt-simulation-overlay.completed {
+  border-color: color-mix(in srgb, var(--reuse) 48%, var(--line));
+}
+
+.virtual-dt-simulation-overlay.rejected,
+.virtual-dt-simulation-overlay.failed,
+.virtual-dt-simulation-overlay.canceled,
+.virtual-dt-simulation-overlay.unknown {
+  border-color: color-mix(in srgb, var(--warning) 48%, var(--line));
+}
+
+.virtual-dt-simulation-heading,
+.virtual-dt-simulation-route,
+.virtual-dt-simulation-detail,
+.virtual-dt-simulation-kicker,
+.virtual-dt-simulation-state {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+}
+
+.virtual-dt-simulation-heading {
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.virtual-dt-simulation-kicker,
+.virtual-dt-simulation-state {
+  gap: 4px;
+  overflow: hidden;
+  font-size: 10px;
+  font-weight: 800;
+  line-height: 1.15;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.virtual-dt-simulation-kicker {
+  color: var(--color-accent-strong);
+}
+
+.virtual-dt-simulation-state {
+  flex: 0 1 auto;
+  color: var(--soft);
+}
+
+.virtual-dt-simulation-overlay.completed .virtual-dt-simulation-state {
+  color: var(--color-success-text);
+}
+
+.virtual-dt-simulation-overlay.rejected .virtual-dt-simulation-state,
+.virtual-dt-simulation-overlay.failed .virtual-dt-simulation-state,
+.virtual-dt-simulation-overlay.canceled .virtual-dt-simulation-state,
+.virtual-dt-simulation-overlay.unknown .virtual-dt-simulation-state {
+  color: var(--color-danger-text);
+}
+
+.virtual-dt-simulation-route {
+  gap: 5px;
+}
+
+.virtual-dt-simulation-route > strong {
+  min-width: 0;
+  max-width: 39%;
+  overflow: hidden;
+  color: var(--text);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.15;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.virtual-dt-simulation-route > strong:last-child {
+  text-align: end;
+}
+
+.virtual-dt-simulation-progress {
+  position: relative;
+  display: block;
+  min-width: 18px;
+  height: 4px;
+  flex: 1 1 auto;
+  overflow: hidden;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--line-strong) 72%, transparent);
+}
+
+.virtual-dt-simulation-progress > span {
+  position: absolute;
+  inset: 0;
+  display: block;
+  transform-origin: left center;
+  border-radius: inherit;
+  background: var(--robot);
+}
+
+.virtual-dt-simulation-overlay.completed .virtual-dt-simulation-progress > span {
+  background: var(--reuse);
+}
+
+.virtual-dt-simulation-overlay.rejected .virtual-dt-simulation-progress > span,
+.virtual-dt-simulation-overlay.failed .virtual-dt-simulation-progress > span,
+.virtual-dt-simulation-overlay.canceled .virtual-dt-simulation-progress > span,
+.virtual-dt-simulation-overlay.unknown .virtual-dt-simulation-progress > span {
+  background: var(--warning);
+}
+
+.virtual-dt-simulation-detail {
+  justify-content: space-between;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.15;
+}
+
+.virtual-dt-simulation-detail span:first-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.virtual-dt-simulation-detail span:last-child {
+  flex: 0 0 auto;
+  color: var(--soft);
+  font-variant-numeric: tabular-nums;
+}
+
+.virtual-dt-simulation-overlay > p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1.28;
+}
+
+/* The operating-board action cell is intentionally compact. When this
+   observer panel occupies it, preserve the full virtual-route animation while
+   avoiding a second card silhouette or any implication of physical telemetry. */
+.humanoid-action-status .virtual-dt-simulation-overlay {
+  width: 100%;
+  min-height: 0;
+  gap: 4px;
+  padding: 5px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--surface-2) 68%, transparent);
+  box-shadow: none;
+}
+
+.humanoid-action-status .virtual-dt-simulation-heading,
+.humanoid-action-status .virtual-dt-simulation-route,
+.humanoid-action-status .virtual-dt-simulation-detail {
+  gap: 4px;
+}
+
+.humanoid-action-status .virtual-dt-simulation-overlay > p {
+  font-size: 10px;
+  line-height: 1.2;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .virtual-dt-simulation-overlay,
+  .virtual-dt-simulation-progress > span {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+  }
+}

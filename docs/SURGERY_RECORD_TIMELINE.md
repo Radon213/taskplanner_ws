@@ -46,7 +46,7 @@ Replay의 전체 trace를 수술 종료 후 후처리하여, 별도의 수술기
 - VLM `raw_json`
 - VLM Phase 후보와 confidence
 - VLM 도구/위치 후보와 confidence
-- gesture, intent, uncertainty
+- intent and uncertainty (hand gesture is supplied by the separate CAM4 contract)
 - `vlm_model_raw`
 - 평가용 `evaluation_ground_truth` 및 annotation reference
 - 반복되는 reducer 전체 상태와 로봇 running/health heartbeat

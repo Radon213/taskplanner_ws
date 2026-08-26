@@ -122,11 +122,80 @@ def test_text_vlm_grounded_single_side_adjustment_uses_documented_default() -> N
     assert result.normalized.distance_m == 0.05
 
 
+def test_text_vlm_grounded_bilateral_adjustment_applies_distance_per_arm() -> None:
+    result = TextOnlyRetractionVLMInterpreter(
+        base_url="http://127.0.0.1:8001",
+        model_id="local-text-vlm",
+        request_json=lambda *_args, **_kwargs: _response(
+            '{"v":"1","command":"adjust_retraction",'
+            '"target_side":"both","distance_m":0.001}'
+        ),
+    ).interpret("양쪽으로 1mm씩 당겨줘", RetractionState.RETRACTION_ACTIVE)
+
+    assert result.interpreter_source == "text_vlm"
+    assert result.normalized.command is RetractionCommand.ADJUST_RETRACTION
+    assert result.normalized.target_side is RetractionTargetSide.BOTH
+    assert result.normalized.distance_m == pytest.approx(0.001)
+
+
+@pytest.mark.parametrize(
+    ("transcript", "model_side"),
+    [
+        ("왼팔 직접 교시 종료", "left"),
+        ("오른쪽 직접 교시 종료", "right"),
+    ],
+)
+def test_text_vlm_accepts_grounded_optional_finish_target_side(
+    transcript: str,
+    model_side: str,
+) -> None:
+    result = TextOnlyRetractionVLMInterpreter(
+        base_url="http://127.0.0.1:8080",
+        model_id="qwen3.6-35b-a3b",
+        request_json=lambda *_args, **_kwargs: _response(
+            json.dumps(
+                {
+                    "v": "1",
+                    "command": "finish_direct_teach",
+                    "target_side": model_side,
+                    "distance_m": 0.0,
+                }
+            )
+        ),
+    ).interpret(transcript, RetractionState.DIRECT_TEACHING)
+
+    assert result.interpreter_source == "text_vlm"
+    assert result.normalized.command == RetractionCommand.FINISH_DIRECT_TEACH
+    assert result.normalized.target_side.value == model_side
+
+
+def test_text_vlm_cannot_invent_optional_finish_target_side() -> None:
+    result = TextOnlyRetractionVLMInterpreter(
+        base_url="http://127.0.0.1:8080",
+        model_id="qwen3.6-35b-a3b",
+        request_json=lambda *_args, **_kwargs: _response(
+            '{"v":"1","command":"finish_direct_teach",'
+            '"target_side":"left","distance_m":0}'
+        ),
+    ).interpret("직접 교시 종료", RetractionState.DIRECT_TEACHING)
+
+    assert result.interpreter_source == "deterministic_fallback"
+    assert result.normalized.command == RetractionCommand.FINISH_DIRECT_TEACH
+    assert result.normalized.target_side == RetractionTargetSide.NONE
+
+
 @pytest.mark.parametrize(
     ("transcript", "state", "model_json", "expected_command"),
     [
         (
             "리트렉터 직접 가르치기 모드 켜줘",
+            RetractionState.IDLE,
+            '{"v":"1","command":"start_direct_teach",'
+            '"target_side":"none","distance_m":0}',
+            RetractionCommand.START_DIRECT_TEACH,
+        ),
+        (
+            "직접 교실 시작",
             RetractionState.IDLE,
             '{"v":"1","command":"start_direct_teach",'
             '"target_side":"none","distance_m":0}',
@@ -141,6 +210,20 @@ def test_text_vlm_grounded_single_side_adjustment_uses_documented_default() -> N
         ),
         (
             "직접 교시 다 됐어",
+            RetractionState.DIRECT_TEACHING,
+            '{"v":"1","command":"finish_direct_teach",'
+            '"target_side":"none","distance_m":0}',
+            RetractionCommand.FINISH_DIRECT_TEACH,
+        ),
+        (
+            "교시 마칠게",
+            RetractionState.DIRECT_TEACHING,
+            '{"v":"1","command":"finish_direct_teach",'
+            '"target_side":"none","distance_m":0}',
+            RetractionCommand.FINISH_DIRECT_TEACH,
+        ),
+        (
+            "이제 끝낼게",
             RetractionState.DIRECT_TEACHING,
             '{"v":"1","command":"finish_direct_teach",'
             '"target_side":"none","distance_m":0}',
@@ -168,7 +251,28 @@ def test_text_vlm_grounded_single_side_adjustment_uses_documented_default() -> N
             RetractionCommand.CHANGE_TOOL,
         ),
         (
+            "툴을 바꿔줘",
+            RetractionState.IDLE,
+            '{"v":"1","command":"change_tool",'
+            '"target_side":"none","distance_m":0}',
+            RetractionCommand.CHANGE_TOOL,
+        ),
+        (
+            "새 장비로 바꿔줘",
+            RetractionState.IDLE,
+            '{"v":"1","command":"change_tool",'
+            '"target_side":"none","distance_m":0}',
+            RetractionCommand.CHANGE_TOOL,
+        ),
+        (
             "견인은 여기서 끝내",
+            RetractionState.RETRACTION_ACTIVE,
+            '{"v":"1","command":"stop_retraction",'
+            '"target_side":"none","distance_m":0}',
+            RetractionCommand.STOP_RETRACTION,
+        ),
+        (
+            "리트랙션 스톱",
             RetractionState.RETRACTION_ACTIVE,
             '{"v":"1","command":"stop_retraction",'
             '"target_side":"none","distance_m":0}',
@@ -194,6 +298,34 @@ def test_text_vlm_accepts_grounded_demo_paraphrase_corpus(
     if expected_command == RetractionCommand.ADJUST_RETRACTION:
         assert result.normalized.target_side == RetractionTargetSide.RIGHT
         assert result.normalized.distance_m == pytest.approx(0.050)
+
+
+def test_text_vlm_debug_bypass_accepts_a_command_outside_the_local_state() -> None:
+    captured: dict[str, object] = {}
+
+    def request_json(_url, body, _timeout_sec, _headers):
+        captured.update(body)
+        return _response(
+            '{"v":"1","command":"stop_retraction",'
+            '"target_side":"none","distance_m":0}'
+        )
+
+    result = TextOnlyRetractionVLMInterpreter(
+        base_url="http://127.0.0.1:8080",
+        model_id="qwen3.6-35b-a3b",
+        request_json=request_json,
+    ).interpret(
+        "리트랙션 종료",
+        RetractionState.IDLE,
+        enforce_state=False,
+    )
+
+    assert result.interpreter_source == "text_vlm"
+    assert result.normalized.command is RetractionCommand.STOP_RETRACTION
+    user_message = captured["messages"][1]["content"]
+    assert set(json.loads(user_message)["allowed_commands"]) == {
+        command.value for command in RetractionCommand
+    }
 
 
 def test_ninfer_fenced_json_numeric_version_and_null_non_adjustment_fields() -> None:

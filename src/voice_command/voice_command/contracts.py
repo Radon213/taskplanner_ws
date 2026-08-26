@@ -19,6 +19,11 @@ DISPOSITION_NO_COMMAND: Final = "no_command"
 
 INTENT_TOOL_HANDOVER: Final = "tool_handover"
 INTENT_RETRACTOR_COMMAND: Final = "retractor_command"
+# Procedure lifecycle proposals are intentionally distinct from robot actions.
+# The simulation manager re-admits them against the live integration contract
+# before it changes any runtime state.
+INTENT_PROCEDURE_START: Final = "procedure_start"
+INTENT_PROCEDURE_STOP: Final = "procedure_stop"
 
 TARGET_SIDE_NONE: Final = "none"
 

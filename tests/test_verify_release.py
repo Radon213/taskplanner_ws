@@ -151,6 +151,29 @@ def test_web_build_installs_locked_dependencies(tmp_path: Path) -> None:
     assert command.startswith("npm --prefix webapp ci && ")
 
 
+def test_container_checks_select_the_intended_install_overlay(tmp_path: Path) -> None:
+    checks = verify.build_checks(
+        config=_config(),
+        run_id="test-install-roots",
+        report_dir=tmp_path / "report",
+        tier="rc",
+        verify_dataset_payloads=False,
+        restart_iterations=1,
+        soak_hours=0.01,
+        shadow_options=None,
+    )
+    by_name = {check.name: check.command for check in checks}
+
+    quick = by_name["quick_safety_contracts"]
+    assert "TASKPLANNER_SKIP_WORKSPACE_SETUP=true" in quick
+    assert "/workspaces/taskplanner_ws/install/docker/setup.bash" in quick
+    assert "/workspaces/taskplanner_ws/install/setup.bash" not in quick
+
+    product = by_name["product_colcon_build_and_test"]
+    assert "TASKPLANNER_SKIP_WORKSPACE_SETUP=true" in product
+    assert "/test_outputs/release-build/test-install-roots/install/setup.bash" in product
+
+
 def test_run_check_records_external_log_path_without_crashing(tmp_path: Path) -> None:
     logs_dir = tmp_path / "logs"
     logs_dir.mkdir()

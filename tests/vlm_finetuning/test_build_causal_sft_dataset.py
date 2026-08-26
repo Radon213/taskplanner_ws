@@ -133,7 +133,7 @@ class DatasetArtifactTest(unittest.TestCase):
         self.assertTrue(self.audit["ok"])
         task_counts = Counter(row["task_type"] for row in self.rows)
         self.assertEqual(207, task_counts["tool_presence_at_transfer"])
-        self.assertEqual(133, task_counts["request_intent"])
+        self.assertNotIn("request_intent", task_counts)
         self.assertEqual(132, task_counts["current_phase"])
         self.assertEqual(202, task_counts["clinical_observation_interpretation"])
         self.assertGreater(task_counts["next_physical_tool"], 190)
@@ -195,18 +195,25 @@ class DatasetArtifactTest(unittest.TestCase):
                     row["quality"]["tool_name_voice_leakage_blocked"]
                 )
 
-    def test_implicit_request_never_backfills_eventual_tool(self) -> None:
-        requests = [
-            row for row in self.rows if row["task_type"] == "request_intent"
+    def test_visual_hand_task_and_forecast_conditioning_are_absent(self) -> None:
+        self.assertFalse(
+            any(row["task_type"] == "request_intent" for row in self.rows)
+        )
+        forecasts = [
+            row for row in self.rows if row["task_type"] == "next_physical_tool"
         ]
-        self.assertEqual(133, len(requests))
-        for row in requests:
+        self.assertTrue(forecasts)
+        for row in forecasts:
             with self.subTest(example_id=row["example_id"]):
-                self.assertIsNone(row["target"]["requested_tool"])
-                self.assertFalse(
-                    row["target"][
-                        "tool_identity_inferred_from_later_transfer"
-                    ]
+                self.assertNotIn("causal_request_event_id", row["target"])
+                self.assertNotIn("request_tool_backfilled", row["target"])
+                self.assertIn(
+                    row["target"]["prediction_regime"],
+                    {
+                        "explicit_voice",
+                        "anticipatory_context",
+                        "negative_horizon",
+                    },
                 )
 
     def test_next_tool_is_first_physical_surgeon_direction_transfer(self) -> None:

@@ -13,7 +13,7 @@ import time
 
 from procedure_spec import get_default_spec_dir
 import rclpy
-from surgical_msgs.msg import BTDecision, SurgeonActorEvent, SurgeonGestureEvidence, SurgeonRequest, WorldState
+from surgical_msgs.msg import BTDecision, SurgeonActorEvent, SurgeonRequest, WorldState
 
 from .smoke_test import ManagedProcess, SmokeHarness
 
@@ -84,7 +84,6 @@ class BTAuditHarness(SmokeHarness):
     def __init__(self) -> None:
         super().__init__()
         self._bundle_name = ""
-        self._gesture_log: list[tuple[float, SurgeonGestureEvidence]] = []
         self._request_log: list[tuple[float, SurgeonRequest]] = []
         self._actor_event_log: list[tuple[float, SurgeonActorEvent]] = []
         self._world_log: deque[tuple[float, WorldState]] = deque(maxlen=240)
@@ -95,12 +94,6 @@ class BTAuditHarness(SmokeHarness):
         self._vlm_rejected_proposal_detected = False
         self._vlm_rejection_samples: list[dict[str, object]] = []
         self._last_observed_phase = ""
-        self.create_subscription(
-            SurgeonGestureEvidence,
-            "/vlm/surgeon_gesture_evidence",
-            self._on_gesture,
-            20,
-        )
         self.create_subscription(
             SurgeonActorEvent,
             "/surgeon/actor_event",
@@ -124,7 +117,6 @@ class BTAuditHarness(SmokeHarness):
         self._surgeon_requests.clear()
         self._latest_world = None
         self._world_invariant_violations.clear()
-        self._gesture_log.clear()
         self._request_log.clear()
         self._actor_event_log.clear()
         self._world_log.clear()
@@ -135,10 +127,6 @@ class BTAuditHarness(SmokeHarness):
         self._vlm_rejected_proposal_detected = False
         self._vlm_rejection_samples.clear()
         self._last_observed_phase = ""
-
-    def _on_gesture(self, msg: SurgeonGestureEvidence) -> None:
-        self._gesture_log.append((_stamp_to_sec(msg.stamp), msg))
-        self._gesture_log = self._gesture_log[-60:]
 
     def _on_surgeon_request(self, msg):  # type: ignore[override]
         super()._on_surgeon_request(msg)
@@ -200,13 +188,6 @@ class BTAuditHarness(SmokeHarness):
         for stamp_sec, request in reversed(self._request_log):
             if now_sec - stamp_sec <= 4.0:
                 return (stamp_sec, request)
-        return None
-
-    def _recent_gesture(self, world: WorldState) -> SurgeonGestureEvidence | None:
-        now_sec = _stamp_to_sec(world.stamp)
-        for stamp_sec, evidence in reversed(self._gesture_log):
-            if now_sec - stamp_sec <= 4.0:
-                return evidence
         return None
 
     def _push_finding(
@@ -272,7 +253,6 @@ class BTAuditHarness(SmokeHarness):
                 self._vlm_rejection_samples.append(sample)
         request_tuple = self._recent_request(world)
         request = request_tuple[1] if request_tuple is not None else None
-        gesture = self._recent_gesture(world)
         state_by_tool = {
             instrument.instrument_id: instrument for instrument in world.instrument_states
         }
@@ -436,13 +416,13 @@ class BTAuditHarness(SmokeHarness):
                         f"selected_tool={decision.selected_tool} handover_ready={world.surgeon_ready_for_handover}."
                     ),
                 )
-            if world.phase_uncertain or not world.handover_allowed:
+            if not world.handover_allowed:
                 self._push_finding(
                     severity="blocker",
                     code="anticipatory_under_guard_block",
                     decision=decision,
                     world=world,
-                    detail="anticipatory branch fired while phase was uncertain or handover guard was blocked.",
+                    detail="anticipatory branch fired while the handover guard was blocked.",
                 )
             if decision.selected_tool not in world.expected_instruments:
                 self._push_finding(
@@ -485,13 +465,13 @@ class BTAuditHarness(SmokeHarness):
                     detail=f"anticipatory selected {decision.selected_tool} in lifecycle {selected_state.lifecycle_stage}.",
                 )
         elif decision.decision == "hold":
-            if not world.phase_uncertain and world.handover_allowed and not explicit_tool and not recoverable:
+            if world.handover_allowed and not explicit_tool and not recoverable:
                 self._push_finding(
                     severity="suspicious",
                     code="hold_without_guard_reason",
                     decision=decision,
                     world=world,
-                    detail="hold/retract_arm fired without uncertainty or another stronger guard reason.",
+                    detail="hold/retract_arm fired without another stronger guard reason.",
                 )
         elif decision.decision == "idle":
             if explicit_tool or pending_recovery or world.pending_transition_tools:
@@ -529,8 +509,7 @@ class BTAuditHarness(SmokeHarness):
             )
 
         if (
-            gesture is not None
-            and gesture.event_type == "return_tool"
+            world.surgeon_intent in {"return_tool", "extend_hand_for_retrieval"}
             and decision.decision == "anticipatory_handover"
             and pending_recovery
         ):

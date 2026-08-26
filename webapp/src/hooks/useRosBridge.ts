@@ -2,23 +2,19 @@ import { useEffect, useLayoutEffect, useRef, useState, startTransition } from "r
 import ROSLIB from "roslib";
 
 import type {
-  BedRobotArmState,
-  BedRobotArmStateArray,
   BTDecision,
   Cam4ToolRequestObservation,
   CompressedImageFrame,
+  ExecutionTrace,
   InputSourceStatus,
   InstrumentState,
   LiveAsrControlResult,
-  LiveAsrDevice,
-  LiveAsrFinal,
-  LiveAsrLanHealth,
-  LiveAsrRoutePolicy,
   LiveAsrStatus,
   ModelCatalogEntry,
   ModelProviderStatus,
   ModelRuntimeCommand,
   ModelSelection,
+  RankedToolPrediction,
   RosTime,
   ShadowGroundTruthState,
   ShadowReplayState,
@@ -37,6 +33,109 @@ import {
   runtimeBridgeUrl,
   type TaskplannerRuntimeMode,
 } from "../runtimeModes";
+import type { MissionObservationProfile } from "../runtimeFeatures";
+import {
+  missionSubscriptionPlan,
+  type MissionCameraId,
+} from "../ros/missionSubscriptionPlan";
+import {
+  rfdetrToolViewConfigs,
+} from "../ros/rfdetrObservationSources";
+import {
+  normalizeTypedRfdetrToolDetections,
+  normalizeVlmRequestToolDetectionEvidence,
+  type TypedRfdetrToolDetections,
+  type TypedRfdetrToolViewId,
+  type VlmRequestToolDetectionEvidence,
+} from "../ros/toolObservationMessages";
+import {
+  integrationReadinessBlockReason,
+  normalizeExecutionEndpointSource,
+  normalizeExecutionRouteCommandResult,
+  normalizeExecutionRouteState,
+  normalizeIntegrationReadiness,
+  type ExecutionEndpointSource,
+  type ExecutionRouteState,
+  type IntegrationReadiness,
+} from "../ros/runtimeAdmissionMessages";
+import {
+  isBoundedRosPayload,
+  MAX_ROS_JSON_PAYLOAD_CHARS,
+  MAX_ROS_PAYLOAD_STRING_CHARS,
+} from "../ros/rosMessageBounds";
+import {
+  DEFAULT_LIVE_ASR_STATUS,
+  normalizeLiveAsrStatus,
+} from "../ros/liveAsrMessages";
+import {
+  BED_ROBOT_STATUS_MAX_AGE_MS,
+  canonicalBedRobotProcedure,
+  normalizeBedRobotArmStates,
+  normalizeBedRobotArmStatus,
+  sameBedRobotArmState,
+  type ValidatedBedRobotArmStatus,
+} from "../ros/bedRobotArmMessages";
+import {
+  assertSetParametersAccepted,
+  boolParameter,
+  parseLegacyModelCatalogResponse,
+  parseModelCatalogResponse,
+  ROS_PARAMETER_BOOL,
+  setParametersRequest,
+  stringParameter,
+  type ModelCatalogProjection,
+  type RosParameter,
+} from "../ros/modelCatalogMessages";
+import {
+  EMPTY_SCENARIO_REVISION_STATE,
+  SELECT_BUNDLE_SERVICE,
+  SELECT_BUNDLE_SERVICE_TYPE,
+  parseScenarioRevisionResult,
+  scenarioRevisionApplyAdmission as computeScenarioRevisionApplyAdmission,
+  scenarioRevisionApplyRequest,
+  scenarioRevisionPreviewRequest,
+  type ScenarioRevisionState,
+} from "../ros/scenarioRevision";
+
+export {
+  INTEGRATION_READINESS_MAX_AGE_MS,
+  integrationReadinessBlockReason,
+  normalizeExecutionRouteState,
+  normalizeIntegrationReadiness,
+} from "../ros/runtimeAdmissionMessages";
+export type {
+  ExecutionEndpointSource,
+  ExecutionRouteInitializationState,
+  ExecutionRouteSourceEndpointReadiness,
+  ExecutionRouteState,
+  IntegrationReadiness,
+  IntegrationReadinessBlockReason,
+  IntegrationReadinessChecklistItem,
+  IntegrationReadinessChecklistStatus,
+} from "../ros/runtimeAdmissionMessages";
+export type {
+  ScenarioRevisionApplyAdmission,
+  ScenarioRevisionResult,
+  ScenarioRevisionState,
+} from "../ros/scenarioRevision";
+export { normalizeLiveAsrStatus } from "../ros/liveAsrMessages";
+export {
+  TYPED_RFDETR_STAGE_MAX_FRAME_SKEW_SEC,
+  normalizeTypedRfdetrToolDetections,
+  normalizeVlmRequestToolDetectionEvidence,
+} from "../ros/toolObservationMessages";
+export type {
+  TypedRfdetrToolDetectionFrame,
+  TypedRfdetrToolDetectionInstance,
+  TypedRfdetrToolDetections,
+  TypedRfdetrToolViewId,
+  VlmRequestToolDetectionEvidence,
+  VlmToolDetectionFreshness,
+  VlmToolDetectionInstance,
+  VlmToolDetectionView,
+  VlmToolDetectionViewId,
+  VlmToolDetectionVisualAlignment,
+} from "../ros/toolObservationMessages";
 
 const DEFAULT_STATE: SimulationState = {
   procedure_id: "",
@@ -199,10 +298,6 @@ const DEFAULT_VLM_RESULT: VLMResult = {
   observed_location_ids: [],
   observed_location_types: [],
   observed_confidences: [],
-  gesture_event_type: "",
-  gesture_requested_tool: "",
-  gesture_hand_pose: "",
-  gesture_confidence: 0,
   uncertainty: 0,
 };
 
@@ -252,8 +347,15 @@ const DEFAULT_WORLD_STATE: WorldState = {
   predicted_tool: "",
   predicted_tool_confidence: 0,
   predicted_tool_stability_sec: 0,
+  ranked_tool_predictions: [],
   surgeon_request_tool: "",
   explicit_request_voice_backed: false,
+  implicit_request_visible: false,
+  implicit_request_tool: "",
+  implicit_request_hand_pose: "",
+  implicit_request_confidence: 0,
+  implicit_request_stability_sec: 0,
+  implicit_request_generation: 0,
   bed_robot_arms: [],
 };
 
@@ -283,201 +385,88 @@ const DEFAULT_SHADOW_REPLAY_STATE: ShadowReplayState = {
   active_skill_count: 0,
 };
 
-const DEFAULT_LIVE_ASR_STATUS: LiveAsrStatus = {
-  schema: "taskplanner.asr.status.v1",
-  stamp_sec: 0,
-  available: false,
-  dependency_error: "",
-  state: "UNAVAILABLE",
-  server_url: "",
-  topic: "/sensors/surgeon/sentence",
-  device_id: null,
-  device_name: "",
-  devices: [],
-  device_status: "NO_INPUT",
-  device_message: "ASR 상태를 기다리는 중입니다.",
-  connected: false,
-  audio_level_dbfs: -99,
-  peak_level_dbfs: -99,
-  elapsed_sec: 0,
-  partial_text: "",
-  finals: [],
-  last_error: "",
-  sample_rate: 16000,
-  channels: 1,
-  sample_width_bits: 16,
-  endpoint_id: "",
-  route_policy: "cloud",
-  selection_reason: "",
-  lan_health: {
-    enabled: false,
-    state: "UNKNOWN",
-    method: "websocket_handshake",
-    age_ms: null,
-    latency_ms: null,
-    consecutive_failures: 0,
-    last_error: "",
-  },
+export type ExecutionRouteTransition = {
+  state: "idle" | "switching" | "resetting" | "ready" | "failed";
+  message: string;
 };
 
-const MAX_LIVE_ASR_STATUS_JSON_CHARS = 256 * 1024;
-const MAX_LIVE_ASR_DEVICES = 64;
-const MAX_LIVE_ASR_FINALS = 48;
-const MAX_LIVE_ASR_DISPLAY_TEXT_CHARS = 4_096;
+const DEFAULT_INTEGRATION_READINESS: IntegrationReadiness | null = null;
+
+const MAX_SKILL_STATUS_HISTORY = 64;
 
 type RosCompressedImage = {
   header?: {
+    stamp?: RosTime;
     frame_id?: string;
   };
   format?: string;
   data?: string | number[] | Uint8Array;
 };
 
+
 type RosString = {
   data?: string;
 };
 
-function finiteNumber(value: unknown, fallback = 0): number {
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : fallback;
+const EXECUTION_TRACE_TRANSPORTS = new Set(["action", "service"]);
+const EXECUTION_TRACE_STAGES = new Set([
+  "sent",
+  "accepted",
+  "rejected",
+  "completed",
+  "failed",
+  "canceled",
+  "unknown",
+]);
+
+function boundedTraceText(value: unknown, maxLength: number): string {
+  return typeof value === "string" ? value.trim().slice(0, maxLength) : "";
 }
 
-function optionalFiniteNumber(value: unknown): number | null {
-  if (value === null || value === undefined || value === "") return null;
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : null;
-}
-
-const MAX_ROS_JSON_PAYLOAD_CHARS = 256 * 1024;
-const MAX_ROS_PAYLOAD_COLLECTION_ITEMS = 256;
-const MAX_ROS_PAYLOAD_OBJECT_KEYS = 512;
-const MAX_ROS_PAYLOAD_STRING_CHARS = 64 * 1024;
-
-function isBoundedRosPayload(value: unknown, depth = 0): boolean {
-  if (depth > 8) return false;
-  if (typeof value === "string") return value.length <= MAX_ROS_PAYLOAD_STRING_CHARS;
-  if (Array.isArray(value)) {
-    return value.length <= MAX_ROS_PAYLOAD_COLLECTION_ITEMS
-      && value.every((item) => isBoundedRosPayload(item, depth + 1));
-  }
-  if (value && typeof value === "object") {
-    const entries = Object.entries(value as Record<string, unknown>);
-    return entries.length <= MAX_ROS_PAYLOAD_OBJECT_KEYS
-      && entries.every(([key, item]) => key.length <= MAX_ROS_PAYLOAD_STRING_CHARS
-        && isBoundedRosPayload(item, depth + 1));
-  }
-  return true;
-}
-
-function normalizeLiveAsrRoutePolicy(value: unknown): LiveAsrRoutePolicy {
-  const policy = String(value ?? "").trim().toLowerCase();
-  return policy === "lan" || policy === "auto" || policy === "cloud"
-    ? policy
-    : "cloud";
-}
-
-function normalizeLiveAsrLanHealth(value: unknown): LiveAsrLanHealth {
-  const health = value && typeof value === "object"
-    ? value as Record<string, unknown>
-    : {};
-  const age = optionalFiniteNumber(health.age_ms);
-  const latency = optionalFiniteNumber(health.latency_ms);
-  return {
-    enabled: Boolean(health.enabled),
-    state: String(health.state ?? "UNKNOWN").toUpperCase().slice(0, 64),
-    method: String(health.method ?? "websocket_handshake").slice(0, 128),
-    age_ms: age === null ? null : Math.max(0, age),
-    latency_ms: latency === null ? null : Math.max(0, latency),
-    consecutive_failures: Math.max(0, Math.trunc(finiteNumber(health.consecutive_failures))),
-    last_error: String(health.last_error ?? "").slice(0, MAX_LIVE_ASR_DISPLAY_TEXT_CHARS),
-  };
-}
-
-function normalizeLiveAsrDevice(value: unknown): LiveAsrDevice | null {
-  if (!value || typeof value !== "object") return null;
-  const device = value as Record<string, unknown>;
-  const id = Number(device.id);
-  if (!Number.isInteger(id)) return null;
-  return {
-    id,
-    name: String(device.name ?? `Input ${id}`).slice(0, 512),
-    input_channels: Math.max(0, Math.trunc(finiteNumber(device.input_channels))),
-    default_samplerate: Math.max(0, finiteNumber(device.default_samplerate)),
-    default: Boolean(device.default),
-  };
-}
-
-function normalizeLiveAsrFinal(value: unknown): LiveAsrFinal | null {
-  if (!value || typeof value !== "object") return null;
-  const final = value as Record<string, unknown>;
-  const text = String(final.text ?? "").trim().slice(0, MAX_LIVE_ASR_DISPLAY_TEXT_CHARS);
-  if (!text) return null;
-  const latencyMissing = final.response_latency_ms === null
-    || final.response_latency_ms === undefined
-    || final.response_latency_ms === "";
-  const rawLatency = latencyMissing ? Number.NaN : Number(final.response_latency_ms);
-  return {
-    stamp: String(final.stamp ?? "").slice(0, 128),
-    text,
-    response_latency_ms: Number.isFinite(rawLatency) && rawLatency >= 0 ? rawLatency : null,
-    latency_basis: String(final.latency_basis ?? "unavailable").slice(0, 128),
-    latency_correlated: Boolean(final.latency_correlated),
-  };
-}
-
-export function normalizeLiveAsrStatus(message: unknown): LiveAsrStatus | null {
-  const raw = String((message as RosString | null)?.data ?? "");
-  if (raw.length > MAX_LIVE_ASR_STATUS_JSON_CHARS) return null;
-  try {
-    const envelope = JSON.parse(raw) as Record<string, unknown>;
-    if (!isBoundedRosPayload(envelope)) return null;
-    if (envelope.schema !== "taskplanner.asr.status.v1") return null;
-    const snapshot = envelope.asr && typeof envelope.asr === "object"
-      ? envelope.asr as Record<string, unknown>
-      : {};
-    const rawDevices = Array.isArray(snapshot.devices)
-      ? snapshot.devices.slice(0, MAX_LIVE_ASR_DEVICES)
-      : [];
-    const rawFinals = Array.isArray(snapshot.finals)
-      ? snapshot.finals.slice(-MAX_LIVE_ASR_FINALS)
-      : [];
-    const rawDeviceId = snapshot.device_id;
-    return {
-      ...DEFAULT_LIVE_ASR_STATUS,
-      schema: "taskplanner.asr.status.v1",
-      stamp_sec: finiteNumber(envelope.stamp_sec),
-      available: Boolean(snapshot.available),
-      dependency_error: String(snapshot.dependency_error ?? "").slice(0, MAX_LIVE_ASR_DISPLAY_TEXT_CHARS),
-      state: String(snapshot.state ?? "UNAVAILABLE").toUpperCase().slice(0, 64),
-      server_url: String(snapshot.server_url ?? "").slice(0, 2048),
-      topic: String(snapshot.topic ?? "/sensors/surgeon/sentence").slice(0, 512),
-      device_id: rawDeviceId === null || rawDeviceId === undefined || rawDeviceId === ""
-        ? null
-        : Number.isInteger(Number(rawDeviceId))
-          ? Number(rawDeviceId)
-          : null,
-      device_name: String(snapshot.device_name ?? "").slice(0, 512),
-      devices: rawDevices.map(normalizeLiveAsrDevice).filter((value): value is LiveAsrDevice => value !== null),
-      device_status: String(snapshot.device_status ?? "NO_INPUT").slice(0, 64),
-      device_message: String(snapshot.device_message ?? "").slice(0, MAX_LIVE_ASR_DISPLAY_TEXT_CHARS),
-      connected: Boolean(snapshot.connected),
-      audio_level_dbfs: finiteNumber(snapshot.audio_level_dbfs, -99),
-      peak_level_dbfs: finiteNumber(snapshot.peak_level_dbfs, -99),
-      elapsed_sec: Math.max(0, finiteNumber(snapshot.elapsed_sec)),
-      partial_text: String(snapshot.partial_text ?? "").slice(0, MAX_LIVE_ASR_DISPLAY_TEXT_CHARS),
-      finals: rawFinals.map(normalizeLiveAsrFinal).filter((value): value is LiveAsrFinal => value !== null),
-      last_error: String(snapshot.last_error ?? "").slice(0, MAX_LIVE_ASR_DISPLAY_TEXT_CHARS),
-      sample_rate: Math.max(0, finiteNumber(snapshot.sample_rate, 16000)),
-      channels: Math.max(0, Math.trunc(finiteNumber(snapshot.channels, 1))),
-      sample_width_bits: Math.max(0, Math.trunc(finiteNumber(snapshot.sample_width_bits, 16))),
-      endpoint_id: String(snapshot.endpoint_id ?? "").slice(0, 64),
-      route_policy: normalizeLiveAsrRoutePolicy(snapshot.route_policy),
-      selection_reason: String(snapshot.selection_reason ?? "").slice(0, MAX_LIVE_ASR_DISPLAY_TEXT_CHARS),
-      lan_health: normalizeLiveAsrLanHealth(snapshot.lan_health),
-    };
-  } catch {
+/** Reject malformed transport telemetry instead of fabricating dispatch state. */
+function normalizeExecutionTrace(message: unknown): ExecutionTrace | null {
+  if (!isBoundedRosPayload(message) || !message || typeof message !== "object" || Array.isArray(message)) {
     return null;
   }
+  const trace = message as Partial<ExecutionTrace>;
+  const sequence = Number(trace.sequence);
+  const transport = boundedTraceText(trace.transport, 16).toLowerCase();
+  const stage = boundedTraceText(trace.stage, 16).toLowerCase();
+  const retractionCommand = Number(trace.retraction_command);
+  const retractionTargetSide = Number(trace.retraction_target_side);
+  const retractionDistanceM = Number(trace.retraction_distance_m);
+  if (!Number.isSafeInteger(sequence) || sequence < 1) return null;
+  if (!EXECUTION_TRACE_TRANSPORTS.has(transport) || !EXECUTION_TRACE_STAGES.has(stage)) return null;
+  if (typeof trace.dispatch_submitted !== "boolean" || typeof trace.terminal !== "boolean") return null;
+  return {
+    stamp: trace.stamp,
+    sequence,
+    command_id: boundedTraceText(trace.command_id, 128),
+    route: boundedTraceText(trace.route, 48),
+    transport,
+    endpoint: boundedTraceText(trace.endpoint, 192),
+    stage,
+    dispatch_submitted: trace.dispatch_submitted,
+    terminal: trace.terminal,
+    evidence: boundedTraceText(trace.evidence, 48),
+    reason_code: boundedTraceText(trace.reason_code, 128),
+    retraction_command: Number.isInteger(retractionCommand)
+      && retractionCommand >= 1
+      && retractionCommand <= 6
+      ? retractionCommand
+      : 0,
+    retraction_target_side: Number.isInteger(retractionTargetSide)
+      && retractionTargetSide >= 0
+      && retractionTargetSide <= 2
+      ? retractionTargetSide
+      : 0,
+    retraction_distance_m: Number.isFinite(retractionDistanceM)
+      && retractionDistanceM >= 0
+      && retractionDistanceM <= 1
+      ? retractionDistanceM
+      : 0,
+    receivedAt: Date.now(),
+  };
 }
 
 const CAM4_TOOL_REQUEST_STATES = new Set<
@@ -594,12 +583,10 @@ const ROSBRIDGE_PREVIEW_IMAGE_QOS = {
   durability: "volatile",
 } as const;
 
-// The browser is an operator preview, not the acquisition recorder. Cap every
-// image stream at 5 FPS and keep queue_length=1 so five synchronized previews
-// plus derived overlays cannot build a rosbridge serialization backlog when a
-// tab is briefly slow or hidden. ROS/CV consumers still receive the native
-// 15 FPS topics directly.
-const CAMERA_FRAME_THROTTLE_MS = 180;
+// The surgical-stage views are the operator's live visual confirmation path.
+// Keep queue_length=1 to discard stale work if a browser falls behind, while
+// leaving throttling disabled so the source's native 15 Hz reaches the stage.
+const CAMERA_FRAME_THROTTLE_MS = 0;
 const CAMERA_STALE_AFTER_MS = 3000;
 const RUNTIME_STATE_MAX_AGE_MS = 4000;
 // An idle SimulationState checkpoint can arrive about every 2.5 seconds once
@@ -623,15 +610,15 @@ const INTERNAL_CAMERA_TOPICS: RawCameraTopicMap = {
 
 const EXTERNAL_CAMERA_TOPICS: RawCameraTopicMap = {
   cam1: import.meta.env.VITE_EXTERNAL_CAM1_TOPIC?.trim()
-    || "/preview/cam_1/color/image_raw/compressed",
+    || "/synced/cam_1/color/image_raw/compressed",
   cam2: import.meta.env.VITE_EXTERNAL_CAM2_TOPIC?.trim()
-    || "/preview/cam_2/color/image_raw/compressed",
+    || "/synced/cam_2/color/image_raw/compressed",
   cam3: import.meta.env.VITE_EXTERNAL_CAM3_TOPIC?.trim()
-    || "/preview/cam_3/color/image_raw/compressed",
+    || "/synced/cam_3/color/image_raw/compressed",
   cam4: import.meta.env.VITE_EXTERNAL_CAM4_TOPIC?.trim()
-    || "/preview/cam_4/color/image_raw/compressed",
+    || "/synced/cam_4/color/image_raw/compressed",
   flir: import.meta.env.VITE_EXTERNAL_FLIR_TOPIC?.trim()
-    || "/preview/flir/color/image_raw/compressed",
+    || "/synced/flir/color/image_raw/compressed",
 };
 
 function rawCameraTopicsForMode(runtimeMode: TaskplannerRuntimeMode): RawCameraTopicMap {
@@ -644,8 +631,9 @@ function configurePreviewImageSubscription(topic: any): void {
   // roslib 1.4.1 does not expose rosbridge's per-subscription QoS option.
   // Decorate its connection command so the same preview QoS request is also
   // replayed after a WebSocket reconnect. This is used only for the five
-  // browser-only physical-camera previews.  Acquisition and perception retain
-  // their full-rate `/synced` subscriptions outside rosbridge.
+  // browser-only physical-camera previews. Acquisition and perception keep
+  // their own independent subscriptions; this path only displays the latest
+  // frame from the VIPLab `/synced` contract.
   const sendOnConnection = topic.callForSubscribeAndAdvertise.bind(topic);
   topic.callForSubscribeAndAdvertise = (request: Record<string, unknown>) => {
     sendOnConnection(
@@ -654,50 +642,6 @@ function configurePreviewImageSubscription(topic: any): void {
         : request,
     );
   };
-}
-
-export type PerceptionLayerHealth = {
-  received: boolean;
-  enabled: boolean;
-  connected: boolean;
-  status: string;
-  latencyMs: number;
-  lastError: string;
-};
-
-const DEFAULT_PERCEPTION_HEALTH: PerceptionLayerHealth = {
-  received: false,
-  enabled: false,
-  connected: false,
-  status: "unavailable",
-  latencyMs: 0,
-  lastError: "",
-};
-
-function normalizePerceptionHealth(
-  message: unknown,
-): PerceptionLayerHealth {
-  const raw = (message as RosString | null)?.data;
-  if (!raw || raw.length > MAX_ROS_JSON_PAYLOAD_CHARS) return DEFAULT_PERCEPTION_HEALTH;
-  try {
-    const parsed = JSON.parse(raw) as Record<string, unknown>;
-    if (!isBoundedRosPayload(parsed)) return DEFAULT_PERCEPTION_HEALTH;
-    if (parsed.schema !== "taskplanner.rfdetr_health.v1") {
-      return DEFAULT_PERCEPTION_HEALTH;
-    }
-    return {
-      received: true,
-      enabled: Boolean(parsed.enabled),
-      connected: Boolean(parsed.connected),
-      status: String(parsed.status || "unknown"),
-      latencyMs: Number.isFinite(Number(parsed.latency_ms))
-        ? Number(parsed.latency_ms)
-        : 0,
-      lastError: String(parsed.last_error || ""),
-    };
-  } catch {
-    return DEFAULT_PERCEPTION_HEALTH;
-  }
 }
 
 type ShadowTranscriptHistory = {
@@ -819,141 +763,6 @@ function unsubscribeWhileConnected(ros: any, topics: any[]): void {
   });
 }
 
-function normalizeBedRobotArmState(message: unknown): BedRobotArmState | null {
-  if (!message || typeof message !== "object") return null;
-  const arm = message as Partial<BedRobotArmState>;
-  const armId = String(arm.arm_id || "").trim();
-  if (!armId || String(arm.role || "").trim().toLowerCase() !== "retraction") {
-    return null;
-  }
-  return {
-    arm_id: armId,
-    role: "retraction",
-    role_instance_id: String(arm.role_instance_id || "").trim(),
-    state: String(arm.state || "unknown").trim().toLowerCase(),
-    direct_teach_active: Boolean(arm.direct_teach_active),
-    reason_code: String(arm.reason_code || "").trim(),
-  };
-}
-
-function normalizeBedRobotArmStates(message: unknown): BedRobotArmState[] {
-  if (!Array.isArray(message)) return [];
-  return message
-    .map((arm) => normalizeBedRobotArmState(arm))
-    .filter((arm): arm is BedRobotArmState => arm !== null);
-}
-
-const BED_ROBOT_ARM_STATES = new Set([
-  "standby",
-  "direct_teach",
-  "retracting",
-  "changing_tool",
-  "moving_to_standby",
-  "fault",
-  "protective_stop",
-  "unknown",
-]);
-
-const BED_ROBOT_PROCEDURE_LAYOUTS: Record<string, ReadonlySet<string>> = {
-  thyroidectomy: new Set(["army_navy"]),
-  nephrectomy: new Set(["left_malleable", "right_malleable"]),
-};
-
-const BED_ROBOT_STATUS_MAX_AGE_MS = 3000;
-
-type ValidatedBedRobotArmStatus = {
-  stampMs: number;
-  receivedAtMs: number;
-  revision: number;
-  procedureType: string;
-  arms: BedRobotArmState[];
-};
-
-function canonicalBedRobotProcedure(procedureId: string): string {
-  const normalized = procedureId.trim().toLowerCase();
-  if (normalized === "thyroidectomy" || normalized === "thyroidectomy_demo") {
-    return "thyroidectomy";
-  }
-  return normalized === "nephrectomy" ? normalized : "";
-}
-
-function rosTimeToMilliseconds(stamp: BedRobotArmStateArray["stamp"] | undefined): number | null {
-  const sec = Number(stamp?.sec);
-  const nanosec = Number(stamp?.nanosec);
-  if (
-    !Number.isSafeInteger(sec) ||
-    sec < 0 ||
-    !Number.isInteger(nanosec) ||
-    nanosec < 0 ||
-    nanosec >= 1_000_000_000
-  ) {
-    return null;
-  }
-  return sec * 1000 + nanosec / 1_000_000;
-}
-
-function normalizeBedRobotArmStatus(message: unknown): ValidatedBedRobotArmStatus | null {
-  if (!isBoundedRosPayload(message) || !message || typeof message !== "object") return null;
-  const status = message as Partial<BedRobotArmStateArray>;
-  const procedureType = String(status.procedure_type || "").trim().toLowerCase();
-  const expectedRoles = BED_ROBOT_PROCEDURE_LAYOUTS[procedureType];
-  const stampMs = rosTimeToMilliseconds(status.stamp);
-  const revision = Number(status.revision);
-  if (
-    !expectedRoles ||
-    !Array.isArray(status.arms) ||
-    stampMs === null ||
-    stampMs <= 0 ||
-    !Number.isSafeInteger(revision) ||
-    revision < 0
-  ) {
-    return null;
-  }
-
-  const arms = normalizeBedRobotArmStates(status.arms);
-  if (arms.length !== status.arms.length || arms.length !== expectedRoles.size) {
-    return null;
-  }
-  const armIds = new Set<string>();
-  const roles = new Set<string>();
-  for (const arm of arms) {
-    if (
-      !new Set(["arm_1", "arm_2"]).has(arm.arm_id) ||
-      armIds.has(arm.arm_id) ||
-      !expectedRoles.has(arm.role_instance_id) ||
-      roles.has(arm.role_instance_id) ||
-      !BED_ROBOT_ARM_STATES.has(arm.state) ||
-      arm.direct_teach_active !== (arm.state === "direct_teach")
-    ) {
-      return null;
-    }
-    armIds.add(arm.arm_id);
-    roles.add(arm.role_instance_id);
-  }
-  return roles.size === expectedRoles.size
-    ? { stampMs, receivedAtMs: Date.now(), revision, procedureType, arms }
-    : null;
-}
-
-function sameBedRobotArmState(
-  left: BedRobotArmState[],
-  right: BedRobotArmState[],
-): boolean {
-  if (left.length !== right.length) return false;
-  const leftById = new Map(left.map((arm) => [arm.arm_id, arm]));
-  return right.every((arm) => {
-    const previous = leftById.get(arm.arm_id);
-    return Boolean(
-      previous &&
-      previous.role === arm.role &&
-      previous.role_instance_id === arm.role_instance_id &&
-      previous.state === arm.state &&
-      previous.direct_teach_active === arm.direct_teach_active &&
-      previous.reason_code === arm.reason_code,
-    );
-  });
-}
-
 function normalizeSimulationState(message: unknown): SimulationState {
   if (!isBoundedRosPayload(message)) return DEFAULT_STATE;
   const state = message && typeof message === "object" ? (message as Partial<SimulationState>) : {};
@@ -1028,7 +837,7 @@ function isNonNegativeInteger(value: unknown): value is number {
   return isFiniteNonNegativeNumber(value) && Number.isInteger(value);
 }
 
-function isRosTime(value: unknown): boolean {
+function isRosTime(value: unknown): value is RosTime {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const stamp = value as Partial<RosTime>;
   return typeof stamp.sec === "number"
@@ -1037,6 +846,7 @@ function isRosTime(value: unknown): boolean {
     && isNonNegativeInteger(stamp.nanosec)
     && stamp.nanosec < 1_000_000_000;
 }
+
 
 function isAuthoritativeSimulationState(message: unknown): boolean {
   if (!isBoundedRosPayload(message) || !message || typeof message !== "object" || Array.isArray(message)) return false;
@@ -1100,26 +910,76 @@ function isAuthoritativeShadowReplayState(message: unknown): boolean {
 function normalizeWorldState(message: unknown): WorldState {
   if (!isBoundedRosPayload(message)) return DEFAULT_WORLD_STATE;
   const state = message && typeof message === "object" ? (message as Partial<WorldState>) : {};
+  const implicitRequestConfidence = Number(state.implicit_request_confidence);
+  const implicitRequestStabilitySec = Number(state.implicit_request_stability_sec);
+  const implicitRequestGeneration = Number(state.implicit_request_generation);
   return {
     ...DEFAULT_WORLD_STATE,
     ...state,
+    implicit_request_visible: state.implicit_request_visible === true,
+    implicit_request_tool: typeof state.implicit_request_tool === "string"
+      ? state.implicit_request_tool.trim()
+      : "",
+    implicit_request_hand_pose: typeof state.implicit_request_hand_pose === "string"
+      ? state.implicit_request_hand_pose.trim()
+      : "",
+    implicit_request_confidence:
+      Number.isFinite(implicitRequestConfidence)
+      && implicitRequestConfidence >= 0
+      && implicitRequestConfidence <= 1
+        ? implicitRequestConfidence
+        : 0,
+    implicit_request_stability_sec:
+      Number.isFinite(implicitRequestStabilitySec) && implicitRequestStabilitySec >= 0
+        ? implicitRequestStabilitySec
+        : 0,
+    implicit_request_generation:
+      Number.isSafeInteger(implicitRequestGeneration) && implicitRequestGeneration >= 0
+        ? implicitRequestGeneration
+        : 0,
     bed_robot_arms: normalizeBedRobotArmStates(state.bed_robot_arms),
+    ranked_tool_predictions: normalizeRankedToolPredictions(state.ranked_tool_predictions),
   };
 }
 
-export type OverrideAck = {
-  eventType: string;
-  toolId: string;
-  message: string;
-  voiceText?: string;
-};
-
-export type OverridePayload = {
-  eventType: "request_tool" | "voice_request" | "return_tool";
-  requestedTool: string;
-  voiceText: string;
-  toolLabel: string;
-};
+function normalizeRankedToolPredictions(message: unknown): RankedToolPrediction[] {
+  if (!Array.isArray(message)) return [];
+  const seenRanks = new Set<number>();
+  const seenTools = new Set<string>();
+  const rows: RankedToolPrediction[] = [];
+  for (const value of message.slice(0, 24)) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+    const row = value as Partial<RankedToolPrediction>;
+    const rank = Number(row.rank);
+    const instrumentId = String(row.instrument_id || "").trim();
+    const confidence = Number(row.confidence);
+    const stabilitySec = Number(row.stability_sec);
+    if (
+      !Number.isInteger(rank)
+      || rank < 1
+      || rank > 3
+      || !instrumentId
+      || !Number.isFinite(confidence)
+      || confidence < 0
+      || confidence > 1
+      || !Number.isFinite(stabilitySec)
+      || stabilitySec < 0
+      || seenRanks.has(rank)
+      || seenTools.has(instrumentId)
+    ) {
+      continue;
+    }
+    seenRanks.add(rank);
+    seenTools.add(instrumentId);
+    rows.push({
+      rank,
+      instrument_id: instrumentId,
+      confidence,
+      stability_sec: stabilitySec,
+    });
+  }
+  return rows.sort((left, right) => left.rank - right.rank).slice(0, 3);
+}
 
 export type ControlCommand = "start" | "pause" | "resume" | "stop" | "reset";
 export type ShadowReplayMode = "realtime_1x" | "elastic_demo";
@@ -1128,13 +988,13 @@ export type RuntimeAuthorityStatus =
   | "connecting"
   | "waiting"
   | "ready"
+  // The runtime controller has deliberately withheld the bridge connection
+  // because the selected UI mode does not match the running runtime.
+  | "blocked"
   | "invalid"
   | "stale"
   | "reconnecting"
   | "offline";
-
-const ROS_PARAM_BOOL = 1;
-const ROS_PARAM_STRING = 4;
 
 function mimeTypeFromCompressedFormat(format: string): string {
   const normalized = format.toLowerCase();
@@ -1166,11 +1026,16 @@ function compressedImageToFrame(message: RosCompressedImage, topic: string): Com
   const mimeType = mimeTypeFromCompressedFormat(format);
   const base64 = typeof data === "string" ? data : byteArrayToBase64(data);
   const src = base64.startsWith("data:") ? base64 : `data:${mimeType};base64,${base64}`;
+  const headerStamp = message.header?.stamp;
+  const sourceStampSec = isRosTime(headerStamp)
+    ? headerStamp.sec + headerStamp.nanosec / 1_000_000_000
+    : undefined;
   return {
     src,
     format,
     topic,
     frameId: message.header?.frame_id || "",
+    sourceStampSec,
     sizeBytes,
     receivedAt: Date.now(),
   };
@@ -1192,90 +1057,21 @@ function runtimeStatusMessage(state: SimulationState): string {
   return "";
 }
 
-function normalizeProviderStatus(value: unknown): ModelProviderStatus | null {
-  if (!value || typeof value !== "object") return null;
-  const row = value as Record<string, unknown>;
-  const providerId = String(row.provider_id || "").trim();
-  if (!providerId) return null;
-  return {
-    provider_id: providerId.slice(0, 512),
-    provider_name: String(row.provider_name || providerId).slice(0, 512),
-    endpoint: String(row.endpoint || "").slice(0, 2_048),
-    reachable: Boolean(row.reachable),
-    status: String(row.status || "").slice(0, 128),
-    detail: String(row.detail || "").slice(0, 4_096),
-    latency_sec: Number(row.latency_sec || 0),
-    model_count: Number(row.model_count || 0),
-  };
-}
-
-function normalizeModelEntry(value: unknown): ModelCatalogEntry | null {
-  if (!value || typeof value !== "object") return null;
-  const row = value as Record<string, unknown>;
-  const providerId = String(row.provider_id || "").trim();
-  const modelId = String(row.model_id || "").trim();
-  if (!providerId || !modelId) return null;
-  const availableActions = Array.isArray(row.available_actions)
-    ? row.available_actions
-        .map((command) => String(command))
-        .filter(
-          (command): command is ModelRuntimeCommand =>
-            command === "load" ||
-            command === "unload" ||
-            command === "sleep" ||
-            command === "wake",
-        )
-    : [];
-  return {
-    provider_id: providerId.slice(0, 512),
-    provider_name: String(row.provider_name || providerId).slice(0, 512),
-    model_id: modelId.slice(0, 512),
-    display_name: String(row.display_name || modelId).slice(0, 1_024),
-    capability: String(row.capability || "unknown").slice(0, 128),
-    load_state: String(row.load_state || "unknown").slice(0, 128),
-    selectable: row.selectable === undefined ? true : Boolean(row.selectable),
-    detail: String(row.detail || "").slice(0, 4_096),
-    runtime_managed: Boolean(row.runtime_managed),
-    available_actions: availableActions,
-  };
-}
-
-function legacyCatalog(modelIds: string[], providerName: string) {
-  const provider: ModelProviderStatus = {
-    provider_id: "legacy",
-    provider_name: providerName,
-    endpoint: "",
-    reachable: true,
-    status: "online",
-    detail: "Legacy single-provider catalog",
-    latency_sec: 0,
-    model_count: modelIds.length,
-  };
-  const models: ModelCatalogEntry[] = modelIds.map((modelId) => ({
-    provider_id: provider.provider_id,
-    provider_name: provider.provider_name,
-    model_id: modelId,
-    display_name: modelId,
-    capability: "unknown",
-    load_state: "unknown",
-    selectable: true,
-    detail: "",
-    runtime_managed: false,
-    available_actions: [],
-  }));
-  return { provider, models };
-}
-
 export function useRosBridge(
   runtimeMode: TaskplannerRuntimeMode,
   connectEnabled = true,
   connectionPending = false,
+  connectionBlocked = false,
+  observationProfile: MissionObservationProfile = "extended",
 ) {
+  const subscriptionPlan = missionSubscriptionPlan(runtimeMode, observationProfile);
   const [url, setUrl] = useState(() => runtimeBridgeUrl(runtimeMode));
   const [transportConnected, setTransportConnected] = useState(false);
   const [connected, setConnected] = useState(false);
   const [runtimeAuthorityStatus, setRuntimeAuthorityStatus] =
-    useState<RuntimeAuthorityStatus>(connectEnabled ? "connecting" : "offline");
+    useState<RuntimeAuthorityStatus>(
+      connectEnabled ? "connecting" : connectionBlocked ? "blocked" : "offline",
+    );
   const [bundle, setBundle] = useState("");
   const [startPhase, setStartPhase] = useState("");
   const [simulationState, setSimulationState] = useState<SimulationState>(DEFAULT_STATE);
@@ -1286,15 +1082,22 @@ export function useRosBridge(
   const [surgeonLlmDecision, setSurgeonLlmDecision] = useState<SurgeonLLMDecision>(DEFAULT_SURGEON_LLM_DECISION);
   const [btDecision, setBtDecision] = useState<BTDecision>(DEFAULT_BT_DECISION);
   const [skillStatus, setSkillStatus] = useState<SkillStatus>(DEFAULT_SKILL_STATUS);
+  const [skillStatusByCommand, setSkillStatusByCommand] = useState<
+    Record<string, SkillStatus>
+  >({});
+  const [executionTraces, setExecutionTraces] = useState<ExecutionTrace[]>([]);
   const [vlmHealth, setVlmHealth] = useState<VLMHealth>(DEFAULT_VLM_HEALTH);
   const [inputSourceStatuses, setInputSourceStatuses] = useState<
     Record<string, InputSourceStatus>
   >({});
   const [vlmResult, setVlmResult] = useState<VLMResult>(DEFAULT_VLM_RESULT);
+  const [vlmRequestToolDetectionEvidence, setVlmRequestToolDetectionEvidence] =
+    useState<VlmRequestToolDetectionEvidence | null>(null);
+  const [typedRfdetrToolDetections, setTypedRfdetrToolDetections] =
+    useState<TypedRfdetrToolDetections>({});
   const [cam4ToolRequest, setCam4ToolRequest] =
     useState<Cam4ToolRequestObservation>(DEFAULT_CAM4_TOOL_REQUEST);
   const [vlmReducerDecisions, setVlmReducerDecisions] = useState<VLMReducerDecision[]>([]);
-  const [vlmImage, setVlmImage] = useState<CompressedImageFrame | null>(null);
   const [vlmCompositeImage, setVlmCompositeImage] =
     useState<CompressedImageFrame | null>(null);
   const [cam1Image, setCam1Image] = useState<CompressedImageFrame | null>(null);
@@ -1302,16 +1105,6 @@ export function useRosBridge(
   const [cam3Image, setCam3Image] = useState<CompressedImageFrame | null>(null);
   const [cam4Image, setCam4Image] = useState<CompressedImageFrame | null>(null);
   const [flirImage, setFlirImage] = useState<CompressedImageFrame | null>(null);
-  const [cam4PerceptionImage, setCam4PerceptionImage] =
-    useState<CompressedImageFrame | null>(null);
-  const [flirPerceptionImage, setFlirPerceptionImage] =
-    useState<CompressedImageFrame | null>(null);
-  const [cam4PerceptionOverlay, setCam4PerceptionOverlay] =
-    useState<CompressedImageFrame | null>(null);
-  const [flirPerceptionOverlay, setFlirPerceptionOverlay] =
-    useState<CompressedImageFrame | null>(null);
-  const [perceptionHealth, setPerceptionHealth] =
-    useState<PerceptionLayerHealth>(DEFAULT_PERCEPTION_HEALTH);
   const [vlmHealthReceivedAt, setVlmHealthReceivedAt] = useState<number | null>(null);
   const [vlmResultReceivedAt, setVlmResultReceivedAt] = useState<number | null>(null);
   const [vlmModelOptions, setVlmModelOptions] = useState<ModelCatalogEntry[]>([]);
@@ -1325,7 +1118,6 @@ export function useRosBridge(
   const [events, setEvents] = useState<SimulationEvent[]>([]);
   const [actionPending, setActionPending] = useState("");
   const [actionMessage, setActionMessage] = useState("Ready.");
-  const [overrideAck, setOverrideAck] = useState<OverrideAck | null>(null);
   const [actorEnabled, setActorEnabledState] = useState(false);
   const [actorEnabledKnown, setActorEnabledKnown] = useState(false);
   const [shadowReplayState, setShadowReplayState] = useState<ShadowReplayState>(
@@ -1341,14 +1133,27 @@ export function useRosBridge(
   const [liveAsrStatusBridgeUrl, setLiveAsrStatusBridgeUrl] = useState("");
   const [liveAsrControlPending, setLiveAsrControlPending] = useState("");
   const [liveAsrControlMessage, setLiveAsrControlMessage] = useState("");
+  const [integrationReadiness, setIntegrationReadiness] =
+    useState<IntegrationReadiness | null>(DEFAULT_INTEGRATION_READINESS);
+  const [integrationReadinessReceivedAt, setIntegrationReadinessReceivedAt] =
+    useState<number | null>(null);
+  const [integrationReadinessBridgeUrl, setIntegrationReadinessBridgeUrl] =
+    useState("");
+  const [executionRouteState, setExecutionRouteState] =
+    useState<ExecutionRouteState | null>(null);
+  const [executionRouteStateReceivedAt, setExecutionRouteStateReceivedAt] =
+    useState<number | null>(null);
+  const [executionRouteTransition, setExecutionRouteTransition] =
+    useState<ExecutionRouteTransition>({ state: "idle", message: "" });
+  const [scenarioRevision, setScenarioRevision] = useState<ScenarioRevisionState>(
+    EMPTY_SCENARIO_REVISION_STATE,
+  );
 
   const rosRef = useRef<unknown>(null);
   const simulationStateRef = useRef<SimulationState>(DEFAULT_STATE);
   const shadowReplayStateRef = useRef<ShadowReplayState>(
     DEFAULT_SHADOW_REPLAY_STATE,
   );
-  const perceptionHealthReceivedRef = useRef(false);
-  const perceptionEnabledRef = useRef(false);
   const cam4ToolRequestRef = useRef<Cam4ToolRequestObservation>(
     DEFAULT_CAM4_TOOL_REQUEST,
   );
@@ -1372,9 +1177,23 @@ export function useRosBridge(
   const actorPolicyRevisionRef = useRef(0);
   const controlRunIdRef = useRef(0);
   const controlInFlightRef = useRef(false);
+  const priorityStopInFlightRef = useRef(false);
   const bundleApplyRunIdRef = useRef(0);
+  const scenarioRevisionRef = useRef<ScenarioRevisionState>(
+    EMPTY_SCENARIO_REVISION_STATE,
+  );
+  const bundlePreviewInFlightRef = useRef(false);
   const liveAsrControlRunIdRef = useRef(0);
   const liveAsrControlInFlightRef = useRef(false);
+  const liveAsrStatusRef = useRef<LiveAsrStatus>(DEFAULT_LIVE_ASR_STATUS);
+  const liveAsrStatusReceivedAtRef = useRef(0);
+  const integrationReadinessRef = useRef<IntegrationReadiness | null>(
+    DEFAULT_INTEGRATION_READINESS,
+  );
+  const integrationReadinessReceivedAtRef = useRef(0);
+  const executionRouteStateRef = useRef<ExecutionRouteState | null>(null);
+  const executionRouteStateReceivedAtRef = useRef(0);
+  const executionRouteRunIdRef = useRef(0);
   const pendingCameraFramesRef = useRef(
     new Map<
       (frame: CompressedImageFrame | null) => void,
@@ -1383,17 +1202,49 @@ export function useRosBridge(
   );
   const cameraFlushFrameRef = useRef<number | null>(null);
 
-  const activeBundle = bundle || simulationState.active_bundle;
+  // A locally selected preview candidate must never replace the bundle that
+  // the server says is active on the stage or execution projections.
+  const activeBundle =
+    simulationState.active_bundle || simulationState.procedure_id || "";
+
+  function updateScenarioRevision(next: ScenarioRevisionState) {
+    scenarioRevisionRef.current = next;
+    setScenarioRevision(next);
+  }
+
+  useEffect(() => {
+    if (connected) return;
+    bundleApplyRunIdRef.current += 1;
+    bundlePreviewInFlightRef.current = false;
+    updateScenarioRevision(EMPTY_SCENARIO_REVISION_STATE);
+  }, [connected, url]);
 
   useEffect(() => {
     if (runtimeMode === "live") return;
     liveAsrControlRunIdRef.current += 1;
     liveAsrControlInFlightRef.current = false;
+    liveAsrStatusRef.current = DEFAULT_LIVE_ASR_STATUS;
+    liveAsrStatusReceivedAtRef.current = 0;
     setLiveAsrStatus(DEFAULT_LIVE_ASR_STATUS);
     setLiveAsrStatusReceivedAt(null);
     setLiveAsrStatusBridgeUrl("");
     setLiveAsrControlPending("");
     setLiveAsrControlMessage("");
+  }, [runtimeMode]);
+
+  useEffect(() => {
+    if (runtimeMode === "live") return;
+    integrationReadinessRef.current = DEFAULT_INTEGRATION_READINESS;
+    integrationReadinessReceivedAtRef.current = 0;
+    setIntegrationReadiness(DEFAULT_INTEGRATION_READINESS);
+    setIntegrationReadinessReceivedAt(null);
+    setIntegrationReadinessBridgeUrl("");
+    executionRouteRunIdRef.current += 1;
+    executionRouteStateRef.current = null;
+    executionRouteStateReceivedAtRef.current = 0;
+    setExecutionRouteState(null);
+    setExecutionRouteStateReceivedAt(null);
+    setExecutionRouteTransition({ state: "idle", message: "" });
   }, [runtimeMode]);
 
   useLayoutEffect(() => {
@@ -1402,6 +1253,10 @@ export function useRosBridge(
     // controller is still checking (or while it is switching modes).
     if (!connectEnabled || url !== runtimeBridgeUrl(runtimeMode)) return;
 
+    const activeSubscriptionPlan = missionSubscriptionPlan(
+      runtimeMode,
+      observationProfile,
+    );
     let disposed = false;
     let connectionTimer: number | null = null;
     let bedRobotArmExpiryTimer: number | null = null;
@@ -1419,16 +1274,23 @@ export function useRosBridge(
     actionRunIdRef.current += 1;
     actionInFlightRef.current = false;
     controlRunIdRef.current += 1;
+    controlInFlightRef.current = false;
+    priorityStopInFlightRef.current = false;
     bundleApplyRunIdRef.current += 1;
     liveAsrControlRunIdRef.current += 1;
     liveAsrControlInFlightRef.current = false;
+    liveAsrStatusRef.current = DEFAULT_LIVE_ASR_STATUS;
+    liveAsrStatusReceivedAtRef.current = 0;
+    executionRouteRunIdRef.current += 1;
     simulationStateRef.current = DEFAULT_STATE;
     shadowReplayStateRef.current = DEFAULT_SHADOW_REPLAY_STATE;
+    integrationReadinessRef.current = DEFAULT_INTEGRATION_READINESS;
+    integrationReadinessReceivedAtRef.current = 0;
+    executionRouteStateRef.current = null;
+    executionRouteStateReceivedAtRef.current = 0;
     bedRobotArmStatusRef.current = null;
     cam4ToolRequestRef.current = DEFAULT_CAM4_TOOL_REQUEST;
     shadowGroundTruthRef.current = DEFAULT_SHADOW_GROUND_TRUTH;
-    perceptionHealthReceivedRef.current = false;
-    perceptionEnabledRef.current = false;
     bundleDirtyRef.current = false;
     setTransportConnected(false);
     setConnected(false);
@@ -1442,16 +1304,18 @@ export function useRosBridge(
     setSurgeonLlmDecision(DEFAULT_SURGEON_LLM_DECISION);
     setBtDecision(DEFAULT_BT_DECISION);
     setSkillStatus(DEFAULT_SKILL_STATUS);
+    setSkillStatusByCommand({});
     setVlmHealth(DEFAULT_VLM_HEALTH);
     setInputSourceStatuses({});
     setVlmResult(DEFAULT_VLM_RESULT);
+    setVlmRequestToolDetectionEvidence(null);
+    setTypedRfdetrToolDetections({});
     setVlmReducerDecisions([]);
     setVlmHealthReceivedAt(null);
     setVlmResultReceivedAt(null);
     setEvents([]);
     setActionPending("");
     setActionMessage("Connecting to ROS bridge...");
-    setOverrideAck(null);
     setShadowReplayState(DEFAULT_SHADOW_REPLAY_STATE);
     setShadowTranscript([]);
     setShadowGroundTruth(DEFAULT_SHADOW_GROUND_TRUTH);
@@ -1460,14 +1324,14 @@ export function useRosBridge(
     setCam3Image(null);
     setCam4Image(null);
     setFlirImage(null);
-    setVlmImage(null);
     setVlmCompositeImage(null);
-    setCam4PerceptionImage(null);
-    setFlirPerceptionImage(null);
-    setCam4PerceptionOverlay(null);
-    setFlirPerceptionOverlay(null);
-    setPerceptionHealth(DEFAULT_PERCEPTION_HEALTH);
     setCam4ToolRequest(DEFAULT_CAM4_TOOL_REQUEST);
+    setIntegrationReadiness(DEFAULT_INTEGRATION_READINESS);
+    setIntegrationReadinessReceivedAt(null);
+    setIntegrationReadinessBridgeUrl("");
+    setExecutionRouteState(null);
+    setExecutionRouteStateReceivedAt(null);
+    setExecutionRouteTransition({ state: "idle", message: "" });
     const ros = new ROSLIB.Ros();
     const isCurrentGeneration = () =>
       !disposed && bridgeGenerationRef.current === generation;
@@ -1528,14 +1392,22 @@ export function useRosBridge(
       actionInFlightRef.current = false;
       controlRunIdRef.current += 1;
       controlInFlightRef.current = false;
+      priorityStopInFlightRef.current = false;
       bundleApplyRunIdRef.current += 1;
       liveAsrControlRunIdRef.current += 1;
       liveAsrControlInFlightRef.current = false;
+      liveAsrStatusRef.current = DEFAULT_LIVE_ASR_STATUS;
+      liveAsrStatusReceivedAtRef.current = 0;
+      executionRouteRunIdRef.current += 1;
       for (const cancel of Array.from(pendingServiceCancelsRef.current)) {
         cancel(message);
       }
       simulationStateRef.current = DEFAULT_STATE;
       shadowReplayStateRef.current = DEFAULT_SHADOW_REPLAY_STATE;
+      integrationReadinessRef.current = DEFAULT_INTEGRATION_READINESS;
+      integrationReadinessReceivedAtRef.current = 0;
+      executionRouteStateRef.current = null;
+      executionRouteStateReceivedAtRef.current = 0;
       simulationStateReceivedAtRef.current = 0;
       shadowReplayStateReceivedAtRef.current = 0;
       setTransportConnected(false);
@@ -1547,6 +1419,9 @@ export function useRosBridge(
       setWorldState(DEFAULT_WORLD_STATE);
       setShadowReplayState(DEFAULT_SHADOW_REPLAY_STATE);
       setEvents([]);
+      setVlmRequestToolDetectionEvidence(null);
+      setTypedRfdetrToolDetections({});
+      setSkillStatusByCommand({});
       setActionPending("");
       setCam1Image(null);
       setCam2Image(null);
@@ -1554,13 +1429,6 @@ export function useRosBridge(
       setCam4Image(null);
       setFlirImage(null);
       clearBedRobotArmStatus();
-      perceptionHealthReceivedRef.current = false;
-      perceptionEnabledRef.current = false;
-      setPerceptionHealth(DEFAULT_PERCEPTION_HEALTH);
-      setCam4PerceptionImage(null);
-      setFlirPerceptionImage(null);
-      setCam4PerceptionOverlay(null);
-      setFlirPerceptionOverlay(null);
       setCam4ToolRequest(DEFAULT_CAM4_TOOL_REQUEST);
       cam4ToolRequestRef.current = DEFAULT_CAM4_TOOL_REQUEST;
       setShadowGroundTruth(DEFAULT_SHADOW_GROUND_TRUTH);
@@ -1569,6 +1437,12 @@ export function useRosBridge(
       setLiveAsrStatusReceivedAt(null);
       setLiveAsrStatusBridgeUrl("");
       setLiveAsrControlPending("");
+      setIntegrationReadiness(DEFAULT_INTEGRATION_READINESS);
+      setIntegrationReadinessReceivedAt(null);
+      setIntegrationReadinessBridgeUrl("");
+      setExecutionRouteState(null);
+      setExecutionRouteStateReceivedAt(null);
+      setExecutionRouteTransition({ state: "idle", message: "" });
       setActionMessage(message);
     };
     const forceRuntimeStateReconnect = () => {
@@ -1604,9 +1478,13 @@ export function useRosBridge(
       actionInFlightRef.current = false;
       controlRunIdRef.current += 1;
       controlInFlightRef.current = false;
+      priorityStopInFlightRef.current = false;
       bundleApplyRunIdRef.current += 1;
       liveAsrControlRunIdRef.current += 1;
       liveAsrControlInFlightRef.current = false;
+      liveAsrStatusRef.current = DEFAULT_LIVE_ASR_STATUS;
+      liveAsrStatusReceivedAtRef.current = 0;
+      executionRouteRunIdRef.current += 1;
       for (const cancel of Array.from(pendingServiceCancelsRef.current)) {
         cancel(message);
       }
@@ -1614,6 +1492,10 @@ export function useRosBridge(
       shadowReplayStateReceivedAtRef.current = 0;
       simulationStateRef.current = DEFAULT_STATE;
       shadowReplayStateRef.current = DEFAULT_SHADOW_REPLAY_STATE;
+      integrationReadinessRef.current = DEFAULT_INTEGRATION_READINESS;
+      integrationReadinessReceivedAtRef.current = 0;
+      executionRouteStateRef.current = null;
+      executionRouteStateReceivedAtRef.current = 0;
       setConnected(false);
       setRuntimeAuthorityStatus("invalid");
       setBundle("");
@@ -1622,6 +1504,15 @@ export function useRosBridge(
       setWorldState(DEFAULT_WORLD_STATE);
       setShadowReplayState(DEFAULT_SHADOW_REPLAY_STATE);
       setSurgeonState(DEFAULT_SURGEON);
+      setVlmRequestToolDetectionEvidence(null);
+      setTypedRfdetrToolDetections({});
+      setSkillStatusByCommand({});
+      setIntegrationReadiness(DEFAULT_INTEGRATION_READINESS);
+      setIntegrationReadinessReceivedAt(null);
+      setIntegrationReadinessBridgeUrl("");
+      setExecutionRouteState(null);
+      setExecutionRouteStateReceivedAt(null);
+      setExecutionRouteTransition({ state: "idle", message: "" });
       setActionPending("");
       setActionMessage(message);
       scheduleRuntimeStateRecovery();
@@ -1641,14 +1532,20 @@ export function useRosBridge(
       actionInFlightRef.current = false;
       controlRunIdRef.current += 1;
       controlInFlightRef.current = false;
+      priorityStopInFlightRef.current = false;
       bundleApplyRunIdRef.current += 1;
       liveAsrControlRunIdRef.current += 1;
       liveAsrControlInFlightRef.current = false;
+      liveAsrStatusRef.current = DEFAULT_LIVE_ASR_STATUS;
+      liveAsrStatusReceivedAtRef.current = 0;
       for (const cancel of Array.from(pendingServiceCancelsRef.current)) {
         cancel("Runtime state heartbeat expired before the service response arrived.");
       }
       setConnected(false);
       setRuntimeAuthorityStatus("stale");
+      setVlmRequestToolDetectionEvidence(null);
+      setTypedRfdetrToolDetections({});
+      setSkillStatusByCommand({});
       setActionPending("");
       setActionMessage("Runtime state heartbeat expired. Waiting for a fresh state...");
       if (runtimeMode === "shadow") {
@@ -1727,11 +1624,13 @@ export function useRosBridge(
       name: "/surgeon/state",
       messageType: "surgical_msgs/msg/SurgeonState",
     });
-    const surgeonLlmDecisionTopic = new ROSLIB.Topic({
-      ros,
-      name: "/surgeon/llm_decision",
-      messageType: "surgical_msgs/msg/SurgeonLLMDecision",
-    });
+    const surgeonLlmDecisionTopic = activeSubscriptionPlan.surgeonLlmDecision
+      ? new ROSLIB.Topic({
+          ros,
+          name: "/surgeon/llm_decision",
+          messageType: "surgical_msgs/msg/SurgeonLLMDecision",
+        })
+      : null;
     const btDecisionTopic = new ROSLIB.Topic({
       ros,
       name: "/bt/decision",
@@ -1741,6 +1640,11 @@ export function useRosBridge(
       ros,
       name: "/skill/status",
       messageType: "surgical_msgs/msg/SkillStatus",
+    });
+    const executionTraceTopic = new ROSLIB.Topic({
+      ros,
+      name: "/surgery/execution_trace",
+      messageType: "surgical_msgs/msg/ExecutionTrace",
     });
     const vlmHealthTopic = new ROSLIB.Topic({
       ros,
@@ -1752,71 +1656,75 @@ export function useRosBridge(
       name: "/vlm/result",
       messageType: "surgical_msgs/msg/VLMResult",
     });
-    const inputSourceStatusTopics = ["flir", "cam4", "vlm", "speech"].map(
-      (sourceId) =>
-        new ROSLIB.Topic({
+    const vlmRequestContextTopic = activeSubscriptionPlan.vlmRequestContext
+      ? new ROSLIB.Topic({
           ros,
-          name: `/input/${sourceId}/status`,
-          messageType: "surgical_msgs/msg/InputSourceStatus",
-        }),
-    );
-    const vlmReducerTopic = new ROSLIB.Topic({
-      ros,
-      name: "/vlm/reducer_decisions",
-      messageType: "surgical_msgs/msg/VLMReducerDecision",
-    });
-    const vlmFieldImageTopic = new ROSLIB.Topic({
-      ros,
-      name: "/surgery/images/field/compressed",
-      messageType: "sensor_msgs/msg/CompressedImage",
-      compression: ROSBRIDGE_IMAGE_COMPRESSION,
-      throttle_rate: 100,
-      queue_length: ROSBRIDGE_IMAGE_QUEUE_LENGTH,
-    });
+          name: "/context/vlm_request_context",
+          messageType: "surgical_msgs/msg/VLMRequestContext",
+        })
+      : null;
+    const inputSourceStatusTopics = activeSubscriptionPlan.inputSourceStatuses
+      ? ["flir", "cam4", "vlm", "speech"].map(
+          (sourceId) =>
+            new ROSLIB.Topic({
+              ros,
+              name: `/input/${sourceId}/status`,
+              messageType: "surgical_msgs/msg/InputSourceStatus",
+            }),
+        )
+      : [];
+    const vlmReducerTopic = activeSubscriptionPlan.vlmReducerDecisions
+      ? new ROSLIB.Topic({
+          ros,
+          name: "/vlm/reducer_decisions",
+          messageType: "surgical_msgs/msg/VLMReducerDecision",
+        })
+      : null;
     const rawCameraTopics = rawCameraTopicsForMode(runtimeMode);
     const useExternalPreviews = runtimeMode === "live" || runtimeMode === "llm";
     const externalPreviewNames = new Set(Object.values(rawCameraTopics));
-    const cameraTopics = [
+    const rawCameraSet = new Set<MissionCameraId>(
+      activeSubscriptionPlan.rawCameras,
+    );
+    const rawCameraSubscriptions = [
       {
+        cameraId: "cam1" as const,
         name: rawCameraTopics.cam1,
         setter: setCam1Image,
       },
       {
+        cameraId: "cam2" as const,
         name: rawCameraTopics.cam2,
         setter: setCam2Image,
       },
       {
+        cameraId: "cam3" as const,
         name: rawCameraTopics.cam3,
         setter: setCam3Image,
       },
       {
+        cameraId: "cam4" as const,
         name: rawCameraTopics.cam4,
         setter: setCam4Image,
       },
       {
+        cameraId: "flir" as const,
         name: rawCameraTopics.flir,
         setter: setFlirImage,
       },
-      {
-        name: "/surgery/images/cam4/detected/compressed",
-        setter: setCam4PerceptionImage,
-      },
-      {
-        name: "/surgery/images/flir/segmented/compressed",
-        setter: setFlirPerceptionImage,
-      },
-      {
-        name: "/surgery/images/cam4/detection_overlay/compressed",
-        setter: setCam4PerceptionOverlay,
-      },
-      {
-        name: "/surgery/images/flir/segmentation_overlay/compressed",
-        setter: setFlirPerceptionOverlay,
-      },
-      {
-        name: "/surgery/images/vlm/composite/compressed",
+    ].filter(({ cameraId }) => rawCameraSet.has(cameraId));
+    const modelVisualSubscriptions = activeSubscriptionPlan.vlmModelVisual
+      ? [{
+        // This is the model-ready visual stream only. RF-DETR tool detections
+        // reach the VLM as typed CAM3/CAM4 observation facts, not painted
+        // detector pixels. Operator overlays remain on their own topics.
+        name: "/taskplanner/internal/vlm/model_visual/compressed",
         setter: setVlmCompositeImage,
-      },
+      }]
+      : [];
+    const cameraSubscriptions = [
+      ...rawCameraSubscriptions,
+      ...modelVisualSubscriptions,
     ].map(({ name, setter }) => {
       const topic = new ROSLIB.Topic({
         ros,
@@ -1829,20 +1737,8 @@ export function useRosBridge(
       if (useExternalPreviews && externalPreviewNames.has(name)) {
         configurePreviewImageSubscription(topic);
       }
-      topic.subscribe((message: unknown) => {
+      const onMessage = (message: unknown) => {
         if (!isCurrentGeneration()) return;
-        if (
-          (name === "/surgery/images/cam4/detected/compressed" ||
-            name === "/surgery/images/flir/segmented/compressed" ||
-            name ===
-              "/surgery/images/cam4/detection_overlay/compressed" ||
-            name ===
-              "/surgery/images/flir/segmentation_overlay/compressed") &&
-          perceptionHealthReceivedRef.current &&
-          !perceptionEnabledRef.current
-        ) {
-          return;
-        }
         const frame = compressedImageToFrame(
           message as RosCompressedImage,
           name,
@@ -1861,44 +1757,115 @@ export function useRosBridge(
             }
           });
         }
-      });
-      return topic;
+      };
+      return { topic, onMessage };
     });
-    const shadowReplayStateTopic = new ROSLIB.Topic({
-      ros,
-      name: "/shadow/replay_state",
-      messageType: "surgical_msgs/msg/ShadowReplayState",
-    });
-    const perceptionHealthTopic = new ROSLIB.Topic({
-      ros,
-      name: "/surgery/perception/rfdetr/health",
-      messageType: "std_msgs/msg/String",
-    });
-    const cam4SemanticsTopic = new ROSLIB.Topic({
-      ros,
-      name: "/surgery/perception/cam4/semantics/json",
-      messageType: "std_msgs/msg/String",
-    });
-    const shadowTranscriptTopic = new ROSLIB.Topic({
-      ros,
-      name: "/shadow/speech/utterance",
-      messageType: "surgical_msgs/msg/SpeechUtterance",
-    });
-    const shadowTranscriptHistoryTopic = new ROSLIB.Topic({
-      ros,
-      name: "/shadow/speech/history",
-      messageType: "std_msgs/msg/String",
-    });
-    const shadowGroundTruthTopic = new ROSLIB.Topic({
-      ros,
-      name: "/shadow/ground_truth/state",
-      messageType: "std_msgs/msg/String",
-    });
+    const cameraTopics = cameraSubscriptions.map(({ topic }) => topic);
+    const typedRfdetrToolObservationSubscriptions = rfdetrToolViewConfigs(
+      activeSubscriptionPlan.rfdetrObservationSource,
+    ).map(
+      (config) => {
+        const topic = new ROSLIB.Topic({
+          ros,
+          name: config.topic,
+          messageType: "surgical_perception_msgs/msg/ToolObservation2DArray",
+          // Detector outputs are for display only. Keep the newest completed
+          // observation instead of allowing a slow browser to accumulate its
+          // mask-bearing upstream messages.
+          throttle_rate: CAMERA_FRAME_THROTTLE_MS,
+          queue_length: ROSBRIDGE_IMAGE_QUEUE_LENGTH,
+        });
+        const onMessage = (message: unknown) => {
+          if (!isCurrentGeneration()) return;
+          const frame = normalizeTypedRfdetrToolDetections(message, config);
+          if (!frame) return;
+          startTransition(() => {
+            setTypedRfdetrToolDetections((current) => {
+              const previous = current[config.cameraId];
+              // A late DDS delivery must not repaint an older bounding box
+              // over a newer raw camera frame.
+              if (previous && frame.sourceStampSec <= previous.sourceStampSec) {
+                return current;
+              }
+              return { ...current, [config.cameraId]: frame };
+            });
+          });
+        };
+        return { topic, onMessage };
+      },
+    );
+    const typedRfdetrToolObservationTopics =
+      typedRfdetrToolObservationSubscriptions.map(({ topic }) => topic);
+    const shadowReplayStateTopic = activeSubscriptionPlan.shadowReplay
+      ? new ROSLIB.Topic({
+          ros,
+          name: "/shadow/replay_state",
+          messageType: "surgical_msgs/msg/ShadowReplayState",
+        })
+      : null;
+    const cam4SemanticsTopic = activeSubscriptionPlan.cam4Semantics
+      ? new ROSLIB.Topic({
+          ros,
+          name: "/surgery/perception/cam4/semantics/json",
+          messageType: "std_msgs/msg/String",
+        })
+      : null;
+    const shadowTranscriptTopic = activeSubscriptionPlan.shadowReplay
+      ? new ROSLIB.Topic({
+          ros,
+          name: "/shadow/speech/utterance",
+          messageType: "surgical_msgs/msg/SpeechUtterance",
+        })
+      : null;
+    const shadowTranscriptHistoryTopic = activeSubscriptionPlan.shadowReplay
+      ? new ROSLIB.Topic({
+          ros,
+          name: "/shadow/speech/history",
+          messageType: "std_msgs/msg/String",
+        })
+      : null;
+    const shadowGroundTruthTopic = activeSubscriptionPlan.shadowReplay
+      ? new ROSLIB.Topic({
+          ros,
+          name: "/shadow/ground_truth/state",
+          messageType: "std_msgs/msg/String",
+        })
+      : null;
     const liveAsrStatusTopic = new ROSLIB.Topic({
       ros,
       name: "/input/asr/runtime_status",
       messageType: "std_msgs/msg/String",
     });
+    const integrationReadinessTopic = new ROSLIB.Topic({
+      ros,
+      name: "/integration/readiness",
+      messageType: "std_msgs/msg/String",
+    });
+    const executionRouteStateTopic = new ROSLIB.Topic({
+      ros,
+      name: "/integration/execution_route/state",
+      messageType: "std_msgs/msg/String",
+    });
+
+    let heavySubscriptionsStarted = false;
+    const startHeavySubscriptions = () => {
+      if (
+        heavySubscriptionsStarted ||
+        !isCurrentGeneration() ||
+        !ros.isConnected
+      ) {
+        return;
+      }
+      heavySubscriptionsStarted = true;
+      cameraSubscriptions.forEach(({ topic, onMessage }) => {
+        topic.subscribe(onMessage);
+      });
+      typedRfdetrToolObservationSubscriptions.forEach(
+        ({ topic, onMessage }) => {
+          topic.subscribe(onMessage);
+        },
+      );
+    };
 
     simulationTopic.subscribe((message: unknown) => {
       if (!isCurrentGeneration()) return;
@@ -1926,6 +1893,7 @@ export function useRosBridge(
         setRuntimeAuthorityStatus("ready");
         setActionMessage("ROS bridge connected.");
         scheduleRuntimeStateFreshness();
+        startHeavySubscriptions();
       }
     });
     worldTopic.subscribe((message: unknown) => {
@@ -1991,7 +1959,7 @@ export function useRosBridge(
         setSurgeonState(message as SurgeonState);
       });
     });
-    surgeonLlmDecisionTopic.subscribe((message: unknown) => {
+    surgeonLlmDecisionTopic?.subscribe((message: unknown) => {
       if (!isCurrentGeneration()) return;
       if (!isBoundedRosPayload(message)) return;
       startTransition(() => {
@@ -2008,8 +1976,40 @@ export function useRosBridge(
     skillStatusTopic.subscribe((message: unknown) => {
       if (!isCurrentGeneration()) return;
       if (!isBoundedRosPayload(message)) return;
+      const status = message as SkillStatus;
+      const commandId = typeof status.command_id === "string"
+        ? status.command_id.trim()
+        : "";
       startTransition(() => {
-        setSkillStatus(message as SkillStatus);
+        setSkillStatus(status);
+        if (!commandId) return;
+        setSkillStatusByCommand((current) => {
+          // Refreshing an existing command moves it to the end so pruning is
+          // based on last status update rather than first observation.
+          const next = { ...current };
+          delete next[commandId];
+          next[commandId] = status;
+          const commandIds = Object.keys(next);
+          for (const staleCommandId of commandIds.slice(0, -MAX_SKILL_STATUS_HISTORY)) {
+            delete next[staleCommandId];
+          }
+          return next;
+        });
+      });
+    });
+    executionTraceTopic.subscribe((message: unknown) => {
+      if (!isCurrentGeneration()) return;
+      const trace = normalizeExecutionTrace(message);
+      if (!trace) return;
+      startTransition(() => {
+        setExecutionTraces((current) => {
+          if (current.some((entry) =>
+            entry.sequence === trace.sequence
+            && entry.command_id === trace.command_id
+            && entry.stage === trace.stage,
+          )) return current;
+          return [trace, ...current].slice(0, 32);
+        });
       });
     });
     vlmHealthTopic.subscribe((message: unknown) => {
@@ -2024,6 +2024,16 @@ export function useRosBridge(
       startTransition(() => {
         setVlmResult(message as VLMResult);
         setVlmResultReceivedAt(Date.now());
+      });
+    });
+    vlmRequestContextTopic?.subscribe((message: unknown) => {
+      if (!isCurrentGeneration()) return;
+      // This is an observer-only display of the facts committed to the VLM
+      // request. A malformed context clears the prior evidence rather than
+      // making stale locations look current.
+      const parsed = normalizeVlmRequestToolDetectionEvidence(message);
+      startTransition(() => {
+        setVlmRequestToolDetectionEvidence(parsed);
       });
     });
     inputSourceStatusTopics.forEach((topic) => {
@@ -2041,28 +2051,14 @@ export function useRosBridge(
         });
       });
     });
-    vlmReducerTopic.subscribe((message: unknown) => {
+    vlmReducerTopic?.subscribe((message: unknown) => {
       if (!isCurrentGeneration()) return;
       if (!isBoundedRosPayload(message)) return;
       startTransition(() => {
         setVlmReducerDecisions((current) => [message as VLMReducerDecision, ...current].slice(0, 8));
       });
     });
-    vlmFieldImageTopic.subscribe((message: unknown) => {
-      if (!isCurrentGeneration()) return;
-      if (
-        perceptionHealthReceivedRef.current &&
-        !perceptionEnabledRef.current
-      ) {
-        return;
-      }
-      const frame = compressedImageToFrame(message as RosCompressedImage, "/surgery/images/field/compressed");
-      if (!frame) return;
-      startTransition(() => {
-        setVlmImage(frame);
-      });
-    });
-    shadowReplayStateTopic.subscribe((message: unknown) => {
+    shadowReplayStateTopic?.subscribe((message: unknown) => {
       if (!isCurrentGeneration()) return;
       if (!isBoundedRosPayload(message)) return;
       if (runtimeMode === "shadow") {
@@ -2096,25 +2092,25 @@ export function useRosBridge(
         setRuntimeAuthorityStatus("ready");
         setActionMessage("ROS bridge connected.");
         scheduleRuntimeStateFreshness();
+        startHeavySubscriptions();
       }
       startTransition(() => {
         if (runChanged || replayRewound) {
           setShadowTranscript([]);
           setEvents([]);
+          setExecutionTraces([]);
+          setSkillStatusByCommand({});
           setVlmReducerDecisions([]);
           setVlmResult(DEFAULT_VLM_RESULT);
+          setVlmRequestToolDetectionEvidence(null);
+          setTypedRfdetrToolDetections({});
           setVlmResultReceivedAt(0);
-          setVlmImage(null);
           setVlmCompositeImage(null);
           setCam1Image(null);
           setCam2Image(null);
           setCam3Image(null);
           setCam4Image(null);
           setFlirImage(null);
-          setCam4PerceptionImage(null);
-          setFlirPerceptionImage(null);
-          setCam4PerceptionOverlay(null);
-          setFlirPerceptionOverlay(null);
           setCam4ToolRequest(DEFAULT_CAM4_TOOL_REQUEST);
           cam4ToolRequestRef.current = DEFAULT_CAM4_TOOL_REQUEST;
           setShadowGroundTruth(DEFAULT_SHADOW_GROUND_TRUTH);
@@ -2127,36 +2123,7 @@ export function useRosBridge(
         }
       });
     });
-    perceptionHealthTopic.subscribe((message: unknown) => {
-      if (!isCurrentGeneration()) return;
-      const health = normalizePerceptionHealth(message);
-      const wasEnabled = perceptionEnabledRef.current;
-      perceptionHealthReceivedRef.current = health.received;
-      perceptionEnabledRef.current = health.received && health.enabled;
-      setPerceptionHealth(health);
-      if (!health.received) return;
-      if (!health.enabled) {
-        setCam4PerceptionImage(null);
-        setFlirPerceptionImage(null);
-        setCam4PerceptionOverlay(null);
-        setFlirPerceptionOverlay(null);
-        setCam4ToolRequest(DEFAULT_CAM4_TOOL_REQUEST);
-        cam4ToolRequestRef.current = DEFAULT_CAM4_TOOL_REQUEST;
-        return;
-      }
-      if (health.status !== "ready" && !wasEnabled) {
-        setVlmHealth((current) => ({
-          ...current,
-          healthy: false,
-          image_source: "",
-          latency_sec: 0,
-          last_error: health.lastError || "waiting for fresh RF-DETR frame",
-          last_mode: "waiting_for_perception",
-        }));
-        setVlmHealthReceivedAt(Date.now());
-      }
-    });
-    cam4SemanticsTopic.subscribe((message: unknown) => {
+    cam4SemanticsTopic?.subscribe((message: unknown) => {
       if (!isCurrentGeneration()) return;
       const parsed = normalizeCam4ToolRequest(message);
       const previous = cam4ToolRequestRef.current;
@@ -2184,7 +2151,7 @@ export function useRosBridge(
         setCam4ToolRequest(observation);
       });
     });
-    shadowGroundTruthTopic.subscribe((message: unknown) => {
+    shadowGroundTruthTopic?.subscribe((message: unknown) => {
       if (!isCurrentGeneration()) return;
       const parsed = normalizeShadowGroundTruth(message);
       const previous = shadowGroundTruthRef.current;
@@ -2209,12 +2176,62 @@ export function useRosBridge(
         if (!isCurrentGeneration()) return;
         const parsed = normalizeLiveAsrStatus(message);
         if (!parsed) return;
+        const receivedAt = Date.now();
+        liveAsrStatusRef.current = parsed;
+        liveAsrStatusReceivedAtRef.current = receivedAt;
         setLiveAsrStatus(parsed);
-        setLiveAsrStatusReceivedAt(Date.now());
+        setLiveAsrStatusReceivedAt(receivedAt);
         setLiveAsrStatusBridgeUrl(url);
       });
+      integrationReadinessTopic.subscribe((message: unknown) => {
+        if (!isCurrentGeneration()) return;
+        const parsed = normalizeIntegrationReadiness(message);
+        if (!parsed) {
+          // A malformed or contradictory status is an active safety failure,
+          // not a reason to continue trusting the preceding heartbeat.
+          integrationReadinessRef.current = DEFAULT_INTEGRATION_READINESS;
+          integrationReadinessReceivedAtRef.current = 0;
+          setIntegrationReadiness(DEFAULT_INTEGRATION_READINESS);
+          setIntegrationReadinessReceivedAt(null);
+          setIntegrationReadinessBridgeUrl("");
+          return;
+        }
+        const receivedAt = Date.now();
+        integrationReadinessRef.current = parsed;
+        integrationReadinessReceivedAtRef.current = receivedAt;
+        setIntegrationReadiness(parsed);
+        setIntegrationReadinessReceivedAt(receivedAt);
+        setIntegrationReadinessBridgeUrl(url);
+      });
+      executionRouteStateTopic.subscribe((message: unknown) => {
+        if (!isCurrentGeneration()) return;
+        const parsed = normalizeExecutionRouteState(message);
+        if (!parsed) {
+          executionRouteStateRef.current = null;
+          executionRouteStateReceivedAtRef.current = 0;
+          setExecutionRouteState(null);
+          setExecutionRouteStateReceivedAt(null);
+          return;
+        }
+        const previous = executionRouteStateRef.current;
+        // A transient-local retained status can race a newer service response
+        // during bridge reconnect. Never regress to an older route revision.
+        if (
+          previous &&
+          (parsed.revision < previous.revision ||
+            (parsed.revision === previous.revision &&
+              parsed.initializationRevision < previous.initializationRevision))
+        ) {
+          return;
+        }
+        const receivedAt = Date.now();
+        executionRouteStateRef.current = parsed;
+        executionRouteStateReceivedAtRef.current = receivedAt;
+        setExecutionRouteState(parsed);
+        setExecutionRouteStateReceivedAt(receivedAt);
+      });
     }
-    shadowTranscriptTopic.subscribe((message: unknown) => {
+    shadowTranscriptTopic?.subscribe((message: unknown) => {
       if (!isCurrentGeneration()) return;
       if (!isBoundedRosPayload(message)) return;
       const utterance = message as SpeechUtterance;
@@ -2234,7 +2251,7 @@ export function useRosBridge(
         );
       });
     });
-    shadowTranscriptHistoryTopic.subscribe((message: unknown) => {
+    shadowTranscriptHistoryTopic?.subscribe((message: unknown) => {
       if (!isCurrentGeneration()) return;
       const history = normalizeShadowTranscriptHistory(message);
       const activeRunId = shadowReplayStateRef.current.run_id;
@@ -2266,18 +2283,35 @@ export function useRosBridge(
         commandReadyGenerationRef.current = 0;
         actionInFlightRef.current = false;
         controlInFlightRef.current = false;
+        priorityStopInFlightRef.current = false;
         liveAsrControlRunIdRef.current += 1;
         liveAsrControlInFlightRef.current = false;
+        liveAsrStatusRef.current = DEFAULT_LIVE_ASR_STATUS;
+        liveAsrStatusReceivedAtRef.current = 0;
+        executionRouteRunIdRef.current += 1;
         simulationStateReceivedAtRef.current = 0;
         shadowReplayStateReceivedAtRef.current = 0;
         simulationStateRef.current = DEFAULT_STATE;
         shadowReplayStateRef.current = DEFAULT_SHADOW_REPLAY_STATE;
+        integrationReadinessRef.current = DEFAULT_INTEGRATION_READINESS;
+        integrationReadinessReceivedAtRef.current = 0;
+        executionRouteStateRef.current = null;
+        executionRouteStateReceivedAtRef.current = 0;
         rosRef.current = null;
         setTransportConnected(false);
         setConnected(false);
         setRuntimeAuthorityStatus("offline");
         setSimulationState(DEFAULT_STATE);
+        setExecutionTraces([]);
+        setSkillStatusByCommand({});
+        setTypedRfdetrToolDetections({});
         setShadowReplayState(DEFAULT_SHADOW_REPLAY_STATE);
+        setIntegrationReadiness(DEFAULT_INTEGRATION_READINESS);
+        setIntegrationReadinessReceivedAt(null);
+        setIntegrationReadinessBridgeUrl("");
+        setExecutionRouteState(null);
+        setExecutionRouteStateReceivedAt(null);
+        setExecutionRouteTransition({ state: "idle", message: "" });
         setActionPending("");
         setActorEnabledKnown(false);
         for (const cancel of Array.from(pendingServiceCancelsRef.current)) {
@@ -2298,20 +2332,27 @@ export function useRosBridge(
         surgeonLlmDecisionTopic,
         btDecisionTopic,
         skillStatusTopic,
+        executionTraceTopic,
         vlmHealthTopic,
         vlmResultTopic,
+        vlmRequestContextTopic,
         ...inputSourceStatusTopics,
         vlmReducerTopic,
-        vlmFieldImageTopic,
         ...cameraTopics,
+        ...typedRfdetrToolObservationTopics,
         shadowReplayStateTopic,
-        perceptionHealthTopic,
         cam4SemanticsTopic,
         shadowTranscriptTopic,
         shadowTranscriptHistoryTopic,
         shadowGroundTruthTopic,
-        ...(runtimeMode === "live" ? [liveAsrStatusTopic] : []),
-      ]);
+        ...(runtimeMode === "live"
+          ? [
+              liveAsrStatusTopic,
+              integrationReadinessTopic,
+              executionRouteStateTopic,
+            ]
+          : []),
+      ].filter(Boolean));
       pendingCameraFramesRef.current.clear();
       if (cameraFlushFrameRef.current !== null) {
         window.cancelAnimationFrame(cameraFlushFrameRef.current);
@@ -2324,7 +2365,7 @@ export function useRosBridge(
       ros.close();
       if (rosRef.current === ros) rosRef.current = null;
     };
-  }, [connectEnabled, runtimeMode, url]);
+  }, [connectEnabled, observationProfile, runtimeMode, url]);
 
   useEffect(() => {
     const clearIfStale = (frame: CompressedImageFrame | null) =>
@@ -2337,17 +2378,20 @@ export function useRosBridge(
       setCam3Image(clearIfStale);
       setCam4Image(clearIfStale);
       setFlirImage(clearIfStale);
-      // VLM field/composite frames are also operator-facing evidence. Do not
+      // VLM model-visual frames are also operator-facing evidence. Do not
       // leave the last model input looking current after that publisher stops.
-      setVlmImage(clearIfStale);
       setVlmCompositeImage(clearIfStale);
-      // Derived perception frames are also operator-facing camera previews.
-      // Clear them on the same heartbeat as raw feeds so a stopped detector
-      // cannot leave the last segmentation/detection image looking current.
-      setCam4PerceptionImage(clearIfStale);
-      setFlirPerceptionImage(clearIfStale);
-      setCam4PerceptionOverlay(clearIfStale);
-      setFlirPerceptionOverlay(clearIfStale);
+      setTypedRfdetrToolDetections((current) => {
+        const staleCameraIds = (Object.keys(current) as TypedRfdetrToolViewId[])
+          .filter((cameraId) => {
+            const frame = current[cameraId];
+            return Boolean(frame && Date.now() - frame.receivedAt > CAMERA_STALE_AFTER_MS);
+          });
+        if (!staleCameraIds.length) return current;
+        const next = { ...current };
+        for (const cameraId of staleCameraIds) delete next[cameraId];
+        return next;
+      });
     }, 1000);
     return () => window.clearInterval(staleSweep);
   }, []);
@@ -2377,7 +2421,6 @@ export function useRosBridge(
   }, [simulationState.execution_state, simulationState.running, simulationState.active_bundle, simulationState.filtered_phase, bundle]);
 
   useEffect(() => {
-    setOverrideAck(null);
     const expectedProcedure = canonicalBedRobotProcedure(activeBundle);
     const currentStatus = bedRobotArmStatusRef.current;
     if (
@@ -2391,8 +2434,14 @@ export function useRosBridge(
   }, [activeBundle]);
 
   function setBundleSelection(nextBundle: string) {
+    bundleApplyRunIdRef.current += 1;
+    bundlePreviewInFlightRef.current = false;
     bundleDirtyRef.current = true;
     setBundle(nextBundle);
+    updateScenarioRevision({
+      ...EMPTY_SCENARIO_REVISION_STATE,
+      bundleName: nextBundle,
+    });
   }
 
   function runtimeStateIsFresh(): boolean {
@@ -2407,14 +2456,16 @@ export function useRosBridge(
     serviceType: string,
     request: Record<string, unknown>,
     timeoutMs = 20000,
+    options: { requireFreshRuntimeState?: boolean } = {},
   ) {
+    const requireFreshRuntimeState = options.requireFreshRuntimeState !== false;
     const generation = bridgeGenerationRef.current;
     const ros = rosRef.current as RosServiceConnection;
     if (
       !ros ||
       !ros.isConnected ||
       commandReadyGenerationRef.current !== generation ||
-      !runtimeStateIsFresh()
+      (requireFreshRuntimeState && !runtimeStateIsFresh())
     ) {
       throw new Error("ROS bridge is waiting for a fresh runtime state.");
     }
@@ -2440,7 +2491,7 @@ export function useRosBridge(
           generation !== bridgeGenerationRef.current ||
           commandReadyGenerationRef.current !== generation ||
           rosRef.current !== ros ||
-          !runtimeStateIsFresh()
+          (requireFreshRuntimeState && !runtimeStateIsFresh())
         ) {
           cancel("ROS bridge changed before the service response arrived.");
           return;
@@ -2491,69 +2542,45 @@ export function useRosBridge(
     let disposed = false;
     let refreshing = false;
 
+    if (!subscriptionPlan.modelControls) {
+      setVlmModelOptions([]);
+      setVlmProviderStatuses([]);
+      setVlmModelSelection(null);
+      setVlmModelCatalogStatus("read-only in Production Live core");
+      return () => {
+        disposed = true;
+      };
+    }
+
     async function refreshVlmModels() {
       if (!connected || refreshing) return;
       refreshing = true;
       try {
-        let response: Record<string, unknown>;
+        let projection: ModelCatalogProjection;
         try {
-          response = await callService(
-            "/real_vlm_node/list_model_catalog",
-            "surgical_msgs/srv/ListModelCatalog",
-            {},
-            10000,
+          projection = parseModelCatalogResponse(
+            await callService(
+              "/real_vlm_node/list_model_catalog",
+              "surgical_msgs/srv/ListModelCatalog",
+              {},
+              10000,
+            ),
           );
         } catch {
-          const legacyResponse = await callService(
-            "/real_vlm_node/list_models",
-            "surgical_msgs/srv/ListModels",
-            {},
-            10000,
+          projection = parseLegacyModelCatalogResponse(
+            await callService(
+              "/real_vlm_node/list_models",
+              "surgical_msgs/srv/ListModels",
+              {},
+              10000,
+            ),
           );
-          if (!Boolean(legacyResponse.success)) {
-            throw new Error(String(legacyResponse.message || "VLM model catalog unavailable."));
-          }
-          const modelIds = Array.isArray(legacyResponse.model_ids)
-            ? legacyResponse.model_ids
-              .slice(0, MAX_ROS_PAYLOAD_COLLECTION_ITEMS)
-              .map((modelId) => String(modelId).slice(0, 512))
-              .filter(Boolean)
-            : [];
-          const fallback = legacyCatalog(modelIds, "OpenAI compatible");
-          if (disposed) return;
-          setVlmModelOptions(fallback.models);
-          setVlmProviderStatuses([fallback.provider]);
-          setVlmModelSelection(
-            modelIds[0] ? { provider_id: "legacy", model_id: modelIds[0] } : null,
-          );
-          setVlmModelCatalogStatus(
-            String(legacyResponse.message || (modelIds.length ? "connected" : "empty")).slice(0, 4_096),
-          );
-          return;
         }
-        const providers = Array.isArray(response.providers)
-          ? response.providers
-              .map(normalizeProviderStatus)
-              .filter((row): row is ModelProviderStatus => row !== null)
-          : [];
-        const models = Array.isArray(response.models)
-          ? response.models
-              .map(normalizeModelEntry)
-              .filter((row): row is ModelCatalogEntry => row !== null)
-          : [];
-        const activeProviderId = String(response.active_provider_id || "").trim().slice(0, 512);
-        const activeModelId = String(response.active_model_id || "").trim().slice(0, 512);
         if (disposed) return;
-        setVlmModelOptions(models);
-        setVlmProviderStatuses(providers);
-        setVlmModelSelection(
-          activeProviderId && activeModelId
-            ? { provider_id: activeProviderId, model_id: activeModelId }
-            : null,
-        );
-        setVlmModelCatalogStatus(
-          String(response.message || (models.length ? "connected" : "empty")).slice(0, 4_096),
-        );
+        setVlmModelOptions(projection.models);
+        setVlmProviderStatuses(projection.providers);
+        setVlmModelSelection(projection.selection);
+        setVlmModelCatalogStatus(projection.status);
       } catch (error) {
         if (disposed) return;
         setVlmModelCatalogStatus(error instanceof Error ? error.message : "VLM model catalog unavailable.");
@@ -2567,7 +2594,11 @@ export function useRosBridge(
       setVlmProviderStatuses([]);
       setVlmModelSelection(null);
       setVlmModelCatalogStatus(
-        transportConnected || connectionPending ? "ROS state pending" : "ROS bridge offline",
+        connectionBlocked
+          ? "ROS access blocked by runtime-contract mismatch"
+          : transportConnected || connectionPending
+            ? "ROS state pending"
+            : "ROS bridge offline",
       );
       return () => {
         disposed = true;
@@ -2586,14 +2617,25 @@ export function useRosBridge(
       window.clearInterval(timer);
       document.removeEventListener("visibilitychange", refreshWhenVisible);
     };
-  }, [connected, connectionPending, transportConnected, url]);
+  }, [
+    connected,
+    connectionBlocked,
+    connectionPending,
+    subscriptionPlan.modelControls,
+    transportConnected,
+    url,
+  ]);
 
   useEffect(() => {
     let disposed = false;
     let refreshing = false;
     actorPolicyRevisionRef.current += 1;
     setActorEnabledKnown(false);
-    if (!connected || runtimeMode === "shadow") {
+    if (
+      !subscriptionPlan.modelControls ||
+      !connected ||
+      runtimeMode === "shadow"
+    ) {
       return () => {
         disposed = true;
       };
@@ -2616,7 +2658,7 @@ export function useRosBridge(
         if (
           !value ||
           typeof value !== "object" ||
-          Number((value as { type?: unknown }).type) !== ROS_PARAM_BOOL ||
+          Number((value as { type?: unknown }).type) !== ROS_PARAMETER_BOOL ||
           typeof (value as { bool_value?: unknown }).bool_value !== "boolean"
         ) {
           setActorEnabledKnown(false);
@@ -2644,7 +2686,7 @@ export function useRosBridge(
       window.clearInterval(timer);
       document.removeEventListener("visibilitychange", refreshWhenVisible);
     };
-  }, [connected, runtimeMode, url]);
+  }, [connected, runtimeMode, subscriptionPlan.modelControls, url]);
 
   useEffect(() => {
     let disposed = false;
@@ -2654,65 +2696,31 @@ export function useRosBridge(
       if (!connected || refreshing) return;
       refreshing = true;
       try {
-        let response: Record<string, unknown>;
+        let projection: ModelCatalogProjection;
         try {
-          response = await callService(
-            "/surgeon_actor/list_model_catalog",
-            "surgical_msgs/srv/ListModelCatalog",
-            {},
-            10000,
+          projection = parseModelCatalogResponse(
+            await callService(
+              "/surgeon_actor/list_model_catalog",
+              "surgical_msgs/srv/ListModelCatalog",
+              {},
+              10000,
+            ),
           );
         } catch {
-          const legacyResponse = await callService(
-            "/surgeon_actor/list_models",
-            "surgical_msgs/srv/ListModels",
-            {},
-            10000,
+          projection = parseLegacyModelCatalogResponse(
+            await callService(
+              "/surgeon_actor/list_models",
+              "surgical_msgs/srv/ListModels",
+              {},
+              10000,
+            ),
           );
-          if (!Boolean(legacyResponse.success)) {
-            throw new Error(String(legacyResponse.message || "Actor model catalog unavailable."));
-          }
-          const modelIds = Array.isArray(legacyResponse.model_ids)
-            ? legacyResponse.model_ids
-              .slice(0, MAX_ROS_PAYLOAD_COLLECTION_ITEMS)
-              .map((modelId) => String(modelId).slice(0, 512))
-              .filter(Boolean)
-            : [];
-          const fallback = legacyCatalog(modelIds, "OpenAI compatible");
-          if (disposed) return;
-          setActorModelOptions(fallback.models);
-          setActorProviderStatuses([fallback.provider]);
-          setActorModelSelection(
-            modelIds[0] ? { provider_id: "legacy", model_id: modelIds[0] } : null,
-          );
-          setActorModelCatalogStatus(
-            String(legacyResponse.message || (modelIds.length ? "connected" : "empty")).slice(0, 4_096),
-          );
-          return;
         }
-        const providers = Array.isArray(response.providers)
-          ? response.providers
-              .map(normalizeProviderStatus)
-              .filter((row): row is ModelProviderStatus => row !== null)
-          : [];
-        const models = Array.isArray(response.models)
-          ? response.models
-              .map(normalizeModelEntry)
-              .filter((row): row is ModelCatalogEntry => row !== null)
-          : [];
-        const activeProviderId = String(response.active_provider_id || "").trim().slice(0, 512);
-        const activeModelId = String(response.active_model_id || "").trim().slice(0, 512);
         if (disposed) return;
-        setActorModelOptions(models);
-        setActorProviderStatuses(providers);
-        setActorModelSelection(
-          activeProviderId && activeModelId
-            ? { provider_id: activeProviderId, model_id: activeModelId }
-            : null,
-        );
-        setActorModelCatalogStatus(
-          String(response.message || (models.length ? "connected" : "empty")).slice(0, 4_096),
-        );
+        setActorModelOptions(projection.models);
+        setActorProviderStatuses(projection.providers);
+        setActorModelSelection(projection.selection);
+        setActorModelCatalogStatus(projection.status);
       } catch (error) {
         if (disposed) return;
         setActorModelCatalogStatus(error instanceof Error ? error.message : "Actor model catalog unavailable.");
@@ -2721,16 +2729,24 @@ export function useRosBridge(
       }
     }
 
-    if (!connected || runtimeMode !== "llm") {
+    if (
+      !subscriptionPlan.modelControls ||
+      !connected ||
+      runtimeMode !== "llm"
+    ) {
       setActorModelOptions([]);
       setActorProviderStatuses([]);
       setActorModelSelection(null);
       setActorModelCatalogStatus(
-        runtimeMode !== "llm"
+        !subscriptionPlan.modelControls
+          ? "disabled in Production Live core"
+          : runtimeMode !== "llm"
           ? "disabled in this runtime mode"
-          : transportConnected || connectionPending
-            ? "ROS state pending"
-            : "ROS bridge offline",
+          : connectionBlocked
+            ? "ROS access blocked by runtime-contract mismatch"
+            : transportConnected || connectionPending
+              ? "ROS state pending"
+              : "ROS bridge offline",
       );
       return () => {
         disposed = true;
@@ -2749,44 +2765,27 @@ export function useRosBridge(
       window.clearInterval(timer);
       document.removeEventListener("visibilitychange", refreshWhenVisible);
     };
-  }, [connected, connectionPending, runtimeMode, transportConnected, url]);
-
-  function stringParameter(name: string, value: string) {
-    return {
-      name,
-      value: {
-        type: ROS_PARAM_STRING,
-        string_value: value,
-      },
-    };
-  }
-
-  function boolParameter(name: string, value: boolean) {
-    return {
-      name,
-      value: {
-        type: ROS_PARAM_BOOL,
-        bool_value: value,
-      },
-    };
-  }
+  }, [
+    connected,
+    connectionBlocked,
+    connectionPending,
+    runtimeMode,
+    subscriptionPlan.modelControls,
+    transportConnected,
+    url,
+  ]);
 
   async function setNodeParameters(
     nodeName: string,
-    parameters: Array<ReturnType<typeof stringParameter> | ReturnType<typeof boolParameter>>,
+    parameters: RosParameter[],
   ) {
     const response = await callService(
       `/${nodeName}/set_parameters`,
       "rcl_interfaces/srv/SetParameters",
-      { parameters },
+      setParametersRequest(parameters),
       10000,
     );
-    const results = Array.isArray(response.results) ? response.results : [];
-    const failed = results.find((result) => result && typeof result === "object" && !(result as { successful?: boolean }).successful);
-    if (failed) {
-      const reason = String((failed as { reason?: string }).reason || "parameter update rejected");
-      throw new Error(reason);
-    }
+    assertSetParametersAccepted(response, parameters.length);
   }
 
   async function runAction(label: string, work: () => Promise<void>) {
@@ -2953,18 +2952,16 @@ export function useRosBridge(
       setEvents([]);
       setVlmReducerDecisions([]);
       setVlmResult(DEFAULT_VLM_RESULT);
+      setVlmRequestToolDetectionEvidence(null);
+      setTypedRfdetrToolDetections({});
+      setSkillStatusByCommand({});
       setVlmResultReceivedAt(0);
-      setVlmImage(null);
       setVlmCompositeImage(null);
       setCam1Image(null);
       setCam2Image(null);
       setCam3Image(null);
       setCam4Image(null);
       setFlirImage(null);
-      setCam4PerceptionImage(null);
-      setFlirPerceptionImage(null);
-      setCam4PerceptionOverlay(null);
-      setFlirPerceptionOverlay(null);
       setCam4ToolRequest(DEFAULT_CAM4_TOOL_REQUEST);
       cam4ToolRequestRef.current = DEFAULT_CAM4_TOOL_REQUEST;
       setActionMessage(
@@ -3001,51 +2998,228 @@ export function useRosBridge(
     }
   }
 
+  async function previewBundle(targetBundle = bundle) {
+    const selectedBundle = (targetBundle || bundle).trim();
+    if (!selectedBundle || bundlePreviewInFlightRef.current) return;
+    const runId = bundleApplyRunIdRef.current + 1;
+    bundleApplyRunIdRef.current = runId;
+    bundlePreviewInFlightRef.current = true;
+    updateScenarioRevision({
+      phase: "previewing",
+      bundleName: selectedBundle,
+      message: "Checking the selected bundle revision...",
+      result: null,
+    });
+    try {
+      // Preview is a read-only server operation. It is deliberately not routed
+      // through runAction and does not inherit running/paused write gates.
+      const response = await callService(
+        SELECT_BUNDLE_SERVICE,
+        SELECT_BUNDLE_SERVICE_TYPE,
+        scenarioRevisionPreviewRequest(selectedBundle),
+        12000,
+        { requireFreshRuntimeState: false },
+      );
+      const result = parseScenarioRevisionResult(response);
+      if (bundleApplyRunIdRef.current !== runId || bundle !== selectedBundle) return;
+      updateScenarioRevision({
+        phase: result.success ? "previewed" : "failed",
+        bundleName: selectedBundle,
+        message: result.message,
+        result,
+      });
+    } catch (error) {
+      if (bundleApplyRunIdRef.current !== runId) return;
+      updateScenarioRevision({
+        phase: "failed",
+        bundleName: selectedBundle,
+        message: error instanceof Error ? error.message : String(error),
+        result: null,
+      });
+    } finally {
+      if (bundleApplyRunIdRef.current === runId) {
+        bundlePreviewInFlightRef.current = false;
+      }
+    }
+  }
+
   async function applyBundle(targetBundle = bundle) {
-    const selectedBundle = targetBundle || bundle;
+    const selectedBundle = (targetBundle || bundle).trim();
     if (!selectedBundle) return;
+    const currentRevision = scenarioRevisionRef.current;
+    const initialAdmission = computeScenarioRevisionApplyAdmission({
+      runtimeMode,
+      state: simulationStateRef.current,
+      selectedBundle,
+      revision: currentRevision,
+      stateFresh: runtimeStateIsFresh(),
+      commandPending: actionInFlightRef.current,
+    });
+    if (!initialAdmission.allowed) {
+      updateScenarioRevision({
+        ...currentRevision,
+        phase: "failed",
+        bundleName: selectedBundle,
+        message: initialAdmission.reason,
+      });
+      setActionMessage(initialAdmission.reason);
+      return;
+    }
+
     const applyRunId = bundleApplyRunIdRef.current + 1;
     bundleApplyRunIdRef.current = applyRunId;
-    const stateAtRequest = simulationStateRef.current;
-    setBundle(selectedBundle);
-    bundleDirtyRef.current = true;
-    await runAction("Applying bundle", async () => {
+    updateScenarioRevision({
+      ...currentRevision,
+      phase: "applying",
+      bundleName: selectedBundle,
+      message: "Applying the server-verified bundle revision...",
+    });
+    await runAction("Applying bundle revision", async () => {
+      // State may change between preview and click. Re-evaluate immediately
+      // before transport; the manager performs the final authoritative check.
+      const admission = computeScenarioRevisionApplyAdmission({
+        runtimeMode,
+        state: simulationStateRef.current,
+        selectedBundle,
+        revision: currentRevision,
+        stateFresh: runtimeStateIsFresh(),
+        commandPending: false,
+      });
+      if (!admission.allowed) throw new Error(admission.reason);
+      const expectedCandidateRevision =
+        currentRevision.result?.candidateRevision.trim();
+      if (!expectedCandidateRevision) {
+        throw new Error("Preview this bundle revision before applying it.");
+      }
       const response = await callService(
-        "/simulation/select_bundle",
-        "surgical_msgs/srv/SelectSimulationBundle",
-        {
-          bundle_name: selectedBundle,
-          restart_if_running: stateAtRequest.running,
-        },
-        stateAtRequest.running ? 22000 : 12000,
+        SELECT_BUNDLE_SERVICE,
+        SELECT_BUNDLE_SERVICE_TYPE,
+        scenarioRevisionApplyRequest(
+          selectedBundle,
+          admission,
+          expectedCandidateRevision,
+        ),
+        admission.restartIfRunning ? 22000 : 12000,
       );
-      const success = response.success === undefined ? true : Boolean(response.success);
-      if (!success) {
-        throw new Error(String(response.message || `Failed to apply ${selectedBundle}.`));
+      const result = parseScenarioRevisionResult(response);
+      if (bundleApplyRunIdRef.current !== applyRunId) return;
+      const appliedRevisionMatches =
+        result.activeBundle === selectedBundle &&
+        result.activeRevision === result.candidateRevision &&
+        result.activeRevision === expectedCandidateRevision;
+      const applyAccepted =
+        result.success &&
+        appliedRevisionMatches &&
+        (
+          (result.applied && result.changed && result.disposition === "applied") ||
+          (!result.applied && !result.changed && result.disposition === "unchanged")
+        );
+      if (!applyAccepted) {
+        updateScenarioRevision({
+          phase: "failed",
+          bundleName: selectedBundle,
+          message: result.message || "The server did not apply the selected revision.",
+          result,
+        });
+        throw new Error(result.message || "The server did not apply the selected revision.");
       }
-      if (bundleApplyRunIdRef.current !== applyRunId) {
-        return;
-      }
-      const appliedBundle = String(response.active_bundle || selectedBundle);
+
+      const appliedBundle = result.activeBundle;
       bundleDirtyRef.current = false;
       setBundle(appliedBundle);
       setStartPhase("");
-      setOverrideAck(null);
       clearEventLog({ suppressMs: 500 });
-      setSimulationState((current) => ({
-        ...current,
-        active_bundle: appliedBundle,
-        procedure_id: appliedBundle,
-      }));
-      setActionMessage(String(response.message || `Bundle switched to ${appliedBundle}.`));
+      // Do not synthesize a hybrid state from the Service result. The next
+      // complete /simulation/state frame owns bundle, layout and instruments.
+      updateScenarioRevision({
+        phase: "applied",
+        bundleName: appliedBundle,
+        message: result.message,
+        result,
+      });
+      setActionMessage(result.message || `Bundle revision applied to ${appliedBundle}.`);
     });
+    if (
+      bundleApplyRunIdRef.current === applyRunId &&
+      scenarioRevisionRef.current.phase === "applying"
+    ) {
+      updateScenarioRevision({
+        ...scenarioRevisionRef.current,
+        phase: "failed",
+        message: "The bundle revision request did not complete.",
+      });
+    }
   }
 
   async function control(command: ControlCommand) {
+    // Stop is intentionally a separate, high-priority planner lifecycle
+    // request.  A Start Service can remain outstanding for 45 seconds, and a
+    // blanket single-flight guard would otherwise swallow the operator's Stop
+    // click precisely when the manager can still interrupt startup.  This is
+    // not a physical E-stop: the UI explicitly directs externally accepted
+    // robot motion to the device's independent safety procedure.
+    if (command === "stop") {
+      if (priorityStopInFlightRef.current) return;
+      priorityStopInFlightRef.current = true;
+      const stopRunId = controlRunIdRef.current + 1;
+      controlRunIdRef.current = stopRunId;
+      // Let an earlier request settle on the transport, but make its late
+      // result unable to mutate UI state or restart the displayed lifecycle.
+      actionRunIdRef.current += 1;
+      actionInFlightRef.current = false;
+      controlInFlightRef.current = false;
+      const label = "Stopping planner execution";
+      setActionPending(label);
+      setActionMessage(`${label}...`);
+      try {
+        await prepareShadowControl("stop");
+        if (controlRunIdRef.current !== stopRunId) return;
+        const response = await callService(
+          "/simulation/control",
+          "surgical_msgs/srv/ControlSimulation",
+          { command: "stop", start_phase_id: "" },
+          20000,
+        );
+        if (controlRunIdRef.current !== stopRunId) return;
+        const success = response.success === undefined ? true : Boolean(response.success);
+        if (!success) {
+          throw new Error(String(response.message || "Stopping planner execution failed."));
+        }
+        const rawMessage = String(response.message || "planner execution stopped");
+        const stopMessage = runtimeMode === "live"
+          ? `${rawMessage === "ok" ? "planner stop accepted" : rawMessage}. Verify external robot safety state separately.`
+          : rawMessage === "ok" ? "simulation stopped" : rawMessage;
+        setActionMessage(stopMessage);
+        if (rawMessage.endsWith("requested")) {
+          const stableMessage = await waitForControlTarget("stop", 20000, stopRunId);
+          if (controlRunIdRef.current !== stopRunId) return;
+          await finalizeShadowControl("stop", stopRunId);
+          if (stableMessage) {
+            setActionMessage(
+              runtimeMode === "live"
+                ? `${stableMessage}. Verify external robot safety state separately.`
+                : stableMessage,
+            );
+          }
+        }
+      } catch (error) {
+        if (controlRunIdRef.current === stopRunId) {
+          setActionMessage(error instanceof Error ? error.message : String(error));
+        }
+      } finally {
+        priorityStopInFlightRef.current = false;
+        if (controlRunIdRef.current === stopRunId) {
+          setActionPending("");
+          controlInFlightRef.current = false;
+        }
+      }
+      return;
+    }
+
     // The buttons are disabled while a command is pending, but keep a ref-level
     // single-flight guard as well so rapid clicks or DOM-driven retries cannot
     // submit two conflicting runtime commands before React re-renders.
-    if (controlInFlightRef.current) return;
+    if (priorityStopInFlightRef.current || controlInFlightRef.current) return;
     controlInFlightRef.current = true;
     const controlRunId = controlRunIdRef.current + 1;
     controlRunIdRef.current = controlRunId;
@@ -3056,19 +3230,38 @@ export function useRosBridge(
           ? "Pausing simulation"
           : command === "resume"
             ? "Resuming simulation"
-            : command === "stop"
-              ? "Stopping simulation"
-              : "Resetting simulation";
+            : "Resetting simulation";
     try {
       await runAction(label, async () => {
         if (command === "start") {
+          if (runtimeMode === "live") {
+            const blocker = integrationReadinessBlockReason(
+              integrationReadinessRef.current,
+              integrationReadinessReceivedAtRef.current || null,
+              simulationStateRef.current.active_bundle || bundle,
+            );
+            if (blocker) {
+              throw new Error(`Live integration start is blocked: ${blocker}.`);
+            }
+          }
           suppressEventsUntilRef.current = 0;
           clearEventLog();
+        }
+        if (command === "resume" && runtimeMode === "live") {
+          const blocker = integrationReadinessBlockReason(
+            integrationReadinessRef.current,
+            integrationReadinessReceivedAtRef.current || null,
+            simulationStateRef.current.active_bundle || bundle,
+          );
+          if (blocker) {
+            throw new Error(`Live integration resume is blocked: ${blocker}.`);
+          }
         }
         if (command === "reset") {
           clearEventLog({ suppressMs: 1200 });
         }
         await prepareShadowControl(command);
+        if (controlRunIdRef.current !== controlRunId) return;
         try {
           const response = await callService(
             "/simulation/control",
@@ -3076,11 +3269,11 @@ export function useRosBridge(
             { command, start_phase_id: command === "start" ? startPhase : "" },
             command === "start" ? 45000 : command === "reset" ? 30000 : 20000,
           );
+        if (controlRunIdRef.current !== controlRunId) return;
         const success = response.success === undefined ? true : Boolean(response.success);
         if (!success) {
           throw new Error(String(response.message || `${label} failed.`));
         }
-        setOverrideAck(null);
         if (command === "reset") {
           clearEventLog({ suppressMs: 1200 });
           setSurgeonState({
@@ -3096,9 +3289,7 @@ export function useRosBridge(
               ? "simulation paused"
               : command === "resume"
                 ? "simulation resumed"
-                : command === "stop"
-                  ? "simulation stopped"
-                  : "simulation runtime reset to idle";
+                : "simulation runtime reset to idle";
         const rawMessage = String(response.message || fallbackMessage);
         setActionMessage(rawMessage === "ok" ? fallbackMessage : rawMessage);
         if (rawMessage.endsWith("requested") && command !== "start") {
@@ -3129,7 +3320,6 @@ export function useRosBridge(
                 controlRunId,
               );
               if (command === "reset") {
-                setOverrideAck(null);
                 clearEventLog({ suppressMs: 1200 });
                 const current = simulationStateRef.current;
                 setSurgeonState({
@@ -3158,38 +3348,164 @@ export function useRosBridge(
     }
   }
 
-  async function sendOverride(payload: OverridePayload) {
-    await runAction(payload.eventType === "voice_request" ? "Sending voice override" : "Sending surgeon override", async () => {
-      const response = await callService(
-        "/simulation/inject_surgeon_override",
-        "surgical_msgs/srv/InjectSurgeonOverride",
-        {
-          event_type: payload.eventType,
-          requested_tool: payload.requestedTool,
-          voice_text: payload.eventType === "voice_request" ? payload.voiceText : "",
-          ready_for_handover: payload.eventType !== "return_tool",
-          ready_for_retrieval: payload.eventType === "return_tool",
-          clear_pending_requests: true,
-        },
-        12000,
-      );
-      const success = response.success === undefined ? true : Boolean(response.success);
-      if (!success) {
-        throw new Error(String(response.message || "Override request failed."));
+  function executionRouteSwitchBlocker(): string | null {
+    if (runtimeMode !== "live") {
+      return "Action/Service route selection is available only in live integration mode.";
+    }
+    if (!runtimeStateIsFresh() || !connected) {
+      return "Wait for a fresh live runtime state before changing the Action/Service route.";
+    }
+    const routeState = executionRouteStateRef.current;
+    if (!routeState || !routeState.routeControlEnabled) {
+      return "The live runtime has not confirmed stopped-state Action/Service route control.";
+    }
+    if (routeState.initializationState === "initializing") {
+      return "Wait for the selected Action/Service route to be acknowledged by the integration start check.";
+    }
+    if (actionInFlightRef.current || controlInFlightRef.current) {
+      return "Wait for the current runtime control request before changing the Action/Service route.";
+    }
+    const state = simulationStateRef.current;
+    const executionState = String(state.execution_state || "").trim().toLowerCase();
+    if (
+      state.running ||
+      !["idle", "halted", "completed", "terminated"].includes(executionState) ||
+      String(state.robot_state || "").trim().toLowerCase() !== "idle" ||
+      Boolean(state.active_robot_task_id) ||
+      state.cleaner_busy ||
+      state.pending_transition_tools.length > 0 ||
+      state.active_recovery_tools.length > 0
+    ) {
+      return "Stop planner execution and all active work before changing the Action/Service route.";
+    }
+    return null;
+  }
+
+  function commitExecutionRouteState(
+    next: ExecutionRouteState,
+    receivedAt = Date.now(),
+  ) {
+    const previous = executionRouteStateRef.current;
+    if (
+      previous &&
+      (next.revision < previous.revision ||
+        (next.revision === previous.revision &&
+          next.initializationRevision < previous.initializationRevision))
+    ) {
+      return false;
+    }
+    executionRouteStateRef.current = next;
+    executionRouteStateReceivedAtRef.current = receivedAt;
+    setExecutionRouteState(next);
+    setExecutionRouteStateReceivedAt(receivedAt);
+    return true;
+  }
+
+  /**
+   * Change the independently reviewed Action and Service endpoint sources. The
+   * manager/bridge rechecks stopped state and performs the authoritative
+   * initialization; the browser only clears observer-derived presentation
+   * after that server acknowledgement.
+   */
+  async function configureExecutionRoute(sources: {
+    toolHandoverSource: ExecutionEndpointSource;
+    retractionSource: ExecutionEndpointSource;
+  }) {
+    const requestedSource = normalizeExecutionEndpointSource(sources.toolHandoverSource);
+    const requestedRetractionSource = normalizeExecutionEndpointSource(sources.retractionSource);
+    if (!requestedSource || !requestedRetractionSource) return;
+    const blocker = executionRouteSwitchBlocker();
+    if (blocker) {
+      setExecutionRouteTransition({ state: "failed", message: blocker });
+      setActionMessage(blocker);
+      return;
+    }
+    if (actionInFlightRef.current) return;
+    const routeRunId = executionRouteRunIdRef.current + 1;
+    executionRouteRunIdRef.current = routeRunId;
+    const currentRevision = executionRouteStateRef.current?.revision ?? -1;
+    const isCurrentRouteRun = () =>
+      executionRouteRunIdRef.current === routeRunId &&
+      runtimeMode === "live" &&
+      bridgeGenerationRef.current === commandReadyGenerationRef.current;
+    setExecutionRouteTransition({
+      state: "switching",
+      message: "Applying the selected Action and Service routes.",
+    });
+    await runAction("Switching Action/Service server", async () => {
+      try {
+        const response = await callService(
+          "/integration/execution_route/command",
+          "surgical_msgs/srv/IntegrationDebugCommand",
+          {
+            operation: "configure_execution_endpoints",
+            payload_json: JSON.stringify({
+              tool_handover_source: requestedSource,
+              retraction_source: requestedRetractionSource,
+            }),
+          },
+          30000,
+        );
+        if (!isCurrentRouteRun()) return;
+        const commandResult = normalizeExecutionRouteCommandResult(
+          response.result_json,
+        );
+        const resultState = commandResult?.state ?? null;
+        const accepted = Boolean(response.accepted);
+        const serverMessage = String(
+          response.message ||
+            (accepted
+              ? "Action/Service route initialized."
+              : "Action/Service route change was rejected."),
+        ).trim().slice(0, 360);
+        if (resultState) commitExecutionRouteState(resultState);
+        if (
+          !accepted ||
+          !resultState ||
+          commandResult?.digitalTwinReset !== true ||
+          resultState.selectedSource !== requestedSource ||
+          resultState.retractionSource !== requestedRetractionSource ||
+          resultState.revision <= currentRevision ||
+          !resultState.routeControlEnabled
+        ) {
+          const message = !accepted
+            ? serverMessage
+            : !resultState
+              ? "The Action/Service route response did not contain a valid server state."
+              : commandResult?.digitalTwinReset !== true
+                ? "The Action/Service route did not confirm a completed digital-twin reset."
+              : "The Action/Service route did not confirm the requested initialized state.";
+          setExecutionRouteTransition({ state: "failed", message });
+          throw new Error(message);
+        }
+
+        setExecutionRouteTransition({
+          state: "resetting",
+          message: "Resetting observer state for the selected Action/Service route.",
+        });
+        // The ROS-side route service has completed its stopped-state reset at
+        // this point. Clear only browser-held observer data; the next
+        // authoritative SimulationState and readiness heartbeat repopulate it.
+        clearEventLog({ suppressMs: 1500 });
+        setSkillStatus(DEFAULT_SKILL_STATUS);
+        setSkillStatusByCommand({});
+        setExecutionTraces([]);
+        integrationReadinessRef.current = DEFAULT_INTEGRATION_READINESS;
+        integrationReadinessReceivedAtRef.current = 0;
+        setIntegrationReadiness(DEFAULT_INTEGRATION_READINESS);
+        setIntegrationReadinessReceivedAt(null);
+        setIntegrationReadinessBridgeUrl("");
+        setExecutionRouteTransition({
+          state: "ready",
+          message: "Action/Service route changed and initialized. Verify the fresh integration-start check before starting.",
+        });
+        setActionMessage(serverMessage || "Action/Service route initialized.");
+      } catch (error) {
+        if (!isCurrentRouteRun()) return;
+        const message = error instanceof Error ? error.message : String(error);
+        setExecutionRouteTransition({ state: "failed", message });
+        throw error;
       }
-      const message =
-        payload.eventType === "return_tool"
-          ? `${payload.toolLabel} return/recovery transaction requested.`
-          : payload.eventType === "voice_request"
-            ? `${payload.toolLabel} voice handover requested.`
-            : `${payload.toolLabel} handover requested.`;
-      setOverrideAck({
-        eventType: payload.eventType,
-        toolId: payload.requestedTool,
-        message,
-        voiceText: payload.eventType === "voice_request" ? payload.voiceText : "",
-      });
-      setActionMessage(String(response.message || "Override accepted."));
     });
   }
 
@@ -3385,50 +3701,53 @@ export function useRosBridge(
     });
   }
 
-  async function setPerceptionEnabled(enabled: boolean) {
-    await runAction(
-      enabled ? "Enabling object recognition" : "Disabling object recognition",
-      async () => {
-        setCam4PerceptionImage(null);
-        setFlirPerceptionImage(null);
-        setCam4PerceptionOverlay(null);
-        setFlirPerceptionOverlay(null);
-        const response = await callService(
-          "/rfdetr_perception_bridge/set_enabled",
-          "std_srvs/srv/SetBool",
-          { data: enabled },
-          10000,
-        );
-        if (!Boolean(response.success)) {
-          throw new Error(
-            String(
-              response.message ||
-                "Object recognition control request was rejected.",
-            ),
-          );
-        }
-        setPerceptionHealth((current) => ({
-          ...current,
-          received: true,
-          enabled,
-          connected: false,
-          status: enabled ? "waiting_for_frame" : "disabled",
-          lastError: "",
-        }));
-        setActionMessage(
-          String(
-            response.message ||
-              (enabled
-                ? "Object recognition enabled."
-                : "Object recognition disabled."),
-          ),
-        );
+  function commitLiveAsrStatus(
+    status: LiveAsrStatus,
+    isCurrentRun: () => boolean,
+  ) {
+    if (!isCurrentRun()) return;
+    const receivedAt = Date.now();
+    liveAsrStatusRef.current = status;
+    liveAsrStatusReceivedAtRef.current = receivedAt;
+    setLiveAsrStatus(status);
+    setLiveAsrStatusReceivedAt(receivedAt);
+    setLiveAsrStatusBridgeUrl(url);
+  }
+
+  async function requestLiveAsrControl(
+    operation: "refresh_devices" | "set_route_policy" | "start" | "stop" | "start_recording",
+    deviceId: number,
+    routePolicy: string,
+    isCurrentRun: () => boolean,
+  ): Promise<LiveAsrControlResult> {
+    const response = await callService(
+      "/input/asr/control",
+      "surgical_msgs/srv/AsrControl",
+      {
+        operation,
+        device_id: deviceId,
+        // The browser never selects an endpoint by URL. The reviewed policy
+        // identifier is validated by the Live ASR node, which then chooses a
+        // concrete cloud/LAN URL from deployment configuration.
+        server_url: "",
+        route_policy: routePolicy,
       },
+      20000,
     );
+    const accepted = Boolean(response.accepted);
+    const message = String(
+      response.message || (accepted ? "ASR request accepted." : "ASR request rejected."),
+    );
+    const rawResult = String(response.result_json ?? "").trim();
+    if (rawResult && isCurrentRun()) {
+      const parsed = normalizeLiveAsrStatus({ data: rawResult });
+      if (parsed) commitLiveAsrStatus(parsed, isCurrentRun);
+    }
+    return { accepted, message };
   }
 
   async function controlLiveAsr(
-    operation: "refresh_devices" | "set_route_policy" | "start" | "stop",
+    operation: "refresh_devices" | "set_route_policy" | "start" | "stop" | "restart_node",
     deviceId = -1,
     routePolicy = "",
   ): Promise<LiveAsrControlResult> {
@@ -3458,35 +3777,49 @@ export function useRosBridge(
     setLiveAsrControlPending(operation);
     setLiveAsrControlMessage("");
     try {
-      const response = await callService(
-        "/input/asr/control",
-        "surgical_msgs/srv/AsrControl",
-        {
-          operation,
-          device_id: deviceId,
-          // The browser never selects an endpoint by URL.  The reviewed
-          // policy identifier is validated by the Live ASR node, which then
-          // chooses a concrete cloud/LAN URL from deployment configuration.
-          server_url: "",
-          route_policy: routePolicy,
-        },
-        20000,
-      );
-      const accepted = Boolean(response.accepted);
-      const message = String(response.message || (accepted ? "ASR request accepted." : "ASR request rejected."));
-      const rawResult = String(response.result_json ?? "").trim();
-      if (rawResult && isCurrentRun()) {
-        const parsed = normalizeLiveAsrStatus({ data: rawResult });
-        if (parsed) {
-          setLiveAsrStatus(parsed);
-          setLiveAsrStatusReceivedAt(Date.now());
-          setLiveAsrStatusBridgeUrl(url);
+      if (operation === "restart_node") {
+        if (!connected) {
+          throw new Error("Live ROS bridge가 준비된 뒤 다시 시도하세요.");
         }
+        const requestedAt = Date.now();
+        const previousStatus = liveAsrStatusRef.current;
+        const previousStatusReceivedAt = liveAsrStatusReceivedAtRef.current;
+        const { hotRestartAsrNode } = await import("../ros/asrRestartControl");
+        const { message } = await hotRestartAsrNode({
+          requestedAt,
+          previousStatus,
+          previousStatusReceivedAt,
+          isCurrent: isCurrentRun,
+          getCurrentStatus: () => ({
+            status: liveAsrStatusRef.current,
+            receivedAt: liveAsrStatusReceivedAtRef.current,
+          }),
+          requestControl: (requestedOperation, requestedDeviceId, requestedRoutePolicy) =>
+            requestLiveAsrControl(
+              requestedOperation,
+              requestedDeviceId,
+              requestedRoutePolicy,
+              isCurrentRun,
+            ),
+        });
+        if (isCurrentRun()) setLiveAsrControlMessage(message);
+        return { accepted: true, message };
       }
+
+      const result = await requestLiveAsrControl(
+        operation,
+        deviceId,
+        routePolicy,
+        isCurrentRun,
+      );
+      const { message } = result;
       if (isCurrentRun()) setLiveAsrControlMessage(message);
-      return { accepted, message };
+      return result;
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+      const reason = error instanceof Error ? error.message : String(error);
+      const message = operation === "restart_node"
+        ? `ASR 노드 새로 시작 실패: ${reason} 코드를 수정한 뒤 이 버튼으로 다시 시도하세요.`
+        : reason;
       if (isCurrentRun()) setLiveAsrControlMessage(message);
       return { accepted: false, message };
     } finally {
@@ -3506,6 +3839,14 @@ export function useRosBridge(
   const shouldPreferRuntimeMessage =
     !actionPending && Boolean(runtimeMessage) && (actionMessage === "Ready." || actionMessage === "ROS bridge connected.");
   const displayActionMessage = shouldPreferRuntimeMessage ? runtimeMessage : actionMessage;
+  const scenarioRevisionAdmission = computeScenarioRevisionApplyAdmission({
+    runtimeMode,
+    state: simulationState,
+    selectedBundle: bundle,
+    revision: scenarioRevision,
+    stateFresh: runtimeStateIsFresh(),
+    commandPending: Boolean(actionPending),
+  });
 
   return {
     url,
@@ -3514,6 +3855,8 @@ export function useRosBridge(
     connected,
     runtimeAuthorityStatus: connectionPending
       ? "checking" as const
+      : connectionBlocked
+        ? "blocked" as const
       : connectEnabled
         ? runtimeAuthorityStatus
         : "offline" as const,
@@ -3529,23 +3872,22 @@ export function useRosBridge(
     surgeonLlmDecision,
     btDecision,
     skillStatus,
+    skillStatusByCommand,
+    executionTraces,
     vlmHealth,
     inputSourceStatuses,
     vlmResult,
+    vlmRequestToolDetectionEvidence,
+    typedRfdetrToolDetections,
     cam4ToolRequest,
     vlmReducerDecisions,
-    vlmImage: vlmCompositeImage ?? vlmImage,
+    vlmImage: vlmCompositeImage,
     vlmCompositeImage,
     cam1Image,
     cam2Image,
     cam3Image,
     cam4Image,
     flirImage,
-    cam4PerceptionImage,
-    flirPerceptionImage,
-    cam4PerceptionOverlay,
-    flirPerceptionOverlay,
-    perceptionHealth,
     vlmHealthReceivedAt,
     vlmResultReceivedAt,
     vlmModelOptions,
@@ -3561,7 +3903,6 @@ export function useRosBridge(
     actionMessage: displayActionMessage,
     runtimeMessage,
     simulationReady,
-    overrideAck,
     actorEnabled,
     actorEnabledKnown,
     shadowReplayState,
@@ -3571,16 +3912,26 @@ export function useRosBridge(
     liveAsrStatusReceivedAt: liveAsrStatusBridgeUrl === url ? liveAsrStatusReceivedAt : null,
     liveAsrControlPending,
     liveAsrControlMessage,
+    integrationReadiness,
+    integrationReadinessReceivedAt:
+      integrationReadinessBridgeUrl === url
+        ? integrationReadinessReceivedAt
+        : null,
+    executionRouteState,
+    executionRouteStateReceivedAt,
+    executionRouteTransition,
+    scenarioRevision,
+    scenarioRevisionAdmission,
+    previewBundle,
     applyBundle,
     control,
-    sendOverride,
     setVlmModel,
     setActorModel,
     controlVlmModelRuntime,
     controlActorModelRuntime,
     setActorEnabled,
-    setPerceptionEnabled,
     controlLiveAsr,
+    configureExecutionRoute,
     selectShadowCase,
     configureShadowReplay,
   };

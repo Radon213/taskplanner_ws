@@ -1,0 +1,227 @@
+# Voice-retraction-only integration demonstration.
+#
+# The source procedure sheet contains humanoid handovers, image-based phase
+# inference, and bed-arm tasks.  This bundle intentionally authorizes only the
+# bed-arm voice retraction lane.  Staff prepare the operative field, tools,
+# phase, retractors, and robot posture manually.  The tool/phase sections below
+# exist only to give the shared state and UI a plausible surgical context.
+
+id: inguinal_hernia_repair_demo_prompt_v1
+
+procedure:
+  id: "inguinal_hernia_repair_demo"
+  name: "Open Inguinal Hernia Repair Demonstration"
+  ko: "서혜부탈장술(시연)"
+  default_phase_id: "P02"
+  scope: >
+    Integration demonstration with manually prepared instruments and operative
+    phase. Taskplanner accepts only voice commands for the bed-mounted Army-Navy
+    retraction arms; it does not perform humanoid handover, instrument recovery,
+    visual phase inference, or image-VLM actions.
+
+# Scenario choices are editable here and are not physical-safety interlocks.
+# Empty means every displayed instrument is context-only and cannot become a
+# voice, VLM, prediction, preposition, handover, or retrieval target.
+scenario_policy:
+  requestable_tools: []
+  handover_arm: right
+  recovery_arm: left
+  require_cleaning_after_surgeon_use: true
+  allow_anticipatory_hold: false
+  voice_override_preempts_preposition: true
+  allow_prepositioning_when_uncertain: false
+  explicit_request_priority: true
+  unused_preposition_destination: retain
+  # Voice/retraction-only runtime selection. This does not bypass the external
+  # controller Service or its admission and idempotency contracts.
+  runtime_requirements:
+    procedure_type: inguinal_hernia_repair
+    tool_handover_action_required: false
+    retraction_service_required: true
+    bed_robot_status_required: false
+    image_vlm_enabled: false
+    dialogue_vlm_enabled: true
+    perception_enabled: false
+    rfdetr_tool_observations_required: false
+    voice_intent_resolver_enabled: true
+    surgeon_actor_enabled: false
+    phase_inference_enabled: false
+    retraction_workflow_state_enforced: false
+    legacy_raw_retractor_voice_enabled: false
+
+phase_inference_policy:
+  primary_evidence: "Operator-selected phase only."
+  tool_order_role: "Display context only; never infer or advance the phase."
+  tool_only_detailed_phase_transition_allowed: false
+  uncertainty_rule: >
+    Use only the operator-selected phase; ignore images, ASR, tool names, and tool order.
+    Keep the operator-selected phase until a person changes it.
+  time_prior_role: forbidden
+
+phase_labels:
+  normal:
+    P01: "Manual setup and operative-field preparation"
+    P02: "Army-Navy retraction and external-oblique exposure"
+    P03: "Cord mobilization and hernia-sac dissection"
+    P04: "Hernia-sac treatment"
+    P05: "Repair and wound closure"
+  interrupt: {}
+
+phase_labels_ko:
+  normal:
+    P01: "수동 세팅 및 수술야 준비"
+    P02: "아미-네이비 견인 및 외복사근막 노출"
+    P03: "정삭 유리 및 탈장낭 박리"
+    P04: "탈장낭 처리"
+    P05: "복원 및 창상 봉합"
+  interrupt: {}
+
+tools:
+  T01: "Scalpel handle with #15 blade"
+  T02: "Bovie surgical cautery"
+  T03: "Army navy retractor"
+  T04: "Smooth forceps"
+  T05: "Metzenbaum scissors"
+  T06: "Mosquito forceps"
+  T07: "Kelly clamp"
+  T08: "Mayo-Hegar needle holder"
+  T09: "Surgical scissors"
+
+# Authoritative home-rack order for the bundle. Runtime and UI projections are
+# derived from this list; no frontend copy is maintained.
+tool_placement:
+  rack_order: [T01, T02, T03, T04, T05, T06, T07, T08, T09]
+  initial_states: []
+
+tool_inventory:
+  T01: 1
+  T02: 1
+  T03: 2
+  T04: 1
+  T05: 1
+  T06: 2
+  T07: 1
+  T08: 1
+  T09: 1
+
+bed_robot_arm_groups:
+  direction_enum: [UP, DOWN, LEFT, RIGHT, LEFT_RIGHT, UP_DOWN]
+  distance_policy:
+    precedence: [explicit_with_unit]
+    max_distance_mm: 30
+    cm_to_mm_multiplier: 10
+    require_explicit_unit: true
+    clamp_explicit_values: false
+    distance_origins: [explicit_with_unit]
+  groups:
+    retraction:
+      enabled: true
+      initial_end_effector_profile: "army_navy_retractor"
+      allowed_operations: [retraction]
+      # Tool change is deliberately absent: staff handle every setup change.
+      allowed_voice_commands:
+        - start_direct_teach
+        - finish_direct_teach
+        - start_retraction
+        - adjust_retraction
+        - stop_retraction
+  cues:
+    - id: "right_army_adjust_10mm"
+      phase_id: "P02"
+      group_id: "retraction"
+      operation: "retraction"
+      utterances:
+        - "아미를 오른쪽으로 1센치 더 당겨줘"
+        - "아미를 오른쪽으로 1씨엠 더 당겨줘"
+      adjustment_mode: "single"
+      target_retractor_id: "right_army_navy"
+      direction_frame: "surgeon_view"
+      directions: [RIGHT]
+    - id: "left_army_adjust_10mm"
+      phase_id: "P02"
+      group_id: "retraction"
+      operation: "retraction"
+      utterances:
+        - "아미를 왼쪽으로 1센치 더 당겨줘"
+        - "아미를 왼쪽으로 1씨엠 더 당겨줘"
+      adjustment_mode: "single"
+      target_retractor_id: "left_army_navy"
+      direction_frame: "surgeon_view"
+      directions: [LEFT]
+    - id: "both_army_adjust_1mm_each"
+      phase_id: "P02"
+      group_id: "retraction"
+      operation: "retraction"
+      utterances:
+        - "양쪽으로 1mm씩 당겨줘"
+        - "아미 양쪽을 1밀리씩 더 당겨줘"
+        - "아미 좌우로 1밀리미터 더 당겨줘"
+      adjustment_mode: "multi"
+      target_retractor_id: "both_army_navy"
+      direction_frame: "surgeon_view"
+      directions: [LEFT_RIGHT]
+  end_effector_transitions: []
+
+# A bilateral adjustment is represented atomically by the public Service's
+# TARGET_NONE (0) wire value. The controller applies the same distance once to
+# each arm; it is not two planner requests and must not be split by Taskplanner.
+
+phase_flow:
+  normal_sequence:
+    - from: "P01"
+      to: "P02"
+      transition_cues:
+        anatomy: "the incision and manually positioned Army-Navy retractors expose the external oblique"
+        action: "staff finish setup and select the active retraction phase"
+        tool_cue: "T03 is mounted manually; no Taskplanner handover"
+    - from: "P02"
+      to: "P03"
+      transition_cues:
+        anatomy: "the external oblique is open and cord structures are exposed"
+        action: "staff select cord and sac dissection"
+        tool_cue: "T04/T05/T06 are display context only"
+    - from: "P03"
+      to: "P04"
+      transition_cues:
+        anatomy: "the hernia sac is separated from cord structures"
+        action: "staff select sac treatment"
+        tool_cue: "T05/T06/T08 are display context only"
+    - from: "P04"
+      to: "P05"
+      transition_cues:
+        anatomy: "sac treatment is complete and repair or closure begins"
+        action: "staff select repair and closure"
+        tool_cue: "T08/T09 are display context only"
+
+phase_details:
+  P01:
+    visual_cues:
+      - "manual positioning, draping, instrument setup, and bed-arm preparation"
+      - "T01-T09 are arranged by staff; Taskplanner does not request or move them"
+    expected_tool_sequence: []
+  P02:
+    visual_cues:
+      - "T03 Army-Navy retractors maintain the exposed groin field"
+      - "T01/T02 may be used by staff during incision and exposure"
+    tool_roles:
+      field_deployed: [T03]
+    expected_tool_sequence: []
+  P03:
+    visual_cues:
+      - "cord structures and hernia sac are dissected under stable T03 retraction"
+      - "T04/T05/T06 may be present as manually managed context"
+    tool_roles:
+      field_deployed: [T03]
+    expected_tool_sequence: []
+  P04:
+    visual_cues:
+      - "hernia-sac control or ligation proceeds under maintained T03 retraction"
+      - "T05/T06/T08 may be present as manually managed context"
+    tool_roles:
+      field_deployed: [T03]
+    expected_tool_sequence: []
+  P05:
+    visual_cues:
+      - "repair and layered closure proceed after sac treatment"
+      - "T08/T09 may be present as manually managed context"
+    expected_tool_sequence: []

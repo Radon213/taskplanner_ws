@@ -235,7 +235,7 @@ def test_active_mayo_recovery_is_canceled_when_tool_is_requested_for_reuse() -> 
     assert tool_id not in twin.state.active_recovery_tools
 
 
-def test_mayo_handover_respects_two_tool_surgeon_capacity() -> None:
+def test_mayo_handover_does_not_limit_surgeon_owned_tool_count() -> None:
     twin = _thyroid_twin()
     mayo_tool = "T01"
     twin._set_lifecycle(
@@ -256,10 +256,34 @@ def test_mayo_handover_respects_two_tool_surgeon_capacity() -> None:
 
     twin.update_surgeon_request(_request(mayo_tool))
 
-    assert twin.handover_allowed() is False
+    assert twin.handover_allowed() is True
+
+    twin.apply_event(
+        _event(
+            "RobotGraspedTool",
+            mayo_tool,
+            source="mayo_reuse_zone",
+            source_type="mayo_reuse_zone",
+            target="robot_right_hand",
+            target_type="robot_right_hand",
+        )
+    )
+    twin.apply_event(
+        _event(
+            "ToolHandoverCompleted",
+            mayo_tool,
+            source="robot_right_hand",
+            source_type="robot_right_hand",
+            target="surgeon_receive_zone",
+            target_type="handover_zone",
+        )
+    )
+
+    assert _state(twin, mayo_tool).lifecycle_stage == LIFECYCLE_SURGEON_OWNED
+    assert "surgeon_owned_overloaded" not in twin.state.safety_flags
 
 
-def test_corroborated_public_mayo_stand_observation_maps_to_mayo_reuse() -> None:
+def test_type_only_mayo_observation_cannot_move_home_inventory() -> None:
     twin = _thyroid_twin()
     observation = ToolObservation()
     observation.stamp.sec = 12
@@ -277,13 +301,12 @@ def test_corroborated_public_mayo_stand_observation_maps_to_mayo_reuse() -> None
 
     state = _state(twin, "T04")
     assert result is not None
-    assert result["reducer_result"] == "accepted"
-    assert state.lifecycle_stage == LIFECYCLE_MAYO_REUSE
-    assert state.location_type == "mayo_stand"
-    assert state.mayo_placement_evidence == "public_visual_observation"
+    assert result["reducer_result"] == "rejected"
+    assert result["reducer_reason"] == "cam4_mayo_no_surgeon_owned_instance"
+    assert state.lifecycle_stage != LIFECYCLE_MAYO_REUSE
 
 
-def test_stable_cam4_can_move_field_tool_to_mayo_reuse() -> None:
+def test_vlm_only_mayo_visibility_cannot_move_field_tool() -> None:
     twin = _thyroid_twin()
     state = _state(twin, "T04")
     twin._set_lifecycle(
@@ -308,9 +331,9 @@ def test_stable_cam4_can_move_field_tool_to_mayo_reuse() -> None:
     )
 
     assert result is not None
-    assert result["reducer_result"] == "accepted"
-    assert state.lifecycle_stage == LIFECYCLE_MAYO_REUSE
-    assert state.mayo_placement_evidence == "public_visual_observation"
+    assert result["reducer_result"] == "rejected"
+    assert result["reducer_reason"] == "cam4_mayo_requires_typed_detector_episode"
+    assert state.lifecycle_stage == LIFECYCLE_SURGEON_OWNED
 
 
 def test_low_confidence_cam4_cannot_move_field_tool_to_mayo() -> None:
@@ -339,10 +362,7 @@ def test_low_confidence_cam4_cannot_move_field_tool_to_mayo() -> None:
 
     assert result is not None
     assert result["reducer_result"] == "rejected"
-    assert (
-        result["reducer_reason"]
-        == "field_deployed_tool_requires_explicit_return_context"
-    )
+    assert result["reducer_reason"] == "cam4_mayo_confidence_below_threshold"
     assert state.lifecycle_stage == LIFECYCLE_SURGEON_OWNED
 
 
@@ -351,13 +371,23 @@ def test_direct_cam4_mayo_observation_preserves_source_timestamp() -> None:
     state = _state(twin, "T04")
     twin._set_lifecycle(
         state,
-        LIFECYCLE_SURGEON_OWNED,
-        location_type="surgical_field",
-        location_id="surgical_field",
+        LIFECYCLE_PREPOSITIONED_RIGHT,
+        location_type="robot_right_hand",
+        location_id="robot_right_hand",
         confidence=1.0,
     )
+    handover = _event(
+        "ToolHandoverCompleted",
+        "T04",
+        source="robot_right_hand",
+        source_type="robot_right_hand",
+        target="surgeon_receive_zone",
+        target_type="handover_zone",
+    )
+    handover.stamp.sec = 44
+    twin.apply_event(handover)
     observation = ToolObservation()
-    observation.stamp.sec = 44
+    observation.stamp.sec = 45
     observation.stamp.nanosec = 500_000_000
     observation.instrument_id = "Bovie surgical cautery"
     observation.location_type = "mayo_stand"
@@ -369,12 +399,14 @@ def test_direct_cam4_mayo_observation_preserves_source_timestamp() -> None:
         observation,
         source="cam4_rfdetr_mayo_observation",
         proposal_id="test:direct-cam4-source-time",
+        placement_episode_started_sec=45.0,
+        placement_episode_id="episode:45",
     )
 
     assert result is not None
     assert result["reducer_result"] == "accepted"
     assert state.lifecycle_stage == LIFECYCLE_MAYO_REUSE
-    assert state.last_update_sec == 44.5
+    assert state.last_update_sec == 45.5
 
 
 def test_direct_cam4_mayo_observation_cannot_move_robot_held_tool() -> None:
@@ -403,9 +435,81 @@ def test_direct_cam4_mayo_observation_cannot_move_robot_held_tool() -> None:
 
     assert result is not None
     assert result["reducer_result"] == "rejected"
-    assert result["reducer_reason"] == "illegal_observation_transition"
+    assert result["reducer_reason"] == "cam4_mayo_no_surgeon_owned_instance"
     assert state.lifecycle_stage == LIFECYCLE_PREPOSITIONED_RIGHT
     assert state.location_type == "robot_right_hand"
+
+
+def test_pre_handover_episode_stays_rejected_until_new_release_episode() -> None:
+    twin = _thyroid_twin()
+    state = _state(twin, "T04")
+    twin._set_lifecycle(
+        state,
+        LIFECYCLE_PREPOSITIONED_RIGHT,
+        location_type="robot_right_hand",
+        location_id="robot_right_hand",
+        confidence=1.0,
+    )
+
+    first = ToolObservation()
+    first.stamp.sec = 44
+    first.instrument_id = "Bovie surgical cautery"
+    first.location_type = "mayo_stand"
+    first.location_id = "mayo_stand"
+    first.confidence = 0.92
+    first.visible = True
+    rejected = twin.reconcile_observation(
+        first,
+        source="cam4_rfdetr_mayo_observation",
+        proposal_id="test:cam4-lease-before-handover",
+    )
+
+    assert rejected is not None
+    assert rejected["reducer_reason"] == "cam4_mayo_no_surgeon_owned_instance"
+    assert state.lifecycle_stage == LIFECYCLE_PREPOSITIONED_RIGHT
+
+    handover = _event(
+        "ToolHandoverCompleted",
+        "T04",
+        source="robot_right_hand",
+        source_type="robot_right_hand",
+        target="surgeon_receive_zone",
+        target_type="handover_zone",
+    )
+    handover.stamp.sec = 45
+    twin.apply_event(handover)
+    renewed = ToolObservation()
+    renewed.stamp.sec = 45
+    renewed.instrument_id = "Bovie surgical cautery"
+    renewed.location_type = "mayo_stand"
+    renewed.location_id = "mayo_stand"
+    renewed.confidence = 0.92
+    renewed.visible = True
+    still_rejected = twin.reconcile_observation(
+        renewed,
+        source="cam4_rfdetr_mayo_observation",
+        proposal_id="test:cam4-lease-after-handover",
+        placement_episode_started_sec=44.0,
+        placement_episode_id="episode:44",
+    )
+
+    assert still_rejected is not None
+    assert still_rejected["reducer_reason"] == (
+        "cam4_mayo_episode_precedes_return_authority"
+    )
+    renewed.stamp.sec = 46
+    accepted = twin.reconcile_observation(
+        renewed,
+        source="cam4_rfdetr_mayo_observation",
+        proposal_id="test:cam4-new-release-after-handover",
+        placement_episode_started_sec=45.5,
+        placement_episode_id="episode:45.5",
+    )
+    assert accepted is not None
+    assert accepted["reducer_result"] == "accepted"
+    assert state.lifecycle_stage == LIFECYCLE_MAYO_REUSE
+    assert state.location_type == "mayo_stand"
+    assert state.last_update_sec == 46.0
 
 
 def test_recovery_evidence_preserves_future_use_fact_for_bt() -> None:
@@ -441,8 +545,8 @@ def test_recovery_evidence_preserves_future_use_fact_for_bt() -> None:
 
 def test_recovery_evidence_never_promotes_lifecycle_or_opens_transaction() -> None:
     twin = _thyroid_demo_twin()
-    twin.set_initial_phase("P03")
-    state = _state(twin, "T01")
+    twin.set_initial_phase("P10")
+    state = _state(twin, "T04")
     twin._set_lifecycle(
         state,
         LIFECYCLE_MAYO_REUSE,
@@ -469,9 +573,40 @@ def test_recovery_evidence_never_promotes_lifecycle_or_opens_transaction() -> No
     assert twin.state.active_recovery_tool_instances == []
 
 
+def test_mayo_policy_evidence_rejects_noncanonical_mayo_location() -> None:
+    twin = _thyroid_demo_twin()
+    state = _state(twin, "T04")
+    twin._set_lifecycle(
+        state,
+        LIFECYCLE_MAYO_REUSE,
+        location_type="mayo_stand",
+        location_id="mayo_stand",
+        confidence=0.9,
+    )
+    # Simulate an inconsistent legacy/stale projection. A lifecycle label by
+    # itself must never make the VLM policy path eligible.
+    state.location_type = "mayo_reuse_zone"
+    state.location_id = "mayo_reuse_zone"
+
+    result = twin.record_mayo_policy_evidence(
+        instrument_id=state.instance_id,
+        evidence_type="recover",
+        confidence=0.92,
+        stability_sec=5.0,
+        source="vlm_mayo_retrieve",
+        proposal_id="test:noncanonical-mayo",
+        stamp_sec=50.0,
+    )
+
+    assert result is not None
+    assert result["reducer_result"] == "rejected"
+    assert result["reducer_reason"] == "mayo_policy_tool_not_on_mayo"
+    assert state.mayo_recovery_confidence == 0.0
+
+
 def test_recovery_transaction_promotes_mayo_state_and_queues_once() -> None:
     twin = _thyroid_demo_twin()
-    state = _state(twin, "T01")
+    state = _state(twin, "T04")
     twin._set_lifecycle(
         state,
         LIFECYCLE_MAYO_REUSE,
@@ -494,7 +629,7 @@ def test_recovery_transaction_promotes_mayo_state_and_queues_once() -> None:
 
 def test_open_return_waits_for_physical_mayo_arrival_before_state_promotion() -> None:
     twin = _thyroid_demo_twin()
-    state = _state(twin, "T01")
+    state = _state(twin, "T04")
     twin._set_lifecycle(
         state,
         LIFECYCLE_SURGEON_OWNED,
@@ -503,6 +638,7 @@ def test_open_return_waits_for_physical_mayo_arrival_before_state_promotion() ->
         confidence=1.0,
     )
     twin._open_recovery_transaction(state.instance_id, "surgeon_return_request")
+    twin._recovery_transaction_opened_stamp_by_instance[state.instance_id] = 9.0
 
     assert state.lifecycle_stage == LIFECYCLE_SURGEON_OWNED
     assert twin.state.active_recovery_tool_instances == [state.instance_id]
@@ -518,6 +654,8 @@ def test_open_return_waits_for_physical_mayo_arrival_before_state_promotion() ->
         observation,
         source="cam4_rfdetr_mayo_observation",
         proposal_id="test:mayo-arrival",
+        placement_episode_started_sec=9.5,
+        placement_episode_id="episode:9.5",
     )
 
     assert state.lifecycle_stage == LIFECYCLE_MAYO_RECOVERY
@@ -610,11 +748,8 @@ def test_recorded_mayo_observation_cannot_undo_shadow_recovery() -> None:
     )
 
     assert result is not None
-    assert result["reducer_result"] == "quarantined"
-    assert (
-        result["reducer_reason"]
-        == "shadow_counterfactual_branch_conflict"
-    )
+    assert result["reducer_result"] == "rejected"
+    assert result["reducer_reason"] == "cam4_mayo_no_surgeon_owned_instance"
     assert state.lifecycle_stage == LIFECYCLE_RETURNED_HOME
     assert state.location_type == state.home_location_type
 
@@ -625,4 +760,5 @@ def test_recorded_mayo_observation_cannot_undo_shadow_recovery() -> None:
         proposal_id="test:post-reset-mayo",
     )
     assert reset_result is not None
-    assert reset_result["reducer_result"] == "accepted"
+    assert reset_result["reducer_result"] == "rejected"
+    assert reset_result["reducer_reason"] == "cam4_mayo_no_surgeon_owned_instance"

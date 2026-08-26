@@ -338,33 +338,32 @@ test("keeps the command ribbon readable at an intermediate laptop width", async 
   const ribbon = page.locator('[data-slot="mission-command-bar"]');
   const debugEntry = ribbon.locator(".debug-mode-entry");
   const integratedObserve = ribbon.getByRole("button", { name: "통합 Debug 관측 열기" });
-  await expect(debugEntry).toBeVisible();
+  await expect(debugEntry).toHaveCount(0);
   await expect(integratedObserve).toBeVisible();
   const audit = await page.evaluate(() => {
     const viewport = document.documentElement.clientWidth;
-    const entry = document.querySelector<HTMLElement>('[data-slot="mission-command-bar"] .debug-mode-entry');
     const navigation = document.querySelector<HTMLElement>('[data-slot="mission-command-bar"] .workspace-navigation');
     const model = document.querySelector<HTMLElement>('[data-slot="mission-command-bar"] .ribbon-model-control');
     const status = document.querySelector<HTMLElement>('[data-slot="mission-command-bar"] .ribbon-status-actions');
-    if (!entry || !navigation || !model || !status) return null;
+    const integratedObserveButton = document.querySelector<HTMLElement>(
+      '[data-slot="mission-command-bar"] [aria-label="통합 Debug 관측 열기"]',
+    );
+    if (!navigation || !model || !status || !integratedObserveButton) return null;
     const rect = (element: HTMLElement) => {
       const bounds = element.getBoundingClientRect();
       return { right: bounds.right, width: bounds.width, height: bounds.height };
     };
     return {
       viewport,
-      entry: rect(entry),
-      integratedObserve: rect(document.querySelector<HTMLElement>('[data-slot="mission-command-bar"] [aria-label="통합 Debug 관측 열기"]')!),
+      integratedObserve: rect(integratedObserveButton),
       navigation: rect(navigation),
       model: rect(model),
       status: rect(status),
-      whiteSpace: getComputedStyle(entry).whiteSpace,
+      whiteSpace: getComputedStyle(integratedObserveButton).whiteSpace,
     };
   });
   expect(audit).not.toBeNull();
   expect(audit?.whiteSpace).toBe("nowrap");
-  expect(audit?.entry.width).toBeGreaterThanOrEqual(100);
-  expect(audit?.entry.height).toBeLessThanOrEqual(46);
   expect(audit?.integratedObserve.height).toBeGreaterThanOrEqual(44);
   expect(audit?.integratedObserve.width).toBeGreaterThanOrEqual(100);
   expect(audit?.navigation.right).toBeLessThanOrEqual((audit?.viewport ?? 0) + 1);
@@ -375,9 +374,9 @@ test("keeps the command ribbon readable at an intermediate laptop width", async 
   // the command-center ribbon can safely return to one row.
   await page.setViewportSize({ width: 1440, height: 900 });
   await page.reload();
-  const desktopEntry = page.locator('[data-slot="mission-command-bar"] .debug-mode-entry');
-  await expect(desktopEntry).toBeVisible();
-  await expect.poll(async () => (await desktopEntry.boundingBox())?.width ?? 0).toBeGreaterThanOrEqual(100);
+  const desktopIntegratedObserve = page.getByRole("button", { name: "통합 Debug 관측 열기" });
+  await expect(desktopIntegratedObserve).toBeVisible();
+  await expect.poll(async () => (await desktopIntegratedObserve.boundingBox())?.width ?? 0).toBeGreaterThanOrEqual(100);
 });
 
 test("keeps embedded camera controls distinct and LLM status readable across board scales", async ({ page }, testInfo) => {
@@ -401,7 +400,7 @@ test("keeps embedded camera controls distinct and LLM status readable across boa
       };
       const cameras = [...document.querySelectorAll<HTMLElement>(".switchable-stage-camera")].map((camera) => {
         const cameraBounds = camera.getBoundingClientRect();
-        const buttons = [...camera.querySelectorAll<HTMLElement>("button")]
+        const sourceButtons = [...camera.querySelectorAll<HTMLElement>(".stage-camera-toggle button, .stage-camera-toggle-compact")]
           .filter(visible)
           .map((button) => {
             const bounds = button.getBoundingClientRect();
@@ -413,45 +412,85 @@ test("keeps embedded camera controls distinct and LLM status readable across boa
               bottom: bounds.bottom,
               width: bounds.width,
               height: bounds.height,
+              labelMetrics: {
+                text: button.textContent?.trim() ?? "",
+                fontSize: Number.parseFloat(getComputedStyle(button).fontSize),
+                hasLayoutHeight: button.clientHeight > 0,
+                clipped: button.scrollHeight > button.clientHeight + 1,
+              },
             };
           });
-        const overlaps = buttons.flatMap((left, index) => buttons.slice(index + 1).flatMap((right) => {
+        const overlaps = sourceButtons.flatMap((left, index) => sourceButtons.slice(index + 1).flatMap((right) => {
           const width = Math.max(0, Math.min(left.right, right.right) - Math.max(left.left, right.left));
           const height = Math.max(0, Math.min(left.bottom, right.bottom) - Math.max(left.top, right.top));
           return width > 1 && height > 1 ? [`${left.label}/${right.label}`] : [];
         }));
+        const header = camera.querySelector<HTMLElement>("figcaption");
+        const expand = camera.querySelector<HTMLElement>(".stage-camera-expand");
         return {
-          buttons,
+          sourceButtons,
           overlaps,
-          contained: buttons.every((button) =>
+          contained: sourceButtons.every((button) =>
             button.left >= cameraBounds.left - 1 && button.right <= cameraBounds.right + 1
             && button.top >= cameraBounds.top - 1 && button.bottom <= cameraBounds.bottom + 1),
+          headerHeight: header?.getBoundingClientRect().height ?? 0,
+          expand: expand ? (() => {
+            const bounds = expand.getBoundingClientRect();
+            return { width: bounds.width, height: bounds.height };
+          })() : null,
         };
       });
       const surgeon = document.querySelector<HTMLElement>(".llm-surgeon-dock");
       const loadState = surgeon?.querySelector<HTMLElement>(".model-load-state");
-      const gestureLabel = surgeon?.querySelector<HTMLElement>(".public-gesture-status > span");
+      const handSignalLabel = surgeon?.querySelector<HTMLElement>(".hand-handover-signal-status > span");
       return {
         cameras,
         loadStateClipped: Boolean(loadState && loadState.scrollWidth > loadState.clientWidth + 1),
-        gestureLabelClipped: Boolean(gestureLabel && gestureLabel.scrollWidth > gestureLabel.clientWidth + 1),
+        handSignalLabelClipped: Boolean(handSignalLabel && handSignalLabel.scrollWidth > handSignalLabel.clientWidth + 1),
       };
     });
 
     for (const camera of audit.cameras) {
-      expect(camera.buttons.length, `${viewport.width}px camera switch is missing`).toBeGreaterThan(0);
+      expect(camera.sourceButtons.length, `${viewport.width}px camera switch is missing`).toBeGreaterThan(0);
       expect(camera.overlaps, `${viewport.width}px camera controls overlap`).toEqual([]);
       expect(camera.contained, `${viewport.width}px camera control is clipped`).toBe(true);
-      for (const button of camera.buttons) {
-        expect(button.width, `${viewport.width}px ${button.label} width`).toBeGreaterThanOrEqual(44);
-        expect(button.height, `${viewport.width}px ${button.label} height`).toBeGreaterThanOrEqual(44);
+      expect(camera.headerHeight, `${viewport.width}px camera source header is not compact`).toBeLessThanOrEqual(24);
+      for (const button of camera.sourceButtons) {
+        expect(button.labelMetrics.text, `${viewport.width}px camera label is missing`).toBeTruthy();
+        expect(button.labelMetrics.fontSize, `${viewport.width}px camera label must fit the compact control`).toBeLessThanOrEqual(8);
+        expect(button.labelMetrics.hasLayoutHeight, `${viewport.width}px camera label has no layout height`).toBe(true);
+        expect(button.labelMetrics.clipped, `${viewport.width}px camera label is vertically clipped`).toBe(false);
+      }
+      if (camera.expand) {
+        expect(camera.expand.width, `${viewport.width}px camera expand width`).toBeGreaterThanOrEqual(44);
+        expect(camera.expand.height, `${viewport.width}px camera expand height`).toBeGreaterThanOrEqual(44);
       }
     }
     if (viewport.width === 1366) {
       expect(audit.loadStateClipped).toBe(false);
-      expect(audit.gestureLabelClipped).toBe(false);
+      expect(audit.handSignalLabelClipped).toBe(false);
     }
   }
+
+  const stageCameraPlacement = await page.evaluate(() => {
+    const labels = (selector: string) => [...document.querySelectorAll<HTMLButtonElement>(selector)]
+      .map((button) => button.textContent?.trim() ?? "")
+      .filter(Boolean);
+    const cam1 = document.querySelector<HTMLElement>(".cam1-stage-camera");
+    const cam3 = document.querySelector<HTMLElement>(".cam3-stage-camera");
+    return {
+      cam1Slot: cam1?.dataset.slot ?? null,
+      cam1Sources: labels(".cam1-stage-camera .stage-camera-toggle button"),
+      cam3Slot: cam3?.dataset.slot ?? null,
+      cam3SourceToggleCount: cam3?.querySelectorAll(".stage-camera-toggle").length ?? 0,
+    };
+  });
+  expect(stageCameraPlacement).toEqual({
+    cam1Slot: "stage-camera-toggle-viewport",
+    cam1Sources: ["CAM1", "CAM4"],
+    cam3Slot: "stage-camera-viewport",
+    cam3SourceToggleCount: 0,
+  });
 });
 
 test("Multicam and Debug workspaces pass WCAG AA", async ({ page }, testInfo) => {

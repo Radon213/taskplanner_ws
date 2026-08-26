@@ -1,6 +1,6 @@
-# 공개 토픽 빠른 참조 — v0.3.0
+# 공개 토픽 빠른 참조 — v0.5.0
 
-기준: 로컬 `main` 워크트리 / `surgical_interop_msgs` 0.3.0
+기준: 로컬 `main` 워크트리 / `surgical_interop_msgs` 0.5.0
 
 공개 상태 Gateway는 기본 활성화되어 있다. 시나리오가 없거나
 `/twin/world_state`가 stale이면 이전 데이터를 유지하지 않고 동적
@@ -37,7 +37,7 @@ ID/confidence는 계속 제공된다. 이 Gateway는 자유문장을 비식별�
 | `/surgery/robot_end_effectors` | `RobotEndEffectorStateArray` | humanoid 왼손·오른손의 `empty/holding/unknown`과 보유 도구 | 빈 배열 |
 | `/surgery/tool_predictions` | `ToolPredictionArray` | 다음 도구 rank, ID, confidence, stability, source | 빈 배열 |
 | `/surgery/speech` | `SpeechRecognitionState` | ASR 상태, 연결, sequence, 응답 latency; 확정 문장은 별도 opt-in | unavailable + 빈 text |
-| `/surgery/clinical_observations` | `ClinicalObservationArray` | VLM 관찰 단계·도구·위치·gesture와 불확실성; summary는 별도 opt-in | 빈 배열 |
+| `/surgery/clinical_observations` | `ClinicalObservationArray` | VLM 관찰 단계·도구·위치와 불확실성; summary는 별도 opt-in | 빈 배열 |
 | `/surgery/health` | `SurgeryHealth` | source별 unavailable/stale/error | 실제 상태 계속 발행 |
 | `/surgery/events` | `SurgeryEvent` | 단계/도구 등 상태 변화와 outcome, correlation ID | 발행하지 않음 |
 
@@ -48,8 +48,8 @@ ID/confidence는 계속 제공된다. 이 Gateway는 자유문장을 비식별�
 ### Gateway heartbeat
 
 ```yaml
-schema_version: "1.1.0"
-interface_version: "0.3.0"
+schema_version: "1.3.0"
+interface_version: "0.5.0"
 catalog_version: "sha256:<catalog digest>"
 gateway_instance_id: "<opaque gateway UUID>"
 procedure_run_id: "<opaque run UUID>"
@@ -63,6 +63,10 @@ procedure_active: true
 procedure_type: thyroidectomy
 procedure_display_name: Open Thyroidectomy
 procedure_display_name_ko: 갑상선절제술
+procedure_target_site: Right Lobectomy
+procedure_target_site_ko: Right Lobectomy
+procedure_approach: Open
+procedure_approach_ko: Open
 default_phase_id: P01
 phases:
   - ordinal: 1
@@ -121,8 +125,9 @@ predictions:
     evidence_status: DT_ACCEPTED
 ```
 
-예측은 최대 3개이며 confidence 내림차순이다. rank 1만 기존 내부 BT scalar와
-동일하고, rank 2·3은 제어에 들어가지 않는다. 이 예측 전체는 UI 표시용 advisory
+예측은 최대 3개이며 confidence 내림차순이다. rank 1의 도구 ID와 stability만
+기존 내부 BT scalar와 일치하며, 표시 confidence는 Top-3 합이 100%가 되도록
+정규화될 수 있다. rank 2·3은 제어에 들어가지 않는다. 이 예측 전체는 UI 표시용 advisory
 정보이며 Action 실행 지시나 승인으로 사용하면 안 된다.
 
 ### 로봇 손과 도구 상태
@@ -176,15 +181,24 @@ evidence_status: GATEWAY_OBSERVED_REDACTED
 `latency_available=false`이면 `response_latency_ms`를 표시하지 않는다. 알 수 없는
 자유문장 `latency_basis`는 공개하지 않고 latency 전체를 unavailable 처리한다.
 
-VLM도 기본 정책에서 단계·도구·위치·gesture의 구조화된 값은 유지하고
+VLM도 기본 정책에서 단계·도구·위치와 uncertainty의 구조화된 값은 유지하고
 `summary=""`로 발행한다. 원래 summary가 존재했다면
 `evidence_status=MODEL_OBSERVED_REDACTED`이므로 UI가 문장을 추정해서 만들면 안 된다.
+
+손 전달 신호는 VLM 출력이나 공개 `ClinicalObservation` 필드가 아니다. Digital
+Twin이 CAM4의 typed `/perception/cam_4/hand/gestures`,
+`/perception/cam_4/hand/facing`, `/perception/cam_4/hand/health`를 직접 검증하고,
+동일 source header의 정확한 `Right + Open_Palm + PALM_UP` 관측이 source time과
+receipt time 모두에서 최소 0.300초 연속될 때만 tool-agnostic handover evidence
+episode를 만든다. 이 evidence는 도구를
+선택하지 않고, 공개 clinical observation으로 복사되지 않으며, 그 자체가 로봇
+명령이나 실행 승인이 아니다.
 
 ### Event outcome
 
 ```yaml
 sequence: 287
-schema_version: "1.1.0"
+schema_version: "1.3.0"
 catalog_version: "sha256:<catalog digest>"
 gateway_instance_id: "<opaque gateway UUID>"
 procedure_run_id: "<opaque run UUID>"
@@ -237,7 +251,7 @@ ros2 topic info /surgery/images/flir/compressed --verbose
 ```
 
 다른 PC의 native ROS 2 subscriber는 동일 Domain/RMW/discovery와
-`surgical_interop_msgs` 0.3.0 설치가 필요하다.
+`surgical_interop_msgs` 0.5.0 설치가 필요하다.
 
 > **Native DDS 보안 경계 주의**: 현재 배포의 DDS subnet은 인증/ACL 경계가
 > 아니다. 같은 Domain 참가자는 공개 13개 endpoint뿐 아니라 내부 토픽도

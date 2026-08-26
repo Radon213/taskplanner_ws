@@ -22,18 +22,6 @@ IsProcedureActive:
   allow_unreachable: true
   logger_level: ""
   extra: ~
-IsPhaseCertain:
-  class_name: taskplanner_bt_nodes::IsPhaseCertain
-  description: Return SUCCESS when the mirrored phase uncertainty flag is false.
-  topic: ""
-  port_alias: {}
-  port_default: {}
-  hidden_ports: []
-  wait_timeout: 1
-  request_timeout: 2
-  allow_unreachable: true
-  logger_level: ""
-  extra: ~
 HasExplicitRequest:
   class_name: taskplanner_bt_nodes::HasExplicitRequest
   description: Return SUCCESS when an explicit tool request is present on the mirrored blackboard.
@@ -192,7 +180,7 @@ ConfigureHumanoidCommand:
   extra: ~
 ShouldDispatchDecision:
   class_name: taskplanner_bt_nodes::ShouldDispatchDecision
-  description: Allow emit/publish only when the intent changes or a cooldown expires.
+  description: Allow emit/publish only when the intent or authoritative world context changes and no tracked Action blocks dispatch.
   topic: ""
   port_alias: {}
   port_default: {}

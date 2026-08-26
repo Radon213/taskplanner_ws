@@ -1,7 +1,9 @@
 import json
 import math
+from pathlib import Path
 import threading
 import time
+import uuid
 
 import pytest
 import rclpy
@@ -19,10 +21,12 @@ from integration_debug.operational_asr_node import (
     SENTENCE_TOPIC,
     STATUS_SCHEMA,
     STATUS_TOPIC,
+    UTTERANCE_TOPIC,
     OperationalAsrNode,
     _absolute_topic_name,
     _bounded_float,
     _json_dumps,
+    _source_revision,
     resolve_puzzle_asr_endpoint,
 )
 from integration_debug.asr_health_monitor import LAN_HEALTH_READY
@@ -113,10 +117,13 @@ class FakeHealthMonitor:
 @pytest.fixture
 def node(monkeypatch):
     monkeypatch.setenv("PUZZLE_ASR_ENDPOINT", ASR_ENDPOINT_CLOUD)
+    monkeypatch.delenv("PUZZLE_ASR_ROUTE_POLICY", raising=False)
     monkeypatch.setenv("PUZZLE_ASR_URL", "wss://asr.example.test/v1")
     monkeypatch.delenv("PUZZLE_ASR_LAN_URL", raising=False)
     monkeypatch.setenv("TASKPLANNER_ASR_CAPTURE_LOCK", "/tmp/test-asr.lock")
     monkeypatch.delenv("SENTENCE_INPUT_TOPIC", raising=False)
+    monkeypatch.delenv("TASKPLANNER_ASR_OUTPUT_MODE", raising=False)
+    monkeypatch.delenv("TASKPLANNER_ASR_UTTERANCE_TOPIC", raising=False)
     rclpy.init(args=[])
     created = OperationalAsrNode(
         runtime_factory=FakeRuntime,
@@ -169,7 +176,15 @@ def test_fixed_contract_and_json_safe_status(node) -> None:
     status = json.loads(encoded)
     assert status["schema"] == STATUS_SCHEMA == "taskplanner.asr.status.v1"
     assert isinstance(status["stamp_sec"], float)
-    assert status["asr"]["artifacts_enabled"] is False
+    assert str(uuid.UUID(status["node_instance_id"])) == status["node_instance_id"]
+    assert status["node_started_at_sec"] > 0.0
+    assert len(status["source_revision"]) == 64
+    assert set(status["source_revision"]) <= set("0123456789abcdef")
+    # Artifact support is enabled so the explicit start_recording/
+    # stop_recording controls can work, but an ASR microphone session must not
+    # begin recording on its own.
+    assert status["asr"]["artifacts_enabled"] is True
+    assert node._runtime.kwargs["recording_default_active"] is False
     assert status["asr"]["endpoint_id"] == ASR_ENDPOINT_CLOUD
     assert status["asr"]["route_policy"] == ASR_ENDPOINT_CLOUD
     assert status["asr"]["lan_health"]["state"] == LAN_HEALTH_READY
@@ -181,6 +196,40 @@ def test_fixed_contract_and_json_safe_status(node) -> None:
         _absolute_topic_name("sensors/surgeon/sentence")
     with pytest.raises(Exception):
         _absolute_topic_name("/sensors//sentence")
+
+
+def test_runtime_identity_is_stable_per_node_and_distinct(node) -> None:
+    first = node._status_envelope()
+    repeated = node._status_envelope()
+    other = OperationalAsrNode(
+        runtime_factory=FakeRuntime,
+        health_monitor_factory=FakeHealthMonitor,
+    )
+    try:
+        other_status = other._status_envelope()
+
+        assert repeated["node_instance_id"] == first["node_instance_id"]
+        assert repeated["node_started_at_sec"] == first["node_started_at_sec"]
+        assert repeated["source_revision"] == first["source_revision"]
+        assert other_status["node_instance_id"] != first["node_instance_id"]
+        assert other_status["source_revision"] == first["source_revision"]
+    finally:
+        other.close()
+        other.destroy_node()
+
+
+def test_source_revision_uses_fixed_manifest_without_host_paths(tmp_path) -> None:
+    (tmp_path / "operational_asr_node.py").write_text("first\n", encoding="utf-8")
+    (tmp_path / "asr_runtime.py").write_text("runtime\n", encoding="utf-8")
+
+    first = _source_revision(tmp_path)
+    repeated = _source_revision(tmp_path)
+    (tmp_path / "operational_asr_node.py").write_text("second\n", encoding="utf-8")
+    changed = _source_revision(tmp_path)
+
+    assert first == repeated
+    assert changed != first
+    assert len(first) == 64
 
 
 def test_endpoint_resolver_allows_only_cloud_and_lan() -> None:
@@ -356,6 +405,51 @@ def test_sentence_publisher_tracks_connection_and_stop(node) -> None:
     node._runtime.events.append({"type": "asr_connection", "connected": True})
     node._drain_runtime_events()
     assert node._sentence_pub is None
+
+
+def test_typed_final_output_preserves_final_source_metadata(monkeypatch) -> None:
+    monkeypatch.setenv("PUZZLE_ASR_ENDPOINT", ASR_ENDPOINT_CLOUD)
+    monkeypatch.delenv("PUZZLE_ASR_ROUTE_POLICY", raising=False)
+    monkeypatch.setenv("PUZZLE_ASR_URL", "wss://asr.example.test/v1")
+    monkeypatch.setenv("TASKPLANNER_ASR_CAPTURE_LOCK", "/tmp/test-asr-typed.lock")
+    monkeypatch.setenv("TASKPLANNER_ASR_OUTPUT_MODE", "typed_utterance")
+    monkeypatch.setenv("TASKPLANNER_ASR_UTTERANCE_TOPIC", UTTERANCE_TOPIC)
+    rclpy.init(args=[])
+    created = OperationalAsrNode(
+        runtime_factory=FakeRuntime,
+        health_monitor_factory=FakeHealthMonitor,
+    )
+    try:
+        message = created._typed_final_message(
+            {
+                "stamp": "2026-08-22T00:00:00+00:00",
+            },
+            "Bovie please",
+        )
+
+        assert created._output_mode == "typed_utterance"
+        assert created._output_topic == UTTERANCE_TOPIC
+        assert message is not None
+        assert message.text == "Bovie please"
+        assert message.is_final is True
+        assert message.utterance_id.startswith("asr-cloud-")
+        assert message.source == "taskplanner_asr:cloud"
+        assert message.speaker_role == "surgeon"
+        assert message.stamp.sec == 1_787_356_800
+        assert message.end_stamp == message.stamp
+    finally:
+        created.close()
+        created.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+def test_live_compose_defaults_to_typed_final_asr_output() -> None:
+    compose = Path(__file__).parents[3] / "docker-compose.yml"
+    source = compose.read_text(encoding="utf-8")
+
+    assert "TASKPLANNER_ASR_OUTPUT_MODE: ${TASKPLANNER_ASR_OUTPUT_MODE:-typed_utterance}" in source
+    assert "TASKPLANNER_ASR_UTTERANCE_TOPIC: ${ASR_UTTERANCE_TOPIC:-/sensors/surgeon/utterance}" in source
 
 
 def test_disconnect_removes_publisher_and_reconnect_restores_it(node) -> None:

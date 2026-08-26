@@ -102,10 +102,6 @@ class PredictionProbe(Node):
         msg.observed_location_ids = []
         msg.observed_location_types = []
         msg.observed_confidences = []
-        msg.gesture_event_type = ""
-        msg.gesture_requested_tool = ""
-        msg.gesture_hand_pose = ""
-        msg.gesture_confidence = 0.0
         msg.uncertainty = 0.05
         self._result_pub.publish(msg)
 

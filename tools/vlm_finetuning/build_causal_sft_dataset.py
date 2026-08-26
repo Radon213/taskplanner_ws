@@ -51,10 +51,9 @@ EPSILON_SEC = 1e-6
 TASK_ORDER = {
     "tool_presence_at_transfer": 0,
     "tool_presence_pseudo": 1,
-    "request_intent": 2,
-    "current_phase": 3,
-    "next_physical_tool": 4,
-    "clinical_observation_interpretation": 5,
+    "current_phase": 2,
+    "next_physical_tool": 3,
+    "clinical_observation_interpretation": 4,
 }
 
 PHASE_LABELS = {
@@ -935,67 +934,6 @@ def _build_tool_presence_rows(sources: CaseSources) -> list[dict[str, Any]]:
     return rows
 
 
-def _build_request_rows(sources: CaseSources) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    for event in sources.observed:
-        if event.get("event_type") != "implicit_tool_request":
-            continue
-        if event.get("requested_tool") not in (None, ""):
-            raise BuildError(
-                f"{event.get('event_id')}: implicit request must not backfill tool"
-            )
-        start_frame, end_frame = _event_start_end_frames(event)
-        _, cutoff = _event_frame_time(
-            event,
-            sources.timestamps,
-            label=str(event.get("event_id")),
-            frame_field="end_source_frame_idx",
-            time_field="end_sec",
-        )
-        segment_start, _ = frame_segment_bounds(
-            end_frame,
-            frame_count=len(sources.timestamps),
-            gaps=sources.gaps,
-        )
-        lookback_start = _nearest_frame_in_bounds(
-            sources.timestamps,
-            cutoff - max(1.0, cutoff - sources.timestamps[start_frame]),
-            lower=segment_start,
-            upper=end_frame,
-        )
-        media = sample_causal_frames(
-            sources,
-            cutoff_frame=end_frame,
-            start_frame=lookback_start,
-            count=3,
-            view="cam4",
-        )
-        event_id = str(event["event_id"])
-        rows.append(
-            _base_row(
-                sources,
-                example_id=f"{sources.case_id}:request_intent:{event_id}",
-                task_type="request_intent",
-                cutoff_sec=cutoff,
-                window_start_sec=sources.timestamps[lookback_start],
-                media=media,
-                target={
-                    "event": "implicit_tool_request",
-                    "intent": "receive_unspecified_tool",
-                    "requested_tool": None,
-                    "tool_identity_inferred_from_later_transfer": False,
-                },
-                authority=_authority_for_event(event),
-                source_ids=[event_id],
-                quality_extra={
-                    "supervision_scope": "strict_empty_open_palm_interval",
-                    "future_tool_backfill_forbidden": True,
-                },
-            )
-        )
-    return rows
-
-
 def _phase_interval_frames(
     phases: Sequence[Mapping[str, Any]],
     frame_count: int,
@@ -1155,25 +1093,6 @@ def _surgeon_direction_transfers(
     )
 
 
-def _requests_before(
-    sources: CaseSources,
-    cutoff_sec: float,
-) -> list[dict[str, Any]]:
-    return sorted(
-        [
-            dict(event)
-            for event in sources.dt
-            if event.get("event_type") == "implicit_tool_request"
-            and float(event.get("end_sec", event["time_sec"]))
-            <= cutoff_sec + EPSILON_SEC
-        ],
-        key=lambda event: (
-            float(event.get("end_sec", event["time_sec"])),
-            str(event["event_id"]),
-        ),
-    )
-
-
 def _first_future_transfer(
     transfers: Sequence[Mapping[str, Any]],
     *,
@@ -1205,14 +1124,11 @@ def _prediction_regime(
     *,
     tool: str,
     voices: Sequence[Mapping[str, Any]],
-    causal_request_id: str | None,
 ) -> str:
     aliases = TOOL_SPEECH_ALIASES.get(tool, ())
     combined = " ".join(str(voice.get("text", "")).casefold() for voice in voices)
     if any(alias.casefold() in combined for alias in aliases):
         return "explicit_voice"
-    if causal_request_id:
-        return "implicit_request"
     return "anticipatory_context"
 
 
@@ -1236,23 +1152,7 @@ def _build_next_tool_rows(
             gaps=sources.gaps,
         )
         segment_start_sec = sources.timestamps[segment_start]
-        requests = [
-            event
-            for event in _requests_before(sources, transfer_time)
-            if transfer_time
-            - float(event.get("end_sec", event["time_sec"]))
-            <= NEXT_TOOL_HORIZON_SEC + EPSILON_SEC
-            and float(event.get("end_sec", event["time_sec"]))
-            >= segment_start_sec
-        ]
-        causal_request = requests[-1] if requests else None
-        proposed_cutoff = (
-            float(
-                causal_request.get("end_sec", causal_request["time_sec"])
-            )
-            if causal_request
-            else transfer_time - 2.0
-        )
+        proposed_cutoff = transfer_time - 2.0
         if transfer_index:
             previous_transfer = transfers[transfer_index - 1]
             previous_time = float(previous_transfer["time_sec"])
@@ -1299,9 +1199,6 @@ def _build_next_tool_rows(
             count=4,
             view="cam4",
         )
-        causal_request_id = (
-            str(causal_request["event_id"]) if causal_request else None
-        )
         preliminary_voices = _voice_context(
             sources,
             cutoff_sec=cutoff,
@@ -1309,8 +1206,6 @@ def _build_next_tool_rows(
         )
         target_tool = str(transfer["tool"])
         source_ids = [str(transfer["event_id"])]
-        if causal_request_id:
-            source_ids.append(causal_request_id)
         rows.append(
             _base_row(
                 sources,
@@ -1331,10 +1226,7 @@ def _build_next_tool_rows(
                     "prediction_regime": _prediction_regime(
                         tool=target_tool,
                         voices=preliminary_voices,
-                        causal_request_id=causal_request_id,
                     ),
-                    "causal_request_event_id": causal_request_id,
-                    "request_tool_backfilled": False,
                 },
                 authority=_authority_for_event(transfer, derived=True),
                 source_ids=source_ids,
@@ -1428,8 +1320,6 @@ def _build_next_tool_rows(
                     "target_time_sec": None,
                     "basis": "no_physical_transfer_within_horizon",
                     "prediction_regime": "negative_horizon",
-                    "causal_request_event_id": None,
-                    "request_tool_backfilled": False,
                 },
                 authority={
                     "tier": "derived_from_complete_dt_reference",
@@ -1843,7 +1733,6 @@ def build_case_rows(
     rng = random.Random(case_seed)
     rows = [
         *_build_tool_presence_rows(sources),
-        *_build_request_rows(sources),
         *_build_phase_rows(sources),
         *_build_next_tool_rows(sources, rng=rng),
         *_build_clinical_rows(sources),
@@ -2192,14 +2081,6 @@ def _task_prompt(row: Mapping[str, Any]) -> str:
             "출력 키: event, tool, view, "
             "exhaustive_visible_tool_inventory"
         )
-    if task == "request_intent":
-        return (
-            "시간 순서의 CAM4 프레임에서 집도의 손짓을 판별하라. 빈 손바닥 "
-            "요청 뒤 실제 전달된 도구를 소급해 요청 도구로 쓰지 말라.\n"
-            f"{voice_section}\n"
-            "출력 키: event, intent, requested_tool, "
-            "tool_identity_inferred_from_later_transfer"
-        )
     if task == "current_phase":
         phase_text = "; ".join(
             f"{phase_id}={name}" for phase_id, name in PHASE_LABELS.items()
@@ -2218,8 +2099,8 @@ def _task_prompt(row: Mapping[str, Any]) -> str:
             "시간 순서의 CAM4 프레임과 현재 시점까지 완료된 ASR을 바탕으로 "
             f"앞으로 {horizon:g}초 이내 scrub_nurse에서 surgeon으로 실제 "
             "전달될 첫 도구를 예측하라. 해당 전달이 없으면 "
-            "next_transfer_tool과 event를 모두 none으로 답하라. 무언 요청의 "
-            "도구를 미래 전달에서 역으로 채우지 말라. "
+            "next_transfer_tool과 event를 모두 none으로 답하라. 미래의 실제 "
+            "전달 결과를 현재 입력으로 소급하지 말라. "
             f"canonical tool ID: {canonical_tools}.\n{voice_section}\n"
             "출력 키: next_transfer_tool, event, basis"
         )
@@ -2370,9 +2251,6 @@ def validate_rows(
                 errors.append(f"{example_id}: pseudo label outside train split")
             if row["quality"].get("pseudo_label_train_only") is not True:
                 errors.append(f"{example_id}: missing train-only pseudo guard")
-        if row["task_type"] == "request_intent":
-            if row["target"].get("requested_tool") is not None:
-                errors.append(f"{example_id}: implicit request tool backfilled")
         if row["task_type"] == "current_phase":
             if row["authority"].get("tier") != (
                 "provisional_ai_phase_not_scoring_ground_truth"

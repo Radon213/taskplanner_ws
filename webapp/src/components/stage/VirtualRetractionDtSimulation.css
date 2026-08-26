@@ -1,0 +1,148 @@
+.virtual-retraction-dt-simulation {
+  display: grid;
+  min-width: 0;
+  align-content: start;
+  gap: 8px;
+  padding: 10px 12px;
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--robot) 50%, var(--line));
+  border-radius: var(--radius-sm);
+  background:
+    linear-gradient(135deg, color-mix(in srgb, var(--robot) 12%, transparent), transparent 62%),
+    rgba(14, 31, 50, 0.86);
+  box-shadow:
+    inset 3px 0 0 var(--robot),
+    0 10px 22px rgba(0, 0, 0, 0.08);
+}
+
+.virtual-retraction-dt-heading,
+.virtual-retraction-dt-kicker,
+.virtual-retraction-dt-state,
+.virtual-retraction-dt-route {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+}
+
+.virtual-retraction-dt-heading {
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.virtual-retraction-dt-kicker,
+.virtual-retraction-dt-state {
+  gap: 5px;
+  overflow: hidden;
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.virtual-retraction-dt-kicker {
+  color: var(--robot-strong);
+}
+
+.virtual-retraction-dt-state {
+  flex: 0 1 auto;
+  color: var(--soft);
+}
+
+.virtual-retraction-dt-track {
+  position: relative;
+  display: block;
+  height: 18px;
+  overflow: hidden;
+  border-radius: 999px;
+  background:
+    linear-gradient(90deg, color-mix(in srgb, var(--robot) 16%, transparent), transparent 45%, color-mix(in srgb, var(--robot) 9%, transparent)),
+    color-mix(in srgb, var(--line-strong) 68%, transparent);
+}
+
+.virtual-retraction-dt-track::before {
+  position: absolute;
+  inset: 8px 9px;
+  content: "";
+  border-radius: inherit;
+  background: color-mix(in srgb, var(--robot) 34%, var(--line));
+}
+
+.virtual-retraction-dt-anchor {
+  position: absolute;
+  top: 4px;
+  z-index: 2;
+  width: 10px;
+  height: 10px;
+  border: 2px solid var(--surface-2);
+  border-radius: 50%;
+  background: var(--robot-strong);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--robot) 45%, transparent);
+}
+
+.virtual-retraction-dt-anchor-source {
+  left: 8px;
+}
+
+.virtual-retraction-dt-anchor-target {
+  right: 8px;
+  background: var(--reuse);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--reuse) 45%, transparent);
+}
+
+.virtual-retraction-dt-carriage {
+  position: absolute;
+  top: 5px;
+  left: 14px;
+  z-index: 3;
+  width: 22px;
+  height: 8px;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--robot-strong), color-mix(in srgb, var(--reuse) 72%, var(--robot)));
+  box-shadow: 0 0 12px color-mix(in srgb, var(--robot) 65%, transparent);
+}
+
+.virtual-retraction-dt-route {
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.virtual-retraction-dt-route strong,
+.virtual-retraction-dt-route span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.virtual-retraction-dt-route strong {
+  min-width: 0;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 800;
+  line-height: 1.2;
+}
+
+.virtual-retraction-dt-route span {
+  flex: 0 1 auto;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.2;
+  text-align: end;
+}
+
+.virtual-retraction-dt-simulation > p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1.32;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .virtual-retraction-dt-simulation,
+  .virtual-retraction-dt-carriage {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+  }
+}

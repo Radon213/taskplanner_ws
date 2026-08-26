@@ -218,9 +218,11 @@ def project_tool_predictions(world: Any) -> tuple[ToolPredictionProjection, ...]
     """Project up to three reducer-accepted forecasts as one atomic snapshot.
 
     New WorldState publishers must provide ``ranked_tool_predictions``. The
-    scalar fields remain the control-compatible rank-1 lane and are checked for
-    exact semantic agreement. A missing ranked field means an older publisher,
-    for which the legacy scalar projection remains supported.
+    scalar fields remain the control-compatible rank-1 lane. Tool identity and
+    stability must agree, while confidence may differ because the ranked lane
+    is normalized to a 100% display distribution after control selection. A
+    missing ranked field means an older publisher, for which the legacy scalar
+    projection remains supported.
     """
 
     if hasattr(world, "ranked_tool_predictions"):
@@ -276,9 +278,6 @@ def project_tool_predictions(world: Any) -> tuple[ToolPredictionProjection, ...]
             scalar_tool != first.instrument_id
             or scalar_confidence is None
             or scalar_stability is None
-            or not math.isclose(
-                scalar_confidence, first.confidence, rel_tol=1e-6, abs_tol=1e-6
-            )
             or not math.isclose(
                 scalar_stability, first.stability_sec, rel_tol=1e-6, abs_tol=1e-6
             )
@@ -514,10 +513,6 @@ class ClinicalObservationProjection:
     observed_location_ids: tuple[str, ...]
     observed_location_types: tuple[str, ...]
     observed_confidences: tuple[float, ...]
-    gesture_event_type: str
-    gesture_requested_tool: str
-    gesture_hand_pose: str
-    gesture_confidence: float
     uncertainty: float
     evidence_status: str = MODEL_OBSERVED
 
@@ -605,21 +600,6 @@ def project_clinical_observation(result: Any) -> ClinicalObservationProjection:
         observed_location_types = tuple(row[2] for row in valid_observed_rows)
         observed_confidences = tuple(row[3] for row in valid_observed_rows)
 
-    gesture_event_type = str(_value(result, "gesture_event_type", ""))
-    gesture_requested_tool = str(_value(result, "gesture_requested_tool", ""))
-    gesture_hand_pose = str(_value(result, "gesture_hand_pose", ""))
-    gesture_confidence = finite_probability(
-        _value(result, "gesture_confidence", 0.0)
-    )
-    if gesture_confidence is None:
-        # Gesture fields form one claim. Clearing all of them avoids publishing
-        # a categorical gesture paired with fabricated numeric certainty.
-        gesture_event_type = ""
-        gesture_requested_tool = ""
-        gesture_hand_pose = ""
-        gesture_confidence = 0.0
-        malformed = True
-
     uncertainty = finite_probability(_value(result, "uncertainty", 1.0))
     if uncertainty is None:
         # Maximum uncertainty is the conservative scalar fallback.
@@ -636,10 +616,6 @@ def project_clinical_observation(result: Any) -> ClinicalObservationProjection:
         observed_location_ids=observed_location_ids,
         observed_location_types=observed_location_types,
         observed_confidences=observed_confidences,
-        gesture_event_type=gesture_event_type,
-        gesture_requested_tool=gesture_requested_tool,
-        gesture_hand_pose=gesture_hand_pose,
-        gesture_confidence=gesture_confidence,
         uncertainty=uncertainty,
         evidence_status=UNKNOWN if malformed else MODEL_OBSERVED,
     )

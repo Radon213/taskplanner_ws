@@ -28,7 +28,6 @@ from vlm_node.pnu_perception_bridge import (
     buffered_camera_info,
     build_blood_semantics,
     build_cam4_semantics,
-    build_hand_keypoints_message,
     build_pnu_debug_overlay,
     build_pnu_pose_overlay,
     build_request_metadata,
@@ -49,11 +48,12 @@ from vlm_node.rfdetr_contract import Cam4MayoPlacementTracker
 
 from procedure_spec import load_bundle
 
-DIGESTS = {
+WORKER_DIGESTS = {
     "tool": "1" * 64,
     "blood": "2" * 64,
     "hand": "3" * 64,
 }
+DIGESTS = {name: WORKER_DIGESTS[name] for name in ("tool", "blood")}
 
 
 def _frame(stamp_ns: int, *, depth: bool = False) -> BinaryFrame:
@@ -338,7 +338,7 @@ def _model_record(
         "executed": executed,
         "status": "executed" if executed else "loaded",
         "version": f"{algorithm}-v1",
-        "digest_sha256": DIGESTS[algorithm],
+        "digest_sha256": WORKER_DIGESTS[algorithm],
         "backend": "mediapipe" if algorithm == "hand" else "rfdetr",
         "error": None,
     }
@@ -457,7 +457,7 @@ def _metadata(
     *,
     now_ms: int,
     stamp_ns: int | None = None,
-    algorithms: tuple[str, ...] = ("tool", "blood", "hand"),
+    algorithms: tuple[str, ...] = ("tool", "blood"),
 ) -> dict[str, object]:
     rgb = _frame(stamp_ns or now_ms * 1_000_000)
     depth = _frame(rgb.stamp_ns + 20_000_000, depth=True)
@@ -492,12 +492,6 @@ def _response(
             "image": {"width": 1280, "height": 720},
             "detections": [],
         },
-        "hand": {
-            "schema": "pnu.hand.2d.v1",
-            "executed": True,
-            "image": {"width": 1280, "height": 720},
-            "hands": [],
-        },
     }
     return {
         "schema": RESPONSE_SCHEMA,
@@ -516,7 +510,7 @@ def _response(
         "latency_ms": {
             "decode": 1.0,
             **{
-                algorithm: {"tool": 4.0, "blood": 5.0, "hand": 3.0}[algorithm]
+                algorithm: {"tool": 4.0, "blood": 5.0}[algorithm]
                 for algorithm in algorithms
             },
             "total": 13.0,
@@ -575,7 +569,7 @@ def _rgbd_fixture(now_ms: int):
         depth=depth,
         color_camera_info=color_info,
         depth_camera_info=depth_info,
-        requested_algorithms=("tool", "blood", "hand"),
+        requested_algorithms=("tool", "blood"),
         deadline_unix_ms=now_ms + 2_000,
         depth_scale_m_per_unit=0.001,
         depth_scale_validated=True,
@@ -605,13 +599,6 @@ def _rgbd_fixture(now_ms: int):
         "metric_3d": dict(metric),
         "combined_blood_centroid_xy_px": None,
         "combined_blood_centroid_depth_m": None,
-    }
-    payload["results"]["hand"] = {
-        "schema": "pnu.hand.rgbd.v1",
-        "executed": True,
-        "image": {"width": 8, "height": 6},
-        "hands": [],
-        "metric_3d": dict(metric),
     }
     payload["metric_3d"] = {"ready": True, "reasons": []}
     payload["depth_evidence"] = {
@@ -694,48 +681,6 @@ def _rgbd_tool_detection(
             "validity": "VALID" if orientation_valid else "DEGRADED",
             "status_flags": [] if orientation_valid else ["SUPPORT_PLANE_UNVALIDATED"],
             "invalid_reason": "" if orientation_valid else "SUPPORT_PLANE_UNVALIDATED",
-        },
-    }
-
-
-def _rgbd_hand_detection() -> dict[str, object]:
-    joints_2d = [
-        [float(1 + index % 6), float(1 + (index // 6) % 4)]
-        for index in range(21)
-    ]
-    joints_2d[0] = [1.0, 4.0]
-    joints_2d[2] = [2.0, 1.0]
-    joints_2d[9] = [6.0, 4.0]
-    joints_2d[17] = [6.0, 1.0]
-    joints_3d = [
-        [
-            round((point[0] - 4.0) * 0.008, 6),
-            round((point[1] - 3.0) * 0.008, 6),
-            0.8,
-        ]
-        for point in joints_2d
-    ]
-    return {
-        "hand_index": 0,
-        "handedness": {"label": "Left", "score": 0.95},
-        "joints_2d": joints_2d,
-        "kp_scores": [1.0] * 21,
-        "joints_3d": joints_3d,
-        "kp_valid_depth": [True] * 21,
-        "palm_6d": {
-            "translation": [-0.004, 0.008, 0.8],
-            "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
-            "rotation_matrix": [
-                1.0,
-                0.0,
-                0.0,
-                0.0,
-                1.0,
-                0.0,
-                0.0,
-                0.0,
-                1.0,
-            ],
         },
     }
 
@@ -827,8 +772,13 @@ def test_expected_model_digests_require_lowercase_sha256() -> None:
 def test_expected_model_digests_pin_every_requested_algorithm() -> None:
     assert parse_expected_model_digests(
         json.dumps(DIGESTS),
-        requested_algorithms=("tool", "blood", "hand"),
+        requested_algorithms=("tool", "blood"),
     ) == DIGESTS
+    with pytest.raises(ValueError, match="tool/blood"):
+        parse_expected_model_digests(
+            json.dumps(WORKER_DIGESTS),
+            requested_algorithms=("tool", "blood"),
+        )
     with pytest.raises(ValueError, match="pin every requested algorithm"):
         parse_expected_model_digests(
             "{}",
@@ -839,6 +789,12 @@ def test_expected_model_digests_pin_every_requested_algorithm() -> None:
             json.dumps({"tool": DIGESTS["tool"]}),
             requested_algorithms=("tool", "blood"),
         )
+
+
+def test_pnu_hand_algorithm_is_rejected_at_the_request_boundary() -> None:
+    now_ms = int(time.time() * 1000)
+    with pytest.raises(ValueError, match="tool or blood"):
+        _metadata(now_ms=now_ms, algorithms=("hand",))
 
 
 def test_native_depth_pairing_is_skew_bounded_and_never_claims_alignment() -> None:
@@ -1018,14 +974,14 @@ def test_health_and_capabilities_pin_upstream_and_model_digests() -> None:
     now_ms = int(time.time() * 1000)
     health_digests = validate_worker_health(
         _health(now_ms),
-        requested_algorithms=("tool", "blood", "hand"),
+        requested_algorithms=("tool", "blood"),
         received_unix_ms=now_ms,
         max_age_ms=5_000,
         max_clock_skew_ms=1_000,
     )
     capability_digests = validate_capabilities(
         _capabilities(),
-        requested_algorithms=("tool", "blood", "hand"),
+        requested_algorithms=("tool", "blood"),
         expected_model_digests=DIGESTS,
         expected_auth_mode="none",
     )
@@ -1049,7 +1005,7 @@ def test_capabilities_pin_response_and_rle_resource_budgets() -> None:
     assert at_boundary["limits"]["total_rle_counts_per_algorithm"] == 1_000_000
     validate_capabilities(
         at_boundary,
-        requested_algorithms=("tool", "blood", "hand"),
+        requested_algorithms=("tool", "blood"),
         expected_model_digests=DIGESTS,
         expected_auth_mode="none",
     )
@@ -1067,7 +1023,7 @@ def test_capabilities_pin_response_and_rle_resource_budgets() -> None:
         with pytest.raises(ContractError, match=error):
             validate_capabilities(
                 oversized,
-                requested_algorithms=("tool", "blood", "hand"),
+                requested_algorithms=("tool", "blood"),
                 expected_model_digests=DIGESTS,
                 expected_auth_mode="none",
             )
@@ -1081,31 +1037,43 @@ def test_degraded_global_health_allows_only_a_ready_requested_subset() -> None:
     health["models"] = _models(executed=False, unavailable={"tool"})
     digests = validate_worker_health(
         health,
-        requested_algorithms=("blood", "hand"),
+        requested_algorithms=("blood",),
         received_unix_ms=now_ms,
         max_age_ms=5_000,
         max_clock_skew_ms=1_000,
     )
-    assert digests == {"blood": DIGESTS["blood"], "hand": DIGESTS["hand"]}
+    assert digests == {"blood": DIGESTS["blood"]}
     capabilities = _capabilities()
     capabilities["models"] = _models(executed=False, unavailable={"tool"})
     assert validate_capabilities(
         capabilities,
-        requested_algorithms=("blood", "hand"),
-        expected_model_digests={
-            "blood": DIGESTS["blood"],
-            "hand": DIGESTS["hand"],
-        },
+        requested_algorithms=("blood",),
+        expected_model_digests={"blood": DIGESTS["blood"]},
         expected_auth_mode="none",
-    ) == {"blood": DIGESTS["blood"], "hand": DIGESTS["hand"]}
+    ) == {"blood": DIGESTS["blood"]}
     with pytest.raises(ContractError, match="tool.ready"):
         validate_worker_health(
             health,
-            requested_algorithms=("tool", "blood", "hand"),
+            requested_algorithms=("tool", "blood"),
             received_unix_ms=now_ms,
             max_age_ms=5_000,
             max_clock_skew_ms=1_000,
         )
+
+    # The worker v1 ABI still reports its legacy hand model. Taskplanner no
+    # longer requests it, so a globally degraded worker caused only by that
+    # model must not block the admitted tool/blood subset.
+    hand_degraded = _health(now_ms)
+    hand_degraded["status"] = "degraded"
+    hand_degraded["ready"] = False
+    hand_degraded["models"] = _models(executed=False, unavailable={"hand"})
+    assert validate_worker_health(
+        hand_degraded,
+        requested_algorithms=("tool", "blood"),
+        received_unix_ms=now_ms,
+        max_age_ms=5_000,
+        max_clock_skew_ms=1_000,
+    ) == DIGESTS
 
 
 def test_zero_detections_are_valid_only_with_explicit_execution_evidence() -> None:
@@ -1121,7 +1089,6 @@ def test_zero_detections_are_valid_only_with_explicit_execution_evidence() -> No
     )
     assert validated.tool_detections == ()
     assert validated.blood_detections == ()
-    assert validated.hands == ()
 
     payload["results"]["tool"]["executed"] = False
     with pytest.raises(ContractError, match="executed"):
@@ -1416,11 +1383,10 @@ def test_rgbd_zero_detections_are_metric_ready_and_publish_empty_typed_arrays() 
     node._tool_pose_pub = _Publisher()
     node._tool_observations_pub = _Publisher()
     node._blood_semantics_pub = _Publisher()
-    node._hand_keypoints_pub = _Publisher()
     node._overlay_pub = _Publisher()
     node._pose_overlay_pub = _Publisher()
     node._mayo_tracker = Cam4MayoPlacementTracker()
-    node._requested_algorithms = ("tool", "blood", "hand")
+    node._requested_algorithms = ("tool", "blood")
     node._overlay_enabled = True
     node._overlay_max_rate_hz = 5.0
     node._overlay_max_pixels = 1_000
@@ -1454,8 +1420,6 @@ def test_rgbd_zero_detections_are_metric_ready_and_publish_empty_typed_arrays() 
     assert node._tool_pose_pub.messages[0].tools == []
     assert node._tool_pose_pub.messages[0].header.frame_id == rgb.frame_id
     assert node._tool_observations_pub.messages[0].instances == []
-    assert node._hand_keypoints_pub.messages[0].hands == []
-    assert node._hand_keypoints_pub.messages[0].depth_source == "real"
     assert len(node._overlay_pub.messages) == 1
     overlay_message = node._overlay_pub.messages[0]
     assert overlay_message.format == "webp"
@@ -1730,7 +1694,6 @@ def test_rgbd_nonempty_fields_map_to_upstream_typed_messages_and_reject_bad_pose
     ]
     payload["results"]["blood"]["combined_blood_centroid_xy_px"] = [0.0, 0.0]
     payload["results"]["blood"]["combined_blood_centroid_depth_m"] = 0.8
-    payload["results"]["hand"]["hands"] = [_rgbd_hand_detection()]
     validated = validate_worker_response(
         payload,
         metadata=metadata,
@@ -1744,9 +1707,6 @@ def test_rgbd_nonempty_fields_map_to_upstream_typed_messages_and_reject_bad_pose
         detections=validated.tool_detections,
         tool_result=payload["results"]["tool"],
         model_version="tool-v1",
-    )
-    hands = build_hand_keypoints_message(
-        frame=rgb, hands=validated.hands, metric_3d_ready=True
     )
     blood = build_blood_semantics(
         validated.blood_detections,
@@ -1772,8 +1732,6 @@ def test_rgbd_nonempty_fields_map_to_upstream_typed_messages_and_reject_bad_pose
     assert poses.tools[0].pose.position.z == pytest.approx(0.8)
     assert observations.instances[0].observation_point_depth_m == pytest.approx(0.8)
     assert observations.instances[0].mask_counts
-    assert hands.hands[0].has_palm_6d is True
-    assert hands.hands[0].palm_6d.translation.z == pytest.approx(0.8)
     assert set(blood) == {
         "schema",
         "source",
@@ -1801,7 +1759,6 @@ def test_rgbd_nonempty_fields_map_to_upstream_typed_messages_and_reject_bad_pose
     assert rendered.message.format == "webp"
     assert rendered.drawn_tool_count == 1
     assert rendered.drawn_blood_count == 1
-    assert rendered.drawn_hand_count == 1
     assert rendered.truncated is False
     with Image.open(BytesIO(bytes(rendered.message.data))) as overlay:
         rgba = overlay.convert("RGBA")
@@ -1816,22 +1773,6 @@ def test_rgbd_nonempty_fields_map_to_upstream_typed_messages_and_reject_bad_pose
         max_mask_segments=1,
     )
     assert bounded.truncated is True
-
-    invalid = copy.deepcopy(payload)
-    invalid["results"]["hand"]["hands"][0]["palm_6d"]["orientation_xyzw"] = [
-        0.0,
-        0.0,
-        0.0,
-        2.0,
-    ]
-    with pytest.raises(ContractError, match="quaternion"):
-        validate_worker_response(
-            invalid,
-            metadata=metadata,
-            pinned_model_digests=DIGESTS,
-            request_started_unix_ms=now_ms,
-            received_unix_ms=now_ms + 10,
-        )
 
     unsafe_plane = copy.deepcopy(payload)
     unsafe_pose = unsafe_plane["results"]["tool"]["detections"][0]["pose"]
@@ -1876,75 +1817,6 @@ def test_rgbd_nonempty_fields_map_to_upstream_typed_messages_and_reject_bad_pose
             request_started_unix_ms=now_ms,
             received_unix_ms=now_ms + 10,
         )
-
-
-def test_rgbd_hand_geometry_is_self_consistent_with_camera_and_palm_frame() -> None:
-    now_ms = int(time.time() * 1000)
-    _rgb, _depth, _color, _depth_info, metadata, payload = _rgbd_fixture(now_ms)
-    payload["results"]["hand"]["hands"] = [_rgbd_hand_detection()]
-
-    def validate(candidate):
-        return validate_worker_response(
-            candidate,
-            metadata=metadata,
-            pinned_model_digests=DIGESTS,
-            request_started_unix_ms=now_ms,
-            received_unix_ms=now_ms + 10,
-        )
-
-    assert validate(payload).hands[0]["palm_6d"] is not None
-
-    bad_reprojection = copy.deepcopy(payload)
-    bad_reprojection["results"]["hand"]["hands"][0]["joints_3d"][5][0] += 0.02
-    with pytest.raises(ContractError, match="does not reproject"):
-        validate(bad_reprojection)
-
-    bad_translation = copy.deepcopy(payload)
-    bad_translation["results"]["hand"]["hands"][0]["palm_6d"]["translation"][
-        0
-    ] += 0.01
-    with pytest.raises(ContractError, match=r"not \(j0\+j9\)/2"):
-        validate(bad_translation)
-
-    reflected = copy.deepcopy(payload)
-    reflected["results"]["hand"]["hands"][0]["palm_6d"]["rotation_matrix"] = [
-        1.0,
-        0.0,
-        0.0,
-        0.0,
-        1.0,
-        0.0,
-        0.0,
-        0.0,
-        -1.0,
-    ]
-    with pytest.raises(ContractError, match=r"determinant is not \+1"):
-        validate(reflected)
-
-    quaternion_mismatch = copy.deepcopy(payload)
-    quaternion_mismatch["results"]["hand"]["hands"][0]["palm_6d"][
-        "orientation_xyzw"
-    ] = [0.0, 0.0, 1.0, 0.0]
-    with pytest.raises(ContractError, match="quaternion and rotation matrix disagree"):
-        validate(quaternion_mismatch)
-
-    wrong_palm_frame = copy.deepcopy(payload)
-    root_half = math.sqrt(0.5)
-    wrong_palm = wrong_palm_frame["results"]["hand"]["hands"][0]["palm_6d"]
-    wrong_palm["orientation_xyzw"] = [0.0, 0.0, root_half, root_half]
-    wrong_palm["rotation_matrix"] = [
-        0.0,
-        -1.0,
-        0.0,
-        1.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        1.0,
-    ]
-    with pytest.raises(ContractError, match="palm_frame_v2"):
-        validate(wrong_palm_frame)
 
 
 def test_validated_tool_support_plane_requires_exact_taskplanner_pin() -> None:
@@ -2256,31 +2128,6 @@ def test_response_rejects_source_digest_and_freshness_mismatch() -> None:
         )
 
 
-def test_real_hand_result_shape_requires_bounded_handedness_and_keypoints() -> None:
-    now_ms = int(time.time() * 1000)
-    metadata = _metadata(now_ms=now_ms, algorithms=("hand",))
-    payload = _response(metadata, generated_unix_ms=now_ms + 5)
-    payload["results"]["hand"]["hands"] = [
-        {
-            "hand_index": 0,
-            "handedness": {"label": "Left", "score": 0.94},
-            "joints_2d": [[100.0 + index, 200.0 + index] for index in range(21)],
-            "kp_scores": [1.0] * 21,
-        }
-    ]
-    validated = validate_worker_response(
-        payload,
-        metadata=metadata,
-        pinned_model_digests={"hand": DIGESTS["hand"]},
-        request_started_unix_ms=now_ms,
-        received_unix_ms=now_ms + 10,
-    )
-    assert validated.hands[0]["handedness"] == {
-        "label": "left",
-        "score": 0.94,
-    }
-
-
 def test_pnu_tool_ontology_projects_to_existing_semantics_without_boxes() -> None:
     semantics = build_cam4_semantics(
         [
@@ -2327,7 +2174,7 @@ def test_pnu_tool_ontology_projects_to_existing_semantics_without_boxes() -> Non
     assert semantics["tool_request"]["state"] == "uncertain"
 
 
-def test_pnu_compatibility_names_resolve_against_real_thyroid_catalogs() -> None:
+def test_pnu_compatibility_names_respect_demo_bed_arm_rack_exclusion() -> None:
     raw_names = (
         "Scalpel",
         "Allis Forceps",
@@ -2362,7 +2209,7 @@ def test_pnu_compatibility_names_resolve_against_real_thyroid_catalogs() -> None
     # subset happens to be an alias in each active procedure catalog.
     assert (
         sum(demo_spec.resolve_instrument_alias(name) is not None for name in raw_names)
-        == 4
+        == 2
     )
     assert (
         sum(
@@ -2374,15 +2221,16 @@ def test_pnu_compatibility_names_resolve_against_real_thyroid_catalogs() -> None
     assert {
         name: demo_spec.resolve_instrument_alias(name) for name in compatibility_names
     } == {
-        "#15 Scalpel": "T01",
+        "#15 Scalpel": None,
         "Adson forceps": "T02",
         "Allis clamp forceps": "T03",
-        "Army navy retractor": "T05",
+        "Army navy retractor": None,
         "Bipolar cautery": "T07",
         "Bovie surgical cautery": "T04",
-        "Mosquito forceps": "T08",
-        "Thyroid retractor": "T11",
+        "Mosquito forceps": None,
+        "Thyroid retractor": None,
     }
+    assert {"T05", "T11"}.isdisjoint(demo_spec.list_instrument_ids())
     normal_resolved = {
         name: normal_spec.resolve_instrument_alias(name) for name in compatibility_names
     }
@@ -2821,63 +2669,6 @@ def test_spoofed_tool_class_name_is_rejected_before_overlay() -> None:
         )
 
 
-def test_low_confidence_hand_is_transparent_and_not_counted_as_drawn() -> None:
-    now_ms = int(time.time() * 1000)
-    width, height = 128, 96
-    rgb = _real_frame(now_ms * 1_000_000, width=width, height=height)
-    metadata = build_request_metadata(
-        request_id="low-confidence-hand-overlay",
-        rgb=rgb,
-        depth=None,
-        color_camera_info=None,
-        depth_camera_info=None,
-        requested_algorithms=("hand",),
-        deadline_unix_ms=now_ms + 2_000,
-    )
-    payload = _response(metadata, generated_unix_ms=now_ms + 5)
-    payload["results"]["hand"]["image"] = {"width": width, "height": height}
-    payload["results"]["hand"]["hands"] = [
-        {
-            "hand_index": 0,
-            "handedness": {"label": "unknown", "score": 0.9},
-            "joints_2d": [[64.0, 48.0] for _ in range(21)],
-            "kp_scores": [0.19] * 21,
-        }
-    ]
-    validated = validate_worker_response(
-        payload,
-        metadata=metadata,
-        pinned_model_digests={"hand": DIGESTS["hand"]},
-        request_started_unix_ms=now_ms,
-        received_unix_ms=now_ms + 10,
-    )
-
-    rendered = build_pnu_debug_overlay(
-        frame=rgb,
-        validated=validated,
-        max_pixels=width * height,
-    )
-    assert len(validated.hands) == 1
-    assert rendered.drawn_hand_count == 0
-    with Image.open(BytesIO(bytes(rendered.message.data))) as overlay:
-        assert overlay.convert("RGBA").getchannel("A").getextrema() == (0, 0)
-
-    node = PNUPerceptionBridgeNode.__new__(PNUPerceptionBridgeNode)
-    node._overlay_pub = _Publisher()
-    node._overlay_enabled = True
-    node._overlay_max_rate_hz = 5.0
-    node._overlay_max_pixels = width * height
-    node._last_overlay_published_monotonic = 0.0
-    overlay_diagnostics = node._publish_debug_overlay(
-        rgb=rgb,
-        validated=validated,
-    )
-    assert overlay_diagnostics["overlay_published"] is True
-    assert overlay_diagnostics["overlay_drawn_hand_count"] == 0
-    with Image.open(BytesIO(bytes(node._overlay_pub.messages[0].data))) as overlay:
-        assert overlay.convert("RGBA").getchannel("A").getextrema() == (0, 0)
-
-
 def test_successful_empty_execution_publishes_empty_semantics_and_ready_health() -> (
     None
 ):
@@ -2899,9 +2690,8 @@ def test_successful_empty_execution_publishes_empty_semantics_and_ready_health()
     node._tool_pose_pub = _Publisher()
     node._tool_observations_pub = _Publisher()
     node._blood_semantics_pub = _Publisher()
-    node._hand_keypoints_pub = _Publisher()
     node._mayo_tracker = Cam4MayoPlacementTracker()
-    node._requested_algorithms = ("tool", "blood", "hand")
+    node._requested_algorithms = ("tool", "blood")
     node._sequence = 0
     node._dropped_frames = 0
     node._last_success_monotonic = 0.0
@@ -2927,8 +2717,8 @@ def test_successful_empty_execution_publishes_empty_semantics_and_ready_health()
     diagnostics = json.loads(node._diagnostics_pub.messages[0].data)
     assert semantics["tools"] == []
     assert diagnostics["empty_detection_result"] is True
-    assert diagnostics["requested_algorithms"] == ["tool", "blood", "hand"]
-    assert diagnostics["executed_algorithms"] == ["tool", "blood", "hand"]
+    assert diagnostics["requested_algorithms"] == ["tool", "blood"]
+    assert diagnostics["executed_algorithms"] == ["tool", "blood"]
     assert diagnostics["instance_count"] == 0
     assert diagnostics["auth_mode"] == "none_local"
     assert diagnostics["transport_mode"] == "http_local"
@@ -2940,19 +2730,17 @@ def test_successful_empty_execution_publishes_empty_semantics_and_ready_health()
         json.loads(node._blood_semantics_pub.messages[0].data)["metric_3d_ready"]
         is False
     )
-    assert node._hand_keypoints_pub.messages[0].hands == []
-    assert node._hand_keypoints_pub.messages[0].depth_source == "2d_only"
     assert health[-1]["connected"] is True
     assert health[-1]["status"] == "ready"
     assert health[-1]["detection_count"] == 0
     assert health[-1]["semantic_ready"] is True
 
 
-def test_partial_blood_hand_execution_never_publishes_tool_semantics() -> None:
+def test_partial_blood_execution_never_publishes_tool_semantics() -> None:
     now_ms = int(time.time() * 1000)
-    metadata = _metadata(now_ms=now_ms, algorithms=("blood", "hand"))
+    metadata = _metadata(now_ms=now_ms, algorithms=("blood",))
     payload = _response(metadata, generated_unix_ms=now_ms + 5)
-    subset_digests = {"blood": DIGESTS["blood"], "hand": DIGESTS["hand"]}
+    subset_digests = {"blood": DIGESTS["blood"]}
     validated = validate_worker_response(
         payload,
         metadata=metadata,
@@ -2968,9 +2756,8 @@ def test_partial_blood_hand_execution_never_publishes_tool_semantics() -> None:
     node._tool_pose_pub = _Publisher()
     node._tool_observations_pub = _Publisher()
     node._blood_semantics_pub = _Publisher()
-    node._hand_keypoints_pub = _Publisher()
     node._mayo_tracker = Cam4MayoPlacementTracker()
-    node._requested_algorithms = ("blood", "hand")
+    node._requested_algorithms = ("blood",)
     node._sequence = 0
     node._dropped_frames = 0
     node._last_success_monotonic = 0.0
@@ -2996,14 +2783,14 @@ def test_partial_blood_hand_execution_never_publishes_tool_semantics() -> None:
     assert health[-1]["status"] == "partial_ready"
     assert health[-1]["semantic_ready"] is False
     diagnostics = json.loads(node._diagnostics_pub.messages[-1].data)
-    assert diagnostics["executed_algorithms"] == ["blood", "hand"]
+    assert diagnostics["executed_algorithms"] == ["blood"]
 
 
 def test_ros_health_contract_separates_connection_from_semantic_readiness() -> None:
     node = PNUPerceptionBridgeNode.__new__(PNUPerceptionBridgeNode)
     node._enabled = True
     node._pinned_model_digests = dict(DIGESTS)
-    node._requested_algorithms = ("blood", "hand")
+    node._requested_algorithms = ("blood",)
     node._auth_mode = "none_local"
     node._transport_mode = "http_local"
     node._health_pub = _Publisher()
@@ -3029,7 +2816,7 @@ def test_ros_health_contract_separates_connection_from_semantic_readiness() -> N
     assert partial["cam4_aligned"] is False
     assert partial["auth_mode"] == "none_local"
     assert partial["transport_mode"] == "http_local"
-    assert partial["executed_algorithms"] == ["blood", "hand"]
+    assert partial["executed_algorithms"] == ["blood"]
     assert partial["metric_3d_ready"] is False
     assert partial["metric_3d_reasons"] == ["no_validated_metric_3d_result"]
     assert partial["support_plane_config_version"] == ""
@@ -3115,7 +2902,7 @@ def test_http_path_uses_raw_multipart_bytes_and_never_falls_back() -> None:
     node = PNUPerceptionBridgeNode.__new__(PNUPerceptionBridgeNode)
     node._max_source_age_sec = 2.0
     node._request_timeout_sec = 2.0
-    node._requested_algorithms = ("tool", "blood", "hand")
+    node._requested_algorithms = ("tool", "blood")
     node._max_worker_clock_skew_ms = 1_000
     node._service_url = "http://192.168.1.20:8020"
     node._session = _Session()

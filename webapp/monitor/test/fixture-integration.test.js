@@ -12,6 +12,10 @@ function catalogFromCsv(csv) {
     revision: 1,
     catalog_version: "synthetic-catalog-v1",
     procedure_display_name: procedure[3],
+    procedure_target_site: procedure[9],
+    procedure_target_site_ko: procedure[10],
+    procedure_approach: procedure[11],
+    procedure_approach_ko: procedure[12],
     phases: rows.filter(([type]) => type === "phase").map((row) => ({
       ordinal: Number(row[1]),
       phase_id: row[2],
@@ -35,7 +39,17 @@ test("synthetic handoff fixture drives phase, instrument cards, and Top-3", asyn
   assert.equal(fixture.synthetic, true);
 
   const mapper = new MainLayoutScenarioMapper();
-  mapper.map(PUBLIC_TOPIC_NAMES.catalog, catalogFromCsv(catalogText));
+  const catalog = catalogFromCsv(catalogText);
+  const procedure = mapper.map(PUBLIC_TOPIC_NAMES.catalog, catalog);
+  assert.deepEqual(procedure.patch.procedure, {
+    name: "Thyroidectomy",
+    targetSite: "Right Lobectomy",
+    approach: "Open",
+  });
+  const rackToolIds = catalog.instruments.map(({ instrument_id: instrumentId }) => instrumentId);
+  assert.ok(!rackToolIds.includes("T05"), "Army-Navy retractor must not appear in the demo rack catalog");
+  assert.ok(!rackToolIds.includes("T11"), "thyroid retractor must not appear in the demo rack catalog");
+  assert.deepEqual(rackToolIds, ["T02", "T03", "T04", "T07"]);
   const context = mapper.map(PUBLIC_TOPIC_NAMES.context, fixture[PUBLIC_TOPIC_NAMES.context]);
   assert.equal(context.patch.phase.code, "P05");
   assert.equal(context.patch.phase.index, 5);
@@ -78,8 +92,12 @@ test("synthetic handoff fixture drives phase, instrument cards, and Top-3", asyn
     toolId,
     confidence: Math.round(confidence),
   })), [
-    { toolId: "T02", confidence: 86 },
-    { toolId: "T04", confidence: 72 },
-    { toolId: "T07", confidence: 58 },
+    { toolId: "T02", confidence: 60 },
+    { toolId: "T04", confidence: 25 },
+    { toolId: "T07", confidence: 15 },
   ]);
+  assert.ok(
+    predictions.patch.predictions.every(({ toolId }) => rackToolIds.includes(toolId)),
+    "demo predictions must refer only to rack-catalog instruments",
+  );
 });

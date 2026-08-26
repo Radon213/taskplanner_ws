@@ -17,6 +17,7 @@ RUN apt-get update \
 WORKDIR /opt/taskplanner-ninfer-manager
 
 COPY scripts/ninfer_runtime_manager.py /opt/taskplanner-ninfer-manager/ninfer_runtime_manager.py
+COPY docker/ninfer-manager/build_catalog.py /opt/taskplanner-ninfer-manager/build_catalog.py
 COPY docker/ninfer-manager/start_manager.sh /usr/local/bin/taskplanner-ninfer-manager
 COPY docker/ninfer-manager/run_ninfer_worker.sh /usr/local/bin/taskplanner-ninfer-worker
 

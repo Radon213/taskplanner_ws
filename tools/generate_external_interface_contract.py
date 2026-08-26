@@ -27,11 +27,11 @@ from docx.shared import Inches, Pt, RGBColor
 
 ROOT = Path(__file__).resolve().parents[1]
 TEMPLATE = ROOT / "docs/Taskplanner_ROS2_External_Interface_Contract_v0.2.0_KO.docx"
-OUTPUT = ROOT / "docs/Taskplanner_ROS2_External_Interface_Contract_v0.3.0_KO.docx"
+OUTPUT = ROOT / "docs/Taskplanner_ROS2_External_Interface_Contract_v0.5.0_KO.docx"
 
-BASELINE = "0.3.0"
-SCHEMA_VERSION = "1.1.0"
-DATE = date(2026, 8, 13).isoformat()
+BASELINE = "0.5.0"
+SCHEMA_VERSION = "1.3.0"
+DATE = date(2026, 8, 26).isoformat()
 FONT_BODY = "NanumBarunGothic"
 FONT_HEADING = "NanumSquare Neo"
 FONT_CODE = "D2Coding ligature"
@@ -128,8 +128,8 @@ TOPIC_DETAILS = (
         "Gateway 생존, wire/schema 버전, catalog digest, 프로세스 UUID와 활성 run UUID를 제공한다.",
         "heartbeat 유지; procedure_active=false, procedure_run_id는 빈 문자열.",
         "가장 먼저 구독한다. gateway_instance_id가 바뀌면 revision/sequence 캐시를 전부 버린다.",
-        """schema_version: \"1.1.0\"
-interface_version: \"0.3.0\"
+        """schema_version: \"1.3.0\"
+interface_version: \"0.5.0\"
 catalog_version: \"sha256:<digest>\"
 gateway_instance_id: \"<opaque UUID>\"
 procedure_run_id: \"<opaque run UUID>\"
@@ -271,7 +271,7 @@ evidence_status: GATEWAY_OBSERVED_REDACTED""",
     TopicDetail(
         "/surgery/clinical_observations",
         "surgical_interop_msgs/msg/ClinicalObservationArray",
-        "최신 fresh VLM 결과의 단계·도구·위치·gesture·uncertainty를 제공한다. 자유문장 summary는 명시적 free-text opt-in일 때만 제공한다.",
+        "최신 fresh VLM 결과의 단계·도구·위치·uncertainty를 제공한다. gesture, hand pose/facing, requested tool, handover intent는 포함하지 않으며 자유문장 summary는 명시적 free-text opt-in일 때만 제공한다.",
         "observations=[]",
         "기본값에서 summary는 비어도 구조화 배열은 유효하다. 배열 pair의 길이를 확인하고 model evidence 하나만으로 robot을 command하면 안 된다.",
         """revision: 1043
@@ -308,7 +308,7 @@ evidence_status: GATEWAY_OBSERVED""",
         "발행하지 않음; 과거 replay 없음.",
         "DT_ACCEPTED는 event fact의 공개 수용이다. 성공/거절/실패는 state를 확인한다. sequence gap이면 snapshot을 재조회한다.",
         """sequence: 287
-schema_version: "1.1.0"
+schema_version: "1.3.0"
 catalog_version: "sha256:<catalog digest>"
 gateway_instance_id: "<opaque gateway UUID>"
 procedure_run_id: "<opaque run UUID>"
@@ -781,7 +781,7 @@ def _cover(doc: DocumentType, head: str) -> None:
     sr.font.color.rgb = RGBColor.from_string("1F4D78")
 
     for label, value, mono in (
-        ("계약 기준", "surgical_interop_msgs 0.3.0 / schema 1.1.0", False),
+        ("계약 기준", "surgical_interop_msgs 0.5.0 / schema 1.3.0", False),
         ("대상 환경", "ROS 2 Jazzy · Cyclone DDS 검증 기준", False),
         ("소스 기준", f"local main@{head} + 동봉 IDL SHA-256", True),
         ("기준일", DATE, False),
@@ -837,7 +837,9 @@ def _document_control(w: Writer, head: str) -> None:
     w.bullet("MUST(필수): wire 호환성, 정보 경계 또는 안전을 위해 반드시 지켜야 하는 조건.")
     w.bullet("SHOULD(권고): 특별한 근거가 없다면 따라야 하는 상호운용 권고.")
     w.bullet("MAY(선택): wire 형식을 변경하지 않는 구현 선택.")
-    w.heading("0.3.0 핵심 변경", 2)
+    w.heading("0.5.0 핵심 변경", 2)
+    w.bullet("ClinicalObservation에서 VLM gesture/request 필드를 제거하고 phase·tool·semantic location·uncertainty만 공개.")
+    w.bullet("CAM4 Right + Open_Palm + PALM_UP 0.300초 신호는 VLM이 아닌 Digital Twin의 direct typed evidence로 분리.")
     w.bullet("공개 상태 Gateway 기본값을 true로 변경하고 live·simulation/LLM runtime 공통으로 기동.")
     w.bullet("기존 6개에서 11개 공개 상태/event 토픽으로 확장.")
     w.bullet("Gateway/run/catalog identity, 한·영 카탈로그, 다음 도구 예측, robot 손 상태, ASR latency 추가.")
@@ -897,7 +899,7 @@ def _scope(w: Writer) -> None:
     ):
         w.bullet(item)
     w.body(
-        "0.3.0의 Top-3 도구 예측과 semantic robot-hand possession은 명시적으로 검토된 좁은 예외다. "
+        "0.5.0의 Top-3 도구 예측과 semantic robot-hand possession은 명시적으로 검토된 좁은 예외다. "
         "그 때문에 내부 /twin/world_state 전체가 공개되는 것은 아니다."
     )
 
@@ -931,7 +933,7 @@ def _overview(w: Writer) -> None:
     w.callout(
         "Action/Service는 토픽이 아닙니다",
         "Goal/Feedback/Result와 request/response를 동일 이름의 일반 topic처럼 직접 발행하지 않습니다. "
-        "외부 서버는 surgical_interop_msgs 0.3.0의 생성된 Action/Service 타입을 설치해야 합니다.",
+        "외부 서버는 surgical_interop_msgs 0.5.0의 생성된 Action/Service 타입을 설치해야 합니다.",
     )
 
 
@@ -1001,7 +1003,7 @@ ros2 topic echo /surgery/images/flir/compressed \\
         "permissions가 필요합니다.",
     )
     w.body(
-        "Native ROS 2 consumer는 동일 Domain/discovery/RMW network와 surgical_interop_msgs 0.3.0 설치가 필요하다. "
+        "Native ROS 2 consumer는 동일 Domain/discovery/RMW network와 surgical_interop_msgs 0.5.0 설치가 필요하다. "
         "브라우저용 공개 endpoint는 전용 sidecar의 127.0.0.1:9092를 지정 유선 인터페이스에만 proxy한다. "
         "Sidecar는 direct TCP peer가 loopback인지도 검사하여 Tailscale/VPN의 loopback DNAT 우회를 차단한다. "
         "현재 기본 유선 주소가 192.168.1.4이면 ws://192.168.1.4:9092를 사용한다. 이 주소는 DHCP/현장 배포에 따라 "
@@ -1025,11 +1027,11 @@ ros2 topic echo /surgery/images/flir/compressed \\
 def _identity_idle(w: Writer) -> None:
     w.heading("4. Identity·run·idle 계약", 1, page_break=True)
     w.table(
-        "v0.3 identity 필드",
+        "v0.5 identity 필드",
         ("필드", "scope", "consumer 동작"),
         (
             ("schema_version", "projection schema", "지원하지 않는 major/schema이면 fail closed"),
-            ("interface_version", "installed IDL package", "0.3.0 타입과 일치 확인"),
+            ("interface_version", "installed IDL package", "0.5.0 타입과 일치 확인"),
             ("catalog_version", "catalog content SHA-256", "변경 시 label/alias cache 재구성"),
             ("gateway_instance_id", "Gateway process", "변경 시 revision/sequence cache 폐기"),
             ("procedure_run_id", "one active run", "변경 시 timeline·dynamic state 초기화"),
@@ -1107,6 +1109,16 @@ def _topic_details(w: Writer) -> None:
                 "PUBLISH_SHARED_FREE_TEXT=false가 기본이다. 이때 speech.text와 clinical summary만 비우고 "
                 "상태·sequence·latency 및 구조화 ID/confidence는 유지한다. true는 redaction을 수행하지 않는 "
                 "명시적 개발 opt-in이므로 비식별 입력·외부기관 승인·로그 보존 정책을 먼저 확정해야 한다.",
+                tone="gold",
+            )
+        if detail.title == "/surgery/clinical_observations":
+            w.callout(
+                "CAM4 손 전달 신호는 VLM/public clinical field가 아님",
+                "Digital Twin이 /perception/cam_4/hand/gestures, /perception/cam_4/hand/facing, "
+                "/perception/cam_4/hand/health를 직접 검증합니다. 동일 source header에서 정확한 "
+                "Right + Open_Palm + PALM_UP 관측이 최소 0.300초 연속될 때만 tool-agnostic handover "
+                "evidence episode가 됩니다. 이 evidence는 도구를 선택하지 않고 ClinicalObservation으로 "
+                "복사되지 않으며, 로봇 명령 또는 실행 승인이 아닙니다.",
                 tone="gold",
             )
         if detail.title == "/surgery/events":
@@ -1218,7 +1230,8 @@ def _robot_endpoints(w: Writer) -> None:
             ("mayo", "robot", "재사용 Mayo 도구 pick-up 후 stable hold"),
             ("tray", "surgeon", "direct pick-up and handover"),
             ("robot", "surgeon", "held tool handover"),
-            ("robot", "tray", "unused held tool return"),
+            ("robot", "mayo", "park unused preparation and free the robot hand"),
+            ("robot", "tray", "controller-directed tray recovery"),
             ("mayo", "tray", "used tool retrieval"),
         ),
         (1600, 1600, 6160),
@@ -1231,6 +1244,18 @@ def _robot_endpoints(w: Writer) -> None:
         "Result final_state는 completed, canceled, failed이며 ROS Action terminal status와 일치해야 한다. Cancel은 즉시 stop이 아니라 "
         "verified compensating recovery다. canceled_source_unchanged 또는 canceled_recovered_to_tray를 확인한 뒤에만 다음 명령이 가능하다."
     )
+    w.body(
+        "현재 tracked Goal의 SUCCEEDED + success=true + final_state=completed는 권위 있는 물리 완료 증거다. "
+        "Taskplanner는 local detector/VLM, lifecycle, arm occupancy belief가 충돌해도 완료된 semantic 위치를 Digital Twin에 반영한다. "
+        "단 command, instance, instrument type, semantic leg, projection order, duplicate, stale timestamp 검증은 계속 fail-closed다. "
+        "정상 return_unused_preposition은 더 빠른 robot -> mayo이며, robot -> tray Cancel 보상과 구분한다."
+    )
+    w.body(
+        "return_unused_preposition 자동 선택은 (1) 현재 준비 도구와 다른 canonical 명시 요청, 또는 "
+        "(2) 다른 system-final top-1이 source time 기준 2.0초 이상 연속 유지된 경우로 한정한다. "
+        "raw VLM top-1 변화, prediction 소실, 단순 보유시간, finishing/completed, implicit hand cue는 발동 사유가 아니다. "
+        "tracked tool Action이 실행 중이면 terminal 결과를 WorldState에 반영하기 전까지 새 robot -> mayo Goal을 보내지 않는다."
+    )
     w.heading("8.2 /surgery/retraction/command", 2)
     w.table(
         "ExecuteRetractionCommand",
@@ -1240,7 +1265,7 @@ def _robot_endpoints(w: Writer) -> None:
             ("Request", "source_id", "호출 client 식별자"),
             ("Request", "command_id", "caller correlation ID"),
             ("Request", "command", "6개 COMMAND_* 상수 중 하나"),
-            ("Request", "target_side / distance_m", "조절은 LEFT/RIGHT와 metre 거리; 그 외는 NONE / 0.0"),
+            ("Request", "target_side / distance_m", "조절은 LEFT/RIGHT 또는 양쪽을 뜻하는 NONE(0)과 metre 거리; 그 외는 NONE / 0.0"),
             ("Response", "request_accepted / result_code", "요청 admission 여부와 stable result code"),
             ("Response", "command_id / message", "request correlation echo와 선택적 설명"),
         ),
@@ -1248,7 +1273,7 @@ def _robot_endpoints(w: Writer) -> None:
     )
     w.body(
         "명령은 direct teach 시작/종료, retraction 시작/조절/종료, Tool Change의 여섯 COMMAND_* 상수로 고정한다. "
-        "예를 들어 왼쪽 5 cm 조절은 COMMAND_ADJUST_RETRACTION, TARGET_LEFT, distance_m=0.050이다. "
+        "예를 들어 왼쪽 5 cm 조절은 COMMAND_ADJUST_RETRACTION, TARGET_LEFT, distance_m=0.050이고, 양쪽 1 mm 조절은 TARGET_NONE(0), distance_m=0.001이다. "
         "Response는 admission receipt일 뿐 물리 완료, controller state, feedback, cancel, retry/idempotency, tool attachment를 확인하지 않는다. "
         "그 이후의 구현과 안전 판단은 controller 소유이다."
     )
@@ -1258,7 +1283,7 @@ def _ui_examples(w: Writer) -> None:
     w.heading("9. UI 소비 흐름과 코드 예시", 1, page_break=True)
     w.heading("9.1 권장 startup/reconnect flow", 2)
     steps = (
-        "배포 담당자가 제공한 Domain/RMW/discovery/interface를 적용하고 IDL 0.3.0이 resolve되는지 확인한다.",
+        "배포 담당자가 제공한 Domain/RMW/discovery/interface를 적용하고 IDL 0.5.0이 resolve되는지 확인한다.",
         "gateway_info를 reliable/transient-local로 구독해 heartbeat와 버전을 검증한다.",
         "catalog를 받아 phase/tool label map을 만들고 catalog_version에 묶는다.",
         "health와 필요한 snapshot을 구독한다.",
@@ -1326,7 +1351,7 @@ def _verification(w: Writer) -> None:
         "최소 인수 체크리스트",
         ("영역", "합격 조건", "증거"),
         (
-            ("IDL", "surgical_interop_msgs 0.3.0 build/resolve", "ros2 interface show + SHA-256"),
+            ("IDL", "surgical_interop_msgs 0.5.0 build/resolve", "ros2 interface show + SHA-256"),
             ("Gateway idle", "11 topic owner 존재; heartbeat/catalog/health + dynamic empty", "topic echo fixture"),
             ("Gateway active", "run ID 생성, same-cycle revision, reviewed values", "active simulation smoke"),
             ("Run boundary", "이전 speech/VLM/robot cache 재노출 없음", "stop/start regression"),

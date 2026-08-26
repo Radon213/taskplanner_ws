@@ -215,11 +215,6 @@ class SmokeHarness(Node):
             for instrument in msg.instrument_states
             if instrument.owner == "robot_right_hand" or instrument.location_type == "robot_right_hand"
         }
-        surgeon_tools = {
-            instrument.instrument_id
-            for instrument in msg.instrument_states
-            if instrument.status == "handed_over"
-        }
         cleaning_tools = {
             instrument.instrument_id
             for instrument in msg.instrument_states
@@ -233,10 +228,6 @@ class SmokeHarness(Node):
         if len(right_arm_tools) > 1:
             self._world_invariant_violations.append(
                 f"right arm carried multiple tools simultaneously: {sorted(right_arm_tools)}"
-            )
-        if len(surgeon_tools) > 2:
-            self._world_invariant_violations.append(
-                f"surgeon held more than two active tools simultaneously: {sorted(surgeon_tools)}"
             )
         if msg.left_hand_tool and msg.left_hand_tool not in left_arm_tools:
             self._world_invariant_violations.append(
@@ -392,7 +383,6 @@ class SmokeHarness(Node):
         self.wait_until(
             lambda: self._latest_world is not None
             and bool(self._latest_world.handover_allowed)
-            and not bool(self._latest_world.phase_uncertain)
             and not bool(self._latest_world.cleaner_busy),
             timeout_sec,
             "handover-ready world state",

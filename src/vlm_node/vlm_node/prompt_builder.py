@@ -51,18 +51,9 @@ class PromptBuilder:
             "- robot_left_hand: recovered tool on way to cleaner or rack",
         ]
 
-        gesture_lines = [
-            "Gesture semantics:",
-            "- sg[0] request_tool means surgeon requests a tool handover.",
-            "- sg[0] return_tool means surgeon presents a used tool for recovery.",
-            "- hand_pose open_receive supports request_tool.",
-            "- hand_pose present_return supports return_tool.",
-            "- If there is no reliable gesture, emit sg as ['', '', '', 0.0].",
-        ]
-
         schema_lines = [
             "Schema:",
-            '{\"v\":\"1\",\"ph\":[[phase_id,confidence],...],\"to\":[[tool_id,location_id,location_type,confidence],...],\"sg\":[event_type,requested_tool,hand_pose,confidence],\"u\":uncertainty,\"sum\":\"optional short note\"}',
+            '{\"v\":\"1\",\"ph\":[[phase_id,confidence],...],\"to\":[[tool_id,location_id,location_type,confidence],...],\"u\":uncertainty,\"sum\":\"optional short note\"}',
             "Keep output compact. Prefer only likely visible tools. Use exact tool ids and location ids from context.",
         ]
 
@@ -72,7 +63,6 @@ class PromptBuilder:
             "\n".join(phase_lines),
             "\n".join(instrument_lines),
             "\n".join(location_lines),
-            "\n".join(gesture_lines),
             "\n".join(schema_lines),
         ]
         if optional_context:

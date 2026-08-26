@@ -7,8 +7,9 @@ if [ -f /opt/btops_ws/install/setup.bash ]; then
   source /opt/btops_ws/install/setup.bash
 fi
 
-if [ -f /workspaces/taskplanner_ws/install/setup.bash ]; then
-  source /workspaces/taskplanner_ws/install/setup.bash
+if [[ "${TASKPLANNER_SKIP_WORKSPACE_SETUP:-false}" != "true" \
+    && -f /workspaces/taskplanner_ws/install/docker/setup.bash ]]; then
+  source /workspaces/taskplanner_ws/install/docker/setup.bash
 fi
 
 exec "$@"

@@ -139,7 +139,6 @@ class ThyroidectomyLLME2EProbe(Node):
 
     def _record_world_invariants(self, msg: WorldState) -> None:
         holder_by_tool: dict[str, set[str]] = {}
-        surgeon_owned = []
         for instrument in msg.instrument_states:
             holders = holder_by_tool.setdefault(instrument.instrument_id, set())
             owner = instrument.owner
@@ -154,10 +153,6 @@ class ThyroidectomyLLME2EProbe(Node):
                 holders.add("cleaner")
             elif owner and owner != "none":
                 holders.add(owner)
-            if instrument.lifecycle_stage == "surgeon_owned":
-                surgeon_owned.append(instrument.instrument_id)
-        if len(surgeon_owned) > 2:
-            self.world_invariant_violations.append(f"surgeon owned >2 tools: {sorted(surgeon_owned)}")
         for tool_id, holders in holder_by_tool.items():
             physical = holders.intersection({"surgeon", "surgeon_hand", "robot_right_hand", "robot_left_hand", "cleaner_slot"})
             if len(physical) > 1:

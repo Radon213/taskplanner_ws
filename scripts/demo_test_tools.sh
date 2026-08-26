@@ -20,7 +20,7 @@ ros_exec() {
 
   docker exec "$RUNTIME" bash -lc "
     source /opt/ros/humble/setup.bash 2>/dev/null || source /opt/ros/jazzy/setup.bash
-    source /workspaces/taskplanner_ws/install/setup.bash
+    source /workspaces/taskplanner_ws/install/docker/setup.bash
     $*
   "
 }
@@ -53,7 +53,7 @@ record_test() {
 
   timeout "${DURATION}s" docker exec -i "$RUNTIME" bash -lc "
     source /opt/ros/humble/setup.bash 2>/dev/null || source /opt/ros/jazzy/setup.bash
-    source /workspaces/taskplanner_ws/install/setup.bash
+    source /workspaces/taskplanner_ws/install/docker/setup.bash
     ros2 topic echo /simulation/event
   " | awk '
     BEGIN { block = ""; skip = 0 }
@@ -117,7 +117,7 @@ record_test_manual() {
 
   docker exec -i "$RUNTIME" bash -lc "
     source /opt/ros/humble/setup.bash 2>/dev/null || source /opt/ros/jazzy/setup.bash
-    source /workspaces/taskplanner_ws/install/setup.bash
+    source /workspaces/taskplanner_ws/install/docker/setup.bash
     ros2 topic echo /simulation/event
   " | tee "$LOG_FILE"
 }
@@ -481,7 +481,7 @@ record_test() {
 
   timeout "${DURATION}s" docker exec -i "$RUNTIME" bash -lc "
     source /opt/ros/humble/setup.bash 2>/dev/null || source /opt/ros/jazzy/setup.bash
-    source /workspaces/taskplanner_ws/install/setup.bash
+    source /workspaces/taskplanner_ws/install/docker/setup.bash
     stdbuf -oL -eL ros2 topic echo /simulation/event
   " | tee "$RAW_FILE"
 
@@ -533,7 +533,7 @@ run_logged_test() {
 
   setsid bash -c "docker exec -i '$RUNTIME' bash -lc '
     source /opt/ros/humble/setup.bash 2>/dev/null || source /opt/ros/jazzy/setup.bash
-    source /workspaces/taskplanner_ws/install/setup.bash
+    source /workspaces/taskplanner_ws/install/docker/setup.bash
     stdbuf -oL -eL ros2 topic echo /simulation/event
   ' | tee '$RAW_FILE'" &
   LOGGER_PGID=$!
@@ -622,7 +622,7 @@ run_logged_test() {
 
   setsid bash -c "docker exec -i '$RUNTIME' bash -lc '
     source /opt/ros/humble/setup.bash 2>/dev/null || source /opt/ros/jazzy/setup.bash
-    source /workspaces/taskplanner_ws/install/setup.bash
+    source /workspaces/taskplanner_ws/install/docker/setup.bash
     stdbuf -oL -eL ros2 topic echo /simulation/event
   ' > '$RAW_FILE' 2>&1" &
   LOGGER_PGID=$!

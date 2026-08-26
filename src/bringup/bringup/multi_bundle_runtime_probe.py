@@ -237,7 +237,6 @@ class MultiBundleRuntimeProbe(Node):
 
     def _record_world_invariants(self, msg: WorldState) -> None:
         holder_by_tool: dict[str, set[str]] = {}
-        surgeon_owned: list[str] = []
         for instrument in msg.instrument_states:
             holders = holder_by_tool.setdefault(instrument.instrument_id, set())
             owner = str(instrument.owner)
@@ -250,10 +249,6 @@ class MultiBundleRuntimeProbe(Node):
                 holders.add("robot_left_hand")
             if location_type == "cleaner_slot":
                 holders.add("cleaner")
-            if instrument.lifecycle_stage == "surgeon_owned":
-                surgeon_owned.append(instrument.instrument_id)
-        if len(surgeon_owned) > 2:
-            self.world_invariant_violations.append(f"surgeon owned >2 tools: {sorted(surgeon_owned)}")
         for tool_id, holders in holder_by_tool.items():
             if len(holders) > 1:
                 self.world_invariant_violations.append(f"{tool_id} appears in multiple holders: {sorted(holders)}")
@@ -487,9 +482,6 @@ class MultiBundleRuntimeProbe(Node):
             "candidate_evidence": candidates.get("evidence", {}) if isinstance(candidates, dict) else {},
             "evidence_window": {
                 "speech": evidence_window.get("speech", [])[-4:] if isinstance(evidence_window.get("speech", []), list) else [],
-                "observed_signals": evidence_window.get("observed_signals", [])[-4:]
-                if isinstance(evidence_window.get("observed_signals", []), list)
-                else [],
                 "skill_status": evidence_window.get("skill_status", [])[-4:]
                 if isinstance(evidence_window.get("skill_status", []), list)
                 else [],
@@ -810,7 +802,6 @@ class MultiBundleRuntimeProbe(Node):
             for msg in self.vlm_results
             for tool_id in [
                 *list(msg.observed_tool_ids),
-                msg.gesture_requested_tool,
                 self._vlm_tool_prediction(msg),
             ]
             if str(tool_id)

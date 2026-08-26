@@ -27,9 +27,6 @@ TASK_ALIASES = {
     "tool_recognition": "tool",
     "tool_detection": "tool",
     "current_tools": "tool",
-    "request_intent": "intent",
-    "surgeon_intent": "intent",
-    "intent": "intent",
     "current_phase": "phase",
     "phase": "phase",
     "phase_classification": "phase",
@@ -406,8 +403,6 @@ def _next_tool_stratum(
             continue
         if "explicit" in normalized:
             return "explicit"
-        if "implicit" in normalized or "silent" in normalized:
-            return "implicit"
         if "anticip" in normalized or "context" in normalized:
             return "anticipatory"
         if normalized in NONE_LABELS:
@@ -606,24 +601,6 @@ def _generic_exact(
     }
 
 
-def _evaluate_intents(
-    examples: Sequence[tuple[Mapping[str, Any], Mapping[str, Any]]]
-) -> dict[str, Any]:
-    exact = _generic_exact(examples)
-    gold = [_label(reference.get("intent")) for reference, _ in examples]
-    predicted = [_label(prediction.get("intent")) for _, prediction in examples]
-    annotated = [index for index, value in enumerate(gold) if value is not None]
-    classification = _multiclass_metrics(
-        [gold[index] for index in annotated],
-        [predicted[index] for index in annotated],
-    )
-    return {
-        **exact,
-        "intent_label_accuracy": classification["accuracy"],
-        "intent_classification": classification,
-    }
-
-
 def _nonempty_string(value: Any) -> bool:
     return isinstance(value, str) and bool(value.strip())
 
@@ -651,24 +628,6 @@ def _task_schema_valid(
             and all(_nonempty_string(prediction[key]) for key in string_fields)
             and isinstance(
                 prediction["exhaustive_visible_tool_inventory"], bool
-            )
-        )
-
-    if task == "intent":
-        required = {
-            "event",
-            "intent",
-            "requested_tool",
-            "tool_identity_inferred_from_later_transfer",
-        }
-        return (
-            required.issubset(prediction)
-            and _nonempty_string(prediction["event"])
-            and _nonempty_string(prediction["intent"])
-            and _string_or_none(prediction["requested_tool"])
-            and isinstance(
-                prediction["tool_identity_inferred_from_later_transfer"],
-                bool,
             )
         )
 
@@ -845,8 +804,6 @@ def evaluate_predictions(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
             metrics[task] = _evaluate_next_tools(examples)
         elif task == "clinical":
             metrics[task] = _evaluate_clinical(pairs)
-        elif task == "intent":
-            metrics[task] = _evaluate_intents(pairs)
         else:
             metrics[task] = _generic_exact(pairs)
         metrics[task]["json_valid_support"] = json_valid_by_task[task]

@@ -3,20 +3,16 @@ import { useLayoutEffect, useRef, useState } from "react";
 import {
   DEBUG_PERCEPTION_BLOOD_SEMANTICS_TOPIC,
   DEBUG_PERCEPTION_DIAGNOSTICS_TOPIC,
-  DEBUG_PERCEPTION_HAND_KEYPOINTS_TOPIC,
   DEBUG_PERCEPTION_HEALTH_TOPIC,
   DEBUG_PERCEPTION_MAX_AGE_MS,
   DEBUG_PERCEPTION_TOOL_POSES_TOPIC,
   debugPerceptionStampNsKey,
   parseBloodSemantics,
-  parseHandKeypoints,
   parsePerceptionDiagnostics,
   parsePerceptionHealth,
   parseToolPoseArray,
   type DebugBloodEvidence,
   type DebugBloodSemantics,
-  type DebugHandEvidence,
-  type DebugHandKeypoints,
   type DebugPerceptionDiagnostics,
   type DebugPerceptionEvidenceState,
   type DebugPerceptionHealth,
@@ -73,28 +69,22 @@ export function useDebugPerceptionBridge(subscribeTopic: DebugReadOnlyTopicSubsc
   const diagnosticsRef = useRef<DebugPerceptionDiagnostics | null>(null);
   const diagnosticsByStampRef = useRef(new Map<string, DebugPerceptionDiagnostics>());
   const pendingToolPosesRef = useRef<DebugToolPoseArray | null>(null);
-  const pendingHandsByStampRef = useRef(new Map<string, DebugHandKeypoints>());
   const pendingBloodByStampRef = useRef(new Map<string, DebugBloodSemantics>());
   const toolPoseEvidenceRef = useRef<DebugToolPoseEvidence | null>(null);
-  const handEvidenceRef = useRef<DebugHandEvidence | null>(null);
   const bloodEvidenceRef = useRef<DebugBloodEvidence | null>(null);
   const toolPoseContractErrorRef = useRef(false);
-  const handContractErrorRef = useRef(false);
   const bloodContractErrorRef = useRef(false);
   const perceptionContractErrorRef = useRef(false);
 
   const [health, setHealth] = useState<DebugPerceptionHealth | null>(null);
   const [diagnostics, setDiagnostics] = useState<DebugPerceptionDiagnostics | null>(null);
   const [toolPoseEvidence, setToolPoseEvidence] = useState<DebugToolPoseEvidence | null>(null);
-  const [handEvidence, setHandEvidence] = useState<DebugHandEvidence | null>(null);
   const [bloodEvidence, setBloodEvidence] = useState<DebugBloodEvidence | null>(null);
   const [toolPoseDetail, setToolPoseDetail] = useState(
     "동일 stamp의 ToolPoseArray와 health/diagnostics를 기다리고 있습니다.",
   );
-  const [handDetail, setHandDetail] = useState("동일 stamp의 HandKeypoints를 기다리고 있습니다.");
   const [bloodDetail, setBloodDetail] = useState("동일 stamp의 Blood semantics를 기다리고 있습니다.");
   const [toolPoseContractError, setToolPoseContractError] = useState(false);
-  const [handContractError, setHandContractError] = useState(false);
   const [bloodContractError, setBloodContractError] = useState(false);
   const [evidenceState, setEvidenceState] = useState<DebugPerceptionEvidenceState>("waiting_for_health");
   const [evidenceDetail, setEvidenceDetail] = useState(INITIAL_EVIDENCE_DETAIL);
@@ -108,12 +98,6 @@ export function useDebugPerceptionBridge(subscribeTopic: DebugReadOnlyTopicSubsc
       setToolPoseEvidence(null);
     }
 
-    function clearHandEvidence({ clearPending = false } = {}) {
-      if (clearPending) pendingHandsByStampRef.current.clear();
-      handEvidenceRef.current = null;
-      setHandEvidence(null);
-    }
-
     function clearBloodEvidence({ clearPending = false } = {}) {
       if (clearPending) pendingBloodByStampRef.current.clear();
       bloodEvidenceRef.current = null;
@@ -122,7 +106,6 @@ export function useDebugPerceptionBridge(subscribeTopic: DebugReadOnlyTopicSubsc
 
     function clearScalarEvidence() {
       clearToolPoseEvidence();
-      clearHandEvidence();
       clearBloodEvidence();
     }
 
@@ -131,25 +114,19 @@ export function useDebugPerceptionBridge(subscribeTopic: DebugReadOnlyTopicSubsc
       diagnosticsRef.current = null;
       diagnosticsByStampRef.current.clear();
       pendingToolPosesRef.current = null;
-      pendingHandsByStampRef.current.clear();
       pendingBloodByStampRef.current.clear();
       toolPoseEvidenceRef.current = null;
-      handEvidenceRef.current = null;
       bloodEvidenceRef.current = null;
       toolPoseContractErrorRef.current = false;
-      handContractErrorRef.current = false;
       bloodContractErrorRef.current = false;
       perceptionContractErrorRef.current = false;
       setHealth(null);
       setDiagnostics(null);
       setToolPoseEvidence(null);
-      setHandEvidence(null);
       setBloodEvidence(null);
       setToolPoseContractError(false);
-      setHandContractError(false);
       setBloodContractError(false);
       setToolPoseDetail("동일 stamp의 ToolPoseArray와 health/diagnostics를 기다리고 있습니다.");
-      setHandDetail("동일 stamp의 HandKeypoints를 기다리고 있습니다.");
       setBloodDetail("동일 stamp의 Blood semantics를 기다리고 있습니다.");
       setEvidenceState("waiting_for_health");
       setEvidenceDetail(INITIAL_EVIDENCE_DETAIL);
@@ -157,7 +134,6 @@ export function useDebugPerceptionBridge(subscribeTopic: DebugReadOnlyTopicSubsc
 
     function pruneCaches(now: number) {
       trimMap(diagnosticsByStampRef.current, now);
-      trimMap(pendingHandsByStampRef.current, now);
       trimMap(pendingBloodByStampRef.current, now);
       if (
         pendingToolPosesRef.current
@@ -182,13 +158,6 @@ export function useDebugPerceptionBridge(subscribeTopic: DebugReadOnlyTopicSubsc
       setEvidenceState("contract_error");
       setEvidenceDetail(detail);
       setToolPoseDetail(detail);
-    }
-
-    function failHandContract(detail: string) {
-      handContractErrorRef.current = true;
-      setHandContractError(true);
-      clearHandEvidence();
-      setHandDetail(detail);
     }
 
     function failBloodContract(detail: string) {
@@ -350,41 +319,6 @@ export function useDebugPerceptionBridge(subscribeTopic: DebugReadOnlyTopicSubsc
       const anchor = currentAnchor(now);
       if (!anchor) return;
       const { diagnostics: exactDiagnostics } = anchor;
-      const hand = pendingHandsByStampRef.current.get(exactDiagnostics.sourceStampKey) ?? null;
-      if (hand) {
-        if (
-          now - hand.receivedAt > DEBUG_PERCEPTION_MAX_AGE_MS
-          || hand.frameId !== exactDiagnostics.frameId
-          || !exactDiagnostics.requestedAlgorithms.includes("hand")
-          || !exactDiagnostics.executedAlgorithms.includes("hand")
-          || exactDiagnostics.handCount !== hand.hands.length
-          || (hand.depthSource === "2d_only") === exactDiagnostics.metric3dReady
-        ) {
-          failHandContract("HandKeypoints가 동일 stamp/frame의 실행·count·depth_source 계약과 일치하지 않습니다.");
-        } else {
-          const evidence = { diagnostics: exactDiagnostics, result: hand };
-          handEvidenceRef.current = evidence;
-          pendingHandsByStampRef.current.delete(hand.sourceStampKey);
-          setHandEvidence(evidence);
-          handContractErrorRef.current = false;
-          setHandContractError(false);
-          setHandDetail(
-            hand.hands.length === 0
-              ? "Hand 알고리즘 실행 완료 · Hand 0건입니다."
-              : `동일 stamp의 Hand ${hand.hands.length}건과 21-joint scalar 증거를 결합했습니다.`,
-          );
-        }
-      } else if (
-        !handContractErrorRef.current
-        && handEvidenceRef.current?.result.sourceStampKey !== exactDiagnostics.sourceStampKey
-      ) {
-        setHandDetail(
-          pendingHandsByStampRef.current.size > 0
-            ? "HandKeypoints를 stamp별로 버퍼링했습니다. 현재 diagnostics와 동일 stamp 결과를 기다립니다."
-            : "현재 diagnostics와 동일 stamp의 HandKeypoints를 기다리고 있습니다.",
-        );
-      }
-
       const stampNsKey = debugPerceptionStampNsKey(
         exactDiagnostics.sourceStampSec,
         exactDiagnostics.sourceStampNanosec,
@@ -515,28 +449,6 @@ export function useDebugPerceptionBridge(subscribeTopic: DebugReadOnlyTopicSubsc
       promoteAnchor(receivedAt);
     });
 
-    const unsubscribeHandKeypoints = subscribeTopic({
-      name: DEBUG_PERCEPTION_HAND_KEYPOINTS_TOPIC,
-      messageType: "hand_keypoint_interfaces/msg/HandKeypoints",
-      queueLength: 1,
-      reliability: "reliable",
-    }, (message) => {
-      if (disposed) return;
-      const receivedAt = Date.now();
-      const result = parseHandKeypoints(message, receivedAt);
-      if (!result) {
-        failHandContract("HandKeypoints가 bounded 21-joint, depth validity 또는 palm 6D 계약과 일치하지 않습니다.");
-        return;
-      }
-      pendingHandsByStampRef.current.delete(result.sourceStampKey);
-      pendingHandsByStampRef.current.set(result.sourceStampKey, result);
-      handContractErrorRef.current = false;
-      setHandContractError(false);
-      setHandDetail("HandKeypoints를 수신했습니다. 동일 stamp의 diagnostics와 결합 중입니다.");
-      pruneCaches(receivedAt);
-      promoteAnchor(receivedAt);
-    });
-
     const unsubscribeBloodSemantics = subscribeTopic({
       name: DEBUG_PERCEPTION_BLOOD_SEMANTICS_TOPIC,
       messageType: "std_msgs/msg/String",
@@ -569,7 +481,7 @@ export function useDebugPerceptionBridge(subscribeTopic: DebugReadOnlyTopicSubsc
         setHealth(staleHealth);
         clearScalarEvidence();
         setEvidenceState("stale");
-        setEvidenceDetail("PNU health가 3초 이상 갱신되지 않아 scalar Tool·Hand·Blood 증거를 지웠습니다.");
+        setEvidenceDetail("PNU health가 3초 이상 갱신되지 않아 scalar Tool·Blood 증거를 지웠습니다.");
         setToolPoseDetail("PNU health가 만료되어 Tool 자세 증거를 지웠습니다.");
       }
       const currentDiagnostics = diagnosticsRef.current;
@@ -593,13 +505,6 @@ export function useDebugPerceptionBridge(subscribeTopic: DebugReadOnlyTopicSubsc
         clearToolPoseEvidence();
         setToolPoseDetail("Tool 자세 scalar 증거가 3초 이상 갱신되지 않아 위치·quaternion을 지웠습니다.");
       }
-      if (handEvidenceRef.current && (
-        now - handEvidenceRef.current.result.receivedAt > DEBUG_PERCEPTION_MAX_AGE_MS
-        || now - handEvidenceRef.current.diagnostics.receivedAt > DEBUG_PERCEPTION_MAX_AGE_MS
-      )) {
-        clearHandEvidence();
-        setHandDetail("HandKeypoints exact-stamp 증거가 만료되어 2D/3D joint와 palm pose를 지웠습니다.");
-      }
       if (bloodEvidenceRef.current && (
         now - bloodEvidenceRef.current.result.receivedAt > DEBUG_PERCEPTION_MAX_AGE_MS
         || now - bloodEvidenceRef.current.diagnostics.receivedAt > DEBUG_PERCEPTION_MAX_AGE_MS
@@ -616,7 +521,6 @@ export function useDebugPerceptionBridge(subscribeTopic: DebugReadOnlyTopicSubsc
       unsubscribeHealth();
       unsubscribeDiagnostics();
       unsubscribeToolPoses();
-      unsubscribeHandKeypoints();
       unsubscribeBloodSemantics();
       resetEvidence();
     };
@@ -626,13 +530,10 @@ export function useDebugPerceptionBridge(subscribeTopic: DebugReadOnlyTopicSubsc
     health,
     diagnostics,
     toolPoseEvidence,
-    handEvidence,
     bloodEvidence,
     toolPoseDetail,
-    handDetail,
     bloodDetail,
     toolPoseContractError,
-    handContractError,
     bloodContractError,
     evidenceState,
     evidenceDetail,

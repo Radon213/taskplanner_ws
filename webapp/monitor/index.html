@@ -6,7 +6,7 @@
     <meta name="theme-color" content="#081425" />
     <title>SurgiMate · Robot Monitoring</title>
     <link rel="icon" href="/favicon.svg" />
-    <link rel="stylesheet" href="/monitor/styles.css?v=20260821-2" />
+    <link rel="stylesheet" href="/monitor/styles.css?v=20260824-1" />
   </head>
   <body>
     <main class="app-shell">
@@ -18,12 +18,14 @@
         <section class="time-panel"><time id="clock">14:32</time><span>ELAPSED TIME</span><strong id="elapsed">01:24:05</strong></section>
         <section class="procedure">
           <div><strong>Thyroidectomy</strong><dl><dt>TARGET SITE</dt><dd>Right Lobectomy</dd><dt>APPROACH</dt><dd>BABA</dd></dl></div>
-          <div class="surgeon"><button class="settings-profile-trigger" type="button" data-settings-trigger aria-label="교수 프로필에서 연결 설정 열기" aria-haspopup="dialog" aria-controls="settings-dialog" aria-expanded="false"><img src="assets/figma/surgeon-prof-sung.png" alt="Prof. Sung" /></button><span><strong>Prof. Sung</strong><small>ENT</small></span></div>
+          <div class="surgeon"><button class="settings-profile-trigger" type="button" data-settings-trigger aria-label="교수 프로필에서 연결 설정 열기" aria-haspopup="dialog" aria-controls="settings-dialog" aria-expanded="false"><img src="assets/figma/surgeon-prof-sung.webp" alt="Prof. Sung" /></button><span><strong>Prof. Sung</strong><small>ENT</small></span></div>
         </section>
       </header>
 
       <section class="surgical-view">
-        <img class="surgery-image" src="assets/figma/raw-14.png" alt="수술 부위 카메라 화면" />
+        <img class="surgery-image" src="assets/figma/raw-14.webp" alt="수술 부위 카메라 화면" />
+        <video class="surgery-stream" muted autoplay playsinline preload="none" aria-label="수술 부위 카메라 실시간 영상" hidden></video>
+        <span id="camera-transport-status" class="visually-hidden" role="status" aria-live="polite">카메라 연결 준비 중</span>
         <div class="image-vignette"></div>
         <div class="view-tabs" role="tablist" aria-label="카메라 보기">
           <button class="active" role="tab" aria-selected="true" data-view="overview"><img class="view-tab-icon" src="assets/figma/ui/overview-tab-icon.svg" alt="" />OVERVIEW</button>
@@ -44,7 +46,7 @@
         </article>
 
         <section class="focus-only focus-info" aria-label="Field Focus 수술 정보">
-          <span>PROCEDURE&nbsp;&nbsp; <strong>Thyroidectomy</strong></span><span>CURRENT TIME&nbsp;&nbsp; <strong id="focus-clock">14:32</strong></span><span>ELAPSED TIME&nbsp;&nbsp; <strong id="focus-elapsed">01:24:05</strong></span><span class="focus-doctor"><button class="settings-profile-trigger" type="button" data-settings-trigger aria-label="교수 프로필에서 연결 설정 열기" aria-haspopup="dialog" aria-controls="settings-dialog" aria-expanded="false"><img src="assets/figma/surgeon-prof-sung.png" alt="Prof. Sung" /></button><strong>Prof. Sung</strong>&nbsp; ENT</span>
+          <span>PROCEDURE&nbsp;&nbsp; <strong>Thyroidectomy</strong></span><span>CURRENT TIME&nbsp;&nbsp; <strong id="focus-clock">14:32</strong></span><span>ELAPSED TIME&nbsp;&nbsp; <strong id="focus-elapsed">01:24:05</strong></span><span class="focus-doctor"><button class="settings-profile-trigger" type="button" data-settings-trigger aria-label="교수 프로필에서 연결 설정 열기" aria-haspopup="dialog" aria-controls="settings-dialog" aria-expanded="false"><img src="assets/figma/surgeon-prof-sung.webp" alt="Prof. Sung" /></button><strong>Prof. Sung</strong>&nbsp; ENT</span>
         </section>
         <section class="focus-only bed-map" aria-label="수술대 주변 위치"><div class="bed-grid"><div class="bed">BED</div><img class="map-inactive" src="assets/figma/ui/map-inactive.svg" alt="" /><img class="map-arm arm12" src="assets/figma/ui/map-arm12.svg" alt="" /><img class="map-arm arm34 a" src="assets/figma/ui/map-arm34.svg" alt="" /><img class="map-arm arm34 b" src="assets/figma/ui/map-arm34.svg" alt="" /><img class="map-surgeon" src="assets/figma/ui/map-surgeon.svg" alt="" /></div><div class="map-legend"><span><i></i>ARM 1,2</span><span><i></i>ARM 3,4</span><span><i></i>SURGEON</span></div></section>
         <article class="focus-only focus-arm focus-arm-1"><header><b>L</b><span class="status idle"><i></i>IDLE</span></header><p class="arm-label"><img class="arm-hand-icon" src="assets/figma/ui/arm-hand-icon.svg" alt="" /><span>ARM 1</span></p><h2>NONE</h2></article>
@@ -80,15 +82,27 @@
         </article>
 
         <article class="dock-card predicted-dock">
-          <nav class="rank-tabs" aria-label="예측 순위"><button class="active">1</button><button>2</button><button>3</button></nav>
-          <button class="prediction-arrow prev-arrow" aria-label="이전"><img src="assets/figma/ui/prediction-arrow.svg" alt="" /></button>
+          <div class="rank-tabs" aria-label="예측 순위" role="list"><span class="rank-tab active" role="listitem">1</span><span class="rank-tab" role="listitem">2</span><span class="rank-tab" role="listitem">3</span></div>
+          <span class="prediction-arrow prev-arrow" aria-hidden="true"><img src="assets/figma/ui/prediction-arrow.svg" alt="" /></span>
           <section class="prediction-mini empty"><strong>NONE</strong></section>
           <section class="prediction-mini empty"><strong>NONE</strong></section>
           <section class="prediction-mini empty"><strong>NONE</strong></section>
-          <button class="prediction-arrow next-arrow" aria-label="다음"><img src="assets/figma/ui/prediction-arrow.svg" alt="" /></button>
+          <span class="prediction-arrow next-arrow" aria-hidden="true"><img src="assets/figma/ui/prediction-arrow.svg" alt="" /></span>
         </article>
 
-        <article class="dock-card voice-card"><div class="mic" aria-hidden="true"><img src="assets/figma/ui/microphone-icon.svg" alt="" /></div><strong>Listening...</strong><span class="listening"><img src="assets/figma/ui/listening-dot-1.svg" alt="" /><img src="assets/figma/ui/listening-dot-2.svg" alt="" /><img src="assets/figma/ui/listening-dot-3.svg" alt="" /></span></article>
+        <article class="dock-card voice-card" data-status="listening" data-signal="quiet">
+          <div class="mic" aria-hidden="true"><img src="assets/figma/ui/microphone-icon.svg" alt="" /></div>
+          <div class="voice-copy">
+            <div class="voice-heading">
+              <strong class="voice-status">Listening...</strong>
+              <span class="listening" aria-hidden="true"><img src="assets/figma/ui/listening-dot-1.svg" alt="" /><img src="assets/figma/ui/listening-dot-2.svg" alt="" /><img src="assets/figma/ui/listening-dot-3.svg" alt="" /></span>
+              <output class="voice-db" aria-label="마이크 입력 레벨">사용할 수 없음</output>
+            </div>
+            <p class="voice-transcript" data-transcript-state="empty"><span>말씀해 주세요…</span></p>
+            <div class="voice-meter" role="meter" aria-label="마이크 입력 레벨" aria-valuemin="-60" aria-valuemax="0" aria-valuenow="-60" aria-valuetext="마이크 입력 레벨을 사용할 수 없음"><i></i><b></b></div>
+          </div>
+          <span class="visually-hidden voice-final-announcement" aria-live="polite" aria-atomic="true"></span>
+        </article>
       </section>
       <div class="connection" role="status" aria-live="polite" hidden><i></i><span>SIMULATION</span><strong>LOCAL DATA</strong></div>
       <div id="settings-dialog" class="settings-overlay" hidden>
@@ -111,7 +125,7 @@
 
               <label for="throttle-rate">CAMERA THROTTLE RATE</label>
               <div class="number-field"><input id="throttle-rate" name="throttleRateMs" type="number" min="100" max="5000" step="10" /><span>ms</span></div>
-              <small>Overview와 Field Focus가 공유하는 FLIR 영상의 최소 전달 간격입니다. 기본 100ms는 최대 10 FPS입니다.</small>
+              <small>ROS 영상 폴백의 최소 전달 간격입니다. TV의 기본 H.264 경로가 끊긴 경우에만 사용됩니다.</small>
             </div>
 
             <div class="settings-fields dummy-file" data-mode-fields="dummy">
@@ -144,6 +158,6 @@
       </div>
     </main>
     <script src="/monitor/runtime-config.js"></script>
-    <script type="module" src="/monitor/app.js"></script>
+    <script type="module" src="/monitor/app.js?v=20260824-1"></script>
   </body>
 </html>

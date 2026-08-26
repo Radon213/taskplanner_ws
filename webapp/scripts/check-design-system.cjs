@@ -25,7 +25,9 @@ for (const file of walk(srcRoot)) {
     }
   }
 
-  if (/import\s*\{[^}]*\bmotion\b[^}]*\}\s*from\s*["']framer-motion["']/.test(source) || /\bmotion\./.test(source)) {
+  // Match the React component syntax, not prose such as "robot motion." in
+  // operator safety copy or implementation comments.
+  if (/import\s*\{[^}]*\bmotion\b[^}]*\}\s*from\s*["']framer-motion["']/.test(source) || /<\/?motion\./.test(source)) {
     violations.push(`${relative}: use strict LazyMotion-compatible m components`);
   }
 

@@ -1,3 +1,5 @@
+import { runtimeModeIsAvailable } from "./runtimeFeatures";
+
 export type TaskplannerRuntimeMode = "live" | "llm" | "shadow" | "debug";
 
 const STORAGE_KEY_PREFIX = "taskplanner.runtimeMode";
@@ -9,7 +11,9 @@ function isRuntimeMode(value: string | null | undefined): value is TaskplannerRu
 
 function configuredDefaultRuntimeMode(): TaskplannerRuntimeMode {
   const configuredMode = import.meta.env.VITE_DEFAULT_RUNTIME_MODE?.trim();
-  return isRuntimeMode(configuredMode) ? configuredMode : "live";
+  return isRuntimeMode(configuredMode) && runtimeModeIsAvailable(configuredMode)
+    ? configuredMode
+    : "live";
 }
 
 function scopedStorageKey(prefix: string): string {
@@ -117,12 +121,15 @@ export function multicamBridgeUrl(): string {
 export function initialRuntimeMode(): TaskplannerRuntimeMode {
   if (typeof window !== "undefined") {
     const storedMode = window.localStorage.getItem(runtimeModeStorageKey());
-    if (isRuntimeMode(storedMode)) return storedMode;
+    if (isRuntimeMode(storedMode) && runtimeModeIsAvailable(storedMode)) return storedMode;
   }
   return configuredDefaultRuntimeMode();
 }
 
 export function persistRuntimeMode(mode: TaskplannerRuntimeMode): void {
   if (typeof window === "undefined") return;
-  window.localStorage.setItem(runtimeModeStorageKey(), mode);
+  window.localStorage.setItem(
+    runtimeModeStorageKey(),
+    runtimeModeIsAvailable(mode) ? mode : "live",
+  );
 }

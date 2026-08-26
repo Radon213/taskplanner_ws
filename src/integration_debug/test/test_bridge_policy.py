@@ -99,7 +99,6 @@ def test_debug_perception_surface_is_exactly_read_only() -> None:
         "/surgery/perception/cam4/mayo_tool_observations",
         "/surgery/perception/cam4/observations",
         "/surgery/perception/cam4/tool_poses",
-        "/surgery/perception/cam4/hand_keypoints",
         "/surgery/perception/cam4/blood_semantics/json",
         "/surgery/perception/rfdetr/diagnostics/json",
         "/surgery/perception/rfdetr/health",
@@ -115,21 +114,21 @@ def test_debug_perception_surface_is_exactly_read_only() -> None:
     assert "/perception/cam_4/debug/hand/compressed" not in expected
 
 
-def test_debug_multicam_preview_patterns_remain_read_only() -> None:
+def test_debug_multicam_synced_patterns_remain_read_only() -> None:
     restricted = restrict_debug_rosbridge_protocol({})
-    assert "/preview/*" in DEBUG_MULTICAM_SUBSCRIBE_ALLOWLIST
-    assert "/preview/*" in restricted["topics_sub_glob"]
-    assert "/preview/*" not in restricted["topics_pub_glob"]
+    assert "/synced/*" in DEBUG_MULTICAM_SUBSCRIBE_ALLOWLIST
+    assert "/synced/*" in restricted["topics_sub_glob"]
+    assert "/synced/*" not in restricted["topics_pub_glob"]
 
 
-def test_browser_multicam_policies_are_preview_only() -> None:
+def test_browser_multicam_policies_are_synced_only() -> None:
     debug_restricted = restrict_debug_rosbridge_protocol({})
     observer_restricted = restrict_multicam_observer_rosbridge_protocol({})
     for restricted in (debug_restricted, observer_restricted):
-        assert "/preview/*" in restricted["topics_sub_glob"]
+        assert "/synced/*" in restricted["topics_sub_glob"]
+        assert "/preview/*" not in restricted["topics_sub_glob"]
         assert "/camera/*" not in restricted["topics_sub_glob"]
         assert "/flir_camera/*" not in restricted["topics_sub_glob"]
-        assert "/synced/*" not in restricted["topics_sub_glob"]
 
 
 def test_operational_debug_policy_denies_world_anchor_mutations() -> None:

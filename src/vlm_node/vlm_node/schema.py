@@ -17,6 +17,31 @@ class SchemaValidationError(ValueError):
     """Raised when the compact VLM schema is invalid."""
 
 
+RETIRED_VLM_HAND_OUTPUT_FIELDS = frozenset(
+    {
+        "gesture",
+        "hand_pose",
+        "handedness",
+        "palm_facing",
+        "sg",
+        "surgeon_gesture",
+    }
+)
+
+
+def _reject_retired_vlm_hand_output_fields(
+    payload: dict[str, Any],
+    *,
+    version: str,
+) -> None:
+    retired = sorted(RETIRED_VLM_HAND_OUTPUT_FIELDS.intersection(payload))
+    if retired:
+        raise SchemaValidationError(
+            f"schema v{version} no longer accepts retired VLM hand output fields: "
+            + ", ".join(retired)
+        )
+
+
 def _mayo_confidence(value: Any) -> float:
     confidence = float(value)
     if not math.isfinite(confidence) or confidence < 0.0 or confidence > 1.0:
@@ -182,11 +207,6 @@ def _validate_v1_payload(payload: dict[str, Any]) -> dict[str, Any]:
             raise SchemaValidationError("each to item must be [tool_id, location_id, location_type, confidence]")
         normalized_tools.append([str(item[0]), str(item[1]), str(item[2]), float(item[3])])
 
-    gesture = payload.get("sg", ["", "", "", 0.0])
-    if not isinstance(gesture, list) or len(gesture) != 4:
-        raise SchemaValidationError("'sg' must be [event_type, requested_tool, hand_pose, confidence]")
-    normalized_gesture = [str(gesture[0]), str(gesture[1]), str(gesture[2]), float(gesture[3])]
-
     uncertainty = _uncertainty(payload.get("u", 0.0))
     summary = str(payload.get("sum", ""))
 
@@ -194,7 +214,6 @@ def _validate_v1_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "v": "1",
         "ph": normalized_phases,
         "to": normalized_tools,
-        "sg": normalized_gesture,
         "u": uncertainty,
         "sum": summary,
     }
@@ -345,18 +364,23 @@ def _validate_v4_bed_robot_arm_group(value: Any) -> dict[str, Any] | None:
     if operation != "retraction":
         raise SchemaValidationError("bed_robot_arm_group operation must be retraction")
     if adjustment_mode == "single":
-        if target_retractor_id not in {"left_malleable", "right_malleable"}:
+        if target_retractor_id not in {
+            "left_malleable",
+            "right_malleable",
+            "left_army_navy",
+            "right_army_navy",
+        }:
             raise SchemaValidationError(
-                "single adjustment requires left_malleable or right_malleable"
+                "single adjustment requires a supported left/right retractor target"
             )
         if direction not in {"up", "down", "left", "right"} or axis != "none":
             raise SchemaValidationError(
                 "single adjustment requires a cardinal direction and axis none"
             )
     elif adjustment_mode == "multi":
-        if target_retractor_id != "both_malleable":
+        if target_retractor_id not in {"both_malleable", "both_army_navy"}:
             raise SchemaValidationError(
-                "multi adjustment requires both_malleable"
+                "multi adjustment requires a supported bilateral retractor target"
             )
         if direction != "none" or axis not in {"left_right", "up_down"}:
             raise SchemaValidationError(
@@ -415,32 +439,173 @@ def _validate_v4_payload(payload: dict[str, Any]) -> dict[str, Any]:
     v3_payload.pop("bed_robot_arm_group", None)
     normalized = _validate_v3_payload(v3_payload)
     normalized["v"] = "4"
-    gesture = payload.get("gesture", ["", "", "", 0.0])
-    if not isinstance(gesture, list) or len(gesture) != 4:
-        raise SchemaValidationError(
-            "'gesture' must be [event_type, tool_id, hand_pose, confidence]"
-        )
-    gesture_confidence = float(gesture[3])
-    if (
-        not math.isfinite(gesture_confidence)
-        or gesture_confidence < 0.0
-        or gesture_confidence > 1.0
-    ):
-        raise SchemaValidationError("gesture confidence must be between 0 and 1")
-    normalized["gesture"] = [
-        str(gesture[0]),
-        str(gesture[1]),
-        str(gesture[2]),
-        gesture_confidence,
-    ]
     normalized["bed_robot_arm_group"] = _validate_v4_bed_robot_arm_group(
         payload.get("bed_robot_arm_group")
     )
     return normalized
 
 
+def _validate_v5_object_fields(
+    value: dict[str, Any],
+    *,
+    label: str,
+    required: set[str],
+) -> None:
+    missing = sorted(required - set(value))
+    extra = sorted(set(value) - required)
+    if missing:
+        raise SchemaValidationError(f"{label} is missing fields: " + ", ".join(missing))
+    if extra:
+        raise SchemaValidationError(
+            f"{label} has unsupported fields: " + ", ".join(extra)
+        )
+
+
+def _validate_v5_nonempty_string(value: Any, *, label: str) -> str:
+    if not isinstance(value, str):
+        raise SchemaValidationError(f"{label} must be a string")
+    normalized = value.strip()
+    if not normalized:
+        raise SchemaValidationError(f"{label} must be non-empty")
+    return normalized
+
+
+def _validate_v5_function_call(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise SchemaValidationError("'function_call' must be an object or null")
+
+    required = {"turn_id", "name", "arguments"}
+    _validate_v5_object_fields(value, label="function_call", required=required)
+
+    arguments = value["arguments"]
+    if not isinstance(arguments, dict):
+        raise SchemaValidationError("function_call arguments must be an object")
+
+    return {
+        "turn_id": _validate_v5_nonempty_string(
+            value["turn_id"], label="function_call turn_id"
+        ),
+        "name": _validate_v5_nonempty_string(
+            value["name"], label="function_call name"
+        ),
+        "arguments": dict(arguments),
+    }
+
+
+def _validate_v5_humanoid_reply(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise SchemaValidationError("'humanoid_reply' must be an object or null")
+
+    required = {"turn_id", "text", "speak", "timing"}
+    _validate_v5_object_fields(value, label="humanoid_reply", required=required)
+
+    text = value["text"]
+    if not isinstance(text, str):
+        raise SchemaValidationError("humanoid_reply text must be a string")
+    if len(text) > 240:
+        raise SchemaValidationError("humanoid_reply text must be at most 240 characters")
+
+    speak = value["speak"]
+    if not isinstance(speak, bool):
+        raise SchemaValidationError("humanoid_reply speak must be a boolean")
+
+    timing = value["timing"]
+    if not isinstance(timing, str):
+        raise SchemaValidationError("humanoid_reply timing must be a string")
+    timing = timing.strip()
+    allowed_timings = {
+        "immediate",
+        "on_function_accepted",
+        "on_function_completed",
+    }
+    if timing not in allowed_timings:
+        raise SchemaValidationError(
+            "humanoid_reply timing must be immediate, on_function_accepted, "
+            "or on_function_completed"
+        )
+
+    return {
+        "turn_id": _validate_v5_nonempty_string(
+            value["turn_id"], label="humanoid_reply turn_id"
+        ),
+        "text": text.strip(),
+        "speak": speak,
+        "timing": timing,
+    }
+
+
+def _validate_v5_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    if str(payload.get("v", "")) != "5":
+        raise SchemaValidationError("missing or unsupported schema version")
+
+    required = {
+        "v",
+        "phase",
+        "tool",
+        "intent",
+        "mayo",
+        "mayo_retrieve",
+        "u",
+        "sum",
+        "bed_robot_arm_group",
+        "function_call",
+        "humanoid_reply",
+    }
+    allowed = required
+    missing = sorted(required - set(payload))
+    extra = sorted(set(payload) - allowed)
+    if missing:
+        raise SchemaValidationError("schema v5 is missing fields: " + ", ".join(missing))
+    if extra:
+        raise SchemaValidationError(
+            "schema v5 has unsupported fields: " + ", ".join(extra)
+        )
+
+    v4_payload = dict(payload)
+    v4_payload["v"] = "4"
+    v4_payload.pop("function_call")
+    v4_payload.pop("humanoid_reply")
+    normalized = _validate_v4_payload(v4_payload)
+    normalized["v"] = "5"
+    normalized["function_call"] = _validate_v5_function_call(
+        payload["function_call"]
+    )
+    normalized["humanoid_reply"] = _validate_v5_humanoid_reply(
+        payload["humanoid_reply"]
+    )
+
+    function_call = normalized["function_call"]
+    humanoid_reply = normalized["humanoid_reply"]
+    if (
+        function_call is not None
+        and humanoid_reply is not None
+        and function_call["turn_id"] != humanoid_reply["turn_id"]
+    ):
+        raise SchemaValidationError(
+            "function_call and humanoid_reply turn_id must match"
+        )
+    return normalized
+
+
+def _validate_v6_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Validate the gesture-free actor-log and dialogue response contract."""
+
+    if str(payload.get("v", "")) != "6":
+        raise SchemaValidationError("missing or unsupported schema version")
+    v5_payload = dict(payload)
+    v5_payload["v"] = "5"
+    normalized = _validate_v5_payload(v5_payload)
+    normalized["v"] = "6"
+    return normalized
+
+
 def validate_payload(payload: dict[str, Any]) -> dict[str, Any]:
     version = str(payload.get("v", ""))
+    _reject_retired_vlm_hand_output_fields(payload, version=version or "unknown")
     if version == "1":
         return _validate_v1_payload(payload)
     if version == "2":
@@ -449,6 +614,10 @@ def validate_payload(payload: dict[str, Any]) -> dict[str, Any]:
         return _validate_v3_payload(payload)
     if version == "4":
         return _validate_v4_payload(payload)
+    if version == "5":
+        return _validate_v5_payload(payload)
+    if version == "6":
+        return _validate_v6_payload(payload)
     raise SchemaValidationError("missing or unsupported schema version")
 
 
@@ -458,25 +627,63 @@ def normalize_raw_text(raw_text: str) -> tuple[str, dict[str, Any]]:
 
 
 def compact_vlm_json_schema(version: str = "1") -> dict[str, Any]:
+    if str(version) == "6":
+        schema = compact_vlm_json_schema("5")
+        schema["properties"] = dict(schema["properties"])
+        schema["properties"]["v"] = {"type": "string", "enum": ["6"]}
+        return schema
+    if str(version) == "5":
+        schema = compact_vlm_json_schema("4")
+        schema["properties"] = dict(schema["properties"])
+        schema["properties"]["v"] = {"type": "string", "enum": ["5"]}
+        schema["properties"]["function_call"] = {
+            "anyOf": [
+                {"type": "null"},
+                {
+                    "type": "object",
+                    "properties": {
+                        "turn_id": {"type": "string", "minLength": 1},
+                        "name": {"type": "string", "minLength": 1},
+                        "arguments": {"type": "object"},
+                    },
+                    "required": ["turn_id", "name", "arguments"],
+                    "additionalProperties": False,
+                },
+            ]
+        }
+        schema["properties"]["humanoid_reply"] = {
+            "anyOf": [
+                {"type": "null"},
+                {
+                    "type": "object",
+                    "properties": {
+                        "turn_id": {"type": "string", "minLength": 1},
+                        "text": {"type": "string", "maxLength": 240},
+                        "speak": {"type": "boolean"},
+                        "timing": {
+                            "type": "string",
+                            "enum": [
+                                "immediate",
+                                "on_function_accepted",
+                                "on_function_completed",
+                            ],
+                        },
+                    },
+                    "required": ["turn_id", "text", "speak", "timing"],
+                    "additionalProperties": False,
+                },
+            ]
+        }
+        schema["required"] = [
+            *schema["required"],
+            "function_call",
+            "humanoid_reply",
+        ]
+        return schema
     if str(version) == "4":
         schema = compact_vlm_json_schema("3")
         schema["properties"] = dict(schema["properties"])
         schema["properties"]["v"] = {"type": "string", "enum": ["4"]}
-        schema["properties"]["gesture"] = {
-            "type": "array",
-            "prefixItems": [
-                {"type": "string", "enum": ["", "request_tool"]},
-                {"type": "string"},
-                {"type": "string", "enum": ["", "open_receive"]},
-                {
-                    "type": "number",
-                    "minimum": 0.0,
-                    "maximum": 1.0,
-                },
-            ],
-            "minItems": 4,
-            "maxItems": 4,
-        }
         schema["properties"]["bed_robot_arm_group"] = {
             "anyOf": [
                 {"type": "null"},
@@ -496,6 +703,9 @@ def compact_vlm_json_schema(version: str = "1") -> dict[str, Any]:
                                 "left_malleable",
                                 "right_malleable",
                                 "both_malleable",
+                                "left_army_navy",
+                                "right_army_navy",
+                                "both_army_navy",
                             ],
                         },
                         "direction_frame": {
@@ -547,7 +757,7 @@ def compact_vlm_json_schema(version: str = "1") -> dict[str, Any]:
         schema["required"] = [*schema["required"], "bed_robot_arm_group"]
         return schema
     if str(version) == "3":
-        pair_array = {
+        phase_pair_array = {
             "type": "array",
             "items": {
                 "type": "array",
@@ -561,12 +771,17 @@ def compact_vlm_json_schema(version: str = "1") -> dict[str, Any]:
             "minItems": 1,
             "maxItems": 4,
         }
+        tool_pair_array = {
+            **phase_pair_array,
+            "items": dict(phase_pair_array["items"]),
+            "maxItems": 3,
+        }
         return {
             "type": "object",
             "properties": {
                 "v": {"type": "string", "enum": ["3"]},
-                "phase": pair_array,
-                "tool": pair_array,
+                "phase": phase_pair_array,
+                "tool": tool_pair_array,
                 "intent": {
                     "type": "array",
                     "prefixItems": [
@@ -696,20 +911,9 @@ def compact_vlm_json_schema(version: str = "1") -> dict[str, Any]:
                     "maxItems": 4,
                 },
             },
-            "sg": {
-                "type": "array",
-                "prefixItems": [
-                    {"type": "string"},
-                    {"type": "string"},
-                    {"type": "string"},
-                    {"type": "number", "minimum": 0.0, "maximum": 1.0},
-                ],
-                "minItems": 4,
-                "maxItems": 4,
-            },
             "u": {"type": "number", "minimum": 0.0, "maximum": 1.0},
             "sum": {"type": "string"},
         },
-        "required": ["v", "ph", "to", "sg", "u", "sum"],
+        "required": ["v", "ph", "to", "u", "sum"],
         "additionalProperties": False,
     }

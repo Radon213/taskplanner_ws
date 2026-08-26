@@ -7,7 +7,9 @@
 #   tray  -> robot    (pick up the planner-selected next tool and hold it ready)
 #   tray  -> surgeon  (pick up and hand over)
 #   robot -> surgeon  (hand over a held tool)
-#   robot -> tray     (return an unused held tool)
+#   robot -> tray     (controller-directed recovery/compensation only)
+#   robot -> mayo     (normal return of an unused anticipated tool; this is the
+#                      fast path used before preparing a replacement)
 #   mayo  -> robot    (pick up a reusable Mayo tool and hold it ready)
 #   mayo  -> tray     (retrieve a used tool)
 # The server selects its own arm and must reject every other transition.
@@ -41,6 +43,11 @@ bool success
 string final_state
 # A short machine-readable code. Keep it empty or "completed" on success.
 string reason_code
+# Optional terminal diagnostic.  It is human-readable evidence only and must
+# never replace ``reason_code`` for planner state transitions.  This field is
+# present in the EIR controller Action ABI and is retained locally so GetResult
+# has an identical wire contract on both peers.
+string failure_detail
 ---
 # Goal-scoped execution phase. Stages that do not apply to a source/target pair
 # may be skipped. A cancel request transitions through STOPPING and exactly one

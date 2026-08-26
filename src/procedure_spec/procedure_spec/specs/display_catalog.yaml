@@ -132,8 +132,8 @@ skill_states:
     display_name: Returning tool to rack
     display_name_ko: 도구 랙에 정리하는 중
   returning_prediction_to_rack:
-    display_name: Returning predicted tool to rack
-    display_name_ko: 예측 도구를 랙에 내려놓는 중
+    display_name: Parking prepared tool on Mayo
+    display_name_ko: 준비 도구를 메이요 스탠드에 내려놓는 중
   completed:
     display_name: Completed
     display_name_ko: 완료
@@ -161,8 +161,8 @@ transitions:
     display_name: Return home
     display_name_ko: 랙 복귀
   return_unused_preposition:
-    display_name: Return unused preposition
-    display_name_ko: 미사용 예비 도구 복귀
+    display_name: Park unused preparation on Mayo
+    display_name_ko: 미사용 준비 도구 메이요 스탠드 배치
   cleaning:
     display_name: Cleaning transfer
     display_name_ko: 세척 이동
@@ -281,13 +281,13 @@ events:
     severity: normal
     tone: robot
   PredictedToolReturnedToRack:
-    display_name: Predicted tool returned to rack
-    display_name_ko: 예측 도구 랙 복귀
+    display_name: Legacy predicted-tool rack return
+    display_name_ko: 레거시 예측 도구 랙 복귀
     severity: normal
     tone: robot
   UnusedPrepositionReturned:
-    display_name: Unused prepared tool returned
-    display_name_ko: 미사용 준비 도구 원위치 복귀
+    display_name: Unused prepared tool parked on Mayo
+    display_name_ko: 미사용 준비 도구 메이요 스탠드 배치
     severity: normal
     tone: robot
   ToolHandoverCompleted:

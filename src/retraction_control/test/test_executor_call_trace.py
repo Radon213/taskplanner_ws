@@ -163,6 +163,37 @@ def test_all_six_commands_produce_deterministic_confirmed_call_trace(tmp_path):
     executor.shutdown()
 
 
+def test_bilateral_adjustment_jogs_each_arm_by_the_same_distance(tmp_path):
+    executor, _robot, _sensor, trace = _executor(tmp_path)
+    executor.start()
+    assert executor.execute(_request("teach-start-both", 1)).success
+    assert executor.execute(_request("teach-finish-both", 2)).success
+    assert executor.execute(_request("retract-start-both", 3)).success
+    trace.clear()
+
+    adjusted = executor.execute(
+        _request("adjust-both", 4, target_side=0, distance_m=0.001)
+    )
+
+    _assert_success(adjusted, ExecutorState.RETRACTING)
+    assert adjusted.affected_arm_id == "arm_1,arm_2"
+    assert adjusted.target_side == 0
+    assert adjusted.details["distance_mm"] == 1.0
+    assert trace.method_names == (
+        "latest_sample",
+        "latest_sample",
+        "jog_tcp",
+        "controller_state",
+        "jog_tcp",
+        "controller_state",
+    )
+    assert trace.records[2].args == ("arm_1",)
+    assert trace.records[4].args == ("arm_2",)
+    assert dict(trace.records[2].kwargs)["distance_mm"] == 1.0
+    assert dict(trace.records[4].kwargs)["distance_mm"] == -1.0
+    executor.shutdown()
+
+
 def test_executor_preflight_has_no_adapter_calls_and_stop_bypasses_busy(tmp_path):
     executor, _robot, _sensor, trace = _executor(tmp_path)
     not_started = executor.check_admission(_request("teach", 1))

@@ -1,19 +1,26 @@
 """Operational microphone ASR ROS 2 endpoint for Taskplanner.
 
 Unlike Debug Mode, this node exposes a stable control/status contract to the
-operational runtime and does not persist microphone audio or transcripts by
-default.  The finalized sentence publisher exists only while the configured
+operational runtime. Recording is an explicit operator-controlled window and
+never starts merely because the microphone ASR session is active. The finalized
+sentence publisher exists only while the configured
 ASR WebSocket is connected, so publisher-count readiness cannot report a
 microphone source that is merely starting, disconnected, or stopping.
 """
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+import hashlib
+import itertools
 import json
 import math
 import os
+from pathlib import Path
 import threading
+import time
 from typing import Any, Callable
+import uuid
 
 import rclpy
 from rclpy._rclpy_pybind11 import RCLError
@@ -28,6 +35,7 @@ from rclpy.qos import (
 )
 from rclpy.validate_full_topic_name import validate_full_topic_name
 from std_msgs.msg import String
+from surgical_msgs.msg import SpeechUtterance
 from surgical_msgs.srv import AsrControl
 
 from integration_debug.asr_endpoints import (
@@ -52,6 +60,7 @@ NODE_NAME = "taskplanner_asr"
 STATUS_TOPIC = "/input/asr/runtime_status"
 CONTROL_SERVICE = "/input/asr/control"
 SENTENCE_TOPIC = "/sensors/surgeon/sentence"
+UTTERANCE_TOPIC = "/sensors/surgeon/utterance"
 STATUS_SCHEMA = "taskplanner.asr.status.v1"
 # Preserve the established public constant name for launch/tests that import it.
 DEFAULT_SERVER_URL = DEFAULT_CLOUD_SERVER_URL
@@ -61,6 +70,13 @@ DEFAULT_LAN_HEALTH_INTERVAL_SEC = 1.0
 DEFAULT_LAN_HEALTH_FAILURE_INTERVAL_SEC = 0.5
 DEFAULT_LAN_HEALTH_TIMEOUT_SEC = 0.5
 DEFAULT_LAN_HEALTH_STALE_AFTER_SEC = 2.0
+ASR_SOURCE_MANIFEST = (
+    "operational_asr_node.py",
+    "asr_runtime.py",
+    "asr_endpoints.py",
+    "asr_health_monitor.py",
+    "puzzle_asr_postprocess.py",
+)
 
 
 def _status_qos() -> QoSProfile:
@@ -96,7 +112,7 @@ def _json_dumps(value: Any) -> str:
 def _absolute_topic_name(value: Any) -> str:
     topic = str(value or "").strip()
     if not topic.startswith("/") or topic.startswith("//"):
-        raise ValueError("sentence_topic must be an absolute ROS topic name")
+        raise ValueError("output topic must be an absolute ROS topic name")
     validate_full_topic_name(topic)
     return topic
 
@@ -111,6 +127,52 @@ def _bounded_float(value: Any, *, default: float, minimum: float) -> float:
     if not math.isfinite(parsed):
         return default
     return max(minimum, parsed)
+
+
+def _event_stamp_sec(value: Any) -> float | None:
+    """Parse the ASR runtime's UTC final-event timestamp without guessing."""
+
+    try:
+        text = str(value or "").strip()
+        if text.endswith("Z"):
+            text = f"{text[:-1]}+00:00"
+        stamp = datetime.fromisoformat(text)
+        if stamp.tzinfo is None:
+            return None
+        seconds = stamp.astimezone(timezone.utc).timestamp()
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return seconds if math.isfinite(seconds) and seconds > 0.0 else None
+
+
+def _source_revision(package_dir: Path | None = None) -> str:
+    """Return a location-independent fingerprint of the loaded ASR sources.
+
+    The fixed manifest and explicit missing/unreadable markers make the result
+    deterministic without exposing host paths in the public status contract.
+    A node captures this once during initialization, so edits made afterwards
+    become visible only after the node has actually restarted.
+    """
+
+    root = Path(__file__).resolve().parent if package_dir is None else package_dir
+    digest = hashlib.sha256()
+    for filename in ASR_SOURCE_MANIFEST:
+        encoded_name = filename.encode("utf-8")
+        digest.update(len(encoded_name).to_bytes(2, "big"))
+        digest.update(encoded_name)
+        source_path = root / filename
+        try:
+            source = source_path.read_bytes()
+        except FileNotFoundError:
+            digest.update(b"\x00missing")
+            continue
+        except OSError:
+            digest.update(b"\x00unreadable")
+            continue
+        digest.update(b"\x00present")
+        digest.update(len(source).to_bytes(8, "big"))
+        digest.update(source)
+    return digest.hexdigest()
 
 
 class OperationalAsrNode(Node):
@@ -130,6 +192,15 @@ class OperationalAsrNode(Node):
         self._closed = False
         self._capture_requested = False
         self._sentence_pub: Any | None = None
+        self._utterance_counter = itertools.count(1)
+        self._node_instance_id = str(uuid.uuid4())
+        started_at_sec = time.time()
+        self._node_started_at_sec = (
+            round(started_at_sec, 6)
+            if math.isfinite(started_at_sec) and started_at_sec > 0.0
+            else 0.0
+        )
+        self._source_revision = _source_revision()
 
         self.declare_parameter(
             "endpoint",
@@ -162,6 +233,21 @@ class OperationalAsrNode(Node):
             os.environ.get("SENTENCE_INPUT_TOPIC", SENTENCE_TOPIC),
         )
         self.declare_parameter(
+            "utterance_topic",
+            os.environ.get("TASKPLANNER_ASR_UTTERANCE_TOPIC", UTTERANCE_TOPIC),
+        )
+        # The String route remains a deliberate Debug/replay compatibility
+        # contract.  Live must opt into ``typed_utterance`` so final/source
+        # metadata cannot be lost before command admission.
+        self.declare_parameter(
+            "output_mode",
+            os.environ.get("TASKPLANNER_ASR_OUTPUT_MODE", "sentence_text"),
+        )
+        self.declare_parameter(
+            "speaker_role",
+            os.environ.get("TASKPLANNER_ASR_SPEAKER_ROLE", "surgeon"),
+        )
+        self.declare_parameter(
             "output_dir",
             os.environ.get("TASKPLANNER_ASR_OUTPUT_DIR", DEFAULT_OUTPUT_DIR),
         )
@@ -169,7 +255,10 @@ class OperationalAsrNode(Node):
             "capture_lock_path",
             os.environ.get("TASKPLANNER_ASR_CAPTURE_LOCK", DEFAULT_CAPTURE_LOCK),
         )
-        self.declare_parameter("status_period_sec", 0.5)
+        # Partial transcripts and microphone level feedback are operator-facing
+        # live signals. Ten updates per second keeps the monitor responsive
+        # without coupling status publication to the 20 Hz audio-event drain.
+        self.declare_parameter("status_period_sec", 0.1)
         self.declare_parameter(
             "lan_health_interval_sec",
             _bounded_float(
@@ -236,6 +325,28 @@ class OperationalAsrNode(Node):
         self._sentence_topic = _absolute_topic_name(
             self.get_parameter("sentence_topic").get_parameter_value().string_value
         )
+        self._utterance_topic = _absolute_topic_name(
+            self.get_parameter("utterance_topic")
+            .get_parameter_value()
+            .string_value
+        )
+        self._output_mode = str(
+            self.get_parameter("output_mode").get_parameter_value().string_value
+        ).strip().lower()
+        if self._output_mode not in {"sentence_text", "typed_utterance"}:
+            raise ValueError(
+                "output_mode must be 'sentence_text' or 'typed_utterance'"
+            )
+        self._output_topic = (
+            self._utterance_topic
+            if self._output_mode == "typed_utterance"
+            else self._sentence_topic
+        )
+        self._speaker_role = str(
+            self.get_parameter("speaker_role").get_parameter_value().string_value
+        ).strip()
+        if self._output_mode == "typed_utterance" and not self._speaker_role:
+            raise ValueError("speaker_role is required for typed_utterance output")
         output_dir = self.get_parameter("output_dir").get_parameter_value().string_value
         capture_lock_path = (
             self.get_parameter("capture_lock_path")
@@ -251,12 +362,13 @@ class OperationalAsrNode(Node):
 
         self._runtime = runtime_factory(
             default_url=self._server_url,
-            topic=self._sentence_topic,
+            topic=self._output_topic,
             output_dir=output_dir,
-            # Operational ASR never persists raw audio or transcripts. This is
-            # deliberately not a ROS parameter, so a launch override cannot
-            # silently change the data-retention boundary.
-            save_artifacts=False,
+            # Persistence is available only through the explicit
+            # start_recording/stop_recording controls. Starting Live ASR alone
+            # continues to retain no audio or transcript artifacts.
+            save_artifacts=True,
+            recording_default_active=False,
             capture_lock_path=capture_lock_path,
         )
         self._status_pub = self.create_publisher(
@@ -352,9 +464,14 @@ class OperationalAsrNode(Node):
             asr["route_policy"] = self._route_policy
             asr["selection_reason"] = selection_reason
             asr["lan_health"] = self._lan_health_snapshot()
+            asr["output_mode"] = self._output_mode
+            asr["output_topic"] = self._output_topic
             return {
                 "schema": STATUS_SCHEMA,
                 "stamp_sec": self._stamp_sec(),
+                "node_instance_id": self._node_instance_id,
+                "node_started_at_sec": self._node_started_at_sec,
+                "source_revision": self._source_revision,
                 "asr": asr,
             }
 
@@ -515,12 +632,35 @@ class OperationalAsrNode(Node):
                     accepted=True,
                     message="operational ASR microphone stop requested",
                 )
+            if operation == "start_recording":
+                self._runtime.start_recording()
+                return self._set_response(
+                    response,
+                    accepted=True,
+                    message="operational ASR recording started",
+                )
+            if operation == "stop_recording":
+                snapshot = self._runtime.stop_recording()
+                recording_path = str(snapshot.get("recording_path", ""))
+                transcript_path = str(snapshot.get("transcript_path", ""))
+                saved = ", ".join(
+                    path for path in (recording_path, transcript_path) if path
+                )
+                return self._set_response(
+                    response,
+                    accepted=True,
+                    message=(
+                        f"operational ASR recording saved: {saved}"
+                        if saved
+                        else "operational ASR recording stopped; no audio or final transcript was captured"
+                    ),
+                )
             return self._set_response(
                 response,
                 accepted=False,
                 message=(
                     "operation must be refresh_devices, set_route_policy, start, "
-                    "or stop"
+                    "stop, start_recording, or stop_recording"
                 ),
             )
         except Exception as exc:
@@ -539,8 +679,12 @@ class OperationalAsrNode(Node):
         with self._publisher_lock:
             if self._sentence_pub is None:
                 self._sentence_pub = self.create_publisher(
-                    String,
-                    self._sentence_topic,
+                    (
+                        SpeechUtterance
+                        if self._output_mode == "typed_utterance"
+                        else String
+                    ),
+                    self._output_topic,
                     _sentence_qos(),
                 )
 
@@ -569,11 +713,20 @@ class OperationalAsrNode(Node):
                 text = str(event.get("text", "")).strip()
                 if not text:
                     continue
+                if self._output_mode == "typed_utterance":
+                    message = self._typed_final_message(event, text)
+                    if message is None:
+                        self.get_logger().warning(
+                            "dropped ASR final without a valid source timestamp",
+                            throttle_duration_sec=2.0,
+                        )
+                        continue
+                else:
+                    message = String()
+                    message.data = text
                 with self._publisher_lock:
                     publisher = self._sentence_pub
                     if publisher is not None and self._capture_requested:
-                        message = String()
-                        message.data = text
                         publisher.publish(message)
                 continue
             if event_type == "asr_stopped":
@@ -582,6 +735,42 @@ class OperationalAsrNode(Node):
                 self._sync_sentence_publisher(False)
         snapshot = self._runtime.snapshot()
         self._sync_sentence_publisher(bool(snapshot.get("connected", False)))
+
+    def _typed_final_message(
+        self,
+        event: dict[str, Any],
+        text: str,
+    ) -> SpeechUtterance | None:
+        """Construct one immutable final-ASR envelope for the Live route."""
+
+        stamp_sec = _event_stamp_sec(event.get("stamp"))
+        if stamp_sec is None:
+            return None
+        sec = int(stamp_sec)
+        nanosec = int(round((stamp_sec - sec) * 1_000_000_000.0))
+        if nanosec >= 1_000_000_000:
+            sec += 1
+            nanosec = 0
+        message = SpeechUtterance()
+        message.stamp.sec = sec
+        message.stamp.nanosec = nanosec
+        message.end_stamp.sec = sec
+        message.end_stamp.nanosec = nanosec
+        message.utterance_id = (
+            f"asr-{self._endpoint}-{sec}-{nanosec}-"
+            f"{next(self._utterance_counter)}"
+        )
+        message.text = text
+        message.is_final = True
+        # The remote ASR protocol does not provide a calibrated confidence
+        # score.  Downstream policy sees that explicitly rather than a made-up
+        # number, and applies its reviewed missing-confidence policy.
+        message.has_confidence = False
+        message.confidence = 0.0
+        message.speaker_role = self._speaker_role
+        message.language = ""
+        message.source = f"{NODE_NAME}:{self._endpoint}"
+        return message
 
     def close(self) -> bool:
         # Wait for any in-flight start/stop service transition before closing

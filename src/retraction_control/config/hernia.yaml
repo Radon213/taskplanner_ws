@@ -1,11 +1,11 @@
-# Non-executable partner-calibration draft.  The public procedure mapping is
-# itself pending partner confirmation and is deliberately not guessed here.
+# Non-executable partner-calibration draft.  The public procedure identity is
+# known, but every physical calibration field remains intentionally unset.
 schema_version: 2
 profile:
   name: hernia
   version: upstream-unapproved-2026-08-20
   procedure_type: hernia
-  public_procedure_type: null
+  public_procedure_type: inguinal_hernia_repair
 calibration:
   approved: false
   revision: null

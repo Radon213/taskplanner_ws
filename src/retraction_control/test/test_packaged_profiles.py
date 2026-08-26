@@ -33,11 +33,13 @@ def test_partner_profiles_remain_non_executable_drafts(filename):
     assert raised.value.code is ErrorCode.PROFILE_NOT_APPROVED
 
 
-def test_hernia_draft_has_no_invented_public_procedure_mapping():
+def test_hernia_draft_has_public_identity_but_no_invented_calibration():
     profile = load_profile(CONFIG_ROOT / "hernia.yaml")
     assert isinstance(profile, DraftProfile)
     assert profile.procedure_type == "hernia"
-    assert profile.public_procedure_type is None
+    assert profile.public_procedure_type == "inguinal_hernia_repair"
+    assert profile.readiness_issues
+    assert profile.side_mappings == {}
 
 
 def test_logging_directory_is_absolute_and_no_secret_value_is_packaged():

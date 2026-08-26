@@ -26,6 +26,7 @@ type RetractionVoiceStatusOptions = {
   vlmInvoked?: boolean;
   interpreterMode?: "deterministic" | "vlm_with_fallback";
   interpreterPending?: boolean;
+  stateMachineBypassEnabled?: boolean;
   detail?: string;
   lastRejectionReason?: string;
 };
@@ -46,6 +47,7 @@ function retractionVoiceStatus({
   vlmInvoked = false,
   interpreterMode = "deterministic",
   interpreterPending = false,
+  stateMachineBypassEnabled = false,
   detail = "deterministic_normalizer",
   lastRejectionReason = "",
 }: RetractionVoiceStatusOptions = {}): Record<string, unknown> {
@@ -54,6 +56,7 @@ function retractionVoiceStatus({
     internal_state: internalState,
     interpreter_mode: interpreterMode,
     interpreter_pending: interpreterPending,
+    state_machine_bypass_enabled: stateMachineBypassEnabled,
     allowed_commands: allowedCommands,
     service_ready: serviceReady,
     in_flight: inFlight,
@@ -153,8 +156,14 @@ function debugStatus(sessionId: string, armed = false): Record<string, unknown> 
       rmw_implementation: "rmw_fastrtps_cpp",
       discovery_range: "LOCALHOST",
       blocked_nodes: [],
+      operational_state: "idle",
+      operational_running: false,
       operational_runtime_stopped: true,
+      operational_intervention_allowed: true,
+      operational_intervention_block_reason: "",
+      operational_control_window_open: true,
       manual_control_available: true,
+      manual_control_gate: "planner_nodes",
       planner_coexistence_allowed: false,
       network: {
         primary_interface: "eth0",
@@ -173,6 +182,7 @@ function debugStatus(sessionId: string, armed = false): Record<string, unknown> 
     inputs: [
       debugInput("surgeon_sentence", "/sensors/surgeon/sentence"),
       debugInput("speech_adapter_request", "/surgery/audio/request_text"),
+      debugInput("debug_speech_adapter_status", "/integration/debug/speech/status"),
     ],
     endpoints: [],
     action: {
@@ -314,6 +324,7 @@ function manualControlsReadyStatus(sessionId: string): Record<string, unknown> {
 async function openDebugWorkspace(page: Page, options: DebugSocketOptions = {}) {
   let connectionCount = 0;
   const sockets: WebSocketRoute[] = [];
+  const readOnlyServiceCalls: string[] = [];
   const subscriptionsBySocket = new Map<WebSocketRoute, Set<string>>();
   const subscriptionRequestsBySocket = new Map<WebSocketRoute, Map<string, Record<string, unknown>>>();
   await page.addInitScript(() => {
@@ -399,7 +410,45 @@ async function openDebugWorkspace(page: Page, options: DebugSocketOptions = {}) 
         }));
         return;
       }
+      if (message.op === "subscribe" && message.topic === "/multicam_node/capture_status") {
+        socket.send(JSON.stringify({
+          op: "publish",
+          topic: message.topic,
+          msg: {
+            online_cameras: ["cam_1", "cam_2", "cam_3", "cam_4", "flir"],
+            offline_cameras: [],
+            all_cameras_online: true,
+            uptime_sec: 12,
+            cameras: [],
+          },
+        }));
+        return;
+      }
       if (message.op !== "call_service" || !message.id || !message.service) return;
+      if (message.service === "/rosapi/topics") {
+        readOnlyServiceCalls.push(message.service);
+        socket.send(JSON.stringify({
+          op: "service_response",
+          id: message.id,
+          service: message.service,
+          result: true,
+          values: {
+            topics: [
+              "/multicam_node/capture_status",
+              "/world_anchor_node/status",
+              "/synced/cam_1/color/image_raw/compressed",
+              "/synced/cam_4/depth/image_rect_raw/compressedDepth",
+            ],
+            types: [
+              "arpa_multicam_msgs/msg/CaptureStatus",
+              "std_msgs/msg/String",
+              "sensor_msgs/msg/CompressedImage",
+              "sensor_msgs/msg/CompressedImage",
+            ],
+          },
+        }));
+        return;
+      }
       let payload: Record<string, unknown> = {};
       try {
         const decoded = JSON.parse(String(message.args?.payload_json ?? "{}"));
@@ -444,70 +493,9 @@ async function openDebugWorkspace(page: Page, options: DebugSocketOptions = {}) 
   return {
     connectionCount: () => connectionCount,
     sockets,
+    readOnlyServiceCalls,
     subscriptionsBySocket,
     subscriptionRequestsBySocket,
-  };
-}
-
-async function installDebugMulticamObserverStub(page: Page) {
-  const serviceCalls: string[] = [];
-  const subscriptions = new Set<string>();
-  const subscriptionRequests = new Map<string, Record<string, unknown>>();
-  let closeCount = 0;
-  await page.routeWebSocket(/ws:\/\/127\.0\.0\.1:9091\/multicam\/?$/, (socket) => {
-    let closed = false;
-    socket.onClose((code, reason) => {
-      if (closed) return;
-      closed = true;
-      closeCount += 1;
-      void socket.close({ code, reason });
-    });
-    socket.onMessage((raw) => {
-      const message = JSON.parse(typeof raw === "string" ? raw : raw.toString()) as {
-        op?: string;
-        id?: string;
-        service?: string;
-        topic?: string;
-      };
-      if (message.op === "subscribe" && message.topic) {
-        subscriptions.add(message.topic);
-        subscriptionRequests.set(message.topic, message as Record<string, unknown>);
-        if (message.topic === "/multicam_node/capture_status") {
-          socket.send(JSON.stringify({
-            op: "publish",
-            topic: message.topic,
-            msg: {
-              online_cameras: ["cam_1", "cam_2", "cam_3", "cam_4", "flir"],
-              offline_cameras: [],
-              all_cameras_online: true,
-              uptime_sec: 12,
-              cameras: [],
-            },
-          }));
-        }
-        return;
-      }
-      if (message.op !== "call_service" || !message.id || !message.service) return;
-      serviceCalls.push(message.service);
-      socket.send(JSON.stringify({
-        op: "service_response",
-        id: message.id,
-        service: message.service,
-        result: true,
-        values: message.service === "/multicam_observer/rosapi/topics"
-          ? {
-              topics: ["/multicam_node/capture_status"],
-              types: ["arpa_multicam_msgs/msg/CaptureStatus"],
-            }
-          : {},
-      }));
-    });
-  });
-  return {
-    closeCount: () => closeCount,
-    serviceCalls,
-    subscriptions,
-    subscriptionRequests,
   };
 }
 
@@ -535,32 +523,6 @@ function supportPlaneDiagnosticsFixture(valid: boolean): Record<string, unknown>
       residual_median_m: valid ? 0.0014 : 0.0032,
       residual_p95_m: valid ? 0.0038 : 0.021,
       camera_info_sha256: "d".repeat(64),
-    },
-  };
-}
-
-function validHandKeypoint(handIndex = 0): Record<string, unknown> {
-  return {
-    hand_index: handIndex,
-    has_handedness: true,
-    handedness_label: handIndex % 2 === 0 ? "Right" : "Left",
-    handedness_score: 0.96 - handIndex * 0.01,
-    joints_2d: Array.from({ length: 21 }, (_, index) => ({
-      u: 320 + index * 3 + handIndex * 10,
-      v: 220 + index * 2,
-    })),
-    joints_3d: Array.from({ length: 21 }, (_, index) => ({
-      x: 0.01 + index * 0.002,
-      y: -0.03 + index * 0.001,
-      z: 0.72 + index * 0.0005,
-    })),
-    kp_scores: Array.from({ length: 21 }, (_, index) => 0.99 - index * 0.005),
-    kp_valid_depth: Array.from({ length: 21 }, () => true),
-    has_palm_6d: true,
-    palm_6d: {
-      translation: { x: 0.019, y: -0.0255, z: 0.72225 },
-      orientation: { x: 0, y: 0, z: 0, w: 1 },
-      rotation_matrix: [1, 0, 0, 0, 1, 0, 0, 0, 1],
     },
   };
 }
@@ -673,7 +635,6 @@ async function waitForPnuSubscriptions(bridge: Awaited<ReturnType<typeof openDeb
       "/perception/debug/final_overlay/compressed",
       "/perception/debug/final_overlay/status",
       "/surgery/perception/cam4/tool_poses",
-      "/surgery/perception/cam4/hand_keypoints",
       "/surgery/perception/cam4/blood_semantics/json",
       "/surgery/perception/rfdetr/health",
       "/surgery/perception/rfdetr/diagnostics/json",
@@ -694,7 +655,6 @@ function publishPnuEvidence(
     nanosec = 123_456_789,
     tool = 1,
     blood = 1,
-    hand = 1,
     overlaySec = sec,
     provider = "pnu_hand_blood",
     rawFrameId = "cam_4_color_optical_frame",
@@ -705,14 +665,12 @@ function publishPnuEvidence(
     supportPlaneValidated = false,
     healthOverrides = {},
     diagnosticsOverrides = {},
-    handMessageOverrides = {},
     bloodMessageOverrides = {},
   }: {
     sec?: number;
     nanosec?: number;
     tool?: number;
     blood?: number;
-    hand?: number;
     overlaySec?: number;
     provider?: string;
     rawFrameId?: string;
@@ -723,12 +681,10 @@ function publishPnuEvidence(
     supportPlaneValidated?: boolean;
     healthOverrides?: Record<string, unknown>;
     diagnosticsOverrides?: Record<string, unknown>;
-    handMessageOverrides?: Record<string, unknown>;
     bloodMessageOverrides?: Record<string, unknown>;
   } = {},
 ) {
-  const total = tool + blood + hand;
-  const stamp = { sec, nanosec };
+  const total = tool + blood;
   publishDebugTopic(socket, "/surgery/perception/rfdetr/health", {
     data: JSON.stringify({
       schema: "taskplanner.rfdetr_health.v1",
@@ -744,8 +700,8 @@ function publishPnuEvidence(
       support_plane_validated: supportPlaneValidated,
       transport_mode: "http_local",
       auth_mode: "none_local",
-      requested_algorithms: ["tool", "blood", "hand"],
-      executed_algorithms: ["tool", "blood", "hand"],
+      requested_algorithms: ["tool", "blood"],
+      executed_algorithms: ["tool", "blood"],
       detection_count: total,
       empty_detection_result: total === 0,
       source_stamp_sec: sec,
@@ -763,17 +719,15 @@ function publishPnuEvidence(
       frame_id: diagnosticsFrameId,
       source_stamp_sec: sec,
       source_stamp_nanosec: nanosec,
-      requested_algorithms: ["tool", "blood", "hand"],
-      executed_algorithms: ["tool", "blood", "hand"],
-      model_version: "tool:v1,blood:v1,hand:v1",
+      requested_algorithms: ["tool", "blood"],
+      executed_algorithms: ["tool", "blood"],
+      model_version: "tool:v1,blood:v1",
       model_digests: {
         tool: "a".repeat(64),
         blood: "b".repeat(64),
-        hand: "c".repeat(64),
       },
       tool_detection_count: tool,
       blood_detection_count: blood,
-      hand_count: hand,
       instance_count: total,
       empty_detection_result: total === 0,
       metric_3d_ready: true,
@@ -793,19 +747,12 @@ function publishPnuEvidence(
       overlay_truncated: false,
       overlay_drawn_tool_count: publishOverlay ? tool : 0,
       overlay_drawn_blood_count: publishOverlay ? blood : 0,
-      overlay_drawn_hand_count: publishOverlay ? hand : 0,
       error_code: "",
       error_message: "",
       ...diagnosticsOverrides,
     }),
   });
   if (publishSemanticEvidence) {
-    publishDebugTopic(socket, "/surgery/perception/cam4/hand_keypoints", {
-      header: { stamp, frame_id: rawFrameId },
-      depth_source: "real",
-      hands: Array.from({ length: hand }, (_, index) => validHandKeypoint(index)),
-      ...handMessageOverrides,
-    });
     const sourceStampNs = BigInt(sec) * 1_000_000_000n + BigInt(nanosec);
     publishDebugTopic(socket, "/surgery/perception/cam4/blood_semantics/json", {
       data: JSON.stringify({
@@ -940,9 +887,15 @@ function publishToolPoseEvidence(
   // Pose pixels are included only in the server-composited final raster.
 }
 
-test("embeds the multicam observer in Debug without granting World Anchor control", async ({ page }) => {
-  const observer = await installDebugMulticamObserverStub(page);
-  await openDebugWorkspace(page);
+test("embeds the multicam observer in Debug on the existing read-only ROS session", async ({ page }) => {
+  let standaloneMulticamConnections = 0;
+  await page.routeWebSocket(/ws:\/\/127\.0\.0\.1:9091\/multicam\/?$/, (socket) => {
+    standaloneMulticamConnections += 1;
+    void socket.close();
+  });
+  const bridge = await openDebugWorkspace(page);
+  await expect(page.getByRole("heading", { name: "디버그 모드" })).toBeVisible();
+  const debugConnectionsBeforeMulticam = bridge.connectionCount();
 
   await page.getByRole("tab", { name: /^멀티캠 관제/ }).click();
   const panel = page.locator('[data-slot="debug-multicam-ops"]');
@@ -951,29 +904,36 @@ test("embeds the multicam observer in Debug without granting World Anchor contro
   await expect(panel).toContainText("멀티캠 observer ready · CaptureStatus fresh");
   await expect(panel.getByText("Graph topic 발견")).toBeVisible();
   await expect(page.locator("main main")).toHaveCount(0);
-  await expect.poll(() => [...observer.subscriptions].sort()).toEqual(expect.arrayContaining([
+  const socket = activeDebugSocket(bridge);
+  await expect.poll(() => [...(bridge.subscriptionsBySocket.get(socket) ?? [])].sort()).toEqual(expect.arrayContaining([
     "/multicam_node/capture_status",
     "/world_anchor_node/status",
-    "/preview/cam_1/color/image_raw/compressed",
+    "/synced/cam_1/color/image_raw/compressed",
   ]));
-  expect(observer.subscriptionRequests.get("/preview/cam_1/color/image_raw/compressed")).toMatchObject({
+  expect(bridge.subscriptionRequestsBySocket.get(socket)?.get("/synced/cam_1/color/image_raw/compressed")).toMatchObject({
     throttle_rate: 0,
     qos: { reliability: "best_effort", durability: "volatile", depth: 1 },
   });
+  expect(bridge.connectionCount()).toBe(debugConnectionsBeforeMulticam);
+  expect(standaloneMulticamConnections).toBe(0);
+  await expect(panel.getByText(/^ws:\/\/127\.0\.0\.1:9091$/)).toBeVisible();
   await expect(panel.locator(".ops-tf-card")).toHaveCount(0);
   await panel.getByRole("tab", { name: "Depth" }).click();
-  await expect.poll(() => [...observer.subscriptions]).toContain(
-    "/preview/cam_4/depth/image_rect_raw/compressedDepth",
+  await expect.poll(() => [...(bridge.subscriptionsBySocket.get(socket) ?? [])]).toContain(
+    "/synced/cam_4/depth/image_rect_raw/compressedDepth",
   );
   for (const buttonName of ["샘플 수집 시작", "수집 중지", "Solve · 저장 · TF 발행", "저장된 Anchor 다시 발행"]) {
     await expect(panel.getByRole("button", { name: buttonName })).toBeDisabled();
   }
-  await expect.poll(() => observer.serviceCalls).toEqual(["/multicam_observer/rosapi/topics"]);
+  await expect.poll(() => bridge.readOnlyServiceCalls).toEqual(["/rosapi/topics"]);
 
   await page.getByRole("tab", { name: /^관측 로그/ }).click();
   await expect(panel).toHaveCount(0);
-  await expect.poll(observer.closeCount).toBe(1);
-  expect(observer.serviceCalls).toEqual(["/multicam_observer/rosapi/topics"]);
+  await expect.poll(() => [...(bridge.subscriptionsBySocket.get(socket) ?? [])]).not.toContain(
+    "/multicam_node/capture_status",
+  );
+  expect(standaloneMulticamConnections).toBe(0);
+  expect(bridge.readOnlyServiceCalls).toEqual(["/rosapi/topics"]);
 });
 
 test("opens a read-only TF tab with separately bounded static and dynamic transforms", async ({ page }) => {
@@ -1030,12 +990,9 @@ test("uses one final 2-up raster while retaining scalar PNU evidence", async ({ 
   expect(subscriptionRequests?.get("/surgery/perception/cam4/tool_poses")).not.toHaveProperty(
     "compression",
   );
-  for (const semanticTopic of [
-    "/surgery/perception/cam4/hand_keypoints",
-    "/surgery/perception/cam4/blood_semantics/json",
-  ]) {
-    expect(subscriptionRequests?.get(semanticTopic)).not.toHaveProperty("compression");
-  }
+  expect(
+    subscriptionRequests?.get("/surgery/perception/cam4/blood_semantics/json"),
+  ).not.toHaveProperty("compression");
   expect(subscriptionRequests?.get("/perception/debug/final_overlay/compressed")).toMatchObject({
     compression: "cbor",
     throttle_rate: 180,
@@ -1078,17 +1035,17 @@ test("uses one final 2-up raster while retaining scalar PNU evidence", async ({ 
   await expect(panel.locator('[data-slot="debug-direct-perception-snapshot-relation"]')).toContainText("STATUS SNAPSHOT · LOW-RATE");
   await expect(panel.locator('[data-slot="debug-perception-evidence-state"]')).toContainText("Scalar 실행 증거 검증 가능");
   await expect(panel.locator('[data-slot="debug-perception-image-consumer-disabled"]')).toContainText("상단 final raster 한 장");
-  await expect(panel).toContainText("PNU hand-blood-tools");
-  await expect(panel).toContainText("TOOL · BLOOD · HAND");
+  await expect(panel).toContainText("PNU tool/blood worker");
+  await expect(panel).toContainText("TOOL · BLOOD");
   await expect(panel).toContainText("Metric 3D");
   await expect(panel).toContainText("VALIDATED");
   await expect(panel).toContainText("Support plane");
   await expect(panel).toContainText("Tool orientation / 6D는 DEGRADED");
   await expect(panel).toContainText("84.5 ms");
   await expect(panel).toContainText("121.8 ms");
-  await expect(panel.locator(".debug-perception-kpis")).toContainText("3");
+  await expect(panel.locator(".debug-perception-kpis")).toContainText("2");
   await expect(panel.locator('[data-slot="debug-perception-overlay-status"]')).toContainText(
-    "Server final overlay PUBLISHED · Drawn T 1 / B 1 / H 1",
+    "Server final overlay PUBLISHED · Drawn T 1 / B 1",
   );
 });
 
@@ -1153,35 +1110,12 @@ test("keeps a final raster visible when one server layer is missing and reports 
   await expect(direct.locator('[data-slot="debug-direct-perception-final-status"]')).toContainText("상태 계약 오류");
 });
 
-test("shows exact-stamp Hand joints, palm pose, and Blood centroid evidence as monitor-only", async ({ page }) => {
+test("shows exact-stamp Blood centroid evidence as monitor-only", async ({ page }) => {
   const bridge = await openDebugWorkspace(page);
   await page.getByRole("tab", { name: /CAM4 인식 오버레이/ }).click();
   const panel = page.locator('[data-slot="debug-perception-panel"]');
   await waitForPnuSubscriptions(bridge);
   publishPnuEvidence(activeDebugSocket(bridge));
-
-  const handCard = panel.locator('[data-slot="debug-hand-evidence"]');
-  await expect(handCard.locator('[data-slot="debug-hand-state"]')).toContainText("Hand 1건 검토 가능");
-  await expect(handCard.locator('[data-slot="debug-hand-list"] > li')).toHaveCount(1);
-  await expect(handCard).toContainText("Right");
-  await expect(handCard).toContainText("21 / 21");
-  await expect(handCard).toContainText("PALM 6D");
-  await expect(handCard).toContainText("AVAILABLE");
-  await expect(handCard.locator('[data-slot="debug-hand-palm"]')).toContainText("X +0.019");
-  await expect(handCard.locator('[data-slot="debug-hand-palm"]')).toContainText("+1.0000");
-  await expect(handCard).toContainText("CAM4 optical frame의 monitor-only 증거");
-  await expect(handCard).toContainText("Robot/world/TCP pose나 Taskplanner 실행 권한이 아닙니다");
-
-  const handDetails = handCard.locator("details.debug-hand-details");
-  const handSummary = handDetails.locator("summary");
-  await expect(handSummary).toHaveText("21-joint · rotation matrix 상세");
-  await handSummary.click();
-  await expect(handDetails).toHaveAttribute("open", "");
-  await expect(handDetails.locator('[data-slot="debug-hand-joints"] > li')).toHaveCount(21);
-  await expect(handDetails.locator('[data-slot="debug-hand-joints"] > li').first()).toContainText("0. WRIST");
-  await expect(handDetails.locator('[data-slot="debug-hand-joints"] > li').first()).toContainText("UV 320.0, 220.0 px");
-  await expect(handDetails.locator('[data-slot="debug-hand-joints"] > li').first()).toContainText("XYZ +0.010, -0.030, +0.720 m");
-  await expect(handDetails).toContainText("PALM ROTATION · ROW-MAJOR 3×3");
 
   const bloodCard = panel.locator('[data-slot="debug-blood-evidence"]');
   await expect(bloodCard.locator('[data-slot="debug-blood-state"]')).toContainText("Blood 1건 검토 가능");
@@ -1195,8 +1129,6 @@ test("shows exact-stamp Hand joints, palm pose, and Blood centroid evidence as m
   await expect(bloodCard).toContainText("Robot/world/TCP pose나 흡인 목표·실행 권한이 아닙니다");
 
   await page.setViewportSize({ width: 320, height: 800 });
-  const summaryBounds = await handSummary.boundingBox();
-  expect(summaryBounds?.height ?? 0).toBeGreaterThanOrEqual(44);
   const compactGeometry = await panel.evaluate((element) => ({
     clientWidth: document.documentElement.clientWidth,
     scrollWidth: document.documentElement.scrollWidth,
@@ -1214,26 +1146,17 @@ test("shows exact-stamp Hand joints, palm pose, and Blood centroid evidence as m
   expect(compactGeometry.overflowing).toEqual([]);
 });
 
-test("buffers next-frame Hand and Blood results until their exact overlay arrives", async ({ page }) => {
+test("buffers next-frame Blood results until their exact diagnostics arrive", async ({ page }) => {
   const bridge = await openDebugWorkspace(page);
   await page.getByRole("tab", { name: /CAM4 인식 오버레이/ }).click();
   const panel = page.locator('[data-slot="debug-perception-panel"]');
   await waitForPnuSubscriptions(bridge);
   const socket = activeDebugSocket(bridge);
   publishPnuEvidence(socket);
-  await expect(panel.locator('[data-slot="debug-hand-state"]')).toContainText("Hand 1건 검토 가능");
   await expect(panel.locator('[data-slot="debug-blood-state"]')).toContainText("Blood 1건 검토 가능");
 
   const nextSec = 1_900_000_001;
   const nextNanosec = 223_456_789;
-  publishDebugTopic(socket, "/surgery/perception/cam4/hand_keypoints", {
-    header: {
-      stamp: { sec: nextSec, nanosec: nextNanosec },
-      frame_id: "cam_4_color_optical_frame",
-    },
-    depth_source: "real",
-    hands: [validHandKeypoint()],
-  });
   publishDebugTopic(socket, "/surgery/perception/cam4/blood_semantics/json", {
     data: JSON.stringify({
       schema: "taskplanner.cam4_blood_semantics.v1",
@@ -1256,7 +1179,6 @@ test("buffers next-frame Hand and Blood results until their exact overlay arrive
   // ROSBridge may deliver the next semantic results while the prior overlay is
   // still current. They must remain buffered instead of being compared to and
   // discarded against that older frame.
-  await expect(panel.locator('[data-slot="debug-hand-state"]')).toContainText("Hand 1건 검토 가능");
   await expect(panel.locator('[data-slot="debug-blood-state"]')).toContainText("Blood 1건 검토 가능");
 
   publishPnuEvidence(socket, {
@@ -1264,76 +1186,49 @@ test("buffers next-frame Hand and Blood results until their exact overlay arrive
     nanosec: nextNanosec,
     publishSemanticEvidence: false,
   });
-  await expect(panel.locator('[data-slot="debug-hand-state"]')).toContainText("Hand 1건 검토 가능");
   await expect(panel.locator('[data-slot="debug-blood-state"]')).toContainText("Blood 1건 검토 가능");
-  await expect(panel.locator('[data-slot="debug-hand-evidence"]')).toContainText(
-    "동일 stamp의 Hand 1건",
-  );
-  await expect(panel.locator('[data-slot="debug-hand-evidence"]')).toContainText(
-    `${nextSec}:${nextNanosec}`,
-  );
   await expect(panel.locator('[data-slot="debug-blood-evidence"]')).toContainText(
     "동일 stamp의 Blood 1건",
   );
 });
 
-test("shows exact-stamp executed zero Hand and Blood results as normal empty states", async ({ page }) => {
+test("shows an exact-stamp executed zero Blood result as a normal empty state", async ({ page }) => {
   const bridge = await openDebugWorkspace(page);
   await page.getByRole("tab", { name: /CAM4 인식 오버레이/ }).click();
   const panel = page.locator('[data-slot="debug-perception-panel"]');
   await waitForPnuSubscriptions(bridge);
-  publishPnuEvidence(activeDebugSocket(bridge), { tool: 0, blood: 0, hand: 0 });
+  publishPnuEvidence(activeDebugSocket(bridge), { tool: 0, blood: 0 });
 
-  await expect(panel.locator('[data-slot="debug-hand-state"]')).toContainText("실행 완료 · Hand 0건");
   await expect(panel.locator('[data-slot="debug-blood-state"]')).toContainText("실행 완료 · Blood 0건");
-  await expect(panel.locator('[data-slot="debug-hand-empty"]')).toContainText("정상 empty result");
   await expect(panel.locator('[data-slot="debug-blood-empty"]')).toContainText("정상 empty result");
-  await expect(panel.locator('[data-slot="debug-hand-list"]')).toHaveCount(0);
   await expect(panel.locator('[data-slot="debug-blood-list"]')).toHaveCount(0);
 });
 
-test("fails closed on malformed bounded Hand and lossless Blood semantic payloads", async ({ page }) => {
+test("fails closed on a malformed lossless Blood semantic payload", async ({ page }) => {
   const bridge = await openDebugWorkspace(page);
   await page.getByRole("tab", { name: /CAM4 인식 오버레이/ }).click();
   const panel = page.locator('[data-slot="debug-perception-panel"]');
   await waitForPnuSubscriptions(bridge);
-  const malformedHand = {
-    ...validHandKeypoint(),
-    joints_2d: Array.from({ length: 20 }, (_, index) => ({ u: 320 + index, v: 220 + index })),
-  };
   publishPnuEvidence(activeDebugSocket(bridge), {
-    handMessageOverrides: { hands: [malformedHand] },
     bloodMessageOverrides: { source_stamp_ns: "not-a-decimal-stamp" },
   });
 
-  await expect(panel.locator('[data-slot="debug-hand-state"]')).toContainText("Hand 증거 계약 불일치");
-  await expect(panel.locator('[data-slot="debug-hand-evidence"]')).toContainText("bounded 21-joint");
   await expect(panel.locator('[data-slot="debug-blood-state"]')).toContainText("Blood 증거 계약 불일치");
   await expect(panel.locator('[data-slot="debug-blood-evidence"]')).toContainText("lossless source_stamp_ns");
-  await expect(panel.locator('[data-slot="debug-hand-list"]')).toHaveCount(0);
   await expect(panel.locator('[data-slot="debug-blood-list"]')).toHaveCount(0);
 });
 
-test("does not display Hand and Blood payloads without a matching overlay source stamp", async ({ page }) => {
+test("does not display Blood payloads without a matching diagnostics source stamp", async ({ page }) => {
   const bridge = await openDebugWorkspace(page);
   await page.getByRole("tab", { name: /CAM4 인식 오버레이/ }).click();
   const panel = page.locator('[data-slot="debug-perception-panel"]');
   await waitForPnuSubscriptions(bridge);
   publishPnuEvidence(activeDebugSocket(bridge), {
-    handMessageOverrides: {
-      header: {
-        stamp: { sec: 1_900_000_000, nanosec: 123_456_788 },
-        frame_id: "cam_4_color_optical_frame",
-      },
-    },
     bloodMessageOverrides: { source_stamp_ns: "1900000000123456788" },
   });
 
-  await expect(panel.locator('[data-slot="debug-hand-state"]')).toContainText("HandKeypoints 대기");
   await expect(panel.locator('[data-slot="debug-blood-state"]')).toContainText("Blood semantics 대기");
-  await expect(panel.locator('[data-slot="debug-hand-evidence"]')).toContainText("stamp별로 버퍼링");
   await expect(panel.locator('[data-slot="debug-blood-evidence"]')).toContainText("stamp별로 버퍼링");
-  await expect(panel.locator('[data-slot="debug-hand-list"]')).toHaveCount(0);
   await expect(panel.locator('[data-slot="debug-blood-list"]')).toHaveCount(0);
 });
 
@@ -1345,7 +1240,6 @@ test("shows a live-valid support-plane audit and local transport claims with zer
   publishPnuEvidence(activeDebugSocket(bridge), {
     tool: 0,
     blood: 0,
-    hand: 0,
     supportPlaneValidated: true,
   });
 
@@ -1657,7 +1551,6 @@ test("shows a typed zero-Tool result as a normal empty pose frame", async ({ pag
   publishPnuEvidence(activeDebugSocket(bridge), {
     tool: 0,
     blood: 0,
-    hand: 0,
     supportPlaneValidated: true,
     diagnosticsOverrides: poseDiagnosticsOverrides(tools),
   });
@@ -1717,7 +1610,7 @@ test("distinguishes an executed zero-result overlay from failure", async ({ page
   const panel = page.locator('[data-slot="debug-perception-panel"]');
   await expect(panel).toBeVisible();
   await waitForPnuSubscriptions(bridge);
-  publishPnuEvidence(activeDebugSocket(bridge), { tool: 0, blood: 0, hand: 0 });
+  publishPnuEvidence(activeDebugSocket(bridge), { tool: 0, blood: 0 });
 
   await expect(panel.locator('[data-slot="debug-perception-executed-zero"]')).toContainText(
     "모델은 실행됐습니다",
@@ -1735,7 +1628,6 @@ test("shows rate-limited diagnostics without fabricating a browser-local overlay
   await expect(panel).toBeVisible();
   await waitForPnuSubscriptions(bridge);
   publishPnuEvidence(activeDebugSocket(bridge));
-  await expect(panel.locator('[data-slot="debug-hand-list"] > li')).toHaveCount(1);
   await expect(panel.locator('[data-slot="debug-blood-list"] > li')).toHaveCount(1);
   await expect(panel.locator('[data-slot="debug-support-plane-runtime"]')).toContainText("12,480");
   publishPnuEvidence(activeDebugSocket(bridge), {
@@ -1763,7 +1655,6 @@ test("does not create a browser-local overlay from rate-limited diagnostics", as
       overlay_status: "rate_limited",
       overlay_drawn_tool_count: 0,
       overlay_drawn_blood_count: 0,
-      overlay_drawn_hand_count: 0,
     },
   });
 
@@ -1795,7 +1686,7 @@ test("surfaces a PNU worker failure without retaining detection evidence", async
       support_plane_validated: false,
       transport_mode: "http_local",
       auth_mode: "none_local",
-      requested_algorithms: ["tool", "blood", "hand"],
+      requested_algorithms: ["tool", "blood"],
       executed_algorithms: [],
       detection_count: 0,
       empty_detection_result: false,
@@ -1813,7 +1704,7 @@ test("surfaces a PNU worker failure without retaining detection evidence", async
   await expect(panel.locator('[data-slot="debug-perception-evidence-state"]')).toContainText(
     "worker response failed validation",
   );
-  await expect(panel.locator(".debug-perception-kpis dd")).toHaveText(["—", "—", "—", "—"]);
+  await expect(panel.locator(".debug-perception-kpis dd")).toHaveText(["—", "—", "—"]);
   await expect(panel.locator('[data-slot="debug-perception-model-state"]')).toHaveText("검증 보류");
   await expect(panel.locator('[data-slot="debug-perception-executed-state"]')).toHaveText("검증 보류");
 });
@@ -1850,7 +1741,7 @@ test("rejects numeric strings in versioned PNU diagnostics", async ({ page }) =>
   await expect(panel.locator('[data-slot="debug-perception-evidence-state"]')).toContainText(
     "인식 계약 불일치",
   );
-  await expect(panel.locator(".debug-perception-kpis dd")).toHaveText(["—", "—", "—", "—"]);
+  await expect(panel.locator(".debug-perception-kpis dd")).toHaveText(["—", "—", "—"]);
 });
 
 test("requires a pinned SHA-256 digest for every successful requested model", async ({ page }) => {
@@ -1861,7 +1752,7 @@ test("requires a pinned SHA-256 digest for every successful requested model", as
   publishPnuEvidence(activeDebugSocket(bridge), {
     publishOverlay: false,
     diagnosticsOverrides: {
-      model_digests: { tool: "a".repeat(64), blood: "b".repeat(64) },
+      model_digests: { tool: "a".repeat(64) },
     },
   });
 
@@ -1897,7 +1788,6 @@ test("rejects same-stamp health and diagnostics with different executed model se
   await waitForPnuSubscriptions(bridge);
   publishPnuEvidence(activeDebugSocket(bridge), {
     blood: 0,
-    hand: 0,
     diagnosticsOverrides: {
       requested_algorithms: ["tool"],
       executed_algorithms: ["tool"],
@@ -1966,7 +1856,6 @@ test("clears stale scalar evidence while ignoring a legacy raw CAM4 topic", asyn
   await expect(panel).toBeVisible();
   await waitForPnuSubscriptions(bridge);
   publishPnuEvidence(activeDebugSocket(bridge));
-  await expect(panel.locator('[data-slot="debug-hand-list"] > li')).toHaveCount(1);
   await expect(panel.locator('[data-slot="debug-blood-list"] > li')).toHaveCount(1);
   await expect(panel.locator('[data-slot="debug-support-plane-runtime"]')).toContainText("12,480");
 
@@ -1980,12 +1869,10 @@ test("clears stale scalar evidence while ignoring a legacy raw CAM4 topic", asyn
     data: DEBUG_RAW_JPEG,
   });
   await expect(panel.locator('[data-slot="debug-perception-overlay"]')).toHaveCount(0);
-  await expect(panel.locator('[data-slot="debug-hand-list"]')).toHaveCount(0);
   await expect(panel.locator('[data-slot="debug-blood-list"]')).toHaveCount(0);
-  await expect(panel.locator('[data-slot="debug-hand-state"]')).toContainText("HandKeypoints 대기");
   await expect(panel.locator('[data-slot="debug-blood-state"]')).toContainText("Blood semantics 대기");
   await expect(panel.locator('[data-slot="debug-perception-evidence-state"]')).toContainText("인식 결과 만료");
-  await expect(panel.locator(".debug-perception-kpis dd")).toHaveText(["—", "—", "—", "—"]);
+  await expect(panel.locator(".debug-perception-kpis dd")).toHaveText(["—", "—", "—"]);
   await expect(panel.locator('[data-slot="debug-perception-model-state"]')).toHaveText("검증 보류");
   await expect(panel.locator('[data-slot="debug-perception-executed-state"]')).toHaveText("검증 보류");
   await expect(panel.locator('[data-slot="debug-support-plane-state"]')).toContainText("진단 대기");
@@ -2005,7 +1892,6 @@ test("clears all PNU evidence immediately when the ROSBridge generation changes"
   });
   publishToolPoseEvidence(activeDebugSocket(bridge), { tools });
   await expect(panel.locator('[data-slot="debug-tool-pose-card"]')).toHaveCount(1);
-  await expect(panel.locator('[data-slot="debug-hand-list"] > li')).toHaveCount(1);
   await expect(panel.locator('[data-slot="debug-blood-list"] > li')).toHaveCount(1);
   await expect(panel.locator('[data-slot="debug-support-plane-runtime"]')).toContainText("12,480");
   await expect(panel.locator('[data-slot="debug-perception-evidence-state"]')).toContainText(
@@ -2016,11 +1902,9 @@ test("clears all PNU evidence immediately when the ROSBridge generation changes"
   await activeDebugSocket(bridge).close({ code: 1012, reason: "test generation change" });
   await expect(panel.locator('[data-slot="debug-perception-overlay"]')).toHaveCount(0);
   await expect(panel.locator('[data-slot="debug-tool-pose-card"]')).toHaveCount(0);
-  await expect(panel.locator('[data-slot="debug-hand-list"]')).toHaveCount(0);
   await expect(panel.locator('[data-slot="debug-blood-list"]')).toHaveCount(0);
-  await expect(panel.locator('[data-slot="debug-hand-state"]')).toContainText("HandKeypoints 대기");
   await expect(panel.locator('[data-slot="debug-blood-state"]')).toContainText("Blood semantics 대기");
-  await expect(panel.locator(".debug-perception-kpis dd")).toHaveText(["—", "—", "—", "—"]);
+  await expect(panel.locator(".debug-perception-kpis dd")).toHaveText(["—", "—", "—"]);
   await expect(panel.locator('[data-slot="debug-support-plane-state"]')).toContainText("진단 대기");
   await expect(panel.locator('[data-slot="debug-support-plane-runtime"]')).not.toContainText("12,480");
   await expect(panel.locator('[data-slot="debug-perception-evidence-state"]')).toContainText(
@@ -2035,7 +1919,6 @@ test("clears all PNU evidence immediately when the ROSBridge generation changes"
     diagnosticsOverrides: poseDiagnosticsOverrides(tools),
   });
   publishToolPoseEvidence(activeDebugSocket(bridge), { sec: 1_900_000_010, tools });
-  await expect(panel.locator('[data-slot="debug-hand-list"] > li')).toHaveCount(1);
   await expect(panel.locator('[data-slot="debug-blood-list"] > li')).toHaveCount(1);
 });
 
@@ -2163,8 +2046,8 @@ test("locks Debug writes and cancels a pending command when status becomes stale
   const staleInterlock = page.locator("#debug-operational-interlock");
   await expect(staleInterlock).toHaveClass(/warning/);
   await expect(staleInterlock).not.toHaveClass(/active/);
-  await expect(staleInterlock).toContainText("상태 확인 대기");
-  await expect(page.locator(".debug-header-status").getByText("운영 안전 상태 확인 대기")).toBeVisible();
+  await expect(staleInterlock).toContainText("개입 허용 상태를 기다리고 있습니다");
+  await expect(page.locator(".debug-header-status").getByText("관찰 가능 · 개입 상태 대기")).toBeVisible();
   await page.getByRole("tab", { name: "ROS 연결" }).click();
   await page.setViewportSize({ width: 320, height: 800 });
   await page.waitForTimeout(300);
@@ -2258,6 +2141,216 @@ test("separates individual diagnostics, integrated scenarios, and observability"
   await page.getByRole("tab", { name: /관측 로그/ }).click();
   await expect(page.getByRole("heading", { name: "확정 문장 관측" })).toBeVisible();
   await expect(page.getByRole("button", { name: "ASR 시작" })).toHaveCount(0);
+});
+
+test("keeps a live Speech adapter pending until a final transcript is admitted", async ({ page }) => {
+  const status = manualControlsReadyStatus("speech-adapter-waiting-final");
+  status.inputs = [
+    debugInput("surgeon_sentence", "/sensors/surgeon/sentence"),
+    {
+      ...debugInput("admitted_request_text", "/surgery/audio/request_text"),
+      message_count: 0,
+      window_message_count: 0,
+      last_sample: "",
+      state: "WAITING_MESSAGES",
+    },
+    debugInput("debug_speech_adapter_status", "/integration/debug/speech/status"),
+  ];
+  await openDebugWorkspace(page, { statusForConnection: () => status });
+
+  await page.getByRole("tab", { name: /음성 도구전달/ }).click();
+  const adapterStage = page.locator('[data-slot="debug-speech-adapter-stage"]');
+  await expect(adapterStage).toHaveAttribute("data-stage-state", "PENDING_FINAL");
+  await expect(adapterStage).toHaveClass(/pending/);
+  await expect(adapterStage).toContainText("final 문장 대기");
+  await expect(adapterStage).not.toHaveClass(/error/);
+});
+
+test("keeps observation and Text VLM available while the operational intervention gate is closed", async ({ page }) => {
+  const commands: Array<{ operation: string; payload: Record<string, unknown> }> = [];
+  const reason = "pause or stop the operational scenario before manual control";
+  await openDebugWorkspace(page, {
+    statusForConnection: () => {
+      const status = manualControlsReadyStatus("running-observation-only");
+      status.runtime = {
+        ...(status.runtime as Record<string, unknown>),
+        blocked_nodes: ["simulation_manager", "tree_executor"],
+        detected_planner_nodes: ["simulation_manager", "tree_executor"],
+        operational_state: "running",
+        operational_running: true,
+        // Deliberately contradictory legacy fields prove they no longer admit UI writes.
+        operational_runtime_stopped: true,
+        manual_control_available: true,
+        planner_coexistence_allowed: true,
+        operational_intervention_allowed: false,
+        operational_intervention_block_reason: reason,
+        operational_control_window_open: false,
+        manual_control_gate: "operational_state",
+        network: {
+          ...((status.runtime as Record<string, unknown>).network as Record<string, unknown>),
+          locked_to_runtime: true,
+        },
+      };
+      return status;
+    },
+    resultForCommand: (operation, payload) => operation === "vlm_interpret" ? {
+      state: "completed",
+      transcript: payload.text,
+      command: "unknown",
+      interpreter_source: "text_vlm",
+      vlm_invoked: true,
+      latency_ms: 12.5,
+      dispatch_performed: false,
+    } : {},
+    onCommand: (operation, payload) => commands.push({ operation, payload }),
+  });
+
+  const manualButton = page.getByRole("button", { name: "수동 제어 잠김" });
+  await expect(manualButton).toBeDisabled();
+  await page.getByRole("tab", { name: /음성 도구전달/ }).click();
+  await expect(page.locator("#debug-operational-interlock")).toContainText(reason);
+  await expect(page.locator("#debug-operational-interlock")).toContainText("Text VLM 진단");
+  await expect(page.getByRole("button", { name: "도구 전달 요청" })).toBeDisabled();
+  await expect(page.locator("#debug-coexistence-checkbox")).toHaveCount(0);
+
+  await page.getByRole("tab", { name: /Text VLM 입·출력/ }).click();
+  await page.getByLabel("확정 STT 문장").fill("현재 상태만 해석해줘");
+  await page.getByRole("button", { name: /해석만 실행/ }).click();
+  await expect(page.locator('[data-slot="debug-vlm-output-success"]')).toContainText("DISPATCH없음");
+  expect(commands).toEqual([{
+    operation: "vlm_interpret",
+    payload: { text: "현재 상태만 해석해줘", state: "idle" },
+  }]);
+});
+
+test("blocks shared VLM loading but keeps VLM observation available while running", async ({ page }) => {
+  const commands: string[] = [];
+  await openDebugWorkspace(page, {
+    statusForConnection: () => {
+      const status = manualControlsReadyStatus("running-vlm-load-locked");
+      status.runtime = {
+        ...(status.runtime as Record<string, unknown>),
+        operational_state: "running",
+        operational_running: true,
+        operational_intervention_allowed: false,
+        operational_intervention_block_reason: "pause or stop the operational scenario before manual control",
+        operational_control_window_open: false,
+        manual_control_available: false,
+        manual_control_gate: "operational_state",
+      };
+      status.vlm = {
+        ...(status.vlm as Record<string, unknown>),
+        loaded: false,
+        load_state: "UNLOADED",
+      };
+      return status;
+    },
+    onCommand: (operation) => commands.push(operation),
+  });
+
+  await page.getByRole("tab", { name: /Text VLM 입·출력/ }).click();
+  const loadButton = page.getByRole("button", { name: "구성 모델 로드" });
+  await expect(loadButton).toBeDisabled();
+  await expect(page.getByText(/공유 모델 로드는 개입 작업입니다/)).toBeVisible();
+  await loadButton.evaluate((button) => {
+    button.removeAttribute("disabled");
+    button.click();
+  });
+  await page.waitForTimeout(100);
+  expect(commands).toEqual([]);
+});
+
+test("fails closed when the optional operational intervention fields are absent", async ({ page }) => {
+  const commands: string[] = [];
+  await openDebugWorkspace(page, {
+    statusForConnection: () => {
+      const status = manualControlsReadyStatus("intervention-status-not-rolled-out");
+      const runtime = status.runtime as Record<string, unknown>;
+      delete runtime.operational_intervention_allowed;
+      delete runtime.operational_intervention_block_reason;
+      delete runtime.operational_control_window_open;
+      delete runtime.manual_control_gate;
+      // Legacy values must not become an implicit compatibility bypass.
+      runtime.operational_runtime_stopped = true;
+      runtime.manual_control_available = true;
+      return status;
+    },
+    onCommand: (operation) => commands.push(operation),
+  });
+
+  await expect(page.getByRole("button", { name: "수동 제어 잠김" })).toBeDisabled();
+  await page.getByRole("tab", { name: /음성 도구전달/ }).click();
+  await expect(page.locator("#debug-operational-interlock")).toContainText(
+    "operational_intervention_allowed 상태를 아직 제공하지 않았습니다",
+  );
+  const handoverButton = page.getByRole("button", { name: "도구 전달 요청" });
+  await expect(handoverButton).toBeDisabled();
+  await handoverButton.evaluate((button) => {
+    button.removeAttribute("disabled");
+    button.click();
+  });
+  await expect(page.getByRole("alert")).toContainText("시나리오 개입이 잠겼습니다");
+  expect(commands).toEqual([]);
+});
+
+test("arms integrated Debug from a paused idle snapshot without planner acknowledgement", async ({ page }) => {
+  const commands: Array<{ operation: string; payload: Record<string, unknown> }> = [];
+  await openDebugWorkspace(page, {
+    statusForConnection: () => {
+      const status = manualControlsReadyStatus("paused-intervention-window");
+      status.runtime = {
+        ...(status.runtime as Record<string, unknown>),
+        operational_state: "paused",
+        operational_running: true,
+        operational_runtime_stopped: false,
+        operational_intervention_allowed: true,
+        operational_intervention_block_reason: "",
+        operational_control_window_open: true,
+        manual_control_available: true,
+        manual_control_gate: "operational_state",
+        detected_planner_nodes: ["simulation_manager", "tree_executor"],
+        network: {
+          ...((status.runtime as Record<string, unknown>).network as Record<string, unknown>),
+          locked_to_runtime: true,
+        },
+      };
+      return status;
+    },
+    onCommand: (operation, payload) => commands.push({ operation, payload }),
+  });
+
+  const manualButton = page.getByRole("button", { name: "수동 제어 활성화" });
+  await expect(manualButton).toBeEnabled();
+  await manualButton.click();
+  await expect.poll(() => commands).toEqual([{ operation: "arm", payload: {} }]);
+  await expect(page.getByRole("button", { name: "수동 제어 해제" })).toBeVisible();
+});
+
+test("shows a Speech adapter fault only when its dedicated heartbeat is unhealthy", async ({ page }) => {
+  const status = manualControlsReadyStatus("speech-adapter-heartbeat-fault");
+  status.inputs = [
+    debugInput("surgeon_sentence", "/sensors/surgeon/sentence"),
+    {
+      ...debugInput("admitted_request_text", "/surgery/audio/request_text"),
+      message_count: 0,
+      window_message_count: 0,
+      last_sample: "",
+      state: "WAITING_MESSAGES",
+    },
+    {
+      ...debugInput("debug_speech_adapter_status", "/integration/debug/speech/status"),
+      publisher_count: 0,
+      publishers: [],
+      state: "WAITING_PUBLISHER",
+    },
+  ];
+  await openDebugWorkspace(page, { statusForConnection: () => status });
+
+  await page.getByRole("tab", { name: /음성 도구전달/ }).click();
+  const adapterStage = page.locator('[data-slot="debug-speech-adapter-stage"]');
+  await expect(adapterStage).toHaveAttribute("data-stage-state", "ERROR");
+  await expect(adapterStage).toHaveClass(/error/);
+  await expect(adapterStage).toContainText("adapter WAITING_PUBLISHER");
 });
 
 test("runs an isolated Text VLM micro-test without dispatching a robot command", async ({ page }) => {
@@ -2486,6 +2579,105 @@ test("uses the single retraction Service contract without legacy jog fields", as
 
 });
 
+test("toggles the Debug-only retraction state-machine admission gate", async ({ page }) => {
+  const commands: Array<{ operation: string; payload: Record<string, unknown> }> = [];
+  await openDebugWorkspace(page, {
+    statusForConnection: () => retractionServiceStatus("retraction-state-machine-bypass-session"),
+    onCommand: (operation, payload) => commands.push({ operation, payload }),
+  });
+
+  await page.getByRole("tab", { name: /리트랙터 6개 명령/ }).click();
+  const bypass = page.getByRole("button", { name: "상태머신 제한 해제" });
+  await expect(bypass).toBeEnabled();
+  await expect(bypass).toHaveAttribute("aria-pressed", "false");
+  await bypass.click();
+  await expect.poll(() => commands).toContainEqual({
+    operation: "configure_retraction_state_machine_bypass",
+    payload: { enabled: true },
+  });
+});
+
+test("shows every reviewed retraction Service command while the Debug gate is bypassed", async ({ page }) => {
+  await openDebugWorkspace(page, {
+    statusForConnection: () => {
+      const status = retractionServiceStatus("retraction-state-machine-bypass-enabled-session");
+      status.voice = {
+        auto_execute: false,
+        last_sentence: "",
+        last_parse: {},
+        retraction: retractionVoiceStatus({
+          internalState: "idle",
+          allowedCommands: [
+            "start_direct_teach",
+            "finish_direct_teach",
+            "start_retraction",
+            "adjust_retraction",
+            "change_tool",
+            "stop_retraction",
+          ],
+          stateMachineBypassEnabled: true,
+          serviceReady: true,
+        }),
+      };
+      return status;
+    },
+  });
+
+  await page.getByRole("tab", { name: /리트랙터 6개 명령/ }).click();
+  await expect(page.getByRole("button", { name: "상태머신 제한 켜기" })).toHaveAttribute("aria-pressed", "true");
+  for (const name of [
+    "직접 교시 시작",
+    "직접 교시 종료",
+    "Retraction 시작",
+    "왼쪽 5 cm 더",
+    "Tool change",
+    "Retraction 종료",
+  ]) {
+    await expect(page.getByRole("button", { name })).toBeEnabled();
+  }
+});
+
+test("allows every target field selection when finishing direct teach", async ({ page }) => {
+  const commands: Array<{ operation: string; payload: Record<string, unknown> }> = [];
+  await openDebugWorkspace(page, {
+    statusForConnection: () => {
+      const status = retractionServiceStatus("finish-direct-teach-side-session");
+      status.voice = {
+        auto_execute: false,
+        last_sentence: "",
+        last_parse: {},
+        retraction: retractionVoiceStatus({
+          internalState: "direct_teaching",
+          allowedCommands: ["finish_direct_teach"],
+          serviceReady: true,
+        }),
+      };
+      return status;
+    },
+    onCommand: (operation, payload) => commands.push({ operation, payload }),
+  });
+
+  await page.getByRole("tab", { name: /리트랙터 6개 명령/ }).click();
+  for (const [buttonName, targetSide] of [
+    ["왼쪽 left", "left"],
+    ["오른쪽 right", "right"],
+    ["양쪽 both", "both"],
+  ] as const) {
+    await page.getByRole("button", { name: buttonName }).click();
+    const finishButton = page.getByRole("button", { name: "직접 교시 종료" });
+    await expect(finishButton).toBeEnabled();
+    await finishButton.click();
+    await expect.poll(() => commands).toContainEqual({
+      operation: "retraction_command",
+      payload: {
+        command: "finish_direct_teach",
+        target_side: targetSide,
+        distance_m: 0,
+      },
+    });
+  }
+});
+
 test("forces only the Debug retraction state to idle after explicit confirmation", async ({ page }) => {
   const commands: Array<{ operation: string; payload: Record<string, unknown> }> = [];
   await openDebugWorkspace(page, {
@@ -2606,7 +2798,15 @@ test("keeps retraction voice routing as a final-transcript gate without starting
 test("selects a reviewed Debug ASR route without sending a raw WebSocket URL", async ({ page }) => {
   const commands: Array<{ operation: string; payload: Record<string, unknown> }> = [];
   await openDebugWorkspace(page, {
-    statusForConnection: () => debugStatus("debug-asr-route-session", true),
+    statusForConnection: () => {
+      const status = debugStatus("debug-asr-route-session", true);
+      const runtime = status.runtime as Record<string, unknown>;
+      runtime.network = {
+        ...(runtime.network as Record<string, unknown>),
+        locked_to_runtime: true,
+      };
+      return status;
+    },
     onCommand: (operation, payload) => commands.push({ operation, payload }),
   });
 

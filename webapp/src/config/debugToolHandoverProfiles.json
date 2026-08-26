@@ -15,6 +15,11 @@
       "catalogId": "T07",
       "instrumentId": "Bipolar cautery",
       "instanceIds": ["Bipolar cautery#1"]
+    },
+    {
+      "catalogId": "T08",
+      "instrumentId": "Mosquito forceps",
+      "instanceIds": ["Mosquito forceps#1"]
     }
   ]
 }

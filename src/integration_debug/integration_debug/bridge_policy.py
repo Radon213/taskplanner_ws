@@ -8,9 +8,10 @@ from typing import Any
 
 DEBUG_TOPICS_PUBLISH_ALLOWLIST = ("/integration/debug/heartbeat",)
 DEBUG_MULTICAM_SUBSCRIBE_ALLOWLIST = (
-    # Browser rendering uses only VIPLab's bandwidth-bounded preview plane.
-    # Calibration/detail `/synced/*` and driver `/camera/*` stay server-side.
-    "/preview/*",
+    # Browser rendering uses VIPLab's timestamp-preserving synchronized plane.
+    # Driver-native `/camera/*` inputs stay server-side and there is no
+    # `/preview/*` fallback in the Taskplanner input contract.
+    "/synced/*",
     "/multicam_node/*",
     "/world_anchor_node/status",
 )
@@ -28,7 +29,6 @@ DEBUG_PERCEPTION_SUBSCRIBE_ALLOWLIST = (
     "/surgery/perception/cam4/mayo_tool_observations",
     "/surgery/perception/cam4/observations",
     "/surgery/perception/cam4/tool_poses",
-    "/surgery/perception/cam4/hand_keypoints",
     "/surgery/perception/cam4/blood_semantics/json",
     "/surgery/perception/rfdetr/diagnostics/json",
     "/surgery/perception/rfdetr/health",
@@ -85,9 +85,10 @@ DEBUG_ROSAPI_TOPICS_GLOB = "[" + ", ".join(DEBUG_TOPICS_SUBSCRIBE_ALLOWLIST) + "
 # rosapi topic-list service.  In particular it cannot advertise or publish,
 # call world-anchor/debug services, or use any Action protocol capability.
 MULTICAM_OBSERVER_TOPICS_SUBSCRIBE_ALLOWLIST = (
-    # The always-on browser observer also stays preview-only. This prevents a
-    # topic-picker or stale client from subscribing to raw/depth fan-out.
-    "/preview/*",
+    # The always-on browser observer follows the same synchronized-only input
+    # contract. A stale client cannot fall back to driver-native `/camera/*`
+    # or the retired `/preview/*` namespace.
+    "/synced/*",
     "/multicam_node/*",
     "/tf_static",
     "/world_anchor_node/status",

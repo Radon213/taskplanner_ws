@@ -2,8 +2,9 @@
 
 실행 기준본은 `mayo_prompt_eval.py`의 `prompt_for()`와
 `request_context_for()`이다. 이 문서는 사람이 검토할 수 있는 같은 계약을
-정리한 것이며, 운영 `schema-v4`의 `phase`, `tool`, `gesture`, `intent`,
-`mayo_retrieve` 필드는 포함하지 않는다.
+정리한 것이며, 운영 `schema-v6`의 `phase`, `tool`, `intent`,
+`mayo_retrieve` 필드는 포함하지 않는다. 손 상태는 별도 CAM4 typed
+perception 계약이 담당하며 VLM 출력 계약에 존재하지 않는다.
 
 ## 모델 입력
 

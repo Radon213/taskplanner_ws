@@ -35,8 +35,16 @@ _MAX_ADJUSTMENT_DISTANCE_M = 0.050
 
 _TEACH_DOMAIN_TERMS = (
     "직접교시",
+    # Final-STT often turns ``교시`` into ``교실`` or the spoken letters
+    # ``오씨``/``OC``.  Keep ``직접`` in each repair so ordinary classroom or
+    # operating-room speech cannot satisfy the teach-family evidence gate.
+    "직접교실",
+    "직접오씨",
+    "직접oc",
     "직접교수",
     "가르치",
+    "가르쳐",
+    "가르쳤",
     "가르키",
     "가리키",
     "가리치",
@@ -49,6 +57,8 @@ _TEACH_DOMAIN_TERMS = (
     "hand guiding",
 )
 _RETRACTION_DOMAIN_TERMS = (
+    "아미",
+    "아미 네이비",
     "리트랙",
     "리트렉",
     "리트락",
@@ -56,6 +66,8 @@ _RETRACTION_DOMAIN_TERMS = (
     "retract",
     "retraction",
     "retractor",
+    "army",
+    "army navy",
 )
 _TOOL_DOMAIN_TERMS = (
     "툴",
@@ -71,8 +83,11 @@ _TOOL_DOMAIN_TERMS = (
 _START_CUE_TERMS = (
     "시작",
     "개시",
+    "시작해",
     "켜",
+    "켜줘",
     "들어가",
+    "진입",
     "가자",
     "하자",
     "해줘",
@@ -93,12 +108,18 @@ _STOP_CUE_TERMS = (
     "중지",
     "멈",
     "마치",
+    "마칠",
+    "마쳐",
     "마무리",
     "됐",
     "다했",
     "다했어",
     "끄",
     "해제",
+    "스톱",
+    "스탑",
+    "끝내",
+    "끝낼",
     "stop",
     "end",
     "finish",
@@ -133,6 +154,13 @@ _ADJUST_CUE_TERMS = (
     "당기",
     "끌어",
     "밀어",
+    "조금",
+    "살짝",
+    "한번더",
+    "한번만더",
+    "조금더",
+    "좀더",
+    "미세조정",
     "한번",
     "한차례",
     "more",
@@ -316,20 +344,32 @@ class TextOnlyRetractionVLMInterpreter:
             "v, command, target_side, distance_m. v must be the string '1'. "
             "command must be one of start_direct_teach, finish_direct_teach, "
             "start_retraction, adjust_retraction, change_tool, stop_retraction, "
-            "or none. target_side must be none, left, or right. distance_m "
-            "must be 0 for every non-adjust command; an adjustment requires "
-            "a single side and a positive metres value. Do not infer a missing "
-            "side. If an adjustment names exactly one side but omits distance, "
-            "use 0.05 metres. If its side is missing or bilateral, return "
+            "or none. target_side must be none, left, right, or both. distance_m "
+            "must be 0 for every non-adjust command; finish_direct_teach may "
+            "use an explicitly spoken none/left/right target; an adjustment requires "
+            "left, right, or both and a positive metres value. For both, apply "
+            "the same distance to each arm. Do not infer a missing side. If an "
+            "adjustment names exactly one side or both but omits distance, use "
+            "0.05 metres. If its side is missing or contradictory, return "
             "command='none', target_side='none', distance_m=0. Do not report "
             "execution or physical completion. The current state and allowed "
             "commands are authoritative. Be tolerant of STT spelling errors, "
-            "particles, and natural paraphrases, but return command='none' for "
-            "unrelated operating-room speech. Examples: '직접 교시 시작' or "
+            "particles, spacing, polite endings, and natural paraphrases. "
+            "Korean number words with an explicit unit, such as '다섯 센치', "
+            "are explicit distances; do not replace an out-of-range distance "
+            "with the 0.05-metre default. "
+            "Common final-STT repairs such as '직접 교실', '직접 OC', "
+            "'리트렉션', '스톱', and '툴을 바꿔' should be understood only "
+            "when the surrounding command family is present. Return "
+            "command='none' for unrelated operating-room speech. Examples: "
+            "'직접 교시 시작', '직접 교실 시작', or "
             "'리트렉터 직접 가르치기 모드 켜줘' -> start_direct_teach; "
+            "'교시 마칠게' in direct-teach state -> finish_direct_teach; "
             "'리트랙션 오른쪽 5cm 더' or '오른쪽으로 한 번만 더 당겨' "
-            "-> adjust_retraction/right/0.05; '장비 다른 걸로 바꿔줘' -> "
-            "change_tool; '석션 주세요' -> none."
+            "-> adjust_retraction/right/0.05; '양쪽으로 1mm씩 당겨줘' "
+            "-> adjust_retraction/both/0.001; '장비 다른 걸로 바꿔줘' -> "
+            "change_tool; '툴을 바꿔줘' -> change_tool; '석션 주세요' "
+            "-> none."
         )
 
     def _headers(self) -> dict[str, str]:
@@ -376,6 +416,8 @@ class TextOnlyRetractionVLMInterpreter:
         raw: str,
         transcript: str,
         current_state: RetractionState | str,
+        *,
+        enforce_state: bool = True,
     ) -> NormalizedRetractionCommand:
         payload = _extract_json_object(raw)
         if set(payload) != {"v", "command", "target_side", "distance_m"}:
@@ -393,7 +435,7 @@ class TextOnlyRetractionVLMInterpreter:
         except ValueError:
             return self._rejected("text_vlm_command_invalid")
         state = self._coerce_state(current_state)
-        if command not in allowed_retractor_commands(state):
+        if enforce_state and command not in allowed_retractor_commands(state):
             return self._rejected(f"command_not_allowed_in_{state.value}")
         if command == RetractionCommand.ADJUST_RETRACTION:
             try:
@@ -409,6 +451,7 @@ class TextOnlyRetractionVLMInterpreter:
             if target_side not in {
                 RetractionTargetSide.LEFT,
                 RetractionTargetSide.RIGHT,
+                RetractionTargetSide.BOTH,
             }:
                 return self._rejected("text_vlm_adjustment_side_invalid")
             if (
@@ -446,7 +489,16 @@ class TextOnlyRetractionVLMInterpreter:
                     distance_m = float(raw_distance)
                 except (TypeError, ValueError):
                     return self._rejected("text_vlm_distance_invalid")
-            if target_side != RetractionTargetSide.NONE or distance_m != 0.0:
+            if command == RetractionCommand.FINISH_DIRECT_TEACH:
+                if target_side is RetractionTargetSide.BOTH:
+                    return self._rejected(
+                        "text_vlm_finish_target_side_invalid"
+                    )
+                if distance_m != 0.0:
+                    return self._rejected(
+                        "text_vlm_finish_direct_teach_distance_invalid"
+                    )
+            elif target_side != RetractionTargetSide.NONE or distance_m != 0.0:
                 return self._rejected("text_vlm_non_adjustment_parameters_invalid")
             model_normalized = NormalizedRetractionCommand(
                 command=command,
@@ -458,7 +510,11 @@ class TextOnlyRetractionVLMInterpreter:
 
         # Prefer an exact deterministic match whenever it exists.  It detects
         # explicit contradictions/ambiguity before the fuzzier semantic gate.
-        grounded = normalize_retractor_command(transcript, state)
+        grounded = normalize_retractor_command(
+            transcript,
+            state,
+            enforce_state=enforce_state,
+        )
         if grounded.command is not None and grounded.command != command:
             return self._rejected("text_vlm_command_conflicts_with_transcript")
         if grounded.reason == "ambiguous_command":
@@ -485,10 +541,21 @@ class TextOnlyRetractionVLMInterpreter:
             if not _has_command_family_evidence(transcript, command):
                 return self._rejected("text_vlm_command_family_not_grounded")
             grounded = raw_adjustment
+        elif command == RetractionCommand.FINISH_DIRECT_TEACH and grounded.command is not None:
+            # An optional finish target is still a physical selector.  It must
+            # be present in the deterministic transcript grounding; the text
+            # model may not invent left/right from context.
+            if grounded.target_side != model_normalized.target_side:
+                return self._rejected("text_vlm_finish_side_conflicts_with_transcript")
         elif grounded.command is None:
             # This is the intentional fuzzy path: the model resolves a natural
             # paraphrase, while command-specific raw words prove it belongs to
             # the retractor domain.  State restriction above still applies.
+            if (
+                command == RetractionCommand.FINISH_DIRECT_TEACH
+                and model_normalized.target_side != RetractionTargetSide.NONE
+            ):
+                return self._rejected("text_vlm_finish_side_not_grounded")
             if not _has_command_family_evidence(transcript, command):
                 return self._rejected("text_vlm_command_family_not_grounded")
             grounded = model_normalized
@@ -534,10 +601,16 @@ class TextOnlyRetractionVLMInterpreter:
         self,
         transcript: str,
         current_state: RetractionState | str,
+        *,
+        enforce_state: bool = True,
     ) -> RetractionVoiceInterpretation:
         """Prefer a real model call and preserve a safe deterministic fallback."""
 
-        fallback = normalize_retractor_command(transcript, current_state)
+        fallback = normalize_retractor_command(
+            transcript,
+            current_state,
+            enforce_state=enforce_state,
+        )
         if not self._base_url or not self._model_id:
             return RetractionVoiceInterpretation(
                 normalized=fallback,
@@ -566,7 +639,11 @@ class TextOnlyRetractionVLMInterpreter:
                             "current_state": state.value,
                             "allowed_commands": sorted(
                                 command.value
-                                for command in allowed_retractor_commands(state)
+                                for command in (
+                                    allowed_retractor_commands(state)
+                                    if enforce_state
+                                    else RetractionCommand
+                                )
                             ),
                             "default_adjustment_distance_m": _MAX_ADJUSTMENT_DISTANCE_M,
                         },
@@ -582,6 +659,7 @@ class TextOnlyRetractionVLMInterpreter:
                 _response_text(payload),
                 transcript,
                 state,
+                enforce_state=enforce_state,
             )
         except (HTTPError, URLError, OSError, TimeoutError, ValueError, json.JSONDecodeError) as exc:
             return RetractionVoiceInterpretation(

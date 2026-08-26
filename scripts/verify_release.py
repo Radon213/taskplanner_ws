@@ -106,6 +106,8 @@ colcon test-result --test-result-base {artifact_root}/build --verbose
             "run",
             "--rm",
             "--no-deps",
+            "--env",
+            "TASKPLANNER_SKIP_WORKSPACE_SETUP=true",
             "taskplanner-dev",
             "bash",
             "-lc",
@@ -136,6 +138,8 @@ pytest -q {tests}
             "run",
             "--rm",
             "--no-deps",
+            "--env",
+            "TASKPLANNER_SKIP_WORKSPACE_SETUP=true",
             "taskplanner-dev",
             "bash",
             "-lc",
@@ -167,6 +171,8 @@ python3 scripts/release_fault_campaign.py --output-dir {shlex.quote(output_dir)}
             "run",
             "--rm",
             "--no-deps",
+            "--env",
+            "TASKPLANNER_SKIP_WORKSPACE_SETUP=true",
             "--volume",
             f"{host_output_dir}:{output_dir}",
             "taskplanner-dev",
@@ -202,6 +208,8 @@ python3 scripts/release_ros_fault_probe.py \
             "run",
             "--rm",
             "--no-deps",
+            "--env",
+            "TASKPLANNER_SKIP_WORKSPACE_SETUP=true",
             "--volume",
             f"{host_output_dir}:/release-output",
             "taskplanner-dev",
@@ -250,6 +258,8 @@ python3 scripts/release_shadow_campaign.py \
             "run",
             "--rm",
             "--no-deps",
+            "--env",
+            "TASKPLANNER_SKIP_WORKSPACE_SETUP=true",
             "--volume",
             f"{options['dataset_root']}:/release-shadow-dataset:ro",
             "--volume",
@@ -314,7 +324,7 @@ def quick_contract_command() -> str:
 set -eo pipefail
 source /opt/ros/jazzy/setup.bash
 source /opt/btops_ws/install/setup.bash
-source /workspaces/taskplanner_ws/install/setup.bash
+source /workspaces/taskplanner_ws/install/docker/setup.bash
 set -u
 cd /workspaces/taskplanner_ws
 export PYTHONDONTWRITEBYTECODE=1
@@ -334,6 +344,8 @@ pytest -q \
             "run",
             "--rm",
             "--no-deps",
+            "--env",
+            "TASKPLANNER_SKIP_WORKSPACE_SETUP=true",
             "taskplanner-dev",
             "bash",
             "-lc",

@@ -12,6 +12,10 @@ bool procedure_active
 
 string procedure_display_name
 string procedure_display_name_ko
+string procedure_target_site
+string procedure_target_site_ko
+string procedure_approach
+string procedure_approach_ko
 string default_phase_id
 surgical_interop_msgs/PhaseCatalogEntry[] phases
 surgical_interop_msgs/InstrumentCatalogEntry[] instruments

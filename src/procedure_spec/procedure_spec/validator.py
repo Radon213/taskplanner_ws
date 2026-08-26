@@ -9,6 +9,7 @@ from .bed_robot_arm_group import (
     DISTANCE_ORIGINS,
     RETRACTION_DIRECTIONS,
 )
+from .scenario_policy import SCENARIO_RUNTIME_REQUIREMENT_KEYS
 
 
 REQUIRED_FILES = (
@@ -43,11 +44,6 @@ ALLOWED_SURGEON_EVENTS = {
     "extend_hand_for_handover",
     "extend_hand_for_retrieval",
     "cancel_request",
-}
-
-ALLOWED_SURGEON_GESTURE_EVENTS = {
-    "request_tool",
-    "return_tool",
 }
 
 REQUIRED_DISPLAY_CATALOG_SECTIONS = {
@@ -115,11 +111,24 @@ ALLOWED_BED_ROBOT_ARM_OPERATIONS = {
     "retraction",
     "change_end_effector",
 }
+ALLOWED_RETRACTION_VOICE_COMMANDS = {
+    "start_direct_teach",
+    "finish_direct_teach",
+    "start_retraction",
+    "adjust_retraction",
+    "change_tool",
+    "stop_retraction",
+}
 
 BED_ROBOT_ARM_IDS = {"arm_1", "arm_2"}
 BED_ROBOT_ARM_TARGET_TOOLS = {"thyroid_retractor", "army_navy_retractor"}
-BED_ROBOT_ARM_SINGLE_TARGETS = {"left_malleable", "right_malleable"}
-BED_ROBOT_ARM_MULTI_TARGET = "both_malleable"
+BED_ROBOT_ARM_SINGLE_TARGETS = {
+    "left_malleable",
+    "right_malleable",
+    "left_army_navy",
+    "right_army_navy",
+}
+BED_ROBOT_ARM_MULTI_TARGETS = {"both_malleable", "both_army_navy"}
 
 
 class SpecValidationError(ValueError):
@@ -254,6 +263,22 @@ def _validate_bed_robot_arm_groups(payload: object, phase_ids: set[str]) -> None
                 + ", ".join(unsupported)
             )
         allowed_by_group[str(group_id)] = operations
+        raw_voice_commands = group.get("allowed_voice_commands", [])
+        voice_commands = {
+            str(item)
+            for item in _require_list(
+                raw_voice_commands,
+                f"bed_robot_arm_groups groups.{group_id}.allowed_voice_commands",
+            )
+        }
+        unsupported_voice_commands = sorted(
+            voice_commands - ALLOWED_RETRACTION_VOICE_COMMANDS
+        )
+        if unsupported_voice_commands:
+            raise SpecValidationError(
+                f"bed_robot_arm_groups group '{group_id}' has unsupported voice commands: "
+                + ", ".join(unsupported_voice_commands)
+            )
         if (
             bool(group["enabled"])
             and "change_end_effector" in operations
@@ -324,16 +349,16 @@ def _validate_bed_robot_arm_groups(payload: object, phase_ids: set[str]) -> None
             if adjustment_mode == "single":
                 if target_retractor_id not in BED_ROBOT_ARM_SINGLE_TARGETS:
                     raise SpecValidationError(
-                        f"bed_robot_arm_groups single cue '{cue_id}' requires left_malleable or right_malleable."
+                        f"bed_robot_arm_groups single cue '{cue_id}' requires a supported left/right retractor target."
                     )
                 if not set(cue_directions) <= {"UP", "DOWN", "LEFT", "RIGHT"}:
                     raise SpecValidationError(
                         f"bed_robot_arm_groups single cue '{cue_id}' supports cardinal directions only."
                     )
             elif adjustment_mode == "multi":
-                if target_retractor_id != BED_ROBOT_ARM_MULTI_TARGET:
+                if target_retractor_id not in BED_ROBOT_ARM_MULTI_TARGETS:
                     raise SpecValidationError(
-                        f"bed_robot_arm_groups multi cue '{cue_id}' requires both_malleable."
+                        f"bed_robot_arm_groups multi cue '{cue_id}' requires a supported bilateral retractor target."
                     )
                 if not set(cue_directions) <= {"LEFT_RIGHT", "UP_DOWN"}:
                     raise SpecValidationError(
@@ -447,6 +472,7 @@ def validate_raw_bundle(raw_bundle: dict[str, object]) -> None:
     if not instrument_entries:
         raise SpecValidationError("instruments.yaml must define at least one instrument.")
     instrument_ids: set[str] = set()
+    requestable_instrument_ids: set[str] = set()
     inventory_counts: dict[str, int] = {}
     for instrument in instrument_entries:
         instrument_map = _require_mapping(instrument, "instrument entry")
@@ -469,6 +495,8 @@ def validate_raw_bundle(raw_bundle: dict[str, object]) -> None:
         inventory_counts[instrument_id] = inventory_count
         if "requestable" in instrument_map and not isinstance(instrument_map["requestable"], bool):
             raise SpecValidationError(f"instrument '{instrument_id}' requestable must be boolean.")
+        if bool(instrument_map.get("requestable", True)):
+            requestable_instrument_ids.add(instrument_id)
         if not instrument_map.get("category"):
             raise SpecValidationError(f"instrument '{instrument_id}' requires category.")
         if not instrument_map.get("handover_profile"):
@@ -517,6 +545,7 @@ def validate_raw_bundle(raw_bundle: dict[str, object]) -> None:
         "scene_layout.yaml initial_instrument_placement",
     )
     placed_instruments: set[str] = set()
+    home_locations: dict[str, str] = {}
     for placement in placements:
         placement_map = _require_mapping(placement, "initial placement entry")
         instrument_id = str(placement_map.get("instrument_id", "")).strip()
@@ -534,6 +563,7 @@ def validate_raw_bundle(raw_bundle: dict[str, object]) -> None:
                 f"Instrument '{instrument_id}' has more than one initial placement."
             )
         placed_instruments.add(instrument_id)
+        home_locations[instrument_id] = location_id
 
     missing_placements = sorted(instrument_ids.difference(placed_instruments))
     if missing_placements:
@@ -557,6 +587,14 @@ def validate_raw_bundle(raw_bundle: dict[str, object]) -> None:
         "recovering_left",
         "cleaning_left",
         "cleaned_left",
+    }
+    lifecycle_location_types = {
+        "mayo_reuse": "mayo_stand",
+        "mayo_recovery": "mayo_stand",
+        "prepositioned_right": "robot_right_hand",
+        "recovering_left": "robot_left_hand",
+        "cleaning_left": "cleaner_slot",
+        "cleaned_left": "cleaner_slot",
     }
     for raw_state in initial_states:
         state = _require_mapping(raw_state, "initial instrument state")
@@ -609,9 +647,24 @@ def validate_raw_bundle(raw_bundle: dict[str, object]) -> None:
             raise SpecValidationError(
                 f"Initial instrument state for '{instance_id}' confidence must be between 0 and 1."
             )
+        location_type = location_types[location_id]
+        if (
+            lifecycle_stage in {"home_rack", "returned_home"}
+            and location_id != home_locations[instrument_id]
+        ):
+            raise SpecValidationError(
+                f"Initial {lifecycle_stage} instrument '{instance_id}' must use its "
+                f"authored home location '{home_locations[instrument_id]}'."
+            )
+        expected_location_type = lifecycle_location_types.get(lifecycle_stage)
+        if expected_location_type and location_type != expected_location_type:
+            raise SpecValidationError(
+                f"Initial {lifecycle_stage} instrument '{instance_id}' must use a "
+                f"'{expected_location_type}' location."
+            )
         if (
             lifecycle_stage == "surgeon_owned"
-            and location_types[location_id]
+            and location_type
             not in {"surgeon_hand", "surgical_field", "bed_fixed_tool", "return_zone"}
         ):
             raise SpecValidationError(
@@ -621,7 +674,19 @@ def validate_raw_bundle(raw_bundle: dict[str, object]) -> None:
 
     phase_guard = _require_mapping(policy.get("phase_guard"), "policy.yaml phase_guard")
     action_guard = _require_mapping(policy.get("action_guard"), "policy.yaml action_guard")
-    humanoid_policy = _require_mapping(policy.get("humanoid_policy"), "policy.yaml humanoid_policy")
+    raw_scenario_policy = policy.get("scenario_policy")
+    scenario_policy = (
+        _require_mapping(raw_scenario_policy, "policy.yaml scenario_policy")
+        if raw_scenario_policy is not None
+        else None
+    )
+    # Legacy split bundles remain loadable while prompt-derived bundles use
+    # the single scenario_policy section.
+    humanoid_policy = (
+        _require_mapping(policy.get("humanoid_policy"), "policy.yaml humanoid_policy")
+        if scenario_policy is None
+        else None
+    )
 
     for key in (
         "min_confidence_to_keep",
@@ -646,30 +711,133 @@ def validate_raw_bundle(raw_bundle: dict[str, object]) -> None:
                 "policy.yaml phase_guard min_evidence_duration_sec must be non-negative."
             )
 
-    for key in (
-        "block_handover_when_phase_uncertain",
-        "require_multi_evidence_for_handover",
-        "allow_prepositioning_when_uncertain",
-        "explicit_request_priority",
-    ):
+    for key in ("require_multi_evidence_for_handover",):
         if key not in action_guard:
             raise SpecValidationError(f"policy.yaml action_guard requires '{key}'.")
+    if not isinstance(action_guard["require_multi_evidence_for_handover"], bool):
+        raise SpecValidationError(
+            "policy.yaml action_guard.require_multi_evidence_for_handover must be boolean."
+        )
+    if action_guard["require_multi_evidence_for_handover"] is not True:
+        raise SpecValidationError(
+            "policy.yaml action_guard.require_multi_evidence_for_handover "
+            "must remain true; scenario policy cannot weaken admission evidence."
+        )
 
-    for key in (
-        "handover_arm",
-        "recovery_arm",
-        "require_cleaning_after_surgeon_use",
-        "allow_anticipatory_hold",
-        "voice_override_preempts_preposition",
-        "direct_return_to_rack_for_unused_prepositioned_tool",
-    ):
-        if key not in humanoid_policy:
-            raise SpecValidationError(f"policy.yaml humanoid_policy requires '{key}'.")
-
-    if str(humanoid_policy["handover_arm"]) not in {"left", "right"}:
-        raise SpecValidationError("policy.yaml humanoid_policy.handover_arm must be 'left' or 'right'.")
-    if str(humanoid_policy["recovery_arm"]) not in {"left", "right"}:
-        raise SpecValidationError("policy.yaml humanoid_policy.recovery_arm must be 'left' or 'right'.")
+    if scenario_policy is not None:
+        scenario_keys = (
+            "handover_arm",
+            "recovery_arm",
+            "require_cleaning_after_surgeon_use",
+            "allow_anticipatory_hold",
+            "voice_override_preempts_preposition",
+            "allow_prepositioning_when_uncertain",
+            "explicit_request_priority",
+            "unused_preposition_destination",
+        )
+        for key in scenario_keys:
+            if key not in scenario_policy:
+                raise SpecValidationError(
+                    f"policy.yaml scenario_policy requires '{key}'."
+                )
+        for key in ("handover_arm", "recovery_arm"):
+            if str(scenario_policy[key]) not in {"left", "right"}:
+                raise SpecValidationError(
+                    f"policy.yaml scenario_policy.{key} must be 'left' or 'right'."
+                )
+        for key in (
+            "require_cleaning_after_surgeon_use",
+            "allow_anticipatory_hold",
+            "voice_override_preempts_preposition",
+            "allow_prepositioning_when_uncertain",
+            "explicit_request_priority",
+        ):
+            if not isinstance(scenario_policy[key], bool):
+                raise SpecValidationError(
+                    f"policy.yaml scenario_policy.{key} must be boolean."
+                )
+        if str(scenario_policy["unused_preposition_destination"]) not in {
+            "mayo",
+            "rack",
+            "retain",
+        }:
+            raise SpecValidationError(
+                "policy.yaml scenario_policy.unused_preposition_destination "
+                "must be mayo, rack, or retain."
+            )
+        runtime_requirements = scenario_policy.get("runtime_requirements")
+        if runtime_requirements is not None:
+            runtime_requirements = _require_mapping(
+                runtime_requirements,
+                "policy.yaml scenario_policy.runtime_requirements",
+            )
+            runtime_keys = set(runtime_requirements)
+            missing = sorted(
+                SCENARIO_RUNTIME_REQUIREMENT_KEYS - runtime_keys
+            )
+            unknown = sorted(
+                runtime_keys - SCENARIO_RUNTIME_REQUIREMENT_KEYS
+            )
+            if missing or unknown:
+                details = []
+                if missing:
+                    details.append("missing: " + ", ".join(missing))
+                if unknown:
+                    details.append("unknown: " + ", ".join(unknown))
+                raise SpecValidationError(
+                    "policy.yaml scenario_policy.runtime_requirements must "
+                    "define the complete contract (" + "; ".join(details) + ")"
+                )
+            if not isinstance(runtime_requirements["procedure_type"], str):
+                raise SpecValidationError(
+                    "policy.yaml scenario_policy.runtime_requirements."
+                    "procedure_type must be a string."
+                )
+            for key in sorted(
+                SCENARIO_RUNTIME_REQUIREMENT_KEYS - {"procedure_type"}
+            ):
+                if not isinstance(runtime_requirements[key], bool):
+                    raise SpecValidationError(
+                        "policy.yaml scenario_policy.runtime_requirements."
+                        f"{key} must be boolean."
+                    )
+    else:
+        for key in (
+            "allow_prepositioning_when_uncertain",
+            "explicit_request_priority",
+        ):
+            if key not in action_guard:
+                raise SpecValidationError(
+                    f"legacy policy.yaml action_guard requires '{key}'."
+                )
+        assert humanoid_policy is not None
+        for key in (
+            "handover_arm",
+            "recovery_arm",
+            "require_cleaning_after_surgeon_use",
+            "allow_anticipatory_hold",
+            "voice_override_preempts_preposition",
+            "return_unused_preposition_to_mayo",
+        ):
+            if key not in humanoid_policy:
+                raise SpecValidationError(
+                    f"legacy policy.yaml humanoid_policy requires '{key}'."
+                )
+        if str(humanoid_policy["handover_arm"]) not in {"left", "right"}:
+            raise SpecValidationError(
+                "legacy policy.yaml humanoid_policy.handover_arm must be 'left' or 'right'."
+            )
+        if str(humanoid_policy["recovery_arm"]) not in {"left", "right"}:
+            raise SpecValidationError(
+                "legacy policy.yaml humanoid_policy.recovery_arm must be 'left' or 'right'."
+            )
+        if not isinstance(
+            humanoid_policy["return_unused_preposition_to_mayo"], bool
+        ):
+            raise SpecValidationError(
+                "legacy policy.yaml humanoid_policy.return_unused_preposition_to_mayo "
+                "must be boolean."
+            )
 
     simulation_entities = _require_list(simulation_layout.get("entities"), "simulation_layout.yaml entities")
     if not simulation_entities:
@@ -746,6 +914,13 @@ def validate_raw_bundle(raw_bundle: dict[str, object]) -> None:
                 raise SpecValidationError(f"Duplicate mock perception stage '{stage_name}'.")
             stage_names.add(stage_name)
 
+            if "surgeon_gesture" in stage_map:
+                raise SpecValidationError(
+                    f"mock perception stage '{stage_name}' uses retired field "
+                    "'surgeon_gesture'; hand perception is admitted only by the "
+                    "typed CAM4 hand contract."
+                )
+
             if int(stage_map.get("duration_ticks", 0)) <= 0:
                 raise SpecValidationError(
                     f"mock perception stage '{stage_name}' requires duration_ticks > 0."
@@ -814,38 +989,11 @@ def validate_raw_bundle(raw_bundle: dict[str, object]) -> None:
                         f"mock perception stage '{stage_name}' observation confidence must be between 0 and 1."
                     )
 
-            surgeon_gesture = stage_map.get("surgeon_gesture")
-            if surgeon_gesture is not None:
-                gesture_map = _require_mapping(
-                    surgeon_gesture,
-                    f"mock perception stage '{stage_name}' surgeon_gesture",
-                )
-                event_type = str(gesture_map.get("event_type", "")).strip()
-                requested_tool = str(gesture_map.get("requested_tool", "")).strip()
-                hand_pose = str(gesture_map.get("hand_pose", "")).strip()
-                confidence = float(gesture_map.get("confidence", -1.0))
-                if event_type not in ALLOWED_SURGEON_GESTURE_EVENTS:
-                    raise SpecValidationError(
-                        f"mock perception stage '{stage_name}' uses unsupported surgeon_gesture event_type '{event_type}'."
-                    )
-                if requested_tool not in instrument_ids:
-                    raise SpecValidationError(
-                        f"mock perception stage '{stage_name}' surgeon_gesture references unknown instrument '{requested_tool}'."
-                    )
-                if not hand_pose:
-                    raise SpecValidationError(
-                        f"mock perception stage '{stage_name}' surgeon_gesture requires hand_pose."
-                    )
-                if confidence < 0.0 or confidence > 1.0:
-                    raise SpecValidationError(
-                        f"mock perception stage '{stage_name}' surgeon_gesture confidence must be between 0 and 1."
-                    )
-
     surgeon_period_sec = float(mock_surgeon.get("period_sec", 1.0))
     if surgeon_period_sec <= 0.0:
         raise SpecValidationError("mock_surgeon.yaml period_sec must be greater than 0.")
     surgeon_stages = _require_list(mock_surgeon.get("stages"), "mock_surgeon.yaml stages")
-    if not surgeon_stages:
+    if not surgeon_stages and requestable_instrument_ids:
         raise SpecValidationError("mock_surgeon.yaml must define at least one stage.")
     surgeon_stage_names: set[str] = set()
     for stage in surgeon_stages:
@@ -874,6 +1022,11 @@ def validate_raw_bundle(raw_bundle: dict[str, object]) -> None:
         if requested_tool and requested_tool not in instrument_ids:
             raise SpecValidationError(
                 f"mock surgeon stage '{stage_name}' references unknown instrument '{requested_tool}'."
+            )
+        if requested_tool and requested_tool not in requestable_instrument_ids:
+            raise SpecValidationError(
+                f"mock surgeon stage '{stage_name}' references non-requestable "
+                f"instrument '{requested_tool}'."
             )
         if event_type == "voice_request" and not str(stage_map.get("voice_text", "")).strip():
             raise SpecValidationError(

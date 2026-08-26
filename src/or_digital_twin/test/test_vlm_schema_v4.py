@@ -15,7 +15,6 @@ from surgical_msgs.msg import VLMHealth, VLMResult
 
 
 def _prepare_result_handler(node: ORDigitalTwinNode) -> None:
-    node._handle_vlm_implicit_request = lambda *_args: None
     node._mayo_retrieve_stability = {}
     node._mayo_reuse_stability = {}
     node._publish_world_state_if_dirty = lambda: None
@@ -23,7 +22,7 @@ def _prepare_result_handler(node: ORDigitalTwinNode) -> None:
     node._stamp = lambda: None
 
 
-def test_v4_result_reaches_tool_prediction_reducer() -> None:
+def test_gesture_free_v6_result_reaches_tool_prediction_reducer() -> None:
     spec_dir = (
         Path(__file__).parents[2]
         / "procedure_spec"
@@ -49,10 +48,10 @@ def test_v4_result_reaches_tool_prediction_reducer() -> None:
     )
 
     msg = VLMResult()
-    msg.schema_version = "4"
+    msg.schema_version = "6"
     msg.raw_json = json.dumps(
         {
-            "v": "4",
+            "v": "6",
             "phase": [["P03", 0.9]],
             "tool": [["T02", 0.9]],
             "intent": ["none", "", 0.0],
@@ -66,10 +65,45 @@ def test_v4_result_reaches_tool_prediction_reducer() -> None:
 
     node._on_vlm_result(msg)
 
-    assert observed["schema_version"] == "4"
+    assert observed["schema_version"] == "6"
     assert observed["now_sec"] == 12.0
     assert observed["received_sec"] == 12.0
     assert observed["payload"]["tool"] == [["T02", 0.9]]
+
+
+def test_vlm_hand_fields_are_rejected_before_tool_reducer() -> None:
+    node = ORDigitalTwinNode.__new__(ORDigitalTwinNode)
+    node._twin = SimpleNamespace(
+        state=SimpleNamespace(predicted_tool=""),
+    )
+    node._stamp_sec = lambda _stamp: 12.0
+    _prepare_result_handler(node)
+    decisions: list[dict] = []
+    node._publish_reducer_decision_event = lambda **kwargs: decisions.append(kwargs)
+    node._handle_vlm_tool_prediction = lambda *_args: (_ for _ in ()).throw(
+        AssertionError("forbidden VLM hand payload reached the tool reducer")
+    )
+
+    msg = VLMResult()
+    msg.source = "legacy_vlm:test"
+    msg.schema_version = "4"
+    msg.raw_json = json.dumps(
+        {
+            "v": "4",
+            "phase": [["P03", 0.9]],
+            "tool": [["T02", 0.9]],
+            "intent": ["none", "", 0.0],
+            "gesture": ["request_tool", "", "open_receive", 0.99],
+            "mayo": [],
+            "mayo_retrieve": ["", 0.0],
+            "bed_robot_arm_group": None,
+        }
+    )
+
+    node._on_vlm_result(msg)
+
+    assert decisions[-1]["accepted"] is False
+    assert decisions[-1]["reason"] == "vlm_hand_fields_forbidden"
 
 
 def test_v4_ranked_tool_rows_are_preserved_for_fusion() -> None:
@@ -83,12 +117,54 @@ def test_v4_ranked_tool_rows_are_preserved_for_fusion() -> None:
     ) == [["T02", 0.91], ["T04", 0.63]]
 
 
+@pytest.mark.parametrize("schema_version", ["5", "6"])
+@pytest.mark.parametrize(
+    "rows",
+    [
+        [["T02", 0.91]],
+        [["T02", 0.91], ["T04", 0.63]],
+        [["T02", 0.91], ["T04", 0.63], ["T07", 0.46]],
+    ],
+)
+def test_v5_v6_ranked_tool_rows_are_preserved_for_fusion(
+    schema_version: str,
+    rows: list[list],
+) -> None:
+    node = ORDigitalTwinNode.__new__(ORDigitalTwinNode)
+
+    assert node._vlm_tool_rows(
+        {
+            "v": schema_version,
+            "tool": rows,
+        }
+    ) == rows
+
+
+@pytest.mark.parametrize("schema_version", ["5", "6"])
+def test_v5_v6_ranked_tool_rows_ignore_malformed_confidence(
+    schema_version: str,
+) -> None:
+    node = ORDigitalTwinNode.__new__(ORDigitalTwinNode)
+
+    assert node._vlm_tool_rows(
+        {
+            "v": schema_version,
+            "tool": [
+                ["T02", 0.91],
+                ["T04", [0.63]],
+                ["T07", "not-a-number"],
+                ["T09", float("nan")],
+            ],
+        }
+    ) == [["T02", 0.91]]
+
+
 def test_reducer_preserves_deterministic_top_three_but_rank_one_owns_control() -> None:
     node = ORDigitalTwinNode.__new__(ORDigitalTwinNode)
     node._tool_predict_stability = {}
     node._tool_predict_evidence_threshold = 0.5
-    node._tool_predict_threshold = 0.8
-    node._tool_predict_stability_sec = 3.0
+    node._tool_predict_threshold = 0.55
+    node._tool_predict_stability_sec = 0.30
     state = SimpleNamespace(
         predicted_tool="",
         predicted_tool_confidence=0.0,
@@ -125,6 +201,10 @@ def test_reducer_preserves_deterministic_top_three_but_rank_one_owns_control() -
         "T07",
     ]
     assert [row.rank for row in state.ranked_tool_predictions] == [1, 2, 3]
+    assert sum(row.confidence for row in state.ranked_tool_predictions) == 1.0
+    assert sum(
+        round(row.confidence * 100) for row in state.ranked_tool_predictions
+    ) == 100
     assert [row.stability_sec for row in state.ranked_tool_predictions] == [
         3.4,
         0.0,
@@ -287,7 +367,10 @@ def test_prediction_evidence_duration_is_separate_from_action_readiness() -> Non
     assert stable is False
     assert first_duration == 0.0
     assert second_duration == pytest.approx(0.8)
-    source = inspect.getsource(ORDigitalTwinNode._handle_vlm_tool_prediction)
+    source = (
+        inspect.getsource(ORDigitalTwinNode._fused_tool_prediction)
+        + inspect.getsource(ORDigitalTwinNode._handle_vlm_tool_prediction)
+    )
     assert "threshold=self._tool_predict_evidence_threshold" in source
     assert "confidence >= self._tool_predict_threshold" in source
 
@@ -354,10 +437,18 @@ def _prediction_fusion_node(
     available: set[str],
     prior_evidence: dict | None = None,
 ) -> ORDigitalTwinNode:
+    spec_dir = (
+        Path(__file__).parents[2]
+        / "procedure_spec"
+        / "procedure_spec"
+        / "specs"
+        / "thyroidectomy"
+    )
+    spec = load_bundle(spec_dir)
     node = ORDigitalTwinNode.__new__(ORDigitalTwinNode)
     node._tool_predict_stability = {}
     node._tool_predict_evidence_threshold = 0.5
-    node._tool_predict_stability_sec = 3.0
+    node._tool_predict_stability_sec = 0.30
     node._prior_scorer = SimpleNamespace(
         score=lambda _evidence: {
             "tool": prior_rows,
@@ -365,11 +456,11 @@ def _prediction_fusion_node(
         }
     )
     node._runtime_prior_evidence = lambda: {}
+    node._handover_ngram_prior = None
     node._twin = SimpleNamespace(
-        spec=SimpleNamespace(
-            resolve_instrument_alias=lambda tool_id: str(tool_id)
-        ),
+        spec=spec,
         state=SimpleNamespace(predicted_tool=""),
+        get_available_instruments=lambda: sorted(available),
         _instances_for_type=lambda tool_id: (
             [
                 SimpleNamespace(
@@ -380,7 +471,7 @@ def _prediction_fusion_node(
                     )
                 )
             ]
-            if tool_id in {"T01", "T02"}
+            if any(instrument.id == tool_id for instrument in spec.bundle.instruments)
             else []
         ),
         get_instrument_state=lambda tool_id: SimpleNamespace(
@@ -392,7 +483,7 @@ def _prediction_fusion_node(
     return node
 
 
-def test_procedure_prior_only_nudges_vlm_candidates() -> None:
+def test_procedure_prior_fills_only_currently_eligible_candidates() -> None:
     node = _prediction_fusion_node(
         prior_rows=[["T02", 1.0]],
         available={"T01", "T02"},
@@ -405,7 +496,8 @@ def test_procedure_prior_only_nudges_vlm_candidates() -> None:
 
     assert tool_id == "T01"
     assert confidence == pytest.approx(0.8)
-    assert "T02" not in detail["fused"]
+    assert detail["fused"]["T02"] == pytest.approx(0.15)
+    assert detail["eligible_candidates"] == ["T01", "T02"]
 
 
 def test_validated_procedure_path_can_create_reversible_preparation_candidate() -> None:
@@ -458,7 +550,7 @@ def test_strong_current_visual_forecast_can_override_procedure_path() -> None:
     assert confidence == pytest.approx(0.97)
 
 
-def test_unavailable_vlm_candidate_remains_evidence_without_prior_fallback() -> None:
+def test_unavailable_vlm_candidate_is_removed_before_final_ranking() -> None:
     node = _prediction_fusion_node(
         prior_rows=[["T02", 1.0]],
         available={"T02"},
@@ -469,12 +561,69 @@ def test_unavailable_vlm_candidate_remains_evidence_without_prior_fallback() -> 
         10.0,
     )
 
-    assert tool_id == "T01"
-    assert confidence == pytest.approx(0.9)
-    assert detail["candidate_lifecycles"] == {
-        "T01": ["surgeon_owned"]
-    }
-    assert detail["fused"] == {"T01": pytest.approx(0.9)}
+    assert tool_id == "T02"
+    assert confidence == pytest.approx(0.15)
+    assert detail["candidate_lifecycles"] == {"T02": ["home_rack"]}
+    assert detail["fused"] == {"T02": pytest.approx(0.15)}
+    assert "T01" in detail["filtered_candidates"]
+    assert detail["degraded"] is True
+
+
+def test_mayo_recovery_is_not_an_implicit_final_handover_candidate() -> None:
+    node = _prediction_fusion_node(
+        prior_rows=[["T02", 1.0]],
+        available={"T01", "T02"},
+    )
+    node._twin._instances_for_type = lambda tool_id: [
+        SimpleNamespace(
+            lifecycle_stage=(
+                "mayo_recovery" if tool_id == "T01" else "home_rack"
+            )
+        )
+    ]
+
+    tool_id, _confidence, detail = node._fused_tool_prediction(
+        {"v": "4", "tool": [["T01", 0.95]]},
+        10.0,
+    )
+
+    assert tool_id == "T02"
+    assert detail["eligible_candidates"] == ["T02"]
+    assert "T01" in detail["filtered_candidates"]
+
+
+def test_frozen_ngram_prior_fills_exact_system_top_three_with_unit_mass() -> None:
+    node = _prediction_fusion_node(
+        prior_rows=[],
+        available={"T02", "T04", "T07", "T08"},
+    )
+    node._handover_ngram_prior = SimpleNamespace(
+        predict=lambda **_kwargs: {
+            "id": "frozen-0704-test",
+            "match": "global",
+            "support": 10,
+            "candidates": [["T04", 0.6], ["T07", 0.3], ["T08", 0.1]],
+        }
+    )
+
+    tool_id, confidence, detail = node._fused_tool_prediction(
+        {"v": "4", "tool": [["T02", 0.8]]},
+        10.0,
+    )
+
+    assert tool_id == "T02"
+    assert confidence == pytest.approx(0.8)
+    assert [row[0] for row in detail["ranked_distribution"]] == [
+        "T02",
+        "T04",
+        "T07",
+    ]
+    assert sum(row[1] for row in detail["ranked_distribution"]) == 1.0
+    assert sum(
+        round(row[1] * 100) for row in detail["ranked_distribution"]
+    ) == 100
+    assert detail["ngram"] == {"T04": 0.6, "T07": 0.3, "T08": 0.1}
+    assert detail["degraded"] is False
 
 
 def test_prediction_continuity_resets_when_top_candidate_changes() -> None:

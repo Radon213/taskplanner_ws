@@ -8,6 +8,7 @@ import type {
   BTDecision,
   CompressedImageFrame,
   InputSourceStatus,
+  InstrumentState,
   SimulationState,
   SkillStatus,
   SurgeonState,
@@ -25,17 +26,7 @@ type TimelineFilter = "all" | "normal" | "warning" | "error";
 type DetailTone = "normal" | "match" | "mismatch";
 type PanelVariant = "combined" | "timeline" | "decision";
 
-const VLM_IMPLICIT_REQUEST_EVENTS = new Set([
-  "extend_hand_for_handover",
-  "implicit_tool_request",
-  "request_tool",
-]);
-const VLM_IMPLICIT_REQUEST_POSES = new Set([
-  "hand_extending",
-  "open_palm",
-  "open_receive",
-  "palm_up",
-]);
+const MAX_DISPLAYED_NEXT_TOOL_RANK = 3;
 
 function DetailCard({ label, value, tone = "normal" }: { label: string; value: string | number; tone?: DetailTone }) {
   return (
@@ -63,6 +54,91 @@ function compactIdentifier(value: string): string {
   return `${value.slice(0, 14)}…${value.slice(-6)}`;
 }
 
+function isCanonicalMayoInstrument(instrument: InstrumentState): boolean {
+  return (
+    instrument.location_type === "mayo_stand"
+    && instrument.location_id === "mayo_stand"
+    && (instrument.lifecycle_stage === "mayo_reuse" || instrument.lifecycle_stage === "mayo_recovery")
+  );
+}
+
+type RankedToolRow = {
+  rank: number;
+  toolId: string;
+  confidence: number;
+};
+
+function rankedVlmToolRows(vlmResult: VLMResult): RankedToolRow[] {
+  if (!vlmResult.raw_json) return [];
+  try {
+    const parsed = parseBoundedJson(vlmResult.raw_json);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return [];
+    const rawTool = (parsed as { tool?: unknown }).tool;
+    if (!Array.isArray(rawTool)) return [];
+    const rawRows = Array.isArray(rawTool[0])
+      ? rawTool
+      : rawTool.length === 2 ? [rawTool] : [];
+    const candidates = new Map<string, number>();
+    for (const row of rawRows.slice(0, 24)) {
+      if (!Array.isArray(row) || row.length !== 2) continue;
+      const toolId = String(row[0] ?? "").trim();
+      const confidence = Number(row[1]);
+      if (!toolId || !Number.isFinite(confidence) || confidence < 0 || confidence > 1) continue;
+      const previous = candidates.get(toolId);
+      if (previous === undefined || confidence > previous) candidates.set(toolId, confidence);
+    }
+    return [...candidates.entries()]
+      .map(([toolId, confidence]) => ({ toolId, confidence }))
+      .sort((left, right) => right.confidence - left.confidence || left.toolId.localeCompare(right.toolId))
+      .slice(0, MAX_DISPLAYED_NEXT_TOOL_RANK)
+      .map((row, index) => ({ ...row, rank: index + 1 }));
+  } catch {
+    return [];
+  }
+}
+
+function formatRankedToolLabel(
+  rows: readonly RankedToolRow[],
+  displayToolName: (toolId: string) => string,
+  noneLabel: string,
+  language: Language,
+): string {
+  if (!rows.length) return noneLabel;
+  return rows
+    .map((row) => `${language === "ko" ? `${row.rank}순위` : `#${row.rank}`} ${displayToolName(row.toolId)} (${Math.round(row.confidence * 100)}%)`)
+    .join(" · ");
+}
+
+function systemRankedToolRows(worldState: WorldState): RankedToolRow[] {
+  const seenRanks = new Set<number>();
+  const seenTools = new Set<string>();
+  const rows: RankedToolRow[] = [];
+  for (const value of worldState.ranked_tool_predictions.slice(0, 24)) {
+    const rank = Number(value.rank);
+    const toolId = String(value.instrument_id || "").trim();
+    const confidence = Number(value.confidence);
+    if (
+      !Number.isInteger(rank)
+      || rank < 1
+      || rank > MAX_DISPLAYED_NEXT_TOOL_RANK
+      || !toolId
+      || !Number.isFinite(confidence)
+      || confidence < 0
+      || confidence > 1
+      || seenRanks.has(rank)
+      || seenTools.has(toolId)
+    ) {
+      continue;
+    }
+    seenRanks.add(rank);
+    seenTools.add(toolId);
+    rows.push({ rank, toolId, confidence });
+  }
+  return rows
+    .sort((left, right) => left.rank - right.rank || left.toolId.localeCompare(right.toolId))
+    .slice(0, MAX_DISPLAYED_NEXT_TOOL_RANK);
+}
+
 function vlmInputImageLabel(
   imageSource: string,
   sizeBytes: number,
@@ -80,24 +156,19 @@ function vlmInputImageLabel(
   const freshnessLabel = ageMs > 3_000
     ? language === "ko" ? "오래된 프레임" : "stale frame"
     : language === "ko" ? "마지막 수신" : "last received";
-  const isComposite = source.startsWith("flir_cam4_");
-  const isRawFallback = source.endsWith("raw_fallback");
+  const isFlirCam4Visual = source.startsWith("flir_cam4_");
 
   if (language === "ko") {
-    const viewLabel = isComposite
-      ? "FLIR + CAM4 합성 입력"
-      : isRawFallback
-        ? "원본 FLIR 폴백"
-        : "RF-DETR 분할 FLIR";
-    return `${viewLabel} · ${sizeLabel} · ${freshnessLabel} ${ageLabel}${ageSuffix}`;
+    const viewLabel = isFlirCam4Visual
+      ? "원본 FLIR + CAM4 모델 시각 문맥"
+      : "원본 모델 시각 문맥";
+    return `${viewLabel} · 도구 위치 근거 아님 · ${sizeLabel} · ${freshnessLabel} ${ageLabel}${ageSuffix}`;
   }
 
-  const viewLabel = isComposite
-    ? "FLIR + CAM4 composite"
-    : isRawFallback
-      ? "Raw FLIR fallback"
-      : "RF-DETR segmented FLIR";
-  return `${viewLabel} · ${sizeLabel} · ${freshnessLabel} ${ageLabel}${ageSuffix}`;
+  const viewLabel = isFlirCam4Visual
+    ? "Raw FLIR + CAM4 model visual context"
+    : "Raw model visual context";
+  return `${viewLabel} · not tool-location evidence · ${sizeLabel} · ${freshnessLabel} ${ageLabel}${ageSuffix}`;
 }
 
 function BedRobotArmTraceCard({
@@ -148,28 +219,18 @@ function BedRobotArmTraceCard({
   );
 }
 
-function parseVlmToolLabel(vlmResult: VLMResult, displayToolName: (toolId: string) => string, noneLabel: string): string {
-  if (!vlmResult.raw_json) return noneLabel;
-  try {
-    const parsed = parseBoundedJson(vlmResult.raw_json);
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return noneLabel;
-    const payload = parsed as { tool?: unknown };
-    const rawTool = payload.tool;
-    if (Array.isArray(rawTool) && Array.isArray(rawTool[0])) {
-      const first = rawTool[0] as unknown[];
-      const toolId = String(first[0] || "");
-      const confidence = Number(first[1] || 0);
-      return toolId ? `${displayToolName(toolId)} (${Math.round(confidence * 100)}%)` : noneLabel;
-    }
-    if (Array.isArray(rawTool) && rawTool.length === 2) {
-      const toolId = String(rawTool[0] || "");
-      const confidence = Number(rawTool[1] || 0);
-      return toolId ? `${displayToolName(toolId)} (${Math.round(confidence * 100)}%)` : noneLabel;
-    }
-  } catch {
-    return noneLabel;
-  }
-  return noneLabel;
+function parseVlmToolLabel(
+  vlmResult: VLMResult,
+  displayToolName: (toolId: string) => string,
+  noneLabel: string,
+  language: Language,
+): string {
+  return formatRankedToolLabel(
+    rankedVlmToolRows(vlmResult),
+    displayToolName,
+    noneLabel,
+    language,
+  );
 }
 
 function parseVlmMayoLabel(
@@ -177,6 +238,7 @@ function parseVlmMayoLabel(
   displayToolName: (toolId: string) => string,
   noneLabel: string,
   language: Language,
+  eligibleToolIds: ReadonlySet<string>,
 ): string {
   if (!vlmResult.raw_json) return noneLabel;
   try {
@@ -189,7 +251,7 @@ function parseVlmMayoLabel(
       const toolId = String(row[0] ?? "");
       const decision = String(row[1] ?? "").toLowerCase();
       const confidence = Number(row[2]);
-      if (!toolId || !Number.isFinite(confidence)) return [];
+      if (!toolId || !eligibleToolIds.has(toolId) || !Number.isFinite(confidence)) return [];
       const decisionLabel =
         decision === "reuse"
           ? language === "ko"
@@ -328,36 +390,34 @@ export function ObservabilityPanel({
       ? `VLM ${vlmMatchesGround ? "일치" : "불일치"} · 시스템 ${systemMatchesGround ? "일치" : "불일치"}`
       : `VLM ${vlmMatchesGround ? "match" : "mismatch"} · system ${systemMatchesGround ? "match" : "mismatch"}`
     : vm.ui.none;
-  const rawVlmToolLabel = parseVlmToolLabel(vlmResult, vm.displayToolName, vm.ui.none);
-  const rawVlmMayoLabel = parseVlmMayoLabel(
+  const canonicalMayoToolIds = new Set(
+    simulationState.instrument_states
+      .filter(isCanonicalMayoInstrument)
+      .map((instrument) => instrument.instrument_id),
+  );
+  const rawVlmToolLabel = parseVlmToolLabel(
     vlmResult,
     vm.displayToolName,
     vm.ui.none,
     language,
   );
-  const implicitRequestDetected =
-    VLM_IMPLICIT_REQUEST_EVENTS.has(vlmResult.gesture_event_type) &&
-    VLM_IMPLICIT_REQUEST_POSES.has(vlmResult.gesture_hand_pose) &&
-    vlmResult.gesture_confidence > 0;
-  const implicitRequestToolLabel = vlmResult.gesture_requested_tool
-    ? vm.displayToolName(vlmResult.gesture_requested_tool)
-    : language === "ko"
-      ? "도구 미확정"
-      : "tool unresolved";
-  const implicitRequestLabel = implicitRequestDetected
+  const rawVlmMayoLabel = parseVlmMayoLabel(
+    vlmResult,
+    vm.displayToolName,
+    vm.ui.none,
+    language,
+    canonicalMayoToolIds,
+  );
+  const handHandoverSignalActive = worldState.implicit_request_visible;
+  const handHandoverSignalLabel = handHandoverSignalActive
     ? language === "ko"
-      ? `감지 · ${implicitRequestToolLabel} (${Math.round(vlmResult.gesture_confidence * 100)}%)`
-      : `Detected · ${implicitRequestToolLabel} (${Math.round(vlmResult.gesture_confidence * 100)}%)`
+      ? `게이트 통과 · ${worldState.implicit_request_stability_sec.toFixed(1)}초`
+      : `Gate passed · ${worldState.implicit_request_stability_sec.toFixed(1)}s`
     : language === "ko"
-      ? "감지 안 됨"
-      : "Not detected";
+      ? "신호 대기"
+      : "Waiting for signal";
   const finalMayoLabel = simulationState.instrument_states
-    .filter((instrument) =>
-      instrument.lifecycle_stage === "mayo_reuse" ||
-      instrument.lifecycle_stage === "mayo_recovery" ||
-      instrument.location_type === "mayo_stand" ||
-      instrument.location_type === "mayo_reuse_zone" ||
-      instrument.location_type === "mayo_recovery_zone")
+    .filter(isCanonicalMayoInstrument)
     .map((instrument) => {
       const recovery =
         instrument.lifecycle_stage === "mayo_recovery" ||
@@ -369,9 +429,26 @@ export function ObservabilityPanel({
       return `${vm.displayToolName(instrument.instrument_id)} ${decision}`;
     })
     .join(" · ") || vm.ui.none;
-  const systemPredictedToolLabel = worldState.predicted_tool
-    ? `${vm.displayToolName(worldState.predicted_tool)} (${Math.round((worldState.predicted_tool_confidence || 0) * 100)}%, ${Math.round(worldState.predicted_tool_stability_sec || 0)}s)`
-    : vm.ui.none;
+  const systemPredictedToolRows = systemRankedToolRows(worldState);
+  const systemPredictedToolLabel = systemPredictedToolRows.length
+    ? formatRankedToolLabel(
+      systemPredictedToolRows,
+      vm.displayToolName,
+      vm.ui.none,
+      language,
+    )
+    : worldState.predicted_tool
+      ? formatRankedToolLabel(
+        [{
+          rank: 1,
+          toolId: worldState.predicted_tool,
+          confidence: Math.max(0, Math.min(1, Number(worldState.predicted_tool_confidence) || 0)),
+        }],
+        vm.displayToolName,
+        vm.ui.none,
+        language,
+      )
+      : vm.ui.none;
 
   useLayoutEffect(() => {
     if (!followLatestRef.current) return;
@@ -598,6 +675,11 @@ export function ObservabilityPanel({
                   value={btDecision.next_required_transition ? vm.displayTransitionName(btDecision.next_required_transition) : vm.ui.none}
                 />
                 <DetailCard label={vm.ui.guard} value={btDecision.blocking_guard || vm.ui.none} />
+                <DetailCard
+                  label={language === "ko" ? "손 전달 신호 · 리듀서" : "Hand handover signal · reducer"}
+                  value={handHandoverSignalLabel}
+                  tone={handHandoverSignalActive ? "match" : "normal"}
+                />
                 <DetailCard label={vm.ui.skill} value={skillStatus.action ? vm.displayActionName(skillStatus.action) : vm.ui.none} />
                 <DetailCard label={vm.ui.progress} value={`${Math.round((skillStatus.progress || 0) * 100)}%`} />
                 <article className="detail-card wide">
@@ -636,7 +718,7 @@ export function ObservabilityPanel({
                   ))}
                 </section>
                 <DetailCard
-                  label={language === "ko" ? "VLM 입력 영상" : "VLM input image"}
+                  label={language === "ko" ? "VLM 모델 시각 문맥" : "VLM model visual context"}
                   value={
                     vlmImage
                       ? vlmInputImageLabel(
@@ -657,11 +739,6 @@ export function ObservabilityPanel({
                 <DetailCard label={vm.ui.mode} value={vlmHealth.last_mode || vm.ui.none} />
                 <DetailCard label={vm.ui.source} value={vlmResult.source || vm.ui.none} />
                 <DetailCard label={vm.ui.imageSource} value={vlmHealth.image_source || vm.ui.none} />
-                <DetailCard
-                  label={language === "ko" ? "암묵적 도구 요청" : "Implicit tool request"}
-                  value={implicitRequestLabel}
-                  tone={implicitRequestDetected ? "match" : "normal"}
-                />
                 <DetailCard label={vm.ui.latency} value={vlmHealth.latency_sec ? `${vlmHealth.latency_sec.toFixed(3)}s` : vm.ui.none} />
                 <DetailCard label={language === "ko" ? "집도의 정답 단계" : "Actor ground"} value={groundLabel} />
                 <DetailCard label={language === "ko" ? "VLM 제안 단계" : "VLM proposed phase"} value={vlmPhaseLabel} tone={vlmPhaseTone} />

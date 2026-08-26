@@ -301,7 +301,7 @@ def test_wpctl_distinguishes_reachable_graph_with_no_input(monkeypatch) -> None:
 
     def fake_run(command, **_kwargs):
         calls.append(command)
-        if command == ["wpctl", "status"]:
+        if command == ["wpctl", "status", "--name"]:
             return SimpleNamespace(stdout="Audio\n Sources:\n")
         raise asr_runtime.subprocess.CalledProcessError(3, command)
 
@@ -314,13 +314,13 @@ def test_wpctl_distinguishes_reachable_graph_with_no_input(monkeypatch) -> None:
     assert "no PipeWire microphone input" in str(exc_info.value)
     assert calls == [
         ["wpctl", "inspect", asr_runtime.PIPEWIRE_DEFAULT_SOURCE],
-        ["wpctl", "status"],
+        ["wpctl", "status", "--name"],
     ]
 
 
 def test_wpctl_reports_unreachable_host_audio_graph(monkeypatch) -> None:
     def fake_run(command, **_kwargs):
-        if command == ["wpctl", "status"]:
+        if command == ["wpctl", "status", "--name"]:
             raise asr_runtime.subprocess.CalledProcessError(3, command)
         raise asr_runtime.subprocess.CalledProcessError(3, command)
 
@@ -331,6 +331,53 @@ def test_wpctl_reports_unreachable_host_audio_graph(monkeypatch) -> None:
 
     assert exc_info.value.status == asr_runtime.DEVICE_STATUS_HOST_AUDIO_UNAVAILABLE
     assert "not reachable" in str(exc_info.value)
+
+
+def test_wpctl_resolves_selected_source_when_alias_points_to_sink(monkeypatch) -> None:
+    sink_output = """
+id 59, type PipeWire:Interface:Node
+  * media.class = \"Audio/Sink\"
+"""
+    status_output = """
+Audio
+ ├─ Sources:
+ │      62. alsa_input.usb-Test.HiFi__Line__source [vol: 1.00]
+ │      63. alsa_input.usb-Test.HiFi__Mic__source [vol: 1.00]
+Settings
+ └─ Default Configured Devices:
+         1. Audio/Source  alsa_input.usb-Test.HiFi__Mic__source
+"""
+    source_output = """
+id 63, type PipeWire:Interface:Node
+    audio.channels = \"2\"
+  * media.class = \"Audio/Source\"
+  * node.nick = \"USB Audio Microphone\"
+"""
+    calls = []
+
+    def fake_run(command, **_kwargs):
+        calls.append(command)
+        if command == ["wpctl", "inspect", asr_runtime.PIPEWIRE_DEFAULT_SOURCE]:
+            return SimpleNamespace(stdout=sink_output)
+        if command == ["wpctl", "status", "--name"]:
+            return SimpleNamespace(stdout=status_output)
+        if command == ["wpctl", "inspect", "63"]:
+            return SimpleNamespace(stdout=source_output)
+        raise AssertionError(command)
+
+    monkeypatch.setattr(asr_runtime.subprocess, "run", fake_run)
+
+    source = asr_runtime._query_pipewire_default_source()
+
+    assert source == {
+        "name": "Input - USB Audio Microphone",
+        "input_channels": 2,
+    }
+    assert calls == [
+        ["wpctl", "inspect", asr_runtime.PIPEWIRE_DEFAULT_SOURCE],
+        ["wpctl", "status", "--name"],
+        ["wpctl", "inspect", "63"],
+    ]
 
 
 def test_runtime_exposes_only_pipewire_default_input(monkeypatch, tmp_path) -> None:

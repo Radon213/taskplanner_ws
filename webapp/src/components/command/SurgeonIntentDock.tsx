@@ -5,9 +5,9 @@ import { BrainCircuit, Clock3, MessageSquareText, Power, PowerOff, UserRound } f
 
 import { ProviderModelSelect } from "./ProviderModelSelect";
 import {
-  PublicSurgeonGestureStatus,
-  type PublicSurgeonGesture,
-} from "./PublicSurgeonGestureStatus";
+  HandHandoverSignalStatus,
+  type HandHandoverSignal,
+} from "./HandHandoverSignalStatus";
 import type { useDigitalTwinViewModel } from "../../hooks/useDigitalTwinViewModel";
 import type {
   ModelCatalogEntry,
@@ -94,7 +94,7 @@ export function SurgeonIntentDock({
   modelSelection,
   connected,
   actionPending,
-  publicSurgeonGesture,
+  handHandoverSignal,
   onActorEnabledChange,
   onActorModelChange,
   onActorRuntimeAction,
@@ -110,7 +110,7 @@ export function SurgeonIntentDock({
   modelSelection: ModelSelection | null;
   connected: boolean;
   actionPending: string;
-  publicSurgeonGesture: PublicSurgeonGesture;
+  handHandoverSignal: HandHandoverSignal;
   onActorEnabledChange: (enabled: boolean) => void;
   onActorModelChange: (selection: ModelSelection) => void;
   onActorRuntimeAction: (
@@ -132,9 +132,6 @@ export function SurgeonIntentDock({
   const toolLabel = llmDecision.tool ? vm.displayToolName(llmDecision.tool) : vm.ui.none;
   const heldToolLabel = overlay.heldTool ? vm.displayToolName(overlay.heldTool) : vm.ui.none;
   const mayoLabel = overlay.mayoTools.length ? overlay.mayoTools.map(vm.displayToolName).join(", ") : vm.ui.none;
-  const gestureToolLabel = publicSurgeonGesture.requestedTool
-    ? vm.displayToolName(publicSurgeonGesture.requestedTool)
-    : "";
   const nextDwellLabel =
     payload.nextDwellSec === null
       ? vm.ui.none
@@ -259,10 +256,9 @@ export function SurgeonIntentDock({
         </article>
       </div>
 
-      <PublicSurgeonGestureStatus
-        evidence={publicSurgeonGesture}
+      <HandHandoverSignalStatus
+        signal={handHandoverSignal}
         language={language}
-        toolLabel={gestureToolLabel}
       />
 
       <div className="llm-speech-log">

@@ -721,14 +721,18 @@ class MockSkillActionServer(Node):
                 instrument.home_location_type if instrument is not None else "tray_slot"
             )
             return_lifecycle = (
-                getattr(
-                    instrument,
-                    "preposition_origin_lifecycle_stage",
-                    "",
-                )
-                if instrument is not None
-                else ""
-            ) or "returned_home"
+                "mayo_reuse"
+                if "mayo" in f"{return_location_type} {return_location_id}".casefold()
+                else (
+                    getattr(
+                        instrument,
+                        "preposition_origin_lifecycle_stage",
+                        "",
+                    )
+                    if instrument is not None
+                    else ""
+                ) or "returned_home"
+            )
             duration_sec = self._cleaner_to_rack_sec
             self._publish_task_state(
                 goal,

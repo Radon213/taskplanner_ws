@@ -28,7 +28,7 @@ if [[ -z "${TEST}" ]]; then
 fi
 
 ros() {
-  docker compose exec -T taskplanner-runtime bash -lc "source install/setup.bash && $*"
+  docker compose exec -T taskplanner-runtime bash -lc "source install/docker/setup.bash && $*"
 }
 
 log_core() {

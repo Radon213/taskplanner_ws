@@ -24,12 +24,13 @@ DEFAULT_SEED = 3407
 
 TASK_QUOTAS: dict[str, int] = {
     "clinical_observation_interpretation": 99,
-    "request_intent": 63,
     "current_phase": 117,
     "next_physical_tool": 118,
     "tool_presence_at_transfer": 117,
     "tool_presence_pseudo": 60,
 }
+
+FORBIDDEN_VISUAL_HAND_TASKS = {"gesture", "request_intent", "surgeon_intent"}
 
 STRATUM_QUOTAS: dict[str, dict[str, int]] = {
     "current_phase": {
@@ -151,7 +152,7 @@ def assistant_target(row: Mapping[str, Any]) -> dict[str, Any]:
 
 def row_stratum(row: Mapping[str, Any]) -> str:
     task = str(row.get("task_type", ""))
-    if task in {"clinical_observation_interpretation", "request_intent"}:
+    if task == "clinical_observation_interpretation":
         return "all"
     target = assistant_target(row)
     if task == "current_phase":
@@ -210,6 +211,18 @@ def select_balanced_train_rows(
     *,
     seed: int = DEFAULT_SEED,
 ) -> list[dict[str, Any]]:
+    forbidden_tasks = sorted(
+        {
+            str(row.get("task_type", ""))
+            for row in rows
+            if str(row.get("task_type", "")) in FORBIDDEN_VISUAL_HAND_TASKS
+        }
+    )
+    if forbidden_tasks:
+        raise BalanceError(
+            "visual hand tasks are excluded from the hand-free training view: "
+            f"{forbidden_tasks}"
+        )
     source_train = [row for row in rows if split_role(row) == "train"]
     unexpected_tasks = sorted(
         {str(row.get("task_type", "")) for row in source_train} - TASK_QUOTAS.keys()

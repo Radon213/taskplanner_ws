@@ -15,8 +15,8 @@ export const PUBLIC_TOPIC_NAMES = Object.freeze({
 });
 
 export const PUBLIC_CONTRACT = Object.freeze({
-  schemaVersion: "1.1.0",
-  interfaceVersion: "0.3.0",
+  schemaVersion: "1.2.0",
+  interfaceVersion: "0.4.0",
   snapshotStaleAfterMs: 3000,
   cameraStaleAfterMs: 3000,
 });

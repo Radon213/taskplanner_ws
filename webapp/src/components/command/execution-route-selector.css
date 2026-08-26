@@ -1,0 +1,326 @@
+/* Controlled Action/Service route selector for the operating workspace.
+   It uses semantic tokens only and intentionally never exposes endpoint URLs. */
+.execution-route-selector {
+  display: grid;
+  min-width: 0;
+  gap: 8px;
+  margin-top: 8px;
+  padding: 10px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-card);
+  background: color-mix(in srgb, var(--color-surface-raised) 82%, transparent);
+  box-shadow: var(--shadow-card);
+}
+
+.execution-route-selector-header {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.execution-route-selector-header > div {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.execution-route-selector-header > div > span,
+.execution-route-selector-summary dt,
+.execution-route-selector-option small,
+.execution-route-selector-option em,
+.execution-route-selector-feedback {
+  color: var(--color-text-muted);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.25;
+}
+
+.execution-route-selector-header > div > span {
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.execution-route-selector-header > div > strong {
+  color: var(--color-text);
+  font-size: 13px;
+  line-height: 1.2;
+}
+
+.execution-route-selector-header > svg {
+  flex: 0 0 auto;
+  color: var(--color-accent-strong);
+}
+
+.execution-route-selector[data-transition-state="ready"] .execution-route-selector-header > svg {
+  color: var(--color-success);
+}
+
+.execution-route-selector[data-transition-state="failed"] .execution-route-selector-header > svg {
+  color: var(--color-danger);
+}
+
+.execution-route-selector-spinner {
+  animation: execution-route-selector-spin 0.9s linear infinite;
+}
+
+.execution-route-selector-summary {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+  margin: 0;
+}
+
+.execution-route-selector-summary > div {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+  padding: 7px 8px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-inner);
+  background: color-mix(in srgb, var(--color-page-raised) 56%, transparent);
+}
+
+.execution-route-selector-summary dt,
+.execution-route-selector-summary dd {
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.execution-route-selector-summary dd {
+  color: var(--color-text-secondary);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1.25;
+}
+
+.execution-route-selector-options {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.execution-route-selector-operation {
+  display: grid;
+  gap: 6px;
+}
+
+.execution-route-selector-operation-title {
+  color: var(--color-text-secondary);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1.25;
+}
+
+.execution-route-selector-option {
+  display: grid;
+  min-width: 0;
+  min-height: 82px;
+  grid-template-columns: auto minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 4px 7px;
+  padding: 9px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-inner);
+  background: color-mix(in srgb, var(--color-page-raised) 44%, transparent);
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  text-align: start;
+  transition:
+    border-color var(--duration-fast) var(--ease-default),
+    background-color var(--duration-fast) var(--ease-default),
+    color var(--duration-fast) var(--ease-default),
+    transform var(--duration-fast) var(--ease-default);
+}
+
+.execution-route-selector-option > svg {
+  margin-top: 1px;
+  color: var(--color-text-muted);
+}
+
+.execution-route-selector-option > span {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.execution-route-selector-option strong,
+.execution-route-selector-option small,
+.execution-route-selector-option em {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.execution-route-selector-option strong {
+  color: var(--color-text-secondary);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1.2;
+}
+
+.execution-route-selector-option small {
+  font-weight: 600;
+}
+
+.execution-route-selector-option .execution-route-selector-health {
+  color: var(--color-text-muted);
+  font-size: 9px;
+}
+
+.execution-route-selector-option[data-health="ready"] .execution-route-selector-health {
+  color: var(--color-success);
+}
+
+.execution-route-selector-option[data-health="partial"] .execution-route-selector-health {
+  color: var(--color-warning-text);
+}
+
+.execution-route-selector-option em {
+  grid-column: 1 / -1;
+  align-self: end;
+  color: var(--color-text-muted);
+  font-size: 9px;
+  font-style: normal;
+  text-align: start;
+}
+
+.execution-route-selector-option:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--color-accent) 46%, var(--color-border));
+  background: var(--state-hover);
+  transform: translateY(-1px);
+}
+
+.execution-route-selector-option:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+
+.execution-route-selector-option.selected {
+  border-color: color-mix(in srgb, var(--color-accent) 62%, var(--color-border));
+  background: var(--state-selected);
+}
+
+.execution-route-selector-option.selected > svg,
+.execution-route-selector-option.selected strong {
+  color: var(--color-accent-strong);
+}
+
+.execution-route-selector-option[data-readiness="ready"] em {
+  color: var(--color-success);
+}
+
+.execution-route-selector-option[data-readiness="unavailable"] em {
+  color: var(--color-danger-text);
+}
+
+.execution-route-selector-option:disabled {
+  cursor: not-allowed;
+}
+
+.execution-route-selector-option:disabled:not(.selected) {
+  opacity: 0.62;
+}
+
+.execution-route-selector-reset-note,
+.execution-route-selector-lock,
+.execution-route-selector-feedback {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 7px;
+  padding: 8px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-inner);
+  background: color-mix(in srgb, var(--color-page-raised) 46%, transparent);
+}
+
+.execution-route-selector-reset-note {
+  color: var(--color-warning-text);
+}
+
+.execution-route-selector-reset-note > svg {
+  margin-top: 1px;
+  color: var(--color-warning);
+}
+
+.execution-route-selector-reset-note span,
+.execution-route-selector-lock span {
+  color: var(--color-text-secondary);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.35;
+}
+
+.execution-route-selector-lock {
+  border-color: color-mix(in srgb, var(--color-warning) 42%, var(--color-border));
+}
+
+.execution-route-selector-lock > svg {
+  margin-top: 1px;
+  color: var(--color-warning);
+}
+
+.execution-route-selector-feedback {
+  grid-template-columns: minmax(0, 1fr);
+  color: var(--color-text-muted);
+}
+
+.execution-route-selector-feedback.switching,
+.execution-route-selector-feedback.resetting {
+  border-color: color-mix(in srgb, var(--color-accent) 44%, var(--color-border));
+  color: var(--color-accent-strong);
+}
+
+.execution-route-selector-feedback.ready {
+  border-color: color-mix(in srgb, var(--color-success) 44%, var(--color-border));
+  color: var(--color-success-text);
+}
+
+.execution-route-selector-feedback.failed {
+  border-color: color-mix(in srgb, var(--color-danger) 52%, var(--color-border));
+  color: var(--color-danger-text);
+}
+
+@keyframes execution-route-selector-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (max-width: 460px) {
+  .execution-route-selector-options {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .execution-route-selector *,
+  .execution-route-selector-spinner {
+    animation-duration: 0.01ms;
+    animation-iteration-count: 1;
+    transition-duration: 0.01ms;
+  }
+
+  .execution-route-selector-option:hover:not(:disabled) {
+    transform: none;
+  }
+}
+
+.execution-route-selector[data-motion="reduced"] *,
+.execution-route-selector[data-motion="reduced"] .execution-route-selector-spinner {
+  animation-duration: 0.01ms;
+  animation-iteration-count: 1;
+  transition-duration: 0.01ms;
+}
+
+.execution-route-selector[data-motion="reduced"] .execution-route-selector-option:hover:not(:disabled) {
+  transform: none;
+}

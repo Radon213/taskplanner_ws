@@ -289,19 +289,12 @@ class ThyroidectomyTimelineRecorder(Node):
                 msg.observed_confidences,
             )
         )
-        gesture = (
-            str(msg.gesture_event_type),
-            str(msg.gesture_requested_tool),
-            str(msg.gesture_hand_pose),
-            round(float(msg.gesture_confidence), 2),
-        )
         structure = (
             tuple(phase_id for phase_id, _confidence in phase_rows),
             tuple(
                 (tool_id, location_id, location_type)
                 for tool_id, location_id, location_type, _confidence in tool_rows
             ),
-            gesture[:3],
         )
         now = time.monotonic()
         if (
@@ -328,14 +321,6 @@ class ThyroidectomyTimelineRecorder(Node):
                     f"{self._tool_name(tool_id)}@{location_id or location_type} {confidence:.2f}"
                     for tool_id, location_id, location_type, confidence in tool_rows
                 )
-            )
-        if msg.gesture_event_type:
-            gesture_tool = self._tool_name(msg.gesture_requested_tool)
-            parts.append(
-                "제스처="
-                f"{msg.gesture_event_type}"
-                f"{f'/{gesture_tool}' if gesture_tool else ''}"
-                f" {float(msg.gesture_confidence):.2f}"
             )
         summary = _compact_text(msg.summary, 300)
         if summary:

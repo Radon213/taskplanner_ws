@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import ROSLIB from "roslib";
 
 // Keep the bridge expiry and Debug UI's age badge/write lock on one contract.
@@ -10,6 +10,10 @@ const MAX_DEBUG_STATUS_COLLECTION_ITEMS = 512;
 const MAX_DEBUG_STATUS_OBJECT_KEYS = 512;
 const MAX_DEBUG_STATUS_STRING_CHARS = 16 * 1024;
 const MAX_DEBUG_COMMAND_RESULT_JSON_CHARS = 128 * 1024;
+const DEBUG_READ_ONLY_TOPICS_TIMEOUT_MS = 4000;
+const MAX_DEBUG_READ_ONLY_TOPICS = 512;
+const MAX_DEBUG_READ_ONLY_TOPIC_NAME_CHARS = 512;
+const MAX_DEBUG_READ_ONLY_TOPIC_TYPE_CHARS = 256;
 interface RosConnection {
   close: () => void;
   idCounter?: number;
@@ -45,6 +49,24 @@ export type DebugReadOnlyTopicSubscriber = (
   spec: DebugReadOnlyTopicSpec,
   onMessage: (message: unknown) => void,
 ) => () => void;
+
+export interface DebugReadOnlyTopicInfo {
+  name: string;
+  type: string;
+}
+
+/**
+ * Observation-only view of the Debug ROS session.  Consumers can subscribe or
+ * ask for the bounded topic inventory, but cannot publish, invoke arbitrary
+ * services, or access the mutable ROSLIB connection.
+ */
+export interface DebugReadOnlyRosSession {
+  url: string;
+  transportConnected: boolean;
+  subscribeTopic: DebugReadOnlyTopicSubscriber;
+  listTopics: () => Promise<DebugReadOnlyTopicInfo[]>;
+  retry: () => void;
+}
 
 export type DebugSessionState = "MONITOR_ONLY" | "ARMED" | "BUSY" | "FAULT_LOCKED";
 
@@ -142,6 +164,8 @@ export interface DebugRetractionVoiceStatus {
   mode: "buttons_only" | "voice_and_buttons" | (string & {});
   /** Local Debug bookkeeping derived from Service admission, never robot pose. */
   internal_state: string;
+  /** Debug-only override that exposes the full closed Service command set. */
+  state_machine_bypass_enabled?: boolean;
   /** Selected runtime policy; voice mode alone never changes this setting. */
   interpreter_mode?: "deterministic" | "vlm_with_fallback" | (string & {});
   /** A final transcript is being interpreted asynchronously; no Service call yet. */
@@ -296,6 +320,11 @@ export interface DebugAsrStatus {
   last_error: string;
   recording_path: string;
   transcript_path: string;
+  artifacts_enabled?: boolean;
+  recording_active?: boolean;
+  status_received?: boolean;
+  status_age_sec?: number | null;
+  status_fresh?: boolean;
   sample_rate: number;
   channels: number;
   sample_width_bits: number;
@@ -385,6 +414,7 @@ export interface IntegrationDebugStatus {
     session_id: string;
     state: DebugSessionState;
     armed: boolean;
+    manual_control_scope?: "none" | "all" | "tool_handover";
     acknowledged_blocked_nodes?: string[];
     planner_coexistence_active?: boolean;
     fault_locked: boolean;
@@ -400,6 +430,12 @@ export interface IntegrationDebugStatus {
     operational_state?: string | null;
     operational_state_age_sec?: number | null;
     operational_runtime_stopped?: boolean;
+    /** Authoritative admission result for a new ROS write or manual session. */
+    operational_intervention_allowed?: boolean;
+    /** Stable backend explanation when a new intervention is not admissible. */
+    operational_intervention_block_reason?: string;
+    /** Lifecycle-only window retained for an already-admitted Debug command. */
+    operational_control_window_open?: boolean;
     operational_running?: boolean;
     operational_active_robot_task_id?: string;
     operational_robot_state?: string;
@@ -409,6 +445,8 @@ export interface IntegrationDebugStatus {
     operational_state_publisher_trusted?: boolean;
     operational_state_fresh?: boolean;
     manual_control_available?: boolean;
+    /** Selects the backend authority used for manual-control admission. */
+    manual_control_gate?: "operational_state" | "planner_nodes" | (string & {});
     planner_coexistence_allowed?: boolean;
     action_watchdog?: {
       goal_response_timeout_sec: number;
@@ -439,6 +477,8 @@ export interface IntegrationDebugStatus {
   /** Optional while the explicit external/virtual endpoint selector rolls out. */
   virtual_robot?: DebugVirtualRobotStatus;
   asr: DebugAsrStatus;
+  /** Live sidecar ASR observed through the least-privilege Debug gateway. */
+  operational_asr?: DebugAsrStatus;
   surgery_record: DebugSurgeryRecordStatus;
   recent_events: DebugRecentEvent[];
 }
@@ -489,6 +529,14 @@ function hasRequiredDebugStatusShape(value: unknown): value is IntegrationDebugS
     && typeof session.last_error === "string" && typeof session.event_log_path === "string"
     && isRecord(runtime)
     && Array.isArray(runtime.blocked_nodes) && runtime.blocked_nodes.every((node) => typeof node === "string")
+    && (runtime.operational_intervention_allowed === undefined
+      || typeof runtime.operational_intervention_allowed === "boolean")
+    && (runtime.operational_intervention_block_reason === undefined
+      || typeof runtime.operational_intervention_block_reason === "string")
+    && (runtime.operational_control_window_open === undefined
+      || typeof runtime.operational_control_window_open === "boolean")
+    && (runtime.manual_control_gate === undefined
+      || typeof runtime.manual_control_gate === "string")
     && isRecord(network) && Array.isArray(network.addresses)
     && isRecord(action) && typeof action.state === "string"
     && typeof action.progress === "number" && Number.isFinite(action.progress) && action.progress >= 0 && action.progress <= 1
@@ -536,6 +584,33 @@ function parseStatus(raw: unknown): IntegrationDebugStatus | null {
   } catch {
     return null;
   }
+}
+
+function startsOperationalIntervention(
+  operation: string,
+  payload: Record<string, unknown>,
+): boolean {
+  if ([
+    "arm",
+    "asr_start",
+    "publish_once",
+    "publish_voice_command",
+    "retraction_command",
+    "tool_handover",
+    "vlm_load",
+  ].includes(operation)) return true;
+  if ([
+    "configure_output",
+    "configure_retraction_state_machine_bypass",
+    "configure_retraction_voice",
+    "configure_voice",
+  ].includes(operation)) return payload.enabled === true;
+  return false;
+}
+
+function operationalInterventionRejection(status: IntegrationDebugStatus | null): string {
+  const reason = status?.runtime.operational_intervention_block_reason?.trim();
+  return reason || "시나리오를 일시정지하거나 완전히 정지하고 공유 로봇 자원이 idle인지 확인하세요.";
 }
 
 function cleanupDebugTopics(ros: any, topics: any[], advertisedTopic: any): void {
@@ -613,7 +688,9 @@ export function useIntegrationDebugBridge(url: string) {
   const commandReadyGenerationRef = useRef(0);
   const statusReceivedAtRef = useRef(0);
   const statusStampSecRef = useRef<number | null>(null);
+  const statusRef = useRef<IntegrationDebugStatus | null>(null);
   const pendingCommandCancelsRef = useRef(new Set<(reason: string) => void>());
+  const pendingReadOnlyCancelsRef = useRef(new Set<(reason: string) => void>());
   const [transportConnected, setTransportConnected] = useState(false);
   const [connected, setConnected] = useState(false);
   const [status, setStatus] = useState<IntegrationDebugStatus | null>(null);
@@ -631,8 +708,12 @@ export function useIntegrationDebugBridge(url: string) {
     commandReadyGenerationRef.current = 0;
     statusReceivedAtRef.current = 0;
     statusStampSecRef.current = null;
+    statusRef.current = null;
     for (const cancel of Array.from(pendingCommandCancelsRef.current)) {
       cancel("디버그 ROSBridge 연결이 변경되어 대기 중인 명령을 취소했습니다.");
+    }
+    for (const cancel of Array.from(pendingReadOnlyCancelsRef.current)) {
+      cancel("디버그 ROSBridge 연결이 변경되어 토픽 조회를 취소했습니다.");
     }
     setTransportConnected(false);
     setConnected(false);
@@ -692,6 +773,9 @@ export function useIntegrationDebugBridge(url: string) {
       if (!isCurrentGeneration()) return;
       setTransportConnected(false);
       invalidateCommandReadiness("디버그 ROSBridge 오류로 대기 중인 명령을 취소했습니다.");
+      for (const cancel of Array.from(pendingReadOnlyCancelsRef.current)) {
+        cancel("디버그 ROSBridge 오류로 토픽 조회를 취소했습니다.");
+      }
       setConnectionError(error instanceof Error ? error.message : "ROSBridge 연결에 실패했습니다.");
       scheduleReconnect();
     });
@@ -699,6 +783,9 @@ export function useIntegrationDebugBridge(url: string) {
       if (!isCurrentGeneration()) return;
       setTransportConnected(false);
       invalidateCommandReadiness("디버그 ROSBridge 연결이 종료되어 대기 중인 명령을 취소했습니다.");
+      for (const cancel of Array.from(pendingReadOnlyCancelsRef.current)) {
+        cancel("디버그 ROSBridge 연결이 종료되어 토픽 조회를 취소했습니다.");
+      }
       setConnectionError("ROSBridge 연결이 종료되었습니다.");
       scheduleReconnect();
     });
@@ -733,6 +820,7 @@ export function useIntegrationDebugBridge(url: string) {
       }
       statusStampSecRef.current = parsed.stamp_sec;
       statusReceivedAtRef.current = receivedAt;
+      statusRef.current = parsed;
       commandReadyGenerationRef.current = generation;
       setStatus(parsed);
       setStatusReceivedAt(receivedAt);
@@ -775,10 +863,14 @@ export function useIntegrationDebugBridge(url: string) {
         commandReadyGenerationRef.current = 0;
         statusReceivedAtRef.current = 0;
         statusStampSecRef.current = null;
+        statusRef.current = null;
         setTransportConnected(false);
         setConnected(false);
         for (const cancel of Array.from(pendingCommandCancelsRef.current)) {
           cancel("디버그 ROSBridge 연결이 변경되어 대기 중인 명령을 취소했습니다.");
+        }
+        for (const cancel of Array.from(pendingReadOnlyCancelsRef.current)) {
+          cancel("디버그 ROSBridge 연결이 변경되어 토픽 조회를 취소했습니다.");
         }
       }
       cleanupDebugTopics(
@@ -811,6 +903,13 @@ export function useIntegrationDebugBridge(url: string) {
         pendingCommandCancelsRef.current.size > 0
       ) {
         throw new Error("디버그 제어가 잠겼습니다.");
+      }
+      const currentStatus = statusRef.current;
+      if (
+        startsOperationalIntervention(operation, payload)
+        && currentStatus?.runtime.operational_intervention_allowed !== true
+      ) {
+        throw new Error(`시나리오 개입이 잠겼습니다: ${operationalInterventionRejection(currentStatus)}`);
       }
       return new Promise<DebugCommandResponse>((resolve, reject) => {
         let settled = false;
@@ -956,10 +1055,92 @@ export function useIntegrationDebugBridge(url: string) {
     };
   }, [connectionNonce, transportConnected]);
 
+  const listReadOnlyTopics = useCallback((): Promise<DebugReadOnlyTopicInfo[]> => {
+    const ros = rosRef.current;
+    const generation = bridgeGenerationRef.current;
+    if (!ros?.isConnected) {
+      return Promise.reject(new Error("디버그 ROSBridge가 연결되지 않아 토픽을 조회할 수 없습니다."));
+    }
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      let timeout = 0;
+      const serviceCallId = `call_service:/rosapi/topics:${Number(ros.idCounter ?? 0) + 1}`;
+      ros.idCounter = Number(ros.idCounter ?? 0) + 1;
+      const cleanup = (handler: (message: unknown) => void) => {
+        window.clearTimeout(timeout);
+        pendingReadOnlyCancelsRef.current.delete(cancel);
+        if (typeof ros.off === "function") ros.off(serviceCallId, handler);
+        else if (typeof ros.removeListener === "function") ros.removeListener(serviceCallId, handler);
+      };
+      let cancel = (_reason: string) => {};
+      const handler = (message: unknown) => {
+        if (
+          rosRef.current !== ros
+          || bridgeGenerationRef.current !== generation
+          || !ros.isConnected
+        ) {
+          cancel("디버그 ROSBridge 연결이 변경되어 이전 토픽 조회 응답을 무시했습니다.");
+          return;
+        }
+        if (settled) return;
+        settled = true;
+        cleanup(handler);
+        const response = message && typeof message === "object"
+          ? message as { result?: unknown; values?: unknown }
+          : {};
+        if (response.result !== true || !response.values || typeof response.values !== "object" || Array.isArray(response.values)) {
+          reject(new Error("디버그 토픽 조회 응답 형식이 유효하지 않습니다."));
+          return;
+        }
+        const raw = response.values as { topics?: unknown; types?: unknown };
+        const names = Array.isArray(raw.topics) ? raw.topics.slice(0, MAX_DEBUG_READ_ONLY_TOPICS) : [];
+        const types = Array.isArray(raw.types) ? raw.types : [];
+        resolve(names.flatMap((name, index): DebugReadOnlyTopicInfo[] => {
+          if (typeof name !== "string" || !name.startsWith("/") || name.length > MAX_DEBUG_READ_ONLY_TOPIC_NAME_CHARS) return [];
+          const type = types[index];
+          if (typeof type !== "string" || type.length > MAX_DEBUG_READ_ONLY_TOPIC_TYPE_CHARS) return [];
+          return [{ name, type }];
+        }));
+      };
+      cancel = (reason: string) => {
+        if (settled) return;
+        settled = true;
+        cleanup(handler);
+        reject(new Error(reason));
+      };
+      pendingReadOnlyCancelsRef.current.add(cancel);
+      timeout = window.setTimeout(
+        () => cancel("디버그 토픽 조회 응답 시간이 초과되었습니다."),
+        DEBUG_READ_ONLY_TOPICS_TIMEOUT_MS,
+      );
+      ros.on(serviceCallId, handler);
+      try {
+        ros.callOnConnection({
+          op: "call_service",
+          id: serviceCallId,
+          service: "/rosapi/topics",
+          type: "rosapi_msgs/srv/Topics",
+          args: new ROSLIB.ServiceRequest({}),
+          timeout: DEBUG_READ_ONLY_TOPICS_TIMEOUT_MS / 1000,
+        });
+      } catch (error) {
+        cancel(error instanceof Error ? error.message : String(error));
+      }
+    });
+  }, [connectionNonce, transportConnected]);
+
   const retry = useCallback(() => {
     setReconnecting(true);
     setConnectionNonce((value) => value + 1);
   }, []);
+
+  const readOnlySession = useMemo<DebugReadOnlyRosSession>(() => ({
+    url,
+    transportConnected,
+    subscribeTopic: subscribeReadOnlyTopic,
+    listTopics: listReadOnlyTopics,
+    retry,
+  }), [listReadOnlyTopics, retry, subscribeReadOnlyTopic, transportConnected, url]);
 
   return {
     url,
@@ -971,6 +1152,7 @@ export function useIntegrationDebugBridge(url: string) {
     readiness,
     statusReceivedAt,
     subscribeReadOnlyTopic,
+    readOnlySession,
     command,
     retry,
   };

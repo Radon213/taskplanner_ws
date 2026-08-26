@@ -9,6 +9,7 @@ from launch.actions import DeclareLaunchArgument, ExecuteProcess, Shutdown
 from launch.conditions import IfCondition
 from launch_ros.actions import Node
 from launch_ros.utilities import evaluate_parameters
+import yaml
 
 
 def _load_launch_module():
@@ -157,6 +158,35 @@ def test_debug_retractor_vlm_api_key_may_inherit_shared_secret(monkeypatch) -> N
     assert context.launch_configurations[argument.name] == "test-key"
 
 
+def test_debug_demo_bundles_default_to_retraction_software_admission_bypass(
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv(
+        "RETRACTION_STATE_MACHINE_BYPASS_DEFAULT_BUNDLES", raising=False
+    )
+    entities = list(_load_launch_description().entities)
+    context = LaunchContext()
+    argument = next(
+        entity
+        for entity in entities
+        if isinstance(entity, DeclareLaunchArgument)
+        and entity.name == "retraction_state_machine_bypass_default_bundles"
+    )
+    argument.execute(context)
+
+    assert context.launch_configurations[argument.name] == (
+        "thyroidectomy_demo,inguinal_hernia_repair_demo"
+    )
+
+    config_path = (
+        Path(__file__).resolve().parents[1] / "config" / "integration_debug.yaml"
+    )
+    payload = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert payload["voice"][
+        "retraction_state_machine_bypass_default_bundles"
+    ] == ["thyroidectomy_demo", "inguinal_hernia_repair_demo"]
+
+
 def test_debug_launch_uses_admitted_speech_path_and_isolated_virtual_robot() -> None:
     entities = list(_load_launch_description().entities)
     nodes = {
@@ -169,12 +199,24 @@ def test_debug_launch_uses_admitted_speech_path_and_isolated_virtual_robot() -> 
     assert getattr(speech, "_Node__package") == "simulation_runtime"
     assert getattr(speech, "_Node__node_executable") == "speech_input_adapter"
     assert _shutdown_reason(speech) == "debug speech input adapter stopped"
+    parameters = evaluate_parameters(LaunchContext(), speech._Node__parameters)[0]
+    assert parameters["status_topic"] == "/integration/debug/speech/status"
 
     virtual = nodes["integration_debug_virtual_robot"]
     assert getattr(virtual, "_Node__package") == "surgical_interop_execution"
     assert getattr(virtual, "_Node__node_executable") == "fault_action_emulator"
     assert isinstance(virtual.condition, IfCondition)
     assert _shutdown_reason(virtual) == "integration debug virtual robot stopped"
+
+
+def test_virtual_tool_handover_stays_visible_long_enough_to_monitor() -> None:
+    profile_path = (
+        Path(__file__).resolve().parents[1] / "config" / "virtual_robot.yaml"
+    )
+    payload = yaml.safe_load(profile_path.read_text(encoding="utf-8"))
+
+    duration_sec = payload["routes"]["tool_handover"]["default"]["duration_sec"]
+    assert duration_sec >= 3.0
 
 
 def test_debug_launch_defaults_to_external_source_with_virtual_available() -> None:
@@ -214,7 +256,7 @@ def test_debug_pnu_bridge_is_disabled_unless_the_profile_explicitly_enables_it(
     assert module._launch_debug_pnu_bridge(context) == []
 
 
-def test_debug_pnu_bridge_uses_live_cam4_rgbd_and_all_pinned_models(
+def test_debug_pnu_bridge_uses_live_cam4_rgbd_and_pinned_tool_blood_models(
     monkeypatch,
 ) -> None:
     configured = {
@@ -222,11 +264,10 @@ def test_debug_pnu_bridge_uses_live_cam4_rgbd_and_all_pinned_models(
         "PERCEPTION_PROVIDER": "pnu_hand_blood",
         "PERCEPTION_LOCATION": "local",
         "PERCEPTION_ENDPOINT": "http://127.0.0.1:8020",
-        "PNU_DEBUG_REQUESTED_ALGORITHMS": "tool,blood,hand",
+        "PNU_DEBUG_REQUESTED_ALGORITHMS": "tool,blood",
         "PNU_EXPECTED_MODEL_DIGESTS_JSON": (
             '{"tool":"253617aa5337fec219d694ca50537e4867fb8c403ce60f3a6945bbe15fecf430",'
-            '"blood":"f4967b2b8c7ab63921f8aa9b2ea0a4e3324243a9b98253da3ea4b9ecd6df6f75",'
-            '"hand":"fbc2a30080c3c557093b5ddfc334698132eb341044ccee322ccf8bcf3607cde1"}'
+            '"blood":"f4967b2b8c7ab63921f8aa9b2ea0a4e3324243a9b98253da3ea4b9ecd6df6f75"}'
         ),
         "PNU_DEPTH_SCALE_M_PER_UNIT": "0.001",
         "PNU_DEPTH_SCALE_VALIDATED": "true",
@@ -251,7 +292,7 @@ def test_debug_pnu_bridge_uses_live_cam4_rgbd_and_all_pinned_models(
     assert _shutdown_reason(node) == "debug PNU perception bridge stopped"
     parameters = evaluate_parameters(context, node._Node__parameters)[0]
     assert parameters["service_url"] == "http://127.0.0.1:8020"
-    assert parameters["requested_algorithms"] == ("tool", "blood", "hand")
+    assert parameters["requested_algorithms"] == ("tool", "blood")
     assert parameters["rgb_input_topic"] == (
         "/synced/cam_4/color/image_raw/compressed"
     )
@@ -272,8 +313,7 @@ def test_debug_pnu_bridge_uses_live_cam4_rgbd_and_all_pinned_models(
     )
     assert parameters["expected_model_digests_json"] == (
         '{"tool":"253617aa5337fec219d694ca50537e4867fb8c403ce60f3a6945bbe15fecf430",'
-        '"blood":"f4967b2b8c7ab63921f8aa9b2ea0a4e3324243a9b98253da3ea4b9ecd6df6f75",'
-        '"hand":"fbc2a30080c3c557093b5ddfc334698132eb341044ccee322ccf8bcf3607cde1"}'
+        '"blood":"f4967b2b8c7ab63921f8aa9b2ea0a4e3324243a9b98253da3ea4b9ecd6df6f75"}'
     )
     assert parameters["depth_scale_m_per_unit"] == 0.001
     assert parameters["depth_scale_validated"] is True
@@ -292,7 +332,7 @@ def test_debug_pnu_remote_placement_uses_endpoint_and_token_without_local_fallba
         "PERCEPTION_LOCATION": "remote",
         "PERCEPTION_ENDPOINT": "https://192.168.1.20:8020",
         "PNU_CLIENT_API_TOKEN_FILE": "/run/taskplanner/perception/token",
-        "PNU_DEBUG_REQUESTED_ALGORITHMS": "tool,blood,hand",
+        "PNU_DEBUG_REQUESTED_ALGORITHMS": "tool,blood",
     }
     for name, value in configured.items():
         monkeypatch.setenv(name, value)

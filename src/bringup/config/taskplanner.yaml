@@ -32,6 +32,7 @@ bt_decision_bridge:
 
 tree_executor:
   ros__parameters:
+    # auto_apms interprets this as the interval in seconds: 0.1 s = 10 Hz.
     tick_rate: 0.1
     groot2_port: 0
     state_change_logger: true

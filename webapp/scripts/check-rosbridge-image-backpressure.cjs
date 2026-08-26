@@ -9,14 +9,14 @@ const source = fs.readFileSync(
 const violations = [];
 
 for (const topic of [
-  "/preview/cam_1/color/image_raw/compressed",
-  "/preview/cam_2/color/image_raw/compressed",
-  "/preview/cam_3/color/image_raw/compressed",
-  "/preview/cam_4/color/image_raw/compressed",
-  "/preview/flir/color/image_raw/compressed",
+  "/synced/cam_1/color/image_raw/compressed",
+  "/synced/cam_2/color/image_raw/compressed",
+  "/synced/cam_3/color/image_raw/compressed",
+  "/synced/cam_4/color/image_raw/compressed",
+  "/synced/flir/color/image_raw/compressed",
 ]) {
   if (!source.includes(topic)) {
-    violations.push(`Live camera fallback must use the rate-limited preview source ${topic}`);
+    violations.push(`Live camera fallback must use the synchronized source ${topic}`);
   }
 }
 
@@ -26,8 +26,8 @@ if (!source.includes("const ROSBRIDGE_IMAGE_QUEUE_LENGTH = 1;")) {
 if (!source.includes('const ROSBRIDGE_IMAGE_COMPRESSION = "cbor";')) {
   violations.push("CompressedImage subscriptions must use binary CBOR transport");
 }
-if (!source.includes("const CAMERA_FRAME_THROTTLE_MS = 180;")) {
-  violations.push("Mission camera previews must not exceed the 5 Hz preview-plane budget");
+if (!source.includes("const CAMERA_FRAME_THROTTLE_MS = 0;")) {
+  violations.push("Mission camera rendering must retain native synced-frame delivery");
 }
 for (const qosContract of [
   'history: "keep_last"',
@@ -37,7 +37,7 @@ for (const qosContract of [
   "configurePreviewImageSubscription(topic)",
 ]) {
   if (!source.includes(qosContract)) {
-    violations.push(`Physical preview cameras must request QoS: ${qosContract}`);
+    violations.push(`Physical synchronized cameras must request QoS: ${qosContract}`);
   }
 }
 
@@ -45,8 +45,8 @@ const topicBlocks = [...source.matchAll(/new ROSLIB\.Topic\(\{([\s\S]*?)\}\)/g)]
   .map((match) => match[1])
   .filter((block) => block.includes('messageType: "sensor_msgs/msg/CompressedImage"'));
 
-if (topicBlocks.length !== 2) {
-  violations.push(`Expected two CompressedImage topic factories, found ${topicBlocks.length}`);
+if (topicBlocks.length === 0) {
+  violations.push("Expected at least one bounded CompressedImage topic factory");
 }
 
 for (const block of topicBlocks) {

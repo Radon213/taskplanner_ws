@@ -103,7 +103,7 @@ test("opens the pixel-isolated monitor and preserves browser history without a r
   await page.goto("/");
   await expect(page.locator('[data-slot="mission-workspace"]')).toBeVisible();
 
-  await page.getByRole("button", { name: "수술 관제" }).click();
+  await page.getByRole("button", { name: "수술 관제", exact: true }).click();
   await expect(page).toHaveURL(/\?workspace=monitor$/);
   await expect(page.locator('[data-slot="surgimate-monitor-workspace"]')).toHaveAttribute("data-state", "ready");
 
@@ -173,6 +173,15 @@ test("standalone SurgiMate monitor passes WCAG AA", async ({ page }, testInfo) =
   await installShellStubs(page);
   await page.goto("/monitor/index.html?mode=dummy");
   await expect(page.locator(".connection")).toHaveAttribute("data-state", "dummy");
+  const unavailableVoiceMeter = page.locator(".voice-meter");
+  await expect(unavailableVoiceMeter).toHaveAttribute("aria-valuemin", "-60");
+  await expect(unavailableVoiceMeter).toHaveAttribute("aria-valuemax", "0");
+  await expect(unavailableVoiceMeter).toHaveAttribute("aria-valuenow", "-60");
+  await expect(unavailableVoiceMeter).toHaveAttribute(
+    "aria-valuetext",
+    "마이크 입력 레벨을 사용할 수 없음",
+  );
+  await expect(page.locator(".voice-db")).toHaveText("사용할 수 없음");
   const result = await new AxeBuilder({ page })
     .withTags(["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"])
     .analyze();
@@ -334,11 +343,13 @@ test("the live monitor emits only allowlisted subscribe and unsubscribe operatio
 test("offers Mission recovery when the lazy monitor chunk fails", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "fhd", "One viewport is enough for the lazy-load recovery check.");
   await installShellStubs(page);
-  await page.route("**/src/components/monitor/SurgiMateMonitorWorkspace.tsx*", (route) =>
-    route.abort("failed"));
+  await page.route(
+    /(?:src\/components\/monitor\/SurgiMateMonitorWorkspace\.tsx|assets\/SurgiMateMonitorWorkspace-[^/]+\.js)(?:\?.*)?$/,
+    (route) => route.abort("failed"),
+  );
 
   await page.goto("/");
-  await page.getByRole("button", { name: "수술 관제" }).click();
+  await page.getByRole("button", { name: "수술 관제", exact: true }).click();
   await expect(page.getByRole("alert")).toContainText("수술 관제 화면을 불러오지 못했습니다.");
   await page.getByRole("button", { name: "미션 화면" }).click();
   await expect(page.locator('[data-slot="mission-workspace"]')).toBeVisible();

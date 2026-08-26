@@ -390,9 +390,11 @@ class SurgeonActorNode(Node):
             if candidate and candidate != current_phase:
                 if not self._spec.is_transition_allowed(current_phase, candidate):
                     return ""
-                if bool(self._phase_hint.uncertain) or float(self._phase_hint.confidence) < float(
-                    guard.min_confidence_to_switch
-                ):
+                # Phase uncertainty is observation metadata only.  Keep the
+                # estimator's confidence threshold as the phase-transition
+                # quality boundary, but never turn the compatibility field
+                # itself into an execution gate.
+                if float(self._phase_hint.confidence) < float(guard.min_confidence_to_switch):
                     return ""
                 return candidate
 

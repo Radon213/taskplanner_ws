@@ -12,6 +12,7 @@
   <exec_depend>btops_gateway</exec_depend>
   <exec_depend>btops_interfaces</exec_depend>
   <exec_depend>bt_orchestrator</exec_depend>
+  <exec_depend>hand_keypoint_interfaces</exec_depend>
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
   <exec_depend>or_digital_twin</exec_depend>

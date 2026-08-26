@@ -7,8 +7,12 @@ id: thyroidectomy_demo_prompt_v4
 
 procedure:
   id: "thyroidectomy_demo"
-  name: "Open Thyroidectomy Demonstration"
+  name: "Thyroidectomy"
   ko: "갑상선절제술(시연)"
+  target_site: "Right Lobectomy"
+  target_site_ko: "Right Lobectomy"
+  approach: "Open"
+  approach_ko: "Open"
   default_phase_id: "P03"
   scope: >
     Cross-case open-thyroidectomy demonstration protocol. Detailed runtime
@@ -81,26 +85,78 @@ phase_labels_ko:
   interrupt: {}
 
 tools:
-  T01: "#15 Scalpel"
   T02: "Adson forceps"
   T03: "Allis clamp forceps"
   T04: "Bovie surgical cautery"
-  T05: "Army navy retractor"
   T07: "Bipolar cautery"
-  T08: "Mosquito forceps"
-  T11: "Thyroid retractor (Middeldorpf)"
 
-# Physical tray inventory confirmed from the demonstration setup. Clinical
-# suction remains a surgical cue and is not represented as a bed-robot command.
+# Procedure-local ASR variants remain editable data. They augment canonical
+# names only; the voice catalog still removes aliases shared by multiple tools.
+tool_voice_aliases:
+  T02: ["아드손", "애드손", "에드슨", "에드손"]
+
+# Single owner for home-rack order and per-instance starting placement. The
+# Digital Twin, generated observations and Web stage all consume this result.
+tool_placement:
+  rack_order: [T02, T03, T04, T07]
+  initial_states:
+    - instrument_id: T02
+      instance_id: T02#1
+      location_id: main_tray_slot_1
+      lifecycle_stage: home_rack
+      confidence: 1.0
+    - instrument_id: T03
+      instance_id: T03#1
+      location_id: field_region_procedure
+      lifecycle_stage: surgeon_owned
+      confidence: 1.0
+    - instrument_id: T03
+      instance_id: T03#2
+      location_id: field_region_procedure
+      lifecycle_stage: surgeon_owned
+      confidence: 1.0
+
+# Physical rack inventory confirmed from the demonstration setup. Army-Navy and
+# thyroid retractors are controller-owned bed-arm end-effectors, not rack tools
+# or surgeon/humanoid handover candidates. Clinical suction remains a surgical
+# cue and is not represented as a bed-robot command.
 tool_inventory:
-  T01: 1
-  T02: 2
+  T02: 1
   T03: 2
   T04: 1
-  T05: 2
   T07: 1
-  T08: 1
-  T11: 2
+
+# Scenario choices are editable here and are not physical-safety interlocks.
+# Exact EIR-NUC reviewed handover capability set. Both T03 instances are
+# already surgeon-owned in the field and may not be synthesized as a
+# humanoid/external robot handover request.
+scenario_policy:
+  requestable_tools: [T02, T04, T07]
+  handover_arm: right
+  recovery_arm: left
+  require_cleaning_after_surgeon_use: true
+  allow_anticipatory_hold: true
+  voice_override_preempts_preposition: true
+  allow_prepositioning_when_uncertain: false
+  explicit_request_priority: true
+  unused_preposition_destination: mayo
+  # Runtime lane selection is scenario configuration, not motion authority.
+  # External endpoint, Service admission, stopped-route, freshness, and
+  # idempotency checks remain fail-closed in their owning components.
+  runtime_requirements:
+    procedure_type: thyroidectomy
+    tool_handover_action_required: true
+    retraction_service_required: true
+    bed_robot_status_required: false
+    image_vlm_enabled: true
+    dialogue_vlm_enabled: true
+    perception_enabled: true
+    rfdetr_tool_observations_required: true
+    voice_intent_resolver_enabled: true
+    surgeon_actor_enabled: true
+    phase_inference_enabled: true
+    retraction_workflow_state_enforced: false
+    legacy_raw_retractor_voice_enabled: false
 
 # Common request-order priors for anticipatory preparation. These paths carry
 # no case id or timestamp and are never sufficient to authorize a handover.
@@ -109,25 +165,11 @@ tool_inventory:
 # validated requests, inventory, and BT guards remain authoritative.
 handover_patterns:
   primary:
-    - [T02, T02, T04, T07, T04, T05, T05, T02, T07, T08, T07, T04]
+    - [T02, T02, T04, T07, T04, T02, T07, T07, T04]
   alternatives:
-    - [T04, T02, T05]
-    - [T02, T08, T07, T04]
-    - [T05, T05, T02, T02, T07]
-
-# The demonstration begins inside an already-open field. Both Allis instances
-# are already deployed and in active surgeon use rather than waiting on the rack.
-initial_instrument_states:
-  - instrument_id: T03
-    instance_id: T03#1
-    location_id: field_region_procedure
-    lifecycle_stage: surgeon_owned
-    confidence: 1.0
-  - instrument_id: T03
-    instance_id: T03#2
-    location_id: field_region_procedure
-    lifecycle_stage: surgeon_owned
-    confidence: 1.0
+    - [T04, T02]
+    - [T02, T07, T04]
+    - [T02, T02, T07]
 
 bed_robot_arm_groups:
   direction_enum: [UP, DOWN, LEFT, RIGHT, LEFT_RIGHT, UP_DOWN]
@@ -141,9 +183,26 @@ bed_robot_arm_groups:
   groups:
     retraction:
       enabled: true
+      # This controller-owned profile is already mounted before the demo. The
+      # fixed Army-Navy and thyroid retractors are deliberately absent from
+      # tools/tool_inventory and are never rack-handover candidates.
       initial_end_effector_profile: thyroid_retractor
-      allowed_operations: [change_end_effector]
+      # The reviewed Service owns teaching/retraction and its parameterless,
+      # controller-preconfigured CHANGE_TOOL operation.  No arm/profile
+      # identity is invented by Taskplanner.
+      allowed_operations: [retraction]
+      allowed_voice_commands:
+        - start_direct_teach
+        - finish_direct_teach
+        - start_retraction
+        - adjust_retraction
+        - change_tool
+        - stop_retraction
+      # change_tool is dispatched as the controller-preconfigured V1 Service
+      # command.  Identity-bearing mount transitions remain absent below.
   cues: []
+  # Empty by audit: the pre-mounted profile is not an authorization to mount
+  # another tool during this demonstration.
   end_effector_transitions: []
 
 phase_flow:
@@ -166,8 +225,8 @@ phase_flow:
       to: "P04"
       transition_cues:
         anatomy: "fixed lateral retraction creates a persistently wider and deeper field"
-        action: "a retractor becomes seated at the wound edge and the changed field geometry persists"
-        tool_cue: "T05 is common, but any visibly equivalent fixed retractor can support this transition"
+        action: "a controller-owned bed-arm retractor is seated at the wound edge and the changed field geometry persists"
+        tool_cue: "persistent bed-arm retraction, not a rack handover, can support this transition"
 
     - from: "P04"
       to: "P05"
@@ -181,7 +240,7 @@ phase_flow:
       transition_cues:
         anatomy: "a small focal tissue point is isolated under stable exposure"
         action: "persistent localized clamp or equivalent control replaces broad target manipulation"
-        tool_cue: "T08 is common, while T03 or an equivalent control may substitute; T07/T04 can follow in either order or after a delay"
+        tool_cue: "T03 or an equivalent control may isolate the focal point; T07/T04 can follow in either order or after a delay"
 
     - from: "P06"
       to: "P07"
@@ -239,7 +298,6 @@ phase_details:
       entry_handover: [T02]
       tissue_handling: [T02, T03]
       dissection_or_hemostasis: [T04, T07]
-      upcoming_fixed_retraction: [T05, T11]
     expected_tool_sequence:
       - current: "T02"
         next: "T02"
@@ -257,22 +315,6 @@ phase_details:
         next: "T04"
         strength: "high"
         cue: "broader dissection commonly resumes after focal bipolar control"
-      - current: "T04"
-        next: "T05"
-        strength: "high"
-        cue: "fixed retraction is commonly prepared as the central field becomes ready for sustained exposure"
-      - current: "T05"
-        next: "T05"
-        strength: "high"
-        cue: "a second fixed retractor commonly completes balanced exposure when another instance is available"
-      - current: "T02"
-        next: "T05"
-        strength: "medium"
-        cue: "fixed retraction may follow renewed tissue handling when the field is already sufficiently dissected"
-      - current: "T04"
-        next: "T11"
-        strength: "medium"
-        cue: "a visibly equivalent thyroid retractor may substitute for the fixed-retraction setup"
       - current: "T02"
         next: "T07"
         strength: "medium"
@@ -280,7 +322,7 @@ phase_details:
       - current: "T04"
         next: "T02"
         strength: "high"
-        cue: "fine handling may resume before fixed retraction"
+        cue: "fine handling may resume while controller-owned fixed retraction is prepared"
       - current: "T04"
         next: "T04"
         strength: "medium"
@@ -292,39 +334,22 @@ phase_details:
 
   P04:
     visual_cues:
-      - "a fixed retractor is seated at the wound edge and persistently changes field geometry"
+      - "a controller-owned bed-arm retractor is seated at the wound edge and persistently changes field geometry"
       - "exposure establishment is dominant; sustained direct target manipulation has not yet begun"
     exclusion_cues:
-      - "a retractor is only approaching, rotating, or being handed over"
+      - "a bed-arm retractor is only approaching or rotating and has not yet established stable exposure"
       - "stable exposure is already followed by sustained central target manipulation"
     tool_roles:
-      fixed_retraction: [T05, T11]
       subsequent_target_handling: [T02, T03]
     expected_tool_sequence:
-      - current: "T05"
-        next: "T05"
-        strength: "high"
-        cue: "a second fixed retractor is common but not required"
-      - current: "T05"
-        next: "T02"
-        strength: "high"
-        cue: "fine target handling may follow once exposure is stable"
       - current: "T02"
         next: "T02"
         strength: "medium"
         cue: "a second fine forceps may reinforce traction after fixed exposure"
-      - current: "T05"
-        next: "T03"
-        strength: "medium"
-        cue: "Allis can substitute when firmer target handling is needed"
-      - current: "T11"
-        next: "T02"
-        strength: "medium"
-        cue: "fine target handling may follow an equivalent fixed thyroid retractor"
 
   P05:
     visual_cues:
-      - "fixed retraction remains stable while an exposed central target is directly manipulated"
+      - "controller-owned bed-arm retraction remains stable while an exposed central target is directly manipulated"
       - "broad or fine target grasping persists, without a clearly isolated small focal control state"
     exclusion_cues:
       - "the tool is only entering or aligning after a handover"
@@ -332,28 +357,20 @@ phase_details:
     tool_roles:
       target_grasp_or_traction: [T02, T03]
       optional_dissection_energy: [T04, T07]
-      possible_focal_control_preparation: [T08]
+      possible_focal_control_preparation: [T03]
     expected_tool_sequence:
       - current: "T02"
         next: "T07"
         strength: "high"
         cue: "focal bipolar treatment commonly follows target traction before clamp placement"
       - current: "T07"
-        next: "T08"
+        next: "T03"
         strength: "high"
-        cue: "a small focal point commonly becomes ready for clamp control after bipolar work"
-      - current: "T02"
-        next: "T08"
-        strength: "medium"
-        cue: "Mosquito can follow directly when a small focal point is already isolated"
+        cue: "a small focal point may become ready for Allis control after bipolar work"
       - current: "T02"
         next: "T03"
         strength: "medium"
-        cue: "Allis is an alternative for firmer target manipulation"
-      - current: "T03"
-        next: "T08"
-        strength: "medium"
-        cue: "focal control may follow firmer target exposure"
+        cue: "Allis can provide firmer control when a small focal point is isolated"
       - current: "T02"
         next: "T04"
         strength: "medium"
@@ -371,21 +388,13 @@ phase_details:
       - "an energy tool is merely exchanged or used without a visible focal-control state"
       - "broad Allis traction or ordinary target manipulation is present without focal isolation"
     tool_roles:
-      focal_control: [T08, T03]
+      focal_control: [T03]
       localized_treatment_alternatives: [T07, T04]
     expected_tool_sequence:
-      - current: "T08"
-        next: "T07"
-        strength: "high"
-        cue: "bipolar is one treatment option for the controlled point"
       - current: "T07"
         next: "T04"
         strength: "high"
         cue: "broader treatment commonly follows precise energy when further division is needed"
-      - current: "T08"
-        next: "T04"
-        strength: "medium"
-        cue: "Bovie is an alternative treatment option and may occur without prior bipolar"
       - current: "T03"
         next: "T07"
         strength: "medium"
@@ -428,6 +437,6 @@ phase_details:
   P10:
     visual_cues:
       - "the wound is closed or active demonstration work has stopped"
-      - "instruments and retractors are returned without a new operative handover"
+      - "rack instruments are returned and bed-arm retraction is released without a new operative handover"
       - "this is a workflow completion state, not an independent clinical resection step"
     expected_tool_sequence: []

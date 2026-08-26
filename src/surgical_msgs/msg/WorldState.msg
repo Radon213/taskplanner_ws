@@ -1,5 +1,8 @@
 builtin_interfaces/Time stamp
 string procedure_id
+# Opaque ID for one accepted start-to-terminal runtime interval. It changes on
+# every new start, including a restart of the same procedure bundle.
+string procedure_run_id
 bool running
 string execution_state
 string filtered_phase
@@ -33,6 +36,8 @@ bool surgeon_request_additional_instance_assumed
 bool explicit_request_voice_backed
 bool surgeon_ready_for_handover
 bool surgeon_ready_for_retrieval
+# Direct CAM4 hand-signal evidence. Despite the compatibility-era field name,
+# this is not populated by VLM output and never carries a tool selection.
 bool implicit_request_visible
 string implicit_request_tool
 string implicit_request_hand_pose

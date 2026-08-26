@@ -63,7 +63,8 @@ def test_start_reset_start_edges_mutate_once_and_each_reset_is_applied() -> None
     )
     node._last_lifecycle_control_signature = None
     node._pending_bed_robot_arm_group_requests = {}
-    node._clear_vlm_implicit_request_state = lambda: None
+    node._recent_voice_intent_ids = {}
+    node._reset_hand_handover_state = lambda: None
     node._clear_tool_histories = lambda: None
     node._reset_bed_robot_controller_freshness = lambda: None
     node._stamp_all_bed_robot_arm_groups = lambda: None

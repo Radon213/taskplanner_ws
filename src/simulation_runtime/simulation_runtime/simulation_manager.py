@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import json
 from pathlib import Path
+import re
 import socket
 import threading
 import time
@@ -19,8 +22,12 @@ from rclpy.parameter import Parameter
 from rclpy.parameter_client import AsyncParameterClient
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
-from surgical_msgs.msg import SimulationState, SurgeonRequest
-from surgical_msgs.srv import ControlSimulation, InjectSurgeonOverride, SelectSimulationBundle
+from surgical_msgs.msg import SimulationState, SurgeonRequest, VoiceCommandIntent
+from surgical_msgs.srv import (
+    ControlSimulation,
+    InjectSurgeonOverride,
+    SelectSimulationBundle,
+)
 
 
 RESOURCE_ID = "tree/taskplanner_bt_trees::surgical_assist_v1::TaskplannerAssistDemo"
@@ -43,6 +50,176 @@ TRANSITION_STATE_MAX_AGE_SEC = 3.0
 TRANSITION_PROTOCOL_MARKER = (
     "transition-reservation-v2; dt_receipt_max_age=3.0;"
 )
+_FAULTED_ROBOT_STATES = frozenset(
+    {
+        "fault",
+        "error",
+        "failed",
+        "protective_stop",
+        "emergency_stop",
+        "estop",
+    }
+)
+_LIVE_SWITCH_SAFE_ROBOT_STATES = frozenset({"idle"})
+_VOICE_PROCEDURE_START = "procedure_start"
+_VOICE_PROCEDURE_STOP = "procedure_stop"
+_VOICE_PROCEDURE_INTENTS = frozenset({_VOICE_PROCEDURE_START, _VOICE_PROCEDURE_STOP})
+_BUNDLE_CONFIG_REVISION_SCHEMA = b"taskplanner.procedure_bundle.revision.v1\0"
+_BUNDLE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+
+
+def validate_bundle_name(bundle_name: str) -> str:
+    """Return one path-safe bundle identifier or raise ``ValueError``."""
+
+    value = str(bundle_name or "").strip()
+    if not _BUNDLE_NAME_PATTERN.fullmatch(value) or ".." in value:
+        raise ValueError(
+            "bundle name must be a simple identifier using only "
+            "letters, digits, '_', '-', or '.'; path traversal is not allowed"
+        )
+    return value
+
+
+def compute_bundle_config_revision(bundle_dir: str | Path) -> str:
+    """Hash every YAML input that can affect one loaded procedure bundle.
+
+    The revision intentionally ignores mtimes and absolute paths.  It covers
+    the bundle-local YAML files plus the shared display catalog consumed by
+    ``procedure_spec.load_bundle`` so an edited, active bundle can be detected
+    without rebuilding or restarting the ROS runtime.
+    """
+
+    bundle_path = Path(bundle_dir)
+    if not bundle_path.is_dir():
+        raise FileNotFoundError(
+            f"procedure bundle directory does not exist: {bundle_path}"
+        )
+
+    inputs: dict[str, Path] = {}
+    shared_catalog = bundle_path.parent / "display_catalog.yaml"
+    if shared_catalog.is_file():
+        inputs["../display_catalog.yaml"] = shared_catalog
+    for path in bundle_path.rglob("*"):
+        if path.is_file() and path.suffix.casefold() in {".yaml", ".yml"}:
+            inputs[path.relative_to(bundle_path).as_posix()] = path
+
+    digest = hashlib.sha256(_BUNDLE_CONFIG_REVISION_SCHEMA)
+    for logical_path, path in sorted(inputs.items()):
+        logical_bytes = logical_path.encode("utf-8")
+        payload = path.read_bytes()
+        digest.update(len(logical_bytes).to_bytes(8, "big"))
+        digest.update(logical_bytes)
+        digest.update(len(payload).to_bytes(8, "big"))
+        digest.update(payload)
+    return f"sha256:{digest.hexdigest()}"
+
+
+@dataclass(frozen=True, slots=True)
+class VoiceProcedureIntentAdmission:
+    """Fail-closed admission result for an ASR-originated lifecycle proposal."""
+
+    accepted: bool
+    reason: str
+    command: str = ""
+
+
+class RecentVoiceProcedureIntentIds:
+    """Suppress replay of one immutable ASR utterance across the lifecycle gate."""
+
+    def __init__(self, retention_sec: float) -> None:
+        self._retention_sec = max(1.0, float(retention_sec))
+        self._seen: dict[str, float] = {}
+
+    def accept(self, utterance_id: str, now_monotonic: float) -> bool:
+        cutoff = float(now_monotonic) - self._retention_sec
+        self._seen = {
+            key: seen_at
+            for key, seen_at in self._seen.items()
+            if seen_at >= cutoff
+        }
+        key = str(utterance_id or "").strip()
+        if not key or key in self._seen:
+            return False
+        self._seen[key] = float(now_monotonic)
+        return True
+
+
+def _stamp_sec(stamp) -> float:
+    return float(stamp.sec) + float(stamp.nanosec) / 1_000_000_000.0
+
+
+def evaluate_voice_procedure_intent(
+    msg: VoiceCommandIntent,
+    *,
+    active_procedure_id: str,
+    now_sec: float,
+    min_confidence: float,
+    accept_missing_confidence: bool = False,
+    max_age_sec: float,
+    max_future_skew_sec: float,
+    running: bool,
+    execution_state: str,
+) -> VoiceProcedureIntentAdmission:
+    """Re-admit a lifecycle proposal before it can control the simulation.
+
+    The resolver publishes proposals only.  The second boundary here requires
+    the final, fresh surgeon ASR envelope and an exact active procedure binding
+    before forwarding to the existing integration-preflight-gated control path.
+    """
+
+    intent = str(getattr(msg, "intent", "") or "").strip()
+    if intent not in _VOICE_PROCEDURE_INTENTS:
+        return VoiceProcedureIntentAdmission(False, "unsupported_voice_intent")
+    if str(getattr(msg, "disposition", "") or "").strip() != "propose":
+        return VoiceProcedureIntentAdmission(False, "voice_intent_not_proposed")
+    if bool(getattr(msg, "requires_confirmation", False)):
+        return VoiceProcedureIntentAdmission(False, "voice_intent_requires_confirmation")
+    if str(getattr(msg, "procedure_id", "") or "").strip() != str(
+        active_procedure_id
+    ).strip():
+        return VoiceProcedureIntentAdmission(False, "voice_intent_procedure_mismatch")
+    if not str(getattr(msg, "utterance_id", "") or "").strip():
+        return VoiceProcedureIntentAdmission(False, "missing_utterance_id")
+    if not str(getattr(msg, "source", "") or "").strip():
+        return VoiceProcedureIntentAdmission(False, "missing_source")
+    if not bool(getattr(msg, "source_is_final", False)):
+        return VoiceProcedureIntentAdmission(False, "interim_transcript")
+    if str(getattr(msg, "source_speaker_role", "") or "").strip().casefold() != "surgeon":
+        return VoiceProcedureIntentAdmission(False, "unexpected_speaker_role")
+    source_has_confidence = bool(
+        getattr(msg, "source_has_confidence", False)
+    )
+    if not source_has_confidence and not accept_missing_confidence:
+        return VoiceProcedureIntentAdmission(False, "missing_confidence")
+    if source_has_confidence and float(
+        getattr(msg, "source_confidence", 0.0)
+    ) < float(min_confidence):
+        return VoiceProcedureIntentAdmission(False, "low_confidence")
+    stamp = getattr(getattr(msg, "header", None), "stamp", None)
+    if stamp is None or _stamp_sec(stamp) <= 0.0:
+        return VoiceProcedureIntentAdmission(False, "missing_timestamp")
+    age_sec = float(now_sec) - _stamp_sec(stamp)
+    if age_sec > max(0.0, float(max_age_sec)):
+        return VoiceProcedureIntentAdmission(False, f"stale:{age_sec:.3f}s")
+    if age_sec < -max(0.0, float(max_future_skew_sec)):
+        return VoiceProcedureIntentAdmission(
+            False,
+            f"future_timestamp:{-age_sec:.3f}s",
+        )
+    state = str(execution_state or "").strip().casefold()
+    if intent == _VOICE_PROCEDURE_START:
+        if bool(running) or state != "idle":
+            return VoiceProcedureIntentAdmission(False, "procedure_not_idle")
+        command = "start"
+    else:
+        if not bool(running) or state != "running":
+            return VoiceProcedureIntentAdmission(False, "procedure_not_running")
+        command = "pause"
+    return VoiceProcedureIntentAdmission(
+        True,
+        "accepted",
+        command=command,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,14 +229,55 @@ class ExternalRobotContract:
     procedure_type: str
     require_retraction_service: bool
     require_bed_robot_arm_status: bool
+    require_tool_handover_action_server: bool = True
+
+    @property
+    def endpoint_shape(self) -> tuple[bool, bool, bool]:
+        """The launch-time endpoint topology, excluding procedure identity.
+
+        A stopped Live runtime can replace a procedure specification only when
+        the already-running processes expose the same endpoint shape.  The
+        procedure identity itself is intentionally *not* part of this shape:
+        it is re-admitted against the external controller manifest before a
+        later start, rather than pinning the whole Live process forever.
+        """
+
+        return (
+            bool(self.require_tool_handover_action_server),
+            bool(self.require_retraction_service),
+            bool(self.require_bed_robot_arm_status),
+        )
+
+    def supports(self, required: "ExternalRobotContract") -> bool:
+        """Return whether this launch-time endpoint capacity can host a spec.
+
+        Live may safely select a procedure that requires a subset of endpoints
+        already launched. It must still reject a target that would require an
+        endpoint the running topology does not own.
+        """
+
+        return all(
+            runtime_has or not target_requires
+            for runtime_has, target_requires in zip(
+                self.endpoint_shape,
+                required.endpoint_shape,
+                strict=True,
+            )
+        )
 
 
 _NO_BED_ROBOT_CONTRACT = ExternalRobotContract("", False, False)
 _THYROID_BED_ROBOT_CONTRACT = ExternalRobotContract(
-    "thyroidectomy", True, True
+    "thyroidectomy", True, False
 )
 _NEPHRECTOMY_BED_ROBOT_CONTRACT = ExternalRobotContract(
-    "nephrectomy", True, True
+    "nephrectomy", True, False
+)
+_INGUINAL_HERNIA_BED_ROBOT_CONTRACT = ExternalRobotContract(
+    "inguinal_hernia_repair",
+    True,
+    False,
+    False,
 )
 
 
@@ -85,11 +303,18 @@ def external_robot_contract_for_spec(spec) -> ExternalRobotContract:
         if str(operation).strip()
     }
 
-    if procedure_id in {"thyroidectomy", "thyroidectomy_demo"}:
+    if procedure_id == "thyroidectomy":
         if len(enabled_groups) != 1 or operations != {"change_end_effector"}:
             raise RuntimeError(
                 f"procedure '{procedure_id}' does not match the thyroidectomy "
                 "external robot contract"
+            )
+        return _THYROID_BED_ROBOT_CONTRACT
+    if procedure_id == "thyroidectomy_demo":
+        if len(enabled_groups) != 1 or operations != {"retraction"}:
+            raise RuntimeError(
+                "procedure 'thyroidectomy_demo' does not match the "
+                "pre-mounted retraction-service external robot contract"
             )
         return _THYROID_BED_ROBOT_CONTRACT
     if procedure_id == "nephrectomy":
@@ -99,6 +324,13 @@ def external_robot_contract_for_spec(spec) -> ExternalRobotContract:
                 "external robot contract"
             )
         return _NEPHRECTOMY_BED_ROBOT_CONTRACT
+    if procedure_id == "inguinal_hernia_repair_demo":
+        if len(enabled_groups) != 1 or operations != {"retraction"}:
+            raise RuntimeError(
+                "procedure 'inguinal_hernia_repair_demo' does not match the "
+                "voice-retraction-only external robot contract"
+            )
+        return _INGUINAL_HERNIA_BED_ROBOT_CONTRACT
     if enabled_groups:
         raise RuntimeError(
             f"procedure '{procedure_id}' enables an unsupported external robot contract"
@@ -129,10 +361,38 @@ class SimulationManagerNode(Node):
         )
         self.declare_parameter("integration_preflight_timeout_sec", 5.0)
         self.declare_parameter("transition_reservation_ttl_sec", 75.0)
+        # The execution bridge owns the single public route coordinator.  The
+        # manager remains its stopped-state/reset authority through
+        # `/simulation/check_transition_ready` and `/simulation/control`.
+        self.declare_parameter("enable_runtime_route_control", False)
+        # Disabled outside Live by default.  This cannot replace the existing
+        # `/simulation/control` gate; it only provides a validated spoken
+        # request to that same gate.
+        self.declare_parameter("enable_voice_procedure_control", False)
+        self.declare_parameter("voice_intent_topic", "/surgery/voice/intent")
+        self.declare_parameter(
+            "voice_procedure_result_topic",
+            "/simulation/voice_procedure_control/result",
+        )
+        self.declare_parameter("voice_procedure_min_confidence", 0.55)
+        # Operational ASR may truthfully report that no calibrated confidence
+        # is available. Keep the generic default fail-closed; Live must opt in
+        # explicitly while retaining every other typed-ASR authority check.
+        self.declare_parameter(
+            "voice_procedure_accept_missing_confidence",
+            False,
+        )
+        self.declare_parameter("voice_procedure_max_age_sec", 3.0)
+        self.declare_parameter("voice_procedure_max_future_skew_sec", 1.0)
+        self.declare_parameter("voice_procedure_dedupe_retention_sec", 120.0)
 
         self._spec_root = Path(str(self.get_parameter("spec_root").value))
         self._active_bundle = str(self.get_parameter("default_bundle").value)
-        self._active_spec_dir, self._active_spec = self._load_spec_for_bundle(self._active_bundle)
+        (
+            self._active_spec_dir,
+            self._active_spec,
+            self._active_config_revision,
+        ) = self._load_spec_candidate(self._active_bundle)
         self._runtime_external_robot_contract = external_robot_contract_for_spec(
             self._active_spec
         )
@@ -163,9 +423,43 @@ class SimulationManagerNode(Node):
             60.0,
             float(self.get_parameter("transition_reservation_ttl_sec").value),
         )
+        self._enable_runtime_route_control = bool(
+            self.get_parameter("enable_runtime_route_control").value
+        )
+        self._enable_voice_procedure_control = bool(
+            self.get_parameter("enable_voice_procedure_control").value
+        )
+        self._voice_procedure_min_confidence = max(
+            0.0,
+            min(
+                1.0,
+                float(self.get_parameter("voice_procedure_min_confidence").value),
+            ),
+        )
+        self._voice_procedure_accept_missing_confidence = bool(
+            self.get_parameter(
+                "voice_procedure_accept_missing_confidence"
+            ).value
+        )
+        self._voice_procedure_max_age_sec = max(
+            0.0,
+            float(self.get_parameter("voice_procedure_max_age_sec").value),
+        )
+        self._voice_procedure_max_future_skew_sec = max(
+            0.0,
+            float(
+                self.get_parameter("voice_procedure_max_future_skew_sec").value
+            ),
+        )
+        self._voice_procedure_intent_ids = RecentVoiceProcedureIntentIds(
+            float(
+                self.get_parameter("voice_procedure_dedupe_retention_sec").value
+            )
+        )
         self._running = False
         self._execution_state = "idle"
         self._bundle_dirty = False
+        self._bundle_reload_recovery_required = False
         self._operation_name = ""
         self._operation_cancel = threading.Event()
         self._operation_lock = threading.Lock()
@@ -195,6 +489,29 @@ class SimulationManagerNode(Node):
             20,
             callback_group=self._callback_group,
         )
+        self._voice_procedure_result_pub = None
+        if self._enable_voice_procedure_control:
+            voice_intent_topic = str(self.get_parameter("voice_intent_topic").value)
+            voice_result_topic = str(
+                self.get_parameter("voice_procedure_result_topic").value
+            )
+            self._voice_procedure_result_pub = self.create_publisher(
+                String,
+                voice_result_topic,
+                20,
+            )
+            self.create_subscription(
+                VoiceCommandIntent,
+                voice_intent_topic,
+                self._on_voice_procedure_intent,
+                20,
+                callback_group=self._callback_group,
+            )
+            self.get_logger().info(
+                "voice procedure control enabled: "
+                f"{voice_intent_topic} -> /simulation/control; "
+                f"result={voice_result_topic}"
+            )
 
         self._start_client = self.create_client(
             StartBehavior,
@@ -222,6 +539,25 @@ class SimulationManagerNode(Node):
             callback_group=self._callback_group,
         )
         self._parameter_clients = {
+            # The typed voice resolver and direct execution bridge are part of
+            # the Live procedure contract.  They must reload their catalog/
+            # instrument allowlist with every stopped-state Live switch, or a
+            # stale alias could be interpreted against the next bundle.
+            "/voice_command_resolver": AsyncParameterClient(
+                self,
+                "/voice_command_resolver",
+                callback_group=self._callback_group,
+            ),
+            "/surgical_interop_execution_bridge": AsyncParameterClient(
+                self,
+                "/surgical_interop_execution_bridge",
+                callback_group=self._callback_group,
+            ),
+            "/surgical_interop_gateway": AsyncParameterClient(
+                self,
+                "/surgical_interop_gateway",
+                callback_group=self._callback_group,
+            ),
             "/mock_vlm_node": AsyncParameterClient(
                 self, "/mock_vlm_node", callback_group=self._callback_group
             ),
@@ -286,10 +622,90 @@ class SimulationManagerNode(Node):
         raise TimeoutError("Timed out waiting for async operation to complete.")
 
     def _load_spec_for_bundle(self, bundle_name: str):
-        bundle_dir = self._spec_root / bundle_name
+        bundle_id = validate_bundle_name(bundle_name)
+        spec_root = Path(self._spec_root).resolve()
+        bundle_dir = (spec_root / bundle_id).resolve()
+        try:
+            bundle_dir.relative_to(spec_root)
+        except ValueError as exc:
+            raise ValueError(
+                f"bundle '{bundle_id}' resolves outside the configured spec root"
+            ) from exc
         if not bundle_dir.is_dir():
-            raise FileNotFoundError(f"bundle '{bundle_name}' not found under {self._spec_root}")
+            raise FileNotFoundError(
+                f"bundle '{bundle_id}' not found under {spec_root}"
+            )
         return bundle_dir, load_bundle(bundle_dir)
+
+    def _bundle_config_revision(self, spec_dir: str | Path) -> str:
+        return compute_bundle_config_revision(spec_dir)
+
+    def _load_spec_candidate(self, bundle_name: str):
+        """Load one revision-stable candidate, retrying an in-progress save."""
+
+        spec_root = getattr(self, "_spec_root", None)
+        if spec_root is None:
+            spec_dir, spec = self._load_spec_for_bundle(bundle_name)
+            return spec_dir, spec, self._bundle_config_revision(spec_dir)
+
+        bundle_id = validate_bundle_name(bundle_name)
+        spec_root_path = Path(spec_root).resolve()
+        expected_spec_dir = (spec_root_path / bundle_id).resolve()
+        try:
+            expected_spec_dir.relative_to(spec_root_path)
+        except ValueError as exc:
+            raise ValueError(
+                f"bundle '{bundle_id}' resolves outside the configured spec root"
+            ) from exc
+        for _attempt in range(3):
+            before_revision = self._bundle_config_revision(expected_spec_dir)
+            spec_dir, spec = self._load_spec_for_bundle(bundle_name)
+            after_revision = self._bundle_config_revision(spec_dir)
+            if before_revision == after_revision:
+                return spec_dir, spec, after_revision
+        raise RuntimeError(
+            f"bundle '{bundle_name}' changed while it was being loaded; retry preview or reload"
+        )
+
+    def _set_bundle_response_metadata(
+        self,
+        response,
+        *,
+        candidate_revision: str | None = None,
+        changed: bool = False,
+        applied: bool = False,
+        disposition: str = "rejected",
+    ) -> None:
+        """Populate revision fields while tolerating a rolling interface build.
+
+        The ``AttributeError`` fallback matters only while a source workspace
+        has the new manager code but still has the previous generated service
+        class installed.  Once ``surgical_msgs`` is rebuilt, all fields are
+        present on the typed response.
+        """
+
+        active_revision = str(
+            getattr(self, "_active_config_revision", "") or ""
+        )
+        values = {
+            "active_config_revision": active_revision,
+            "candidate_config_revision": (
+                active_revision
+                if candidate_revision is None
+                else str(candidate_revision or "")
+            ),
+            "changed": bool(changed),
+            "applied": bool(applied),
+            "disposition": str(disposition or "rejected"),
+        }
+        for name, value in values.items():
+            try:
+                setattr(response, name, value)
+            except AttributeError:
+                # Generated ROS response classes reject fields unknown to an
+                # older install.  Preserve the legacy response during the one
+                # build needed to regenerate this interface.
+                pass
 
     def _spec_dir_for_bundle(self, bundle_name: str) -> Path:
         spec_dir, _ = self._load_spec_for_bundle(bundle_name)
@@ -338,6 +754,96 @@ class SimulationManagerNode(Node):
                     daemon=True,
                 )
                 thread.start()
+
+    def _on_voice_procedure_intent(self, msg: VoiceCommandIntent) -> None:
+        """Forward one validated spoken lifecycle request through normal control.
+
+        No robot Action or service is called from this subscription.  Start
+        remains blocked by `_check_integration_preflight`; end speech reuses
+        the same pause path as the operator UI.
+        """
+
+        now_sec = self.get_clock().now().nanoseconds / 1_000_000_000.0
+        admission = evaluate_voice_procedure_intent(
+            msg,
+            active_procedure_id=self._active_bundle,
+            now_sec=now_sec,
+            min_confidence=self._voice_procedure_min_confidence,
+            accept_missing_confidence=(
+                self._voice_procedure_accept_missing_confidence
+            ),
+            max_age_sec=self._voice_procedure_max_age_sec,
+            max_future_skew_sec=self._voice_procedure_max_future_skew_sec,
+            running=self._running,
+            execution_state=self._execution_state,
+        )
+        if not admission.accepted:
+            self.get_logger().warning(
+                f"voice procedure command rejected: {admission.reason}",
+                throttle_duration_sec=2.0,
+            )
+            return
+        if not self._voice_procedure_intent_ids.accept(
+            str(msg.utterance_id),
+            time.monotonic(),
+        ):
+            self.get_logger().warning(
+                "voice procedure command rejected: duplicate_utterance_id",
+                throttle_duration_sec=2.0,
+            )
+            return
+        request = ControlSimulation.Request()
+        request.command = admission.command
+        request.start_phase_id = ""
+        result = self._handle_control(request, ControlSimulation.Response())
+        self._publish_voice_procedure_result(
+            msg=msg,
+            command=admission.command,
+            result=result,
+        )
+        if result.success:
+            self.get_logger().info(
+                "voice procedure command admitted: "
+                f"{admission.command} ({msg.utterance_id})"
+            )
+        else:
+            self.get_logger().warning(
+                "voice procedure command blocked by simulation control: "
+                f"{result.message}",
+                throttle_duration_sec=2.0,
+            )
+
+    def _publish_voice_procedure_result(
+        self,
+        *,
+        msg: VoiceCommandIntent,
+        command: str,
+        result,
+    ) -> None:
+        """Publish a bounded, transcript-free receipt for operational sidecars."""
+
+        publisher = self._voice_procedure_result_pub
+        if publisher is None:
+            return
+        payload = {
+            "schema": "taskplanner.voice_procedure_control.result.v1",
+            "stamp_sec": round(
+                self.get_clock().now().nanoseconds / 1_000_000_000.0,
+                6,
+            ),
+            "utterance_id": str(getattr(msg, "utterance_id", "") or "")[:128],
+            "procedure_id": str(getattr(msg, "procedure_id", "") or "")[:64],
+            "requested_command": str(command or "")[:16],
+            "success": bool(getattr(result, "success", False)),
+            "message": str(getattr(result, "message", "") or "")[:512],
+            "running": bool(getattr(result, "running", self._running)),
+            "execution_state": str(
+                getattr(result, "execution_state", self._execution_state) or ""
+            )[:32],
+        }
+        publisher.publish(
+            String(data=json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+        )
 
     def _terminate_executor_after_completion(self) -> None:
         try:
@@ -433,28 +939,60 @@ class SimulationManagerNode(Node):
                 return False
         return observed_configured_instances == set(configured_states)
 
-    def _set_spec_dir_on_runtime(self, spec_dir: Path) -> None:
-        optional_clients = {
-            "/mock_vlm_node",
-            "/real_vlm_node",
-            "/no_image_camera",
-            "/phase_estimator",
-            "/surgeon_actor",
+    def _set_spec_dir_on_runtime(
+        self,
+        spec_dir: Path,
+        *,
+        rollback_spec_dir: Path | None = None,
+    ) -> set[str]:
+        """Reload every present procedure-aware participant.
+
+        For Live, the resolver, direct bridge, and authoritative digital twin
+        are mandatory.  A VLM/actor which is not launched is harmless; one
+        that is present but rejects the update is not.  If any update fails,
+        best-effort rollback leaves the integration preflight closed, so an
+        incomplete procedure transition can never dispatch a command.
+        """
+
+        # Optional participants may be launch-disabled, so absence is allowed.
+        # Once a parameter service is present, however, a rejection is always
+        # transactional in every mode; otherwise consumers can retain mixed
+        # revisions of the same procedure bundle.
+        live_required_clients = {
+            "/or_digital_twin",
+            "/voice_command_resolver",
+            "/surgical_interop_execution_bridge",
         }
+        if not bool(getattr(self, "_require_integration_preflight", False)):
+            live_required_clients = {"/or_digital_twin"}
         required_clients = [
-            (name, client) for name, client in self._parameter_clients.items() if name not in optional_clients
+            (name, client)
+            for name, client in self._parameter_clients.items()
+            if name in live_required_clients
         ]
         optional_parameter_clients = [
-            (name, client) for name, client in self._parameter_clients.items() if name in optional_clients
+            (name, client)
+            for name, client in self._parameter_clients.items()
+            if name not in live_required_clients
         ]
         updated_clients: set[str] = set()
 
-        def update_client(name, client, wait_sec: float) -> bool:
+        def parameter_for(name: str, value: Path) -> Parameter:
+            # ``procedure_bundle`` is the resolver's active catalog source;
+            # all other spec-aware nodes use the common ``spec_dir`` name.
+            parameter_name = (
+                "procedure_bundle"
+                if name == "/voice_command_resolver"
+                else "spec_dir"
+            )
+            return Parameter(name=parameter_name, value=str(value))
+
+        def update_client(name, client, value: Path, wait_sec: float) -> bool:
             ready = client.services_are_ready()
             if not ready and wait_sec > 0:
                 ready = client.wait_for_services(timeout_sec=wait_sec)
             if ready:
-                future = client.set_parameters([Parameter(name="spec_dir", value=str(spec_dir))])
+                future = client.set_parameters([parameter_for(name, value)])
                 response = self._wait_future(future, timeout_sec=10.0)
                 results = getattr(response, "results", response or [])
                 failed = [
@@ -463,32 +1001,69 @@ class SimulationManagerNode(Node):
                     if not bool(getattr(result, "successful", False))
                 ]
                 if failed:
-                    reason = "; ".join(str(getattr(result, "reason", "")) for result in failed).strip()
-                    raise RuntimeError(f"spec update rejected by {name}: {reason or 'unknown reason'}")
+                    reason = "; ".join(
+                        str(getattr(result, "reason", "")) for result in failed
+                    ).strip()
+                    raise RuntimeError(
+                        f"spec update rejected by {name}: {reason or 'unknown reason'}"
+                    )
                 updated_clients.add(name)
                 return True
             return False
 
-        deadline = time.time() + 8.0
-        pending_clients = required_clients
-        while pending_clients and time.time() < deadline:
-            still_pending = []
-            for name, client in pending_clients:
-                if not update_client(name, client, wait_sec=0.25):
-                    still_pending.append((name, client))
-            pending_clients = still_pending
-        if pending_clients:
-            missing = ", ".join(name for name, _ in pending_clients)
-            raise TimeoutError(f"parameter services not ready for: {missing}")
+        def rollback_updated_clients() -> list[str]:
+            if rollback_spec_dir is None:
+                return []
+            rollback_failures: list[str] = []
+            for name in sorted(updated_clients, reverse=True):
+                client = self._parameter_clients.get(name)
+                if client is None:
+                    continue
+                try:
+                    if not update_client(name, client, rollback_spec_dir, wait_sec=1.0):
+                        rollback_failures.append(f"{name}:parameter_service_unavailable")
+                except Exception as exc:
+                    rollback_failures.append(f"{name}:{exc}")
+            return rollback_failures
 
-        for name, client in optional_parameter_clients:
-            try:
-                if not update_client(name, client, wait_sec=0.05):
-                    self.get_logger().info(f"optional parameter service unavailable, skipping spec update for {name}")
-            except Exception as exc:
-                self.get_logger().warn(f"optional spec update failed for {name}: {exc}")
+        try:
+            deadline = time.time() + 8.0
+            pending_clients = required_clients
+            while pending_clients and time.time() < deadline:
+                still_pending = []
+                for name, client in pending_clients:
+                    if not update_client(name, client, spec_dir, wait_sec=0.25):
+                        still_pending.append((name, client))
+                pending_clients = still_pending
+            if pending_clients:
+                missing = ", ".join(name for name, _ in pending_clients)
+                raise TimeoutError(f"parameter services not ready for: {missing}")
+
+            for name, client in optional_parameter_clients:
+                try:
+                    if not update_client(name, client, spec_dir, wait_sec=0.05):
+                        self.get_logger().info(
+                            "optional parameter service unavailable, skipping "
+                            f"spec update for {name}"
+                        )
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"spec update rejected by present participant {name}: {exc}"
+                    ) from exc
+        except Exception as exc:
+            rollback_failures = rollback_updated_clients()
+            if rollback_failures:
+                raise RuntimeError(
+                    "procedure reload failed and rollback was incomplete: "
+                    + "; ".join(rollback_failures[:4])
+                ) from exc
+            raise
         if not updated_clients.intersection({"/mock_vlm_node", "/real_vlm_node"}):
-            self.get_logger().info("no VLM parameter service was available during bundle switch; continuing without direct spec update")
+            self.get_logger().info(
+                "no VLM parameter service was available during bundle switch; "
+                "continuing without direct spec update"
+            )
+        return updated_clients
 
     def _start_behavior(self, clear_blackboard: bool) -> tuple[bool, str]:
         if not self._start_client.wait_for_service(timeout_sec=5.0):
@@ -652,7 +1227,11 @@ class SimulationManagerNode(Node):
             return False
         return True
 
-    def _local_transition_ready_status_locked(self) -> tuple[bool, str]:
+    def _local_transition_ready_status_locked(
+        self,
+        *,
+        allow_current_bundle_transition: bool = False,
+    ) -> tuple[bool, str]:
         """Check all cheap local and digital-twin gates under ``_operation_lock``."""
 
         if self._transition_reservation_active_locked():
@@ -660,7 +1239,10 @@ class SimulationManagerNode(Node):
         operation = str(self._operation_name or "")
         if operation:
             return False, f"simulation operation is still pending: {operation}"
-        if bool(getattr(self, "_bundle_transition_in_progress", False)):
+        if (
+            bool(getattr(self, "_bundle_transition_in_progress", False))
+            and not allow_current_bundle_transition
+        ):
             return False, "simulation bundle selection is still pending"
         if bool(getattr(self, "_override_in_progress", False)):
             return False, "surgeon override publication is still pending"
@@ -696,10 +1278,16 @@ class SimulationManagerNode(Node):
 
         return True, "local runtime state is transition ready"
 
-    def _transition_ready_status_locked(self) -> tuple[bool, str]:
+    def _transition_ready_status_locked(
+        self,
+        *,
+        allow_current_bundle_transition: bool = False,
+    ) -> tuple[bool, str]:
         """Return readiness while the caller owns ``_operation_lock``."""
 
-        ready, message = self._local_transition_ready_status_locked()
+        ready, message = self._local_transition_ready_status_locked(
+            allow_current_bundle_transition=allow_current_bundle_transition
+        )
         if not ready:
             return False, message
 
@@ -714,7 +1302,9 @@ class SimulationManagerNode(Node):
         # The executor query may take up to two seconds while SimulationState
         # callbacks continue in the reentrant group.  Recheck every cheap local
         # gate and the receipt deadline immediately before accepting/reserving.
-        ready, message = self._local_transition_ready_status_locked()
+        ready, message = self._local_transition_ready_status_locked(
+            allow_current_bundle_transition=allow_current_bundle_transition
+        )
         if not ready:
             return False, message
         if success and executor_state in TRANSITION_READY_EXECUTOR_STATES:
@@ -735,6 +1325,42 @@ class SimulationManagerNode(Node):
         if not success:
             return False, f"executor state is unavailable: {detail}"
         return False, f"executor is not settled: {executor_state or 'unknown'}"
+
+    def _live_bundle_switch_safe_status_locked(
+        self,
+        *,
+        allow_current_bundle_transition: bool = False,
+    ) -> tuple[bool, str]:
+        """Require a completely quiescent Live runtime before a spec swap.
+
+        This is deliberately independent of integration *readiness*: an ASR,
+        camera, or remote controller may be unavailable while the operator is
+        choosing the next procedure.  The only admission here is that no
+        execution-capable local state remains and the latest twin frame says
+        the robot is idle, clean-up/recovery is complete, and no fault exists.
+        A later ``start`` still runs the complete integration preflight.
+        """
+
+        ready, message = self._transition_ready_status_locked(
+            allow_current_bundle_transition=allow_current_bundle_transition
+        )
+        if not ready:
+            return False, message
+        with self._latest_state_lock:
+            state = self._latest_state
+        if state is None:
+            return False, "digital twin state is unavailable"
+        robot_state = str(getattr(state, "robot_state", "") or "").strip().casefold()
+        if robot_state in _FAULTED_ROBOT_STATES:
+            return False, f"robot is faulted: {robot_state}"
+        if robot_state not in _LIVE_SWITCH_SAFE_ROBOT_STATES:
+            return False, f"robot is not idle: {robot_state or 'unknown'}"
+        for group in list(getattr(state, "bed_robot_arm_groups", []) or []):
+            group_state = str(getattr(group, "state", "") or "").strip().casefold()
+            group_error = str(getattr(group, "error_code", "") or "").strip()
+            if group_state in _FAULTED_ROBOT_STATES or group_error:
+                return False, "bed-robot arm group reports a fault"
+        return True, "live runtime is stopped and safe for bundle selection"
 
     def _transition_ready_status(self) -> tuple[bool, str]:
         """Return manager-authoritative readiness without reserving it."""
@@ -986,10 +1612,12 @@ class SimulationManagerNode(Node):
         if client is None or not client.wait_for_services(timeout_sec=2.0):
             raise RuntimeError("integration preflight parameter service is unavailable")
         contract = external_robot_contract_for_spec(spec)
+        spec_dir = self._spec_dir_for_bundle(bundle_name)
         response = self._wait_future(
             client.set_parameters_atomically(
                 [
                     Parameter(name="active_bundle", value=str(bundle_name)),
+                    Parameter(name="spec_dir", value=str(spec_dir)),
                     Parameter(
                         name="procedure_type",
                         value=contract.procedure_type,
@@ -997,6 +1625,10 @@ class SimulationManagerNode(Node):
                     Parameter(
                         name="require_retraction_service",
                         value=contract.require_retraction_service,
+                    ),
+                    Parameter(
+                        name="require_tool_handover_action_server",
+                        value=contract.require_tool_handover_action_server,
                     ),
                     Parameter(
                         name="require_bed_robot_arm_status",
@@ -1104,6 +1736,13 @@ class SimulationManagerNode(Node):
             return "simulation already running"
         if self._execution_state != "paused":
             raise RuntimeError("simulation is not paused")
+        # A pause is a potentially long loss-of-control interval.  Live
+        # integration must therefore re-admit every execution dependency
+        # before publishing a resume frame or waking the behavior tree.  Keep
+        # the local twin and BT paused when admission fails; publishing resume
+        # first would create a partial restart that cannot be rolled back
+        # safely if ASR, perception, or the controller route disappeared.
+        self._check_integration_preflight()
         self._publish_control("resume")
         self._wait_for_simulation_state(
             lambda state: state.running and state.execution_state == "running" and len(state.instrument_states) > 0,
@@ -1150,6 +1789,11 @@ class SimulationManagerNode(Node):
         self._execution_state = "idle"
 
     def _handle_select_bundle(self, request, response):
+        self._set_bundle_response_metadata(response)
+        if bool(getattr(request, "preview_only", False)):
+            # Preview is read-only: it remains available while a procedure or
+            # runtime-mode transition is in progress.
+            return self._handle_select_bundle_impl(request, response)
         with self._operation_lock:
             if self._transition_reservation_active_locked():
                 response.success = False
@@ -1165,6 +1809,53 @@ class SimulationManagerNode(Node):
                 response.active_bundle = self._active_bundle
                 response.spec_dir = str(self._active_spec_dir)
                 return response
+            requested_bundle = str(getattr(request, "bundle_name", "")).strip()
+            if requested_bundle:
+                try:
+                    requested_bundle = validate_bundle_name(requested_bundle)
+                except ValueError as exc:
+                    response.success = False
+                    response.message = str(exc)
+                    response.active_bundle = self._active_bundle
+                    response.spec_dir = str(self._active_spec_dir)
+                    return response
+            # A Live selection never interrupts or restarts a procedure. It
+            # is available while stopped even if ASR/perception/controller
+            # readiness is red, but only after the manager's authoritative
+            # twin+executor safety proof succeeds.
+            if (
+                bool(getattr(self, "_require_integration_preflight", False))
+                and requested_bundle
+                and requested_bundle != self._active_bundle
+            ):
+                ready, message = self._live_bundle_switch_safe_status_locked()
+                if not ready:
+                    active_procedure = (
+                        self._operation_name == "start"
+                        or self._running
+                        or self._execution_state
+                        in {"starting", "running", "paused"}
+                    )
+                    response.success = False
+                    response.message = (
+                        (
+                            "live bundle switch deferred (not queued): "
+                            if active_procedure
+                            else "live bundle selection is blocked: "
+                        )
+                        + message
+                    )
+                    response.active_bundle = self._active_bundle
+                    response.spec_dir = str(self._active_spec_dir)
+                    self._set_bundle_response_metadata(
+                        response,
+                        candidate_revision="",
+                        changed=True,
+                        disposition=(
+                            "deferred" if active_procedure else "blocked"
+                        ),
+                    )
+                    return response
             self._bundle_transition_in_progress = True
         try:
             return self._handle_select_bundle_impl(request, response)
@@ -1173,23 +1864,235 @@ class SimulationManagerNode(Node):
                 self._bundle_transition_in_progress = False
 
     def _handle_select_bundle_impl(self, request, response):
+        candidate_revision = ""
+        changed = False
+        self._set_bundle_response_metadata(response)
         try:
-            interrupted_start = False
+            requested_bundle = str(getattr(request, "bundle_name", "")).strip()
+            is_live = bool(getattr(self, "_require_integration_preflight", False))
+            preview_only = bool(getattr(request, "preview_only", False))
+            reload_if_changed = bool(
+                getattr(request, "reload_if_changed", False)
+            )
+            if not requested_bundle:
+                response.success = False
+                response.message = "bundle name is required"
+                response.active_bundle = self._active_bundle
+                response.spec_dir = str(self._active_spec_dir)
+                return response
+            requested_bundle = validate_bundle_name(requested_bundle)
+
+            spec_dir, spec, candidate_revision = self._load_spec_candidate(
+                requested_bundle
+            )
+            same_bundle = requested_bundle == self._active_bundle
+            changed = (
+                not same_bundle
+                or candidate_revision
+                != str(getattr(self, "_active_config_revision", "") or "")
+            )
+            self._set_bundle_response_metadata(
+                response,
+                candidate_revision=candidate_revision,
+                changed=changed,
+            )
+
+            expected_candidate_revision = str(
+                getattr(request, "expected_candidate_revision", "") or ""
+            ).strip()
+            if len(expected_candidate_revision) > 256:
+                response.success = False
+                response.message = "expected candidate revision is invalid"
+                response.active_bundle = self._active_bundle
+                response.spec_dir = str(spec_dir)
+                self._set_bundle_response_metadata(
+                    response,
+                    candidate_revision=candidate_revision,
+                    changed=changed,
+                    disposition="rejected",
+                )
+                return response
+            if (
+                not preview_only
+                and expected_candidate_revision
+                and expected_candidate_revision != candidate_revision
+            ):
+                response.success = False
+                response.message = (
+                    "bundle configuration changed since preview; preview the "
+                    "candidate revision again before applying it"
+                )
+                response.active_bundle = self._active_bundle
+                response.spec_dir = str(spec_dir)
+                self._set_bundle_response_metadata(
+                    response,
+                    candidate_revision=candidate_revision,
+                    changed=changed,
+                    disposition="revision_changed",
+                )
+                return response
+
+            target_contract = external_robot_contract_for_spec(spec)
+            runtime_contract = getattr(
+                self,
+                "_runtime_external_robot_contract",
+                external_robot_contract_for_spec(self._active_spec),
+            )
+            contracts_compatible = (
+                runtime_contract.supports(target_contract)
+                if is_live
+                else target_contract == runtime_contract
+            )
+
+            if preview_only:
+                response.success = True
+                response.active_bundle = self._active_bundle
+                response.spec_dir = str(spec_dir)
+                if not contracts_compatible:
+                    response.message = (
+                        "bundle configuration is valid but changes the "
+                        "launch-time endpoint shape; a runtime restart is required"
+                    )
+                    self._set_bundle_response_metadata(
+                        response,
+                        candidate_revision=candidate_revision,
+                        changed=changed,
+                        disposition="restart_required",
+                    )
+                elif changed:
+                    response.message = (
+                        f"bundle preview detected configuration changes for "
+                        f"{requested_bundle}"
+                    )
+                    self._set_bundle_response_metadata(
+                        response,
+                        candidate_revision=candidate_revision,
+                        changed=True,
+                        disposition="preview_change_available",
+                    )
+                else:
+                    response.message = (
+                        f"bundle preview found no configuration changes for "
+                        f"{requested_bundle}"
+                    )
+                    self._set_bundle_response_metadata(
+                        response,
+                        candidate_revision=candidate_revision,
+                        disposition="preview_unchanged",
+                    )
+                return response
+
+            if same_bundle and not changed:
+                response.success = True
+                response.message = (
+                    f"active bundle {requested_bundle} has no configuration changes"
+                )
+                response.active_bundle = self._active_bundle
+                response.spec_dir = str(self._active_spec_dir)
+                self._set_bundle_response_metadata(
+                    response,
+                    candidate_revision=candidate_revision,
+                    disposition="unchanged",
+                )
+                return response
+
+            if same_bundle and not reload_if_changed:
+                response.success = True
+                response.message = (
+                    f"active bundle {requested_bundle} has configuration changes; "
+                    "set reload_if_changed=true to apply them"
+                )
+                response.active_bundle = self._active_bundle
+                response.spec_dir = str(self._active_spec_dir)
+                self._set_bundle_response_metadata(
+                    response,
+                    candidate_revision=candidate_revision,
+                    changed=True,
+                    disposition="change_available",
+                )
+                return response
+
+            same_bundle_reload = same_bundle and reload_if_changed
+            if same_bundle_reload and (
+                self._operation_name == "start"
+                or self._running
+                or self._execution_state in {"starting", "running", "paused"}
+            ):
+                response.success = False
+                response.message = (
+                    "bundle reload deferred (not queued): the current full-spec "
+                    "reload resets procedure state, so apply it only while the "
+                    "simulation is idle or fully stopped"
+                )
+                response.active_bundle = self._active_bundle
+                response.spec_dir = str(self._active_spec_dir)
+                self._set_bundle_response_metadata(
+                    response,
+                    candidate_revision=candidate_revision,
+                    changed=True,
+                    disposition="deferred",
+                )
+                return response
+
+            if same_bundle_reload and is_live:
+                with self._operation_lock:
+                    ready, message = self._live_bundle_switch_safe_status_locked(
+                        allow_current_bundle_transition=True
+                    )
+                if not ready:
+                    response.success = False
+                    response.message = (
+                        "live bundle reload requires a fully stopped safe "
+                        f"runtime: {message}"
+                    )
+                    response.active_bundle = self._active_bundle
+                    response.spec_dir = str(self._active_spec_dir)
+                    self._set_bundle_response_metadata(
+                        response,
+                        candidate_revision=candidate_revision,
+                        changed=True,
+                        disposition="blocked",
+                    )
+                    return response
+
+            if not same_bundle and (
+                self._operation_name == "start"
+                or self._execution_state in {"starting", "running"}
+                or (self._running and self._execution_state != "paused")
+            ):
+                response.success = False
+                response.message = (
+                    "bundle switch deferred (not queued): pause or fully stop "
+                    "the simulation before changing scenarios"
+                )
+                response.active_bundle = self._active_bundle
+                response.spec_dir = str(self._active_spec_dir)
+                self._set_bundle_response_metadata(
+                    response,
+                    candidate_revision=candidate_revision,
+                    changed=changed,
+                    disposition="deferred",
+                )
+                return response
+
             if self._operation_name == "start":
-                if not request.restart_if_running:
-                    response.success = False
-                    response.message = "cannot switch bundle while simulation is starting without restart_if_running=true"
-                    response.active_bundle = self._active_bundle
-                    response.spec_dir = str(self._active_spec_dir)
-                    return response
-                self._interrupt_start_sequence("reset")
-                if not self._wait_for_operation_clear(timeout_sec=12.0):
-                    response.success = False
-                    response.message = "start operation is still stopping; retry bundle switch"
-                    response.active_bundle = self._active_bundle
-                    response.spec_dir = str(self._active_spec_dir)
-                    return response
-                interrupted_start = True
+                # Recheck after candidate validation in case a concurrent start
+                # claimed the operation between the first admission check and
+                # this point.  Scenario selection never interrupts a start.
+                response.success = False
+                response.message = (
+                    "bundle switch deferred (not queued): simulation start is "
+                    "already in progress"
+                )
+                response.active_bundle = self._active_bundle
+                response.spec_dir = str(self._active_spec_dir)
+                self._set_bundle_response_metadata(
+                    response,
+                    candidate_revision=candidate_revision,
+                    changed=changed,
+                    disposition="deferred",
+                )
+                return response
             elif self._operation_name:
                 if not self._wait_for_operation_clear(timeout_sec=25.0):
                     response.success = False
@@ -1198,29 +2101,50 @@ class SimulationManagerNode(Node):
                     response.spec_dir = str(self._active_spec_dir)
                     return response
 
-            was_running = interrupted_start or self._running or self._execution_state in {"starting", "running", "paused"}
-            if was_running and not request.restart_if_running:
-                response.success = False
-                response.message = "cannot switch bundle while simulation is running without restart_if_running=true"
-                response.active_bundle = self._active_bundle
-                response.spec_dir = str(self._active_spec_dir)
-                return response
-
-            spec_dir, spec = self._load_spec_for_bundle(request.bundle_name)
-            target_contract = external_robot_contract_for_spec(spec)
-            runtime_contract = getattr(
-                self,
-                "_runtime_external_robot_contract",
-                external_robot_contract_for_spec(self._active_spec),
+            was_running = (
+                self._running
+                or self._execution_state in {"starting", "running", "paused"}
             )
-            if target_contract != runtime_contract:
+            if is_live and was_running:
                 response.success = False
                 response.message = (
-                    "bundle switch changes the external robot contract; restart "
-                    f"the runtime with default_bundle={request.bundle_name}"
+                    "live bundle selection requires a fully stopped safe "
+                    "runtime; it does not stop or restart a procedure"
                 )
                 response.active_bundle = self._active_bundle
                 response.spec_dir = str(self._active_spec_dir)
+                return response
+            if was_running and not request.restart_if_running:
+                response.success = False
+                response.message = (
+                    "bundle switch deferred (not queued): a paused simulation "
+                    "requires restart_if_running=true for an explicit scenario "
+                    "change"
+                )
+                response.active_bundle = self._active_bundle
+                response.spec_dir = str(self._active_spec_dir)
+                self._set_bundle_response_metadata(
+                    response,
+                    candidate_revision=candidate_revision,
+                    changed=changed,
+                    disposition="deferred",
+                )
+                return response
+
+            if not contracts_compatible:
+                response.success = False
+                response.message = (
+                    "bundle switch changes the launch-time endpoint shape; "
+                    f"restart the runtime with default_bundle={requested_bundle}"
+                )
+                response.active_bundle = self._active_bundle
+                response.spec_dir = str(self._active_spec_dir)
+                self._set_bundle_response_metadata(
+                    response,
+                    candidate_revision=candidate_revision,
+                    changed=changed,
+                    disposition="restart_required",
+                )
                 return response
 
             if not self._begin_operation("bundle-switch"):
@@ -1230,47 +2154,225 @@ class SimulationManagerNode(Node):
                 response.spec_dir = str(self._active_spec_dir)
                 return response
 
+            old_bundle = self._active_bundle
+            old_spec_dir = self._active_spec_dir
+            old_spec = self._active_spec
+            old_revision = str(
+                getattr(self, "_active_config_revision", "") or ""
+            )
+            runtime_spec_update_attempted = False
+            runtime_spec_updated = False
+            revision_mismatch_after_apply = False
             try:
                 self._configure_integration_preflight(
-                    self._active_bundle,
-                    self._active_spec,
+                    old_bundle,
+                    old_spec,
                     transitioning=True,
                 )
                 self._quiesce_runtime_for_bundle_change()
-                self._set_spec_dir_on_runtime(spec_dir)
+                # Validate the target procedure's preflight shape while the
+                # admission lease is still closed. This does not require the
+                # target to be ready; it only prevents a split bundle/spec
+                # identity from being released later.
                 self._configure_integration_preflight(
-                    request.bundle_name,
+                    requested_bundle,
                     spec,
-                    transitioning=False,
+                    transitioning=True,
                 )
-                self._active_bundle = request.bundle_name
+                if self._bundle_config_revision(spec_dir) != candidate_revision:
+                    raise RuntimeError(
+                        "bundle configuration changed after candidate validation "
+                        "and before participant apply; reload was not applied"
+                    )
+                runtime_spec_update_attempted = True
+                self._set_spec_dir_on_runtime(
+                    spec_dir,
+                    # A same-path edit cannot be rolled back by setting the
+                    # same path again: it would reload the new bytes.  Keep
+                    # admission closed and require recovery if a participant
+                    # rejects such a reload after partial application.
+                    rollback_spec_dir=(
+                        None if same_bundle_reload else old_spec_dir
+                    ),
+                )
+                runtime_spec_updated = True
+                if self._bundle_config_revision(spec_dir) != candidate_revision:
+                    revision_mismatch_after_apply = True
+                    raise RuntimeError(
+                        "bundle configuration changed during participant apply; "
+                        "reload commit was rejected"
+                    )
+                self._active_bundle = requested_bundle
                 self._active_spec_dir = spec_dir
                 self._active_spec = spec
+                self._active_config_revision = candidate_revision
+                # In Live this object records immutable launch-time endpoint
+                # capacity, not the currently selected procedure requirement.
+                # Preserve the superset so a later stopped switch can return
+                # to a procedure that uses an endpoint omitted by this target.
+                if not is_live:
+                    self._runtime_external_robot_contract = target_contract
                 self._bundle_dirty = True
                 if was_running and request.restart_if_running:
+                    if self._bundle_config_revision(spec_dir) != candidate_revision:
+                        revision_mismatch_after_apply = True
+                        raise RuntimeError(
+                            "bundle configuration changed before scenario restart; "
+                            "reload commit was rejected"
+                        )
                     response.message = self._start_sequence(prepare_executor=False)
                     response.success = True
                 else:
                     # Publish a fresh idle frame from the newly selected spec.
                     self._reset_digital_twin_to_idle()
+                    if self._bundle_config_revision(spec_dir) != candidate_revision:
+                        revision_mismatch_after_apply = True
+                        raise RuntimeError(
+                            "bundle configuration changed before reload commit; "
+                            "reload commit was rejected"
+                        )
                     response.success = True
-                    response.message = f"active bundle set to {request.bundle_name}"
+                    response.message = (
+                        f"active bundle {requested_bundle} reloaded without a "
+                        "runtime restart"
+                        if same_bundle_reload
+                        else f"active bundle set to {requested_bundle}"
+                    )
+                # Reopen Live admission only after the new Digital Twin frame
+                # has been observed.  A reset/reload failure therefore cannot
+                # expose a partially applied procedure configuration.
+                self._configure_integration_preflight(
+                    requested_bundle,
+                    spec,
+                    transitioning=False,
+                )
+                self._bundle_reload_recovery_required = False
+            except Exception as exc:
+                self._active_bundle = old_bundle
+                self._active_spec_dir = old_spec_dir
+                self._active_spec = old_spec
+                self._active_config_revision = old_revision
+                rollback_failures: list[str] = []
+                same_path_recovery_required = (
+                    same_bundle_reload and runtime_spec_update_attempted
+                )
+                if same_path_recovery_required and not is_live:
+                    self._bundle_dirty = True
+                    self._bundle_reload_recovery_required = True
+                    detail = (
+                        "configuration changed after participant apply"
+                        if revision_mismatch_after_apply
+                        else "participant reload did not complete"
+                    )
+                    raise RuntimeError(
+                        "same-bundle reload was not fully applied; runtime "
+                        f"recovery is required ({detail})"
+                    ) from exc
+                if not is_live and runtime_spec_updated:
+                    try:
+                        self._set_spec_dir_on_runtime(old_spec_dir)
+                        self._reset_digital_twin_to_idle()
+                    except Exception as rollback_exc:
+                        self._bundle_dirty = True
+                        self._bundle_reload_recovery_required = True
+                        raise RuntimeError(
+                            "bundle reload commit failed and non-Live rollback "
+                            f"was incomplete: {rollback_exc}"
+                        ) from exc
+                if is_live:
+                    incomplete_participant_rollback = (
+                        "rollback was incomplete" in str(exc).casefold()
+                    )
+                    if (
+                        same_path_recovery_required
+                        or incomplete_participant_rollback
+                    ):
+                        self._bundle_reload_recovery_required = True
+                        try:
+                            self._configure_integration_preflight(
+                                old_bundle,
+                                old_spec,
+                                transitioning=True,
+                            )
+                        except Exception as close_exc:
+                            rollback_failures.append(
+                                f"preflight_close:{close_exc}"
+                            )
+                        detail = (
+                            "; ".join(rollback_failures[:2])
+                            if rollback_failures
+                            else "admission remains closed"
+                        )
+                        raise RuntimeError(
+                            "same-bundle reload was not fully applied; "
+                            f"runtime recovery is required ({detail})"
+                        ) from exc
+                    if runtime_spec_updated:
+                        try:
+                            self._set_spec_dir_on_runtime(old_spec_dir)
+                        except Exception as rollback_exc:
+                            rollback_failures.append(
+                                f"participant_reload:{rollback_exc}"
+                            )
+                    if not rollback_failures:
+                        try:
+                            self._reset_digital_twin_to_idle()
+                            self._configure_integration_preflight(
+                                old_bundle,
+                                old_spec,
+                                transitioning=False,
+                            )
+                        except Exception as rollback_exc:
+                            rollback_failures.append(
+                                f"preflight_restore:{rollback_exc}"
+                            )
+                if rollback_failures:
+                    self._bundle_reload_recovery_required = True
+                    raise RuntimeError(
+                        "bundle selection failed; runtime remains admission-blocked: "
+                        + "; ".join(rollback_failures[:2])
+                    ) from exc
+                raise
             finally:
                 self._finish_operation("bundle-switch")
             response.active_bundle = self._active_bundle
-            response.spec_dir = str(spec_dir)
+            response.spec_dir = str(self._active_spec_dir)
+            self._set_bundle_response_metadata(
+                response,
+                candidate_revision=candidate_revision,
+                changed=changed,
+                applied=True,
+                disposition="applied",
+            )
             return response
         except Exception as exc:
             response.success = False
             response.message = str(exc)
             response.active_bundle = self._active_bundle
-            response.spec_dir = ""
+            response.spec_dir = str(getattr(self, "_active_spec_dir", "") or "")
+            self._set_bundle_response_metadata(
+                response,
+                candidate_revision=candidate_revision,
+                changed=changed,
+                disposition="rejected",
+            )
             return response
 
     def _handle_control(self, request, response):
         command = request.command.strip().lower()
         requested_start_phase = str(getattr(request, "start_phase_id", "") or "").strip()
         try:
+            if command in {"start", "resume"} and bool(
+                getattr(self, "_bundle_reload_recovery_required", False)
+            ):
+                response.success = False
+                response.message = (
+                    "procedure configuration recovery is required before "
+                    f"simulation {command}"
+                )
+                response.running = self._running
+                response.execution_state = self._execution_state
+                return response
             if command not in {"status", "stop"}:
                 with self._operation_lock:
                     if self._transition_reservation_active_locked():

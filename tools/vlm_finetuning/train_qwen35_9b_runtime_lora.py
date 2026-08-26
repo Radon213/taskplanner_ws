@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Train a BF16 Qwen3.5-9B LoRA on the exact Taskplanner schema-v4 contract.
+"""Train a BF16 Qwen3.5-9B LoRA on the hand-free Taskplanner schema-v6 contract.
 
 Unlike the older causal trainer, this script respects per-field supervision
-spans.  It therefore learns reviewed gesture/forecast labels without turning
+spans.  It therefore learns reviewed forecast labels without turning
 unreviewed placeholder fields into accidental targets.
 """
 

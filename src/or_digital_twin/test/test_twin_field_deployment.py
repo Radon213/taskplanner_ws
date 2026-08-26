@@ -3,12 +3,11 @@ from __future__ import annotations
 from pathlib import Path
 
 from or_digital_twin.models import (
-    LIFECYCLE_PREPOSITIONED_RIGHT,
     LIFECYCLE_SURGEON_OWNED,
 )
 from or_digital_twin.twin import ORDigitalTwin
 from procedure_spec import load_bundle
-from surgical_msgs.msg import PhaseEvidence, ToolObservation, TwinEvent
+from surgical_msgs.msg import PhaseEvidence, ToolObservation
 
 
 def _demo_spec():
@@ -19,15 +18,6 @@ def _demo_spec():
         / "specs"
         / "thyroidectomy_demo"
     )
-
-
-def _handover_event(instance_id: str) -> TwinEvent:
-    event = TwinEvent()
-    event.event_type = "ToolHandoverCompleted"
-    event.instrument_id = instance_id.partition("#")[0]
-    event.instance_id = instance_id
-    event.confidence = 1.0
-    return event
 
 
 def _mayo_observation(instance_id: str, stamp_sec: int) -> ToolObservation:
@@ -64,33 +54,45 @@ def test_demo_starts_with_both_allis_instances_in_active_surgeon_use() -> None:
     )
 
 
-def test_phase_entry_relocates_matching_hand_tools_to_surgical_field() -> None:
+def test_demo_omits_bed_retractors_from_instances_and_rack_slots() -> None:
     twin = ORDigitalTwin(_demo_spec())
-    fixed_retractor = twin.instrument_states["T05#1"]
+    controller_owned_retractors = {"T05", "T11"}
+
+    assert controller_owned_retractors.isdisjoint(
+        twin.spec.list_instrument_ids()
+    )
+    assert all(
+        state.instrument_id not in controller_owned_retractors
+        for state in twin.instrument_states.values()
+    )
+    assert all(
+        twin.spec.get_initial_location(tool_id) is None
+        and twin.spec.get_initial_location_type(tool_id) is None
+        for tool_id in controller_owned_retractors
+    )
+
+
+def test_demo_phase_entry_does_not_relocate_rack_tools_for_controller_retraction() -> None:
+    twin = ORDigitalTwin(_demo_spec())
     hand_tool = twin.instrument_states["T02#1"]
-    for state in (fixed_retractor, hand_tool):
-        twin._set_lifecycle(
-            state,
-            LIFECYCLE_SURGEON_OWNED,
-            location_type="surgeon_hand",
-            location_id="surgeon_hand",
-            confidence=1.0,
-        )
+    twin._set_lifecycle(
+        hand_tool,
+        LIFECYCLE_SURGEON_OWNED,
+        location_type="surgeon_hand",
+        location_id="surgeon_hand",
+        confidence=1.0,
+    )
 
     twin.set_initial_phase("P04")
 
-    assert fixed_retractor.location_type == "surgical_field"
-    assert fixed_retractor.location_id.startswith("field_region")
-    assert fixed_retractor.status == "in_use"
     assert hand_tool.location_type == "surgeon_hand"
-    assert any(
+    assert not any(
         event["event_type"] == "ToolFieldDeploymentInferred"
-        and event["instance_id"] == fixed_retractor.instance_id
         for event in twin.event_history
     )
 
 
-def test_field_handover_does_not_consume_two_hand_capacity() -> None:
+def test_demo_retractor_names_do_not_consume_handover_capacity() -> None:
     twin = ORDigitalTwin(_demo_spec())
     twin.set_initial_phase("P04")
     for instance_id in ("T02#1", "T03#1"):
@@ -103,34 +105,18 @@ def test_field_handover_does_not_consume_two_hand_capacity() -> None:
         )
     twin.normalize_for_publish()
 
-    for request_text, expected_instance_id in (
-        ("T05", "T05#1"),
-        ("T05 one more", "T05#2"),
+    for request_text in (
+        "Army navy retractor please",
+        "thyroid retractor please",
     ):
-        assert twin.update_explicit_request(request_text) == "T05"
-        assert twin.state.surgeon_request_instance_id == expected_instance_id
-        state = twin.instrument_states[expected_instance_id]
-        twin._set_lifecycle(
-            state,
-            LIFECYCLE_PREPOSITIONED_RIGHT,
-            location_type="robot_right_hand",
-            location_id="robot_right_hand",
-            confidence=1.0,
-        )
-        twin.normalize_for_publish()
-
-        assert twin.handover_allowed() is True
-        twin.apply_event(_handover_event(expected_instance_id))
-
-        assert state.lifecycle_stage == LIFECYCLE_SURGEON_OWNED
-        assert state.location_type == "surgical_field"
-        assert state.status == "in_use"
+        assert twin.update_explicit_request(request_text) == ""
+        assert twin.request_queue_summary()["queue_length"] == 0
 
     assert len(twin._surgeon_owned_hand_states()) == 2
     assert "surgeon_owned_overloaded" not in twin.state.safety_flags
 
 
-def test_next_phase_retractor_handover_unlocks_field_phase_transition() -> None:
+def test_next_phase_controller_retraction_does_not_require_rack_handover() -> None:
     twin = ORDigitalTwin(_demo_spec())
     now = [100.0]
     twin._monotonic_sec = lambda: now[0]
@@ -146,34 +132,18 @@ def test_next_phase_retractor_handover_unlocks_field_phase_transition() -> None:
         twin.apply_phase_evidence(evidence)
         now[0] += 1.0
 
-    assert twin.state.filtered_phase == "P03"
-    assert any(
+    assert twin.state.filtered_phase == "P04"
+    assert not any(
         event["event_type"] == "PhaseTransitionRejected"
         and event["reason"] == "phase_field_deployment_not_observed"
         for event in twin.event_history
     )
 
-    state = twin.instrument_states["T05#1"]
-    twin._set_lifecycle(
-        state,
-        LIFECYCLE_PREPOSITIONED_RIGHT,
-        location_type="robot_right_hand",
-        location_id="robot_right_hand",
-        confidence=1.0,
-    )
-    twin.apply_event(_handover_event(state.instance_id))
 
-    assert state.location_type == "surgical_field"
-
-    twin.apply_phase_evidence(evidence)
-
-    assert twin.state.filtered_phase == "P04"
-
-
-def test_field_tool_does_not_jump_to_mayo_without_return_context() -> None:
+def test_surgical_field_tool_does_not_jump_to_mayo_without_return_context() -> None:
     twin = ORDigitalTwin(_demo_spec())
     twin.set_initial_phase("P04")
-    state = twin.instrument_states["T05#1"]
+    state = twin.instrument_states["T02#1"]
     twin._set_lifecycle(
         state,
         LIFECYCLE_SURGEON_OWNED,

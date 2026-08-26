@@ -20,12 +20,56 @@ from launch_ros.substitutions import FindPackageShare
 from bringup.perception_config import resolve_launch_perception
 
 
+# RF-DETR overlays are local-only operator rasters.  The VLM itself consumes
+# raw visual panels plus typed CAM3/CAM4 ``ToolObservation2DArray`` evidence;
+# no detector overlay/segmentation raster is used as a detector-input proxy.
+# The public gateway exposes only raw FLIR/CAM4 aliases, so these names must
+# never be supplied by generic overlay settings.
+LIVE_RFDETR_FLIR_SEGMENTED_TOPIC = (
+    "/taskplanner/internal/rfdetr/flir/segmented/compressed"
+)
+LIVE_RFDETR_FLIR_OVERLAY_TOPIC = (
+    "/taskplanner/internal/rfdetr/flir/segmentation_overlay/compressed"
+)
+LIVE_RFDETR_CAM4_OVERLAY_TOPIC = (
+    "/taskplanner/internal/rfdetr/cam4/detection_overlay/compressed"
+)
+LIVE_RFDETR_CAM3_OVERLAY_TOPIC = (
+    "/taskplanner/internal/rfdetr/cam3/detection_overlay/compressed"
+)
+LIVE_RFDETR_CAM3_TOOL_OBSERVATIONS_TOPIC = (
+    "/perception/cam_3/tool/observations"
+)
+LIVE_RFDETR_CAM4_TOOL_OBSERVATIONS_TOPIC = (
+    "/perception/cam_4/tool/observations"
+)
+LIVE_RFDETR_BRIDGE_CAM3_TOOL_OBSERVATIONS_TOPIC = (
+    "/taskplanner/internal/rfdetr/cam_3/tool/observations"
+)
+LIVE_RFDETR_BRIDGE_CAM4_TOOL_OBSERVATIONS_TOPIC = (
+    "/taskplanner/internal/rfdetr/cam_4/tool/observations"
+)
+# Production observes model provenance but does not pin a deployment version.
+# A non-empty environment override remains available for incident isolation.
+LIVE_RFDETR_MODEL_VERSION_PIN = ""
+LIVE_VLM_MODEL_VISUAL_TOPIC = (
+    "/taskplanner/internal/vlm/model_visual/compressed"
+)
+LIVE_VLM_MODE = "real"
+LIVE_VLM_BASE_URL = "http://127.0.0.1:8080"
+LIVE_VLM_PROVIDER_ID = "ninfer"
+LIVE_VLM_MODEL_ID = "qwen3.6-35b-a3b"
+
+
 def _env(name: str, default: str) -> EnvironmentVariable:
     return EnvironmentVariable(name, default_value=default)
 
 
 def generate_launch_description() -> LaunchDescription:
-    vlm_mode = _env("VLM_MODE", "real")
+    vlm_mode = LaunchConfiguration("vlm_mode")
+    vlm_base_url = LaunchConfiguration("vlm_base_url")
+    vlm_provider_id = LaunchConfiguration("vlm_provider_id")
+    vlm_model_id = LaunchConfiguration("vlm_model_id")
     publish_shared_state = LaunchConfiguration("publish_shared_state")
     publish_shared_free_text = LaunchConfiguration("publish_shared_free_text")
     publish_camera_aliases = LaunchConfiguration("publish_camera_aliases")
@@ -34,30 +78,49 @@ def generate_launch_description() -> LaunchDescription:
     perception_provider = LaunchConfiguration("perception_provider")
     perception_location = LaunchConfiguration("perception_location")
     perception_endpoint = LaunchConfiguration("perception_endpoint")
-    pnu_api_token_file = LaunchConfiguration("pnu_api_token_file")
-    pnu_allow_insecure_remote_http = LaunchConfiguration(
-        "pnu_allow_insecure_remote_http"
-    )
-    pnu_allow_unauthenticated_remote = LaunchConfiguration(
-        "pnu_allow_unauthenticated_remote"
-    )
-    pnu_expected_model_digests_json = LaunchConfiguration(
-        "pnu_expected_model_digests_json"
-    )
-    pnu_expected_tool_support_plane_config_version = LaunchConfiguration(
-        "pnu_expected_tool_support_plane_config_version"
-    )
-    pnu_depth_scale_m_per_unit = LaunchConfiguration(
-        "pnu_depth_scale_m_per_unit"
-    )
-    pnu_depth_scale_validated = LaunchConfiguration(
-        "pnu_depth_scale_validated"
-    )
-    pnu_depth_alignment_validated = LaunchConfiguration(
-        "pnu_depth_alignment_validated"
-    )
-    pnu_depth_alignment_id = LaunchConfiguration("pnu_depth_alignment_id")
     default_bundle = LaunchConfiguration("default_bundle")
+    robot_endpoint_source = LaunchConfiguration("robot_endpoint_source")
+    retraction_endpoint_source = LaunchConfiguration("retraction_endpoint_source")
+    external_controller_contract_id = LaunchConfiguration(
+        "external_controller_contract_id"
+    )
+    external_capability_policy_id = LaunchConfiguration(
+        "external_capability_policy_id"
+    )
+    controller_contract_max_age_sec = LaunchConfiguration(
+        "controller_contract_max_age_sec"
+    )
+    dispatch_readiness_max_age_sec = LaunchConfiguration(
+        "dispatch_readiness_max_age_sec"
+    )
+    # Procedure-specific perception is decided by integration_preflight from
+    # the *active* selected bundle.  This launch-time flag is only the explicit
+    # global opt-in for other Live procedures; tying it to default_bundle would
+    # leave a safely switched stopped demo with the wrong health requirement.
+    global_perception_required = PythonExpression(
+        [
+            "'",
+            _env("REQUIRE_PERCEPTION_ON_START", "false"),
+            "'.lower() in ('true', '1', 'yes')",
+        ]
+    )
+    # Keep the typed RF-DETR contract armed for the external Production input
+    # when the process initially starts on a different bundle. The preflight
+    # node applies it only after the operator selects the thyroidectomy demo;
+    # otherwise a stopped-state switch could silently inherit no CAM3/CAM4
+    # location admission gate.
+    structured_rfdetr_tool_observations_enabled = "true"
+    # Keep the read-only relay alive whenever its public contract is enabled.
+    # It opens native streams only for a fresh, active and locally validated
+    # selected bundle, so a stopped-state bundle switch remains supportable
+    # even if Live was launched with a different initial bundle.
+    camera_aliases_enabled = PythonExpression(
+        [
+            "'",
+            publish_camera_aliases,
+            "'.lower() in ('true', '1', 'yes')",
+        ]
+    )
     flir_input_topic = _env(
         "FLIR_INPUT_TOPIC",
         "/synced/flir/color/image_raw/compressed",
@@ -66,17 +129,13 @@ def generate_launch_description() -> LaunchDescription:
         "CAM4_INPUT_TOPIC",
         "/synced/cam_4/color/image_raw/compressed",
     )
-    perception_enabled = PythonExpression(
-        [
-            "'",
-            perception_provider,
-            "' == 'builtin_rfdetr' and '",
-            _env("ENABLE_RFDETR_PERCEPTION", "true"),
-            "'.lower() in ('true', '1', 'yes') and '",
-            vlm_mode,
-            "' in ('real', 'dual')",
-        ]
+    cam3_input_topic = _env(
+        "CAM3_INPUT_TOPIC",
+        "/synced/cam_3/color/image_raw/compressed",
     )
+    # Production never creates a detector process or HTTP adapter.  The
+    # reviewed 192.168.1.7 runtime owns inference and publishes typed DDS.
+    local_perception_adapter_enabled = "false"
     base_launch = PythonLaunchDescriptionSource(
         PathJoinSubstitution(
             [FindPackageShare("bringup"), "launch", "taskplanner_mock.launch.py"]
@@ -86,8 +145,103 @@ def generate_launch_description() -> LaunchDescription:
         [
             DeclareLaunchArgument(
                 "default_bundle",
-                default_value=_env("TASKPLANNER_DEFAULT_BUNDLE", "thyroidectomy"),
-                description="Procedure bundle selected for the live runtime.",
+                default_value=_env(
+                    "TASKPLANNER_LIVE_DEFAULT_BUNDLE",
+                    "thyroidectomy_demo",
+                ),
+                description=(
+                    "Procedure bundle selected for the live runtime. An explicit "
+                    "default_bundle:= argument still takes precedence."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "vlm_mode",
+                default_value=LIVE_VLM_MODE,
+                choices=(LIVE_VLM_MODE,),
+                description="Production always runs the reviewed real VLM path.",
+            ),
+            DeclareLaunchArgument(
+                "vlm_base_url",
+                default_value=LIVE_VLM_BASE_URL,
+                choices=(LIVE_VLM_BASE_URL,),
+                description=(
+                    "Production NInfer manager endpoint. Alternate model servers "
+                    "belong to Lab."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "vlm_provider_id",
+                default_value=LIVE_VLM_PROVIDER_ID,
+                choices=(LIVE_VLM_PROVIDER_ID,),
+                description="Production is fixed to the NInfer provider.",
+            ),
+            DeclareLaunchArgument(
+                "vlm_model_id",
+                default_value=LIVE_VLM_MODEL_ID,
+                choices=(LIVE_VLM_MODEL_ID,),
+                description="Production is fixed to the reviewed 35B A3B model.",
+            ),
+            DeclareLaunchArgument(
+                "robot_endpoint_source",
+                default_value=_env("TASKPLANNER_ROBOT_ENDPOINT_SOURCE", "external"),
+                choices=("external", "virtual"),
+                description=(
+                    "Launch-lifetime controller route. virtual uses only the "
+                    "isolated in-process emulator endpoints."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "retraction_endpoint_source",
+                default_value=_env(
+                    "TASKPLANNER_RETRACTION_ENDPOINT_SOURCE",
+                    _env("TASKPLANNER_ROBOT_ENDPOINT_SOURCE", "external"),
+                ),
+                choices=("external", "virtual"),
+                description=(
+                    "Launch default for the retraction Service route. Runtime "
+                    "selection remains stopped-only and independently bounded."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "external_controller_contract_id",
+                default_value=_env(
+                    "TASKPLANNER_EXTERNAL_CONTROLLER_CONTRACT_ID",
+                    "eir-nuc-tool-handover.real.v1",
+                ),
+                description=(
+                    "Expected ID in the external controller's read-only contract "
+                    "manifest for route diagnostics; it does not gate start or "
+                    "dispatch."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "external_capability_policy_id",
+                default_value=_env(
+                    "TASKPLANNER_EXTERNAL_CAPABILITY_POLICY_ID",
+                    "eir-nuc-tool-handover.v1",
+                ),
+                description=(
+                    "Exact reviewed handover capability policy expected from the "
+                    "external controller manifest."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "controller_contract_max_age_sec",
+                default_value=_env("CONTROLLER_CONTRACT_MAX_AGE_SEC", "3.0"),
+                description=(
+                    "Legacy compatibility setting used for controller diagnostics "
+                    "only; it never authorizes or blocks dispatch."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "dispatch_readiness_max_age_sec",
+                default_value=_env(
+                    "TASKPLANNER_DISPATCH_READINESS_MAX_AGE_SEC", "3.0"
+                ),
+                description=(
+                    "Maximum age of /integration/readiness at the dispatch edge. "
+                    "This is independent of controller-contract telemetry."
+                ),
             ),
             DeclareLaunchArgument(
                 "publish_shared_state",
@@ -123,98 +277,44 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument(
                 "perception_backend",
-                default_value=_env("PERCEPTION_BACKEND", "local"),
+                default_value=_env("PERCEPTION_BACKEND", "external"),
+                choices=("external",),
                 description=(
-                    "local runs the built-in RF-DETR bridge; external reserves "
-                    "the CV-team contract; disabled runs neither backend."
+                    "Production is fixed to externally owned typed DDS input."
                 ),
             ),
             DeclareLaunchArgument(
                 "perception_provider",
-                default_value=_env("PERCEPTION_PROVIDER", ""),
+                default_value=_env(
+                    "PERCEPTION_PROVIDER", "external_rfdetr_topics"
+                ),
+                choices=("external_rfdetr_topics",),
                 description=(
-                    "Explicit provider axis. Empty maps the legacy "
-                    "PERCEPTION_BACKEND alias."
+                    "Production provider; local/PNU adapters belong to Lab."
                 ),
             ),
             DeclareLaunchArgument(
                 "perception_location",
-                default_value=_env("PERCEPTION_LOCATION", ""),
+                default_value=_env("PERCEPTION_LOCATION", "remote"),
+                choices=("remote",),
                 description=(
-                    "Worker placement: local or remote. No automatic failover."
+                    "External RF-DETR placement. No automatic fallback."
                 ),
             ),
             DeclareLaunchArgument(
                 "perception_endpoint",
                 default_value=_env("PERCEPTION_ENDPOINT", ""),
                 description=(
-                    "Explicit worker endpoint. Empty maps RFDETR_SERVICE_URL."
+                    "Must remain empty: typed DDS has no HTTP worker endpoint."
                 ),
             ),
             DeclareLaunchArgument(
                 "rfdetr_service_url",
                 default_value=_env(
                     "RFDETR_SERVICE_URL",
-                    "http://127.0.0.1:8010",
-                ),
-                description="Legacy alias for perception_endpoint.",
-            ),
-            DeclareLaunchArgument(
-                "pnu_service_url",
-                default_value=_env("PNU_SERVICE_URL", ""),
-                description=(
-                    "Optional PNU Hand/Tool/Blood endpoint alias. Remote "
-                    "placement requires a non-loopback value."
-                ),
-            ),
-            DeclareLaunchArgument(
-                "pnu_api_token_file",
-                default_value=_env("PNU_CLIENT_API_TOKEN_FILE", ""),
-            ),
-            DeclareLaunchArgument(
-                "pnu_allow_insecure_remote_http",
-                default_value=_env(
-                    "PNU_ALLOW_INSECURE_REMOTE_HTTP",
-                    "false",
-                ),
-                description=(
-                    "Development-only opt-in for HTTP to a non-loopback PNU "
-                    "worker. Remote endpoints require HTTPS by default."
-                ),
-            ),
-            DeclareLaunchArgument(
-                "pnu_allow_unauthenticated_remote",
-                default_value=_env(
-                    "PNU_ALLOW_UNAUTHENTICATED_REMOTE",
-                    "false",
-                ),
-            ),
-            DeclareLaunchArgument(
-                "pnu_expected_model_digests_json",
-                default_value=_env("PNU_EXPECTED_MODEL_DIGESTS_JSON", "{}"),
-            ),
-            DeclareLaunchArgument(
-                "pnu_expected_tool_support_plane_config_version",
-                default_value=_env(
-                    "PNU_EXPECTED_TOOL_SUPPORT_PLANE_CONFIG_VERSION",
                     "",
                 ),
-            ),
-            DeclareLaunchArgument(
-                "pnu_depth_scale_m_per_unit",
-                default_value=_env("PNU_DEPTH_SCALE_M_PER_UNIT", "0.0"),
-            ),
-            DeclareLaunchArgument(
-                "pnu_depth_scale_validated",
-                default_value=_env("PNU_DEPTH_SCALE_VALIDATED", "false"),
-            ),
-            DeclareLaunchArgument(
-                "pnu_depth_alignment_validated",
-                default_value=_env("PNU_DEPTH_ALIGNMENT_VALIDATED", "false"),
-            ),
-            DeclareLaunchArgument(
-                "pnu_depth_alignment_id",
-                default_value=_env("PNU_DEPTH_ALIGNMENT_ID", ""),
+                description="Deprecated alias; empty in Production.",
             ),
             OpaqueFunction(function=resolve_launch_perception),
             IncludeLaunchDescription(
@@ -233,10 +333,75 @@ def generate_launch_description() -> LaunchDescription:
                     "publish_shared_free_text": publish_shared_free_text,
                     "execution_backend": "external",
                     "execution_contract": "direct",
-                    "speech_input_mode": "sentence_text",
-                    "sentence_input_topic": _env(
-                        "SENTENCE_INPUT_TOPIC",
-                        "/sensors/surgeon/sentence",
+                    # The operator's 2026-08-26 live CAM4 check accepted the
+                    # pinned forced-Right/palm-facing mapping. The base launch
+                    # remains fail-closed by default for mock/replay callers.
+                    "hand_mapping_operator_approved": "true",
+                    "robot_endpoint_source": robot_endpoint_source,
+                    "retraction_endpoint_source": retraction_endpoint_source,
+                    "enable_runtime_route_control": "true",
+                    "external_controller_contract_id": (
+                        external_controller_contract_id
+                    ),
+                    "external_capability_policy_id": (
+                        external_capability_policy_id
+                    ),
+                    "controller_contract_max_age_sec": (
+                        controller_contract_max_age_sec
+                    ),
+                    "dispatch_readiness_max_age_sec": (
+                        dispatch_readiness_max_age_sec
+                    ),
+                    # Live is intentionally immutable to the typed ASR path.
+                    # Do not inherit generic SPEECH_INPUT_MODE or the legacy
+                    # String topic here: they are Debug/replay compatibility
+                    # controls, not a safe Live input authority.
+                    "speech_input_mode": "utterance",
+                    "speech_input_topic": _env(
+                        "ASR_UTTERANCE_TOPIC",
+                        "/sensors/surgeon/utterance",
+                    ),
+                    "speech_output_mode": "typed_utterance",
+                    "speech_typed_output_topic": (
+                        "/surgery/audio/admitted_utterance"
+                    ),
+                    # The local speaker is physically audible to the ASR
+                    # microphone. Track typed playback status so a robot reply
+                    # cannot be admitted again as a surgeon command.
+                    "enable_tts_echo_guard": "true",
+                    "tts_playback_status_topic": "/tts/playback_status",
+                    "tts_echo_tail_sec": _env("TTS_ECHO_TAIL_SEC", "0.8"),
+                    "tts_echo_similarity_threshold": _env(
+                        "TTS_ECHO_SIMILARITY_THRESHOLD", "0.88"
+                    ),
+                    "voice_command_input_mode": "utterance",
+                    "voice_command_input_topic": (
+                        "/surgery/audio/admitted_utterance"
+                    ),
+                    # The resolver remains a proposal-only language adapter.
+                    # Only the durable VLM function gate may publish the
+                    # existing execution-intent topic in Live.
+                    "voice_command_output_topic": "/surgery/voice/proposal",
+                    "vlm_function_gate_enabled": "true",
+                    "vlm_function_gate_ledger_path": (
+                        "/taskplanner-tts-state/vlm_function_gate.sqlite3"
+                    ),
+                    "enable_voice_procedure_control": "true",
+                    # The operational ASR publishes an explicit
+                    # has_confidence=false when its backend has no calibrated
+                    # score. Live accepts that honest absence while the typed
+                    # final/surgeon/fresh/procedure gates remain mandatory.
+                    "voice_procedure_accept_missing_confidence": "true",
+                    "voice_intent_require_source_metadata": "true",
+                    "require_asr_runtime_status": "true",
+                    "asr_runtime_status_topic": "/input/asr/runtime_status",
+                    "asr_runtime_status_max_age_sec": _env(
+                        "ASR_RUNTIME_STATUS_MAX_AGE_SEC",
+                        "3.0",
+                    ),
+                    "asr_runtime_status_source_future_tolerance_sec": _env(
+                        "ASR_RUNTIME_STATUS_SOURCE_FUTURE_TOLERANCE_SEC",
+                        "0.5",
                     ),
                     # The speech adapter remains the only ASR owner.  This
                     # text-only VLM receives its final transcript downstream
@@ -247,17 +412,8 @@ def generate_launch_description() -> LaunchDescription:
                         "RETRACTOR_VOICE_INTERPRETER_MODE",
                         "vlm_with_fallback",
                     ),
-                    "retractor_voice_vlm_base_url": _env(
-                        "RETRACTOR_VOICE_VLM_BASE_URL",
-                        _env("VLM_BASE_URL", "http://127.0.0.1:8001"),
-                    ),
-                    "retractor_voice_vlm_model_id": _env(
-                        "RETRACTOR_VOICE_VLM_MODEL_ID",
-                        _env(
-                            "VLM_MODEL_ID",
-                            "unsloth/gemma-4-E4B-it-NVFP4",
-                        ),
-                    ),
+                    "retractor_voice_vlm_base_url": vlm_base_url,
+                    "retractor_voice_vlm_model_id": vlm_model_id,
                     "retractor_voice_vlm_api_key": _env(
                         "RETRACTOR_VOICE_VLM_API_KEY",
                         _env("VLM_API_KEY", ""),
@@ -275,37 +431,29 @@ def generate_launch_description() -> LaunchDescription:
                     "voice_command_selector_endpoint": PythonExpression(
                         [
                             "'",
-                            _env("VOICE_COMMAND_SELECTOR_ENDPOINT", ""),
-                            "' if '",
-                            _env("VOICE_COMMAND_SELECTOR_ENDPOINT", ""),
-                            "' else '",
-                            _env("VLM_BASE_URL", "http://127.0.0.1:8001"),
+                            vlm_base_url,
                             "/v1/chat/completions'",
                         ]
                     ),
-                    "voice_command_selector_model": _env(
-                        "VOICE_COMMAND_SELECTOR_MODEL",
-                        _env("VLM_MODEL_ID", "unsloth/gemma-4-E4B-it-NVFP4"),
-                    ),
+                    "voice_command_selector_model": vlm_model_id,
                     "voice_command_selector_timeout_sec": _env(
                         "VOICE_COMMAND_SELECTOR_TIMEOUT_SEC", "0.35"
                     ),
                     "vlm_mode": vlm_mode,
-                    "vlm_base_url": _env(
-                        "VLM_BASE_URL",
-                        "http://127.0.0.1:8001",
-                    ),
-                    "vlm_provider_id": _env("VLM_PROVIDER_ID", "vllm"),
-                    "vlm_model_id": _env(
-                        "VLM_MODEL_ID",
-                        "unsloth/gemma-4-E4B-it-NVFP4",
-                    ),
-                    "vlm_api_mode": _env("VLM_API_MODE", "openai_compat"),
+                    "vlm_base_url": vlm_base_url,
+                    "vlm_provider_id": vlm_provider_id,
+                    "vlm_model_id": vlm_model_id,
+                    "vlm_api_mode": "openai_compat",
                     "vlm_publish_period_sec": _env(
                         "VLM_PUBLISH_PERIOD_SEC",
                         "1.0",
                     ),
                     "vlm_image_stale_sec": _env("VLM_IMAGE_STALE_SEC", "3.0"),
+                    # Live visual admission tracks source frame time, rather
+                    # than a newly received replayed image/health message.
+                    "vlm_require_source_frame_timestamp": "true",
+                    "vlm_model_input_max_source_lag_sec": "1.0",
+                    "vlm_model_input_max_source_future_skew_sec": "0.25",
                     "vlm_max_output_tokens": _env(
                         "VLM_MAX_OUTPUT_TOKENS",
                         "320",
@@ -323,55 +471,73 @@ def generate_launch_description() -> LaunchDescription:
                     "surgeon_actor_mode": "none",
                     "enable_no_image_camera": "false",
                     "enable_synthetic_scene_camera": "false",
-                    "enable_rfdetr_perception": perception_enabled,
+                    "enable_rfdetr_perception": local_perception_adapter_enabled,
                     "perception_backend": perception_backend,
                     "perception_provider": perception_provider,
                     "perception_location": perception_location,
                     "perception_endpoint": perception_endpoint,
                     "rfdetr_service_url": perception_endpoint,
-                    "pnu_api_token_file": pnu_api_token_file,
-                    "pnu_allow_insecure_remote_http": (
-                        pnu_allow_insecure_remote_http
-                    ),
-                    "pnu_allow_unauthenticated_remote": (
-                        pnu_allow_unauthenticated_remote
-                    ),
-                    "pnu_expected_model_digests_json": (
-                        pnu_expected_model_digests_json
-                    ),
-                    "pnu_expected_tool_support_plane_config_version": (
-                        pnu_expected_tool_support_plane_config_version
-                    ),
-                    "pnu_depth_scale_m_per_unit": pnu_depth_scale_m_per_unit,
-                    "pnu_depth_scale_validated": pnu_depth_scale_validated,
-                    "pnu_depth_alignment_validated": (
-                        pnu_depth_alignment_validated
-                    ),
-                    "pnu_depth_alignment_id": pnu_depth_alignment_id,
                     "flir_input_topic": flir_input_topic,
                     "cam4_input_topic": cam4_input_topic,
-                    "field_image_topic": _env(
-                        "SEGMENTED_FLIR_TOPIC",
-                        "/surgery/images/flir/segmented/compressed",
+                    "cam3_input_topic": cam3_input_topic,
+                    # The model receives raw FLIR/CAM4 visual panels. RF-DETR
+                    # tool geometry reaches it only through the typed CAM3/4
+                    # observation topics below; transparent overlays remain
+                    # a separate low-latency operator-display layer.
+                    "field_image_topic": flir_input_topic,
+                    "rfdetr_flir_output_topic": (
+                        LIVE_RFDETR_FLIR_SEGMENTED_TOPIC
                     ),
-                    "cam4_overlay_image_topic": _env(
-                        "CAM4_OVERLAY_TOPIC",
-                        "/surgery/images/cam4/detection_overlay/compressed",
-                    ),
+                    "flir_overlay_image_topic": LIVE_RFDETR_FLIR_OVERLAY_TOPIC,
+                    "cam4_overlay_image_topic": LIVE_RFDETR_CAM4_OVERLAY_TOPIC,
+                    "cam3_overlay_image_topic": LIVE_RFDETR_CAM3_OVERLAY_TOPIC,
+                    # This is a raw visual composite emitted by ``real_vlm``
+                    # for local observability, not RF-DETR detector evidence.
+                    "composite_image_topic": LIVE_VLM_MODEL_VISUAL_TOPIC,
                     "cam4_semantics_topic": _env(
                         "CAM4_SEMANTICS_TOPIC",
                         "/surgery/perception/cam4/semantics/json",
                     ),
-                    "require_field_image": perception_enabled,
+                    "cam3_tool_observations_topic": _env(
+                        "CAM3_TOOL_OBSERVATIONS_TOPIC",
+                        LIVE_RFDETR_CAM3_TOOL_OBSERVATIONS_TOPIC,
+                    ),
+                    "cam4_tool_observations_topic": _env(
+                        "CAM4_TOOL_OBSERVATIONS_TOPIC",
+                        LIVE_RFDETR_CAM4_TOOL_OBSERVATIONS_TOPIC,
+                    ),
+                    # The shared base launch still declares Lab bridge topic
+                    # arguments, but Production hard-disables that bridge.
+                    # Keep its unused names private so a later Lab refactor
+                    # cannot collide with the authoritative external topics.
+                    "rfdetr_bridge_cam3_tool_observations_topic": (
+                        LIVE_RFDETR_BRIDGE_CAM3_TOOL_OBSERVATIONS_TOPIC
+                    ),
+                    "rfdetr_bridge_cam4_tool_observations_topic": (
+                        LIVE_RFDETR_BRIDGE_CAM4_TOOL_OBSERVATIONS_TOPIC
+                    ),
+                    "cam3_tool_observations_expected_model_version": _env(
+                        "CAM3_TOOL_OBSERVATIONS_EXPECTED_MODEL_VERSION",
+                        LIVE_RFDETR_MODEL_VERSION_PIN,
+                    ),
+                    "cam4_tool_observations_expected_model_version": _env(
+                        "CAM4_TOOL_OBSERVATIONS_EXPECTED_MODEL_VERSION",
+                        LIVE_RFDETR_MODEL_VERSION_PIN,
+                    ),
+                    "allow_legacy_cam4_semantics_fallback": "false",
+                    "require_field_image": "false",
+                    "require_rfdetr_applied_field_image": "false",
+                    "require_rfdetr_cam4_overlay": "false",
                     "require_integration_preflight": "true",
-                    "preflight_require_perception": _env(
-                        "REQUIRE_PERCEPTION_ON_START",
-                        "false",
+                    "preflight_require_perception": global_perception_required,
+                    "preflight_require_rfdetr_tool_observations": (
+                        structured_rfdetr_tool_observations_enabled
                     ),
-                    "preflight_require_metric_3d": _env(
-                        "PNU_REQUIRE_METRIC_3D_ON_START",
-                        "false",
+                    "rfdetr_vlm_request_context_topic": _env(
+                        "RFDETR_VLM_REQUEST_CONTEXT_TOPIC",
+                        "/context/vlm_request_context",
                     ),
+                    "preflight_require_metric_3d": "false",
                     "cv_contract_status_topic": _env(
                         "CV_CONTRACT_STATUS_TOPIC",
                         "/integration/cv_contract/status",
@@ -427,7 +593,7 @@ def generate_launch_description() -> LaunchDescription:
                 package="surgical_interop_gateway",
                 executable="camera_alias_relay",
                 name="surgical_camera_alias_relay",
-                condition=IfCondition(publish_camera_aliases),
+                condition=IfCondition(camera_aliases_enabled),
                 parameters=[
                     {
                         "flir_source_topic": flir_input_topic,

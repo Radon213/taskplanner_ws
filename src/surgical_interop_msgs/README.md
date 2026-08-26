@@ -19,7 +19,7 @@ prompts, and diagnostic text.
 | `/surgery/gateway_info` | `GatewayInfo` | Gateway heartbeat, schema/interface identity, process identity, and active procedure-run identity. |
 | `/surgery/tool_predictions` | `ToolPredictionArray` | Ranked advisory next-instrument predictions; never a robot command or handover authorization. |
 | `/surgery/robot_end_effectors` | `RobotEndEffectorStateArray` | Semantic empty/holding/unknown state and held instrument for each robot end effector. |
-| `/surgery/catalog` | `ProcedureCatalog` | Procedure-scoped Korean/English phase and instrument display metadata. |
+| `/surgery/catalog` | `ProcedureCatalog` | Procedure name, target site, approach, phase, and instrument display metadata in Korean/English. |
 | `/surgery/speech` | `SpeechRecognitionState` | ASR availability, connectivity, finalized sequence, and measured latency; transcript text is redacted by default. |
 | `/external/bed_robot_arms/status` | `BedRobotArmStateArray` | Controller-owned state of the bed-mounted retraction arms. |
 
@@ -73,6 +73,16 @@ interpret a zero latency when that flag is false. While no procedure is active
 it reports `available=false` with empty text. Existing plain String speech topics
 remain compatibility/internal inputs and are not the public UI contract.
 
+`ClinicalObservation` intentionally contains only VLM phase, tool, semantic
+location, uncertainty, and optional summary fields. It has no gesture, hand
+pose, requested-tool, or handover-intent field. Taskplanner consumes the typed
+CAM4 hand streams directly inside the Digital Twin: only the exact
+`Right + Open_Palm + PALM_UP` condition sustained for at least 0.300 seconds in
+both source and receipt time can create a tool-agnostic handover evidence
+episode. That internal evidence is
+not copied to `/surgery/clinical_observations`, does not select an instrument,
+and is not itself a robot command or authorization.
+
 Confidence and uncertainty fields are finite values in `[0.0, 1.0]`.
 Malformed scalar claims are made `UNKNOWN` or omitted; malformed clinical
 parallel-array rows are never emitted as aligned evidence. Tool-prediction
@@ -90,7 +100,9 @@ distinguishes lifecycle policy without inventing physical Mayo zones.
 
 `/surgery/tool_predictions` contains zero to three contiguous ranks in
 descending confidence order. Rank 1 matches the private control-compatible
-scalar. Ranks 2 and 3 are display-only and currently use `stability_sec=0.0`.
+scalar's tool identity and stability; its display confidence may differ because
+the ranked distribution is normalized to 100%. Ranks 2 and 3 are display-only
+and currently use `stability_sec=0.0`.
 
 ## Focused capability requests
 
@@ -110,8 +122,15 @@ caller-provided `command_id`, `command`, `target_side`, and `distance_m`.
 `COMMAND_CHANGE_TOOL`, and `COMMAND_STOP_RETRACTION`.
 
 For commands other than `COMMAND_ADJUST_RETRACTION`, callers send
-`TARGET_NONE` and `distance_m=0.0`. An adjustment sends `TARGET_LEFT` or
-`TARGET_RIGHT` and a metre distance; for example, 5 cm is `distance_m=0.050`.
+`distance_m=0.0`. `COMMAND_FINISH_DIRECT_TEACH` accepts `TARGET_NONE`,
+`TARGET_LEFT`, or `TARGET_RIGHT`; the value is passed as the optional finish
+target selector and the controller owns its per-arm interpretation. The other
+non-adjustment commands use `TARGET_NONE`. An adjustment sends `TARGET_LEFT`,
+`TARGET_RIGHT`, or `TARGET_NONE` and a metre distance. For an adjustment,
+`TARGET_NONE` is the peer contract's bilateral value: the same distance is
+applied once to each arm. For example, “both arms by 1 mm” is
+`target_side=TARGET_NONE, distance_m=0.001`, while 5 cm is
+`distance_m=0.050`.
 
 The Response contains `request_accepted`, `result_code`, `command_id`, and
 `message`. `RESULT_ACCEPTED` means the server accepted the Request;
@@ -133,14 +152,23 @@ location values. The only valid transitions are `tray -> robot` (pick up the
 Taskplanner-selected next tool from the supply tray and hold it ready),
 `mayo -> robot` (pick up a reusable Mayo tool selected by the same stable
 next-tool policy and hold it ready), `tray -> surgeon` (direct pickup and
-handover), `robot -> surgeon` (held-tool handover), `robot -> tray` (return an
-unused held tool), and `mayo -> tray` (retrieve a used tool).
+handover), `robot -> surgeon` (held-tool handover), `robot -> mayo` (park an
+unused speculative preparation on Mayo to free the robot hand), `robot -> tray`
+(controller-directed tray recovery), and `mayo -> tray` (retrieve a used tool).
 `instrument_id` is
 the shared real instrument name (for example `Bovie surgical cautery`), not a
 private procedure-catalog code such as `T04`. The server chooses the arm; arm
 selection is intentionally absent from the Goal. A successful `tray -> robot`
 or `mayo -> robot` Result means stable holding has been reached and the robot
-keeps holding the tool until a later handover or `robot -> tray` return Goal.
+keeps holding the tool until a later handover or a new
+`return_unused_preposition` `robot -> mayo` Goal.
+
+For any supported tool-transfer leg, a correlated `SUCCEEDED` Result with
+`success=true` and `final_state=completed` is authoritative physical completion
+evidence. Taskplanner must project that location/lifecycle result even when a
+local detector/VLM, arm-occupancy, or lifecycle belief disagrees. Provenance,
+Goal/instance/type/leg correlation, projection order, duplicate, and stale-time
+checks still fail closed; failed and canceled Results are not success evidence.
 
 `ExecuteToolHandover.Feedback.state` uses exactly nine lower-case values:
 `moving_to_source`, `grasping`, `moving_to_target`,
@@ -170,5 +198,9 @@ finishes `completed`. This operational interrupt does not replace the
 controller's local E-stop or protective stop.
 
 A `tray -> robot` or `mayo -> robot` Goal that already returned `completed` is
-no longer cancellable. Returning that stably held but now-unneeded tool is a
-new `robot -> tray` Goal; Cancel applies only while a Goal is still active.
+no longer cancellable. Taskplanner parks that stably held but now-unneeded tool
+with a new `robot -> mayo` Goal; Cancel applies only while a Goal is active.
+The new Goal is admitted only for an explicit different-tool request or a
+different system-final rank-1 tool held for at least 2.0 continuous source-time
+seconds, and never while another tracked tool Goal is active.
+`canceled_recovered_to_tray` remains a separate compensating recovery outcome.

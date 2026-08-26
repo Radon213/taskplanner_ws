@@ -21,6 +21,7 @@ from vlm_node.real_vlm import (
     bound_actor_log_context,
     build_forecast_constraints,
     compact_prompt_json,
+    normalize_ranked_tool_distribution,
 )
 
 
@@ -43,7 +44,6 @@ def _node() -> RealVLMNode:
     }
     node._phase_entered_wall_sec = 123.0
     node._recent_speech = deque()
-    node._recent_observed_signals = deque()
     node._recent_skill_statuses = deque()
     node._recent_events = deque()
     node._latest_bed_robot_arm_group_request = None
@@ -69,7 +69,8 @@ def _node() -> RealVLMNode:
             SimpleNamespace(
                 instrument_id="T02",
                 lifecycle_stage="mayo_reuse",
-                location_type="mayo",
+                location_type="mayo_stand",
+                location_id="mayo_stand",
             ),
         ],
     )
@@ -90,6 +91,45 @@ def test_prior_falls_back_to_authoritative_simulation_phase() -> None:
     evidence = node._actor_log_prior_evidence()
 
     assert evidence["current_phase"] == "P04"
+
+
+def test_simulation_state_recovers_lifecycle_after_a_missed_start_event() -> None:
+    node = RealVLMNode.__new__(RealVLMNode)
+    node._last_simulation_bundle = ""
+    node._active = False
+    transitions: list[tuple[str, str]] = []
+    node._reset_public_evidence = lambda: transitions.append(("evidence", ""))
+    node._activate_lifecycle = lambda phase: transitions.append(("start", phase))
+    node._stop_lifecycle = lambda: transitions.append(("stop", ""))
+    node._track_authoritative_phase = lambda: None
+    node._publish_context_summaries = lambda: None
+
+    node._on_simulation(
+        SimpleNamespace(
+            active_bundle="thyroidectomy_demo",
+            running=True,
+            execution_state="running",
+            filtered_phase="P03",
+        )
+    )
+    node._on_simulation(
+        SimpleNamespace(
+            active_bundle="thyroidectomy_demo",
+            running=True,
+            execution_state="starting",
+            filtered_phase="P03",
+        )
+    )
+    node._on_simulation(
+        SimpleNamespace(
+            active_bundle="thyroidectomy_demo",
+            running=False,
+            execution_state="idle",
+            filtered_phase="P03",
+        )
+    )
+
+    assert transitions == [("evidence", ""), ("start", "P03"), ("stop", "")]
 
 
 def test_actor_log_context_injects_only_the_frozen_ngram_prior_result() -> None:
@@ -119,7 +159,6 @@ def test_actor_log_context_injects_only_the_frozen_ngram_prior_result() -> None:
     node._actor_log_prior_evidence = lambda **_kwargs: {
         "current_phase": "P04",
         "speech": [],
-        "observed_signals": [],
         "skill_status": [],
     }
     node._prior_scorer = _Scorer()
@@ -156,6 +195,74 @@ def test_public_evidence_uses_ros_source_time_when_available() -> None:
     assert node._causal_now_sec() == 12.5
     assert node._append_public_speech("Adson")
     assert node._recent_speech[-1]["at"] == 12.5
+
+
+def test_default_live_context_carries_typed_rfdetr_boxes_not_detector_images():
+    node = RealVLMNode.__new__(RealVLMNode)
+    node._world = SimpleNamespace(
+        stamp=Time(sec=42),
+        procedure_id="thyroidectomy_demo",
+        filtered_phase="P03",
+        phase_confidence=0.8,
+        phase_uncertain=False,
+        explicit_request_tool="",
+        surgeon_request_tool="",
+        surgeon_intent="",
+        right_hand_tool="",
+        left_hand_tool="",
+        prepositioned_tool="",
+        cleaner_busy=False,
+        cleaner_remaining_sec=0.0,
+        expected_instruments=["T02"],
+        pending_transition_tools=[],
+        instrument_states=[],
+    )
+    node._simulation = SimpleNamespace()
+    node._recent_events = deque()
+    node._latest_bt = None
+    node._latest_bed_robot_arm_group_request = None
+    node._retraction_group_states = lambda: []
+    node._bed_robot_arm_group_state_rows = lambda: []
+    node._pending_bed_robot_arm_group_request_context = lambda: None
+    observed_reference_stamps: list[float | None] = []
+    typed_detector_context = {
+        "schema": "taskplanner.rfdetr_multiview_tool_context.v1",
+        "source": "rfdetr_tool_observation_2d",
+        "ground_truth": False,
+        "mask_rle_forwarded_to_vlm": False,
+        "tool_detection_views": [
+            {
+                "view": "cam_3",
+                "instances": [
+                    {
+                        "class_name": "Adson forceps",
+                        "tool_id": "T02",
+                        "confidence": 0.93,
+                        "bbox_xywh_norm": [0.1, 0.2, 0.3, 0.4],
+                        "center_uv_norm": [0.25, 0.4],
+                    }
+                ],
+            }
+        ],
+    }
+
+    def perception(reference_stamp_sec=None):
+        observed_reference_stamps.append(reference_stamp_sec)
+        return typed_detector_context
+
+    node._public_perception_context = perception
+
+    message, context = node._assemble_context(
+        perception_reference_stamp_sec=42.125,
+    )
+    compact = json.loads(message.compact_json)
+
+    assert observed_reference_stamps == [42.125]
+    assert context["observable_perception"] is typed_detector_context
+    assert compact["observable_perception"] == typed_detector_context
+    serialized = json.dumps(compact["observable_perception"])
+    assert "mask" not in serialized.replace("mask_rle_forwarded_to_vlm", "")
+    assert "image" not in serialized
 
 
 def test_vlm_input_freshness_uses_source_time_and_concurrent_callbacks() -> None:
@@ -216,8 +323,7 @@ def test_actor_log_context_is_bounded_without_repeating_static_ontology() -> Non
                 for index in range(10)
             ],
             "observed_signals": [
-                {"type": f"signal-{index}", "detail": "x" * 180}
-                for index in range(12)
+                {"type": "request_tool", "tool": "T02", "hand_pose": "open_palm"}
             ],
             "skill_status": [
                 {"action": f"skill-{index}", "detail": "x" * 180}
@@ -245,6 +351,7 @@ def test_actor_log_context_is_bounded_without_repeating_static_ontology() -> Non
     assert bounded["digital_twin"]["tools"] == [
         {"id": "T01", "lc": "mayo_reuse"}
     ]
+    assert "observed_signals" not in bounded["evidence_window"]
     assert [
         row["tool"] for row in bounded["digital_twin"]["completed_handovers"]
     ] == ["T02"] * 8
@@ -275,10 +382,6 @@ def test_complete_actor_log_prompt_budget_preserves_latest_public_request() -> N
                 {"text": f"speech-{index}-" + ("x" * 240)}
                 for index in range(8)
             ],
-            "observed_signals": [
-                {"type": "voice_request", "tool": "T02", "detail": "x" * 240}
-                for _ in range(8)
-            ],
             "skill_status": [
                 {"action": "handover", "detail": "x" * 240}
                 for _ in range(8)
@@ -289,7 +392,7 @@ def test_complete_actor_log_prompt_budget_preserves_latest_public_request() -> N
             "image_layout": "flir_left_cam4_right",
             "sources": [
                 {"role": "flir", "stamp_sec": 12.3},
-                {"role": "cam4_mayo_hand_crop", "stamp_sec": 12.32},
+                {"role": "cam4_mayo_instrument_crop", "stamp_sec": 12.32},
             ],
             "cam4_image_forwarded_to_vlm": True,
             "preprocessing": "x" * 1200,
@@ -332,6 +435,7 @@ def test_complete_actor_log_prompt_budget_preserves_latest_public_request() -> N
     assert "previous" not in request_context
     assert request_context["visual_input"]["image_layout"] == "flir_left_cam4_right"
     assert request_context["observable_perception"]["ground_truth"] is False
+    assert "tool_request" not in request_context["observable_perception"]
 
 
 def test_actor_log_request_context_handles_dense_detector_rows_at_runtime_budget() -> None:
@@ -346,9 +450,6 @@ def test_actor_log_request_context_handles_dense_detector_rows_at_runtime_budget
         },
         "evidence_window": {
             "speech": [{"text": "앨리스 포셉 하나 더 주세요", "at": 42.0}],
-            "observed_signals": [
-                {"type": "voice_request", "tool": "T02", "at": 42.0}
-            ],
             "skill_status": [
                 {
                     "action": "direct_handover",
@@ -371,7 +472,7 @@ def test_actor_log_request_context_handles_dense_detector_rows_at_runtime_budget
                 }
                 for role in (
                     "flir_segmented",
-                    "cam4_mayo_hand_crop",
+                    "cam4_mayo_instrument_crop",
                     "cam4_overlay",
                 )
             ],
@@ -441,6 +542,96 @@ def test_actor_log_request_context_handles_dense_detector_rows_at_runtime_budget
         "support": 12,
         "candidates": [["T07", 0.583], ["T04", 0.333]],
     }
+
+
+def test_actor_log_prompt_budget_keeps_typed_rfdetr_boxes_ahead_of_long_asr() -> None:
+    """A long ambient transcript cannot evict actual CAM3/CAM4 VLM input."""
+
+    context = {
+        "proc": "thyroidectomy_demo",
+        "phase_search_mode": "temporal_prior",
+        "evidence_window": {
+            "speech": [{"text": "ambient " * 900, "at": 42.0}],
+            "skill_status": [],
+        },
+        "visual_input": {
+            "image_source": "flir_cam4_rfdetr_segmented",
+            "image_layout": "flir_left_cam4_right",
+            "cam4_image_forwarded_to_vlm": True,
+            "cam4_detector_overlay_forwarded_to_vlm": False,
+            "detector_advisory": True,
+        },
+        "observable_perception": {
+            "schema": "taskplanner.rfdetr_multiview_tool_context.v1",
+            "source": "rfdetr_tool_observation_2d",
+            "ground_truth": False,
+            "mask_rle_forwarded_to_vlm": False,
+            "flir_reference_stamp_sec": 42.0,
+            "max_source_skew_sec": 0.2,
+            "freshness": {
+                "cam_3": {"status": "fresh", "received_age_sec": 0.01},
+                "cam_4": {"status": "fresh", "received_age_sec": 0.02},
+            },
+            "visual_alignment": {
+                "cam_3": {"status": "aligned", "detector_stamp_sec": 42.0, "offset_sec": 0.0},
+                "cam_4": {"status": "misaligned", "detector_stamp_sec": 41.2, "offset_sec": -0.8},
+            },
+            "tool_detection_views": [
+                {
+                    "view": "cam_3",
+                    "source_stamp_sec": 42.0,
+                    "sequence": 17,
+                    "model_version": "rfdetr-small",
+                    "ontology_version": "tool-v1",
+                    "detection_status": "detections",
+                    "truncated": False,
+                    "freshness": {"status": "fresh", "received_age_sec": 0.01},
+                    "visual_alignment": {"status": "aligned", "detector_stamp_sec": 42.0, "offset_sec": 0.0},
+                    "instances": [
+                        {
+                            "tool_id": "T02",
+                            "class_name": "Adson forceps",
+                            "confidence": 0.91,
+                            "bbox_xyxy_norm": [0.1, 0.2, 0.4, 0.6],
+                            "center_uv_norm": [0.25, 0.4],
+                            "image_region": "middle_left",
+                        }
+                    ],
+                },
+                {
+                    "view": "cam_4",
+                    "source_stamp_sec": 42.01,
+                    "sequence": 18,
+                    "model_version": "rfdetr-small",
+                    "ontology_version": "tool-v1",
+                    "detection_status": "no_detections",
+                    "truncated": False,
+                    "freshness": {"status": "fresh", "received_age_sec": 0.02},
+                    "visual_alignment": {"status": "misaligned", "detector_stamp_sec": 41.2, "offset_sec": -0.8},
+                    "instances": [],
+                },
+            ],
+        },
+        "digital_twin": {
+            "hands": {"rh": "", "lh": ""},
+            "forecast_inventory": {"available": [["T02", 1]]},
+            "tools": [],
+        },
+    }
+
+    static_chars = 15_000
+    request_context = actor_log_request_context(
+        context,
+        static_prompt_chars=static_chars,
+    )
+    perception = request_context["observable_perception"]
+
+    assert static_chars + len(compact_prompt_json(request_context)) <= VLM_PROMPT_MAX_CHARS
+    assert perception["schema"] == "taskplanner.rfdetr_multiview_tool_context.v1"
+    assert perception["mask_rle_forwarded_to_vlm"] is False
+    assert perception["freshness"]["cam_3"]["status"] == "fresh"
+    assert perception["tool_detection_views"][0]["instances"][0]["tool_id"] == "T02"
+    assert "ambient ambient ambient" not in compact_prompt_json(request_context)
 
 
 def test_model_context_excludes_ranked_feedback_but_keeps_public_evidence() -> None:
@@ -562,12 +753,14 @@ def test_public_forecast_inventory_exposes_spares_without_authorizing_action() -
             contaminated=False,
             procedure_future_use_expected=True,
         ),
-        SimpleNamespace(
-            instrument_id="T04",
-            lifecycle_stage="mayo_reuse",
-            owner="none",
-            contaminated=True,
-            procedure_future_use_expected=True,
+            SimpleNamespace(
+                instrument_id="T04",
+                lifecycle_stage="mayo_reuse",
+                owner="none",
+                contaminated=True,
+                procedure_future_use_expected=True,
+                location_type="mayo_stand",
+                location_id="mayo_stand",
         ),
         SimpleNamespace(
             instrument_id="T05",
@@ -669,7 +862,6 @@ def test_model_phase_ranking_is_not_overwritten_by_procedure_prior() -> None:
     context = {
         "evidence_window": {
             "speech": [],
-            "observed_signals": [],
         },
         "candidates": {
             "phase": [["P03", 0.95], ["P04", 0.61]],
@@ -704,7 +896,7 @@ def test_temporal_phase_stabilizer_preserves_nonadjacent_visual_evidence() -> No
     }
     context = {
         "phase_search_mode": "temporal_prior",
-        "evidence_window": {"speech": [], "observed_signals": []},
+        "evidence_window": {"speech": []},
         "candidates": {
             "phase": [["P03", 1.0], ["P04", 0.4]],
             "tool": [],
@@ -737,7 +929,7 @@ def test_open_set_public_tool_sequence_does_not_override_visual_phase() -> None:
     }
     context = {
         "phase_search_mode": "open_set",
-        "evidence_window": {"speech": [], "observed_signals": []},
+        "evidence_window": {"speech": []},
         "candidates": {
             "phase": [["P03", 1.0], ["P07", 0.8]],
             "tool": [],
@@ -776,7 +968,7 @@ def test_open_set_phase_preserves_uncertain_visual_candidates() -> None:
     }
     context = {
         "phase_search_mode": "open_set",
-        "evidence_window": {"speech": [], "observed_signals": []},
+        "evidence_window": {"speech": []},
         "candidates": {
             "phase": [["P04", 0.62], ["P07", 0.55]],
             "tool": [],
@@ -815,7 +1007,7 @@ def test_open_set_visual_phase_is_not_overridden_by_tool_sequence_when_forbidden
     }
     context = {
         "phase_search_mode": "open_set",
-        "evidence_window": {"speech": [], "observed_signals": []},
+        "evidence_window": {"speech": []},
         "candidates": {
             "phase": [["P04", 1.0], ["P05", 0.7]],
             "tool": [],
@@ -849,7 +1041,6 @@ def test_phase_abstention_is_published_without_default_phase() -> None:
             self.messages.append(message)
 
     node._phase_pub = _Publisher()
-    node._gesture_pub = _Publisher()
     node._result_pub = _Publisher()
     node._tool_pub = _Publisher()
     node._publish_bed_robot_arm_group_proposal = lambda *args, **kwargs: None
@@ -882,10 +1073,9 @@ def test_phase_abstention_is_published_without_default_phase() -> None:
 
     assert node._phase_pub.messages[-1].phase_ids == []
     assert node._result_pub.messages[-1].phase_ids == []
-    assert node._gesture_pub.messages[-1].phase_id == ""
 
 
-def test_model_raw_audit_preserves_pre_stabilization_intent() -> None:
+def test_model_raw_audit_preserves_pre_stabilization_tool_intent() -> None:
     class _Publisher:
         def __init__(self) -> None:
             self.messages = []
@@ -900,7 +1090,6 @@ def test_model_raw_audit_preserves_pre_stabilization_intent() -> None:
         "phase": [["P03", 0.84]],
         "tool": [["T02", 0.91]],
         "intent": ["handover", "T02", 0.88],
-        "gesture": ["request_tool", "T02", "open_receive", 0.86],
         "mayo": [],
         "mayo_retrieve": ["", 0.0],
         "u": 0.16,
@@ -923,9 +1112,7 @@ def test_model_raw_audit_preserves_pre_stabilization_intent() -> None:
     result = node._model_raw_result_pub.messages[-1]
     assert result.raw_json == raw_json
     assert result.phase_ids == ["P03"]
-    assert result.gesture_event_type == "request_tool"
-    assert result.gesture_requested_tool == "T02"
-    assert result.gesture_hand_pose == "open_receive"
+    assert json.loads(result.raw_json)["intent"] == ["handover", "T02", 0.88]
     assert result.source.startswith("real_vlm_model_raw:")
 
 
@@ -945,7 +1132,6 @@ def test_model_tool_ranking_is_not_overwritten_by_procedure_prior() -> None:
     context = {
         "evidence_window": {
             "speech": [],
-            "observed_signals": [],
         },
         "candidates": {
             "phase": [["P03", 0.95]],
@@ -979,7 +1165,6 @@ def test_model_rankings_are_normalized_by_confidence_before_publication() -> Non
     context = {
         "evidence_window": {
             "speech": [],
-            "observed_signals": [],
         },
         "candidates": {
             "phase": [["P03", 0.95]],
@@ -998,6 +1183,95 @@ def test_model_rankings_are_normalized_by_confidence_before_publication() -> Non
     ]
 
 
+def test_live_vlm_forecast_is_exactly_three_eligible_tools_with_unit_mass() -> None:
+    node = _node()
+    payload = {
+        "v": "4",
+        "phase": [["P03", 0.88]],
+        "tool": [["T03", 0.99], ["T02", 0.80]],
+        "intent": ["none", "", 0.0],
+        "mayo": [],
+        "mayo_retrieve": ["", 0.0],
+        "u": 0.2,
+        "sum": "forecast evidence",
+        "bed_robot_arm_group": None,
+    }
+    context = {
+        "evidence_window": {"speech": []},
+        "tools": [
+            {"id": "T02", "requestable": True},
+            {"id": "T03", "requestable": False},
+            {"id": "T04", "requestable": True},
+            {"id": "T07", "requestable": True},
+            {"id": "T08", "requestable": True},
+        ],
+        "forecast_constraints": {
+            "available_for_next_handover": [
+                ["T02", 1],
+                ["T03", 1],
+                ["T04", 1],
+                ["T07", 1],
+            ]
+        },
+        "frozen_ngram_prior": {
+            "candidates": [["T04", 0.6], ["T07", 0.4], ["T08", 0.2]]
+        },
+        "candidates": {"tool": [["T08", 0.9], ["T07", 0.5]]},
+        "digital_twin": {"hands": {}, "tools": []},
+    }
+
+    stabilized = node._stabilize_actor_log_payload(payload, context)
+
+    assert [row[0] for row in stabilized["tool"]] == ["T02", "T04", "T07"]
+    assert sum(row[1] for row in stabilized["tool"]) == 1.0
+    assert sum(round(row[1] * 100) for row in stabilized["tool"]) == 100
+    assert stabilized["u"] == 0.2
+
+
+def test_live_vlm_forecast_marks_fewer_than_three_eligible_tools_degraded() -> None:
+    node = _node()
+    payload = {
+        "v": "4",
+        "phase": [["P03", 0.88]],
+        "tool": [["T02", 0.8]],
+        "intent": ["none", "", 0.0],
+        "mayo": [],
+        "mayo_retrieve": ["", 0.0],
+        "u": 0.2,
+        "sum": "limited inventory",
+        "bed_robot_arm_group": None,
+    }
+    context = {
+        "evidence_window": {"speech": []},
+        "tools": [
+            {"id": "T02", "requestable": True},
+            {"id": "T04", "requestable": True},
+        ],
+        "forecast_constraints": {
+            "available_for_next_handover": [["T02", 1], ["T04", 1]]
+        },
+        "frozen_ngram_prior": {"candidates": [["T04", 1.0]]},
+        "digital_twin": {"hands": {}, "tools": []},
+    }
+
+    stabilized = node._stabilize_actor_log_payload(payload, context)
+
+    assert [row[0] for row in stabilized["tool"]] == ["T02", "T04"]
+    assert sum(row[1] for row in stabilized["tool"]) == 1.0
+    assert stabilized["u"] == 0.8
+
+
+def test_forecast_distribution_is_stable_in_both_display_precisions() -> None:
+    rows = normalize_ranked_tool_distribution(
+        [["T02", 1.0], ["T04", 1.0], ["T07", 1.0]]
+    )
+
+    assert rows == [["T02", 0.34], ["T04", 0.33], ["T07", 0.33]]
+    assert sum(row[1] for row in rows) == 1.0
+    assert sum(round(row[1] * 100) for row in rows) == 100
+    assert sum(round(row[1] * 100, 1) for row in rows) == 100.0
+
+
 def test_model_cannot_invent_handover_intent_without_public_request() -> None:
     node = _node()
     payload = {
@@ -1014,7 +1288,6 @@ def test_model_cannot_invent_handover_intent_without_public_request() -> None:
     context = {
         "evidence_window": {
             "speech": [],
-            "observed_signals": [],
         },
         "candidates": {
             "phase": [],
@@ -1045,7 +1318,6 @@ def test_public_voice_request_resolves_intent_without_overwriting_forecast() -> 
     context = {
         "evidence_window": {
             "speech": [{"text": "Bovie", "at": time.time()}],
-            "observed_signals": [],
         },
         "candidates": {
             "phase": [],

@@ -1,10 +1,8 @@
 #include <algorithm>
 #include <atomic>
-#include <chrono>
 #include <cstdint>
 #include <limits>
 #include <memory>
-#include <optional>
 #include <sstream>
 #include <string>
 #include <unordered_set>
@@ -38,30 +36,16 @@ std::atomic<uint64_t> skill_command_sequence{0};
 // occupy the single right-hand preparation slot; handover keeps stricter guards.
 constexpr double kPreparationMinConfidence = 0.65;
 constexpr double kPreparationMinStabilitySec = 0.3;
-constexpr double kImplicitGestureMinConfidence = 0.8;
-constexpr double kImplicitGestureMinStabilitySec = 0.7;
-// The reducer already withdraws stale prediction evidence. Keep only a short
-// BT-side grace period so a transient blackboard update does not cause churn.
-constexpr double kPreparationUnsupportedGraceSec = 0.8;
-// A speculative preparation must not monopolize the right hand indefinitely.
-// Explicit requests bypass this limit and can still hand over the held tool.
-constexpr double kPreparationMaxDwellSec = 6.0;
-// A high-confidence prediction that remains the reducer's current winner may
-// be held across a longer surgical maneuver. A replacement prediction still
-// releases it through the faster reversible replacement branch.
-constexpr double kPreparationStrongConfidence = 0.85;
-constexpr double kPreparationStrongMaxDwellSec = 30.0;
-// A returned candidate is re-armed only after it has remained absent from the
-// prediction stream for this long. Merely waiting while the same unstable
-// candidate keeps reappearing must not trigger repeated robot motion.
-constexpr double kPreparationRetryCooldownSec = 5.0;
-
-double steadyNowSec()
-{
-  return std::chrono::duration<double>(
-    std::chrono::steady_clock::now().time_since_epoch()).count();
-}
-
+// Replacement is driven by the reducer's system-final rank 1, not the raw VLM
+// rank 1. The reducer resets this continuity clock whenever its winner changes.
+constexpr double kSystemTopReplacementMinStabilitySec = 2.0;
+// The CAM4 reducer has already required an exact Right/Open_Palm/PALM_UP join,
+// pinned provenance, and source-time dwell. Repeat the policy threshold here
+// so no alternate WorldState producer can bypass the 300 ms admission rule.
+constexpr double kHandHandoverMinConfidence = 0.50;
+constexpr double kHandHandoverMinStabilitySec = 0.30;
+constexpr double kImplicitPredictionMinConfidence = 0.55;
+constexpr double kImplicitPredictionMinStabilitySec = 0.30;
 template <typename T>
 bool readBlackboard(const BT::TreeNode & node, const std::string & key, T & out)
 {
@@ -214,6 +198,66 @@ bool toolIsActive(const BT::TreeNode & node, const std::string & tool_id)
   return active;
 }
 
+bool directHandSignalActive(const BT::TreeNode & node)
+{
+  bool visible = false;
+  std::string execution_state;
+  std::string implicit_tool;
+  std::string hand_pose;
+  double confidence = 0.0;
+  double stability_sec = 0.0;
+  readBlackboard(node, "runtime.execution_state", execution_state);
+  readBlackboard(node, "request.implicit_visible", visible);
+  readBlackboard(node, "request.implicit_tool", implicit_tool);
+  readBlackboard(node, "request.implicit_hand_pose", hand_pose);
+  readBlackboard(node, "request.implicit_confidence", confidence);
+  readBlackboard(node, "request.implicit_stability_sec", stability_sec);
+  return execution_state == "running" && visible && implicit_tool.empty() &&
+         hand_pose == "open_receive" &&
+         confidence >= kHandHandoverMinConfidence &&
+         stability_sec >= kHandHandoverMinStabilitySec;
+}
+
+bool isExactRightHandPreposition(
+  const BT::TreeNode & node, const std::string & selected_instance = {})
+{
+  std::string prepositioned_tool;
+  std::string prepositioned_instance;
+  std::string right_hand_instance;
+  readBlackboard(node, "robot.prepositioned_tool", prepositioned_tool);
+  readBlackboard(node, "robot.prepositioned_instance", prepositioned_instance);
+  readBlackboard(node, "robot.right_hand_instance", right_hand_instance);
+  if (
+    prepositioned_tool.empty() || prepositioned_instance.empty() ||
+    right_hand_instance.empty() ||
+    prepositioned_instance != right_hand_instance ||
+    (!selected_instance.empty() && selected_instance != prepositioned_instance) ||
+    !toolIsActive(node, prepositioned_instance) ||
+    !toolMatchesType(node, prepositioned_instance, prepositioned_tool) ||
+    toolLifecycle(node, prepositioned_instance) != "prepositioned_right")
+  {
+    return false;
+  }
+  std::string owner;
+  std::string location_id;
+  std::string location_type;
+  readBlackboard(node, makeToolKey(prepositioned_instance, "owner"), owner);
+  readBlackboard(
+    node, makeToolKey(prepositioned_instance, "location"), location_id);
+  readBlackboard(
+    node, makeToolKey(prepositioned_instance, "location_type"), location_type);
+  // The Digital Twin's canonical event projection uses the generic `robot`
+  // anchor for a tool that is physically held in the robot's right hand. The
+  // endpoint action contract still names `robot_right_hand`; accepting either
+  // representation here is safe only because the exact instance, lifecycle,
+  // and right-hand owner checks above have already established laterality.
+  const bool canonical_right_hand_location =
+    (location_id == "robot_right_hand" &&
+     location_type == "robot_right_hand") ||
+    (location_id == "robot" && location_type == "robot");
+  return owner == "robot_right_hand" && canonical_right_hand_location;
+}
+
 std::string findActiveInstanceForType(
   const BT::TreeNode & node, const std::string & instrument_type,
   const std::unordered_set<std::string> & allowed_lifecycles = {})
@@ -281,50 +325,6 @@ bool otherToolHasAnyStatus(
   return false;
 }
 
-constexpr int kMaxSurgeonHeldTools = 2;
-
-bool toolOccupiesSurgeonHand(const BT::TreeNode & node, const std::string & tool_id)
-{
-  if (!toolIsActive(node, tool_id)) {
-    return false;
-  }
-  std::string status;
-  std::string location_type;
-  std::string owner;
-  const auto lifecycle = toolLifecycle(node, tool_id);
-  readBlackboard(node, makeToolKey(tool_id, "status"), status);
-  readBlackboard(node, makeToolKey(tool_id, "location_type"), location_type);
-  readBlackboard(node, makeToolKey(tool_id, "owner"), owner);
-  if (
-    location_type == "surgical_field" || location_type == "bed_fixed_tool" ||
-    location_type == "return_zone")
-  {
-    return false;
-  }
-  if (location_type == "surgeon_hand") {
-    return true;
-  }
-  if (!location_type.empty()) {
-    return false;
-  }
-  return lifecycle == "surgeon_owned" || status == "handed_over" ||
-         owner == "surgeon";
-}
-
-int surgeonHeldToolCount(const BT::TreeNode & node, const std::string & excluded_tool = {})
-{
-  int count = 0;
-  for (const auto & tool_id : allTools(node)) {
-    if (tool_id == excluded_tool) {
-      continue;
-    }
-    if (toolOccupiesSurgeonHand(node, tool_id)) {
-      ++count;
-    }
-  }
-  return count;
-}
-
 bool toolIsRecoverableFromSurgeon(const BT::TreeNode & node, const std::string & tool_id)
 {
   if (!toolIsActive(node, tool_id)) {
@@ -378,15 +378,39 @@ std::string findAnticipatoryInstanceForType(
   return {};
 }
 
-bool stablePredictionReplacesPreposition(const BT::TreeNode & node)
+bool explicitRequestReplacesPreposition(const BT::TreeNode & node)
+{
+  std::string surgeon_intent;
+  std::string requested_tool;
+  std::string requested_instance;
+  std::string prepositioned_tool;
+  std::string prepositioned_instance;
+  int64_t request_generation = 0;
+  readBlackboard(node, "surgeon.intent", surgeon_intent);
+  readBlackboard(node, "request.surgeon_tool", requested_tool);
+  readBlackboard(node, "request.surgeon_instance", requested_instance);
+  readBlackboard(node, "request.generation", request_generation);
+  readBlackboard(node, "robot.prepositioned_tool", prepositioned_tool);
+  readBlackboard(node, "robot.prepositioned_instance", prepositioned_instance);
+  if (
+    request_generation <= 0 || !isExplicitSurgeonIntent(surgeon_intent) ||
+    prepositioned_tool.empty() || prepositioned_instance.empty())
+  {
+    return false;
+  }
+  if (!requested_instance.empty()) {
+    return requested_instance != prepositioned_instance;
+  }
+  return !requested_tool.empty() && requested_tool != prepositioned_tool;
+}
+
+bool systemTopPredictionReplacesPreposition(const BT::TreeNode & node)
 {
   std::string predicted_tool;
   std::string prepositioned_tool;
-  double confidence = 0.0;
   double stability_sec = 0.0;
   readBlackboard(node, "prediction.tool", predicted_tool);
   readBlackboard(node, "robot.prepositioned_tool", prepositioned_tool);
-  readBlackboard(node, "prediction.confidence", confidence);
   readBlackboard(node, "prediction.stability_sec", stability_sec);
   const auto replacement_instance = findAnticipatoryInstanceForType(
     node, predicted_tool);
@@ -395,8 +419,7 @@ bool stablePredictionReplacesPreposition(const BT::TreeNode & node)
     !predicted_tool.empty() && !prepositioned_tool.empty() &&
     predicted_tool != prepositioned_tool &&
     replacement_available &&
-    confidence >= kPreparationMinConfidence &&
-    stability_sec >= kPreparationMinStabilitySec;
+    stability_sec >= kSystemTopReplacementMinStabilitySec;
 }
 
 struct RecoveryPolicyCandidate
@@ -416,7 +439,6 @@ RecoveryPolicyCandidate selectRecoveryPolicyCandidate(const BT::TreeNode & node)
   std::string active_task_id;
   std::string left_hand_tool;
   bool cleaner_busy = false;
-  bool phase_uncertain = true;
   readBlackboard(node, "runtime.execution_state", execution_state);
   readBlackboard(node, "request.explicit_tool", explicit_request);
   readBlackboard(node, "request.surgeon_tool", surgeon_request);
@@ -426,7 +448,6 @@ RecoveryPolicyCandidate selectRecoveryPolicyCandidate(const BT::TreeNode & node)
   readBlackboard(node, "robot.active_task_id", active_task_id);
   readBlackboard(node, "robot.left_hand_tool", left_hand_tool);
   readBlackboard(node, "cleaner.busy", cleaner_busy);
-  readBlackboard(node, "phase.uncertain", phase_uncertain);
   if (
     execution_state != "running" && execution_state != "finishing")
   {
@@ -438,10 +459,6 @@ RecoveryPolicyCandidate selectRecoveryPolicyCandidate(const BT::TreeNode & node)
   {
     return {};
   }
-  if (execution_state == "running" && phase_uncertain) {
-    return {};
-  }
-
   std::vector<std::string> mayo_tools;
   for (const auto & tool_id : allTools(node)) {
     const auto lifecycle = toolLifecycle(node, tool_id);
@@ -548,7 +565,10 @@ bool hasRecoveryContext(const BT::TreeNode & node)
   if (required || ready_for_retrieval || cleaner_busy || !left_hand_tool.empty()) {
     return true;
   }
-  if (stablePredictionReplacesPreposition(node)) {
+  if (explicitRequestReplacesPreposition(node)) {
+    return true;
+  }
+  if (systemTopPredictionReplacesPreposition(node)) {
     return true;
   }
 
@@ -568,8 +588,7 @@ bool hasRecoveryContext(const BT::TreeNode & node)
         if (
           next_required_transition == "recover_left" ||
           next_required_transition == "clean_left" ||
-          next_required_transition == "return_home" ||
-          next_required_transition == "return_unused_preposition")
+          next_required_transition == "return_home")
         {
           return true;
         }
@@ -639,6 +658,7 @@ private:
       ++bundle_generation_;
     }
     writeBlackboard(*this, "procedure.id", msg.procedure_id);
+    writeBlackboard(*this, "runtime.procedure_run_id", msg.procedure_run_id);
     writeBlackboard(*this, "bundle.generation", bundle_generation_);
     writeBlackboard(*this, "phase.id", msg.filtered_phase);
     writeBlackboard(*this, "runtime.running", static_cast<bool>(msg.running));
@@ -806,24 +826,6 @@ public:
   }
 };
 
-class IsPhaseCertain : public BT::ConditionNode
-{
-public:
-  explicit IsPhaseCertain(const std::string & name, const BT::NodeConfig & config)
-  : BT::ConditionNode(name, config)
-  {
-  }
-
-  static BT::PortsList providedPorts() { return {}; }
-
-  BT::NodeStatus tick() override
-  {
-    bool uncertain = true;
-    readBlackboard(*this, "phase.uncertain", uncertain);
-    return uncertain ? BT::NodeStatus::FAILURE : BT::NodeStatus::SUCCESS;
-  }
-};
-
 class HasExplicitRequest : public BT::ConditionNode
 {
 public:
@@ -862,55 +864,27 @@ public:
 
   BT::NodeStatus tick() override
   {
-    bool visible = false;
-    double confidence = 0.0;
-    double stability_sec = 0.0;
-    std::string hand_pose;
-    std::string implicit_tool;
     std::string predicted_tool;
-    std::string prepositioned_tool;
-    std::string prepositioned_instance;
-    readBlackboard(*this, "request.implicit_visible", visible);
-    readBlackboard(*this, "request.implicit_confidence", confidence);
-    readBlackboard(*this, "request.implicit_stability_sec", stability_sec);
-    readBlackboard(*this, "request.implicit_hand_pose", hand_pose);
-    readBlackboard(*this, "request.implicit_tool", implicit_tool);
+    double prediction_confidence = 0.0;
+    double prediction_stability_sec = 0.0;
     readBlackboard(*this, "prediction.tool", predicted_tool);
-    readBlackboard(*this, "robot.prepositioned_tool", prepositioned_tool);
-    readBlackboard(*this, "robot.prepositioned_instance", prepositioned_instance);
+    readBlackboard(*this, "prediction.confidence", prediction_confidence);
+    readBlackboard(*this, "prediction.stability_sec", prediction_stability_sec);
+    if (!directHandSignalActive(*this)) {
+      return BT::NodeStatus::FAILURE;
+    }
+    if (isExactRightHandPreposition(*this)) {
+      return BT::NodeStatus::SUCCESS;
+    }
+    // A rank can exist only to keep operator probabilities complete.  An
+    // unresolved request may use rank 1 only after the independent reducer
+    // evidence and persistence thresholds have made it policy-ready.
     if (
-      !visible || hand_pose != "open_receive" ||
-      confidence < kImplicitGestureMinConfidence ||
-      stability_sec < kImplicitGestureMinStabilitySec)
+      predicted_tool.empty() ||
+      prediction_confidence < kImplicitPredictionMinConfidence ||
+      prediction_stability_sec < kImplicitPredictionMinStabilitySec)
     {
       return BT::NodeStatus::FAILURE;
-    }
-    if (!implicit_tool.empty() && !predicted_tool.empty() && implicit_tool != predicted_tool) {
-      return BT::NodeStatus::FAILURE;
-    }
-    if (implicit_tool.empty()) {
-      const auto prepared_instance =
-        !prepositioned_instance.empty() ? prepositioned_instance :
-        findActiveInstanceForType(
-        *this, prepositioned_tool, {"prepositioned_right"});
-      if (
-        !prepositioned_tool.empty() && !prepared_instance.empty() &&
-        toolIsActive(*this, prepared_instance) &&
-        toolLifecycle(*this, prepared_instance) == "prepositioned_right")
-      {
-        return BT::NodeStatus::SUCCESS;
-      }
-      double prediction_confidence = 0.0;
-      double prediction_stability_sec = 0.0;
-      readBlackboard(*this, "prediction.confidence", prediction_confidence);
-      readBlackboard(*this, "prediction.stability_sec", prediction_stability_sec);
-      if (
-        predicted_tool.empty() ||
-        prediction_confidence < kPreparationMinConfidence ||
-        prediction_stability_sec < kPreparationMinStabilitySec)
-      {
-        return BT::NodeStatus::FAILURE;
-      }
     }
     return BT::NodeStatus::SUCCESS;
   }
@@ -928,101 +902,9 @@ public:
 
   BT::NodeStatus tick() override
   {
-    const bool unsupported_preposition = prepositionEvidenceExpired();
-    return (unsupported_preposition || hasRecoveryContext(*this)) ?
+    return hasRecoveryContext(*this) ?
       BT::NodeStatus::SUCCESS : BT::NodeStatus::FAILURE;
   }
-
-private:
-  bool prepositionEvidenceExpired()
-  {
-    std::string prepositioned_tool;
-    std::string prepositioned_instance;
-    std::string predicted_tool;
-    double prediction_confidence = 0.0;
-    readBlackboard(*this, "robot.prepositioned_tool", prepositioned_tool);
-    readBlackboard(*this, "robot.prepositioned_instance", prepositioned_instance);
-    readBlackboard(*this, "prediction.tool", predicted_tool);
-    readBlackboard(*this, "prediction.confidence", prediction_confidence);
-
-    if (prepositioned_tool.empty() || prepositioned_instance.empty()) {
-      tracked_prepositioned_instance_.clear();
-      prepositioned_since_.reset();
-      unsupported_since_.reset();
-      writeBlackboard(
-        *this, "policy.expired_preposition_instance", std::string{});
-      writeBlackboard(
-        *this, "policy.expired_preposition_reason", std::string{});
-      return false;
-    }
-
-    if (tracked_prepositioned_instance_ != prepositioned_instance) {
-      tracked_prepositioned_instance_ = prepositioned_instance;
-      prepositioned_since_ = std::chrono::steady_clock::now();
-      unsupported_since_.reset();
-    }
-
-    const auto now = std::chrono::steady_clock::now();
-    const auto max_dwell_sec =
-      predicted_tool == prepositioned_tool &&
-      prediction_confidence >= kPreparationStrongConfidence ?
-      kPreparationStrongMaxDwellSec : kPreparationMaxDwellSec;
-    if (
-      prepositioned_since_.has_value() &&
-      std::chrono::duration<double>(
-        now - prepositioned_since_.value()).count() >=
-      max_dwell_sec)
-    {
-      writeBlackboard(
-        *this, "policy.expired_preposition_instance",
-        prepositioned_instance);
-      writeBlackboard(
-        *this, "policy.expired_preposition_reason",
-        std::string("preposition_dwell_expired"));
-      return true;
-    }
-
-    if (predicted_tool == prepositioned_tool) {
-      unsupported_since_.reset();
-      writeBlackboard(
-        *this, "policy.expired_preposition_instance", std::string{});
-      writeBlackboard(
-        *this, "policy.expired_preposition_reason", std::string{});
-      return false;
-    }
-
-    // A stable different prediction is handled by the replacement policy.
-    if (stablePredictionReplacesPreposition(*this)) {
-      unsupported_since_.reset();
-      writeBlackboard(
-        *this, "policy.expired_preposition_instance", std::string{});
-      writeBlackboard(
-        *this, "policy.expired_preposition_reason", std::string{});
-      return false;
-    }
-
-    if (!unsupported_since_.has_value()) {
-      unsupported_since_ = now;
-      return false;
-    }
-    const auto unsupported_sec =
-      std::chrono::duration<double>(now - unsupported_since_.value()).count();
-    if (unsupported_sec < kPreparationUnsupportedGraceSec) {
-      return false;
-    }
-
-    writeBlackboard(
-      *this, "policy.expired_preposition_instance",
-      prepositioned_instance);
-    writeBlackboard(
-      *this, "policy.expired_preposition_reason",
-      std::string("prediction_evidence_expired"));
-    return true;
-  }
-
-  std::string tracked_prepositioned_instance_;
-  std::optional<std::chrono::steady_clock::time_point> prepositioned_since_;
-  std::optional<std::chrono::steady_clock::time_point> unsupported_since_;
 };
 
 class IsToolAvailable : public BT::ConditionNode
@@ -1075,31 +957,35 @@ public:
     std::string selected_tool;
     std::string explicit_request;
     std::string surgeon_request;
+    std::string surgeon_intent;
     bool voice_backed = false;
     readBlackboard(*this, "selected.tool", selected_tool);
     readBlackboard(*this, "request.explicit_tool", explicit_request);
     readBlackboard(*this, "request.surgeon_tool", surgeon_request);
+    readBlackboard(*this, "surgeon.intent", surgeon_intent);
     readBlackboard(*this, "request.voice_backed", voice_backed);
     const auto selected_tool_type = toolTypeId(*this, selected_tool);
     const bool voice_backed_selected =
       voice_backed && !selected_tool.empty() &&
       (selected_tool_type == explicit_request ||
-      selected_tool_type == surgeon_request);
-    if (hasBlockingSafetyFlag(*this, voice_backed_selected)) {
+      (isExplicitSurgeonIntent(surgeon_intent) && selected_tool_type == surgeon_request));
+    const bool direct_hand_preposition_selected =
+      directHandSignalActive(*this) &&
+      isExactRightHandPreposition(*this, selected_tool);
+    if (hasBlockingSafetyFlag(
+        *this, voice_backed_selected || direct_hand_preposition_selected))
+    {
       return BT::NodeStatus::FAILURE;
     }
-    if (hasActiveRobotTask(*this)) {
+    if (hasActiveRobotTask(*this) && !voice_backed_selected) {
       return BT::NodeStatus::FAILURE;
     }
     if (!toolIsActive(*this, selected_tool)) {
       return BT::NodeStatus::FAILURE;
     }
     const auto lifecycle = toolLifecycle(*this, selected_tool);
-    if (lifecycle == "surgeon_owned") {
+    if (lifecycle == "surgeon_owned" && !voice_backed_selected) {
       return BT::NodeStatus::SUCCESS;
-    }
-    if (surgeonHeldToolCount(*this, selected_tool) >= kMaxSurgeonHeldTools) {
-      return BT::NodeStatus::FAILURE;
     }
     bool allowed = false;
     readBlackboard(*this, "action.guard.handover_allowed", allowed);
@@ -1229,25 +1115,18 @@ public:
   {
     std::string tool_type;
     std::string selected_instance;
-    std::string policy_basis = "implicit_visual_request";
-    readBlackboard(*this, "request.implicit_tool", tool_type);
-    if (tool_type.empty()) {
-      std::string prepositioned_tool;
-      std::string prepositioned_instance;
-      readBlackboard(*this, "robot.prepositioned_tool", prepositioned_tool);
-      readBlackboard(*this, "robot.prepositioned_instance", prepositioned_instance);
-      if (
-        !prepositioned_tool.empty() && !prepositioned_instance.empty() &&
-        toolIsActive(*this, prepositioned_instance) &&
-        toolLifecycle(*this, prepositioned_instance) == "prepositioned_right")
-      {
-        tool_type = prepositioned_tool;
-        selected_instance = prepositioned_instance;
-        policy_basis = "implicit_visual_preposition_match";
-      } else {
-        readBlackboard(*this, "prediction.tool", tool_type);
-        policy_basis = "implicit_visual_prediction_fallback";
-      }
+    std::string policy_basis = "hand_handover_signal";
+    std::string prepositioned_tool;
+    std::string prepositioned_instance;
+    readBlackboard(*this, "robot.prepositioned_tool", prepositioned_tool);
+    readBlackboard(*this, "robot.prepositioned_instance", prepositioned_instance);
+    if (isExactRightHandPreposition(*this)) {
+      tool_type = prepositioned_tool;
+      selected_instance = prepositioned_instance;
+      policy_basis = "hand_signal_preposition_match";
+    } else {
+      readBlackboard(*this, "prediction.tool", tool_type);
+      policy_basis = "hand_signal_prediction_fallback";
     }
     if (tool_type.empty()) {
       return BT::NodeStatus::FAILURE;
@@ -1255,7 +1134,7 @@ public:
     if (selected_instance.empty()) {
       selected_instance = findActiveInstanceForType(
         *this, tool_type,
-        {"prepositioned_right", "home_rack", "returned_home", "mayo_reuse"});
+        {"home_rack", "returned_home", "mayo_reuse"});
     }
     if (selected_instance.empty()) {
       return BT::NodeStatus::FAILURE;
@@ -1293,8 +1172,12 @@ public:
     readBlackboard(*this, "surgeon.intent", surgeon_intent);
     std::string prepositioned_tool;
     std::string predicted_tool;
+    double prediction_confidence = 0.0;
+    double prediction_stability_sec = 0.0;
     readBlackboard(*this, "robot.prepositioned_tool", prepositioned_tool);
     readBlackboard(*this, "prediction.tool", predicted_tool);
+    readBlackboard(*this, "prediction.confidence", prediction_confidence);
+    readBlackboard(*this, "prediction.stability_sec", prediction_stability_sec);
     const bool active_return_intent =
       !surgeon_request.empty() &&
       (surgeon_intent == "return_tool" || surgeon_intent == "extend_hand_for_retrieval");
@@ -1307,36 +1190,6 @@ public:
       return BT::NodeStatus::FAILURE;
     }
 
-    double prediction_confidence = 0.0;
-    double prediction_stability_sec = 0.0;
-    readBlackboard(*this, "prediction.confidence", prediction_confidence);
-    readBlackboard(*this, "prediction.stability_sec", prediction_stability_sec);
-    std::string cooldown_tool;
-    double cooldown_clear_since_sec = 0.0;
-    readBlackboard(*this, "policy.preposition_cooldown_tool", cooldown_tool);
-    readBlackboard(
-      *this, "policy.preposition_cooldown_clear_since_sec",
-      cooldown_clear_since_sec);
-    const auto now_sec = steadyNowSec();
-    if (!cooldown_tool.empty()) {
-      if (cooldown_tool == predicted_tool) {
-        writeBlackboard(
-          *this, "policy.preposition_cooldown_clear_since_sec", 0.0);
-        return BT::NodeStatus::FAILURE;
-      }
-      if (cooldown_clear_since_sec <= 0.0) {
-        writeBlackboard(
-          *this, "policy.preposition_cooldown_clear_since_sec", now_sec);
-      } else if (
-        now_sec - cooldown_clear_since_sec >=
-        kPreparationRetryCooldownSec)
-      {
-        writeBlackboard(
-          *this, "policy.preposition_cooldown_tool", std::string{});
-        writeBlackboard(
-          *this, "policy.preposition_cooldown_clear_since_sec", 0.0);
-      }
-    }
     if (
       !predicted_tool.empty() &&
       prediction_confidence >= kPreparationMinConfidence &&
@@ -1441,37 +1294,20 @@ public:
       }
     }
 
-    for (const auto & tool_id : allTools(*this)) {
-      const auto lifecycle = toolLifecycle(*this, tool_id);
-      if (
-        toolNextRequiredTransition(*this, tool_id) == "return_unused_preposition" &&
-        lifecycle == "prepositioned_right")
-      {
-        return selectTool(
-          tool_id, "return_unused_preposition", "unused_preposition");
+    if (explicitRequestReplacesPreposition(*this)) {
+      for (const auto & tool_id : allTools(*this)) {
+        const auto lifecycle = toolLifecycle(*this, tool_id);
+        if (
+          toolNextRequiredTransition(*this, tool_id) == "return_unused_preposition" &&
+          lifecycle == "prepositioned_right")
+        {
+          return selectTool(
+            tool_id, "return_unused_preposition", "explicit_request_replacement");
+        }
       }
     }
 
-    std::string expired_preposition_instance;
-    readBlackboard(
-      *this, "policy.expired_preposition_instance",
-      expired_preposition_instance);
-    if (
-      !expired_preposition_instance.empty() &&
-      toolLifecycle(*this, expired_preposition_instance) == "prepositioned_right")
-    {
-      std::string expiration_reason;
-      readBlackboard(
-        *this, "policy.expired_preposition_reason",
-        expiration_reason);
-      return selectTool(
-        expired_preposition_instance, "return_unused_preposition",
-        expiration_reason.empty() ?
-        std::string("prediction_evidence_expired") :
-        expiration_reason);
-    }
-
-    if (stablePredictionReplacesPreposition(*this)) {
+    if (systemTopPredictionReplacesPreposition(*this)) {
       std::string prepositioned_tool;
       readBlackboard(*this, "robot.prepositioned_tool", prepositioned_tool);
       for (const auto & tool_id : allTools(*this)) {
@@ -1480,7 +1316,7 @@ public:
           toolMatchesType(*this, tool_id, prepositioned_tool))
         {
           return selectTool(
-            tool_id, "return_unused_preposition", "stable_prediction_replacement");
+            tool_id, "return_unused_preposition", "system_top_replacement_stable_2s");
         }
       }
     }
@@ -1504,36 +1340,14 @@ private:
     readBlackboard(*this, makeToolKey(tool_id, "home_location"), home_location_id);
     readBlackboard(*this, makeToolKey(tool_id, "home_type"), home_location_type);
     if (policy_transition == "return_unused_preposition") {
-      std::string origin_location_id;
-      std::string origin_location_type;
-      readBlackboard(
-        *this, makeToolKey(tool_id, "preposition_origin_location"),
-        origin_location_id);
-      readBlackboard(
-        *this, makeToolKey(tool_id, "preposition_origin_type"),
-        origin_location_type);
-      if (!origin_location_id.empty()) {
-        home_location_id = origin_location_id;
-      }
-      if (!origin_location_type.empty()) {
-        home_location_type = origin_location_type;
-      }
+      home_location_id = "mayo_stand";
+      home_location_type = "mayo_stand";
     }
     writeBlackboard(*this, "selected.tool", tool_id);
     writeBlackboard(*this, "selected.policy_transition", policy_transition);
     writeBlackboard(*this, "selected.policy_basis", policy_basis);
     writeBlackboard(*this, "bt.target_location_id", home_location_id);
     writeBlackboard(*this, "bt.target_location_type", home_location_type);
-    if (policy_transition == "return_unused_preposition") {
-      auto cooldown_tool = toolTypeId(*this, tool_id);
-      if (cooldown_tool.empty()) {
-        cooldown_tool = tool_id;
-      }
-      writeBlackboard(
-        *this, "policy.preposition_cooldown_tool", cooldown_tool);
-      writeBlackboard(
-        *this, "policy.preposition_cooldown_clear_since_sec", 0.0);
-    }
     return BT::NodeStatus::SUCCESS;
   }
 };
@@ -1616,15 +1430,11 @@ public:
   BT::NodeStatus tick() override
   {
     const auto selected_tool = firstInputOrBlackboard(*this, "tool_id", "selected.tool");
-    bool uncertain = true;
-    bool implicit_visible = false;
     std::string robot_state;
     std::string active_task_id;
     std::string explicit_request;
     std::string surgeon_request;
     std::string surgeon_intent;
-    std::string implicit_tool;
-    std::string implicit_hand_pose;
     std::string predicted_tool;
     std::string prepositioned_tool;
     std::string owner;
@@ -1633,11 +1443,8 @@ public:
     bool cleaner_busy = false;
     bool ready_for_handover = false;
     bool voice_backed = false;
-    double implicit_confidence = 0.0;
-    double implicit_stability_sec = 0.0;
     double prediction_confidence = 0.0;
     double prediction_stability_sec = 0.0;
-    readBlackboard(*this, "phase.uncertain", uncertain);
     readBlackboard(*this, "robot.state", robot_state);
     readBlackboard(*this, "robot.active_task_id", active_task_id);
     readBlackboard(*this, "request.explicit_tool", explicit_request);
@@ -1645,11 +1452,6 @@ public:
     readBlackboard(*this, "surgeon.intent", surgeon_intent);
     readBlackboard(*this, "surgeon.ready_handover", ready_for_handover);
     readBlackboard(*this, "request.voice_backed", voice_backed);
-    readBlackboard(*this, "request.implicit_visible", implicit_visible);
-    readBlackboard(*this, "request.implicit_tool", implicit_tool);
-    readBlackboard(*this, "request.implicit_hand_pose", implicit_hand_pose);
-    readBlackboard(*this, "request.implicit_confidence", implicit_confidence);
-    readBlackboard(*this, "request.implicit_stability_sec", implicit_stability_sec);
     readBlackboard(*this, "prediction.tool", predicted_tool);
     readBlackboard(*this, "prediction.confidence", prediction_confidence);
     readBlackboard(*this, "prediction.stability_sec", prediction_stability_sec);
@@ -1665,55 +1467,60 @@ public:
         (isExplicitSurgeonIntent(surgeon_intent) &&
         selected_tool_type == surgeon_request)
       );
+    const bool exact_right_hand_preposition =
+      isExactRightHandPreposition(*this, selected_tool);
     const auto implicit_target =
-      !implicit_tool.empty() ? implicit_tool :
-      (!prepositioned_tool.empty() ? prepositioned_tool : predicted_tool);
+      exact_right_hand_preposition ? prepositioned_tool : predicted_tool;
     const bool implicit_candidate_supported =
-      !implicit_tool.empty() ||
-      (!prepositioned_tool.empty() && implicit_target == prepositioned_tool) ||
+      exact_right_hand_preposition ||
       (
-        prediction_confidence >= kPreparationMinConfidence &&
-        prediction_stability_sec >= kPreparationMinStabilitySec
+        prediction_confidence >= kImplicitPredictionMinConfidence &&
+        prediction_stability_sec >= kImplicitPredictionMinStabilitySec
       );
     const bool implicit_request_selected =
-      implicit_visible && implicit_hand_pose == "open_receive" &&
-      implicit_confidence >= kImplicitGestureMinConfidence &&
-      implicit_stability_sec >= kImplicitGestureMinStabilitySec &&
+      directHandSignalActive(*this) &&
       implicit_candidate_supported &&
-      !implicit_target.empty() && selected_tool_type == implicit_target &&
-      (implicit_tool.empty() || predicted_tool.empty() || implicit_tool == predicted_tool);
+      selected_tool_type == implicit_target;
     const bool voice_backed_explicit_request =
       explicit_request_selected && voice_backed;
     const bool active_tool = toolIsActive(*this, selected_tool);
     const bool prepositioned_right = lifecycle == "prepositioned_right";
-    const bool holder_available = owner.empty() || owner == "none" || (prepositioned_right && owner == "robot_right_hand");
+    const bool holder_available = prepositioned_right ?
+      exact_right_hand_preposition : (owner.empty() || owner == "none");
     const bool usable_lifecycle = lifecycle == "home_rack" || lifecycle == "returned_home" || prepositioned_right;
     const bool surgeon_owned = lifecycle == "surgeon_owned";
     const bool on_mayo = lifecycle == "mayo_reuse" || lifecycle == "mayo_recovery";
-    const bool blocked_by_safety =
-      hasBlockingSafetyFlag(*this, voice_backed_explicit_request);
-    const bool surgeon_hand_has_capacity =
-      surgeonHeldToolCount(*this, selected_tool) < kMaxSurgeonHeldTools;
+    const bool direct_hand_preposition_selected =
+      implicit_request_selected && exact_right_hand_preposition;
+    // VLM health is irrelevant only for a tool already held in the verified
+    // right-hand preparation slot. Prediction fallback still fails closed:
+    // unhealthy VLM evidence is withdrawn before this branch can select it.
+    const bool blocked_by_safety = hasBlockingSafetyFlag(
+      *this,
+      voice_backed_explicit_request || direct_hand_preposition_selected);
     const bool request_ready =
       (explicit_request_selected && ready_for_handover) ||
       implicit_request_selected ||
       (!explicit_request_selected && !implicit_request_selected);
+    const bool robot_task_slot_available =
+      active_task_id.empty() || voice_backed_explicit_request;
     const bool mayo_handover_allowed =
-      on_mayo && holder_available && active_task_id.empty() && !cleaner_busy &&
-      (!uncertain || voice_backed_explicit_request) && robot_state != "fault" &&
-      surgeon_hand_has_capacity && request_ready;
+      on_mayo && holder_available && robot_task_slot_available && !cleaner_busy &&
+      robot_state != "fault" && request_ready;
+    const bool stale_surgeon_owned_voice_retry_allowed =
+      surgeon_owned && voice_backed_explicit_request && robot_task_slot_available &&
+      !cleaner_busy && robot_state != "fault" && request_ready;
 
     const bool allowed =
       active_tool &&
       !blocked_by_safety &&
       (
-        surgeon_owned ||
+        (surgeon_owned && !voice_backed_explicit_request) ||
+        stale_surgeon_owned_voice_retry_allowed ||
         mayo_handover_allowed ||
         (
-          usable_lifecycle && holder_available && !contaminated && active_task_id.empty() &&
-          !cleaner_busy && (!uncertain || voice_backed_explicit_request) &&
-          robot_state != "fault" && surgeon_hand_has_capacity &&
-          request_ready
+          usable_lifecycle && holder_available && !contaminated && robot_task_slot_available &&
+          !cleaner_busy && robot_state != "fault" && request_ready
         )
       );
 
@@ -1767,14 +1574,6 @@ public:
     writeBlackboard(*this, "bt.selected_tool_lifecycle", lifecycle);
     writeBlackboard(*this, "bt.next_required_transition", next_required_transition);
 
-    if (mode == "safety") {
-      writeBlackboard(*this, "bt.action", std::string{});
-      writeBlackboard(*this, "bt.blocking_guard", std::string("phase_uncertain"));
-      clearCommandFields(*this, true);
-      writeBlackboard(*this, "bt.mode", mode);
-      return BT::NodeStatus::SUCCESS;
-    }
-
     if (mode == "idle") {
       std::string explicit_request;
       std::string surgeon_request;
@@ -1824,9 +1623,13 @@ public:
     std::string right_hand_instance;
     readBlackboard(
       *this, "robot.right_hand_instance", right_hand_instance);
+    bool voice_backed = false;
+    readBlackboard(*this, "request.voice_backed", voice_backed);
 
     if (mode == "explicit_request" || mode == "implicit_request") {
-      if (lifecycle == "surgeon_owned") {
+      const bool stale_surgeon_owned_voice_retry =
+        mode == "explicit_request" && voice_backed && lifecycle == "surgeon_owned";
+      if (lifecycle == "surgeon_owned" && !stale_surgeon_owned_voice_retry) {
         writeBlackboard(*this, "bt.action", std::string{});
         writeBlackboard(*this, "bt.decision_reason", std::string("requested tool already surgeon-side"));
         writeBlackboard(*this, "bt.rationale", std::string("requested tool already surgeon-side"));
@@ -1838,46 +1641,107 @@ public:
         return BT::NodeStatus::SUCCESS;
       }
       const bool on_mayo =
-        lifecycle == "mayo_reuse" || lifecycle == "mayo_recovery";
+        lifecycle == "mayo_reuse" || lifecycle == "mayo_recovery" ||
+        stale_surgeon_owned_voice_retry;
       if (contaminated && !on_mayo) {
         return BT::NodeStatus::FAILURE;
       }
-      if (
-        right_hand_instance == selected_tool ||
-        lifecycle == "prepositioned_right")
+      const bool exact_direct_hand_preposition =
+        mode == "implicit_request" &&
+        directHandSignalActive(*this) &&
+        isExactRightHandPreposition(*this, selected_tool);
+      const bool explicit_right_hand_selection =
+        mode == "explicit_request" &&
+        (right_hand_instance == selected_tool ||
+        lifecycle == "prepositioned_right");
+      if (exact_direct_hand_preposition || explicit_right_hand_selection)
       {
         writeBlackboard(*this, "bt.action", std::string("direct_handover"));
         writeBlackboard(*this, "bt.source_location_id", std::string("robot_right_hand"));
         writeBlackboard(*this, "bt.source_location_type", std::string("robot_right_hand"));
       } else if (!right_hand_instance.empty()) {
-        writeBlackboard(*this, "bt.action", std::string("put_down_and_handover"));
+        if (
+          mode != "explicit_request" ||
+          !explicitRequestReplacesPreposition(*this))
+        {
+          // A direct hand signal is not an explicit request for a different
+          // tool. Let the recovery branch wait for a 2 s system-top change.
+          writeBlackboard(
+            *this, "bt.blocking_guard",
+            std::string("non_explicit_request_waiting_for_system_top_replacement"));
+          return BT::NodeStatus::FAILURE;
+        }
+        if (hasActiveRobotTask(*this)) {
+          writeBlackboard(
+            *this, "bt.blocking_guard",
+            std::string("active_tool_action"));
+          return BT::NodeStatus::FAILURE;
+        }
+        const auto held_lifecycle = toolLifecycle(*this, right_hand_instance);
+        if (
+          !toolIsActive(*this, right_hand_instance) ||
+          held_lifecycle != "prepositioned_right")
+        {
+          writeBlackboard(*this, "bt.blocking_guard", std::string("right_hand_occupied"));
+          return BT::NodeStatus::FAILURE;
+        }
+        // The public interface has no atomic "put down then hand over" action.
+        // Park the currently prepared instance on Mayo first and leave the
+        // explicit or direct hand signal untouched. This is the intentionally
+        // short robot-to-Mayo leg; the next WorldState tick can select and hand
+        // over the requested instance without a rack/home round trip.
+        writeBlackboard(*this, "selected.tool", right_hand_instance);
+        writeBlackboard(*this, "bt.selected_tool_lifecycle", held_lifecycle);
         writeBlackboard(
-          *this, "bt.source_location_id",
-          tool_location.empty() ? home_location_id : tool_location);
+          *this, "bt.next_required_transition", std::string("return_unused_preposition"));
+        writeBlackboard(*this, "bt.action", std::string("return_unused_preposition"));
+        writeBlackboard(*this, "bt.arm", std::string("right"));
+        writeBlackboard(*this, "bt.source_location_id", std::string("robot_right_hand"));
+        writeBlackboard(*this, "bt.source_location_type", std::string("robot_right_hand"));
         writeBlackboard(
-          *this, "bt.source_location_type",
-          tool_location_type.empty() ? home_location_type : tool_location_type);
+          *this, "bt.target_location_id", std::string("mayo_stand"));
+        writeBlackboard(
+          *this, "bt.target_location_type", std::string("mayo_stand"));
+        writeBlackboard(*this, "bt.target_owner", std::string("none"));
+        writeBlackboard(*this, "bt.cleaning_required", false);
         writeBlackboard(
           *this, "bt.decision_reason",
-          std::string("right hand occupied; return held tool before requested handover"));
+          std::string("right hand occupied; park held tool on Mayo before requested handover"));
         writeBlackboard(
           *this, "bt.rationale",
-          std::string("right hand occupied; return held tool before requested handover"));
+          std::string("right hand occupied; park held tool on Mayo before requested handover"));
+        return BT::NodeStatus::SUCCESS;
       } else if (on_mayo) {
+        // The public interface supports Mayo -> robot preparation and robot ->
+        // surgeon handover as two audited transitions, not an atomic composite.
+        // Keep the current request pending; after ToolPrepared updates this
+        // instance to prepositioned_right, the next tick uses direct_handover.
         writeBlackboard(
-          *this, "bt.action", std::string("pick_up_from_mayo_and_handover"));
+          *this, "bt.action", std::string("prepare_tool"));
         writeBlackboard(
           *this, "bt.source_location_id",
-          tool_location.empty() ? std::string("mayo_stand") : tool_location);
+          stale_surgeon_owned_voice_retry || tool_location.empty() ?
+          std::string("mayo_stand") : tool_location);
         writeBlackboard(
           *this, "bt.source_location_type",
-          tool_location_type.empty() ? std::string("mayo_stand") : tool_location_type);
+          stale_surgeon_owned_voice_retry || tool_location_type.empty() ?
+          std::string("mayo_stand") : tool_location_type);
+        writeBlackboard(*this, "bt.arm", std::string("right"));
+        writeBlackboard(*this, "bt.target_location_id", std::string("robot_right_hand"));
+        writeBlackboard(*this, "bt.target_location_type", std::string("robot_right_hand"));
+        writeBlackboard(*this, "bt.target_owner", std::string("robot_right_hand"));
+        writeBlackboard(*this, "bt.cleaning_required", false);
         writeBlackboard(
           *this, "bt.decision_reason",
-          std::string("requested tool is on Mayo; pick up and hand over"));
+          stale_surgeon_owned_voice_retry ?
+          std::string("validated voice request overrides stale surgeon ownership; retry from Mayo") :
+          std::string("requested tool is on Mayo; prepare it before handover"));
         writeBlackboard(
           *this, "bt.rationale",
-          std::string("requested tool is on Mayo; pick up and hand over"));
+          stale_surgeon_owned_voice_retry ?
+          std::string("validated voice request overrides stale surgeon ownership; retry from Mayo") :
+          std::string("requested tool is on Mayo; prepare it before handover"));
+        return BT::NodeStatus::SUCCESS;
       } else {
         writeBlackboard(*this, "bt.action", std::string("pick_up_and_handover"));
         writeBlackboard(
@@ -1934,30 +1798,18 @@ public:
         writeBlackboard(*this, "bt.arm", std::string("right"));
         writeBlackboard(*this, "bt.source_location_id", std::string("robot_right_hand"));
         writeBlackboard(*this, "bt.source_location_type", std::string("robot_right_hand"));
-        std::string return_location_id;
-        std::string return_location_type;
-        readBlackboard(
-          *this, makeToolKey(selected_tool, "preposition_origin_location"),
-          return_location_id);
-        readBlackboard(
-          *this, makeToolKey(selected_tool, "preposition_origin_type"),
-          return_location_type);
         writeBlackboard(
-          *this, "bt.target_location_id",
-          return_location_id.empty() ? home_location_id : return_location_id);
+          *this, "bt.target_location_id", std::string("mayo_stand"));
         writeBlackboard(
-          *this, "bt.target_location_type",
-          return_location_type.empty() ? home_location_type : return_location_type);
+          *this, "bt.target_location_type", std::string("mayo_stand"));
         writeBlackboard(*this, "bt.target_owner", std::string("none"));
         writeBlackboard(*this, "bt.cleaning_required", false);
         const auto return_reason =
-          policy_basis == "stable_prediction_replacement" ?
-          std::string("stable replacement prediction frees the right-hand preparation slot") :
-          policy_basis == "prediction_evidence_expired" ?
-          std::string("prediction evidence expired; release the reversible preparation slot") :
-          policy_basis == "preposition_dwell_expired" ?
-          std::string("speculative preparation dwell expired; release the right-hand slot") :
-          std::string("unused prepositioned tool must return to its source");
+          policy_basis == "system_top_replacement_stable_2s" ?
+          std::string("system top prediction changed for 2 s; park current preparation on Mayo") :
+          policy_basis == "explicit_request_replacement" ?
+          std::string("explicit request changed tools; park current preparation on Mayo") :
+          std::string("unused prepositioned tool must be parked on Mayo to free the right hand");
         writeBlackboard(*this, "bt.decision_reason", return_reason);
         writeBlackboard(*this, "bt.rationale", return_reason);
         return BT::NodeStatus::SUCCESS;
@@ -2032,27 +1884,76 @@ public:
       firstInputOrBlackboard(*this, "next_required_transition", "bt.next_required_transition");
 
     std::string selected_tool;
+    std::string explicit_request;
+    std::string surgeon_request;
+    std::string surgeon_intent;
     std::string right_hand_instance;
     std::string left_hand_instance;
+    std::string procedure_run_id;
+    bool voice_backed = false;
     int64_t bundle_generation = 0;
     int64_t request_generation = 0;
     int64_t implicit_request_generation = 0;
     readBlackboard(*this, "selected.tool", selected_tool);
+    readBlackboard(*this, "request.explicit_tool", explicit_request);
+    readBlackboard(*this, "request.surgeon_tool", surgeon_request);
+    readBlackboard(*this, "surgeon.intent", surgeon_intent);
+    readBlackboard(*this, "request.voice_backed", voice_backed);
     readBlackboard(*this, "robot.right_hand_instance", right_hand_instance);
     readBlackboard(*this, "robot.left_hand_instance", left_hand_instance);
+    readBlackboard(*this, "runtime.procedure_run_id", procedure_run_id);
     readBlackboard(*this, "bundle.generation", bundle_generation);
     readBlackboard(*this, "request.generation", request_generation);
     readBlackboard(
       *this, "request.implicit_generation", implicit_request_generation);
 
-    if (hasActiveRobotTask(*this)) {
+    const bool validated_voice_request_present =
+      !explicit_request.empty() ||
+      (isExplicitSurgeonIntent(surgeon_intent) && !surgeon_request.empty());
+    const bool voice_backed_selected =
+      decision == "explicit_request" && voice_backed && validated_voice_request_present;
+    // A new robot->Mayo Goal must never preempt or overlap another tracked
+    // external tool Action. The triggering request remains pending and is
+    // reconsidered after the terminal result is projected into WorldState.
+    if (
+      hasActiveRobotTask(*this) &&
+      action == "return_unused_preposition")
+    {
       return BT::NodeStatus::FAILURE;
+    }
+    if (hasActiveRobotTask(*this) && !voice_backed_selected) {
+      return BT::NodeStatus::FAILURE;
+    }
+
+    const bool implicit_handover_action =
+      action == "direct_handover" || action == "pick_up_and_handover";
+    std::string implicit_episode_signature;
+    if (
+      decision == "implicit_request" &&
+      (procedure_run_id.empty() || implicit_request_generation <= 0))
+    {
+      return BT::NodeStatus::FAILURE;
+    }
+    if (decision == "implicit_request" && implicit_handover_action) {
+      // One continuous direct hand-signal episode authorizes at most one handover.
+      // Inventory/lifecycle changes after a successful handover must not turn
+      // the same hand-signal episode into a request for a second instance or a new rank-1
+      // prediction.  The reducer re-arms this only after its fresh-negative
+      // release debounce creates a new episode.
+      implicit_episode_signature =
+        procedure_run_id + "|" +
+        std::to_string(implicit_request_generation);
+      std::string last_implicit_episode;
+      readBlackboard(*this, "dispatch.last_implicit_episode", last_implicit_episode);
+      if (implicit_episode_signature == last_implicit_episode) {
+        return BT::NodeStatus::FAILURE;
+      }
     }
 
     const auto signature = makeSignature(
       decision, action, rationale, selected_tool, selected_tool_lifecycle, next_required_transition,
       target_location_id, target_location_type, mode, arm, right_hand_instance,
-      left_hand_instance, bundle_generation, request_generation,
+      left_hand_instance, procedure_run_id, bundle_generation, request_generation,
       implicit_request_generation);
 
     std::string last_signature;
@@ -2065,6 +1966,10 @@ public:
       return BT::NodeStatus::FAILURE;
     }
 
+    if (!implicit_episode_signature.empty()) {
+      writeBlackboard(
+        *this, "dispatch.last_implicit_episode", implicit_episode_signature);
+    }
     writeBlackboard(*this, "dispatch.last_signature", signature);
     return BT::NodeStatus::SUCCESS;
   }
@@ -2076,14 +1981,15 @@ private:
     const std::string & next_required_transition, const std::string & target_location_id,
     const std::string & target_location_type, const std::string & mode, const std::string & arm,
     const std::string & right_hand_instance,
-    const std::string & left_hand_instance, const int64_t bundle_generation,
+    const std::string & left_hand_instance, const std::string & procedure_run_id,
+    const int64_t bundle_generation,
     const int64_t request_generation, const int64_t implicit_request_generation)
   {
     std::ostringstream stream;
     stream << decision << "|" << action << "|" << rationale << "|" << selected_tool << "|" <<
       selected_tool_lifecycle << "|" << next_required_transition << "|" << target_location_id << "|" <<
       target_location_type << "|" << mode << "|" << arm << "|" << right_hand_instance << "|" <<
-      left_hand_instance << "|" << bundle_generation << "|" <<
+      left_hand_instance << "|" << procedure_run_id << "|" << bundle_generation << "|" <<
       request_generation << "|" << implicit_request_generation;
     return stream.str();
   }
@@ -2175,14 +2081,43 @@ public:
     readBlackboard(
       *this, "selected.tool", msg.instrument_instance_id);
     msg.instrument_id = toolTypeId(*this, msg.instrument_instance_id);
+    bool request_voice_backed = false;
+    readBlackboard(*this, "request.voice_backed", request_voice_backed);
+    // Voice provenance belongs only to the explicit-request command that was
+    // selected from that request.  A stale flag must never promote an
+    // implicit or anticipatory command to the bridge's preemptive class.
+    msg.voice_backed = request_voice_backed && msg.mode == "explicit_request";
     int64_t request_generation = 0;
     readBlackboard(*this, "request.generation", request_generation);
     msg.request_generation = static_cast<uint64_t>(std::max<int64_t>(0, request_generation));
+    msg.procedure_run_id = "";
+    msg.implicit_request_generation = 0;
     readBlackboard(*this, "bt.cleaning_required", msg.cleaning_required);
-    const auto sequence = skill_command_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
-    msg.command_id =
-      "skill-" + std::to_string(context_.getCurrentTime().nanoseconds()) + "-" +
-      std::to_string(sequence);
+    if (msg.mode == "implicit_request") {
+      std::string procedure_run_id;
+      int64_t implicit_request_generation = 0;
+      readBlackboard(*this, "runtime.procedure_run_id", procedure_run_id);
+      readBlackboard(
+        *this, "request.implicit_generation", implicit_request_generation);
+      if (procedure_run_id.empty() || implicit_request_generation <= 0) {
+        return false;
+      }
+      msg.procedure_run_id = procedure_run_id;
+      msg.implicit_request_generation = static_cast<uint64_t>(
+        implicit_request_generation);
+      // A stable ID lets the bridge/controller recognize a replay after a BT
+      // restart. The durable bridge ledger separately fences all handover
+      // variants to one handover per run/episode.
+      msg.command_id =
+        "skill-hand-" + procedure_run_id + "-" +
+        std::to_string(implicit_request_generation) + "-" + msg.action;
+    } else {
+      const auto sequence =
+        skill_command_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+      msg.command_id =
+        "skill-" + std::to_string(context_.getCurrentTime().nanoseconds()) + "-" +
+        std::to_string(sequence);
+    }
     return !msg.action.empty();
   }
 };
@@ -2191,7 +2126,6 @@ public:
 
 AUTO_APMS_BEHAVIOR_TREE_REGISTER_NODE(taskplanner_bt_nodes::LoadWorldState)
 AUTO_APMS_BEHAVIOR_TREE_REGISTER_NODE(taskplanner_bt_nodes::IsProcedureActive)
-AUTO_APMS_BEHAVIOR_TREE_REGISTER_NODE(taskplanner_bt_nodes::IsPhaseCertain)
 AUTO_APMS_BEHAVIOR_TREE_REGISTER_NODE(taskplanner_bt_nodes::HasExplicitRequest)
 AUTO_APMS_BEHAVIOR_TREE_REGISTER_NODE(taskplanner_bt_nodes::HasImplicitRequest)
 AUTO_APMS_BEHAVIOR_TREE_REGISTER_NODE(taskplanner_bt_nodes::NeedsRecovery)

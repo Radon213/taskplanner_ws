@@ -126,6 +126,26 @@ def test_perception_provider_and_location_are_independent_axes() -> None:
     assert selection.source == "explicit_axes"
 
 
+def test_external_rfdetr_topics_are_remote_and_endpointless() -> None:
+    selection = resolve_perception_selection(
+        provider="external_rfdetr_topics",
+        location="remote",
+        legacy_backend="local",
+    )
+    assert selection.provider == "external_rfdetr_topics"
+    assert selection.location == "remote"
+    assert selection.legacy_backend == "external"
+    assert validate_perception_endpoint("", selection) == ""
+
+    with pytest.raises(ValueError, match="requires PERCEPTION_LOCATION=remote"):
+        resolve_perception_selection(
+            provider="external_rfdetr_topics",
+            location="local",
+        )
+    with pytest.raises(ValueError, match="typed DDS perception"):
+        validate_perception_endpoint("http://192.168.1.7:8010", selection)
+
+
 @pytest.mark.parametrize(
     ("backend", "provider", "location"),
     [

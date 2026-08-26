@@ -40,6 +40,39 @@ tools:
   T09: "Needle driver"
   T10: "Poole suction tip"
 
+# Authoritative home-rack order for the bundle. Runtime and UI projections are
+# derived from this list; no frontend copy is maintained.
+tool_placement:
+  rack_order: [T01, T02, T03, T04, T05, T06, T07, T08, T09, T10]
+  initial_states: []
+
+# Editable procedure choices and runtime lanes. Physical request admission
+# remains in the owning Action/Service/controller components.
+scenario_policy:
+  requestable_tools: [T01, T02, T03, T04, T05, T06, T07, T08, T09, T10]
+  handover_arm: right
+  recovery_arm: left
+  require_cleaning_after_surgeon_use: true
+  allow_anticipatory_hold: true
+  voice_override_preempts_preposition: true
+  allow_prepositioning_when_uncertain: false
+  explicit_request_priority: true
+  unused_preposition_destination: mayo
+  runtime_requirements:
+    procedure_type: nephrectomy
+    tool_handover_action_required: true
+    retraction_service_required: true
+    bed_robot_status_required: false
+    image_vlm_enabled: true
+    dialogue_vlm_enabled: true
+    perception_enabled: true
+    rfdetr_tool_observations_required: false
+    voice_intent_resolver_enabled: true
+    surgeon_actor_enabled: true
+    phase_inference_enabled: true
+    retraction_workflow_state_enforced: true
+    legacy_raw_retractor_voice_enabled: false
+
 bed_robot_arm_groups:
   direction_enum: [UP, DOWN, LEFT, RIGHT, LEFT_RIGHT, UP_DOWN]
   distance_policy:
@@ -94,6 +127,7 @@ bed_robot_arm_groups:
       direction_frame: surgeon_view
       utterances:
         - "좌우로 1센치 더 당겨줘"
+        - "양쪽으로 1mm씩 당겨줘"
         - "위아래로 1센치 더 당겨줘"
         - "상하로 동시에 10밀리미터 더 당겨줘"
       directions: [LEFT_RIGHT, UP_DOWN]

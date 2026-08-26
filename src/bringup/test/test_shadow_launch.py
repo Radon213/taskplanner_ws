@@ -2,6 +2,7 @@ import importlib.util
 import json
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 _SRC_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_SRC_ROOT / "simulation_runtime"))
@@ -121,6 +122,10 @@ def test_shadow_launch_exposes_strict_replay_controls():
         "depth_scale_m_per_unit",
         "depth_scale_validated",
     }.issubset(pnu_parameters)
+    assert [
+        "".join(part.text for part in item).splitlines()[0]
+        for item in pnu_parameters["requested_algorithms"]
+    ] == ["tool", "blood"]
     context.launch_configurations["perception_provider"] = "disabled"
     assert bridges[0].condition.evaluate(context) is False
     assert pnu_bridges[0].condition.evaluate(context) is False
@@ -209,6 +214,7 @@ def test_shadow_launch_exposes_strict_replay_controls():
     context.launch_configurations.update(
         {
             "default_bundle": "thyroidectomy_demo",
+            "spec_dir": "/tmp/test-procedure-bundle",
             "publish_shared_state": "true",
             "publish_shared_free_text": "false",
         }
@@ -219,6 +225,7 @@ def test_shadow_launch_exposes_strict_replay_controls():
     )[0]
     assert public_parameters == {
         "default_bundle": "thyroidectomy_demo",
+        "spec_dir": "/tmp/test-procedure-bundle",
         "publish_free_text": False,
     }
 
@@ -272,6 +279,11 @@ def test_shadow_spec_dir_follows_default_bundle(monkeypatch):
         ("thyroidectomy_demo", "true", "thyroidectomy"),
         ("nephrectomy", "true", "nephrectomy"),
         ("inguinal_hernia_repair", "false", ""),
+        (
+            "inguinal_hernia_repair_demo",
+            "true",
+            "inguinal_hernia_repair",
+        ),
     ],
 )
 def test_shadow_bed_robot_contract_bundle_mapping(
@@ -321,6 +333,37 @@ def test_shadow_contract_nodes_are_disabled_for_inguinal_bundle():
         node.condition is not None and not node.condition.evaluate(context)
         for node in nodes.values()
     )
+
+
+def test_shadow_bed_robot_contract_reads_custom_spec_instead_of_bundle_name(
+    monkeypatch,
+):
+    module = _load_shadow_launch_module()
+    runtime = SimpleNamespace(
+        bed_robot_contract_enabled=False,
+        procedure_type="",
+    )
+    loaded_paths = []
+    monkeypatch.setattr(
+        module,
+        "load_bundle",
+        lambda path: loaded_paths.append(path)
+        or SimpleNamespace(get_scenario_runtime_requirements=lambda: runtime),
+    )
+    context = LaunchContext()
+    context.launch_configurations.update(
+        {
+            "default_bundle": "thyroidectomy",
+            "spec_dir": "/tmp/custom-authored-procedure",
+        }
+    )
+
+    for action in module._bed_robot_contract_configuration(context):
+        action.visit(context)
+
+    assert loaded_paths == ["/tmp/custom-authored-procedure"]
+    assert context.launch_configurations["bed_robot_contract_enabled"] == "false"
+    assert context.launch_configurations["bed_robot_contract_procedure_type"] == ""
 
 
 def _valid_routes() -> dict[str, str]:

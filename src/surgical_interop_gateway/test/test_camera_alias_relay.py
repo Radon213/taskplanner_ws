@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 
 import pytest
 
@@ -164,3 +165,83 @@ def test_idle_preview_override_applies_only_to_flir() -> None:
     assert flir_publisher.messages == [flir_message]
     assert not node._publish_if_available("cam4", cam4_publisher, object())
     assert cam4_publisher.messages == []
+
+
+def test_relay_follows_stopped_bundle_selection_before_camera_run() -> None:
+    node = CameraAliasRelay.__new__(CameraAliasRelay)
+    node._expected_procedure_id = "thyroidectomy"
+    node._world_running = False
+    node._world_procedure_id = ""
+    node._world_received_monotonic_sec = None
+    node._reconcile_source_demand = lambda: None
+    node._monotonic = lambda: 10.0
+    node._validated_bundle_id = lambda value: (
+        value if value == "thyroidectomy_demo" else ""
+    )
+
+    node._on_world_state(
+        SimpleNamespace(running=False, procedure_id="thyroidectomy_demo")
+    )
+
+    assert node._expected_procedure_id == "thyroidectomy_demo"
+    assert node._world_procedure_id == "thyroidectomy_demo"
+    assert node._world_received_monotonic_sec == 10.0
+
+
+def test_relay_never_latches_running_unknown_or_pathlike_bundle() -> None:
+    node = CameraAliasRelay.__new__(CameraAliasRelay)
+    node._expected_procedure_id = "thyroidectomy_demo"
+    node._world_running = False
+    node._world_procedure_id = ""
+    node._world_received_monotonic_sec = None
+    node._world_stale_after_sec = 3.0
+    node._publish_flir_while_idle = False
+    node._reconcile_source_demand = lambda: None
+    node._monotonic = lambda: 10.0
+    node._validated_bundle_id = lambda value: (
+        value if value == "thyroidectomy_demo" else ""
+    )
+
+    node._on_world_state(
+        SimpleNamespace(running=True, procedure_id="thyroidectomy")
+    )
+    assert node._expected_procedure_id == "thyroidectomy_demo"
+    assert node._procedure_active() is False
+
+    node._on_world_state(SimpleNamespace(running=False, procedure_id="unknown"))
+    assert node._expected_procedure_id == "thyroidectomy_demo"
+
+    node._on_world_state(
+        SimpleNamespace(running=False, procedure_id="../thyroidectomy_demo")
+    )
+    assert node._expected_procedure_id == "thyroidectomy_demo"
+
+
+def test_relay_forwards_cam4_only_after_matching_stopped_selection_then_run() -> None:
+    node = CameraAliasRelay.__new__(CameraAliasRelay)
+    node._expected_procedure_id = "thyroidectomy"
+    node._world_running = False
+    node._world_procedure_id = ""
+    node._world_received_monotonic_sec = None
+    node._world_stale_after_sec = 3.0
+    node._publish_flir_while_idle = False
+    node._reconcile_source_demand = lambda: None
+    node._monotonic = lambda: 10.0
+    node._validated_bundle_id = lambda value: (
+        value if value == "thyroidectomy_demo" else ""
+    )
+    publisher = _FakePublisher(subscription_count=1)
+
+    node._on_world_state(
+        SimpleNamespace(running=False, procedure_id="thyroidectomy_demo")
+    )
+    node._on_world_state(
+        SimpleNamespace(running=True, procedure_id="thyroidectomy_demo")
+    )
+    assert node._publish_if_available("cam4", publisher, "demo-frame") is True
+    assert publisher.messages == ["demo-frame"]
+
+    node._on_world_state(SimpleNamespace(running=True, procedure_id="unknown"))
+    assert node._expected_procedure_id == "thyroidectomy_demo"
+    assert node._publish_if_available("cam4", publisher, "bad-frame") is False
+    assert publisher.messages == ["demo-frame"]

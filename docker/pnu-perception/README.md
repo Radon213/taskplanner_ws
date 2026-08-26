@@ -23,6 +23,11 @@ The `docker run` examples therefore set the two checkpoint paths explicitly so
 the local and remote deployment contracts use the same verified artifacts as
 Compose.
 
+The worker v1 ABI still advertises all three upstream capabilities for direct
+compatibility. Taskplanner itself requests and requires only `tool,blood`; it
+does not parse or publish the worker's legacy hand result. The authoritative
+handover hand signal comes from the separate direct CAM4 gesture/facing topics.
+
 Build after the unified compatibility image:
 
 ```bash
@@ -170,7 +175,7 @@ Minimal RGB-only request metadata:
       "format": "jpeg"
     }
   },
-  "requested_algorithms": ["tool", "blood", "hand"],
+  "requested_algorithms": ["tool", "blood"],
   "deadline_unix_ms": 1787242400000
 }
 ```

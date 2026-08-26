@@ -1019,9 +1019,14 @@ def _optional_public_procedure_type(value: object, path: str) -> str | None:
     if value is None or value == "":
         return None
     normalized = _nonempty_string(value, path)
-    if normalized not in {"thyroidectomy", "nephrectomy"}:
+    if normalized not in {
+        "thyroidectomy",
+        "nephrectomy",
+        "inguinal_hernia_repair",
+    }:
         raise _schema_error(
-            "public_procedure_type must be thyroidectomy, nephrectomy, or null",
+            "public_procedure_type must be thyroidectomy, nephrectomy, "
+            "inguinal_hernia_repair, or null",
             path,
         )
     return normalized

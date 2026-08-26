@@ -9,9 +9,21 @@ import type {
   StageToolChipPlacement,
   useDigitalTwinViewModel,
 } from "../../hooks/useDigitalTwinViewModel";
-import type { PerceptionLayerHealth } from "../../hooks/useRosBridge";
+import type { RankedToolPrediction } from "../../types";
+import type { TypedRfdetrToolDetections } from "../../hooks/useRosBridge";
 import { MOTION_DURATION, SILK_EASE } from "../../motion-system";
 import { BedRobotArmCard } from "./BedRobotArmCard";
+import {
+  HandHandoverSignalPopup,
+  type HandHandoverSignal,
+} from "../command/HandHandoverSignalStatus";
+import {
+  OperationExecutionDispatchPopup,
+  SurgeonFinalSentencePopup,
+  VlmToolEvidenceBadges,
+  type ExecutionDispatchEvent,
+  type VlmOperationObservations,
+} from "../observability/OperationVlmObservability";
 import {
   StageCameraToggleViewport,
   StageCameraViewport,
@@ -48,11 +60,51 @@ type SystemSurgeonRequest = {
   requestedTool: string;
 };
 
+type SurgeonFinalSentence = {
+  eventKey: string;
+  text: string;
+};
+
 const HIGHLIGHT_PRIORITY: Record<StageToolChipPlacement["highlight"], number> = {
   requested: 2,
   predicted: 1,
   normal: 0,
 };
+
+type SystemToolPrediction = {
+  rank: number;
+  confidence: number;
+};
+
+function systemToolPredictionsById(
+  predictions: readonly RankedToolPrediction[],
+): ReadonlyMap<string, SystemToolPrediction> {
+  const rows = [...predictions]
+    .filter((prediction) => {
+      const rank = Number(prediction.rank);
+      const confidence = Number(prediction.confidence);
+      return (
+        Number.isInteger(rank)
+        && rank >= 1
+        && rank <= 3
+        && Boolean(prediction.instrument_id.trim())
+        && Number.isFinite(confidence)
+        && confidence >= 0
+        && confidence <= 1
+      );
+    })
+    .sort((left, right) => left.rank - right.rank)
+    .slice(0, 3);
+  const byId = new Map<string, SystemToolPrediction>();
+  for (const prediction of rows) {
+    if (byId.has(prediction.instrument_id)) continue;
+    byId.set(prediction.instrument_id, {
+      rank: prediction.rank,
+      confidence: prediction.confidence,
+    });
+  }
+  return byId;
+}
 
 function normalizedToolGroupKey(value: string): string {
   return value.trim().replace(/\s+/g, " ").toLocaleLowerCase();
@@ -75,6 +127,29 @@ function quantityStackLayerOffset(layerDepth: number, quantity: number): number 
 function instanceIdsForChip(chip: QuantifiedToolChipPlacement): string[] {
   const ids = chip.instanceIds?.filter(Boolean) ?? [];
   return ids.length ? ids : chip.id ? [chip.id] : [];
+}
+
+function toolInstanceMarker(instanceId: string | undefined, instrumentId: string): string {
+  const normalized = instanceId?.trim() ?? "";
+  if (!normalized || normalized === instrumentId.trim()) return "";
+  const markerIndex = normalized.lastIndexOf("#");
+  if (markerIndex >= 0 && markerIndex < normalized.length - 1) {
+    return normalized.slice(markerIndex, markerIndex + 17);
+  }
+  return normalized.slice(0, 16);
+}
+
+function showToolInstanceMarker(chip: DisplayToolChipPlacement): boolean {
+  const instanceId = chip.displayInstanceId?.trim() ?? "";
+  if (!instanceId || !chip.instanceIds.includes(instanceId)) return false;
+  return (
+    chip.active
+    || chip.highlight !== "normal"
+    // Leaving the rack is itself the spatial transition operators need to
+    // disambiguate, even when a display catalog has not yet mapped the raw
+    // lifecycle to a highlighted visual state.
+    || chip.holderId !== "rack"
+  );
 }
 
 function mergeToolBadges(chips: StageToolChipPlacement[]): StageToolChipBadge[] {
@@ -159,6 +234,7 @@ function aggregateRackTools(chips: StageToolChipPlacement[], vm: ViewModel): Dis
     rackPlacements.push({
       ...source,
       id: `rack-inventory-${inventory?.id ?? labelKey}`,
+      instrumentId: inventory?.id ?? source.instrumentId,
       label: inventory?.label ?? source.label,
       holderId: "rack",
       holderLabel: vm.language === "ko" ? "랙" : "Rack",
@@ -189,6 +265,7 @@ function aggregateRackTools(chips: StageToolChipPlacement[], vm: ViewModel): Dis
     if (!slot) continue;
     rackPlacements.push({
       id: `rack-inventory-${inventory.id}`,
+      instrumentId: inventory.id,
       label: inventory.label,
       shortLabel: slot.shortLabel,
       holderId: "rack",
@@ -301,18 +378,28 @@ function PhaseStepper({ steps, label }: { steps: StagePhaseStep[]; label: string
 export function OperatingRoomStage({
   vm,
   cameraFrames,
-  perceptionCameraFrames,
-  perceptionOverlayFrames,
-  perceptionHealth,
+  typedRfdetrToolDetections,
   systemSurgeonRequest,
+  asrFinalSentence,
+  handHandoverSignal,
+  vlmObservations,
+  systemToolPredictions = [],
+  executionDispatch,
   onStageAspectChange,
 }: {
   vm: ViewModel;
   cameraFrames?: StageCameraFrames;
-  perceptionCameraFrames?: StageCameraFrames;
-  perceptionOverlayFrames?: StageCameraFrames;
-  perceptionHealth?: PerceptionLayerHealth;
+  /** Local typed RF-DETR facts for their matching CAM3/CAM4 raw frames. */
+  typedRfdetrToolDetections?: TypedRfdetrToolDetections;
   systemSurgeonRequest: SystemSurgeonRequest;
+  /** A finalized ASR transcript, displayed only as observer evidence. */
+  asrFinalSentence?: SurgeonFinalSentence | null;
+  /** Reducer-authoritative direct hand-perception gate state. */
+  handHandoverSignal: HandHandoverSignal;
+  vlmObservations: VlmOperationObservations;
+  /** Reducer-accepted system-final ranking; never raw VLM candidates. */
+  systemToolPredictions?: readonly RankedToolPrediction[];
+  executionDispatch: ExecutionDispatchEvent | null;
   onStageAspectChange?: (ratio: number) => void;
 }) {
   const reduceMotion = useReducedMotion();
@@ -324,31 +411,23 @@ export function OperatingRoomStage({
     () => aggregateRackTools(vm.toolChipPlacements, vm),
     [vm],
   );
+  const systemPredictionByToolId = useMemo(
+    () => systemToolPredictionsById(systemToolPredictions),
+    [systemToolPredictions],
+  );
   const cameraLiveLabel = vm.language === "ko" ? "영상 수신 중" : "Live";
   const cameraWaitingLabel = vm.language === "ko" ? "연결 대기" : "Waiting";
-  const recognitionLiveLabel = vm.language === "ko" ? "인식 결과" : "Detected";
-  const recognitionWaitingLabel =
-    vm.language === "ko" ? "인식 결과 대기" : "Waiting for detections";
-  const perceptionEnabled = Boolean(
-    perceptionHealth?.received && perceptionHealth.enabled,
-  );
-  // Raw CAM4/FLIR frames can continue while the perception publisher is
-  // stalled. Only call the preview "Detected" when a current derived frame
-  // or overlay is actually available; otherwise keep the raw camera label so
-  // the operator is not told that stale detector output is present.
-  const cam4PerceptionVisible = perceptionEnabled && Boolean(
-    perceptionOverlayFrames?.cam4 ||
-      (!cameraFrames?.cam4 && perceptionCameraFrames?.cam4),
-  );
-  const flirPerceptionVisible = perceptionEnabled && Boolean(
-    perceptionOverlayFrames?.flir ||
-      (!cameraFrames?.flir && perceptionCameraFrames?.flir),
-  );
   const surgeonRequestConfirmed = systemSurgeonRequest.confirmed;
+  const handHandoverActive = handHandoverSignal.active;
   const confirmedRequestTool = systemSurgeonRequest.requestedTool
     ? vm.displayToolName(systemSurgeonRequest.requestedTool)
     : vm.ui.none;
-
+  const asrFinalEventKey = asrFinalSentence?.eventKey ?? "";
+  const [visibleAsrFinalEventKey, setVisibleAsrFinalEventKey] = useState("");
+  const visibleAsrFinalSentence = asrFinalSentence
+    && asrFinalEventKey === visibleAsrFinalEventKey
+    ? asrFinalSentence
+    : null;
   useEffect(() => {
     const board = boardRef.current;
     if (!board) return;
@@ -409,6 +488,20 @@ export function OperatingRoomStage({
     return () => window.clearTimeout(timer);
   }, [interruptAlertKey]);
 
+  useEffect(() => {
+    if (!asrFinalEventKey) {
+      setVisibleAsrFinalEventKey("");
+      return;
+    }
+    setVisibleAsrFinalEventKey(asrFinalEventKey);
+    const timer = window.setTimeout(() => {
+      setVisibleAsrFinalEventKey((current) =>
+        current === asrFinalEventKey ? "" : current,
+      );
+    }, 6200);
+    return () => window.clearTimeout(timer);
+  }, [asrFinalEventKey]);
+
   return (
     <section className="stage-card foxglove-stage-card" aria-label={vm.ui.stageTitle}>
       <div className="stage-chrome">
@@ -416,9 +509,30 @@ export function OperatingRoomStage({
           <div>
             <p className="section-kicker">{vm.ui.stageTitle}</p>
             <h2>{vm.stage.procedureLabel}</h2>
+            {vm.stage.procedureTargetSite || vm.stage.procedureApproach ? (
+              <dl className="stage-procedure-metadata" aria-label={vm.ui.procedureDetails}>
+                {vm.stage.procedureTargetSite ? (
+                  <div>
+                    <dt>{vm.ui.targetSite}</dt>
+                    <dd>{vm.stage.procedureTargetSite}</dd>
+                  </div>
+                ) : null}
+                {vm.stage.procedureApproach ? (
+                  <div>
+                    <dt>{vm.ui.approach}</dt>
+                    <dd>{vm.stage.procedureApproach}</dd>
+                  </div>
+                ) : null}
+              </dl>
+            ) : null}
           </div>
           <PhaseStepper steps={vm.stage.phaseSteps} label={vm.ui.phaseOverview} />
         </div>
+        <OperationExecutionDispatchPopup
+          event={executionDispatch}
+          language={vm.language}
+          className="stage-execution-dispatch-popup"
+        />
 
         {vm.boardBedRobotArms.length ? (
           <div
@@ -538,30 +652,13 @@ export function OperatingRoomStage({
           <StageCameraToggleViewport
             frames={{
               cam2: cameraFrames?.cam2,
-              flir:
-                cameraFrames?.flir ??
-                (perceptionEnabled ? perceptionCameraFrames?.flir : null),
+              flir: cameraFrames?.flir,
             }}
-            overlays={
-              perceptionEnabled
-                ? { flir: perceptionOverlayFrames?.flir }
-                : undefined
-            }
             cameraIds={["cam2", "flir"]}
             initialCamera="flir"
             language={vm.language}
             liveLabel={cameraLiveLabel}
-            liveLabels={{
-              flir: flirPerceptionVisible
-                ? recognitionLiveLabel
-                : cameraLiveLabel,
-            }}
             emptyLabel={cameraWaitingLabel}
-            emptyLabels={{
-              flir: perceptionEnabled
-                ? recognitionWaitingLabel
-                : cameraWaitingLabel,
-            }}
             className="surgical-bed-camera-view"
           />
         </div>
@@ -585,7 +682,7 @@ export function OperatingRoomStage({
             <div
               key={holder.id}
               className={`holder-zone ${holder.tone} ${holder.active ? "active" : ""} ${
-                holder.id === "surgeon" && (surgeonRequestConfirmed || displayedSurgeonAlerts.length)
+                holder.id === "surgeon" && (surgeonRequestConfirmed || displayedSurgeonAlerts.length || visibleAsrFinalSentence)
                   ? "has-evidence"
                   : ""
               }`}
@@ -626,9 +723,17 @@ export function OperatingRoomStage({
           );
         })}
 
-        <StageCameraViewport
-          cameraId="cam1"
-          frame={cameraFrames?.cam1}
+        <StageCameraToggleViewport
+          frames={{
+            cam1: cameraFrames?.cam1,
+            // CAM4 is reviewed from the surgeon-side mini-view. Typed RF-DETR
+            // facts stay tied to the matching raw CAM4 frame.
+            cam4: cameraFrames?.cam4,
+          }}
+          typedRfdetrDetections={typedRfdetrToolDetections}
+          cameraIds={["cam1", "cam4"]}
+          initialCamera="cam1"
+          language={vm.language}
           liveLabel={cameraLiveLabel}
           emptyLabel={cameraWaitingLabel}
           className="independent-stage-camera cam1-stage-camera"
@@ -640,33 +745,12 @@ export function OperatingRoomStage({
           }}
         />
 
-        <StageCameraToggleViewport
-          frames={{
-            cam3: cameraFrames?.cam3,
-            cam4:
-              cameraFrames?.cam4 ??
-              (perceptionEnabled ? perceptionCameraFrames?.cam4 : null),
-          }}
-          overlays={
-            perceptionEnabled
-              ? { cam4: perceptionOverlayFrames?.cam4 }
-              : undefined
-          }
-          cameraIds={["cam3", "cam4"]}
-          initialCamera="cam3"
-          language={vm.language}
+        <StageCameraViewport
+          cameraId="cam3"
+          frame={cameraFrames?.cam3}
+          typedRfdetrDetection={typedRfdetrToolDetections?.cam3}
           liveLabel={cameraLiveLabel}
-          liveLabels={{
-            cam4: cam4PerceptionVisible
-              ? recognitionLiveLabel
-              : cameraLiveLabel,
-          }}
           emptyLabel={cameraWaitingLabel}
-          emptyLabels={{
-            cam4: perceptionEnabled
-              ? recognitionWaitingLabel
-              : cameraWaitingLabel,
-          }}
           className="independent-stage-camera cam3-stage-camera"
           style={{
             left: `${vm.boardCameraRects.cam3.left}%`,
@@ -703,6 +787,15 @@ export function OperatingRoomStage({
         <div className="stage-tools board-tools">
           {displayToolPlacements.map((chip) => {
             const footerBadges = [...chip.footerBadges, ...chipAttentionBadges(chip, vm)];
+            const instanceMarker = showToolInstanceMarker(chip)
+              ? toolInstanceMarker(chip.displayInstanceId, chip.instrumentId)
+              : "";
+            const systemPrediction = systemPredictionByToolId.get(chip.instrumentId);
+            const mayoDecision = chip.mayoDecisionEligible === true
+              ? vlmObservations.mayoDecisions.find(
+                (decision) => decision.toolId === chip.instrumentId,
+              ) ?? null
+              : null;
             const previousRect = previousToolRects[chip.id];
             const moveDurationMs = toolMoveDurationMs(chip, previousRect, boardMetricsRef.current, Boolean(reduceMotion));
             return (
@@ -762,7 +855,32 @@ export function OperatingRoomStage({
                       <span className="chip-label-full">{chip.label}</span>
                       <span className="chip-label-short">{chip.shortLabel}</span>
                     </strong>
+                    {instanceMarker ? (
+                      <span
+                        className="tool-instance-marker"
+                        data-slot="stage-tool-instance-marker"
+                        data-tool-instance-id={chip.displayInstanceId}
+                        aria-label={
+                          vm.language === "ko"
+                            ? `${chip.label} 인스턴스 ${instanceMarker}`
+                            : `${chip.label} instance ${instanceMarker}`
+                        }
+                      >
+                        {instanceMarker}
+                      </span>
+                    ) : null}
                   </div>
+                  <VlmToolEvidenceBadges
+                    evidence={{
+                      nextToolProbability: systemPrediction?.confidence ?? null,
+                      nextToolRank: systemPrediction?.rank ?? null,
+                      mayoDecision,
+                    }}
+                    language={vm.language}
+                    showMayoDecision={chip.mayoDecisionEligible === true}
+                    nextToolAuthority="system"
+                    className="stage-tool-vlm-evidence"
+                  />
                   {chip.quantity > 1 ? (
                     <span
                       className="tool-quantity-badge"
@@ -788,7 +906,7 @@ export function OperatingRoomStage({
           })}
         </div>
 
-        {surgeonHolder && (surgeonRequestConfirmed || displayedSurgeonAlerts.length) ? (
+        {surgeonHolder && (surgeonRequestConfirmed || displayedSurgeonAlerts.length || handHandoverActive || visibleAsrFinalSentence) ? (
           <div
             className="surgeon-evidence-overlay"
             aria-label={`${surgeonHolder.label} evidence`}
@@ -799,7 +917,17 @@ export function OperatingRoomStage({
               height: `${surgeonHolder.rect.height}%`,
             }}
           >
-            <div className="surgeon-evidence-stack">
+            <div
+              className={`surgeon-evidence-stack ${handHandoverActive ? "has-hand-handover" : ""} ${visibleAsrFinalSentence ? "has-asr-final" : ""}`.trim()}
+            >
+              {visibleAsrFinalSentence ? (
+                <SurgeonFinalSentencePopup
+                  eventKey={visibleAsrFinalSentence.eventKey}
+                  text={visibleAsrFinalSentence.text}
+                  language={vm.language}
+                  className="stage-asr-final-popup"
+                />
+              ) : null}
               {surgeonRequestConfirmed ? (
                 <div
                   className="surgeon-hand-status active"
@@ -816,6 +944,13 @@ export function OperatingRoomStage({
                   </span>
                   <strong>{confirmedRequestTool}</strong>
                 </div>
+              ) : null}
+              {handHandoverActive ? (
+                <HandHandoverSignalPopup
+                  signal={handHandoverSignal}
+                  language={vm.language}
+                  className="stage-hand-handover-popup"
+                />
               ) : null}
               {displayedSurgeonAlerts.length ? (
                 <div className="holder-alert-stack" aria-label={`${surgeonHolder.label} alerts`}>

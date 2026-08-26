@@ -35,13 +35,37 @@ These rules are the source of truth for debugging runtime behavior.
    prepositioned into that same hand before the current tool is either handed over
    or returned.
 
+## External Tool Action Completion Authority
+
+1. A tool Action completion is authoritative only when it belongs to the current
+   tracked Goal and the ROS terminal status is `SUCCEEDED`, `success=true`,
+   `final_state=completed`, and `reason_code` is empty or `completed`.
+2. Every valid public leg has a total semantic projection: tray/Mayo to robot is
+   `prepositioned_right`; tray/robot to surgeon is `surgeon_owned`; robot to Mayo
+   is `mayo_reuse` at `mayo_stand`; Mayo to tray passes through
+   `recovering_left` and ends `returned_home`; controller recovery from robot to
+   tray ends `returned_home`.
+3. Once that completion is correlated, local lifecycle, arm-occupancy, or stale
+   VLM/detector belief must not veto the projection. The controller result is
+   evidence of what physically completed, while detector/VLM locations remain
+   observation updates subject to their own provenance and hysteresis policy.
+4. Missing provenance, a wrong instance/type/semantic leg, malformed projection
+   metadata, duplicate command step, or stale completion timestamp still fails
+   closed. These are correlation checks, not local-belief admission checks.
+5. Failed and canceled Results are not success projections. In particular,
+   `canceled_recovered_to_tray` is reconciled as verified Cancel compensation and
+   remains distinct from normal `return_unused_preposition` robot to Mayo.
+
 ## Surgeon Interaction Rules
 
-1. Empty-hand extension toward the receive zone is a handover cue. It can be
-   produced by VLM evidence, manual override, or the LLM surgeon actor.
+1. A direct typed CAM4 observation of the configured right hand with an open
+   palm facing up for the required dwell is a handover cue. This cue bypasses
+   the VLM input, prompt, and output contracts.
 2. The normal used-tool return path is not direct hand retrieval. The surgeon
    places used or reusable tools on the Mayo stand.
-3. `request_tool` may be explicit voice, implicit hand extension, or voice+hand.
+3. `request_tool` may be explicit voice or an independently admitted direct-hand
+   cue. A direct-hand cue does not identify a tool; the BT may use it only with
+   the independently stabilized or prepositioned candidate selected by policy.
 4. Voice requests may override an anticipatory/prepositioned tool.
 5. A voice request must be visible in the UI immediately as active spoken intent.
 6. A Mayo-placed tool is assumed used/contaminated unless explicitly modeled otherwise.
@@ -50,7 +74,7 @@ These rules are the source of truth for debugging runtime behavior.
 8. A floor-dropped tool is not a robot recovery target. Robot dispatch must hold
    until a human recovery event removes the contaminated tool from the field and
    either starts cleaning or provides a sterile replacement.
-9. A valid explicit voice request or implicit handover cue may request a tool
+9. A valid explicit voice request or direct handover cue may request a tool
    already on Mayo. The right arm then executes
    `pick_up_from_mayo_and_handover` instead of treating the tool as unavailable.
 
@@ -67,7 +91,6 @@ These rules are the source of truth for debugging runtime behavior.
    - whether the tool is still expected in that phase
    - the tool's observed location (`mayo_recovery_zone`, `return_zone`, field, reuse zone)
    - recent tool history on surgeon-side locations
-   - observed hand pose
    - phase uncertainty
 4. The VLM context must contain only public evidence that could exist in the
    real system: image/overlay cues, voice transcript, visible Mayo tools,
@@ -83,16 +106,14 @@ These rules are the source of truth for debugging runtime behavior.
    BT may dispatch `predict_tool`.
 9. Stabilization must suppress one-frame noise; transient raw cues must not directly
    become BT-visible intent.
-10. Schema v4 keeps semantic `intent` separate from visual-only `gesture`.
-    `gesture=["request_tool", tool_id, "open_receive", confidence]` is valid only
-    when the current raw CAM4 pixels clearly show an empty open palm extended
-    toward the assistant. Speech, procedure order, detector text, prior output,
-    and next-tool candidates must not fabricate this field.
-11. RF-DETR remains advisory. With object recognition disabled, raw CAM4 pixels
-    may still establish visual gesture evidence, but the reducer accepts one
-    request per gesture episode only after confidence and temporal stability
-    checks and agreement with an independently stabilized or prepositioned next
-    tool. Ambiguous tool identity remains observation-only.
+10. VLM input context, prompts, outputs, replay payloads, and mock-perception
+    contracts must not contain hand shape, palm facing, handedness, gesture, or
+    a hand-derived handover signal. Legacy `sg`, `gesture`, and
+    `surgeon_gesture` fields are invalid rather than silently ignored.
+11. Hand landmarks and facing are admitted only through the direct typed CAM4
+    hand gate. The gate is tool-agnostic and does not turn a forecast into a
+    request; BT policy may act only on a separately eligible, stabilized or
+    prepositioned tool candidate.
 
 ## Sentence-only Degraded Operation
 
@@ -179,8 +200,26 @@ These rules are the source of truth for debugging runtime behavior.
 
 1. Every instrument has exactly one configured home slot in the procedure bundle.
 2. When a clean tool is returned to storage, it must go to its configured home slot.
-3. An unused prepositioned tool may be returned directly to its home slot without cleaning.
+3. An unused prepositioned tool is parked on Mayo through the normal
+   `return_unused_preposition` `robot -> mayo` Action so the right hand can
+   prepare the replacement tool quickly. Rack/home return is not this policy.
 4. A contaminated tool must never be shown on the rack.
+5. `return_unused_preposition` has exactly two policy triggers:
+   (a) a canonical explicit `request_tool` or `voice_request` selects a physical
+   tool instance different from the one prepositioned in the robot right hand;
+   or (b) the reducer's system-final rank-1 tool changes to a different eligible
+   replacement and remains that system winner for at least 2.0 continuous
+   source-time seconds. Raw VLM rank 1 alone is not this trigger.
+6. Prediction disappearance, confidence loss, elapsed preposition dwell,
+   procedure finishing/completion, a local right-hand belief mismatch, and an
+   implicit/direct-hand cue do not trigger this Action. There is no 0.8/6/30 s
+   expiry and no 5 s re-arm cooldown. The 0.3 s threshold used to admit an
+   initial reversible preparation is a separate policy and is not a return
+   trigger.
+7. A trigger never preempts a tracked external tool Action. While
+   `active_robot_task_id` is non-empty, dispatch remains blocked; the request or
+   system prediction is reconsidered only after the terminal Action result has
+   been projected into WorldState.
 
 ## BT and Runtime Consistency Rules
 

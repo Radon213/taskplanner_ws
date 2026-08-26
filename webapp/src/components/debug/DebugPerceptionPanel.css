@@ -1041,7 +1041,7 @@
 .debug-perception-semantic-grid {
   display: grid;
   min-width: 0;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: minmax(0, 1fr);
   align-items: start;
   gap: 12px;
 }
@@ -1068,7 +1068,6 @@
 }
 
 .debug-semantic-meta,
-.debug-hand-summary,
 .debug-blood-combined {
   display: grid;
   min-width: 0;
@@ -1077,12 +1076,7 @@
   margin: 0;
 }
 
-.debug-hand-summary {
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-}
-
 .debug-semantic-meta > div,
-.debug-hand-summary > div,
 .debug-blood-combined > div {
   min-width: 0;
   padding: 8px 9px;
@@ -1092,8 +1086,6 @@
 
 .debug-semantic-meta dt,
 .debug-semantic-meta dd,
-.debug-hand-summary dt,
-.debug-hand-summary dd,
 .debug-blood-combined dt,
 .debug-blood-combined dd,
 .debug-blood-list dt,
@@ -1103,7 +1095,6 @@
 }
 
 .debug-semantic-meta dt,
-.debug-hand-summary dt,
 .debug-blood-combined dt,
 .debug-blood-list dt {
   color: var(--muted);
@@ -1112,7 +1103,6 @@
 }
 
 .debug-semantic-meta dd,
-.debug-hand-summary dd,
 .debug-blood-combined dd,
 .debug-blood-list dd {
   margin-top: 5px;
@@ -1130,13 +1120,11 @@
   white-space: normal;
 }
 
-.debug-hand-summary dd.ready,
 .debug-blood-combined dd.ready,
 .debug-blood-list dd.ready {
   color: var(--color-success-text);
 }
 
-.debug-hand-summary dd.waiting,
 .debug-blood-combined dd.waiting,
 .debug-blood-list dd.waiting {
   color: var(--surgeon-strong);
@@ -1159,7 +1147,6 @@
 .debug-semantic-empty strong { font-size: 12px; }
 .debug-semantic-empty span { color: var(--soft); font-size: 10px; line-height: 1.4; }
 
-.debug-hand-list,
 .debug-blood-list {
   display: grid;
   min-width: 0;
@@ -1169,7 +1156,6 @@
   list-style: none;
 }
 
-.debug-hand-card,
 .debug-blood-list > li {
   display: grid;
   min-width: 0;
@@ -1180,7 +1166,6 @@
   background: color-mix(in srgb, var(--surface-2) 34%, transparent);
 }
 
-.debug-hand-card > header,
 .debug-blood-list > li > header {
   display: flex;
   min-width: 0;
@@ -1189,14 +1174,11 @@
   gap: 8px;
 }
 
-.debug-hand-card > header span,
-.debug-hand-card > header h3,
 .debug-blood-list header span,
 .debug-blood-list header h3 {
   margin: 0;
 }
 
-.debug-hand-card > header span,
 .debug-blood-list header span {
   color: var(--muted);
   font-size: 9px;
@@ -1204,118 +1186,17 @@
   letter-spacing: 0.05em;
 }
 
-.debug-hand-card > header h3,
 .debug-blood-list header h3 {
   margin-top: 3px;
   color: var(--text);
   font-size: 14px;
 }
 
-.debug-hand-card > header > strong,
 .debug-blood-list header > strong {
   color: var(--clinical-strong);
   font-size: 12px;
   font-variant-numeric: tabular-nums;
 }
-
-.debug-hand-palm {
-  display: grid;
-  min-width: 0;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 7px;
-}
-
-.debug-hand-palm > div,
-.debug-hand-rotation {
-  display: grid;
-  min-width: 0;
-  gap: 5px;
-  padding: 9px;
-  border-radius: var(--radius-sm);
-  background: var(--ops-canvas);
-}
-
-.debug-hand-palm span,
-.debug-hand-rotation > span {
-  color: var(--muted);
-  font-size: 8px;
-  font-weight: 800;
-}
-
-.debug-hand-palm code,
-.debug-hand-rotation code {
-  overflow-wrap: anywhere;
-  color: var(--clinical-strong);
-  font-size: 10px;
-  font-variant-numeric: tabular-nums;
-  line-height: 1.4;
-}
-
-.debug-hand-details {
-  min-width: 0;
-  border-top: 1px solid var(--line);
-}
-
-.debug-hand-details > summary {
-  display: flex;
-  min-height: 44px;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  color: var(--clinical-strong);
-  font-size: 11px;
-  font-weight: 800;
-  cursor: pointer;
-  list-style: none;
-}
-
-.debug-hand-details > summary::-webkit-details-marker { display: none; }
-.debug-hand-details > summary::after { content: "+"; color: var(--muted); font-size: 16px; }
-.debug-hand-details[open] > summary::after { content: "−"; }
-.debug-hand-details > summary:focus-visible { outline: 2px solid var(--clinical); outline-offset: 2px; }
-
-.debug-hand-details[open] {
-  display: grid;
-  gap: 8px;
-}
-
-.debug-hand-joints {
-  display: grid;
-  min-width: 0;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 6px;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.debug-hand-joints > li {
-  display: grid;
-  min-width: 0;
-  gap: 4px;
-  padding: 7px 8px;
-  border-radius: var(--radius-sm);
-  background: color-mix(in srgb, var(--surface-2) 40%, transparent);
-}
-
-.debug-hand-joints > li > div {
-  display: flex;
-  min-width: 0;
-  justify-content: space-between;
-  gap: 6px;
-}
-
-.debug-hand-joints strong,
-.debug-hand-joints span,
-.debug-hand-joints code {
-  overflow-wrap: anywhere;
-  color: var(--soft);
-  font-size: 9px;
-  line-height: 1.35;
-}
-
-.debug-hand-joints span { color: var(--muted); }
-.debug-hand-joints li[data-depth-valid="false"] > span { color: var(--surgeon-strong); }
 
 .debug-blood-combined {
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -1433,18 +1314,6 @@
   .debug-semantic-monitor-boundary,
   .debug-semantic-meta dt,
   .debug-semantic-meta dd,
-  .debug-hand-summary dt,
-  .debug-hand-summary dd,
-  .debug-hand-card > header span,
-  .debug-hand-card > header > strong,
-  .debug-hand-palm span,
-  .debug-hand-palm code,
-  .debug-hand-details > summary,
-  .debug-hand-rotation > span,
-  .debug-hand-rotation code,
-  .debug-hand-joints strong,
-  .debug-hand-joints span,
-  .debug-hand-joints code,
   .debug-blood-combined dt,
   .debug-blood-combined dd,
   .debug-blood-list header span,
@@ -1455,9 +1324,6 @@
     font-size: 12px;
   }
 
-  .debug-hand-summary,
-  .debug-hand-palm,
-  .debug-hand-joints,
   .debug-blood-list > li > dl {
     grid-template-columns: 1fr;
   }

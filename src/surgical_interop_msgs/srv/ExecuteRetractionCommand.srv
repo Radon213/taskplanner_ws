@@ -17,6 +17,11 @@ uint16 protocol_version
 string source_id
 string command_id
 uint8 command
+# For COMMAND_ADJUST_RETRACTION, TARGET_NONE (0) means both retractor arms;
+# TARGET_LEFT and TARGET_RIGHT select one arm.  The same distance_m is applied
+# independently to both arms when TARGET_NONE is used for an adjustment.
+# COMMAND_FINISH_DIRECT_TEACH accepts TARGET_NONE/LEFT/RIGHT as an optional
+# target selector.  Other non-adjustment commands use TARGET_NONE.
 uint8 target_side
 float64 distance_m
 ---

@@ -102,7 +102,7 @@ def test_fast_cam4_path_publishes_once_after_non_request_stability() -> None:
     assert len(node._tool_pub.messages) == 1
 
 
-def test_fast_cam4_path_suppresses_active_hand_request() -> None:
+def test_fast_cam4_path_ignores_retired_request_field() -> None:
     node = _node()
     node._active = True
     node._perception_enabled = True
@@ -122,7 +122,8 @@ def test_fast_cam4_path_suppresses_active_hand_request() -> None:
         )
         node._publish_fast_cam4_mayo_observations(summary)
 
-    assert node._tool_pub.messages == []
+    assert len(node._tool_pub.messages) == 1
+    assert node._tool_pub.messages[0].instrument_id == "T04"
 
 
 def test_real_vlm_cam4_callback_only_buffers_public_semantics() -> None:
@@ -282,138 +283,12 @@ def test_raw_cam4_pixels_preserve_mayo_claims_without_detector_rows() -> None:
     assert payload["mayo_retrieve"] == ["T04", 0.81]
 
 
-def test_raw_cam4_visual_request_survives_stabilization_without_detector() -> None:
-    payload = {
-        "v": "4",
-        "phase": [["P02", 0.82]],
-        "tool": [["T02", 0.77]],
-        "intent": ["handover", "T02", 0.74],
-        "gesture": ["request_tool", "T02", "open_receive", 0.74],
-        "mayo": [],
-        "mayo_retrieve": ["", 0.0],
-        "u": 0.26,
-        "sum": "An open palm is extended toward the assistant.",
-        "bed_robot_arm_group": None,
-    }
-    context = {
-        "phase_search_mode": "temporal_prior",
-        "evidence_window": {
-            "speech": [],
-            "observed_signals": [],
-        },
-        "visual_input": {
-            "image_source": "flir_raw_fallback",
-            "cam4_image_forwarded_to_vlm": True,
-            "detector_advisory": False,
-        },
-        "observable_perception": {
-            "source": "cam4_rfdetr_small",
-            "alignment": {"status": "missing"},
-        },
-        "candidates": {
-            "phase": [["P02", 0.9]],
-            "tool": [["T02", 0.68]],
-            "evidence": {
-                "current_phase": "P02",
-                "allowed_next": ["P03"],
-                "phase_search_mode": "temporal_prior",
-            },
-        },
-        "digital_twin": {"hands": {}, "tools": []},
-    }
-
-    stabilized = _node()._stabilize_actor_log_payload(payload, context)
-
-    assert stabilized["intent"] == ["handover", "T02", 0.74]
-    assert stabilized["gesture"] == [
-        "request_tool",
-        "T02",
-        "open_receive",
-        0.74,
-    ]
-
-
-def test_raw_cam4_request_pose_survives_before_tool_is_identified() -> None:
-    payload = {
-        "v": "4",
-        "phase": [["P02", 0.82]],
-        "tool": [["T02", 0.51]],
-        "intent": ["none", "", 0.0],
-        "gesture": ["request_tool", "", "open_receive", 0.62],
-        "mayo": [["T04", "reuse", 0.68]],
-        "mayo_retrieve": ["", 0.0],
-        "u": 0.38,
-        "sum": "An empty open palm is extended while a cautery rests on Mayo.",
-        "bed_robot_arm_group": None,
-    }
-    context = {
-        "phase_search_mode": "temporal_prior",
-        "evidence_window": {
-            "speech": [],
-            "observed_signals": [],
-        },
-        "visual_input": {
-            "image_source": "flir_raw_fallback",
-            "cam4_image_forwarded_to_vlm": True,
-            "detector_advisory": False,
-        },
-        "observable_perception": {
-            "source": "cam4_rfdetr_small",
-            "alignment": {"status": "missing"},
-        },
-        "candidates": {
-            "phase": [["P02", 0.9]],
-            "tool": [["T02", 0.51]],
-            "evidence": {
-                "current_phase": "P02",
-                "allowed_next": ["P03"],
-                "phase_search_mode": "temporal_prior",
-            },
-        },
-        "digital_twin": {"hands": {}, "tools": []},
-    }
-
-    stabilized = _node()._stabilize_actor_log_payload(payload, context)
-
-    assert stabilized["gesture"] == [
-        "request_tool",
-        "",
-        "open_receive",
-        0.62,
-    ]
-    assert stabilized["intent"] == ["none", "", 0.0]
-    assert stabilized["mayo"] == [["T04", "reuse", 0.68]]
-
-
-def test_detector_independent_prompt_separates_pose_and_tool_identity() -> None:
-    instruction = RealVLMNode.__new__(
-        RealVLMNode
-    )._actor_log_developer_instruction()
-
-    assert "inspect only the upper-right surgeon hand in CAM4" in instruction
-    assert "clearly open, empty, and held out/upward" in instruction
-    assert "If it holds anything" in instruction
-    assert "unclear, occluded, or cropped" in instruction
-    assert 'emit ["","","",0.0]' in instruction
-    assert "Ignore all other cues, objects, and people" in instruction
-    assert 'For a positive emit ["request_tool","","open_receive",confidence]' in instruction
-    assert "never infer its tool id" in instruction
-    assert 'intent ["none","",0.0]' in instruction
-    assert "gesture always has exactly four values" in instruction
-    assert 'no request is exactly ["","","",0.0]' in instruction
-    assert "Never emit [\"open_receive\",\"\",0.85]" in instruction
-    assert "center-right interior request zone" not in instruction
-    assert "blue Mayo work surface" not in instruction
-    assert "skin-toned staff glove" not in instruction
-    assert "blue or green sterile gown" not in instruction
-
-
 def test_detector_independent_prompt_requires_full_mayo_inventory() -> None:
     instruction = RealVLMNode.__new__(
         RealVLMNode
     )._actor_log_developer_instruction()
 
-    assert "scan the complete hand/Mayo image" in instruction
+    assert "scan only instrument contents in the right CAM4 panel" in instruction
     assert "one row per distinct visible instrument instance" in instruction
     assert "preserve duplicates" in instruction
     assert "rings, hinge, shaft, jaws, blade, insulation/cable, or lumen" in instruction
@@ -434,9 +309,11 @@ def test_cam4_observations_precede_procedure_priors_in_prompt() -> None:
         RealVLMNode
     )._actor_log_developer_instruction()
 
-    assert instruction.index("GESTURE:") < instruction.index("MAYO:")
     assert instruction.index("MAYO:") < instruction.index("PHASE/NEXT TOOL:")
-    assert "gesture and mayo must come only from the hand/Mayo pixels" in instruction
+    assert "GESTURE:" not in instruction
+    assert "observed request signal" not in instruction
+    assert "palm" not in instruction.lower()
+    assert "handedness" not in instruction.lower()
 
 
 def test_next_tool_prompt_encourages_calibrated_proactive_forecast() -> None:
@@ -449,7 +326,7 @@ def test_next_tool_prompt_encourages_calibrated_proactive_forecast() -> None:
     assert "not a label for the tool currently in use" in instruction
     assert "which additional instrument the assistant should prepare next" in instruction
     assert "does not inventory visible instruments" in instruction
-    assert "Predict before a hand gesture or spoken request" in instruction
+    assert "Predict before a spoken request" in instruction
     assert "most plausible subsequent additional tool" in instruction
     assert "visible task trajectory" in instruction
     assert "broad procedure-role transitions" in instruction
@@ -485,13 +362,32 @@ def test_demo_procedure_context_exposes_recurring_chains_and_alternatives() -> N
     phases = {phase["id"]: phase for phase in context["phases"]}
 
     assert phases["P03"]["chain"] == [
-        ["T02", "T02", "T04", "T07", "T04", "T05", "T05"],
-        ["T04", "T02"],
+        ["T02", "T02", "T04", "T07", "T04", "T02"],
     ]
     assert ["T04", "T04"] in phases["P03"]["alt"]
-    assert phases["P04"]["chain"] == [["T05", "T05", "T02"]]
-    assert phases["P05"]["chain"] == [["T02", "T07", "T08"]]
-    assert phases["P06"]["chain"] == [["T08", "T07", "T04"]]
+    assert phases["P04"] == {
+        "id": "P04",
+        "name": "Fixed retraction and exposure establishment",
+        "next": ["P05"],
+        "tools": ["T02", "T03"],
+        "cue": [
+            "a controller-owned bed-arm retractor is seated at the wound edge and persistently changes field geometry",
+            "exposure establishment is dominant; sustained direct target manipulation has not yet begun",
+        ],
+        "not": [
+            "a bed-arm retractor is only approaching or rotating and has not yet established stable exposure",
+            "stable exposure is already followed by sustained central target manipulation",
+        ],
+        "alt": [["T02", "T02"]],
+        "roles": {"subsequent_target_handling": ["T02", "T03"]},
+    }
+    assert phases["P05"]["chain"] == [["T02", "T07", "T03"]]
+    assert phases["P06"]["chain"] == [["T07", "T04"]]
+    assert all(
+        tool_id not in {"T05", "T11"}
+        for phase in phases.values()
+        for tool_id in phase["tools"]
+    )
     assert "sequence" not in phases["P03"]
 
 
@@ -536,7 +432,8 @@ def test_actor_log_prompt_is_camera_agnostic_and_token_bounded() -> None:
     system_prompt = node._actor_log_system_prompt()
     developer_prompt = node._actor_log_developer_instruction()
 
-    assert "upper-right surgeon hand gesture" in system_prompt
+    assert "Independently inspect only instrument contents in any right Mayo panel" in system_prompt
+    assert "schema-v6" in system_prompt
     assert "ground truth" in system_prompt
     assert "Procedure context:" in system_prompt
     assert "temporal_prior favors current/next" in system_prompt
@@ -549,48 +446,6 @@ def test_actor_log_prompt_is_camera_agnostic_and_token_bounded() -> None:
     assert "temporal_prior is a preference, not a candidate filter" in developer_prompt
     assert "ASR near-homophones" in developer_prompt
     assert len(system_prompt) + len(developer_prompt) < 14_000
-
-
-def test_handover_intent_does_not_fabricate_visual_gesture() -> None:
-    payload = {
-        "v": "4",
-        "phase": [["P02", 0.82]],
-        "tool": [["T02", 0.77]],
-        "intent": ["handover", "T02", 0.91],
-        "gesture": ["", "", "", 0.0],
-        "mayo": [],
-        "mayo_retrieve": ["", 0.0],
-        "u": 0.26,
-        "sum": "No hand gesture is directly visible.",
-        "bed_robot_arm_group": None,
-    }
-    context = {
-        "phase_search_mode": "temporal_prior",
-        "evidence_window": {
-            "speech": [],
-            "observed_signals": [],
-        },
-        "visual_input": {
-            "image_source": "flir_raw_fallback",
-            "cam4_image_forwarded_to_vlm": True,
-            "detector_advisory": False,
-        },
-        "candidates": {
-            "phase": [["P02", 0.9]],
-            "tool": [["T02", 0.68]],
-            "evidence": {
-                "current_phase": "P02",
-                "allowed_next": ["P03"],
-                "phase_search_mode": "temporal_prior",
-            },
-        },
-        "digital_twin": {"hands": {}, "tools": []},
-    }
-
-    stabilized = _node()._stabilize_actor_log_payload(payload, context)
-
-    assert stabilized["gesture"] == ["", "", "", 0.0]
-    assert stabilized["intent"] == ["none", "", 0.0]
 
 
 def test_aligned_cam4_with_no_tools_clears_mayo_claims() -> None:
@@ -640,15 +495,13 @@ def test_stable_cam4_detection_adds_fail_closed_reuse_observation() -> None:
 
 
 @pytest.mark.parametrize(
-    ("tool_request_state", "stable_sample_count", "stable_duration_sec"),
+    ("stable_sample_count", "stable_duration_sec"),
     [
-        ("request", 4, 0.34),
-        ("none", 2, 0.34),
-        ("none", 4, 0.2),
+        (2, 0.34),
+        (4, 0.2),
     ],
 )
-def test_cam4_fallback_requires_stable_non_request_evidence(
-    tool_request_state: str,
+def test_cam4_fallback_requires_stable_evidence(
     stable_sample_count: int,
     stable_duration_sec: float,
 ) -> None:
@@ -666,12 +519,32 @@ def test_cam4_fallback_requires_stable_non_request_evidence(
                 "stable_duration_sec": stable_duration_sec,
             }
         ],
-        tool_request_state=tool_request_state,
     )
 
     _node()._corroborate_mayo_with_cam4_semantics(payload, context)
 
     assert payload["mayo"] == []
+    assert payload["mayo_retrieve"] == ["", 0.0]
+
+
+def test_cam4_corroboration_ignores_retired_request_field() -> None:
+    payload = {"mayo": [], "mayo_retrieve": ["", 0.0]}
+    context = _aligned_context(
+        [
+            {
+                "name": "Bovie surgical cautery",
+                "count": 1,
+                "max_confidence": 0.91,
+                "stable_sample_count": 4,
+                "stable_duration_sec": 0.34,
+            }
+        ],
+        tool_request_state="request",
+    )
+
+    _node()._corroborate_mayo_with_cam4_semantics(payload, context)
+
+    assert payload["mayo"] == [["T04", "reuse", 0.91]]
     assert payload["mayo_retrieve"] == ["", 0.0]
 
 
@@ -702,10 +575,10 @@ def test_field_deployed_tool_is_not_reclassified_as_mayo() -> None:
 def test_future_procedure_tool_is_kept_on_mayo_for_reuse() -> None:
     payload = {
         "mayo": [
-            ["T05", "recover", 0.95],
+            ["T04", "recover", 0.95],
             ["T01", "recover", 0.83],
         ],
-        "mayo_retrieve": ["T05", 0.95],
+        "mayo_retrieve": ["T04", 0.95],
     }
     context = {
         "candidates": {
@@ -715,7 +588,10 @@ def test_future_procedure_tool_is_kept_on_mayo_for_reuse() -> None:
         },
         "digital_twin": {
             "hands": {},
-            "tools": [],
+            "tools": [
+                {"id": "T04", "lc": "mayo_reuse", "lt": "mayo_stand", "loc": "mayo_stand"},
+                {"id": "T01", "lc": "mayo_recovery", "lt": "mayo_stand", "loc": "mayo_stand"},
+            ],
         },
         "visual_input": {
             "cam4_image_forwarded_to_vlm": True,
@@ -725,8 +601,7 @@ def test_future_procedure_tool_is_kept_on_mayo_for_reuse() -> None:
     _demo_node()._suppress_non_mayo_recovery_candidates(payload, context)
 
     assert payload["mayo"] == [
-        ["T05", "reuse", 0.95],
-        ["T01", "recover", 0.83],
+        ["T04", "reuse", 0.95],
     ]
     assert payload["mayo_retrieve"] == ["", 0.0]
 
@@ -750,7 +625,6 @@ def test_actor_log_stabilization_applies_cam4_mayo_corroboration() -> None:
         "phase_search_mode": "temporal_prior",
         "evidence_window": {
             "speech": [],
-            "observed_signals": [],
         },
         "candidates": {
             "phase": [["P02", 0.9]],
@@ -763,7 +637,9 @@ def test_actor_log_stabilization_applies_cam4_mayo_corroboration() -> None:
         },
         "digital_twin": {
             "hands": {},
-            "tools": [],
+            "tools": [
+                {"id": "T02", "lc": "mayo_reuse", "lt": "mayo_stand", "loc": "mayo_stand"},
+            ],
         },
         "observable_perception": _aligned_context(
             [
@@ -793,7 +669,6 @@ def test_schema_v4_corroborated_mayo_rows_publish_tool_observations() -> None:
 
     node = _node()
     node._phase_pub = _Publisher()
-    node._gesture_pub = _Publisher()
     node._result_pub = _Publisher()
     node._tool_pub = _Publisher()
     node._publish_bed_robot_arm_group_proposal = lambda *args, **kwargs: None

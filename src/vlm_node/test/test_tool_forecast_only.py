@@ -48,7 +48,7 @@ def test_tool_only_instruction_has_only_forecast_response_fields() -> None:
     system = node._tool_forecast_only_system_prompt()
 
     assert '{"tool":[["Txx",0.0]],"u":0.0}' in prompt
-    assert "Emit no phase, intent, gesture, Mayo, summary" in prompt
+    assert "Emit no phase, intent, Mayo, summary" in prompt
     assert "frozen_ngram_prior" in prompt
     assert "regardless of elapsed time" in system
     assert "2-8" not in system
@@ -64,7 +64,7 @@ def test_tool_only_response_is_adapted_without_fabricated_observations() -> None
     assert payload["phase"] == []
     assert payload["tool"] == [["T04", 0.82], ["T07", 0.41]]
     assert payload["intent"] == ["none", "", 0.0]
-    assert payload["gesture"] == ["", "", "", 0.0]
+    assert "gesture" not in payload
     assert payload["mayo"] == []
     assert payload["bed_robot_arm_group"] is None
 
@@ -88,4 +88,5 @@ def test_tool_only_json_schema_is_two_field_contract() -> None:
 
     assert schema["required"] == ["tool", "u"]
     assert set(schema["properties"]) == {"tool", "u"}
+    assert schema["properties"]["tool"]["maxItems"] == 3
     assert schema["additionalProperties"] is False

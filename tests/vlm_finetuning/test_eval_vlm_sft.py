@@ -177,12 +177,12 @@ class EvalVlmSftTest(unittest.TestCase):
                 {"next_transfer_tool": "bovie"},
             ),
             prediction_row(
-                "next-implicit",
+                "next-context",
                 "next_physical_tool",
                 {
                     "next_transfer_tool": "mosquito",
                     "event": "scrub_nurse_to_surgeon",
-                    "basis": "silent_request",
+                    "basis": "context_only",
                 },
                 {"next_transfer_tool": "adson_forceps"},
             ),
@@ -217,10 +217,7 @@ class EvalVlmSftTest(unittest.TestCase):
             1.0, metrics["none_detection"]["gold_none_top1_accuracy"]
         )
         self.assertEqual(
-            1.0, metrics["per_stratum"]["anticipatory"]["top1_accuracy"]
-        )
-        self.assertEqual(
-            0.0, metrics["per_stratum"]["implicit"]["top1_accuracy"]
+            0.5, metrics["per_stratum"]["anticipatory"]["top1_accuracy"]
         )
 
     def test_clinical_slots_and_structured_entity_scaffold(self) -> None:
@@ -277,95 +274,21 @@ class EvalVlmSftTest(unittest.TestCase):
             0.75, metrics["entity_scaffold"]["mean_set_f1"]
         )
 
-    def test_invalid_prediction_json_counts_as_json_failure(self) -> None:
-        rows = [
-            prediction_row(
-                "valid",
-                "request_intent",
-                {"intent": "receive_unspecified_tool"},
-                '{"intent":"receive_unspecified_tool"}',
-            ),
-            prediction_row(
-                "invalid",
-                "request_intent",
-                {"intent": "receive_unspecified_tool"},
-                "```json\n{\"intent\":\"receive_unspecified_tool\"}\n```",
-            ),
-        ]
-
-        report = evaluate_predictions(rows)
-
-        self.assertTrue(report["ok"])
-        self.assertEqual(0.5, report["json_validity"]["valid_rate"])
-        self.assertEqual(1, report["metrics"]["intent"]["json_valid_support"])
-        self.assertEqual(2, report["metrics"]["intent"]["total_support"])
-        self.assertEqual(0.5, report["metrics"]["intent"]["exact_match"])
-        self.assertEqual(
-            0.5, report["metrics"]["intent"]["intent_label_accuracy"]
-        )
-
-    def test_invalid_raw_json_empties_preparsed_semantic_prediction(self) -> None:
-        target = {"intent": "receive_unspecified_tool"}
+    def test_request_intent_is_rejected_by_hand_free_evaluator(self) -> None:
         report = evaluate_predictions(
             [
                 prediction_row(
-                    "fenced-preparsed",
+                    "legacy-request",
                     "request_intent",
-                    target,
-                    target,
-                    prediction_text=(
-                        "```json\n"
-                        '{"intent":"receive_unspecified_tool"}'
-                        "\n```"
-                    ),
+                    {"intent": "receive_unspecified_tool"},
+                    {"intent": "receive_unspecified_tool"},
                 )
             ]
         )
 
-        self.assertEqual(0.0, report["metrics"]["intent"]["exact_match"])
-        self.assertEqual(
-            0.0, report["metrics"]["intent"]["intent_label_accuracy"]
-        )
-
-    def test_intent_label_accuracy_and_task_schema_compliance(self) -> None:
-        target = {
-            "event": "implicit_tool_request",
-            "intent": "receive_unspecified_tool",
-            "requested_tool": None,
-            "tool_identity_inferred_from_later_transfer": False,
-        }
-        rows = [
-            prediction_row(
-                "intent-valid",
-                "request_intent",
-                target,
-                {
-                    **target,
-                    "event": "hand_gesture",
-                },
-            ),
-            prediction_row(
-                "intent-invalid-type",
-                "request_intent",
-                target,
-                {
-                    **target,
-                    "event": "hand_gesture",
-                    "tool_identity_inferred_from_later_transfer": "false",
-                },
-            ),
-        ]
-
-        report = evaluate_predictions(rows)
-        metrics = report["metrics"]["intent"]
-        compliance = report["task_schema_compliance"]
-
-        self.assertEqual(0.0, metrics["exact_match"])
-        self.assertEqual(1.0, metrics["intent_label_accuracy"])
-        self.assertEqual(1, metrics["schema_valid_support"])
-        self.assertEqual(0.5, metrics["schema_valid_rate"])
-        self.assertEqual(1, compliance["valid_count"])
-        self.assertEqual(0.5, compliance["valid_rate"])
+        self.assertFalse(report["ok"])
+        self.assertEqual({}, report["metrics"])
+        self.assertEqual("task_type_invalid", report["input_errors"][0]["code"])
 
     def test_task_schema_compliance_covers_all_task_contracts(self) -> None:
         examples = [
@@ -378,16 +301,6 @@ class EvalVlmSftTest(unittest.TestCase):
                     "from": "scrub_nurse",
                     "to": "surgeon",
                     "exhaustive_visible_tool_inventory": False,
-                },
-            ),
-            (
-                "intent",
-                "request_intent",
-                {
-                    "event": "implicit_tool_request",
-                    "intent": "receive_unspecified_tool",
-                    "requested_tool": None,
-                    "tool_identity_inferred_from_later_transfer": False,
                 },
             ),
             (
@@ -430,7 +343,7 @@ class EvalVlmSftTest(unittest.TestCase):
 
         report = evaluate_predictions(rows)
 
-        self.assertEqual(5, report["task_schema_compliance"]["valid_count"])
+        self.assertEqual(4, report["task_schema_compliance"]["valid_count"])
         self.assertEqual(1.0, report["task_schema_compliance"]["valid_rate"])
         self.assertTrue(
             all(

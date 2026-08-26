@@ -1,0 +1,594 @@
+/* Observer-only VLM/execution overlays. These use existing semantic theme
+   tokens so they can sit inside the dense operating-room canvas safely. */
+.operation-vlm-tool-evidence {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+  pointer-events: none;
+}
+
+.operation-vlm-tool-badge {
+  display: inline-grid;
+  min-width: 0;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 3px;
+  padding: 3px 4px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-inner);
+  background: color-mix(in srgb, var(--color-page-raised) 92%, transparent);
+  color: var(--color-text-secondary);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+}
+
+.operation-vlm-tool-badge > span,
+.operation-vlm-tool-badge > strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.operation-vlm-tool-badge > strong {
+  color: var(--color-text);
+}
+
+.operation-vlm-tool-badge.next {
+  border-color: color-mix(in srgb, var(--color-accent) 48%, var(--color-border));
+  color: var(--color-accent-strong);
+}
+
+.operation-vlm-tool-badge.mayo.recover {
+  border-color: color-mix(in srgb, var(--color-warning) 52%, var(--color-border));
+  color: var(--color-warning-text);
+}
+
+.operation-vlm-tool-badge.mayo.reuse {
+  border-color: color-mix(in srgb, var(--color-success) 48%, var(--color-border));
+  color: var(--color-success);
+}
+
+.operation-surgeon-final-popup,
+.operation-dispatch-popup,
+.operation-dispatch-feed {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-card);
+  background: var(--color-surface-raised);
+  box-shadow: var(--shadow-card);
+}
+
+.operation-surgeon-final-popup {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 6px 9px;
+  padding: 12px;
+  border-color: color-mix(in srgb, var(--color-accent) 52%, var(--color-border));
+  color: var(--color-accent-strong);
+  animation: operation-observability-in var(--duration-fast) var(--ease-silk) both;
+}
+
+.operation-surgeon-final-popup > svg {
+  margin-top: 2px;
+}
+
+.operation-surgeon-final-popup > div {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.operation-surgeon-final-popup span,
+.operation-surgeon-final-popup small,
+.operation-dispatch-popup span,
+.operation-dispatch-popup small,
+.operation-dispatch-header span,
+.operation-dispatch-row span,
+.operation-dispatch-row small {
+  color: var(--color-text-muted);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.25;
+}
+
+.operation-surgeon-final-popup strong,
+.operation-dispatch-popup strong,
+.operation-dispatch-header strong,
+.operation-dispatch-row strong {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--color-text);
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Keep the human-relevant subject above the transport path. The endpoint is
+   still shown directly below it as observer evidence, never as a substitute
+   for the instrument identity. */
+.operation-dispatch-popup .operation-dispatch-subject,
+.operation-dispatch-row .operation-dispatch-subject {
+  color: var(--color-text);
+}
+
+.operation-dispatch-endpoint {
+  overflow: hidden;
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* This is the physical/logical tool movement described by SkillStatus (for
+   example, Mayo stand → surgeon). It is deliberately separate from the ROS
+   endpoint shown below it. */
+.operation-dispatch-flow {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border: 1px solid color-mix(in srgb, var(--color-accent) 32%, var(--color-border));
+  border-radius: calc(var(--radius-inner) - 2px);
+  background: color-mix(in srgb, var(--color-accent) 7%, var(--color-page-raised));
+}
+
+.operation-dispatch-flow > div {
+  display: grid;
+  min-width: 0;
+  gap: 1px;
+}
+
+.operation-dispatch-flow > div:last-child {
+  text-align: end;
+}
+
+.operation-dispatch-flow strong {
+  overflow: hidden;
+  color: var(--color-text);
+  font-size: 12px;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.operation-dispatch-flow-arrow {
+  color: var(--color-accent-strong) !important;
+  font-size: 16px !important;
+  font-weight: 800 !important;
+}
+
+.operation-dispatch-retraction-payload {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: 1.4fr 1fr 1fr;
+  gap: 8px;
+  margin: 0;
+  padding: 7px 8px;
+  border: 1px solid color-mix(in srgb, var(--color-accent) 32%, var(--color-border));
+  border-radius: calc(var(--radius-inner) - 2px);
+  background: color-mix(in srgb, var(--color-accent) 7%, var(--color-page-raised));
+}
+
+.operation-dispatch-retraction-payload > div {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.operation-dispatch-retraction-payload dt,
+.operation-dispatch-retraction-payload dd {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.25;
+}
+
+.operation-dispatch-retraction-payload dt {
+  color: var(--color-text-muted);
+  font-weight: 600;
+}
+
+.operation-dispatch-retraction-payload dd {
+  color: var(--color-text);
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.operation-dispatch-metadata {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 4px 8px;
+  margin: 1px 0 0;
+}
+
+.operation-dispatch-metadata > div {
+  min-width: 0;
+}
+
+.operation-dispatch-metadata dt,
+.operation-dispatch-metadata dd {
+  overflow: hidden;
+  margin: 0;
+  color: var(--color-text-muted);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.operation-dispatch-metadata dd {
+  color: var(--color-text-secondary);
+}
+
+.operation-dispatch-mono {
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+}
+
+.surgeon-evidence-stack .stage-asr-final-popup {
+  gap: 4px 7px;
+  padding: 7px 8px;
+}
+
+.surgeon-evidence-stack .stage-asr-final-popup > div {
+  gap: 2px;
+}
+
+.surgeon-evidence-stack .stage-asr-final-popup span,
+.surgeon-evidence-stack .stage-asr-final-popup small {
+  font-size: 9px;
+  line-height: 1.15;
+}
+
+.surgeon-evidence-stack .stage-asr-final-popup strong {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  font-size: 11px;
+  line-height: 1.22;
+  text-overflow: clip;
+  white-space: normal;
+}
+
+.operation-dispatch-popup {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 9px;
+  padding: 12px;
+  animation: operation-observability-in var(--duration-fast) var(--ease-silk) both;
+}
+
+.operation-dispatch-popup > svg {
+  margin-top: 2px;
+  color: var(--color-accent-strong);
+}
+
+.operation-dispatch-popup > div,
+.operation-dispatch-header > div,
+.operation-dispatch-row > div {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.operation-dispatch-popup.state-completed,
+.operation-dispatch-row.state-completed {
+  border-color: color-mix(in srgb, var(--color-success) 46%, var(--color-border));
+}
+
+.operation-dispatch-popup.state-completed > svg,
+.operation-dispatch-row.state-completed > svg,
+.operation-dispatch-row.state-accepted > svg {
+  color: var(--color-success);
+}
+
+.operation-dispatch-popup.state-rejected,
+.operation-dispatch-popup.state-failed,
+.operation-dispatch-row.state-rejected,
+.operation-dispatch-row.state-failed {
+  border-color: color-mix(in srgb, var(--color-danger) 52%, var(--color-border));
+}
+
+.operation-dispatch-popup.state-rejected > svg,
+.operation-dispatch-popup.state-failed > svg,
+.operation-dispatch-row.state-rejected > svg,
+.operation-dispatch-row.state-failed > svg {
+  color: var(--color-danger);
+}
+
+.operation-dispatch-feed {
+  display: grid;
+  min-width: 0;
+  gap: 9px;
+  padding: 12px;
+}
+
+.operation-dispatch-header {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 9px;
+}
+
+.operation-dispatch-header > svg {
+  flex: 0 0 auto;
+  color: var(--color-accent-strong);
+}
+
+.operation-dispatch-feed > ol {
+  display: grid;
+  max-height: 260px;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  list-style: none;
+}
+
+.operation-dispatch-row {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 8px;
+  padding: 9px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-inner);
+  background: var(--color-page-raised);
+}
+
+.operation-dispatch-row > svg {
+  margin-top: 3px;
+  color: var(--color-accent-strong);
+}
+
+.operation-dispatch-row > em {
+  margin-top: 2px;
+  max-width: 112px;
+  overflow: hidden;
+  color: var(--color-text-secondary);
+  font-size: 10px;
+  font-style: normal;
+  font-weight: 700;
+  line-height: 1.2;
+  text-align: end;
+  text-overflow: ellipsis;
+}
+
+@media (max-width: 680px) {
+  .operation-dispatch-retraction-payload {
+    grid-template-columns: 1fr;
+  }
+
+  .operation-dispatch-metadata {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+.operation-dispatch-row.state-proposed > em {
+  color: var(--color-warning-text);
+}
+
+.operation-dispatch-row.state-sent > em,
+.operation-dispatch-row.state-accepted > em {
+  color: var(--color-accent-strong);
+}
+
+.operation-dispatch-row.state-completed > em {
+  color: var(--color-success);
+}
+
+.operation-dispatch-row.state-rejected > em,
+.operation-dispatch-row.state-failed > em {
+  color: var(--color-danger);
+}
+
+.operation-dispatch-empty {
+  margin: 0;
+  padding: 12px;
+  border: 1px dashed var(--color-border-strong);
+  border-radius: var(--radius-inner);
+  color: var(--color-text-muted);
+  font-size: 12px;
+  line-height: 1.4;
+  text-align: center;
+}
+
+/* Typed RF-DETR facts committed to the VLM request. This is intentionally a
+   text/coordinate panel: no detector bitmap is mounted here. */
+.operation-vlm-detection-evidence {
+  display: grid;
+  min-width: 0;
+  gap: 9px;
+  padding: 12px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-card);
+  background: var(--color-surface-raised);
+  box-shadow: var(--shadow-card);
+}
+
+.operation-vlm-detection-evidence.state-waiting {
+  border-style: dashed;
+}
+
+.operation-vlm-detection-header,
+.operation-vlm-detection-view > header {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.operation-vlm-detection-header > div,
+.operation-vlm-detection-view > header > div,
+.operation-vlm-detection-view li > div {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.operation-vlm-detection-header > svg {
+  flex: 0 0 auto;
+  color: var(--color-accent-strong);
+}
+
+.operation-vlm-detection-header span,
+.operation-vlm-detection-header small,
+.operation-vlm-detection-evidence > p,
+.operation-vlm-detection-view small,
+.operation-vlm-detection-view-meta,
+.operation-vlm-detection-visual-diagnostic,
+.operation-vlm-detection-empty {
+  color: var(--color-text-muted);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.32;
+}
+
+.operation-vlm-detection-header strong,
+.operation-vlm-detection-view strong {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--color-text);
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.operation-vlm-detection-evidence > p {
+  margin: 0;
+}
+
+.operation-vlm-detection-boundary {
+  padding: 7px 8px;
+  border: 1px solid color-mix(in srgb, var(--color-accent) 28%, var(--color-border));
+  border-radius: var(--radius-inner);
+  background: color-mix(in srgb, var(--color-accent) 7%, transparent);
+}
+
+.operation-vlm-detection-views {
+  display: grid;
+  min-width: 0;
+  gap: 7px;
+}
+
+.operation-vlm-detection-view {
+  display: grid;
+  min-width: 0;
+  gap: 6px;
+  padding: 9px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-inner);
+  background: var(--color-page-raised);
+}
+
+.operation-vlm-detection-view.state-fresh {
+  border-color: color-mix(in srgb, var(--color-success) 45%, var(--color-border));
+}
+
+.operation-vlm-detection-view.state-unavailable {
+  border-color: color-mix(in srgb, var(--color-warning) 42%, var(--color-border));
+}
+
+.operation-vlm-detection-view > header > em,
+.operation-vlm-detection-view li > em {
+  flex: 0 0 auto;
+  color: var(--color-text-secondary);
+  font-size: 10px;
+  font-style: normal;
+  font-weight: 700;
+  line-height: 1.2;
+  text-align: end;
+}
+
+.operation-vlm-detection-view.state-fresh > header > em {
+  color: var(--color-success);
+}
+
+.operation-vlm-detection-view.state-unavailable > header > em {
+  color: var(--color-warning-text);
+}
+
+.operation-vlm-detection-view-meta,
+.operation-vlm-detection-visual-diagnostic,
+.operation-vlm-detection-empty {
+  margin: 0;
+  overflow: hidden;
+  font-variant-numeric: tabular-nums;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.operation-vlm-detection-view > ol {
+  display: grid;
+  max-height: 150px;
+  gap: 5px;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  list-style: none;
+}
+
+.operation-vlm-detection-view li {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 7px;
+  padding: 7px;
+  border: 1px solid color-mix(in srgb, var(--color-border) 82%, transparent);
+  border-radius: var(--radius-inner);
+  background: color-mix(in srgb, var(--color-surface-raised) 84%, transparent);
+}
+
+.operation-vlm-detection-view li > em {
+  color: var(--color-accent-strong);
+  font-variant-numeric: tabular-nums;
+}
+
+@keyframes operation-observability-in {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (max-width: 520px) {
+  .operation-dispatch-row {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .operation-dispatch-row > em {
+    grid-column: 2;
+    max-width: none;
+    text-align: start;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .operation-surgeon-final-popup,
+  .operation-dispatch-popup {
+    animation: none;
+  }
+}

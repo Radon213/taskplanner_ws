@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from dataclasses import asdict
 import json
+from pathlib import Path
 import threading
 from types import SimpleNamespace
 
 from builtin_interfaces.msg import Time
+from procedure_spec import load_bundle
 from surgical_interop_msgs.msg import BedRobotArmState, BedRobotArmStateArray
 from std_msgs.msg import String
 
@@ -26,6 +28,32 @@ from surgical_interop_gateway.projections import (
     project_tool_predictions,
 )
 from surgical_interop_gateway.node import SurgicalInteropGateway
+
+
+def test_public_catalog_carries_target_site_and_approach_metadata() -> None:
+    node = SurgicalInteropGateway.__new__(SurgicalInteropGateway)
+    spec_dir = (
+        Path(__file__).parents[2]
+        / "procedure_spec"
+        / "procedure_spec"
+        / "specs"
+        / "thyroidectomy_demo"
+    )
+    node._procedure_spec = load_bundle(spec_dir)
+    node._catalog_version = "sha256:test"
+    node._gateway_instance_id = "gateway-test"
+    node._procedure_run_id = ""
+
+    message = node._catalog_message(
+        stamp=Time(sec=1),
+        revision=1,
+        procedure_active=False,
+    )
+
+    assert message.procedure_target_site == "Right Lobectomy"
+    assert message.procedure_target_site_ko == "Right Lobectomy"
+    assert message.procedure_approach == "Open"
+    assert message.procedure_approach_ko == "Open"
 
 
 def test_context_is_only_dt_accepted_state_not_planner_predictions():
@@ -126,6 +154,25 @@ def test_tool_prediction_projects_reducer_accepted_top_three():
     assert [row.instrument_id for row in projected] == ["T02", "T04", "T07"]
     assert [row.confidence for row in projected] == [0.91, 0.73, 0.61]
     assert [row.stability_sec for row in projected] == [3.4, 0.0, 0.0]
+
+
+def test_normalized_ranked_distribution_accepts_distinct_scalar_policy_confidence():
+    world = SimpleNamespace(
+        stamp=SimpleNamespace(sec=4, nanosec=0),
+        predicted_tool="T02",
+        predicted_tool_confidence=0.86,
+        predicted_tool_stability_sec=3.4,
+        ranked_tool_predictions=[
+            SimpleNamespace(rank=1, instrument_id="T02", confidence=0.88, stability_sec=3.4),
+            SimpleNamespace(rank=2, instrument_id="T07", confidence=0.10, stability_sec=0.0),
+            SimpleNamespace(rank=3, instrument_id="T04", confidence=0.02, stability_sec=0.0),
+        ],
+    )
+
+    projected = project_tool_predictions(world)
+
+    assert [row.instrument_id for row in projected] == ["T02", "T07", "T04"]
+    assert [row.confidence for row in projected] == [0.88, 0.10, 0.02]
 
 
 def test_ranked_prediction_snapshot_fails_closed_as_one_unit():
@@ -411,10 +458,6 @@ def test_clinical_projection_never_leaks_raw_vlm_json_or_prediction_fields():
         observed_location_ids=["surgical_field"],
         observed_location_types=["surgical_field"],
         observed_confidences=[0.84],
-        gesture_event_type="",
-        gesture_requested_tool="",
-        gesture_hand_pose="",
-        gesture_confidence=0.0,
         uncertainty=0.22,
         raw_json='{"reasoning":"do not publish"}',
         predicted_tool_ids=["forceps"],
@@ -438,7 +481,6 @@ def test_clinical_projection_drops_misaligned_parallel_groups():
         observed_location_ids=["mayo", "field"],
         observed_location_types=["mayo_tray"],
         observed_confidences=[0.8],
-        gesture_confidence=0.0,
         uncertainty=0.2,
     )
 
@@ -461,10 +503,6 @@ def test_clinical_projection_drops_only_bad_rows_and_maximizes_bad_uncertainty()
         observed_location_ids=["mayo", "field"],
         observed_location_types=["mayo_tray", "surgical_field"],
         observed_confidences=[float("inf"), 0.7],
-        gesture_event_type="request_tool",
-        gesture_requested_tool="T01",
-        gesture_hand_pose="open_receive",
-        gesture_confidence=1.2,
         uncertainty=float("nan"),
     )
 
@@ -476,10 +514,6 @@ def test_clinical_projection_drops_only_bad_rows_and_maximizes_bad_uncertainty()
     assert projected.observed_location_ids == ("surgeon",)
     assert projected.observed_location_types == ("surgeon",)
     assert projected.observed_confidences == (0.7,)
-    assert projected.gesture_event_type == ""
-    assert projected.gesture_requested_tool == ""
-    assert projected.gesture_hand_pose == ""
-    assert projected.gesture_confidence == 0.0
     assert projected.uncertainty == 1.0
     assert projected.evidence_status == UNKNOWN
 
@@ -635,6 +669,7 @@ def _event_test_node(
         message=SimpleNamespace(
             running=running,
             procedure_id="thyroidectomy",
+            procedure_run_id="run-test" if running else "",
             stamp=Time(sec=source_stamp_sec),
         ),
         received_monotonic_sec=received_at,
@@ -668,6 +703,7 @@ def _health_mismatch_test_node():
     node._SOURCE_NAMES = SurgicalInteropGateway._SOURCE_NAMES
     node._required_health_sources = {"world_state"}
     node._procedure_mismatch = True
+    node._procedure_run_scope_mismatch = False
     node._vlm_health = None
     node._skill_status = None
     node._bed_robot_arm_status = None
@@ -693,6 +729,22 @@ def test_health_reports_procedure_catalog_mismatch():
     assert "procedure_catalog_mismatch" in message.error_codes
 
 
+def test_health_reports_missing_authoritative_run_scope():
+    node = _health_mismatch_test_node()
+    node._procedure_mismatch = False
+    node._procedure_run_scope_mismatch = True
+    fresh = {
+        name: SimpleNamespace(available=True, fresh=True)
+        for name in node._SOURCE_NAMES
+    }
+
+    message = node._health_message(revision=1, fresh=fresh)
+
+    assert message.healthy is False
+    assert message.state == "degraded"
+    assert "procedure_run_scope_missing" in message.error_codes
+
+
 def _lifecycle_test_node():
     node = SurgicalInteropGateway.__new__(SurgicalInteropGateway)
     node._lock = threading.RLock()
@@ -712,7 +764,11 @@ def _lifecycle_test_node():
     node._catalog_version = "sha256:test"
     node._last_procedure_active = False
     node._procedure_mismatch = False
+    node._procedure_run_scope_mismatch = False
     node._procedure_spec = SimpleNamespace(procedure_id="thyroidectomy")
+    node._active_bundle = "thyroidectomy"
+    node._spec_dir = "/specs/thyroidectomy"
+    node._spec_root = Path("/specs")
     node._world_stale_after_sec = 3.0
     node._monotonic = lambda: 10.0
     node.get_logger = lambda: SimpleNamespace(
@@ -721,7 +777,7 @@ def _lifecycle_test_node():
     return node
 
 
-def test_world_start_establishes_run_before_first_event_and_does_not_reset_twice():
+def test_world_start_adopts_twin_run_before_first_event_and_does_not_reset_twice():
     node = _lifecycle_test_node()
     published: list[object] = []
     node._events_pub = SimpleNamespace(publish=published.append)
@@ -729,7 +785,10 @@ def test_world_start_establishes_run_before_first_event_and_does_not_reset_twice
 
     node._on_world(
         SimpleNamespace(
-            running=True, procedure_id="thyroidectomy", stamp=Time(sec=10)
+            running=True,
+            procedure_id="thyroidectomy",
+            procedure_run_id="twin-run-1",
+            stamp=Time(sec=10),
         )
     )
     first_run_id = node._procedure_run_id
@@ -740,7 +799,10 @@ def test_world_start_establishes_run_before_first_event_and_does_not_reset_twice
     )
     node._on_world(
         SimpleNamespace(
-            running=True, procedure_id="thyroidectomy", stamp=Time(sec=11)
+            running=True,
+            procedure_id="thyroidectomy",
+            procedure_run_id="twin-run-1",
+            stamp=Time(sec=11),
         )
     )
     node._on_event(
@@ -749,18 +811,90 @@ def test_world_start_establishes_run_before_first_event_and_does_not_reset_twice
         )
     )
 
-    assert first_run_id
+    gateway_info = node._gateway_info_message(
+        stamp=Time(sec=11),
+        revision=1,
+        procedure_type="thyroidectomy",
+        procedure_active=True,
+    )
+
+    assert first_run_id == "twin-run-1"
     assert node._procedure_run_id == first_run_id
+    assert gateway_info.procedure_active is True
+    assert gateway_info.procedure_run_id == "twin-run-1"
     assert node._event_sequence == 9
     assert len(published) == 2
     assert published[0].gateway_instance_id == "gateway-1"
     assert published[0].procedure_run_id == first_run_id
     assert published[0].procedure_type == "thyroidectomy"
-    assert published[0].schema_version == "1.1.0"
+    assert published[0].schema_version == "1.3.0"
     assert published[0].catalog_version == "sha256:test"
 
 
-def test_event_identity_distinguishes_new_run_and_gateway_restart():
+def test_active_world_without_twin_run_id_keeps_gateway_scope_idle():
+    node = _lifecycle_test_node()
+    errors: list[str] = []
+    node.get_logger = lambda: SimpleNamespace(
+        error=errors.append, warning=lambda *_: None
+    )
+
+    node._on_world(
+        SimpleNamespace(
+            running=True,
+            procedure_id="thyroidectomy",
+            procedure_run_id="",
+            stamp=Time(sec=10),
+        )
+    )
+    _, active = node._public_world_locked(now_monotonic_sec=10.0)
+    gateway_info = node._gateway_info_message(
+        stamp=Time(sec=10),
+        revision=1,
+        procedure_type="thyroidectomy",
+        procedure_active=active,
+    )
+
+    assert active is False
+    assert node._last_procedure_active is False
+    assert node._procedure_run_id == ""
+    assert node._procedure_run_scope_mismatch is True
+    assert gateway_info.procedure_active is False
+    assert gateway_info.procedure_run_id == ""
+    assert errors == [
+        "public gateway rejected active WorldState without procedure_run_id"
+    ]
+
+
+def test_authoritative_twin_run_change_replaces_public_scope_atomically():
+    node = _lifecycle_test_node()
+    node._on_world(
+        SimpleNamespace(
+            running=True,
+            procedure_id="thyroidectomy",
+            procedure_run_id="twin-run-1",
+            stamp=Time(sec=10),
+        )
+    )
+    node._vlm_result = SimpleNamespace(message="run-1-vlm")
+    node._speech_text = SimpleNamespace(message="run-1-speech")
+
+    node._on_world(
+        SimpleNamespace(
+            running=True,
+            procedure_id="thyroidectomy",
+            procedure_run_id="twin-run-2",
+            stamp=Time(sec=20),
+        )
+    )
+
+    assert node._last_procedure_active is True
+    assert node._procedure_run_id == "twin-run-2"
+    assert node._procedure_run_start_source_stamp_sec == 20.0
+    assert node._vlm_result is None
+    assert node._speech_text is None
+
+
+def test_event_identity_tracks_new_twin_run_across_gateway_restart():
     node = _lifecycle_test_node()
     first_process_events: list[object] = []
     node._events_pub = SimpleNamespace(publish=first_process_events.append)
@@ -768,7 +902,10 @@ def test_event_identity_distinguishes_new_run_and_gateway_restart():
 
     node._on_world(
         SimpleNamespace(
-            running=True, procedure_id="thyroidectomy", stamp=Time(sec=10)
+            running=True,
+            procedure_id="thyroidectomy",
+            procedure_run_id="twin-run-1",
+            stamp=Time(sec=10),
         )
     )
     node._on_event(
@@ -777,12 +914,18 @@ def test_event_identity_distinguishes_new_run_and_gateway_restart():
     first_run_id = first_process_events[-1].procedure_run_id
     node._on_world(
         SimpleNamespace(
-            running=False, procedure_id="thyroidectomy", stamp=Time(sec=19)
+            running=False,
+            procedure_id="thyroidectomy",
+            procedure_run_id="twin-run-1",
+            stamp=Time(sec=19),
         )
     )
     node._on_world(
         SimpleNamespace(
-            running=True, procedure_id="thyroidectomy", stamp=Time(sec=20)
+            running=True,
+            procedure_id="thyroidectomy",
+            procedure_run_id="twin-run-2",
+            stamp=Time(sec=20),
         )
     )
     node._on_event(
@@ -797,20 +940,21 @@ def test_event_identity_distinguishes_new_run_and_gateway_restart():
     restarted._stamp_or_now = lambda stamp: stamp or Time()
     restarted._on_world(
         SimpleNamespace(
-            running=True, procedure_id="thyroidectomy", stamp=Time(sec=30)
+            running=True,
+            procedure_id="thyroidectomy",
+            procedure_run_id="twin-run-2",
+            stamp=Time(sec=30),
         )
     )
     restarted._on_event(
         SimpleNamespace(event_type="RunStarted", stamp=Time(sec=30), confidence=1.0)
     )
 
-    assert first_run_id != second_run_event.procedure_run_id
+    assert first_run_id == "twin-run-1"
+    assert second_run_event.procedure_run_id == "twin-run-2"
     assert second_run_event.gateway_instance_id == "gateway-1"
     assert restarted_events[0].gateway_instance_id == "gateway-2"
-    assert restarted_events[0].procedure_run_id not in {
-        first_run_id,
-        second_run_event.procedure_run_id,
-    }
+    assert restarted_events[0].procedure_run_id == "twin-run-2"
 
 
 def test_gateway_rejects_stamped_event_older_than_current_run_start():
@@ -837,7 +981,13 @@ def test_gateway_rejects_stamped_event_older_than_current_run_start():
 def test_new_run_clears_previous_run_scoped_snapshots():
     node = _lifecycle_test_node()
 
-    node._on_world(SimpleNamespace(running=True, procedure_id="thyroidectomy"))
+    node._on_world(
+        SimpleNamespace(
+            running=True,
+            procedure_id="thyroidectomy",
+            procedure_run_id="twin-run-1",
+        )
+    )
 
     assert node._vlm_result is None
     assert node._skill_status is None
@@ -849,11 +999,23 @@ def test_new_run_clears_previous_run_scoped_snapshots():
 
 def test_world_stop_clears_current_run_and_prevents_replay():
     node = _lifecycle_test_node()
-    node._on_world(SimpleNamespace(running=True, procedure_id="thyroidectomy"))
+    node._on_world(
+        SimpleNamespace(
+            running=True,
+            procedure_id="thyroidectomy",
+            procedure_run_id="twin-run-1",
+        )
+    )
     node._vlm_result = SimpleNamespace(message="current-vlm")
     node._speech_text = SimpleNamespace(message="current-speech")
 
-    node._on_world(SimpleNamespace(running=False, procedure_id="thyroidectomy"))
+    node._on_world(
+        SimpleNamespace(
+            running=False,
+            procedure_id="thyroidectomy",
+            procedure_run_id="twin-run-1",
+        )
+    )
 
     assert node._procedure_run_id == ""
     assert node._last_procedure_active is False
@@ -864,17 +1026,229 @@ def test_world_stop_clears_current_run_and_prevents_replay():
 def test_event_and_clinical_sequences_remain_gateway_instance_monotonic():
     node = _lifecycle_test_node()
 
-    node._on_world(SimpleNamespace(running=True, procedure_id="thyroidectomy"))
-    node._on_world(SimpleNamespace(running=False, procedure_id="thyroidectomy"))
+    node._on_world(
+        SimpleNamespace(
+            running=True,
+            procedure_id="thyroidectomy",
+            procedure_run_id="twin-run-1",
+        )
+    )
+    node._on_world(
+        SimpleNamespace(
+            running=False,
+            procedure_id="thyroidectomy",
+            procedure_run_id="twin-run-1",
+        )
+    )
 
     assert node._event_sequence == 7
     assert node._clinical_sequence == 8
 
 
-def test_active_world_with_wrong_catalog_is_fail_closed():
+def test_stopped_bundle_switch_adopts_the_new_catalog_before_start():
     node = _lifecycle_test_node()
+    demo_spec = SimpleNamespace(procedure_id="thyroidectomy_demo")
+    node._catalog_digest = lambda spec: f"sha256:{spec.procedure_id}"
+    node._load_active_bundle_spec = lambda bundle_id: (
+        demo_spec if bundle_id == "thyroidectomy_demo" else None
+    )
 
-    node._on_world(SimpleNamespace(running=True, procedure_id="nephrectomy"))
+    node._on_world(SimpleNamespace(running=False, procedure_id="thyroidectomy_demo"))
+
+    # A bundle transition must make prior run facts unavailable before the
+    # new catalog can be observed by a public client.
+    assert node._vlm_result is None
+    assert node._skill_status is None
+    assert node._bed_robot_arm_status is None
+    assert node._speech_text is None
+    assert node._catalog_version == "sha256:thyroidectomy_demo"
+
+    node._on_world(
+        SimpleNamespace(
+            running=True,
+            procedure_id="thyroidectomy_demo",
+            procedure_run_id="demo-run-1",
+        )
+    )
+    _, active = node._public_world_locked(now_monotonic_sec=10.0)
+
+    assert active is True
+    assert node._procedure_mismatch is False
+    assert node._procedure_spec is demo_spec
+    assert node._active_bundle == "thyroidectomy_demo"
+    assert node._procedure_run_id == "demo-run-1"
+
+
+def test_stopped_same_bundle_spec_dir_update_reloads_edited_yaml(monkeypatch):
+    node = _lifecycle_test_node()
+    node._world = SimpleNamespace(
+        message=SimpleNamespace(running=False, procedure_id="thyroidectomy")
+    )
+    revised_spec = SimpleNamespace(procedure_id="thyroidectomy", revision="new")
+    node._catalog_digest = lambda spec: f"sha256:{spec.revision}"
+    monkeypatch.setattr(
+        "surgical_interop_gateway.node.load_bundle",
+        lambda spec_dir: (
+            revised_spec
+            if str(spec_dir) == "/specs/thyroidectomy"
+            else None
+        ),
+    )
+
+    result = node._on_parameters_changed(
+        [SimpleNamespace(name="spec_dir", value="/specs/thyroidectomy")]
+    )
+
+    assert result.successful is True
+    assert node._procedure_spec is revised_spec
+    assert node._active_bundle == "thyroidectomy"
+    assert node._spec_dir == "/specs/thyroidectomy"
+    assert node._catalog_version == "sha256:new"
+    assert node._procedure_mismatch is False
+    assert node._vlm_result is None
+    assert node._skill_status is None
+    assert node._bed_robot_arm_status is None
+    assert node._speech_text is None
+
+
+def test_spec_dir_update_is_rejected_while_a_procedure_is_active(monkeypatch):
+    node = _lifecycle_test_node()
+    original_spec = node._procedure_spec
+    node._last_procedure_active = True
+    node._procedure_run_id = "twin-run-1"
+    node._world = SimpleNamespace(
+        message=SimpleNamespace(
+            running=True,
+            procedure_id="thyroidectomy",
+            procedure_run_id="twin-run-1",
+        )
+    )
+    monkeypatch.setattr(
+        "surgical_interop_gateway.node.load_bundle",
+        lambda _spec_dir: (_ for _ in ()).throw(
+            AssertionError("active reload must be rejected before reading YAML")
+        ),
+    )
+
+    result = node._on_parameters_changed(
+        [SimpleNamespace(name="spec_dir", value="/specs/thyroidectomy")]
+    )
+
+    assert result.successful is False
+    assert "only while the procedure is stopped" in result.reason
+    assert node._procedure_spec is original_spec
+    assert node._catalog_version == "sha256:test"
+
+
+def test_malformed_spec_dir_update_preserves_current_catalog(monkeypatch):
+    node = _lifecycle_test_node()
+    original_spec = node._procedure_spec
+    node._world = SimpleNamespace(
+        message=SimpleNamespace(running=False, procedure_id="thyroidectomy")
+    )
+    monkeypatch.setattr(
+        "surgical_interop_gateway.node.load_bundle",
+        lambda _spec_dir: (_ for _ in ()).throw(ValueError("invalid YAML")),
+    )
+
+    result = node._on_parameters_changed(
+        [SimpleNamespace(name="spec_dir", value="/specs/thyroidectomy")]
+    )
+
+    assert result.successful is False
+    assert "failed to reload procedure spec" in result.reason
+    assert node._procedure_spec is original_spec
+    assert node._catalog_version == "sha256:test"
+    assert node._vlm_result is not None
+    assert node._skill_status is not None
+    assert node._bed_robot_arm_status is not None
+    assert node._speech_text is not None
+
+
+def test_running_world_without_prior_stopped_selection_does_not_adopt_catalog():
+    node = _lifecycle_test_node()
+    demo_spec = SimpleNamespace(procedure_id="thyroidectomy_demo")
+    node._catalog_digest = lambda spec: f"sha256:{spec.procedure_id}"
+    node._load_active_bundle_spec = lambda bundle_id: (
+        demo_spec if bundle_id == "thyroidectomy_demo" else None
+    )
+
+    node._on_world(
+        SimpleNamespace(
+            running=True,
+            procedure_id="thyroidectomy_demo",
+            procedure_run_id="demo-run-1",
+        )
+    )
+    _, active = node._public_world_locked(now_monotonic_sec=10.0)
+
+    assert active is False
+    assert node._procedure_mismatch is True
+    assert node._procedure_spec.procedure_id == "thyroidectomy"
+    assert node._catalog_version == "sha256:test"
+    assert node._active_bundle == "thyroidectomy"
+    assert node._procedure_run_id == ""
+
+
+def test_active_run_identity_change_does_not_adopt_catalog():
+    node = _lifecycle_test_node()
+    demo_spec = SimpleNamespace(procedure_id="thyroidectomy_demo")
+    node._catalog_digest = lambda spec: f"sha256:{spec.procedure_id}"
+    node._load_active_bundle_spec = lambda bundle_id: (
+        demo_spec if bundle_id == "thyroidectomy_demo" else None
+    )
+
+    node._on_world(
+        SimpleNamespace(
+            running=True,
+            procedure_id="thyroidectomy",
+            procedure_run_id="twin-run-1",
+        )
+    )
+    original_run_id = node._procedure_run_id
+    assert original_run_id
+    node._on_world(
+        SimpleNamespace(
+            running=True,
+            procedure_id="thyroidectomy_demo",
+            procedure_run_id="twin-run-1",
+        )
+    )
+    _, active = node._public_world_locked(now_monotonic_sec=10.0)
+
+    assert active is False
+    assert node._procedure_mismatch is True
+    assert node._procedure_spec.procedure_id == "thyroidectomy"
+    assert node._catalog_version == "sha256:test"
+    assert node._active_bundle == "thyroidectomy"
+    assert node._procedure_run_id == ""
+
+
+def test_unknown_or_pathlike_stopped_bundle_is_rejected():
+    node = _lifecycle_test_node()
+    node._load_active_bundle_spec = lambda _bundle_id: None
+
+    for bundle_id in ("unknown_bundle", "../thyroidectomy_demo"):
+        node._on_world(SimpleNamespace(running=False, procedure_id=bundle_id))
+
+        assert node._procedure_mismatch is True
+        assert node._procedure_spec.procedure_id == "thyroidectomy"
+        assert node._catalog_version == "sha256:test"
+        assert node._active_bundle == "thyroidectomy"
+        assert node._procedure_run_id == ""
+
+
+def test_active_world_with_unknown_catalog_is_fail_closed():
+    node = _lifecycle_test_node()
+    node._load_active_bundle_spec = lambda _bundle_id: None
+
+    node._on_world(
+        SimpleNamespace(
+            running=True,
+            procedure_id="unknown_bundle",
+            procedure_run_id="unknown-run-1",
+        )
+    )
     _, active = node._public_world_locked(now_monotonic_sec=10.0)
 
     assert active is False
@@ -885,7 +1259,13 @@ def test_active_world_with_wrong_catalog_is_fail_closed():
 def test_stale_world_ends_run_and_clears_run_scoped_data():
     node = _lifecycle_test_node()
     node._world_stale_after_sec = 3.0
-    node._on_world(SimpleNamespace(running=True, procedure_id="thyroidectomy"))
+    node._on_world(
+        SimpleNamespace(
+            running=True,
+            procedure_id="thyroidectomy",
+            procedure_run_id="twin-run-1",
+        )
+    )
     node._vlm_result = SimpleNamespace(message="current-vlm")
     node._speech_text = SimpleNamespace(message="current-speech")
 
@@ -956,6 +1336,63 @@ def test_gateway_speech_boundary_accepts_expected_bounded_schema():
     assert warnings == []
 
 
+def test_operational_asr_status_satisfies_public_speech_health_when_connected():
+    freshness = SurgicalInteropGateway._operational_asr_freshness(
+        SimpleNamespace(
+            received_monotonic_sec=8.0,
+            message={
+                "asr": {
+                    "available": True,
+                    "connected": True,
+                    "state": "RECORDING",
+                }
+            },
+        ),
+        now_monotonic_sec=10.0,
+        stale_after_sec=3.0,
+    )
+
+    assert freshness.available is True
+    assert freshness.fresh is True
+    assert freshness.age_sec == 2.0
+
+
+def test_stopped_or_stale_operational_asr_does_not_satisfy_public_speech_health():
+    stopped = SurgicalInteropGateway._operational_asr_freshness(
+        SimpleNamespace(
+            received_monotonic_sec=8.0,
+            message={
+                "asr": {
+                    "available": True,
+                    "connected": False,
+                    "state": "STOPPED",
+                }
+            },
+        ),
+        now_monotonic_sec=10.0,
+        stale_after_sec=3.0,
+    )
+    stale = SurgicalInteropGateway._operational_asr_freshness(
+        SimpleNamespace(
+            received_monotonic_sec=1.0,
+            message={
+                "asr": {
+                    "available": True,
+                    "connected": True,
+                    "state": "RECORDING",
+                }
+            },
+        ),
+        now_monotonic_sec=10.0,
+        stale_after_sec=3.0,
+    )
+
+    assert stopped.available is False
+    assert stopped.fresh is False
+    assert stale.available is True
+    assert stale.fresh is False
+
+
 def test_gateway_speech_boundary_rejects_oversized_final_text():
     node, warnings = _speech_input_test_node()
     message = String()
@@ -1020,6 +1457,29 @@ def test_public_speech_matches_final_latency_and_receipt_stamp():
     assert message.utterance_stamp.sec == 12
     assert message.latency_available is True
     assert round(message.response_latency_ms, 1) == 184.2
+
+
+def test_public_speech_projects_live_partial_text_and_microphone_levels():
+    node = _speech_projection_test_node(publish_free_text=True)
+    node._asr_status.message["asr"].update(
+        {
+            "partial_text": "갑상선 절제술 시",
+            "audio_level_dbfs": -31.4,
+            "peak_level_dbfs": -24.8,
+        }
+    )
+
+    message = node._speech_message(
+        stamp=Time(sec=20),
+        revision=4,
+        procedure_type="thyroidectomy",
+        procedure_active=True,
+    )
+
+    assert message.audio_level_available is True
+    assert round(message.audio_level_dbfs, 1) == -31.4
+    assert round(message.peak_level_dbfs, 1) == -24.8
+    assert message.partial_text == "갑상선 절제술 시"
 
 
 def test_public_speech_redacts_text_by_default_but_keeps_typed_metadata():
@@ -1090,7 +1550,7 @@ def test_public_speech_rejects_unreviewed_free_form_latency_basis():
     assert message.latency_basis == ""
 
 
-def test_public_speech_is_empty_when_idle_or_status_stale():
+def test_public_speech_runtime_remains_available_while_idle_and_stale_clears():
     node = _speech_projection_test_node(publish_free_text=False)
     idle = node._speech_message(
         stamp=Time(sec=20),
@@ -1106,7 +1566,8 @@ def test_public_speech_is_empty_when_idle_or_status_stale():
         procedure_active=True,
     )
 
-    assert idle.available is False and idle.text == ""
+    assert idle.available is True and idle.connected is True and idle.text == ""
+    assert idle.state == idle.STATE_LISTENING
     assert stale.available is False and stale.text == ""
 
 
@@ -1121,10 +1582,6 @@ def test_public_clinical_summary_is_redacted_without_dropping_structured_evidenc
         observed_location_ids=["surgical_field"],
         observed_location_types=["surgical_field"],
         observed_confidences=[0.84],
-        gesture_event_type="request_tool",
-        gesture_requested_tool="T02",
-        gesture_hand_pose="open_receive",
-        gesture_confidence=0.8,
         uncertainty=0.22,
     )
     projection = project_clinical_observation(result)
@@ -1137,7 +1594,6 @@ def test_public_clinical_summary_is_redacted_without_dropping_structured_evidenc
     assert message.phase_ids == ["P03"]
     assert list(message.phase_confidences) == [0.75]
     assert message.observed_tool_ids == ["T02"]
-    assert message.gesture_event_type == "request_tool"
     assert message.evidence_status == "MODEL_OBSERVED_REDACTED"
 
     node._publish_free_text = True
@@ -1156,7 +1612,6 @@ def test_public_clinical_malformed_numeric_state_stays_unknown_when_text_redacte
             observed_location_ids=[],
             observed_location_types=[],
             observed_confidences=[],
-            gesture_confidence=0.0,
             uncertainty=float("nan"),
         )
     )

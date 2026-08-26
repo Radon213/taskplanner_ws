@@ -6,6 +6,7 @@ from collections.abc import Iterable
 import re
 
 from .models import InitialInstrumentState, ProcedureBundle
+from .scenario_policy import ScenarioPolicy
 
 
 class ProcedureSpec:
@@ -13,6 +14,7 @@ class ProcedureSpec:
 
     def __init__(self, bundle: ProcedureBundle):
         self.bundle = bundle
+        self._scenario_policy = ScenarioPolicy(bundle)
         self._phases = {phase.id: phase for phase in bundle.phases}
         self._instruments = {instrument.id: instrument for instrument in bundle.instruments}
         self._locations = {location.id: location for location in bundle.locations}
@@ -217,7 +219,7 @@ class ProcedureSpec:
         return list(self.bundle.mock_perception.stages)
 
     def _is_home_reset_stage(self, stage) -> bool:
-        if stage.surgeon_gesture is not None or stage.explicit_request.strip():
+        if stage.explicit_request.strip():
             return False
         visible_observations = [observation for observation in stage.observations if observation.visible]
         if not visible_observations:
@@ -262,6 +264,39 @@ class ProcedureSpec:
 
     def get_humanoid_policy(self):
         return self.bundle.humanoid_policy
+
+    def get_scenario_policy(self) -> ScenarioPolicy:
+        """Return the only query surface for mutable scenario choices."""
+
+        return self._scenario_policy
+
+    def get_scenario_runtime_requirements(self):
+        """Return authored feature/workflow choices without granting execution."""
+
+        return self._scenario_policy.runtime_requirements
+
+    def list_requestable_instrument_ids(self) -> list[str]:
+        """Return requestable instruments in authored catalog order.
+
+        Consumers previously rebuilt this projection by reading
+        ``InstrumentSpec.requestable`` throughout the runtime.  Keeping the
+        ordered view here makes scenario edits flow through one policy owner
+        while preserving deterministic UI and prompt ordering.
+        """
+
+        requestable = self._scenario_policy.requestable_instrument_ids
+        return [
+            instrument.id
+            for instrument in self.bundle.instruments
+            if instrument.id in requestable
+        ]
+
+    def is_instrument_requestable(self, instrument_id: str) -> bool:
+        """Return the authored scenario decision without granting execution."""
+
+        return self._scenario_policy.check_instrument_request(
+            instrument_id
+        ).allowed
 
     def get_bed_robot_arm_group_spec(self):
         return self.bundle.bed_robot_arm_groups

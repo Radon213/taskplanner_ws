@@ -36,6 +36,7 @@ class RetractionTargetSide(str, Enum):
     NONE = "none"
     LEFT = "left"
     RIGHT = "right"
+    BOTH = "both"
 
 
 class RetractionState(str, Enum):
@@ -117,6 +118,11 @@ _ACCEPTED_TRANSITIONS: dict[
 
 _DIRECT_TEACH_TERMS = (
     "직접교시",
+    # Common final-STT repair for ``교시`` -> ``교실``.  Keep the ``직접``
+    # anchor so an unrelated classroom sentence cannot become a robot command.
+    "직접교실",
+    "직접오씨",
+    "직접oc",
     "직접기시",
     "직접교수",
     "다이렉트티치",
@@ -124,11 +130,21 @@ _DIRECT_TEACH_TERMS = (
     "directteach",
     "directteech",
     "directteaching",
+    "가르치기",
+    "가르치",
+    "가르쳐",
+    "가르쳤",
+    "교시",
 )
 _RETRACTION_TERMS = (
+    "아미",
+    "아미네이비",
     "리트랙션",
     "리트렉션",
     "리트랙숀",
+    "리트렉숀",
+    "리트락션",
+    "리트락숀",
     "리트랙터",
     "리트렉터",
     "리트랙타",
@@ -142,6 +158,8 @@ _RETRACTION_TERMS = (
     "retractor",
     "retrator",
     "retract",
+    "army",
+    "armynavy",
 )
 _TOOL_CHANGE_TERMS = (
     "툴체인지",
@@ -149,12 +167,37 @@ _TOOL_CHANGE_TERMS = (
     "툴교체",
     "툴교환",
     "툴바꿔",
+    "툴을바꿔",
+    "툴을교체",
+    "툴을교환",
     "도구교체",
     "도구교환",
     "도구변경",
     "도구바꿔",
+    "도구를바꿔",
+    "도구를교환",
+    "도구로교환",
+    "새도구",
+    "새도구로교환",
+    "다른도구",
     "기구교체",
+    "기구교환",
+    "기구바꿔",
+    "기구를바꿔",
+    "새기구",
+    "다른기구",
+    "장비바꿔",
+    "장비를바꿔",
+    "장비교체",
+    "장비교환",
+    "장비로바꿔",
+    "장비를교환",
+    "새장비",
+    "다른장비",
     "엔드이펙터교체",
+    "엔드이펙터교환",
+    "엔드이펙터바꿔",
+    "엔드이펙터를바꿔",
     "toolchange",
     "toolchage",
     "toolcheange",
@@ -174,6 +217,14 @@ _STOP_TERMS = (
     "멈춰",
     "멈추",
     "해제",
+    "마치",
+    "마칠",
+    "마쳐",
+    "마무리",
+    "스톱",
+    "스탑",
+    "끝내",
+    "끝낼",
     "stop",
     "end",
     "finish",
@@ -188,6 +239,14 @@ _KOREAN_STOP_TERMS = (
     "멈춰",
     "멈추",
     "해제",
+    "마치",
+    "마칠",
+    "마쳐",
+    "마무리",
+    "스톱",
+    "스탑",
+    "끝내",
+    "끝낼",
 )
 _ADJUSTMENT_TERMS = (
     "더",
@@ -198,15 +257,42 @@ _ADJUSTMENT_TERMS = (
     "당기",
     "끌어",
     "밀어",
+    "조금",
+    "살짝",
+    "한번더",
+    "한번만더",
+    "조금더",
+    "좀더",
+    "미세조정",
     "more",
     "adjust",
     "move",
     "pull",
     "shift",
 )
-_LEFT_TERMS = ("왼쪽", "왠쪽", "왼편", "좌측", "좌방", "레프트", "left")
-_RIGHT_TERMS = ("오른쪽", "오룬쪽", "오른편", "우측", "우방", "라이트", "right")
-_BILATERAL_TERMS = ("양쪽", "좌우", "both", "bilateral")
+_LEFT_TERMS = (
+    "왼쪽",
+    "왠쪽",
+    "왼편",
+    "왼팔",
+    "왼쪽팔",
+    "좌측",
+    "좌방",
+    "레프트",
+    "left",
+)
+_RIGHT_TERMS = (
+    "오른쪽",
+    "오룬쪽",
+    "오른편",
+    "오른팔",
+    "오른쪽팔",
+    "우측",
+    "우방",
+    "라이트",
+    "right",
+)
+_BILATERAL_TERMS = ("양쪽", "양팔", "좌우", "both", "bilateral")
 
 _EXPLICIT_DISTANCE_RE = re.compile(
     r"(?<![\d.])(?P<value>[+-]?(?:\d+(?:\.\d+)?|\.\d+))\s*"
@@ -218,6 +304,38 @@ _EXPLICIT_DISTANCE_RE = re.compile(
     r")(?![a-z0-9.])",
     re.IGNORECASE,
 )
+_KOREAN_DISTANCE_RE = re.compile(
+    r"(?<![가-힣])(?P<value>다섯|여섯|일곱|여덟|아홉|열|십|영|공|한|일|두|이|세|삼|네|사|오|육|칠|팔|구)\s*"
+    r"(?P<unit>"
+    r"밀\s*리\s*미\s*터|밀\s*리|미\s*리|"
+    r"센\s*티\s*미\s*터|센\s*치\s*미\s*터|센\s*티|센\s*치|"
+    r"미\s*터"
+    r")(?![가-힣])"
+)
+_KOREAN_DISTANCE_VALUES = {
+    "영": 0,
+    "공": 0,
+    "한": 1,
+    "일": 1,
+    "두": 2,
+    "이": 2,
+    "세": 3,
+    "삼": 3,
+    "네": 4,
+    "사": 4,
+    "다섯": 5,
+    "오": 5,
+    "여섯": 6,
+    "육": 6,
+    "일곱": 7,
+    "칠": 7,
+    "여덟": 8,
+    "팔": 8,
+    "아홉": 9,
+    "구": 9,
+    "열": 10,
+    "십": 10,
+}
 _MINUS_SIGN = "\N{MINUS SIGN}"
 _PRESERVED_MINUS = "\ue000"
 _PRESERVED_PLUS = "\ue001"
@@ -303,11 +421,21 @@ def _coerce_command(value: RetractionCommand | str | None) -> RetractionCommand 
 def _target_side(
     compact: str,
     spaced: str,
+    *,
+    allow_bilateral: bool = False,
 ) -> tuple[RetractionTargetSide | None, str]:
     left = _contains_any(compact, spaced, _LEFT_TERMS)
     right = _contains_any(compact, spaced, _RIGHT_TERMS)
     bilateral = _contains_any(compact, spaced, _BILATERAL_TERMS)
-    if bilateral or (left and right):
+    # A bilateral selector is a physical target in the adjustment contract,
+    # but it is not a valid direct-teach completion selector.  Also reject
+    # contradictory wording such as "양쪽 오른쪽" instead of silently
+    # preferring one arm.
+    if left and right or (bilateral and (left or right)):
+        return None, "ambiguous_target_side"
+    if bilateral:
+        if allow_bilateral:
+            return RetractionTargetSide.BOTH, ""
         return None, "ambiguous_target_side"
     if left:
         return RetractionTargetSide.LEFT, ""
@@ -317,13 +445,22 @@ def _target_side(
 
 
 def _distance_m(spaced: str) -> tuple[float | None, str]:
-    matches = list(_EXPLICIT_DISTANCE_RE.finditer(spaced))
-    if len(matches) > 1:
+    numeric_matches = list(_EXPLICIT_DISTANCE_RE.finditer(spaced))
+    korean_matches = list(_KOREAN_DISTANCE_RE.finditer(spaced))
+    if len(numeric_matches) + len(korean_matches) > 1:
         return None, "multiple_adjustment_distances"
-    if matches:
-        match = matches[0]
+    if numeric_matches:
+        match = numeric_matches[0]
         value = float(match.group("value"))
         unit = re.sub(r"\s+", "", match.group("unit").casefold())
+    elif korean_matches:
+        match = korean_matches[0]
+        value = float(_KOREAN_DISTANCE_VALUES[match.group("value")])
+        unit = re.sub(r"\s+", "", match.group("unit").casefold())
+    else:
+        value = None
+        unit = ""
+    if value is not None:
         if not math.isfinite(value) or value <= 0.0:
             return None, "invalid_adjustment_distance"
         if unit in {"mm", "millimeter", "millimeters", "millimetre", "millimetres", "밀리미터", "밀리", "미리"}:
@@ -348,23 +485,36 @@ def _is_adjustment_intent(
     state: RetractionState,
 ) -> bool:
     retraction_named = _contains_any(compact, spaced, _RETRACTION_TERMS)
+    bilateral_named = _contains_any(compact, spaced, _BILATERAL_TERMS)
     active_context = state == RetractionState.RETRACTION_ACTIVE
-    if not (retraction_named or active_context):
+    # A bilateral command is often spoken without repeating the noun after the
+    # retraction mode is established ("양쪽으로 1mm씩 당겨줘").  Its explicit
+    # bilateral selector remains a sufficient closed-vocabulary anchor even in
+    # the scenario-free Debug bypass; normal state admission still rejects it
+    # outside RETRACTION_ACTIVE.
+    if not (retraction_named or active_context or bilateral_named):
         return False
     has_marker = _contains_any(compact, spaced, _ADJUSTMENT_TERMS)
-    has_explicit_distance = bool(_EXPLICIT_DISTANCE_RE.search(spaced))
+    has_explicit_distance = bool(
+        _EXPLICIT_DISTANCE_RE.search(spaced)
+        or _KOREAN_DISTANCE_RE.search(spaced)
+    )
     has_number = bool(re.search(r"\d", spaced))
     # State may supply the omitted word "retraction", but a spatial phrase
     # alone (for example "오른쪽 절개 부위 5 cm") is not motion intent.  When
     # the retractor itself is not named, retain an explicit movement cue.
     if active_context and not retraction_named:
         return has_marker
+    if bilateral_named and not retraction_named:
+        return has_marker or has_explicit_distance or has_number
     return has_marker or has_explicit_distance or has_number
 
 
 def _is_bare_korean_lifecycle_utterance(
     compact: str,
     cue_terms: tuple[str, ...],
+    *,
+    allow_target_side: bool = False,
 ) -> bool:
     """Accept short state-context verbs without swallowing another task.
 
@@ -378,6 +528,16 @@ def _is_bare_korean_lifecycle_utterance(
     for term in sorted(cue_terms, key=len, reverse=True):
         if not term.isascii():
             remainder = remainder.replace(term, "")
+    if allow_target_side:
+        # In direct-teach state a final-STT result such as ``오른쪽 완료`` is a
+        # common elliptical form of ``오른쪽 직접 교시 종료``.  Only remove a
+        # single explicit side selector here; the caller still grounds it
+        # through ``_target_side`` and bilateral/contradictory wording remains
+        # rejected.  This option is intentionally not used for retraction stop
+        # so an ambient ``오른쪽 끝`` cannot stop an active robot.
+        for term in sorted((*_LEFT_TERMS, *_RIGHT_TERMS), key=len, reverse=True):
+            if not term.isascii():
+                remainder = remainder.replace(term, "")
     for filler in (
         "이제",
         "그럼",
@@ -390,6 +550,8 @@ def _is_bare_korean_lifecycle_utterance(
         "줘",
         "주세요",
         "할게",
+        "게요",
+        "게",
         "하자",
         "요",
     ):
@@ -446,7 +608,15 @@ def _detected_command(
         ) and _is_bare_korean_lifecycle_utterance(compact, _KOREAN_STOP_TERMS)
         if has_korean_start and state == RetractionState.IDLE:
             commands.add(RetractionCommand.START_DIRECT_TEACH)
-        elif has_korean_stop and state == RetractionState.DIRECT_TEACHING:
+        elif (
+            _contains_any(compact, spaced, _KOREAN_STOP_TERMS)
+            and _is_bare_korean_lifecycle_utterance(
+                compact,
+                _KOREAN_STOP_TERMS,
+                allow_target_side=True,
+            )
+            and state == RetractionState.DIRECT_TEACHING
+        ):
             commands.add(RetractionCommand.FINISH_DIRECT_TEACH)
         elif has_korean_start and state == RetractionState.TAUGHT_READY:
             commands.add(RetractionCommand.START_RETRACTION)
@@ -486,14 +656,15 @@ def normalize_retractor_adjustment_parameters(
     This helper deliberately does not infer whether the surgeon intended an
     adjustment.  It exists so a text model may classify a fuzzy utterance while
     the two physical parameters still come exclusively from the STT evidence.
-    Exactly one side is required; an omitted distance uses the reviewed 5 cm
-    demo default, and malformed/signed/out-of-range values remain rejected.
+    One side or the bilateral target is required; an omitted distance uses the
+    reviewed 5 cm demo default, and malformed/signed/out-of-range values remain
+    rejected.  ``both`` means the same distance is applied to each arm.
     """
 
     spaced, compact = _canonicalize(transcript)
     if not compact:
         return _rejected("empty_transcript")
-    target_side, reason = _target_side(compact, spaced)
+    target_side, reason = _target_side(compact, spaced, allow_bilateral=True)
     if target_side is None:
         return _rejected(reason)
     distance_m, distance_reason = _distance_m(spaced)
@@ -515,12 +686,16 @@ def normalize_retractor_adjustment_parameters(
 def normalize_retractor_command(
     transcript: str,
     current_state: RetractionState | str,
+    *,
+    enforce_state: bool = True,
 ) -> NormalizedRetractionCommand:
     """Normalize one STT transcript without guessing a missing adjustment side.
 
     The function is deterministic.  A rejected or ambiguous transcript has
     ``command=None`` and a machine-readable ``reason`` so callers cannot send a
-    partially inferred physical command.
+    partially inferred physical command. ``enforce_state=False`` is reserved
+    for the scenario-free Debug test harness; it keeps the closed vocabulary
+    and parameter grounding but omits only the local lifecycle admission gate.
     """
 
     spaced, compact = _canonicalize(transcript)
@@ -528,7 +703,7 @@ def normalize_retractor_command(
         return _rejected("empty_transcript")
 
     state = _coerce_state(current_state)
-    if state == RetractionState.UNKNOWN:
+    if enforce_state and state == RetractionState.UNKNOWN:
         return _rejected("state_unknown")
 
     command, reason = _detected_command(compact, spaced, state)
@@ -549,8 +724,17 @@ def normalize_retractor_command(
         success_reason = grounded_adjustment.reason.replace(
             "grounded_", "normalized_", 1
         )
+    elif command == RetractionCommand.FINISH_DIRECT_TEACH:
+        # Finishing direct teach may optionally identify one arm.  No side is
+        # still valid and remains the neutral value for a controller-wide
+        # finish request; bilateral/contradictory side wording is rejected.
+        finish_side, side_reason = _target_side(compact, spaced)
+        if side_reason == "ambiguous_target_side":
+            return _rejected(side_reason)
+        if finish_side is not None:
+            target_side = finish_side
 
-    if command not in allowed_retractor_commands(state):
+    if enforce_state and command not in allowed_retractor_commands(state):
         return _rejected(f"command_not_allowed_in_{state.value}")
 
     return NormalizedRetractionCommand(

@@ -4,6 +4,7 @@ import type { TaskplannerRuntimeMode } from "../runtimeModes";
 import { parseBoundedJson } from "../utils/display";
 
 type LauncherRuntimeMode = "live" | "llm-surgeon" | "replay" | "debug";
+export type RuntimeDiagnosticCode = "runtime_profile_mismatch" | null;
 export type RuntimeTransitionPhase =
   | "checking"
   | "idle"
@@ -18,6 +19,7 @@ export interface RuntimeTransitionStatus {
   requestedMode: TaskplannerRuntimeMode | null;
   message: string;
   retryable: boolean;
+  diagnosticCode: RuntimeDiagnosticCode;
 }
 
 interface RuntimeControlApiStatus {
@@ -26,6 +28,7 @@ interface RuntimeControlApiStatus {
   requested_mode: LauncherRuntimeMode | null;
   message?: string;
   retryable: boolean;
+  diagnostic_code?: RuntimeDiagnosticCode;
 }
 
 const MAX_RUNTIME_STATUS_BODY_CHARS = 128 * 1024;
@@ -63,6 +66,8 @@ function isApiStatus(value: unknown): value is RuntimeControlApiStatus {
       status.requested_mode === "live" || status.requested_mode === "llm-surgeon" ||
       status.requested_mode === "replay" || status.requested_mode === "debug") &&
     (status.message === undefined || (typeof status.message === "string" && status.message.length <= MAX_RUNTIME_STATUS_MESSAGE_CHARS)) &&
+    (status.diagnostic_code === undefined || status.diagnostic_code === null ||
+      status.diagnostic_code === "runtime_profile_mismatch") &&
     typeof status.retryable === "boolean"
   );
 }
@@ -74,6 +79,9 @@ function fromApiStatus(status: RuntimeControlApiStatus): RuntimeTransitionStatus
     requestedMode: uiModeFromLauncher(status.requested_mode),
     message: status.message?.trim() || "",
     retryable: status.retryable,
+    diagnosticCode: status.diagnostic_code === "runtime_profile_mismatch"
+      ? "runtime_profile_mismatch"
+      : null,
   };
 }
 
@@ -84,6 +92,7 @@ function unavailableStatus(): RuntimeTransitionStatus {
     requestedMode: null,
     message: "",
     retryable: true,
+    diagnosticCode: null,
   };
 }
 
@@ -104,6 +113,7 @@ export function useRuntimeControl() {
     requestedMode: null,
     message: "",
     retryable: false,
+    diagnosticCode: null,
   });
   const transitionGenerationRef = useRef(0);
   const transitionInFlightRef = useRef<TaskplannerRuntimeMode | null>(null);
@@ -183,6 +193,7 @@ export function useRuntimeControl() {
       requestedMode: mode,
       message: "",
       retryable: false,
+      diagnosticCode: null,
     }));
     try {
       const response = await fetch("/api/runtime/transition", {
@@ -221,6 +232,7 @@ export function useRuntimeControl() {
           requestedMode: mode,
           message: "Runtime transition response was not received. Checking host state.",
           retryable: false,
+          diagnosticCode: null,
         }));
         refreshRunIdRef.current += 1;
         refreshInFlightRef.current = false;

@@ -131,6 +131,9 @@ class TwinState:
     phase_confidence: float
     phase_uncertain: bool
     phase_stability: float
+    # Opaque identifier regenerated for every accepted runtime start, even
+    # when the same procedure bundle is started again.
+    procedure_run_id: str = ""
     explicit_request_tool: str = ""
     robot_state: str = "idle"
     safety_flags: list[str] = field(default_factory=list)

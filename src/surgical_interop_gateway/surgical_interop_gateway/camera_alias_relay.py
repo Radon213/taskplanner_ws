@@ -9,10 +9,13 @@ alias, so an idle public endpoint does not pull a full image stream over DDS.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 import time
 from typing import Any, Iterable
 
 import rclpy
+from ament_index_python.packages import get_package_share_directory
+from procedure_spec import load_bundle
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import CompressedImage
@@ -124,6 +127,9 @@ class CameraAliasRelay(Node):
         self._expected_procedure_id = str(
             self.declare_parameter("default_bundle", "thyroidectomy").value
         ).strip()
+        self._spec_root = Path(get_package_share_directory("procedure_spec")) / "specs"
+        if not self._validated_bundle_id(self._expected_procedure_id):
+            raise ValueError("default_bundle must be a locally valid procedure bundle")
         self._world_stale_after_sec = max(
             0.1,
             float(self.declare_parameter("world_stale_after_sec", 3.0).value),
@@ -215,9 +221,38 @@ class CameraAliasRelay(Node):
     def _monotonic() -> float:
         return time.monotonic()
 
+    def _validated_bundle_id(self, procedure_id: str) -> str:
+        """Return a local canonical bundle ID, or an empty string.
+
+        Camera aliases are public projections.  They must never treat an
+        arbitrary WorldState string as authority to publish a camera stream;
+        only a bundle that the local procedure catalog can load is eligible.
+        """
+
+        normalized = str(procedure_id or "").strip()
+        if not normalized or Path(normalized).name != normalized:
+            return ""
+        try:
+            spec = load_bundle(self._spec_root / normalized)
+        except (OSError, TypeError, ValueError, KeyError):
+            return ""
+        return (
+            normalized
+            if str(getattr(spec, "procedure_id", "")).strip() == normalized
+            else ""
+        )
+
     def _on_world_state(self, message: WorldState) -> None:
         self._world_running = bool(message.running)
-        self._world_procedure_id = str(message.procedure_id)
+        self._world_procedure_id = str(message.procedure_id).strip()
+        # The manager permits procedure changes only while stopped.  Latch a
+        # new camera-gate identity only from that stopped selection and only
+        # after it resolves to a local catalog entry.  Running mismatches,
+        # unknown names, and path-like strings stay closed.
+        if not self._world_running:
+            selected_bundle = self._validated_bundle_id(self._world_procedure_id)
+            if selected_bundle:
+                self._expected_procedure_id = selected_bundle
         self._world_received_monotonic_sec = self._monotonic()
         # Reconcile immediately on a stop/mismatch so an already acquired
         # source is released without waiting for the periodic timer.

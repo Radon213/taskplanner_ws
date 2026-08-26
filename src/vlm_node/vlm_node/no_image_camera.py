@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from io import BytesIO
 import json
-import time
 from typing import Iterable
 
 from PIL import Image, ImageDraw, ImageFont
@@ -15,7 +14,7 @@ from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
-from surgical_msgs.msg import SkillStatus, SurgeonOutwardSignal
+from surgical_msgs.msg import SkillStatus
 
 
 RECOVERY_ACTIONS = {
@@ -56,10 +55,8 @@ class NoImageCameraNode(Node):
         self.declare_parameter("label", "")
         self.declare_parameter("jpeg_quality", 88)
         self.declare_parameter("spec_dir", str(get_default_spec_dir()))
-        self.declare_parameter("outward_signal_topic", "/surgeon/outward_signal")
         self.declare_parameter("actor_overlay_topic", "/surgeon/actor_overlay")
         self.declare_parameter("skill_status_topic", "/skill/status")
-        self.declare_parameter("overlay_hold_sec", 2.0)
 
         self._image_topic = str(self.get_parameter("image_topic").value)
         self._width = int(self.get_parameter("width").value)
@@ -68,9 +65,6 @@ class NoImageCameraNode(Node):
         self._label = str(self.get_parameter("label").value)
         self._jpeg_quality = int(self.get_parameter("jpeg_quality").value)
         self._spec_dir = str(self.get_parameter("spec_dir").value)
-        self._overlay_hold_sec = float(self.get_parameter("overlay_hold_sec").value)
-        self._hand_overlay = ""
-        self._hand_overlay_until = 0.0
         self._mayo_tools: list[str] = []
         self._actor_mayo_tools: set[str] = set()
         self._mayo_removed_by_skill: set[str] = set()
@@ -84,12 +78,6 @@ class NoImageCameraNode(Node):
             qos_profile_sensor_data,
         )
         self._jpeg_payload = self._render_payload([])
-        self.create_subscription(
-            SurgeonOutwardSignal,
-            str(self.get_parameter("outward_signal_topic").value),
-            self._on_outward_signal,
-            20,
-        )
         self.create_subscription(
             String,
             str(self.get_parameter("actor_overlay_topic").value),
@@ -127,8 +115,6 @@ class NoImageCameraNode(Node):
             elif parameter.name == "spec_dir":
                 self._spec_dir = str(parameter.value)
                 self._tool_display_names = self._load_tool_display_names(self._spec_dir)
-                self._hand_overlay = ""
-                self._hand_overlay_until = 0.0
                 self._mayo_tools = []
                 self._actor_mayo_tools.clear()
                 self._mayo_removed_by_skill.clear()
@@ -138,9 +124,6 @@ class NoImageCameraNode(Node):
             elif parameter.name == "fps":
                 self._fps = float(parameter.value)
                 rebuild_timer = True
-            elif parameter.name == "overlay_hold_sec":
-                self._overlay_hold_sec = float(parameter.value)
-                rebuild_image = True
 
         if rebuild_image:
             self._render_key = None
@@ -160,18 +143,6 @@ class NoImageCameraNode(Node):
             for instrument in spec.bundle.instruments
             if instrument.id and instrument.display_name
         }
-
-    def _on_outward_signal(self, msg: SurgeonOutwardSignal) -> None:
-        hand_pose = (msg.hand_pose or "").strip()
-        signal_type = (msg.signal_type or "").strip()
-        if hand_pose == "open_receive" or signal_type in {"request_tool", "extend_hand_for_handover"}:
-            self._hand_overlay = "Surgeon hand extending"
-            self._hand_overlay_until = time.time() + max(0.1, self._overlay_hold_sec)
-            self._render_key = None
-        elif hand_pose == "present_return" or signal_type in {"return_tool", "extend_hand_for_retrieval"}:
-            self._hand_overlay = "Surgeon presenting used tool"
-            self._hand_overlay_until = time.time() + max(0.1, self._overlay_hold_sec)
-            self._render_key = None
 
     def _on_actor_overlay(self, msg: String) -> None:
         try:
@@ -197,10 +168,6 @@ class NoImageCameraNode(Node):
             self._field_event_lines = [field_event.strip()]
         else:
             self._field_event_lines = []
-        hand = str(payload.get("hand", "") or "")
-        if hand:
-            self._hand_overlay = hand
-            self._hand_overlay_until = time.time() + max(0.1, self._overlay_hold_sec)
         speech = str(payload.get("speech", "") or "")
         self._speech = speech[:80]
         self._render_key = None
@@ -232,8 +199,6 @@ class NoImageCameraNode(Node):
     def _overlay_lines(self) -> list[str]:
         lines: list[str] = []
         lines.extend(self._field_event_lines)
-        if self._hand_overlay and time.time() <= self._hand_overlay_until:
-            lines.append(self._hand_overlay)
         mayo_tools = self._visible_mayo_tools()
         if mayo_tools:
             lines.append("Mayo stand:")

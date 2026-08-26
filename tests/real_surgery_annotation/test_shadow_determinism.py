@@ -92,6 +92,32 @@ class ShadowDeterminismTest(unittest.TestCase):
             semantic_trace_signature([unsafe]),
         )
 
+    def test_unknown_vlm_hand_metadata_is_not_a_semantic_output(
+        self,
+    ) -> None:
+        base = {
+            "layer": "vlm_raw",
+            "payload": {
+                "raw_json": "{}",
+                "phase_ids": [],
+                "predicted_tool_id": "T01",
+            },
+        }
+        legacy = {
+            "layer": "vlm_raw",
+            "payload": {
+                **base["payload"],
+                "deprecated_hand_signal": "OPEN_PALM",
+                "deprecated_hand_tool": "T99",
+                "deprecated_hand_score": 0.99,
+            },
+        }
+
+        self.assertEqual(
+            semantic_trace_signature([base]),
+            semantic_trace_signature([legacy]),
+        )
+
     def test_runtime_latency_is_excluded_but_safety_counts_are_not(self) -> None:
         report = {
             "mode": "strict",

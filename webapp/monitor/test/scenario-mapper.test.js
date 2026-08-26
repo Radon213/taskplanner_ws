@@ -15,6 +15,10 @@ function catalogMessage(revision = 1) {
     revision,
     catalog_version: "catalog-1",
     procedure_display_name: "Open Thyroidectomy Demonstration",
+    procedure_target_site: "Right Lobectomy",
+    procedure_target_site_ko: "Right Lobectomy",
+    procedure_approach: "Open",
+    procedure_approach_ko: "Open",
     phases: [
       { ordinal: 1, phase_id: "P01", display_name: "Preparation", phase_kind: "normal" },
       { ordinal: 2, phase_id: "P02", display_name: "Incision", phase_kind: "normal" },
@@ -31,8 +35,8 @@ function catalogMessage(revision = 1) {
 function gatewayMessage({ revision, procedureActive, procedureRunId }) {
   return {
     revision,
-    schema_version: "1.1.0",
-    interface_version: "0.3.0",
+    schema_version: "1.2.0",
+    interface_version: "0.4.0",
     catalog_version: "catalog-1",
     gateway_instance_id: "gateway-replay",
     procedure_run_id: procedureRunId,
@@ -43,7 +47,7 @@ function gatewayMessage({ revision, procedureActive, procedureRunId }) {
 
 function replayIdentity({ procedureActive = true, procedureRunId = "run-replay" } = {}) {
   return {
-    schema_version: "1.1.0",
+    schema_version: "1.2.0",
     catalog_version: "catalog-1",
     gateway_instance_id: "gateway-replay",
     procedure_run_id: procedureRunId,
@@ -51,6 +55,18 @@ function replayIdentity({ procedureActive = true, procedureRunId = "run-replay" 
     procedure_active: procedureActive,
   };
 }
+
+test("catalog maps authoritative target site and approach into the procedure card", () => {
+  const mapper = new MainLayoutScenarioMapper();
+
+  const result = mapper.map(PUBLIC_TOPIC_NAMES.catalog, catalogMessage());
+
+  assert.deepEqual(result.patch.procedure, {
+    name: "Open Thyroidectomy Demonstration",
+    targetSite: "Right Lobectomy",
+    approach: "Open",
+  });
+});
 
 test("valid topic snapshots are applied in arrival order when replay revisions decrease", () => {
   const cases = [
@@ -880,10 +896,20 @@ test("redacted speech renders listening state and lower replay revisions are acc
     connected: true,
     state: "listening",
     text: "Bipolar cautery, please",
+    partial_text: "Bipolar cautery",
+    audio_level_available: true,
+    audio_level_dbfs: -31.4,
+    peak_level_dbfs: -24.8,
+    utterance_sequence: 7,
   });
   assert.deepEqual(recognized.patch.voice, {
     status: "listening",
     text: "Bipolar cautery, please",
+    partialText: "Bipolar cautery",
+    audioLevelAvailable: true,
+    audioLevelDbfs: -31.4,
+    peakLevelDbfs: -24.8,
+    utteranceSequence: 7,
   });
 
   const speech = mapper.map(PUBLIC_TOPIC_NAMES.speech, {
@@ -894,7 +920,15 @@ test("redacted speech renders listening state and lower replay revisions are acc
     state: "listening",
     text: "",
   });
-  assert.deepEqual(speech.patch.voice, { status: "listening", text: "Listening..." });
+  assert.deepEqual(speech.patch.voice, {
+    status: "listening",
+    text: "Listening...",
+    partialText: "",
+    audioLevelAvailable: false,
+    audioLevelDbfs: -99,
+    peakLevelDbfs: -99,
+    utteranceSequence: 0,
+  });
 
   const replayed = mapper.map(PUBLIC_TOPIC_NAMES.speech, {
     revision: 1,
@@ -904,7 +938,15 @@ test("redacted speech renders listening state and lower replay revisions are acc
     state: "ready",
     text: "Replay restarted",
   });
-  assert.deepEqual(replayed.patch.voice, { status: "ready", text: "Replay restarted" });
+  assert.deepEqual(replayed.patch.voice, {
+    status: "ready",
+    text: "Replay restarted",
+    partialText: "",
+    audioLevelAvailable: false,
+    audioLevelDbfs: -99,
+    peakLevelDbfs: -99,
+    utteranceSequence: 0,
+  });
 });
 
 test("missing snapshots preserve last-known values while lower replay revisions apply in arrival order", () => {
@@ -1116,7 +1158,15 @@ test("an active-idle-active replay loop recovers from a lower gateway revision",
     state: "ready",
     text: "Second loop",
   });
-  assert.deepEqual(replayedSpeech.patch.voice, { status: "ready", text: "Second loop" });
+  assert.deepEqual(replayedSpeech.patch.voice, {
+    status: "ready",
+    text: "Second loop",
+    partialText: "",
+    audioLevelAvailable: false,
+    audioLevelDbfs: -99,
+    peakLevelDbfs: -99,
+    utteranceSequence: 0,
+  });
 });
 
 test("replay compatibility keeps identity and structured-message validation fail closed", () => {
@@ -1201,8 +1251,8 @@ test("gateway contract and identity changes fail closed and reset the run scope"
   const mapper = new MainLayoutScenarioMapper();
   const first = mapper.map(PUBLIC_TOPIC_NAMES.gatewayInfo, {
     revision: 1,
-    schema_version: "1.1.0",
-    interface_version: "0.3.0",
+    schema_version: "1.2.0",
+    interface_version: "0.4.0",
     catalog_version: "catalog-1",
     gateway_instance_id: "gateway-1",
     procedure_run_id: "run-1",
@@ -1214,7 +1264,7 @@ test("gateway contract and identity changes fail closed and reset the run scope"
 
   const matchingPrediction = {
     revision: 2,
-    schema_version: "1.1.0",
+    schema_version: "1.2.0",
     catalog_version: "catalog-1",
     gateway_instance_id: "gateway-1",
     procedure_run_id: "run-1",
@@ -1231,8 +1281,8 @@ test("gateway contract and identity changes fail closed and reset the run scope"
   const nextRun = mapper.map(PUBLIC_TOPIC_NAMES.gatewayInfo, {
     ...first,
     revision: 2,
-    schema_version: "1.1.0",
-    interface_version: "0.3.0",
+    schema_version: "1.2.0",
+    interface_version: "0.4.0",
     catalog_version: "catalog-1",
     gateway_instance_id: "gateway-1",
     procedure_run_id: "run-2",
@@ -1244,7 +1294,7 @@ test("gateway contract and identity changes fail closed and reset the run scope"
   const mismatch = mapper.map(PUBLIC_TOPIC_NAMES.gatewayInfo, {
     revision: 3,
     schema_version: "9.9.9",
-    interface_version: "0.3.0",
+    interface_version: "0.4.0",
     catalog_version: "catalog-1",
     gateway_instance_id: "gateway-1",
     procedure_run_id: "run-2",

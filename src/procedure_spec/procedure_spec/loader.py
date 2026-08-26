@@ -21,13 +21,14 @@ from .models import (
     MockPerceptionScenario,
     MockPerceptionStage,
     MockPhaseHypothesis,
-    MockSurgeonGesture,
     MockSurgeonScenario,
     MockSurgeonStage,
     PhaseGuardPolicy,
     PhaseSpec,
     ProcedureBundle,
     SceneLocation,
+    ScenarioPolicySpec,
+    ScenarioRuntimeRequirements,
     SimulationAnchor,
     SimulationEntity,
 )
@@ -74,6 +75,36 @@ def _instrument_requestable(instrument: dict) -> bool:
     ui_payload = instrument.get("ui", {})
     ui_requestable = ui_payload.get("requestable", True) if isinstance(ui_payload, dict) else True
     return bool(instrument.get("requestable", ui_requestable))
+
+
+def _scenario_policy_payload(policy: dict) -> dict:
+    """Return the authored scenario section with legacy bundle fallback."""
+
+    authored = policy.get("scenario_policy")
+    if isinstance(authored, dict):
+        return authored
+    action = policy.get("action_guard", {})
+    humanoid = policy.get("humanoid_policy", {})
+    return {
+        "handover_arm": humanoid.get("handover_arm", "right"),
+        "recovery_arm": humanoid.get("recovery_arm", "left"),
+        "require_cleaning_after_surgeon_use": humanoid.get(
+            "require_cleaning_after_surgeon_use", True
+        ),
+        "allow_anticipatory_hold": humanoid.get("allow_anticipatory_hold", True),
+        "voice_override_preempts_preposition": humanoid.get(
+            "voice_override_preempts_preposition", True
+        ),
+        "allow_prepositioning_when_uncertain": action.get(
+            "allow_prepositioning_when_uncertain", False
+        ),
+        "explicit_request_priority": action.get("explicit_request_priority", True),
+        "unused_preposition_destination": (
+            "mayo"
+            if humanoid.get("return_unused_preposition_to_mayo", True)
+            else "retain"
+        ),
+    }
 
 
 def _reject_prompt_legacy_conflicts(bundle_path: Path) -> None:
@@ -125,12 +156,22 @@ def load_bundle(bundle_dir: str | Path | None = None) -> ProcedureSpec:
     mock_perception = raw_bundle.get("mock_perception", {})
     mock_surgeon = raw_bundle["mock_surgeon"]
     bed_robot_arm_groups = raw_bundle.get("bed_robot_arm_groups", {})
+    scenario_policy = _scenario_policy_payload(policy)
+    runtime_requirements = scenario_policy.get("runtime_requirements")
 
     bundle = ProcedureBundle(
         procedure_id=str(procedure["procedure_id"]),
         procedure_display_name=str(procedure.get("procedure_display_name", procedure["procedure_id"])),
         procedure_display_name_ko=str(
             procedure.get("procedure_display_name_ko", procedure.get("procedure_display_name", procedure["procedure_id"]))
+        ),
+        procedure_target_site=str(procedure.get("procedure_target_site", "")),
+        procedure_target_site_ko=str(
+            procedure.get("procedure_target_site_ko", procedure.get("procedure_target_site", ""))
+        ),
+        procedure_approach=str(procedure.get("procedure_approach", "")),
+        procedure_approach_ko=str(
+            procedure.get("procedure_approach_ko", procedure.get("procedure_approach", ""))
         ),
         default_phase_id=str(procedure.get("default_phase_id", "")),
         normal_phase_ids=[str(item) for item in procedure.get("normal_phase_ids", [])],
@@ -197,29 +238,49 @@ def load_bundle(bundle_dir: str | Path | None = None) -> ProcedureSpec:
             ),
         ),
         action_guard=ActionGuardPolicy(
-            block_handover_when_phase_uncertain=bool(
-                policy["action_guard"]["block_handover_when_phase_uncertain"]
-            ),
             require_multi_evidence_for_handover=bool(
                 policy["action_guard"]["require_multi_evidence_for_handover"]
             ),
-            allow_prepositioning_when_uncertain=bool(
-                policy["action_guard"]["allow_prepositioning_when_uncertain"]
-            ),
-            explicit_request_priority=bool(policy["action_guard"]["explicit_request_priority"]),
         ),
         humanoid_policy=HumanoidPolicy(
-            handover_arm=str(policy["humanoid_policy"]["handover_arm"]),
-            recovery_arm=str(policy["humanoid_policy"]["recovery_arm"]),
+            handover_arm=str(scenario_policy["handover_arm"]),
+            recovery_arm=str(scenario_policy["recovery_arm"]),
             require_cleaning_after_surgeon_use=bool(
-                policy["humanoid_policy"]["require_cleaning_after_surgeon_use"]
+                scenario_policy["require_cleaning_after_surgeon_use"]
             ),
-            allow_anticipatory_hold=bool(policy["humanoid_policy"]["allow_anticipatory_hold"]),
+            allow_anticipatory_hold=bool(scenario_policy["allow_anticipatory_hold"]),
             voice_override_preempts_preposition=bool(
-                policy["humanoid_policy"]["voice_override_preempts_preposition"]
+                scenario_policy["voice_override_preempts_preposition"]
             ),
-            direct_return_to_rack_for_unused_prepositioned_tool=bool(
-                policy["humanoid_policy"]["direct_return_to_rack_for_unused_prepositioned_tool"]
+            return_unused_preposition_to_mayo=bool(
+                scenario_policy["unused_preposition_destination"] == "mayo"
+            ),
+        ),
+        scenario_policy=ScenarioPolicySpec(
+            handover_arm=str(scenario_policy["handover_arm"]),
+            recovery_arm=str(scenario_policy["recovery_arm"]),
+            require_cleaning_after_surgeon_use=bool(
+                scenario_policy["require_cleaning_after_surgeon_use"]
+            ),
+            allow_anticipatory_hold=bool(
+                scenario_policy["allow_anticipatory_hold"]
+            ),
+            voice_override_preempts_preposition=bool(
+                scenario_policy["voice_override_preempts_preposition"]
+            ),
+            allow_prepositioning_when_uncertain=bool(
+                scenario_policy["allow_prepositioning_when_uncertain"]
+            ),
+            explicit_request_priority=bool(
+                scenario_policy["explicit_request_priority"]
+            ),
+            unused_preposition_destination=str(
+                scenario_policy["unused_preposition_destination"]
+            ),
+            runtime_requirements=(
+                ScenarioRuntimeRequirements(**runtime_requirements)
+                if isinstance(runtime_requirements, dict)
+                else None
             ),
         ),
         bed_robot_arm_groups=BedRobotArmProcedureSpec(
@@ -260,6 +321,13 @@ def load_bundle(bundle_dir: str | Path | None = None) -> ProcedureSpec:
                     allowed_operations=[
                         str(operation) for operation in group.get("allowed_operations", [])
                     ],
+                    allowed_voice_commands=[
+                        str(command)
+                        for command in group.get("allowed_voice_commands", [])
+                    ],
+                    voice_command_policy_configured=(
+                        "allowed_voice_commands" in group
+                    ),
                 )
                 for group_id, group in (bed_robot_arm_groups.get("groups", {}) or {}).items()
             ],
@@ -342,15 +410,6 @@ def load_bundle(bundle_dir: str | Path | None = None) -> ProcedureSpec:
                         )
                         for observation in stage.get("observations", [])
                     ],
-                    surgeon_gesture=MockSurgeonGesture(
-                        event_type=str(stage["surgeon_gesture"]["event_type"]),
-                        requested_tool=str(stage["surgeon_gesture"].get("requested_tool", "")),
-                        hand_pose=str(stage["surgeon_gesture"].get("hand_pose", "")),
-                        confidence=float(stage["surgeon_gesture"].get("confidence", 0.0)),
-                        note=str(stage["surgeon_gesture"].get("note", "")),
-                    )
-                    if stage.get("surgeon_gesture")
-                    else None,
                     scene_summary=str(stage.get("scene_summary", "")),
                     uncertainty=float(stage.get("uncertainty", 0.0)),
                     explicit_request=str(stage.get("explicit_request", "")),

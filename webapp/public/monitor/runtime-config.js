@@ -5,12 +5,29 @@
     ? `[${hostname}]`
     : hostname;
   const websocketScheme = location.protocol === "https:" ? "wss" : "ws";
-  const queryMode = new URLSearchParams(String(location.search || "")).get("mode");
+  const query = new URLSearchParams(String(location.search || ""));
+  const queryMode = query.get("mode");
+  const profile = String(query.get("profile") || "").trim().toLowerCase();
+  const cameraOverride = String(query.get("camera") || "").trim().toLowerCase();
+  const userAgent = String(global.navigator?.userAgent || "");
+  const webosDevice = /(?:web0s|webos|netcast)/i.test(userAgent);
+  const tvProfile = profile === "tv" || (profile !== "desktop" && webosDevice);
+  const preferHls = queryMode !== "dummy" && cameraOverride !== "ros" && tvProfile;
 
   global.SURGIMATE_CONFIG = Object.freeze({
     // The monitor honors an explicit ?mode=dummy without creating a WebSocket.
     mode: queryMode === "dummy" ? "dummy" : "ros",
     dummyDataFile: "/monitor/dummy-data.json",
+    deviceProfile: tvProfile ? "webos-tv" : "desktop",
+    media: Object.freeze({
+      // webOS receives H.264/HLS from the local projection service. Desktop
+      // and explicit ?camera=ros sessions retain the existing latest-only ROS
+      // CompressedImage path.
+      preferredTransport: preferHls ? "hls" : "ros",
+      hlsUrl: "/media/flir.m3u8",
+      probeTimeoutMs: 1800,
+      playbackStartTimeoutMs: 8000,
+    }),
     rosbridge: Object.freeze({
       // Use the same browser-visible host and the reviewed subscribe-only port.
       // Brackets are required when location.hostname is an IPv6 literal.
@@ -27,7 +44,7 @@
         jitterRatio: 0.2,
       }),
       cameraStreams: Object.freeze({
-        enabled: true,
+        enabled: !preferHls,
         throttleRateMs: 100,
         fit: "contain",
         playoutMode: "latest",

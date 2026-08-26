@@ -6,9 +6,11 @@ from collections import OrderedDict
 import math
 from pathlib import Path
 import re
-from typing import Any
+from typing import Any, Mapping, Sequence
+import unicodedata
 
 from .procedure_prompt import PROMPT_FILE_NAMES, load_procedure_prompt
+from .scenario_policy import SCENARIO_RUNTIME_REQUIREMENT_KEYS
 
 
 _TOOL_ID_RE = re.compile(r"\bT\d{2}\b")
@@ -67,6 +69,60 @@ _GENERIC_KO_TOOL_WORDS = {
     "전기소작기",
     "클램프",
     "포셉",
+}
+
+# Editable aliases are names only.  Keeping request/question/negation language
+# out of the catalog prevents a scenario edit from smuggling an executable
+# cue into every mention of a tool.  This is intentionally local to
+# ``procedure_spec`` so prompt validation does not depend on ``voice_command``.
+_RESERVED_TOOL_VOICE_ALIAS_CUES = (
+    "주세요",
+    "주십시오",
+    "줘요",
+    "줘",
+    "내놔",
+    "건네",
+    "전달",
+    "가져와",
+    "부탁합니다",
+    "부탁드립니다",
+    "부탁드려요",
+    "give me",
+    "hand me",
+    "pass me",
+    "please",
+    "handover",
+    "hand over",
+    "할까",
+    "할까요",
+    "인가요",
+    "겠습니까",
+    "can you",
+    "would you",
+    "do we",
+    "is this",
+    "하지마",
+    "하지말",
+    "주지마",
+    "주지말",
+    "말자",
+    "말고",
+    "금지",
+    "do not",
+    "dont",
+    "don't",
+    "not",
+)
+
+_DEFAULT_SCENARIO_POLICY = {
+    "handover_arm": "right",
+    "recovery_arm": "left",
+    "require_cleaning_after_surgeon_use": True,
+    "allow_anticipatory_hold": True,
+    "voice_override_preempts_preposition": True,
+    "allow_prepositioning_when_uncertain": False,
+    "explicit_request_priority": True,
+    "unused_preposition_destination": "mayo",
 }
 
 _KO_TOOL_NAMES = {
@@ -231,7 +287,12 @@ def _distinctive_name_aliases(name: str, generic_words: set[str]) -> list[str]:
     return aliases
 
 
-def _tool_aliases(tool_id: str, name: str, localized_name: str = "") -> list[str]:
+def _tool_aliases(
+    tool_id: str,
+    name: str,
+    localized_name: str = "",
+    extra_aliases: Sequence[str] = (),
+) -> list[str]:
     aliases = [name, tool_id]
     lower = name.lower()
     aliases.append(lower)
@@ -263,6 +324,7 @@ def _tool_aliases(tool_id: str, name: str, localized_name: str = "") -> list[str
                 "미들돌프 리트랙터",
             ]
         )
+    aliases.extend(str(alias).strip() for alias in extra_aliases)
     return _ordered_unique([alias for alias in aliases if alias])
 
 
@@ -273,6 +335,140 @@ def _prompt_tools(prompt: dict[str, Any]) -> OrderedDict[str, str]:
         for tool_id, name in tools.items():
             result[str(tool_id)] = str(name)
     return result
+
+
+def _normalize_prompt_voice_alias(value: str) -> str:
+    """Use the active voice catalog's canonical comparison form."""
+
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    normalized = re.sub(r"[^0-9a-z가-힣]+", " ", normalized)
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def _reserved_tool_voice_alias_cue(normalized_alias: str) -> str:
+    compact_alias = normalized_alias.replace(" ", "")
+    for cue in _RESERVED_TOOL_VOICE_ALIAS_CUES:
+        normalized_cue = _normalize_prompt_voice_alias(cue)
+        if not normalized_cue:
+            continue
+        if normalized_cue.isascii():
+            if re.search(
+                rf"(?:^| ){re.escape(normalized_cue)}(?: |$)",
+                normalized_alias,
+            ):
+                return cue
+        elif normalized_cue.replace(" ", "") in compact_alias:
+            return cue
+    return ""
+
+
+def _prompt_tool_voice_aliases(
+    prompt: dict[str, Any],
+    tool_ids: list[str],
+) -> dict[str, tuple[str, ...]]:
+    """Load editable, procedure-local ASR variants for canonical tools."""
+
+    raw = prompt.get("tool_voice_aliases", {})
+    if raw in ({}, None):
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError("procedure prompt tool_voice_aliases must be a mapping.")
+    unknown = sorted(set(str(key) for key in raw) - set(tool_ids))
+    if unknown:
+        raise ValueError(
+            "procedure prompt tool_voice_aliases references unknown tools: "
+            + ", ".join(unknown)
+        )
+    aliases: dict[str, tuple[str, ...]] = {}
+    claimed_aliases: dict[str, str] = {}
+    for raw_tool_id, raw_values in raw.items():
+        tool_id = str(raw_tool_id)
+        if not isinstance(raw_values, list):
+            raise ValueError(
+                f"procedure prompt tool_voice_aliases.{tool_id} must be a list."
+            )
+        if not raw_values:
+            raise ValueError(
+                f"procedure prompt tool_voice_aliases.{tool_id} must be non-empty."
+            )
+        values: list[str] = []
+        seen_for_tool: dict[str, str] = {}
+        for value in raw_values:
+            if not isinstance(value, str):
+                raise ValueError(
+                    f"procedure prompt tool_voice_aliases.{tool_id} aliases "
+                    "must be strings."
+                )
+            stripped = value.strip()
+            normalized = _normalize_prompt_voice_alias(stripped)
+            if not normalized:
+                raise ValueError(
+                    f"procedure prompt tool_voice_aliases.{tool_id} contains "
+                    "an empty alias."
+                )
+            if normalized in seen_for_tool:
+                raise ValueError(
+                    f"procedure prompt tool_voice_aliases.{tool_id} contains "
+                    f"duplicate aliases after normalization: {value!r}."
+                )
+            reserved_cue = _reserved_tool_voice_alias_cue(normalized)
+            if reserved_cue:
+                raise ValueError(
+                    f"procedure prompt tool_voice_aliases.{tool_id} alias "
+                    f"{value!r} contains reserved command cue "
+                    f"{reserved_cue!r}."
+                )
+            compact_identifier = normalized.replace(" ", "")
+            if len(compact_identifier) < 2 or compact_identifier.isdigit():
+                raise ValueError(
+                    f"procedure prompt tool_voice_aliases.{tool_id} alias "
+                    f"{value!r} is not a distinctive tool identifier."
+                )
+            owner = claimed_aliases.get(normalized)
+            if owner is not None and owner != tool_id:
+                raise ValueError(
+                    "procedure prompt tool_voice_aliases assigns normalized "
+                    f"alias {value!r} to both {owner} and {tool_id}."
+                )
+            seen_for_tool[normalized] = value
+            claimed_aliases[normalized] = tool_id
+            values.append(stripped)
+        if not values:
+            raise ValueError(
+                f"procedure prompt tool_voice_aliases.{tool_id} must be non-empty."
+            )
+        aliases[tool_id] = tuple(values)
+    return aliases
+
+
+def _validate_prompt_tool_voice_alias_ownership(
+    tools: OrderedDict[str, str],
+    extra_aliases: Mapping[str, Sequence[str]],
+) -> None:
+    """Reject custom aliases that impersonate another tool's built-in name."""
+
+    normalized_by_tool = {
+        tool_id: {
+            _normalize_prompt_voice_alias(alias)
+            for alias in _tool_aliases(
+                tool_id,
+                tool_name,
+                _KO_TOOL_NAMES.get(tool_name, tool_name),
+                extra_aliases.get(tool_id, ()),
+            )
+            if _normalize_prompt_voice_alias(alias)
+        }
+        for tool_id, tool_name in tools.items()
+    }
+    for owner, aliases in extra_aliases.items():
+        for alias in aliases:
+            normalized = _normalize_prompt_voice_alias(alias)
+            for other_tool_id, other_aliases in normalized_by_tool.items():
+                if other_tool_id != owner and normalized in other_aliases:
+                    raise ValueError(
+                        "procedure prompt tool_voice_aliases alias "
+                        f"{alias!r} for {owner} collides with {other_tool_id}."
+                    )
 
 
 def _prompt_inventory(
@@ -312,6 +508,170 @@ def _prompt_inventory(
                 + ", ".join(unknown)
             )
     return inventory
+
+
+def _prompt_requestable_tools(
+    prompt: dict[str, Any],
+    tool_ids: list[str],
+) -> set[str]:
+    """Return the explicit handover allowlist, defaulting legacy prompts to all."""
+
+    raw_scenario_policy = prompt.get("scenario_policy", {})
+    if raw_scenario_policy is None:
+        raw_scenario_policy = {}
+    if not isinstance(raw_scenario_policy, dict):
+        raise ValueError("procedure prompt scenario_policy must be a mapping.")
+    nested_present = "requestable_tools" in raw_scenario_policy
+    legacy_present = "requestable_tools" in prompt
+    if nested_present and legacy_present:
+        raise ValueError(
+            "procedure prompt requestable_tools must be authored only under scenario_policy."
+        )
+    if not nested_present and not legacy_present:
+        return set(tool_ids)
+    raw_requestable = (
+        raw_scenario_policy.get("requestable_tools")
+        if nested_present
+        else prompt.get("requestable_tools")
+    )
+    if not isinstance(raw_requestable, list):
+        raise ValueError("procedure prompt requestable_tools must be a list.")
+    requestable = {str(item).strip() for item in raw_requestable}
+    if "" in requestable:
+        raise ValueError(
+            "procedure prompt requestable_tools must not contain an empty tool ID."
+        )
+    unknown = sorted(requestable - set(tool_ids))
+    if unknown:
+        raise ValueError(
+            "procedure prompt requestable_tools references unknown tools: "
+            + ", ".join(unknown)
+        )
+    return requestable
+
+
+def _prompt_scenario_policy(prompt: dict[str, Any]) -> dict[str, Any]:
+    """Load procedure choices without mixing them into safety admission."""
+
+    raw = prompt.get("scenario_policy", {})
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ValueError("procedure prompt scenario_policy must be a mapping.")
+    unknown = sorted(
+        set(raw)
+        - set(_DEFAULT_SCENARIO_POLICY)
+        - {"requestable_tools", "runtime_requirements"}
+    )
+    if unknown:
+        raise ValueError(
+            "procedure prompt scenario_policy has unknown fields: "
+            + ", ".join(unknown)
+        )
+    result = {
+        key: raw.get(key, default)
+        for key, default in _DEFAULT_SCENARIO_POLICY.items()
+    }
+    runtime_requirements = raw.get("runtime_requirements")
+    if runtime_requirements is not None:
+        if not isinstance(runtime_requirements, dict):
+            raise ValueError(
+                "procedure prompt scenario_policy.runtime_requirements "
+                "must be a mapping."
+            )
+        missing = sorted(
+            SCENARIO_RUNTIME_REQUIREMENT_KEYS - set(runtime_requirements)
+        )
+        unknown_runtime = sorted(
+            set(runtime_requirements) - SCENARIO_RUNTIME_REQUIREMENT_KEYS
+        )
+        if missing or unknown_runtime:
+            details = []
+            if missing:
+                details.append("missing: " + ", ".join(missing))
+            if unknown_runtime:
+                details.append("unknown: " + ", ".join(unknown_runtime))
+            raise ValueError(
+                "procedure prompt scenario_policy.runtime_requirements must "
+                "define the complete contract (" + "; ".join(details) + ")"
+            )
+        result["runtime_requirements"] = dict(runtime_requirements)
+    return result
+
+
+def _prompt_tool_placement(
+    prompt: dict[str, Any],
+    tool_ids: list[str],
+) -> tuple[list[str], list[dict[str, Any]]]:
+    """Load the bundle-owned rack order and per-instance initial state.
+
+    Older prompts implicitly used the insertion order of ``tools`` and, for a
+    short transition period, could carry ``initial_instrument_states`` at the
+    document root.  New prompts keep both mutable placement choices together
+    under ``tool_placement`` so the Digital Twin, mock observations and Web UI
+    cannot acquire separate placement lists.
+    """
+
+    raw = prompt.get("tool_placement")
+    legacy_states_present = "initial_instrument_states" in prompt
+    if raw is None:
+        legacy_states = prompt.get("initial_instrument_states", [])
+        if not isinstance(legacy_states, list):
+            raise ValueError(
+                "procedure prompt initial_instrument_states must be a list."
+            )
+        return list(tool_ids), legacy_states
+    if not isinstance(raw, dict):
+        raise ValueError("procedure prompt tool_placement must be a mapping.")
+    unknown = sorted(set(raw) - {"rack_order", "initial_states"})
+    if unknown:
+        raise ValueError(
+            "procedure prompt tool_placement has unknown fields: "
+            + ", ".join(unknown)
+        )
+    if legacy_states_present:
+        raise ValueError(
+            "procedure prompt initial instrument states must be authored only "
+            "under tool_placement.initial_states."
+        )
+
+    rack_order = raw.get("rack_order")
+    if not isinstance(rack_order, list):
+        raise ValueError(
+            "procedure prompt tool_placement.rack_order must be a list."
+        )
+    normalized_order = [str(item).strip() for item in rack_order]
+    if any(not item for item in normalized_order):
+        raise ValueError(
+            "procedure prompt tool_placement.rack_order must not contain an "
+            "empty tool ID."
+        )
+    duplicates = sorted(
+        tool_id
+        for tool_id in set(normalized_order)
+        if normalized_order.count(tool_id) > 1
+    )
+    missing = sorted(set(tool_ids) - set(normalized_order))
+    unknown_tools = sorted(set(normalized_order) - set(tool_ids))
+    if duplicates or missing or unknown_tools or len(normalized_order) != len(tool_ids):
+        details: list[str] = []
+        if duplicates:
+            details.append("duplicates: " + ", ".join(duplicates))
+        if missing:
+            details.append("missing: " + ", ".join(missing))
+        if unknown_tools:
+            details.append("unknown: " + ", ".join(unknown_tools))
+        raise ValueError(
+            "procedure prompt tool_placement.rack_order must list every tool "
+            "exactly once (" + "; ".join(details) + ")"
+        )
+
+    initial_states = raw.get("initial_states", [])
+    if not isinstance(initial_states, list):
+        raise ValueError(
+            "procedure prompt tool_placement.initial_states must be a list."
+        )
+    return normalized_order, initial_states
 
 
 def _phase_tools(prompt: dict[str, Any], known_tools: set[str]) -> dict[str, list[str]]:
@@ -403,6 +763,7 @@ def _phase_next_map(prompt: dict[str, Any], phase_ids: list[str], interrupt_ids:
 
 def _build_scene_layout(
     tool_ids: list[str],
+    rack_order: list[str],
     initial_instrument_states: Any = None,
 ) -> dict[str, Any]:
     locations = [
@@ -425,7 +786,7 @@ def _build_scene_layout(
         "locations": locations,
         "initial_instrument_placement": [
             {"instrument_id": tool_id, "location_id": f"main_tray_slot_{index + 1}"}
-            for index, tool_id in enumerate(tool_ids)
+            for index, tool_id in enumerate(rack_order)
         ],
         "initial_instrument_states": (
             initial_instrument_states
@@ -469,13 +830,20 @@ def _build_simulation_layout(procedure_id: str, tool_ids: list[str]) -> dict[str
             {"id": "surgeon_return_zone", "attached_to": "surgeon_actor", "x": 78.5, "y": 53.0, "label": "Return Zone"},
             {"id": "surgeon_hand", "attached_to": "surgeon_actor", "x": 88.0, "y": 42.5, "label": "Surgeon Hand"},
             {"id": field_id, "attached_to": f"{procedure_id}_bed", "x": 66.2, "y": 44.8, "label": "Surgical Field"},
+            {"id": "mayo_recovery_zone", "attached_to": "mayo_stand", "x": 61.5, "y": 66.5, "label": "Recovery Zone"},
+            {"id": "mayo_reuse_zone", "attached_to": "mayo_stand", "x": 76.5, "y": 66.5, "label": "Reuse Zone"},
             {"id": "unknown_zone_anchor", "attached_to": "unknown_zone", "x": 93.0, "y": 66.0, "label": "Unknown"},
             *[_slot_anchor(index, len(tool_ids)) for index in range(len(tool_ids))],
         ],
     }
 
 
-def _build_policy() -> dict[str, Any]:
+def _build_policy(
+    scenario_policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    authored_scenario = dict(_DEFAULT_SCENARIO_POLICY)
+    if scenario_policy:
+        authored_scenario.update(scenario_policy)
     return {
         "phase_guard": {
             "min_confidence_to_keep": 0.55,
@@ -486,26 +854,22 @@ def _build_policy() -> dict[str, Any]:
             "min_evidence_duration_sec": 1.0,
         },
         "action_guard": {
-            "block_handover_when_phase_uncertain": True,
             "require_multi_evidence_for_handover": True,
-            "allow_prepositioning_when_uncertain": False,
-            "explicit_request_priority": True,
         },
-        "humanoid_policy": {
-            "handover_arm": "right",
-            "recovery_arm": "left",
-            "require_cleaning_after_surgeon_use": True,
-            "allow_anticipatory_hold": True,
-            "voice_override_preempts_preposition": True,
-            "direct_return_to_rack_for_unused_prepositioned_tool": True,
-        },
+        "scenario_policy": authored_scenario,
     }
 
 
-def _build_mock_surgeon(phase_tools: dict[str, list[str]], tools: OrderedDict[str, str]) -> dict[str, Any]:
+def _build_mock_surgeon(
+    phase_tools: dict[str, list[str]],
+    tools: OrderedDict[str, str],
+    requestable_tools: set[str],
+) -> dict[str, Any]:
     stages: list[dict[str, Any]] = []
     for phase_id, tool_ids in phase_tools.items():
-        for index, tool_id in enumerate(tool_ids):
+        for index, tool_id in enumerate(
+            tool_id for tool_id in tool_ids if tool_id in requestable_tools
+        ):
             tool_name = tools.get(tool_id, tool_id)
             stages.append(
                 {
@@ -524,8 +888,36 @@ def _build_mock_surgeon(phase_tools: dict[str, list[str]], tools: OrderedDict[st
     return {"period_sec": 1.0, "stages": stages}
 
 
-def _build_mock_perception(phase_tools: dict[str, list[str]], tool_ids: list[str]) -> dict[str, Any]:
+def _build_mock_perception(
+    phase_tools: dict[str, list[str]],
+    rack_order: list[str],
+    requestable_tools: set[str],
+    initial_instrument_states: list[dict[str, Any]],
+) -> dict[str, Any]:
     first_phase = next(iter(phase_tools), "")
+    home_location_by_tool = {
+        tool_id: f"main_tray_slot_{index + 1}"
+        for index, tool_id in enumerate(rack_order)
+    }
+    # MockObservation is intentionally type-level, while authored setup can
+    # place individual instances. If any instance of a type starts away from
+    # its home rack position, publishing a synthetic type-level home sample
+    # would move every instance back to the rack. Omit that ambiguous sample;
+    # the Digital Twin's authored per-instance state remains authoritative.
+    non_home_initial_tool_ids = {
+        str(state.get("instrument_id", "")).strip()
+        for state in initial_instrument_states
+        if isinstance(state, dict)
+        and (
+            str(state.get("lifecycle_stage", "")).strip()
+            not in {"home_rack", "returned_home"}
+            or str(state.get("location_id", "")).strip()
+            != home_location_by_tool.get(
+                str(state.get("instrument_id", "")).strip(),
+                "",
+            )
+        )
+    }
     home_observations = [
         {
             "instrument_id": tool_id,
@@ -534,7 +926,8 @@ def _build_mock_perception(phase_tools: dict[str, list[str]], tool_ids: list[str
             "confidence": 0.98,
             "visible": True,
         }
-        for index, tool_id in enumerate(tool_ids)
+        for index, tool_id in enumerate(rack_order)
+        if tool_id not in non_home_initial_tool_ids
     ]
     stages: list[dict[str, Any]] = [
         {
@@ -542,27 +935,24 @@ def _build_mock_perception(phase_tools: dict[str, list[str]], tool_ids: list[str
             "duration_ticks": 2,
             "phase_hypotheses": [{"phase_id": first_phase, "confidence": 0.72}] if first_phase else [],
             "observations": home_observations,
-            "scene_summary": "All procedure-prompt instruments are visible at their home tray slots.",
+            "scene_summary": (
+                "Only unambiguous home-rack instruments are visible at their "
+                "home tray slots; authored non-home instance placements remain unchanged."
+            ),
             "uncertainty": 0.1,
         }
     ]
     for phase_id, expected_tools in phase_tools.items():
-        request_tool = expected_tools[0] if expected_tools else ""
+        request_tool = next(
+            (tool_id for tool_id in expected_tools if tool_id in requestable_tools),
+            "",
+        )
         stages.append(
             {
                 "name": f"{phase_id.lower()}_evidence",
                 "duration_ticks": 5,
                 "phase_hypotheses": [{"phase_id": phase_id, "confidence": 0.86}],
                 "observations": home_observations,
-                "surgeon_gesture": {
-                    "event_type": "request_tool",
-                    "requested_tool": request_tool,
-                    "hand_pose": "open_palm" if request_tool else "",
-                    "confidence": 0.75 if request_tool else 0.0,
-                    "note": f"Prompt-derived cue for {phase_id}.",
-                }
-                if request_tool
-                else None,
                 "scene_summary": f"Prompt-derived VLM evidence for {phase_id}.",
                 "uncertainty": 0.18,
                 "explicit_request": request_tool,
@@ -581,12 +971,28 @@ def build_raw_bundle_from_prompt(bundle_dir: str | Path, display_catalog: dict[s
     procedure_id = str(procedure_payload.get("id") or bundle_path.name)
     procedure_name = str(procedure_payload.get("name") or _slug_label(procedure_id))
     procedure_name_ko = str(procedure_payload.get("ko") or procedure_name)
+    procedure_target_site = str(procedure_payload.get("target_site") or "")
+    procedure_target_site_ko = str(
+        procedure_payload.get("target_site_ko") or procedure_target_site
+    )
+    procedure_approach = str(procedure_payload.get("approach") or "")
+    procedure_approach_ko = str(
+        procedure_payload.get("approach_ko") or procedure_approach
+    )
 
     tools = _prompt_tools(prompt)
     if not tools:
         raise ValueError(f"{bundle_path} procedure prompt must define tools.")
     tool_ids = list(tools.keys())
+    tool_voice_aliases = _prompt_tool_voice_aliases(prompt, tool_ids)
+    _validate_prompt_tool_voice_alias_ownership(tools, tool_voice_aliases)
     tool_inventory = _prompt_inventory(prompt, tool_ids)
+    requestable_tools = _prompt_requestable_tools(prompt, tool_ids)
+    scenario_policy = _prompt_scenario_policy(prompt)
+    rack_order, initial_instrument_states = _prompt_tool_placement(
+        prompt,
+        tool_ids,
+    )
     known_tools = set(tool_ids)
     phase_labels, phase_labels_ko, normal_phase_ids, interrupt_ids = _phase_label_maps(prompt)
     if not phase_labels:
@@ -604,6 +1010,10 @@ def build_raw_bundle_from_prompt(bundle_dir: str | Path, display_catalog: dict[s
             "procedure_id": procedure_id,
             "procedure_display_name": procedure_name,
             "procedure_display_name_ko": procedure_name_ko,
+            "procedure_target_site": procedure_target_site,
+            "procedure_target_site_ko": procedure_target_site_ko,
+            "procedure_approach": procedure_approach,
+            "procedure_approach_ko": procedure_approach_ko,
             "default_phase_id": str(procedure_payload.get("default_phase_id", "")),
             "normal_phase_ids": normal_phase_ids,
             "interrupt_phase_ids": sorted(interrupt_ids),
@@ -632,10 +1042,11 @@ def build_raw_bundle_from_prompt(bundle_dir: str | Path, display_catalog: dict[s
                         tool_id,
                         tool_name,
                         _KO_TOOL_NAMES.get(tool_name, tool_name),
+                        tool_voice_aliases.get(tool_id, ()),
                     ),
                     "category": _tool_category(tool_name),
                     "inventory_count": tool_inventory[tool_id],
-                    "requestable": True,
+                    "requestable": tool_id in requestable_tools,
                     "role": _tool_category(tool_name),
                     "handover_profile": _handover_profile(_tool_category(tool_name), tool_name),
                 }
@@ -644,12 +1055,22 @@ def build_raw_bundle_from_prompt(bundle_dir: str | Path, display_catalog: dict[s
         },
         "scene_layout": _build_scene_layout(
             tool_ids,
-            prompt.get("initial_instrument_states", []),
+            rack_order,
+            initial_instrument_states,
         ),
-        "policy": _build_policy(),
-        "simulation_layout": _build_simulation_layout(procedure_id, tool_ids),
-        "mock_surgeon": _build_mock_surgeon(phase_tools, tools),
-        "mock_perception": _build_mock_perception(phase_tools, tool_ids),
+        "policy": _build_policy(scenario_policy),
+        "simulation_layout": _build_simulation_layout(procedure_id, rack_order),
+        "mock_surgeon": _build_mock_surgeon(
+            phase_tools,
+            tools,
+            requestable_tools,
+        ),
+        "mock_perception": _build_mock_perception(
+            phase_tools,
+            rack_order,
+            requestable_tools,
+            initial_instrument_states,
+        ),
         "bed_robot_arm_groups": prompt.get("bed_robot_arm_groups", {}),
         "display_catalog": display_catalog,
     }

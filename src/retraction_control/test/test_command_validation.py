@@ -87,8 +87,8 @@ def test_unknown_command_maps_to_service_invalid_command_result() -> None:
     assert raised.value.result_code is ResultCode.INVALID_COMMAND
 
 
-@pytest.mark.parametrize("side", [TargetSide.NONE, 3, -1])
-def test_adjustment_requires_left_or_right(side: TargetSide | int) -> None:
+@pytest.mark.parametrize("side", [3, 4, -1])
+def test_adjustment_rejects_unknown_wire_target_side(side: TargetSide | int) -> None:
     with pytest.raises(CommandValidationError) as raised:
         CommandRequest(  # type: ignore[arg-type]
             1, "taskplanner", "cmd-adjust", 4, side, 0.050
@@ -98,6 +98,19 @@ def test_adjustment_requires_left_or_right(side: TargetSide | int) -> None:
         ErrorCode.TARGET_SIDE_REQUIRED,
         ErrorCode.INVALID_TARGET_SIDE,
     }
+
+
+def test_adjustment_accepts_bilateral_target_side() -> None:
+    request = CommandRequest(
+        protocol_version=1,
+        source_id="taskplanner",
+        command_id="cmd-adjust-both",
+        command=Command.ADJUST_RETRACTION,
+        target_side=TargetSide.BOTH,
+        distance_m=0.001,
+    )
+
+    assert request.target_side is TargetSide.BOTH
 
 
 @pytest.mark.parametrize("distance", [0.0, -0.001, float("nan"), float("inf")])
@@ -126,6 +139,53 @@ def test_non_adjustment_rejects_adjustment_only_parameters(
         )
 
     assert raised.value.code is code
+
+
+@pytest.mark.parametrize(
+    "side", [TargetSide.NONE, TargetSide.LEFT, TargetSide.RIGHT]
+)
+def test_finish_direct_teach_accepts_none_or_either_target_side(
+    side: TargetSide,
+) -> None:
+    request = CommandRequest(
+        protocol_version=1,
+        source_id="taskplanner",
+        command_id=f"cmd-finish-{int(side)}",
+        command=Command.FINISH_DIRECT_TEACH,
+        target_side=side,
+        distance_m=0.0,
+    )
+
+    assert request.command is Command.FINISH_DIRECT_TEACH
+    assert request.target_side is side
+
+
+def test_wire_rejects_legacy_bilateral_target_side_value() -> None:
+    with pytest.raises(CommandValidationError) as raised:
+        CommandRequest(
+            protocol_version=1,
+            source_id="taskplanner",
+            command_id="cmd-finish-both",
+            command=Command.FINISH_DIRECT_TEACH,
+            target_side=3,
+            distance_m=0.0,
+        )
+
+    assert raised.value.code is ErrorCode.INVALID_TARGET_SIDE
+
+
+def test_finish_direct_teach_still_rejects_a_distance() -> None:
+    with pytest.raises(CommandValidationError) as raised:
+        CommandRequest(
+            protocol_version=1,
+            source_id="taskplanner",
+            command_id="cmd-finish-distance",
+            command=Command.FINISH_DIRECT_TEACH,
+            target_side=TargetSide.LEFT,
+            distance_m=0.001,
+        )
+
+    assert raised.value.code is ErrorCode.DISTANCE_NOT_ALLOWED
 
 
 def test_ros_like_request_is_adapted_without_importing_ros() -> None:

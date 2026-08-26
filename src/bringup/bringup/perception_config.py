@@ -6,6 +6,7 @@ from launch.actions import SetLaunchConfiguration
 from launch.substitutions import LaunchConfiguration
 
 from simulation_runtime.cv_contract import (
+    TYPED_TOPIC_PERCEPTION_PROVIDERS,
     resolve_perception_selection,
     validate_perception_endpoint,
 )
@@ -36,7 +37,11 @@ def resolve_launch_perception(context):
         # An explicitly supplied new endpoint is still rejected by the shared
         # validator, preventing stale connection settings from being mistaken
         # for a disabled, fail-closed deployment.
-        if explicit_endpoint or selection.provider == "disabled":
+        if (
+            explicit_endpoint
+            or selection.provider == "disabled"
+            or selection.provider in TYPED_TOPIC_PERCEPTION_PROVIDERS
+        ):
             endpoint_candidate = explicit_endpoint
         elif selection.provider == "pnu_hand_blood":
             # The PNU worker has its own versioned API and port.  An explicit

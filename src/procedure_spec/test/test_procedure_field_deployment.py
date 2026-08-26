@@ -34,10 +34,10 @@ def test_field_deployed_tools_are_derived_from_semantic_tool_roles() -> None:
     ) == {"P01": ["T01", "T02"]}
 
 
-def test_demo_bundle_exposes_fixed_retractors_as_field_deployed() -> None:
+def test_demo_bundle_excludes_bed_arm_retractors_from_field_deployed_inventory() -> None:
     spec = _demo_spec()
 
     assert spec.get_field_deployed_instruments("P03") == []
-    assert spec.get_field_deployed_instruments("P04") == ["T05", "T11"]
-    assert spec.is_field_deployed_instrument("P04", "T05#2") is True
+    assert spec.get_field_deployed_instruments("P04") == []
+    assert {"T05", "T11"}.isdisjoint(spec.list_instrument_ids())
     assert spec.is_field_deployed_instrument("P04", "T02#1") is False

@@ -29,11 +29,10 @@ from typing import Any
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_REPORT_DIR = REPOSITORY_ROOT / "reports/pnu_perception_preflight"
 DEFAULT_ARTIFACT_MANIFEST = DEFAULT_REPORT_DIR / "artifact_manifest.json"
-DEFAULT_ALGORITHMS = ("tool", "blood", "hand")
+DEFAULT_ALGORITHMS = ("tool", "blood")
 MODEL_ENVIRONMENT_KEYS = {
     "tool": "PNU_TOOL_CHECKPOINT",
     "blood": "PNU_BLOOD_CHECKPOINT",
-    "hand": "PNU_HAND_MODEL",
 }
 MODEL_MOUNT_TARGET = "/models"
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
@@ -41,7 +40,6 @@ INFERENCE_RESPONSE_SCHEMA = "taskplanner.pnu_perception.response.v1"
 RESULT_COLLECTION_KEYS = {
     "tool": "detections",
     "blood": "detections",
-    "hand": "hands",
 }
 
 EXIT_INVALID = 2
@@ -459,9 +457,9 @@ def validate_model_digest_pins(
 ) -> dict[str, str]:
     """Validate deployment-owned, non-TOFU model identities.
 
-    Extra pins for another supported algorithm are allowed so a reviewed
-    all-model map can safely be reused by a Debug subset. Every requested
-    algorithm must still have an exact canonical lowercase SHA-256 value.
+    A reviewed Taskplanner map may be reused by a smaller Debug subset. Every
+    requested algorithm must still have an exact canonical lowercase SHA-256
+    value; legacy worker-only algorithms are rejected at this boundary.
     """
 
     requested = tuple(algorithms)
@@ -962,8 +960,7 @@ def _self_test() -> Mapping[str, Any]:
             "decode": 1.0,
             "tool": 1.0,
             "blood": 1.0,
-            "hand": 1.0,
-            "total": 4.0,
+            "total": 3.0,
         },
         "results": {
             "tool": {
@@ -974,11 +971,6 @@ def _self_test() -> Mapping[str, Any]:
             "blood": {
                 "schema": "pnu.blood.2d.v1",
                 "detections": [],
-                "executed": True,
-            },
-            "hand": {
-                "schema": "pnu.hand.2d.v1",
-                "hands": [],
                 "executed": True,
             },
         },
@@ -1021,7 +1013,7 @@ def _self_test() -> Mapping[str, Any]:
     assert outcome.error_code == "MODEL_NOT_READY" and outcome.exit_code == 3
 
     malformed = json.loads(json.dumps(base))
-    del malformed["results"]["hand"]["hands"]
+    del malformed["results"]["blood"]["detections"]
     outcome = validate_inference_result(malformed)
     assert outcome.error_code == "INVALID_RESULT" and outcome.exit_code == 2
 

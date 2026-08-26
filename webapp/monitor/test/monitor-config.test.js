@@ -12,9 +12,9 @@ import {
 
 const runtimeConfigUrl = new URL("../../public/monitor/runtime-config.js", import.meta.url);
 
-async function loadRuntimeConfig(location) {
+async function loadRuntimeConfig(location, userAgent = "") {
   const source = await readFile(runtimeConfigUrl, "utf8");
-  const window = { location };
+  const window = { location, navigator: { userAgent } };
   runInNewContext(source, { URLSearchParams, window });
   return window.SURGIMATE_CONFIG;
 }
@@ -27,6 +27,7 @@ test("monitor runtime config uses the browser host and public bridge port safely
   });
   assert.equal(ipv4.mode, "ros");
   assert.equal(ipv4.rosbridge.url, "ws://192.168.1.4:9092");
+  assert.equal(ipv4.media.preferredTransport, "ros");
 
   const ipv6 = await loadRuntimeConfig({
     protocol: "https:",
@@ -34,6 +35,27 @@ test("monitor runtime config uses the browser host and public bridge port safely
     search: "",
   });
   assert.equal(ipv6.rosbridge.url, "wss://[2001:db8::7]:9092");
+});
+
+test("webOS and the explicit TV profile prefer HLS while preserving ROS state", async () => {
+  const webos = await loadRuntimeConfig({
+    protocol: "http:",
+    hostname: "192.168.1.4",
+    search: "",
+  }, "Mozilla/5.0 (Web0S; Linux/SmartTV) AppleWebKit/537.36");
+  assert.equal(webos.deviceProfile, "webos-tv");
+  assert.equal(webos.media.preferredTransport, "hls");
+  assert.equal(webos.media.hlsUrl, "/media/flir.m3u8");
+  assert.equal(webos.rosbridge.cameraStreams.enabled, false);
+  assert.equal(webos.rosbridge.url, "ws://192.168.1.4:9092");
+
+  const forcedRos = await loadRuntimeConfig({
+    protocol: "http:",
+    hostname: "192.168.1.4",
+    search: "?profile=tv&camera=ros",
+  });
+  assert.equal(forcedRos.media.preferredTransport, "ros");
+  assert.equal(forcedRos.rosbridge.cameraStreams.enabled, true);
 });
 
 test("?mode=dummy boots the scoped synthetic fixture without changing the bridge contract", async () => {
@@ -63,7 +85,7 @@ test("monitor page honors runtime mode and keeps every entry path under /monitor
   assert.match(app, /const\s+defaultSettings\s*=\s*runtimeDefaults\s*;/);
   assert.doesNotMatch(app, /defaultSettings\s*=\s*Object\.freeze\([^\n]*mode\s*:\s*["']ros["']/);
   assert.match(html, /src=["']\/monitor\/runtime-config\.js["']/);
-  assert.match(html, /src=["']\/monitor\/app\.js["']/);
+  assert.match(html, /src=["']\/monitor\/app\.js(?:\?[^"']+)?["']/);
   assert.match(html, /href=["']\/monitor\/styles\.css/);
   assert.equal((html.match(/class=["']flow-list["'][^>]*tabindex=["']0["']/g) || []).length, 2);
   assert.doesNotMatch(html, /fonts\.googleapis\.com|fonts\.gstatic\.com/);

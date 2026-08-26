@@ -83,6 +83,18 @@ VOICE_COMMAND_INTENT_SOURCE = "voice_command_intent"
 # by default alongside the typed subscription: otherwise one utterance can be
 # interpreted twice by two different policies.
 RETRACTOR_LEGACY_RAW_VOICE_PARAMETER = "retractor_legacy_raw_voice_enabled"
+ROBOT_ENDPOINT_SOURCE_PARAMETER = "robot_endpoint_source"
+RETRACTION_ENDPOINT_SOURCE_PARAMETER = "retraction_endpoint_source"
+RETRACTION_STATE_MACHINE_SUPPRESSION_PARAMETER = (
+    "suppress_retraction_state_machine"
+)
+_ROBOT_ENDPOINT_SOURCES = frozenset({"external", "virtual"})
+VOICE_INTENT_SOURCE_METADATA_PARAMETER = "require_voice_intent_source_metadata"
+VOICE_INTENT_MAX_AGE_PARAMETER = "voice_intent_max_age_sec"
+VOICE_INTENT_FUTURE_TOLERANCE_PARAMETER = (
+    "voice_intent_future_tolerance_sec"
+)
+VOICE_INTENT_DEDUPE_RETENTION_PARAMETER = "voice_intent_dedupe_retention_sec"
 
 _RETRACTOR_TYPED_INTENTS = frozenset(
     {
@@ -106,10 +118,38 @@ _OPERATION_BY_RETRACTION_COMMAND = {
     RetractionCommand.STOP_RETRACTION: OP_STOP_RETRACTION,
 }
 
+# ``allowed_operations`` describes the reviewed controller capability, not the
+# legacy request-envelope spelling.  All six typed commands use the single
+# reviewed retraction Service capability.  The typed CHANGE_TOOL form is the
+# controller's preconfigured swap command and carries no arm/profile identity;
+# identity-bearing legacy mount requests still use the stricter tool guard.
+_RETRACTION_SERVICE_COMMANDS = frozenset(
+    {
+        RetractionCommand.START_DIRECT_TEACH,
+        RetractionCommand.FINISH_DIRECT_TEACH,
+        RetractionCommand.START_RETRACTION,
+        RetractionCommand.ADJUST_RETRACTION,
+        RetractionCommand.CHANGE_TOOL,
+        RetractionCommand.STOP_RETRACTION,
+    }
+)
+
 ARM_IDS = frozenset({"arm_1", "arm_2"})
 TARGET_TOOL_IDS = frozenset({"thyroid_retractor", "army_navy_retractor"})
-SINGLE_TARGETS = frozenset({"left_malleable", "right_malleable"})
+SINGLE_TARGETS = frozenset(
+    {
+        "left_malleable",
+        "right_malleable",
+        "left_army_navy",
+        "right_army_navy",
+    }
+)
 MULTI_TARGET = "both_malleable"
+MULTI_TARGETS = frozenset({"both_malleable", "both_army_navy"})
+MULTI_TARGET_ROLES = {
+    "both_malleable": ("left_malleable", "right_malleable"),
+    "both_army_navy": ("left_army_navy", "right_army_navy"),
+}
 DIRECTION_FRAME = "surgeon_view"
 CARDINAL_DIRECTIONS = frozenset({"up", "down", "left", "right"})
 ADJUSTMENT_AXES = frozenset({"left_right", "up_down"})
@@ -129,6 +169,9 @@ _CONTROLLER_STATES = frozenset(
 _PROCEDURE_ROLE_LAYOUTS = {
     "thyroidectomy": frozenset({"army_navy"}),
     "nephrectomy": frozenset({"left_malleable", "right_malleable"}),
+    "inguinal_hernia_repair": frozenset(
+        {"left_army_navy", "right_army_navy"}
+    ),
 }
 
 _TOOL_ALIASES = {
@@ -185,6 +228,23 @@ class BedRobotArmGroupOrchestrator(Node):
         self.declare_parameter("bed_robot_status_timeout_sec", 2.0)
         self.declare_parameter("bed_robot_source_max_age_sec", 2.0)
         self.declare_parameter("bed_robot_source_future_tolerance_sec", 0.5)
+        self.declare_parameter(VOICE_INTENT_SOURCE_METADATA_PARAMETER, False)
+        self.declare_parameter(VOICE_INTENT_MAX_AGE_PARAMETER, 3.0)
+        self.declare_parameter(VOICE_INTENT_FUTURE_TOLERANCE_PARAMETER, 1.0)
+        self.declare_parameter(VOICE_INTENT_DEDUPE_RETENTION_PARAMETER, 120.0)
+        # These are launch-lifetime policy settings.  A virtual endpoint is
+        # isolated from the physical controller and may deliberately exercise
+        # reviewed Service admission without local lifecycle sequencing.  The
+        # normal external route retains local state admission by default.
+        self.declare_parameter(ROBOT_ENDPOINT_SOURCE_PARAMETER, "external")
+        # Keep the retraction Service route independent from the tool Action
+        # route.  An empty direct-node default retains the legacy behavior;
+        # bringup always supplies the reviewed source explicitly.
+        self.declare_parameter(RETRACTION_ENDPOINT_SOURCE_PARAMETER, "")
+        self.declare_parameter("require_bed_robot_status", True)
+        self.declare_parameter(
+            RETRACTION_STATE_MACHINE_SUPPRESSION_PARAMETER, False
+        )
         # The central resolver is the only normal speech entry point.  Keep
         # the pre-existing String parser available strictly for an explicit
         # compatibility/replay opt-in; enabling it in production together
@@ -201,6 +261,11 @@ class BedRobotArmGroupOrchestrator(Node):
         self.declare_parameter("retractor_voice_vlm_api_key", "")
         self.declare_parameter("retractor_voice_vlm_timeout_sec", 2.0)
         self._spec_dir = str(self.get_parameter("spec_dir").value)
+        # Load the procedure before validating route/suppression policy.  Demo
+        # suppression is procedure-scoped; checking it while ``_spec`` is not
+        # initialized makes every external demo launch look like a non-demo
+        # configuration and terminates this node at startup.
+        self._spec = load_bundle(self._spec_dir)
         self._confidence_threshold = float(
             self.get_parameter("vlm_confidence_threshold").value
         )
@@ -227,6 +292,56 @@ class BedRobotArmGroupOrchestrator(Node):
                 ).value
             ),
         )
+        self._require_voice_intent_source_metadata = bool(
+            self.get_parameter(VOICE_INTENT_SOURCE_METADATA_PARAMETER).value
+        )
+        self._voice_intent_max_age_sec = max(
+            0.0,
+            float(self.get_parameter(VOICE_INTENT_MAX_AGE_PARAMETER).value),
+        )
+        self._voice_intent_future_tolerance_sec = max(
+            0.0,
+            float(
+                self.get_parameter(
+                    VOICE_INTENT_FUTURE_TOLERANCE_PARAMETER
+                ).value
+            ),
+        )
+        self._voice_intent_dedupe_retention_sec = max(
+            1.0,
+            float(
+                self.get_parameter(
+                    VOICE_INTENT_DEDUPE_RETENTION_PARAMETER
+                ).value
+            ),
+        )
+        self._robot_endpoint_source = self._normalize_robot_endpoint_source(
+            self.get_parameter(ROBOT_ENDPOINT_SOURCE_PARAMETER).value
+        )
+        retraction_endpoint_source = str(
+            self.get_parameter(RETRACTION_ENDPOINT_SOURCE_PARAMETER).value
+        ).strip()
+        self._retraction_endpoint_source = self._normalize_robot_endpoint_source(
+            retraction_endpoint_source or self._robot_endpoint_source
+        )
+        self._require_bed_robot_status = bool(
+            self.get_parameter("require_bed_robot_status").value
+        )
+        self._suppress_retraction_state_machine = bool(
+            self.get_parameter(
+                RETRACTION_STATE_MACHINE_SUPPRESSION_PARAMETER
+            ).value
+        )
+        if (
+            self._suppress_retraction_state_machine
+            and self._retraction_endpoint_source != "virtual"
+            and self._retraction_workflow_state_enforced()
+        ):
+            raise RuntimeError(
+                "retraction state-machine suppression requires "
+                "retraction_endpoint_source=virtual or scenario policy with "
+                "retraction workflow ordering disabled"
+            )
         self._retractor_legacy_raw_voice_enabled = bool(
             self.get_parameter(RETRACTOR_LEGACY_RAW_VOICE_PARAMETER).value
         )
@@ -252,7 +367,6 @@ class BedRobotArmGroupOrchestrator(Node):
                 self.get_parameter("retractor_voice_vlm_timeout_sec").value
             ),
         )
-        self._spec = load_bundle(self._spec_dir)
         self._bt_ready = False
         self._group_states: dict[str, BedRobotArmGroupState] = {}
         self._world: WorldState | None = None
@@ -261,6 +375,7 @@ class BedRobotArmGroupOrchestrator(Node):
         self._seen_request_ids: set[str] = set()
         self._dispatched_request_ids: set[str] = set()
         self._recent_voice_requests: dict[str, tuple[str, float]] = {}
+        self._recent_typed_voice_intent_ids: dict[str, float] = {}
         self._retractor_voice_state = RetractionState.IDLE
         self._normalized_retractor_requests: dict[
             str, NormalizedRetractionCommand
@@ -270,6 +385,12 @@ class BedRobotArmGroupOrchestrator(Node):
         ] = {}
         self._normalized_retractor_command_requests: dict[str, str] = {}
         self._normalized_retractor_sources: dict[str, tuple[str, bool, str]] = {}
+        self._normalized_retractor_function_scopes: dict[
+            str, tuple[str, str, str]
+        ] = {}
+        self._normalized_retractor_request_messages: dict[
+            str, BedRobotArmGroupRequest
+        ] = {}
         self._pending_text_vlm_interpretations: dict[
             str, PendingTextVLMInterpretation
         ] = {}
@@ -332,12 +453,14 @@ class BedRobotArmGroupOrchestrator(Node):
             50,
         )
         self.create_subscription(WorldState, "/twin/world_state", self._on_world, 20)
-        self.create_subscription(
-            BedRobotArmStateArray,
-            "/external/bed_robot_arms/status",
-            self._on_controller_status,
-            20,
-        )
+        self._controller_status_subscription = None
+        if self._controller_status_required():
+            self._controller_status_subscription = self.create_subscription(
+                BedRobotArmStateArray,
+                "/external/bed_robot_arms/status",
+                self._on_controller_status,
+                20,
+            )
         self.create_subscription(
             VoiceCommandIntent,
             VOICE_COMMAND_INTENT_TOPIC,
@@ -383,6 +506,31 @@ class BedRobotArmGroupOrchestrator(Node):
                 self._bed_robot_source_future_tolerance_sec = max(
                     0.0, float(parameter.value)
                 )
+            elif parameter.name == VOICE_INTENT_SOURCE_METADATA_PARAMETER:
+                self._require_voice_intent_source_metadata = bool(parameter.value)
+            elif parameter.name == VOICE_INTENT_MAX_AGE_PARAMETER:
+                self._voice_intent_max_age_sec = max(0.0, float(parameter.value))
+            elif parameter.name == VOICE_INTENT_FUTURE_TOLERANCE_PARAMETER:
+                self._voice_intent_future_tolerance_sec = max(
+                    0.0, float(parameter.value)
+                )
+            elif parameter.name == VOICE_INTENT_DEDUPE_RETENTION_PARAMETER:
+                self._voice_intent_dedupe_retention_sec = max(
+                    1.0, float(parameter.value)
+                )
+            elif parameter.name in {
+                ROBOT_ENDPOINT_SOURCE_PARAMETER,
+                RETRACTION_ENDPOINT_SOURCE_PARAMETER,
+                "require_bed_robot_status",
+                RETRACTION_STATE_MACHINE_SUPPRESSION_PARAMETER,
+            }:
+                return SetParametersResult(
+                    successful=False,
+                    reason=(
+                        f"{parameter.name} is launch-lifetime and cannot be "
+                        "changed while the orchestrator is running"
+                    ),
+                )
             elif parameter.name == RETRACTOR_LEGACY_RAW_VOICE_PARAMETER:
                 self._retractor_legacy_raw_voice_enabled = bool(parameter.value)
             elif parameter.name == "retractor_voice_normalization_enabled":
@@ -401,11 +549,85 @@ class BedRobotArmGroupOrchestrator(Node):
         return SetParametersResult(successful=True)
 
     @staticmethod
-    def _public_procedure_type(procedure_id: str) -> str:
+    def _normalize_robot_endpoint_source(value: object) -> str:
+        source = str(value).strip().casefold()
+        if source not in _ROBOT_ENDPOINT_SOURCES:
+            raise RuntimeError(
+                "robot_endpoint_source must be 'external' or 'virtual'"
+            )
+        return source
+
+    def _controller_status_required(self) -> bool:
+        return bool(getattr(self, "_require_bed_robot_status", True))
+
+    def _retraction_workflow_state_enforced(self) -> bool:
+        spec = getattr(self, "_spec", None)
+        if spec is None:
+            return True
+        return bool(
+            spec.get_scenario_runtime_requirements().retraction_workflow_state_enforced
+        )
+
+    def _retraction_state_machine_suppressed(self) -> bool:
+        return bool(
+            getattr(self, "_suppress_retraction_state_machine", False)
+            and (
+                getattr(
+                    self,
+                    "_retraction_endpoint_source",
+                    getattr(self, "_robot_endpoint_source", "external"),
+                )
+                == "virtual"
+                or not self._retraction_workflow_state_enforced()
+            )
+        )
+
+    def _retraction_state_machine_suppressed_for_source(
+        self, source: object
+    ) -> bool:
+        """Limit bypass to the central typed-voice contract only."""
+
+        return bool(
+            self._retraction_state_machine_suppressed()
+            and str(source).strip() == VOICE_COMMAND_INTENT_SOURCE
+        )
+
+    def _retraction_state_machine_suppressed_for_request(
+        self, request: BedRobotArmGroupRequest
+    ) -> bool:
+        source = str(getattr(request, "source", "") or "").strip()
+        return self._retraction_state_machine_suppressed_for_source(
+            source.removeprefix(f"{RETRACTOR_VOICE_NORMALIZER_SOURCE}:")
+        )
+
+    def _public_procedure_type(self, procedure_id: str) -> str:
         normalized = str(procedure_id or "").strip().casefold()
-        if normalized in {"thyroidectomy", "thyroidectomy_demo"}:
-            return "thyroidectomy"
+        spec = getattr(self, "_spec", None)
+        if spec is not None and normalized == str(spec.procedure_id).casefold():
+            resolved = str(
+                spec.get_scenario_runtime_requirements().procedure_type
+            ).strip().casefold()
+            if resolved:
+                return resolved
         return normalized
+
+    def _adjustment_target_by_side(self) -> dict[RetractionTargetSide, str]:
+        procedure_type = self._public_procedure_type(
+            self._world.procedure_id
+            if self._world is not None
+            else self._spec.procedure_id
+        )
+        if procedure_type == "inguinal_hernia_repair":
+            return {
+                RetractionTargetSide.LEFT: "left_army_navy",
+                RetractionTargetSide.RIGHT: "right_army_navy",
+                RetractionTargetSide.BOTH: "both_army_navy",
+            }
+        return {
+            RetractionTargetSide.LEFT: "left_malleable",
+            RetractionTargetSide.RIGHT: "right_malleable",
+            RetractionTargetSide.BOTH: "both_malleable",
+        }
 
     @staticmethod
     def _aggregate_controller_state(arms_by_role: dict[str, object]) -> str:
@@ -682,6 +904,66 @@ class BedRobotArmGroupOrchestrator(Node):
             reason=reason,
         )
 
+    @staticmethod
+    def _voice_intent_stamp_sec(stamp: object) -> float:
+        try:
+            return float(stamp.sec) + float(stamp.nanosec) / 1_000_000_000.0
+        except (AttributeError, TypeError, ValueError):
+            return 0.0
+
+    def _typed_voice_intent_source_rejection_reason(
+        self, msg: VoiceCommandIntent
+    ) -> str:
+        """Reject a legacy/replayed typed proposal before Service routing."""
+
+        if not bool(
+            getattr(self, "_require_voice_intent_source_metadata", False)
+        ):
+            return ""
+        utterance_id = str(getattr(msg, "utterance_id", "") or "").strip()
+        source = str(getattr(msg, "source", "") or "").strip()
+        if not utterance_id:
+            return "typed_intent_missing_utterance_id"
+        if not source:
+            return "typed_intent_missing_source"
+        if not bool(getattr(msg, "source_is_final", False)):
+            return "typed_intent_source_not_final"
+        source_stamp = self._voice_intent_stamp_sec(
+            getattr(getattr(msg, "header", None), "stamp", None)
+        )
+        if not math.isfinite(source_stamp) or source_stamp <= 0.0:
+            return "typed_intent_missing_source_timestamp"
+        now_sec = self._voice_intent_stamp_sec(self._stamp())
+        if not math.isfinite(now_sec) or now_sec <= 0.0:
+            return "typed_intent_unavailable_local_clock"
+        age_sec = now_sec - source_stamp
+        if age_sec > float(getattr(self, "_voice_intent_max_age_sec", 3.0)):
+            return f"typed_intent_stale:{age_sec:.3f}s"
+        if age_sec < -float(
+            getattr(self, "_voice_intent_future_tolerance_sec", 1.0)
+        ):
+            return f"typed_intent_future_timestamp:{-age_sec:.3f}s"
+
+        now_monotonic = time.monotonic()
+        retention_sec = max(
+            1.0,
+            float(
+                getattr(self, "_voice_intent_dedupe_retention_sec", 120.0)
+            ),
+        )
+        seen = getattr(self, "_recent_typed_voice_intent_ids", None)
+        if seen is None:
+            seen = {}
+            self._recent_typed_voice_intent_ids = seen
+        cutoff = now_monotonic - retention_sec
+        for key in [key for key, seen_at in seen.items() if seen_at < cutoff]:
+            seen.pop(key, None)
+        replay_key = f"{source}:{utterance_id}"
+        if replay_key in seen:
+            return "typed_intent_duplicate_utterance_id"
+        seen[replay_key] = now_monotonic
+        return ""
+
     def _normalize_typed_retractor_intent(
         self, msg: VoiceCommandIntent
     ) -> tuple[NormalizedRetractionCommand, str, str]:
@@ -838,8 +1120,11 @@ class BedRobotArmGroupOrchestrator(Node):
                 raw_text,
                 provenance,
             )
-        if command not in allowed_retractor_commands(
-            self._retractor_voice_state_value()
+        if (
+            not self._retraction_state_machine_suppressed()
+            and command not in allowed_retractor_commands(
+                self._retractor_voice_state_value()
+            )
         ):
             return (
                 self._rejected_typed_retractor_intent(
@@ -883,6 +1168,7 @@ class BedRobotArmGroupOrchestrator(Node):
             if target_side not in {
                 RetractionTargetSide.LEFT,
                 RetractionTargetSide.RIGHT,
+                RetractionTargetSide.BOTH,
             }:
                 return (
                     self._rejected_typed_retractor_intent(
@@ -895,6 +1181,23 @@ class BedRobotArmGroupOrchestrator(Node):
                 return (
                     self._rejected_typed_retractor_intent(
                         "typed_intent_adjustment_distance_is_out_of_range"
+                    ),
+                    raw_text,
+                    provenance,
+                )
+        elif command == RetractionCommand.FINISH_DIRECT_TEACH:
+            if target_side is RetractionTargetSide.BOTH:
+                return (
+                    self._rejected_typed_retractor_intent(
+                        "typed_intent_finish_direct_teach_target_side_is_invalid"
+                    ),
+                    raw_text,
+                    provenance,
+                )
+            if distance_m != 0.0:
+                return (
+                    self._rejected_typed_retractor_intent(
+                        "typed_intent_finish_direct_teach_distance_is_not_zero"
                     ),
                     raw_text,
                     provenance,
@@ -931,6 +1234,45 @@ class BedRobotArmGroupOrchestrator(Node):
         executable typed proposal into the existing guarded Service lane.
         """
 
+        function_request_id = str(
+            getattr(msg, "function_request_id", "") or ""
+        ).strip()
+        gateway_instance_id = str(
+            getattr(msg, "gateway_instance_id", "") or ""
+        ).strip()
+        procedure_run_id = str(
+            getattr(msg, "procedure_run_id", "") or ""
+        ).strip()
+        source_rejection_reason = self._typed_voice_intent_source_rejection_reason(
+            msg
+        )
+        if source_rejection_reason:
+            pending_request = getattr(
+                self, "_normalized_retractor_request_messages", {}
+            ).get(function_request_id)
+            if (
+                source_rejection_reason
+                == "typed_intent_duplicate_utterance_id"
+                and pending_request is not None
+                and function_request_id
+                not in getattr(self, "_dispatched_request_ids", set())
+            ):
+                self._request_pub.publish(pending_request)
+            self._publish_retractor_voice_status(
+                normalized=self._rejected_typed_retractor_intent(
+                    source_rejection_reason
+                ),
+                interpreter_source=VOICE_COMMAND_INTENT_SOURCE,
+                vlm_invoked=False,
+                stage="typed_intent_rejected",
+                detail="typed_voice_intent:source_metadata",
+                request_id=function_request_id,
+                gateway_instance_id=gateway_instance_id,
+                procedure_run_id=procedure_run_id,
+                function_request_id=function_request_id,
+            )
+            return
+
         normalized, raw_text, provenance = self._normalize_typed_retractor_intent(
             msg
         )
@@ -946,6 +1288,10 @@ class BedRobotArmGroupOrchestrator(Node):
                 vlm_invoked=False,
                 stage="typed_intent_rejected",
                 detail=detail,
+                request_id=function_request_id,
+                gateway_instance_id=gateway_instance_id,
+                procedure_run_id=procedure_run_id,
+                function_request_id=function_request_id,
             )
             return
 
@@ -959,17 +1305,35 @@ class BedRobotArmGroupOrchestrator(Node):
                 vlm_invoked=False,
                 stage="typed_intent_rejected",
                 detail=detail,
+                request_id=function_request_id,
+                gateway_instance_id=gateway_instance_id,
+                procedure_run_id=procedure_run_id,
+                function_request_id=function_request_id,
             )
             return
         now = time.monotonic()
         recent = self._recent_voice_requests.get(signature)
         if recent is not None and now - recent[1] <= self._VOICE_DEDUP_SEC:
+            pending_request = getattr(
+                self, "_normalized_retractor_request_messages", {}
+            ).get(function_request_id)
+            if (
+                pending_request is not None
+                and str(recent[0] or "") == function_request_id
+                and function_request_id
+                not in getattr(self, "_dispatched_request_ids", set())
+            ):
+                self._request_pub.publish(pending_request)
             self._publish_retractor_voice_status(
                 normalized=normalized,
                 interpreter_source=VOICE_COMMAND_INTENT_SOURCE,
                 vlm_invoked=False,
                 stage="typed_intent_duplicate_suppressed",
                 detail=detail,
+                request_id=str(recent[0] or ""),
+                gateway_instance_id=gateway_instance_id,
+                procedure_run_id=procedure_run_id,
+                function_request_id=function_request_id,
             )
             return
         self._submit_normalized_retractor_request(
@@ -979,6 +1343,10 @@ class BedRobotArmGroupOrchestrator(Node):
             interpreter_source=VOICE_COMMAND_INTENT_SOURCE,
             vlm_invoked=False,
             detail=detail,
+            request_id=function_request_id,
+            gateway_instance_id=gateway_instance_id,
+            procedure_run_id=procedure_run_id,
+            function_request_id=function_request_id,
         )
 
     def _publish_retractor_voice_status(
@@ -991,6 +1359,9 @@ class BedRobotArmGroupOrchestrator(Node):
         detail: str,
         request_id: str = "",
         command_id: str = "",
+        gateway_instance_id: str = "",
+        procedure_run_id: str = "",
+        function_request_id: str = "",
     ) -> None:
         """Publish provenance without exposing the raw surgeon transcript.
 
@@ -1008,6 +1379,22 @@ class BedRobotArmGroupOrchestrator(Node):
             "vlm_invoked": bool(vlm_invoked),
             "stage": str(stage),
             "state": state.value,
+            # In virtual integration mode this is the local admission state,
+            # not a controller-owned physical arm state.  Publish the fixed
+            # launch configuration so consumers cannot infer otherwise.
+            "robot_endpoint_source": str(
+                getattr(self, "_robot_endpoint_source", "external")
+            ),
+            "retraction_endpoint_source": str(
+                getattr(
+                    self,
+                    "_retraction_endpoint_source",
+                    getattr(self, "_robot_endpoint_source", "external"),
+                )
+            ),
+            "retraction_state_machine_suppressed": (
+                self._retraction_state_machine_suppressed()
+            ),
             "command": normalized.command.value if normalized.command else "",
             "target_side": normalized.target_side.value,
             "distance_m": float(normalized.distance_m),
@@ -1018,6 +1405,12 @@ class BedRobotArmGroupOrchestrator(Node):
             payload["request_id"] = request_id
         if command_id:
             payload["command_id"] = command_id
+        if gateway_instance_id:
+            payload["gateway_instance_id"] = gateway_instance_id
+        if procedure_run_id:
+            payload["procedure_run_id"] = procedure_run_id
+        if function_request_id:
+            payload["function_request_id"] = function_request_id
         message = String()
         message.data = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         publisher.publish(message)
@@ -1031,6 +1424,10 @@ class BedRobotArmGroupOrchestrator(Node):
         interpreter_source: str,
         vlm_invoked: bool,
         detail: str,
+        request_id: str = "",
+        gateway_instance_id: str = "",
+        procedure_run_id: str = "",
+        function_request_id: str = "",
     ) -> None:
         if normalized.command is None:
             self._publish_retractor_voice_status(
@@ -1044,7 +1441,9 @@ class BedRobotArmGroupOrchestrator(Node):
         operation = _OPERATION_BY_RETRACTION_COMMAND[normalized.command]
         request = BedRobotArmGroupRequest()
         request.stamp = self._stamp()
-        request.request_id = f"voice-{uuid.uuid4().hex}"
+        request.request_id = str(request_id or "").strip() or (
+            f"voice-{uuid.uuid4().hex}"
+        )
         request.group_id = GROUP_RETRACTION
         request.operation = operation
         request.voice_text = transcript
@@ -1054,18 +1453,33 @@ class BedRobotArmGroupOrchestrator(Node):
         request.phase_id = self._world.filtered_phase if self._world is not None else ""
         request.source = f"{RETRACTOR_VOICE_NORMALIZER_SOURCE}:{interpreter_source}"
         if normalized.command == RetractionCommand.ADJUST_RETRACTION:
-            request.adjustment_mode = "single"
-            request.target_retractor_id = {
-                RetractionTargetSide.LEFT: "left_malleable",
-                RetractionTargetSide.RIGHT: "right_malleable",
-            }[normalized.target_side]
+            request.adjustment_mode = (
+                "multi"
+                if normalized.target_side is RetractionTargetSide.BOTH
+                else "single"
+            )
+            request.target_retractor_id = self._adjustment_target_by_side()[
+                normalized.target_side
+            ]
             request.direction_frame = DIRECTION_FRAME
+        elif normalized.command == RetractionCommand.FINISH_DIRECT_TEACH:
+            request.arm_id = {
+                RetractionTargetSide.LEFT: "arm_1",
+                RetractionTargetSide.RIGHT: "arm_2",
+            }.get(normalized.target_side, "")
         self._normalized_retractor_requests[request.request_id] = normalized
+        self._normalized_retractor_request_messages[request.request_id] = request
         self._normalized_retractor_sources[request.request_id] = (
             interpreter_source,
             bool(vlm_invoked),
             detail,
         )
+        if gateway_instance_id or procedure_run_id or function_request_id:
+            self._normalized_retractor_function_scopes[request.request_id] = (
+                gateway_instance_id,
+                procedure_run_id,
+                function_request_id,
+            )
         self._recent_voice_requests[signature] = (request.request_id, time.monotonic())
         self._publish_retractor_voice_status(
             normalized=normalized,
@@ -1074,6 +1488,9 @@ class BedRobotArmGroupOrchestrator(Node):
             stage="normalized",
             detail=detail,
             request_id=request.request_id,
+            gateway_instance_id=gateway_instance_id,
+            procedure_run_id=procedure_run_id,
+            function_request_id=function_request_id,
         )
         self._request_pub.publish(request)
 
@@ -1372,8 +1789,17 @@ class BedRobotArmGroupOrchestrator(Node):
         command = normalized.command
         if command is None:
             return normalized.reason or "voice command normalization failed"
-        if command not in allowed_retractor_commands(
-            self._retractor_voice_state_value()
+        policy_decision = self._spec.get_scenario_policy().check_group_voice_command(
+            GROUP_RETRACTION,
+            command.value,
+        )
+        if not policy_decision.allowed:
+            return policy_decision.reason
+        if (
+            not self._retraction_state_machine_suppressed_for_request(request)
+            and command not in allowed_retractor_commands(
+                self._retractor_voice_state_value()
+            )
         ):
             return (
                 "normalized command is no longer allowed in local state "
@@ -1383,15 +1809,34 @@ class BedRobotArmGroupOrchestrator(Node):
         if request.operation != expected_operation:
             return "normalized command operation does not match request"
         if command != RetractionCommand.ADJUST_RETRACTION:
+            if command == RetractionCommand.FINISH_DIRECT_TEACH:
+                if normalized.target_side is RetractionTargetSide.BOTH:
+                    return "normalized finish target side cannot be both"
+                expected_arm_id = {
+                    RetractionTargetSide.LEFT: "arm_1",
+                    RetractionTargetSide.RIGHT: "arm_2",
+                    RetractionTargetSide.NONE: "",
+                }[normalized.target_side]
+                if request.arm_id != expected_arm_id:
+                    return "normalized finish target does not match arm selector"
+            elif request.arm_id:
+                return "normalized non-finish command has an arm selector"
             return ""
-        expected_target = {
-            RetractionTargetSide.LEFT: "left_malleable",
-            RetractionTargetSide.RIGHT: "right_malleable",
-        }.get(normalized.target_side)
+        expected_target = self._adjustment_target_by_side().get(
+            normalized.target_side
+        )
         if expected_target is None:
             return "normalized adjustment target side is invalid"
-        if request.adjustment_mode != "single":
-            return "normalized adjustment must use one retractor side"
+        expected_mode = (
+            "multi"
+            if normalized.target_side is RetractionTargetSide.BOTH
+            else "single"
+        )
+        if request.adjustment_mode != expected_mode:
+            return (
+                "normalized adjustment mode does not match target side "
+                f"(expected {expected_mode})"
+            )
         if request.target_retractor_id != expected_target:
             return "normalized adjustment target does not match target side"
         if request.direction_frame != DIRECTION_FRAME:
@@ -1400,12 +1845,113 @@ class BedRobotArmGroupOrchestrator(Node):
             return "normalized adjustment distance is outside the Service range"
         return ""
 
+    @staticmethod
+    def _policy_aliases_for_request(
+        request: BedRobotArmGroupRequest,
+        normalized: NormalizedRetractionCommand | None,
+    ) -> frozenset[str]:
+        """Return the spec-level capability required by one request.
+
+        The normalized voice lane serializes lifecycle commands in the old
+        envelope with names such as ``start_direct_teach``.  Those are not
+        distinct procedure capabilities: they are all commands of the single
+        retraction Service.  Keeping that translation here means typed voice
+        requests cannot bypass ``allowed_operations`` merely because their
+        wire spelling differs from an adjustment request.
+        """
+
+        if normalized is not None:
+            if normalized.command in _RETRACTION_SERVICE_COMMANDS:
+                return frozenset({OP_ADJUSTMENT, POLICY_ADJUSTMENT})
+            if normalized.command is RetractionCommand.CHANGE_TOOL:
+                return frozenset({OP_TOOL_CHANGE, POLICY_TOOL_CHANGE})
+            return frozenset()
+        return frozenset(
+            {
+                OP_ADJUSTMENT: {OP_ADJUSTMENT, POLICY_ADJUSTMENT},
+                OP_TOOL_CHANGE: {OP_TOOL_CHANGE, POLICY_TOOL_CHANGE},
+            }.get(request.operation, {request.operation})
+        )
+
+    def _tool_change_guard_reason(
+        self,
+        request: BedRobotArmGroupRequest,
+        state: BedRobotArmGroupState | None,
+    ) -> str:
+        """Require an explicit, phase-authorized mounting transition.
+
+        A controller-owned initial profile means an end effector was mounted
+        before this Taskplanner run; it is not evidence that the planner may
+        mount or swap one.  Every actual tool-change request therefore needs
+        both the procedure capability and a matching transition in the active
+        phase.  This guard is intentionally shared by legacy and normalized
+        voice requests.
+        """
+
+        active_conflict = bool(
+            state
+            and (
+                state.active_command_id
+                or (
+                    state.active_request_id
+                    and state.active_request_id != request.request_id
+                )
+            )
+        )
+        if active_conflict or (
+            state is not None and state.state in self._RETRACTION_BUSY_STATES
+        ):
+            return (
+                "group operation is blocked while retraction state is "
+                f"'{state.state if state is not None else 'unknown'}'"
+            )
+        if self._controller_status_required():
+            expected_arm_id = self._controller_arm_id_for_role("army_navy")
+            if not expected_arm_id:
+                return "army_navy retraction role is unavailable"
+            if request.arm_id not in ARM_IDS:
+                return "tool_change requires arm_id arm_1 or arm_2"
+            if request.arm_id != expected_arm_id:
+                return "tool_change arm_id does not match controller role assignment"
+        if request.target_tool_id not in TARGET_TOOL_IDS:
+            return "tool_change target_tool_id is unsupported"
+        if self._controller_status_required():
+            target_arm = self._controller_arms_by_role["army_navy"]
+            if (
+                bool(target_arm.direct_teach_active)
+                or target_arm.state != "standby"
+            ):
+                return "tool_change requires the retraction arm to be standby"
+
+        transitions = self._spec.get_bed_robot_arm_end_effector_transitions(
+            self._world.filtered_phase
+        )
+        transition_allowed = any(
+            transition.group_id == GROUP_RETRACTION
+            and (
+                getattr(transition, "target_tool_id", "")
+                or _TOOL_ALIASES.get(transition.to_profile, "")
+            )
+            == request.target_tool_id
+            for transition in transitions
+        )
+        if not transition_allowed:
+            return (
+                "requested tool transition is not allowed "
+                "for the current procedure phase"
+            )
+        return ""
+
     def _request_guard_reason(self, request: BedRobotArmGroupRequest) -> str:
         if request.group_id != GROUP_RETRACTION:
             return f"unsupported logical group '{request.group_id}'"
+        scenario_policy = self._spec.get_scenario_policy()
+        group_decision = scenario_policy.check_group_enabled(request.group_id)
+        if not group_decision.allowed:
+            return group_decision.reason
         group_config = self._group_config(request.group_id)
-        if group_config is None or not group_config.enabled:
-            return f"group '{request.group_id}' is disabled for procedure '{self._spec.procedure_id}'"
+        if group_config is None:
+            return f"group '{request.group_id}' has no runtime configuration"
         normalized_voice = getattr(
             self, "_normalized_retractor_requests", {}
         ).get(request.request_id.strip())
@@ -1413,14 +1959,15 @@ class BedRobotArmGroupOrchestrator(Node):
             self, "_retractor_voice_normalization_enabled", False
         ):
             return "retractor voice normalization is disabled"
-        policy_aliases = {
-            OP_ADJUSTMENT: {OP_ADJUSTMENT, POLICY_ADJUSTMENT},
-            OP_TOOL_CHANGE: {OP_TOOL_CHANGE, POLICY_TOOL_CHANGE},
-        }.get(request.operation, {request.operation})
-        if normalized_voice is None and not policy_aliases.intersection(
-            group_config.allowed_operations
-        ):
-            return f"operation '{request.operation}' is not allowed for group '{request.group_id}'"
+        policy_aliases = self._policy_aliases_for_request(
+            request, normalized_voice
+        )
+        operation_decision = scenario_policy.check_group_operation(
+            request.group_id,
+            policy_aliases,
+        )
+        if not operation_decision.allowed:
+            return operation_decision.reason
         if self._world is None:
             return "world state is not available"
         if not self._bt_ready:
@@ -1444,14 +1991,15 @@ class BedRobotArmGroupOrchestrator(Node):
             # it only after an admitted start-retraction command.
             if normalized_voice.command == RetractionCommand.STOP_RETRACTION:
                 return ""
-            if state is None or not state.connected or state.state in {
-                "offline",
-                "fault",
-            }:
-                return f"group '{request.group_id}' is not connected and ready"
-            controller_status_reason = self._controller_status_guard()
-            if controller_status_reason:
-                return controller_status_reason
+            if self._controller_status_required():
+                if state is None or not state.connected or state.state in {
+                    "offline",
+                    "fault",
+                }:
+                    return f"group '{request.group_id}' is not connected and ready"
+                controller_status_reason = self._controller_status_guard()
+                if controller_status_reason:
+                    return controller_status_reason
             local_inflight = getattr(self, "_inflight_commands", {}).get(
                 request.group_id
             )
@@ -1464,11 +2012,16 @@ class BedRobotArmGroupOrchestrator(Node):
                     f"'{local_inflight.operation}'"
                 )
             return ""
-        if state is None or not state.connected or state.state in {"offline", "fault"}:
-            return f"group '{request.group_id}' is not connected and ready"
-        controller_status_reason = self._controller_status_guard()
-        if controller_status_reason:
-            return controller_status_reason
+        if self._controller_status_required():
+            if (
+                state is None
+                or not state.connected
+                or state.state in {"offline", "fault"}
+            ):
+                return f"group '{request.group_id}' is not connected and ready"
+            controller_status_reason = self._controller_status_guard()
+            if controller_status_reason:
+                return controller_status_reason
         local_inflight = getattr(self, "_inflight_commands", {}).get(request.group_id)
         if local_inflight is not None and local_inflight.request_id != request.request_id:
             return (
@@ -1476,10 +2029,13 @@ class BedRobotArmGroupOrchestrator(Node):
                 f"'{local_inflight.operation}'"
             )
         active_conflict = bool(
-            state.active_command_id
-            or (
-                state.active_request_id
-                and state.active_request_id != request.request_id
+            state
+            and (
+                state.active_command_id
+                or (
+                    state.active_request_id
+                    and state.active_request_id != request.request_id
+                )
             )
         )
         if active_conflict and state.operation != request.operation:
@@ -1491,76 +2047,57 @@ class BedRobotArmGroupOrchestrator(Node):
             return f"unsupported retraction operation '{request.operation}'"
         if request.group_id == GROUP_RETRACTION:
             if request.operation == OP_ADJUSTMENT and (
-                active_conflict or state.state in self._RETRACTION_BUSY_STATES
+                active_conflict
+                or (
+                    state is not None
+                    and state.state in self._RETRACTION_BUSY_STATES
+                )
             ):
-                return f"retraction is blocked while group state is '{state.state}'"
-            if request.operation == OP_TOOL_CHANGE and (
-                active_conflict or state.state in self._RETRACTION_BUSY_STATES
-            ):
-                return f"group operation is blocked while retraction state is '{state.state}'"
+                return (
+                    "retraction is blocked while group state is "
+                    f"'{state.state if state is not None else 'unknown'}'"
+                )
             if request.operation == OP_ADJUSTMENT:
-                if request.target_retractor_id == MULTI_TARGET:
-                    target_arms = [
-                        self._controller_arms_by_role.get("left_malleable"),
-                        self._controller_arms_by_role.get("right_malleable"),
-                    ]
-                else:
-                    target_arms = [
-                        self._controller_arms_by_role.get(
-                            request.target_retractor_id
-                        )
-                    ]
-                if any(arm is None for arm in target_arms):
-                    return "requested retractor role is unavailable"
-                for arm in target_arms:
-                    arm_state = str(arm.state).strip()
-                    if bool(arm.direct_teach_active) or arm_state == "direct_teach":
-                        return "retraction is blocked while direct teach is active"
-                    if arm_state not in {"standby", "retracting"}:
-                        return (
-                            "retraction adjustment requires controller state "
-                            "standby or retracting"
-                        )
+                if self._controller_status_required():
+                    if request.target_retractor_id in MULTI_TARGETS:
+                        target_arms = [
+                            self._controller_arms_by_role.get(role)
+                            for role in MULTI_TARGET_ROLES[
+                                request.target_retractor_id
+                            ]
+                        ]
+                    else:
+                        target_arms = [
+                            self._controller_arms_by_role.get(
+                                request.target_retractor_id
+                            )
+                        ]
+                    if any(arm is None for arm in target_arms):
+                        return "requested retractor role is unavailable"
+                    for arm in target_arms:
+                        arm_state = str(arm.state).strip()
+                        if (
+                            bool(arm.direct_teach_active)
+                            or arm_state == "direct_teach"
+                        ):
+                            return "retraction is blocked while direct teach is active"
+                        if arm_state not in {"standby", "retracting"}:
+                            return (
+                                "retraction adjustment requires controller state "
+                                "standby or retracting"
+                            )
                 if request.direction_frame != DIRECTION_FRAME:
                     return "retraction adjustment requires direction_frame surgeon_view"
                 if request.adjustment_mode == "single":
                     if request.target_retractor_id not in SINGLE_TARGETS:
                         return "single adjustment requires one malleable target"
                 elif request.adjustment_mode == "multi":
-                    if request.target_retractor_id != MULTI_TARGET:
-                        return "multi adjustment requires both_malleable"
+                    if request.target_retractor_id not in MULTI_TARGETS:
+                        return "multi adjustment requires a bilateral retractor target"
                 else:
                     return "adjustment_mode must be single or multi"
             if request.operation == OP_TOOL_CHANGE:
-                expected_arm_id = self._controller_arm_id_for_role("army_navy")
-                if not expected_arm_id:
-                    return "army_navy retraction role is unavailable"
-                if request.arm_id not in ARM_IDS:
-                    return "tool_change requires arm_id arm_1 or arm_2"
-                if request.arm_id != expected_arm_id:
-                    return "tool_change arm_id does not match controller role assignment"
-                if request.target_tool_id not in TARGET_TOOL_IDS:
-                    return "tool_change target_tool_id is unsupported"
-                target_arm = self._controller_arms_by_role["army_navy"]
-                if bool(target_arm.direct_teach_active) or target_arm.state != "standby":
-                    return "tool_change requires the retraction arm to be standby"
-                transitions = self._spec.get_bed_robot_arm_end_effector_transitions(
-                    self._world.filtered_phase
-                )
-                transition_allowed = any(
-                    transition.group_id == GROUP_RETRACTION
-                    and (
-                        getattr(transition, "target_tool_id", "")
-                        or _TOOL_ALIASES.get(transition.to_profile, "")
-                    )
-                    == request.target_tool_id
-                    for transition in transitions
-                )
-                if not transition_allowed:
-                    return (
-                        "requested tool transition is not allowed "
-                        "for the current procedure phase"
-                    )
+                return self._tool_change_guard_reason(request, state)
         return ""
 
     @staticmethod
@@ -1694,7 +2231,11 @@ class BedRobotArmGroupOrchestrator(Node):
                 f"expected {source_normalized.distance_mm:g} mm"
             )
         state = self._group_states.get(GROUP_RETRACTION)
-        if state is None or not state.connected or state.state in self._RETRACTION_BUSY_STATES:
+        if self._controller_status_required() and (
+            state is None
+            or not state.connected
+            or state.state in self._RETRACTION_BUSY_STATES
+        ):
             return "retraction group became unavailable before proposal approval"
         return ""
 
@@ -1738,8 +2279,15 @@ class BedRobotArmGroupOrchestrator(Node):
             )
             command.confidence = float(normalized_voice.confidence)
             if normalized_voice.command == RetractionCommand.ADJUST_RETRACTION:
-                command.direction = normalized_voice.target_side.value
-                command.axis = "none"
+                if normalized_voice.target_side is RetractionTargetSide.BOTH:
+                    # The public Service carries a bilateral target, not a
+                    # legacy direction vector.  Preserve the semantic that
+                    # both arms receive the same lateral distance.
+                    command.direction = "none"
+                    command.axis = "left_right"
+                else:
+                    command.direction = normalized_voice.target_side.value
+                    command.axis = "none"
                 command.distance_mm = float(normalized_voice.distance_m) * 1000.0
                 command.distance_origin = "normalized_voice"
             self._normalized_retractor_commands[command.command_id] = normalized_voice
@@ -1751,6 +2299,13 @@ class BedRobotArmGroupOrchestrator(Node):
                 bool(vlm_invoked),
                 detail,
             )
+            function_scope = getattr(
+                self, "_normalized_retractor_function_scopes", {}
+            ).get(request.request_id, ("", "", ""))
+            if any(function_scope):
+                self._normalized_retractor_function_scopes[
+                    command.command_id
+                ] = function_scope
             self._publish_retractor_voice_status(
                 normalized=normalized_voice,
                 interpreter_source=source,
@@ -1759,6 +2314,9 @@ class BedRobotArmGroupOrchestrator(Node):
                 detail=detail,
                 request_id=request.request_id,
                 command_id=command.command_id,
+                gateway_instance_id=function_scope[0],
+                procedure_run_id=function_scope[1],
+                function_request_id=function_scope[2],
             )
         self._inflight_commands[request.group_id] = command
         self._dispatched_request_ids.add(request.request_id)
@@ -1823,6 +2381,9 @@ class BedRobotArmGroupOrchestrator(Node):
                 request.request_id,
                 ("deterministic", False, "normalization_source_missing"),
             )
+            function_scope = getattr(
+                self, "_normalized_retractor_function_scopes", {}
+            ).get(request.request_id, ("", "", ""))
             self._publish_retractor_voice_status(
                 normalized=normalized_voice,
                 interpreter_source=source,
@@ -1831,10 +2392,19 @@ class BedRobotArmGroupOrchestrator(Node):
                 detail=reason or error_code or outcome or detail,
                 request_id=request.request_id,
                 command_id=status.command_id,
+                gateway_instance_id=function_scope[0],
+                procedure_run_id=function_scope[1],
+                function_request_id=function_scope[2],
             )
             if command is None:
                 self._normalized_retractor_requests.pop(request.request_id, None)
                 self._normalized_retractor_sources.pop(request.request_id, None)
+                getattr(
+                    self, "_normalized_retractor_request_messages", {}
+                ).pop(request.request_id, None)
+                getattr(
+                    self, "_normalized_retractor_function_scopes", {}
+                ).pop(request.request_id, None)
         self._status_pub.publish(status)
 
     def _apply_retractor_voice_service_admission(
@@ -1860,13 +2430,19 @@ class BedRobotArmGroupOrchestrator(Node):
             msg.command_id,
             ("deterministic", False, "normalization_source_missing"),
         )
+        function_scope = getattr(
+            self, "_normalized_retractor_function_scopes", {}
+        ).get(msg.command_id) or getattr(
+            self, "_normalized_retractor_function_scopes", {}
+        ).get(msg.request_id, ("", "", ""))
         # The bridge uses this exact pair only after validating the public
         # response ``request_accepted`` field and its result code.  Do not use
         # a controller progress/physical-state message as an admission signal.
         accepted = bool(msg.success) and msg.outcome == "accepted"
-        self._retractor_voice_state = apply_retractor_service_admission(
-            self._retractor_voice_state_value(), normalized.command, accepted
-        )
+        if not self._retraction_state_machine_suppressed_for_source(source):
+            self._retractor_voice_state = apply_retractor_service_admission(
+                self._retractor_voice_state_value(), normalized.command, accepted
+            )
         self._publish_retractor_voice_status(
             normalized=normalized,
             interpreter_source=source,
@@ -1875,12 +2451,24 @@ class BedRobotArmGroupOrchestrator(Node):
             detail=msg.message or msg.error_code or msg.outcome or detail,
             request_id=msg.request_id,
             command_id=msg.command_id,
+            gateway_instance_id=function_scope[0],
+            procedure_run_id=function_scope[1],
+            function_request_id=function_scope[2],
         )
         self._normalized_retractor_commands.pop(msg.command_id, None)
         self._normalized_retractor_command_requests.pop(msg.command_id, None)
         self._normalized_retractor_requests.pop(msg.request_id, None)
         self._normalized_retractor_sources.pop(msg.command_id, None)
         self._normalized_retractor_sources.pop(msg.request_id, None)
+        getattr(self, "_normalized_retractor_request_messages", {}).pop(
+            msg.request_id, None
+        )
+        getattr(self, "_normalized_retractor_function_scopes", {}).pop(
+            msg.command_id, None
+        )
+        getattr(self, "_normalized_retractor_function_scopes", {}).pop(
+            msg.request_id, None
+        )
 
     def _on_group_status(self, msg: BedRobotArmGroupStatus) -> None:
         if msg.group_id != GROUP_RETRACTION:
@@ -1986,11 +2574,14 @@ class BedRobotArmGroupOrchestrator(Node):
         self._seen_request_ids.clear()
         self._dispatched_request_ids.clear()
         self._recent_voice_requests.clear()
+        getattr(self, "_recent_typed_voice_intent_ids", {}).clear()
         self._retractor_voice_state = RetractionState.IDLE
         self._normalized_retractor_requests.clear()
         self._normalized_retractor_commands.clear()
         self._normalized_retractor_command_requests.clear()
         self._normalized_retractor_sources.clear()
+        getattr(self, "_normalized_retractor_function_scopes", {}).clear()
+        getattr(self, "_normalized_retractor_request_messages", {}).clear()
         for pending in self._pending_text_vlm_interpretations.values():
             pending.future.cancel()
         self._pending_text_vlm_interpretations.clear()

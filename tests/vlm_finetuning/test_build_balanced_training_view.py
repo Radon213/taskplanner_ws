@@ -7,6 +7,7 @@ from pathlib import Path
 from tools.vlm_finetuning.build_balanced_training_view import (
     STRATUM_QUOTAS,
     TASK_QUOTAS,
+    BalanceError,
     build_balanced_training_view,
     read_jsonl,
     row_stratum,
@@ -52,12 +53,6 @@ def _fixture_rows() -> list[dict[str, object]]:
             split="train",
             task="clinical_observation_interpretation",
             target={"observation": "o", "interpretation": "i"},
-        ),
-        _row(
-            "intent-1",
-            split="train",
-            task="request_intent",
-            target={"intent": "receive_unspecified_tool"},
         ),
     ]
     for stratum in STRATUM_QUOTAS["current_phase"]:
@@ -143,7 +138,7 @@ def test_balanced_view_exact_quotas_and_preserves_nontrain(tmp_path: Path) -> No
     nontrain = [row for row in output_rows if row["split"] != "train"]
 
     assert audit["ok"]
-    assert len(train) == 574
+    assert len(train) == 511
     assert Counter(row["task_type"] for row in train) == Counter(TASK_QUOTAS)
     for task, quotas in STRATUM_QUOTAS.items():
         assert Counter(
@@ -194,3 +189,28 @@ def test_balanced_view_is_byte_deterministic(tmp_path: Path) -> None:
         == (second / "unsloth_messages.jsonl").read_bytes()
     )
     assert first_audit["output"]["sha256"] == second_audit["output"]["sha256"]
+
+
+def test_balanced_view_rejects_visual_hand_tasks(tmp_path: Path) -> None:
+    source = tmp_path / "source.jsonl"
+    rows = _fixture_rows()
+    rows.append(
+        _row(
+            "legacy-request",
+            split="validation",
+            task="request_intent",
+            target={"intent": "receive_unspecified_tool"},
+        )
+    )
+    _write_jsonl(source, rows)
+
+    try:
+        build_balanced_training_view(
+            input_path=source,
+            output_dir=tmp_path / "balanced",
+            seed=3407,
+        )
+    except BalanceError as exc:
+        assert "visual hand tasks are excluded" in str(exc)
+    else:
+        raise AssertionError("visual hand task was admitted to balanced view")

@@ -3,6 +3,11 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 COMPOSE_FILE="${ROOT_DIR}/docker-compose.yml"
+source "${ROOT_DIR}/scripts/lib/taskplanner_mode_policy.sh"
+source "${ROOT_DIR}/scripts/lib/taskplanner_execution.sh"
+CONTAINER_INSTALL_REL="install/docker"
+CONTAINER_INSTALL_ABS="/workspaces/taskplanner_ws/${CONTAINER_INSTALL_REL}"
+CONTAINER_INSTALL_ROOT="${ROOT_DIR}/${CONTAINER_INSTALL_REL}"
 WAIT_TIMEOUT_SEC="${TASKPLANNER_COMPOSE_WAIT_SEC:-300}"
 OPTIONAL_WAIT_TIMEOUT_SEC="${TASKPLANNER_OPTIONAL_WAIT_SEC:-30}"
 RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}/taskplanner"
@@ -37,26 +42,28 @@ Usage:
   scripts/taskplanner help
 
 Commands:
-  up       Start the selected runtime plus webapp, ROS bridge/model registry,
-           and unloaded vLLM/NInfer control planes. Live/replay start RF-DETR
-           only when the selected provider is builtin_rfdetr and its location
-           is local. PERCEPTION_BACKEND remains a legacy compatibility alias.
+  up       Start the selected runtime plus the core web/ROS interfaces. Live
+           uses one NInfer provider and consumes typed RF-DETR observations
+           from 192.168.1.7; it never starts a local detector or PNU worker.
+           Alternative model/perception stacks are Lab-only.
            Standalone Debug starts the read-only PNU worker only for a local
            selection; a remote selection runs only the local ROS adapter.
-           Live starts the USB microphone ASR sidecar before the planner and
-           waits for its ROS status publisher; llm-surgeon does not start it.
+           Live starts its USB microphone ASR sidecar. TTS, multicam, HLS/TV,
+           LAN/Tailnet proxies and Integrated Debug are optional Ops services,
+           disabled by default.
            Omitting a runtime selects Live, the actual external-integration
-           profile. Live requires the integrated Debug observation sidecar in
-           the same UI; it must pass its bridge and status checks before Live
-           is marked ready. LLM Surgeon and Replay do not start that sidecar
-           or the external multicamera observer by default. Manual Debug
+           profile. LLM Surgeon and Replay do not start the Ops plane by
+           default. Manual Debug
            control unlocks only while the operational scenario reports a
-           trusted, fresh stopped state.
+           trusted, fresh paused or fully stopped state with idle resources.
            --replace-active permits an explicit reviewed transition from an
            operational runtime into standalone Debug Mode.
-           Reuses install/ and node_modules unless --build is supplied.
+           Reuses the container-only install/docker overlay and node_modules
+           unless --build is supplied. Host and release builds keep install/.
            --ensure-build validates the selected runtime's install contract
            first and performs the scoped serialized build only when stale.
+           A healthy, fully stopped same-mode operational runtime restarts only
+           its core and preserves the stable model, ASR, and browser I/O services.
   down     Stop and remove every Taskplanner Compose profile.
   status   Show containers from every Taskplanner profile.
   runtime-control
@@ -90,10 +97,8 @@ die() {
 }
 
 validate_mode() {
-  case "${1:-}" in
-    live|llm-surgeon|replay|debug) ;;
-    *) die "mode must be live, llm-surgeon, replay, or debug" ;;
-  esac
+  taskplanner_mode_is_valid "${1:-}" ||
+    die "mode must be live, llm-surgeon, replay, or debug"
 }
 
 compose_env_args() {
@@ -163,15 +168,11 @@ acquire_launcher_lock() {
     die "another Taskplanner start/stop operation is still in progress"
 }
 
-verify_runtime_control_transition_interlock() {
-  if [[ "${TASKPLANNER_RUNTIME_REQUIRE_STOPPED:-0}" != "1" ]]; then
-    return 0
-  fi
-  local expected_mode="${TASKPLANNER_RUNTIME_EXPECTED_ACTIVE_MODE:-}"
+verify_expected_runtime_transition_interlock() {
+  local expected_mode="${1:-}"
+  local failure_message="$2"
   if [[ "${DRY_RUN}" == "true" ]]; then
     print_command verify-runtime-transition-interlock "${expected_mode:-none}"
-    unset TASKPLANNER_RUNTIME_REQUIRE_STOPPED
-    unset TASKPLANNER_RUNTIME_EXPECTED_ACTIVE_MODE
     return 0
   fi
   if ! python3 - "${ROOT_DIR}" "${RUNTIME_CONTROL_STATE_FILE}" "${expected_mode}" <<'PY'
@@ -198,45 +199,68 @@ if not safe:
     raise SystemExit(reason)
 PY
   then
-    die "runtime state changed after the controller safety check; transition cancelled"
+    die "${failure_message}"
   fi
+}
+
+verify_runtime_control_transition_interlock() {
+  if [[ "${TASKPLANNER_RUNTIME_REQUIRE_STOPPED:-0}" != "1" ]]; then
+    return 0
+  fi
+  local expected_mode="${TASKPLANNER_RUNTIME_EXPECTED_ACTIVE_MODE:-}"
+  verify_expected_runtime_transition_interlock \
+    "${expected_mode}" \
+    "runtime state changed after the controller safety check; transition cancelled"
   unset TASKPLANNER_RUNTIME_REQUIRE_STOPPED
   unset TASKPLANNER_RUNTIME_EXPECTED_ACTIVE_MODE
 }
 
-run_serial_workspace_build() {
+verify_same_mode_warm_restart_interlock() {
   local mode="$1"
-  local build_command
-  local -a build_profile_args=(--profile "${mode}" --profile dev)
-  if mode_requires_integrated_debug_observer "${mode}" &&
-      [[ "${INTEGRATED_DEBUG_ENABLED:-true}" == "true" ]]; then
-    build_profile_args+=(--profile debug)
-  fi
+  verify_expected_runtime_transition_interlock \
+    "${mode}" \
+    "same-mode warm restart requires a freshly stopped and reserved runtime; restart cancelled"
+}
 
-  if [[ "${mode}" == "debug" ]]; then
-    build_command="colcon build --symlink-install --packages-up-to integration_debug vlm_node hand_keypoint_interfaces surgical_perception_msgs --cmake-args -DBUILD_TESTING=OFF && test -f install/setup.bash && test -x install/integration_debug/lib/integration_debug/integration_debug_node && test -x install/vlm_node/lib/vlm_node/pnu_perception_bridge && test -f install/hand_keypoint_interfaces/share/ament_index/resource_index/packages/hand_keypoint_interfaces && test -f install/surgical_perception_msgs/share/ament_index/resource_index/packages/surgical_perception_msgs"
-  else
-    build_command="colcon build --symlink-install --cmake-args -DBUILD_TESTING=OFF && test -f install/setup.bash && test -e install/bringup/share/bringup/launch/taskplanner_live.launch.py && test -x install/integration_debug/lib/integration_debug/operational_asr_node"
-  fi
+requested_operational_runtime_is_ready() {
+  local mode="$1"
+  [[ "${DRY_RUN}" != "true" ]] || return 1
+  python3 - "${ROOT_DIR}" "${RUNTIME_CONTROL_STATE_FILE}" "${mode}" <<'PY'
+import importlib.util
+import sys
+from pathlib import Path
 
-  # Every runtime container bind-mounts this workspace, including build/,
-  # install/, and log/. Build once in a foreground one-off container and wait
-  # for its artifact checks before starting any reader of those directories.
-  # The process-wide launcher lock also prevents a second launcher invocation
-  # from starting services in the middle of this critical section.
-  run_or_print \
-    "${COMPOSE[@]}" "${build_profile_args[@]}" \
-    run --rm --no-deps --build -T \
-    --user "$(id -u):$(id -g)" \
-    -e HOME=/tmp/taskplanner-builder \
-    taskplanner-dev bash -lc "${build_command}"
-
-  if [[ "${DRY_RUN}" != "true" ]]; then
-    if [[ "${mode}" == "debug" ]]; then
-      record_debug_install_contract
-    fi
-    printf 'Taskplanner workspace build complete (%s)\n' "${mode}"
-  fi
+root = Path(sys.argv[1]).resolve()
+state_file = Path(sys.argv[2])
+requested_mode = sys.argv[3]
+module_path = root / "scripts" / "taskplanner_runtime_control.py"
+spec = importlib.util.spec_from_file_location("taskplanner_runtime_fast_path", module_path)
+if spec is None or spec.loader is None:
+    raise SystemExit(1)
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+active_mode = module.read_active_mode(state_file)
+try:
+    running = module.compose_service_running(root, requested_mode)
+    contract_matches = module.mode_runtime_contract_matches(root, requested_mode)
+    running_modes = module.detect_running_mode_candidates(root)
+    required_plane_ready = module.mode_required_plane_ready(root, requested_mode)
+except Exception:
+    raise SystemExit(1)
+raise SystemExit(
+    0
+    if module.runtime_request_is_already_ready(
+        requested_mode=requested_mode,
+        active_mode=active_mode,
+        running=running,
+        contract_matches=contract_matches,
+        running_modes=running_modes,
+        required_plane_ready=required_plane_ready,
+    )
+    else 1
+)
+PY
 }
 
 debug_install_contract_fingerprint() {
@@ -280,7 +304,7 @@ PY
 }
 
 debug_install_contract_file() {
-  printf '%s\n' "${ROOT_DIR}/install/.taskplanner-debug-install-contract-v1"
+  printf '%s\n' "${CONTAINER_INSTALL_ROOT}/.taskplanner-debug-install-contract-v1"
 }
 
 record_debug_install_contract() {
@@ -314,6 +338,107 @@ debug_install_contract_matches_source() {
   fi
 }
 
+runtime_install_contract_file() {
+  printf '%s\n' "${CONTAINER_INSTALL_ROOT}/.taskplanner-runtime-abi-contract-v1"
+}
+
+runtime_install_contract_fingerprint() {
+  # Python and launch/config files are symlink-installed and take effect
+  # immediately. Rebuild only for ABI, interface, dependency, or entry-point
+  # changes that actually alter generated/compiled install artifacts.
+  python3 - "${ROOT_DIR}" <<'PY'
+import hashlib
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1]).resolve()
+source_root = root / "src"
+names = {"CMakeLists.txt", "package.xml", "setup.py", "setup.cfg"}
+suffixes = {".action", ".c", ".cc", ".cpp", ".h", ".hpp", ".idl", ".msg", ".srv"}
+ignored = {".pytest_cache", "__pycache__", "build", "install", "log"}
+digest = hashlib.sha256()
+for path in sorted(source_root.rglob("*")):
+    if not path.is_file() or any(part in ignored for part in path.parts):
+        continue
+    if path.name not in names and path.suffix not in suffixes:
+        continue
+    digest.update(path.relative_to(root).as_posix().encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(path.read_bytes())
+    digest.update(b"\0")
+print(digest.hexdigest())
+PY
+}
+
+asr_install_contract_file() {
+  printf '%s\n' "${CONTAINER_INSTALL_ROOT}/.taskplanner-asr-abi-contract-v1"
+}
+
+asr_install_contract_fingerprint() {
+  # Keep ASR hot reload independent of unrelated compiled packages while
+  # still invalidating entry-point/dependency or imported ROS ABI changes.
+  python3 - "${ROOT_DIR}" <<'PY'
+import hashlib
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1]).resolve()
+relative_paths = (
+    "src/integration_debug/package.xml",
+    "src/integration_debug/setup.py",
+    "src/integration_debug/setup.cfg",
+    "src/surgical_msgs/package.xml",
+    "src/surgical_msgs/msg/SpeechUtterance.msg",
+    "src/surgical_msgs/srv/AsrControl.srv",
+)
+digest = hashlib.sha256()
+for relative in relative_paths:
+    path = root / relative
+    digest.update(relative.encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(path.read_bytes())
+    digest.update(b"\0")
+print(digest.hexdigest())
+PY
+}
+
+record_asr_install_contract() {
+  local contract_file expected_fingerprint temporary_file
+  contract_file="$(asr_install_contract_file)"
+  expected_fingerprint="$(asr_install_contract_fingerprint)" ||
+    die "could not fingerprint the ASR ABI contract after build"
+  temporary_file="${contract_file}.tmp.$$"
+  printf '%s\n' "${expected_fingerprint}" >"${temporary_file}" ||
+    die "could not write ASR ABI contract: ${temporary_file}"
+  mv -f "${temporary_file}" "${contract_file}" ||
+    die "could not publish ASR ABI contract: ${contract_file}"
+}
+
+record_runtime_install_contract() {
+  local contract_file expected_fingerprint temporary_file
+  contract_file="$(runtime_install_contract_file)"
+  expected_fingerprint="$(runtime_install_contract_fingerprint)" ||
+    die "could not fingerprint the runtime ABI contract after build"
+  temporary_file="${contract_file}.tmp.$$"
+  printf '%s\n' "${expected_fingerprint}" >"${temporary_file}" ||
+    die "could not write runtime ABI contract: ${temporary_file}"
+  mv -f "${temporary_file}" "${contract_file}" ||
+    die "could not publish runtime ABI contract: ${contract_file}"
+  record_asr_install_contract
+}
+
+runtime_install_contract_matches_source() {
+  local contract_file expected_fingerprint recorded_fingerprint
+  contract_file="$(runtime_install_contract_file)"
+  [[ -s "${contract_file}" ]] || return 1
+  [[ -f "${CONTAINER_INSTALL_ROOT}/setup.bash" ]] || return 1
+  [[ -x "${CONTAINER_INSTALL_ROOT}/voice_command/lib/voice_command/voice_intent_resolver" ]] || return 1
+  [[ -x "${CONTAINER_INSTALL_ROOT}/voice_command/lib/voice_command/vlm_function_admission_gate" ]] || return 1
+  expected_fingerprint="$(runtime_install_contract_fingerprint)" || return 1
+  IFS= read -r recorded_fingerprint <"${contract_file}" || true
+  [[ "${recorded_fingerprint}" == "${expected_fingerprint}" ]]
+}
+
 verify_runtime_install_contract() {
   local mode="$1"
   local debug_pnu_enabled="${2:-false}"
@@ -325,12 +450,29 @@ verify_runtime_install_contract() {
     if [[ "${DRY_RUN}" != "true" ]] && ! debug_install_contract_matches_source; then
       return 1
     fi
-    check_command="source /opt/ros/jazzy/setup.bash && source /opt/btops_ws/install/setup.bash && source /workspaces/taskplanner_ws/install/setup.bash && test -x /workspaces/taskplanner_ws/install/integration_debug/lib/integration_debug/integration_debug_node && ros2 pkg prefix integration_debug >/dev/null"
+    check_command="source /opt/ros/jazzy/setup.bash && source /opt/btops_ws/install/setup.bash && source ${CONTAINER_INSTALL_ABS}/setup.bash && test -x ${CONTAINER_INSTALL_ABS}/integration_debug/lib/integration_debug/integration_debug_node && ros2 pkg prefix integration_debug >/dev/null"
     if [[ "${debug_pnu_enabled}" == "true" ]]; then
-      check_command+=" && test -x /workspaces/taskplanner_ws/install/vlm_node/lib/vlm_node/pnu_perception_bridge && ros2 pkg prefix vlm_node >/dev/null && ros2 pkg prefix hand_keypoint_interfaces >/dev/null && ros2 pkg prefix surgical_perception_msgs >/dev/null && python3 -c 'from hand_keypoint_interfaces.msg import HandKeypoints; from surgical_perception_msgs.msg import ToolPoseArray; import vlm_node.pnu_perception_bridge'"
+      check_command+=" && test -x ${CONTAINER_INSTALL_ABS}/vlm_node/lib/vlm_node/pnu_perception_bridge && ros2 pkg prefix vlm_node >/dev/null && ros2 pkg prefix hand_keypoint_interfaces >/dev/null && ros2 pkg prefix surgical_perception_msgs >/dev/null && python3 -c 'from hand_keypoint_interfaces.msg import HandKeypoints; from surgical_perception_msgs.msg import ToolPoseArray; import vlm_node.pnu_perception_bridge'"
     fi
   else
-    check_command="source /opt/ros/jazzy/setup.bash && source /opt/btops_ws/install/setup.bash && source /workspaces/taskplanner_ws/install/setup.bash && test -x /workspaces/taskplanner_ws/install/voice_command/lib/voice_command/voice_intent_resolver && ros2 pkg prefix voice_command >/dev/null && python3 -c 'from surgical_msgs.msg import VoiceCommandIntent; import voice_command.node; from bt_orchestrator.bed_robot_arm_group_orchestrator import BedRobotArmGroupOrchestrator; from or_digital_twin.node import ORDigitalTwinNode'"
+    # The ABI stamp is a host-side file, so a dry run can inspect it safely.
+    # This makes --dry-run --ensure-build show the same stale-overlay decision
+    # as the real invocation without starting a container.
+    if [[ -s "$(runtime_install_contract_file)" ]]; then
+      runtime_install_contract_matches_source
+      return $?
+    fi
+    # An existing install without the ABI stamp predates this contract and may
+    # contain compiled interfaces from a different dirty-worktree snapshot.
+    # `--ensure-build` must establish the first trusted baseline by rebuilding
+    # once instead of blessing imports that merely happen to exist.
+    if [[ "${ENSURE_BUILD}" == "true" ]]; then
+      return 1
+    fi
+    check_command="source /opt/ros/jazzy/setup.bash && source /opt/btops_ws/install/setup.bash && source ${CONTAINER_INSTALL_ABS}/setup.bash && test -x ${CONTAINER_INSTALL_ABS}/voice_command/lib/voice_command/voice_intent_resolver && ros2 pkg prefix voice_command >/dev/null && python3 -c 'from surgical_msgs.msg import VoiceCommandIntent; import voice_command.node; from bt_orchestrator.bed_robot_arm_group_orchestrator import BedRobotArmGroupOrchestrator; from or_digital_twin.node import ORDigitalTwinNode'"
+    if [[ "${mode}" == "live" ]]; then
+      check_command+=" && test -x ${CONTAINER_INSTALL_ABS}/voice_command/lib/voice_command/vlm_function_admission_gate && python3 -c 'from surgical_msgs.msg import HumanoidReply, VLMFunctionCallStatus; import voice_command.vlm_function_gate'"
+    fi
   fi
   if ! run_or_print \
       "${COMPOSE[@]}" --profile dev run --rm --no-deps -T \
@@ -338,6 +480,9 @@ verify_runtime_install_contract() {
       -e HOME=/tmp/taskplanner-install-check \
       taskplanner-dev bash -lc "${check_command}"; then
     return 1
+  fi
+  if [[ "${DRY_RUN}" != "true" && "${mode}" != "debug" ]]; then
+    record_runtime_install_contract
   fi
 }
 
@@ -390,6 +535,98 @@ raise SystemExit(
     if payload.get("service") == "taskplanner-ninfer-manager"
     else 1
 )
+PY
+}
+
+ensure_ninfer_model_loaded() {
+  local model_id="${TASKPLANNER_NINFER_AUTOLOAD_MODEL_ID:-}"
+  [[ -n "${model_id}" ]] || return 0
+  if [[ "${DRY_RUN}" == "true" ]]; then
+    print_command ensure-ninfer-model-loaded "${model_id}"
+    return 0
+  fi
+
+  local container_id
+  container_id="$(
+    docker ps \
+      --filter label=com.docker.compose.project=taskplanner_ws \
+      --filter label=com.docker.compose.service=ninfer-manager \
+      --filter status=running \
+      --format '{{.ID}}' | head -n 1
+  )"
+  [[ -n "${container_id}" ]] || die "NInfer manager container is not running"
+
+  # Execute inside the manager container so its configured API credential is
+  # never copied into a shell command or printed.  The lifecycle API is
+  # idempotent for the selected model and rejects another loaded/loading model
+  # instead of attempting a second VRAM allocation.
+  docker exec -i "${container_id}" python3 - "${model_id}" <<'PY'
+import json
+import os
+import sys
+import time
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
+model_id = sys.argv[1]
+port = int(os.environ.get("NINFER_MANAGER_PORT", "8080"))
+root = f"http://127.0.0.1:{port}"
+api_key = os.environ.get("NINFER_API_KEY", "").strip()
+headers = {"Content-Type": "application/json"}
+if api_key:
+    headers["Authorization"] = f"Bearer {api_key}"
+
+
+def request(path: str, *, payload: dict[str, str] | None = None) -> dict:
+    data = None if payload is None else json.dumps(payload).encode("utf-8")
+    req = Request(root + path, data=data, headers=headers)
+    try:
+        with urlopen(req, timeout=10.0) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise SystemExit(f"NInfer lifecycle request failed ({exc.code}): {detail}")
+    except (OSError, URLError, ValueError) as exc:
+        raise SystemExit(f"NInfer lifecycle request failed: {exc}")
+    if not isinstance(body, dict):
+        raise SystemExit("NInfer lifecycle response is not a JSON object")
+    return body
+
+
+def model_states() -> dict[str, str]:
+    payload = request("/manager/status")
+    return {
+        str(entry.get("id", "")): str(entry.get("state", ""))
+        for entry in payload.get("models", [])
+        if isinstance(entry, dict)
+    }
+
+
+states = model_states()
+if model_id not in states:
+    raise SystemExit(f"NInfer model is not installed/configured: {model_id}")
+busy = {
+    other_id: state
+    for other_id, state in states.items()
+    if other_id != model_id and state in {"loading", "loaded", "unloading"}
+}
+if busy:
+    raise SystemExit(f"another NInfer model owns the runtime: {busy}")
+if states[model_id] == "unloading":
+    raise SystemExit(f"NInfer model is still unloading: {model_id}")
+if states[model_id] != "loaded":
+    request("/manager/load", payload={"model_id": model_id})
+
+deadline = time.monotonic() + 660.0
+while time.monotonic() < deadline:
+    state = model_states().get(model_id, "missing")
+    if state == "loaded":
+        print(f"NInfer model ready: {model_id}")
+        raise SystemExit(0)
+    if state == "error":
+        raise SystemExit(f"NInfer model load failed: {model_id}")
+    time.sleep(0.5)
+raise SystemExit(f"NInfer model load timed out: {model_id}")
 PY
 }
 
@@ -783,233 +1020,6 @@ validate_pnu_model_digest_pins() {
   fi
 }
 
-wait_for_websocket_endpoint() {
-  local host="$1"
-  local port="$2"
-  local path="$3"
-  local label="$4"
-  local timeout_sec="${5:-${WAIT_TIMEOUT_SEC}}"
-  local owner_container_id="${6:-}"
-  if [[ "${DRY_RUN}" == "true" ]]; then
-    printf '+ wait-for-websocket %q %q %q %q\n' \
-      "${host}" "${port}" "${path}" "${label}"
-    return 0
-  fi
-  [[ "${port}" =~ ^[0-9]+$ ]] || die "${label} port is not numeric: ${port}"
-  (( port >= 1 && port <= 65535 )) || die "${label} port is invalid: ${port}"
-  [[ "${path}" == /* ]] || die "${label} websocket path must start with /"
-  python3 - "${host}" "${port}" "${path}" "${timeout_sec}" "${label}" "${owner_container_id}" <<'PY'
-import base64
-import os
-import socket
-import subprocess
-import sys
-import time
-
-host, port_raw, path, timeout_raw, label, owner_container_id = sys.argv[1:]
-port = int(port_raw)
-timeout = max(1.0, float(timeout_raw))
-deadline = time.monotonic() + timeout
-last_error = "endpoint did not accept a websocket handshake"
-
-while time.monotonic() < deadline:
-    if owner_container_id:
-        try:
-            inspected = subprocess.run(
-                [
-                    "docker",
-                    "inspect",
-                    "--format",
-                    "{{.State.Running}}",
-                    owner_container_id,
-                ],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=0.75,
-            )
-        except (OSError, subprocess.TimeoutExpired) as error:
-            raise SystemExit(f"{label} owner state could not be checked: {error}")
-        if inspected.returncode != 0 or inspected.stdout.strip() != "true":
-            raise SystemExit(f"{label} owner container exited before the endpoint became ready")
-    try:
-        key = base64.b64encode(os.urandom(16)).decode("ascii")
-        request = (
-            f"GET {path} HTTP/1.1\r\n"
-            f"Host: {host}:{port}\r\n"
-            "Upgrade: websocket\r\n"
-            "Connection: Upgrade\r\n"
-            f"Sec-WebSocket-Key: {key}\r\n"
-            "Sec-WebSocket-Version: 13\r\n\r\n"
-        ).encode("ascii")
-        with socket.create_connection((host, port), timeout=1.0) as connection:
-            connection.settimeout(1.0)
-            connection.sendall(request)
-            response = bytearray()
-            while b"\r\n\r\n" not in response and len(response) < 8192:
-                chunk = connection.recv(4096)
-                if not chunk:
-                    break
-                response.extend(chunk)
-        status_line = bytes(response).split(b"\r\n", 1)[0]
-        if status_line.startswith((b"HTTP/1.1 101 ", b"HTTP/1.0 101 ")):
-            print(f"{label}: websocket ready on {host}:{port}{path}")
-            raise SystemExit(0)
-        last_error = f"unexpected handshake response: {status_line[:120]!r}"
-    except OSError as error:
-        last_error = str(error)
-    time.sleep(0.1)
-
-raise SystemExit(f"{label} was not ready after {timeout:g}s: {last_error}")
-PY
-}
-
-wait_for_mode_rosbridge() {
-  local mode="$1"
-  local router_port runtime_service owner_container_id=""
-  router_port="$(
-    compose_environment_value \
-      "${mode}" webapp VITE_ROSBRIDGE_TAILSCALE_PORT 9091
-  )"
-  local websocket_path="/"
-  case "${mode}" in
-    live)
-      runtime_service="taskplanner-runtime"
-      websocket_path="$(
-        compose_environment_value \
-          "${mode}" webapp VITE_ROSBRIDGE_LIVE_TAILSCALE_PATH /live
-      )"
-      ;;
-    llm-surgeon)
-      runtime_service="taskplanner-runtime"
-      websocket_path="$(
-        compose_environment_value \
-          "${mode}" webapp VITE_ROSBRIDGE_LLM_TAILSCALE_PATH /llm
-      )"
-      ;;
-    replay)
-      runtime_service="shadow-runner"
-      websocket_path="$(
-        compose_environment_value \
-          "${mode}" webapp VITE_ROSBRIDGE_SHADOW_TAILSCALE_PATH /shadow
-      )"
-      ;;
-    debug)
-      runtime_service="integration-debug"
-      ;;
-  esac
-  local timeout_sec="${TASKPLANNER_ROSBRIDGE_WAIT_TIMEOUT_SEC:-30}"
-  [[ "${timeout_sec}" =~ ^[0-9]+$ && "${timeout_sec}" -ge 1 ]] ||
-    die "TASKPLANNER_ROSBRIDGE_WAIT_TIMEOUT_SEC must be a positive integer"
-  if [[ "${DRY_RUN}" != "true" ]]; then
-    owner_container_id="$(
-      "${COMPOSE[@]}" --profile "${mode}" ps -q "${runtime_service}"
-    )"
-    [[ -n "${owner_container_id}" ]] ||
-      die "${mode} runtime container is unavailable before ROS bridge readiness"
-  fi
-  wait_for_websocket_endpoint \
-    127.0.0.1 "${router_port}" "${websocket_path}" \
-    "${mode} ROS bridge router" "${timeout_sec}" "${owner_container_id}"
-}
-
-wait_for_multicam_observer() {
-  local mode="$1"
-  local router_port
-  router_port="$(
-    compose_environment_value \
-      "${mode}" webapp VITE_ROSBRIDGE_DEBUG_PORT 9091
-  )"
-  # Camera publishers and /multicam_node/capture_status are intentionally not
-  # boot prerequisites.  The operator UI reports their absence separately;
-  # startup only verifies that the read-only observer websocket is reachable.
-  wait_for_websocket_endpoint \
-    127.0.0.1 "${router_port}" /multicam "multicam observer" \
-    "${TASKPLANNER_MULTICAM_OBSERVER_WAIT_TIMEOUT_SEC:-8}"
-}
-
-wait_for_mode_semantic_ready() {
-  local mode="$1"
-  local service topic message_type control_service control_service_type
-  local expected_case="" expected_bundle=""
-  case "${mode}" in
-    live|llm-surgeon)
-      service="taskplanner-runtime"
-      topic="/simulation/state"
-      message_type="surgical_msgs/msg/SimulationState"
-      control_service="/simulation/control"
-      control_service_type="surgical_msgs/srv/ControlSimulation"
-      expected_bundle="$(
-        compose_environment_value \
-          "${mode}" taskplanner-runtime TASKPLANNER_DEFAULT_BUNDLE thyroidectomy
-      )"
-      ;;
-    replay)
-      service="shadow-runner"
-      topic="/shadow/replay_state"
-      message_type="surgical_msgs/msg/ShadowReplayState"
-      control_service="/shadow/control_replay"
-      control_service_type="surgical_msgs/srv/ControlShadowReplay"
-      expected_case="$(
-        compose_environment_value \
-          "${mode}" shadow-runner SHADOW_CASE_ID "${SHADOW_CASE_ID:-0704_6}"
-      )"
-      ;;
-    debug)
-      service="integration-debug"
-      topic="/integration/debug/status"
-      message_type="std_msgs/msg/String"
-      control_service="/integration/debug/check_readiness"
-      control_service_type="std_srvs/srv/Trigger"
-      ;;
-    *)
-      die "unsupported semantic readiness mode: ${mode}"
-      ;;
-  esac
-  if [[ "${DRY_RUN}" == "true" ]]; then
-    printf '+ wait-for-ros-semantic-ready %q %q %q %q %q %q %q\n' \
-      "${mode}" "${service}" "${topic}" "${message_type}" \
-      "${control_service}" "${control_service_type}" "${expected_bundle}"
-    return 0
-  fi
-
-  local timeout_sec="${TASKPLANNER_SEMANTIC_READY_TIMEOUT_SEC:-30}"
-  [[ "${timeout_sec}" =~ ^[0-9]+$ && "${timeout_sec}" -ge 1 ]] ||
-    die "TASKPLANNER_SEMANTIC_READY_TIMEOUT_SEC must be a positive integer"
-  local deadline=$((SECONDS + timeout_sec))
-  while (( SECONDS < deadline )); do
-    if "${COMPOSE[@]}" --profile "${mode}" exec -T "${service}" \
-        bash -lc 'set -o pipefail
-          source /opt/ros/jazzy/setup.bash
-          source /opt/btops_ws/install/setup.bash
-          source /workspaces/taskplanner_ws/install/setup.bash
-          actual_type="$(timeout 8 ros2 service type "$1")"
-          [[ "${actual_type}" == "$2" ]]
-          if [[ "$5" == "live" || "$5" == "llm-surgeon" ]]; then
-            publisher_info="$(timeout 8 ros2 topic info --no-daemon -v "$3")"
-            [[ "$(grep -c "Node name: or_digital_twin$" <<<"${publisher_info}")" == "1" ]]
-            [[ "$(awk "/^Publisher count:/{print \$3; exit}" <<<"${publisher_info}")" == "1" ]]
-            transition_service="/simulation/check_transition_ready"
-            transition_type="std_srvs/srv/Trigger"
-            [[ "$(timeout 8 ros2 service type "${transition_service}")" == "${transition_type}" ]]
-            timeout 8 ros2 service call "${transition_service}" "${transition_type}" "{}" |
-              grep -Eq "success=(True|true)"
-          elif [[ "$5" == "debug" ]]; then
-            timeout 8 ros2 service call "$1" "$2" "{}" |
-              grep -Eq "success=(True|False), message="
-          fi
-          timeout 8 ros2 topic echo --once --no-daemon --spin-time 1 --timeout 5 --flow-style --full-length "$3" "$4" |
-            python3 /workspaces/taskplanner_ws/scripts/taskplanner_ros_readiness.py --mode "$5" --expected-case "$6" --expected-bundle "$7"' \
-        -- "${control_service}" "${control_service_type}" "${topic}" \
-        "${message_type}" "${mode}" "${expected_case}" "${expected_bundle}"; then
-      printf '%s ROS semantic readiness: received %s\n' "${mode}" "${topic}"
-      return 0
-    fi
-    sleep 0.2
-  done
-  die "${mode} ROS semantic readiness timed out waiting for ${topic}"
-}
-
 endpoint_host_port() {
   python3 - "$1" "$2" <<'PY'
 import sys
@@ -1223,21 +1233,122 @@ else:
     die "ASR run directory is not writable by UID $(id -u): ${run_root}/asr"
 }
 
-compose_base() {
-  COMPOSE=(docker compose --project-directory "${ROOT_DIR}")
-  COMPOSE+=(-f "${COMPOSE_FILE}")
-  COMPOSE+=("${ENV_ARGS[@]}")
+prepare_vlm_reply_outbox_state() {
+  local mode="$1"
+  local state_root
+  state_root="$(
+    "${COMPOSE[@]}" --profile "${mode}" config --format json |
+      python3 -c '
+import json
+import sys
+
+config = json.load(sys.stdin)
+for volume in config["services"]["taskplanner-runtime"].get("volumes", []):
+    if volume.get("type") == "bind" and volume.get("target") == "/taskplanner-tts-state":
+        print(volume["source"])
+        break
+else:
+    raise SystemExit("taskplanner-runtime /taskplanner-tts-state bind mount is missing")
+'
+  )"
+  [[ -n "${state_root}" ]] ||
+    die "cannot resolve the VLM reply outbox state directory"
+  if [[ "${DRY_RUN}" == "true" ]]; then
+    print_command install -d -m 0700 "${state_root}"
+    return 0
+  fi
+  install -d -m 0700 "${state_root}" 2>/dev/null ||
+    die "VLM reply outbox state directory cannot be created: ${state_root}"
+  [[ -w "${state_root}" ]] ||
+    die "VLM reply outbox state is not writable by UID $(id -u): ${state_root}"
 }
 
-all_profiles() {
-  ALL_PROFILE_ARGS=(
-    --profile live
-    --profile llm-surgeon
-    --profile replay
-    --profile shadow
-    --profile debug
-    --profile dev
+prepare_execution_ledger_state() {
+  local mode="$1"
+  local state_root
+  state_root="$(
+    "${COMPOSE[@]}" --profile "${mode}" config --format json |
+      python3 -c '
+import json
+import sys
+
+config = json.load(sys.stdin)
+for volume in config["services"]["taskplanner-runtime"].get("volumes", []):
+    if volume.get("type") == "bind" and volume.get("target") == "/taskplanner-execution-state":
+        print(volume["source"])
+        break
+else:
+    raise SystemExit("taskplanner-runtime /taskplanner-execution-state bind mount is missing")
+'
+  )"
+  [[ -n "${state_root}" ]] ||
+    die "cannot resolve the Taskplanner execution ledger state directory"
+  if [[ "${DRY_RUN}" == "true" ]]; then
+    print_command install -d -m 0700 "${state_root}"
+    return 0
+  fi
+  install -d -m 0700 "${state_root}" 2>/dev/null ||
+    die "execution ledger state directory cannot be created: ${state_root}"
+  [[ -w "${state_root}" ]] ||
+    die "execution ledger state is not writable by UID $(id -u): ${state_root}"
+}
+
+prepare_tts_runtime() {
+  local -a tts_contract
+  mapfile -t tts_contract < <(
+    "${COMPOSE[@]}" --profile live --profile ops config --format json |
+      python3 -c '
+import json
+import sys
+
+config = json.load(sys.stdin)
+service = config["services"]["taskplanner-tts"]
+sources = {
+    volume["target"]: volume["source"]
+    for volume in service.get("volumes", [])
+    if volume.get("type") == "bind"
+}
+for target in (
+    "/models/supertonic-3",
+    "/taskplanner-tts-state",
+    "/taskplanner-tts-cache",
+):
+    if target not in sources:
+        raise SystemExit(f"taskplanner-tts bind mount is missing: {target}")
+    print(sources[target])
+print(service.get("environment", {}).get("TASKPLANNER_TTS_VOICE_ID", "F1"))
+'
   )
+  if [[ "${#tts_contract[@]}" -ne 4 ]]; then
+    die "cannot resolve the taskplanner-tts model/state/cache contract"
+  fi
+
+  local model_root="${tts_contract[0]}"
+  local state_root="${tts_contract[1]}"
+  local cache_root="${tts_contract[2]}"
+  local voice_id="${tts_contract[3]}"
+  if [[ "${DRY_RUN}" == "true" ]]; then
+    print_command test -f "${model_root}/onnx/tts.json"
+    print_command test -f "${model_root}/voice_styles/${voice_id}.json"
+    print_command mkdir -p "${state_root}" "${cache_root}"
+    return 0
+  fi
+
+  [[ -f "${model_root}/onnx/tts.json" ]] ||
+    die "Supertonic model is missing: ${model_root}/onnx/tts.json"
+  [[ -f "${model_root}/voice_styles/${voice_id}.json" ]] ||
+    die "Supertonic voice is missing: ${model_root}/voice_styles/${voice_id}.json"
+  mkdir -p "${state_root}" "${cache_root}" 2>/dev/null ||
+    die "TTS state/cache directories cannot be created"
+  [[ -w "${state_root}" ]] ||
+    die "TTS state directory is not writable by UID $(id -u): ${state_root}"
+  [[ -w "${cache_root}" ]] ||
+    die "TTS cache directory is not writable by UID $(id -u): ${cache_root}"
+
+  local user_runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+  local pipewire_socket="${TASKPLANNER_PIPEWIRE_SOCKET:-${user_runtime_dir}/pipewire-0}"
+  [[ -S "${pipewire_socket}" ]] ||
+    die "Ubuntu PipeWire output is unavailable: ${pipewire_socket}"
 }
 
 assert_debug_runtime_is_exclusive() {
@@ -1250,22 +1361,37 @@ assert_debug_runtime_is_exclusive() {
   fi
 }
 
-mode_requires_integrated_debug_observer() {
-  case "$1" in
-    live) return 0 ;;
-    *) return 1 ;;
-  esac
-}
+start_operational_asr_capture() {
+  local timeout_sec="${TASKPLANNER_ASR_START_TIMEOUT_SEC:-20}"
+  if [[ ! "${timeout_sec}" =~ ^[1-9][0-9]*$ ]]; then
+    die "TASKPLANNER_ASR_START_TIMEOUT_SEC must be a positive integer"
+  fi
+  local request="{operation: start, device_id: -1, server_url: '', route_policy: ''}"
+  local start_script
+  start_script='set -euo pipefail
+# ROS setup scripts probe optional variables before defining them. Keep
+# nounset disabled only while sourcing the reviewed environments.
+set +u
+source /opt/ros/jazzy/setup.bash
+source /opt/btops_ws/install/setup.bash
+source /workspaces/taskplanner_ws/install/docker/setup.bash
+set -u
+response="$(timeout "$1" ros2 service call /input/asr/control surgical_msgs/srv/AsrControl "$2")"
+printf "%s\n" "$response"
+# Warm Live restarts preserve an already-active capture session. Accept only
+# the exact node response; every other rejection still fails.
+grep -q "accepted=True" <<<"$response" ||
+  grep -Fq "ASR microphone session is already active" <<<"$response"'
 
-mode_uses_multicam_observer() {
-  case "$1" in
-    live|debug) return 0 ;;
-    *) return 1 ;;
-  esac
-}
+  if [[ "${DRY_RUN}" == "true" ]]; then
+    print_command \
+      "${COMPOSE[@]}" --profile live exec -T taskplanner-asr \
+      bash -lc "${start_script}" taskplanner-asr-start "${timeout_sec}" "${request}"
+    return 0
+  fi
 
-mode_uses_operational_asr_sidecar() {
-  [[ "$1" == "live" ]]
+  "${COMPOSE[@]}" --profile live exec -T taskplanner-asr \
+    bash -lc "${start_script}" taskplanner-asr-start "${timeout_sec}" "${request}"
 }
 
 prepare_debug_audio_runtime() {
@@ -1354,12 +1480,13 @@ case "${action}" in
     fi
 
     # Runtime services never mutate the shared colcon workspace themselves.
-    # --build is handled by run_serial_workspace_build below.
+    # The common execution layer handles --build before any new reader starts.
     export TASKPLANNER_REBUILD_ON_START=false
     # Container profiles own this URI. A shell value often points at a host
     # path and would otherwise override the mode file with an unreadable DDS
     # configuration inside the container. Put deliberate overrides in .env.
     unset CYCLONEDDS_URI
+    enforce_runtime_mode_contract "${mode}"
     acquire_launcher_lock
     ensure_runtime_control_service
 
@@ -1382,12 +1509,11 @@ case "${action}" in
       export ENABLE_PNU_DEBUG_PERCEPTION=false
     fi
     if [[ "${mode}" == "live" || "${mode}" == "replay" ]]; then
-      # Operational PNU readiness means all three pinned models. Keep this an
+      # Operational PNU readiness means both pinned Tool/Blood models. Keep this
       # invariant even if a shell override is used for a separate Debug test.
-      export PNU_WORKER_REQUIRED_ALGORITHMS=tool,blood,hand
+      export PNU_WORKER_REQUIRED_ALGORITHMS=tool,blood
     fi
-    compose_base
-    all_profiles
+    taskplanner_compose_init
     trap cleanup_failed_runtime_start EXIT
     public_rosbridge_enabled="false"
     perception_backend="local"
@@ -1401,7 +1527,7 @@ case "${action}" in
     pnu_client_api_token_file=""
     pnu_worker_api_token_file=""
     pnu_allow_unauthenticated_remote="false"
-    pnu_requested_algorithms="tool,blood,hand"
+    pnu_requested_algorithms="tool,blood"
     debug_pnu_enabled="false"
     perception_mode_enabled="false"
     perception_consumer_service="taskplanner-runtime"
@@ -1469,8 +1595,8 @@ case "${action}" in
         esac
       else
         case "${perception_provider}" in
-          builtin_rfdetr|pnu_hand_blood|disabled) ;;
-          *) die "PERCEPTION_PROVIDER must resolve to builtin_rfdetr, pnu_hand_blood, or disabled" ;;
+          external_rfdetr_topics|builtin_rfdetr|pnu_hand_blood|disabled) ;;
+          *) die "PERCEPTION_PROVIDER must resolve to external_rfdetr_topics, builtin_rfdetr, pnu_hand_blood, or disabled" ;;
         esac
         perception_location="${perception_location:-local}"
         case "${perception_location}" in
@@ -1482,7 +1608,11 @@ case "${action}" in
         compose_environment_value \
           "${mode}" "${perception_consumer_service}" PERCEPTION_ENDPOINT ""
       )"
-      if [[ "${perception_provider}" != "disabled" && \
+      if [[ "${perception_provider}" == "external_rfdetr_topics" ]]; then
+        # Typed DDS has no HTTP endpoint. Producer placement is expressed by
+        # DDS discovery plus message provenance/model-version validation.
+        perception_endpoint=""
+      elif [[ "${perception_provider}" != "disabled" && \
           -z "${perception_endpoint}" ]]; then
         if [[ "${perception_provider}" == "pnu_hand_blood" ]]; then
           perception_endpoint="$(
@@ -1508,12 +1638,14 @@ case "${action}" in
           )"
         fi
       fi
-      perception_selection_error="$(
-        PYTHONPATH="${ROOT_DIR}/src/simulation_runtime${PYTHONPATH:+:${PYTHONPATH}}" \
-          python3 - \
-            "${perception_provider}" \
-            "${perception_location}" \
-            "${perception_endpoint}" 2>&1 <<'PY' || true
+      perception_selection_error=""
+      if [[ "${perception_provider}" != "external_rfdetr_topics" ]]; then
+        perception_selection_error="$(
+          PYTHONPATH="${ROOT_DIR}/src/simulation_runtime${PYTHONPATH:+:${PYTHONPATH}}" \
+            python3 - \
+              "${perception_provider}" \
+              "${perception_location}" \
+              "${perception_endpoint}" 2>&1 <<'PY' || true
 import sys
 
 from simulation_runtime.cv_contract import (
@@ -1531,7 +1663,8 @@ try:
 except ValueError as exc:
     print(exc)
 PY
-      )"
+        )"
+      fi
       [[ -z "${perception_selection_error}" ]] || \
         die "${perception_selection_error}"
       if [[ "${mode}" == "debug" && \
@@ -1543,7 +1676,7 @@ PY
           pnu_requested_algorithms="$(
             compose_environment_value \
               "${mode}" "${perception_consumer_service}" \
-              PNU_DEBUG_REQUESTED_ALGORITHMS "tool,blood,hand"
+              PNU_DEBUG_REQUESTED_ALGORITHMS "tool,blood"
           )"
         fi
         pnu_client_api_token_file="$(
@@ -1612,7 +1745,7 @@ PY
       local_rfdetr_enabled="$(
         compose_environment_value \
           "${mode}" "${perception_consumer_service}" \
-          ENABLE_RFDETR_PERCEPTION true
+          ENABLE_RFDETR_PERCEPTION false
       )"
       case "${local_rfdetr_enabled}" in
         true|false) ;;
@@ -1644,8 +1777,29 @@ PY
     # timeout after the transition has crossed its safety boundary.
     ensure_runtime_install_contract "${mode}" "${debug_pnu_enabled}"
 
+    same_mode_warm_restart=false
+    active_runtime_ready=false
+    if requested_operational_runtime_is_ready "${mode}"; then
+      active_runtime_ready=true
+    fi
+    if taskplanner_same_mode_warm_restart_allowed \
+        "${mode}" "${active_runtime_ready}" "${BUILD_REQUESTED}"; then
+      same_mode_warm_restart=true
+      printf 'Taskplanner %s runtime is healthy; preserving the stable I/O plane for a warm core restart\n' \
+        "${mode}"
+    fi
+    taskplanner_select_optional_recreate_args "${same_mode_warm_restart}"
+    optional_recreate_args=("${TASKPLANNER_SELECTED_RECREATE_ARGS[@]}")
+
+    if [[ "${mode}" == "live" || "${mode}" == "llm-surgeon" ]]; then
+      prepare_vlm_reply_outbox_state "${mode}"
+      prepare_execution_ledger_state "${mode}"
+    fi
     if mode_uses_operational_asr_sidecar "${mode}"; then
       prepare_operational_asr_run_root
+    fi
+    if mode_uses_tts_sidecar "${mode}"; then
+      prepare_tts_runtime
     fi
 
     if [[ "${mode}" == "debug" ]]; then
@@ -1657,50 +1811,22 @@ PY
       # shared install tree. Remove every such reader before a standalone
       # Debug build; otherwise colcon can still race a stale service even
       # though no full planner process is running.
-      debug_reset_services=(
-        taskplanner-runtime
-        public-rosbridge
-        public-rosbridge-lan-proxy
-        taskplanner-asr
-        shadow-runner
-        object-perception
-        pnu-perception
-        integration-debug
-        integration-debug-lan-proxy
-      )
-      if [[ "${BUILD_REQUESTED}" == "true" ]]; then
-        # The observer reads the shared symlink-install tree. Stop it only for
-        # a serialized build; ordinary mode switches keep it warm.
-        debug_reset_services+=(multicam-observer)
-      fi
+      taskplanner_select_debug_reset_services "${BUILD_REQUESTED}"
+      debug_reset_services=("${TASKPLANNER_SELECTED_RESET_SERVICES[@]}")
       RUNTIME_FAILURE_CLEANUP_SERVICES=(
-        taskplanner-runtime
-        public-rosbridge
-        public-rosbridge-lan-proxy
-        taskplanner-asr
-        shadow-runner
-        object-perception
-        pnu-perception
-        integration-debug
-        integration-debug-lan-proxy
+        "${TASKPLANNER_DEBUG_FAILURE_CLEANUP_SERVICES[@]}"
       )
       verify_runtime_control_transition_interlock
       RUNTIME_FAILURE_CLEANUP_ARMED=true
       # Preserve the old marker through preflight failures. Clear it only
       # after the final stopped-state gate, immediately before the stop.
       clear_active_runtime_mode
-      run_or_print \
-        "${COMPOSE[@]}" "${ALL_PROFILE_ARGS[@]}" \
-        stop "${debug_reset_services[@]}"
-      run_or_print \
-        "${COMPOSE[@]}" "${ALL_PROFILE_ARGS[@]}" \
-        rm -f "${debug_reset_services[@]}"
-      if [[ "${BUILD_REQUESTED}" == "true" ]]; then
-        run_serial_workspace_build "${mode}"
-      fi
+      taskplanner_compose_stop_remove "${debug_reset_services[@]}"
+      taskplanner_build_selected_runtime "${mode}"
       # Keep the dashboard process alive across mode transitions. Runtime status
-      # is authoritative and the webapp configuration is intentionally mode-
-      # independent, so restarting it would only discard client transition state.
+      # is authoritative and its configuration is mode-independent. Recreate
+      # it only when its own source/build stamp is stale.
+      refresh_webapp_if_stale --profile debug
       run_or_print \
         "${COMPOSE[@]}" --profile debug \
         up -d "${BUILD_ARGS[@]}" webapp
@@ -1735,22 +1861,14 @@ PY
         up -d "${BUILD_ARGS[@]}" integration-debug-tailscale-proxy
       if [[ "${local_pnu_perception_enabled}" == "true" ]]; then
         run_best_effort \
-          "Debug PNU Tool/Blood/Hand worker is not healthy; ROS diagnostics remain available" \
+          "Debug PNU Tool/Blood worker is not healthy; ROS diagnostics remain available" \
           "${COMPOSE[@]}" --profile debug \
           up -d "${BUILD_ARGS[@]}" \
           --wait --wait-timeout "${OPTIONAL_WAIT_TIMEOUT_SEC}" \
           pnu-perception
       fi
-      if [[ "${DRY_RUN}" != "true" ]]; then
-        "${COMPOSE[@]}" --profile debug ps
-      fi
-      wait_for_mode_rosbridge "${mode}"
-      wait_for_mode_semantic_ready "${mode}"
-      write_active_runtime_mode "${mode}"
-      RUNTIME_FAILURE_CLEANUP_ARMED=false
-      run_best_effort \
-        "multicam observer is unavailable; camera monitoring remains degraded" \
-        wait_for_multicam_observer "${mode}"
+      taskplanner_finalize_runtime_readiness \
+        "${mode}" false --profile debug
       exit 0
     fi
 
@@ -1758,63 +1876,34 @@ PY
       prepare_replay_run_root
     fi
 
-    runtime_reset_services=(
-      taskplanner-runtime
-      public-rosbridge
-      public-rosbridge-lan-proxy
-      taskplanner-asr
-      shadow-runner
-    )
-    if [[ "${local_object_perception_enabled}" != "true" ]]; then
-      # The HTTP-only detector can stay warm between Live and Replay, but modes
-      # that do not own local perception must release its GPU allocation.
-      runtime_reset_services+=(object-perception)
+    if [[ "${same_mode_warm_restart}" == "true" ]]; then
+      taskplanner_select_operational_warm_cleanup_services \
+        "${mode}" \
+        "${local_object_perception_enabled}" \
+        "${local_pnu_perception_enabled}" \
+        "${INTEGRATED_DEBUG_ENABLED}"
+      runtime_reset_services=("${TASKPLANNER_SELECTED_RESET_SERVICES[@]}")
+      taskplanner_compose_stop_remove "${runtime_reset_services[@]}"
+    else
+      taskplanner_select_operational_reset_services \
+        "${mode}" \
+        "${BUILD_REQUESTED}" \
+        "${local_object_perception_enabled}" \
+        "${local_pnu_perception_enabled}"
+      runtime_reset_services=("${TASKPLANNER_SELECTED_RESET_SERVICES[@]}")
+      RUNTIME_FAILURE_CLEANUP_SERVICES=(
+        "${TASKPLANNER_OPERATIONAL_FAILURE_CLEANUP_SERVICES[@]}"
+      )
+      verify_runtime_control_transition_interlock
+      RUNTIME_FAILURE_CLEANUP_ARMED=true
+      # Preserve the old marker through preflight failures. Clear it only after
+      # the final controller-authorized stopped-state check and immediately
+      # before stopping the old runtime.
+      clear_active_runtime_mode
+      taskplanner_compose_stop_remove "${runtime_reset_services[@]}"
     fi
-    if [[ "${local_pnu_perception_enabled}" != "true" ]]; then
-      # The PNU worker follows the same placement invariant: a remote
-      # selection must never leave a stale local worker accepting frames.
-      runtime_reset_services+=(pnu-perception)
-    fi
-    # Never carry an armed/manual Debug session across an operational runtime
-    # restart. Recreate the sidecar only after the new runtime is running, so
-    # its scenario-state interlock starts from a clean MONITOR_ONLY session.
-    runtime_reset_services+=(
-      integration-debug
-      integration-debug-lan-proxy
-    )
-    if [[ "${BUILD_REQUESTED}" == "true" ]] || ! mode_uses_multicam_observer "${mode}"; then
-      # Keep the external camera observer out of simulated/replay modes. A
-      # build also stops it briefly so it cannot read the symlink-install tree
-      # while colcon replaces that tree.
-      runtime_reset_services+=(multicam-observer)
-    fi
-    RUNTIME_FAILURE_CLEANUP_SERVICES=(
-      taskplanner-runtime
-      public-rosbridge
-      public-rosbridge-lan-proxy
-      taskplanner-asr
-      shadow-runner
-      object-perception
-      pnu-perception
-      integration-debug
-      integration-debug-lan-proxy
-    )
-    verify_runtime_control_transition_interlock
-    RUNTIME_FAILURE_CLEANUP_ARMED=true
-    # Preserve the old marker through preflight failures. Clear it only after
-    # the final controller-authorized stopped-state check and immediately
-    # before stopping the old runtime.
-    clear_active_runtime_mode
-    run_or_print \
-      "${COMPOSE[@]}" "${ALL_PROFILE_ARGS[@]}" \
-      stop "${runtime_reset_services[@]}"
-    run_or_print \
-      "${COMPOSE[@]}" "${ALL_PROFILE_ARGS[@]}" \
-      rm -f "${runtime_reset_services[@]}"
 
-    if [[ "${BUILD_REQUESTED}" == "true" ]]; then
-      run_serial_workspace_build "${mode}"
-    fi
+    taskplanner_build_selected_runtime "${mode}"
 
     # Releases before the Compose control plane used a host transient service.
     # Stop only that legacy process so it cannot occupy the manager port.
@@ -1824,23 +1913,28 @@ PY
     if [[ "${mode}" == "replay" ]]; then
       runtime_service="shadow-runner"
     fi
-    run_best_effort \
-      "LM Studio control plane is unavailable; provider remains offline" \
-      start_lmstudio_control_plane "${mode}" "${runtime_service}"
-    run_best_effort \
-      "Unsloth Studio control plane is unavailable; provider remains offline" \
-      start_unsloth_control_plane "${mode}" "${runtime_service}"
+    if [[ "${TASKPLANNER_START_LMSTUDIO_CONTROL_PLANE:-false}" == "true" ]]; then
+      run_best_effort \
+        "LM Studio control plane is unavailable; provider remains offline" \
+        start_lmstudio_control_plane "${mode}" "${runtime_service}"
+    fi
+    if [[ "${TASKPLANNER_START_UNSLOTH_CONTROL_PLANE:-false}" == "true" ]]; then
+      run_best_effort \
+        "Unsloth Studio control plane is unavailable; provider remains offline" \
+        start_unsloth_control_plane "${mode}" "${runtime_service}"
+    fi
 
     runtime_profile_args=(--profile "${mode}")
     if [[ "${INTEGRATED_DEBUG_ENABLED}" == "true" ]]; then
       runtime_profile_args+=(--profile debug)
     fi
+    refresh_webapp_if_stale "${runtime_profile_args[@]}"
     run_or_print \
       "${COMPOSE[@]}" "${runtime_profile_args[@]}" \
       up -d "${BUILD_ARGS[@]}" \
-      --remove-orphans \
       --wait --wait-timeout "${WAIT_TIMEOUT_SEC}" \
-      vllm-manager ninfer-manager webapp
+      ninfer-manager webapp
+    ensure_ninfer_model_loaded
 
     if mode_uses_multicam_observer "${mode}"; then
       run_best_effort \
@@ -1849,15 +1943,33 @@ PY
         up -d "${BUILD_ARGS[@]}" multicam-observer
     fi
 
+    if mode_uses_tts_sidecar "${mode}"; then
+      # Bring up the typed playback/ACK endpoint before ASR capture and the
+      # VLM runtime. No audio is produced until a validated reply arrives.
+      run_or_print \
+        "${COMPOSE[@]}" --profile live --profile ops \
+        up -d "${BUILD_ARGS[@]}" "${optional_recreate_args[@]}" \
+        --wait --wait-timeout "${WAIT_TIMEOUT_SEC}" \
+        taskplanner-tts
+    fi
+
     if mode_uses_operational_asr_sidecar "${mode}"; then
       # Health means the dedicated ROS node has advertised its status topic.
       # The live integration preflight separately requires the final sentence
       # publisher, which exists only while the ASR transport is connected.
       run_or_print \
         "${COMPOSE[@]}" --profile live \
-        up -d "${BUILD_ARGS[@]}" --force-recreate \
+        up -d "${BUILD_ARGS[@]}" \
         --wait --wait-timeout "${WAIT_TIMEOUT_SEC}" \
         taskplanner-asr
+      # Live is voice-operated by default.  Starting only the sidecar leaves
+      # the node STOPPED with no typed utterance publisher and makes every
+      # integration start wait forever.  Start the reviewed auto route after
+      # the control service is healthy; operators can explicitly opt out for a
+      # microphone-free diagnostic launch.
+      if [[ "${TASKPLANNER_LIVE_ASR_AUTO_START:-true}" == "true" ]]; then
+        start_operational_asr_capture
+      fi
     fi
 
     if [[ "${local_object_perception_enabled}" == "true" ]]; then
@@ -1878,14 +1990,20 @@ PY
         up -d "${BUILD_ARGS[@]}" pnu-perception
     fi
 
-    if [[ "${mode}" == "replay" ]]; then
+    if [[ "${same_mode_warm_restart}" == "true" ]]; then
+      # Cross the warm-restart boundary only after every fallible sidecar
+      # preflight has completed. A preflight failure therefore leaves the old
+      # core marker and process authoritative.
+      taskplanner_cross_warm_restart_boundary \
+        "${mode}" "${runtime_service}"
+    elif [[ "${mode}" == "replay" ]]; then
       run_or_print \
         "${COMPOSE[@]}" --profile replay \
-        up -d "${BUILD_ARGS[@]}" --force-recreate shadow-runner
+        up -d "${BUILD_ARGS[@]}" shadow-runner
     else
       run_or_print \
         "${COMPOSE[@]}" --profile "${mode}" \
-        up -d "${BUILD_ARGS[@]}" --force-recreate taskplanner-runtime
+        up -d "${BUILD_ARGS[@]}" taskplanner-runtime
     fi
 
     if [[ "${public_rosbridge_enabled}" == "true" ]]; then
@@ -1894,41 +2012,43 @@ PY
       # policy instead of taking the operational runtime down with it.
       run_or_print \
         "${COMPOSE[@]}" --profile "${mode}" \
-        up -d --force-recreate \
+        up -d \
         --wait --wait-timeout "${WAIT_TIMEOUT_SEC}" public-rosbridge
       # Keep the public browser surface separate from the operator/debug LAN
       # proxy. This route exposes only the read-only 9092 sidecar on the wired
       # interface and is available in Live, LLM Surgeon, and Replay.
-      run_or_print \
-        "${COMPOSE[@]}" --profile "${mode}" \
-        up -d --force-recreate public-rosbridge-lan-proxy
+      if mode_uses_ops_plane "${mode}"; then
+        run_or_print \
+          "${COMPOSE[@]}" --profile ops \
+          up -d public-rosbridge-lan-proxy
+      fi
     fi
 
     if [[ "${INTEGRATED_DEBUG_ENABLED}" == "true" ]]; then
       # Start the required Live observation plane only after the operational
       # runtime. It exposes monitoring on 9091 and unlocks manual commands
-      # only from a trusted, fresh stopped /simulation/state; the operational
-      # container itself may remain running.
+      # only from a trusted, fresh paused or fully stopped /simulation/state;
+      # the operational container itself may remain running.
       run_or_print \
         "${COMPOSE[@]}" --profile "${mode}" --profile debug \
-        up -d "${BUILD_ARGS[@]}" --force-recreate \
+        up -d "${BUILD_ARGS[@]}" "${optional_recreate_args[@]}" \
         integration-debug
     fi
 
-    # This is a path router for LAN dashboard clients, not the Debug runtime.
-    # Keep it available for every reviewed runtime so remote LLM/Replay UI
-    # traffic still reaches its own bridge while their Debug sidecar stays off.
-    run_or_print \
-      "${COMPOSE[@]}" --profile "${mode}" \
-      up -d --force-recreate integration-debug-lan-proxy
-
-    # One Tailnet-permitted loopback port routes each selected runtime by
-    # websocket path. It is intentionally separate from the LAN proxy and
-    # opens no new network listener.
-    run_or_print \
-      "${COMPOSE[@]}" --profile "${mode}" \
-      up -d "${BUILD_ARGS[@]}" \
-      integration-debug-tailscale-proxy
+    if mode_uses_ops_plane "${mode}"; then
+      # LAN/Tailnet exposure and HLS/TV media are an explicit Ops plane. The
+      # loopback Production core neither starts nor waits for these services.
+      run_or_print \
+        "${COMPOSE[@]}" --profile ops \
+        up -d webapp-lan-proxy monitor-media-gateway \
+        integration-debug-lan-proxy integration-debug-tailscale-proxy
+    elif [[ "${mode}" != "live" ]]; then
+      # Legacy Lab/Debug modes retain their path router until they are split
+      # into a separate launcher. This branch is never part of Production.
+      run_or_print \
+        "${COMPOSE[@]}" --profile "${mode}" \
+        up -d integration-debug-lan-proxy integration-debug-tailscale-proxy
+    fi
 
     if [[ "${local_object_perception_enabled}" == "true" ]]; then
       run_best_effort \
@@ -1947,22 +2067,8 @@ PY
         pnu-perception
     fi
 
-    if [[ "${DRY_RUN}" != "true" ]]; then
-      "${COMPOSE[@]}" "${runtime_profile_args[@]}" ps
-    fi
-    wait_for_mode_rosbridge "${mode}"
-    wait_for_mode_semantic_ready "${mode}"
-    if [[ "${INTEGRATED_DEBUG_ENABLED}" == "true" ]]; then
-      wait_for_mode_rosbridge debug
-      wait_for_mode_semantic_ready debug
-    fi
-    write_active_runtime_mode "${mode}"
-    RUNTIME_FAILURE_CLEANUP_ARMED=false
-    if mode_uses_multicam_observer "${mode}"; then
-      run_best_effort \
-        "multicam observer is unavailable; camera monitoring remains degraded" \
-        wait_for_multicam_observer "${mode}"
-    fi
+    taskplanner_finalize_runtime_readiness \
+      "${mode}" "${INTEGRATED_DEBUG_ENABLED}" "${runtime_profile_args[@]}"
     ;;
 
   down)
@@ -1979,8 +2085,7 @@ PY
     done
     acquire_launcher_lock
     compose_env_args
-    compose_base
-    all_profiles
+    taskplanner_compose_init
     run_or_print \
       "${COMPOSE[@]}" "${ALL_PROFILE_ARGS[@]}" \
       down --remove-orphans
@@ -1994,8 +2099,7 @@ PY
   status)
     (($# == 0)) || die "status takes no arguments"
     compose_env_args
-    compose_base
-    all_profiles
+    taskplanner_compose_init
     "${COMPOSE[@]}" "${ALL_PROFILE_ARGS[@]}" ps -a
     if ninfer_manager_ready "$(ninfer_manager_url)"; then
       printf 'NInfer manager: Compose control plane ready\n'
@@ -2039,12 +2143,13 @@ PY
     mode="${1:-}"
     validate_mode "${mode}"
     (($# == 1)) || die "config takes exactly one mode"
+    enforce_runtime_mode_contract "${mode}"
     compose_env_args "${mode}"
     if mode_requires_integrated_debug_observer "${mode}"; then
       export TASKPLANNER_DEBUG_LOCK_TO_RUNTIME_NETWORK=true
       export TASKPLANNER_DEBUG_ALLOW_PLANNER_COEXISTENCE=false
     fi
-    compose_base
+    taskplanner_compose_init
     if mode_requires_integrated_debug_observer "${mode}"; then
       "${COMPOSE[@]}" --profile "${mode}" --profile debug config
     else

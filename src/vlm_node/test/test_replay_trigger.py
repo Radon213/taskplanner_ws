@@ -12,6 +12,7 @@ from vlm_node.real_vlm import (
     ImageSample,
     InferenceBackpressure,
     RealVLMNode,
+    actor_log_model_context,
     bound_image_for_model,
     compose_flir_cam4_for_model,
     crop_cam4_for_model,
@@ -23,6 +24,7 @@ from vlm_node.real_vlm import (
     should_trigger_source_time_live_frame,
     should_use_open_set_phase_bootstrap,
     source_frame_is_fresh,
+    source_frame_timestamp_rejection_reason,
     summarize_public_perception_json,
 )
 
@@ -52,6 +54,59 @@ def test_source_frame_freshness_uses_replay_clock_lag() -> None:
     assert not source_frame_is_fresh(44.351, 44.0, 0.35)
     assert source_frame_is_fresh(0.0, 44.0, 0.35)
     assert source_frame_is_fresh(99.0, 1.0, 0.0)
+
+
+def test_live_source_frame_timestamp_gate_rejects_missing_stale_and_future_frames() -> None:
+    # Live source time is deliberately stricter than replay cadence: a
+    # contemporaneous frame passes, while an absent, old, or future header
+    # timestamp cannot enter model selection.
+    assert (
+        source_frame_timestamp_rejection_reason(
+            100.0,
+            100.0,
+            1.0,
+            0.25,
+        )
+        == ""
+    )
+    assert source_frame_timestamp_rejection_reason(100.0, 0.0, 1.0, 0.25) == (
+        "missing_source_timestamp"
+    )
+    assert source_frame_timestamp_rejection_reason(100.0, 98.9, 1.0, 0.25).startswith(
+        "stale_source_frame:"
+    )
+    assert source_frame_timestamp_rejection_reason(100.0, 100.3, 1.0, 0.25).startswith(
+        "future_source_frame:"
+    )
+
+
+def test_live_model_selection_rechecks_source_timestamp_after_receipt() -> None:
+    node = RealVLMNode.__new__(RealVLMNode)
+    node._image_stale_sec = 3.0
+    node._require_source_frame_timestamp = True
+    node._model_input_max_source_lag_sec = 1.0
+    node._model_input_max_source_future_skew_sec = 0.25
+    node._latest_images = {
+        "field": ImageSample(
+            received_monotonic=100.0,
+            stamp_sec=98,
+            stamp_nanosec=0,
+            frame_id="field",
+            data=b"image",
+            mime_type="image/jpeg",
+        )
+    }
+
+    assert node._fresh_image("field", 100.0) is None
+    node._latest_images["field"] = ImageSample(
+        received_monotonic=100.0,
+        stamp_sec=100,
+        stamp_nanosec=0,
+        frame_id="field",
+        data=b"image",
+        mime_type="image/jpeg",
+    )
+    assert node._fresh_image("field", 100.0) is not None
 
 
 def test_source_time_live_cadence_tolerates_frame_jitter() -> None:
@@ -159,12 +214,13 @@ def _overlay_sample(
     stamp_sec: int,
     stamp_nanosec: int,
     color: tuple[int, int, int, int],
+    frame_id: str = "camera|rfdetr_bbox_overlay",
 ) -> ImageSample:
     return ImageSample(
         received_monotonic=time.time(),
         stamp_sec=stamp_sec,
         stamp_nanosec=stamp_nanosec,
-        frame_id="camera|rfdetr_bbox_overlay",
+        frame_id=frame_id,
         data=_transparent_webp((1280, 720), color),
         mime_type="image/webp",
     )
@@ -175,12 +231,13 @@ def _sample(
     stamp_sec: int,
     stamp_nanosec: int,
     color: tuple[int, int, int],
+    frame_id: str = "camera",
 ) -> ImageSample:
     return ImageSample(
         received_monotonic=time.time(),
         stamp_sec=stamp_sec,
         stamp_nanosec=stamp_nanosec,
-        frame_id="camera",
+        frame_id=frame_id,
         data=_jpeg((1280, 720), color),
         mime_type="image/jpeg",
     )
@@ -268,7 +325,7 @@ def test_composite_uses_the_same_visible_height_for_flir_and_cam4() -> None:
     assert lower_right_pixel[1] > lower_right_pixel[0] * 2
 
 
-def test_composite_blends_the_cam4_detector_overlay() -> None:
+def test_composite_does_not_use_cam4_detector_overlay_as_model_input() -> None:
     composite, _ = compose_flir_cam4_for_model(
         _jpeg((1920, 1080), (180, 20, 20)),
         "image/jpeg",
@@ -286,9 +343,11 @@ def test_composite_blends_the_cam4_detector_overlay() -> None:
     with Image.open(BytesIO(composite)) as image:
         right_pixel = image.getpixel((image.width - 8, 60))
 
-    # An opaque detector overlay turns the raw green CAM4 panel magenta.
-    assert right_pixel[0] > right_pixel[1] * 2
-    assert right_pixel[2] > right_pixel[1] * 2
+    # Detector pixels are not embedded in the model image.  The raw CAM4
+    # panel remains green; typed RF-DETR boxes enter the request context
+    # separately.
+    assert right_pixel[1] > right_pixel[0] * 2
+    assert right_pixel[1] > right_pixel[2] * 2
 
 
 def test_dynamic_cam4_crop_frames_union_with_padding_and_minimum_size() -> None:
@@ -499,6 +558,9 @@ def _segmented_flir_node() -> RealVLMNode:
     node._cam4_semantics_topic = (
         "/surgery/perception/cam4/semantics/json"
     )
+    node._cam3_tool_observations_topic = ""
+    node._cam4_tool_observations_topic = ""
+    node._perception_max_instances = 24
     node._perception_bboxes_topic = ""
     node._perception_segmentation_topic = ""
     node._current_perception_reference_stamp_sec = None
@@ -506,7 +568,7 @@ def _segmented_flir_node() -> RealVLMNode:
     return node
 
 
-def test_model_selection_fuses_segmented_flir_and_cam4_overlay_into_one_image() -> None:
+def test_model_selection_keeps_detector_overlay_out_of_vlm_image() -> None:
     node = _segmented_flir_node()
     node._latest_images["cam4"] = _sample(
         stamp_sec=44,
@@ -524,7 +586,7 @@ def test_model_selection_fuses_segmented_flir_and_cam4_overlay_into_one_image() 
     assert image_source == "flir_cam4_rfdetr_segmented"
     assert len(images) == 1
     assert images[0][0] == (
-        "Synchronized FLIR surgical field + CAM4 Mayo/surgeon-hand context"
+        "Synchronized FLIR surgical field + CAM4 Mayo instruments"
     )
     for _label, image_bytes, _mime_type in images:
         with Image.open(BytesIO(image_bytes)) as image:
@@ -546,35 +608,105 @@ def test_model_selection_fuses_segmented_flir_and_cam4_overlay_into_one_image() 
                 "frame_id": "camera",
             },
             {
-                "role": "cam4_mayo_hand_crop",
+                "role": "cam4_mayo_instrument_crop",
                 "topic": "/surgery/images/cam4/compressed",
                 "stamp_sec": 44.08,
                 "frame_id": "camera",
                 "offset_sec": 0.03,
             },
-            {
-                "role": "cam4_rfdetr_small_overlay",
-                "topic": "/surgery/images/cam4/detection_overlay/compressed",
-                "stamp_sec": 44.08,
-                "frame_id": "camera|rfdetr_bbox_overlay",
-                "offset_sec": 0.03,
-                "cam4_offset_sec": 0.0,
-            },
         ],
         "preprocessing": (
             "single side-by-side composite: RFDETRSegSmall FLIR + "
-            "RFDETRSmall CAM4 bbox/hand overlay"
+            "raw CAM4 Mayo instrument pixels"
         ),
         "image_layout": "flir_left_cam4_right",
         "cam4_image_forwarded_to_vlm": True,
         "cam4_alignment_skew_sec": 0.03,
-        "cam4_detector_overlay_forwarded_to_vlm": True,
-        "cam4_detector_overlay_alignment_skew_sec": 0.0,
+        "cam4_detector_overlay_forwarded_to_vlm": False,
         "detector_advisory": True,
+        "rfdetr_applied_field_required": False,
+        "rfdetr_cam4_overlay_required": False,
+        "structured_rfdetr_tool_observations": True,
         "cam4_fallback_reason": "",
-        "cam4_overlay_fallback_reason": "",
+        "cam4_overlay_fallback_reason": (
+            "not used for VLM; typed CAM3/CAM4 RF-DETR observations "
+            "supply detector evidence"
+        ),
         "input_error": "",
     }
+
+
+def test_strict_live_visual_selection_requires_local_rfdetr_frames() -> None:
+    node = _segmented_flir_node()
+    node._require_rfdetr_applied_field_image = True
+    node._require_rfdetr_cam4_overlay = True
+    node._latest_images["raw_field"] = _sample(
+        stamp_sec=44,
+        stamp_nanosec=50_000_000,
+        color=(120, 20, 0),
+        frame_id="viplab_flir_raw",
+    )
+
+    images, image_source, model_image = node._select_images()
+
+    assert images == []
+    assert image_source == "missing(flir_visual)"
+    assert model_image is None
+    assert "provenance marker" in node._current_image_input_error
+    assert node._current_visual_input["rfdetr_applied_field_required"] is True
+
+    node._latest_images["field"] = _sample(
+        stamp_sec=44,
+        stamp_nanosec=50_000_000,
+        color=(100, 0, 0),
+        frame_id="flir_color|rfdetr_seg",
+    )
+    node._latest_images["cam4"] = _sample(
+        stamp_sec=44,
+        stamp_nanosec=80_000_000,
+        color=(0, 100, 0),
+        frame_id="cam4_color",
+    )
+    node._latest_images["cam4_overlay"] = _overlay_sample(
+        stamp_sec=44,
+        stamp_nanosec=80_000_000,
+        color=(190, 10, 210, 255),
+        frame_id="cam4_color|rfdetr_cam4_overlay",
+    )
+
+    images, image_source, model_image = node._select_images()
+
+    assert image_source == "flir_cam4_rfdetr_segmented"
+    assert len(images) == 1
+    assert model_image is not None
+    assert node._current_visual_input["cam4_image_forwarded_to_vlm"] is True
+    assert node._current_visual_input["rfdetr_cam4_overlay_required"] is False
+
+
+def test_legacy_overlay_requirement_does_not_omit_raw_cam4_visual_input() -> None:
+    node = _segmented_flir_node()
+    node._require_rfdetr_applied_field_image = True
+    node._require_rfdetr_cam4_overlay = True
+    node._latest_images["field"] = _sample(
+        stamp_sec=44,
+        stamp_nanosec=50_000_000,
+        color=(100, 0, 0),
+        frame_id="flir_color|rfdetr_seg",
+    )
+    node._latest_images["cam4"] = _sample(
+        stamp_sec=44,
+        stamp_nanosec=80_000_000,
+        color=(0, 100, 0),
+        frame_id="cam4_color",
+    )
+
+    images, image_source, model_image = node._select_images()
+
+    assert image_source == "flir_cam4_rfdetr_segmented"
+    assert len(images) == 1
+    assert model_image is not None
+    assert node._current_visual_input["cam4_image_forwarded_to_vlm"] is True
+    assert node._current_visual_input["cam4_detector_overlay_forwarded_to_vlm"] is False
 
 
 def test_model_selection_falls_back_to_raw_flir_when_detector_is_off() -> None:
@@ -604,7 +736,7 @@ def test_model_selection_falls_back_to_raw_flir_when_detector_is_off() -> None:
         node._current_visual_input["cam4_detector_overlay_forwarded_to_vlm"]
         is False
     )
-    assert "perception is disabled" in node._current_visual_input[
+    assert "typed CAM3/CAM4 RF-DETR observations" in node._current_visual_input[
         "cam4_overlay_fallback_reason"
     ]
     assert node._current_visual_input["detector_advisory"] is False
@@ -664,6 +796,7 @@ def test_cam4_semantics_is_aligned_to_segmented_flir_stamp() -> None:
     }
     assert context["flir_reference_stamp_sec"] == 44.05
     assert context["max_source_skew_sec"] == 0.2
+    assert "tool_request" not in context
 
 
 def test_misaligned_cam4_semantics_is_omitted() -> None:
@@ -708,6 +841,262 @@ def test_cam4_semantics_buffer_selects_nearest_source_frame() -> None:
         "offset_sec": 0.03,
     }
     assert context["tools"][0]["name"] == "Bovie surgical cautery"
+
+
+def _rfdetr_tool_view(
+    *,
+    view: str,
+    stamp_sec: float,
+    class_name: str,
+) -> dict[str, object]:
+    return {
+        "schema": "taskplanner.rfdetr_tool_observations.v1",
+        "source": "rfdetr_tool_observation_2d",
+        "view": view,
+        "source_stamp_sec": stamp_sec,
+        "sequence": 7,
+        "model_version": f"{view}-rfdetr-tool-v1",
+        "ontology_version": "thyroid-tools-v1",
+        "instances": [
+            {
+                "class_name": class_name,
+                "canonical_class_id": 2,
+                "model_class_index": 2,
+                "confidence": 0.91,
+                "bbox_xyxy_norm": [0.1, 0.2, 0.5, 0.6],
+                "center_uv_norm": [0.3, 0.4],
+                "observation_point_uv_norm": [0.32, 0.42],
+                "image_region": "middle_left",
+                "frame_local_instance_id": 3,
+                "depth_m": 0.83,
+            }
+        ],
+        "detection_status": "detections",
+        "truncated": False,
+        "ground_truth": False,
+        "mask_rle_forwarded_to_vlm": False,
+    }
+
+
+def test_typed_cam3_cam4_rfdetr_boxes_are_primary_vlm_location_context() -> None:
+    node = _segmented_flir_node()
+    node._cam3_tool_observations_topic = "/perception/cam_3/tool/observations"
+    node._cam4_tool_observations_topic = "/perception/cam_4/tool/observations"
+    node._canonical_tool_id = lambda name: {
+        "Thyroid retractor": "T07",
+        "Bovie surgical cautery": "T02",
+    }.get(str(name), "")
+    now = time.time()
+    node._latest_perception["rfdetr_cam_3_tools"] = (
+        now,
+        _rfdetr_tool_view(
+            view="cam_3",
+            stamp_sec=44.04,
+            class_name="Thyroid retractor",
+        ),
+    )
+    node._latest_perception["rfdetr_cam_4_tools"] = (
+        now,
+        _rfdetr_tool_view(
+            view="cam_4",
+            stamp_sec=44.08,
+            class_name="Bovie surgical cautery",
+        ),
+    )
+
+    node._select_images()
+    context = node._public_perception_context()
+
+    assert context["source"] == "rfdetr_tool_observation_2d"
+    assert context["mask_rle_forwarded_to_vlm"] is False
+    assert set(context["freshness"]) == {"cam_3", "cam_4"}
+    assert all(
+        item["status"] == "fresh"
+        and 0.0 <= item["received_age_sec"] < 0.1
+        for item in context["freshness"].values()
+    )
+    assert context["visual_alignment"] == {
+        "cam_3": {
+            "status": "aligned",
+            "detector_stamp_sec": 44.04,
+            "offset_sec": -0.01,
+        },
+        "cam_4": {
+            "status": "aligned",
+            "detector_stamp_sec": 44.08,
+            "offset_sec": 0.03,
+        },
+    }
+    assert [view["view"] for view in context["tool_detection_views"]] == [
+        "cam_3",
+        "cam_4",
+    ]
+    assert context["tool_detection_views"][0]["instances"][0]["tool_id"] == "T07"
+    assert context["tool_detection_views"][1]["instances"][0]["tool_id"] == "T02"
+    assert context["tool_detection_views"][0]["instances"][0]["bbox_xyxy_norm"] == [
+        0.1,
+        0.2,
+        0.5,
+        0.6,
+    ]
+    assert context["tool_detection_views"][0]["instances"][0][
+        "observation_point_uv_norm"
+    ] == [0.32, 0.42]
+    assert "mask_counts" not in json.dumps(context)
+
+
+def test_fresh_typed_rfdetr_view_survives_missing_or_misaligned_flir() -> None:
+    node = _segmented_flir_node()
+    node._cam3_tool_observations_topic = "/perception/cam_3/tool/observations"
+    node._canonical_tool_id = lambda _name: ""
+    now = time.time()
+    node._latest_perception["rfdetr_cam_3_tools"] = (
+        now,
+        _rfdetr_tool_view(
+            view="cam_3",
+            stamp_sec=43.0,
+            class_name="Thyroid retractor",
+        ),
+    )
+
+    # No FLIR frame is available. The typed CAM3 box remains valid, named-view
+    # location evidence rather than being erased as an image-pair failure.
+    context_without_flir = node._public_perception_context()
+    assert context_without_flir["freshness"]["cam_3"]["status"] == "fresh"
+    assert context_without_flir["visual_alignment"]["cam_3"] == {
+        "status": "not_compared_no_flir_reference",
+        "detector_stamp_sec": 43.0,
+    }
+    assert context_without_flir["tool_detection_views"][0]["instances"]
+    assert context_without_flir["tool_detection_views"][0]["visual_alignment"][
+        "status"
+    ] == "not_compared_no_flir_reference"
+
+    # A fresh row also remains present when its source stamp cannot be
+    # pixel-paired with the FLIR panel selected for this VLM request.
+    node._select_images()
+    context_misaligned = node._public_perception_context()
+    assert context_misaligned["visual_alignment"]["cam_3"] == {
+        "status": "misaligned",
+        "detector_stamp_sec": 43.0,
+        "offset_sec": -1.05,
+    }
+    assert context_misaligned["tool_detection_views"][0]["instances"]
+    assert context_misaligned["tool_detection_views"][0]["visual_alignment"][
+        "status"
+    ] == "misaligned"
+
+
+def test_typed_rfdetr_empty_observation_stays_aligned_no_detection() -> None:
+    node = _segmented_flir_node()
+    node._cam3_tool_observations_topic = "/perception/cam_3/tool/observations"
+    node._cam4_tool_observations_topic = ""
+    summary = _rfdetr_tool_view(
+        view="cam_3",
+        stamp_sec=44.04,
+        class_name="Thyroid retractor",
+    )
+    summary["instances"] = []
+    summary["detection_status"] = "no_detections"
+    now = time.time()
+    node._latest_perception["rfdetr_cam_3_tools"] = (now, summary)
+
+    node._select_images()
+    context = node._public_perception_context()
+
+    assert context["freshness"]["cam_3"]["status"] == "fresh"
+    assert context["visual_alignment"]["cam_3"]["status"] == "aligned"
+    observed_view = dict(context["tool_detection_views"][0])
+    assert observed_view.pop("freshness") == context["freshness"]["cam_3"]
+    assert observed_view == {
+        "view": "cam_3",
+        "source_stamp_sec": 44.04,
+        "sequence": 7,
+        "model_version": "cam_3-rfdetr-tool-v1",
+        "ontology_version": "thyroid-tools-v1",
+        "instances": [],
+        "detection_status": "no_detections",
+        "truncated": False,
+        "visual_alignment": {
+            "status": "aligned",
+            "detector_stamp_sec": 44.04,
+            "offset_sec": -0.01,
+        },
+    }
+
+
+def test_actor_log_context_preserves_bounded_typed_tool_location_evidence() -> None:
+    request_context = actor_log_model_context(
+        {
+            "observable_perception": {
+                "schema": "taskplanner.rfdetr_multiview_tool_context.v1",
+                "source": "rfdetr_tool_observation_2d",
+                "ground_truth": False,
+                "mask_rle_forwarded_to_vlm": False,
+                "flir_reference_stamp_sec": 44.05,
+                "max_source_skew_sec": 0.2,
+                "freshness": {
+                    "cam_3": {
+                        "status": "fresh",
+                        "received_age_sec": 0.02,
+                    }
+                },
+                "visual_alignment": {
+                    "cam_3": {
+                        "status": "not_compared_no_flir_reference",
+                        "detector_stamp_sec": 44.04,
+                    }
+                },
+                "tool_detection_views": [
+                    {
+                        "view": "cam_3",
+                        "source_stamp_sec": 44.04,
+                        "sequence": 7,
+                        "model_version": "cam_3-rfdetr-tool-v1",
+                        "ontology_version": "thyroid-tools-v1",
+                        "detection_status": "detections",
+                        "instances": [
+                            {
+                                "tool_id": "T07",
+                                "class_name": "Thyroid retractor",
+                                "confidence": 0.91,
+                                "bbox_xyxy_norm": [0.1, 0.2, 0.5, 0.6],
+                                "center_uv_norm": [0.3, 0.4],
+                                "observation_point_uv_norm": [0.32, 0.42],
+                                "image_region": "middle_left",
+                                "depth_m": 0.83,
+                                "mask_counts": "must-not-reach-model",
+                            }
+                        ],
+                        "freshness": {
+                            "status": "fresh",
+                            "received_age_sec": 0.02,
+                        },
+                        "visual_alignment": {
+                            "status": "not_compared_no_flir_reference",
+                            "detector_stamp_sec": 44.04,
+                        },
+                    }
+                ],
+            }
+        }
+    )
+
+    view = request_context["observable_perception"]["tool_detection_views"][0]
+    assert view["detection_status"] == "detections"
+    assert view["instances"][0]["tool_id"] == "T07"
+    assert view["instances"][0]["center_uv_norm"] == [0.3, 0.4]
+    assert view["instances"][0]["observation_point_uv_norm"] == [0.32, 0.42]
+    assert view["freshness"] == {"status": "fresh", "received_age_sec": 0.02}
+    assert view["visual_alignment"] == {
+        "status": "not_compared_no_flir_reference",
+        "detector_stamp_sec": 44.04,
+    }
+    assert request_context["observable_perception"]["schema"] == (
+        "taskplanner.rfdetr_multiview_tool_context.v1"
+    )
+    assert request_context["observable_perception"]["mask_rle_forwarded_to_vlm"] is False
+    assert "mask_counts" not in json.dumps(request_context)
 
 
 def test_shadow_launch_uses_rfdetr_input_contract() -> None:

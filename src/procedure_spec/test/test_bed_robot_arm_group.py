@@ -164,6 +164,13 @@ def _spec_root() -> Path:
     [
         ("inguinal_hernia_repair", False, "", [], False),
         (
+            "inguinal_hernia_repair_demo",
+            True,
+            "army_navy_retractor",
+            ["retraction"],
+            True,
+        ),
+        (
             "thyroidectomy",
             True,
             "thyroid_retractor",
@@ -174,7 +181,7 @@ def _spec_root() -> Path:
             "thyroidectomy_demo",
             True,
             "thyroid_retractor",
-            ["change_end_effector"],
+            ["retraction"],
             False,
         ),
         ("nephrectomy", True, "", ["retraction"], True),
@@ -211,7 +218,12 @@ def test_procedure_bundles_load_group_scenarios(
 
 
 def test_expected_end_effector_transitions_are_loaded() -> None:
-    for procedure_id in ("inguinal_hernia_repair", "nephrectomy", "thyroidectomy_demo"):
+    for procedure_id in (
+        "inguinal_hernia_repair",
+        "inguinal_hernia_repair_demo",
+        "nephrectomy",
+        "thyroidectomy_demo",
+    ):
         spec = load_bundle(_spec_root() / procedure_id)
         assert spec.get_bed_robot_arm_end_effector_transitions() == []
 

@@ -17,7 +17,9 @@ single-side adjustment onto the Service command enum. The legacy Action's
 multi-arm, direction-vector, axis, arm-ID, and tool-ID fields do not exist in
 the Service. They are never silently dropped: multi-axis or non-lateral legacy
 adjustments are rejected locally. A left/right adjustment is sent as
-`TARGET_LEFT`/`TARGET_RIGHT` plus metres (`5 cm = 0.050`).
+`TARGET_LEFT`/`TARGET_RIGHT`/`TARGET_NONE` plus metres (`5 cm = 0.050`).
+For an adjustment, `TARGET_NONE` is the peer-compatible bilateral value and
+applies the same distance independently to both retractor arms.
 
 The Service response is admission only. `request_accepted=true` proves only
 that the controller received the request; it does not prove direct teach,
@@ -26,19 +28,36 @@ retraction, or tool change physically completed. The compatibility status uses
 never exposes a requested end-effector profile as confirmed physical state.
 
 The tool Action sends only `command_id`, the real catalog instrument name, a
-human-readable instance ID, and one of six fixed location pairs:
+human-readable instance ID, and one of seven fixed location pairs:
 
 - `tray -> robot`: pick up the planner-selected next tool and hold it ready
 - `mayo -> robot`: pick up a reusable Mayo tool selected by the planner and hold it ready
 - `tray -> surgeon`: handover
 - `robot -> surgeon`: handover a held tool
-- `robot -> tray`: return an unused held tool
+- `robot -> mayo`: park an unused speculative preparation and free the hand
+- `robot -> tray`: controller-directed tray recovery
 - `mayo -> tray`: retrieve
 
 For `tray -> robot` and `mayo -> robot`, success means stable holding has been
 reached. The Action then terminates while the controller keeps holding the tool
-until a later handover or `robot -> tray` return Goal. Preparation prediction
-and the reuse decision remain internal to Taskplanner.
+until a later handover or `return_unused_preposition` `robot -> mayo` Goal.
+Preparation prediction and the reuse decision remain internal to Taskplanner.
+The normal unused-preposition path never returns to a rack or tray;
+`canceled_recovered_to_tray` is a separate compensating Cancel result.
+Taskplanner selects that path only for an explicit different-tool request or a
+different system-final rank-1 tool maintained for at least 2.0 continuous
+source-time seconds. It does not use elapsed hold, evidence-loss, completion, or
+implicit-hand-signal timers, and it does not dispatch while a tracked tool Goal
+is active.
+
+For every tracked Goal, `SUCCEEDED` plus `success=true` and
+`final_state=completed` is authoritative physical completion evidence. The
+bridge emits a correlated projection step for every supported leg, and the
+Digital Twin applies it without re-running local lifecycle or arm-occupancy
+admission gates. It still rejects missing/mismatched provenance, instance,
+instrument type, semantic leg, projection order, duplicate command steps, and
+stale timestamps. Detector/VLM location updates remain advisory observation
+evidence and cannot overrule a correlated Action completion.
 
 The only public location values are `tray`, `mayo`, `robot`, and `surgeon`.
 Compound internal actions that require returning one tool and handing over
@@ -65,11 +84,14 @@ stop leaves physical state unknown and blocks further dispatch. A bounded
 ledger prevents the same `command_id`, or the same explicit request generation,
 from causing a second outbound command.
 
-The retraction controller publishes `BedRobotArmStateArray`; this state is a
-dispatch prerequisite and is not inferred from service or Action completion.
-Tool handover continues to report its fixed feedback states and monotonic
-progress through the Action itself. Interrupts use standard ROS 2 Action cancel;
-no custom `/interrupt` topic is defined.
+When `require_bed_robot_status=true`, controller-owned
+`BedRobotArmStateArray` is a dispatch prerequisite and is not inferred from a
+Service or Action completion. The Live launcher intentionally uses the
+reviewed Service-only retraction contract (`false`), so absence of that
+optional telemetry does not block admission. Tool handover continues to report
+its fixed feedback states and monotonic progress through the Action itself.
+Interrupts use standard ROS 2 Action cancel; no custom `/interrupt` topic is
+defined.
 
 Only one tool-transfer Goal may be active, including its cancel recovery. The
 caller sends the next Goal only after the prior Result is terminal. A canceled

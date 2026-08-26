@@ -133,6 +133,38 @@ def test_retraction_service_request_uses_the_single_public_contract() -> None:
     assert request.target_side == ExecuteRetractionCommand.Request.TARGET_RIGHT
     assert request.distance_m == 0.05
 
+    bilateral = IntegrationDebugNode._build_retraction_service_request(
+        object(),
+        "debug-command-both",
+        {
+            "command": "adjust_retraction",
+            "target_side": "both",
+            "distance_m": 0.001,
+        },
+    )
+    # The peer Service uses TARGET_NONE (0) to encode a bilateral adjustment.
+    assert bilateral.target_side == ExecuteRetractionCommand.Request.TARGET_NONE
+    assert bilateral.distance_m == 0.001
+
+    # Direct-teach completion is a session-level peer operation.  Every Debug
+    # field selection must therefore remain usable while serializing the
+    # deployed peer's required TARGET_NONE value.
+    for side in ("none", "left", "right", "both"):
+        finish = IntegrationDebugNode._build_retraction_service_request(
+            object(),
+            f"debug-command-finish-{side}",
+            {
+                "command": "finish_direct_teach",
+                "target_side": side,
+                "distance_m": 0.0,
+            },
+        )
+        assert finish.command == (
+            ExecuteRetractionCommand.Request.COMMAND_FINISH_DIRECT_TEACH
+        )
+        assert finish.target_side == ExecuteRetractionCommand.Request.TARGET_NONE
+        assert finish.distance_m == 0.0
+
 
 def test_legacy_retraction_debug_operations_fail_before_manual_interlock() -> None:
     for operation, payload, required_text in (

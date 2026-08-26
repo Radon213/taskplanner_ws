@@ -70,7 +70,8 @@ It establishes:
 - Added Mayo stand display and Mayo-based recovery semantics.
 - Kept bleeding/hemostasis as an interrupt event rather than a normal sequential
   phase.
-- Added return of unused prepositioned right-hand tools during cleanup.
+- Added Mayo parking for unused prepositioned right-hand tools before an
+  explicit or stable system-predicted replacement.
 - Added VLM/system phase and tool scoreboards with
   `correct / proposed / evaluable` semantics.
 - Added multi-bundle runtime probe and focused LLM/prediction probes.

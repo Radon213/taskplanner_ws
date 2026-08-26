@@ -1,7 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
-import { layouts } from "../layouts";
-import { applyVisualLayout } from "../visualLayouts";
 import type {
   BedRobotArmState,
   DisplayCatalog,
@@ -29,7 +27,6 @@ import {
 } from "../utils/display";
 import { getUiCopy } from "../utils/uiCopy";
 import { fanOutAnchorPoint, type ScenePoint } from "../utils/stageGeometry";
-import type { OverrideAck } from "./useRosBridge";
 
 export type StagePoint = ScenePoint;
 
@@ -55,6 +52,15 @@ export type StageTool = {
 
 function instrumentInstanceKey(instrument: InstrumentState): string {
   return instrument.instance_id?.trim() || instrument.instrument_id;
+}
+
+/** A policy badge is meaningful only after the DT has a canonical Mayo fact. */
+function isMayoDecisionEligible(instrument: InstrumentState): boolean {
+  return (
+    instrument.location_type === "mayo_stand"
+    && instrument.location_id === "mayo_stand"
+    && (instrument.lifecycle_stage === "mayo_reuse" || instrument.lifecycle_stage === "mayo_recovery")
+  );
 }
 
 export type StageRoute = {
@@ -169,10 +175,14 @@ export type StageToolChipDensity = "comfortable" | "regular" | "dense" | "micro"
 
 export type StageToolChipPlacement = {
   id: string;
+  /** Canonical procedure-spec tool ID for VLM evidence lookup. */
+  instrumentId: string;
   label: string;
   shortLabel: string;
   /** Physical instances represented by this visual card. */
   instanceIds?: string[];
+  /** Instance represented by the card's current active/recovery state. */
+  displayInstanceId?: string;
   /** Visual-only inventory count; the digital-twin instances remain separate. */
   quantity?: number;
   holderId: StageHolderId;
@@ -187,6 +197,8 @@ export type StageToolChipPlacement = {
   displayState: StageToolDisplayState;
   highlight: "requested" | "predicted" | "normal";
   lifecycle: string;
+  /** The represented DT instance is physically confirmed on canonical Mayo. */
+  mayoDecisionEligible?: boolean;
   footerBadges: StageToolChipBadge[];
   contaminated: boolean;
   active: boolean;
@@ -645,15 +657,22 @@ function holderIdForAnchor(anchorId: string, lifecycleStage = "", locationType =
   return "rack";
 }
 
-function rackSlotRect(index: number): StageHolderRect {
+function rackSlotRect(index: number, count = RACK_SLOT_COUNT): StageHolderRect {
   const rect = BASE_HOLDER_RECTS.rack;
   const column = index % RACK_SLOT_COLUMNS;
   const row = Math.floor(index / RACK_SLOT_COLUMNS);
+  const rows = Math.max(1, Math.ceil(count / RACK_SLOT_COLUMNS));
+  const top = rect.top + RACK_TITLE_SPACE + RACK_PADDING_Y;
+  const availableHeight = CLEANER_TOP - RACK_CLEANER_GAP - top;
+  const height = Math.min(
+    TOOL_CARD_H,
+    (availableHeight - RACK_SLOT_GAP_Y * (rows - 1)) / rows,
+  );
   return {
     left: rect.left + RACK_PADDING_X + column * (TOOL_CARD_W + RACK_SLOT_GAP_X) + TOOL_CARD_W / 2,
-    top: rect.top + RACK_TITLE_SPACE + RACK_PADDING_Y + row * (TOOL_CARD_H + RACK_SLOT_GAP_Y) + TOOL_CARD_H / 2,
+    top: top + row * (height + RACK_SLOT_GAP_Y) + height / 2,
     width: TOOL_CARD_W,
-    height: TOOL_CARD_H,
+    height,
   };
 }
 
@@ -775,7 +794,9 @@ function chipRectForHolder(
   holderRects: Record<StageHolderId, StageHolderRect>,
 ): StageHolderRect & { scale: number; compact: boolean; gridIndex: number } {
   if (holderId === "rack") {
-    return { ...rackSlotRect(index), scale: 1, compact: false, gridIndex: index };
+    const rect = rackSlotRect(index, holderCount);
+    const scale = Math.min(1, rect.height / TOOL_CARD_H);
+    return { ...rect, scale, compact: scale < 0.78, gridIndex: index };
   }
   if (holderId === "mayo") {
     return mayoListRectForHolder(holderId, index, holderCount, holderRects);
@@ -880,36 +901,21 @@ function footerBadgesForInstrument(
   ui: ReturnType<typeof getUiCopy>,
   activeRecoveryToolIds: Set<string>,
   holderId: StageHolderId,
-  mayoAssessment: MayoVlmAssessment | undefined,
 ): StageToolChipBadge[] {
   if (holderId === "mayo") {
     const finalRecovery =
       isActiveRecoveryInstrument(instrument, activeRecoveryToolIds) ||
       instrument.lifecycle_stage === "mayo_recovery" ||
       instrument.next_required_transition === "recover_left";
-    const confidence = Math.round((mayoAssessment?.confidence ?? 0) * 100);
     const decisionBadge: StageToolChipBadge = finalRecovery
       ? {
           label: language === "ko" ? "회수 예정" : "Recovery scheduled",
           tone: "recovery",
         }
-      : mayoAssessment?.decision === "reuse"
-        ? {
-            label: language === "ko" ? `재사용 ${confidence}%` : `Reuse ${confidence}%`,
-            tone: "reuse",
-          }
-        : mayoAssessment?.decision === "recover"
-          ? {
-              label:
-                language === "ko"
-                  ? `${mayoAssessment.selectedForRetrieve ? "회수 후보" : "회수 판단"} ${confidence}%`
-                  : `${mayoAssessment.selectedForRetrieve ? "Recovery candidate" : "Recover"} ${confidence}%`,
-              tone: "warning",
-            }
-          : {
-              label: language === "ko" ? "판단 대기" : "Decision pending",
-              tone: "neutral",
-            };
+      : {
+          label: language === "ko" ? "판단 대기" : "Decision pending",
+          tone: "neutral",
+        };
     const badges: StageToolChipBadge[] = [decisionBadge];
     if (instrument.contaminated) {
       badges.push({ label: ui.contaminated, tone: "danger" });
@@ -926,54 +932,6 @@ function footerBadgesForInstrument(
     badges.push({ label: ui.contaminated, tone: "danger" });
   }
   return badges;
-}
-
-type MayoVlmAssessment = {
-  decision: "recover" | "reuse";
-  confidence: number;
-  selectedForRetrieve: boolean;
-};
-
-function mayoVlmAssessments(
-  vlmResult: VLMResult,
-  resolveToolId: (rawToolId: string) => string,
-): Map<string, MayoVlmAssessment> {
-  const assessments = new Map<string, MayoVlmAssessment>();
-  if (!vlmResult.raw_json) return assessments;
-  try {
-    const parsed = parseBoundedJson(vlmResult.raw_json);
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return assessments;
-    const payload = parsed as {
-      mayo?: unknown;
-      mayo_retrieve?: unknown;
-    };
-    const retrieveToolId =
-      Array.isArray(payload.mayo_retrieve) && payload.mayo_retrieve.length >= 2
-        ? resolveToolId(String(payload.mayo_retrieve[0] ?? "").trim())
-        : "";
-    if (!Array.isArray(payload.mayo)) return assessments;
-    for (const row of payload.mayo) {
-      if (!Array.isArray(row) || row.length < 3) continue;
-      const toolId = resolveToolId(String(row[0] ?? "").trim());
-      const decision = String(row[1] ?? "").trim().toLowerCase();
-      const confidence = Number(row[2]);
-      if (
-        !toolId ||
-        !Number.isFinite(confidence) ||
-        (decision !== "reuse" && decision !== "recover" && decision !== "recovery")
-      ) {
-        continue;
-      }
-      assessments.set(toolId, {
-        decision: decision === "reuse" ? "reuse" : "recover",
-        confidence: Math.max(0, Math.min(1, confidence)),
-        selectedForRetrieve: toolId === retrieveToolId,
-      });
-    }
-  } catch {
-    return assessments;
-  }
-  return assessments;
 }
 
 function isLayoutBundle(value: unknown): value is LayoutBundle {
@@ -1006,6 +964,10 @@ function selectedBundleMetadata(
       id: selected.id,
       display_name: selected.display_name,
       display_name_ko: selected.display_name_ko,
+      target_site: selected.target_site,
+      target_site_ko: selected.target_site_ko,
+      approach: selected.approach,
+      approach_ko: selected.approach_ko,
     },
     default_phase_id: selected.default_phase_id,
     phases: selected.phases ?? [],
@@ -1069,13 +1031,14 @@ function layoutJsonProcedureId(layoutJson: string | undefined): string {
 function placeholderInstrumentStates(metadata: LayoutDisplayMetadata | undefined): InstrumentState[] {
   const instruments = metadata?.instruments ?? [];
   return instruments.map((instrument, index) => {
-    const slotId = `main_tray_slot_${index + 1}`;
+    const locationId = instrument.home_location_id?.trim() || `main_tray_slot_${index + 1}`;
+    const locationType = instrument.home_location_type?.trim() || "tray_slot";
     return {
       instrument_id: instrument.id,
-      home_location_type: "tray_slot",
-      home_location_id: slotId,
-      location_type: "tray_slot",
-      location_id: slotId,
+      home_location_type: locationType,
+      home_location_id: locationId,
+      location_type: locationType,
+      location_id: locationId,
       owner: "rack",
       status: "ready",
       confidence: 1,
@@ -1085,13 +1048,12 @@ function placeholderInstrumentStates(metadata: LayoutDisplayMetadata | undefined
       last_holder: "",
       lifecycle_stage: "home",
       next_required_transition: "",
-      visual_anchor_id: slotId,
+      visual_anchor_id: locationId,
     };
   });
 }
 
 function runtimeLayout(bundleName: string, state: SimulationState): LayoutBundle {
-  const curated = layouts[bundleName];
   if (state.layout_json) {
     const parsed = parseBoundedJson(state.layout_json);
     if (isLayoutBundle(parsed)) {
@@ -1100,12 +1062,9 @@ function runtimeLayout(bundleName: string, state: SimulationState): LayoutBundle
         return parsed;
       }
       const selected = bundleMetadataFor(parsed.metadata, bundleName);
-      const fallback = curated ?? genericProcedureLayout(bundleName, selected?.instruments?.length);
+      const fallback = genericProcedureLayout(bundleName, selected?.instruments?.length);
       return layoutWithSelectedMetadata(fallback, parsed.metadata, bundleName);
     }
-  }
-  if (curated) {
-    return curated;
   }
   return genericProcedureLayout(bundleName);
 }
@@ -1935,7 +1894,6 @@ export function useDigitalTwinViewModel({
   skillStatus,
   surgeonState,
   events,
-  overrideAck,
   vlmHealth,
   vlmResult,
   vlmHealthReceivedAt,
@@ -1949,7 +1907,6 @@ export function useDigitalTwinViewModel({
   skillStatus: SkillStatus;
   surgeonState: SurgeonState;
   events: SimulationEvent[];
-  overrideAck: OverrideAck | null;
   vlmHealth: VLMHealth;
   vlmResult: VLMResult;
   vlmHealthReceivedAt: number | null;
@@ -1973,8 +1930,10 @@ export function useDigitalTwinViewModel({
 
   const viewModel = useMemo(() => {
     const ui = getUiCopy(language);
-    const logicalLayout = runtimeLayout(activeBundle, simulationState);
-    const layout = applyVisualLayout(activeBundle, logicalLayout);
+    // Runtime layout_json is the only procedure-specific layout projection.
+    // The local generator is a transport/bootstrap fallback, not another
+    // editable per-bundle catalog.
+    const layout = runtimeLayout(activeBundle, simulationState);
     const metadata = layout.metadata;
     const catalog = metadata?.display_catalog;
     const phaseDisplayById = new Map((metadata?.phases ?? []).map((phase) => [phase.id, phase]));
@@ -1982,18 +1941,6 @@ export function useDigitalTwinViewModel({
     const bundleDisplayById = new Map((metadata?.bundles ?? []).map((bundle) => [bundle.id, bundle]));
     const localizedToolName = (instrumentId: string) =>
       localizedDisplayName(toolDisplayById.get(instrumentId), language, displayToolName(instrumentId, language));
-    const toolAliasToId = new Map<string, string>();
-    for (const instrument of metadata?.instruments ?? []) {
-      for (const candidate of [instrument.id, instrument.display_name, instrument.display_name_ko, ...(instrument.aliases ?? [])]) {
-        const normalized = String(candidate ?? "").trim().toLowerCase();
-        if (normalized) toolAliasToId.set(normalized, instrument.id);
-      }
-    }
-    const resolveVlmToolId = (rawToolId: string) => {
-      const normalized = rawToolId.trim().toLowerCase();
-      return toolAliasToId.get(normalized) ?? (toolDisplayById.has(rawToolId) ? rawToolId : "");
-    };
-    const mayoAssessmentByTool = mayoVlmAssessments(vlmResult, resolveVlmToolId);
     const localizedPhaseName = (phaseId: string) =>
       localizedDisplayName(phaseDisplayById.get(phaseId), language, displayPhaseName(phaseId, language));
     const localizedBundleName = (bundleName: string) =>
@@ -2010,6 +1957,22 @@ export function useDigitalTwinViewModel({
       language,
       localizedBundleName(activeBundle),
     );
+    const localizedProcedureTargetSite = localizedDisplayName(
+      {
+        display_name: metadata?.procedure?.target_site,
+        display_name_ko: metadata?.procedure?.target_site_ko,
+      },
+      language,
+      "",
+    );
+    const localizedProcedureApproach = localizedDisplayName(
+      {
+        display_name: metadata?.procedure?.approach,
+        display_name_ko: metadata?.procedure?.approach_ko,
+      },
+      language,
+      "",
+    );
     const anchorMap = Object.fromEntries(layout.anchors.map((anchor) => [anchor.id, anchor])) as Record<
       string,
       LayoutAnchor
@@ -2019,6 +1982,16 @@ export function useDigitalTwinViewModel({
       LayoutEntity
     >;
     const fieldAnchor = layout.anchors.find((anchor) => anchor.id.startsWith("field_region"));
+    const mayoStandEntity = entityMap.mayo_stand;
+    const mayoFallbackAnchor: LayoutAnchor | undefined = mayoStandEntity
+      ? {
+          id: "mayo_stand",
+          attached_to: "mayo_stand",
+          x: mayoStandEntity.x + mayoStandEntity.width / 2,
+          y: mayoStandEntity.y + mayoStandEntity.height / 2,
+          label: mayoStandEntity.label,
+        }
+      : undefined;
     const unknownAnchor = anchorMap.unknown_zone_anchor;
     const anchorNameForId = (anchorId: string) => {
       const anchor = anchorMap[anchorId];
@@ -2032,7 +2005,7 @@ export function useDigitalTwinViewModel({
       : activeBundle
         ? [{ id: activeBundle, label: localizedBundleName(activeBundle) }]
         : [];
-    const requestableInstrumentIds = metadata?.requestable_instruments?.length
+    const requestableInstrumentIds = Array.isArray(metadata?.requestable_instruments)
       ? metadata.requestable_instruments
       : (metadata?.instruments ?? []).filter((instrument) => instrument.requestable !== false).map((instrument) => instrument.id);
     const requestableTools: RequestableToolOption[] = requestableInstrumentIds
@@ -2113,8 +2086,8 @@ export function useDigitalTwinViewModel({
       if (instrument.lifecycle_stage === "recovering_left" && anchorMap.robot_left_hand) return anchorMap.robot_left_hand;
       if (instrument.lifecycle_stage === "cleaned_left" && anchorMap.robot_left_hand) return anchorMap.robot_left_hand;
       if (instrument.lifecycle_stage === "cleaning_left" && anchorMap.cleaner_slot) return anchorMap.cleaner_slot;
-      if (instrument.lifecycle_stage === "mayo_recovery" && anchorMap.mayo_recovery_zone) return anchorMap.mayo_recovery_zone;
-      if (instrument.lifecycle_stage === "mayo_reuse" && anchorMap.mayo_reuse_zone) return anchorMap.mayo_reuse_zone;
+      if (instrument.lifecycle_stage === "mayo_recovery") return anchorMap.mayo_recovery_zone ?? mayoFallbackAnchor;
+      if (instrument.lifecycle_stage === "mayo_reuse") return anchorMap.mayo_reuse_zone ?? mayoFallbackAnchor;
       if (instrument.lifecycle_stage === "surgeon_owned" && fieldAnchor) return fieldAnchor;
 
       const byLocationType =
@@ -2122,9 +2095,9 @@ export function useDigitalTwinViewModel({
         (instrument.location_type === "robot_left_hand" && anchorMap.robot_left_hand) ||
         (instrument.location_type === "surgeon_hand" && anchorMap.surgeon_hand) ||
         (instrument.location_type === "surgical_field" && fieldAnchor) ||
-        (instrument.location_type === "mayo_recovery_zone" && anchorMap.mayo_recovery_zone) ||
-        (instrument.location_type === "mayo_reuse_zone" && anchorMap.mayo_reuse_zone) ||
-        (instrument.location_type === "mayo_stand" && anchorMap.mayo_reuse_zone) ||
+        (instrument.location_type === "mayo_recovery_zone" && (anchorMap.mayo_recovery_zone ?? mayoFallbackAnchor)) ||
+        (instrument.location_type === "mayo_reuse_zone" && (anchorMap.mayo_reuse_zone ?? mayoFallbackAnchor)) ||
+        (instrument.location_type === "mayo_stand" && (anchorMap.mayo_reuse_zone ?? mayoFallbackAnchor)) ||
         (instrument.location_type === "return_zone" && anchorMap.surgeon_return_zone) ||
         (instrument.location_type === "handover_zone" && anchorMap.surgeon_receive_zone) ||
         (instrument.location_type === "cleaner_slot" && anchorMap.cleaner_slot);
@@ -2155,7 +2128,6 @@ export function useDigitalTwinViewModel({
         simulationState.right_hand_tool ||
         simulationState.left_hand_tool ||
         simulationState.prepositioned_tool ||
-        overrideAck?.toolId ||
         requestedSurgeonToolId ||
         ""
       : "";
@@ -2254,7 +2226,23 @@ export function useDigitalTwinViewModel({
       mayoStandRect,
       cameraRects,
     } = buildHolderRects(stageAspectRatio);
-    const rackSlotIds = Array.from({ length: RACK_SLOT_COUNT }).map((_, index) => `main_tray_slot_${index + 1}`);
+    const rackSlotIds = layout.anchors
+      .filter((anchor) => anchor.attached_to === "instrument_rack")
+      .map((anchor) => anchor.id);
+    for (const instrument of displayInstrumentStates) {
+      if (
+        instrument.home_location_id &&
+        !rackSlotIds.includes(instrument.home_location_id)
+      ) {
+        rackSlotIds.push(instrument.home_location_id);
+      }
+    }
+    if (!rackSlotIds.length) {
+      rackSlotIds.push(...Array.from(
+        { length: RACK_SLOT_COUNT },
+        (_, index) => `main_tray_slot_${index + 1}`,
+      ));
+    }
     const boardRackSlotCount = rackSlotIds.length;
     const rackSlotIndexById = new Map(rackSlotIds.map((slotId, index) => [slotId, index]));
     const instrumentByHomeSlot = new Map(
@@ -2272,15 +2260,15 @@ export function useDigitalTwinViewModel({
         label,
         shortLabel: instrument ? toolShortLabel(label) : `${index + 1}`,
         occupied: instrument ? rackOccupiedInstrumentIds.has(instrument.instrument_id) : false,
-        rect: rackSlotRect(index),
+        rect: rackSlotRect(index, boardRackSlotCount),
       };
     });
     const activeRequestIntent =
       runtimeAllowsActiveTask &&
-      [simulationState.surgeon_intent, surgeonState.intent, overrideAck?.eventType ?? ""].some(
+      [simulationState.surgeon_intent, surgeonState.intent].some(
         (intent) => intent === "request_tool" || intent === "voice_request" || intent === "extend_hand_for_handover",
       );
-    const requestedHighlightToolId = activeRequestIntent ? overrideAck?.toolId || requestedSurgeonToolId : "";
+    const requestedHighlightToolId = activeRequestIntent ? requestedSurgeonToolId : "";
     const activeRecoveryToolIds = new Set(
       runtimeFrameMatchesActiveBundle
         ? simulationState.active_recovery_tool_instances?.length
@@ -2345,7 +2333,6 @@ export function useDigitalTwinViewModel({
           ui,
           activeRecoveryToolIds,
           holderId,
-          mayoAssessmentByTool.get(instrument.instrument_id),
         );
         const footerBadges =
           contaminated && !representativeBadges.some((badge) => badge.tone === "danger")
@@ -2357,9 +2344,11 @@ export function useDigitalTwinViewModel({
             : instrumentInstanceKey(instrument);
         return {
           id: visualId,
+          instrumentId: instrument.instrument_id,
           label,
           shortLabel: toolShortLabel(label),
           instanceIds: group.instruments.map(instrumentInstanceKey),
+          displayInstanceId: instrumentInstanceKey(instrument),
           quantity: group.instruments.length,
           holderId,
           holderLabel: holderShortLabel(holderId, language),
@@ -2380,6 +2369,7 @@ export function useDigitalTwinViewModel({
             language,
             titleize(displayLifecycleForInstrument(instrument, activeRecoveryToolIds)),
           ),
+          mayoDecisionEligible: group.instruments.some(isMayoDecisionEligible),
           footerBadges,
           contaminated,
           active,
@@ -2407,9 +2397,7 @@ export function useDigitalTwinViewModel({
 
     const activeVoiceCommand = activeVoiceCommandFromEvents(displayEvents);
     const latestVoiceText = activeVoiceCommand?.text ?? "";
-    const activeVoiceText =
-      latestVoiceText ||
-      (overrideAck?.eventType === "voice_request" ? overrideAck.voiceText || overrideAck.message : "");
+    const activeVoiceText = latestVoiceText;
     const cleanerCountdown = runtimeAllowsActiveTask && simulationState.cleaner_busy
       ? Math.max(1, Math.ceil(simulationState.cleaner_remaining_sec || 0))
       : 0;
@@ -2421,17 +2409,13 @@ export function useDigitalTwinViewModel({
     const displayReadyForHandover =
       !surgeonPanelInactive &&
       (surgeonState.ready_for_handover ||
-        simulationState.surgeon_ready_for_handover ||
-        overrideAck?.eventType === "request_tool" ||
-        overrideAck?.eventType === "voice_request");
+        simulationState.surgeon_ready_for_handover);
     const displayReadyForRetrieval =
       !surgeonPanelInactive &&
       (surgeonState.ready_for_retrieval ||
-        simulationState.surgeon_ready_for_retrieval ||
-        overrideAck?.eventType === "return_tool");
+        simulationState.surgeon_ready_for_retrieval);
     const intentBubble =
       activeVoiceText ||
-      overrideAck?.message ||
       (displayReadyForRetrieval
         ? `${localizedToolName(displayRequestedTool || activeToolId)} return`
         : displayReadyForHandover
@@ -2683,13 +2667,7 @@ export function useDigitalTwinViewModel({
           text: activeVoiceText,
           tone: "audio",
         }
-      : overrideAck?.message
-        ? {
-            title: language === "ko" ? "집도의 오버라이드" : "Surgeon Override",
-            text: overrideAck.message,
-            tone: "override",
-          }
-        : undefined;
+      : undefined;
     const newestFirstEvents = displayEvents
       .map((event, index) => ({ event, index }))
       .sort((a, b) => compareTimelineEvents(a.event, b.event, a.index, b.index, displayEvents.length))
@@ -2853,6 +2831,8 @@ export function useDigitalTwinViewModel({
       activeToolId,
       stage: {
         procedureLabel: localizedProcedureName,
+        procedureTargetSite: localizedProcedureTargetSite,
+        procedureApproach: localizedProcedureApproach,
         phaseName,
         rawPhaseId,
         displayedPhaseId,
@@ -2873,7 +2853,6 @@ export function useDigitalTwinViewModel({
         readyForHandover: displayReadyForHandover,
         readyForRetrieval: displayReadyForRetrieval,
         note:
-          overrideAck?.message ||
           surgeonState.scene_note ||
           (simulationState.cleaner_busy
             ? `Cleaner engaged for ${cleanerCountdown}s`
@@ -2908,7 +2887,6 @@ export function useDigitalTwinViewModel({
     skillStatus,
     surgeonState,
     events,
-    overrideAck,
     vlmHealth,
     vlmResult,
     vlmHealthReceivedAt,

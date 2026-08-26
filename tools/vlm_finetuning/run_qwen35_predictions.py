@@ -20,6 +20,8 @@ DEFAULT_MODEL = os.environ.get(
     "unsloth/Qwen3.5-4B",
 )
 
+FORBIDDEN_VISUAL_HAND_TASKS = {"gesture", "request_intent", "surgeon_intent"}
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -114,6 +116,18 @@ def select_rows(
 
     candidates = [row for row in rows if split_role(row) == split]
     candidates.sort(key=lambda row: str(row.get("example_id", "")))
+    forbidden = sorted(
+        {
+            str(row.get("task_type", ""))
+            for row in candidates
+            if str(row.get("task_type", "")) in FORBIDDEN_VISUAL_HAND_TASKS
+        }
+    )
+    if forbidden:
+        raise ValueError(
+            "visual hand tasks are excluded from VLM prediction selection: "
+            f"{forbidden}"
+        )
     if selection_manifest:
         wanted = set(json.loads(selection_manifest.read_text(encoding="utf-8"))["example_ids"])
         selected = [row for row in candidates if row.get("example_id") in wanted]
@@ -143,8 +157,6 @@ def select_rows(
                         )
                     elif task == "next_physical_tool":
                         label = str(gold.get("next_transfer_tool", label))
-                    elif task == "request_intent":
-                        label = str(gold.get("intent", label))
                 groups[(str(row.get("case_id", "unknown")), label)].append(row)
             task_selected: list[dict[str, Any]] = []
             group_keys = sorted(groups)

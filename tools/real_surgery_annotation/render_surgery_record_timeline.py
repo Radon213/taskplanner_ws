@@ -34,7 +34,7 @@ SHADOW_TOOL_EVENT_LABELS = {
     "ToolPrepared": "도구 준비",
     "RobotGraspedTool": "도구 선택 및 전달 준비",
     "ToolHandoverCompleted": "집도의에게 도구 전달",
-    "UnusedPrepositionReturned": "미사용 도구 원위치",
+    "UnusedPrepositionReturned": "미사용 도구 메이요 스탠드 배치",
     "ToolReceivedFromSurgeon": "집도의에게서 도구 회수",
     "ToolSentToCleaner": "도구 세척 의뢰",
     "ToolCleaningCompleted": "도구 세척 완료",

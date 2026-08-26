@@ -20,9 +20,9 @@ import { runtimeAuthorityCopy } from "../../utils/runtimeAuthorityCopy";
 import { type Language } from "../../utils/display";
 import { MOTION_DURATION, SILK_EASE } from "../../motion-system";
 import {
-  PublicSurgeonGestureStatus,
-  type PublicSurgeonGesture,
-} from "./PublicSurgeonGestureStatus";
+  HandHandoverSignalStatus,
+  type HandHandoverSignal,
+} from "./HandHandoverSignalStatus";
 
 type ViewModel = ReturnType<typeof useDigitalTwinViewModel>;
 const SHADOW_CASE_IDS = Array.from(
@@ -156,11 +156,12 @@ export function ShadowReplayDock({
       : language === "ko"
         ? "활성 정답 구간 없음"
         : "No active ground-truth interval";
-  const groundTruthSurgeonGesture: PublicSurgeonGesture = {
-    eventType: groundTruth.active ? "implicit_tool_request" : "",
-    handPose: groundTruth.active ? "hand_extending" : "",
+  const groundTruthHandHandoverSignal: HandHandoverSignal = {
+    active: groundTruth.active,
+    handPose: groundTruth.active ? "open_receive" : "",
     confidence: groundTruth.active ? 1 : 0,
-    requestedTool: "",
+    stabilitySec: 0,
+    generation: 0,
   };
   const authorityFeedback = runtimeAuthorityCopy(runtimeAuthorityStatus, language);
   const replayStatusNote = !connected
@@ -274,14 +275,13 @@ export function ShadowReplayDock({
           <strong>{phaseLabel}</strong>
           <small>{phaseInterval}</small>
         </article>
-        <PublicSurgeonGestureStatus
-          evidence={groundTruthSurgeonGesture}
+        <HandHandoverSignalStatus
+          signal={groundTruthHandHandoverSignal}
           language={language}
-          toolLabel=""
           label={
             language === "ko"
-              ? "정답 이벤트 · 암묵적 도구 요청"
-              : "Ground truth · implicit request"
+              ? "정답 이벤트 · 손 전달 신호"
+              : "Ground truth · handover signal"
           }
         />
       </section>

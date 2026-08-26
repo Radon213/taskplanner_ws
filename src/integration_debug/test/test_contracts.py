@@ -10,6 +10,7 @@ from integration_debug.contracts import (
     load_config,
     manual_write_block_reason,
     measured_rate,
+    operational_runtime_intervention_block_reason,
     operational_runtime_stopped,
     operational_state_publisher_trusted,
     parse_voice_command,
@@ -35,6 +36,7 @@ def test_validates_only_public_handover_transitions() -> None:
         ("tray", "surgeon"),
         ("robot", "surgeon"),
         ("robot", "tray"),
+        ("robot", "mayo"),
         ("mayo", "tray"),
     }
     mapped = validate_tool_handover(
@@ -98,7 +100,7 @@ def test_retraction_command_uses_only_the_single_service_contract() -> None:
                 "target_tool_id": "thyroid_retractor",
             }
         )
-    with pytest.raises(ValueError, match="target_side left or right"):
+    with pytest.raises(ValueError, match="target_side left, right, or both"):
         validate_retraction_command(
             {"command": "adjust_retraction", "target_side": "none", "distance_m": 0.05}
         )
@@ -212,6 +214,30 @@ def test_voice_retraction_service_commands_are_exact(
     }
 
 
+@pytest.mark.parametrize("side", ["none", "left", "right", "both"])
+def test_finish_direct_teach_accepts_each_target_side(side: str) -> None:
+    parsed = validate_retraction_command(
+        {
+            "command": "finish_direct_teach",
+            "target_side": side,
+            "distance_m": 0.0,
+        }
+    )
+
+    assert parsed["target_side"] == side
+
+
+def test_finish_direct_teach_rejects_a_distance() -> None:
+    with pytest.raises(ValueError, match="finish_direct_teach allows"):
+        validate_retraction_command(
+            {
+                "command": "finish_direct_teach",
+                "target_side": "left",
+                "distance_m": 0.001,
+            }
+        )
+
+
 def test_voice_retraction_adjustment_uses_side_and_distance_only() -> None:
     parsed = parse_voice_command("리트랙션 오른쪽 5cm 더", VOICE)
     assert parsed.matched
@@ -223,8 +249,12 @@ def test_voice_retraction_adjustment_uses_side_and_distance_only() -> None:
     }
 
     legacy_direction = parse_voice_command("왼쪽 견인기 왼쪽 5밀리 이동", VOICE)
-    assert not legacy_direction.matched
-    assert legacy_direction.reason == "unsupported_retraction_command"
+    assert legacy_direction.matched
+    assert legacy_direction.payload == {
+        "command": "adjust_retraction",
+        "target_side": "left",
+        "distance_m": 0.005,
+    }
 
     ambiguous_sides = parse_voice_command("리트랙션 왼쪽 오른쪽 1cm 더", VOICE)
     assert not ambiguous_sides.matched
@@ -232,8 +262,20 @@ def test_voice_retraction_adjustment_uses_side_and_distance_only() -> None:
     assert ambiguous_sides.reason == "ambiguous_retraction_target_side"
 
     legacy_multi = parse_voice_command("리트랙션 좌우로 1센치 더", VOICE)
-    assert not legacy_multi.matched
-    assert legacy_multi.reason == "unsupported_retraction_command"
+    assert legacy_multi.matched
+    assert legacy_multi.payload == {
+        "command": "adjust_retraction",
+        "target_side": "both",
+        "distance_m": 0.01,
+    }
+
+    natural_bilateral = parse_voice_command("양쪽으로 1mm씩 당겨줘", VOICE)
+    assert natural_bilateral.matched
+    assert natural_bilateral.payload == {
+        "command": "adjust_retraction",
+        "target_side": "both",
+        "distance_m": 0.001,
+    }
 
 
 def test_bed_mounted_suction_and_legacy_release_are_not_commands() -> None:
@@ -251,7 +293,10 @@ def test_debug_config_exposes_exact_public_contract() -> None:
     assert {(row["topic"], row["type"]) for row in config["inputs"]} == {
         ("/sensors/surgeon/sentence", "std_msgs/msg/String"),
         ("/surgery/audio/request_text", "std_msgs/msg/String"),
-        ("/input/speech/status", "surgical_msgs/msg/InputSourceStatus"),
+        (
+            "/integration/debug/speech/status",
+            "surgical_msgs/msg/InputSourceStatus",
+        ),
         ("/integration/cv_contract/status", "std_msgs/msg/String"),
         ("/synced/cam_1/status", "std_msgs/msg/String"),
         ("/synced/cam_2/status", "std_msgs/msg/String"),
@@ -324,21 +369,22 @@ def test_manual_writes_fail_closed_while_full_runtime_is_active() -> None:
     )
 
 
-def test_manual_writes_require_exact_acknowledgement_during_coexistence() -> None:
+def test_manual_writes_never_allow_standalone_planner_coexistence() -> None:
     values = {
         "armed": True,
         "fault_locked": False,
         "blocked_nodes": ["simulation_manager", "tree_executor"],
         "planner_coexistence_allowed": True,
     }
+    expected = "full Taskplanner nodes are active: simulation_manager, tree_executor"
     assert manual_write_block_reason(
         **values,
         acknowledged_blocked_nodes=["tree_executor"],
-    ).startswith("planner node set changed")
+    ) == expected
     assert manual_write_block_reason(
         **values,
         acknowledged_blocked_nodes=["tree_executor", "simulation_manager"],
-    ) == ""
+    ) == expected
 
 
 def test_manual_output_write_requires_arming_when_runtime_is_stopped() -> None:
@@ -366,6 +412,103 @@ def test_fault_lock_always_blocks_manual_ros_writes() -> None:
         planner_coexistence_allowed=False,
         acknowledged_blocked_nodes=[],
     ) == "manual control is fault locked"
+
+
+@pytest.mark.parametrize(
+    ("running", "execution_state"),
+    [
+        (True, "paused"),
+        (False, "idle"),
+        (False, "halted"),
+        (False, "stopped"),
+    ],
+)
+def test_operational_intervention_accepts_paused_or_fully_stopped_idle_state(
+    running: bool,
+    execution_state: str,
+) -> None:
+    assert operational_runtime_intervention_block_reason(
+        received=True,
+        running=running,
+        execution_state=execution_state,
+        active_robot_task_id="",
+        robot_state="idle",
+        cleaner_busy=False,
+        publisher_trusted=True,
+        age_sec=0.1,
+        max_age_sec=3.0,
+    ) == ""
+
+
+@pytest.mark.parametrize(
+    ("overrides", "reason"),
+    [
+        ({"received": False}, "state is unavailable"),
+        ({"publisher_trusted": False}, "publisher is not trusted"),
+        ({"age_sec": 3.1}, "state is stale"),
+        (
+            {"running": True, "execution_state": "running"},
+            "pause or stop",
+        ),
+        (
+            {"running": False, "execution_state": "paused"},
+            "pause state is inconsistent",
+        ),
+        (
+            {"running": True, "execution_state": "idle"},
+            "stopped state is inconsistent",
+        ),
+        ({"active_robot_task_id": "task-17"}, "active robot task"),
+        ({"robot_state": "moving"}, "robot to become idle"),
+        ({"robot_state": "unknown"}, "robot to become idle"),
+        ({"cleaner_busy": True}, "cleaner to become idle"),
+    ],
+)
+def test_operational_intervention_gate_fails_closed_with_stable_reason(
+    overrides: dict[str, object],
+    reason: str,
+) -> None:
+    values: dict[str, object] = {
+        "received": True,
+        "running": True,
+        "execution_state": "paused",
+        "active_robot_task_id": "",
+        "robot_state": "idle",
+        "cleaner_busy": False,
+        "publisher_trusted": True,
+        "age_sec": 0.1,
+        "max_age_sec": 3.0,
+    }
+    values.update(overrides)
+
+    assert reason in operational_runtime_intervention_block_reason(**values)
+
+
+def test_admitted_command_keeps_only_the_paused_or_stopped_lifecycle_gate() -> None:
+    assert operational_runtime_intervention_block_reason(
+        received=True,
+        running=True,
+        execution_state="paused",
+        active_robot_task_id="debug-task",
+        robot_state="moving",
+        cleaner_busy=True,
+        publisher_trusted=True,
+        age_sec=0.1,
+        max_age_sec=3.0,
+        require_idle_resources=False,
+    ) == ""
+    assert "pause or stop" in operational_runtime_intervention_block_reason(
+        received=True,
+        running=True,
+        execution_state="running",
+        active_robot_task_id="debug-task",
+        robot_state="moving",
+        cleaner_busy=True,
+        publisher_trusted=True,
+        age_sec=0.1,
+        max_age_sec=3.0,
+        require_idle_resources=False,
+    )
 
 
 @pytest.mark.parametrize(
@@ -487,6 +630,7 @@ def test_action_watchdog_policy_is_loaded_from_debug_config() -> None:
     policy = load_action_watchdog_policy(config)
     assert policy == {
         "goal_response_timeout_sec": 10.0,
+        "change_tool_response_timeout_sec": 120.0,
         "feedback_timeout_sec": 30.0,
         "max_duration_sec": 300.0,
         "server_loss_grace_sec": 5.0,

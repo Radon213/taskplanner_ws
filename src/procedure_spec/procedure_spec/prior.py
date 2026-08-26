@@ -52,11 +52,9 @@ class ProcedurePriorScorer:
     def __init__(self, spec: ProcedureSpec, procedure_prompt: dict[str, Any] | None = None) -> None:
         self.spec = spec
         self.prompt = procedure_prompt or {}
-        self._requestable = {
-            instrument.id
-            for instrument in spec.bundle.instruments
-            if bool(getattr(instrument, "requestable", True))
-        }
+        self._requestable = set(
+            spec.get_scenario_policy().requestable_instrument_ids
+        )
         self._expected_by_phase = {
             phase.id: list(phase.expected_instruments)
             for phase in spec.bundle.phases
@@ -383,16 +381,6 @@ class ProcedurePriorScorer:
             resolved = self._resolve_tool(tool.get("tool", "") if isinstance(tool, dict) else tool)
             if resolved:
                 recent_tools.append(resolved)
-        for signal in evidence.get("observed_signals", []) or []:
-            if not isinstance(signal, dict):
-                continue
-            if not self._row_after_phase_entry(signal, phase_entered_sec):
-                continue
-            if str(signal.get("type", "")) not in {"request_tool", "voice_request", "continue_using"}:
-                continue
-            resolved = self._resolve_tool(signal.get("tool", ""))
-            if resolved:
-                recent_tools.append(resolved)
         handover_actions = {
             "direct_handover",
             "pick_up_and_handover",
@@ -696,39 +684,17 @@ class ProcedurePriorScorer:
                 ("recent_tools", recent_tools, 1),
             ]
         )
-        try:
-            phase_entered_sec = float(evidence.get("phase_entered_sec", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            phase_entered_sec = 0.0
         phase_mentions: list[str] = []
         for item in evidence.get("speech", []) or []:
             text = str(item.get("text", "") if isinstance(item, dict) else item)
             phase_mentions.extend(self._phase_mentions_from_text(text))
-        advance_transition_phases: set[str] = set()
-        for item in evidence.get("observed_signals", []) or []:
-            if not isinstance(item, dict):
-                continue
-            if str(item.get("type", "")) != "advance_phase_cue":
-                continue
-            text = str(item.get("speech", "") or "")
-            mentions = [
-                phase_id
-                for phase_id in self._phase_mentions_from_text(text)
-                if phase_id != current_phase and phase_id not in self._interrupt_phase_ids
-            ]
-            if mentions:
-                advance_transition_phases.update(mentions)
-                phase_mentions.extend(mentions)
-                continue
-            try:
-                cue_sec = float(item.get("at", 0.0) or 0.0)
-            except (TypeError, ValueError):
-                cue_sec = 0.0
-            if phase_entered_sec > 0.0 and cue_sec > 0.0 and cue_sec <= phase_entered_sec + 0.5:
-                continue
-            next_normal_phase = self.spec.get_next_normal_phase(current_phase)
-            if next_normal_phase and next_normal_phase in allowed_next:
-                advance_transition_phases.add(next_normal_phase)
+        explicit_speech_transition_phases = {
+            phase_id
+            for phase_id in phase_mentions
+            if phase_id != current_phase
+            and phase_id in regular_allowed_next
+            and phase_id not in self._interrupt_phase_ids
+        }
         mentioned_transition_phases: set[str] = set()
         for index, phase_id in enumerate(reversed(phase_mentions[-3:])):
             if phase_id != current_phase and phase_id not in regular_allowed_next:
@@ -740,15 +706,6 @@ class ProcedurePriorScorer:
                 mentioned_transition_phases.add(phase_id)
         if mentioned_transition_phases:
             phase_scores[current_phase] *= 0.72
-        for phase_id in advance_transition_phases:
-            if phase_id not in self.spec.phase_ids:
-                continue
-            phase_scores[phase_id] += 2.2
-            if phase_id != current_phase:
-                mentioned_transition_phases.add(phase_id)
-        if advance_transition_phases.difference({current_phase}):
-            phase_scores[current_phase] *= 0.25
-
         transition_evidence = speech_tools[-4:] if speech_tools else recent_tools[-6:]
         signature_transition_hits: dict[str, int] = {}
         for phase_id, signature in self._normal_transition_signatures(
@@ -1006,7 +963,7 @@ class ProcedurePriorScorer:
 
         if (
             not self._tool_only_detailed_phase_transition_allowed
-            and not advance_transition_phases
+            and not explicit_speech_transition_phases
         ):
             # Voice, handover and detector identities remain useful next-tool
             # context, but cannot by themselves establish a new visual

@@ -11,6 +11,7 @@ import time
 from typing import Any
 
 import rclpy
+from rcl_interfaces.msg import SetParametersResult
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
@@ -20,6 +21,20 @@ from surgical_interop_msgs.action import ExecuteToolHandover
 from surgical_interop_msgs.msg import BedRobotArmState, BedRobotArmStateArray
 from surgical_interop_msgs.srv import ExecuteRetractionCommand
 import yaml
+
+from .controller_contract import (
+    EIR_NUC_VIRTUAL_CONTRACT_ID,
+    GENERIC_EMULATOR_CAPABILITY_POLICY_ID,
+    VIRTUAL_EMULATOR_CAPABILITY_POLICY_ID,
+    REVIEWED_TOOL_TRANSITIONS,
+    build_controller_contract,
+    get_capability_policy,
+    validate_tool_handover_fields,
+)
+from .virtual_endpoints import (
+    VIRTUAL_ENDPOINT_SOURCE,
+    validate_virtual_endpoint_configuration,
+)
 
 
 SUPPORTED_OUTCOMES = {
@@ -96,14 +111,7 @@ class EmulatorProfile:
 
 
 def valid_tool_transition(source: str, target: str) -> bool:
-    return (source.strip().lower(), target.strip().lower()) in {
-        ("tray", "robot"),
-        ("tray", "surgeon"),
-        ("robot", "surgeon"),
-        ("robot", "tray"),
-        ("mayo", "robot"),
-        ("mayo", "tray"),
-    }
+    return (source.strip().lower(), target.strip().lower()) in REVIEWED_TOOL_TRANSITIONS
 
 
 def validate_retraction_command(
@@ -153,14 +161,17 @@ def validate_retraction_command(
             ExecuteRetractionCommand.Response.RESULT_INVALID_COMMAND,
             "invalid_command",
         )
+    valid_target_sides = {
+        ExecuteRetractionCommand.Request.TARGET_NONE,
+        ExecuteRetractionCommand.Request.TARGET_LEFT,
+        ExecuteRetractionCommand.Request.TARGET_RIGHT,
+    }
     if command == ExecuteRetractionCommand.Request.COMMAND_ADJUST_RETRACTION:
-        if target_side not in {
-            ExecuteRetractionCommand.Request.TARGET_LEFT,
-            ExecuteRetractionCommand.Request.TARGET_RIGHT,
-        }:
+        # The peer contract encodes a bilateral adjustment as TARGET_NONE (0).
+        if target_side not in valid_target_sides:
             return (
                 ExecuteRetractionCommand.Response.RESULT_INVALID_PARAMETER,
-                "adjust_requires_left_or_right_target",
+                "adjust_requires_target_none_for_both_or_left_right_target",
             )
         if (
             not isfinite(distance_m)
@@ -174,10 +185,27 @@ def validate_retraction_command(
                 "invalid_adjust_distance_m",
             )
         return ExecuteRetractionCommand.Response.RESULT_ACCEPTED, ""
-    if (
-        target_side != ExecuteRetractionCommand.Request.TARGET_NONE
-        or distance_m != 0.0
-    ):
+    if command == ExecuteRetractionCommand.Request.COMMAND_FINISH_DIRECT_TEACH:
+        if target_side not in valid_target_sides or distance_m != 0.0:
+            return (
+                ExecuteRetractionCommand.Response.RESULT_INVALID_PARAMETER,
+                (
+                    "command_does_not_accept_target_or_distance"
+                    if target_side not in valid_target_sides
+                    else "finish_direct_teach_requires_zero_distance"
+                ),
+            )
+        return ExecuteRetractionCommand.Response.RESULT_ACCEPTED, ""
+    if command == ExecuteRetractionCommand.Request.COMMAND_CHANGE_TOOL:
+        # This wire command intentionally means "run the controller's
+        # preconfigured swap" and therefore accepts no target or distance.
+        if target_side != ExecuteRetractionCommand.Request.TARGET_NONE or distance_m != 0.0:
+            return (
+                ExecuteRetractionCommand.Response.RESULT_INVALID_PARAMETER,
+                "change_tool_requires_zero_target_and_distance",
+            )
+        return ExecuteRetractionCommand.Response.RESULT_ACCEPTED, ""
+    if target_side not in valid_target_sides or distance_m != 0.0:
         return (
             ExecuteRetractionCommand.Response.RESULT_INVALID_PARAMETER,
             "command_does_not_accept_target_or_distance",
@@ -205,7 +233,67 @@ class FaultActionEmulator(Node):
         self._procedure_type = str(
             self.declare_parameter("procedure_type", "nephrectomy").value
         ).strip()
+        self._tool_handover_endpoint = str(
+            self.declare_parameter(
+                "tool_handover_endpoint", "/surgery/tool_handover"
+            ).value
+        )
+        self._retraction_service_name = str(
+            self.declare_parameter(
+                "retraction_service_name", "/surgery/retraction/command"
+            ).value
+        )
+        self._robot_endpoint_source = str(
+            self.declare_parameter("robot_endpoint_source", "external").value
+        )
+        self._publish_bed_robot_status_enabled = bool(
+            self.declare_parameter("publish_bed_robot_status", True).value
+        )
+        try:
+            self._robot_endpoint_source = validate_virtual_endpoint_configuration(
+                robot_endpoint_source=self._robot_endpoint_source,
+                tool_handover_endpoint=self._tool_handover_endpoint,
+                retraction_service_name=self._retraction_service_name,
+                require_bed_robot_status=self._publish_bed_robot_status_enabled,
+            )
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
+        self._virtual_endpoint_mode = (
+            self._robot_endpoint_source == VIRTUAL_ENDPOINT_SOURCE
+        )
+        default_contract_topic = (
+            "/integration/virtual/surgery/controller_contract"
+            if self._virtual_endpoint_mode
+            else "/surgery/controller_contract"
+        )
+        default_contract_id = (
+            EIR_NUC_VIRTUAL_CONTRACT_ID
+            if self._virtual_endpoint_mode
+            else "taskplanner-generic-emulator.v1"
+        )
+        default_capability_policy = (
+            VIRTUAL_EMULATOR_CAPABILITY_POLICY_ID
+            if self._virtual_endpoint_mode
+            else GENERIC_EMULATOR_CAPABILITY_POLICY_ID
+        )
+        self._controller_contract_topic = str(
+            self.declare_parameter(
+                "controller_contract_topic", default_contract_topic
+            ).value
+        ).strip()
+        self._controller_contract_id = str(
+            self.declare_parameter("controller_contract_id", default_contract_id).value
+        ).strip()
+        self._capability_policy_id = str(
+            self.declare_parameter(
+                "capability_policy_id", default_capability_policy
+            ).value
+        ).strip()
+        if get_capability_policy(self._capability_policy_id) is None:
+            raise RuntimeError("fault action emulator capability policy is unknown")
         self._status_pub = self.create_publisher(String, "/test/action_emulator/status", 10)
+        self._controller_contract_pub = None
+        self._controller_contract_timer = None
         callback_group = ReentrantCallbackGroup()
         self._servers: list[Any] = []
 
@@ -214,7 +302,7 @@ class FaultActionEmulator(Node):
                 ActionServer(
                     self,
                     ExecuteToolHandover,
-                    "/surgery/tool_handover",
+                    self._tool_handover_endpoint,
                     goal_callback=lambda request: self._goal("tool_handover", request),
                     cancel_callback=self._cancel,
                     execute_callback=lambda handle: self._execute_tool(handle),
@@ -225,16 +313,84 @@ class FaultActionEmulator(Node):
             self._servers.append(
                 self.create_service(
                     ExecuteRetractionCommand,
-                    "/surgery/retraction/command",
+                    self._retraction_service_name,
                     self._request_retraction_command,
                     callback_group=callback_group,
                 )
             )
-        self._bed_robot_status_pub = self.create_publisher(
-            BedRobotArmStateArray, "/external/bed_robot_arms/status", 10
-        )
-        self._start_bed_robot_status_heartbeat()
+        self._bed_robot_status_pub = None
+        self._bed_robot_status_timer = None
+        if self._publish_bed_robot_status_enabled:
+            self._bed_robot_status_pub = self.create_publisher(
+                BedRobotArmStateArray, "/external/bed_robot_arms/status", 10
+            )
+            self._start_bed_robot_status_heartbeat()
+        # Contract telemetry is useful for compatibility diagnostics but is
+        # not required to host the isolated Action/Service endpoints.
+        self._start_controller_contract_diagnostics()
         self.create_timer(1.0, self._publish_status)
+        self.add_on_set_parameters_callback(
+            self._on_endpoint_configuration_parameters_changed
+        )
+
+    @staticmethod
+    def _on_endpoint_configuration_parameters_changed(
+        parameters: list[Any],
+    ) -> SetParametersResult:
+        """Do not allow a running emulator to be rebound to another endpoint."""
+
+        launch_lifetime_parameters = {
+            "robot_endpoint_source",
+            "tool_handover_endpoint",
+            "retraction_service_name",
+            "publish_bed_robot_status",
+            "controller_contract_topic",
+            "controller_contract_id",
+            "capability_policy_id",
+        }
+        for parameter in parameters:
+            if parameter.name in launch_lifetime_parameters:
+                return SetParametersResult(
+                    successful=False,
+                    reason=(
+                        f"{parameter.name} is launch-lifetime and cannot be "
+                        "changed while the emulator is running"
+                    ),
+                )
+        return SetParametersResult(successful=True)
+
+    def _start_controller_contract_diagnostics(self) -> None:
+        """Best-effort contract telemetry that cannot block endpoint startup."""
+
+        self._controller_contract_pub = None
+        self._controller_contract_timer = None
+        if not self._controller_contract_topic or not self._controller_contract_id:
+            self.get_logger().warning(
+                "controller contract diagnostics disabled: "
+                "topic or ID is not configured"
+            )
+            return
+        try:
+            self._controller_contract_pub = self.create_publisher(
+                String, self._controller_contract_topic, 10
+            )
+            self._publish_controller_contract()
+            self._controller_contract_timer = self.create_timer(
+                1.0, self._publish_controller_contract
+            )
+        except Exception as exc:
+            publisher = self._controller_contract_pub
+            self._controller_contract_pub = None
+            self._controller_contract_timer = None
+            if publisher is not None:
+                try:
+                    self.destroy_publisher(publisher)
+                except Exception:
+                    pass
+            self.get_logger().warning(
+                "controller contract diagnostics disabled: "
+                f"{type(exc).__name__}"
+            )
 
     def _start_bed_robot_status_heartbeat(self) -> None:
         """Publish the initial snapshot now, then refresh it at the safe cadence."""
@@ -258,11 +414,17 @@ class FaultActionEmulator(Node):
         if not command_id:
             self._count(route, "rejected_missing_command_id")
             return GoalResponse.REJECT
-        if route == "tool_handover" and not valid_tool_transition(
-            request.source_location, request.target_location
-        ):
-            self._count(route, "rejected_invalid_transition")
-            return GoalResponse.REJECT
+        if route == "tool_handover":
+            rejection = validate_tool_handover_fields(
+                instrument_id=getattr(request, "instrument_id", ""),
+                instrument_instance_id=getattr(request, "instrument_instance_id", ""),
+                source_location=getattr(request, "source_location", ""),
+                target_location=getattr(request, "target_location", ""),
+                capability_policy_id=self._capability_policy_id,
+            )
+            if rejection:
+                self._count(route, f"rejected_{rejection}")
+                return GoalResponse.REJECT
         with self._lock:
             if command_id in self._active_ids:
                 self._count(route, "rejected_duplicate_active")
@@ -377,6 +539,8 @@ class FaultActionEmulator(Node):
         result.success = state == "completed"
         result.final_state = state
         result.reason_code = reason
+        if hasattr(result, "failure_detail"):
+            result.failure_detail = "" if state == "completed" else reason
         self._finish("tool_handover", command_id, state, reason)
         return result
 
@@ -427,19 +591,26 @@ class FaultActionEmulator(Node):
         return response
 
     def _publish_bed_robot_status(self) -> None:
+        if self._bed_robot_status_pub is None:
+            return
         message = BedRobotArmStateArray()
         message.stamp = self.get_clock().now().to_msg()
         self._bed_robot_revision += 1
         message.revision = self._bed_robot_revision
         message.procedure_type = self._procedure_type
-        configured_arms = (
-            (("arm_1", "army_navy"),)
-            if "thyroid" in self._procedure_type.casefold()
-            else (
+        procedure_type = self._procedure_type.casefold()
+        if "thyroid" in procedure_type:
+            configured_arms = (("arm_1", "army_navy"),)
+        elif procedure_type == "inguinal_hernia_repair":
+            configured_arms = (
+                ("arm_1", "left_army_navy"),
+                ("arm_2", "right_army_navy"),
+            )
+        else:
+            configured_arms = (
                 ("arm_1", "left_malleable"),
                 ("arm_2", "right_malleable"),
             )
-        )
         for arm_id, role_instance_id in configured_arms:
             arm = BedRobotArmState()
             arm.arm_id = arm_id
@@ -451,12 +622,40 @@ class FaultActionEmulator(Node):
             message.arms.append(arm)
         self._bed_robot_status_pub.publish(message)
 
+    def _publish_controller_contract(self) -> None:
+        if self._controller_contract_pub is None:
+            return
+        message = String()
+        message.data = json.dumps(
+            build_controller_contract(
+                contract_id=self._controller_contract_id,
+                endpoint_source=self._robot_endpoint_source,
+                execution_mode=("virtual" if self._virtual_endpoint_mode else "emulator"),
+                tool_handover_endpoint=self._tool_handover_endpoint,
+                retraction_service_name=self._retraction_service_name,
+                capability_policy_id=self._capability_policy_id,
+                stamp_sec=time.time(),
+            ),
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        self._controller_contract_pub.publish(message)
+
     def _publish_status(self) -> None:
         message = String()
         with self._lock:
             payload = {
                 "schema": "taskplanner.action_emulator_status.v1",
                 "profile_id": self._profile.profile_id,
+                "robot_endpoint_source": self._robot_endpoint_source,
+                "controller_contract_id": self._controller_contract_id,
+                "controller_contract_diagnostics_enabled": bool(
+                    self._controller_contract_pub is not None
+                ),
+                "capability_policy_id": self._capability_policy_id,
+                "bed_robot_status_published": bool(
+                    self._publish_bed_robot_status_enabled
+                ),
                 "active_command_ids": sorted(self._active_ids),
                 "counts": self._route_counts,
             }

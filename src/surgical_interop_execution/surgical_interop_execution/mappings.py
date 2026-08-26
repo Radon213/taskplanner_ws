@@ -35,7 +35,7 @@ ROBOT_HANDOVER_ALIASES = frozenset(
     }
 )
 
-RETURN_TO_TRAY_ALIASES = frozenset({"return_unused_preposition"})
+RETURN_UNUSED_PREPOSITION_ALIASES = frozenset({"return_unused_preposition"})
 
 RETRIEVE_ALIASES = frozenset(
     {
@@ -55,7 +55,7 @@ TRAY_HANDOVER_TRANSITION = (LOCATION_TRAY, LOCATION_SURGEON)
 TRAY_PREPARE_TRANSITION = (LOCATION_TRAY, LOCATION_ROBOT)
 MAYO_PREPARE_TRANSITION = (LOCATION_MAYO, LOCATION_ROBOT)
 ROBOT_HANDOVER_TRANSITION = (LOCATION_ROBOT, LOCATION_SURGEON)
-RETURN_TO_TRAY_TRANSITION = (LOCATION_ROBOT, LOCATION_TRAY)
+RETURN_UNUSED_PREPOSITION_TRANSITION = (LOCATION_ROBOT, LOCATION_MAYO)
 RETRIEVE_TRANSITION = (LOCATION_MAYO, LOCATION_TRAY)
 
 GROUP_RETRACTION = "retraction"
@@ -86,15 +86,32 @@ RETRACTION_COMMAND_STOP_RETRACTION = 6
 RETRACTION_TARGET_NONE = 0
 RETRACTION_TARGET_LEFT = 1
 RETRACTION_TARGET_RIGHT = 2
+# The peer Service has no separate BOTH enum: TARGET_NONE (0) means both arms
+# for an adjustment.  Keep this semantic alias so the internal mapper can
+# retain the explicit ``both`` intent while serializing the peer-compatible
+# wire value.
+RETRACTION_TARGET_BOTH = RETRACTION_TARGET_NONE
 
-ARM_IDS = frozenset({"arm_1", "arm_2"})
+ARM_1 = "arm_1"
+ARM_2 = "arm_2"
+ARM_IDS = frozenset({ARM_1, ARM_2})
 TOOL_THYROID_RETRACTOR = "thyroid_retractor"
 TOOL_ARMY_NAVY_RETRACTOR = "army_navy_retractor"
 TARGET_LEFT_MALLEABLE = "left_malleable"
 TARGET_RIGHT_MALLEABLE = "right_malleable"
 TARGET_BOTH_MALLEABLE = "both_malleable"
+TARGET_LEFT_ARMY_NAVY = "left_army_navy"
+TARGET_RIGHT_ARMY_NAVY = "right_army_navy"
+TARGET_BOTH_ARMY_NAVY = "both_army_navy"
 TARGET_RETRACTOR_IDS = frozenset(
-    {TARGET_LEFT_MALLEABLE, TARGET_RIGHT_MALLEABLE, TARGET_BOTH_MALLEABLE}
+    {
+        TARGET_LEFT_MALLEABLE,
+        TARGET_RIGHT_MALLEABLE,
+        TARGET_BOTH_MALLEABLE,
+        TARGET_LEFT_ARMY_NAVY,
+        TARGET_RIGHT_ARMY_NAVY,
+        TARGET_BOTH_ARMY_NAVY,
+    }
 )
 
 ADJUSTMENT_SINGLE = "single"
@@ -117,29 +134,93 @@ class MappingFailure(ValueError):
 
 
 class DispatchLedger:
-    """Bounded, pure at-most-once ledger for outbound capability requests."""
+    """Bounded, pure at-most-once ledger for outbound capability requests.
+
+    Command IDs remain globally at-most-once.  An explicit request generation
+    is narrower: it is at-most-once per semantic leg so one admitted request
+    may intentionally execute multiple controller transitions (for example,
+    prepare then hand over) without allowing a replay of either transition.
+    """
+
+    _REQUEST_SCOPE = ("__request__", "__request__")
 
     def __init__(self, max_entries: int = 512) -> None:
         self._max_entries = max(1, int(max_entries))
         self._command_ids: set[str] = set()
         self._command_order: deque[str] = deque()
-        self._explicit_generations: set[int] = set()
-        self._generation_order: deque[int] = deque()
+        self._explicit_generation_legs: set[
+            tuple[int, tuple[str, str]]
+        ] = set()
+        # Rebased/original semantic legs are one logical reservation. Keep
+        # their eviction atomic too; otherwise one delayed alternative could
+        # become replayable earlier merely because the request used two legs.
+        self._generation_leg_groups: deque[
+            tuple[tuple[int, tuple[str, str]], ...]
+        ] = deque()
+
+    @classmethod
+    def _generation_leg(
+        cls,
+        explicit_request_generation: int | None,
+        semantic_leg: tuple[str, str] | None,
+    ) -> tuple[int, tuple[str, str]] | None:
+        generation = (
+            int(explicit_request_generation)
+            if explicit_request_generation is not None
+            else 0
+        )
+        if generation <= 0:
+            return None
+        if semantic_leg is None:
+            normalized_leg = cls._REQUEST_SCOPE
+        else:
+            source_location, target_location = semantic_leg
+            normalized_leg = (
+                source_location.strip().casefold(),
+                target_location.strip().casefold(),
+            )
+        return generation, normalized_leg
+
+    @classmethod
+    def _generation_legs(
+        cls,
+        explicit_request_generation: int | None,
+        semantic_leg: tuple[str, str] | None,
+        alternative_semantic_legs: tuple[tuple[str, str], ...],
+    ) -> tuple[tuple[int, tuple[str, str]], ...]:
+        candidates = (semantic_leg, *alternative_semantic_legs)
+        normalized: list[tuple[int, tuple[str, str]]] = []
+        for candidate in candidates:
+            generation_leg = cls._generation_leg(
+                explicit_request_generation,
+                candidate,
+            )
+            if generation_leg is not None and generation_leg not in normalized:
+                normalized.append(generation_leg)
+        return tuple(normalized)
 
     def reserve(
-        self, command_id: str, *, explicit_request_generation: int | None = None
+        self,
+        command_id: str,
+        *,
+        explicit_request_generation: int | None = None,
+        semantic_leg: tuple[str, str] | None = None,
+        alternative_semantic_legs: tuple[tuple[str, str], ...] = (),
     ) -> bool:
         """Reserve a command only when it has not already been dispatched."""
 
         normalized_id = command_id.strip()
         if not normalized_id or normalized_id in self._command_ids:
             return False
-        generation = (
-            int(explicit_request_generation)
-            if explicit_request_generation is not None
-            else 0
+        generation_legs = self._generation_legs(
+            explicit_request_generation,
+            semantic_leg,
+            alternative_semantic_legs,
         )
-        if generation > 0 and generation in self._explicit_generations:
+        if any(
+            generation_leg in self._explicit_generation_legs
+            for generation_leg in generation_legs
+        ):
             return False
 
         self._command_ids.add(normalized_id)
@@ -147,18 +228,46 @@ class DispatchLedger:
         while len(self._command_order) > self._max_entries:
             self._command_ids.discard(self._command_order.popleft())
 
-        if generation > 0:
-            self._explicit_generations.add(generation)
-            self._generation_order.append(generation)
-            while len(self._generation_order) > self._max_entries:
-                self._explicit_generations.discard(self._generation_order.popleft())
+        if generation_legs:
+            self._explicit_generation_legs.update(generation_legs)
+            self._generation_leg_groups.append(generation_legs)
+        while len(self._generation_leg_groups) > self._max_entries:
+            for generation_leg in self._generation_leg_groups.popleft():
+                self._explicit_generation_legs.discard(generation_leg)
         return True
+
+    def is_reserved(
+        self,
+        command_id: str,
+        *,
+        explicit_request_generation: int | None = None,
+        semantic_leg: tuple[str, str] | None = None,
+    ) -> bool:
+        """Return whether an equivalent dispatch has already been consumed.
+
+        Voice-backed corrections may arrive while another Action is active.
+        The bridge must check replay/deduplication before it cancels that
+        Action; otherwise a replayed voice message could interrupt real work
+        even though its replacement Goal would later be suppressed.
+        """
+
+        normalized_id = command_id.strip()
+        if normalized_id and normalized_id in self._command_ids:
+            return True
+        generation_leg = self._generation_leg(
+            explicit_request_generation,
+            semantic_leg,
+        )
+        return (
+            generation_leg is not None
+            and generation_leg in self._explicit_generation_legs
+        )
 
     def clear(self) -> None:
         self._command_ids.clear()
         self._command_order.clear()
-        self._explicit_generations.clear()
-        self._generation_order.clear()
+        self._explicit_generation_legs.clear()
+        self._generation_leg_groups.clear()
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,10 +282,16 @@ class InternalSkillCommand:
     target_location_id: str
     arm: str
     request_generation: int = 0
+    procedure_run_id: str = ""
+    implicit_request_generation: int = 0
     rationale: str = ""
     target_owner: str = ""
     cleaning_required: bool = False
     mode: str = ""
+    # Provenance bit set only by the admitted ASR/voice request path.  Do not
+    # infer this from ``mode=explicit_request``: non-voice UI or test commands
+    # can legitimately use the same policy mode and must not preempt a robot.
+    voice_backed: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -273,8 +388,8 @@ def map_skill_to_tool_handover(
         source_location, target_location = TRAY_HANDOVER_TRANSITION
     elif action in ROBOT_HANDOVER_ALIASES:
         source_location, target_location = ROBOT_HANDOVER_TRANSITION
-    elif action in RETURN_TO_TRAY_ALIASES:
-        source_location, target_location = RETURN_TO_TRAY_TRANSITION
+    elif action in RETURN_UNUSED_PREPOSITION_ALIASES:
+        source_location, target_location = RETURN_UNUSED_PREPOSITION_TRANSITION
     elif action in RETRIEVE_ALIASES:
         source_location, target_location = RETRIEVE_TRANSITION
     else:
@@ -314,7 +429,10 @@ def map_group_command(
     arm-ID, and tool-ID fields.  The replacement Service intentionally does
     not.  This mapper therefore accepts only legacy commands whose meaning is
     losslessly expressible by ``command``, ``target_side``, and ``distance_m``;
-    it rejects the rest instead of discarding safety-relevant detail.
+    it rejects the rest instead of discarding safety-relevant detail.  V1's
+    parameterless ``CHANGE_TOOL`` means "run the controller's preconfigured
+    swap".  It is accepted only when no arm/tool/profile identity is present;
+    identity-bearing mount requests remain unrepresentable and are rejected.
     """
 
     if not command.command_id.strip():
@@ -326,6 +444,22 @@ def map_group_command(
         )
 
     operation = command.operation.strip().casefold()
+    if operation == OPERATION_CHANGE_END_EFFECTOR:
+        if any(
+            str(value).strip()
+            for value in (
+                command.arm_id,
+                command.target_tool_id,
+                command.end_effector_profile,
+            )
+        ):
+            raise MappingFailure("retraction_v1_profile_identity_unsupported")
+        return RetractionCommandRequest(
+            command_id=command.command_id,
+            command=RETRACTION_COMMAND_CHANGE_TOOL,
+            target_side=RETRACTION_TARGET_NONE,
+            distance_m=0.0,
+        )
     basic_commands = {
         OPERATION_START_DIRECT_TEACH: RETRACTION_COMMAND_START_DIRECT_TEACH,
         OPERATION_FINISH_DIRECT_TEACH: RETRACTION_COMMAND_FINISH_DIRECT_TEACH,
@@ -335,13 +469,23 @@ def map_group_command(
         # reviewed Service was introduced.  It is a compatible spelling of the
         # new stop command, so preserve it as an explicit compatibility alias.
         OPERATION_RELEASE_RETRACTION: RETRACTION_COMMAND_STOP_RETRACTION,
-        OPERATION_CHANGE_END_EFFECTOR: RETRACTION_COMMAND_CHANGE_TOOL,
     }
     if operation in basic_commands:
+        target_side = RETRACTION_TARGET_NONE
+        if operation == OPERATION_FINISH_DIRECT_TEACH:
+            finish_arm = command.arm_id.strip().casefold()
+            target_side = {
+                "": RETRACTION_TARGET_NONE,
+                "none": RETRACTION_TARGET_NONE,
+                ARM_1: RETRACTION_TARGET_LEFT,
+                ARM_2: RETRACTION_TARGET_RIGHT,
+            }.get(finish_arm)
+            if target_side is None:
+                raise MappingFailure("unsupported_finish_direct_teach_target_arm")
         return RetractionCommandRequest(
             command_id=command.command_id,
             command=basic_commands[operation],
-            target_side=RETRACTION_TARGET_NONE,
+            target_side=target_side,
             distance_m=0.0,
         )
     if operation != OPERATION_RETRACTION:
@@ -352,29 +496,42 @@ def map_group_command(
     direction_frame = command.direction_frame.strip().casefold()
     direction = command.direction.strip().casefold()
     axis = command.axis.strip().casefold()
-    if adjustment_mode != ADJUSTMENT_SINGLE:
-        raise MappingFailure("unsupported_retraction_adjustment_mode")
     if direction_frame != DIRECTION_FRAME_SURGEON_VIEW:
         raise MappingFailure("invalid_direction_frame")
-    if axis != "none":
-        raise MappingFailure("unsupported_retraction_axis")
 
     side_by_target = {
         TARGET_LEFT_MALLEABLE: RETRACTION_TARGET_LEFT,
         TARGET_RIGHT_MALLEABLE: RETRACTION_TARGET_RIGHT,
+        TARGET_BOTH_MALLEABLE: RETRACTION_TARGET_BOTH,
+        TARGET_LEFT_ARMY_NAVY: RETRACTION_TARGET_LEFT,
+        TARGET_RIGHT_ARMY_NAVY: RETRACTION_TARGET_RIGHT,
+        TARGET_BOTH_ARMY_NAVY: RETRACTION_TARGET_BOTH,
     }
     target_side = side_by_target.get(target_retractor_id)
     if target_side is None:
         raise MappingFailure("unsupported_retraction_target")
-    # The old action's vector was richer than the new Service.  A side and a
-    # matching lateral direction have one unambiguous meaning; every other
-    # direction (including up/down or an opposing lateral vector) must stay
-    # rejected until the public Service grows a field for it.
-    expected_direction = (
-        "left" if target_side == RETRACTION_TARGET_LEFT else "right"
-    )
-    if direction != expected_direction:
-        raise MappingFailure("unsupported_retraction_direction_for_service")
+    if adjustment_mode == ADJUSTMENT_SINGLE:
+        if axis != "none":
+            raise MappingFailure("unsupported_retraction_axis")
+        # The old action's vector was richer than the new Service.  A side and
+        # a matching lateral direction have one unambiguous meaning; every
+        # other direction (including up/down or an opposing lateral vector)
+        # must stay rejected until the public Service grows a field for it.
+        expected_direction = (
+            "left" if target_side == RETRACTION_TARGET_LEFT else "right"
+        )
+        if target_side == RETRACTION_TARGET_BOTH or direction != expected_direction:
+            raise MappingFailure("unsupported_retraction_direction_for_service")
+    elif adjustment_mode == ADJUSTMENT_MULTI:
+        if target_side != RETRACTION_TARGET_BOTH:
+            raise MappingFailure("multi_adjustment_requires_both_target")
+        # The reviewed public field has no vector/axis slot.  Only a bilateral
+        # lateral adjustment can be projected without losing meaning; the
+        # equal distance is applied once to each arm by the controller.
+        if direction != "none" or axis != "left_right":
+            raise MappingFailure("unsupported_bilateral_retraction_axis")
+    else:
+        raise MappingFailure("unsupported_retraction_adjustment_mode")
 
     distance_mm = float(command.distance_mm)
     maximum = float(max_retraction_distance_mm)

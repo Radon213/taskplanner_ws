@@ -215,12 +215,13 @@ docker compose \
   -f "${ROOT_DIR}/docker-compose.yml" \
   --profile dev \
   run --rm -T \
+  -e TASKPLANNER_SKIP_WORKSPACE_SETUP=true \
   -v "${SHADOW_DATASET_ROOT}:/datasets/shadow:ro" \
   taskplanner-dev \
   bash -lc '
     source /opt/ros/jazzy/setup.bash
     source /opt/btops_ws/install/setup.bash
-    source install/setup.bash
+    source install/docker/setup.bash
     exec python3 tools/real_surgery_annotation/run_shadow_replay.py "$@"
   ' bash \
   --source-bag "/datasets/shadow/${SHADOW_CASE_ID}" \

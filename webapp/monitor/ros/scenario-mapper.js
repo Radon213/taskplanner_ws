@@ -56,6 +56,13 @@ function speechLabel(message) {
   return "Listening...";
 }
 
+function speechLevel(message, key) {
+  if (message.audio_level_available !== true) return null;
+  const value = Number(message[key]);
+  if (!Number.isFinite(value)) return null;
+  return Math.max(-99, Math.min(0, value));
+}
+
 export class MainLayoutScenarioMapper {
   constructor() {
     this.reset();
@@ -303,7 +310,17 @@ export class MainLayoutScenarioMapper {
     this.catalogVersion = asString(message.catalog_version) || this.catalogVersion;
     const procedureName = asString(message.procedure_display_name);
     const patch = {};
-    if (procedureName) patch.procedure = { name: procedureName };
+    if (procedureName) {
+      patch.procedure = {
+        name: procedureName,
+        targetSite: asString(message.procedure_target_site_ko)
+          || asString(message.procedure_target_site)
+          || "—",
+        approach: asString(message.procedure_approach_ko)
+          || asString(message.procedure_approach)
+          || "—",
+      };
+    }
     patch.phase = this.phasePatch(this.currentPhaseId);
     delete patch.phase.uncertain;
 
@@ -490,8 +507,23 @@ export class MainLayoutScenarioMapper {
     const state = validState === "listening" && (message.available !== true || message.connected !== true)
       ? "unavailable"
       : validState;
+    const utteranceSequence = Number(message.utterance_sequence);
+    const audioLevelDbfs = speechLevel(message, "audio_level_dbfs");
+    const peakLevelDbfs = speechLevel(message, "peak_level_dbfs") ?? audioLevelDbfs;
     return {
-      patch: { voice: { status: state, text: speechLabel(message) } },
+      patch: {
+        voice: {
+          status: state,
+          text: speechLabel(message),
+          partialText: asString(message.partial_text).slice(0, 2000),
+          audioLevelAvailable: audioLevelDbfs !== null,
+          audioLevelDbfs: audioLevelDbfs ?? -99,
+          peakLevelDbfs: peakLevelDbfs ?? -99,
+          utteranceSequence: Number.isSafeInteger(utteranceSequence) && utteranceSequence >= 0
+            ? utteranceSequence
+            : 0,
+        },
+      },
       tools: [],
       meta: { procedureActive: message.procedure_active === true },
     };

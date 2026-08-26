@@ -4,6 +4,7 @@ import json
 from argparse import Namespace
 from pathlib import Path
 
+from tools.vlm_finetuning.eval_qwen35_9b_runtime_v4 import summarize, validate_shape
 from tools.vlm_finetuning.run_qwen35_predictions import select_rows as select_eval_rows
 from tools.vlm_finetuning.train_qwen35_4b_lora import (
     resolve_resume_checkpoint,
@@ -37,11 +38,46 @@ def _row(
 
 def test_training_selector_accepts_nested_split_and_all() -> None:
     rows = [
-        {**_row("a", case_id="c1", split="train", task="request_intent", target={}), "split": {"role": "train"}},
-        _row("b", case_id="c2", split="validation", task="request_intent", target={}),
+        {**_row("a", case_id="c1", split="train", task="current_phase", target={}), "split": {"role": "train"}},
+        _row("b", case_id="c2", split="validation", task="current_phase", target={}),
     ]
     assert [row["example_id"] for row in select_train_rows(rows, "train", None, 1)] == ["a"]
     assert [row["example_id"] for row in select_train_rows(rows, "all", None, 1)] == ["a", "b"]
+
+
+def test_runtime_schema_v6_keeps_voice_intent_without_hand_field() -> None:
+    target = {
+        "v": "6",
+        "phase": [["P03", 0.9]],
+        "tool": [["T07", 0.9]],
+        "intent": ["handover", "T07", 0.92],
+        "mayo": [],
+        "mayo_retrieve": ["", 0.0],
+        "u": 0.2,
+        "sum": "Visible field summary.",
+        "bed_robot_arm_group": None,
+    }
+
+    assert target["v"] == "6"
+    assert target["intent"][0] == "handover"
+    assert target["intent"][1]
+    assert "gesture" not in target
+    assert validate_shape(target) == []
+    summary = summarize(
+        [
+            {
+                "parsed": target,
+                "shape_errors": [],
+                "latency_sec": 0.01,
+                "task": "intent",
+                "expected": target,
+                "derived_forecast_kind": "",
+            }
+        ],
+        threshold=0.5,
+    )
+    assert summary["intent"] == {"count": 1, "semantic_exact_accuracy": 1.0}
+    assert "gesture" not in summary
 
 
 def test_eval_selector_round_robins_cases_and_tool_targets() -> None:
@@ -69,6 +105,31 @@ def test_eval_selector_round_robins_cases_and_tool_targets() -> None:
         for row in selected
     }
     assert answers == {"adson_forceps", "bovie"}
+
+
+def test_eval_selector_rejects_visual_hand_tasks() -> None:
+    rows = [
+        _row(
+            "legacy-request",
+            case_id="c1",
+            split="test",
+            task="request_intent",
+            target={"intent": "receive_unspecified_tool"},
+        )
+    ]
+
+    try:
+        select_eval_rows(
+            rows,
+            split="test",
+            max_per_task=4,
+            selection_manifest=None,
+            limit=None,
+        )
+    except ValueError as exc:
+        assert "visual hand tasks are excluded" in str(exc)
+    else:
+        raise AssertionError("visual hand task was admitted to eval selection")
 
 
 def test_resume_checkpoint_selects_latest_numeric_step(tmp_path: Path) -> None:

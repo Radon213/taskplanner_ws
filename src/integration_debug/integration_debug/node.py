@@ -45,7 +45,7 @@ from surgical_interop_msgs.msg import (
 )
 from surgical_interop_msgs.srv import ExecuteRetractionCommand
 from surgical_msgs.msg import InputSourceStatus, SimulationState
-from surgical_msgs.srv import IntegrationDebugCommand
+from surgical_msgs.srv import AsrControl, IntegrationDebugCommand
 
 from procedure_spec import (
     NormalizedRetractionCommand,
@@ -74,16 +74,17 @@ from integration_debug.contracts import (
     load_config,
     manual_write_block_reason,
     measured_rate,
+    operational_runtime_intervention_block_reason,
     operational_runtime_stopped,
     operational_state_publisher_trusted,
     parse_voice_command,
     validate_action_recovery_acknowledgement,
-    validate_planner_coexistence_acknowledgement,
     validate_bed_robot_arm_status,
     validate_tool_handover,
     validate_retraction_command,
 )
 from integration_debug.surgery_record_runtime import SurgeryRecordRuntime
+from integration_debug.operational_surgery_record import OperationalSurgeryRecordNode
 from integration_debug.networking import (
     collect_network_status,
     ping_ipv4,
@@ -134,6 +135,9 @@ VIRTUAL_BED_ROBOT_STATUS_DEFAULT_TOPIC = (
     "/integration/debug/virtual/bed_robot_arms/status"
 )
 VIRTUAL_ROBOT_PROFILE_ID = "integration_debug_virtual_robot_v1"
+OPERATIONAL_ASR_STATUS_TOPIC = "/input/asr/runtime_status"
+OPERATIONAL_ASR_CONTROL_SERVICE = "/input/asr/control"
+OPERATIONAL_ASR_STATUS_SCHEMA = "taskplanner.asr.status.v1"
 RETRACTION_SERVICE_SOURCE_ID = "taskplanner_debug"
 RETRACTION_COMMAND_CONSTANTS = {
     "start_direct_teach": "COMMAND_START_DIRECT_TEACH",
@@ -147,6 +151,9 @@ RETRACTION_TARGET_SIDE_CONSTANTS = {
     "none": "TARGET_NONE",
     "left": "TARGET_LEFT",
     "right": "TARGET_RIGHT",
+    # The peer Service contract encodes a bilateral adjustment as
+    # TARGET_NONE (0); ``both`` remains an internal semantic value only.
+    "both": "TARGET_NONE",
 }
 PUBLIC_OUTPUT_TYPES: dict[str, type[Any]] = {
     "surgical_interop_msgs/msg/SurgeryContext": SurgeryContext,
@@ -292,6 +299,7 @@ class PendingDebugRetractionInterpretation:
     transcript: str
     current_state: RetractionState
     voice_generation: int
+    state_machine_bypass_enabled: bool
     submitted_monotonic: float
     future: Future[RetractionVoiceInterpretation]
 
@@ -414,6 +422,12 @@ class IntegrationDebugNode(Node):
         self.declare_parameter(
             "retraction_voice_vlm_probe_interval_sec",
             float(os.environ.get("RETRACTOR_VOICE_VLM_PROBE_INTERVAL_SEC", "15.0")),
+        )
+        self.declare_parameter(
+            "retraction_state_machine_bypass_default_bundles",
+            os.environ.get(
+                "RETRACTION_STATE_MACHINE_BYPASS_DEFAULT_BUNDLES", ""
+            ),
         )
         config_path = str(self.get_parameter("config_path").value)
         external_retraction_service_name = str(
@@ -539,6 +553,29 @@ class IntegrationDebugNode(Node):
             PendingDebugRetractionInterpretation | None
         ) = None
         self._config = load_config(config_path)
+        configured_bypass_bundles: object = str(
+            self.get_parameter(
+                "retraction_state_machine_bypass_default_bundles"
+            ).value
+        ).strip()
+        if not configured_bypass_bundles:
+            configured_bypass_bundles = dict(
+                self._config.get("voice", {})
+            ).get("retraction_state_machine_bypass_default_bundles", ())
+        if isinstance(configured_bypass_bundles, str):
+            bypass_bundle_values = configured_bypass_bundles.split(",")
+        elif isinstance(configured_bypass_bundles, (list, tuple)):
+            bypass_bundle_values = configured_bypass_bundles
+        else:
+            raise ValueError(
+                "retraction_state_machine_bypass_default_bundles must be a "
+                "CSV string or string list"
+            )
+        self._retraction_state_machine_bypass_default_bundles = frozenset(
+            str(bundle).strip().casefold()
+            for bundle in bypass_bundle_values
+            if str(bundle).strip()
+        )
         self._lock = threading.RLock()
         self._log_lock = threading.Lock()
         self._auxiliary_lock = threading.RLock()
@@ -551,6 +588,7 @@ class IntegrationDebugNode(Node):
         )
         self._action_watchdog_policy = load_action_watchdog_policy(self._config)
         self._armed = False
+        self._manual_control_scope = "none"
         self._acknowledged_blocked_nodes: set[str] = set()
         self._fault_locked = False
         self._last_heartbeat_monotonic = 0.0
@@ -570,6 +608,10 @@ class IntegrationDebugNode(Node):
         # buttons-only -> voice-enabled toggle cycle.
         self._retraction_voice_generation = 0
         self._retraction_state = RetractionState.IDLE
+        # Debug-only test escape hatch.  It is session-scoped, requires the
+        # normal manual-control authority, and never changes the external
+        # Service contract or the live/operational runtime.
+        self._retraction_state_machine_bypass_enabled = False
         self._last_retraction_interpretation = self._retraction_interpretation(
             "", normalize_retractor_command("", self._retraction_state)
         )
@@ -627,6 +669,7 @@ class IntegrationDebugNode(Node):
         )
         self._operational_state_received = False
         self._operational_state_received_monotonic = 0.0
+        self._operational_active_bundle = ""
         self._operational_running = False
         self._operational_execution_state = "unknown"
         self._operational_active_robot_task_id = ""
@@ -682,6 +725,8 @@ class IntegrationDebugNode(Node):
                 "/taskplanner-runs/asr/microphone.lock",
             ),
         )
+        self._operational_asr_status: dict[str, Any] = {}
+        self._operational_asr_status_received_monotonic = 0.0
         record_config = dict(self._config.get("surgery_record", {}))
         self._surgery_record = SurgeryRecordRuntime(
             input_dir=os.environ.get(
@@ -726,6 +771,23 @@ class IntegrationDebugNode(Node):
             IntegrationDebugCommand,
             "/integration/debug/command",
             self._handle_command,
+            callback_group=self._callback_group,
+        )
+        self._operational_asr_client = self.create_client(
+            AsrControl,
+            OPERATIONAL_ASR_CONTROL_SERVICE,
+            callback_group=self._callback_group,
+        )
+        self._operational_asr_status_subscription = self.create_subscription(
+            String,
+            OPERATIONAL_ASR_STATUS_TOPIC,
+            self._on_operational_asr_status,
+            QoSProfile(
+                history=QoSHistoryPolicy.KEEP_LAST,
+                depth=1,
+                reliability=QoSReliabilityPolicy.RELIABLE,
+                durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+            ),
             callback_group=self._callback_group,
         )
         self._heartbeat_subscription = self.create_subscription(
@@ -958,10 +1020,36 @@ class IntegrationDebugNode(Node):
         """Clear every session-scoped write authorization while holding the lock."""
 
         self._armed = False
+        self._manual_control_scope = "none"
         self._voice_auto_execute = False
         self._retraction_voice_auto_dispatch = False
+        self._retraction_state_machine_bypass_enabled = (
+            IntegrationDebugNode._default_retraction_state_machine_bypass_for_bundle(
+                self,
+                getattr(self, "_operational_active_bundle", "")
+            )
+        )
         self._retraction_voice_generation += 1
         self._acknowledged_blocked_nodes.clear()
+
+    def _default_retraction_state_machine_bypass_for_bundle(
+        self, bundle: object
+    ) -> bool:
+        """Return the Debug software-admission default for one bundle.
+
+        This override only skips Integration Debug's local command-order gate.
+        It is intentionally keyed by the explicitly configured demo bundle,
+        not by the selected external/virtual endpoint.  Endpoint Service
+        validation, configured limits, controller admission, and E-stop remain
+        authoritative downstream.
+        """
+
+        configured = getattr(
+            self,
+            "_retraction_state_machine_bypass_default_bundles",
+            frozenset(),
+        )
+        return str(bundle or "").strip().casefold() in configured
 
     @staticmethod
     def _retraction_interpretation(
@@ -1010,6 +1098,18 @@ class IntegrationDebugNode(Node):
         message = String()
         message.data = encoded
         self._event_pub.publish(message)
+
+    def _retraction_state_machine_bypass_active(self) -> bool:
+        """Return the Debug-only lifecycle-admission override state."""
+
+        return bool(getattr(self, "_retraction_state_machine_bypass_enabled", False))
+
+    def _debug_retraction_allowed_commands(
+        self, state: RetractionState
+    ) -> frozenset[RetractionCommand]:
+        if IntegrationDebugNode._retraction_state_machine_bypass_active(self):
+            return frozenset(RetractionCommand)
+        return allowed_retractor_commands(state)
 
     def _apply_retraction_voice_interpretation(
         self,
@@ -1063,7 +1163,8 @@ class IntegrationDebugNode(Node):
                 self._last_retraction_rejection_reason = (
                     "retraction_service_unavailable"
                 )
-            elif normalized.command not in allowed_retractor_commands(
+            elif normalized.command not in IntegrationDebugNode._debug_retraction_allowed_commands(
+                self,
                 self._retraction_state
             ):
                 self._last_retraction_rejection_reason = (
@@ -1113,10 +1214,17 @@ class IntegrationDebugNode(Node):
     ) -> None:
         """Submit one non-blocking VLM request or use the shared normalizer."""
 
-        deterministic = normalize_retractor_command(transcript, current_state)
-        if voice_generation is None:
-            with self._lock:
+        with self._lock:
+            if voice_generation is None:
                 voice_generation = self._retraction_voice_generation
+            state_machine_bypass_enabled = (
+                IntegrationDebugNode._retraction_state_machine_bypass_active(self)
+            )
+        deterministic = normalize_retractor_command(
+            transcript,
+            current_state,
+            enforce_state=not state_machine_bypass_enabled,
+        )
         if (
             getattr(self, "_retraction_voice_interpreter_mode", "deterministic")
             != "vlm_with_fallback"
@@ -1172,11 +1280,19 @@ class IntegrationDebugNode(Node):
                 )
                 return
             try:
-                future = executor.submit(
-                    interpreter.interpret,
-                    transcript,
-                    current_state,
-                )
+                if state_machine_bypass_enabled:
+                    future = executor.submit(
+                        interpreter.interpret,
+                        transcript,
+                        current_state,
+                        enforce_state=False,
+                    )
+                else:
+                    future = executor.submit(
+                        interpreter.interpret,
+                        transcript,
+                        current_state,
+                    )
             except Exception as exc:  # pragma: no cover - executor failure
                 submit_error = exc
             else:
@@ -1185,6 +1301,7 @@ class IntegrationDebugNode(Node):
                         transcript=transcript,
                         current_state=current_state,
                         voice_generation=voice_generation,
+                        state_machine_bypass_enabled=state_machine_bypass_enabled,
                         submitted_monotonic=time.monotonic(),
                         future=future,
                     )
@@ -1237,7 +1354,13 @@ class IntegrationDebugNode(Node):
         except Exception as exc:  # pragma: no cover - executor boundary
             interpretation = RetractionVoiceInterpretation(
                 normalized=normalize_retractor_command(
-                    pending.transcript, pending.current_state
+                    pending.transcript,
+                    pending.current_state,
+                    enforce_state=not getattr(
+                        pending,
+                        "state_machine_bypass_enabled",
+                        False,
+                    ),
                 ),
                 interpreter_source="deterministic_fallback",
                 vlm_invoked=False,
@@ -1312,6 +1435,9 @@ class IntegrationDebugNode(Node):
             retraction_voice_enabled = bool(
                 self._retraction_voice_auto_dispatch
             )
+            retraction_state_machine_bypass_enabled = (
+                IntegrationDebugNode._retraction_state_machine_bypass_active(self)
+            )
             # The legacy generic voice router continues to own tool handover,
             # but it must never bypass the dedicated retractor voice gate.
             should_generic_dispatch = (
@@ -1338,7 +1464,9 @@ class IntegrationDebugNode(Node):
         }
         if retraction_voice_enabled:
             deterministic_preview = normalize_retractor_command(
-                text, retraction_state
+                text,
+                retraction_state,
+                enforce_state=not retraction_state_machine_bypass_enabled,
             )
             event_payload["retraction_parse"] = self._retraction_interpretation(
                 text,
@@ -1385,10 +1513,58 @@ class IntegrationDebugNode(Node):
         with self._lock:
             self._last_heartbeat_monotonic = time.monotonic()
 
-    def _on_operational_state(self, msg: SimulationState) -> None:
+    def _on_operational_asr_status(self, msg: String) -> None:
+        raw = str(msg.data or "")
+        if not raw or len(raw) > 1_000_000:
+            return
+        try:
+            envelope = json.loads(raw)
+        except (TypeError, ValueError):
+            return
+        if not isinstance(envelope, dict) or envelope.get("schema") != OPERATIONAL_ASR_STATUS_SCHEMA:
+            return
+        asr = envelope.get("asr")
+        if not isinstance(asr, dict):
+            return
         with self._lock:
+            self._operational_asr_status = dict(asr)
+            self._operational_asr_status_received_monotonic = time.monotonic()
+
+    def _on_operational_state(self, msg: SimulationState) -> None:
+        default_event: dict[str, Any] | None = None
+        with self._lock:
+            active_bundle = (
+                str(msg.active_bundle).strip()
+                or str(msg.procedure_id).strip()
+            )
+            previous_bundle = getattr(self, "_operational_active_bundle", "")
+            previous_running = bool(self._operational_running)
+            started = bool(msg.running) and not previous_running
+            bundle_changed = active_bundle != previous_bundle
+            if bundle_changed or started:
+                previous_bypass = bool(
+                    self._retraction_state_machine_bypass_enabled
+                )
+                default_bypass = (
+                    IntegrationDebugNode._default_retraction_state_machine_bypass_for_bundle(
+                        self,
+                        active_bundle
+                    )
+                )
+                self._retraction_state_machine_bypass_enabled = default_bypass
+                if previous_bypass != default_bypass:
+                    self._retraction_voice_generation += 1
+                default_event = {
+                    "active_bundle": active_bundle,
+                    "enabled": default_bypass,
+                    "previous_enabled": previous_bypass,
+                    "bundle_changed": bundle_changed,
+                    "simulation_started": started,
+                    "software_admission_only": True,
+                }
             self._operational_state_received = True
             self._operational_state_received_monotonic = time.monotonic()
+            self._operational_active_bundle = active_bundle
             self._operational_running = bool(msg.running)
             self._operational_execution_state = (
                 str(msg.execution_state).strip().lower() or "unknown"
@@ -1400,6 +1576,11 @@ class IntegrationDebugNode(Node):
                 str(msg.robot_state).strip().lower() or "unknown"
             )
             self._operational_cleaner_busy = bool(msg.cleaner_busy)
+        if default_event is not None:
+            self._record(
+                "retraction_state_machine_bypass_default_applied",
+                default_event,
+            )
 
     def _on_input_source_status(
         self,
@@ -1591,6 +1772,29 @@ class IntegrationDebugNode(Node):
             age_sec=age_sec,
             max_age_sec=self._operational_state_max_age_sec,
         )
+        intervention_block_reason = operational_runtime_intervention_block_reason(
+            received=received,
+            running=running,
+            execution_state=execution_state,
+            active_robot_task_id=active_robot_task_id,
+            robot_state=robot_state,
+            cleaner_busy=cleaner_busy,
+            publisher_trusted=publisher_trusted,
+            age_sec=age_sec,
+            max_age_sec=self._operational_state_max_age_sec,
+        )
+        control_window_block_reason = operational_runtime_intervention_block_reason(
+            received=received,
+            running=running,
+            execution_state=execution_state,
+            active_robot_task_id=active_robot_task_id,
+            robot_state=robot_state,
+            cleaner_busy=cleaner_busy,
+            publisher_trusted=publisher_trusted,
+            age_sec=age_sec,
+            max_age_sec=self._operational_state_max_age_sec,
+            require_idle_resources=False,
+        )
         return {
             "received": received,
             "running": running,
@@ -1608,33 +1812,111 @@ class IntegrationDebugNode(Node):
                 and age_sec <= self._operational_state_max_age_sec
             ),
             "stopped": stopped,
+            "intervention_allowed": not intervention_block_reason,
+            "intervention_block_reason": intervention_block_reason,
+            "control_window_open": not control_window_block_reason,
+            "control_window_block_reason": control_window_block_reason,
         }
+
+    def _debug_asr_owned_by_operational_runtime(self) -> bool:
+        """Return whether the live runtime must retain USB microphone ownership.
+
+        The runtime-network lock follows the live profile's DDS settings; it is
+        not, by itself, proof that the operational ASR process is capturing.
+        Debug may use the shared microphone only while the same authoritative
+        intervention gate used by every other manual write is open: a fresh,
+        trusted paused or fully stopped state with idle shared resources.
+        The capture lock still prevents two microphone owners. Missing or
+        unavailable state therefore remains fail-closed.
+        """
+
+        if not self._network_locked_to_runtime:
+            return False
+        try:
+            operational = self._operational_runtime_status()
+        except Exception:
+            return True
+        return operational.get("intervention_allowed") is not True
 
     def _blocked_nodes(self) -> list[str]:
         detected = self._detected_planner_nodes()
         if not self._network_locked_to_runtime:
             return detected
         operational = self._operational_runtime_status()
-        if operational["stopped"]:
+        if operational["intervention_allowed"]:
             return []
-        if detected:
-            return detected
-        if not operational["received"] or not operational["fresh"]:
-            return ["simulation_runtime_state_unavailable"]
-        return ["simulation_runtime_active"]
+        return ["operational_runtime_intervention_gate"]
 
-    def _manual_write_block_reason(self) -> str:
+    def _manual_write_block_reason(self, operation: str = "") -> str:
         """Evaluate current graph/session state immediately before a ROS write."""
+
+        if self._network_locked_to_runtime:
+            operational = self._operational_runtime_status()
+            with self._lock:
+                if self._fault_locked:
+                    return "manual control is fault locked"
+                if not operational["intervention_allowed"]:
+                    return str(operational["intervention_block_reason"])
+                if not self._armed:
+                    return "manual control is not armed"
+                scope = getattr(self, "_manual_control_scope", "all")
+                if scope == "tool_handover" and operation != "tool_handover":
+                    return "manual control is limited to tool handover"
+                return ""
 
         blocked = self._blocked_nodes()
         with self._lock:
-            return manual_write_block_reason(
+            scope = getattr(self, "_manual_control_scope", "all")
+            reason = manual_write_block_reason(
                 armed=self._armed,
                 fault_locked=self._fault_locked,
                 blocked_nodes=blocked,
-                planner_coexistence_allowed=self._planner_coexistence_allowed,
-                acknowledged_blocked_nodes=self._acknowledged_blocked_nodes,
+                planner_coexistence_allowed=False,
+                acknowledged_blocked_nodes=(),
             )
+            if reason:
+                return reason
+            if scope == "tool_handover" and operation != "tool_handover":
+                return "manual control is limited to tool handover"
+            return ""
+
+    @staticmethod
+    def _active_command_operational_block_reason(
+        operational: dict[str, Any], command_id: str
+    ) -> str:
+        """Keep a Debug command only inside its authoritative ownership window."""
+
+        if not operational.get("control_window_open"):
+            return str(
+                operational.get("control_window_block_reason")
+                or "operational control window is closed"
+            )
+        robot_state = str(operational.get("robot_state", "")).strip().lower()
+        if bool(operational.get("cleaner_busy")) or robot_state == "cleaning":
+            return "cleaner activity is not owned by the active Debug command"
+        if robot_state in {
+            "",
+            "e_stop",
+            "emergency_stop",
+            "error",
+            "fault",
+            "protective_stop",
+            "retracted",
+            "unknown",
+        }:
+            return (
+                "operational robot state cannot be owned by the active Debug command: "
+                + (robot_state or "empty")
+            )
+        active_task_id = str(
+            operational.get("active_robot_task_id", "")
+        ).strip()
+        if active_task_id and active_task_id != str(command_id).strip():
+            return (
+                "operational robot task is not owned by the active Debug command: "
+                + active_task_id
+            )
+        return ""
 
     def _output_conflicts(self, topic: str) -> list[str]:
         conflicts: set[str] = set()
@@ -1800,7 +2082,12 @@ class IntegrationDebugNode(Node):
         operation: str,
         payload: dict[str, Any],
     ) -> tuple[bool, str, str, dict[str, Any]]:
-        """Model diagnostics never dispatch ROS commands or change robot authority."""
+        """Run isolated diagnostics or explicitly gated shared-runtime changes.
+
+        Refresh and interpretation only observe or use the configured runtime.
+        Loading changes the shared inference runtime, so Integrated Debug must
+        hold the same paused/stopped manual authority as any other intervention.
+        """
 
         if operation == "vlm_refresh":
             submitted = self._submit_vlm_observation(
@@ -1814,6 +2101,15 @@ class IntegrationDebugNode(Node):
                 self._vlm_status_snapshot(),
             )
         if operation == "vlm_load":
+            if getattr(self, "_network_locked_to_runtime", False):
+                blocked_reason = self._manual_write_block_reason("vlm_load")
+                if blocked_reason:
+                    return (
+                        False,
+                        "",
+                        blocked_reason,
+                        self._vlm_status_snapshot(),
+                    )
             runtime = self._vlm_runtime.load()
             with self._lock:
                 stale_probe = self._pending_vlm_observation
@@ -1981,6 +2277,12 @@ class IntegrationDebugNode(Node):
             # between a physical controller and the emulator.
             self._retraction_state = RetractionState.IDLE
             self._retraction_voice_auto_dispatch = False
+            self._retraction_state_machine_bypass_enabled = (
+                IntegrationDebugNode._default_retraction_state_machine_bypass_for_bundle(
+                    self,
+                    getattr(self, "_operational_active_bundle", "")
+                )
+            )
             self._retraction_voice_generation += 1
             self._last_retraction_rejection_reason = ""
         self._record(
@@ -2174,16 +2476,74 @@ class IntegrationDebugNode(Node):
             snapshot["endpoint_id"] = self._asr_endpoint
             return snapshot
 
+    def _operational_asr_status_snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            snapshot = dict(self._operational_asr_status)
+            received_at = self._operational_asr_status_received_monotonic
+        age_sec = max(0.0, time.monotonic() - received_at) if received_at else None
+        snapshot["status_received"] = bool(received_at)
+        snapshot["status_age_sec"] = round(age_sec, 3) if age_sec is not None else None
+        snapshot["status_fresh"] = bool(age_sec is not None and age_sec <= 5.0)
+        return snapshot
+
+    def _proxy_operational_asr_control(
+        self, operation: str
+    ) -> tuple[bool, str, str, dict[str, Any]]:
+        snapshot = self._operational_asr_status_snapshot()
+        if snapshot.get("status_fresh") is not True:
+            return False, "", "operational ASR status is unavailable or stale", snapshot
+        if not self._operational_asr_client.service_is_ready():
+            return False, "", "operational ASR control Service is not ready", snapshot
+        request = AsrControl.Request()
+        request.operation = operation
+        request.device_id = -1
+        request.server_url = ""
+        request.route_policy = ""
+        future = self._operational_asr_client.call_async(request)
+        completed = threading.Event()
+        future.add_done_callback(lambda _future: completed.set())
+        if not completed.wait(timeout=5.0):
+            future.cancel()
+            return False, "", "operational ASR recording control timed out", snapshot
+        try:
+            response = future.result()
+        except Exception as exc:
+            return False, "", f"operational ASR recording control failed: {exc}", snapshot
+        raw_result = str(getattr(response, "result_json", "") or "")
+        if raw_result and len(raw_result) <= 1_000_000:
+            try:
+                envelope = json.loads(raw_result)
+                if (
+                    isinstance(envelope, dict)
+                    and envelope.get("schema") == OPERATIONAL_ASR_STATUS_SCHEMA
+                    and isinstance(envelope.get("asr"), dict)
+                ):
+                    with self._lock:
+                        self._operational_asr_status = dict(envelope["asr"])
+                        self._operational_asr_status_received_monotonic = time.monotonic()
+            except (TypeError, ValueError):
+                pass
+        return (
+            bool(response.accepted),
+            "",
+            str(response.message or "operational ASR recording control completed"),
+            self._operational_asr_status_snapshot(),
+        )
+
     def _handle_asr_command(
         self, operation: str, payload: dict[str, Any]
     ) -> tuple[bool, str, str, dict[str, Any]]:
+        if operation == "asr_recording_start":
+            return self._proxy_operational_asr_control("start_recording")
+        if operation == "asr_recording_stop":
+            return self._proxy_operational_asr_control("stop_recording")
         if operation == "asr_refresh_devices":
             devices = self._asr.refresh_devices()
             return True, "", f"found {len(devices)} microphone input device(s)", {
                 "devices": devices
             }
         if operation == "asr_start":
-            if self._network_locked_to_runtime:
+            if self._debug_asr_owned_by_operational_runtime():
                 return (
                     False,
                     "",
@@ -2308,6 +2668,57 @@ class IntegrationDebugNode(Node):
             else "retraction final-transcript dispatch disabled",
         )
 
+    def _configure_retraction_state_machine_bypass(
+        self, payload: dict[str, Any]
+    ) -> tuple[bool, str, str]:
+        """Toggle the Debug-only retractor lifecycle admission override.
+
+        This changes no ROS message and never changes the live controller. It
+        only lets an armed Debug session exercise any of the six reviewed
+        Service commands without the local state-machine allow-list. The
+        normal manual authority, fault lock, single in-flight request, strict
+        Service schema, and shared endpoint checks remain active.
+        """
+
+        enabled = payload.get("enabled")
+        if not isinstance(enabled, bool):
+            return False, "", "enabled must be a boolean"
+        if enabled:
+            blocked_reason = self._manual_write_block_reason()
+            if blocked_reason:
+                if blocked_reason == "manual control is not armed":
+                    blocked_reason = (
+                        "arm manual control before disabling the retractor state-machine gate"
+                    )
+                return False, "", blocked_reason
+        with self._lock:
+            if self._active_command_id:
+                return False, self._active_command_id, (
+                    "wait for the active retraction Service response before changing "
+                    "the state-machine gate"
+                )
+            previous = bool(self._retraction_state_machine_bypass_enabled)
+            if previous != enabled:
+                self._retraction_voice_generation += 1
+            self._retraction_state_machine_bypass_enabled = enabled
+            current_state = self._retraction_state.value
+        self._record(
+            "retraction_state_machine_bypass_changed",
+            {
+                "enabled": enabled,
+                "previous_enabled": previous,
+                "state": current_state,
+                "debug_only": True,
+            },
+        )
+        return (
+            True,
+            "",
+            "retractor state-machine admission gate disabled for Debug"
+            if enabled
+            else "retractor state-machine admission gate enabled",
+        )
+
     def _drain_auxiliary_events(self) -> None:
         IntegrationDebugNode._drain_retraction_voice_interpretation(self)
         with self._auxiliary_lock:
@@ -2358,35 +2769,39 @@ class IntegrationDebugNode(Node):
                 self._last_heartbeat_monotonic = now
             return True, "", "heartbeat accepted"
         if operation == "arm":
-            blocked = self._blocked_nodes()
-            acknowledged: list[str] = []
+            scope = str(payload.get("manual_control_scope", "all")).strip().lower()
+            if scope not in {"all", "tool_handover"}:
+                return False, "", "manual_control_scope must be all or tool_handover"
             with self._lock:
                 if self._fault_locked:
                     return False, "", "reset the fault lock before arming"
-            if blocked:
-                if not self._planner_coexistence_allowed:
-                    return False, "", "full Taskplanner nodes are active: " + ", ".join(blocked)
-                acknowledged = validate_planner_coexistence_acknowledgement(
-                    payload, blocked
-                )
-                if self._blocked_nodes() != blocked:
+            operational_state = ""
+            if self._network_locked_to_runtime:
+                operational = self._operational_runtime_status()
+                if not operational["intervention_allowed"]:
+                    return False, "", str(operational["intervention_block_reason"])
+                operational_state = str(operational["execution_state"])
+            else:
+                blocked = self._blocked_nodes()
+                if blocked:
                     return (
                         False,
                         "",
-                        "planner node set changed; refresh the status and acknowledge it again",
+                        "full Taskplanner nodes are active: " + ", ".join(blocked),
                     )
             with self._lock:
                 if self._fault_locked:
                     return False, "", "reset the fault lock before arming"
                 self._armed = True
-                self._acknowledged_blocked_nodes = set(acknowledged)
+                self._manual_control_scope = scope
+                self._acknowledged_blocked_nodes.clear()
                 self._last_heartbeat_monotonic = now
                 self._last_error = ""
-            if acknowledged:
+            if operational_state:
                 return (
                     True,
                     "",
-                    "manual control armed with planner coexistence acknowledgement",
+                    f"manual control armed while operational scenario is {operational_state}",
                 )
             return True, "", "manual control armed"
         if operation == "disarm":
@@ -2436,6 +2851,8 @@ class IntegrationDebugNode(Node):
             return True, "", "voice auto-dispatch enabled" if enabled else "voice auto-dispatch disabled"
         if operation == "configure_retraction_voice":
             return self._configure_retraction_voice(payload)
+        if operation == "configure_retraction_state_machine_bypass":
+            return self._configure_retraction_state_machine_bypass(payload)
         if operation == "publish_voice_command":
             blocked_reason = self._manual_write_block_reason()
             if blocked_reason:
@@ -2729,7 +3146,7 @@ class IntegrationDebugNode(Node):
             normalized_retraction_command = RetractionCommand(
                 str(retraction_command["command"])
             )
-        blocked_reason = self._manual_write_block_reason()
+        blocked_reason = self._manual_write_block_reason(operation)
         if blocked_reason:
             return False, "", blocked_reason
         if operation == "tool_handover":
@@ -2752,13 +3169,62 @@ class IntegrationDebugNode(Node):
             goal.instrument_instance_id = mapped["instrument_instance_id"]
             goal.source_location = mapped["source_location"]
             goal.target_location = mapped["target_location"]
-            self._start_action("tool_handover", command_id, source)
-            future = self._tool_client.send_goal_async(
-                goal,
-                feedback_callback=lambda feedback: self._on_action_feedback(
-                    "tool_handover", command_id, feedback
-                ),
+            submit_error: Exception | None = None
+            future: Any | None = None
+            with self._lock:
+                # Keep the operational-state callback excluded between this
+                # final admission check, command-slot reservation, and Goal
+                # enqueue.  The first check above remains an inexpensive early
+                # rejection; this one closes the readiness-check race.
+                if self._active_command_id:
+                    return False, self._active_command_id, "another command is active"
+                blocked_reason = self._manual_write_block_reason(operation)
+                if blocked_reason:
+                    return False, "", blocked_reason
+                self._start_action_locked("tool_handover", command_id, source)
+                try:
+                    future = self._tool_client.send_goal_async(
+                        goal,
+                        feedback_callback=lambda feedback: self._on_action_feedback(
+                            "tool_handover", command_id, feedback
+                        ),
+                    )
+                except Exception as exc:
+                    submit_error = exc
+                    started = float(
+                        self._action_status.get("started_monotonic", 0.0)
+                    )
+                    self._action_status.update(
+                        {
+                            "state": "failed",
+                            "success": False,
+                            "terminal": True,
+                            "reason_code": (
+                                f"action_submit_error:{type(exc).__name__}"
+                            ),
+                            "elapsed_sec": max(
+                                0.0, time.monotonic() - started
+                            ),
+                            "last_update_monotonic": time.monotonic(),
+                        }
+                    )
+                    self._active_route = ""
+                    self._active_command_id = ""
+                    self._active_goal_handle = None
+            if submit_error is not None:
+                reason_code = (
+                    f"action_submit_error:{type(submit_error).__name__}"
+                )
+                self._record(
+                    "tool_handover_submit_failed",
+                    {"command_id": command_id, "reason_code": reason_code},
+                )
+                return False, "", f"failed to submit tool handover Goal ({reason_code})"
+            self._record(
+                "command_started",
+                {"route": "tool_handover", "command_id": command_id, "source": source},
             )
+            assert future is not None
             future.add_done_callback(
                 lambda result: self._on_goal_response(
                     "tool_handover", command_id, result
@@ -2779,12 +3245,11 @@ class IntegrationDebugNode(Node):
                     f"{self._retraction_service_name} Service is unavailable",
                 )
             command_id = f"debug-{uuid4()}"
+            submit_error: Exception | None = None
+            future: Any | None = None
             with self._lock:
-                # The graph-level interlock was checked immediately above,
-                # but arm/voice authority can change on another executor
-                # thread while Service readiness is inspected.  Revalidate
-                # the session-scoped gates atomically with reservation of the
-                # one active command slot.
+                # Session-local authority and command ordering cannot change
+                # while this reservation critical section is held.
                 if not self._armed:
                     return False, "", "manual control is not armed"
                 if self._fault_locked:
@@ -2797,8 +3262,9 @@ class IntegrationDebugNode(Node):
                 if self._active_command_id:
                     return False, self._active_command_id, "another command is active"
                 state_before_dispatch = self._retraction_state
-                if normalized_retraction_command not in allowed_retractor_commands(
-                    state_before_dispatch
+                if normalized_retraction_command not in IntegrationDebugNode._debug_retraction_allowed_commands(
+                    self,
+                    state_before_dispatch,
                 ):
                     self._last_retraction_rejection_reason = (
                         "retraction_command_not_allowed_in_debug_state"
@@ -2815,6 +3281,12 @@ class IntegrationDebugNode(Node):
                 request = self._build_retraction_service_request(
                     command_id, retraction_command
                 )
+                # Re-evaluate authoritative operational evidence only after
+                # readiness, local validation, and serialization, then keep
+                # its callback excluded through ``call_async``.
+                blocked_reason = self._manual_write_block_reason(operation)
+                if blocked_reason:
+                    return False, "", blocked_reason
                 self._start_action_locked(
                     "retraction_service",
                     command_id,
@@ -2823,25 +3295,18 @@ class IntegrationDebugNode(Node):
                     response_semantics="admission",
                 )
                 self._last_retraction_rejection_reason = ""
-            self._record(
-                "command_started",
-                {
-                    "route": "retraction_service",
-                    "command_id": command_id,
-                    "source": source,
-                    "robot_endpoint_source": getattr(
-                        self, "_robot_endpoint_source", "external"
-                    ),
-                },
-            )
-            try:
-                future = self._retraction_client.call_async(request)
-            except Exception as exc:
+                try:
+                    future = self._retraction_client.call_async(request)
+                except Exception as exc:
+                    submit_error = exc
+            if submit_error is not None:
                 # ``call_async`` raising means the client could not enqueue
                 # the request.  Release the reservation without advancing or
                 # invalidating the local state; there was no admission result
                 # to apply and no physical-completion claim is made.
-                reason_code = f"service_submit_error:{type(exc).__name__}"
+                reason_code = (
+                    f"service_submit_error:{type(submit_error).__name__}"
+                )
                 with self._lock:
                     if self._active_command_id == command_id:
                         started = float(
@@ -2880,6 +3345,18 @@ class IntegrationDebugNode(Node):
                     "",
                     f"failed to submit retraction Service request ({reason_code})",
                 )
+            self._record(
+                "command_started",
+                {
+                    "route": "retraction_service",
+                    "command_id": command_id,
+                    "source": source,
+                    "robot_endpoint_source": getattr(
+                        self, "_robot_endpoint_source", "external"
+                    ),
+                },
+            )
+            assert future is not None
             future.add_done_callback(
                 lambda result: self._on_retraction_service_response(
                     command_id, result
@@ -2906,9 +3383,20 @@ class IntegrationDebugNode(Node):
             ExecuteRetractionCommand.Request,
             RETRACTION_COMMAND_CONSTANTS[str(mapped["command"])],
         )
+        # The deployed robot peer treats direct-teach completion as one
+        # session-level operation and rejects arm selectors with
+        # RESULT_INVALID_PARAMETER.  Keep the Debug UI's left/right/both
+        # field choice as operator context, but project every finish request
+        # to the peer-compatible TARGET_NONE wire value.  Adjustment commands
+        # retain their selected-arm semantics (including both -> TARGET_NONE).
+        target_side = (
+            "none"
+            if str(mapped["command"]) == "finish_direct_teach"
+            else str(mapped["target_side"])
+        )
         request.target_side = getattr(
             ExecuteRetractionCommand.Request,
-            RETRACTION_TARGET_SIDE_CONSTANTS[str(mapped["target_side"])],
+            RETRACTION_TARGET_SIDE_CONSTANTS[target_side],
         )
         request.distance_m = float(mapped["distance_m"])
         return request
@@ -3108,7 +3596,10 @@ class IntegrationDebugNode(Node):
                 if (
                     normalized_command is None
                     or normalized_command
-                    not in allowed_retractor_commands(state_before_admission)
+                    not in IntegrationDebugNode._debug_retraction_allowed_commands(
+                        self,
+                        state_before_admission,
+                    )
                 ):
                     # The peer admitted a request that this local state cannot
                     # represent.  Do not invent a physical state; block future
@@ -3504,10 +3995,6 @@ class IntegrationDebugNode(Node):
             item.observed_location_types = []
             item.observed_location_ids = []
             item.observed_confidences = []
-            item.gesture_event_type = ""
-            item.gesture_requested_tool = ""
-            item.gesture_hand_pose = ""
-            item.gesture_confidence = 0.0
             item.uncertainty = 1.0
             item.evidence_status = "UNKNOWN"
             msg = ClinicalObservationArray()
@@ -3712,6 +4199,9 @@ class IntegrationDebugNode(Node):
             action.pop("recovery_detected_monotonic", None)
             recent_events = list(self._recent_events)
             retraction_state = self._retraction_state
+            retraction_state_machine_bypass_enabled = (
+                IntegrationDebugNode._retraction_state_machine_bypass_active(self)
+            )
             retraction_in_flight = bool(
                 self._active_command_id and self._active_route == "retraction_service"
             )
@@ -3731,6 +4221,9 @@ class IntegrationDebugNode(Node):
                         else "buttons_only"
                     ),
                     "internal_state": retraction_state.value,
+                    "state_machine_bypass_enabled": (
+                        retraction_state_machine_bypass_enabled
+                    ),
                     "interpreter_mode": getattr(
                         self,
                         "_retraction_voice_interpreter_mode",
@@ -3756,7 +4249,11 @@ class IntegrationDebugNode(Node):
                     ),
                     "allowed_commands": sorted(
                         command.value
-                        for command in allowed_retractor_commands(retraction_state)
+                        for command in (
+                            frozenset(RetractionCommand)
+                            if retraction_state_machine_bypass_enabled
+                            else allowed_retractor_commands(retraction_state)
+                        )
                     ),
                     # The client checks DDS readiness outside this lock below.
                     "service_ready": False,
@@ -3783,9 +4280,13 @@ class IntegrationDebugNode(Node):
             if self._network_locked_to_runtime
             else not detected_planner_nodes
         )
+        intervention_allowed = bool(
+            operational["intervention_allowed"]
+            if self._network_locked_to_runtime
+            else not detected_planner_nodes
+        )
         manual_control_available = bool(
-            operational_runtime_is_stopped
-            and not blocked
+            intervention_allowed
             and not self._fault_locked
             and not self._active_command_id
         )
@@ -3875,6 +4376,9 @@ class IntegrationDebugNode(Node):
                 "session_id": self._session_id,
                 "state": self._session_state(),
                 "armed": armed,
+                "manual_control_scope": getattr(
+                    self, "_manual_control_scope", "all" if armed else "none"
+                ),
                 "acknowledged_blocked_nodes": acknowledged_blocked_nodes,
                 "planner_coexistence_active": bool(
                     armed and acknowledged_blocked_nodes
@@ -3912,7 +4416,23 @@ class IntegrationDebugNode(Node):
                 ),
                 "operational_state_fresh": operational["fresh"],
                 "operational_runtime_stopped": operational_runtime_is_stopped,
+                "operational_intervention_allowed": intervention_allowed,
+                "operational_intervention_block_reason": (
+                    operational["intervention_block_reason"]
+                    if self._network_locked_to_runtime
+                    else ""
+                ),
+                "operational_control_window_open": bool(
+                    operational["control_window_open"]
+                    if self._network_locked_to_runtime
+                    else not detected_planner_nodes
+                ),
                 "manual_control_available": manual_control_available,
+                "manual_control_gate": (
+                    "operational_state"
+                    if self._network_locked_to_runtime
+                    else "planner_nodes"
+                ),
                 "planner_coexistence_allowed": self._planner_coexistence_allowed,
                 "action_watchdog": dict(self._action_watchdog_policy),
                 "network": network,
@@ -3925,6 +4445,7 @@ class IntegrationDebugNode(Node):
             "vlm": self._vlm_status_snapshot(now),
             "virtual_robot": robot_source,
             "asr": self._asr_status_snapshot(),
+            "operational_asr": self._operational_asr_status_snapshot(),
             "surgery_record": self._surgery_record.snapshot(),
             "recent_events": recent_events,
         }
@@ -4007,7 +4528,9 @@ class IntegrationDebugNode(Node):
         with self._lock:
             if not self._armed:
                 return
-        blocked = self._blocked_nodes()
+        integrated = self._network_locked_to_runtime
+        operational = self._operational_runtime_status() if integrated else None
+        blocked = [] if integrated else self._blocked_nodes()
         with self._lock:
             expired = (
                 self._armed
@@ -4015,17 +4538,53 @@ class IntegrationDebugNode(Node):
                 and now - self._last_heartbeat_monotonic > self._heartbeat_timeout_sec
             )
             acknowledged = sorted(self._acknowledged_blocked_nodes)
-            planner_set_changed = self._armed and blocked != acknowledged
-            if not expired and not planner_set_changed:
-                return
             command_id = self._active_command_id
+            if operational is not None:
+                # A command admitted from an idle paused/stopped snapshot may
+                # itself make the robot busy.  Preserve that activity only
+                # while the task identity is empty or correlated to this
+                # command; unrelated tasks and all cleaner activity revoke it.
+                operational_gate_reason = (
+                    IntegrationDebugNode._active_command_operational_block_reason(
+                        operational, command_id
+                    )
+                    if command_id
+                    else str(operational["intervention_block_reason"])
+                )
+                gate_open = not operational_gate_reason
+                operational_gate_closed = self._armed and not gate_open
+                planner_set_changed = False
+            else:
+                operational_gate_reason = ""
+                operational_gate_closed = False
+                planner_set_changed = self._armed and bool(blocked)
+            if not expired and not planner_set_changed and not operational_gate_closed:
+                return
             self._disarm_locked()
-            if planner_set_changed:
+            if operational_gate_closed:
                 self._last_error = (
-                    "planner node set changed; manual control was disarmed: "
+                    operational_gate_reason
+                    + "; manual control was disarmed"
+                )
+            elif planner_set_changed:
+                self._last_error = (
+                    "Taskplanner node discovered; standalone manual control was disarmed: "
                     + ", ".join(blocked or ["none"])
                 )
-        if planner_set_changed:
+        if operational_gate_closed:
+            self._record(
+                "operational_intervention_gate_closed",
+                {
+                    "active_command_id": command_id,
+                    "execution_state": operational["execution_state"],
+                    "running": operational["running"],
+                    "active_robot_task_id": operational["active_robot_task_id"],
+                    "robot_state": operational["robot_state"],
+                    "cleaner_busy": operational["cleaner_busy"],
+                    "reason": operational_gate_reason,
+                },
+            )
+        elif planner_set_changed:
             self._record(
                 "planner_coexistence_changed",
                 {
@@ -4080,6 +4639,17 @@ class IntegrationDebugNode(Node):
             last_update = float(
                 self._action_status.get("last_update_monotonic", started)
             )
+            watchdog_policy = self._action_watchdog_policy
+            if (
+                route == "retraction_service"
+                and str(self._action_status.get("command", "")) == "change_tool"
+            ):
+                watchdog_policy = dict(self._action_watchdog_policy)
+                watchdog_policy["goal_response_timeout_sec"] = float(
+                    self._action_watchdog_policy[
+                        "change_tool_response_timeout_sec"
+                    ]
+                )
             reason_code = action_watchdog_reason(
                 terminal=bool(self._action_status.get("terminal")),
                 recovery_required=bool(
@@ -4095,7 +4665,7 @@ class IntegrationDebugNode(Node):
                     if unavailable_since > 0.0
                     else 0.0
                 ),
-                policy=self._action_watchdog_policy,
+                policy=watchdog_policy,
             )
         if reason_code:
             self._mark_action_recovery_required(reason_code)
@@ -4144,14 +4714,23 @@ class IntegrationDebugNode(Node):
 def main() -> None:
     rclpy.init()
     node = IntegrationDebugNode()
-    executor = MultiThreadedExecutor(num_threads=4)
+    auto_record_enabled = os.environ.get(
+        "TASKPLANNER_SURGERY_RECORD_AUTO_POST",
+        "false",
+    ).strip().casefold() in {"1", "true", "yes", "on"}
+    record_node = OperationalSurgeryRecordNode() if auto_record_enabled else None
+    executor = MultiThreadedExecutor(num_threads=6 if record_node is not None else 4)
     executor.add_node(node)
+    if record_node is not None:
+        executor.add_node(record_node)
     try:
         executor.spin()
     except KeyboardInterrupt:
         pass
     finally:
         executor.shutdown()
+        if record_node is not None:
+            record_node.destroy_node()
         node.close()
         node.destroy_node()
         if rclpy.ok():

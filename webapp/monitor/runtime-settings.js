@@ -118,11 +118,11 @@ export function validateDummyFixture(payload) {
   if (!isRecord(payload.baseline)) {
     throw new Error("더미 데이터의 baseline 객체가 필요합니다.");
   }
-  if (String(payload.baseline.schema_version || "") !== "1.1.0") {
-    throw new Error("더미 데이터 baseline.schema_version은 1.1.0이어야 합니다.");
+  if (String(payload.baseline.schema_version || "") !== "1.2.0") {
+    throw new Error("더미 데이터 baseline.schema_version은 1.2.0이어야 합니다.");
   }
-  if (String(payload.baseline.interface_version || "") !== "0.3.0") {
-    throw new Error("더미 데이터 baseline.interface_version은 0.3.0이어야 합니다.");
+  if (String(payload.baseline.interface_version || "") !== "0.4.0") {
+    throw new Error("더미 데이터 baseline.interface_version은 0.4.0이어야 합니다.");
   }
   if (!String(payload.baseline.procedure_type || "").trim()) {
     throw new Error("더미 데이터 baseline.procedure_type이 필요합니다.");

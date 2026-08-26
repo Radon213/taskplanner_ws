@@ -21,6 +21,7 @@ import uuid
 import rclpy
 from ament_index_python.packages import get_package_share_directory
 from procedure_spec import load_bundle
+from rcl_interfaces.msg import SetParametersResult
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from surgical_interop_msgs.msg import (
@@ -82,8 +83,8 @@ from .projections import (
 GATEWAY_OBSERVED = "GATEWAY_OBSERVED"
 GATEWAY_OBSERVED_REDACTED = "GATEWAY_OBSERVED_REDACTED"
 MODEL_OBSERVED_REDACTED = "MODEL_OBSERVED_REDACTED"
-SCHEMA_VERSION = "1.1.0"
-INTERFACE_VERSION = "0.3.0"
+SCHEMA_VERSION = "1.3.0"
+INTERFACE_VERSION = "0.5.0"
 _MAX_ASR_STATUS_BYTES = 256 * 1024
 _MAX_SPEECH_TEXT_CHARS = 2000
 _PUBLIC_LATENCY_BASES = frozenset(
@@ -220,8 +221,24 @@ class SurgicalInteropGateway(Node):
         ).strip()
         if not self._default_bundle or Path(self._default_bundle).name != self._default_bundle:
             raise ValueError("default_bundle must be a single procedure bundle name")
-        spec_root = Path(get_package_share_directory("procedure_spec")) / "specs"
-        self._procedure_spec = load_bundle(spec_root / self._default_bundle)
+        packaged_spec_root = (
+            Path(get_package_share_directory("procedure_spec")) / "specs"
+        )
+        default_spec_dir = packaged_spec_root / self._default_bundle
+        configured_spec_dir = str(
+            self.declare_parameter("spec_dir", str(default_spec_dir)).value
+        ).strip()
+        if not configured_spec_dir:
+            raise ValueError("spec_dir must identify a procedure bundle")
+        self._spec_dir = configured_spec_dir
+        self._spec_root = Path(self._spec_dir).parent
+        self._procedure_spec = load_bundle(self._spec_dir)
+        self._active_bundle = str(self._procedure_spec.procedure_id).strip()
+        if self._active_bundle != self._default_bundle:
+            raise ValueError(
+                "spec_dir procedure identity must match default_bundle: "
+                f"{self._active_bundle!r} != {self._default_bundle!r}"
+            )
         self._catalog_version = self._catalog_digest(self._procedure_spec)
 
         self._lock = threading.RLock()
@@ -244,6 +261,8 @@ class SurgicalInteropGateway(Node):
         self._procedure_run_start_source_stamp_sec: float | None = None
         self._last_procedure_active = False
         self._procedure_mismatch = False
+        self._procedure_run_scope_mismatch = False
+        self.add_on_set_parameters_callback(self._on_parameters_changed)
 
         state_qos = _state_qos()
         self._context_pub = self.create_publisher(SurgeryContext, "/surgery/context", state_qos)
@@ -325,6 +344,10 @@ class SurgicalInteropGateway(Node):
             "procedure_type": spec.procedure_id,
             "procedure_display_name": spec.bundle.procedure_display_name,
             "procedure_display_name_ko": spec.bundle.procedure_display_name_ko,
+            "procedure_target_site": spec.bundle.procedure_target_site,
+            "procedure_target_site_ko": spec.bundle.procedure_target_site_ko,
+            "procedure_approach": spec.bundle.procedure_approach,
+            "procedure_approach_ko": spec.bundle.procedure_approach_ko,
             "default_phase_id": spec.default_phase_id,
             "phases": [
                 {
@@ -403,19 +426,157 @@ class SurgicalInteropGateway(Node):
             return None
         return stamp_sec
 
-    def _start_procedure_run_locked(self, world: Any) -> None:
+    def _start_procedure_run_locked(self, world: Any) -> bool:
+        authoritative_run_id = str(
+            getattr(world, "procedure_run_id", "") or ""
+        ).strip()
+        if not authoritative_run_id:
+            # A running flag without the Digital Twin's run identity cannot
+            # establish a public scope. Never substitute a gateway-local ID:
+            # downstream dedupe/ACK joins must use the exact authoritative run.
+            self._end_procedure_run_locked()
+            return False
         self._clear_run_scoped_state_locked()
-        self._procedure_run_id = str(uuid.uuid4())
+        self._procedure_run_id = authoritative_run_id
         self._procedure_run_start_source_stamp_sec = self._positive_source_stamp_sec(
             getattr(world, "stamp", None)
         )
         self._last_procedure_active = True
+        return True
 
     def _end_procedure_run_locked(self) -> None:
         self._clear_run_scoped_state_locked()
         self._procedure_run_id = ""
         self._procedure_run_start_source_stamp_sec = None
         self._last_procedure_active = False
+
+    def _load_active_bundle_spec(self, bundle_id: str) -> Any | None:
+        """Load only a canonical local procedure bundle for public projection."""
+
+        normalized = str(bundle_id or "").strip()
+        if not normalized or Path(normalized).name != normalized:
+            return None
+        try:
+            spec = load_bundle(self._spec_root / normalized)
+        except (OSError, TypeError, ValueError, KeyError):
+            return None
+        return spec if str(getattr(spec, "procedure_id", "")).strip() == normalized else None
+
+    def _stopped_for_spec_reload_locked(self) -> bool:
+        """Return whether no authoritative or cached procedure run is active."""
+
+        cached_world = self._world
+        world = getattr(cached_world, "message", None) if cached_world else None
+        return not (
+            self._last_procedure_active
+            or self._procedure_run_id
+            or bool(getattr(world, "running", False))
+        )
+
+    def _on_parameters_changed(self, parameters: list[Any]) -> SetParametersResult:
+        """Atomically reload the public catalog while the runtime is stopped.
+
+        SimulationManager applies ``spec_dir`` to every procedure-aware node as
+        one stopped-state transaction.  Loading before the commit lock keeps a
+        malformed YAML revision from disturbing the active projection, while a
+        second stopped-state check closes the race with a newly started run.
+        Setting the same path is intentionally not a no-op: the YAML bytes at
+        that path may represent a newer same-bundle revision.
+        """
+
+        spec_update = next(
+            (parameter for parameter in parameters if parameter.name == "spec_dir"),
+            None,
+        )
+        if spec_update is None:
+            return SetParametersResult(successful=True)
+
+        with self._lock:
+            if not self._stopped_for_spec_reload_locked():
+                return SetParametersResult(
+                    successful=False,
+                    reason="spec_dir can change only while the procedure is stopped",
+                )
+
+        next_spec_dir = str(spec_update.value).strip()
+        if not next_spec_dir:
+            return SetParametersResult(
+                successful=False,
+                reason="spec_dir must identify a procedure bundle",
+            )
+        try:
+            next_spec = load_bundle(next_spec_dir)
+            next_bundle = str(getattr(next_spec, "procedure_id", "") or "").strip()
+            if not next_bundle or Path(next_bundle).name != next_bundle:
+                raise ValueError("loaded procedure_id is not a canonical bundle name")
+            if Path(next_spec_dir).name != next_bundle:
+                raise ValueError(
+                    "spec_dir bundle identity does not match loaded procedure_id"
+                )
+            next_catalog_version = self._catalog_digest(next_spec)
+        except Exception as exc:
+            return SetParametersResult(
+                successful=False,
+                reason=f"failed to reload procedure spec: {exc}",
+            )
+
+        with self._lock:
+            if not self._stopped_for_spec_reload_locked():
+                return SetParametersResult(
+                    successful=False,
+                    reason="spec_dir can change only while the procedure is stopped",
+                )
+            self._clear_run_scoped_state_locked()
+            self._procedure_run_id = ""
+            self._procedure_run_start_source_stamp_sec = None
+            self._spec_dir = next_spec_dir
+            self._spec_root = Path(next_spec_dir).parent
+            self._procedure_spec = next_spec
+            self._active_bundle = next_bundle
+            self._catalog_version = next_catalog_version
+            cached_world = self._world
+            world = getattr(cached_world, "message", None) if cached_world else None
+            reported_procedure = str(
+                getattr(world, "procedure_id", "") or ""
+            ).strip()
+            self._procedure_mismatch = bool(
+                reported_procedure and reported_procedure != next_bundle
+            )
+            self._procedure_run_scope_mismatch = False
+        return SetParametersResult(successful=True)
+
+    def _adopt_stopped_bundle_locked(self, message: WorldState) -> bool:
+        """Atomically replace the public catalog from a stopped WorldState.
+
+        The simulation manager already permits bundle selection only after it
+        is fully stopped.  The public read-only gateway follows that selected
+        bundle from WorldState so SurgiMate cannot remain pinned to the bundle
+        used at process launch.  A running frame is never a bundle-selection
+        authority: accepting one would allow a transient or malformed
+        procedure identifier to replace the catalog during (or immediately
+        before) a procedure run.
+        """
+
+        if bool(getattr(message, "running", False)) or self._last_procedure_active:
+            return False
+        normalized = str(getattr(message, "procedure_id", "") or "").strip()
+        if normalized == self._procedure_spec.procedure_id:
+            self._active_bundle = normalized
+            return True
+        if self._last_procedure_active:
+            return False
+        spec = self._load_active_bundle_spec(normalized)
+        if spec is None:
+            return False
+        # Do not carry a prior bundle's VLM, robot, or speech facts into the
+        # catalog that is about to become visible to a public read-only client.
+        self._clear_run_scoped_state_locked()
+        self._procedure_run_id = ""
+        self._procedure_run_start_source_stamp_sec = None
+        self._procedure_spec = spec
+        self._active_bundle = normalized
+        self._catalog_version = self._catalog_digest(spec)
+        return True
 
     def _public_world_locked(self, now_monotonic_sec: float) -> tuple[Any | None, bool]:
         """Resolve the current public run and close it when WorldState is stale."""
@@ -432,13 +593,17 @@ class SurgicalInteropGateway(Node):
             and fresh
             and getattr(world, "running", False)
             and self._last_procedure_active
+            and self._procedure_run_id
+            and str(getattr(world, "procedure_run_id", "") or "").strip()
+            == self._procedure_run_id
             and str(getattr(world, "procedure_id", "")).strip()
             == self._procedure_spec.procedure_id
         )
         if not active and self._last_procedure_active:
             # A stale world ends the public run just like an explicit
-            # running=false transition. A new fresh running WorldState starts
-            # a new run with a new opaque identifier in _on_world.
+            # running=false transition. A new fresh running WorldState with an
+            # authoritative run ID starts the matching public scope in
+            # _on_world.
             self._end_procedure_run_locked()
         return world, active
 
@@ -446,20 +611,44 @@ class SurgicalInteropGateway(Node):
         with self._lock:
             cached = self._cache(message)
             reported_procedure = str(getattr(message, "procedure_id", "")).strip()
-            mismatch = bool(
-                getattr(message, "running", False)
-                and reported_procedure != self._procedure_spec.procedure_id
-            )
+            reported_run_id = str(
+                getattr(message, "procedure_run_id", "") or ""
+            ).strip()
+            matches_catalog = reported_procedure == self._procedure_spec.procedure_id
+            if not matches_catalog and not self._last_procedure_active:
+                # Only a stopped, locally validated selection may update the
+                # public catalog.  An initial or mid-run running frame with a
+                # different ID remains a mismatch and cannot open a new run.
+                matches_catalog = self._adopt_stopped_bundle_locked(message)
+            mismatch = bool(reported_procedure and not matches_catalog)
             if mismatch and not self._procedure_mismatch:
                 self.get_logger().error(
                     "public gateway rejected WorldState procedure/catalog mismatch: "
                     f"world={reported_procedure!r} catalog={self._procedure_spec.procedure_id!r}"
                 )
             self._procedure_mismatch = mismatch
-            requested_active = bool(getattr(message, "running", False) and not mismatch)
+            run_scope_mismatch = bool(
+                getattr(message, "running", False) and not reported_run_id
+            )
+            if run_scope_mismatch and not self._procedure_run_scope_mismatch:
+                self.get_logger().error(
+                    "public gateway rejected active WorldState without "
+                    "procedure_run_id"
+                )
+            self._procedure_run_scope_mismatch = run_scope_mismatch
+            requested_active = bool(
+                getattr(message, "running", False)
+                and not mismatch
+                and reported_run_id
+            )
             if requested_active and not self._last_procedure_active:
                 # Establish run identity before any immediately following event
                 # can be assigned a sequence number for this session.
+                self._start_procedure_run_locked(message)
+            elif requested_active and reported_run_id != self._procedure_run_id:
+                # A missed stop frame must not leave the public gateway pinned
+                # to the previous Digital Twin run. Replace the complete
+                # run-scoped cache atomically with the new authoritative ID.
                 self._start_procedure_run_locked(message)
             elif not requested_active and self._last_procedure_active:
                 self._end_procedure_run_locked()
@@ -514,6 +703,35 @@ class SurgicalInteropGateway(Node):
             return
         with self._lock:
             self._asr_status = self._cache(payload)
+        self._publish_live_speech_snapshot()
+
+    def _publish_live_speech_snapshot(self) -> None:
+        """Refresh only the public ASR projection between full snapshot ticks."""
+
+        publisher = getattr(self, "_speech_pub", None)
+        if publisher is None:
+            return
+        with self._lock:
+            revision = self._revision
+            procedure_active = self._last_procedure_active
+            procedure_type = self._procedure_spec.procedure_id
+        # GatewayInfo establishes the identity scope consumed by the monitor.
+        # Do not race a speech sample ahead of the first public heartbeat.
+        if revision <= 0:
+            return
+        try:
+            publisher.publish(
+                self._speech_message(
+                    stamp=self.get_clock().now().to_msg(),
+                    revision=revision,
+                    procedure_type=procedure_type,
+                    procedure_active=procedure_active,
+                )
+            )
+        except Exception as exc:  # pragma: no cover - defensive ROS boundary
+            self.get_logger().warning(
+                f"Unable to publish live public ASR snapshot: {exc}"
+            )
 
     @staticmethod
     def _replay_speech_status(message: Any) -> dict[str, Any]:
@@ -674,6 +892,7 @@ class SurgicalInteropGateway(Node):
             vlm_result = self._vlm_result
             vlm_health = self._vlm_health
             input_statuses = dict(self._input_statuses)
+            asr_status = self._asr_status
             skill_status = self._skill_status
             bed_robot_arm_status = self._bed_robot_arm_status
         freshness = {
@@ -706,6 +925,20 @@ class SurgicalInteropGateway(Node):
             ),
         }
         for source in ("speech_input", "flir", "cam4"):
+            # Live's reviewed operational ASR publishes its bounded JSON
+            # runtime status rather than the replay-only InputSourceStatus
+            # topic.  Keep that operational status authoritative for public
+            # health so an actually connected, admitted ASR does not leave
+            # SurgiMate permanently in HEALTH WARN.  The local receipt time,
+            # not the status payload's wall-clock value, remains the
+            # freshness authority.
+            if source == "speech_input" and asr_status is not None:
+                freshness[source] = self._operational_asr_freshness(
+                    asr_status,
+                    now_monotonic_sec,
+                    self._health_stale_after_sec,
+                )
+                continue
             cached = input_statuses.get(source)
             receipt = freshness_from_receipt(
                 cached.received_monotonic_sec if cached else None,
@@ -723,6 +956,35 @@ class SurgicalInteropGateway(Node):
                 age_sec=float(getattr(cached.message, "age_sec", receipt.age_sec)),
             )
         return freshness
+
+    @staticmethod
+    def _operational_asr_freshness(
+        status: CachedMessage,
+        now_monotonic_sec: float,
+        stale_after_sec: float,
+    ) -> Freshness:
+        """Project the validated operational ASR status into source health."""
+
+        receipt = freshness_from_receipt(
+            status.received_monotonic_sec,
+            now_monotonic_sec,
+            stale_after_sec,
+        )
+        if not receipt.fresh:
+            return receipt
+        payload = status.message if isinstance(status.message, dict) else {}
+        asr = payload.get("asr") if isinstance(payload, dict) else None
+        if not isinstance(asr, dict):
+            return Freshness(available=False, fresh=False, age_sec=receipt.age_sec)
+        available = bool(asr.get("available", False))
+        connected = bool(asr.get("connected", False))
+        state = str(asr.get("state", "")).strip().casefold()
+        ready = state in {"recording", "listening", "running", "connected", "ready"}
+        return Freshness(
+            available=available and connected,
+            fresh=available and connected and ready,
+            age_sec=receipt.age_sec,
+        )
 
     def _stamp_or_now(self, stamp: Any) -> Any:
         return stamp if stamp is not None else self.get_clock().now().to_msg()
@@ -764,8 +1026,6 @@ class SurgicalInteropGateway(Node):
         message.state = SpeechRecognitionState.STATE_UNAVAILABLE
         message.source = "taskplanner_asr"
         message.evidence_status = GATEWAY_OBSERVED
-        if not procedure_active:
-            return message
 
         with self._lock:
             speech = self._speech_text
@@ -790,6 +1050,28 @@ class SurgicalInteropGateway(Node):
         message.connected = bool(asr.get("connected", False))
         message.state = self._public_asr_state(asr.get("state"))
         message.available = bool(asr.get("available", False)) and message.connected
+        audio_level = asr.get("audio_level_dbfs")
+        peak_level = asr.get("peak_level_dbfs")
+        if (
+            message.available
+            and isinstance(audio_level, (int, float))
+            and not isinstance(audio_level, bool)
+            and math.isfinite(audio_level)
+        ):
+            message.audio_level_available = True
+            message.audio_level_dbfs = float(max(-99.0, min(0.0, audio_level)))
+            if (
+                isinstance(peak_level, (int, float))
+                and not isinstance(peak_level, bool)
+                and math.isfinite(peak_level)
+            ):
+                message.peak_level_dbfs = float(max(-99.0, min(0.0, peak_level)))
+            else:
+                message.peak_level_dbfs = message.audio_level_dbfs
+        if self._publish_free_text and message.available:
+            partial_text = str(asr.get("partial_text", "")).strip()
+            if len(partial_text) <= _MAX_SPEECH_TEXT_CHARS:
+                message.partial_text = partial_text
         speech_fresh = bool(
             speech
             and freshness_from_receipt(
@@ -940,9 +1222,10 @@ class SurgicalInteropGateway(Node):
         if hasattr(message, "catalog_version"):
             message.catalog_version = self._catalog_version
         message.gateway_instance_id = self._gateway_instance_id
-        message.procedure_run_id = self._procedure_run_id if procedure_active else ""
+        scoped_active = bool(procedure_active and self._procedure_run_id)
+        message.procedure_run_id = self._procedure_run_id if scoped_active else ""
         message.procedure_type = procedure_type
-        message.procedure_active = procedure_active
+        message.procedure_active = scoped_active
 
     def _gateway_info_message(
         self,
@@ -981,6 +1264,10 @@ class SurgicalInteropGateway(Node):
         )
         message.procedure_display_name = spec.bundle.procedure_display_name
         message.procedure_display_name_ko = spec.bundle.procedure_display_name_ko
+        message.procedure_target_site = spec.bundle.procedure_target_site
+        message.procedure_target_site_ko = spec.bundle.procedure_target_site_ko
+        message.procedure_approach = spec.bundle.procedure_approach
+        message.procedure_approach_ko = spec.bundle.procedure_approach_ko
         message.default_phase_id = spec.default_phase_id
         normal_phase_ids = set(spec.normal_phase_ids)
         for ordinal, phase in enumerate(spec.bundle.phases, start=1):
@@ -1027,10 +1314,6 @@ class SurgicalInteropGateway(Node):
         message.observed_location_types = list(projection.observed_location_types)
         message.observed_location_ids = list(projection.observed_location_ids)
         message.observed_confidences = list(projection.observed_confidences)
-        message.gesture_event_type = projection.gesture_event_type
-        message.gesture_requested_tool = projection.gesture_requested_tool
-        message.gesture_hand_pose = projection.gesture_hand_pose
-        message.gesture_confidence = projection.gesture_confidence
         message.uncertainty = projection.uncertainty
         if not message.evidence_status:
             message.evidence_status = projection.evidence_status
@@ -1109,6 +1392,8 @@ class SurgicalInteropGateway(Node):
                 errors.append(error_code)
         if self._procedure_mismatch:
             errors.append("procedure_catalog_mismatch")
+        if self._procedure_run_scope_mismatch:
+            errors.append("procedure_run_scope_missing")
 
         required_unavailable = sorted(set(unavailable).intersection(self._required_health_sources))
         required_stale = sorted(set(stale).intersection(self._required_health_sources))

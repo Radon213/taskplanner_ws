@@ -1,6 +1,5 @@
-# Latest public, finalized speech-recognition state. This is a snapshot for UI
-# integration, not an audio stream and not proof that the planner accepted a
-# spoken request.
+# Latest public speech-recognition state. This is a bounded UI snapshot, not an
+# audio stream and not proof that the planner accepted a spoken request.
 string STATE_UNAVAILABLE="unavailable"
 string STATE_IDLE="idle"
 string STATE_LISTENING="listening"
@@ -22,6 +21,14 @@ bool procedure_active
 bool available
 bool connected
 string state
+
+# Live microphone feedback. The dBFS values are valid only when
+# audio_level_available=true. partial_text follows the same deployment
+# free-text policy as finalized text and is empty when that policy is disabled.
+bool audio_level_available
+float32 audio_level_dbfs
+float32 peak_level_dbfs
+string partial_text
 
 # Procedure-run-local finalized-utterance sequence. It resets when
 # procedure_run_id or gateway_instance_id changes. utterance_stamp is the

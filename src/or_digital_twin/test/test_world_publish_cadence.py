@@ -176,6 +176,9 @@ def _signature_node() -> ORDigitalTwinNode:
         stability_sec=1.2,
     )
     state = SimpleNamespace(
+        running=True,
+        execution_state="RUNNING",
+        procedure_run_id="run-1",
         bed_robot_arm_groups={"retraction": retraction},
         filtered_phase="P03",
         phase_confidence=0.9,
@@ -200,6 +203,17 @@ def _signature_node() -> ORDigitalTwinNode:
 @pytest.mark.parametrize(
     "mutate",
     [
+        lambda node: setattr(node._twin.state, "running", False),
+        lambda node: setattr(
+            node._twin.state,
+            "execution_state",
+            "STOPPED",
+        ),
+        lambda node: setattr(
+            node._twin.state,
+            "procedure_run_id",
+            "run-2",
+        ),
         lambda node: setattr(
             node._twin.state.bed_robot_arm_groups["retraction"],
             "connected",

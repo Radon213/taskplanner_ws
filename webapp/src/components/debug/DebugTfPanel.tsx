@@ -12,7 +12,7 @@ import {
   TfScene,
   type TfSceneTransform,
   type TfTransformSource,
-} from "../multicam/MulticamOpsWorkspace";
+} from "../multicam/TfScene";
 import "./DebugTfPanel.css";
 
 interface DebugTfPanelProps {

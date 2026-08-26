@@ -19,7 +19,32 @@ const multicamWorkspace = fs.readFileSync(
   path.join(root, "src", "components", "multicam", "MulticamOpsWorkspace.tsx"),
   "utf8",
 );
+const tfScene = fs.readFileSync(
+  path.join(root, "src", "components", "multicam", "TfScene.tsx"),
+  "utf8",
+);
 const runtimeModes = fs.readFileSync(path.join(root, "src", "runtimeModes.ts"), "utf8");
+const runtimeFeatures = fs.readFileSync(path.join(root, "src", "runtimeFeatures.ts"), "utf8");
+const missionSubscriptionPlan = fs.readFileSync(
+  path.join(root, "src", "ros", "missionSubscriptionPlan.ts"),
+  "utf8",
+);
+const rfdetrObservationSources = fs.readFileSync(
+  path.join(root, "src", "ros", "rfdetrObservationSources.ts"),
+  "utf8",
+);
+const toolObservationMessages = fs.readFileSync(
+  path.join(root, "src", "ros", "toolObservationMessages.ts"),
+  "utf8",
+);
+const modelCatalogMessages = fs.readFileSync(
+  path.join(root, "src", "ros", "modelCatalogMessages.ts"),
+  "utf8",
+);
+const typedRfdetrStatus = fs.readFileSync(
+  path.join(root, "src", "components", "observability", "TypedRfdetrObservationStatus.tsx"),
+  "utf8",
+);
 const procedureDock = fs.readFileSync(
   path.join(root, "src", "components", "command", "ProcedureDock.tsx"),
   "utf8",
@@ -32,6 +57,16 @@ const runtimeControl = fs.readFileSync(
   path.join(root, "src", "hooks", "useRuntimeControl.ts"),
   "utf8",
 );
+function sourceFiles(directory) {
+  return fs.readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+    const absolute = path.join(directory, entry.name);
+    if (entry.isDirectory()) return sourceFiles(absolute);
+    return /\.(?:ts|tsx)$/.test(entry.name) ? [absolute] : [];
+  });
+}
+const browserSource = sourceFiles(path.join(root, "src"))
+  .map((file) => fs.readFileSync(file, "utf8"))
+  .join("\n");
 const violations = [];
 
 for (const eagerImport of [
@@ -91,7 +126,7 @@ if (debugBridge.includes("setFreshnessTick")) {
   violations.push("Debug freshness monitoring must not force an idle workspace render every 500 ms");
 }
 
-if (!multicamWorkspace.includes("const TfScene = memo(function TfScene")) {
+if (!tfScene.includes("const TfScene = memo(function TfScene")) {
   violations.push("The Three.js TF workspace must not rerender for unrelated camera-frame updates");
 }
 
@@ -150,18 +185,27 @@ for (const coldStartGuard of [
   }
 }
 
-for (const debugEntryGuard of [
+// Debug diagnostics are entered only as an integrated observer workspace in
+// Live.  Keep the old standalone runtime transition out of the operator UI;
+// the general transition guards below still protect Live/LLM/Shadow changes.
+for (const [source, removedEntry] of [
   [statusRibbon, "debugModeDisabled"],
   [statusRibbon, "disabled={debugModeDisabled}"],
-  [app, "safety?.isRunning"],
-  [app, "safety?.isPaused"],
-  [app, "safety?.startInFlight"],
-  [app, "safety?.actionPending"],
   [app, 'onRuntimeModeChange("debug", runtimeTransitionSafety)'],
 ]) {
-  const [source, guard] = debugEntryGuard;
-  if (!source.includes(guard)) {
-    violations.push(`Standalone Debug entry safety guard is missing: ${guard}`);
+  if (source.includes(removedEntry)) {
+    violations.push(`Standalone Debug entry must remain removed: ${removedEntry}`);
+  }
+}
+
+for (const transitionSafetyGuard of [
+  "safety?.isRunning",
+  "safety?.isPaused",
+  "safety?.startInFlight",
+  "safety?.actionPending",
+]) {
+  if (!app.includes(transitionSafetyGuard)) {
+    violations.push(`Runtime transition safety guard is missing: ${transitionSafetyGuard}`);
   }
 }
 
@@ -200,12 +244,97 @@ for (const rejectedTransitionGuard of [
 }
 
 for (const workspaceRuntimeGuard of [
-  'onMonitor={() => navigateWorkspace("monitor")}',
+  '() => navigateWorkspace("monitor")',
   'setRuntimeMode(runtimeTransition.activeMode)',
 ]) {
   if (!app.includes(workspaceRuntimeGuard)) {
     violations.push(`Observer workspace runtime transition guard is missing: ${workspaceRuntimeGuard}`);
   }
+}
+
+for (const liveCoreGuard of [
+  [runtimeFeatures, "OPTIONAL_OPERATIONS_UI_ENABLED"],
+  [runtimeFeatures, 'explicitOptionalUi ?? Boolean(configuredDefaultMode && configuredDefaultMode !== "live")'],
+  [runtimeFeatures, 'authoritativeMode !== null && authoritativeMode !== "live"'],
+  [app, "const optionalUiEnabled = optionalOperationsUiEnabled(runtimeTransition.activeMode)"],
+  [app, "workspaceFromLocation(OPTIONAL_OPERATIONS_UI_ENABLED)"],
+  [app, 'if (mode !== "live" && !optionalUiEnabled) return false'],
+  [app, "allowRuntimeModeSelection={optionalUiEnabled}"],
+  [app, "missionObservationProfile(runtimeTransition.activeMode)"],
+  [missionSubscriptionPlan, 'profile === "live-core"'],
+  [missionSubscriptionPlan, "vlmModelVisual: false"],
+  [missionSubscriptionPlan, "modelControls: false"],
+  [rfdetrObservationSources, 'CONFIGURED_RFDETR_PRODUCER_HOST = "192.168.1.7"'],
+  [rfdetrObservationSources, 'topic: "/perception/cam_3/tool/observations"'],
+  [rfdetrObservationSources, 'topic: "/perception/cam_4/tool/observations"'],
+]) {
+  const [source, guard] = liveCoreGuard;
+  if (!source.includes(guard)) {
+    violations.push(`Production Live core boundary is missing: ${guard}`);
+  }
+}
+
+for (const removedBrowserPath of [
+  "internal-lab",
+  "runtime-local",
+  "/taskplanner/internal/rfdetr",
+  "LOCAL RF-DETR",
+  "/surgery/images/cam4/detection_overlay/compressed",
+  "/surgery/images/cam4/pose_overlay/compressed",
+  "setPerceptionEnabled",
+  "/rfdetr_perception_bridge/set_enabled",
+  "sendOverride",
+  "overrideAck",
+  "/simulation/inject_surgeon_override",
+]) {
+  if (browserSource.includes(removedBrowserPath)) {
+    violations.push(`Removed browser control or local perception path remains: ${removedBrowserPath}`);
+  }
+}
+
+for (const [source, guard] of [
+  [missionBridge, 'from "../ros/toolObservationMessages"'],
+  [missionBridge, 'from "../ros/modelCatalogMessages"'],
+  [toolObservationMessages, "export function normalizeVlmRequestToolDetectionEvidence"],
+  [toolObservationMessages, "export function normalizeTypedRfdetrToolDetections"],
+  [modelCatalogMessages, "export function parseModelCatalogResponse"],
+  [modelCatalogMessages, "export function parseLegacyModelCatalogResponse"],
+  [modelCatalogMessages, "export function assertSetParametersAccepted"],
+]) {
+  if (!source.includes(guard)) {
+    violations.push(`Extracted ROS message owner is missing: ${guard}`);
+  }
+}
+for (const duplicatedOwner of [
+  "function normalizeVlmRequestToolDetectionEvidence",
+  "function normalizeTypedRfdetrToolDetections",
+  "function normalizeProviderStatus",
+  "function normalizeModelEntry",
+  "function legacyCatalog",
+  "function stringParameter",
+  "function boolParameter",
+]) {
+  if (missionBridge.includes(duplicatedOwner)) {
+    violations.push(`useRosBridge must not duplicate extracted message ownership: ${duplicatedOwner}`);
+  }
+}
+
+if (app.includes('className="timeline-area"')) {
+  violations.push("Mission must not mount a second hidden Observability timeline");
+}
+
+for (const sourceBoundaryGuard of [
+  'data-configured-producer-host={CONFIGURED_RFDETR_PRODUCER_HOST}',
+  "배포 계약의 구성값",
+  "publisher IP를 증명하지 않습니다",
+  "payload 모델",
+]) {
+  if (!typedRfdetrStatus.includes(sourceBoundaryGuard)) {
+    violations.push(`RF-DETR deployment/source boundary is missing: ${sourceBoundaryGuard}`);
+  }
+}
+if (typedRfdetrStatus.includes("data-source-host")) {
+  violations.push("RF-DETR configuration must not be presented as publisher-host attestation");
 }
 
 for (const unsafeMulticamTransition of [

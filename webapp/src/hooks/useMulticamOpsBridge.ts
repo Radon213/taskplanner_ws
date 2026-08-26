@@ -2,41 +2,46 @@ import { startTransition, useCallback, useEffect, useLayoutEffect, useMemo, useR
 import ROSLIB from "roslib";
 
 import { multicamBridgeUrl } from "../runtimeModes";
+import type {
+  DebugReadOnlyRosSession,
+  DebugReadOnlyTopicSpec,
+  DebugReadOnlyTopicSubscriber,
+} from "./useIntegrationDebugBridge";
 
 export const MULTICAM_CAMERAS = [
   {
     id: "cam_1",
     label: "CAM 1",
     serial: "339522301105",
-    colorTopic: "/preview/cam_1/color/image_raw/compressed",
+    colorTopic: "/synced/cam_1/color/image_raw/compressed",
     depthTopic: null,
   },
   {
     id: "cam_2",
     label: "CAM 2",
     serial: "338522301897",
-    colorTopic: "/preview/cam_2/color/image_raw/compressed",
+    colorTopic: "/synced/cam_2/color/image_raw/compressed",
     depthTopic: null,
   },
   {
     id: "cam_3",
     label: "CAM 3",
     serial: "146222253041",
-    colorTopic: "/preview/cam_3/color/image_raw/compressed",
-    depthTopic: "/preview/cam_3/depth/image_rect_raw/compressedDepth",
+    colorTopic: "/synced/cam_3/color/image_raw/compressed",
+    depthTopic: "/synced/cam_3/depth/image_rect_raw/compressedDepth",
   },
   {
     id: "cam_4",
     label: "CAM 4",
     serial: "146222251000",
-    colorTopic: "/preview/cam_4/color/image_raw/compressed",
-    depthTopic: "/preview/cam_4/depth/image_rect_raw/compressedDepth",
+    colorTopic: "/synced/cam_4/color/image_raw/compressed",
+    depthTopic: "/synced/cam_4/depth/image_rect_raw/compressedDepth",
   },
   {
     id: "flir",
     label: "FLIR",
     serial: "25054909",
-    colorTopic: "/preview/flir/color/image_raw/compressed",
+    colorTopic: "/synced/flir/color/image_raw/compressed",
     depthTopic: null,
   },
 ] as const;
@@ -160,9 +165,9 @@ const MAX_OBSERVER_PAYLOAD_DEPTH = 8;
 // subscribes. Keep enough bridge-side messages to merge the snapshots from the
 // world-anchor and multicam publishers instead of retaining only the last one.
 const STATIC_TF_QUEUE_LENGTH = 32;
-// VIPLab's `/preview/*` writers are the 5 Hz rate authority. Do not add a
+// VIPLab's `/synced/*` streams are the 15 Hz source authority. Do not add a
 // second browser-side throttle: queue_length=1 pass-through always favors the
-// latest preview frame without requesting raw `/synced/*` traffic.
+// latest source frame without building a browser-side backlog.
 const IMAGE_THROTTLE_MS = 0;
 // The observer readiness gate and the operator-facing CaptureStatus cards must
 // agree on one freshness boundary. Export it so a stale card cannot briefly
@@ -170,12 +175,6 @@ const IMAGE_THROTTLE_MS = 0;
 export const CAPTURE_STATUS_MAX_AGE_MS = 3_500;
 const TOPIC_DISCOVERY_TIMEOUT_MS = 4_000;
 const OBSERVER_TOPICS_SERVICE = "/multicam_observer/rosapi/topics";
-const IMAGE_QOS = {
-  history: "keep_last",
-  depth: 1,
-  reliability: "best_effort",
-  durability: "volatile",
-} as const;
 const TF_STATIC_QOS = {
   history: "keep_last",
   // Individual static-transform publishers may each retain one message. Keep a
@@ -561,11 +560,55 @@ function unsubscribeWhileConnected(ros: any, topics: any[]): void {
   });
 }
 
+function subscribeWithRos(
+  ros: any,
+  spec: DebugReadOnlyTopicSpec,
+  onMessage: (message: unknown) => void,
+): () => void {
+  const topic = new ROSLIB.Topic({
+    ros,
+    name: spec.name,
+    messageType: spec.messageType,
+    ...(spec.compression ? { compression: spec.compression } : {}),
+    ...(spec.throttleRate === undefined ? {} : { throttle_rate: spec.throttleRate }),
+    ...(spec.queueLength === undefined ? {} : { queue_length: spec.queueLength }),
+  });
+  if (spec.reliability) {
+    injectQos(topic, {
+      history: "keep_last",
+      depth: Math.max(1, spec.queueLength ?? 1),
+      reliability: spec.reliability,
+      durability: spec.durability ?? "volatile",
+    });
+  }
+  topic.subscribe(onMessage);
+  return () => unsubscribeWhileConnected(ros, [topic]);
+}
+
+function topicInventoryFromResponse(result: Record<string, unknown>): TopicInventoryRow[] {
+  const names = Array.isArray(result.topics) ? result.topics.slice(0, MAX_OBSERVER_TOPICS) : [];
+  const types = Array.isArray(result.types) ? result.types : [];
+  return names
+    .map((name, index) => ({
+      name: String(name).slice(0, MAX_OBSERVER_TOPIC_NAME_CHARS),
+      type: String(types[index] || "unknown").slice(0, MAX_OBSERVER_TOPIC_TYPE_CHARS),
+    }))
+    .filter((topic) => topic.name.startsWith("/"))
+    .sort((left, right) => left.name.localeCompare(right.name));
+}
+
 export function useMulticamOpsBridge(
   activeView: MulticamView,
-  { observeStaticTf = true }: { observeStaticTf?: boolean } = {},
+  {
+    observeStaticTf = true,
+    readOnlySession = null,
+  }: {
+    observeStaticTf?: boolean;
+    readOnlySession?: DebugReadOnlyRosSession | null;
+  } = {},
 ) {
-  const [url] = useState(multicamBridgeUrl);
+  const [standaloneUrl] = useState(multicamBridgeUrl);
+  const url = readOnlySession?.url ?? standaloneUrl;
   const [retryGeneration, setRetryGeneration] = useState(0);
   const [socketConnected, setSocketConnected] = useState(false);
   const [captureTopicDiscovered, setCaptureTopicDiscovered] = useState(false);
@@ -582,7 +625,7 @@ export function useMulticamOpsBridge(
   const [selectedTopicSample, setSelectedTopicSample] = useState<TopicSample | null>(null);
   const [worldActionPending, setWorldActionPending] = useState<WorldAction | null>(null);
   const [worldActionResult, setWorldActionResult] = useState<WorldActionResult | null>(null);
-  const [activeRos, setActiveRos] = useState<any>(null);
+  const [activeSubscriber, setActiveSubscriber] = useState<DebugReadOnlyTopicSubscriber | null>(null);
   const connected = socketConnected && captureStatusFresh;
 
   const rosRef = useRef<any>(null);
@@ -594,6 +637,8 @@ export function useMulticamOpsBridge(
   const objectUrlsRef = useRef(new Set<string>());
   const captureStatusFreshRef = useRef(false);
   const observerGenerationRef = useRef(0);
+  const readOnlySessionRef = useRef(readOnlySession);
+  readOnlySessionRef.current = readOnlySession;
   const topicRefreshInFlightRef = useRef(false);
   const pendingServiceCancelsRef = useRef(new Set<(reason: string) => void>());
 
@@ -674,24 +719,30 @@ export function useMulticamOpsBridge(
 
   const refreshTopics = useCallback(() => {
     const ros = rosRef.current as ObserverServiceConnection | null;
+    const sharedSession = readOnlySession;
     const generation = observerGenerationRef.current;
-    if (!ros?.isConnected || topicRefreshInFlightRef.current) return;
+    if (
+      topicRefreshInFlightRef.current
+      || (sharedSession ? !sharedSession.transportConnected : !ros?.isConnected)
+    ) return;
     topicRefreshInFlightRef.current = true;
     // roslib's legacy getTopics() identifies this ROS 2 service as
     // `rosapi/Topics`, which makes rosbridge try to import the nonexistent
     // Python module rosapi.srv. Call the canonical Jazzy interface directly,
     // with an explicit listener timeout so a silent observer cannot accumulate
     // one pending response handler on every polling interval.
-    void callObserverTopics(ros, generation)
-      .then((result) => {
-        if (observerGenerationRef.current !== generation || rosRef.current !== ros) return;
-        const names = Array.isArray(result.topics) ? result.topics.slice(0, MAX_OBSERVER_TOPICS) : [];
-        const types = Array.isArray(result.types) ? result.types : [];
-        const next = names
-          .map((name, index) => ({
-            name: String(name).slice(0, MAX_OBSERVER_TOPIC_NAME_CHARS),
-            type: String(types[index] || "unknown").slice(0, MAX_OBSERVER_TOPIC_TYPE_CHARS),
-          }))
+    const isCurrentRequest = () => observerGenerationRef.current === generation
+      && (sharedSession
+        ? readOnlySessionRef.current === sharedSession
+        : rosRef.current === ros);
+    const request = sharedSession
+      ? sharedSession.listTopics()
+      : callObserverTopics(ros!, generation).then(topicInventoryFromResponse);
+    void request
+      .then((rows) => {
+        if (!isCurrentRequest()) return;
+        const next = rows
+          .slice(0, MAX_OBSERVER_TOPICS)
           .filter((topic) => topic.name.startsWith("/"))
           .sort((left, right) => left.name.localeCompare(right.name));
         setTopics(next);
@@ -714,22 +765,28 @@ export function useMulticamOpsBridge(
         });
       })
       .catch((error: unknown) => {
-        if (observerGenerationRef.current !== generation || rosRef.current !== ros) return;
-        const message = String((error as { error?: unknown } | null)?.error || "rosapi topic discovery failed");
+        if (!isCurrentRequest()) return;
+        const message = error instanceof Error
+          ? error.message
+          : String((error as { error?: unknown } | null)?.error || "rosapi topic discovery failed");
         setCaptureTopicDiscovered(false);
         setTopicError(message);
         setConnectionMessage("멀티캠 observer unavailable · 실행 중인 런타임은 변경하지 않았습니다.");
       })
       .finally(() => {
-        if (observerGenerationRef.current === generation && rosRef.current === ros) {
+        if (isCurrentRequest()) {
           topicRefreshInFlightRef.current = false;
         }
       });
-  }, [callObserverTopics]);
+  }, [callObserverTopics, readOnlySession]);
 
   const retry = useCallback(() => {
+    if (readOnlySession) {
+      readOnlySession.retry();
+      return;
+    }
     setRetryGeneration((current) => current + 1);
-  }, []);
+  }, [readOnlySession]);
 
   const callWorldAction = useCallback(async (action: WorldAction): Promise<WorldActionResult> => {
     const result: WorldActionResult = {
@@ -773,7 +830,7 @@ export function useMulticamOpsBridge(
     setWorldActionResult(null);
     setColorFrames(emptyFrames());
     setDepthFrames(emptyFrames());
-    setActiveRos(null);
+    setActiveSubscriber(null);
     setConnectionMessage("멀티캠 observer 연결 대기");
     const scheduleReconnect = () => {
       if (!isCurrentGeneration() || reconnectTimer !== null) return;
@@ -782,6 +839,85 @@ export function useMulticamOpsBridge(
         setRetryGeneration((current) => current + 1);
       }, 1_500);
     };
+    const handleCaptureStatus = (message: unknown) => {
+      if (!isCurrentGeneration()) return;
+      if (!isBoundedObserverPayload(message)) {
+        captureStatusFreshRef.current = false;
+        setCaptureStatusFresh(false);
+        setConnectionMessage("멀티캠 observer degraded · CaptureStatus payload 무시");
+        return;
+      }
+      setCaptureStatus(captureStatusFromMessage(message));
+      captureStatusFreshRef.current = true;
+      setCaptureStatusFresh(true);
+      setConnectionMessage("멀티캠 observer ready · CaptureStatus fresh");
+    };
+    const handleWorldStatus = (message: unknown) => {
+      if (!isCurrentGeneration()) return;
+      setWorldStatus(worldStatusFromMessage(message));
+    };
+    const handleStaticTf = (message: unknown) => {
+      if (!isCurrentGeneration()) return;
+      const additions = transformsFromMessage(message);
+      if (!additions.length) return;
+      for (const transform of additions) {
+        if (!tfByChildRef.current.has(transform.childFrame) && tfByChildRef.current.size >= MAX_STATIC_TF_TRANSFORMS) {
+          const oldest = tfByChildRef.current.keys().next().value;
+          if (typeof oldest === "string") tfByChildRef.current.delete(oldest);
+        }
+        tfByChildRef.current.set(transform.childFrame, transform);
+      }
+      setTfTransforms([...tfByChildRef.current.values()].sort((left, right) => left.childFrame.localeCompare(right.childFrame)));
+    };
+
+    if (readOnlySession) {
+      rosRef.current = null;
+      setSocketConnected(readOnlySession.transportConnected);
+      if (!readOnlySession.transportConnected) {
+        setConnectionMessage("공유 Debug observer 연결 대기");
+        return () => {
+          disposed = true;
+          topicRefreshInFlightRef.current = false;
+          setActiveSubscriber(null);
+        };
+      }
+
+      setActiveSubscriber(() => readOnlySession.subscribeTopic);
+      setConnectionMessage("공유 Debug observer 연결 확인 중");
+      const unsubscribe = [
+        readOnlySession.subscribeTopic({
+          name: "/multicam_node/capture_status",
+          messageType: "arpa_multicam_msgs/msg/CaptureStatus",
+          queueLength: 1,
+        }, handleCaptureStatus),
+        readOnlySession.subscribeTopic({
+          name: "/world_anchor_node/status",
+          messageType: "std_msgs/msg/String",
+          queueLength: 1,
+        }, handleWorldStatus),
+        ...(observeStaticTf ? [readOnlySession.subscribeTopic({
+          name: "/tf_static",
+          messageType: "tf2_msgs/msg/TFMessage",
+          queueLength: STATIC_TF_QUEUE_LENGTH,
+          reliability: "reliable",
+          durability: "transient_local",
+        }, handleStaticTf)] : []),
+      ];
+      return () => {
+        disposed = true;
+        unsubscribe.forEach((stop) => stop());
+        topicRefreshInFlightRef.current = false;
+        if (frameFlushRef.current !== null) window.cancelAnimationFrame(frameFlushRef.current);
+        frameFlushRef.current = null;
+        tfByChildRef.current.clear();
+        objectUrlsRef.current.forEach((objectUrl) => URL.revokeObjectURL(objectUrl));
+        objectUrlsRef.current.clear();
+        colorPendingRef.current.clear();
+        depthPendingRef.current.clear();
+        setActiveSubscriber(null);
+      };
+    }
+
     const ros = new ROSLIB.Ros();
     rosRef.current = ros;
 
@@ -790,12 +926,13 @@ export function useMulticamOpsBridge(
       if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
       reconnectTimer = null;
       setSocketConnected(true);
-      setCaptureTopicDiscovered(false);
-      captureStatusFreshRef.current = false;
-      setCaptureStatusFresh(false);
-      setActiveRos(ros);
-      setConnectionMessage("멀티캠 observer 연결 확인 중");
-      refreshTopics();
+      setActiveSubscriber(() => (
+        spec: DebugReadOnlyTopicSpec,
+        onMessage: (message: unknown) => void,
+      ) => subscribeWithRos(ros, spec, onMessage));
+      if (!captureStatusFreshRef.current) {
+        setConnectionMessage("멀티캠 observer 연결 확인 중");
+      }
     });
     ros.on("close", () => {
       if (!isCurrentGeneration()) return;
@@ -807,7 +944,7 @@ export function useMulticamOpsBridge(
       setCaptureTopicDiscovered(false);
       captureStatusFreshRef.current = false;
       setCaptureStatusFresh(false);
-      setActiveRos((current: any) => current === ros ? null : current);
+      setActiveSubscriber(null);
       setConnectionMessage("멀티캠 observer 연결이 끊겼습니다. 재시도 중입니다.");
       scheduleReconnect();
     });
@@ -821,7 +958,7 @@ export function useMulticamOpsBridge(
       setCaptureTopicDiscovered(false);
       captureStatusFreshRef.current = false;
       setCaptureStatusFresh(false);
-      setActiveRos((current: any) => current === ros ? null : current);
+      setActiveSubscriber(null);
       setConnectionMessage("멀티캠 observer unavailable · 실행 중인 런타임은 변경하지 않았습니다.");
       scheduleReconnect();
     });
@@ -833,19 +970,7 @@ export function useMulticamOpsBridge(
       messageType: "arpa_multicam_msgs/msg/CaptureStatus",
       queue_length: 1,
     });
-    captureTopic.subscribe((message: unknown) => {
-      if (!isCurrentGeneration()) return;
-      if (!isBoundedObserverPayload(message)) {
-        captureStatusFreshRef.current = false;
-        setCaptureStatusFresh(false);
-        setConnectionMessage("멀티캠 observer degraded · CaptureStatus payload 무시");
-        return;
-      }
-      setCaptureStatus(captureStatusFromMessage(message));
-      captureStatusFreshRef.current = true;
-      setCaptureStatusFresh(true);
-      setConnectionMessage("멀티캠 observer ready · CaptureStatus fresh");
-    });
+    captureTopic.subscribe(handleCaptureStatus);
     subscriptions.push(captureTopic);
 
     const worldTopic = new ROSLIB.Topic({
@@ -854,10 +979,7 @@ export function useMulticamOpsBridge(
       messageType: "std_msgs/msg/String",
       queue_length: 1,
     });
-    worldTopic.subscribe((message: unknown) => {
-      if (!isCurrentGeneration()) return;
-      setWorldStatus(worldStatusFromMessage(message));
-    });
+    worldTopic.subscribe(handleWorldStatus);
     subscriptions.push(worldTopic);
 
     if (observeStaticTf) {
@@ -868,19 +990,7 @@ export function useMulticamOpsBridge(
         queue_length: STATIC_TF_QUEUE_LENGTH,
       });
       injectQos(tfTopic, TF_STATIC_QOS);
-      tfTopic.subscribe((message: unknown) => {
-        if (!isCurrentGeneration()) return;
-        const additions = transformsFromMessage(message);
-        if (!additions.length) return;
-        for (const transform of additions) {
-          if (!tfByChildRef.current.has(transform.childFrame) && tfByChildRef.current.size >= MAX_STATIC_TF_TRANSFORMS) {
-            const oldest = tfByChildRef.current.keys().next().value;
-            if (typeof oldest === "string") tfByChildRef.current.delete(oldest);
-          }
-          tfByChildRef.current.set(transform.childFrame, transform);
-        }
-        setTfTransforms([...tfByChildRef.current.values()].sort((left, right) => left.childFrame.localeCompare(right.childFrame)));
-      });
+      tfTopic.subscribe(handleStaticTf);
       subscriptions.push(tfTopic);
     }
     connectionTimer = window.setTimeout(() => {
@@ -906,11 +1016,11 @@ export function useMulticamOpsBridge(
       objectUrlsRef.current.clear();
       colorPendingRef.current.clear();
       depthPendingRef.current.clear();
-      setActiveRos((current: any) => current === ros ? null : current);
+      setActiveSubscriber(null);
       if (rosRef.current === ros) rosRef.current = null;
       if (typeof ros.close === "function") ros.close();
     };
-  }, [observeStaticTf, refreshTopics, retryGeneration, url]);
+  }, [observeStaticTf, readOnlySession, refreshTopics, retryGeneration, url]);
 
   useEffect(() => {
     const generation = observerGenerationRef.current;
@@ -942,29 +1052,28 @@ export function useMulticamOpsBridge(
   }, [captureStatus, socketConnected]);
 
   useEffect(() => {
-    if (!activeRos) return;
+    if (!activeSubscriber) return;
     const generation = observerGenerationRef.current;
     const isCurrentGeneration = () =>
-      observerGenerationRef.current === generation && rosRef.current === activeRos;
+      observerGenerationRef.current === generation;
     const pendingFrames = activeView === "color" ? colorPendingRef : depthPendingRef;
     const setFrames = activeView === "color" ? setColorFrames : setDepthFrames;
     const imageTopics = MULTICAM_CAMERAS.flatMap((camera) => {
       const name = activeView === "color" ? camera.colorTopic : camera.depthTopic;
       return name ? [{ camera, name }] : [];
     });
-    const subscriptions = imageTopics.map(({ camera, name }) => {
-      const topic = new ROSLIB.Topic({
-        ros: activeRos,
+    const unsubscribe = imageTopics.map(({ camera, name }) => {
+      const streamKey = `${camera.id}:${activeView}`;
+      previewTimesRef.current.delete(streamKey);
+      return activeSubscriber({
         name,
         messageType: "sensor_msgs/msg/CompressedImage",
         compression: "cbor",
-        throttle_rate: IMAGE_THROTTLE_MS,
-        queue_length: IMAGE_QUEUE_LENGTH,
-      });
-      injectQos(topic, IMAGE_QOS);
-      const streamKey = `${camera.id}:${activeView}`;
-      previewTimesRef.current.delete(streamKey);
-      topic.subscribe((message: unknown) => {
+        throttleRate: IMAGE_THROTTLE_MS,
+        queueLength: IMAGE_QUEUE_LENGTH,
+        reliability: "best_effort",
+        durability: "volatile",
+      }, (message: unknown) => {
         if (!isCurrentGeneration()) return;
         const now = Date.now();
         const samples = previewTimesRef.current.get(streamKey) || [];
@@ -1004,10 +1113,9 @@ export function useMulticamOpsBridge(
           });
         });
       });
-      return topic;
     });
     return () => {
-      unsubscribeWhileConnected(activeRos, subscriptions);
+      unsubscribe.forEach((stop) => stop());
       if (frameFlushRef.current !== null) {
         window.cancelAnimationFrame(frameFlushRef.current);
         frameFlushRef.current = null;
@@ -1019,7 +1127,7 @@ export function useMulticamOpsBridge(
       });
       pendingFrames.current.clear();
     };
-  }, [activeRos, activeView]);
+  }, [activeSubscriber, activeView]);
 
   useEffect(() => {
     if (!socketConnected) return;
@@ -1029,26 +1137,26 @@ export function useMulticamOpsBridge(
   }, [refreshTopics, socketConnected]);
 
   useEffect(() => {
-    const ros = rosRef.current;
-    if (!ros || !connected || !selectedTopic || !selectedTopicType) {
+    if (!activeSubscriber || !connected || !selectedTopic || !selectedTopicType) {
       setSelectedTopicSample(null);
       return;
     }
     const isCompressedImage = selectedTopicType.includes("CompressedImage");
     const generation = observerGenerationRef.current;
-    const topic = new ROSLIB.Topic({
-      ros,
-      name: selectedTopic,
-      messageType: selectedTopicType,
-      compression: isCompressedImage ? "cbor" : "none",
-      throttle_rate: isCompressedImage ? IMAGE_THROTTLE_MS : 250,
-      queue_length: 1,
-    });
-    if (isCompressedImage) injectQos(topic, IMAGE_QOS);
     const samples: number[] = [];
     setSelectedTopicSample(null);
-    topic.subscribe((message: unknown) => {
-      if (observerGenerationRef.current !== generation || rosRef.current !== ros) return;
+    return activeSubscriber({
+      name: selectedTopic,
+      messageType: selectedTopicType,
+      ...(isCompressedImage ? { compression: "cbor" as const } : {}),
+      throttleRate: isCompressedImage ? IMAGE_THROTTLE_MS : 250,
+      queueLength: 1,
+      ...(isCompressedImage ? {
+        reliability: "best_effort" as const,
+        durability: "volatile" as const,
+      } : {}),
+    }, (message: unknown) => {
+      if (observerGenerationRef.current !== generation) return;
       const now = Date.now();
       samples.push(now);
       while (samples.length && now - samples[0] > 5_000) samples.shift();
@@ -1061,8 +1169,7 @@ export function useMulticamOpsBridge(
         preview: previewMessage(message),
       });
     });
-    return () => unsubscribeWhileConnected(ros, [topic]);
-  }, [connected, selectedTopic, selectedTopicType]);
+  }, [activeSubscriber, connected, selectedTopic, selectedTopicType]);
 
   return {
     url,

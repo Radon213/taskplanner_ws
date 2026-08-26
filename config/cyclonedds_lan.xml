@@ -6,7 +6,8 @@
       <Interfaces>
         <NetworkInterface name="enp13s0" multicast="true" />
       </Interfaces>
-      <AllowMulticast>true</AllowMulticast>
+      <!-- Discover via multicast, but send high-rate image data to known peers by unicast. -->
+      <AllowMulticast>spdp</AllowMulticast>
       <!-- MaxMessageSize limits the complete UDP payload after Cyclone packs
            one or more DDSI fragments. 1450 bytes leaves IPv4/UDP headroom on
            a 1500-byte Ethernet MTU; apply the same profile to every LAN writer. -->

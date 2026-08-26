@@ -42,6 +42,18 @@ def _thyroid_demo_spec():
     )
 
 
+def _thyroid_demo_two_adson_spec():
+    """Synthetic duplicate inventory for instance-selection unit tests."""
+
+    spec = _thyroid_demo_spec()
+    next(
+        instrument
+        for instrument in spec.bundle.instruments
+        if instrument.id == "T02"
+    ).inventory_count = 2
+    return spec
+
+
 def _nephrectomy_spec():
     return load_bundle(
         Path(__file__).parents[2]
@@ -874,8 +886,8 @@ def test_short_spoken_voice_correction_prefers_the_last_named_tool():
     assert twin.state.explicit_request_tool == "T07"
 
 
-def test_production_default_uses_real_additional_tool_instance():
-    twin = ORDigitalTwin(_thyroid_demo_spec())
+def test_duplicate_inventory_uses_real_additional_tool_instance():
+    twin = ORDigitalTwin(_thyroid_demo_two_adson_spec())
     first_state = twin.instrument_states["T02#1"]
     second_state = twin.instrument_states["T02#2"]
     twin._set_lifecycle(
@@ -893,7 +905,7 @@ def test_production_default_uses_real_additional_tool_instance():
 
 
 def test_legacy_shadow_completion_resolves_real_additional_instance():
-    twin = ORDigitalTwin(_thyroid_demo_spec())
+    twin = ORDigitalTwin(_thyroid_demo_two_adson_spec())
     first_state = twin.instrument_states["T02#1"]
     second_state = twin.instrument_states["T02#2"]
     twin._set_lifecycle(
@@ -932,10 +944,9 @@ def test_legacy_shadow_completion_resolves_real_additional_instance():
     assert first_generation > 0
 
 
-def test_shadow_public_request_does_not_invent_mayo_placement():
+def test_shadow_public_request_does_not_reconcile_a_removed_hand_capacity_limit():
     twin = ORDigitalTwin(
         _thyroid_spec(),
-        allow_shadow_request_capacity_reconciliation=True,
         allow_shadow_type_instance_requests=True,
     )
     for index, tool_id in enumerate(("T02", "T03"), start=1):
@@ -949,19 +960,15 @@ def test_shadow_public_request_does_not_invent_mayo_placement():
         )
 
     assert twin.update_explicit_request("Bovie") == "T04"
-    assumptions = twin.drain_shadow_assumption_audit()
-
-    assert len(assumptions) == 1
-    assert assumptions[0]["event_type"] == "ShadowPublicRequestHandCapacityReconciled"
-    assert assumptions[0]["ground_truth_used"] is False
+    assert twin.drain_shadow_assumption_audit() == []
     assert twin.instrument_states["T02#1"].lifecycle_stage == LIFECYCLE_SURGEON_OWNED
-    assert twin.instrument_states["T02#1"].location_type == "surgical_field"
+    assert twin.instrument_states["T02#1"].location_type == "surgeon_hand"
     assert twin.instrument_states["T03#1"].lifecycle_stage == LIFECYCLE_SURGEON_OWNED
     assert twin.instrument_states["T03#1"].location_type == "surgeon_hand"
     assert twin.handover_allowed() is True
 
 
-def test_new_voice_request_supersedes_uncommitted_blocked_request():
+def test_new_voice_request_unconditionally_supersedes_older_voice_request():
     twin = ORDigitalTwin(_thyroid_spec())
     for index, tool_id in enumerate(("T02", "T03"), start=1):
         twin._set_lifecycle(
@@ -974,43 +981,50 @@ def test_new_voice_request_supersedes_uncommitted_blocked_request():
         )
 
     assert twin.update_explicit_request("Bovie") == "T04"
-    assert twin.handover_allowed() is False
+    first_generation = twin.state.surgeon_request_generation
     assert twin.update_explicit_request("bipolar") == "T07"
 
     assert twin.request_queue_summary()["queued_tools"] == ["T07"]
     assert twin.state.surgeon_request_tool == "T07"
+    assert twin.state.surgeon_request_generation > first_generation
     assert any(
         event["event_type"] == "SurgeonRequestSuperseded"
         and event["superseded_tool"] == "T04"
         and event["incoming_tool"] == "T07"
+        and event["superseded_generation"] == first_generation
+        and event["incoming_generation"] == twin.state.surgeon_request_generation
         for event in twin.event_history
     )
 
 
-def test_plain_repeat_of_field_deployed_tool_selects_next_instance():
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Army navy retractor please",
+        "army",
+        "thyroid retractor",
+        "갑상선 리트랙터",
+    ],
+)
+def test_demo_bed_retractor_names_do_not_queue_handover(text: str):
     twin = ORDigitalTwin(_thyroid_demo_spec())
-    twin.state.filtered_phase = "P03"
-    twin._set_lifecycle(
-        twin.instrument_states["T05#1"],
-        LIFECYCLE_SURGEON_OWNED,
-        location_type="surgical_field",
-        location_id="field_region",
-        confidence=1.0,
-    )
 
-    assert twin.update_explicit_request("army") == "T05"
-    assert twin.state.surgeon_request_instance_id == "T05#2"
+    assert {"T05", "T11"}.isdisjoint(twin.spec.list_instrument_ids())
+    assert twin.resolve_explicit_voice_tool_request(text) == ""
+    assert twin.update_explicit_request(text) == ""
+    assert twin.request_queue_summary()["queue_length"] == 0
 
 
 def test_one_more_request_queues_a_second_generation_without_coalescing():
-    twin = ORDigitalTwin(_thyroid_demo_spec())
+    twin = ORDigitalTwin(_thyroid_demo_two_adson_spec())
 
-    assert twin.update_explicit_request("army") == "T05"
-    assert twin.update_explicit_request("army 하나 더") == "T05"
+    assert twin.update_explicit_request("Adson") == "T02"
+    assert twin.update_explicit_request("Adson 하나 더") == "T02"
 
     queued = list(twin.state.surgeon_request_queue)
-    assert [cue.instrument_id for cue in queued] == ["T05", "T05"]
-    assert [cue.instance_id for cue in queued] == ["T05#1", "T05#2"]
+    assert [cue.instrument_id for cue in queued] == ["T02", "T02"]
+    assert {cue.instance_id for cue in queued} == {"T02#1", "T02#2"}
+    assert queued[0].instance_id != queued[1].instance_id
     assert queued[0].generation < queued[1].generation
     assert queued[0].shadow_additional_instance_assumed is False
     assert queued[1].shadow_additional_instance_assumed is True
@@ -1020,7 +1034,6 @@ def test_one_more_request_queues_a_second_generation_without_coalescing():
 def test_repeated_tool_name_without_additional_cue_is_coalesced():
     twin = ORDigitalTwin(
         _thyroid_spec(),
-        allow_shadow_request_capacity_reconciliation=True,
         allow_shadow_type_instance_requests=True,
     )
 
@@ -1156,34 +1169,17 @@ def test_bare_procedure_name_fragment_is_not_a_tool_request(text: str):
     assert twin.state.surgeon_request_tool == ""
 
 
-@pytest.mark.parametrize(
-    ("text", "expected_tool"),
-    [
-        ("thyroid retractor", "T11"),
-        ("thyroid please", "T11"),
-        ("갑상선 리트랙터", "T11"),
-        ("갑상선 주세요", "T11"),
-        ("Adson", "T02"),
-    ],
-)
-def test_procedure_name_tool_alias_requires_tool_class_or_request_marker(
-    text: str,
-    expected_tool: str,
-):
-    twin = ORDigitalTwin(_thyroid_demo_spec())
-
-    assert twin.resolve_explicit_voice_tool_request(text) == expected_tool
-
-
 def test_mixed_script_compact_additional_request_selects_second_instance():
-    twin = ORDigitalTwin(_thyroid_demo_spec())
+    twin = ORDigitalTwin(_thyroid_demo_two_adson_spec())
 
     assert twin.update_explicit_request("Adson") == "T02"
     assert twin.update_explicit_request("Adson하나 더") == "T02"
-    assert [
+    queued_instances = [
         cue.instance_id
         for cue in twin.state.surgeon_request_queue
-    ] == ["T02#1", "T02#2"]
+    ]
+    assert set(queued_instances) == {"T02#1", "T02#2"}
+    assert len(queued_instances) == 2
 
 
 @pytest.mark.parametrize(
@@ -1192,8 +1188,6 @@ def test_mixed_script_compact_additional_request_selects_second_instance():
         ("자 여섯 번째 갑상선 절제술 시작 Adson", "T02"),
         ("수술 시작, Bovie 주세요", "T04"),
         ("thyroid procedure start; Adson", "T02"),
-        ("갑상선 리트랙터 주세요", "T11"),
-        ("thyroid retractor", "T11"),
     ],
 )
 def test_tool_request_after_procedure_control_clause_is_preserved(

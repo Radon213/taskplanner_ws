@@ -1,8 +1,10 @@
-# Causal surgical VLM SFT dataset
+# Hand-free causal surgical VLM SFT dataset
 
 `build_causal_sft_dataset.py` converts the current 0704_6–0704_17
 annotation manifests into a case-grouped, causal multimodal SFT dataset.
-It never edits source annotations.
+It never edits source annotations. Visual hand pose, palm facing, gesture, and
+`request_intent` are deliberately outside this VLM contract; the runtime
+consumes those signals from the dedicated hand-perception path.
 
 ## Build
 
@@ -59,17 +61,22 @@ training collator to supervise assistant tokens only
   Samples are capped per tool and temporally separated. Clean proxy frames,
   never box overlays, are supplied to the VLM. Authority remains `pseudo`;
   these rows are forbidden from validation/test and scoring.
-- `request_intent`: strict implicit open-palm request intervals. The eventual
-  transfer tool is never backfilled into the request target.
 - `current_phase`: two interior samples per P03–P06 interval plus observed
   transitions. These remain provisional ambiguous context and are not
   promoted to scoring ground truth.
 - `next_physical_tool`: the first physical
   `scrub_nurse -> surgeon` transfer strictly after the cutoff and within five
-  seconds, or `none`. Input media and ASR stop at the cutoff.
+  seconds, or `none`. Input media and ASR stop at the cutoff. Sampling and
+  labels do not use hand-request intervals.
 - `clinical_observation_interpretation`: the declared FLIR evidence window,
   ending at the causal cutoff. These targets remain AI drafts requiring
-  surgeon review.
+surgeon review.
+
+The runtime 9B schema-v6 dataset keeps transcript-derived `intent` supervision
+(for example, a spoken named-tool handover request) and the next-tool forecast.
+It contains no `gesture` response field or gesture task. The historical
+runtime-v4 filenames are retained for deployment compatibility even though
+their emitted contract is schema-v6.
 
 All frames, camera views, crops, prompt variants, and targets from one case
 remain in one split. Because 0704_6–0704_17 are one development/calibration

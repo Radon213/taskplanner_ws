@@ -11,6 +11,7 @@ import {
   compressedImageTiming,
   normalizeCompressedImage,
 } from "../ros/compressed-image.js";
+import { gatewayHealthIsDegraded } from "../ros/health-status.js";
 
 test("Main Layout subscribes to nine snapshots plus one shared FLIR camera stream", () => {
   const subscriptions = createMainLayoutSubscriptions({
@@ -116,4 +117,20 @@ test("compressed image timing treats missing or malformed header stamps as unava
     { header: { stamp: { sec: 1.5, nanosec: 0 } } },
   ];
   invalidMessages.forEach((message) => assert.equal(compressedImageTiming(message), null));
+});
+
+test("optional diagnostic source lists do not override reviewed gateway health", () => {
+  assert.equal(gatewayHealthIsDegraded({
+    healthy: true,
+    unavailableSources: ["bed_robot_arm_status"],
+    staleSources: ["skill_status"],
+    errorCodes: [],
+  }), false);
+  assert.equal(gatewayHealthIsDegraded({
+    healthy: false,
+    unavailableSources: [],
+    staleSources: [],
+    errorCodes: [],
+  }), true);
+  assert.equal(gatewayHealthIsDegraded(null), true);
 });

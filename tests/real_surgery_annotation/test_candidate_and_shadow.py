@@ -657,6 +657,27 @@ class CandidateAndShadowTest(unittest.TestCase):
         self.assertEqual(1.0, prediction["tool_confidence"])
         self.assertEqual("explicit_request", prediction["prediction_source"])
 
+    def test_unknown_vlm_hand_metadata_cannot_create_tool_prediction(
+        self,
+    ) -> None:
+        prediction = _vlm_prediction(
+            self._trace(
+                sequence=0,
+                time_sec=2.0,
+                layer="vlm_raw",
+                payload={
+                    "deprecated_hand_signal": "OPEN_PALM",
+                    "deprecated_hand_tool": "T05",
+                    "deprecated_hand_score": 0.99,
+                },
+            )
+        )
+
+        self.assertEqual("", prediction["tool_id"])
+        self.assertEqual("", prediction["action"])
+        self.assertEqual(0.0, prediction["tool_confidence"])
+        self.assertEqual("", prediction["prediction_source"])
+
     def test_reducer_explicit_request_is_a_request_backed_system_choice(self) -> None:
         identity_map = load_tool_identity_map(
             ROOT / "annotations/observable_tool_events/catalogs/tools.yaml"

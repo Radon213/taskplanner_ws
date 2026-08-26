@@ -3,8 +3,8 @@
   "synthetic": true,
   "usage": "SurgiMate dummy scenario 03: multiple surgeon and Mayo tools with all Top-3 prediction frames populated.",
   "baseline": {
-    "schema_version": "1.1.0",
-    "interface_version": "0.3.0",
+    "schema_version": "1.2.0",
+    "interface_version": "0.4.0",
     "procedure_type": "thyroidectomy_demo",
     "catalog_version": "synthetic-catalog-v1"
   },

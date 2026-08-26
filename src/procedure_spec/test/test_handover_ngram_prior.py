@@ -55,30 +55,39 @@ def test_demo_artifact_preserves_start_state_and_unknown_boundary() -> None:
         "id": "thyroidectomy_demo_handover_ngram_calibration_v1",
         "match": "phase+last3",
         "support": 15,
-        "candidates": [["T02", 0.6], ["T07", 0.333], ["T05", 0.067]],
+        "candidates": [["T02", 0.667], ["T07", 0.333]],
     }
 
 
 def test_prediction_is_compact_and_cannot_mutate_the_precompiled_lookup() -> None:
     prior = _demo_prior()
-    first = prior.predict(phase_id="P04", completed_handovers=["T05", "T05", "T02"])
+    first = prior.predict(phase_id="P04", completed_handovers=["T02"])
     assert first is not None
     first["candidates"][0][0] = "T01"
 
-    second = prior.predict(phase_id="P04", completed_handovers=["T05", "T05", "T02"])
+    second = prior.predict(phase_id="P04", completed_handovers=["T02"])
 
     assert second == {
         "id": "thyroidectomy_demo_handover_ngram_calibration_v1",
         "match": "phase+last3",
-        "support": 9,
+        "support": 4,
         "candidates": [
-            ["T08", 0.444],
-            ["T07", 0.333],
-            ["T02", 0.111],
-            ["T03", 0.111],
+            ["T07", 0.75],
+            ["T02", 0.25],
         ],
     }
     assert set(second) == {"id", "match", "support", "candidates"}
+
+
+def test_demo_prior_never_exposes_bed_arm_retractors_as_handover_candidates() -> None:
+    prior = _demo_prior()
+
+    prediction = prior.predict(phase_id="P03", completed_handovers=[])
+
+    assert prediction is not None
+    assert {candidate[0] for candidate in prediction["candidates"]}.isdisjoint(
+        {"T05", "T11"}
+    )
 
 
 def test_loader_is_optional_for_procedures_without_an_artifact() -> None:

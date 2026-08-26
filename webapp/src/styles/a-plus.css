@@ -375,7 +375,7 @@ body {
 .stage-camera-viewport figcaption > i,
 .stage-camera-empty span,
 .holder-title .holder-inline-badges span,
-.public-gesture-status span,
+.hand-handover-signal-status span,
 .llm-speech-log-header small,
 .runtime-mode-select > i,
 .runtime-mode-detail {
@@ -627,50 +627,39 @@ body {
   opacity: 0.82;
 }
 
-/* Embedded camera choices retain a 44px hit box while keeping compact labels. */
+/* The stage is an at-a-glance spatial map, so its embedded source strip must
+   remain as compact as the CAM1 viewport. The accessible 44px source controls
+   live in the expanded camera dialog; this strip is a dense desktop shortcut. */
 .switchable-stage-camera figcaption {
   position: relative;
   z-index: 2;
-  min-height: 48px;
+  min-height: 20px;
   align-items: center;
 }
 
 .stage-camera-toggle {
   position: relative;
-  height: 48px;
-  min-width: 94px;
-  overflow: visible;
+  height: 15px;
+  min-width: 64px;
+  overflow: hidden;
 }
 
 .stage-camera-toggle button {
   position: relative;
-  top: 0;
-  height: 44px;
-  min-height: 44px;
-  padding: 0 4px;
+  height: 11px;
+  min-height: 0;
+  padding: 0 3px;
   background: transparent;
-  font-size: 12px;
-}
-
-.stage-camera-toggle button > span {
-  display: grid;
-  min-height: 18px;
-  padding: 2px 4px;
-  border-radius: 5px;
-  place-items: center;
+  font-size: 8px;
 }
 
 .stage-camera-toggle button.active {
-  background: transparent;
+  background: color-mix(in srgb, var(--color-accent) 22%, var(--color-surface-raised));
   color: var(--color-text);
 }
 
-.stage-camera-toggle button.active > span {
-  background: color-mix(in srgb, var(--color-accent) 22%, var(--color-surface-raised));
-}
-
 .stage-camera-toggle button:focus-visible {
-  outline-offset: -2px;
+  outline-offset: 1px;
 }
 
 .stage-camera-toggle-compact {
@@ -682,7 +671,7 @@ body {
    fits; below that point expose one full-size, non-overlapping switch action. */
 @container (max-width: 210px) {
   .switchable-stage-camera figcaption {
-    grid-template-columns: minmax(0, auto) minmax(94px, 1fr);
+    grid-template-columns: minmax(0, auto) minmax(64px, 1fr);
     gap: 4px;
     padding-inline: 2px;
   }
@@ -706,18 +695,241 @@ body {
 
   .switchable-stage-camera .stage-camera-toggle-compact {
     display: inline-flex;
-    width: 44px;
-    height: 44px;
+    width: 36px;
+    height: 16px;
     align-items: center;
     justify-content: center;
-    padding: 0 3px;
+    padding: 0 2px;
     border: 1px solid color-mix(in srgb, var(--color-accent) 32%, var(--color-border));
     border-radius: var(--radius-inner);
     background: var(--color-page-raised);
     color: var(--color-accent-strong);
-    font-size: 10px;
+    font-size: 8px;
     font-weight: 700;
     line-height: 1;
+  }
+}
+
+/* The same live frame is available in a focused view without an additional
+   ROS subscription. The image retains its existing crop and typed overlays. */
+.stage-camera-expandable {
+  pointer-events: auto;
+}
+
+.stage-camera-expand {
+  position: relative;
+  display: block;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  box-sizing: border-box;
+  background: transparent;
+  color: inherit;
+  cursor: zoom-in;
+}
+
+.app-shell .stage-camera-expand {
+  min-width: 0;
+  min-height: 0;
+}
+
+.stage-camera-expand > .stage-camera-canvas {
+  position: absolute;
+  inset: 0;
+  width: auto;
+  height: auto;
+  margin: 0;
+  padding: 0;
+}
+
+.stage-camera-expand:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: -2px;
+}
+
+.stage-camera-expand-hint {
+  position: absolute;
+  top: 7px;
+  right: 7px;
+  display: inline-flex;
+  min-height: 28px;
+  align-items: center;
+  gap: 4px;
+  padding: 0 8px;
+  border: 1px solid var(--color-border-strong);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--color-page) 80%, transparent);
+  color: var(--color-text);
+  font-size: 11px;
+  font-weight: 700;
+  opacity: 0;
+  transition: opacity var(--duration-fast, 140ms) ease;
+}
+
+.stage-camera-expand:hover .stage-camera-expand-hint,
+.stage-camera-expand:focus-visible .stage-camera-expand-hint {
+  opacity: 1;
+}
+
+.stage-camera-inspect-backdrop {
+  position: fixed;
+  z-index: 4100;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: var(--overlay-scrim);
+  backdrop-filter: blur(10px);
+}
+
+.stage-camera-inspect-dialog {
+  display: grid;
+  /* Keep a true 16:9 video surface inside the usable viewport height.
+     The maximum width accounts for its header, footer, and backdrop inset. */
+  width: min(1080px, calc(100vw - 48px), calc(177.7778dvh - 314px));
+  max-height: calc(100dvh - 48px);
+  grid-template-rows: auto auto auto;
+  overflow: hidden;
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-card);
+  background: var(--color-surface-raised);
+  box-shadow: var(--shadow-elevated);
+}
+
+.stage-camera-inspect-dialog > header,
+.stage-camera-inspect-dialog > footer {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 16px;
+  background: var(--color-page-raised);
+}
+
+.stage-camera-inspect-dialog header > div {
+  min-width: 0;
+}
+
+.stage-camera-inspect-dialog header p,
+.stage-camera-inspect-dialog header h2,
+.stage-camera-inspect-dialog header span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.stage-camera-inspect-dialog header p {
+  margin: 0 0 3px;
+  color: var(--color-accent-strong);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.07em;
+}
+
+.stage-camera-inspect-dialog header h2 {
+  margin: 0;
+  color: var(--color-text);
+  font-size: 20px;
+  line-height: 1.2;
+}
+
+.stage-camera-inspect-dialog header span,
+.stage-camera-inspect-dialog footer {
+  color: var(--color-text-secondary);
+  font-size: 12px;
+}
+
+.stage-camera-inspect-close {
+  display: inline-flex;
+  flex: 0 0 auto;
+  min-width: 44px;
+  min-height: 44px;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 0 10px;
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-control);
+  background: var(--color-page-raised);
+  color: var(--color-text);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.stage-camera-inspect-close:hover,
+.stage-camera-inspect-close:focus-visible {
+  border-color: var(--color-accent);
+  color: var(--color-accent-strong);
+}
+
+.stage-camera-inspect-close:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+
+.stage-camera-inspect-media {
+  display: grid;
+  width: 100%;
+  min-height: 0;
+  aspect-ratio: 16 / 9;
+  place-items: stretch;
+  overflow: hidden;
+  background: var(--color-page);
+}
+
+.stage-camera-inspect-media .stage-camera-canvas {
+  min-height: 0;
+}
+
+.stage-camera-inspect-dialog footer {
+  align-items: flex-start;
+}
+
+.stage-camera-inspect-dialog footer code {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--color-accent-strong);
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.stage-camera-inspect-dialog footer span {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+@media (hover: none) {
+  .stage-camera-expand-hint {
+    opacity: 1;
+  }
+}
+
+@media (max-width: 640px) {
+  .stage-camera-inspect-backdrop {
+    align-items: end;
+    padding: 12px;
+  }
+
+  .stage-camera-inspect-dialog {
+    width: 100%;
+    max-height: calc(100dvh - 24px);
+  }
+
+  .stage-camera-inspect-dialog > header,
+  .stage-camera-inspect-dialog > footer {
+    padding-inline: 12px;
+  }
+
+  .stage-camera-inspect-dialog > footer {
+    flex-direction: column;
+    gap: 4px;
   }
 }
 
@@ -911,7 +1123,7 @@ body {
     grid-template-columns: minmax(0, 1fr);
   }
 
-  .llm-surgeon-dock .public-gesture-status {
+  .llm-surgeon-dock .hand-handover-signal-status {
     grid-template-areas:
       "icon label"
       "icon state"
@@ -919,7 +1131,7 @@ body {
     grid-template-columns: auto minmax(0, 1fr);
   }
 
-  .llm-surgeon-dock .public-gesture-status > strong {
+  .llm-surgeon-dock .hand-handover-signal-status > strong {
     justify-self: start;
   }
 }
@@ -1091,7 +1303,7 @@ body {
   .surgical-bed-label span,
   .stage-camera-viewport figcaption span,
   .stage-camera-empty span,
-  .public-gesture-status,
+  .hand-handover-signal-status,
   .runtime-mode-select i,
   .runtime-mode-detail,
   .runtime-endpoint,
@@ -1104,7 +1316,7 @@ body {
   .bed-phase-badge small,
   .holder-inline-badges span,
   .holder-title .holder-inline-badges span,
-  .public-gesture-status span,
+  .hand-handover-signal-status span,
   .llm-speech-log-header small {
     font-size: 12px;
   }

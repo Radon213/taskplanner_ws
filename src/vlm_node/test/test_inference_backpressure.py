@@ -184,6 +184,104 @@ def test_queued_source_frames_keep_only_one_pending_slot() -> None:
     assert policy.complete() is None
 
 
+def test_pending_speech_is_not_overwritten_by_source_frame_churn() -> None:
+    policy = InferenceBackpressure()
+
+    assert policy.queue(INFERENCE_TRIGGER_SPEECH).disposition == "queued"
+    first = policy.queue(INFERENCE_TRIGGER_SOURCE_FRAME)
+    second = policy.queue("newest-visual-frame")
+
+    assert first.disposition == "preserved"
+    assert second.disposition == "preserved"
+    assert policy.begin() == INFERENCE_TRIGGER_SPEECH
+    assert policy.complete() is None
+
+
+def test_speech_replaces_a_pending_source_frame() -> None:
+    policy = InferenceBackpressure()
+
+    assert policy.queue(INFERENCE_TRIGGER_SOURCE_FRAME).disposition == "queued"
+    assert policy.queue(INFERENCE_TRIGGER_SPEECH).disposition == "coalesced"
+    assert policy.begin() == INFERENCE_TRIGGER_SPEECH
+    assert policy.complete() is None
+
+
+def test_in_flight_frame_churn_cannot_erase_queued_speech() -> None:
+    node = RealVLMNode.__new__(RealVLMNode)
+    node._inference_backpressure = InferenceBackpressure()
+    started = threading.Event()
+    release = threading.Event()
+    calls: list[str] = []
+
+    def tick_once(*, force: bool, inference_trigger: str) -> None:
+        assert force
+        calls.append(inference_trigger)
+        if inference_trigger == INFERENCE_TRIGGER_SOURCE_FRAME:
+            started.set()
+            assert release.wait(timeout=2.0)
+
+    node._tick_once = tick_once
+    worker = threading.Thread(
+        target=lambda: node._tick(
+            force=True,
+            inference_trigger=INFERENCE_TRIGGER_SOURCE_FRAME,
+        ),
+        daemon=True,
+    )
+    worker.start()
+    assert started.wait(timeout=2.0)
+
+    node._inference_backpressure.queue(INFERENCE_TRIGGER_SPEECH)
+    for _ in range(100):
+        node._inference_backpressure.queue(INFERENCE_TRIGGER_SOURCE_FRAME)
+    release.set()
+    worker.join(timeout=2.0)
+
+    assert not worker.is_alive()
+    assert calls == [
+        INFERENCE_TRIGGER_SOURCE_FRAME,
+        INFERENCE_TRIGGER_SPEECH,
+    ]
+    assert node._inference_backpressure.snapshot()["in_flight"] is False
+
+
+def test_queue_if_empty_preserves_existing_pending_trigger() -> None:
+    policy = InferenceBackpressure()
+
+    assert policy.queue("forced").disposition == "queued"
+    admission = policy.queue_if_empty("speech")
+
+    assert admission.disposition == "preserved"
+    assert admission.trigger == "forced"
+    assert policy.begin() == "forced"
+    assert policy.complete() is None
+
+
+def test_dialogue_followup_replaces_lower_priority_pending_frame() -> None:
+    policy = InferenceBackpressure()
+
+    assert policy.queue(INFERENCE_TRIGGER_SOURCE_FRAME).disposition == "queued"
+    admission = policy.queue_if_empty(INFERENCE_TRIGGER_SPEECH)
+
+    assert admission.disposition == "coalesced"
+    assert admission.trigger == INFERENCE_TRIGGER_SPEECH
+    assert policy.begin() == INFERENCE_TRIGGER_SPEECH
+    assert policy.complete() is None
+
+
+def test_speech_retry_fallback_replaces_pending_frame_during_backoff() -> None:
+    policy = InferenceBackpressure()
+
+    assert policy.request(INFERENCE_TRIGGER_SPEECH).started
+    assert policy.queue(INFERENCE_TRIGGER_SOURCE_FRAME).disposition == "queued"
+
+    pending = policy.defer_until_ready(INFERENCE_TRIGGER_SPEECH)
+
+    assert pending == INFERENCE_TRIGGER_SPEECH
+    assert policy.begin() == INFERENCE_TRIGGER_SPEECH
+    assert policy.complete() is None
+
+
 def test_transport_failure_backoff_grows_bounded_and_resets() -> None:
     policy = InferenceFailureBackoff(initial_sec=0.5, maximum_sec=2.0)
 
@@ -478,16 +576,17 @@ def test_invalid_model_response_is_preserved_for_bounded_diagnostics() -> None:
     node._json_schema = {}
     node._reasoning_effort = ""
     invalid_payload = {
-        "v": "4",
+        "v": "6",
         "phase": [["P04", 0.8]],
         "tool": ["T05", "T02"],
         "intent": ["none", "", 0.0],
-        "gesture": ["", "", "", 0.0],
         "mayo": [],
         "mayo_retrieve": ["", 0.0],
         "u": 0.2,
         "sum": "visible field",
         "bed_robot_arm_group": None,
+        "function_call": None,
+        "humanoid_reply": None,
     }
     raw_response = json.dumps(invalid_payload)
     node._client = SimpleNamespace(
@@ -523,20 +622,23 @@ def test_schema_retry_receives_bounded_validation_error_and_recovers() -> None:
     node._response_format = "none"
     node._json_schema = {}
     node._reasoning_effort = ""
+    node._context_mode = "actor_log"
     invalid = {
-        "v": "4",
+        "v": "6",
         "phase": [["P04", 0.8]],
         "tool": [["T05", 0.8]],
         "intent": ["none", "", 0.0],
-        "gesture": ["none", "", 0.0],
+        "gesture": ["request_tool", "", "open_receive", 0.9],
         "mayo": [],
         "mayo_retrieve": ["", 0.0],
         "u": 0.2,
         "sum": "visible field",
         "bed_robot_arm_group": None,
+        "function_call": None,
+        "humanoid_reply": None,
     }
     valid = dict(invalid)
-    valid["gesture"] = ["", "", "", 0.0]
+    valid.pop("gesture")
     raw_responses = [json.dumps(invalid), json.dumps(valid)]
     developer_prompts: list[str] = []
 
@@ -558,7 +660,8 @@ def test_schema_retry_receives_bounded_validation_error_and_recovers() -> None:
     assert error == ""
     assert len(developer_prompts) == 2
     assert "failed schema validation" in developer_prompts[1]
-    assert "'gesture' must be" in developer_prompts[1]
+    assert "retired VLM hand output fields: gesture" in developer_prompts[1]
+    assert "schema-v6" in developer_prompts[1]
     assert "do not simplify any array shape" in developer_prompts[1]
 
 
@@ -656,6 +759,95 @@ def test_failed_live_tick_records_health_but_publishes_no_stale_result() -> None
         }
     ]
     assert node._last_periodic_live_image_stamp_sec is None
+
+
+def test_text_only_dialogue_never_publishes_visual_or_action_outputs() -> None:
+    node = RealVLMNode.__new__(RealVLMNode)
+    node._active = True
+    node._response_mode = "live"
+    node._context_mode = "actor_log"
+    node._enable_text_only_dialogue = True
+    node._require_field_image = True
+    node._system_prompt = "public evidence observer"
+    node._developer_instruction = "json only"
+    node._perception_generation = 3
+    node._model_input_epoch = 7
+    node._last_submitted_model_input_key = ""
+    node._exact_duplicate_suppressed_count = 0
+    node._transport_failure_backoff = None
+    node._current_image_input_error = "missing visual"
+
+    def select_images():
+        node._current_image_input_error = "missing visual"
+        return [], "missing(flir_visual)", None
+
+    node._select_images = select_images
+    node.get_clock = lambda: SimpleNamespace(
+        now=lambda: SimpleNamespace(to_msg=lambda: Time(sec=71))
+    )
+    node._assemble_actor_log_context_dict = lambda: {
+        "pending_dialogue_turn": {
+            "turn_id": "7:run-1:u-1",
+            "utterance_id": "u-1",
+            "text": "현재 단계가 무엇인가요?",
+            "reply_required": True,
+        }
+    }
+    node._actor_log_request_context_msg = lambda *_args: SimpleNamespace(
+        stamp=Time(sec=71)
+    )
+    node._request_context_pub = _Publisher()
+    node._current_model_input_signature = lambda *_args: "dialogue-input-1"
+    node._next_visual_evidence_metadata = lambda _key: (7, 1, "vlm-7-1")
+    node._dialogue_turn_gate = SimpleNamespace(claim=lambda **_kwargs: object())
+    node._publish_model_ready_image = lambda _image: None
+    payload = {
+        "v": "6",
+        "function_call": None,
+        "humanoid_reply": {
+            "turn_id": "7:run-1:u-1",
+            "text": "현재 단계는 확인 중입니다.",
+            "speak": True,
+            "timing": "immediate",
+        },
+    }
+    model_calls = []
+
+    def _run_model(*args):
+        model_calls.append(args)
+        return (
+            json.dumps(payload),
+            payload,
+            0.2,
+            "live",
+            0,
+            "",
+        )
+
+    node._run_model = _run_model
+    node._canonicalize_payload_ids = lambda value: value
+    node._reset_inference_failure_log_throttle = lambda: None
+    dialogue_calls = []
+    health_calls = []
+    node._publish_humanoid_reply = lambda value, **kwargs: dialogue_calls.append(
+        (value, kwargs)
+    ) or True
+    node._publish_health = lambda **kwargs: health_calls.append(kwargs)
+    node._publish_model_raw_result = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("text-only dialogue published a visual raw result")
+    )
+    node._publish_vlm_outputs = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("text-only dialogue published visual/action outputs")
+    )
+
+    node._tick_once(force=True, inference_trigger=INFERENCE_TRIGGER_SPEECH)
+
+    assert len(model_calls) == 1
+    assert model_calls[0][2] == "7:run-1:u-1"
+    assert len(dialogue_calls) == 1
+    assert dialogue_calls[0][1]["claimed_turn_id"] == "7:run-1:u-1"
+    assert health_calls[-1]["image_source"] == "dialogue_text_only"
+    assert health_calls[-1]["mode"] == "dialogue_text_only:live"
 
 
 def test_failure_history_is_bounded_and_keeps_latest_sequence() -> None:

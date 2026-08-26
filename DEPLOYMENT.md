@@ -121,23 +121,27 @@ service is loopback-only; its token is read by the Vite server-side proxy and
 is never sent to the browser. Selecting a mode changes runtime services only;
 it does not issue a physical robot Action goal.
 
-Normal startup reuses the repository's existing `build/` and `install/`
-artifacts plus the persistent `taskplanner_web_node_modules` volume. It does not
-run `colcon build`, rebuild images, or run `npm install`. For a first deployment
-or after dependency/interface changes, request those operations explicitly:
+Normal startup reuses the container-only `build/docker/`, `install/docker/`,
+and `log/docker/` roots plus the persistent
+`taskplanner_web_node_modules` volume. The conventional `install/` root remains
+available for explicit host builds and release artifacts, but runtime
+containers never source it. Normal startup does not run `colcon build`, rebuild
+images, or run `npm install`. For a first deployment or after
+dependency/interface changes, request those operations explicitly:
 
 ```bash
 scripts/taskplanner up live --build
 ```
 
 `--build` first runs one foreground `colcon build` in a dedicated one-off
-development container and verifies the required install artifacts. Only after
-that command exits successfully does the launcher start the runtime and its
-sidecars. Runtime containers never build in parallel against the shared
-`build/`, `install/`, and `log/` bind mounts. The option also sets
-`WEBAPP_INSTALL_ON_START=true` for that invocation. Without an existing
-`install/setup.bash` or Vite in `node_modules`, fast startup exits with a clear
-instruction instead of silently performing package installation.
+development container, with workspace auto-sourcing disabled, and verifies the
+required `install/docker/` artifacts. Only after that command exits
+successfully does the launcher start the runtime and its sidecars. Runtime
+containers never build in parallel against the shared container roots. The
+option also sets `WEBAPP_INSTALL_ON_START=true` for that invocation. Without an
+existing `install/docker/setup.bash` or Vite in `node_modules`, fast startup
+exits with a clear instruction instead of silently performing package
+installation.
 
 To inspect commands without changing the machine:
 

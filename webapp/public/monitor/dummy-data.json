@@ -3,8 +3,8 @@
   "synthetic": true,
   "usage": "Editable SurgiMate dummy replay. UI layout and filtering only; not a clinical record or robot authorization.",
   "baseline": {
-    "schema_version": "1.1.0",
-    "interface_version": "0.3.0",
+    "schema_version": "1.2.0",
+    "interface_version": "0.4.0",
     "procedure_type": "thyroidectomy_demo",
     "catalog_version": "synthetic-catalog-v1"
   },
@@ -12,8 +12,8 @@
     "revision": 1001,
     "gateway_instance_id": "surgimate-dummy-gateway",
     "procedure_run_id": "surgimate-dummy-run-001",
-    "schema_version": "1.1.0",
-    "interface_version": "0.3.0",
+    "schema_version": "1.2.0",
+    "interface_version": "0.4.0",
     "procedure_type": "thyroidectomy_demo",
     "procedure_active": true,
     "catalog_version": "synthetic-catalog-v1"
@@ -22,11 +22,15 @@
     "revision": 1001,
     "gateway_instance_id": "surgimate-dummy-gateway",
     "procedure_run_id": "surgimate-dummy-run-001",
-    "schema_version": "1.1.0",
+    "schema_version": "1.2.0",
     "procedure_type": "thyroidectomy_demo",
     "procedure_active": true,
     "catalog_version": "synthetic-catalog-v1",
     "procedure_display_name": "Open Thyroidectomy Demonstration",
+    "procedure_target_site": "Right Lobectomy",
+    "procedure_target_site_ko": "Right Lobectomy",
+    "procedure_approach": "Open",
+    "procedure_approach_ko": "Open",
     "phases": [
       { "ordinal": 1, "phase_id": "P01", "display_name": "Patient positioning and operative-field preparation", "display_name_ko": "환자 체위 및 수술부위 준비", "phase_kind": "normal" },
       { "ordinal": 2, "phase_id": "P02", "display_name": "Skin incision and flap elevation", "display_name_ko": "피부 절개 및 피판 거상", "phase_kind": "normal" },
@@ -44,10 +48,8 @@
       { "instrument_id": "T02", "display_name": "Adson Forceps", "display_name_ko": "애드슨 포셉" },
       { "instrument_id": "T03", "display_name": "Allis clamp forceps", "display_name_ko": "알리스 클램프 포셉" },
       { "instrument_id": "T04", "display_name": "Bovie surgical cautery", "display_name_ko": "보비 전기소작기" },
-      { "instrument_id": "T05", "display_name": "Army navy retractor", "display_name_ko": "아미-네이비 리트랙터" },
       { "instrument_id": "T07", "display_name": "Bipolar cautery", "display_name_ko": "바이폴라 전기소작기" },
-      { "instrument_id": "T08", "display_name": "Mosquito forceps", "display_name_ko": "모스키토 포셉" },
-      { "instrument_id": "T11", "display_name": "Thyroid retractor (Middeldorpf)", "display_name_ko": "갑상선 리트랙터(미들돌프)" }
+      { "instrument_id": "T08", "display_name": "Mosquito forceps", "display_name_ko": "모스키토 포셉" }
     ]
   },
   "/surgery/context": {
@@ -80,7 +82,7 @@
     "revision": 1001,
     "gateway_instance_id": "surgimate-dummy-gateway",
     "procedure_run_id": "surgimate-dummy-run-001",
-    "schema_version": "1.1.0",
+    "schema_version": "1.2.0",
     "procedure_type": "thyroidectomy_demo",
     "procedure_active": true,
     "catalog_version": "synthetic-catalog-v1",
@@ -93,7 +95,7 @@
     "revision": 1001,
     "gateway_instance_id": "surgimate-dummy-gateway",
     "procedure_run_id": "surgimate-dummy-run-001",
-    "schema_version": "1.1.0",
+    "schema_version": "1.2.0",
     "procedure_type": "thyroidectomy_demo",
     "procedure_active": true,
     "catalog_version": "synthetic-catalog-v1",
@@ -107,7 +109,7 @@
     "revision": 1001,
     "gateway_instance_id": "surgimate-dummy-gateway",
     "procedure_run_id": "surgimate-dummy-run-001",
-    "schema_version": "1.1.0",
+    "schema_version": "1.2.0",
     "procedure_type": "thyroidectomy_demo",
     "procedure_active": true,
     "catalog_version": "synthetic-catalog-v1",

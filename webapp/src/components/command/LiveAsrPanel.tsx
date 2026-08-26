@@ -12,7 +12,7 @@ import {
 import type { LiveAsrControlResult, LiveAsrStatus } from "../../types";
 import type { Language } from "../../utils/display";
 
-type LiveAsrOperation = "refresh_devices" | "set_route_policy" | "start" | "stop";
+type LiveAsrOperation = "refresh_devices" | "set_route_policy" | "start" | "stop" | "restart_node";
 
 function formatLatency(value: number | null | undefined, language: Language): string {
   return typeof value === "number" && Number.isFinite(value)
@@ -25,6 +25,20 @@ function formatEventTime(value: string, language: Language): string {
   if (Number.isNaN(parsed.getTime())) return "--:--:--";
   return parsed.toLocaleTimeString(language === "ko" ? "ko-KR" : "en-US", {
     hour12: false,
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
+function formatNodeStartedAt(value: number, language: Language): string {
+  if (!Number.isFinite(value) || value <= 0) {
+    return language === "ko" ? "시작 시각 대기" : "Start time pending";
+  }
+  return new Date(value * 1_000).toLocaleString(language === "ko" ? "ko-KR" : "en-US", {
+    hour12: false,
+    month: "2-digit",
+    day: "2-digit",
     hour: "2-digit",
     minute: "2-digit",
     second: "2-digit",
@@ -150,7 +164,53 @@ export function LiveAsrPanel({
   const refreshDisabled = !connected || !statusFresh || asrActive || Boolean(pendingOperation);
   const selectorDisabled = !connected || !statusFresh || asrActive || Boolean(pendingOperation);
   const routePolicyDisabled = !connected || !statusFresh || asrActive || Boolean(pendingOperation);
+  const restartDisabled = !connected || Boolean(pendingOperation);
+  const restartPending = pendingOperation === "restart_node";
+  const restartFeedbackIsError = controlMessage.startsWith("ASR 노드 새로 시작 실패:");
+  const restartFeedbackIsSuccess = controlMessage.startsWith("ASR 노드 새로 시작 완료");
+  const restartSuccessIsCurrent = restartFeedbackIsSuccess && statusFresh;
   const levelPercent = Math.max(0, Math.min(100, ((status.audio_level_dbfs + 60) / 60) * 100));
+  const startBlockerMessage = statusStale
+    ? language === "ko"
+      ? "ASR sidecar 상태가 5초 이상 갱신되지 않았습니다. /input/asr/control을 호출하지 않습니다. sidecar가 정상 상태를 다시 발행한 뒤 재시도하세요."
+      : "The ASR sidecar status is more than five seconds old. /input/asr/control will not be called until it publishes a fresh status."
+    : !connected
+      ? language === "ko"
+        ? "Live ROS bridge 연결을 기다리는 중입니다. 연결되면 ASR 상태와 제어 Service를 다시 확인합니다."
+        : "Waiting for the Live ROS bridge. ASR status and control will be checked after it connects."
+      : statusAwaiting
+        ? language === "ko"
+          ? "로컬 ASR sidecar의 상태·제어 Service를 기다리는 중입니다. taskplanner-asr가 준비되면 시작 버튼이 활성화됩니다."
+          : "Waiting for the local ASR sidecar status and control service. Start will enable when taskplanner-asr is ready."
+        : !status.available
+          ? language === "ko"
+            ? `ASR sidecar를 사용할 수 없습니다.${status.dependency_error ? ` ${status.dependency_error}` : ""}`
+            : `The ASR sidecar is unavailable.${status.dependency_error ? ` ${status.dependency_error}` : ""}`
+          : !selectedDevice
+            ? formatDeviceMessage(status, language)
+            : lanOnlyUnavailable
+              ? language === "ko"
+                ? "LAN ASR이 아직 준비되지 않았습니다. 자동 또는 클라우드 경로를 선택하거나 LAN 상태가 준비된 뒤 시작하세요."
+                : "LAN ASR is not ready. Choose Auto or Cloud, or wait for LAN readiness before starting."
+              : asrActive
+                ? language === "ko"
+                  ? "ASR 세션 전환이 완료될 때까지 기다리세요."
+                  : "Wait for the ASR session transition to finish."
+                : pendingOperation
+                  ? language === "ko"
+                    ? "ASR 요청을 처리하고 있습니다."
+                    : "Applying the ASR request."
+                  : "";
+  const restartPendingMessage = language === "ko"
+    ? "ASR 노드 다시 시작 중… 최신 Python 소스를 다시 읽고 새 heartbeat를 확인하고 있습니다."
+    : "Restarting the ASR node, reloading the latest Python source, and verifying its new heartbeat."
+  const panelMessage = restartPending
+    ? restartPendingMessage
+    : restartFeedbackIsError || restartSuccessIsCurrent
+      ? controlMessage
+      : status.last_error || startBlockerMessage || controlMessage;
+  const panelMessageIsError = restartFeedbackIsError
+    || (!restartSuccessIsCurrent && Boolean(status.last_error || statusStale));
   const statusLabel = language === "ko"
     ? statusStale
       ? "상태 지연"
@@ -190,7 +250,11 @@ export function LiveAsrPanel({
           data-status-fresh={statusFresh}
         >
           {pendingOperation ? <LoaderCircle className="live-asr-spinner" size={17} aria-hidden="true" /> : listening ? <Mic size={17} aria-hidden="true" /> : <MicOff size={17} aria-hidden="true" />}
-          <span>{pendingOperation ? (language === "ko" ? "요청 처리 중" : "Applying request") : statusLabel}</span>
+          <span>{restartPending
+            ? (language === "ko" ? "ASR 노드 다시 시작 중" : "Restarting ASR node")
+            : pendingOperation
+              ? (language === "ko" ? "요청 처리 중" : "Applying request")
+              : statusLabel}</span>
         </div>
       </div>
 
@@ -252,7 +316,14 @@ export function LiveAsrPanel({
             {pendingOperation === "refresh_devices" ? <LoaderCircle className="live-asr-spinner" size={16} aria-hidden="true" /> : <RefreshCw size={16} aria-hidden="true" />}
             {language === "ko" ? "장치 새로고침" : "Refresh devices"}
           </button>
-          <button className="button button-primary" disabled={startDisabled} onClick={() => void onControl("start", selectedDeviceId)} type="button">
+          <button
+            aria-describedby={startBlockerMessage ? "live-asr-start-help" : undefined}
+            className="button button-primary"
+            disabled={startDisabled}
+            onClick={() => void onControl("start", selectedDeviceId)}
+            title={startDisabled ? startBlockerMessage : undefined}
+            type="button"
+          >
             {pendingOperation === "start" ? <LoaderCircle className="live-asr-spinner" size={16} aria-hidden="true" /> : <Mic size={16} aria-hidden="true" />}
             {language === "ko" ? "ASR 시작" : "Start ASR"}
           </button>
@@ -260,6 +331,26 @@ export function LiveAsrPanel({
             {pendingOperation === "stop" ? <LoaderCircle className="live-asr-spinner" size={16} aria-hidden="true" /> : <CircleStop size={16} aria-hidden="true" />}
             {language === "ko" ? "ASR 중지" : "Stop ASR"}
           </button>
+        </div>
+        <div className="live-asr-node-restart" data-slot="live-asr-node-restart">
+          <button
+            aria-busy={restartPending}
+            aria-describedby="live-asr-restart-help"
+            className="button button-quiet"
+            disabled={restartDisabled}
+            onClick={() => void onControl("restart_node")}
+            type="button"
+          >
+            {restartPending
+              ? <LoaderCircle className="live-asr-spinner" size={16} aria-hidden="true" />
+              : <RefreshCw size={16} aria-hidden="true" />}
+            {language === "ko" ? "ASR 노드 새로 시작" : "Restart ASR node"}
+          </button>
+          <p id="live-asr-restart-help">
+            {language === "ko"
+              ? "ASR Python 소스를 다시 읽습니다. 시나리오·VLM·카메라·UI는 재시작하지 않습니다."
+              : "Reloads ASR Python source without restarting the scenario, VLM, cameras, or UI."}
+          </p>
         </div>
       </div>
 
@@ -277,7 +368,22 @@ export function LiveAsrPanel({
       <div className="live-asr-facts">
         <span><Server size={14} aria-hidden="true" />{status.connected ? (language === "ko" ? "ASR 서버 연결됨" : "ASR server connected") : (language === "ko" ? "ASR 서버 미연결" : "ASR server disconnected")}</span>
         <code title={status.server_url}>{status.server_url || (language === "ko" ? "서버 주소 대기" : "Waiting for server URL")}</code>
-        <code>{status.topic || "/sensors/surgeon/sentence"} · std_msgs/msg/String</code>
+        <code>
+          {status.output_topic || status.topic || (language === "ko" ? "출력 토픽 대기" : "Waiting for output topic")}
+          {" · "}
+          {status.output_mode === "typed_utterance"
+            ? "surgical_msgs/msg/SpeechUtterance"
+            : status.output_mode === "sentence_text" ? "std_msgs/msg/String" : (language === "ko" ? "출력 형식 대기" : "Waiting for output type")}
+        </code>
+        <code
+          className="live-asr-runtime-revision"
+          title={status.node_instance_id
+            ? `${status.source_revision || "revision pending"} · ${status.node_instance_id}`
+            : status.source_revision || undefined}
+        >
+          {language === "ko" ? "코드" : "Code"} {status.source_revision ? status.source_revision.slice(0, 8) : "--------"}
+          {" · "}{formatNodeStartedAt(status.node_started_at_sec, language)}
+        </code>
       </div>
 
       <div className="live-asr-finals">
@@ -298,9 +404,13 @@ export function LiveAsrPanel({
         ) : <p>{language === "ko" ? "아직 확정된 문장이 없습니다." : "No finalized speech yet."}</p>}
       </div>
 
-      {controlMessage || status.last_error || !statusFresh ? (
-        <p className={`live-asr-message ${status.last_error || !statusFresh ? "error" : "normal"}`} role={status.last_error ? "alert" : "status"}>
-          {status.last_error || (!statusFresh ? (language === "ko" ? "ASR 상태 토픽을 기다리는 중입니다." : "Waiting for the ASR status topic.") : controlMessage)}
+      {panelMessage ? (
+        <p
+          className={`live-asr-message ${panelMessageIsError ? "error" : "normal"}`}
+          id="live-asr-start-help"
+          role={panelMessageIsError ? "alert" : "status"}
+        >
+          {panelMessage}
         </p>
       ) : null}
       <p className="sr-only" aria-live="polite" aria-atomic="true">

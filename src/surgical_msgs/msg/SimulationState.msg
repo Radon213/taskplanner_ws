@@ -1,5 +1,7 @@
 builtin_interfaces/Time stamp
 string procedure_id
+# Same opaque start-to-terminal identity published in WorldState.
+string procedure_run_id
 string active_bundle
 bool running
 string execution_state

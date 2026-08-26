@@ -39,7 +39,6 @@ def _compose_config(
                 "environment": {
                     "PNU_TOOL_CHECKPOINT": "/models/tool.pth",
                     "PNU_BLOOD_CHECKPOINT": "/models/blood.pth",
-                    "PNU_HAND_MODEL": "/models/hand.task",
                 },
                 "volumes": [
                     {
@@ -56,7 +55,7 @@ def _compose_config(
 
 def test_digest_pins_require_every_requested_full_lowercase_sha256() -> None:
     digests = {name: character * 64 for name, character in zip(
-        ("tool", "blood", "hand"), ("a", "b", "c"), strict=True
+        ("tool", "blood"), ("a", "b"), strict=True
     )}
     assert validate_model_digest_pins(json.dumps(digests)) == digests
 
@@ -79,15 +78,15 @@ def test_digest_pins_require_every_requested_full_lowercase_sha256() -> None:
 
     duplicate_json = (
         f'{{"tool":"{digests["tool"]}","tool":"{digests["tool"]}",'
-        f'"blood":"{digests["blood"]}","hand":"{digests["hand"]}"}}'
+        f'"blood":"{digests["blood"]}"}}'
     )
     with pytest.raises(PreflightError) as duplicate:
         validate_model_digest_pins(duplicate_json)
     assert duplicate.value.error_code == "INVALID_MODEL_DIGEST_PINS"
 
 
-def test_reviewed_all_model_map_can_pin_a_debug_subset() -> None:
-    digests = {"tool": "a" * 64, "blood": "b" * 64, "hand": "c" * 64}
+def test_reviewed_taskplanner_map_can_pin_a_debug_subset() -> None:
+    digests = {"tool": "a" * 64, "blood": "b" * 64}
     assert validate_model_digest_pins(
         json.dumps(digests), algorithms=("tool",)
     ) == digests
@@ -99,9 +98,8 @@ def test_compose_pin_preflight_hashes_local_read_only_model_files(
     payloads = {
         "tool": b"reviewed tool model",
         "blood": b"reviewed blood model",
-        "hand": b"reviewed hand model",
     }
-    filenames = {"tool": "tool.pth", "blood": "blood.pth", "hand": "hand.task"}
+    filenames = {"tool": "tool.pth", "blood": "blood.pth"}
     for algorithm, payload in payloads.items():
         (tmp_path / filenames[algorithm]).write_bytes(payload)
     digests = {name: _sha256(payload) for name, payload in payloads.items()}
@@ -115,16 +113,16 @@ def test_compose_pin_preflight_hashes_local_read_only_model_files(
 
     assert outcome["accepted"] is True
     assert outcome["local_files_verified"] is True
-    assert set(outcome["verified_files"]) == {"tool", "blood", "hand"}
+    assert set(outcome["verified_files"]) == {"tool", "blood"}
     assert outcome["verified_files"]["tool"]["sha256"] == digests["tool"]
 
 
 def test_compose_pin_preflight_rejects_mismatch_and_writable_mount(
     tmp_path: Path,
 ) -> None:
-    for filename in ("tool.pth", "blood.pth", "hand.task"):
+    for filename in ("tool.pth", "blood.pth"):
         (tmp_path / filename).write_bytes(filename.encode())
-    wrong = {"tool": "a" * 64, "blood": "b" * 64, "hand": "c" * 64}
+    wrong = {"tool": "a" * 64, "blood": "b" * 64}
 
     with pytest.raises(PreflightError) as mismatch:
         check_compose_model_pins(
@@ -150,16 +148,19 @@ def test_compose_pin_preflight_rejects_mismatch_and_writable_mount(
 def test_worker_probe_requires_and_compares_reviewed_model_pins(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    digests = {"tool": "a" * 64, "blood": "b" * 64, "hand": "c" * 64}
+    digests = {"tool": "a" * 64, "blood": "b" * 64}
     models = {
         name: {"ready": True, "digest_sha256": digest}
         for name, digest in digests.items()
     }
     health = {"schema": "pnu.health.v1", "ready": True, "models": models}
+    upstream_models = {**models, "hand": {"ready": True, "digest_sha256": "c" * 64}}
     capabilities = {
         "schema": "pnu.capabilities.v1",
         "algorithms": ["tool", "blood", "hand"],
-        "models": models,
+        # The worker v1 ABI may advertise its legacy hand capability; this
+        # preflight only admits and pins the Taskplanner tool/blood subset.
+        "models": upstream_models,
         "auth": {"mode": "none"},
     }
 

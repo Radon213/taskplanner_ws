@@ -7,8 +7,8 @@ target: first_subsequent_supported_scrub_nurse_to_surgeon_handover_regardless_of
 metadata:
   fit_partition: development_calibration
   fit_source: reviewed_confirmed_scrub_nurse_to_surgeon_transitions
-  eligible_transition_count: 101
-  unsupported_transition_count: 7
+  eligible_transition_count: 74
+  unsupported_transition_count: 34
   history_boundary: unsupported_or_unknown_handover_resets_suffix
   model_visible_fields:
   - id
@@ -22,11 +22,9 @@ rules:
   history: []
   outcomes:
   - tool: T02
-    count: 9
+    count: 10
   - tool: T07
     count: 5
-  - tool: T05
-    count: 1
 - match: phase+last3
   phase: P03
   history:
@@ -73,48 +71,12 @@ rules:
 - match: phase+last3
   phase: P03
   history:
-  - T02
-  - T05
-  - T05
-  outcomes:
-  - tool: T02
-    count: 1
-- match: phase+last3
-  phase: P03
-  history:
-  - T04
-  - T02
-  - T05
-  outcomes:
-  - tool: T05
-    count: 3
-- match: phase+last3
-  phase: P03
-  history:
-  - T04
-  - T04
-  - T05
-  outcomes:
-  - tool: T05
-    count: 1
-- match: phase+last3
-  phase: P03
-  history:
   - T04
   - T07
   - T04
   outcomes:
   - tool: T02
     count: 3
-  - tool: T05
-    count: 1
-- match: phase+last3
-  phase: P03
-  history:
-  - T05
-  outcomes:
-  - tool: T05
-    count: 1
 - match: phase+last3
   phase: P03
   history:
@@ -128,162 +90,54 @@ rules:
   - T07
   - T04
   outcomes:
-  - tool: T05
-    count: 3
   - tool: T04
     count: 1
 - match: phase+last3
-  phase: P03
+  phase: P04
+  history: []
+  outcomes:
+  - tool: T02
+    count: 8
+- match: phase+last3
+  phase: P04
   history:
-  - T07
-  - T04
   - T02
   outcomes:
-  - tool: T05
+  - tool: T07
     count: 3
-- match: phase+last3
-  phase: P03
-  history:
-  - T07
-  - T04
-  - T04
-  outcomes:
-  - tool: T05
+  - tool: T02
     count: 1
 - match: phase+last3
-  phase: P03
-  history:
-  - T07
-  - T04
-  - T05
-  outcomes:
-  - tool: T05
-    count: 4
-- match: phase+last3
   phase: P04
   history:
-  - T02
-  - T05
-  - T05
-  outcomes:
-  - tool: T02
-    count: 2
-- match: phase+last3
-  phase: P04
-  history:
-  - T04
-  - T05
-  - T05
-  outcomes:
-  - tool: T02
-    count: 5
-- match: phase+last3
-  phase: P04
-  history:
-  - T05
   - T02
   - T02
   outcomes:
   - tool: T07
     count: 1
 - match: phase+last3
-  phase: P04
-  history:
-  - T05
-  - T05
+  phase: P05
+  history: []
   outcomes:
-  - tool: T02
-    count: 1
-- match: phase+last3
-  phase: P04
-  history:
-  - T05
-  - T05
-  - T02
-  outcomes:
-  - tool: T08
-    count: 4
   - tool: T07
+    count: 6
+  - tool: T04
     count: 3
-  - tool: T02
-    count: 1
-  - tool: T03
-    count: 1
-- match: phase+last3
-  phase: P05
-  history:
-  - T02
-  - T02
-  - T07
-  outcomes:
-  - tool: T08
-    count: 1
-- match: phase+last3
-  phase: P05
-  history:
-  - T02
-  - T07
-  - T08
-  outcomes:
-  - tool: T04
-    count: 2
-  - tool: T07
-    count: 2
-- match: phase+last3
-  phase: P05
-  history:
-  - T05
-  - T02
-  - T03
-  outcomes:
-  - tool: T04
-    count: 1
-- match: phase+last3
-  phase: P05
-  history:
-  - T05
-  - T02
-  - T07
-  outcomes:
-  - tool: T08
-    count: 3
-- match: phase+last3
-  phase: P05
-  history:
-  - T05
-  - T02
-  - T08
-  outcomes:
-  - tool: T07
-    count: 4
-- match: phase+last3
-  phase: P06
-  history:
-  - T02
-  - T08
-  - T07
-  outcomes:
-  - tool: T04
-    count: 4
 - match: phase+last3
   phase: P06
   history:
   - T07
-  - T08
-  - T07
   outcomes:
   - tool: T04
-    count: 2
+    count: 6
 - match: phase+last2
   phase: P03
   history: []
   outcomes:
   - tool: T02
-    count: 9
+    count: 10
   - tool: T07
     count: 5
-  - tool: T05
-    count: 1
 - match: phase+last2
   phase: P03
   history:
@@ -308,38 +162,6 @@ rules:
   - T04
   outcomes:
   - tool: T07
-    count: 5
-- match: phase+last2
-  phase: P03
-  history:
-  - T02
-  - T05
-  outcomes:
-  - tool: T05
-    count: 3
-- match: phase+last2
-  phase: P03
-  history:
-  - T04
-  - T02
-  outcomes:
-  - tool: T05
-    count: 3
-- match: phase+last2
-  phase: P03
-  history:
-  - T04
-  - T04
-  outcomes:
-  - tool: T05
-    count: 1
-- match: phase+last2
-  phase: P03
-  history:
-  - T04
-  - T05
-  outcomes:
-  - tool: T05
     count: 5
 - match: phase+last2
   phase: P03
@@ -349,21 +171,6 @@ rules:
   outcomes:
   - tool: T04
     count: 4
-- match: phase+last2
-  phase: P03
-  history:
-  - T05
-  outcomes:
-  - tool: T05
-    count: 1
-- match: phase+last2
-  phase: P03
-  history:
-  - T05
-  - T05
-  outcomes:
-  - tool: T02
-    count: 1
 - match: phase+last2
   phase: P03
   history:
@@ -377,80 +184,44 @@ rules:
   - T07
   - T04
   outcomes:
-  - tool: T05
-    count: 4
   - tool: T02
     count: 3
   - tool: T04
     count: 1
 - match: phase+last2
   phase: P04
-  history:
-  - T02
-  - T02
-  outcomes:
-  - tool: T07
-    count: 1
-- match: phase+last2
-  phase: P04
-  history:
-  - T05
-  - T02
-  outcomes:
-  - tool: T08
-    count: 4
-  - tool: T07
-    count: 3
-  - tool: T02
-    count: 1
-  - tool: T03
-    count: 1
-- match: phase+last2
-  phase: P04
-  history:
-  - T05
-  - T05
+  history: []
   outcomes:
   - tool: T02
     count: 8
 - match: phase+last2
-  phase: P05
+  phase: P04
   history:
   - T02
-  - T03
   outcomes:
-  - tool: T04
+  - tool: T07
+    count: 3
+  - tool: T02
+    count: 1
+- match: phase+last2
+  phase: P04
+  history:
+  - T02
+  - T02
+  outcomes:
+  - tool: T07
     count: 1
 - match: phase+last2
   phase: P05
-  history:
-  - T02
-  - T07
-  outcomes:
-  - tool: T08
-    count: 4
-- match: phase+last2
-  phase: P05
-  history:
-  - T02
-  - T08
+  history: []
   outcomes:
   - tool: T07
-    count: 4
-- match: phase+last2
-  phase: P05
-  history:
-  - T07
-  - T08
-  outcomes:
+    count: 6
   - tool: T04
-    count: 2
-  - tool: T07
-    count: 2
+    count: 3
 - match: phase+last2
   phase: P06
   history:
-  - T08
   - T07
   outcomes:
   - tool: T04
@@ -460,11 +231,9 @@ rules:
   history: []
   outcomes:
   - tool: T02
-    count: 9
+    count: 10
   - tool: T07
     count: 5
-  - tool: T05
-    count: 1
 - match: phase+last1
   phase: P03
   history:
@@ -474,15 +243,11 @@ rules:
     count: 8
   - tool: T02
     count: 5
-  - tool: T05
-    count: 3
 - match: phase+last1
   phase: P03
   history:
   - T04
   outcomes:
-  - tool: T05
-    count: 5
   - tool: T07
     count: 5
   - tool: T02
@@ -492,19 +257,16 @@ rules:
 - match: phase+last1
   phase: P03
   history:
-  - T05
-  outcomes:
-  - tool: T05
-    count: 9
-  - tool: T02
-    count: 1
-- match: phase+last1
-  phase: P03
-  history:
   - T07
   outcomes:
   - tool: T04
     count: 9
+- match: phase+last1
+  phase: P04
+  history: []
+  outcomes:
+  - tool: T02
+    count: 8
 - match: phase+last1
   phase: P04
   history:
@@ -512,42 +274,16 @@ rules:
   outcomes:
   - tool: T07
     count: 4
-  - tool: T08
-    count: 4
   - tool: T02
     count: 1
-  - tool: T03
-    count: 1
-- match: phase+last1
-  phase: P04
-  history:
-  - T05
-  outcomes:
-  - tool: T02
-    count: 8
 - match: phase+last1
   phase: P05
-  history:
-  - T03
-  outcomes:
-  - tool: T04
-    count: 1
-- match: phase+last1
-  phase: P05
-  history:
-  - T07
-  outcomes:
-  - tool: T08
-    count: 4
-- match: phase+last1
-  phase: P05
-  history:
-  - T08
+  history: []
   outcomes:
   - tool: T07
     count: 6
   - tool: T04
-    count: 2
+    count: 3
 - match: phase+last1
   phase: P06
   history:
@@ -562,8 +298,6 @@ rules:
   - tool: T02
     count: 18
   - tool: T04
-    count: 18
-  - tool: T05
     count: 18
   - tool: T07
     count: 10
@@ -575,18 +309,12 @@ rules:
     count: 9
   - tool: T07
     count: 4
-  - tool: T08
-    count: 4
-  - tool: T03
-    count: 1
 - match: phase
   phase: P05
   history: []
   outcomes:
   - tool: T07
     count: 6
-  - tool: T08
-    count: 4
   - tool: T04
     count: 3
 - match: phase
@@ -599,18 +327,20 @@ rules:
   history: []
   outcomes:
   - tool: T02
-    count: 9
+    count: 18
   - tool: T07
-    count: 5
-  - tool: T05
-    count: 1
+    count: 11
+  - tool: T04
+    count: 3
 - match: last3
   history:
   - T02
   outcomes:
   - tool: T02
-    count: 5
+    count: 6
   - tool: T04
+    count: 3
+  - tool: T07
     count: 3
 - match: last3
   history:
@@ -619,6 +349,8 @@ rules:
   outcomes:
   - tool: T04
     count: 5
+  - tool: T07
+    count: 1
 - match: last3
   history:
   - T02
@@ -627,14 +359,6 @@ rules:
   outcomes:
   - tool: T07
     count: 3
-- match: last3
-  history:
-  - T02
-  - T02
-  - T07
-  outcomes:
-  - tool: T08
-    count: 1
 - match: last3
   history:
   - T02
@@ -652,327 +376,91 @@ rules:
     count: 4
 - match: last3
   history:
-  - T02
-  - T05
-  - T05
-  outcomes:
-  - tool: T02
-    count: 3
-- match: last3
-  history:
-  - T02
-  - T07
-  - T08
-  outcomes:
-  - tool: T04
-    count: 2
-  - tool: T07
-    count: 2
-- match: last3
-  history:
-  - T02
-  - T08
-  - T07
-  outcomes:
-  - tool: T04
-    count: 4
-- match: last3
-  history:
-  - T04
-  - T02
-  - T05
-  outcomes:
-  - tool: T05
-    count: 3
-- match: last3
-  history:
-  - T04
-  - T04
-  - T05
-  outcomes:
-  - tool: T05
-    count: 1
-- match: last3
-  history:
-  - T04
-  - T05
-  - T05
-  outcomes:
-  - tool: T02
-    count: 5
-- match: last3
-  history:
   - T04
   - T07
   - T04
   outcomes:
   - tool: T02
     count: 3
-  - tool: T05
-    count: 1
-- match: last3
-  history:
-  - T05
-  outcomes:
-  - tool: T05
-    count: 1
-- match: last3
-  history:
-  - T05
-  - T02
-  - T02
-  outcomes:
-  - tool: T07
-    count: 1
-- match: last3
-  history:
-  - T05
-  - T02
-  - T03
-  outcomes:
-  - tool: T04
-    count: 1
-- match: last3
-  history:
-  - T05
-  - T02
-  - T07
-  outcomes:
-  - tool: T08
-    count: 3
-- match: last3
-  history:
-  - T05
-  - T02
-  - T08
-  outcomes:
-  - tool: T07
-    count: 4
-- match: last3
-  history:
-  - T05
-  - T05
-  outcomes:
-  - tool: T02
-    count: 1
-- match: last3
-  history:
-  - T05
-  - T05
-  - T02
-  outcomes:
-  - tool: T08
-    count: 4
-  - tool: T07
-    count: 3
-  - tool: T02
-    count: 1
-  - tool: T03
-    count: 1
 - match: last3
   history:
   - T07
   outcomes:
   - tool: T04
-    count: 5
+    count: 11
 - match: last3
   history:
   - T07
   - T04
   outcomes:
-  - tool: T05
-    count: 3
   - tool: T04
     count: 1
-- match: last3
-  history:
-  - T07
-  - T04
-  - T02
-  outcomes:
-  - tool: T05
-    count: 3
-- match: last3
-  history:
-  - T07
-  - T04
-  - T04
-  outcomes:
-  - tool: T05
-    count: 1
-- match: last3
-  history:
-  - T07
-  - T04
-  - T05
-  outcomes:
-  - tool: T05
-    count: 4
-- match: last3
-  history:
-  - T07
-  - T08
-  - T07
-  outcomes:
-  - tool: T04
-    count: 2
 - match: last2
   history: []
   outcomes:
   - tool: T02
-    count: 9
+    count: 18
   - tool: T07
-    count: 5
-  - tool: T05
-    count: 1
+    count: 11
+  - tool: T04
+    count: 3
 - match: last2
   history:
   - T02
   outcomes:
   - tool: T02
-    count: 5
-  - tool: T04
-    count: 3
-- match: last2
-  history:
-  - T02
-  - T02
-  outcomes:
-  - tool: T04
-    count: 5
-  - tool: T07
-    count: 1
-- match: last2
-  history:
-  - T02
-  - T03
-  outcomes:
-  - tool: T04
-    count: 1
-- match: last2
-  history:
-  - T02
-  - T04
-  outcomes:
-  - tool: T07
-    count: 5
-- match: last2
-  history:
-  - T02
-  - T05
-  outcomes:
-  - tool: T05
-    count: 3
-- match: last2
-  history:
-  - T02
-  - T07
-  outcomes:
-  - tool: T08
-    count: 4
-- match: last2
-  history:
-  - T02
-  - T08
-  outcomes:
-  - tool: T07
-    count: 4
-- match: last2
-  history:
-  - T04
-  - T02
-  outcomes:
-  - tool: T05
-    count: 3
-- match: last2
-  history:
-  - T04
-  - T04
-  outcomes:
-  - tool: T05
-    count: 1
-- match: last2
-  history:
-  - T04
-  - T05
-  outcomes:
-  - tool: T05
-    count: 5
-- match: last2
-  history:
-  - T04
-  - T07
-  outcomes:
-  - tool: T04
-    count: 4
-- match: last2
-  history:
-  - T05
-  outcomes:
-  - tool: T05
-    count: 1
-- match: last2
-  history:
-  - T05
-  - T02
-  outcomes:
-  - tool: T08
-    count: 4
-  - tool: T07
-    count: 3
-  - tool: T02
-    count: 1
-  - tool: T03
-    count: 1
-- match: last2
-  history:
-  - T05
-  - T05
-  outcomes:
-  - tool: T02
-    count: 9
-- match: last2
-  history:
-  - T07
-  outcomes:
-  - tool: T04
-    count: 5
-- match: last2
-  history:
-  - T07
-  - T04
-  outcomes:
-  - tool: T05
-    count: 4
-  - tool: T02
-    count: 3
-  - tool: T04
-    count: 1
-- match: last2
-  history:
-  - T07
-  - T08
-  outcomes:
-  - tool: T04
-    count: 2
-  - tool: T07
-    count: 2
-- match: last2
-  history:
-  - T08
-  - T07
-  outcomes:
-  - tool: T04
     count: 6
+  - tool: T04
+    count: 3
+  - tool: T07
+    count: 3
+- match: last2
+  history:
+  - T02
+  - T02
+  outcomes:
+  - tool: T04
+    count: 5
+  - tool: T07
+    count: 1
+- match: last2
+  history:
+  - T02
+  - T04
+  outcomes:
+  - tool: T07
+    count: 5
+- match: last2
+  history:
+  - T04
+  - T07
+  outcomes:
+  - tool: T04
+    count: 4
+- match: last2
+  history:
+  - T07
+  outcomes:
+  - tool: T04
+    count: 11
+- match: last2
+  history:
+  - T07
+  - T04
+  outcomes:
+  - tool: T02
+    count: 3
+  - tool: T04
+    count: 1
 - match: last1
   history: []
   outcomes:
   - tool: T02
-    count: 9
+    count: 18
   - tool: T07
-    count: 5
-  - tool: T05
-    count: 1
+    count: 11
+  - tool: T04
+    count: 3
 - match: last1
   history:
   - T02
@@ -983,54 +471,22 @@ rules:
     count: 6
   - tool: T07
     count: 4
-  - tool: T08
-    count: 4
-  - tool: T05
-    count: 3
-  - tool: T03
-    count: 1
-- match: last1
-  history:
-  - T03
-  outcomes:
-  - tool: T04
-    count: 1
 - match: last1
   history:
   - T04
   outcomes:
-  - tool: T05
-    count: 5
   - tool: T07
     count: 5
   - tool: T02
     count: 3
   - tool: T04
     count: 1
-- match: last1
-  history:
-  - T05
-  outcomes:
-  - tool: T02
-    count: 9
-  - tool: T05
-    count: 9
 - match: last1
   history:
   - T07
   outcomes:
   - tool: T04
     count: 15
-  - tool: T08
-    count: 4
-- match: last1
-  history:
-  - T08
-  outcomes:
-  - tool: T07
-    count: 6
-  - tool: T04
-    count: 2
 - match: global
   history: []
   outcomes:
@@ -1040,9 +496,3 @@ rules:
     count: 27
   - tool: T07
     count: 20
-  - tool: T05
-    count: 18
-  - tool: T08
-    count: 8
-  - tool: T03
-    count: 1

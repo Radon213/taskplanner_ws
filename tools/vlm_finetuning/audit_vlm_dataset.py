@@ -27,9 +27,6 @@ TASK_ALIASES = {
     "tool_recognition": "tool",
     "tool_detection": "tool",
     "current_tools": "tool",
-    "request_intent": "intent",
-    "surgeon_intent": "intent",
-    "intent": "intent",
     "current_phase": "phase",
     "phase": "phase",
     "phase_classification": "phase",
@@ -40,6 +37,8 @@ TASK_ALIASES = {
     "clinical_observation_interpretation": "clinical",
     "clinical_analysis": "clinical",
 }
+
+FORBIDDEN_VISUAL_HAND_TASKS = {"gesture", "request_intent", "surgeon_intent"}
 
 SPLIT_ALIASES = {
     "train": "train",
@@ -338,16 +337,6 @@ def _validate_target(
                     f"{key} must be boolean when supplied.",
                     example_id=example_id,
                 )
-    elif task == "intent":
-        intent = target.get("intent") or target.get("action")
-        if not _nonempty_string(intent):
-            _finding(
-                report,
-                "error",
-                "target_intent_missing",
-                "Intent target requires a non-empty intent or action.",
-                example_id=example_id,
-            )
     elif task == "phase":
         phase = (
             target.get("phase_id")
@@ -1009,13 +998,22 @@ def audit_dataset(
             task_counts["<missing>"] += 1
         elif task is None:
             task_counts[raw_task] += 1
-            _finding(
-                report,
-                "warning",
-                "task_type_unknown",
-                f"Unknown task_type {raw_task!r}; only generic target checks ran.",
-                example_id=example_id,
-            )
+            if raw_task in FORBIDDEN_VISUAL_HAND_TASKS:
+                _finding(
+                    report,
+                    "error",
+                    "visual_hand_task_forbidden",
+                    f"Visual hand task {raw_task!r} is outside the hand-free VLM contract.",
+                    example_id=example_id,
+                )
+            else:
+                _finding(
+                    report,
+                    "warning",
+                    "task_type_unknown",
+                    f"Unknown task_type {raw_task!r}; only generic target checks ran.",
+                    example_id=example_id,
+                )
         else:
             task_counts[raw_task] += 1
 

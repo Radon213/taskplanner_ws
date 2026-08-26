@@ -23,7 +23,6 @@ ament_target_dependencies(${PROJECT_NAME}
 auto_apms_behavior_tree_register_nodes(${PROJECT_NAME}
   taskplanner_bt_nodes::LoadWorldState
   taskplanner_bt_nodes::IsProcedureActive
-  taskplanner_bt_nodes::IsPhaseCertain
   taskplanner_bt_nodes::HasExplicitRequest
   taskplanner_bt_nodes::HasImplicitRequest
   taskplanner_bt_nodes::NeedsRecovery

@@ -27,6 +27,7 @@ setup(
     entry_points={
         "console_scripts": [
             "integration_debug_node = integration_debug.node:main",
+            "operational_surgery_record = integration_debug.operational_surgery_record:main",
             "operational_asr_node = integration_debug.operational_asr_node:main",
             "taskplanner_asr_node = integration_debug.operational_asr_node:main",
             "secure_debug_rosbridge = integration_debug.secure_rosbridge:main",

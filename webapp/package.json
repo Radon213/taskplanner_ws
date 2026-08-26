@@ -5,7 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "start:production": "node scripts/serve-production.mjs",
     "build": "tsc -b && node scripts/check-dev-server-contract.mjs && vite build && node scripts/check-bundle-budgets.cjs && node scripts/check-monitor-bundle.cjs",
+    "build:runtime": "tsc -b && node scripts/check-dev-server-contract.mjs && vite build && node scripts/check-monitor-bundle.cjs",
     "check:domain-hardcoding": "node scripts/check-domain-hardcoding.cjs",
     "check:debug-safety": "node scripts/check-debug-safety.cjs",
     "check:live-asr-ui": "node scripts/check-live-asr-ui.cjs",
@@ -14,12 +16,15 @@
     "check:design-system": "node scripts/check-design-system.cjs",
     "check:dev-server-contract": "node scripts/check-dev-server-contract.mjs",
     "check:rosbridge-image-backpressure": "node scripts/check-rosbridge-image-backpressure.cjs",
+    "check:scenario-revision": "node scripts/check-scenario-revision-ui.cjs",
     "test:monitor": "node --test monitor/test/*.test.js",
+    "test:server": "node --test scripts/serve-production.test.mjs scripts/start-production.test.mjs",
     "test:e2e": "playwright test",
     "preview": "vite preview"
   },
   "dependencies": {
     "framer-motion": "^12.43.0",
+    "hls.js": "1.7.1",
     "lucide-react": "^1.31.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",

@@ -64,7 +64,8 @@ BED_ROBOT_ARM_PROCEDURE_ROLES = {
 
 
 SURGEON_OWNED_LOCATION_TYPES = {"surgeon_hand", "surgical_field", "bed_fixed_tool", "return_zone"}
-ACTIVE_REQUEST_INTENTS = {"request_tool", "voice_request", "extend_hand_for_handover"}
+EXPLICIT_TOOL_REQUEST_INTENTS = {"request_tool", "voice_request"}
+ACTIVE_REQUEST_INTENTS = EXPLICIT_TOOL_REQUEST_INTENTS | {"extend_hand_for_handover"}
 ACTIVE_RETURN_INTENTS = {"return_tool", "extend_hand_for_retrieval"}
 RIGHT_HAND_LIFECYCLES = {LIFECYCLE_PREPOSITIONED_RIGHT}
 LEFT_HAND_LIFECYCLES = {LIFECYCLE_RECOVERING_LEFT}
@@ -79,7 +80,6 @@ PHASE_INTERACTION_MIN_FRACTION = 0.4
 BLOCKING_SAFETY_FLAGS = {
     "right_arm_overloaded",
     "left_arm_overloaded",
-    "surgeon_owned_overloaded",
     "duplicate_tool_holder",
     "vlm_unhealthy",
     "dropped_tool_requires_human",
@@ -104,6 +104,8 @@ ALLOWED_EVENT_TRANSITIONS = {
 OBSERVATION_STICKY_DIRECT_BLOCKS = {
     (LIFECYCLE_HOME_RACK, LIFECYCLE_SURGEON_OWNED),
     (LIFECYCLE_SURGEON_OWNED, LIFECYCLE_RETURNED_HOME),
+    (LIFECYCLE_MAYO_REUSE, LIFECYCLE_RETURNED_HOME),
+    (LIFECYCLE_MAYO_RECOVERY, LIFECYCLE_RETURNED_HOME),
     (LIFECYCLE_MAYO_REUSE, LIFECYCLE_MAYO_RECOVERY),
 }
 CAM4_MAYO_OBSERVATION_SOURCES = frozenset(
@@ -770,7 +772,6 @@ class ORDigitalTwin:
         self,
         spec: ProcedureSpec,
         *,
-        allow_shadow_request_capacity_reconciliation: bool = False,
         allow_shadow_type_instance_requests: bool = False,
         allow_open_set_phase_bootstrap: bool = False,
         phase_transition_required_counts: dict[
@@ -778,9 +779,6 @@ class ORDigitalTwin:
         ] | None = None,
     ):
         self.spec = spec
-        self._allow_shadow_request_capacity_reconciliation = bool(
-            allow_shadow_request_capacity_reconciliation
-        )
         self._allow_shadow_type_instance_requests = bool(
             allow_shadow_type_instance_requests
         )
@@ -812,6 +810,19 @@ class ORDigitalTwin:
         # transition so consumers do not turn status heartbeats into events.
         self._bed_robot_arm_controller_state_changed = False
         self.instrument_states: dict[str, InstrumentBelief] = {}
+        self._last_handover_completed_stamp_by_instance: dict[str, float] = {}
+        self._applied_authoritative_handover_commands: dict[
+            tuple[str, str], tuple[str, float]
+        ] = {}
+        self._authoritative_handover_correlation_by_command: dict[
+            str, tuple[str, tuple[str, str]]
+        ] = {}
+        self._last_authoritative_handover_stamp_by_instance: dict[
+            str, tuple[float, str, int]
+        ] = {}
+        self._recovery_transaction_opened_stamp_by_instance: dict[
+            str, float
+        ] = {}
         self._observation_candidates: dict[str, dict[str, Any]] = {}
         self._shadow_counterfactual_locked_instances: set[str] = set()
         self._observation_violation_cooldowns: dict[tuple[str, str, str, str], float] = {}
@@ -855,6 +866,11 @@ class ORDigitalTwin:
             for group_id in BED_ROBOT_ARM_GROUP_IDS
         }
         self.instrument_states = {}
+        self._last_handover_completed_stamp_by_instance.clear()
+        self._applied_authoritative_handover_commands.clear()
+        self._authoritative_handover_correlation_by_command.clear()
+        self._last_authoritative_handover_stamp_by_instance.clear()
+        self._recovery_transaction_opened_stamp_by_instance.clear()
         self.event_history.clear()
         self._bed_robot_arm_group_status_signatures.clear()
         self._bed_robot_arm_group_ignored_status_signatures.clear()
@@ -990,13 +1006,23 @@ class ORDigitalTwin:
         preferred_instance_id: str = "",
         allowed_lifecycles: set[str] | None = None,
         exclude_reserved: bool = False,
+        exclude_instance_ids: set[str] | None = None,
     ) -> InstrumentBelief | None:
+        excluded = exclude_instance_ids or set()
         if preferred_instance_id:
             state = self._state_by_instance(preferred_instance_id)
-            if state is not None and state.instrument_id == instrument_id:
+            if (
+                state is not None
+                and state.instrument_id == instrument_id
+                and state.instance_id not in excluded
+            ):
                 if allowed_lifecycles is None or state.lifecycle_stage in allowed_lifecycles:
                     return state
-        candidates = self._instances_for_type(instrument_id)
+        candidates = [
+            state
+            for state in self._instances_for_type(instrument_id)
+            if state.instance_id not in excluded
+        ]
         if allowed_lifecycles is not None:
             candidates = [
                 state
@@ -1881,6 +1907,9 @@ class ORDigitalTwin:
         instrument_id: str,
         event_type: str,
         additional_instance_requested: bool,
+        prefer_actionable_instance: bool = False,
+        exclude_queued_reservations: bool = True,
+        exclude_instance_ids: set[str] | None = None,
     ) -> InstrumentBelief | None:
         if event_type in ACTIVE_RETURN_INTENTS:
             return self._select_instance(
@@ -1899,13 +1928,34 @@ class ORDigitalTwin:
             same_type_prepositioned = self._select_instance(
                 instrument_id,
                 allowed_lifecycles={LIFECYCLE_PREPOSITIONED_RIGHT},
+                exclude_instance_ids=exclude_instance_ids,
             )
             if same_type_prepositioned is not None:
                 return same_type_prepositioned
 
+        if prefer_actionable_instance:
+            # A validated typed voice request is execution-authoritative over
+            # a stale surgeon/Mayo perception belief.  Prefer an instance that
+            # can be acted on immediately before falling back to an instance
+            # still believed to be surgeon-owned.
+            actionable_instance = self._select_instance(
+                instrument_id,
+                allowed_lifecycles={
+                    LIFECYCLE_HOME_RACK,
+                    LIFECYCLE_RETURNED_HOME,
+                    LIFECYCLE_MAYO_REUSE,
+                    LIFECYCLE_MAYO_RECOVERY,
+                },
+                exclude_reserved=exclude_queued_reservations,
+                exclude_instance_ids=exclude_instance_ids,
+            )
+            if actionable_instance is not None:
+                return actionable_instance
+
         same_type_surgeon_owned = self._select_instance(
             instrument_id,
             allowed_lifecycles={LIFECYCLE_SURGEON_OWNED},
+            exclude_instance_ids=exclude_instance_ids,
         )
         if same_type_surgeon_owned is not None and not additional_instance_requested:
             if same_type_surgeon_owned.location_type not in {
@@ -1921,7 +1971,8 @@ class ORDigitalTwin:
                     LIFECYCLE_MAYO_REUSE,
                     LIFECYCLE_MAYO_RECOVERY,
                 },
-                exclude_reserved=True,
+                exclude_reserved=exclude_queued_reservations,
+                exclude_instance_ids=exclude_instance_ids,
             )
             if available_instance is not None:
                 return available_instance
@@ -1936,7 +1987,8 @@ class ORDigitalTwin:
                 LIFECYCLE_MAYO_REUSE,
                 LIFECYCLE_MAYO_RECOVERY,
             },
-            exclude_reserved=True,
+            exclude_reserved=exclude_queued_reservations,
+            exclude_instance_ids=exclude_instance_ids,
         )
 
     def _request_cue_committed(self, cue: SurgeonRequestCue) -> bool:
@@ -1954,35 +2006,34 @@ class ORDigitalTwin:
             in {LIFECYCLE_PREPOSITIONED_RIGHT, LIFECYCLE_SURGEON_OWNED}
         )
 
-    def _supersede_blocked_active_voice_request(
-        self,
-        *,
-        incoming_instrument_id: str,
-    ) -> bool:
-        cue = self._active_request_cue()
-        if (
-            cue is None
-            or cue.event_type != "voice_request"
-            or cue.instrument_id == incoming_instrument_id
-            or self._request_cue_committed(cue)
-            or self.handover_allowed()
-        ):
-            return False
+    def _remove_older_voice_requests(self) -> list[tuple[SurgeonRequestCue, bool, bool]]:
+        """Remove every older voice cue before admitting the latest one.
 
-        superseded = self.state.surgeon_request_queue.popleft()
-        self._sync_active_request_from_queue()
-        self._record_event(
-            "SurgeonRequestSuperseded",
-            {
-                "superseded_tool": superseded.instrument_id,
-                "superseded_instance_id": superseded.instance_id,
-                "superseded_generation": superseded.generation,
-                "incoming_tool": incoming_instrument_id,
-                "reason": "newer_public_voice_request_replaced_uncommitted_blocked_request",
-                "queue_length": len(self.state.surgeon_request_queue),
-            },
-        )
-        return True
+        A typed voice handover is a correction-capable, latest-wins control
+        input.  Lower-priority visual/implicit cues may remain queued, but they
+        must never remain in front of, coalesce into, or replace the newest
+        validated voice cue.  Return enough context to emit an auditable
+        supersession record after the new generation has been allocated.
+        """
+
+        active = self._active_request_cue()
+        retained: deque[SurgeonRequestCue] = deque()
+        removed: list[tuple[SurgeonRequestCue, bool, bool]] = []
+        for cue in self.state.surgeon_request_queue:
+            if cue.event_type != "voice_request":
+                retained.append(cue)
+                continue
+            removed.append(
+                (
+                    cue,
+                    cue is active,
+                    self._request_cue_committed(cue),
+                )
+            )
+        if removed:
+            self.state.surgeon_request_queue = retained
+            self._sync_active_request_from_queue()
+        return removed
 
     def _enqueue_surgeon_request(
         self,
@@ -1995,6 +2046,7 @@ class ORDigitalTwin:
         ready_for_retrieval: bool = False,
         override: bool = False,
         force_shadow_additional_instance_assumption: bool = False,
+        typed_voice_execution_required: bool = False,
     ) -> bool:
         if not instrument_id:
             return False
@@ -2002,7 +2054,18 @@ class ORDigitalTwin:
             force_shadow_additional_instance_assumption
             or _requests_additional_instance(voice_text)
         )
-        if event_type in ACTIVE_REQUEST_INTENTS and not additional_instance_requested:
+        latest_voice_wins = bool(
+            event_type == "voice_request" and not additional_instance_requested
+        )
+        superseded_voice_requests = (
+            self._remove_older_voice_requests() if latest_voice_wins else []
+        )
+
+        if (
+            event_type in ACTIVE_REQUEST_INTENTS
+            and not additional_instance_requested
+            and not latest_voice_wins
+        ):
             for existing in self.state.surgeon_request_queue:
                 if (
                     existing.instrument_id == instrument_id
@@ -2019,28 +2082,63 @@ class ORDigitalTwin:
                         "SurgeonRequestCoalesced",
                         {
                             "queued_tool": instrument_id,
-                            "event_type": event_type,
+                            "request_event_type": event_type,
                             "queue_length": len(self.state.surgeon_request_queue),
                             "active_request_tool": self.state.surgeon_request_tool,
                         },
                     )
                     return bool(existing.shadow_additional_instance_assumed)
 
-        if event_type == "voice_request" and not additional_instance_requested:
-            self._supersede_blocked_active_voice_request(
-                incoming_instrument_id=instrument_id,
-            )
-            self._reconcile_shadow_capacity_for_public_request(
-                instrument_id=instrument_id,
-                voice_text=voice_text,
-            )
-
+        superseded_committed_instances = {
+            superseded.instance_id
+            for superseded, _was_active, was_committed in superseded_voice_requests
+            if was_committed and superseded.instance_id
+        }
         selected_instance = self._resolve_request_instance(
             instrument_id=instrument_id,
             event_type=event_type,
             additional_instance_requested=additional_instance_requested,
+            prefer_actionable_instance=typed_voice_execution_required,
+            exclude_queued_reservations=not latest_voice_wins,
+            exclude_instance_ids=superseded_committed_instances,
         )
+        if (
+            selected_instance is None
+            and latest_voice_wins
+            and superseded_committed_instances
+        ):
+            # Prefer a second physical instance so a late completion for the
+            # preempted command cannot satisfy the new generation.  A
+            # single-instance inventory still keeps the latest request rather
+            # than silently restoring or accepting the older voice cue; the
+            # generation fence below remains authoritative for completion.
+            selected_instance = self._resolve_request_instance(
+                instrument_id=instrument_id,
+                event_type=event_type,
+                additional_instance_requested=additional_instance_requested,
+                prefer_actionable_instance=typed_voice_execution_required,
+                exclude_queued_reservations=False,
+            )
         if selected_instance is None:
+            for superseded, was_active, was_committed in superseded_voice_requests:
+                self._record_event(
+                    "SurgeonRequestSuperseded",
+                    {
+                        "superseded_tool": superseded.instrument_id,
+                        "superseded_instance_id": superseded.instance_id,
+                        "superseded_generation": superseded.generation,
+                        "superseded_was_active": was_active,
+                        "superseded_was_committed": was_committed,
+                        "incoming_tool": instrument_id,
+                        "incoming_instance_id": "",
+                        "incoming_generation": 0,
+                        "incoming_admitted": False,
+                        "reason": (
+                            "newer_validated_voice_request_latest_wins_but_inventory_unavailable"
+                        ),
+                        "queue_length": len(self.state.surgeon_request_queue),
+                    },
+                )
             self._record_invariant_violation(
                 reason="requested_tool_inventory_exhausted",
                 event_type=event_type,
@@ -2060,14 +2158,35 @@ class ORDigitalTwin:
             override=override,
             shadow_additional_instance_assumed=additional_instance_requested,
         )
-        self.state.surgeon_request_queue.append(cue)
+        if latest_voice_wins:
+            # Voice has priority over any retained visual/implicit request.
+            self.state.surgeon_request_queue.appendleft(cue)
+        else:
+            self.state.surgeon_request_queue.append(cue)
         self._sync_active_request_from_queue()
+        for superseded, was_active, was_committed in superseded_voice_requests:
+            self._record_event(
+                "SurgeonRequestSuperseded",
+                {
+                    "superseded_tool": superseded.instrument_id,
+                    "superseded_instance_id": superseded.instance_id,
+                    "superseded_generation": superseded.generation,
+                    "superseded_was_active": was_active,
+                    "superseded_was_committed": was_committed,
+                    "incoming_tool": instrument_id,
+                    "incoming_instance_id": cue.instance_id,
+                    "incoming_generation": cue.generation,
+                    "incoming_admitted": True,
+                    "reason": "newer_validated_voice_request_latest_wins",
+                    "queue_length": len(self.state.surgeon_request_queue),
+                },
+            )
         self._record_event(
             "SurgeonRequestQueued",
             {
                 "queued_tool": instrument_id,
                 "queued_instance_id": cue.instance_id,
-                "event_type": event_type,
+                "request_event_type": event_type,
                 "voice_text": voice_text,
                 "queue_length": len(self.state.surgeon_request_queue),
                 "active_request_tool": self.state.surgeon_request_tool,
@@ -2076,68 +2195,39 @@ class ORDigitalTwin:
         )
         return additional_instance_requested
 
-    def _reconcile_shadow_capacity_for_public_request(
+    def _dequeue_active_request(
         self,
+        reason: str,
         *,
-        instrument_id: str,
-        voice_text: str,
+        completed_request_generation: int | None = None,
+        completion_command_id: str = "",
     ) -> bool:
-        if not self._allow_shadow_request_capacity_reconciliation:
-            return False
-        additional_instance = (
-            self._allow_shadow_type_instance_requests
-            and _requests_additional_instance(voice_text)
-        )
-        hand_states = self._surgeon_owned_hand_states()
-        if len(hand_states) < 2:
-            return False
-        if (
-            not additional_instance
-            and any(state.instrument_id == instrument_id for state in hand_states)
-        ):
-            return False
-        if self._is_field_deployed_for_phase(instrument_id):
-            return False
-
-        released = min(
-            hand_states,
-            key=lambda state: (
-                float(state.last_update_sec or 0.0),
-                state.instance_id,
-            ),
-        )
-        previous_location_type = released.location_type
-        previous_location_id = released.location_id
-        released.location_type = "surgical_field"
-        released.location_id = self._field_anchor_id()
-        released.owner = _owner_for_lifecycle(released)
-        released.status = _status_for_lifecycle(released)
-        self._update_visual_anchor(released)
-        self._record_shadow_assumption(
-            "ShadowPublicRequestHandCapacityReconciled",
-            {
-                "instrument_id": released.instrument_id,
-                "instance_id": released.instance_id,
-                "incoming_request_tool": instrument_id,
-                "previous_location_type": previous_location_type,
-                "previous_location_id": previous_location_id,
-                "location_type": released.location_type,
-                "location_id": released.location_id,
-                "reason": (
-                    "public_voice_request_implies_one_active_handover_slot;"
-                    "exact_non_hand_location_remains_unobserved"
-                ),
-            },
-        )
-        return True
-
-    def _dequeue_active_request(self, reason: str) -> None:
         cue = self._active_request_cue()
         if cue is None:
             self._sync_active_request_from_queue()
-            return
+            return False
+        if (
+            completed_request_generation is not None
+            and int(completed_request_generation) > 0
+            and int(cue.generation) != int(completed_request_generation)
+        ):
+            self._record_event(
+                "StaleSurgeonRequestCompletionIgnored",
+                {
+                    "reason": "completion_request_generation_mismatch",
+                    "completion_request_generation": int(
+                        completed_request_generation
+                    ),
+                    "active_request_generation": int(cue.generation),
+                    "active_request_tool": cue.instrument_id,
+                    "active_request_instance_id": cue.instance_id,
+                    "completion_command_id": completion_command_id,
+                },
+            )
+            return False
         completed_tool = cue.instrument_id
         completed_instance_id = cue.instance_id
+        completed_generation = int(cue.generation)
         self.state.surgeon_request_queue.popleft()
         self._sync_active_request_from_queue()
         self._record_event(
@@ -2145,11 +2235,13 @@ class ORDigitalTwin:
             {
                 "completed_tool": completed_tool,
                 "completed_instance_id": completed_instance_id,
+                "completed_generation": completed_generation,
                 "reason": reason,
                 "queue_length": len(self.state.surgeon_request_queue),
                 "active_request_tool": self.state.surgeon_request_tool,
             },
         )
+        return True
 
     def request_queue_summary(self) -> dict[str, Any]:
         return {
@@ -2157,6 +2249,11 @@ class ORDigitalTwin:
             "active_request_tool": self.state.surgeon_request_tool,
             "active_request_instance_id": self.state.surgeon_request_instance_id,
             "active_request_generation": self.state.surgeon_request_generation,
+            "active_request_event_type": (
+                self._active_request_cue().event_type
+                if self._active_request_cue() is not None
+                else ""
+            ),
             "active_request_additional_instance_assumed": (
                 self.state.surgeon_request_additional_instance_assumed
             ),
@@ -2165,6 +2262,9 @@ class ORDigitalTwin:
                 cue.instance_id for cue in self.state.surgeon_request_queue
             ],
             "queued_generations": [cue.generation for cue in self.state.surgeon_request_queue],
+            "queued_event_types": [
+                cue.event_type for cue in self.state.surgeon_request_queue
+            ],
             "queued_additional_instance_assumptions": [
                 cue.shadow_additional_instance_assumed
                 for cue in self.state.surgeon_request_queue
@@ -3159,17 +3259,44 @@ class ORDigitalTwin:
     def _open_recovery_transaction(
         self, instrument_or_instance_id: str, reason: str
     ) -> None:
-        state = self.get_instrument_state(
-            instrument_or_instance_id,
-            allowed_lifecycles={
-                LIFECYCLE_SURGEON_OWNED,
-                LIFECYCLE_MAYO_REUSE,
-                LIFECYCLE_MAYO_RECOVERY,
-                LIFECYCLE_RECOVERING_LEFT,
-                LIFECYCLE_CLEANING_LEFT,
-                LIFECYCLE_CLEANED_LEFT,
-            },
-        )
+        allowed_lifecycles = {
+            LIFECYCLE_SURGEON_OWNED,
+            LIFECYCLE_MAYO_REUSE,
+            LIFECYCLE_MAYO_RECOVERY,
+            LIFECYCLE_RECOVERING_LEFT,
+            LIFECYCLE_CLEANING_LEFT,
+            LIFECYCLE_CLEANED_LEFT,
+        }
+        state = self._state_by_instance(instrument_or_instance_id)
+        if state is not None and state.lifecycle_stage not in allowed_lifecycles:
+            state = None
+        if state is None:
+            resolved_type = (
+                self.spec.resolve_instrument_alias(instrument_or_instance_id)
+                or instrument_or_instance_id
+            )
+            candidates = [
+                candidate
+                for candidate in self._instances_for_type(resolved_type)
+                if candidate.lifecycle_stage in allowed_lifecycles
+            ]
+            if len(candidates) != 1:
+                if len(candidates) > 1:
+                    self._record_event(
+                        "RecoveryTransactionIgnored",
+                        {
+                            "instrument_id": resolved_type,
+                            "instance_id": "",
+                            "reason": "ambiguous_recovery_instance",
+                            "request_reason": reason,
+                            "candidate_instance_ids": [
+                                candidate.instance_id
+                                for candidate in candidates
+                            ],
+                        },
+                    )
+                return
+            state = candidates[0]
         if state is None:
             return
         instrument_id = state.instrument_id
@@ -3228,6 +3355,15 @@ class ORDigitalTwin:
         if instance_id in self.state.active_recovery_tool_instances:
             return
         self.state.active_recovery_tool_instances.append(instance_id)
+        opened_stamp = float(
+            getattr(self, "_current_event_stamp_sec", 0.0) or 0.0
+        )
+        if opened_stamp <= 0.0:
+            opened_stamp = time.time()
+        self._recovery_transaction_opened_stamp_by_instance.setdefault(
+            instance_id,
+            opened_stamp,
+        )
         if instrument_id not in self.state.active_recovery_tools:
             self.state.active_recovery_tools.append(instrument_id)
         self._record_event(
@@ -3256,6 +3392,10 @@ class ORDigitalTwin:
             for candidate in self.state.active_recovery_tool_instances
             if candidate != instance_id
         ]
+        self._recovery_transaction_opened_stamp_by_instance.pop(
+            instance_id,
+            None,
+        )
         instrument_id = (
             state.instrument_id
             if state is not None
@@ -3440,7 +3580,11 @@ class ORDigitalTwin:
                 confidence=confidence,
             )
         current_stage = state.lifecycle_stage
-        if current_stage not in {LIFECYCLE_MAYO_REUSE, LIFECYCLE_MAYO_RECOVERY}:
+        if (
+            current_stage not in {LIFECYCLE_MAYO_REUSE, LIFECYCLE_MAYO_RECOVERY}
+            or state.location_type != "mayo_stand"
+            or state.location_id != "mayo_stand"
+        ):
             return self._record_vlm_proposal_decision(
                 reducer_result="rejected",
                 reducer_reason="mayo_policy_tool_not_on_mayo",
@@ -3654,6 +3798,92 @@ class ORDigitalTwin:
             return True
         return False
 
+    def _has_exact_return_context(self, state: InstrumentBelief) -> bool:
+        """Return true only when a return cue identifies this exact instance."""
+
+        if state.instance_id in self.state.active_recovery_tool_instances:
+            return True
+        if self.state.surgeon_intent not in ACTIVE_RETURN_INTENTS:
+            return False
+        if self.state.surgeon_request_instance_id:
+            return self.state.surgeon_request_instance_id == state.instance_id
+        if self.state.surgeon_request_tool != state.instrument_id:
+            return False
+        active_same_type = [
+            candidate
+            for candidate in self._instances_for_type(state.instrument_id)
+            if candidate.lifecycle_stage == LIFECYCLE_SURGEON_OWNED
+        ]
+        return len(active_same_type) == 1 and active_same_type[0] is state
+
+    def _resolve_cam4_mayo_instance(
+        self,
+        *,
+        instrument_id: str,
+        direct_state: InstrumentBelief | None,
+    ) -> tuple[InstrumentBelief | None, str]:
+        """Resolve type-only CAM4 evidence without generic inventory ranking."""
+
+        active_recovery = [
+            state
+            for instance_id in self.state.active_recovery_tool_instances
+            if (state := self._state_by_instance(instance_id)) is not None
+            and state.instrument_id == instrument_id
+        ]
+        if len(active_recovery) > 1:
+            return None, "ambiguous_cam4_mayo_recovery_instance"
+        if direct_state is not None:
+            if active_recovery and active_recovery[0] is not direct_state:
+                return None, "cam4_mayo_recovery_instance_conflict"
+            if direct_state.lifecycle_stage in {
+                LIFECYCLE_HOME_RACK,
+                LIFECYCLE_RETURNED_HOME,
+            }:
+                return None, "cam4_mayo_home_instance_forbidden"
+            if direct_state.lifecycle_stage not in {
+                LIFECYCLE_SURGEON_OWNED,
+                LIFECYCLE_MAYO_REUSE,
+                LIFECYCLE_MAYO_RECOVERY,
+            }:
+                return None, "cam4_mayo_instance_not_surgeon_owned"
+            return direct_state, ""
+
+        if active_recovery:
+            recovery_state = active_recovery[0]
+            if recovery_state.lifecycle_stage not in {
+                LIFECYCLE_SURGEON_OWNED,
+                LIFECYCLE_MAYO_REUSE,
+                LIFECYCLE_MAYO_RECOVERY,
+            }:
+                return None, "cam4_mayo_recovery_instance_not_eligible"
+            return recovery_state, ""
+
+        surgeon_owned = [
+            state
+            for state in self._instances_for_type(instrument_id)
+            if state.lifecycle_stage == LIFECYCLE_SURGEON_OWNED
+        ]
+        if len(surgeon_owned) == 1:
+            return surgeon_owned[0], ""
+        if len(surgeon_owned) > 1:
+            return None, "ambiguous_cam4_mayo_instance"
+
+        already_mayo = [
+            state
+            for state in self._instances_for_type(instrument_id)
+            if state.lifecycle_stage
+            in {LIFECYCLE_MAYO_REUSE, LIFECYCLE_MAYO_RECOVERY}
+        ]
+        if len(already_mayo) == 1:
+            # This permits an idempotent observation only; it cannot move an
+            # inventory instance from another lifecycle.
+            return already_mayo[0], ""
+        return None, (
+            "ambiguous_cam4_mayo_instance"
+            if len(already_mayo) > 1
+            else "cam4_mayo_no_surgeon_owned_instance"
+        )
+
     def _observation_transition_allowed(
         self,
         *,
@@ -3661,44 +3891,39 @@ class ORDigitalTwin:
         observed_stage: str,
         source: str,
         confidence: float,
+        cam4_return_authorized: bool = False,
     ) -> tuple[bool, str]:
         current_stage = state.lifecycle_stage
         if observed_stage == current_stage:
             return (True, "")
         if (current_stage, observed_stage) in OBSERVATION_STICKY_DIRECT_BLOCKS:
             return (False, "observation_direct_rebase_forbidden")
-        corroborated_mayo_rebase = bool(
-            source in CAM4_MAYO_OBSERVATION_SOURCES
-            and current_stage
-            in {LIFECYCLE_HOME_RACK, LIFECYCLE_RETURNED_HOME}
-            and observed_stage == LIFECYCLE_MAYO_REUSE
-        )
-        if (
-            not self._transition_allowed(state, observed_stage)
-            and not corroborated_mayo_rebase
-        ):
+        if not self._transition_allowed(state, observed_stage):
             return (False, "illegal_observation_transition")
         if observed_stage == LIFECYCLE_MAYO_RECOVERY and current_stage in {
             LIFECYCLE_SURGEON_OWNED,
             LIFECYCLE_MAYO_REUSE,
         }:
-            if not self._has_strong_return_context(state.instance_id):
+            has_recovery_context = (
+                cam4_return_authorized
+                if source in CAM4_MAYO_OBSERVATION_SOURCES
+                else self._has_strong_return_context(state.instance_id)
+            )
+            if not has_recovery_context:
                 return (False, "observation_recovery_without_return_context")
         if (
             current_stage == LIFECYCLE_SURGEON_OWNED
-            and state.location_type in {"surgical_field", "bed_fixed_tool"}
             and observed_stage in {
                 LIFECYCLE_MAYO_REUSE,
                 LIFECYCLE_MAYO_RECOVERY,
             }
-            and not self._has_strong_return_context(state.instance_id)
         ):
-            stable_cam4_mayo_return = bool(
-                source in CAM4_MAYO_OBSERVATION_SOURCES
-                and observed_stage == LIFECYCLE_MAYO_REUSE
-                and confidence >= CAM4_MAYO_TRANSITION_MIN_CONFIDENCE
+            has_return_authority = (
+                cam4_return_authorized
+                if source in CAM4_MAYO_OBSERVATION_SOURCES
+                else self._has_strong_return_context(state.instance_id)
             )
-            if not stable_cam4_mayo_return:
+            if not has_return_authority:
                 return (
                     False,
                     "field_deployed_tool_requires_explicit_return_context",
@@ -3813,26 +4038,32 @@ class ORDigitalTwin:
         location_id: str,
         confidence: float,
         stamp_sec: float,
+        placement_evidence: str | None = None,
     ) -> None:
         observed_stage = _observed_lifecycle_for_location(state, location_type, location_id)
+        effective_placement_evidence = placement_evidence
+        if observed_stage in {LIFECYCLE_MAYO_REUSE, LIFECYCLE_MAYO_RECOVERY}:
+            # An idempotent or lower-authority visual update must not erase the
+            # provenance of an already confirmed CAM4 Mayo placement.
+            effective_placement_evidence = (
+                placement_evidence
+                or state.mayo_placement_evidence
+                or "public_visual_observation"
+            )
         self._set_lifecycle(
             state,
             observed_stage,
             location_type=location_type,
             location_id=location_id,
             confidence=confidence,
-            placement_evidence=(
-                "public_visual_observation"
-                if observed_stage
-                in {LIFECYCLE_MAYO_REUSE, LIFECYCLE_MAYO_RECOVERY}
-                else None
-            ),
+            placement_evidence=effective_placement_evidence,
         )
         state.last_update_sec = stamp_sec
         self._clear_observation_candidate(state.instance_id)
 
     def _clear_satisfied_request(self) -> None:
         self._sync_active_request_from_queue()
+        active_cue = self._active_request_cue()
         requested_tool = self.state.surgeon_request_tool or self.state.explicit_request_tool
         if not requested_tool:
             return
@@ -3846,6 +4077,12 @@ class ORDigitalTwin:
             self.state.surgeon_intent in ACTIVE_REQUEST_INTENTS
             and requested_state.lifecycle_stage == LIFECYCLE_SURGEON_OWNED
         ):
+            if active_cue is not None and active_cue.event_type == "voice_request":
+                # Visual observation and lifecycle normalization are advisory;
+                # they cannot clear a validated voice request.  Voice cues are
+                # consumed only by a controller completion event, whose request
+                # generation is checked when the producer supplies it.
+                return
             self._dequeue_active_request("requested_tool_handed_over")
             return
 
@@ -3866,13 +4103,27 @@ class ORDigitalTwin:
         ):
             return ""
         if state.lifecycle_stage == LIFECYCLE_PREPOSITIONED_RIGHT:
-            if self.state.execution_state in {"finishing", "completed"}:
-                return "return_unused_preposition"
-            requested_tool = self.state.surgeon_request_tool or self.state.explicit_request_tool
-            if requested_tool and requested_tool != state.instrument_id:
-                return "return_unused_preposition"
-            if self.state.right_hand_tool and self.state.right_hand_tool != state.instrument_id:
-                return "return_unused_preposition"
+            if self.state.active_robot_task is not None:
+                # Keep the explicit cue queued, but do not publish a new return
+                # obligation while another external tool Action is in flight.
+                return ""
+            # Only a canonical explicit tool request can mark the semantic
+            # preposition transition here. Direct-hand/implicit cues, procedure
+            # completion, and local occupancy conflicts are not return policy.
+            if (
+                self.state.surgeon_request_generation > 0
+                and self.state.surgeon_intent in EXPLICIT_TOOL_REQUEST_INTENTS
+            ):
+                requested_instance = self.state.surgeon_request_instance_id
+                requested_tool = (
+                    self.state.surgeon_request_tool
+                    or self.state.explicit_request_tool
+                )
+                if requested_instance:
+                    if requested_instance != state.instance_id:
+                        return "return_unused_preposition"
+                elif requested_tool and requested_tool != state.instrument_id:
+                    return "return_unused_preposition"
             return ""
         if state.lifecycle_stage == LIFECYCLE_SURGEON_OWNED:
             if self.state.execution_state == "finishing":
@@ -3910,7 +4161,6 @@ class ORDigitalTwin:
 
     def _recompute_transient_state(self) -> None:
         self._refresh_active_robot_task()
-        self._normalize_surgeon_hand_conflicts()
         self._normalize_cleaner_conflicts()
         for instance_id in list(
             self.state.active_recovery_tool_instances
@@ -3985,51 +4235,10 @@ class ORDigitalTwin:
         left_conflict = len(left_candidates) > 1
         self._set_flag("right_arm_overloaded", right_conflict)
         self._set_flag("left_arm_overloaded", left_conflict)
-        surgeon_owned_count = len(self._surgeon_owned_hand_states())
-        surgeon_owned_overloaded = surgeon_owned_count > 2
-        was_surgeon_overloaded = "surgeon_owned_overloaded" in self.state.safety_flags
-        self._set_flag("surgeon_owned_overloaded", surgeon_owned_overloaded)
-        if surgeon_owned_overloaded and not was_surgeon_overloaded:
-            self._record_event(
-                "InvariantViolationIgnored",
-                {
-                    "reason": "surgeon_owned_overloaded",
-                    "surgeon_owned_count": surgeon_owned_count,
-                },
-            )
         self._clear_satisfied_request()
         self._validate_inventory_invariants()
         self._normalize_robot_state()
         self._complete_if_cleanup_finished()
-
-    def _normalize_surgeon_hand_conflicts(self) -> None:
-        hand_states = self._surgeon_owned_hand_states()
-        if len(hand_states) <= 2:
-            return
-        already_reported = (
-            "surgeon_owned_overloaded" in self.state.safety_flags
-        )
-        self._set_flag("surgeon_owned_overloaded", True)
-        if already_reported:
-            return
-
-        self._record_event(
-            "StateInvariantViolation",
-            {
-                "reason": "surgeon_hand_capacity_exceeded",
-                "surgeon_hand_tools": [
-                    state.instrument_id for state in hand_states
-                ],
-                "surgeon_hand_instances": [
-                    state.instance_id for state in hand_states
-                ],
-                "active_request_tool": self._active_requested_tool_id(),
-                "active_request_instance_id": (
-                    self._active_requested_instance_id()
-                ),
-                "policy": "fail_closed_without_invented_mayo_placement",
-            },
-        )
 
     def _validate_inventory_invariants(self) -> None:
         expected_counts = self.spec.get_tool_inventory()
@@ -4171,8 +4380,6 @@ class ORDigitalTwin:
         if right_state is not None:
             self.state.robot_state = "handover_ready"
             return
-        if self.state.phase_uncertain and self.state.robot_state == "retracted":
-            return
         self.state.robot_state = "idle"
 
     def _right_arm_conflict(self, instance_id: str) -> bool:
@@ -4188,19 +4395,6 @@ class ORDigitalTwin:
             self.state.left_hand_tool_instance_id
             and self.state.left_hand_tool_instance_id != instance_id
         )
-
-    def _surgeon_hand_conflict(self, instance_id: str) -> str:
-        hand_states = [
-            state
-            for candidate_id, state in self.instrument_states.items()
-            if candidate_id != instance_id
-            and state.lifecycle_stage == LIFECYCLE_SURGEON_OWNED
-            and (state.location_type == "surgeon_hand" or state.status == "handed_over")
-        ]
-        if len(hand_states) < 2:
-            return ""
-        hand_states.sort(key=lambda state: state.last_update_sec or 0.0)
-        return hand_states[0].instance_id
 
     def update_explicit_request(self, request_text: str) -> str:
         if not request_text.strip():
@@ -4272,11 +4466,12 @@ class ORDigitalTwin:
             voice_text="",
             note="typed_voice_command_intent",
             ready_for_handover=True,
+            typed_voice_execution_required=True,
         )
 
         queued = any(
             cue.instrument_id == instrument_id
-            and cue.event_type in ACTIVE_REQUEST_INTENTS
+            and cue.event_type == "voice_request"
             for cue in self.state.surgeon_request_queue
         )
         self._recompute_transient_state()
@@ -4679,8 +4874,6 @@ class ORDigitalTwin:
             phase_id,
             reason="filtered_phase_updated",
         )
-        if not self.state.phase_uncertain and self.state.robot_state == "retracted":
-            self.state.robot_state = "idle"
         self._record_event(
             "PhaseUpdated",
             {
@@ -4697,6 +4890,8 @@ class ORDigitalTwin:
         *,
         source: str = "legacy_tool_observation",
         proposal_id: str = "",
+        placement_episode_started_sec: float | None = None,
+        placement_episode_id: str = "",
     ) -> dict[str, Any] | None:
         if not observation.visible:
             return None
@@ -4711,12 +4906,40 @@ class ORDigitalTwin:
         )
         location_type = observation.location_type
         location_id = observation.location_id
+        confidence = float(observation.confidence)
+        stamp_sec = _stamp_to_sec(observation.stamp)
         if location_type == "surgeon":
             # 0704 annotations identify the holder, not a particular hand or
             # field sub-location. Keep that conservative input vocabulary and
             # map it to the existing private surgeon-owned lane.
             location_type = "surgeon_hand"
             location_id = "surgeon_hand"
+        cam4_mayo_source = source in CAM4_MAYO_OBSERVATION_SOURCES
+        cam4_mayo_location = location_type in {
+            "mayo_stand",
+            "mayo_reuse_zone",
+            "mayo_recovery_zone",
+        }
+        if cam4_mayo_source and not cam4_mayo_location:
+            proposal_id = proposal_id or (
+                f"{source}:{instrument_id}:{location_type}:"
+                f"{location_id}:{stamp_sec:.3f}"
+            )
+            return self._record_observation_violation(
+                reason="cam4_mayo_location_invalid",
+                source=source,
+                proposal_id=proposal_id,
+                instrument_id=instrument_id,
+                current_stage=(
+                    direct_state.lifecycle_stage if direct_state else ""
+                ),
+                observed_stage="",
+                location_type=location_type,
+                location_id=location_id,
+                confidence=confidence,
+                stamp_sec=stamp_sec,
+                instance_id=(direct_state.instance_id if direct_state else ""),
+            )
         preferred_lifecycles: set[str] | None = None
         if location_type in {
             "mayo_stand",
@@ -4732,27 +4955,120 @@ class ORDigitalTwin:
                 LIFECYCLE_SURGEON_OWNED,
                 LIFECYCLE_PREPOSITIONED_RIGHT,
             }
-        current = (
-            direct_state
-            if direct_state is not None
-            else self._select_instance(
-                instrument_id,
-                allowed_lifecycles=preferred_lifecycles,
+        resolution_reason = ""
+        if cam4_mayo_source:
+            current, resolution_reason = self._resolve_cam4_mayo_instance(
+                instrument_id=instrument_id,
+                direct_state=direct_state,
             )
-        )
-        if current is None and preferred_lifecycles is not None:
-            current = self._select_instance(instrument_id)
+        else:
+            current = (
+                direct_state
+                if direct_state is not None
+                else self._select_instance(
+                    instrument_id,
+                    allowed_lifecycles=preferred_lifecycles,
+                )
+            )
+            if current is None and preferred_lifecycles is not None:
+                current = self._select_instance(instrument_id)
         if current is None:
+            proposal_id = proposal_id or (
+                f"{source}:{instrument_id}:{location_type}:"
+                f"{location_id}:{stamp_sec:.3f}"
+            )
+            if resolution_reason:
+                return self._record_observation_violation(
+                    reason=resolution_reason,
+                    source=source,
+                    proposal_id=proposal_id,
+                    instrument_id=instrument_id,
+                    current_stage="",
+                    observed_stage=LIFECYCLE_MAYO_REUSE,
+                    location_type=location_type,
+                    location_id=location_id,
+                    confidence=confidence,
+                    stamp_sec=stamp_sec,
+                )
             return None
         location_type = location_type or current.location_type
         location_id = location_id or current.location_id
-        confidence = float(observation.confidence)
-        stamp_sec = _stamp_to_sec(observation.stamp)
         proposal_id = proposal_id or (
             f"{source}:{current.instance_id}:{location_type}:"
             f"{location_id}:{stamp_sec:.3f}"
         )
         observed_stage = _observed_lifecycle_for_location(current, location_type, location_id)
+        exact_return_context = bool(
+            cam4_mayo_source and self._has_exact_return_context(current)
+        )
+        if exact_return_context and current.lifecycle_stage in {
+            LIFECYCLE_SURGEON_OWNED,
+            LIFECYCLE_MAYO_REUSE,
+        }:
+            observed_stage = LIFECYCLE_MAYO_RECOVERY
+
+        cam4_return_authorized = False
+        cam4_authority_reason = ""
+        if cam4_mayo_source and current.lifecycle_stage == LIFECYCLE_SURGEON_OWNED:
+            if confidence < CAM4_MAYO_TRANSITION_MIN_CONFIDENCE:
+                cam4_authority_reason = "cam4_mayo_confidence_below_threshold"
+            elif source != "cam4_rfdetr_mayo_observation":
+                cam4_authority_reason = "cam4_mayo_requires_typed_detector_episode"
+            else:
+                handover_stamp = float(
+                    self._last_handover_completed_stamp_by_instance.get(
+                        current.instance_id,
+                        0.0,
+                    )
+                )
+                episode_start = float(placement_episode_started_sec or 0.0)
+                if not placement_episode_id or episode_start <= 0.0:
+                    cam4_authority_reason = "cam4_mayo_missing_placement_episode"
+                elif episode_start > stamp_sec:
+                    cam4_authority_reason = "cam4_mayo_episode_after_observation"
+                else:
+                    transaction_stamp = float(
+                        self._recovery_transaction_opened_stamp_by_instance.get(
+                            current.instance_id,
+                            0.0,
+                        )
+                    )
+                    authority_floor = max(handover_stamp, transaction_stamp)
+                    if (
+                        not (
+                            exact_return_context
+                            and transaction_stamp > 0.0
+                        )
+                        and handover_stamp <= 0.0
+                    ):
+                        cam4_authority_reason = (
+                            "cam4_mayo_missing_handover_fence"
+                        )
+                    if (
+                        not cam4_authority_reason
+                        and episode_start <= authority_floor
+                    ):
+                        cam4_authority_reason = (
+                            "cam4_mayo_episode_precedes_return_authority"
+                        )
+                    if not cam4_authority_reason:
+                        cam4_return_authorized = True
+
+        if cam4_authority_reason:
+            self._clear_observation_candidate(current.instance_id)
+            return self._record_observation_violation(
+                reason=cam4_authority_reason,
+                source=source,
+                proposal_id=proposal_id,
+                instrument_id=instrument_id,
+                current_stage=current.lifecycle_stage,
+                observed_stage=observed_stage,
+                location_type=location_type,
+                location_id=location_id,
+                confidence=confidence,
+                stamp_sec=stamp_sec,
+                instance_id=current.instance_id,
+            )
 
         shadow_locked_instances = {
             instance_id
@@ -4787,6 +5103,7 @@ class ORDigitalTwin:
             observed_stage=observed_stage,
             source=source,
             confidence=confidence,
+            cam4_return_authorized=cam4_return_authorized,
         )
         if not allowed:
             result = self._record_observation_violation(
@@ -4835,6 +5152,11 @@ class ORDigitalTwin:
             location_id=location_id,
             confidence=confidence,
             stamp_sec=stamp_sec,
+            placement_evidence=(
+                "cam4_rfdetr_confirmed_mayo_placement"
+                if cam4_return_authorized
+                else None
+            ),
         )
         self._recompute_transient_state()
         return self._record_vlm_proposal_decision(
@@ -4994,7 +5316,197 @@ class ORDigitalTwin:
         )
         if selected is not None:
             return selected
+        if event.event_type in {
+            "PredictedToolReturnedToRack",
+            "UnusedPrepositionReturned",
+        }:
+            # An automatic return prediction is meaningful only for the
+            # currently prepositioned instance.  Never fall back by tool type
+            # and accidentally target a confirmed Mayo/surgeon-owned instance.
+            return None
         return self._select_instance(resolved_type)
+
+    @staticmethod
+    def _completion_request_generation(detail: dict[str, Any]) -> int | None:
+        """Return a producer-supplied generation, preserving legacy events.
+
+        Older execution bridges did not include ``request_generation`` in
+        ``TwinEvent.detail_json``.  Those events remain compatible and use the
+        historic instance/type matching behavior.  New producers can include
+        the generation so a late completion from a superseded Action cannot
+        consume the latest voice request.
+        """
+
+        if "request_generation" not in detail:
+            return None
+        try:
+            generation = int(detail.get("request_generation", 0))
+        except (TypeError, ValueError):
+            return None
+        return generation if generation > 0 else None
+
+    def _authoritative_handover_completion_rejection(
+        self,
+        event: TwinEvent,
+        state: InstrumentBelief | None,
+        detail: dict[str, Any],
+    ) -> tuple[bool, str]:
+        """Validate only provenance/correlation for a completed Action result.
+
+        Dispatch safety was already evaluated before the Action was sent.  A
+        correlated successful controller result is physical-state evidence,
+        so it must not be rejected later because the reducer missed an
+        intermediate grasp event or retains a conflicting arm belief.
+        """
+
+        if detail.get("authoritative_controller_completion") is not True:
+            return False, ""
+        projection_contract = {
+            "ToolPrepared": {
+                ("tray", "robot"): ("prepared", 1, 1),
+                ("mayo", "robot"): ("prepared", 1, 1),
+            },
+            "ToolHandoverCompleted": {
+                ("tray", "surgeon"): ("handover_completed", 1, 1),
+                ("robot", "surgeon"): ("handover_completed", 1, 1),
+            },
+            "ToolRetrievedFromMayo": {
+                ("mayo", "tray"): ("retrieved_from_mayo", 1, 2),
+            },
+            "ToolReturnedToTray": {
+                ("mayo", "tray"): ("returned_to_tray", 2, 2),
+                ("robot", "tray"): ("returned_to_tray", 1, 1),
+            },
+            "UnusedPrepositionReturned": {
+                ("robot", "mayo"): ("unused_preposition_returned", 1, 1),
+            },
+        }
+        event_contract = projection_contract.get(event.event_type)
+        if event_contract is None:
+            return True, "wrong_event_type"
+        if str(detail.get("controller_final_state", "")).strip() != "completed":
+            return True, "controller_result_not_completed"
+        expected_status = "prepared" if event.event_type == "ToolPrepared" else "completed"
+        if str(event.status or "").strip() != expected_status:
+            return True, "event_status_not_completed"
+        controller_leg = (
+            str(detail.get("controller_source_location", "")).strip().casefold(),
+            str(detail.get("controller_target_location", "")).strip().casefold(),
+        )
+        expected_projection = event_contract.get(controller_leg)
+        if expected_projection is None:
+            return True, "controller_semantic_leg_mismatch"
+        expected_step, expected_index, expected_count = expected_projection
+        projection_step = str(
+            detail.get("controller_projection_step", "")
+        ).strip()
+        try:
+            projection_index = int(detail.get("controller_projection_index", 0))
+            projection_count = int(detail.get("controller_projection_count", 0))
+        except (TypeError, ValueError):
+            return True, "invalid_controller_projection"
+        if (
+            projection_step != expected_step
+            or projection_index != expected_index
+            or projection_count != expected_count
+        ):
+            return True, "controller_projection_mismatch"
+        command_id = str(detail.get("command_id", "")).strip()
+        if not command_id:
+            return True, "missing_command_id"
+        instance_id = str(getattr(event, "instance_id", "") or "").strip()
+        if not instance_id or state is None or state.instance_id != instance_id:
+            return True, "instrument_instance_correlation_mismatch"
+        raw_instrument_id = str(event.instrument_id or "").strip()
+        resolved_instrument_id = (
+            self.spec.resolve_instrument_alias(raw_instrument_id)
+            or raw_instrument_id.partition("#")[0]
+        )
+        if not resolved_instrument_id or state.instrument_id != resolved_instrument_id:
+            return True, "instrument_type_correlation_mismatch"
+        if not str(event.target_location_id or "").strip():
+            return True, "missing_target_location"
+        if event.event_type == "UnusedPrepositionReturned" and (
+            "mayo" not in str(event.target_location_type or "").casefold()
+            or "mayo" not in str(event.target_location_id or "").casefold()
+        ):
+            return True, "unused_preposition_target_not_mayo"
+        try:
+            request_generation = int(detail.get("request_generation", 0))
+        except (TypeError, ValueError):
+            return True, "invalid_request_generation"
+        if request_generation < 0:
+            return True, "invalid_request_generation"
+        command_correlation = (
+            self._authoritative_handover_correlation_by_command.get(command_id)
+        )
+        if command_correlation is not None:
+            correlated_instance_id, correlated_leg = command_correlation
+            if correlated_instance_id != instance_id:
+                return True, "command_instance_correlation_mismatch"
+            if correlated_leg != controller_leg:
+                return True, "command_semantic_leg_correlation_mismatch"
+        stamp_sec = float(getattr(self, "_current_event_stamp_sec", 0.0) or 0.0)
+        if stamp_sec <= 0.0:
+            return True, "missing_completion_stamp"
+        applied_key = (command_id, projection_step)
+        applied = self._applied_authoritative_handover_commands.get(applied_key)
+        if applied is not None:
+            return True, (
+                "duplicate_completion_command"
+                if applied[0] == instance_id
+                else "command_instance_correlation_mismatch"
+            )
+        previous_completion = self._last_authoritative_handover_stamp_by_instance.get(
+            instance_id,
+            (0.0, "", 0),
+        )
+        previous_stamp, previous_command_id, previous_projection_index = (
+            previous_completion
+        )
+        if previous_stamp > 0.0 and (
+            stamp_sec < previous_stamp
+            or (
+                stamp_sec == previous_stamp
+                and (
+                    command_id != previous_command_id
+                    or projection_index <= previous_projection_index
+                )
+            )
+        ):
+            return True, "stale_completion_stamp"
+        return True, ""
+
+    def _record_authoritative_handover_completion(
+        self,
+        state: InstrumentBelief,
+        detail: dict[str, Any],
+    ) -> None:
+        command_id = str(detail.get("command_id", "")).strip()
+        projection_step = str(
+            detail.get("controller_projection_step", "")
+        ).strip()
+        projection_index = int(detail.get("controller_projection_index", 0))
+        self._applied_authoritative_handover_commands[
+            (command_id, projection_step)
+        ] = (
+            state.instance_id,
+            self._current_event_stamp_sec,
+        )
+        controller_leg = (
+            str(detail.get("controller_source_location", "")).strip().casefold(),
+            str(detail.get("controller_target_location", "")).strip().casefold(),
+        )
+        self._authoritative_handover_correlation_by_command[command_id] = (
+            state.instance_id,
+            controller_leg,
+        )
+        self._last_authoritative_handover_stamp_by_instance[state.instance_id] = (
+            self._current_event_stamp_sec,
+            command_id,
+            projection_index,
+        )
+        self._clear_observation_candidate(state.instance_id)
 
     def apply_event(self, event: TwinEvent) -> None:
         detail = json.loads(event.detail_json) if event.detail_json else {}
@@ -5016,6 +5528,26 @@ class ORDigitalTwin:
         instance_id = state.instance_id if state is not None else ""
         self._current_event_stamp_sec = _stamp_to_sec(event.stamp)
         self._recompute_transient_state()
+        (
+            authoritative_handover_completion,
+            authoritative_completion_rejection,
+        ) = self._authoritative_handover_completion_rejection(
+            event,
+            state,
+            detail,
+        )
+        if authoritative_completion_rejection:
+            self._record_event(
+                "AuthoritativeToolHandoverCompletionRejected",
+                {
+                    "reason": authoritative_completion_rejection,
+                    "command_id": str(detail.get("command_id", "")),
+                    "instrument_id": str(event.instrument_id or ""),
+                    "instance_id": str(getattr(event, "instance_id", "") or ""),
+                    "completion_stamp_sec": self._current_event_stamp_sec,
+                },
+            )
+            return
 
         if event.event_type == "RobotTaskStarted":
             self._start_active_robot_task(
@@ -5052,7 +5584,7 @@ class ORDigitalTwin:
             self._recompute_transient_state()
             return
 
-        if state and event.event_type in {
+        if state and not authoritative_handover_completion and event.event_type in {
             "RobotGraspedTool",
             "ToolPrepared",
             "ToolHandoverCompleted",
@@ -5068,7 +5600,7 @@ class ORDigitalTwin:
                 )
                 return
 
-        if state and event.event_type in {
+        if state and not authoritative_handover_completion and event.event_type in {
             "ToolReceivedFromSurgeon",
             "ToolRetrievedFromMayo",
             "ToolSentToCleaner",
@@ -5132,15 +5664,55 @@ class ORDigitalTwin:
                 or event.source_location_id
                 or state.location_id
             )
-            if not self._apply_event_transition(
-                state=state,
-                next_stage=LIFECYCLE_PREPOSITIONED_RIGHT,
-                event_type=event.event_type,
-                location_type=event.target_location_type or event.location_type or "robot_right_hand",
-                location_id=event.target_location_id or event.location_id or "robot_right_hand",
-                confidence=max(float(event.confidence), 0.95),
-                reserved_for=detail.get("reserved_for", self.state.filtered_phase),
+            if (
+                authoritative_handover_completion
+                and str(
+                    detail.get("controller_source_location", "")
+                ).strip().casefold()
+                == "mayo"
             ):
+                # The completed Mayo-to-robot Action is physical evidence even
+                # when the local lifecycle missed the preceding Mayo belief.
+                origin_lifecycle = LIFECYCLE_MAYO_REUSE
+                origin_location_type = event.source_location_type or "mayo_stand"
+                origin_location_id = event.source_location_id or "mayo_stand"
+            if authoritative_handover_completion:
+                self._set_lifecycle(
+                    state,
+                    LIFECYCLE_PREPOSITIONED_RIGHT,
+                    location_type=(
+                        event.target_location_type
+                        or event.location_type
+                        or "robot_right_hand"
+                    ),
+                    location_id=(
+                        event.target_location_id
+                        or event.location_id
+                        or "robot_right_hand"
+                    ),
+                    confidence=max(float(event.confidence), 0.95),
+                    last_update_sec=self._current_event_stamp_sec,
+                )
+                state.reserved_for = str(
+                    detail.get("reserved_for", self.state.filtered_phase)
+                )
+                self._record_authoritative_handover_completion(state, detail)
+                if str(
+                    detail.get("controller_source_location", "")
+                ).strip().casefold() == "mayo":
+                    self._close_recovery_transaction(
+                        state.instance_id,
+                        "controller_confirmed_mayo_tool_prepared",
+                    )
+            elif not self._apply_event_transition(
+                    state=state,
+                    next_stage=LIFECYCLE_PREPOSITIONED_RIGHT,
+                    event_type=event.event_type,
+                    location_type=event.target_location_type or event.location_type or "robot_right_hand",
+                    location_id=event.target_location_id or event.location_id or "robot_right_hand",
+                    confidence=max(float(event.confidence), 0.95),
+                    reserved_for=detail.get("reserved_for", self.state.filtered_phase),
+                ):
                 return
             state.preposition_origin_location_type = origin_location_type
             state.preposition_origin_location_id = origin_location_id
@@ -5154,47 +5726,42 @@ class ORDigitalTwin:
             field_deployed = self._is_field_deployed_for_phase(
                 state.instance_id
             )
-            active_surgeon_hand_tool = (
-                ""
-                if field_deployed
-                else self._surgeon_hand_conflict(state.instance_id)
+            handover_location_type = (
+                "surgical_field" if field_deployed else "surgeon_hand"
             )
-            if active_surgeon_hand_tool:
-                self._record_invariant_violation(
-                    reason="surgeon_hand_capacity_exceeded",
-                    event_type=event.event_type,
-                    instrument_id=instrument_id,
-                    active_tool=active_surgeon_hand_tool,
+            handover_location_id = (
+                self._field_anchor_id() if field_deployed else "surgeon_hand"
+            )
+            if authoritative_handover_completion:
+                # The controller has already completed the admitted Action.
+                # This is a post-completion belief projection, not a new
+                # transition request, so do not re-run planner lifecycle or
+                # arm-occupancy admission gates here.
+                self._set_lifecycle(
+                    state,
+                    LIFECYCLE_SURGEON_OWNED,
+                    location_type=handover_location_type,
+                    location_id=handover_location_id,
+                    confidence=max(float(event.confidence), 0.95),
+                    last_update_sec=self._current_event_stamp_sec,
                 )
-                self._record_event(
-                    "ToolHandoverBlocked",
-                    {
-                        "instrument_id": instrument_id,
-                        "instance_id": state.instance_id,
-                        "reason": "surgeon_hand_capacity_exceeded",
-                        "policy": (
-                            "public_mayo_placement_or_completion_cleanup_required"
-                        ),
-                    },
-                )
-                return
-            if not self._apply_event_transition(
+                self._record_authoritative_handover_completion(state, detail)
+            elif not self._apply_event_transition(
                 state=state,
                 next_stage=LIFECYCLE_SURGEON_OWNED,
                 event_type=event.event_type,
-                location_type=(
-                    "surgical_field"
-                    if field_deployed
-                    else "surgeon_hand"
-                ),
-                location_id=(
-                    self._field_anchor_id()
-                    if field_deployed
-                    else "surgeon_hand"
-                ),
+                location_type=handover_location_type,
+                location_id=handover_location_id,
                 confidence=max(float(event.confidence), 0.95),
             ):
                 return
+            handover_stamp = float(
+                getattr(self, "_current_event_stamp_sec", 0.0) or 0.0
+            )
+            if handover_stamp > 0.0:
+                self._last_handover_completed_stamp_by_instance[
+                    state.instance_id
+                ] = handover_stamp
             if handed_over_from_mayo:
                 self._close_recovery_transaction(
                     state.instance_id,
@@ -5205,7 +5772,13 @@ class ORDigitalTwin:
             state.preposition_origin_lifecycle_stage = ""
             self.state.robot_state = "idle"
             if self._is_active_requested_tool(state.instance_id):
-                self._dequeue_active_request("handover_completed")
+                self._dequeue_active_request(
+                    "handover_completed",
+                    completed_request_generation=(
+                        self._completion_request_generation(detail)
+                    ),
+                    completion_command_id=str(detail.get("command_id", "")),
+                )
             else:
                 self._sync_active_request_from_queue()
         elif event.event_type in {
@@ -5215,16 +5788,47 @@ class ORDigitalTwin:
             self._open_recovery_transaction(
                 state.instance_id, "robot_received_returned_tool"
             )
-            if not self._apply_event_transition(
-                state=state,
-                next_stage=LIFECYCLE_RECOVERING_LEFT,
-                event_type=event.event_type,
-                location_type="robot_left_hand",
-                location_id="robot_left_hand",
-                confidence=max(float(event.confidence), 0.95),
+            if authoritative_handover_completion:
+                self._set_lifecycle(
+                    state,
+                    LIFECYCLE_RECOVERING_LEFT,
+                    location_type="robot_left_hand",
+                    location_id="robot_left_hand",
+                    confidence=max(float(event.confidence), 0.95),
+                    last_update_sec=self._current_event_stamp_sec,
+                )
+                self._record_authoritative_handover_completion(state, detail)
+            elif not self._apply_event_transition(
+                    state=state,
+                    next_stage=LIFECYCLE_RECOVERING_LEFT,
+                    event_type=event.event_type,
+                    location_type="robot_left_hand",
+                    location_id="robot_left_hand",
+                    confidence=max(float(event.confidence), 0.95),
+                ):
+                    return
+            active_cue = self._active_request_cue()
+            if (
+                self._is_active_requested_tool(state.instance_id)
+                and active_cue is not None
+                and active_cue.event_type in ACTIVE_REQUEST_INTENTS
             ):
-                return
-            if self._is_active_requested_tool(state.instance_id):
+                # A handover request for a tool parked on Mayo is a two-step
+                # route: retrieve to the robot/tray, then hand it to the
+                # surgeon.  Retrieval is not completion of that request, so
+                # preserve the exact cue and generation for the second step.
+                self._record_event(
+                    "SurgeonHandoverRequestPreservedAfterMayoRetrieval",
+                    {
+                        "instrument_id": state.instrument_id,
+                        "instance_id": state.instance_id,
+                        "request_generation": int(active_cue.generation),
+                        "request_event_type": active_cue.event_type,
+                        "reason": "mayo_retrieval_is_intermediate_handover_step",
+                    },
+                )
+                self._sync_active_request_from_queue()
+            elif self._is_active_requested_tool(state.instance_id):
                 self._dequeue_active_request("retrieval_started")
             else:
                 self._sync_active_request_from_queue()
@@ -5305,58 +5909,117 @@ class ORDigitalTwin:
             "PredictedToolReturnedToRack",
             "UnusedPrepositionReturned",
         } and state:
-            return_to_mayo = (
-                event.event_type == "UnusedPrepositionReturned"
-                and (
-                    str(detail.get("target_lifecycle_stage", ""))
-                    == LIFECYCLE_MAYO_REUSE
-                    or event.target_location_type
-                    in {"mayo_stand", "mayo_reuse_zone"}
-                    or event.target_location_id
-                    in {"mayo_stand", "mayo_reuse_zone"}
-                )
-            )
-            if return_to_mayo:
-                if state.lifecycle_stage != LIFECYCLE_PREPOSITIONED_RIGHT:
-                    self._record_invariant_violation(
-                        reason="unused_preposition_return_requires_right_hand",
-                        event_type=event.event_type,
-                        instrument_id=instrument_id,
-                        proposed_stage=LIFECYCLE_MAYO_REUSE,
-                    )
-                    return
+            if (
+                authoritative_handover_completion
+                and event.event_type == "UnusedPrepositionReturned"
+            ):
                 self._set_lifecycle(
                     state,
                     LIFECYCLE_MAYO_REUSE,
+                    location_type="mayo_stand",
+                    location_id="mayo_stand",
+                    confidence=max(float(event.confidence), 0.95),
+                    last_update_sec=self._current_event_stamp_sec,
+                    placement_evidence="controller_confirmed_unused_preposition_to_mayo",
+                )
+                self._record_authoritative_handover_completion(state, detail)
+            elif (
+                authoritative_handover_completion
+                and event.event_type == "ToolReturnedToTray"
+            ):
+                self._set_lifecycle(
+                    state,
+                    LIFECYCLE_RETURNED_HOME,
                     location_type=(
-                        event.target_location_type or "mayo_stand"
+                        event.target_location_type or state.home_location_type
                     ),
                     location_id=(
-                        event.target_location_id or "mayo_stand"
+                        event.target_location_id or state.home_location_id
                     ),
                     confidence=max(float(event.confidence), 0.95),
-                    last_update_sec=getattr(
-                        self, "_current_event_stamp_sec", None
-                    ),
-                    placement_evidence=(
-                        "robot_returned_unused_preposition"
-                    ),
+                    last_update_sec=self._current_event_stamp_sec,
                 )
-                self._clear_observation_candidate(state.instance_id)
-            elif not self._apply_event_transition(
-                state=state,
-                next_stage=LIFECYCLE_RETURNED_HOME,
-                event_type=event.event_type,
-                location_type=(
-                    event.target_location_type
-                    or state.home_location_type
-                ),
-                location_id=(
-                    event.target_location_id or state.home_location_id
-                ),
-                confidence=max(float(event.confidence), 0.95),
-            ):
-                return
+                self._record_authoritative_handover_completion(state, detail)
+            else:
+                automatic_return_event = event.event_type in {
+                    "PredictedToolReturnedToRack",
+                    "UnusedPrepositionReturned",
+                }
+                mayo_origin = (
+                    state.preposition_origin_lifecycle_stage
+                    in {LIFECYCLE_MAYO_REUSE, LIFECYCLE_MAYO_RECOVERY}
+                    or state.preposition_origin_location_type
+                    in {"mayo_stand", "mayo_reuse_zone", "mayo_recovery_zone"}
+                    or state.preposition_origin_location_id
+                    in {"mayo_stand", "mayo_reuse_zone", "mayo_recovery_zone"}
+                )
+                explicit_mayo_target = (
+                        str(detail.get("target_lifecycle_stage", ""))
+                        == LIFECYCLE_MAYO_REUSE
+                        or event.target_location_type
+                        in {"mayo_stand", "mayo_reuse_zone"}
+                        or event.target_location_id
+                        in {"mayo_stand", "mayo_reuse_zone"}
+                )
+                return_to_mayo = automatic_return_event and (
+                    mayo_origin or explicit_mayo_target
+                )
+                if return_to_mayo:
+                    if state.lifecycle_stage != LIFECYCLE_PREPOSITIONED_RIGHT:
+                        self._record_invariant_violation(
+                            reason="unused_preposition_return_requires_right_hand",
+                            event_type=event.event_type,
+                            instrument_id=instrument_id,
+                            proposed_stage=LIFECYCLE_MAYO_REUSE,
+                        )
+                        return
+                    self._set_lifecycle(
+                        state,
+                        LIFECYCLE_MAYO_REUSE,
+                        location_type=(
+                            event.target_location_type or "mayo_stand"
+                        ),
+                        location_id=(
+                            event.target_location_id or "mayo_stand"
+                        ),
+                        confidence=max(float(event.confidence), 0.95),
+                        last_update_sec=getattr(
+                            self, "_current_event_stamp_sec", None
+                        ),
+                        placement_evidence=(
+                            "mayo_origin_preserved_on_auto_return"
+                            if mayo_origin
+                            else "robot_returned_unused_preposition"
+                        ),
+                    )
+                    self._clear_observation_candidate(state.instance_id)
+                    if mayo_origin:
+                        self._record_event(
+                            "AutomaticRackReturnRedirectedToMayo",
+                            {
+                                "instrument_id": state.instrument_id,
+                                "instance_id": state.instance_id,
+                                "event_type": event.event_type,
+                                "origin_lifecycle_stage": (
+                                    state.preposition_origin_lifecycle_stage
+                                ),
+                                "reason": "confirmed_mayo_origin_is_sticky",
+                            },
+                        )
+                elif not self._apply_event_transition(
+                    state=state,
+                    next_stage=LIFECYCLE_RETURNED_HOME,
+                    event_type=event.event_type,
+                    location_type=(
+                        event.target_location_type
+                        or state.home_location_type
+                    ),
+                    location_id=(
+                        event.target_location_id or state.home_location_id
+                    ),
+                    confidence=max(float(event.confidence), 0.95),
+                ):
+                    return
             state.preposition_origin_location_type = ""
             state.preposition_origin_location_id = ""
             state.preposition_origin_lifecycle_stage = ""
@@ -5410,19 +6073,43 @@ class ORDigitalTwin:
             }
         )
 
-    def handover_allowed(self) -> bool:
-        voice_backed_request = self.explicit_request_voice_backed()
-        if any(
-            flag in BLOCKING_SAFETY_FLAGS
-            and not (voice_backed_request and flag == "vlm_unhealthy")
-            for flag in self.state.safety_flags
-        ):
+    def direct_hand_preposition_ready(self) -> bool:
+        """Return whether direct-hand delivery can ignore only VLM health."""
+
+        state = self.state
+        if not bool(state.running) or state.execution_state != "running":
             return False
         if (
-            self.spec.bundle.action_guard
-            and self.spec.bundle.action_guard.block_handover_when_phase_uncertain
-            and self.state.phase_uncertain
-            and not voice_backed_request
+            not bool(state.implicit_request_visible)
+            or state.implicit_request_tool
+            or state.implicit_request_hand_pose != "open_receive"
+            or float(state.implicit_request_confidence) < 0.50
+            or float(state.implicit_request_stability_sec) < 0.30
+            or not state.prepositioned_tool
+            or not state.prepositioned_tool_instance_id
+        ):
+            return False
+        candidate = self.get_instrument_state(state.prepositioned_tool_instance_id)
+        return bool(
+            candidate is not None
+            and candidate.instrument_id == state.prepositioned_tool
+            and candidate.lifecycle_stage == LIFECYCLE_PREPOSITIONED_RIGHT
+            and candidate.owner == "robot_right_hand"
+            and candidate.location_id == "robot_right_hand"
+            and candidate.location_type == "robot_right_hand"
+            and state.right_hand_tool_instance_id == candidate.instance_id
+        )
+
+    def handover_allowed(self) -> bool:
+        voice_backed_request = self.explicit_request_voice_backed()
+        direct_hand_preposition = self.direct_hand_preposition_ready()
+        if any(
+            flag in BLOCKING_SAFETY_FLAGS
+            and not (
+                (voice_backed_request or direct_hand_preposition)
+                and flag == "vlm_unhealthy"
+            )
+            for flag in self.state.safety_flags
         ):
             return False
         if self.state.active_robot_task is not None:
@@ -5446,17 +6133,6 @@ class ORDigitalTwin:
         if requested_state.contaminated and not requested_on_mayo:
             return False
         if requested_state.lifecycle_stage == LIFECYCLE_SURGEON_OWNED:
-            return False
-        surgeon_owned_count = sum(
-            1
-            for state in self.instrument_states.values()
-            if state.lifecycle_stage == LIFECYCLE_SURGEON_OWNED
-            and (state.location_type == "surgeon_hand" or state.status == "handed_over")
-        )
-        field_deployed = self._is_field_deployed_for_phase(
-            requested_state.instance_id
-        )
-        if surgeon_owned_count >= 2 and not field_deployed:
             return False
         if requested_state.lifecycle_stage not in {
             LIFECYCLE_HOME_RACK,

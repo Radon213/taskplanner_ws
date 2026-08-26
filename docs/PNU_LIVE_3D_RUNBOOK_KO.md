@@ -24,11 +24,13 @@
   경우에만 camera-frame planar 4DoF orientation을 내보내며, 실패하면 즉시
   position-only로 강등한다. 이것은 자유 6DoF/robot-world/TCP 보정이 아니고
   Taskplanner 제어 입력으로 소비하지 않는다.
-- Tool, Blood, Hand 자산은 모두 설치돼 있고 manifest의 size/SHA256 검사를
-  통과한다. Tool checkpoint는 `133,941,485 bytes`, SHA256
+- Upstream worker에는 Tool, Blood, Hand 자산이 설치돼 있지만 Taskplanner PNU
+  admission은 `tool,blood`만 요청·pin·검증한다. Tool checkpoint는
+  `133,941,485 bytes`, SHA256
   `253617aa5337fec219d694ca50537e4867fb8c403ce60f3a6945bbe15fecf430`으로
-  고정한다. 세 자산 중 하나라도 없거나 digest가 다르면 worker health와
-  required-perception startup gate는 fail-closed로 실패한다.
+  고정한다. 요청된 두 자산 중 하나라도 없거나 digest가 다르면 worker health와
+  required-perception startup gate는 fail-closed로 실패한다. 외부 v1 capability의
+  legacy Hand record는 ABI 호환용이며 이 gate에는 참여하지 않는다.
 
 ## 데이터 흐름
 
@@ -112,7 +114,6 @@ Tool/Pose만, CAM4는 Tool/Pose/Hand/Blood를 발급한다.
 | 기존 Mayo 관찰, Digital Twin 입력 | `/surgery/perception/cam4/mayo_tool_observations` | `surgical_msgs/msg/ToolObservation`, RELIABLE/VOLATILE/30 |
 | Tool 2D 관찰 | `/surgery/perception/cam4/observations` | `surgical_perception_msgs/msg/ToolObservation2DArray`, RELIABLE/VOLATILE/10 |
 | Tool metric pose | `/surgery/perception/cam4/tool_poses` | `surgical_perception_msgs/msg/ToolPoseArray`, RELIABLE/VOLATILE/10 |
-| Hand 2D/3D keypoints와 palm | `/surgery/perception/cam4/hand_keypoints` | `hand_keypoint_interfaces/msg/HandKeypoints`, RELIABLE/VOLATILE/10 |
 | Blood mask/centroid depth 요약 | `/surgery/perception/cam4/blood_semantics/json` | `std_msgs/msg/String`, RELIABLE/VOLATILE/10 |
 | CAM4 디버그 overlay | `/surgery/images/cam4/detection_overlay/compressed` | `sensor_msgs/msg/CompressedImage`, BEST_EFFORT/VOLATILE/2 |
 | Tool 자세축 overlay | `/surgery/images/cam4/pose_overlay/compressed` | `sensor_msgs/msg/CompressedImage`, BEST_EFFORT/VOLATILE/2 |
@@ -142,13 +143,10 @@ Tool/Pose/Hand/Blood layer별 `live/stale/missing/disabled`, 결과 수와 drop 
 결과는 scalar 증거 검토용으로 유지하되 원본/개별 overlay JPEG를 추가 구독하지
 않는다. 검출 0건은 transport 실패가 아니며 실행 상태와 결과 count로 구분한다.
 
-Hand 카드는 typed `HandKeypoints`의 handedness, 21개 joint 2D/3D, joint별 depth
-validity, palm translation/quaternion/3x3 rotation matrix와 `depth_source`를 표시한다.
 Blood 카드는 instance/combined centroid의 pixel 좌표와 metric depth validity를
-표시한다. 두 결과는 다음 frame 메시지가 먼저 도착해도 stamp별 bounded buffer에
-보관했다가 같은 검출 overlay가 도착했을 때만 승격한다. overlay rate-limit frame은
-의도적으로 `대기`로 표시하며 이전 frame의 수치를 현재 frame인 것처럼 유지하지
-않는다.
+표시한다. 다음 frame 메시지가 먼저 도착하면 stamp별 bounded buffer에 보관했다가
+같은 diagnostics가 도착했을 때만 승격한다. rate-limit frame은 의도적으로
+`대기`로 표시하며 이전 frame의 수치를 현재 frame인 것처럼 유지하지 않는다.
 
 같은 화면의 support-plane 진단은 보정 당시의 고정 fit 품질과 현재 frame의
 runtime drift 측정을 분리해 표시한다. artifact/version pin, static reason,
@@ -167,8 +165,8 @@ scripts/taskplanner up debug --build
 항상 일치시킨다.
 
 ```bash
-PNU_DEBUG_REQUESTED_ALGORITHMS=tool,blood,hand
-PNU_WORKER_REQUIRED_ALGORITHMS=tool,blood,hand
+PNU_DEBUG_REQUESTED_ALGORITHMS=tool,blood
+PNU_WORKER_REQUIRED_ALGORITHMS=tool,blood
 ```
 
 ## Taskplanner 연결 경계와 ontology
@@ -184,18 +182,21 @@ PNU의 typed Tool 출력은 upstream ontology와 원래 `class_name`을 그대�
 | `4 / Adson Forceps` | `Adson forceps` |
 | `5 / Bipolar Forceps` | `Bipolar cautery` |
 | `6 / Bovie` | `Bovie surgical cautery` |
-| `7 / Army-Navy Retractor` | `Army navy retractor` |
-| `8 / Thyroid Retractor` | `Thyroid retractor` |
+| `7 / Army-Navy Retractor` | 베드로봇팔 전용 — 도구랙/Mayo 호환 경로 제외 |
+| `8 / Thyroid Retractor` | 베드로봇팔 전용 — 도구랙/Mayo 호환 경로 제외 |
 
 ID/name pair가 다르거나 알려지지 않은 label은 semantics/Mayo 호환 경로에서
-버린다. 실제 procedure spec으로 `thyroidectomy_demo`는 8/8이 resolve되고,
-일반 `thyroidectomy`는 catalog에 T11이 없으므로 Thyroid Retractor만 생성하지
-않고 7/8이 resolve된다.
+버린다. `thyroidectomy_demo`에서는 사람/휴머노이드 handover용 여섯 도구만
+도구랙 catalog에 존재한다. Army-Navy와 Thyroid Retractor 검출은 원본 PNU
+ontology에는 남지만, rack tool·Mayo observation·음성 handover로 해석되지 않는다.
+베드로봇팔의 장착/상태는 별도 controller contract가 확인할 때만 사용한다.
 
-현재 planner가 실제로 구독하는 호환 경로는 Tool semantics→RealVLM과 안정화된
-Mayo observation→Digital Twin이다. 새 ToolPose/Observation, HandKeypoints,
-Blood semantics 토픽은 아직 monitor-only이며 직접 구독하는 BT/control node가
-없다. 특히 `metric_3d_ready`만으로 로봇 명령을 만들지 않는다. ToolPose의
+현재 planner가 실제로 구독하는 PNU 호환 경로는 Tool semantics→RealVLM과
+안정화된 Mayo observation→Digital Twin이다. PNU bridge의 HandKeypoints 출력은
+폐기됐다. 1.7의 canonical `/perception/cam_4/hand/keypoints`는 RF-DETR Mayo release
+확인의 보조 증거로만 유지되고, gesture/facing direct 토픽은 별도 손 전달 게이트가
+소비한다. ToolPose/Observation과 Blood semantics는 monitor-only다. 특히
+`metric_3d_ready`만으로 로봇 명령을 만들지 않는다. ToolPose의
 `validity`, `orientation_valid`, support-plane 승인, robot-frame TF와 age gate가
 모두 추가되기 전까지 motion authority는 비활성이다.
 
@@ -273,7 +274,7 @@ PERCEPTION_PROVIDER=pnu_hand_blood
 PERCEPTION_LOCATION=local
 PERCEPTION_ENDPOINT=http://127.0.0.1:8020
 PNU_SERVICE_URL=http://127.0.0.1:8020
-PNU_EXPECTED_MODEL_DIGESTS_JSON={"tool":"253617aa5337fec219d694ca50537e4867fb8c403ce60f3a6945bbe15fecf430","blood":"f4967b2b8c7ab63921f8aa9b2ea0a4e3324243a9b98253da3ea4b9ecd6df6f75","hand":"fbc2a30080c3c557093b5ddfc334698132eb341044ccee322ccf8bcf3607cde1"}
+PNU_EXPECTED_MODEL_DIGESTS_JSON={"tool":"253617aa5337fec219d694ca50537e4867fb8c403ce60f3a6945bbe15fecf430","blood":"f4967b2b8c7ab63921f8aa9b2ea0a4e3324243a9b98253da3ea4b9ecd6df6f75"}
 PNU_EXPECTED_TOOL_SUPPORT_PLANE_CONFIG_VERSION=viplab_cam4_146222251000_support_plane_v1_sha256_b683ecd5a5382a4f
 REQUIRE_PERCEPTION_ON_START=true
 PNU_REQUIRE_METRIC_3D_ON_START=true
@@ -319,7 +320,7 @@ set -a
 . config/pnu_perception/cam4_support_plane.env
 set +a
 
-export PNU_EXPECTED_MODEL_DIGESTS_JSON='{"tool":"253617aa5337fec219d694ca50537e4867fb8c403ce60f3a6945bbe15fecf430","blood":"f4967b2b8c7ab63921f8aa9b2ea0a4e3324243a9b98253da3ea4b9ecd6df6f75","hand":"fbc2a30080c3c557093b5ddfc334698132eb341044ccee322ccf8bcf3607cde1"}'
+export PNU_EXPECTED_MODEL_DIGESTS_JSON='{"tool":"253617aa5337fec219d694ca50537e4867fb8c403ce60f3a6945bbe15fecf430","blood":"f4967b2b8c7ab63921f8aa9b2ea0a4e3324243a9b98253da3ea4b9ecd6df6f75"}'
 
 PERCEPTION_DOCKERFILE=docker/rfdetr-perception/Dockerfile.unified \
 PERCEPTION_IMAGE=taskplanner-rfdetr-perception:unified-compat \
@@ -366,7 +367,7 @@ export PNU_SECRET_ROOT=/absolute/path/to/taskplanner-perception-secret
 export PNU_CLIENT_API_TOKEN_FILE=/run/taskplanner/perception/token
 export PNU_ALLOW_INSECURE_REMOTE_HTTP=false
 export PNU_ALLOW_UNAUTHENTICATED_REMOTE=false
-export PNU_EXPECTED_MODEL_DIGESTS_JSON='{"tool":"253617aa5337fec219d694ca50537e4867fb8c403ce60f3a6945bbe15fecf430","blood":"f4967b2b8c7ab63921f8aa9b2ea0a4e3324243a9b98253da3ea4b9ecd6df6f75","hand":"fbc2a30080c3c557093b5ddfc334698132eb341044ccee322ccf8bcf3607cde1"}'
+export PNU_EXPECTED_MODEL_DIGESTS_JSON='{"tool":"253617aa5337fec219d694ca50537e4867fb8c403ce60f3a6945bbe15fecf430","blood":"f4967b2b8c7ab63921f8aa9b2ea0a4e3324243a9b98253da3ea4b9ecd6df6f75"}'
 export REQUIRE_PERCEPTION_ON_START=true
 export PNU_REQUIRE_METRIC_3D_ON_START=true
 ```

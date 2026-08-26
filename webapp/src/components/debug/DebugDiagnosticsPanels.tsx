@@ -69,7 +69,7 @@ function interpretationLabel(interpretation: IntegrationDebugStatus["voice"]["re
   : never): string {
   if (!interpretation?.command) return interpretation?.reason || "수신 전";
   if (interpretation.command !== "adjust_retraction") return interpretation.command;
-  const side = interpretation.target_side === "left" ? "왼쪽" : interpretation.target_side === "right" ? "오른쪽" : "대상 없음";
+  const side = interpretation.target_side === "left" ? "왼쪽" : interpretation.target_side === "right" ? "오른쪽" : interpretation.target_side === "both" ? "양쪽" : "대상 없음";
   return `Retraction 더 · ${side} ${(interpretation.distance_m * 100).toFixed(0)} cm`;
 }
 
@@ -85,6 +85,9 @@ export function ForceRetractionIdleControl({
   disabled,
   internalState,
   internalStateLabel,
+  bypassEnabled,
+  bypassDisabled,
+  bypassInvoke,
   pending,
   onReset,
 }: {
@@ -92,6 +95,9 @@ export function ForceRetractionIdleControl({
   disabled: boolean;
   internalState: string;
   internalStateLabel: string;
+  bypassEnabled?: boolean;
+  bypassDisabled?: boolean;
+  bypassInvoke?: RunDebugCommand;
   pending: boolean;
   onReset: () => void;
 }) {
@@ -112,6 +118,17 @@ export function ForceRetractionIdleControl({
 
   return (
     <>
+      {bypassInvoke ? (
+        <button
+          aria-pressed={bypassEnabled === true}
+          className="button button-secondary"
+          disabled={bypassDisabled}
+          onClick={() => void bypassInvoke("configure_retraction_state_machine_bypass", { enabled: bypassEnabled !== true })}
+          type="button"
+        >
+          {bypassEnabled === true ? "상태머신 제한 켜기" : "상태머신 제한 해제"}
+        </button>
+      ) : null}
       <div className="debug-state-message warning" data-slot="debug-force-retraction-idle" role="note">
         <RotateCcw size={18} aria-hidden="true" />
         <div>
@@ -153,6 +170,7 @@ export function DebugIntegrationPipeline({ status, kind }: {
 }) {
   const sentence = status.inputs.find((row) => row.topic === "/sensors/surgeon/sentence");
   const adapted = status.inputs.find((row) => row.topic === "/surgery/audio/request_text");
+  const adapterStatus = status.inputs.find((row) => row.topic === "/integration/debug/speech/status");
   const retraction = status.voice.retraction;
   const parse = status.voice.last_parse;
   const selectedSource = status.virtual_robot?.selected_source === "virtual" ? "virtual" : "external";
@@ -163,14 +181,25 @@ export function DebugIntegrationPipeline({ status, kind }: {
   const normalized = kind === "tool_voice" ? parse.matched === true && parse.operation === "tool_handover" : Boolean(retraction?.last_interpretation?.command);
   const rejected = kind === "tool_voice" ? parse.ambiguous === true : Boolean(retraction?.last_rejection_reason) && !pending;
   const sttReady = sentence?.state === "READY" || status.asr.state === "LISTENING" || Boolean(status.voice.last_sentence);
-  const adapterReady = adapted?.state === "READY";
+  // /surgery/audio/request_text is an event topic.  It correctly remains
+  // WAITING_MESSAGES until the first final transcript, which is not an
+  // adapter failure.  The Debug-only heartbeat reports whether the adapter is
+  // actually alive; reserve the error treatment for a real transport fault.
+  const adapterOnline = adapterStatus?.state === "READY";
+  const adapterFault = ["TYPE_MISMATCH", "WAITING_PUBLISHER", "LOW_RATE", "STALE"].includes(adapterStatus?.state || "");
+  const adapterOutputObserved = (adapted?.message_count || 0) > 0;
+  const adapterStageClass = adapterOnline ? (adapterOutputObserved ? "success" : "pending") : adapterFault ? "error" : "idle";
+  const adapterStageState = adapterOnline ? (adapterOutputObserved ? "DELIVERED" : "PENDING_FINAL") : adapterFault ? "ERROR" : "STARTING";
+  const adapterDetail = adapterOnline
+    ? adapterOutputObserved ? "전달 확인됨" : "final 문장 대기"
+    : adapterFault ? `adapter ${adapterStatus?.state}` : "adapter 시작 대기";
   const scenario = kind === "tool_voice" ? "음성 도구전달" : "리트랙터 음성";
   return (
     <article className="debug-section-card debug-pipeline-card" data-slot="debug-integration-pipeline">
-      <div className="debug-section-heading"><div><p>ACTUAL DEBUG PIPELINE</p><h2>{scenario} 통합 경로</h2><span>micro-test와 달리 조건 충족 시 선택된 서버에 실제 Debug 요청을 보냅니다.</span></div><StatusBadge state={endpointReady && adapterReady ? "READY" : "WAITING"} label={`${selectedSource === "virtual" ? "가상" : "외부"} 서버 선택`} /></div>
+      <div className="debug-section-heading"><div><p>ACTUAL DEBUG PIPELINE</p><h2>{scenario} 통합 경로</h2><span>micro-test와 달리 조건 충족 시 선택된 서버에 실제 Debug 요청을 보냅니다.</span></div><StatusBadge state={endpointReady && adapterOnline ? "READY" : "WAITING"} label={`${selectedSource === "virtual" ? "가상" : "외부"} 서버 선택`} /></div>
       <ol className="debug-flow-strip four" aria-label={`${scenario} 실제 처리 단계`}>
         <li className={sttReady ? "success" : sentence && sentence.state !== "READY" ? "error" : "idle"}><span>1</span><div><strong>USB·수동 STT</strong><small>/sensors/surgeon/sentence · {sttReady ? "final 준비" : sentence?.state || "대기"}</small></div></li>
-        <li className={adapterReady ? "success" : adapted && adapted.state !== "READY" ? "error" : "idle"}><span>2</span><div><strong>Speech adapter</strong><small>/surgery/audio/request_text · {adapted?.state || "상태 대기"}</small></div></li>
+        <li className={adapterStageClass} data-slot="debug-speech-adapter-stage" data-stage-state={adapterStageState}><span>2</span><div><strong>Speech adapter</strong><small>/surgery/audio/request_text · {adapterDetail}</small></div></li>
         <li className={pending ? "pending" : normalized ? "success" : rejected ? "error" : "idle"}><span>3</span><div><strong>{kind === "tool_voice" ? "결정론 도구 해석" : "Text VLM·결정론"}</strong><small>{pending ? "해석 중" : normalized ? "정규화 완료" : rejected ? "거부됨" : "문장 대기"}</small></div></li>
         <li className={endpointReady ? "success" : "error"}><span>4</span><div><strong>{selectedSource === "virtual" ? "가상 진단 서버" : "외부 실제 서버"}</strong><small>{kind === "tool_voice" ? "Tool Handover Action" : "Retraction Service"} · {endpointReady ? "발견" : "미발견"}</small></div></li>
       </ol>
@@ -284,6 +313,10 @@ function TextVlmPanel({ status, connected, runCommand, openStt }: {
   const runtimeLoading = pending === "vlm_load" || vlm?.probe_pending === true || vlm?.load_state?.toLowerCase() === "loading";
   const runtimeLoadError = vlm?.load_state?.toLowerCase() === "error" || vlm?.detail?.startsWith("load_failed:");
   const loadable = vlm?.runtime_managed === true && vlm.available === true;
+  const interventionAllowed = status.runtime.operational_intervention_allowed === true;
+  const modelLoadAllowed = interventionAllowed && status.session.armed;
+  const modelLoadBlockReason = status.runtime.operational_intervention_block_reason?.trim()
+    || "시나리오를 일시정지하거나 완전히 정지하고 공유 로봇 자원이 idle인지 확인하세요.";
   const outputAvailable = interpretation !== null && interpretation !== undefined && !(typeof interpretation === "object" && !Array.isArray(interpretation) && !Object.keys(interpretation).length);
   const resultState = String(microResult?.state ?? backendMicroState);
   const resultLatency = typeof microResult?.latency_ms === "number" ? microResult.latency_ms : vlm?.micro_test?.latency_ms;
@@ -303,8 +336,9 @@ function TextVlmPanel({ status, connected, runCommand, openStt }: {
           {runtimeLoadError ? <div className="debug-state-message error" role="alert"><XCircle aria-hidden="true" size={20} /><div><strong>구성 모델 로드에 실패했습니다</strong><span>{vlm?.detail || "상태를 새로고침한 뒤 다시 시도하세요."}</span></div></div> : null}
           <div className="debug-vlm-runtime-actions">
             <button className="button button-secondary" disabled={!connected || Boolean(pending)} onClick={() => void execute("vlm_refresh")} type="button"><RefreshCw aria-hidden="true" size={16} />{pending === "vlm_refresh" ? "Worker micro-test 중" : "상태 + 실제 micro-test"}</button>
-            <button className="button button-primary" disabled={!connected || !vlm || !loadable || vlm.loaded === true || runtimeLoading || Boolean(pending)} onClick={() => void execute("vlm_load")} type="button">{runtimeLoading ? <LoaderCircle aria-hidden="true" className="debug-spinner" size={16} /> : vlm?.loaded ? <CheckCircle2 aria-hidden="true" size={16} /> : <Play aria-hidden="true" size={16} />}{runtimeLoading ? "구성 모델 로드 중" : vlm?.loaded ? "구성 모델 로드됨" : "구성 모델 로드"}</button>
+            <button className="button button-primary" disabled={!connected || !vlm || !loadable || !modelLoadAllowed || vlm.loaded === true || runtimeLoading || Boolean(pending)} onClick={() => void execute("vlm_load")} type="button">{runtimeLoading ? <LoaderCircle aria-hidden="true" className="debug-spinner" size={16} /> : vlm?.loaded ? <CheckCircle2 aria-hidden="true" size={16} /> : <Play aria-hidden="true" size={16} />}{runtimeLoading ? "구성 모델 로드 중" : vlm?.loaded ? "구성 모델 로드됨" : "구성 모델 로드"}</button>
           </div>
+          {vlm && !vlm.loaded && !modelLoadAllowed ? <p className="debug-inline-warning">공유 모델 로드는 개입 작업입니다. {interventionAllowed ? "수동 제어를 먼저 활성화하세요." : modelLoadBlockReason} 상태 새로고침과 해석 micro-test는 계속 사용할 수 있습니다.</p> : null}
           {vlm && !vlm.loaded && !loadable && !runtimeLoadError ? <p className="debug-inline-warning">launch에 고정된 모델이 manager의 load 대상이 아닙니다. 모델·URL을 화면에서 임의로 변경할 수 없습니다.</p> : null}
         </article>
 

@@ -1,6 +1,11 @@
 import { compressedImageTiming, normalizeCompressedImage } from "./ros/compressed-image.js";
 import { cameraTimingStampNs, createCameraPlayout } from "./ros/camera-playout.js";
 import { createDiagnosticLog } from "./ros/diagnostic-log.js";
+import { gatewayHealthIsDegraded } from "./ros/health-status.js";
+import {
+  publicCameraMayRender,
+  publicCameraReceptionStatus,
+} from "./ros/public-camera-policy.js";
 import {
   PUBLIC_CONTRACT,
   PUBLIC_TOPIC_NAMES,
@@ -41,12 +46,12 @@ function applyCameraFit(value) {
 }
 
 const assets = {
-  surgeryFallback: new URL("./assets/figma/raw-14.png", import.meta.url).href,
-  surgeon: new URL("./assets/figma/surgeon-prof-sung.png", import.meta.url).href,
+  surgeryFallback: new URL("./assets/figma/raw-14.webp", import.meta.url).href,
+  surgeon: new URL("./assets/figma/surgeon-prof-sung.webp", import.meta.url).href,
   forceps: new URL("./assets/figma/raw-03.png", import.meta.url).href,
   adsonForceps: new URL("./assets/figma/adson-forceps.png", import.meta.url).href,
   kocherClamp: new URL("./assets/figma/raw-19.png", import.meta.url).href,
-  metzenbaumScissors: new URL("./assets/figma/metzenbaum-scissors.png", import.meta.url).href,
+  metzenbaumScissors: new URL("./assets/figma/metzenbaum-scissors.webp", import.meta.url).href,
   t01Scalpel: new URL("./assets/figma/instruments/t01-scalpel.png", import.meta.url).href,
   t02AdsonForceps: new URL("./assets/figma/instruments/t02-adson-forceps.png", import.meta.url).href,
   t03AllisClampForceps: new URL("./assets/figma/instruments/t03-allis-clamp-forceps.png", import.meta.url).href,
@@ -111,9 +116,22 @@ const state = {
     { toolId: "kocher-clamp", confidence: 51.6, arm: 2, status: "standby" },
     { toolId: "metzenbaum-scissors", confidence: 36.7, arm: 2, status: "standby" },
   ],
-  voice: { status: "listening", text: "Listening..." },
+  voice: {
+    status: "listening",
+    text: "Listening...",
+    partialText: "",
+    audioLevelAvailable: false,
+    audioLevelDbfs: -99,
+    peakLevelDbfs: -99,
+    utteranceSequence: 0,
+  },
 };
 const simulationState = structuredClone(state);
+
+const voiceRenderRuntime = {
+  lastFinalKey: "",
+  finalGlowTimer: null,
+};
 
 const sharedFlirFrame = {
   topic: PUBLIC_TOPIC_NAMES.flirCamera,
@@ -174,6 +192,242 @@ diagnostics.record("info", "session.started", {
   cameraFit: activeSettings.cameraFit,
   userAgent: typeof navigator === "object" ? navigator.userAgent : "",
 });
+
+const cameraTransport = {
+  preferred: runtimeConfig.media?.preferredTransport === "hls" ? "hls" : "ros",
+  active: "ros",
+  state: "idle",
+  hlsUrl: String(runtimeConfig.media?.hlsUrl || "/media/flir.m3u8"),
+  probeTimeoutMs: Math.max(250, Math.min(5000, Number(runtimeConfig.media?.probeTimeoutMs) || 1800)),
+  playbackStartTimeoutMs: Math.max(
+    2000,
+    Math.min(20000, Number(runtimeConfig.media?.playbackStartTimeoutMs) || 8000),
+  ),
+  playbackTimer: null,
+  stallTimer: null,
+  hlsInstance: null,
+  engine: "none",
+  hasPlayed: false,
+  fallbackRequested: false,
+};
+let hlsModulePromise = null;
+
+function browserHasMediaSource() {
+  return typeof window.MediaSource === "function" || typeof window.ManagedMediaSource === "function";
+}
+
+async function loadHlsConstructor() {
+  if (!hlsModulePromise) {
+    hlsModulePromise = import("hls.js/light").then((module) => module.default);
+  }
+  return hlsModulePromise;
+}
+
+function setCameraTransportStatus(stateValue, message) {
+  cameraTransport.state = stateValue;
+  const output = document.querySelector("#camera-transport-status");
+  if (output) output.textContent = message;
+  diagnostics.record(
+    stateValue === "error" || stateValue === "fallback" ? "warn" : "info",
+    "camera.transport_changed",
+    { transport: cameraTransport.active, state: stateValue, message },
+  );
+}
+
+function clearHlsPlaybackTimer() {
+  if (cameraTransport.playbackTimer !== null) clearTimeout(cameraTransport.playbackTimer);
+  cameraTransport.playbackTimer = null;
+}
+
+function clearHlsStallTimer() {
+  if (cameraTransport.stallTimer !== null) clearTimeout(cameraTransport.stallTimer);
+  cameraTransport.stallTimer = null;
+}
+
+function scheduleHlsStallFallback(reason) {
+  clearHlsStallTimer();
+  cameraTransport.stallTimer = setTimeout(() => {
+    void fallbackToRosCamera(reason);
+  }, 6000);
+}
+
+function stopHlsCamera({ restoreImage = true } = {}) {
+  clearHlsPlaybackTimer();
+  clearHlsStallTimer();
+  if (cameraTransport.hlsInstance) {
+    cameraTransport.hlsInstance.destroy();
+    cameraTransport.hlsInstance = null;
+  }
+  const video = document.querySelector(".surgery-stream");
+  if (video) {
+    video.pause();
+    video.removeAttribute("src");
+    video.load();
+    video.hidden = true;
+  }
+  cameraTransport.active = "ros";
+  cameraTransport.engine = "none";
+  cameraTransport.hasPlayed = false;
+  if (restoreImage) renderActiveCamera();
+}
+
+function hlsRequestUrl() {
+  const url = new URL(cameraTransport.hlsUrl, window.location.href);
+  url.searchParams.set("session", String(Date.now()));
+  return url.href;
+}
+
+async function hlsPlaylistIsReady() {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), cameraTransport.probeTimeoutMs);
+  try {
+    const response = await fetch(hlsRequestUrl(), {
+      cache: "no-store",
+      headers: { Accept: "application/vnd.apple.mpegurl, application/x-mpegURL, */*" },
+      signal: controller.signal,
+    });
+    if (!response.ok) return false;
+    const playlist = await response.text();
+    return playlist.startsWith("#EXTM3U") && playlist.includes(".ts");
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function requestVideoPlayback(video) {
+  const playAttempt = video.play();
+  if (playAttempt && typeof playAttempt.catch === "function") {
+    playAttempt.catch(() => {
+      // A transient autoplay rejection is also surfaced by the timeout below;
+      // do not reconnect twice from the same browser event.
+    });
+  }
+}
+
+async function startHlsCamera() {
+  const video = document.querySelector(".surgery-stream");
+  if (!video) return false;
+  const sourceUrl = hlsRequestUrl();
+  cameraTransport.active = "hls";
+  cameraTransport.hasPlayed = false;
+  cameraTransport.fallbackRequested = false;
+  setCameraTransportStatus("starting", "TV 최적화 영상 연결 중");
+  video.hidden = true;
+  let Hls = null;
+  if (browserHasMediaSource()) {
+    try {
+      Hls = await loadHlsConstructor();
+    } catch (error) {
+      diagnostics.record("warn", "camera.hls_engine_load_failed", {
+        name: error instanceof Error ? error.name : "UnknownError",
+      });
+    }
+  }
+  if (Hls?.isSupported()) {
+    cameraTransport.engine = "hlsjs";
+    const hls = new Hls({
+      // The TV feed is AVC-only and intentionally tiny. Keeping transmuxing
+      // on the main thread avoids a separate ESM worker fetch on webOS while
+      // the short buffers bound memory and recovery latency.
+      enableWorker: false,
+      lowLatencyMode: false,
+      backBufferLength: 0,
+      liveSyncDurationCount: 2,
+      liveMaxLatencyDurationCount: 5,
+      maxBufferLength: 6,
+      maxMaxBufferLength: 12,
+    });
+    cameraTransport.hlsInstance = hls;
+    hls.on(Hls.Events.MEDIA_ATTACHED, () => hls.loadSource(sourceUrl));
+    hls.on(Hls.Events.MANIFEST_PARSED, () => requestVideoPlayback(video));
+    hls.on(Hls.Events.ERROR, (_event, data) => {
+      diagnostics.record(data.fatal ? "warn" : "info", "camera.hls_engine_error", {
+        engine: "hlsjs",
+        fatal: Boolean(data.fatal),
+        type: String(data.type || "unknown").slice(0, 80),
+        details: String(data.details || "unknown").slice(0, 120),
+      });
+      if (data.fatal) void fallbackToRosCamera(`HLS.js fatal ${String(data.type || "error")}`);
+    });
+    hls.attachMedia(video);
+  } else if (
+    video.canPlayType("application/vnd.apple.mpegurl")
+    || video.canPlayType("application/x-mpegURL")
+  ) {
+    cameraTransport.engine = "native";
+    video.src = sourceUrl;
+    video.load();
+    requestVideoPlayback(video);
+  } else {
+    cameraTransport.active = "ros";
+    cameraTransport.engine = "none";
+    return false;
+  }
+  clearHlsPlaybackTimer();
+  cameraTransport.playbackTimer = setTimeout(() => {
+    void fallbackToRosCamera("HLS playback start timed out");
+  }, cameraTransport.playbackStartTimeoutMs);
+  renderActiveCamera();
+  return true;
+}
+
+async function selectCameraTransport() {
+  stopHlsCamera({ restoreImage: false });
+  cameraTransport.fallbackRequested = false;
+  if (cameraTransport.preferred !== "hls") {
+    setCameraTransportStatus("ready", "ROS 카메라 경로 사용 중");
+    return true;
+  }
+  setCameraTransportStatus("probing", "TV 최적화 영상 확인 중");
+  if (!await hlsPlaylistIsReady()) {
+    setCameraTransportStatus("fallback", "TV 영상 준비 전 · ROS 영상으로 연결");
+    return true;
+  }
+  if (!await startHlsCamera()) {
+    setCameraTransportStatus("fallback", "TV 영상 요소 없음 · ROS 영상으로 연결");
+    return true;
+  }
+  return false;
+}
+
+async function fallbackToRosCamera(reason) {
+  if (cameraTransport.fallbackRequested || activeSettings.mode !== "ros") return;
+  cameraTransport.fallbackRequested = true;
+  diagnostics.record("warn", "camera.hls_fallback", { reason });
+  stopHlsCamera({ restoreImage: false });
+  setCameraTransportStatus("fallback", "TV 영상 연결 저하 · ROS 영상으로 자동 전환");
+  connectRosBridge({
+    url: activeSettings.bridgeUrl,
+    cameraStreams: { enabled: true, throttleRateMs: activeSettings.throttleRateMs },
+  });
+}
+
+const hlsVideo = document.querySelector(".surgery-stream");
+if (hlsVideo) {
+  hlsVideo.addEventListener("playing", () => {
+    clearHlsPlaybackTimer();
+    clearHlsStallTimer();
+    cameraTransport.active = "hls";
+    cameraTransport.hasPlayed = true;
+    setCameraTransportStatus("playing", "TV 최적화 H.264 영상 재생 중");
+    renderActiveCamera();
+  });
+  hlsVideo.addEventListener("error", () => {
+    if (cameraTransport.engine === "hlsjs" && cameraTransport.hlsInstance) return;
+    void fallbackToRosCamera("HTML video element reported an HLS error");
+  });
+  hlsVideo.addEventListener("stalled", () => {
+    setCameraTransportStatus("stalled", "TV 영상 버퍼 확인 중");
+    scheduleHlsStallFallback("HLS playback remained stalled");
+  });
+  hlsVideo.addEventListener("waiting", () => {
+    if (!cameraTransport.hasPlayed) return;
+    setCameraTransportStatus("waiting", "TV 영상 버퍼 보충 중");
+    scheduleHlsStallFallback("HLS playback remained waiting");
+  });
+}
 
 const directTeachingRuntime = {
   activeArm: null,
@@ -411,7 +665,15 @@ function createBlankDummyState(view = state.view) {
     instrumentFlow: { inUse: [], mayo: [] },
     retrieval: { retrievedToolId: "none", location: "MAYO", inUseToolId: "none" },
     predictions: [],
-    voice: { status: "listening", text: "Listening..." },
+    voice: {
+      status: "listening",
+      text: "Listening...",
+      partialText: "",
+      audioLevelAvailable: false,
+      audioLevelDbfs: -99,
+      peakLevelDbfs: -99,
+      utteranceSequence: 0,
+    },
   };
 }
 
@@ -686,7 +948,7 @@ function renderPredictions() {
   const predictions = Array.isArray(state.predictions) ? state.predictions.slice(0, 3) : [];
   const dock = document.querySelector(".predicted-dock");
   const rankTabs = dock.querySelector(".rank-tabs");
-  const rankButtons = rankTabs.querySelectorAll("button");
+  const rankLabels = rankTabs.querySelectorAll(".rank-tab");
   const arrows = dock.querySelectorAll(".prediction-arrow");
   const cards = document.querySelectorAll(".prediction-mini");
   const activeIndex = predictions.reduce((bestIndex, prediction, index) => {
@@ -699,11 +961,11 @@ function renderPredictions() {
   dock.classList.toggle("empty", predictions.length === 0);
   rankTabs.hidden = false;
   arrows.forEach((arrow) => { arrow.hidden = false; });
-  rankButtons.forEach((button, index) => {
+  rankLabels.forEach((label, index) => {
     const prediction = predictions[index];
-    button.hidden = false;
-    button.textContent = String(prediction?.rank || index + 1);
-    button.classList.toggle("active", index === activeIndex && Boolean(prediction));
+    label.hidden = false;
+    label.textContent = String(prediction?.rank || index + 1);
+    label.classList.toggle("active", index === activeIndex && Boolean(prediction));
   });
   cards.forEach((card, index) => {
     const prediction = predictions[index];
@@ -747,10 +1009,101 @@ function renderPredictions() {
 function renderVoice() {
   const card = document.querySelector(".voice-card");
   const status = state.voice?.status || "listening";
-  const text = String(state.voice?.text || "").trim();
+  const finalText = String(state.voice?.text || "").trim();
+  const partialText = String(state.voice?.partialText || "").trim();
+  const sequence = Math.max(0, Number(state.voice?.utteranceSequence) || 0);
+  const levelAvailable = state.voice?.audioLevelAvailable === true
+    && Number.isFinite(Number(state.voice?.audioLevelDbfs));
+  const measuredLevelDbfs = levelAvailable
+    ? Math.max(-99, Math.min(0, Number(state.voice.audioLevelDbfs)))
+    : -99;
+  const measuredPeakDbfs = levelAvailable && Number.isFinite(Number(state.voice?.peakLevelDbfs))
+    ? Math.max(-99, Math.min(0, Number(state.voice.peakLevelDbfs)))
+    : measuredLevelDbfs;
+  const meterLevelDbfs = Math.max(-60, measuredLevelDbfs);
+  const meterPeakDbfs = Math.max(-60, measuredPeakDbfs);
+  const levelRatio = levelAvailable ? (meterLevelDbfs + 60) / 60 : 0;
+  const peakRatio = levelAvailable ? (meterPeakDbfs + 60) / 60 : 0;
+  const listening = status === "listening";
+  const finalized = sequence > 0 && finalText && finalText !== "Listening...";
+  const transcriptText = partialText || (finalized ? finalText : "");
+  const transcriptState = partialText ? "partial" : finalized ? "final" : "empty";
+  const statusLabels = {
+    unavailable: "ASR Offline",
+    idle: "ASR Idle",
+    listening: "Listening...",
+    processing: "Processing...",
+    ready: "ASR Ready",
+    error: "ASR Error",
+  };
+  const emptyLabels = {
+    unavailable: "음성 입력 연결을 기다리는 중입니다",
+    idle: "음성 인식이 대기 상태입니다",
+    processing: "음성을 처리하고 있습니다…",
+    ready: "말씀해 주세요…",
+    error: "음성 입력 상태를 확인해 주세요",
+  };
+
   card.dataset.status = status;
-  card.querySelector("strong").textContent = text || "Listening...";
-  card.querySelector(".listening").hidden = status !== "listening" && Boolean(text);
+  card.dataset.signal = listening && levelAvailable && measuredLevelDbfs > -55 ? "active" : "quiet";
+  card.style.setProperty("--asr-level", String(levelRatio));
+  card.style.setProperty("--asr-peak-position", `${peakRatio * 100}%`);
+  card.style.setProperty("--asr-peak-alpha", String(Math.max(0.18, peakRatio)));
+  card.style.setProperty("--asr-glow-size", `${10 + 14 * levelRatio}px`);
+  card.style.setProperty("--asr-glow-alpha", String(0.16 + 0.34 * levelRatio));
+  card.style.setProperty("--asr-ring-alpha", String(0.08 + 0.65 * levelRatio));
+  card.style.setProperty("--asr-ring-scale", String(0.92 + 0.17 * levelRatio));
+  card.style.setProperty("--asr-pulse-alpha", String(0.22 + 0.5 * levelRatio));
+  card.style.setProperty("--asr-pulse-scale", String(1.03 + 0.1 * levelRatio));
+  card.querySelector(".voice-status").textContent = statusLabels[status] || "ASR";
+  card.querySelector(".listening").hidden = !listening;
+
+  const dbOutput = card.querySelector(".voice-db");
+  dbOutput.value = levelAvailable ? `${measuredLevelDbfs.toFixed(1)} dBFS` : "사용할 수 없음";
+  dbOutput.textContent = dbOutput.value;
+
+  const meter = card.querySelector(".voice-meter");
+  if (levelAvailable) {
+    meter.setAttribute("aria-valuenow", meterLevelDbfs.toFixed(1));
+    meter.setAttribute("aria-valuetext", `${measuredLevelDbfs.toFixed(1)} dBFS`);
+  } else {
+    // `role="meter"` always requires a value within its declared range. Keep
+    // the visual floor as the technical value while the accessible value text
+    // and adjacent output explicitly distinguish unavailable from measured
+    // silence.
+    meter.setAttribute("aria-valuenow", "-60");
+    meter.setAttribute("aria-valuetext", "마이크 입력 레벨을 사용할 수 없음");
+  }
+
+  const transcript = card.querySelector(".voice-transcript");
+  transcript.dataset.transcriptState = transcriptState;
+  transcript.querySelector("span").textContent = transcriptText
+    || emptyLabels[status]
+    || "말씀해 주세요…";
+
+  if (transcriptState === "final") {
+    const finalKey = `${rosRuntime.observedRunId}:${sequence}:${finalText}`;
+    if (finalKey !== voiceRenderRuntime.lastFinalKey) {
+      voiceRenderRuntime.lastFinalKey = finalKey;
+      transcript.classList.remove("is-finalized");
+      void transcript.offsetWidth;
+      transcript.classList.add("is-finalized");
+      card.querySelector(".voice-final-announcement").textContent = `확정 문장: ${finalText}`;
+      if (voiceRenderRuntime.finalGlowTimer !== null) {
+        clearTimeout(voiceRenderRuntime.finalGlowTimer);
+      }
+      voiceRenderRuntime.finalGlowTimer = setTimeout(() => {
+        transcript.classList.remove("is-finalized");
+        voiceRenderRuntime.finalGlowTimer = null;
+      }, 900);
+    }
+  } else {
+    transcript.classList.remove("is-finalized");
+    if (voiceRenderRuntime.finalGlowTimer !== null) {
+      clearTimeout(voiceRenderRuntime.finalGlowTimer);
+      voiceRenderRuntime.finalGlowTimer = null;
+    }
+  }
 }
 
 function renderDockArm(number) {
@@ -951,10 +1304,27 @@ function configureCameraPlayout(cameraStreams = {}, cameraDefinition = null) {
 
 function renderActiveCamera() {
   const camera = document.querySelector(".surgery-image");
+  const video = document.querySelector(".surgery-stream");
   const view = state.view === "focus" ? "focus" : "overview";
   const frame = rosRuntime.cameraFrames[view];
   camera.dataset.view = view;
   camera.dataset.topic = frame?.topic || "";
+
+  if (activeSettings.mode === "ros" && cameraTransport.active === "hls") {
+    if (cameraTransport.hasPlayed && ["playing", "stalled", "waiting"].includes(cameraTransport.state)) {
+      camera.hidden = true;
+      camera.classList.remove("stream-stale");
+      if (video) video.hidden = false;
+      return;
+    }
+    if (video) video.hidden = true;
+    camera.src = assets.surgeryFallback;
+    camera.alt = "수술 부위 카메라 영상 연결 중";
+    camera.hidden = false;
+    camera.classList.add("stream-stale");
+    return;
+  }
+  if (video) video.hidden = true;
 
   if (["simulation", "dummy"].includes(state.connectionState)) {
     camera.src = assets.surgeryFallback;
@@ -1057,7 +1427,15 @@ function resetRosDisplay({
   state.instrumentFlow = { inUse: [], mayo: [] };
   state.retrieval = { retrievedToolId: "none", location: "MAYO", inUseToolId: "none" };
   state.predictions = [];
-  state.voice = { status: "listening", text: "Listening..." };
+  state.voice = {
+    status: "listening",
+    text: "Listening...",
+    partialText: "",
+    audioLevelAvailable: false,
+    audioLevelDbfs: -99,
+    peakLevelDbfs: -99,
+    utteranceSequence: 0,
+  };
   state.elapsedAvailable = false;
   state.elapsedSource = "waiting";
   if (!keepCatalog) clearDynamicToolRegistry();
@@ -1111,9 +1489,10 @@ function applyCameraHealth(health) {
 }
 
 function cameraMayRender(view) {
-  return rosRuntime.contractCompatible
-    && rosRuntime.procedureActive
-    && Boolean(rosRuntime.cameraFrames[view]?.src);
+  return publicCameraMayRender({
+    contractCompatible: rosRuntime.contractCompatible,
+    hasFrame: Boolean(rosRuntime.cameraFrames[view]?.src),
+  });
 }
 
 function applyCameraFrame(topic, message, definition) {
@@ -1127,19 +1506,14 @@ function applyCameraFrame(topic, message, definition) {
     diagnostics.record("warn", "camera.rejected", { topic, reason: "unconfigured_topic" });
     return;
   }
-  if (
-    rosRuntime.gatewayLastSeenAt === 0
-    || rosRuntime.contractCompatible === false
-    || rosRuntime.procedureActive === false
-  ) {
-    const reason = rosRuntime.gatewayLastSeenAt === 0
-      ? "gateway_not_ready"
-      : rosRuntime.contractCompatible === false
-        ? "contract_not_ready"
-        : "procedure_inactive";
+  const reception = publicCameraReceptionStatus({
+    gatewayReady: rosRuntime.gatewayLastSeenAt !== 0,
+    contractCompatible: rosRuntime.contractCompatible,
+  });
+  if (!reception.ready) {
     diagnostics.record("debug", "camera.rejected", {
       topic,
-      reason,
+      reason: reception.reason,
     });
     return;
   }
@@ -1335,7 +1709,10 @@ function noteGatewayHeartbeat(meta) {
   }
 
   if (!rosRuntime.procedureActive) {
-    clearAllCameraFrames({ reason: "procedure_inactive" });
+    // The public FLIR projection is intentionally available while the
+    // procedure is idle. A run/gateway boundary above clears any old frame;
+    // subsequent frames from the validated public topic may render again.
+    renderActiveCamera();
     setConnectionState("idle", rosRuntime.client?.url || "");
     return;
   }
@@ -1346,12 +1723,9 @@ function noteGatewayHeartbeat(meta) {
   }
 
   const health = rosRuntime.health;
-  const degraded = health && (
-    health.healthy !== true
-    || health.unavailableSources.length
-    || health.staleSources.length
-    || health.errorCodes.length
-  );
+  // Camera-specific availability is handled separately by
+  // cameraSourceIsBlocked().
+  const degraded = gatewayHealthIsDegraded(health);
   setConnectionState(degraded ? "degraded" : "live", rosRuntime.client?.url || "");
 }
 
@@ -1446,10 +1820,7 @@ function handleRosMessage(topic, message, definition) {
     }
     applyCameraHealth(health);
     renderActiveCamera();
-    const degraded = health.healthy !== true
-      || health.unavailableSources.length
-      || health.staleSources.length
-      || health.errorCodes.length;
+    const degraded = gatewayHealthIsDegraded(health);
     if (rosRuntime.procedureActive && gatewayIsFresh()) {
       setConnectionState(degraded ? "degraded" : "live", rosRuntime.client?.url || "");
     }
@@ -1825,11 +2196,18 @@ async function applySettings(
   applyCameraFit(normalized.cameraFit);
   if (normalized.mode === "ros") {
     activeDummySelection = null;
+    const enableRosCamera = await selectCameraTransport();
+    if (applyGeneration !== settingsApplyGeneration) {
+      stopHlsCamera();
+      return activeSettings;
+    }
     connectRosBridge({
       url: normalized.bridgeUrl,
-      cameraStreams: { enabled: true, throttleRateMs: normalized.throttleRateMs },
+      cameraStreams: { enabled: enableRosCamera, throttleRateMs: normalized.throttleRateMs },
     });
   } else {
+    stopHlsCamera({ restoreImage: false });
+    setCameraTransportStatus("idle", "로컬 더미 카메라 화면");
     const sourceLabel = safeText(dummySourceLabel, 180) || normalized.dummyDataFile;
     activeDummySelection = dummyPayload
       ? { name: sourceLabel, payload: validatedDummyPayload }
@@ -1904,6 +2282,7 @@ function disconnectFromSettings() {
     updateSettingsDisconnectButton();
     return;
   }
+  stopHlsCamera({ restoreImage: false });
   disconnectRosBridge({ reason: "settings_disconnect" });
   settingsError.dataset.tone = "success";
   settingsError.textContent = "서버 연결을 해제했습니다. APPLY를 누르면 다시 연결합니다.";
@@ -2070,6 +2449,14 @@ window.SurgiMate = {
     get cameraPlayout() {
       return rosRuntime.cameraPlayout?.snapshot() || null;
     },
+    get cameraTransport() {
+      return Object.freeze({
+        preferred: cameraTransport.preferred,
+        active: cameraTransport.active,
+        state: cameraTransport.state,
+        engine: cameraTransport.engine,
+      });
+    },
   },
   settings: {
     get current() { return Object.freeze({ ...activeSettings }); },
@@ -2106,6 +2493,8 @@ fitDesignToViewport();
 window.addEventListener("resize", fitDesignToViewport);
 window.addEventListener("pagehide", () => {
   clearDirectTeaching("pagehide");
+  if (voiceRenderRuntime.finalGlowTimer !== null) clearTimeout(voiceRenderRuntime.finalGlowTimer);
+  stopHlsCamera({ restoreImage: false });
   if (rosRuntime.client || rosRuntime.cameraPlayout) disconnectRosBridge({ reason: "pagehide" });
   Object.keys(rosRuntime.cameraFrames).forEach(releaseCameraObjectUrl);
 }, { once: true });
@@ -2129,6 +2518,8 @@ void applySettings(defaultSettings).catch((error) => {
 if (import.meta.hot) {
   import.meta.hot.dispose(() => {
     clearDirectTeaching("hot_reload");
+    if (voiceRenderRuntime.finalGlowTimer !== null) clearTimeout(voiceRenderRuntime.finalGlowTimer);
+    stopHlsCamera({ restoreImage: false });
     if (rosRuntime.client || rosRuntime.cameraPlayout) disconnectRosBridge({ reason: "hot_reload" });
     Object.keys(rosRuntime.cameraFrames).forEach(releaseCameraObjectUrl);
   });

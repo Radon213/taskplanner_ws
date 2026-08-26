@@ -1,9 +1,9 @@
-"""Stable ROS contract for local or LAN-hosted PNU perception.
+"""Stable selection contract for Taskplanner perception inputs.
 
-The typed Tool and Hand interfaces are pinned copies of the upstream
-``hand-blood-tools`` IDLs.  Geometry remains fail-closed unless live depth
-registration, metric units, calibration and per-frame timing evidence pass;
-publishing a topic alone never authorizes robot control.
+Production consumes the reviewed RF-DETR ``ToolObservation2DArray`` topics
+directly over DDS.  HTTP-backed built-in/PNU adapters remain explicit Lab
+providers.  Geometry remains fail-closed unless the selected provider's fresh,
+typed evidence passes; publishing a topic alone never authorizes robot control.
 """
 
 from __future__ import annotations
@@ -18,9 +18,16 @@ CV_CONTRACT_SCHEMA = "taskplanner.cv_external_contract.v1"
 CV_CONTRACT_VERSION = "pnu-cv-interface-aligned-depth-3d-v2"
 PERCEPTION_BACKENDS = frozenset({"local", "external", "disabled"})
 PERCEPTION_PROVIDERS = frozenset(
-    {"builtin_rfdetr", "pnu_hand_blood", "disabled"}
+    {
+        "builtin_rfdetr",
+        "external_rfdetr_topics",
+        "pnu_hand_blood",
+        "disabled",
+    }
 )
 PERCEPTION_LOCATIONS = frozenset({"local", "remote"})
+HTTP_PERCEPTION_PROVIDERS = frozenset({"builtin_rfdetr", "pnu_hand_blood"})
+TYPED_TOPIC_PERCEPTION_PROVIDERS = frozenset({"external_rfdetr_topics"})
 
 
 @dataclass(frozen=True)
@@ -122,8 +129,18 @@ def resolve_perception_selection(
         }[backend]
         source = "legacy_backend"
 
+    if (
+        resolved_provider in TYPED_TOPIC_PERCEPTION_PROVIDERS
+        and resolved_location != "remote"
+    ):
+        raise ValueError(
+            "PERCEPTION_PROVIDER=external_rfdetr_topics requires "
+            "PERCEPTION_LOCATION=remote"
+        )
+
     legacy_projection = {
         "builtin_rfdetr": "local",
+        "external_rfdetr_topics": "external",
         "pnu_hand_blood": "external",
         "disabled": "disabled",
     }[resolved_provider]
@@ -147,10 +164,17 @@ def validate_perception_endpoint(
     """
 
     endpoint = str(value).strip()
-    if selection.provider == "disabled":
+    if selection.provider in (
+        {"disabled"} | TYPED_TOPIC_PERCEPTION_PROVIDERS
+    ):
         if endpoint:
+            provider_label = (
+                "perception is disabled"
+                if selection.provider == "disabled"
+                else "typed DDS perception is selected"
+            )
             raise ValueError(
-                "PERCEPTION_ENDPOINT must be empty when perception is disabled"
+                "PERCEPTION_ENDPOINT must be empty when " + provider_label
             )
         return ""
     if not endpoint:
@@ -419,14 +443,6 @@ EXTERNAL_OUTPUT_ENDPOINTS = (
         "/surgery/perception/rfdetr/health",
         "std_msgs/msg/String",
         "RELIABLE/TRANSIENT_LOCAL/KEEP_LAST(1)",
-        "CV team",
-        "output",
-    ),
-    CvEndpoint(
-        "cam4_hand_keypoints",
-        "/surgery/perception/cam4/hand_keypoints",
-        "hand_keypoint_interfaces/msg/HandKeypoints",
-        "RELIABLE/VOLATILE/KEEP_LAST(10)",
         "CV team",
         "output",
     ),

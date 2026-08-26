@@ -50,11 +50,9 @@ class FrozenHandoverNgramPrior:
 
     def __init__(self, spec: ProcedureSpec, payload: Mapping[str, Any]) -> None:
         self._spec = spec
-        self._requestable_tool_ids = {
-            instrument.id
-            for instrument in spec.bundle.instruments
-            if bool(getattr(instrument, "requestable", True))
-        }
+        self._requestable_tool_ids = set(
+            spec.get_scenario_policy().requestable_instrument_ids
+        )
         self._phase_ids = set(spec.phase_ids)
         self._artifact_id, self._lookup = self._validate_and_compile(payload)
 

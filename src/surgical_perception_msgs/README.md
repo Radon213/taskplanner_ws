@@ -1,6 +1,8 @@
 # surgical_perception_msgs
 
 부산대학교 컴퓨터 비전연구실 surgical-tool perception의 ROS 2 Jazzy interface package다.
+아래는 독립 bundle/host 빌드 예시이며 Taskplanner 관리 컨테이너는
+`install/docker/setup.bash`를 사용한다.
 
 ```bash
 cd <bundle-root>/ros2_ws

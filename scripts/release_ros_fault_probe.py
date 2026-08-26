@@ -287,10 +287,6 @@ class ReleaseProbeNode(Node):
         result.summary = "Stable exposed operative field."
         result.phase_ids = ["P03"]
         result.phase_confidences = [0.91]
-        result.gesture_event_type = str(intent[0])
-        result.gesture_requested_tool = str(intent[1])
-        result.gesture_hand_pose = "open_palm" if intent[0] == "handover" else ""
-        result.gesture_confidence = float(intent[2])
         self.raw_vlm_result_pub.publish(result)
 
         if fault_elapsed >= 0.45 and not self._procedure_start_sent:
@@ -863,7 +859,7 @@ def main() -> int:
                         "-p",
                         "vlm_health_timeout_sec:=0.6",
                         "-p",
-                        "vlm_implicit_request_stability_sec:=0.35",
+                        "hand_handover_dwell_sec:=0.3",
                     ],
                     environment=environment,
                     logs_dir=logs_dir,

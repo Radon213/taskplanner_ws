@@ -1,6 +1,6 @@
 # Taskplanner System Structure
 
-Last reviewed: 2026-08-12 KST
+Last reviewed: 2026-08-26 KST
 
 This document describes the current post-`0.1.0` runtime structure of
 `taskplanner_ws`.
@@ -10,7 +10,7 @@ This document describes the current post-`0.1.0` runtime structure of
 The active system is:
 
 ```text
-public surgeon cues + field image + skill events + VLM proposals
+typed surgeon cues + external RF-DETR facts + skill events + VLM proposals
         |
         v
 OR digital twin reducer
@@ -40,12 +40,34 @@ Core ownership rules:
   sends only the documented tool-change Service or adjustment Action request.
 - The webapp is an operator/debug view, not a source of truth.
 
+Runtime feature ownership is deliberately split:
+
+- **Production (`live`)** owns only Digital Twin/BT execution coordination,
+  typed ASR, one fixed NInfer VLM provider, public ROSBridge, the Mission UI,
+  and direct CAM3/CAM4 RF-DETR topic consumption.
+- **Ops (`ops`)** owns optional multicamera, TV/HLS, media, TTS, proxy and
+  integration-diagnostics surfaces.
+- **Lab (`lab`)** owns mock/shadow actors, provider comparison, local/PNU
+  perception adapters, replay, synthetic cameras, training and evaluation.
+
+Production never starts a local RF-DETR/PNU worker or HTTP perception bridge.
+It consumes the reviewed 192.168.1.7 DDS topics and fails closed on missing,
+stale, malformed, wrong-view or wrong-model observations.
+
 ## 2. Packages
 
 ### `procedure_spec`
 
 Loads YAML procedure prompt bundles and exposes query helpers for phases, tools,
 transitions, display names, and priors.
+
+`ScenarioPolicy` is the single query boundary for authored choices such as
+requestable instruments, enabled arm groups, allowed operations/voice commands,
+prepositioning, and where an unused preparation goes. Those choices are YAML,
+not physical safety claims. Controller/Service admission, execution state,
+stopped-only route switching, preflight ACK, freshness and idempotency remain
+separate fail-closed runtime interlocks.
+See `docs/SCENARIO_POLICY_AND_SAFETY_BOUNDARY.md` for the extension rule.
 
 Current bundle format:
 
@@ -69,7 +91,7 @@ VLM and image input layer.
 Executables:
 
 - `real_vlm`: provider-aware OpenAI-compatible VLM node.
-- `model_provider_registry`: concurrently discovers LM Studio, Unsloth Studio,
+- `model_provider_registry`: Lab-only discovery of LM Studio, Unsloth Studio,
   and vLLM catalogs while keeping endpoint credentials inside the ROS runtime.
   LM Studio uses its native catalog for loaded/unloaded state when available.
 - `vllm-manager`: optional always-on lifecycle manager and OpenAI-compatible
@@ -97,13 +119,17 @@ not fed back as the raw VLM phase answer. See
 
 The no-image overlay may show visible/public cues only:
 
-- surgeon hand extension
 - visible Mayo-stand tool names
 - public field interrupt label
 - recent public speech when exposed through the runtime context
 
 It must not show hidden actor state, next required tool answers, or event tool
 hints from the YAML.
+
+Hand posture, palm facing, handedness, and hand-derived handover signals are not
+VLM image, overlay, prompt, or output inputs. The typed CAM4 hand gate bypasses
+the VLM and publishes its tool-agnostic signal directly to the Digital Twin/BT
+admission path.
 
 ### `simulation_runtime`
 
@@ -165,7 +191,8 @@ Important reducer behavior:
 - stabilize Mayo recovery and next-tool prediction before BT can act;
 - treat bleeding/hemostasis as an interrupt event that preserves the current
   normal phase;
-- return unused prepositioned right-hand tools during cleanup.
+- park an unused right-hand preparation on Mayo only for an explicit different-tool
+  request or a different system-final top-1 held continuously for at least 2 seconds.
 
 ### `bt_orchestrator`
 
@@ -282,10 +309,12 @@ Executables:
 
 Launch:
 
+- `taskplanner_live.launch.py` — fixed Production wrapper.
 - `taskplanner_mock.launch.py`
 
-Despite the historical filename, the default launch now runs real VLM mode and
-the LLM surgeon actor unless overridden.
+The historical `taskplanner_mock.launch.py` is the reusable Lab/base graph.
+Production pins its inputs and disables its mock/local provider branches through
+`taskplanner_live.launch.py`; operators do not select those branches at runtime.
 
 ### `webapp`
 
@@ -295,12 +324,13 @@ Main responsibilities:
 
 - procedure selection from YAML catalog;
 - start phase selection for mid-procedure insertion;
-- VLM model selection and health state;
-- LLM surgeon actor model selection and on/off control;
+- fixed Production VLM health state;
 - digital twin scene rendering;
-- VLM input image preview;
-- BT/VLM/reducer observability;
-- public validation scoreboards.
+- itemized integration preflight and execution route state;
+- on-demand live camera preview.
+
+Debug, Multicam, Shadow, raw observability, model controls and TV/HLS are lazy
+optional workspaces and do not create Production subscriptions by default.
 
 ## 3. Default Runtime
 
@@ -310,27 +340,30 @@ Default Docker runtime:
 scripts/taskplanner up live
 ```
 
-For a profile-aware Compose-only startup, bring up the selected profile rather
-than individual services so that its shared provider control planes are present:
+For a profile-aware Compose-only startup, bring up only the Production core:
 
 ```bash
 docker compose \
   --env-file .env.example \
   --env-file .env \
   --env-file docker/orchestration/live.env \
-  --profile live up -d taskplanner-runtime webapp
+  --profile live up -d ninfer-manager taskplanner-runtime taskplanner-asr \
+  public-rosbridge webapp
 ```
 
 Default launch values:
 
 - `vlm_mode=real`
-- `vlm_provider_id=vllm`
+- `vlm_provider_id=ninfer`
 - `vlm_base_url=http://127.0.0.1:8001`
 - `vlm_model_id=unsloth/gemma-4-E4B-it-NVFP4`
 - `vlm_response_format=json_schema`
-- `surgeon_actor_mode=llm`
-- `actor_model_id=google/gemma-4-12b-qat`
-- `enable_no_image_camera=true`
+- `surgeon_actor_mode=none`
+- `perception_provider=external_rfdetr_topics`
+- `perception_location=remote`
+- `perception_endpoint=`
+- `enable_rfdetr_perception=false`
+- `enable_no_image_camera=false`
 - `enable_synthetic_scene_camera=false`
 
 ## 4. Runtime Flow
@@ -483,7 +516,8 @@ Playwright, supply-chain, optional recorded-surgery metric, restart, and soak
 results in one report bundle. The detailed thresholds and software-versus-site
 release boundary are defined in `docs/RELEASE_VERIFICATION.md`.
 
-The commands below are focused developer probes rather than the release gate.
+The commands below are host-side focused developer probes rather than the
+release gate. Managed containers instead source `install/docker/setup.bash`.
 
 ```bash
 source /opt/ros/jazzy/setup.bash

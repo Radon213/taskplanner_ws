@@ -17,6 +17,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import subprocess
 import threading
 import time
@@ -89,9 +90,58 @@ def _parse_wpctl_properties(output: str) -> dict[str, str]:
     return properties
 
 
+def _configured_pipewire_source_id(status_output: str) -> str | None:
+    """Find the selected logical Source's current PipeWire object id.
+
+    WirePlumber 1.6 can report the sink for ``@DEFAULT_AUDIO_SOURCE@`` even
+    though its Settings section contains a valid selected input.  Resolve that
+    selected *logical* source from ``wpctl status --name`` rather than falling
+    back to a raw ALSA device or an arbitrary microphone.
+    """
+
+    configured_name = ""
+    source_ids_by_name: dict[str, str] = {}
+    in_sources = False
+    for raw_line in status_output.splitlines():
+        line = raw_line.replace("│", " ").strip()
+        if line.endswith("Sources:"):
+            in_sources = True
+            continue
+        if in_sources and line.endswith(":"):
+            in_sources = False
+        if in_sources:
+            match = re.match(r"^\*?\s*(\d+)\.\s+(\S+)", line)
+            if match:
+                source_ids_by_name[match.group(2)] = match.group(1)
+        if "Audio/Source" in line:
+            configured_name = line.split("Audio/Source", 1)[1].strip()
+    return source_ids_by_name.get(configured_name) or None
+
+
+def _run_wpctl_status() -> str:
+    """Return named PipeWire graph status or classify an unreachable server."""
+
+    try:
+        return str(
+            subprocess.run(
+                ["wpctl", "status", "--name"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+            ).stdout
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise AudioInputUnavailable(
+            DEVICE_STATUS_HOST_AUDIO_UNAVAILABLE,
+            "Ubuntu PipeWire is not reachable from Debug Mode",
+        ) from exc
+
+
 def _query_pipewire_default_source() -> dict[str, Any]:
     """Return Ubuntu's effective logical input without exposing raw ALSA ports."""
 
+    properties: dict[str, str] = {}
     try:
         completed = subprocess.run(
             ["wpctl", "inspect", PIPEWIRE_DEFAULT_SOURCE],
@@ -101,33 +151,46 @@ def _query_pipewire_default_source() -> dict[str, Any]:
             timeout=2.0,
         )
     except subprocess.CalledProcessError as exc:
-        # ``wpctl inspect @DEFAULT_AUDIO_SOURCE@`` exits non-zero both when the
-        # PipeWire server cannot be reached and when the live graph simply has
-        # no default Source. Probe the graph itself to keep the normal
-        # unplugged/no-input state out of the error channel.
-        try:
-            subprocess.run(
-                ["wpctl", "status"],
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=2.0,
-            )
-        except (OSError, subprocess.SubprocessError) as status_exc:
-            raise AudioInputUnavailable(
-                DEVICE_STATUS_HOST_AUDIO_UNAVAILABLE,
-                "Ubuntu PipeWire is not reachable from Debug Mode",
-            ) from status_exc
-        raise AudioInputUnavailable(
-            DEVICE_STATUS_NO_INPUT,
-            "Ubuntu currently exposes no PipeWire microphone input",
-        ) from exc
+        # ``wpctl inspect @DEFAULT_AUDIO_SOURCE@`` may fail when there is no
+        # Source, and WirePlumber 1.6 can also resolve it to the default Sink.
+        # The named Settings view below distinguishes a real selected input
+        # from both states without broadening capture to an arbitrary device.
+        del exc
     except (OSError, subprocess.SubprocessError) as exc:
         raise AudioInputUnavailable(
             DEVICE_STATUS_HOST_AUDIO_UNAVAILABLE,
             "Ubuntu PipeWire is not reachable from Debug Mode",
         ) from exc
-    properties = _parse_wpctl_properties(completed.stdout)
+    else:
+        properties = _parse_wpctl_properties(completed.stdout)
+
+    if properties.get("media.class") != "Audio/Source":
+        status_output = _run_wpctl_status()
+        source_id = _configured_pipewire_source_id(status_output)
+        if not source_id:
+            raise AudioInputUnavailable(
+                DEVICE_STATUS_NO_INPUT,
+                "Ubuntu currently exposes no PipeWire microphone input",
+            )
+        try:
+            fallback = subprocess.run(
+                ["wpctl", "inspect", source_id],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+            )
+        except subprocess.CalledProcessError as exc:
+            raise AudioInputUnavailable(
+                DEVICE_STATUS_NO_INPUT,
+                "Ubuntu currently exposes no PipeWire microphone input",
+            ) from exc
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise AudioInputUnavailable(
+                DEVICE_STATUS_HOST_AUDIO_UNAVAILABLE,
+                "Ubuntu PipeWire is not reachable from Debug Mode",
+            ) from exc
+        properties = _parse_wpctl_properties(fallback.stdout)
     if properties.get("media.class") != "Audio/Source":
         raise AudioInputUnavailable(
             DEVICE_STATUS_NO_INPUT,
@@ -637,6 +700,7 @@ class AsrMicrophoneRuntime:
         topic: str,
         output_dir: str | Path,
         save_artifacts: bool = True,
+        recording_default_active: bool = True,
         capture_lock_path: str | Path | None = None,
     ) -> None:
         self._np, self._sd, self._websockets, dependency_error = _optional_audio_modules()
@@ -644,6 +708,9 @@ class AsrMicrophoneRuntime:
         self._topic = str(topic)
         self._output_dir = Path(output_dir)
         self._save_artifacts_enabled = bool(save_artifacts)
+        self._recording_default_active = bool(
+            recording_default_active and self._save_artifacts_enabled
+        )
         self._capture_lock_path = (
             Path(capture_lock_path) if capture_lock_path is not None else None
         )
@@ -674,6 +741,8 @@ class AsrMicrophoneRuntime:
         self._partial_text = ""
         self._finals: deque[dict[str, Any]] = deque(maxlen=40)
         self._recorded_pcm: list[bytes] = []
+        self._recorded_finals: list[dict[str, Any]] = []
+        self._recording_active = False
         self._recording_path = ""
         self._transcript_path = ""
         self._stream: Any | None = None
@@ -815,6 +884,8 @@ class AsrMicrophoneRuntime:
             self._partial_text = ""
             self._finals.clear()
             self._recorded_pcm = []
+            self._recorded_finals = []
+            self._recording_active = self._recording_default_active
             self._recording_path = ""
             self._transcript_path = ""
             self._resampler = None
@@ -884,6 +955,7 @@ class AsrMicrophoneRuntime:
             with self._lock:
                 self._client = None
                 self._resampler = None
+                self._recording_active = False
                 self._state = "ERROR"
                 self._last_error = f"Microphone start failed: {exc}"
             self._release_capture_lock()
@@ -952,6 +1024,47 @@ class AsrMicrophoneRuntime:
             self._events.clear()
         return rows
 
+    def start_recording(self) -> dict[str, Any]:
+        """Begin a bounded artifact window without restarting microphone ASR."""
+
+        with self._lock:
+            if not self._save_artifacts_enabled:
+                raise RuntimeError("ASR recording artifacts are disabled")
+            if self._state != "LISTENING":
+                raise RuntimeError("ASR microphone must be LISTENING before recording")
+            if self._recording_active:
+                raise RuntimeError("ASR recording is already active")
+            self._recorded_pcm = []
+            self._recorded_finals = []
+            self._recording_path = ""
+            self._transcript_path = ""
+            self._recording_active = True
+            self._events.append(
+                {"type": "asr_recording_started", "stamp": _utc_now()}
+            )
+        return self.snapshot()
+
+    def stop_recording(self) -> dict[str, Any]:
+        """Close the current artifact window and synchronously persist it."""
+
+        with self._lock:
+            if not self._recording_active:
+                raise RuntimeError("ASR recording is not active")
+            self._recording_active = False
+        recording_path, transcript_path = self._save_artifacts()
+        with self._lock:
+            self._recording_path = recording_path
+            self._transcript_path = transcript_path
+            self._events.append(
+                {
+                    "type": "asr_recording_stopped",
+                    "stamp": _utc_now(),
+                    "recording_path": recording_path,
+                    "transcript_path": transcript_path,
+                }
+            )
+        return self.snapshot()
+
     def snapshot(self) -> dict[str, Any]:
         now = time.monotonic()
         with self._lock:
@@ -984,6 +1097,7 @@ class AsrMicrophoneRuntime:
                 "recording_path": self._recording_path,
                 "transcript_path": self._transcript_path,
                 "artifacts_enabled": self._save_artifacts_enabled,
+                "recording_active": self._recording_active,
                 "sample_rate": SAMPLE_RATE,
                 "channels": CHANNELS,
                 "sample_width_bits": SAMPLE_WIDTH * 8,
@@ -1023,7 +1137,7 @@ class AsrMicrophoneRuntime:
             self._blocks_captured += 1
             self._audio_level_dbfs = max(-99.0, dbfs)
             self._peak_level_dbfs = max(self._audio_level_dbfs, self._peak_level_dbfs - 0.5)
-            if pcm and self._save_artifacts_enabled:
+            if pcm and self._save_artifacts_enabled and self._recording_active:
                 self._recorded_pcm.append(pcm)
             if status:
                 self._input_dropped += 1
@@ -1062,6 +1176,8 @@ class AsrMicrophoneRuntime:
             }
             self._partial_text = ""
             self._finals.append(row)
+            if self._save_artifacts_enabled and self._recording_active:
+                self._recorded_finals.append(dict(row))
             self._events.append({"type": "asr_final", **row})
 
     def _on_connection(self, connected: bool) -> None:
@@ -1109,6 +1225,8 @@ class AsrMicrophoneRuntime:
                 self._connected = False
                 self._state = "ERROR"
             return
+        with self._lock:
+            self._recording_active = False
         try:
             recording_path, transcript_path = self._save_artifacts()
             stop_error = ""
@@ -1120,8 +1238,10 @@ class AsrMicrophoneRuntime:
             self._last_transport_stats = transport_stats
             self._connected = False
             self._stopped_monotonic = time.monotonic()
-            self._recording_path = recording_path
-            self._transcript_path = transcript_path
+            if recording_path:
+                self._recording_path = recording_path
+            if transcript_path:
+                self._transcript_path = transcript_path
             if stop_error:
                 self._state = "ERROR"
                 self._last_error = stop_error
@@ -1131,8 +1251,8 @@ class AsrMicrophoneRuntime:
                 {
                     "type": "asr_stopped",
                     "stamp": _utc_now(),
-                    "recording_path": recording_path,
-                    "transcript_path": transcript_path,
+                    "recording_path": self._recording_path,
+                    "transcript_path": self._transcript_path,
                     "final_count": len(self._finals),
                     "error": stop_error,
                 }
@@ -1141,14 +1261,15 @@ class AsrMicrophoneRuntime:
     def _save_artifacts(self) -> tuple[str, str]:
         with self._lock:
             pcm = b"".join(self._recorded_pcm)
-            finals = list(self._finals)
+            finals = list(self._recorded_finals)
             self._recorded_pcm = []
+            self._recorded_finals = []
         if not self._save_artifacts_enabled:
             return "", ""
         if not pcm and not finals:
             return "", ""
         self._output_dir.mkdir(parents=True, exist_ok=True)
-        stem = datetime.now(timezone.utc).strftime("asr_%Y%m%dT%H%M%SZ")
+        stem = datetime.now(timezone.utc).strftime("asr_%Y%m%dT%H%M%S_%fZ")
         wav_path = self._output_dir / f"{stem}.wav"
         txt_path = self._output_dir / f"{stem}.txt"
         if pcm:

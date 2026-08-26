@@ -64,7 +64,7 @@ separate Action/Service contracts.
 
 ## Public topic set
 
-All eleven state/event topics use `surgical_interop_msgs` 0.3.0.
+All eleven state/event topics use `surgical_interop_msgs` 0.4.0.
 
 | Topic | Type | Category | Purpose |
 | --- | --- | --- | --- |
@@ -123,8 +123,8 @@ Sequence alone is never a globally unique event key.
 `/surgery/gateway_info` is the first topic a consumer should acquire. Its
 fields have the following semantics:
 
-- `schema_version`: public projection schema (`1.1.0` for this contract).
-- `interface_version`: installed interface package (`0.3.0`).
+- `schema_version`: public projection schema (`1.2.0` for this contract).
+- `interface_version`: installed interface package (`0.4.0`).
 - `catalog_version`: deterministic SHA-256 digest of the published catalog.
 - `gateway_instance_id`: opaque non-PHI UUID created once per Gateway process.
 - `procedure_run_id`: opaque non-PHI UUID for one active run; empty while idle.
@@ -192,14 +192,15 @@ from private event detail. Other detail remains private.
 ### `/surgery/gateway_info`
 
 Use this periodic heartbeat to distinguish idle from stopped, identify process
-restart, and bind every v0.3 snapshot to the matching catalog and run. Do not
+restart, and bind every v0.4 snapshot to the matching catalog and run. Do not
 treat a UUID as a patient or case identifier; it is deliberately opaque and
 ephemeral.
 
 ### `/surgery/catalog`
 
 `ProcedureCatalog` remains populated while idle so a UI can build screens before
-a run starts. `PhaseCatalogEntry` provides authored order, stable ID,
+a run starts. It includes the procedure display name, target site, and approach
+in English and Korean. `PhaseCatalogEntry` provides authored order, stable ID,
 English/Korean label, normal/interrupt kind, possible next phase IDs, and
 expected tool IDs. `InstrumentCatalogEntry` provides stable ID,
 English/Korean label, aliases, category, configured inventory count,
@@ -343,7 +344,7 @@ contract.
 ## Consumer startup and reconnect sequence
 
 1. Use the deployment-provided ROS domain, discovery, RMW, and network values.
-2. Confirm `surgical_interop_msgs` 0.3.0 is installed and types resolve.
+2. Confirm `surgical_interop_msgs` 0.4.0 is installed and types resolve.
 3. Subscribe to `/surgery/gateway_info` with reliable/transient-local QoS.
 4. Validate `schema_version`, `interface_version`, and `catalog_version`.
 5. Subscribe to `/surgery/catalog` and build procedure-scoped display labels.

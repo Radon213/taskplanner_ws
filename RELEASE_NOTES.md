@@ -20,8 +20,8 @@ task-planning baseline for surgical tool handover and Mayo-stand recovery.
   speech, hand extension, field interrupt, and visible Mayo-stand instruments.
 - Mayo-based recovery is the normal flow; direct hand recovery remains only as
   a legacy/manual path.
-- BT recovery supports returning unused prepositioned right-hand tools during
-  procedure cleanup.
+- BT recovery parks an unused prepositioned right-hand tool on Mayo when an
+  explicit different-tool request or a stable replacement prediction requires it.
 - Thyroidectomy, nephrectomy, and inguinal hernia repair procedure bundles are
   available for cross-scenario validation.
 

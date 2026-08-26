@@ -1,7 +1,17 @@
 string bundle_name
 bool restart_if_running
+bool preview_only
+bool reload_if_changed
+# Optional optimistic-concurrency token from a prior preview. An empty value
+# preserves direct trusted-client selection; operator UI apply always sets it.
+string expected_candidate_revision
 ---
 bool success
 string message
 string active_bundle
 string spec_dir
+string active_config_revision
+string candidate_config_revision
+bool changed
+bool applied
+string disposition

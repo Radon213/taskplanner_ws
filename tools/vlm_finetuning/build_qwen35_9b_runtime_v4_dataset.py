@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Build a leakage-resistant Qwen3.5-9B SFT set for the live schema-v4 VLM.
+"""Build a leakage-resistant Qwen3.5-9B SFT set for the hand-free schema-v6 VLM.
 
 The builder deliberately uses the same public contract as ``real_vlm``:
 
 * one JPEG composed by ``compose_flir_cam4_for_model`` (FLIR left, CAM4 right),
 * the actor-log system and developer prompts from the checked-out runtime,
 * ``Compact context JSON`` followed by one image label and one image, and
-* the complete schema-v4 JSON response.
+* the complete schema-v6 JSON response, which contains no hand field.
 
 Labels remain field-scoped.  A row may carry a complete, well-formed response,
 but ``supervision_char_spans`` identifies only the reviewed/allowed fields that
@@ -334,15 +334,6 @@ def active_phase(phases: list[dict[str, Any]], time_sec: float) -> str:
     return active
 
 
-def active_request(requests: list[dict[str, Any]], time_sec: float) -> dict[str, Any] | None:
-    for event in requests:
-        if float(event.get("start_sec", event.get("time_sec", 0.0))) <= time_sec <= float(
-            event.get("end_sec", event.get("time_sec", 0.0))
-        ):
-            return event
-    return None
-
-
 def current_intent(voice: list[dict[str, Any]], time_sec: float) -> tuple[str, str, float]:
     candidates = [
         event
@@ -414,7 +405,6 @@ def make_target(
     time_sec: float,
     phases: list[dict[str, Any]],
     transfers: list[dict[str, Any]],
-    requests: list[dict[str, Any]],
     voice: list[dict[str, Any]],
     teacher_payload: dict[str, Any] | None,
     cam4_detections: list[dict[str, Any]],
@@ -423,16 +413,13 @@ def make_target(
 ) -> tuple[dict[str, Any], str]:
     phase_id = active_phase(phases, time_sec)
     tool_rows, uncertainty, forecast_kind = forecast_target(transfers, time_sec)
-    request = active_request(requests, time_sec)
-    gesture = ["request_tool", "", "open_receive", 0.9] if request else ["", "", "", 0.0]
     intent = list(current_intent(voice, time_sec))
     mayo = visible_mayo(cam4_detections, cam4_source_width, cam4_source_height)
     target = {
-        "v": "4",
+        "v": "6",
         "phase": [[phase_id, 0.9]],
         "tool": tool_rows,
         "intent": intent,
-        "gesture": gesture,
         "mayo": mayo,
         "mayo_retrieve": [mayo[0][0], round(float(mayo[0][2]) * 0.75, 2)] if mayo else ["", 0.0],
         "u": uncertainty,
@@ -442,21 +429,11 @@ def make_target(
     return target, forecast_kind
 
 
-def request_before_transfer(requests: list[dict[str, Any]], transfer_time: float) -> dict[str, Any] | None:
-    eligible = [
-        event
-        for event in requests
-        if 0.0 <= transfer_time - float(event.get("end_sec", event.get("time_sec", 0.0))) <= 10.0
-    ]
-    return max(eligible, key=lambda row: float(row.get("end_sec", row.get("time_sec", 0.0)))) if eligible else None
-
-
 def build_anchors(
     case_id: str,
     duration: float,
     phases: list[dict[str, Any]],
     transfers: list[dict[str, Any]],
-    requests: list[dict[str, Any]],
     voice: list[dict[str, Any]],
     cam4_frames: list[list[dict[str, Any]]],
     timestamps: list[float],
@@ -483,13 +460,9 @@ def build_anchors(
         if not tool_id or transfer_time < 2.1:
             continue
         anchor_time = transfer_time - 5.0
-        preceding_request = request_before_transfer(requests, transfer_time)
-        if preceding_request is not None:
-            request_start = float(preceding_request.get("start_sec", preceding_request.get("time_sec", 0.0)))
-            anchor_time = min(anchor_time, request_start - 0.35)
         anchor_time = max(0.0, transfer_time - 7.9, anchor_time)
         delta = transfer_time - anchor_time
-        if 2.0 <= delta <= 8.0 and active_request(requests, anchor_time) is None:
+        if 2.0 <= delta <= 8.0:
             positives.append(Anchor(case_id, "forecast", anchor_time, ("tool", "u"), (str(event.get("event_id", "")),), "confirmed_physical_transfer", "positive_2_8_sec"))
     anchors.extend(positives)
 
@@ -497,28 +470,13 @@ def build_anchors(
     grid = 1.0
     while grid <= duration:
         _, _, kind = forecast_target(transfers, grid)
-        if kind != "imminent_2_8_sec" and active_request(requests, grid) is None:
+        if kind != "imminent_2_8_sec":
             negative_candidates.append(grid)
         grid += 2.0
     rng.shuffle(negative_candidates)
     negative_count = min(len(negative_candidates), int(math.ceil(len(positives) * negative_ratio)))
     for index, time_sec in enumerate(sorted(negative_candidates[:negative_count])):
         anchors.append(Anchor(case_id, "forecast", time_sec, ("tool", "u"), (f"{case_id}-forecast-negative-{index:03d}",), "derived_no_transfer_in_2_8_sec", "negative_outside_window"))
-
-    for event in requests:
-        start = float(event.get("start_sec", event.get("time_sec", 0.0)))
-        end = float(event.get("end_sec", start))
-        time_sec = min(end, start + min(0.7, max(0.0, (end - start) / 2.0)))
-        anchors.append(Anchor(case_id, "gesture", time_sec, ("gesture",), (str(event.get("event_id", "")),), "confirmed_request_interval", "positive_open_receive"))
-    gesture_negative_times: list[float] = []
-    grid = 0.5
-    while grid <= duration and len(gesture_negative_times) < len(requests) * 3:
-        if active_request(requests, grid) is None:
-            gesture_negative_times.append(grid)
-        grid += 2.5
-    rng.shuffle(gesture_negative_times)
-    for index, time_sec in enumerate(sorted(gesture_negative_times[: len(requests)])):
-        anchors.append(Anchor(case_id, "gesture", time_sec, ("gesture",), (f"{case_id}-gesture-negative-{index:03d}",), "derived_outside_confirmed_request_intervals", "negative_no_open_receive"))
 
     for event in voice:
         available = float(event.get("available_sec", event.get("end_sec", 0.0)))
@@ -620,12 +578,6 @@ def main() -> int:
             if not tool_id_from_name(str(event.get("tool", ""))):
                 unsupported_tools[str(event.get("tool", ""))] += 1
         transfers = [event for event in transfers if tool_id_from_name(str(event.get("tool", "")))]
-        requests = [
-            event
-            for event in events
-            if "request" in str(event.get("event_type", ""))
-            and event.get("review_status") == "confirmed"
-        ]
         phases = sorted(read_jsonl(phase_path), key=lambda row: float(row.get("time_sec", 0.0)))
         voice = sorted(read_jsonl(voice_path), key=lambda row: float(row.get("available_sec", row.get("end_sec", 0.0))))
         overlay_payload = json.loads(overlay_path.read_text(encoding="utf-8"))
@@ -640,7 +592,6 @@ def main() -> int:
             duration,
             phases,
             transfers,
-            requests,
             voice,
             cam4_frames,
             timestamps,
@@ -711,7 +662,6 @@ def main() -> int:
                 time_sec=anchor.time_sec,
                 phases=phases,
                 transfers=transfers,
-                requests=requests,
                 voice=voice,
                 teacher_payload=teacher_payload,
                 cam4_detections=cam4_detections,
@@ -723,7 +673,7 @@ def main() -> int:
             supervised = tuple(dict.fromkeys(("v", *anchor.supervision_fields, "bed_robot_arm_group")))
             portable_image_path = image_path.relative_to(output_dir)
             row = {
-                "schema": "taskplanner.qwen35_runtime_v4_sft.v1",
+                "schema": "taskplanner.qwen35_runtime_v6_sft.v1",
                 "example_id": f"{case_id}:{anchor.task}:{frame_idx:06d}:{anchor_index:04d}",
                 "case_id": case_id,
                 "split": split,
@@ -758,7 +708,7 @@ def main() -> int:
                     "derived_forecast_kind": derived_forecast_kind,
                     "forecast_horizon_sec": [2.0, 8.0],
                     "tool_is_additional_handover_not_visible_tool": True,
-                    "gesture_never_backfills_tool": True,
+                    "hand_perception_excluded_from_vlm": True,
                 },
                 "prompt_sha256": {
                     "system": system_sha,
@@ -802,13 +752,13 @@ def main() -> int:
         raise RuntimeError("RF-DETR pseudo labels escaped the training split")
 
     manifest = {
-        "schema": "taskplanner.qwen35_runtime_v4_dataset_manifest.v1",
+        "schema": "taskplanner.qwen35_runtime_v6_dataset_manifest.v1",
         "repo_head": git_text("rev-parse", "HEAD"),
         "origin_main": git_text("rev-parse", "origin/main"),
         "dirty_worktree_preserved": bool(git_text("status", "--porcelain")),
         "seed": args.seed,
         "runtime_contract": {
-            "prompt_profile": "actor_log/full/schema-v4",
+            "prompt_profile": "actor_log/full/schema-v6",
             "system_sha256": system_sha,
             "developer_sha256": developer_sha,
             "single_composite_image": True,
@@ -825,7 +775,7 @@ def main() -> int:
             "rfdetr_mayo": "train-only pseudo labels; not treated as Mayo-location ground truth",
             "summary": "Qwen3.5-35B-A3B public-trace distillation; agreement metric only",
             "phase": "user-authorized provisional boundaries; evaluated separately",
-            "gesture_and_transfer": "confirmed observable intervals/points",
+            "transfer": "confirmed observable points",
             "bed_robot_arm_group": "null-only because no positive reviewed request corpus exists",
         },
         "sources": source_manifest,

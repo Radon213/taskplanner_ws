@@ -2,11 +2,7 @@ export const DEBUG_PERCEPTION_MAX_AGE_MS = 3000;
 export const DEBUG_PERCEPTION_FINAL_OVERLAY_TOPIC = "/perception/debug/final_overlay/compressed";
 export const DEBUG_PERCEPTION_FINAL_OVERLAY_STATUS_TOPIC = "/perception/debug/final_overlay/status";
 export const DEBUG_PERCEPTION_FINAL_OVERLAY_STATUS_SCHEMA = "pnu.perception.final_overlay.v1";
-export const DEBUG_PERCEPTION_RAW_TOPIC = "/synced/cam_4/color/image_raw/compressed";
-export const DEBUG_PERCEPTION_OVERLAY_TOPIC = "/surgery/images/cam4/detection_overlay/compressed";
-export const DEBUG_PERCEPTION_POSE_OVERLAY_TOPIC = "/surgery/images/cam4/pose_overlay/compressed";
 export const DEBUG_PERCEPTION_TOOL_POSES_TOPIC = "/surgery/perception/cam4/tool_poses";
-export const DEBUG_PERCEPTION_HAND_KEYPOINTS_TOPIC = "/surgery/perception/cam4/hand_keypoints";
 export const DEBUG_PERCEPTION_BLOOD_SEMANTICS_TOPIC = "/surgery/perception/cam4/blood_semantics/json";
 export const DEBUG_PERCEPTION_HEALTH_TOPIC = "/surgery/perception/rfdetr/health";
 export const DEBUG_PERCEPTION_DIAGNOSTICS_TOPIC = "/surgery/perception/rfdetr/diagnostics/json";
@@ -134,7 +130,6 @@ export interface DebugPerceptionDiagnostics {
   modelDigests: Record<string, string>;
   toolDetectionCount: number;
   bloodDetectionCount: number;
-  handCount: number;
   instanceCount: number;
   emptyDetectionResult: boolean;
   metric3dReady: boolean;
@@ -154,7 +149,6 @@ export interface DebugPerceptionDiagnostics {
   overlayTruncated: boolean;
   overlayDrawnToolCount: number;
   overlayDrawnBloodCount: number;
-  overlayDrawnHandCount: number;
   poseOverlayPublished: boolean | null;
   poseOverlayStatus: string;
   poseOverlayTruncated: boolean;
@@ -224,43 +218,6 @@ export interface DebugToolPoseEvidence {
   diagnostics: DebugPerceptionDiagnostics;
 }
 
-export type DebugHandDepthSource = "real" | "mono" | "2d_only";
-
-export interface DebugHandJoint {
-  index: number;
-  u: number;
-  v: number;
-  x: number;
-  y: number;
-  z: number;
-  score: number;
-  validDepth: boolean;
-}
-
-export interface DebugHandKeypoint {
-  handIndex: number;
-  hasHandedness: boolean;
-  handednessLabel: "Left" | "Right" | "";
-  handednessScore: number;
-  joints: DebugHandJoint[];
-  hasPalm6d: boolean;
-  palm6d: {
-    translation: { x: number; y: number; z: number };
-    orientation: { x: number; y: number; z: number; w: number };
-    rotationMatrix: [number, number, number, number, number, number, number, number, number];
-  } | null;
-}
-
-export interface DebugHandKeypoints {
-  frameId: string;
-  sourceStampSec: number;
-  sourceStampNanosec: number;
-  sourceStampKey: string;
-  depthSource: DebugHandDepthSource;
-  hands: DebugHandKeypoint[];
-  receivedAt: number;
-}
-
 export interface DebugBloodInstance {
   instanceId: number;
   confidence: number;
@@ -280,11 +237,6 @@ export interface DebugBloodSemantics {
   combinedCentroidDepthValid: boolean;
   combinedCentroidDepthM: number | null;
   receivedAt: number;
-}
-
-export interface DebugHandEvidence {
-  diagnostics: DebugPerceptionDiagnostics;
-  result: DebugHandKeypoints;
 }
 
 export interface DebugBloodEvidence {
@@ -311,7 +263,7 @@ const MAX_COMPRESSED_IMAGE_BYTES = 12 * 1024 * 1024;
 const MAX_TOOL_POSES = 64;
 const MAX_TOOL_STATUS_FLAGS = 32;
 const PROVIDER = "pnu_hand_blood";
-const ALGORITHMS = new Set(["tool", "blood", "hand"]);
+const ALGORITHMS = new Set(["tool", "blood"]);
 const OVERLAY_STATUSES = new Set([
   "published",
   "rate_limited",
@@ -854,9 +806,6 @@ export function parsePerceptionDiagnostics(
   const bloodDetectionCount = finiteNonnegativeInteger(
     parsed.blood_detection_count === undefined && errorCode ? 0 : parsed.blood_detection_count,
   );
-  const handCount = finiteNonnegativeInteger(
-    parsed.hand_count === undefined && errorCode ? 0 : parsed.hand_count,
-  );
   const instanceCount = finiteNonnegativeInteger(parsed.instance_count);
   const inferenceLatencyMs = finiteNonnegativeNumber(parsed.inference_latency_ms);
   const sourceToOutputLatencyMs = finiteNonnegativeNumber(parsed.source_to_output_latency_ms);
@@ -880,7 +829,6 @@ export function parsePerceptionDiagnostics(
     || sequence === null
     || toolDetectionCount === null
     || bloodDetectionCount === null
-    || handCount === null
     || instanceCount === null
     || inferenceLatencyMs === null
     || sourceToOutputLatencyMs === null
@@ -891,7 +839,7 @@ export function parsePerceptionDiagnostics(
   ) return null;
   if (executedAlgorithms.some((algorithm) => !requestedAlgorithms.includes(algorithm))) return null;
   if (!errorCode && !sameStringArray(requestedAlgorithms, executedAlgorithms)) return null;
-  if (!errorCode && instanceCount !== toolDetectionCount + bloodDetectionCount + handCount) return null;
+  if (!errorCode && instanceCount !== toolDetectionCount + bloodDetectionCount) return null;
   if (!errorCode && (
     !frameId
     || !modelVersion
@@ -935,15 +883,9 @@ export function parsePerceptionDiagnostics(
       ? 0
       : parsed.overlay_drawn_blood_count,
   );
-  const overlayDrawnHandCount = finiteNonnegativeInteger(
-    parsed.overlay_drawn_hand_count === undefined && errorCode
-      ? 0
-      : parsed.overlay_drawn_hand_count,
-  );
   if (
     overlayDrawnToolCount === null
     || overlayDrawnBloodCount === null
-    || overlayDrawnHandCount === null
   ) return null;
   if (!errorCode && (
     overlayPublished === null
@@ -953,7 +895,6 @@ export function parsePerceptionDiagnostics(
     || (overlayTruncated && !overlayPublished)
     || overlayDrawnToolCount > toolDetectionCount
     || overlayDrawnBloodCount > bloodDetectionCount
-    || overlayDrawnHandCount > handCount
   )) return null;
   const poseOverlayFieldNames = [
     "pose_overlay_published",
@@ -1009,7 +950,6 @@ export function parsePerceptionDiagnostics(
     modelDigests,
     toolDetectionCount,
     bloodDetectionCount,
-    handCount,
     instanceCount,
     emptyDetectionResult,
     metric3dReady: parsed.metric_3d_ready,
@@ -1029,7 +969,6 @@ export function parsePerceptionDiagnostics(
     overlayTruncated: typeof overlayTruncated === "boolean" ? overlayTruncated : false,
     overlayDrawnToolCount,
     overlayDrawnBloodCount,
-    overlayDrawnHandCount,
     poseOverlayPublished,
     poseOverlayStatus,
     poseOverlayTruncated,
@@ -1044,204 +983,6 @@ export function parsePerceptionDiagnostics(
 
 export function debugPerceptionStampNsKey(sec: number, nanosec: number): string {
   return (BigInt(sec) * 1_000_000_000n + BigInt(nanosec)).toString();
-}
-
-function rotationDeterminant(matrix: number[]): number {
-  return matrix[0] * (matrix[4] * matrix[8] - matrix[5] * matrix[7])
-    - matrix[1] * (matrix[3] * matrix[8] - matrix[5] * matrix[6])
-    + matrix[2] * (matrix[3] * matrix[7] - matrix[4] * matrix[6]);
-}
-
-function quaternionRotationMatrix(quaternion: number[]): number[] {
-  const [x, y, z, w] = quaternion;
-  return [
-    1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w),
-    2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w),
-    2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y),
-  ];
-}
-
-function parseHandKeypoint(value: unknown): DebugHandKeypoint | null {
-  const parsed = exactRecord(value, [
-    "hand_index",
-    "has_handedness",
-    "handedness_label",
-    "handedness_score",
-    "joints_2d",
-    "joints_3d",
-    "kp_scores",
-    "kp_valid_depth",
-    "has_palm_6d",
-    "palm_6d",
-  ]);
-  if (!parsed) return null;
-  const handIndex = unsignedInteger(parsed.hand_index, 0x7fff_ffff);
-  const handednessScore = finiteNumberInRange(parsed.handedness_score, 0, 1);
-  const joints2d = Array.isArray(parsed.joints_2d) && parsed.joints_2d.length === 21
-    ? parsed.joints_2d.map((joint) => {
-      const point = exactRecord(joint, ["u", "v"]);
-      const values = point
-        ? fixedFiniteArray([point.u, point.v], 2, -1_000_000, 1_000_000)
-        : null;
-      return values as [number, number] | null;
-    })
-    : null;
-  const joints3d = Array.isArray(parsed.joints_3d) && parsed.joints_3d.length === 21
-    ? parsed.joints_3d.map((joint) => {
-      const point = exactRecord(joint, ["x", "y", "z"]);
-      const values = point
-        ? fixedFiniteArray([point.x, point.y, point.z], 3, -100, 100)
-        : null;
-      return values as [number, number, number] | null;
-    })
-    : null;
-  const scores = fixedFiniteArray(parsed.kp_scores, 21, 0, 1);
-  const validDepth = fixedBooleanArray(parsed.kp_valid_depth, 21);
-  if (
-    handIndex === null
-    || handednessScore === null
-    || joints2d === null
-    || joints2d.some((joint) => joint === null)
-    || joints3d === null
-    || joints3d.some((joint) => joint === null)
-    || scores === null
-    || validDepth === null
-    || typeof parsed.has_handedness !== "boolean"
-    || typeof parsed.has_palm_6d !== "boolean"
-    || typeof parsed.handedness_label !== "string"
-  ) return null;
-  const handednessLabel = parsed.handedness_label;
-  if (
-    (parsed.has_handedness && !["Left", "Right"].includes(handednessLabel))
-    || (!parsed.has_handedness && (handednessLabel !== "" || handednessScore !== 0))
-  ) return null;
-  const joints = joints2d.map((joint2d, index) => {
-    const joint3d = joints3d[index] as [number, number, number];
-    return {
-      index,
-      u: (joint2d as [number, number])[0],
-      v: (joint2d as [number, number])[1],
-      x: joint3d[0],
-      y: joint3d[1],
-      z: joint3d[2],
-      score: scores[index],
-      validDepth: validDepth[index],
-    };
-  });
-  if (joints.some((joint) => (
-    joint.validDepth
-      ? joint.z <= 0
-      : Math.abs(joint.x) > 1e-9 || Math.abs(joint.y) > 1e-9 || Math.abs(joint.z) > 1e-9
-  ))) return null;
-
-  const palm = exactRecord(parsed.palm_6d, ["translation", "orientation", "rotation_matrix"]);
-  const translationRecord = palm && exactRecord(palm.translation, ["x", "y", "z"]);
-  const orientationRecord = palm && exactRecord(palm.orientation, ["x", "y", "z", "w"]);
-  const translation = translationRecord
-    ? fixedFiniteArray(
-      [translationRecord.x, translationRecord.y, translationRecord.z],
-      3,
-      -100,
-      100,
-    )
-    : null;
-  const orientation = orientationRecord
-    ? fixedFiniteArray(
-      [orientationRecord.x, orientationRecord.y, orientationRecord.z, orientationRecord.w],
-      4,
-      -1.001,
-      1.001,
-    )
-    : null;
-  const rotation = palm ? fixedFiniteArray(palm.rotation_matrix, 9, -1.001, 1.001) : null;
-  if (!palm || !translation || !orientation || !rotation) return null;
-  if (parsed.has_palm_6d) {
-    const quaternionNorm = Math.hypot(...orientation);
-    const columns = [
-      [rotation[0], rotation[3], rotation[6]],
-      [rotation[1], rotation[4], rotation[7]],
-      [rotation[2], rotation[5], rotation[8]],
-    ];
-    const dot = (left: number[], right: number[]) => left.reduce(
-      (total, item, index) => total + item * right[index],
-      0,
-    );
-    const quaternionMatrix = quaternionRotationMatrix(orientation);
-    if (
-      translation[2] <= 0
-      || Math.abs(quaternionNorm - 1) > 0.005
-      || columns.some((column) => Math.abs(dot(column, column) - 1) > 0.01)
-      || Math.abs(dot(columns[0], columns[1])) > 0.01
-      || Math.abs(dot(columns[0], columns[2])) > 0.01
-      || Math.abs(dot(columns[1], columns[2])) > 0.01
-      || Math.abs(rotationDeterminant(rotation) - 1) > 0.01
-      || rotation.some((item, index) => Math.abs(item - quaternionMatrix[index]) > 0.02)
-      || [0, 2, 9, 17].some((index) => !validDepth[index])
-    ) return null;
-  } else if (
-    translation.some((item) => item !== 0)
-    || orientation.some((item) => item !== 0)
-    || rotation.some((item) => item !== 0)
-  ) return null;
-
-  return {
-    handIndex,
-    hasHandedness: parsed.has_handedness,
-    handednessLabel: handednessLabel as DebugHandKeypoint["handednessLabel"],
-    handednessScore,
-    joints,
-    hasPalm6d: parsed.has_palm_6d,
-    palm6d: parsed.has_palm_6d ? {
-      translation: { x: translation[0], y: translation[1], z: translation[2] },
-      orientation: {
-        x: orientation[0],
-        y: orientation[1],
-        z: orientation[2],
-        w: orientation[3],
-      },
-      rotationMatrix: rotation as DebugHandKeypoint["palm6d"] extends infer Palm
-        ? Palm extends { rotationMatrix: infer Matrix } ? Matrix : never
-        : never,
-    } : null,
-  };
-}
-
-export function parseHandKeypoints(
-  message: unknown,
-  receivedAt: number,
-): DebugHandKeypoints | null {
-  const parsed = exactRecord(message, ["header", "depth_source", "hands"]);
-  const header = parsed && exactRecord(parsed.header, ["stamp", "frame_id"]);
-  const stampRecord = header && exactRecord(header.stamp, ["sec", "nanosec"]);
-  const stamp = sourceStamp(stampRecord?.sec, stampRecord?.nanosec);
-  const frameId = boundedText(header?.frame_id, 240);
-  const depthSource = parsed?.depth_source;
-  if (
-    !parsed
-    || !stamp?.key
-    || !frameId
-    || !["real", "mono", "2d_only"].includes(String(depthSource))
-    || !Array.isArray(parsed.hands)
-    || parsed.hands.length > 8
-  ) return null;
-  const hands = parsed.hands.map(parseHandKeypoint);
-  if (
-    hands.some((hand) => hand === null)
-    || new Set(hands.map((hand) => hand?.handIndex)).size !== hands.length
-  ) return null;
-  const typedHands = hands as DebugHandKeypoint[];
-  if (depthSource === "2d_only" && typedHands.some(
-    (hand) => hand.hasPalm6d || hand.joints.some((joint) => joint.validDepth),
-  )) return null;
-  return {
-    frameId,
-    sourceStampSec: stamp.sec,
-    sourceStampNanosec: stamp.nanosec,
-    sourceStampKey: stamp.key,
-    depthSource: depthSource as DebugHandDepthSource,
-    hands: typedHands,
-    receivedAt,
-  };
 }
 
 function parseBloodInstance(value: unknown): DebugBloodInstance | null {

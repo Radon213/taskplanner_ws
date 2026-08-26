@@ -34,7 +34,6 @@ def metric_values(value: dict[str, Any]) -> dict[str, float]:
         "bed_null_rate": float(value.get("bed_null_rate", 0.0)),
         "forecast_top1": float(value.get("forecast", {}).get("positive_top1_accuracy", 0.0)),
         "forecast_trigger_f1": float(value.get("forecast", {}).get("trigger", {}).get("f1", 0.0)),
-        "gesture_f1": float(value.get("gesture", {}).get("trigger", {}).get("f1", 0.0)),
         "intent_accuracy": float(value.get("intent", {}).get("semantic_exact_accuracy", 0.0)),
         "phase_accuracy": float(value.get("phase", {}).get("top1_accuracy", 0.0)),
         "summary_rouge_l": float(value.get("summary_teacher_agreement", {}).get("rouge_l_f1_mean", 0.0)),
@@ -46,7 +45,6 @@ def score(metrics: dict[str, float]) -> float:
     weights = {
         "forecast_top1": 0.24,
         "forecast_trigger_f1": 0.16,
-        "gesture_f1": 0.18,
         "intent_accuracy": 0.10,
         "phase_accuracy": 0.10,
         "summary_rouge_l": 0.06,
@@ -63,7 +61,6 @@ def gates(metrics: dict[str, float], baseline: dict[str, float]) -> dict[str, bo
         "null_bed_safety_exact": metrics["bed_null_rate"] == 1.0,
         "forecast_top1_improves": metrics["forecast_top1"] > baseline["forecast_top1"],
         "forecast_trigger_f1_improves": metrics["forecast_trigger_f1"] > baseline["forecast_trigger_f1"],
-        "gesture_not_regressed": metrics["gesture_f1"] >= baseline["gesture_f1"],
         "intent_not_regressed": metrics["intent_accuracy"] >= baseline["intent_accuracy"],
         "phase_not_regressed": metrics["phase_accuracy"] >= baseline["phase_accuracy"],
         "summary_within_ten_percent": metrics["summary_rouge_l"] >= baseline["summary_rouge_l"] * 0.90,

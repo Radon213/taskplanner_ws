@@ -18,6 +18,7 @@ VALID_TOOL_TRANSITIONS = {
     ("tray", "surgeon"),
     ("robot", "surgeon"),
     ("robot", "tray"),
+    ("robot", "mayo"),
     ("mayo", "robot"),
     ("mayo", "tray"),
 }
@@ -30,10 +31,14 @@ RETRACTION_COMMANDS = {
     "change_tool",
     "stop_retraction",
 }
-RETRACTION_TARGET_SIDES = {"none", "left", "right"}
+RETRACTION_TARGET_SIDES = {"none", "left", "right", "both"}
 MAX_RETRACTION_DISTANCE_M = 0.050
 DEFAULT_ACTION_WATCHDOG_POLICY = {
     "goal_response_timeout_sec": 10.0,
+    # CHANGE_TOOL may synchronously run the controller's preconfigured swap
+    # before replying to the Service.  Keep the generic admission timeout
+    # short, but do not misclassify that one reviewed long-running command.
+    "change_tool_response_timeout_sec": 120.0,
     "feedback_timeout_sec": 30.0,
     "max_duration_sec": 300.0,
     "server_loss_grace_sec": 5.0,
@@ -110,9 +115,12 @@ def load_action_watchdog_policy(config: dict[str, Any]) -> dict[str, float]:
         if value <= 0.0:
             raise ValueError(f"action_watchdog.{key} must be greater than 0")
         policy[key] = value
-    if policy["max_duration_sec"] <= policy["goal_response_timeout_sec"]:
+    if policy["max_duration_sec"] <= max(
+        policy["goal_response_timeout_sec"],
+        policy["change_tool_response_timeout_sec"],
+    ):
         raise ValueError(
-            "action_watchdog.max_duration_sec must exceed goal_response_timeout_sec"
+            "action_watchdog.max_duration_sec must exceed all response timeouts"
         )
     return policy
 
@@ -182,7 +190,12 @@ def validate_action_recovery_acknowledgement(
 def validate_planner_coexistence_acknowledgement(
     payload: dict[str, Any], blocked_nodes: Iterable[str]
 ) -> list[str]:
-    """Require an explicit acknowledgement of the exact discovered planner set."""
+    """Validate the legacy coexistence payload without granting authority.
+
+    This decoder remains for wire compatibility with older Debug clients.
+    ``manual_write_block_reason`` and the node admission path reject every
+    discovered planner regardless of the value returned here.
+    """
 
     expected = sorted(
         {str(node).strip() for node in blocked_nodes if str(node).strip()}
@@ -216,31 +229,22 @@ def manual_write_block_reason(
 ) -> str:
     """Return the fail-closed reason for a Debug Mode ROS write.
 
-    Every ROS write requires an armed session.  Once a Taskplanner runtime is
-    discovered, the explicit coexistence policy and an acknowledgement of the
-    exact current node set are required as well.
+    Every ROS write requires an armed session.  Standalone Debug never shares
+    write authority with a discovered Taskplanner runtime; coexistence flags
+    and the legacy acknowledgement fields remain accepted only for wire/status
+    compatibility and cannot bypass this boundary.
     """
 
     blocked = sorted(
         {str(node).strip() for node in blocked_nodes if str(node).strip()}
     )
-    acknowledged = sorted(
-        {
-            str(node).strip()
-            for node in acknowledged_blocked_nodes
-            if str(node).strip()
-        }
-    )
+    # Retain the arguments in the stable call contract while making it
+    # explicit that neither one grants standalone coexistence authority.
+    del planner_coexistence_allowed, acknowledged_blocked_nodes
     if fault_locked:
         return "manual control is fault locked"
     if blocked:
-        if not planner_coexistence_allowed:
-            return "full Taskplanner nodes are active: " + ", ".join(blocked)
-        if armed and acknowledged != blocked:
-            return (
-                "planner node set changed; refresh the status and arm manual "
-                "control with an exact coexistence acknowledgement"
-            )
+        return "full Taskplanner nodes are active: " + ", ".join(blocked)
     if not armed:
         return "manual control is not armed"
     return ""
@@ -253,6 +257,7 @@ SAFE_STOPPED_EXECUTION_STATES = {
     "completed",
     "terminated",
 }
+PAUSED_EXECUTION_STATE = "paused"
 UNSAFE_OPERATIONAL_ROBOT_STATES = {
     "busy",
     "cleaning",
@@ -268,6 +273,60 @@ UNSAFE_OPERATIONAL_ROBOT_STATES = {
 }
 
 
+def operational_runtime_intervention_block_reason(
+    *,
+    received: bool,
+    running: bool,
+    execution_state: str,
+    active_robot_task_id: str,
+    robot_state: str,
+    cleaner_busy: bool,
+    publisher_trusted: bool,
+    age_sec: float | None,
+    max_age_sec: float,
+    require_idle_resources: bool = True,
+) -> str:
+    """Return why integrated Debug intervention is not currently admissible.
+
+    Observation remains independent of this gate.  It applies only when Debug
+    is about to acquire manual write authority or issue a ROS write.  A
+    coherent paused state (``running=True``) or a coherent fully stopped state
+    (``running=False``) opens the lifecycle window.  New interventions also
+    require the shared robot and cleaner resources to be idle.
+
+    ``require_idle_resources=False`` is used only after one Debug command has
+    already been admitted.  It keeps freshness and the paused/stopped
+    lifecycle authoritative without mistaking activity caused by that command
+    for a scenario resume.
+    """
+
+    state = str(execution_state).strip().lower()
+    robot = str(robot_state).strip().lower()
+    if not received:
+        return "operational runtime state is unavailable"
+    if not publisher_trusted:
+        return "operational runtime state publisher is not trusted"
+    if age_sec is None or age_sec < 0.0 or age_sec > max_age_sec:
+        return "operational runtime state is stale"
+    if state == PAUSED_EXECUTION_STATE:
+        if not running:
+            return "operational runtime pause state is inconsistent"
+    elif state in SAFE_STOPPED_EXECUTION_STATES:
+        if running:
+            return "operational runtime stopped state is inconsistent"
+    else:
+        return "pause or stop the operational scenario before manual control"
+    if not require_idle_resources:
+        return ""
+    if str(active_robot_task_id).strip():
+        return "wait for the active robot task to finish before manual control"
+    if robot != "idle":
+        return "wait for the operational robot to become idle before manual control"
+    if cleaner_busy:
+        return "wait for the cleaner to become idle before manual control"
+    return ""
+
+
 def operational_runtime_stopped(
     *,
     received: bool,
@@ -280,7 +339,7 @@ def operational_runtime_stopped(
     age_sec: float | None,
     max_age_sec: float,
 ) -> bool:
-    """Require a fresh, explicit stopped state before integrated manual writes."""
+    """Require fresh, explicit full-stop evidence from the operational runtime."""
 
     state = str(execution_state).strip().lower()
     robot = str(robot_state).strip().lower()
@@ -348,7 +407,7 @@ def validate_retraction_command(payload: dict[str, Any]) -> dict[str, Any]:
     if command not in RETRACTION_COMMANDS:
         raise ValueError("unsupported retraction command")
     if target_side not in RETRACTION_TARGET_SIDES:
-        raise ValueError("target_side must be none, left, or right")
+        raise ValueError("target_side must be none, left, right, or both")
     try:
         distance_m = float(payload.get("distance_m", 0.0))
     except (TypeError, ValueError) as exc:
@@ -358,7 +417,9 @@ def validate_retraction_command(payload: dict[str, Any]) -> dict[str, Any]:
 
     if command == "adjust_retraction":
         if target_side == "none":
-            raise ValueError("adjust_retraction requires target_side left or right")
+            raise ValueError(
+                "adjust_retraction requires target_side left, right, or both"
+            )
         if distance_m <= 0.0:
             raise ValueError("adjust_retraction requires distance_m greater than 0")
         if distance_m > MAX_RETRACTION_DISTANCE_M:
@@ -366,7 +427,14 @@ def validate_retraction_command(payload: dict[str, Any]) -> dict[str, Any]:
                 "adjust_retraction requires distance_m at most "
                 f"{MAX_RETRACTION_DISTANCE_M:.3f}"
             )
-    elif target_side != "none" or distance_m != 0.0:
+    elif command == "finish_direct_teach" and distance_m != 0.0:
+        raise ValueError(
+            "finish_direct_teach allows target_side none, left, right, or both "
+            "but requires distance_m 0"
+        )
+    elif command != "finish_direct_teach" and (
+        target_side != "none" or distance_m != 0.0
+    ):
         raise ValueError(
             f"{command} requires target_side none and distance_m 0"
         )
@@ -499,7 +567,21 @@ def parse_voice_command(text: str, voice_config: dict[str, Any]) -> VoiceParse:
         "malleable",
     )
     is_retractor = any(term in normalized for term in retraction_terms)
-    if is_retractor:
+    # In an already-active retraction UI, STT often omits the noun entirely
+    # (for example, "양쪽으로 1mm씩 당겨줘").  Treat only an explicit
+    # bilateral selector plus a measured distance and movement cue as the
+    # implicit retraction family; ordinary spatial speech remains outside it.
+    implicit_bilateral_adjustment = (
+        any(term in normalized for term in ("양쪽", "양팔", "좌우", "both", "bilateral"))
+        and bool(
+            re.search(
+                r"\d+(?:\.\d+)?\s*(?:mm|밀리(?:미터)?|cm|센티(?:미터)?|센치(?:미터)?)",
+                normalized,
+            )
+        )
+        and any(cue in normalized for cue in ("더", "당겨", "당기", "끌어", "밀어", "조정", "이동", "추가"))
+    )
+    if is_retractor or implicit_bilateral_adjustment:
         starts = any(token in normalized for token in ("시작", "start"))
         stops = any(token in normalized for token in ("종료", "끝", "stop", "finish"))
         if starts and stops:
@@ -523,6 +605,11 @@ def parse_voice_command(text: str, voice_config: dict[str, Any]) -> VoiceParse:
             "left": "left",
             "오른쪽": "right",
             "right": "right",
+            "양쪽": "both",
+            "양팔": "both",
+            "좌우": "both",
+            "both": "both",
+            "bilateral": "both",
         }
         target_sides = {
             side for alias, side in target_aliases.items() if alias in normalized
@@ -534,7 +621,21 @@ def parse_voice_command(text: str, voice_config: dict[str, Any]) -> VoiceParse:
         )
         if len(target_sides) > 1:
             return VoiceParse(False, True, reason="ambiguous_retraction_target_side")
-        if len(target_sides) == 1 and distance_match and "더" in normalized:
+        adjustment_cues = (
+            "더",
+            "당겨",
+            "당기",
+            "끌어",
+            "밀어",
+            "조정",
+            "이동",
+            "추가",
+        )
+        if (
+            len(target_sides) == 1
+            and distance_match
+            and any(cue in normalized for cue in adjustment_cues)
+        ):
             distance_m = float(distance_match.group(1))
             if distance_match.group(2) in {"mm", "밀리", "밀리미터"}:
                 distance_m /= 1000.0

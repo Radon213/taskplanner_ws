@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate a Qwen3.5 model/adapter on held-out Taskplanner schema-v4 rows."""
+"""Evaluate a Qwen3.5 model/adapter on held-out hand-free schema-v6 rows."""
 
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split", default="test")
     parser.add_argument(
         "--tasks",
-        default="forecast,gesture,intent,phase,summary",
+        default="forecast,intent,phase,summary",
         help="Comma-separated task rows to evaluate.",
     )
     parser.add_argument("--max-per-task", type=int, default=0)
@@ -81,7 +81,7 @@ def select_balanced(rows: list[dict[str, Any]], limit: int, seed: int) -> list[d
                     # tag still says positive.  Stratify on the resolved target
                     # semantics, not the pre-resolution candidate tag.
                     key = (str(row.get("semantic", {}).get("derived_forecast_kind", "")), tool_id)
-                elif task in {"gesture", "intent"}:
+                elif task == "intent":
                     key = (str(row.get("semantic", {}).get("anchor_kind", "")),)
                 elif task == "phase":
                     phase = target.get("phase", [[""]])
@@ -123,10 +123,10 @@ def finite_confidence(value: Any) -> bool:
 
 def validate_shape(value: dict[str, Any]) -> list[str]:
     errors: list[str] = []
-    required = {"v", "phase", "tool", "intent", "gesture", "mayo", "mayo_retrieve", "u", "sum", "bed_robot_arm_group"}
+    required = {"v", "phase", "tool", "intent", "mayo", "mayo_retrieve", "u", "sum", "bed_robot_arm_group"}
     if set(value) != required:
         errors.append("keys")
-    if value.get("v") != "4":
+    if value.get("v") != "6":
         errors.append("v")
     for field, valid_ids in (("phase", VALID_PHASES), ("tool", VALID_TOOLS)):
         rows = value.get(field)
@@ -138,9 +138,6 @@ def validate_shape(value: dict[str, Any]) -> list[str]:
     intent = value.get("intent")
     if not isinstance(intent, list) or len(intent) != 3 or not finite_confidence(intent[-1] if isinstance(intent, list) and intent else None):
         errors.append("intent")
-    gesture = value.get("gesture")
-    if not isinstance(gesture, list) or len(gesture) != 4 or not finite_confidence(gesture[-1] if isinstance(gesture, list) and gesture else None):
-        errors.append("gesture")
     mayo = value.get("mayo")
     if not isinstance(mayo, list) or any(not isinstance(row, list) or len(row) != 3 or row[0] not in VALID_TOOLS or not finite_confidence(row[2]) for row in (mayo if isinstance(mayo, list) else [])):
         errors.append("mayo")
@@ -256,24 +253,6 @@ def summarize(predictions: list[dict[str, Any]], threshold: float) -> dict[str, 
         "threshold": threshold,
         "trigger": binary_prf(tp, fp, fn) | {"tn": tn},
     }
-
-    gesture_rows = [row for row in parsed if row["task"] == "gesture"]
-    gtp = gfp = gfn = gtn = 0
-    for row in gesture_rows:
-        expected_positive = row["expected"].get("gesture", [""])[0] == "request_tool"
-        gesture = row["parsed"].get("gesture")
-        predicted_positive = bool(
-            isinstance(gesture, list)
-            and len(gesture) == 4
-            and gesture[0] == "request_tool"
-            and finite_confidence(gesture[3])
-            and float(gesture[3]) >= threshold
-        )
-        gtp += int(expected_positive and predicted_positive)
-        gfp += int(not expected_positive and predicted_positive)
-        gfn += int(expected_positive and not predicted_positive)
-        gtn += int(not expected_positive and not predicted_positive)
-    summary["gesture"] = {"count": len(gesture_rows), "trigger": binary_prf(gtp, gfp, gfn) | {"tn": gtn}}
 
     intent_rows = [row for row in parsed if row["task"] == "intent"]
     intent_exact = []
@@ -398,7 +377,7 @@ def main() -> int:
 
     summary = summarize(predictions, args.trigger_threshold)
     summary.update({
-        "schema": "taskplanner.qwen35_9b_runtime_v4_evaluation.v1",
+        "schema": "taskplanner.qwen35_9b_runtime_v6_evaluation.v1",
         "model": args.model,
         "processor_model": args.processor_model,
         "dataset": str(args.dataset),

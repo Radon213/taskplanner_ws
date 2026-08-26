@@ -850,6 +850,9 @@ class CvContractMonitor(Node):
         if self._perception.provider == "pnu_hand_blood":
             readiness_state = "PNU_ALIGNED_DEPTH_3D_ADAPTER_AWAITING_HEALTH"
             adapter_state = "PNU_HTTP_ADAPTER_IMPLEMENTED_3D_FAIL_CLOSED"
+        elif self._perception.provider == "external_rfdetr_topics":
+            readiness_state = "EXTERNAL_RFDETR_TYPED_TOPICS_SELECTED"
+            adapter_state = "DIRECT_DDS_NO_LOCAL_ADAPTER"
         elif self._perception.provider == "disabled":
             readiness_state = "DISABLED"
             adapter_state = "DISABLED"

@@ -41,7 +41,6 @@ from rclpy.qos import (
 from sensor_msgs.msg import CameraInfo, CompressedImage
 from std_msgs.msg import String
 
-from hand_keypoint_interfaces.msg import Hand, HandKeypoints, PalmPose6D, Point2D
 from surgical_msgs.msg import ToolObservation
 from surgical_perception_msgs.msg import (
     ToolObservation2D,
@@ -63,7 +62,13 @@ WORKER_HEALTH_SCHEMA = "taskplanner.pnu_perception.health.v1"
 EXPECTED_UPSTREAM_REPOSITORY = "hanwae-py/hand-blood-tools"
 EXPECTED_UPSTREAM_COMMIT = "0f9e93115b8cc1d470398c92e010e3fc6ef1de5d"
 
-SUPPORTED_ALGORITHMS = ("tool", "blood", "hand")
+# Taskplanner deliberately retired the PNU hand model/output.  The upstream
+# worker still advertises its frozen three-model v1 capability surface, but
+# this adapter can request and admit only the tool and blood algorithms.  The
+# authoritative handover intent now arrives on the direct CAM4 gesture/facing
+# DDS contract owned by ``or_digital_twin``.
+SUPPORTED_ALGORITHMS = ("tool", "blood")
+WORKER_ALGORITHMS = ("tool", "blood", "hand")
 # PNU publishes its own frozen ontology on the typed ToolPose/Observation
 # topics.  The legacy CAM4 semantics and Mayo paths predate that ontology and
 # are consumed through the active procedure catalog, so translate only the
@@ -82,7 +87,6 @@ _PNU_TOOL_COMPATIBILITY_NAMES: dict[int, tuple[str, str]] = {
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _MAX_RESPONSE_JSON_BYTES = 16 * 1024 * 1024
 _MAX_DETECTIONS = 256
-_MAX_HANDS = 8
 _MAX_RLE_COUNTS = 1_000_000
 _MAX_ADVERTISED_RLE_COUNTS_PER_ALGORITHM = 1_000_000
 _MAX_BLOOD_UNION_SEGMENTS = 1_000_000
@@ -131,9 +135,6 @@ _TOOL_CANONICAL_CLASSES = {
 }
 _TOOL_POSITION_DEPTH_ABS_TOLERANCE_M = 2e-6
 _TOOL_POSITION_REPROJECTION_TOLERANCE_PX = 1.0
-_HAND_JOINT_REPROJECTION_TOLERANCE_PX = 1.0
-_HAND_PALM_TRANSLATION_TOLERANCE_M = 2e-6
-_HAND_PALM_ROTATION_TOLERANCE = 2e-5
 _DEFAULT_SUPPORT_PLANE_NORMAL_TOLERANCE_DEG = 1.0
 _MAX_SUPPORT_PLANE_NORMAL_TOLERANCE_DEG = 10.0
 # These are part of the pinned upstream planar_pose.PlanarPoseConfig. A remote
@@ -187,7 +188,6 @@ class ValidatedWorkerResponse:
     model_digests: dict[str, str]
     tool_detections: tuple[dict[str, Any], ...]
     blood_detections: tuple[dict[str, Any], ...]
-    hands: tuple[dict[str, Any], ...]
     metric_3d_ready: bool
     tool_support_plane_diagnostics: dict[str, Any] | None
 
@@ -200,7 +200,6 @@ class RenderedDebugOverlay:
     render_encode_latency_ms: float
     drawn_tool_count: int
     drawn_blood_count: int
-    drawn_hand_count: int
     truncated: bool
 
 
@@ -309,66 +308,6 @@ def parse_support_plane_normal(
 
 def _dot3(left: Sequence[float], right: Sequence[float]) -> float:
     return sum(float(a) * float(b) for a, b in zip(left, right, strict=True))
-
-
-def _cross3(
-    left: Sequence[float], right: Sequence[float]
-) -> tuple[float, float, float]:
-    return (
-        float(left[1]) * float(right[2]) - float(left[2]) * float(right[1]),
-        float(left[2]) * float(right[0]) - float(left[0]) * float(right[2]),
-        float(left[0]) * float(right[1]) - float(left[1]) * float(right[0]),
-    )
-
-
-def _palm_frame_v2_from_joints(
-    j0: Sequence[float],
-    j2: Sequence[float],
-    j9: Sequence[float],
-    j17: Sequence[float],
-) -> tuple[tuple[float, float, float], tuple[float, ...]]:
-    """Recompute the pinned upstream palm_frame_v2 without NumPy."""
-
-    origin = tuple(0.5 * (float(j0[i]) + float(j9[i])) for i in range(3))
-    x_axis_raw = tuple(float(j9[i]) - float(j0[i]) for i in range(3))
-    x_norm = math.sqrt(_dot3(x_axis_raw, x_axis_raw))
-    x_axis = tuple(item / (x_norm + 1.0e-9) for item in x_axis_raw)
-    y_axis_raw = tuple(
-        0.5 * (float(j0[i]) + float(j17[i])) - float(j2[i])
-        for i in range(3)
-    )
-    projection = _dot3(y_axis_raw, x_axis)
-    y_axis_orthogonal = tuple(
-        y_axis_raw[i] - projection * x_axis[i] for i in range(3)
-    )
-    y_norm = math.sqrt(_dot3(y_axis_orthogonal, y_axis_orthogonal))
-    y_axis = tuple(item / (y_norm + 1.0e-9) for item in y_axis_orthogonal)
-    z_axis_raw = _cross3(x_axis, y_axis)
-    z_norm = math.sqrt(_dot3(z_axis_raw, z_axis_raw))
-    z_axis = tuple(item / (z_norm + 1.0e-9) for item in z_axis_raw)
-    rotation_row_major = (
-        x_axis[0],
-        y_axis[0],
-        z_axis[0],
-        x_axis[1],
-        y_axis[1],
-        z_axis[1],
-        x_axis[2],
-        y_axis[2],
-        z_axis[2],
-    )
-    return origin, rotation_row_major
-
-
-def _rotation_determinant(rotation: Sequence[float]) -> float:
-    return (
-        float(rotation[0])
-        * (float(rotation[4]) * float(rotation[8]) - float(rotation[5]) * float(rotation[7]))
-        - float(rotation[1])
-        * (float(rotation[3]) * float(rotation[8]) - float(rotation[5]) * float(rotation[6]))
-        + float(rotation[2])
-        * (float(rotation[3]) * float(rotation[7]) - float(rotation[4]) * float(rotation[6]))
-    )
 
 
 def _bounded_string(value: Any, *, field: str, maximum: int = 256) -> str:
@@ -592,12 +531,29 @@ def normalize_algorithms(values: Iterable[Any]) -> tuple[str, ...]:
         value = str(raw).strip().casefold()
         if value not in SUPPORTED_ALGORITHMS:
             raise ValueError(
-                "requested_algorithms entries must be tool, blood, or hand"
+                "requested_algorithms entries must be tool or blood"
             )
         if value not in result:
             result.append(value)
     if not result:
         raise ValueError("requested_algorithms must not be empty")
+    return tuple(result)
+
+
+def _normalize_worker_algorithms(values: Iterable[Any]) -> tuple[str, ...]:
+    """Validate the frozen upstream capability list without admitting hand."""
+
+    result: list[str] = []
+    for raw in values:
+        value = str(raw).strip().casefold()
+        if value not in WORKER_ALGORITHMS:
+            raise ValueError(
+                "worker algorithms entries must be tool, blood, or hand"
+            )
+        if value not in result:
+            result.append(value)
+    if not result:
+        raise ValueError("worker algorithms must not be empty")
     return tuple(result)
 
 
@@ -627,7 +583,7 @@ def parse_expected_model_digests(
             or algorithm in result
         ):
             raise ValueError(
-                "expected model digests must map tool/blood/hand to lowercase SHA256"
+                "expected model digests must map tool/blood to lowercase SHA256"
             )
         result[algorithm] = digest
     if requested_algorithms is not None:
@@ -998,11 +954,11 @@ def _validate_model_records(
     field: str,
     executed: bool,
 ) -> dict[str, str]:
-    if not isinstance(raw, dict) or set(raw) != set(SUPPORTED_ALGORITHMS):
+    if not isinstance(raw, dict) or set(raw) != set(WORKER_ALGORITHMS):
         raise ContractError(f"{field} must contain exactly tool, blood, and hand")
     requested = set(algorithms)
     result: dict[str, str] = {}
-    for algorithm in SUPPORTED_ALGORITHMS:
+    for algorithm in WORKER_ALGORITHMS:
         record = raw.get(algorithm)
         if not isinstance(record, dict):
             raise ContractError(f"{field}.{algorithm} must be an object")
@@ -1119,8 +1075,8 @@ def validate_capabilities(
     ):
         raise ContractError("worker capabilities timestamp is stale or invalid")
 
-    algorithms = normalize_algorithms(payload["algorithms"])
-    if list(algorithms) != list(SUPPORTED_ALGORITHMS):
+    algorithms = _normalize_worker_algorithms(payload["algorithms"])
+    if list(algorithms) != list(WORKER_ALGORITHMS):
         raise ContractError("worker algorithms must use the canonical v1 order")
     requested = normalize_algorithms(requested_algorithms)
     if any(item not in algorithms for item in requested):
@@ -1300,7 +1256,7 @@ def validate_worker_health(
         raise ContractError("worker_health.models must be an object")
     all_models_ready = all(
         isinstance(raw_models.get(name), dict) and raw_models[name].get("ready") is True
-        for name in SUPPORTED_ALGORITHMS
+        for name in WORKER_ALGORITHMS
     )
     if (ready, status) != (
         all_models_ready,
@@ -2750,274 +2706,6 @@ def _validate_blood_results(value: Any) -> tuple[dict[str, Any], ...]:
     return tuple(normalized)
 
 
-def _validate_hand_results(
-    value: Any,
-    *,
-    color_camera_info: Mapping[str, Any] | None = None,
-) -> tuple[dict[str, Any], ...]:
-    if not isinstance(value, dict):
-        raise ContractError("results.hand must be an object")
-    schema = value.get("schema")
-    rgbd = schema == "pnu.hand.rgbd.v1"
-    expected_keys = {"schema", "executed", "image", "hands"}
-    if rgbd:
-        expected_keys.add("metric_3d")
-    _exact_keys(value, expected_keys, field="results.hand")
-    if schema not in {"pnu.hand.2d.v1", "pnu.hand.rgbd.v1"}:
-        raise ContractError("unexpected hand result schema")
-    if value["executed"] is not True:
-        raise ContractError("results.hand.executed must be true")
-    if rgbd and not _validate_metric_result(
-        value["metric_3d"], field="results.hand.metric_3d"
-    ):
-        raise ContractError("RGBD hand result must have metric 3-D ready")
-    camera = None
-    if rgbd:
-        if not isinstance(color_camera_info, Mapping):
-            raise ContractError("RGBD Hand result requires request color CameraInfo")
-        camera = CameraCalibration(
-            received_monotonic=0.0,
-            stamp_ns=int(color_camera_info.get("stamp_ns", 0)),
-            frame_id=str(color_camera_info.get("frame_id", "")),
-            payload=dict(color_camera_info),
-        )
-    image_width, image_height = _validate_image_shape(
-        value["image"], field="results.hand.image"
-    )
-    hands = value["hands"]
-    if not isinstance(hands, list) or len(hands) > _MAX_HANDS:
-        raise ContractError("results.hand.hands must be a bounded array")
-    normalized: list[dict[str, Any]] = []
-    indexes: set[int] = set()
-    for index, row in enumerate(hands):
-        field = f"results.hand.hands[{index}]"
-        if not isinstance(row, dict):
-            raise ContractError(f"{field} must be an object")
-        expected_row_keys = {"hand_index", "handedness", "joints_2d", "kp_scores"}
-        if rgbd:
-            expected_row_keys |= {"joints_3d", "kp_valid_depth", "palm_6d"}
-        _exact_keys(row, expected_row_keys, field=field)
-        hand_index = row["hand_index"]
-        if (
-            not isinstance(hand_index, int)
-            or isinstance(hand_index, bool)
-            or hand_index < 0
-            or hand_index in indexes
-        ):
-            raise ContractError(f"{field}.hand_index is invalid or duplicated")
-        indexes.add(hand_index)
-        handedness_raw = row["handedness"]
-        if not isinstance(handedness_raw, dict):
-            raise ContractError(f"{field}.handedness must be an object")
-        _exact_keys(
-            handedness_raw,
-            {"label", "score"},
-            field=f"{field}.handedness",
-        )
-        handedness_label = str(handedness_raw["label"]).strip().casefold()
-        if handedness_label not in {"left", "right", "unknown"}:
-            raise ContractError(f"{field}.handedness.label is invalid")
-        handedness_score = _validate_confidence(
-            handedness_raw["score"], field=f"{field}.handedness.score"
-        )
-        joints = row["joints_2d"]
-        scores = row["kp_scores"]
-        if (
-            not isinstance(joints, list)
-            or not isinstance(scores, list)
-            or len(joints) != 21
-            or len(scores) != len(joints)
-        ):
-            raise ContractError(f"{field} joint arrays are inconsistent")
-        normalized_joints: list[list[float]] = []
-        for joint_index, joint in enumerate(joints):
-            if (
-                not isinstance(joint, list)
-                or len(joint) != 2
-                or any(not _is_number(item) for item in joint)
-            ):
-                raise ContractError(f"{field}.joints_2d[{joint_index}] is invalid")
-            normalized_joints.append([float(joint[0]), float(joint[1])])
-            if (
-                not -float(image_width) <= float(joint[0]) <= 2.0 * image_width
-                or not -float(image_height) <= float(joint[1]) <= 2.0 * image_height
-            ):
-                raise ContractError(
-                    f"{field}.joints_2d[{joint_index}] exceeds bounded image space"
-                )
-        normalized_scores = [
-            _validate_confidence(item, field=f"{field}.kp_scores") for item in scores
-        ]
-        normalized_joints_3d = [[0.0, 0.0, 0.0] for _ in range(21)]
-        valid_depth = [False] * 21
-        palm = None
-        if rgbd:
-            raw_joints_3d = row["joints_3d"]
-            raw_valid_depth = row["kp_valid_depth"]
-            if (
-                not isinstance(raw_joints_3d, list)
-                or len(raw_joints_3d) != 21
-                or not isinstance(raw_valid_depth, list)
-                or len(raw_valid_depth) != 21
-                or any(not isinstance(item, bool) for item in raw_valid_depth)
-            ):
-                raise ContractError(f"{field} 3-D joint arrays are inconsistent")
-            normalized_joints_3d = []
-            valid_depth = list(raw_valid_depth)
-            for joint_index, (joint, valid) in enumerate(
-                zip(raw_joints_3d, valid_depth, strict=True)
-            ):
-                point = _optional_vector(
-                    joint, length=3, field=f"{field}.joints_3d[{joint_index}]"
-                )
-                if point is None:
-                    raise ContractError(
-                        f"{field}.joints_3d[{joint_index}] cannot be null"
-                    )
-                if valid:
-                    if point[2] <= 0.0 or any(abs(item) > 100.0 for item in point):
-                        raise ContractError(
-                            f"{field}.joints_3d[{joint_index}] is outside camera space"
-                        )
-                elif any(abs(item) > 1.0e-9 for item in point):
-                    raise ContractError(
-                        f"{field}.joints_3d[{joint_index}] must be zero when invalid"
-                    )
-                normalized_joints_3d.append(point)
-                if valid:
-                    joint_uv = normalized_joints[joint_index]
-                    if not (
-                        0.0 <= joint_uv[0] < image_width
-                        and 0.0 <= joint_uv[1] < image_height
-                    ):
-                        raise ContractError(
-                            f"{field}.kp_valid_depth[{joint_index}] is outside image"
-                        )
-                    assert camera is not None
-                    projected_uv = _project_camera_point(point, camera)
-                    if math.hypot(
-                        projected_uv[0] - joint_uv[0],
-                        projected_uv[1] - joint_uv[1],
-                    ) > _HAND_JOINT_REPROJECTION_TOLERANCE_PX:
-                        raise ContractError(
-                            f"{field}.joints_3d[{joint_index}] does not reproject "
-                            "to joints_2d"
-                        )
-            raw_palm = row["palm_6d"]
-            if raw_palm is not None:
-                if not isinstance(raw_palm, dict):
-                    raise ContractError(f"{field}.palm_6d must be null or object")
-                _exact_keys(
-                    raw_palm,
-                    {"translation", "orientation_xyzw", "rotation_matrix"},
-                    field=f"{field}.palm_6d",
-                )
-                translation = _optional_vector(
-                    raw_palm["translation"],
-                    length=3,
-                    field=f"{field}.palm_6d.translation",
-                )
-                orientation = _optional_vector(
-                    raw_palm["orientation_xyzw"],
-                    length=4,
-                    field=f"{field}.palm_6d.orientation_xyzw",
-                )
-                rotation = _optional_vector(
-                    raw_palm["rotation_matrix"],
-                    length=9,
-                    field=f"{field}.palm_6d.rotation_matrix",
-                )
-                if translation is None or orientation is None or rotation is None:
-                    raise ContractError(f"{field}.palm_6d fields cannot be null")
-                if translation[2] <= 0.0 or any(
-                    abs(item) > 100.0 for item in translation
-                ):
-                    raise ContractError(f"{field}.palm_6d.translation is invalid")
-                quaternion_norm = math.sqrt(sum(item * item for item in orientation))
-                if not 0.999 <= quaternion_norm <= 1.001:
-                    raise ContractError(f"{field}.palm_6d quaternion is not unit")
-                columns = (
-                    (rotation[0], rotation[3], rotation[6]),
-                    (rotation[1], rotation[4], rotation[7]),
-                    (rotation[2], rotation[5], rotation[8]),
-                )
-                for column in columns:
-                    if not 0.995 <= sum(item * item for item in column) <= 1.005:
-                        raise ContractError(
-                            f"{field}.palm_6d rotation is not normalized"
-                        )
-                if any(
-                    abs(sum(a * b for a, b in zip(columns[left], columns[right])))
-                    > 0.005
-                    for left, right in ((0, 1), (0, 2), (1, 2))
-                ):
-                    raise ContractError(f"{field}.palm_6d rotation is not orthogonal")
-                determinant = _rotation_determinant(rotation)
-                if not 0.995 <= determinant <= 1.005:
-                    raise ContractError(
-                        f"{field}.palm_6d rotation determinant is not +1"
-                    )
-                if not all(valid_depth[index] for index in (0, 2, 9, 17)):
-                    raise ContractError(f"{field}.palm_6d lacks required valid joints")
-                quaternion_rotation = _quaternion_xyzw_to_rotation_matrix(
-                    orientation
-                )
-                quaternion_rotation_flat = tuple(
-                    item for matrix_row in quaternion_rotation for item in matrix_row
-                )
-                if max(
-                    abs(left - right)
-                    for left, right in zip(
-                        rotation, quaternion_rotation_flat, strict=True
-                    )
-                ) > _HAND_PALM_ROTATION_TOLERANCE:
-                    raise ContractError(
-                        f"{field}.palm_6d quaternion and rotation matrix disagree"
-                    )
-                expected_translation, expected_rotation = _palm_frame_v2_from_joints(
-                    normalized_joints_3d[0],
-                    normalized_joints_3d[2],
-                    normalized_joints_3d[9],
-                    normalized_joints_3d[17],
-                )
-                if max(
-                    abs(left - right)
-                    for left, right in zip(
-                        translation, expected_translation, strict=True
-                    )
-                ) > _HAND_PALM_TRANSLATION_TOLERANCE_M:
-                    raise ContractError(
-                        f"{field}.palm_6d translation is not (j0+j9)/2"
-                    )
-                if max(
-                    abs(left - right)
-                    for left, right in zip(rotation, expected_rotation, strict=True)
-                ) > _HAND_PALM_ROTATION_TOLERANCE:
-                    raise ContractError(
-                        f"{field}.palm_6d rotation disagrees with palm_frame_v2"
-                    )
-                palm = {
-                    "translation": translation,
-                    "orientation_xyzw": orientation,
-                    "rotation_matrix": rotation,
-                }
-        normalized.append(
-            {
-                "hand_index": hand_index,
-                "handedness": {
-                    "label": handedness_label,
-                    "score": handedness_score,
-                },
-                "joints_2d": normalized_joints,
-                "joints_3d": normalized_joints_3d,
-                "kp_scores": normalized_scores,
-                "kp_valid_depth": valid_depth,
-                "palm_6d": palm,
-            }
-        )
-    return tuple(normalized)
-
-
 def _validate_depth_evidence(
     value: Any,
     *,
@@ -3288,7 +2976,6 @@ def validate_worker_response(
         )
     tool_detections: tuple[dict[str, Any], ...] = ()
     blood_detections: tuple[dict[str, Any], ...] = ()
-    hands: tuple[dict[str, Any], ...] = ()
     tool_support_plane_diagnostics: dict[str, Any] | None = None
     for algorithm in accepted:
         if algorithm == "tool":
@@ -3337,15 +3024,6 @@ def validate_worker_response(
                 )
         elif algorithm == "blood":
             blood_detections = _validate_blood_results(results[algorithm])
-        elif algorithm == "hand":
-            hands = _validate_hand_results(
-                results[algorithm],
-                color_camera_info=(
-                    metadata.get("color_camera_info")
-                    if isinstance(metadata.get("color_camera_info"), Mapping)
-                    else None
-                ),
-            )
 
     tool_result = results.get("tool")
     if (
@@ -3422,7 +3100,6 @@ def validate_worker_response(
     rgbd_schemas = {
         "tool": "pnu.tool.rgbd.v1",
         "blood": "pnu.blood.rgbd.v1",
-        "hand": "pnu.hand.rgbd.v1",
     }
     result_rgbd_ready = all(
         results[name].get("schema") == rgbd_schemas[name]
@@ -3449,34 +3126,11 @@ def validate_worker_response(
         model_digests=digests,
         tool_detections=tool_detections,
         blood_detections=blood_detections,
-        hands=hands,
         metric_3d_ready=ready,
         tool_support_plane_diagnostics=tool_support_plane_diagnostics,
     )
 
 
-_HAND_SKELETON = (
-    (0, 1),
-    (1, 2),
-    (2, 3),
-    (3, 4),
-    (0, 5),
-    (5, 6),
-    (6, 7),
-    (7, 8),
-    (0, 9),
-    (9, 10),
-    (10, 11),
-    (11, 12),
-    (0, 13),
-    (13, 14),
-    (14, 15),
-    (15, 16),
-    (0, 17),
-    (17, 18),
-    (18, 19),
-    (19, 20),
-)
 _TOOL_OVERLAY_COLORS = (
     (40, 196, 255),
     (64, 224, 163),
@@ -3488,7 +3142,6 @@ _TOOL_OVERLAY_COLORS = (
     (255, 154, 75),
 )
 _BLOOD_OVERLAY_COLOR = (255, 68, 88)
-_HAND_OVERLAY_COLORS = ((92, 255, 166), (255, 211, 92))
 
 
 def _overlay_font(width: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
@@ -3612,7 +3265,7 @@ def build_pnu_debug_overlay(
     max_rle_runs: int = _MAX_OVERLAY_RLE_RUNS,
     max_mask_segments: int = _MAX_OVERLAY_MASK_SEGMENTS,
 ) -> RenderedDebugOverlay:
-    """Render the accepted Tool/Blood/Hand evidence as a transparent WebP.
+    """Render the accepted Tool/Blood evidence as a transparent WebP.
 
     Operational status is intentionally excluded because this shared overlay
     may also be composited into a RealVLM input.  Debug UI status comes from
@@ -3654,13 +3307,11 @@ def build_pnu_debug_overlay(
         validated.blood_detections,
         key=lambda row: int(row["instance_id"]),
     )
-    hand_rows = sorted(validated.hands, key=lambda row: int(row["hand_index"]))
     drawn_tools = tool_rows[:max_instances_per_algorithm]
     drawn_blood = blood_rows[:max_instances_per_algorithm]
-    drawn_hands = hand_rows[:max_instances_per_algorithm]
     truncated = truncated or any(
         len(rows) > max_instances_per_algorithm
-        for rows in (tool_rows, blood_rows, hand_rows)
+        for rows in (tool_rows, blood_rows)
     )
 
     for row in drawn_tools:
@@ -3771,59 +3422,6 @@ def build_pnu_debug_overlay(
             width=line_width,
         )
 
-    rendered_hand_count = 0
-    for hand_position, row in enumerate(drawn_hands):
-        color = _HAND_OVERLAY_COLORS[hand_position % len(_HAND_OVERLAY_COLORS)]
-        joints = row["joints_2d"]
-        scores = row["kp_scores"]
-        visible = [float(score) >= 0.2 for score in scores]
-        for start_index, end_index in _HAND_SKELETON:
-            if not (visible[start_index] and visible[end_index]):
-                continue
-            start = tuple(round(float(item)) for item in joints[start_index])
-            end = tuple(round(float(item)) for item in joints[end_index])
-            draw.line((*start, *end), fill=(*color, 230), width=line_width)
-        visible_points: list[tuple[int, int]] = []
-        for joint_index, joint in enumerate(joints):
-            if not visible[joint_index]:
-                continue
-            x, y = (round(float(item)) for item in joint)
-            visible_points.append((x, y))
-            valid_depth = bool(row["kp_valid_depth"][joint_index])
-            draw.ellipse(
-                (
-                    x - point_radius,
-                    y - point_radius,
-                    x + point_radius,
-                    y + point_radius,
-                ),
-                fill=(*color, 255 if valid_depth else 100),
-                outline=(*color, 255),
-                width=1,
-            )
-        if visible_points:
-            rendered_hand_count += 1
-            label_x = min(item[0] for item in visible_points)
-            label_y = max(0, min(item[1] for item in visible_points) - 24)
-            handedness = row["handedness"]
-            label = (
-                f"{str(handedness['label']).title()} hand "
-                f"{float(handedness['score']):.2f}"
-            )
-            palm = row.get("palm_6d")
-            if isinstance(palm, Mapping):
-                translation = palm.get("translation")
-                if isinstance(translation, Sequence) and len(translation) == 3:
-                    label += f" z={float(translation[2]):.3f}m"
-            _draw_overlay_label(
-                draw,
-                xy=(label_x, label_y),
-                text=label,
-                color=color,
-                font=font,
-                image_size=(width, height),
-            )
-
     encoded = BytesIO()
     try:
         overlay.save(
@@ -3852,7 +3450,6 @@ def build_pnu_debug_overlay(
         ),
         drawn_tool_count=len(drawn_tools),
         drawn_blood_count=len(drawn_blood),
-        drawn_hand_count=rendered_hand_count,
         truncated=truncated,
     )
 
@@ -4381,7 +3978,7 @@ def build_cam4_semantics(
         "ground_truth": False,
         "cam4_image_forwarded_to_vlm": False,
         "tools": tools,
-        # PNU 2-D hand landmarks do not classify a surgical tool request.
+        # This tool/blood adapter never classifies a surgical hand request.
         "tool_request": {
             "state": "uncertain",
             "requested": None,
@@ -4646,56 +4243,6 @@ def build_tool_ros_messages(
     return pose_array, observation_array
 
 
-def build_hand_keypoints_message(
-    *,
-    frame: BinaryFrame,
-    hands: Sequence[Mapping[str, Any]],
-    metric_3d_ready: bool,
-) -> HandKeypoints:
-    message = HandKeypoints()
-    _set_source_header(message, frame)
-    message.depth_source = "real" if metric_3d_ready else "2d_only"
-    hand_messages: list[Hand] = []
-    for row in hands:
-        item = Hand()
-        item.hand_index = int(row["hand_index"])
-        handedness = row["handedness"]
-        label = str(handedness["label"])
-        item.has_handedness = label in {"left", "right"}
-        if item.has_handedness:
-            item.handedness_label = label.capitalize()
-            item.handedness_score = float(handedness["score"])
-        item.joints_2d = [
-            Point2D(u=float(point[0]), v=float(point[1])) for point in row["joints_2d"]
-        ]
-        for target, point in zip(item.joints_3d, row["joints_3d"], strict=True):
-            target.x, target.y, target.z = (float(value) for value in point)
-        item.kp_scores = [float(value) for value in row["kp_scores"]]
-        item.kp_valid_depth = [bool(value) for value in row["kp_valid_depth"]]
-        palm = row["palm_6d"]
-        item.has_palm_6d = palm is not None
-        if palm is not None:
-            palm_message = PalmPose6D()
-            (
-                palm_message.translation.x,
-                palm_message.translation.y,
-                palm_message.translation.z,
-            ) = (float(value) for value in palm["translation"])
-            (
-                palm_message.orientation.x,
-                palm_message.orientation.y,
-                palm_message.orientation.z,
-                palm_message.orientation.w,
-            ) = (float(value) for value in palm["orientation_xyzw"])
-            palm_message.rotation_matrix = [
-                float(value) for value in palm["rotation_matrix"]
-            ]
-            item.palm_6d = palm_message
-        hand_messages.append(item)
-    message.hands = hand_messages
-    return message
-
-
 class PNUPerceptionBridgeNode(Node):
     """Live VIPLab CAM4 to local-or-remote PNU worker adapter."""
 
@@ -4750,12 +4297,6 @@ class PNUPerceptionBridgeNode(Node):
             self.declare_parameter(
                 "cam4_tool_observations_topic",
                 "/surgery/perception/cam4/observations",
-            ).value
-        )
-        self._cam4_hand_keypoints_topic = str(
-            self.declare_parameter(
-                "cam4_hand_keypoints_topic",
-                "/surgery/perception/cam4/hand_keypoints",
             ).value
         )
         self._cam4_blood_semantics_topic = str(
@@ -5031,9 +4572,6 @@ class PNUPerceptionBridgeNode(Node):
             ToolObservation2DArray,
             self._cam4_tool_observations_topic,
             semantics_qos,
-        )
-        self._hand_keypoints_pub = self.create_publisher(
-            HandKeypoints, self._cam4_hand_keypoints_topic, semantics_qos
         )
         self._blood_semantics_pub = self.create_publisher(
             String, self._cam4_blood_semantics_topic, semantics_qos
@@ -5471,7 +5009,6 @@ class PNUPerceptionBridgeNode(Node):
             "overlay_truncated": False,
             "overlay_drawn_tool_count": 0,
             "overlay_drawn_blood_count": 0,
-            "overlay_drawn_hand_count": 0,
             "render_encode_latency_ms": 0.0,
         }
         publisher = getattr(self, "_overlay_pub", None)
@@ -5523,7 +5060,6 @@ class PNUPerceptionBridgeNode(Node):
         self._last_overlay_visible = bool(
             rendered.drawn_tool_count
             or rendered.drawn_blood_count
-            or rendered.drawn_hand_count
         )
         result.update(
             {
@@ -5532,7 +5068,6 @@ class PNUPerceptionBridgeNode(Node):
                 "overlay_truncated": rendered.truncated,
                 "overlay_drawn_tool_count": rendered.drawn_tool_count,
                 "overlay_drawn_blood_count": rendered.drawn_blood_count,
-                "overlay_drawn_hand_count": rendered.drawn_hand_count,
                 "render_encode_latency_ms": rendered.render_encode_latency_ms,
             }
         )
@@ -5769,18 +5304,10 @@ class PNUPerceptionBridgeNode(Node):
             )
             self._tool_pose_pub.publish(pose_array)
             self._tool_observations_pub.publish(observation_array)
-            if "hand" not in self._requested_algorithms:
-                self._mayo_tracker.reset()
-            elif validated.hands:
-                blocked_semantics = dict(semantics)
-                blocked_semantics["tool_request"] = {
-                    "state": "hand_with_tool",
-                    "requested": None,
-                    "confidence": 0.0,
-                }
-                self._publish_mayo_observations(blocked_semantics)
-            else:
-                self._publish_mayo_observations(semantics)
+            # Mayo tool placement remains a tool-observation path.  It uses
+            # the tracker's existing stable-presence/absence leases and no
+            # longer depends on a second PNU hand model.
+            self._publish_mayo_observations(semantics)
 
         if "blood" in self._requested_algorithms:
             blood_result = validated.payload["results"]["blood"]
@@ -5806,19 +5333,9 @@ class PNUPerceptionBridgeNode(Node):
             )
             self._blood_semantics_pub.publish(blood_message)
 
-        if "hand" in self._requested_algorithms:
-            self._hand_keypoints_pub.publish(
-                build_hand_keypoints_message(
-                    frame=rgb,
-                    hands=validated.hands,
-                    metric_3d_ready=validated.metric_3d_ready,
-                )
-            )
-
         detection_count = (
             len(validated.tool_detections)
             + len(validated.blood_detections)
-            + len(validated.hands)
         )
         overlay_diagnostics = self._publish_debug_overlay(
             rgb=rgb,
@@ -5879,8 +5396,7 @@ class PNUPerceptionBridgeNode(Node):
                 for row in validated.tool_detections
                 if isinstance(row.get("pose"), Mapping)
                 and row["pose"].get("position_valid") is True
-            )
-            + sum(1 for row in validated.hands if row.get("palm_6d") is not None),
+            ),
             "endpoint_sign_low_count": 0,
             "model_version": ",".join(
                 f"{name}:{validated.payload['models'][name]['version']}"
@@ -5908,7 +5424,6 @@ class PNUPerceptionBridgeNode(Node):
             "model_digests": validated.model_digests,
             "tool_detection_count": len(validated.tool_detections),
             "blood_detection_count": len(validated.blood_detections),
-            "hand_count": len(validated.hands),
             "depth_included": depth is not None,
             "depth_camera_info_included": depth_info is not None,
             "depth_scale_m_per_unit": (
