@@ -600,6 +600,24 @@ def generate_launch_description() -> LaunchDescription:
                         "flir_public_topic": "/surgery/images/flir/compressed",
                         "cam4_source_topic": cam4_input_topic,
                         "cam4_public_topic": "/surgery/images/cam4/compressed",
+                        "cam3_overlay_source_topic": (
+                            "/perception/cam_3/overlay/compressed"
+                        ),
+                        "cam3_overlay_public_topic": (
+                            "/surgery/images/cam3/overlay/compressed"
+                        ),
+                        "suction_overlay_source_topic": (
+                            "/perception/suction/overlay/compressed"
+                        ),
+                        "suction_overlay_public_topic": (
+                            "/surgery/images/suction/overlay/compressed"
+                        ),
+                        "right_ee_overlay_source_topic": (
+                            "/perception/right_ee/overlay/compressed"
+                        ),
+                        "right_ee_overlay_public_topic": (
+                            "/surgery/images/right_ee/overlay/compressed"
+                        ),
                         "default_bundle": default_bundle,
                         "publish_flir_while_idle": publish_flir_while_idle,
                     }

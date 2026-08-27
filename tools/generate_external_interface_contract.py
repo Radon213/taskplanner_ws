@@ -876,7 +876,7 @@ def _scope(w: Writer) -> None:
         ("경계", "Taskplanner", "외부 기관"),
         (
             ("11개 /surgery 상태·event", "sole publisher", "subscriber"),
-            ("2개 camera alias", "gated relay publisher", "subscriber"),
+            ("5개 camera alias", "gated relay publisher", "subscriber"),
             ("Robot Action/Service", "client", "authoritative server"),
             ("Bed arm status source", "subscriber/projector", "authoritative publisher"),
             ("Network/ROS Domain", "deployment 제공", "동일 값 적용·검증"),
@@ -918,6 +918,9 @@ def _overview(w: Writer) -> None:
         (
             ("/surgery/images/flir/compressed", "sensor_msgs/msg/CompressedImage", "/synced/flir/color/image_raw/compressed"),
             ("/surgery/images/cam4/compressed", "sensor_msgs/msg/CompressedImage", "/synced/cam_4/color/image_raw/compressed"),
+            ("/surgery/images/cam3/overlay/compressed", "sensor_msgs/msg/CompressedImage", "/perception/cam_3/overlay/compressed"),
+            ("/surgery/images/suction/overlay/compressed", "sensor_msgs/msg/CompressedImage", "/perception/suction/overlay/compressed"),
+            ("/surgery/images/right_ee/overlay/compressed", "sensor_msgs/msg/CompressedImage", "/perception/right_ee/overlay/compressed"),
         ),
         (3100, 2700, 3560),
     )
@@ -1014,7 +1017,7 @@ ros2 topic echo /surgery/images/flir/compressed \\
         ("항목", "계약"),
         (
             ("Capabilities", "Subscribe only (subscribe/unsubscribe); incoming fragment rejected"),
-            ("Allowlist", "11 state/event + 2 gated camera aliases, exact names"),
+            ("Allowlist", "11 state/event + 5 gated camera aliases, exact names"),
             ("Denied", "advertise, publish, service, Action, rosapi"),
             ("Exposure", "direct loopback peer only; designated wired subnet proxy is the sole remote ingress"),
             ("Limits", "8 clients; 64 KiB complete-JSON ingress; camera CBOR/10 Hz/KL1; no fragments; 4 MiB logical egress; 512 MiB sidecar"),
@@ -1138,6 +1141,9 @@ def _camera(w: Writer) -> None:
         (
             ("/surgery/images/flir/compressed", "/synced/flir/color/image_raw/compressed", "BestEffort/Volatile/KL5", "fresh matching active + demand"),
             ("/surgery/images/cam4/compressed", "/synced/cam_4/color/image_raw/compressed", "BestEffort/Volatile/KL5", "fresh matching active + demand"),
+            ("/surgery/images/cam3/overlay/compressed", "/perception/cam_3/overlay/compressed", "BestEffort/Volatile/KL5", "fresh matching active + demand"),
+            ("/surgery/images/suction/overlay/compressed", "/perception/suction/overlay/compressed", "BestEffort/Volatile/KL5", "fresh matching active + demand"),
+            ("/surgery/images/right_ee/overlay/compressed", "/perception/right_ee/overlay/compressed", "BestEffort/Volatile/KL5", "fresh matching active + demand"),
         ),
         (2800, 2800, 1900, 1860),
     )

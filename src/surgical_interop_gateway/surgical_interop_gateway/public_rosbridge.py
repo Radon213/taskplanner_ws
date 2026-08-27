@@ -45,25 +45,25 @@ def _wire_size(message: str | bytes) -> int:
 
 
 def _enqueue_public_outgoing(
-    queue: deque[tuple[str | bytes, bool]],
-    item: tuple[str | bytes, bool],
+    queue: deque[tuple[str | bytes, bool, str | None]],
+    item: tuple[str | bytes, bool, str | None],
 ) -> bool:
     """Enqueue one frame without letting latest-only binary data evict state.
 
     The public gateway publishes its state topics together once per tick. A
     tiny drop-oldest deque therefore lost valid state even for a fast local
     browser. Text state frames now have enough room for one complete burst,
-    while binary payloads are coalesced to the newest pending frame. If a slow
-    client fills the entire queue with state, a new binary frame is discarded
-    instead of displacing safety-relevant state.
+    while binary payloads are coalesced to the newest pending frame *per public
+    camera topic*. If a slow client fills the entire queue with state, a new
+    binary frame is discarded instead of displacing safety-relevant state.
     """
 
-    message, binary = item
+    message, binary, topic = item
     if binary:
         binary_indexes = [
             index
-            for index, (_queued_message, queued_binary) in enumerate(queue)
-            if queued_binary
+            for index, (_queued_message, queued_binary, queued_topic) in enumerate(queue)
+            if queued_binary and queued_topic == topic
         ]
         for index in reversed(binary_indexes[PUBLIC_MAX_OUTGOING_BINARY_MESSAGES - 1 :]):
             del queue[index]
@@ -73,7 +73,7 @@ def _enqueue_public_outgoing(
         binary_index = next(
             (
                 index
-                for index, (_queued_message, queued_binary) in enumerate(queue)
+                for index, (_queued_message, queued_binary, _queued_topic) in enumerate(queue)
                 if queued_binary
             ),
             None,
@@ -83,7 +83,7 @@ def _enqueue_public_outgoing(
         if len(queue) >= PUBLIC_MAX_OUTGOING_QUEUE:
             queue.popleft()
 
-    queue.append((message, binary))
+    queue.append((message, binary, topic))
     return True
 
 
@@ -121,12 +121,24 @@ def _build_public_rosbridge_protocol(
             self.fragment_size = None
             self._public_input_failed = False
             self._public_fail_close: Callable[[int, str], None] | None = None
+            self._public_outgoing_context = threading.local()
 
         def set_public_fail_close(
             self,
             callback: Callable[[int, str], None],
         ) -> None:
             self._public_fail_close = callback
+
+        def set_public_outgoing_topic(self, topic: str | None) -> None:
+            """Bind the current subscription topic to one outgoing callback."""
+
+            self._public_outgoing_context.topic = topic
+
+        def public_outgoing_topic(self) -> str | None:
+            """Return the thread-local topic that produced an outgoing frame."""
+
+            topic = getattr(self._public_outgoing_context, "topic", None)
+            return topic if isinstance(topic, str) else None
 
         def _fail_public_input(self, code: int, reason: str) -> None:
             self.buffer = ""
@@ -244,6 +256,22 @@ def main() -> None:
                 return
             super().subscribe(restricted)
 
+        def publish(
+            self,
+            topic: str,
+            message: Any,
+            fragment_size: int | None = None,
+            compression: str = "none",
+        ) -> None:
+            # Upstream's encoded callback only carries bytes and compression.
+            # Preserve the source topic in a thread-local scope so the
+            # WebSocket queue can keep one latest frame for each public view.
+            self.protocol.set_public_outgoing_topic(topic)
+            try:
+                super().publish(topic, message, fragment_size, compression)
+            finally:
+                self.protocol.set_public_outgoing_topic(None)
+
     base_websocket = upstream.RosbridgeWebSocket
 
     class BoundedPublicRosbridgeWebSocket(base_websocket):
@@ -332,7 +360,11 @@ def main() -> None:
             with self._public_outgoing_lock:
                 enqueued = _enqueue_public_outgoing(
                     self._public_outgoing,
-                    (message, binary),
+                    (
+                        message,
+                        binary,
+                        self.protocol.public_outgoing_topic() if binary else None,
+                    ),
                 )
                 if not enqueued:
                     return
@@ -351,7 +383,7 @@ def main() -> None:
                     if not self._public_outgoing:
                         self._public_drain_scheduled = False
                         return
-                    message, binary = self._public_outgoing.popleft()
+                    message, binary, _topic = self._public_outgoing.popleft()
                 await self.prewrite_message(message, binary)
 
         def on_close(self) -> None:

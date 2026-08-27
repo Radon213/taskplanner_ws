@@ -1,4 +1,4 @@
-"""Demand-driven aliases for the two public compressed camera topics.
+"""Demand-driven aliases for reviewed public compressed camera topics.
 
 The camera owners retain their native topic names.  This node exposes stable
 Taskplanner-owned aliases without decoding or re-encoding JPEG payloads.  It
@@ -179,6 +179,63 @@ class CameraAliasRelay(Node):
                         self.declare_parameter(
                             "cam4_public_topic",
                             "/surgery/images/cam4/compressed",
+                        ).value
+                    )
+                ),
+            ),
+            CameraAliasBinding(
+                name="cam3_overlay",
+                source_topic=self.resolve_topic_name(
+                    str(
+                        self.declare_parameter(
+                            "cam3_overlay_source_topic",
+                            "/perception/cam_3/overlay/compressed",
+                        ).value
+                    )
+                ),
+                public_topic=self.resolve_topic_name(
+                    str(
+                        self.declare_parameter(
+                            "cam3_overlay_public_topic",
+                            "/surgery/images/cam3/overlay/compressed",
+                        ).value
+                    )
+                ),
+            ),
+            CameraAliasBinding(
+                name="suction_overlay",
+                source_topic=self.resolve_topic_name(
+                    str(
+                        self.declare_parameter(
+                            "suction_overlay_source_topic",
+                            "/perception/suction/overlay/compressed",
+                        ).value
+                    )
+                ),
+                public_topic=self.resolve_topic_name(
+                    str(
+                        self.declare_parameter(
+                            "suction_overlay_public_topic",
+                            "/surgery/images/suction/overlay/compressed",
+                        ).value
+                    )
+                ),
+            ),
+            CameraAliasBinding(
+                name="right_ee_overlay",
+                source_topic=self.resolve_topic_name(
+                    str(
+                        self.declare_parameter(
+                            "right_ee_overlay_source_topic",
+                            "/perception/right_ee/overlay/compressed",
+                        ).value
+                    )
+                ),
+                public_topic=self.resolve_topic_name(
+                    str(
+                        self.declare_parameter(
+                            "right_ee_overlay_public_topic",
+                            "/surgery/images/right_ee/overlay/compressed",
                         ).value
                     )
                 ),

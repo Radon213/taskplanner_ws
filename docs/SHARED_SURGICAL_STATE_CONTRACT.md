@@ -18,7 +18,7 @@ same name. The state Gateway is read-only and exposes no control service.
 
 The base Taskplanner runtime starts the state Gateway by default in live and
 simulation/LLM demonstration modes. The live integration wrapper additionally
-starts the two camera aliases by default:
+starts the five reviewed camera aliases by default:
 
 ```bash
 # Public state is enabled by default.
@@ -80,12 +80,15 @@ All eleven state/event topics use `surgical_interop_msgs` 0.4.0.
 | `/surgery/health` | `SurgeryHealth` | snapshot | Gateway-measured source availability, freshness, and stable error codes. |
 | `/surgery/events` | `SurgeryEvent` | event | Ordered public state-change facts emitted while an active procedure is fresh. |
 
-The live integration runtime also advertises two stable media aliases:
+The live integration runtime also advertises five stable media aliases:
 
 | Public topic | Type | Default native source |
 | --- | --- | --- |
 | `/surgery/images/flir/compressed` | `sensor_msgs/msg/CompressedImage` | `/synced/flir/color/image_raw/compressed` |
 | `/surgery/images/cam4/compressed` | `sensor_msgs/msg/CompressedImage` | `/synced/cam_4/color/image_raw/compressed` |
+| `/surgery/images/cam3/overlay/compressed` | `sensor_msgs/msg/CompressedImage` | `/perception/cam_3/overlay/compressed` |
+| `/surgery/images/suction/overlay/compressed` | `sensor_msgs/msg/CompressedImage` | `/perception/suction/overlay/compressed` |
+| `/surgery/images/right_ee/overlay/compressed` | `sensor_msgs/msg/CompressedImage` | `/perception/right_ee/overlay/compressed` |
 
 ## QoS and publication behavior
 
@@ -321,25 +324,32 @@ must not be displayed as successful transitions.
 
 ## Camera media boundary
 
-The camera relay never decodes, re-encodes, resizes, persists, or synthesizes
+The live camera relay never decodes, re-encodes, resizes, persists, or synthesizes
 frames. It creates a native source subscription only when all three conditions
 hold: a consumer is matched, WorldState is fresh and running, and its procedure
 ID matches the selected bundle. Stop, mismatch, or stale state releases the
 native subscription and the frame callback independently rechecks the same gate
 to drop late queued frames.
 
-The native and public topic must be distinct. A source configured directly on
+For live sources, the native and public topic must be distinct. A source configured directly on
 the public name, duplicate public aliases, and cross-topic cycles are rejected
 at startup so another publisher cannot bypass the idle privacy gate.
+
+Interactive Replay uses a separate recorded-data projector rather than the live
+WorldState-gated relay. It maps recorded media to the same five public aliases;
+the only identity route permitted there is a recorded CAM4 stream already named
+`/surgery/images/cam4/compressed`. That replay-only compatibility case does not
+permit a live native publisher to bypass the gate.
 
 The public rosbridge independently forces camera subscriptions to queue length
 one and at most 10 Hz, even if a browser requests an unbounded queue or a faster
 rate. Camera subscriptions are normalized to CBOR even if a client requests PNG;
 PNG and unknown compression modes are never admitted to the camera encoder.
-Each client has a four-message drop-oldest egress queue. Consumers should still
-request CBOR and render only the latest frame. The media alias resolution, frame
-ID, and encoding follow the external camera source and are not fixed by this
-contract.
+Each client keeps one latest pending frame per reviewed camera alias alongside
+one state burst, so a slow five-view browser cannot let one view overwrite the
+other views. Consumers should still request CBOR and render only the latest
+frame. The media alias resolution, frame ID, and encoding follow the external
+camera source and are not fixed by this contract.
 
 ## Consumer startup and reconnect sequence
 
@@ -392,8 +402,8 @@ operator path can invoke Replay controls and must not be given to a read-only
 partner UI; partner UIs continue to use the 9092 contract above.
 
 Port 9092 registers only the Subscribe capability (`subscribe` and `unsubscribe`
-operations), uses an exact allowlist for the eleven public topics and two camera
-aliases, and exposes no Defragment, publish, advertise, service, Action,
+operations), uses an exact allowlist for the eleven public state/event topics and
+five camera aliases, and exposes no Defragment, publish, advertise, service, Action,
 parameter, or rosapi operation. Incoming `fragment` frames and every unknown
 operation are rejected rather than reassembled. It also
 runs in a separate read-only container with a 512 MiB memory/swap cap, bounded
@@ -453,5 +463,5 @@ are narrow exceptions, represented only by their dedicated public IDLs. They do
 not make the remaining internal `WorldState` public.
 
 Partners should depend only on `surgical_interop_msgs`, the public topic names,
-and the two documented `sensor_msgs/CompressedImage` aliases—not Taskplanner's
+and the five documented `sensor_msgs/CompressedImage` aliases—not Taskplanner's
 internal messages or topic layout.

@@ -347,7 +347,7 @@ def test_replay_clock_keeps_active_precision_but_bounds_idle_heartbeat():
     )
 
 
-def test_public_replay_routes_only_raw_cameras_and_public_perception_json():
+def test_public_replay_routes_include_reviewed_overlay_media():
     image_routes, json_routes = public_replay_topic_routes(
         source_cam1_topic="/recorded/cam1",
         source_cam2_topic="/recorded/cam2",
@@ -356,6 +356,9 @@ def test_public_replay_routes_only_raw_cameras_and_public_perception_json():
         source_flir_topic="/recorded/flir",
         source_bbox_topic="/recorded/bboxes",
         source_segmentation_topic="/recorded/segmentation",
+        source_cam3_overlay_topic="/recorded/cam3/overlay",
+        source_suction_overlay_topic="/recorded/suction/overlay",
+        source_right_ee_overlay_topic="/recorded/right-ee/overlay",
     )
 
     assert image_routes == {
@@ -368,6 +371,15 @@ def test_public_replay_routes_only_raw_cameras_and_public_perception_json():
             VIPLAB_CAM4_COLOR_IMAGE_TOPIC,
         ),
         "/recorded/flir": (NORMALIZED_CAMERA_TOPICS["flir"],),
+        "/recorded/cam3/overlay": (
+            NORMALIZED_CAMERA_TOPICS["cam3_overlay"],
+        ),
+        "/recorded/suction/overlay": (
+            NORMALIZED_CAMERA_TOPICS["suction_overlay"],
+        ),
+        "/recorded/right-ee/overlay": (
+            NORMALIZED_CAMERA_TOPICS["right_ee_overlay"],
+        ),
     }
     assert json_routes == {
         "/recorded/bboxes": NORMALIZED_BBOX_TOPIC,

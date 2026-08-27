@@ -225,6 +225,12 @@ launch_endpoint_binding_snapshot:
         flir_public_topic: /surgery/images/flir/compressed
         cam4_source_topic: /synced/cam_4/color/image_raw/compressed
         cam4_public_topic: /surgery/images/cam4/compressed
+        cam3_overlay_source_topic: /perception/cam_3/overlay/compressed
+        cam3_overlay_public_topic: /surgery/images/cam3/overlay/compressed
+        suction_overlay_source_topic: /perception/suction/overlay/compressed
+        suction_overlay_public_topic: /surgery/images/suction/overlay/compressed
+        right_ee_overlay_source_topic: /perception/right_ee/overlay/compressed
+        right_ee_overlay_public_topic: /surgery/images/right_ee/overlay/compressed
 
 public_interfaces:
   topics:
@@ -241,10 +247,16 @@ public_interfaces:
     - {name: /surgery/events, type: surgical_interop_msgs/msg/SurgeryEvent, visibility: public_read_only, owner: surgical_interop_gateway}
     - {name: /surgery/images/flir/compressed, type: sensor_msgs/msg/CompressedImage, visibility: public_read_only, owner: surgical_camera_alias_relay}
     - {name: /surgery/images/cam4/compressed, type: sensor_msgs/msg/CompressedImage, visibility: public_read_only, owner: surgical_camera_alias_relay}
+    - {name: /surgery/images/cam3/overlay/compressed, type: sensor_msgs/msg/CompressedImage, visibility: public_read_only, owner: surgical_camera_alias_relay}
+    - {name: /surgery/images/suction/overlay/compressed, type: sensor_msgs/msg/CompressedImage, visibility: public_read_only, owner: surgical_camera_alias_relay}
+    - {name: /surgery/images/right_ee/overlay/compressed, type: sensor_msgs/msg/CompressedImage, visibility: public_read_only, owner: surgical_camera_alias_relay}
     - {name: /sensors/surgeon/utterance, type: surgical_msgs/msg/SpeechUtterance, visibility: trusted_external_input, owner: taskplanner_asr}
     - {name: /input/asr/runtime_status, type: std_msgs/msg/String, visibility: trusted_external_input, owner: taskplanner_asr}
     - {name: /synced/flir/color/image_raw/compressed, type: sensor_msgs/msg/CompressedImage, visibility: trusted_external_input, owner: external_camera_runtime}
     - {name: /synced/cam_4/color/image_raw/compressed, type: sensor_msgs/msg/CompressedImage, visibility: trusted_external_input, owner: external_camera_runtime}
+    - {name: /perception/cam_3/overlay/compressed, type: sensor_msgs/msg/CompressedImage, visibility: trusted_external_input, owner: external_rfdetr_1_7}
+    - {name: /perception/suction/overlay/compressed, type: sensor_msgs/msg/CompressedImage, visibility: trusted_external_input, owner: external_rfdetr_1_7}
+    - {name: /perception/right_ee/overlay/compressed, type: sensor_msgs/msg/CompressedImage, visibility: trusted_external_input, owner: external_rfdetr_1_7}
     - {name: /perception/cam_3/tool/observations, type: surgical_perception_msgs/msg/ToolObservation2DArray, visibility: trusted_external_input, owner: external_rfdetr_1_7}
     - {name: /perception/cam_4/tool/observations, type: surgical_perception_msgs/msg/ToolObservation2DArray, visibility: trusted_external_input, owner: external_rfdetr_1_7}
     - {name: /surgery/controller_contract, type: std_msgs/msg/String, visibility: trusted_external_telemetry, owner: external_controller}

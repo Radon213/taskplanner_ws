@@ -78,15 +78,22 @@ def _validate_topic(name: str, value: str) -> None:
         raise ValueError(f"{name} is not a valid absolute ROS topic: {topic!r}")
 
 
-def validate_shadow_routes(routes: dict[str, str]) -> None:
+def validate_shadow_routes(
+    routes: dict[str, str],
+    *,
+    allow_recorded_public_cam4: bool = False,
+) -> None:
     """Reject ambiguous source and normalized topic routing."""
     required = {
         "source_field_image_topic",
         "source_cam1_topic",
         "source_cam2_topic",
         "source_cam3_topic",
+        "source_cam3_overlay_topic",
         "source_cam4_topic",
         "source_flir_topic",
+        "source_suction_overlay_topic",
+        "source_right_ee_overlay_topic",
         "source_bbox_topic",
         "source_segmentation_topic",
         "source_transcript_topic",
@@ -109,8 +116,11 @@ def validate_shadow_routes(routes: dict[str, str]) -> None:
             "source_cam1_topic",
             "source_cam2_topic",
             "source_cam3_topic",
+            "source_cam3_overlay_topic",
             "source_cam4_topic",
             "source_flir_topic",
+            "source_suction_overlay_topic",
+            "source_right_ee_overlay_topic",
         )
     }
     duplicates: dict[str, list[str]] = {}
@@ -176,11 +186,23 @@ def validate_shadow_routes(routes: dict[str, str]) -> None:
             for topic, names in sorted(duplicate_outputs.items())
         )
         raise ValueError(f"normalized output routes must be unique ({details})")
-    source_output_overlap = sorted(set(normalized.values()).intersection(source_topics))
+    source_output_overlap = set(normalized.values()).intersection(source_topics)
+    # Some recorded MCAPs already use the reviewed CAM4 public alias.  During
+    # interactive replay the bag reader is the sole source, so it is safe to
+    # republish that compressed stream unchanged on the identical public name.
+    # Do not permit a generic source/output overlap in a live/non-replay launch.
+    recorded_cam4_identity = "/surgery/images/cam4/compressed"
+    if (
+        allow_recorded_public_cam4
+        and routes["source_cam4_topic"] == recorded_cam4_identity
+        and routes["source_field_image_topic"] == recorded_cam4_identity
+        and routes["cam4_image_topic"] == recorded_cam4_identity
+    ):
+        source_output_overlap.discard(recorded_cam4_identity)
     if source_output_overlap:
         raise ValueError(
             "normalized output routes must not overlap source inputs "
-            f"({', '.join(source_output_overlap)})"
+            f"({', '.join(sorted(source_output_overlap))})"
         )
 
 
@@ -236,6 +258,9 @@ def inspect_bag_routes(
         "source_cam1_topic",
         "source_cam2_topic",
         "source_cam3_topic",
+        "source_cam3_overlay_topic",
+        "source_suction_overlay_topic",
+        "source_right_ee_overlay_topic",
         "source_bbox_topic",
         "source_segmentation_topic",
         "source_transcript_topic",
@@ -243,6 +268,11 @@ def inspect_bag_routes(
         topic = routes[label]
         if topic not in topics:
             warnings.append(f"{label} {topic!r} is absent from the rosbag")
+        elif label.endswith("_overlay_topic") and topics[topic] != IMAGE_MESSAGE_TYPE:
+            warnings.append(
+                f"{label} {topic!r} has type {topics[topic]!r}; "
+                f"expected {IMAGE_MESSAGE_TYPE!r}"
+            )
     return errors, warnings
 
 
@@ -415,8 +445,11 @@ def _shadow_preflight(context: Any) -> list[Any]:
             "source_cam1_topic",
             "source_cam2_topic",
             "source_cam3_topic",
+            "source_cam3_overlay_topic",
             "source_cam4_topic",
             "source_flir_topic",
+            "source_suction_overlay_topic",
+            "source_right_ee_overlay_topic",
             "source_bbox_topic",
             "source_segmentation_topic",
             "source_transcript_topic",
@@ -429,7 +462,10 @@ def _shadow_preflight(context: Any) -> list[Any]:
         )
     }
     try:
-        validate_shadow_routes(routes)
+        validate_shadow_routes(
+            routes,
+            allow_recorded_public_cam4=interactive,
+        )
     except ValueError as exc:
         raise RuntimeError(f"shadow route preflight failed: {exc}") from exc
 
@@ -604,8 +640,15 @@ def generate_launch_description() -> LaunchDescription:
     source_cam1_topic = LaunchConfiguration("source_cam1_topic")
     source_cam2_topic = LaunchConfiguration("source_cam2_topic")
     source_cam3_topic = LaunchConfiguration("source_cam3_topic")
+    source_cam3_overlay_topic = LaunchConfiguration("source_cam3_overlay_topic")
     source_cam4_topic = LaunchConfiguration("source_cam4_topic")
     source_flir_topic = LaunchConfiguration("source_flir_topic")
+    source_suction_overlay_topic = LaunchConfiguration(
+        "source_suction_overlay_topic"
+    )
+    source_right_ee_overlay_topic = LaunchConfiguration(
+        "source_right_ee_overlay_topic"
+    )
     source_bbox_topic = LaunchConfiguration("source_bbox_topic")
     source_segmentation_topic = LaunchConfiguration(
         "source_segmentation_topic"
@@ -1042,12 +1085,24 @@ def generate_launch_description() -> LaunchDescription:
                 default_value="/surgery/cam3/color/image/compressed",
             ),
             DeclareLaunchArgument(
+                "source_cam3_overlay_topic",
+                default_value="/perception/cam_3/overlay/compressed",
+            ),
+            DeclareLaunchArgument(
                 "source_cam4_topic",
                 default_value="/surgery/cam4/color/image/compressed",
             ),
             DeclareLaunchArgument(
                 "source_flir_topic",
                 default_value="/surgery/flir/image/compressed",
+            ),
+            DeclareLaunchArgument(
+                "source_suction_overlay_topic",
+                default_value="/perception/suction/overlay/compressed",
+            ),
+            DeclareLaunchArgument(
+                "source_right_ee_overlay_topic",
+                default_value="/perception/right_ee/overlay/compressed",
             ),
             DeclareLaunchArgument(
                 "source_bbox_topic",
@@ -1251,8 +1306,13 @@ def generate_launch_description() -> LaunchDescription:
                         "source_cam1_topic": source_cam1_topic,
                         "source_cam2_topic": source_cam2_topic,
                         "source_cam3_topic": source_cam3_topic,
+                        "source_cam3_overlay_topic": source_cam3_overlay_topic,
                         "source_cam4_topic": source_cam4_topic,
                         "source_flir_topic": source_flir_topic,
+                        "source_suction_overlay_topic": source_suction_overlay_topic,
+                        "source_right_ee_overlay_topic": (
+                            source_right_ee_overlay_topic
+                        ),
                         "source_bbox_topic": source_bbox_topic,
                         "source_segmentation_topic": (
                             source_segmentation_topic

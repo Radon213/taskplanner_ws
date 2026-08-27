@@ -79,6 +79,9 @@ NORMALIZED_CAMERA_TOPICS = {
     "cam3": "/surgery/images/cam3/compressed",
     "cam4": "/surgery/images/cam4/compressed",
     "flir": "/surgery/images/flir/compressed",
+    "cam3_overlay": "/surgery/images/cam3/overlay/compressed",
+    "suction_overlay": "/surgery/images/suction/overlay/compressed",
+    "right_ee_overlay": "/surgery/images/right_ee/overlay/compressed",
 }
 FIELD_IMAGE_COMPATIBILITY_TOPIC = "/surgery/images/field/compressed"
 VIPLAB_CAM4_COLOR_IMAGE_TOPIC = "/synced/cam_4/color/image_raw/compressed"
@@ -706,6 +709,9 @@ def public_replay_topic_routes(
     source_flir_topic: str,
     source_bbox_topic: str,
     source_segmentation_topic: str,
+    source_cam3_overlay_topic: str = "",
+    source_suction_overlay_topic: str = "",
+    source_right_ee_overlay_topic: str = "",
     field_image_topic: str = FIELD_IMAGE_COMPATIBILITY_TOPIC,
     viplab_cam4_image_topic: str = VIPLAB_CAM4_COLOR_IMAGE_TOPIC,
 ) -> tuple[dict[str, tuple[str, ...]], dict[str, str]]:
@@ -726,6 +732,14 @@ def public_replay_topic_routes(
         ),
         str(source_flir_topic): (NORMALIZED_CAMERA_TOPICS["flir"],),
     }
+    for source_topic, alias_key in (
+        (source_cam3_overlay_topic, "cam3_overlay"),
+        (source_suction_overlay_topic, "suction_overlay"),
+        (source_right_ee_overlay_topic, "right_ee_overlay"),
+    ):
+        source = str(source_topic).strip()
+        if source:
+            image_routes[source] = (NORMALIZED_CAMERA_TOPICS[alias_key],)
     json_routes = {
         str(source_bbox_topic): NORMALIZED_BBOX_TOPIC,
         str(source_segmentation_topic): NORMALIZED_SEGMENTATION_TOPIC,
@@ -1504,6 +1518,18 @@ class InteractiveReplayControllerNode(Node):
             "/surgery/cam3/color/image/compressed",
         )
         self.declare_parameter(
+            "source_cam3_overlay_topic",
+            "/perception/cam_3/overlay/compressed",
+        )
+        self.declare_parameter(
+            "source_suction_overlay_topic",
+            "/perception/suction/overlay/compressed",
+        )
+        self.declare_parameter(
+            "source_right_ee_overlay_topic",
+            "/perception/right_ee/overlay/compressed",
+        )
+        self.declare_parameter(
             "source_flir_topic",
             "/surgery/flir/image/compressed",
         )
@@ -1660,6 +1686,15 @@ class InteractiveReplayControllerNode(Node):
             ),
             source_segmentation_topic=str(
                 self.get_parameter("source_segmentation_topic").value
+            ),
+            source_cam3_overlay_topic=str(
+                self.get_parameter("source_cam3_overlay_topic").value
+            ),
+            source_suction_overlay_topic=str(
+                self.get_parameter("source_suction_overlay_topic").value
+            ),
+            source_right_ee_overlay_topic=str(
+                self.get_parameter("source_right_ee_overlay_topic").value
             ),
             field_image_topic=self._output_image_topic,
         )

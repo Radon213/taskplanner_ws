@@ -50,6 +50,9 @@ def test_shadow_launch_exposes_strict_replay_controls():
     assert "vlm_response_mode" in arguments
     assert "reference_path" in arguments
     assert "source_cam4_topic" in arguments
+    assert "source_cam3_overlay_topic" in arguments
+    assert "source_suction_overlay_topic" in arguments
+    assert "source_right_ee_overlay_topic" in arguments
     assert "require_vlm" in arguments
     assert arguments["require_vlm"][0].text == "false"
     assert "rfdetr_preflight_timeout_sec" in arguments
@@ -372,8 +375,11 @@ def _valid_routes() -> dict[str, str]:
         "source_cam1_topic": "/source/cam1",
         "source_cam2_topic": "/source/cam2",
         "source_cam3_topic": "/source/cam3",
+        "source_cam3_overlay_topic": "/source/cam3/overlay",
         "source_cam4_topic": "/source/cam4",
         "source_flir_topic": "/source/flir",
+        "source_suction_overlay_topic": "/source/suction/overlay",
+        "source_right_ee_overlay_topic": "/source/right-ee/overlay",
         "source_bbox_topic": "/source/cam4/bboxes",
         "source_segmentation_topic": "/source/cam4/segments",
         "source_transcript_topic": "/source/transcript",
@@ -389,6 +395,19 @@ def _valid_routes() -> dict[str, str]:
 def test_shadow_route_validation_accepts_explicit_unique_routes():
     module = _load_shadow_launch_module()
     module.validate_shadow_routes(_valid_routes())
+
+
+def test_shadow_route_validation_allows_recorded_public_cam4_only_for_replay():
+    module = _load_shadow_launch_module()
+    routes = _valid_routes()
+    recorded_cam4 = "/surgery/images/cam4/compressed"
+    routes["source_field_image_topic"] = recorded_cam4
+    routes["source_cam4_topic"] = recorded_cam4
+    routes["cam4_image_topic"] = recorded_cam4
+
+    with pytest.raises(ValueError, match="must not overlap source inputs"):
+        module.validate_shadow_routes(routes)
+    module.validate_shadow_routes(routes, allow_recorded_public_cam4=True)
 
 
 @pytest.mark.parametrize(
@@ -470,6 +489,7 @@ def test_bag_route_preflight_requires_cam4_and_flir(tmp_path):
 
     assert any("source_flir_topic" in error for error in errors)
     assert any("source_cam1_topic" in warning for warning in warnings)
+    assert any("source_cam3_overlay_topic" in warning for warning in warnings)
 
 
 def test_bag_route_preflight_checks_image_message_type(tmp_path):

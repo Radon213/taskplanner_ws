@@ -13,7 +13,7 @@ ID/confidence는 계속 제공된다. 이 Gateway는 자유문장을 비식별�
 
 - 상태 snapshot 10개: Reliable / Transient Local / Keep Last 1 / 기본 약 1 Hz
 - Event 1개: Reliable / Volatile / Keep Last 50 / 발생 즉시
-- 카메라 alias 2개: Best Effort / Volatile / Keep Last 5 / 활성 시나리오에서만 전달
+- 카메라 alias 5개: Best Effort / Volatile / Keep Last 5 / 활성 시나리오에서만 전달
 - wire 계약의 최종 원본: `src/surgical_interop_msgs/msg`, `action`, `srv`
 
 ## UI 권장 초기 구독 순서
@@ -227,13 +227,23 @@ Gateway가 길이를 검증한다. UI도 배열을 결합하기 전에 길이를
 | --- | --- | --- |
 | `/surgery/images/flir/compressed` | `/synced/flir/color/image_raw/compressed` | fresh active procedure + subscriber |
 | `/surgery/images/cam4/compressed` | `/synced/cam_4/color/image_raw/compressed` | fresh active procedure + subscriber |
+| `/surgery/images/cam3/overlay/compressed` | `/perception/cam_3/overlay/compressed` | fresh active procedure + subscriber |
+| `/surgery/images/suction/overlay/compressed` | `/perception/suction/overlay/compressed` | fresh active procedure + subscriber |
+| `/surgery/images/right_ee/overlay/compressed` | `/perception/right_ee/overlay/compressed` | fresh active procedure + subscriber |
 
 시나리오 유휴·정지·stale·procedure mismatch이면 공개 토픽은 발견되지만
 프레임은 전달되지 않는다. relay는 원본 JPEG를 decode/re-encode하지 않는다.
 공개 rosbridge는 카메라 구독을 서버에서 `queue_length=1`, 최대 10 Hz로
-강제하고 `compression="cbor"`로 정규화하며 연결별 송신 큐도 최신 4개만
-유지한다. PNG/알 수 없는 압축은 카메라 encoder에 들어가지 않는다. 브라우저도
-CBOR를 요청하고 화면에는 최신 프레임만 렌더링한다.
+강제하고 `compression="cbor"`로 정규화한다. 연결별 송신 큐는 각 view별 최신
+프레임 한 장만 유지한다. 따라서 다섯 view가 동시에 느려져도
+한 view의 대기 프레임이 다른 view를 덮어쓰지 않는다. PNG/알 수 없는 압축은
+카메라 encoder에 들어가지 않는다. 브라우저도 CBOR를 요청하고 화면에는 최신
+프레임만 렌더링한다.
+
+Interactive Replay는 별도 recorded-data projector가 MCAP에 기록된 다섯
+영상 stream을 위와 같은 공개 alias로 재발행한다. 브라우저는 `/synced/*` 또는
+`/perception/*` 원본을 직접 구독하지 않는다. 과거 bag에 해당 stream이 없으면
+그 view만 unavailable로 표시해야 하며, 다른 공개 view의 재생을 막지는 않는다.
 
 ## 수신 점검 명령
 
@@ -254,7 +264,7 @@ ros2 topic info /surgery/images/flir/compressed --verbose
 `surgical_interop_msgs` 0.5.0 설치가 필요하다.
 
 > **Native DDS 보안 경계 주의**: 현재 배포의 DDS subnet은 인증/ACL 경계가
-> 아니다. 같은 Domain 참가자는 공개 13개 endpoint뿐 아니라 내부 토픽도
+> 아니다. 같은 Domain 참가자는 공개 16개 endpoint뿐 아니라 내부 토픽도
 > 탐색·구독할 수 있고, 동일한 공개/내부 토픽 이름으로 위조 또는 충돌 샘플을
 > 발행할 수 있다. free-text suppression, 카메라 active gate, 9092 allowlist는
 > Taskplanner 소유 출력에만 적용되고 다른 DDS 참가자의 트래픽은 필터링하지
@@ -264,7 +274,7 @@ ros2 topic info /surgery/images/flir/compressed --verbose
 > Security의 identity, governance, permissions를 별도로 구축해야 한다.
 
 브라우저 UI는 `ws://<Taskplanner 유선 IP>:9092`에 연결한다. 9092는 별도
-512 MiB 제한 컨테이너이며 위 11개 공개 토픽과 두 카메라 alias에 대한
+512 MiB 제한 컨테이너이며 위 11개 공개 상태/event 토픽과 다섯 카메라 alias에 대한
 `subscribe`만 허용한다. publish/service/Action/rosapi는 제공하지 않는다.
 Live, LLM 시연, Replay 모드 모두 같은 주소와 공개 토픽 계약을 유지한다.
 Replay의 내부 ROS graph는 격리 Domain/LOCALHOST에 남고 9092 전용 프록시만

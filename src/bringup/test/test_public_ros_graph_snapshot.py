@@ -475,6 +475,9 @@ def test_public_gateway_topic_names_and_types_match_snapshot() -> None:
     assert {item["name"] for item in camera_topics} == {
         "/surgery/images/flir/compressed",
         "/surgery/images/cam4/compressed",
+        "/surgery/images/cam3/overlay/compressed",
+        "/surgery/images/suction/overlay/compressed",
+        "/surgery/images/right_ee/overlay/compressed",
     }
     assert {item["type"] for item in camera_topics} == {
         "sensor_msgs/msg/CompressedImage"

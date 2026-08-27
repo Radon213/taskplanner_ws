@@ -526,7 +526,7 @@ de-identify the resulting transcript or summary.
 Browser-only consumers use the dedicated read-only WebSocket endpoint
 `ws://<Taskplanner-wired-IP>:9092`. It registers only the Subscribe capability
 (`subscribe` and `unsubscribe` operations) and has an exact allowlist containing
-the eleven topics below plus the two gated camera aliases. Incoming `fragment`
+the eleven topics below plus the five gated camera aliases. Incoming `fragment`
 frames and every unknown operation are rejected rather than reassembled. The
 endpoint is a memory-limited sidecar behind the designated
 wired-interface/subnet proxy; the sidecar rejects direct non-loopback peers
@@ -536,6 +536,11 @@ not authentication. Each incoming frame must be one complete JSON request and
 is capped at 64 KiB; malformed/incomplete input clears the parser and closes the
 connection. Camera compression is forced to CBOR, and outgoing fragmentation is
 disabled so a logical message over 4 MiB is dropped without emitting fragments.
+The reviewed browser media names are `/surgery/images/flir/compressed`,
+`/surgery/images/cam4/compressed`, `/surgery/images/cam3/overlay/compressed`,
+`/surgery/images/suction/overlay/compressed`, and
+`/surgery/images/right_ee/overlay/compressed`. Native `/synced/*` and
+`/perception/*` names are not part of the browser contract.
 
 Native DDS is deliberately limited to mutually trusted, managed controller
 computers. It is not an authentication or ACL boundary: any participant on the

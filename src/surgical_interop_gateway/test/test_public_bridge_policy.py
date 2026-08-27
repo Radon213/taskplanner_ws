@@ -100,9 +100,12 @@ def test_public_bridge_has_exact_reviewed_topic_allowlist() -> None:
     assert PUBLIC_CAMERA_TOPICS == (
         "/surgery/images/flir/compressed",
         "/surgery/images/cam4/compressed",
+        "/surgery/images/cam3/overlay/compressed",
+        "/surgery/images/suction/overlay/compressed",
+        "/surgery/images/right_ee/overlay/compressed",
     )
     assert PUBLIC_SUBSCRIBE_ALLOWLIST == PUBLIC_STATE_TOPICS + PUBLIC_CAMERA_TOPICS
-    assert len(PUBLIC_SUBSCRIBE_ALLOWLIST) == len(set(PUBLIC_SUBSCRIBE_ALLOWLIST)) == 13
+    assert len(PUBLIC_SUBSCRIBE_ALLOWLIST) == len(set(PUBLIC_SUBSCRIBE_ALLOWLIST)) == 16
     assert not any("*" in topic or "?" in topic or "[" in topic for topic in PUBLIC_SUBSCRIBE_ALLOWLIST)
 
 
@@ -131,6 +134,9 @@ def test_public_bridge_excludes_internal_control_and_raw_sensor_topics() -> None
         "/external/bed_robot_arms/status",
         "/synced/flir/color/image_raw/compressed",
         "/synced/cam_4/color/image_raw/compressed",
+        "/perception/cam_3/overlay/compressed",
+        "/perception/suction/overlay/compressed",
+        "/perception/right_ee/overlay/compressed",
         "/surgery/images/flir/segmented/compressed",
         "/surgery/retraction/command",
         "/rosapi/topics",
@@ -294,42 +300,68 @@ def test_public_bridge_resource_limits_are_small_and_finite() -> None:
     assert tornado_settings["websocket_max_message_size"] == 64 * 1024
 
 
-def test_public_outgoing_queue_preserves_state_burst_and_latest_binary() -> None:
-    outgoing: deque[tuple[str | bytes, bool]] = deque()
-    assert _enqueue_public_outgoing(outgoing, (b"camera-1", True))
+def test_public_outgoing_queue_preserves_state_burst_and_latest_per_camera() -> None:
+    outgoing: deque[tuple[str | bytes, bool, str | None]] = deque()
+    flir = PUBLIC_CAMERA_TOPICS[0]
+    assert _enqueue_public_outgoing(outgoing, (b"flir-1", True, flir))
     for index, topic in enumerate(PUBLIC_STATE_TOPICS):
-        assert _enqueue_public_outgoing(outgoing, (f"state-{index}:{topic}", False))
-    assert _enqueue_public_outgoing(outgoing, (b"camera-2", True))
-    assert _enqueue_public_outgoing(outgoing, (b"camera-3", True))
+        assert _enqueue_public_outgoing(
+            outgoing, (f"state-{index}:{topic}", False, None)
+        )
+    assert _enqueue_public_outgoing(outgoing, (b"flir-2", True, flir))
+    for index, topic in enumerate(PUBLIC_CAMERA_TOPICS[1:], start=1):
+        assert _enqueue_public_outgoing(
+            outgoing, (f"camera-{index}".encode(), True, topic)
+        )
 
-    state_frames = [message for message, binary in outgoing if not binary]
-    binary_frames = [message for message, binary in outgoing if binary]
+    state_frames = [message for message, binary, _topic in outgoing if not binary]
+    binary_frames = {
+        topic: message
+        for message, binary, topic in outgoing
+        if binary
+    }
     assert len(state_frames) == len(PUBLIC_STATE_TOPICS)
-    assert binary_frames == [b"camera-3"]
-    assert len(outgoing) <= PUBLIC_MAX_OUTGOING_QUEUE
+    assert binary_frames == {
+        flir: b"flir-2",
+        PUBLIC_CAMERA_TOPICS[1]: b"camera-1",
+        PUBLIC_CAMERA_TOPICS[2]: b"camera-2",
+        PUBLIC_CAMERA_TOPICS[3]: b"camera-3",
+        PUBLIC_CAMERA_TOPICS[4]: b"camera-4",
+    }
+    assert len(outgoing) == PUBLIC_MAX_OUTGOING_QUEUE
 
 
 def test_public_outgoing_queue_never_evicts_state_for_binary() -> None:
     outgoing = deque(
-        (f"state-{index}", False)
+        (f"state-{index}", False, None)
         for index in range(PUBLIC_MAX_OUTGOING_QUEUE)
     )
     before = list(outgoing)
 
-    assert not _enqueue_public_outgoing(outgoing, (b"camera", True))
+    assert not _enqueue_public_outgoing(
+        outgoing, (b"camera", True, PUBLIC_CAMERA_TOPICS[0])
+    )
     assert list(outgoing) == before
 
 
 def test_public_outgoing_queue_drops_oldest_state_only_when_state_full() -> None:
     outgoing = deque(
-        (f"state-{index}", False)
+        (f"state-{index}", False, None)
         for index in range(PUBLIC_MAX_OUTGOING_QUEUE)
     )
 
-    assert _enqueue_public_outgoing(outgoing, ("state-new", False))
+    assert _enqueue_public_outgoing(outgoing, ("state-new", False, None))
     assert len(outgoing) == PUBLIC_MAX_OUTGOING_QUEUE
-    assert outgoing[0] == ("state-1", False)
-    assert outgoing[-1] == ("state-new", False)
+    assert outgoing[0] == ("state-1", False, None)
+    assert outgoing[-1] == ("state-new", False, None)
+
+
+def test_protocol_outgoing_topic_context_is_scoped_per_callback() -> None:
+    protocol = _protocol_type()()
+    protocol.set_public_outgoing_topic(PUBLIC_CAMERA_TOPICS[0])
+    assert protocol.public_outgoing_topic() == PUBLIC_CAMERA_TOPICS[0]
+    protocol.set_public_outgoing_topic(None)
+    assert protocol.public_outgoing_topic() is None
 
 
 def test_malformed_64k_json_repeated_100_times_cannot_accumulate() -> None:

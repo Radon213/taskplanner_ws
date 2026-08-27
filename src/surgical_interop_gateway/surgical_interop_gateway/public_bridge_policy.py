@@ -1,7 +1,7 @@
 """Immutable read-only rosbridge policy for institutional UI consumers.
 
 The public bridge is deliberately smaller than the operator/debug bridges.  A
-client may only subscribe to the reviewed public projections and the two
+client may only subscribe to the reviewed public projections and the five
 scenario-gated compressed camera aliases.  It cannot publish, advertise, call
 services, send Action goals, inspect rosapi, or widen this list with ROS
 parameters.
@@ -31,6 +31,9 @@ PUBLIC_STATE_TOPICS = (
 PUBLIC_CAMERA_TOPICS = (
     "/surgery/images/flir/compressed",
     "/surgery/images/cam4/compressed",
+    "/surgery/images/cam3/overlay/compressed",
+    "/surgery/images/suction/overlay/compressed",
+    "/surgery/images/right_ee/overlay/compressed",
 )
 PUBLIC_SUBSCRIBE_ALLOWLIST = PUBLIC_STATE_TOPICS + PUBLIC_CAMERA_TOPICS
 PUBLIC_CAPABILITY_CLASS_NAMES = ("Subscribe",)
@@ -71,7 +74,11 @@ PUBLIC_MAX_OUTGOING_MESSAGE_BYTES = 4 * 1024 * 1024
 # frame; a four-item queue silently discarded gateway/context snapshots under
 # normal load and made a healthy monitor oscillate into HEALTH WARN.
 PUBLIC_MAX_OUTGOING_STATE_MESSAGE_BYTES = 256 * 1024
-PUBLIC_MAX_OUTGOING_QUEUE = 16
+# One complete state burst plus one latest frame for each reviewed camera.
+# Binary coalescing is per public camera topic, so this remains bounded while
+# allowing a five-panel viewer to retain one pending frame for every panel.
+PUBLIC_MAX_OUTGOING_QUEUE = len(PUBLIC_STATE_TOPICS) + len(PUBLIC_CAMERA_TOPICS)
+# This limit is per public camera topic, not a global binary-frame cap.
 PUBLIC_MAX_OUTGOING_BINARY_MESSAGES = 1
 
 

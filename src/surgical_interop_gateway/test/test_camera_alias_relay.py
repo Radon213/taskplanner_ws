@@ -20,6 +20,9 @@ def test_default_physical_sources_use_multicam_synced_topics() -> None:
     ).getsource(CameraAliasRelay.__init__)
     assert "/synced/flir/color/image_raw/compressed" in source
     assert "/synced/cam_4/color/image_raw/compressed" in source
+    assert "/perception/cam_3/overlay/compressed" in source
+    assert "/perception/suction/overlay/compressed" in source
+    assert "/perception/right_ee/overlay/compressed" in source
 
 
 def _binding(name: str, source: str, public: str) -> CameraAliasBinding:
