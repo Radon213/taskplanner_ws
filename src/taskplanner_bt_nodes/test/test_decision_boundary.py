@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 import xml.etree.ElementTree as ET
 
 
@@ -30,6 +31,24 @@ def _named_sequence(root: ET.Element, name: str) -> ET.Element:
     )
 
 
+def test_world_state_wait_yields_once_at_the_executor_cadence() -> None:
+    root = ET.parse(TREE_PATH).getroot()
+    tick = _named_sequence(root, "TaskplannerAssistTick")
+    retry = next(tick.iter("RetryUntilSuccessful"))
+    delay = next(iter(retry))
+    assert retry.attrib["num_attempts"] == "-1"
+    assert delay.tag == "Delay"
+    # This is exactly one 40 Hz executor period, not the historical 100 ms
+    # extra gate in front of every direct handover decision.
+    assert int(delay.attrib["delay_msec"]) == 25
+    assert [child.tag for child in delay] == ["LoadWorldState"]
+
+    source = CPP_PATH.read_text(encoding="utf-8")
+    load_world = _section(source, "class LoadWorldState", "class IsProcedureActive")
+    assert "world_state_stale" in load_world
+    assert "return BT::NodeStatus::FAILURE;" in load_world
+
+
 def test_bt_rechecks_direct_hand_signal_policy_and_runtime_gate() -> None:
     source = CPP_PATH.read_text(encoding="utf-8")
     runtime = _section(source, "class IsProcedureActive", "class HasExplicitRequest")
@@ -45,17 +64,21 @@ def test_bt_rechecks_direct_hand_signal_policy_and_runtime_gate() -> None:
     assert 'execution_state == "finishing"' in runtime
     assert 'execution_state == "running"' in direct_hand
     assert "implicit_tool.empty()" in direct_hand
-    assert "confidence >= kHandHandoverMinConfidence" in direct_hand
-    assert "stability_sec >= kHandHandoverMinStabilitySec" in direct_hand
+    assert '"request.implicit_confidence"' not in direct_hand
+    assert '"request.implicit_stability_sec"' not in direct_hand
     assert '"open_receive"' in direct_hand
+    assert "hasActiveRobotTask(*this)" in implicit
     assert "directHandSignalActive(*this)" in implicit
-    assert "kImplicitPredictionMinConfidence" in implicit
-    assert "kImplicitPredictionMinStabilitySec" in implicit
+    assert "rightHandEmpty" not in implicit
+    assert '"prediction.tool"' not in implicit
     assert '"prepositioned_right"' in exact_preposition
-    assert "kHandHandoverMinConfidence = 0.50" in source
-    assert "kHandHandoverMinStabilitySec = 0.30" in source
-    assert "kImplicitPredictionMinConfidence = 0.55" in source
-    assert "kImplicitPredictionMinStabilitySec = 0.30" in source
+    assert "kHandHandoverMinConfidence" not in source
+    assert "kHandHandoverMinStabilitySec" not in source
+    assert "kImplicitPredictionMinConfidence" not in source
+    assert "kImplicitPredictionMinStabilitySec" not in source
+    assert "kPreparationMinConfidence" not in source
+    assert "kPreparationMinStabilitySec" not in source
+    assert '"prediction.autonomous_ready"' in source
 
 
 def test_exact_right_hand_preposition_predicate_checks_the_full_identity() -> None:
@@ -96,19 +119,44 @@ def test_exact_right_hand_preposition_predicate_checks_the_full_identity() -> No
     assert "isExactRightHandPreposition(*this, selected_tool)" in command
 
 
-def test_dt_handover_value_is_only_a_hint_to_bt() -> None:
+def test_recovery_waits_for_right_hand_preposition_to_be_returned() -> None:
+    source = CPP_PATH.read_text(encoding="utf-8")
+    recovery = _section(
+        source, "class SelectRecoveryTool", "class ShouldDispatchDecision"
+    )
+
+    assert 'readBlackboard(*this, "robot.right_hand_tool", right_hand_tool);' in recovery
+    assert 'readBlackboard(*this, "robot.right_hand_instance", right_hand_instance);' in recovery
+    assert "retrieve_blocked_right_hand_preposition" in recovery
+    assert 'return BT::NodeStatus::FAILURE;' in recovery
+    # The finishing cleanup branch must remain ahead of the gate so a held
+    # preposition can be returned before Mayo recovery is retried.
+    cleanup_at = recovery.index('if (execution_state == "finishing")')
+    gate_at = recovery.index("retrieve_blocked_right_hand_preposition")
+    assert cleanup_at < gate_at
+
+
+def test_dt_handover_admission_is_enforced_by_bt_without_source_reselection() -> None:
     source = CPP_PATH.read_text(encoding="utf-8")
     load_world = _section(source, "class LoadWorldState", "class IsProcedureActive")
-    explicit_intents = _section(
-        source, "bool isExplicitSurgeonIntent", "bool isAvailableStatus"
+    action_guard = _section(
+        source, "class ApplyActionGuard", "class ConfigureHumanoidCommand"
+    )
+    can_handover = _section(source, "class CanHandover", "class CanPreposition")
+    explicit_selection = _section(
+        source, "class SelectExplicitTool", "class SelectImplicitTool"
     )
 
     assert '"state.handover_hint"' in load_world
-    assert (
-        '"action.guard.handover_allowed", static_cast<bool>(msg.handover_allowed)'
-        not in load_world
+    assert 'readBlackboard(*this, "state.handover_hint", handover_hint)' in action_guard
+    assert "const bool source_admitted = !explicit_request_selected || handover_hint;" in (
+        action_guard
     )
-    assert "extend_hand_for_handover" not in explicit_intents
+    assert "requested_tool_not_robot_reachable" in action_guard
+    assert 'lifecycle == "surgeon_owned"' not in can_handover
+    assert "findActiveInstanceForType(*this, tool_id" not in explicit_selection
+    assert "Digital Twin is the sole owner of supply selection" in explicit_selection
+    assert "stale_surgeon_owned_voice_retry_allowed" not in source
 
 
 def test_bt_does_not_infer_a_fixed_surgeon_hand_capacity() -> None:
@@ -139,14 +187,22 @@ def test_bt_does_not_infer_a_fixed_surgeon_hand_capacity() -> None:
 def test_recovery_policy_uses_verified_facts_in_bt() -> None:
     source = CPP_PATH.read_text(encoding="utf-8")
     recovery = _section(
-        source, "RecoveryPolicyCandidate selectRecoveryPolicyCandidate", "bool hasRecoveryContext"
+        source, "class SelectRecoveryTool", "class SetIdleDecision"
     )
 
-    assert '"future_use_expected"' in recovery
-    assert '"mayo_recovery_confidence"' in recovery
-    assert '"mayo_recovery_stability_sec"' in recovery
-    assert '"completion_cleanup"' in recovery
-    assert "mayo_tools.size() > 2" in recovery
+    # The BT executes only reducer-issued recovery state; it never rebuilds
+    # Mayo policy from phase-role, VLM-confidence, or capacity heuristics.
+    for removed in (
+        '"future_use_expected"',
+        '"mayo_recovery_confidence"',
+        '"mayo_recovery_stability_sec"',
+        '"completion_cleanup"',
+        "mayo_tools.size() > 2",
+        "selectRecoveryPolicyCandidate",
+    ):
+        assert removed not in source
+    assert '"active_recovery_instances.csv"' in recovery
+    assert '"authoritative_recovery_transaction"' in recovery
 
 
 def test_tree_priority_keeps_direct_hand_signal_and_recovery_in_bt() -> None:
@@ -175,13 +231,21 @@ def test_preparation_is_reversible_and_separate_from_handover_policy() -> None:
         source, "class SelectRecoveryTool", "class SetIdleDecision"
     )
 
-    assert "kPreparationMinConfidence = 0.65" in source
-    assert "kPreparationMinStabilitySec = 0.3" in source
-    assert "hasBlockingSafetyFlag(*this)" in preparation
+    assert "kPreparationMinConfidence" not in source
+    assert "kPreparationMinStabilitySec" not in source
+    assert "hasBlockingSafetyFlag(*this, true)" in preparation
     assert '"robot.right_hand_tool"' in preparation
-    assert "kPreparationMinConfidence" in selection
-    assert "kPreparationMinStabilitySec" in selection
-    assert '"system_top_replacement_stable_2s"' in recovery
+    assert '"prediction.autonomous_ready"' in selection
+    assert '"prediction.confidence"' not in selection
+    assert '"prediction.stability_sec"' not in selection
+    assert '"dt_authorized_prediction_replacement"' in recovery
+    replacement = _section(
+        source,
+        "bool systemTopPredictionReplacesPreposition",
+        "bool hasRecoveryContext",
+    )
+    assert '"reserved_for"' in replacement
+    assert 'preposition_reservation != "voice_prepared"' in replacement
 
     anticipatory = next(
         element
@@ -195,7 +259,18 @@ def test_preparation_is_reversible_and_separate_from_handover_policy() -> None:
     assert 'name="AnticipatoryPreparation"' in xml
 
 
-def test_tool_agnostic_hand_signal_prefers_prepositioned_then_prediction() -> None:
+def test_deterministic_ngram_preparation_does_not_wait_for_vlm_health() -> None:
+    source = CPP_PATH.read_text(encoding="utf-8")
+    preparation = _section(
+        source, "class CanPreposition", "class SelectExplicitTool"
+    )
+
+    # The n-gram policy is Digital-Twin-owned. A VLM response may arrive
+    # later in a new run, but it is not an input to this preparation decision.
+    assert "hasBlockingSafetyFlag(*this, true)" in preparation
+
+
+def test_hand_signal_requires_an_exact_prepositioned_right_hand_tool() -> None:
     source = CPP_PATH.read_text(encoding="utf-8")
     implicit_condition = _section(
         source, "class HasImplicitRequest", "class NeedsRecovery"
@@ -214,22 +289,128 @@ def test_tool_agnostic_hand_signal_prefers_prepositioned_then_prediction() -> No
     assert 'toolLifecycle(node, prepositioned_instance) != "prepositioned_right"' in (
         exact_preposition
     )
-    assert "prediction_confidence < kImplicitPredictionMinConfidence" in implicit_condition
-    assert "prediction_stability_sec < kImplicitPredictionMinStabilitySec" in implicit_condition
+    assert "rightHandEmpty" not in implicit_condition
+    assert '"prediction.tool"' not in implicit_condition
+    assert "kImplicitPredictionMinConfidence" not in implicit_condition
+    assert "kImplicitPredictionMinStabilitySec" not in implicit_condition
 
-    preposition_at = implicit_selection.index("robot.prepositioned_tool")
-    prediction_at = implicit_selection.index("prediction.tool")
-    assert preposition_at < prediction_at
     assert '"hand_signal_preposition_match"' in implicit_selection
-    assert '"hand_signal_prediction_fallback"' in implicit_selection
+    assert '"hand_signal_prediction_fallback"' not in implicit_selection
+    assert '"prediction.tool"' not in implicit_selection
+    assert "findActiveInstanceForType" not in implicit_selection
     assert '"surgeon_owned"' not in implicit_selection
     assert '"request.implicit_tool"' not in implicit_selection
 
-    assert "implicit_candidate_supported" in action_guard
     assert "directHandSignalActive(*this)" in action_guard
-    assert "prediction_confidence >= kImplicitPredictionMinConfidence" in action_guard
-    assert "prediction_stability_sec >= kImplicitPredictionMinStabilitySec" in action_guard
-    assert "implicit_tool == predicted_tool" not in action_guard
+    assert "implicit_prediction_fallback" not in action_guard
+    assert "direct_hand_prediction_selected" not in action_guard
+    assert "implicit_request_requires_prepositioned_right_tool" in source
+
+
+def test_cam4_hand_presence_blocks_autonomous_mayo_prediction_and_recovery() -> None:
+    source = CPP_PATH.read_text(encoding="utf-8")
+    load_world = _section(source, "class LoadWorldState", "class IsProcedureActive")
+    active_selector = _section(
+        source, "std::string findActiveInstanceForType", "bool hasBlockingSafetyFlag"
+    )
+    anticipatory_selector = _section(
+        source,
+        "std::string findAnticipatoryInstanceForType",
+        "bool explicitRequestReplacesPreposition",
+    )
+    recovery_selection = _section(
+        source, "class SelectRecoveryTool", "class SetIdleDecision"
+    )
+
+    assert "msg.cam4_mayo_hand_present" in load_world
+    assert '"perception.cam4_mayo_hand_present"' in load_world
+    # The candidate finder is shared by implicit request selection and must
+    # therefore default to preserving the observation-only Mayo exclusion.
+    # Only the direct hand-request path opts into the explicit override below.
+    assert "bool allow_occupied_mayo = false" in active_selector
+    assert "mayoWorkspaceOccupied(node)" in active_selector
+    assert "mayo_occupied && on_mayo && !allow_occupied_mayo" in active_selector
+    assert "mayoWorkspaceOccupied(node)" in anticipatory_selector
+    assert "if (mayo_occupied)" in anticipatory_selector
+    assert "mayoWorkspaceOccupied(*this)" in recovery_selection
+    assert 'std::string("cam4_mayo_hand_present")' in recovery_selection
+    assert "kWorldStateMaxReceiptAgeNs" in source
+    assert "last_world_state_receipt_ns_" in load_world
+    assert "steadyNowNs()" in load_world
+    assert 'std::string("world_state_stale")' in load_world
+    assert '"perception.cam4_mayo_hand_present", true' in load_world
+
+
+def test_cam4_hand_presence_does_not_enable_empty_hand_prediction_handover() -> None:
+    source = CPP_PATH.read_text(encoding="utf-8")
+    operator_request = _section(
+        source, "bool operatorRequestedMayoPickup", "bool hasBlockingSafetyFlag"
+    )
+    implicit_selection = _section(
+        source, "class SelectImplicitTool", "class SelectExpectedTool"
+    )
+    action_guard = _section(
+        source, "class ApplyActionGuard", "class ConfigureHumanoidCommand"
+    )
+    command = _section(
+        source, "class ConfigureHumanoidCommand", "class ShouldDispatchDecision"
+    )
+    dispatch = _section(
+        source, "class ShouldDispatchDecision", "class EmitBTDecision"
+    )
+
+    # An Open_Receive episode only releases the already prepared right-hand
+    # instance. It cannot select a Mayo/rack tool from rank-1 prediction,
+    # including while the Mayo workspace is occupied.
+    assert '"prediction.tool"' not in implicit_selection
+    assert "findActiveInstanceForType" not in implicit_selection
+    assert "directHandSignalActive(node)" not in operator_request
+    assert "rightHandEmpty(node)" not in operator_request
+    assert "implicit_generation" not in operator_request
+    assert "predicted_tool" not in operator_request
+    assert "operatorRequestedMayoPickup(*this, selected_tool)" in action_guard
+    mayo_guard = _section(
+        action_guard, "const bool mayo_handover_allowed", "const bool allowed"
+    )
+    assert "!mayoWorkspaceOccupied(*this) || operator_requested_mayo_handover" in mayo_guard
+
+    # Occupied-Mayo bypass remains limited to the explicit voice request path;
+    # an implicit signal cannot re-enable it downstream.
+    command_gate = command[: command.index('writeBlackboard(*this, "bt.decision"')]
+    dispatch_gate = dispatch[: dispatch.index("if (hasActiveRobotTask(*this))")]
+    assert 'mode == "explicit_request"' in command_gate
+    assert 'decision == "explicit_request"' in dispatch_gate
+    assert "implicit_request_requires_prepositioned_right_tool" in command
+
+
+def test_cam4_hand_presence_allows_only_voice_backed_explicit_mayo_request() -> None:
+    source = CPP_PATH.read_text(encoding="utf-8")
+    operator_request = _section(
+        source, "bool operatorRequestedMayoPickup", "bool hasBlockingSafetyFlag"
+    )
+    action_guard = _section(
+        source, "class ApplyActionGuard", "class ConfigureHumanoidCommand"
+    )
+    command = _section(
+        source, "class ConfigureHumanoidCommand", "class ShouldDispatchDecision"
+    )
+    dispatch = _section(
+        source, "class ShouldDispatchDecision", "class EmitBTDecision"
+    )
+
+    assert 'surgeon_intent == "voice_request"' in operator_request
+    assert "voice_backed && ready_for_handover && handover_hint" in operator_request
+    assert "surgeon_instance == selected_tool" in operator_request
+    assert "operatorRequestedMayoPickup(*this, selected_tool)" in action_guard
+
+    # The override is deliberately narrow: a typed/voice explicit request can
+    # pass the occupied-Mayo guard, but an arbitrary explicit BT branch cannot.
+    command_gate = command[: command.index('writeBlackboard(*this, "bt.decision"')]
+    dispatch_gate = dispatch[: dispatch.index("if (hasActiveRobotTask(*this))")]
+    for gate, branch_name in ((command_gate, "mode"), (dispatch_gate, "decision")):
+        assert f'{branch_name} == "explicit_request"' in gate
+        assert "operatorRequestedMayoPickup(*this, selected_tool)" in gate
+        assert "!operator_requested_mayo_handover" in gate
 
 
 def test_direct_hand_signal_can_handover_the_robot_held_tool() -> None:
@@ -251,7 +432,8 @@ def test_direct_hand_signal_can_handover_the_robot_held_tool() -> None:
         implicit_selection
     )
     assert "isExactRightHandPreposition(*this)" in implicit_selection
-    assert '{"home_rack", "returned_home", "mayo_reuse"}' in implicit_selection
+    assert "findActiveInstanceForType" not in implicit_selection
+    assert '"prediction.tool"' not in implicit_selection
 
     # If that matching instance is already in the humanoid right hand, the
     # configured operation is a direct robot-to-surgeon handover.
@@ -261,7 +443,7 @@ def test_direct_hand_signal_can_handover_the_robot_held_tool() -> None:
     assert 'std::string("surgeon_receive_zone")' in command
 
 
-def test_reducer_records_evidence_without_creating_action_obligations() -> None:
+def test_reducer_uses_ngram_policy_without_creating_hand_action_obligations() -> None:
     source = DT_NODE_PATH.read_text(encoding="utf-8")
     direct_hand = _section(
         source, "def _apply_hand_handover_update", "def _withdraw_hand_handover_evidence"
@@ -279,10 +461,27 @@ def test_reducer_records_evidence_without_creating_action_obligations() -> None:
     assert 'state.implicit_request_tool = ""' in direct_hand
     assert 'input_type="hand_handover_signal"' in direct_hand
     assert "_tool_available_for_prediction" not in prediction
-    assert "predicted_tool_not_available_for_preposition" not in prediction_handler
+    assert "return self._ngram_tool_prediction()" in prediction
+    assert "self._refresh_ngram_tool_policy" in prediction_handler
+    assert "del payload, msg, received_sec" in prediction_handler
+    assert "record_mayo_policy_evidence" not in prediction_handler
     assert "interrupt_visible" not in vlm_result
-    assert "record_mayo_policy_evidence" in vlm_result
+    assert "self._publish_world_state()" in vlm_result
+    assert "record_mayo_policy_evidence" not in vlm_result
+    assert "mayo_rows:" not in vlm_result
     assert "promote_mayo_recovery_from_vlm" not in vlm_result
+    # Retired VLM fusion/stability code must be absent, not merely hidden
+    # behind an early return where a future edit could reactivate it.
+    for helper in (
+        "_normalize_ranked_tool_distribution",
+        "_update_stability",
+        "_tool_prediction_sample_status",
+        "_vlm_tool_rows",
+        "_is_canonical_mayo_policy_state",
+    ):
+        assert f"def {helper}(" not in source
+    assert "vlm_scores" not in prediction
+    assert "_tool_predict_stability" not in prediction_handler
 
 
 def test_prediction_replacement_returns_old_preposition_before_preparing_new() -> None:
@@ -291,7 +490,7 @@ def test_prediction_replacement_returns_old_preposition_before_preparing_new() -
     replacement = _section(
         source,
         "bool systemTopPredictionReplacesPreposition",
-        "struct RecoveryPolicyCandidate",
+        "bool hasRecoveryContext",
     )
     recovery_context = _section(
         source, "bool hasRecoveryContext", "bool hasActiveRobotTask"
@@ -311,32 +510,34 @@ def test_prediction_replacement_returns_old_preposition_before_preparing_new() -
     assert "replacement_available" in replacement
     assert "replacement_available = !replacement_instance.empty()" in replacement
     assert 'readBlackboard(node, "prediction.confidence"' not in replacement
-    assert "kSystemTopReplacementMinStabilitySec = 2.0" in source
-    assert "stability_sec >= kSystemTopReplacementMinStabilitySec" in replacement
+    assert "kSystemTopReplacementMinStabilitySec" not in source
+    assert 'readBlackboard(node, "prediction.autonomous_ready"' in replacement
+    assert "autonomous_ready" in replacement
     assert "systemTopPredictionReplacesPreposition(node)" in recovery_context
+    assert "bool isVoicePreparedPreposition" in source
+    assert "!isVoicePreparedPreposition(*this, tool_id)" in recovery_selection
 
     replacement_at = recovery_selection.index(
         "if (systemTopPredictionReplacesPreposition(*this))"
     )
-    generic_recovery_at = recovery_selection.index(
-        "const auto policy_candidate = selectRecoveryPolicyCandidate(*this)"
-    )
-    assert replacement_at < generic_recovery_at
     assert '"prepositioned_right"' in recovery_selection[replacement_at:]
     assert '"return_unused_preposition"' in recovery_selection[replacement_at:]
-    assert '"system_top_replacement_stable_2s"' in recovery_selection[replacement_at:]
+    assert '"dt_authorized_prediction_replacement"' in recovery_selection[replacement_at:]
 
     assert "hasRecoveryContext(*this)" in expected_selection
-    assert (
-        expected_selection.index("hasRecoveryContext(*this)")
-        < expected_selection.index("kPreparationMinConfidence")
-    )
+    assert '"prediction.autonomous_ready"' in expected_selection
     assert 'next_required_transition == "return_unused_preposition"' in command
     assert 'writeBlackboard(*this, "bt.arm", std::string("right"))' in command
     assert (
         'writeBlackboard(*this, "bt.action", '
         'std::string("return_unused_preposition"))'
     ) in command
+    assert 'std::string("voice_prepared_waiting_for_hand")' in command
+
+    dispatch = _section(source, "class ShouldDispatchDecision", "class EmitBTDecision")
+    assert 'decision == "recovery"' in dispatch
+    assert 'action == "return_unused_preposition"' in dispatch
+    assert "isVoicePreparedPreposition(*this, selected_tool)" in dispatch
 
     decision_root = next(root.iter("Fallback"))
     branch_names = [
@@ -349,7 +550,7 @@ def test_prediction_replacement_returns_old_preposition_before_preparing_new() -
     )
 
 
-def test_mayo_reuse_preparation_is_future_scoped_and_returns_to_mayo() -> None:
+def test_mayo_reuse_preparation_is_ngram_scoped_and_returns_to_mayo() -> None:
     source = CPP_PATH.read_text(encoding="utf-8")
     candidate_guard = _section(
         source,
@@ -367,8 +568,8 @@ def test_mayo_reuse_preparation_is_future_scoped_and_returns_to_mayo() -> None:
     )
 
     assert 'lifecycle == "mayo_reuse"' in candidate_guard
-    assert '"future_use_expected"' in candidate_guard
-    assert "return future_use_expected" in candidate_guard
+    assert '"future_use_expected"' not in candidate_guard
+    assert "return true;" in candidate_guard
     assert "findAnticipatoryInstanceForType" in candidate_guard
     assert "toolIsAnticipatoryCandidate(node, tool_id)" in candidate_guard
     assert "findAnticipatoryInstanceForType" in expected_selection
@@ -404,13 +605,53 @@ def test_recovery_selection_consumes_instance_fifo_before_generic_scan() -> None
     assert "hasBlockingSafetyFlag(*this)" in recovery_selection
 
 
+def test_completion_release_parks_an_excluded_preposition_before_mayo_recovery() -> None:
+    source = CPP_PATH.read_text(encoding="utf-8")
+    recovery_selection = _section(
+        source, "class SelectRecoveryTool", "class SetIdleDecision"
+    )
+    command = _section(
+        source, "class ConfigureHumanoidCommand", "class ShouldDispatchDecision"
+    )
+
+    completion_release_at = recovery_selection.index(
+        '"completion_release_excluded_preposition"'
+    )
+    explicit_replacement_at = recovery_selection.index(
+        "if (explicitRequestReplacesPreposition(*this))"
+    )
+    completion_frozen_at = recovery_selection.index(
+        '"completion_frozen_mayo_target"'
+    )
+    assert completion_release_at < explicit_replacement_at
+    assert completion_release_at < completion_frozen_at
+    assert 'execution_state == "finishing"' in recovery_selection
+    assert 'lifecycle == "prepositioned_right"' in recovery_selection
+    assert 'toolNextRequiredTransition(*this, tool_id) == "return_unused_preposition"' in (
+        recovery_selection
+    )
+    assert 'tool_id, "return_unused_preposition", "completion_release_excluded_preposition"' in (
+        recovery_selection
+    )
+    assert 'tool_id, "return_preposition_to_tray", "completion_return_preposition_to_tray"' in (
+        recovery_selection
+    )
+    assert '"completion_frozen_mayo_target"' in recovery_selection
+    assert 'lifecycle == "mayo_reuse" || lifecycle == "mayo_recovery"' in recovery_selection
+    assert 'toolNextRequiredTransition(*this, tool_id) == "recover_left"' in recovery_selection
+    assert 'next_required_transition == "return_preposition_to_tray"' in command
+    assert 'std::string("return_preposition_to_tray")' in command
+    assert "completion cleanup returns prepared recovery tool directly to tray" in command
+
+
 def test_bt_control_reads_only_rank_one_scalar_prediction_fields() -> None:
     source = CPP_PATH.read_text(encoding="utf-8")
     load_world = _section(source, "class LoadWorldState", "class IsProcedureActive")
 
     assert "msg.predicted_tool" in load_world
-    assert "msg.predicted_tool_confidence" in load_world
-    assert "msg.predicted_tool_stability_sec" in load_world
+    assert "msg.autonomous_preparation_ready" in load_world
+    assert "msg.predicted_tool_confidence" not in load_world
+    assert "msg.predicted_tool_stability_sec" not in load_world
     assert "ranked_tool_predictions" not in load_world
 
 
@@ -426,11 +667,11 @@ def test_return_unused_preposition_has_no_legacy_time_triggers() -> None:
         source, "class ConfigureHumanoidCommand", "class ShouldDispatchDecision"
     )
 
-    assert "kSystemTopReplacementMinStabilitySec = 2.0" in source
+    assert "kSystemTopReplacementMinStabilitySec" not in source
     assert "return hasRecoveryContext(*this)" in needs_recovery
     assert '"return_unused_preposition"' in recovery_selection
-    assert '"system_top_replacement_stable_2s"' in recovery_selection
-    assert "system top prediction changed for 2 s" in command
+    assert '"dt_authorized_prediction_replacement"' in recovery_selection
+    assert "DT-authorized n-gram prediction changed" in command
     for removed in (
         "kPreparationUnsupportedGraceSec",
         "kPreparationMaxDwellSec",
@@ -458,7 +699,7 @@ def test_returned_preposition_has_no_time_based_rearm_cooldown() -> None:
     assert "steadyNowSec" not in source
 
 
-def test_explicit_request_preempts_direct_hand_and_anticipatory_paths() -> None:
+def test_explicit_request_outranks_direct_hand_and_anticipatory_paths() -> None:
     source = CPP_PATH.read_text(encoding="utf-8")
     root = ET.parse(TREE_PATH).getroot()
     decision_root = next(root.iter("Fallback"))
@@ -505,17 +746,71 @@ def test_explicit_request_uses_matching_preposition_before_another_instance() ->
         'std::string("explicit_request_preposition_match")'
     )
     requested_instance_at = explicit_selection.index(
-        "if (!surgeon_instance.empty()"
+        "!surgeon_instance.empty()"
     )
     assert matching_preposition_at < requested_instance_at
     assert '"robot.right_hand_tool"' in explicit_selection
     assert '"robot.right_hand_instance"' in explicit_selection
     assert "toolMatchesType" in explicit_selection
+    assert "toolMatchesType(*this, surgeon_instance, requested_tool_type)" in (
+        explicit_selection
+    )
     assert 'writeBlackboard(*this, "selected.tool", right_hand_instance)' in (
         explicit_selection
     )
     assert "right_hand_instance == selected_tool" in command
+    assert "exact_direct_hand_preposition || explicit_right_hand_selection" in command
+
+
+def test_voice_explicit_request_hands_over_an_already_prepared_tool() -> None:
+    source = CPP_PATH.read_text(encoding="utf-8")
+    command = _section(
+        source, "class ConfigureHumanoidCommand", "class ShouldDispatchDecision"
+    )
+
+    assert 'readBlackboard(*this, "request.voice_backed", voice_backed)' in command
+    assert 'mode == "explicit_request" && voice_backed' in command
+    assert 'mode == "implicit_request" &&' in command
+    assert "exact_direct_hand_preposition || explicit_right_hand_selection" in command
+    assert "voice_requested_tool_already_prepared" not in command
     assert 'std::string("direct_handover")' in command
+    assert 'std::string("prepare_tool")' in command
+    assert "voice-requested tool is prepared for a later hand signal" in command
+
+
+def test_explicit_tool_selection_uses_the_twin_instance_while_other_modes_can_prefer_mayo() -> None:
+    source = CPP_PATH.read_text(encoding="utf-8")
+    active_selector = _section(
+        source, "std::string findActiveInstanceForType", "bool hasBlockingSafetyFlag"
+    )
+    anticipatory_selector = _section(
+        source,
+        "std::string findAnticipatoryInstanceForType",
+        "bool explicitRequestReplacesPreposition",
+    )
+    explicit_selection = _section(
+        source, "class SelectExplicitTool", "class SelectImplicitTool"
+    )
+    implicit_selection = _section(
+        source, "class SelectImplicitTool", "class SelectExpectedTool"
+    )
+    expected_selection = _section(
+        source, "class SelectExpectedTool", "class SelectRecoveryTool"
+    )
+
+    assert "bool prefer_mayo = false" in active_selector
+    assert 'lifecycle == "mayo_reuse" || lifecycle == "mayo_recovery"' in (
+        active_selector
+    )
+    assert "return first_eligible;" in active_selector
+    assert "findActiveInstanceForType(*this, tool_id" not in explicit_selection
+    assert "Digital Twin is the sole owner of supply selection" in explicit_selection
+    assert "findActiveInstanceForType" not in implicit_selection
+    assert '"prediction.tool"' not in implicit_selection
+    assert 'toolLifecycle(node, tool_id) == "mayo_reuse"' in (
+        anticipatory_selector
+    )
+    assert "findAnticipatoryInstanceForType" in expected_selection
 
 
 def test_dispatch_dedupe_does_not_rearm_on_phase_jitter() -> None:
@@ -590,16 +885,20 @@ def test_direct_hand_identity_is_fail_closed_and_command_id_is_deterministic() -
     assert "std::to_string(implicit_request_generation)" in dispatch
     assert "procedure_run_id" in dispatch[dispatch.index("static std::string makeSignature") :]
 
-    assert 'msg.procedure_run_id = "";' in publish
-    assert "msg.implicit_request_generation = 0;" in publish
-    assert "if (procedure_run_id.empty() || implicit_request_generation <= 0)" in (
-        implicit_publish
+    # All commands, including implicit handover, are bound to the accepted
+    # procedure interval so a delayed command cannot be admitted by a later
+    # run.  The older blank-field assertion predated this run fence.
+    assert (
+        'readBlackboard(*this, "runtime.procedure_run_id", msg.procedure_run_id);'
+        in publish
     )
+    assert "if (msg.procedure_run_id.empty())" in publish
+    assert "msg.implicit_request_generation = 0;" in publish
+    assert "if (implicit_request_generation <= 0)" in implicit_publish
     assert "return false;" in implicit_publish
-    assert "msg.procedure_run_id = procedure_run_id;" in implicit_publish
     assert "msg.implicit_request_generation = static_cast<uint64_t>" in implicit_publish
     assert (
-        '"skill-hand-" + procedure_run_id + "-" +\n'
+        '"skill-hand-" + msg.procedure_run_id + "-" +\n'
         "        std::to_string(implicit_request_generation) + \"-\" + msg.action"
         in implicit_publish
     )
@@ -645,6 +944,8 @@ def test_direct_hand_signal_remains_evidence_until_bt_policy_accepts_it() -> Non
     assert "phase_uncertain_implicit_override" not in source
     assert "phase_uncertainty_permits_handover" not in source
     assert "kPhaseUncertainImplicitPrediction" not in source
+    assert "direct_hand_prediction_selected" not in guard
+    assert "implicit_prediction_fallback" not in guard
     assert "voice_backed_explicit_request || direct_hand_preposition_selected" in guard
 
 
@@ -685,11 +986,7 @@ def test_phase_uncertainty_is_observational_only_not_a_bt_decision_gate() -> Non
     xml = TREE_PATH.read_text(encoding="utf-8")
     config = NODE_CONFIG_PATH.read_text(encoding="utf-8")
     cmake = CMAKE_PATH.read_text(encoding="utf-8")
-    recovery = _section(
-        source,
-        "RecoveryPolicyCandidate selectRecoveryPolicyCandidate",
-        "bool hasRecoveryContext",
-    )
+    recovery = _section(source, "bool hasRecoveryContext", "bool hasActiveRobotTask")
     command = _section(
         source, "class ConfigureHumanoidCommand", "class ShouldDispatchDecision"
     )
@@ -721,7 +1018,7 @@ def test_skill_command_carries_voice_priority_provenance_only_for_explicit_mode(
     )
 
 
-def test_voice_explicit_request_alone_can_bypass_the_bt_active_task_gate() -> None:
+def test_active_robot_action_blocks_every_bt_command_including_voice() -> None:
     source = CPP_PATH.read_text(encoding="utf-8")
     can_handover = _section(
         source, "class CanHandover", "class CanPreposition"
@@ -733,21 +1030,16 @@ def test_voice_explicit_request_alone_can_bypass_the_bt_active_task_gate() -> No
         source, "class ShouldDispatchDecision", "class EmitBTDecision"
     )
 
-    assert "hasActiveRobotTask(*this) && !voice_backed_selected" in can_handover
-    assert "isExplicitSurgeonIntent(surgeon_intent)" in can_handover
-    assert (
-        "active_task_id.empty() || voice_backed_explicit_request"
-        in action_guard
+    assert "if (hasActiveRobotTask(*this))" in can_handover
+    assert "const bool robot_task_slot_available = active_task_id.empty();" in (
+        action_guard
     )
-    assert "hasActiveRobotTask(*this) && !voice_backed_selected" in dispatch
-    assert 'decision == "explicit_request"' in dispatch
-    assert "isExplicitSurgeonIntent(surgeon_intent)" in dispatch
-    assert "validated_voice_request_present" in dispatch
-
-    # Implicit requests never receive the bypass and still rely on the same
-    # active-task checks before dispatch.
-    assert "implicit_request_selected" in action_guard
-    assert "voice_backed_explicit_request" in action_guard
+    assert "if (hasActiveRobotTask(*this))" in dispatch
+    assert "voice_backed_selected" not in dispatch
+    assert "validated_voice_request_present" not in dispatch
+    assert "active_task_id.empty() || voice_backed_explicit_request" not in (
+        action_guard
+    )
 
 
 def test_occupied_right_hand_uses_supported_sequential_return_before_handover() -> None:
@@ -788,10 +1080,8 @@ def test_occupied_right_hand_uses_supported_sequential_return_before_handover() 
     assert '"bt.target_location_id", std::string("mayo_stand")' in replacement_branch
     assert '"bt.target_location_type", std::string("mayo_stand")' in replacement_branch
     assert "right hand occupied; park held tool on Mayo" in replacement_branch
-    assert 'action == "return_unused_preposition"' in dispatch
-    assert dispatch.index('action == "return_unused_preposition"') < dispatch.index(
-        "if (hasActiveRobotTask(*this) && !voice_backed_selected)"
-    )
+    assert "if (hasActiveRobotTask(*this))" in dispatch
+    assert "voice_backed_selected" not in dispatch
 
 
 def test_mayo_request_uses_supported_prepare_then_direct_handover_sequence() -> None:
@@ -806,7 +1096,11 @@ def test_mayo_request_uses_supported_prepare_then_direct_handover_sequence() -> 
 
     assert 'std::string("pick_up_from_mayo_and_handover")' not in command
     assert 'std::string("prepare_tool")' in mayo_branch
-    assert 'std::string("mayo_stand")' in mayo_branch
+    # The configured command must preserve the Twin's confirmed source rather
+    # than inventing a Mayo location for a stale or unknown instance.
+    assert '"bt.source_location_id", tool_location' in mayo_branch
+    assert '"bt.source_location_type", tool_location_type' in mayo_branch
+    assert 'tool_location.empty() || tool_location_type.empty()' in mayo_branch
     assert 'std::string("robot_right_hand")' in mayo_branch
     assert "requested tool is on Mayo; prepare it before handover" in mayo_branch
 

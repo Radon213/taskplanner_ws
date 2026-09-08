@@ -2,17 +2,26 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass, replace
-from typing import Any
 import json
 import math
+from pathlib import Path
 import threading
 import time
 import uuid
+from typing import Any
 
 import rclpy
 from action_msgs.msg import GoalStatus
-from procedure_spec import load_bundle
+from procedure_spec import (
+    ScenarioConfigSnapshot,
+    compute_bundle_config_revision,
+    get_default_spec_dir,
+    load_bundle,
+    load_scenario_consumer_bundle,
+    parse_scenario_config,
+)
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rcl_interfaces.msg import SetParametersResult
 from rclpy.action import ActionClient
@@ -37,9 +46,8 @@ from surgical_msgs.msg import (
     SkillStatus,
     TwinEvent,
 )
-from surgical_msgs.srv import ControlSimulation, IntegrationDebugCommand
+from surgical_msgs.srv import IntegrationDebugCommand
 from std_msgs.msg import String
-from std_srvs.srv import Trigger
 
 from .direct_hand_ledger import (
     DurableDirectHandLedger,
@@ -55,12 +63,16 @@ from .mappings import (
     RETRACTION_TARGET_BOTH,
     RETRACTION_TARGET_LEFT,
     RETRACTION_TARGET_RIGHT,
+    RETRIEVE_ALIASES,
+    RETURN_PREPOSITION_TO_TRAY_ALIASES,
     RETURN_UNUSED_PREPOSITION_ALIASES,
     RetractionCommandRequest,
     ToolHandoverRequest,
     map_group_command,
     map_skill_to_tool_handover,
     public_instrument_instance_id,
+    retraction_request_allowed_by_scenario,
+    retrieval_block_reason,
 )
 from .controller_contract import (
     EIR_NUC_CAPABILITY_POLICY_ID,
@@ -69,9 +81,18 @@ from .controller_contract import (
     VIRTUAL_EMULATOR_CAPABILITY_POLICY_ID,
     validate_source_stamp,
 )
+from .command_proxy import (
+    EXECUTION_PROXY_ACTIVITY_SCHEMA,
+    EXECUTION_PROXY_ACTIVITY_TOPIC,
+    EXECUTION_PROXY_LIFECYCLE_SCHEMA,
+    EXECUTION_PROXY_LIFECYCLE_TOPIC,
+)
+from .route_selection import (
+    load_persisted_route_selection,
+    persist_route_selection,
+)
 from .virtual_endpoints import (
     EXECUTION_ROUTE_COMMAND_SERVICE,
-    EXECUTION_ROUTE_PREFLIGHT_ACK_SERVICE,
     EXECUTION_ROUTE_STATE_SCHEMA,
     EXECUTION_ROUTE_STATE_TOPIC,
     EXTERNAL_CONTROLLER_CONTRACT_TOPIC,
@@ -82,13 +103,16 @@ from .virtual_endpoints import (
     VIRTUAL_CONTROLLER_CONTRACT_TOPIC,
     VIRTUAL_RETRACTION_SERVICE_ENDPOINT,
     VIRTUAL_TOOL_HANDOVER_ENDPOINT,
+    is_isolated_virtual_endpoint,
     normalize_robot_endpoint_source,
     validate_endpoint_source,
 )
 
 
-_INTEGRATION_READINESS_SCHEMA = "taskplanner.integration_readiness.v1"
 _EXECUTION_TRACE_TOPIC = "/surgery/execution_trace"
+_EXECUTION_ANNOUNCEMENT_SCHEMA = "taskplanner.execution_announcement.v1"
+_EXECUTION_ANNOUNCEMENT_TOPIC = "/taskplanner/execution/announcement"
+_EXECUTION_ANNOUNCEMENT_MAX_FACTS = 512
 _EXECUTION_TRACE_TRANSPORTS = frozenset({"action", "service"})
 _EXECUTION_TRACE_STAGES = frozenset(
     {
@@ -107,6 +131,9 @@ _EXECUTION_TRACE_EVIDENCE = frozenset(
         "goal_response",
         "controller_result",
         "service_admission_only",
+        # Only the isolated virtual Service finished handling a request.  It
+        # is never controller or physical bed-arm completion evidence.
+        "virtual_service_transaction_completed",
         "response_unavailable",
         "response_invalid",
         "not_dispatched",
@@ -116,6 +143,7 @@ _EXECUTION_TRACE_MAX_COMMAND_ID_CHARS = 128
 _EXECUTION_TRACE_MAX_ROUTE_CHARS = 48
 _EXECUTION_TRACE_MAX_ENDPOINT_CHARS = 192
 _EXECUTION_TRACE_MAX_REASON_CHARS = 128
+_EXECUTION_EVENT_FAILURE_DETAIL_MAX_CHARS = 512
 _EXECUTION_TRACE_REASON_CODE_CHARACTERS = frozenset(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.:-"
 )
@@ -126,11 +154,23 @@ _EXECUTION_ROUTE_SAFE_STOPPED_STATES = frozenset(
     # switchable after the same active-request and manager checks as idle.
     {"idle", "halted", "completed", "terminated"}
 )
-_EXECUTION_ROUTE_MANAGER_TRANSITION_SERVICE = "/simulation/check_transition_ready"
-_EXECUTION_ROUTE_MANAGER_CONTROL_SERVICE = "/simulation/control"
-_EXECUTION_ROUTE_MANAGER_CHECK_TIMEOUT_SEC = 3.0
-_EXECUTION_ROUTE_RESET_TIMEOUT_SEC = 10.0
-_EXECUTION_ROUTE_PREFLIGHT_ACK_TIMEOUT_SEC = 4.0
+# A ScenarioStore revision replaces only this bridge's local names and
+# retraction-distance mapping.  It is safe at an explicit pause once no
+# controller-facing work remains in flight.  Route selection deliberately does
+# *not* use this set: changing real endpoint routing still requires a fully
+# stopped procedure below.
+_SCENARIO_CONFIG_SAFE_STATES = (
+    _EXECUTION_ROUTE_SAFE_STOPPED_STATES | frozenset({"paused"})
+)
+
+# ScenarioStore owns the digest and publishes it on the latched configuration
+# topic.  The execution owner independently recomputes the same small digest
+# before it swaps its own local mapping.  This avoids a reverse dependency on
+# the ScenarioStore process while still rejecting an accidental or stale topic
+# publisher.  Keep this byte format aligned with ScenarioStore's
+# ``compute_bundle_config_revision`` helper.
+_CONTROLLER_TELEMETRY_MAX_AGE_SEC = 30.0
+_CONTROLLER_TELEMETRY_FUTURE_TOLERANCE_SEC = 0.5
 
 
 _TOOL_TRANSFER_FEEDBACK_STATES = frozenset(
@@ -216,26 +256,56 @@ def procedure_retraction_distance_limit_mm(
     return configured
 
 
+def _bundle_config_revision(bundle_dir: str | Path) -> str:
+    """Return the ScenarioStore-compatible digest for one local bundle.
+
+    The bridge needs this only as a consumer-side integrity check for an
+    already-selected ScenarioStore revision.  It neither selects a bundle nor
+    republishes configuration.
+    """
+
+    return compute_bundle_config_revision(bundle_dir)
+
+
 @dataclass(slots=True)
 class ActiveAction:
     route: str
     command: InternalSkillCommand | InternalGroupCommand
+    # Keep the route chosen at reservation time.  ``_run_endpoint_source`` is
+    # deliberately cleared on stop/reset, so it cannot safely identify a
+    # stranded controller request while the operator later changes routes.
+    endpoint_source: str = ""
     goal_handle: Any | None = None
     cancelled: bool = False
     dispatched: bool = False
     semantic_leg: tuple[str, str] | None = None
     dispatch_epoch: int = 0
+    task_started_published: bool = False
+    task_completed_published: bool = False
+    # Stop/reset releases only this run's UI ownership.  The controller Goal
+    # itself remains a recovery concern until its terminal result or timeout.
+    recovery_deadline_monotonic: float | None = None
 
 
 @dataclass(slots=True)
 class ActiveService:
     route: str
     command: InternalGroupCommand
+    # See ``ActiveAction.endpoint_source``.  This is required to distinguish
+    # a stopped external request from a request aimed at the newly selected
+    # virtual route.
+    endpoint_source: str = ""
     # ROS services cannot be canceled after dispatch.  This flag means runtime
     # stop/reset was requested while the blocking controller call is in flight.
     cancelled: bool = False
     dispatched: bool = False
     future: Any | None = None
+    # A Service has no transport-level cancellation.  A stopped request stays
+    # here as controller recovery evidence and, once submitted, continues to
+    # occupy the controller lane until it reaches a terminal response or the
+    # bounded recovery timeout.  Stop/reset only releases its UI ownership.
+    dispatch_epoch: int = 0
+    recovery_deadline_monotonic: float | None = None
 
 
 @dataclass(slots=True)
@@ -249,6 +319,32 @@ class QueuedVoiceToolTransfer:
     original_semantic_leg: tuple[str, str] | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class DeferredStartupToolTransfer:
+    """One BT handover held between ``start_runtime`` and ``start_actors``.
+
+    This is not an Action reservation: no controller-facing work starts until
+    the actor-start control edge opens the normal dispatch lane.
+    """
+
+    command: InternalSkillCommand
+    request: ToolHandoverRequest
+
+
+@dataclass(frozen=True, slots=True)
+class _ProcedureSpecCandidate:
+    """One fully validated local mapping replacement.
+
+    This stays private to the execution owner: ScenarioStore remains the sole
+    owner of selection and only publishes a small revision notice.
+    """
+
+    spec_dir: str
+    procedure_spec: object
+    instrument_names: dict[str, str]
+    max_retraction_distance_mm: float
+
+
 class SurgicalInteropExecutionBridge(Node):
     """Translate internal commands while keeping internal policy off the wire."""
 
@@ -256,6 +352,26 @@ class SurgicalInteropExecutionBridge(Node):
         super().__init__("surgical_interop_execution_bridge")
         self._server_wait_timeout_sec = float(
             self.declare_parameter("server_wait_timeout_sec", 1.0).value
+        )
+        # A stop/reset is a UI/run-lifecycle boundary, not proof that an
+        # already-sent controller request disappeared.  Bound the recovery
+        # record explicitly instead of clearing it at the boundary.
+        self._controller_recovery_timeout_sec = max(
+            0.1,
+            float(
+                self.declare_parameter(
+                    "controller_recovery_timeout_sec", 15.0
+                ).value
+            ),
+        )
+        # Route/scenario changes must be based on an actually fresh stopped
+        # frame.  The timestamp is maintained by _on_simulation_state; the
+        # zero-value fallback keeps focused object-level tests source-only.
+        self._simulation_state_max_age_sec = max(
+            0.1,
+            float(
+                self.declare_parameter("simulation_state_max_age_sec", 2.0).value
+            ),
         )
         self._tool_transfer_endpoint = str(
             self.declare_parameter(
@@ -266,8 +382,27 @@ class SurgicalInteropExecutionBridge(Node):
         self._tool_handover_enabled = bool(
             self.declare_parameter("tool_handover_enabled", True).value
         )
-        self._spec_dir = str(self.declare_parameter("spec_dir", "").value).strip()
-        self._procedure_spec = load_bundle(self._spec_dir or None)
+        configured_spec_dir = str(
+            self.declare_parameter("spec_dir", "").value
+        ).strip()
+        # ``spec_dir`` is a launch-time bootstrap value.  ScenarioStore owns
+        # subsequent selection; keeping the resolved parent immutable makes a
+        # latched topic unable to redirect this execution owner to an arbitrary
+        # directory.
+        self._spec_dir = str(
+            Path(configured_spec_dir or get_default_spec_dir()).resolve()
+        )
+        self._scenario_config_root = Path(self._spec_dir).resolve().parent
+        self._scenario_config_topic = str(
+            self.declare_parameter(
+                "scenario_config_topic", "/simulation/scenario_config"
+            ).value
+        ).strip()
+        if not self._scenario_config_topic:
+            raise RuntimeError("scenario_config_topic must not be empty")
+        self._scenario_config_revision = ""
+        self._pending_scenario_config: ScenarioConfigSnapshot | None = None
+        self._procedure_spec = load_bundle(self._spec_dir)
         self._instrument_names = {
             instrument.id: instrument.display_name.strip()
             for instrument in self._procedure_spec.bundle.instruments
@@ -285,6 +420,15 @@ class SurgicalInteropExecutionBridge(Node):
                 "retraction_endpoint_source", self._robot_endpoint_source
             ).value
         )
+        self._route_selection_state_path = str(
+            self.declare_parameter(
+                "route_selection_state_path",
+                "/taskplanner-execution-state/route_selection.json",
+            ).value
+        ).strip()
+        self._route_selection_runtime_mode = str(
+            self.declare_parameter("route_selection_runtime_mode", "").value
+        ).strip()
         self._retraction_source_id = str(
             self.declare_parameter("retraction_source_id", "taskplanner").value
         ).strip()
@@ -315,6 +459,21 @@ class SurgicalInteropExecutionBridge(Node):
             )
         except ValueError as exc:
             raise RuntimeError(str(exc)) from exc
+        persisted_route = load_persisted_route_selection(
+            self._route_selection_state_path,
+            runtime_mode=self._route_selection_runtime_mode,
+        )
+        self._route_selection_restored = persisted_route is not None
+        if persisted_route is not None:
+            (
+                self._robot_endpoint_source,
+                self._retraction_endpoint_source,
+            ) = persisted_route
+            self.get_logger().info(
+                "restored stopped execution route selection: "
+                f"tool={self._robot_endpoint_source}, "
+                f"retraction={self._retraction_endpoint_source}"
+            )
         self._virtual_endpoint_mode = (
             self._retraction_endpoint_source == VIRTUAL_ENDPOINT_SOURCE
         )
@@ -323,13 +482,29 @@ class SurgicalInteropExecutionBridge(Node):
                 "retraction_state_machine_suppressed", False
             ).value
         )
-        if configured_retraction_suppression != (
+        expected_retraction_suppression = (
             self._virtual_endpoint_mode
             or not self._retraction_workflow_state_enforced()
+        )
+        if (
+            configured_retraction_suppression != expected_retraction_suppression
+            and not self._route_selection_restored
         ):
             raise RuntimeError(
                 "retraction_state_machine_suppressed does not match the "
                 "reviewed endpoint/procedure policy"
+            )
+        if (
+            configured_retraction_suppression != expected_retraction_suppression
+            and self._route_selection_restored
+        ):
+            # A persisted pair was accepted only through the stopped/no-active
+            # request route service.  Its source-specific local workflow rule
+            # must follow the restored route; controller/service admission is
+            # still re-established from live observations below.
+            self.get_logger().info(
+                "restored route overrides launch-default retraction workflow "
+                "suppression"
             )
         default_contract_topic = (
             "/integration/virtual/surgery/controller_contract"
@@ -340,9 +515,6 @@ class SurgicalInteropExecutionBridge(Node):
             EIR_NUC_VIRTUAL_CONTRACT_ID
             if self._virtual_endpoint_mode
             else EIR_NUC_EXTERNAL_CONTRACT_ID
-        )
-        self._require_dispatch_admission_lease = bool(
-            self.declare_parameter("require_dispatch_admission_lease", True).value
         )
         self._controller_contract_topic = str(
             self.declare_parameter(
@@ -365,18 +537,6 @@ class SurgicalInteropExecutionBridge(Node):
                 "integration_readiness_topic", "/integration/readiness"
             ).value
         ).strip()
-        self._admission_lease_max_age_sec = max(
-            0.1,
-            float(self.declare_parameter("admission_lease_max_age_sec", 3.0).value),
-        )
-        self._admission_lease_source_future_tolerance_sec = max(
-            0.0,
-            float(
-                self.declare_parameter(
-                    "admission_lease_source_future_tolerance_sec", 0.5
-                ).value
-            ),
-        )
         # A Service V1 receipt does not prove physical stop.  Require an
         # explicit controller declaration for an external Live route; virtual
         # exercise endpoints remain deliberately unknown rather than physical.
@@ -543,14 +703,11 @@ class SurgicalInteropExecutionBridge(Node):
             ).value
         )
         self._dispatch_lock = threading.RLock()
-        # The stopped-only route coordinator waits for a reset state and a
-        # preflight acknowledgement.  Keep those callbacks re-entrant so the
-        # incoming SimulationState can advance while the Service handler is
-        # waiting on the manager/preflight boundaries.
+        # Route commands and their authoritative state updates may arrive in
+        # parallel.  The lock below makes the stopped/no-inflight decision and
+        # source swap one short atomic operation; no route change waits on a
+        # manager reset or a preflight acknowledgement.
         self._route_control_callback_group = ReentrantCallbackGroup()
-        self._simulation_state_condition = threading.Condition(
-            self._dispatch_lock
-        )
         self._runtime_accepting_commands = False
         self._dispatch_epoch = 0
         self._last_lifecycle_control_signature: tuple[str, str] | None = None
@@ -588,6 +745,10 @@ class SurgicalInteropExecutionBridge(Node):
         self._active_actions: dict[tuple[str, str], ActiveAction] = {}
         self._active_services: dict[tuple[str, str], ActiveService] = {}
         self._queued_voice_tool_transfer: QueuedVoiceToolTransfer | None = None
+        self._startup_actors_pending = False
+        self._deferred_startup_tool_transfer: DeferredStartupToolTransfer | None = (
+            None
+        )
         self._bed_robot_revision: int | None = None
         self._bed_robot_source_stamp_ns: int | None = None
         self._bed_robot_epoch = 0
@@ -613,13 +774,28 @@ class SurgicalInteropExecutionBridge(Node):
         }
         self._latest_integration_readiness: dict[str, Any] | None = None
         self._latest_integration_readiness_received_monotonic = 0.0
-        self._latest_integration_readiness_source_error = ""
-        self._last_accepted_integration_readiness_source_stamp_sec = 0.0
-        self._dispatch_admission_armed = not self._require_dispatch_admission_lease
-        self._dispatch_admission_disarmed_reason = (
-            "" if self._dispatch_admission_armed else "admission_lease_missing"
-        )
+        self._latest_integration_readiness_error = ""
+        # The stable command proxy is part of this execution owner.  Its
+        # requests must participate in the same stopped/no-inflight route
+        # mutation boundary as internal bridge dispatches.
+        self._execution_proxy_active = False
         self._execution_trace_sequence = 0
+        # Latch the origin run at command admission.  Do not derive a run ID
+        # from the *current* state in a delayed Action/Service callback: that
+        # would relabel an old result as a new scenario result.
+        self._execution_trace_run_by_command: dict[str, str] = {}
+        # TTS receives one execution-owned admission fact instead of deriving
+        # speech from several independently delivered observer topics.
+        self._execution_announced_commands: OrderedDict[str, None] = OrderedDict()
+        # A voice replacement has two controller Actions: first park the
+        # already prepared tool, then prepare the explicitly requested one.
+        # Keep the request identity only as presentation context so the first
+        # accepted Action can announce the requested preparation without
+        # giving TTS any control authority.
+        self._voice_request_targets: OrderedDict[tuple[str, int], str] = OrderedDict()
+        self._pending_voice_replacement_announcements: OrderedDict[
+            tuple[str, int], str
+        ] = OrderedDict()
         self._route_revision = 0
         self._route_initialization_revision = 0
         self._route_initialization_state = "launch_default"
@@ -627,7 +803,6 @@ class SurgicalInteropExecutionBridge(Node):
         self._run_retraction_source = ""
         self._latest_simulation_state: SimulationState | None = None
         self._latest_simulation_state_received_monotonic = 0.0
-        self._latest_simulation_state_generation = 0
         self._skill_status_pub = self.create_publisher(SkillStatus, "/skill/status", 20)
         self._skill_event_pub = self.create_publisher(TwinEvent, "/skill/events", 20)
         self._group_status_pub = self.create_publisher(
@@ -639,6 +814,16 @@ class SurgicalInteropExecutionBridge(Node):
         # it never claims remote receipt or physical completion.
         self._execution_trace_pub = self.create_publisher(
             ExecutionTrace, _EXECUTION_TRACE_TOPIC, 50
+        )
+        self._execution_announcement_pub = self.create_publisher(
+            String,
+            _EXECUTION_ANNOUNCEMENT_TOPIC,
+            QoSProfile(
+                history=QoSHistoryPolicy.KEEP_LAST,
+                depth=50,
+                reliability=QoSReliabilityPolicy.RELIABLE,
+                durability=QoSDurabilityPolicy.VOLATILE,
+            ),
         )
         self._execution_route_state_pub = self.create_publisher(
             String,
@@ -666,25 +851,6 @@ class SurgicalInteropExecutionBridge(Node):
         self._virtual_retraction_service_client = self.create_client(
             ExecuteRetractionCommand, self._virtual_retraction_service_name
         )
-        self._route_transition_ready_client = None
-        self._route_reset_client = None
-        self._route_preflight_ack_client = None
-        if self._enable_runtime_route_control:
-            self._route_transition_ready_client = self.create_client(
-                Trigger,
-                _EXECUTION_ROUTE_MANAGER_TRANSITION_SERVICE,
-                callback_group=self._route_control_callback_group,
-            )
-            self._route_reset_client = self.create_client(
-                ControlSimulation,
-                _EXECUTION_ROUTE_MANAGER_CONTROL_SERVICE,
-                callback_group=self._route_control_callback_group,
-            )
-            self._route_preflight_ack_client = self.create_client(
-                IntegrationDebugCommand,
-                EXECUTION_ROUTE_PREFLIGHT_ACK_SERVICE,
-                callback_group=self._route_control_callback_group,
-            )
         with self._dispatch_lock:
             self._set_route_source_locked(
                 self._robot_endpoint_source,
@@ -692,6 +858,10 @@ class SurgicalInteropExecutionBridge(Node):
                 clear_admission=False,
             )
         self.create_subscription(SkillCommand, "/bt/skill_command", self._on_skill, 20)
+        # The digital twin owns the typed request queue. This subscription is
+        # read-only presentation context for the accepted replacement return;
+        # it never authorizes, routes, or dispatches a command.
+        self.create_subscription(TwinEvent, "/twin/events", self._on_twin_event, 50)
         self.create_subscription(
             BedRobotArmGroupCommand,
             "/bt/bed_robot_arm_group_command",
@@ -712,6 +882,22 @@ class SurgicalInteropExecutionBridge(Node):
             20,
             callback_group=self._route_control_callback_group,
         )
+        # ScenarioStore publishes this tiny state with transient-local QoS.
+        # A focused execution-owner restart therefore receives the selected
+        # bundle again without asking the manager to replay a selection or
+        # performing a Digital-Twin reset.
+        scenario_config_qos = QoSProfile(
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self._scenario_config_subscription = self.create_subscription(
+            String,
+            self._scenario_config_topic,
+            self._on_scenario_config,
+            scenario_config_qos,
+        )
         self.create_subscription(
             String,
             self._external_controller_contract_topic,
@@ -729,6 +915,32 @@ class SurgicalInteropExecutionBridge(Node):
             self._integration_readiness_topic,
             self._on_integration_readiness,
             10,
+        )
+        self.create_subscription(
+            String,
+            EXECUTION_PROXY_ACTIVITY_TOPIC,
+            self._on_execution_proxy_activity,
+            QoSProfile(
+                history=QoSHistoryPolicy.KEEP_LAST,
+                depth=1,
+                reliability=QoSReliabilityPolicy.RELIABLE,
+                durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+            ),
+        )
+        # Direct typed voice commands traverse the stable execution proxy,
+        # rather than this legacy BT adapter.  The proxy owns that request
+        # lifecycle, while this bridge remains the single public
+        # /surgery/execution_trace producer and sequence owner.
+        self.create_subscription(
+            String,
+            EXECUTION_PROXY_LIFECYCLE_TOPIC,
+            self._on_execution_proxy_lifecycle,
+            QoSProfile(
+                history=QoSHistoryPolicy.KEEP_LAST,
+                depth=50,
+                reliability=QoSReliabilityPolicy.RELIABLE,
+                durability=QoSDurabilityPolicy.VOLATILE,
+            ),
         )
         # Service-only Live/virtual routes do not subscribe to a physical
         # controller status topic.  The direct callback stays available for
@@ -754,6 +966,10 @@ class SurgicalInteropExecutionBridge(Node):
         )
         self._publish_execution_route_state()
         self.create_timer(1.0, self._publish_execution_route_state)
+        self.create_timer(
+            min(1.0, max(0.1, self._controller_recovery_timeout_sec / 4.0)),
+            self._expire_controller_recovery,
+        )
 
     def _route_definition(
         self,
@@ -841,7 +1057,10 @@ class SurgicalInteropExecutionBridge(Node):
         """Invalidate leases and local dispatch history across route families."""
 
         self._dispatch_ledger.clear()
+        self._clear_voice_replacement_announcement_state_locked()
         self._queued_voice_tool_transfer = None
+        self._deferred_startup_tool_transfer = None
+        self._startup_actors_pending = False
         self._latest_controller_contract = None
         self._latest_controller_contract_received_monotonic = 0.0
         self._latest_controller_contract_source_error = ""
@@ -855,14 +1074,8 @@ class SurgicalInteropExecutionBridge(Node):
                     "last_accepted_stamp_sec": 0.0,
                 }
             )
-        self._latest_integration_readiness = None
-        self._latest_integration_readiness_received_monotonic = 0.0
-        self._latest_integration_readiness_source_error = ""
-        self._last_accepted_integration_readiness_source_stamp_sec = 0.0
-        self._dispatch_admission_armed = not self._require_dispatch_admission_lease
-        self._dispatch_admission_disarmed_reason = (
-            "" if self._dispatch_admission_armed else "route_reinitialized"
-        )
+        # Readiness is cross-owner diagnostic telemetry, not selected-route
+        # authority.  Keep the latest observation across a route change.
         self._bed_robot_revision = None
         self._bed_robot_source_stamp_ns = None
         self._bed_robot_epoch = 0
@@ -870,6 +1083,17 @@ class SurgicalInteropExecutionBridge(Node):
         self._bed_robot_procedure_type = ""
         self._bed_robot_received_monotonic = 0.0
         self._bed_robot_states = {}
+
+    def _clear_voice_replacement_announcement_state_locked(self) -> None:
+        """Forget TTS-only voice replacement context at a run boundary."""
+
+        for attribute in (
+            "_voice_request_targets",
+            "_pending_voice_replacement_announcements",
+        ):
+            cache = getattr(self, attribute, None)
+            if cache is not None:
+                cache.clear()
 
     def _set_route_source_locked(
         self,
@@ -925,6 +1149,11 @@ class SurgicalInteropExecutionBridge(Node):
             except Exception:
                 return False
 
+        # This is deliberately independent from endpoint readiness, controller
+        # contracts, UI admission, and preflight telemetry.  It answers only
+        # whether replacing this execution-owner process would lose a live
+        # bridge request or race an authoritative running scenario.
+        restart_blocker = self._execution_route_switch_guard_locked()
         return {
             "schema": EXECUTION_ROUTE_STATE_SCHEMA,
             "stamp_sec": round(time.time(), 6),
@@ -995,9 +1224,6 @@ class SurgicalInteropExecutionBridge(Node):
                 },
             },
             "route_control_enabled": bool(self._enable_runtime_route_control),
-            # The bridge owns the one public coordinator.  The manager is
-            # consulted through its stopped-state/reset services, rather than
-            # exposing a second mutating route endpoint.
             "route_command_service": EXECUTION_ROUTE_COMMAND_SERVICE,
             "route_command_service_enabled": bool(
                 self._enable_runtime_route_control
@@ -1005,13 +1231,16 @@ class SurgicalInteropExecutionBridge(Node):
             "route_command_service_ready": bool(
                 getattr(self, "_route_command_service", None) is not None
             ),
-            "preflight_ack_service": EXECUTION_ROUTE_PREFLIGHT_ACK_SERVICE,
-            "preflight_ack_service_ready": client_ready(
-                getattr(self, "_route_preflight_ack_client", None),
-                "service_is_ready",
+            "route_selection_restored": bool(
+                getattr(self, "_route_selection_restored", False)
             ),
             "active_request_count": len(self._active_actions)
             + len(self._active_services),
+            "execution_proxy_active": bool(
+                getattr(self, "_execution_proxy_active", False)
+            ),
+            "restart_allowed": not bool(restart_blocker),
+            "restart_blocker": restart_blocker,
         }
 
     def _execution_route_state_snapshot(self) -> dict[str, object]:
@@ -1035,48 +1264,436 @@ class SurgicalInteropExecutionBridge(Node):
             self.get_logger().warning("execution route state publish failed")
 
     def _on_simulation_state(self, msg: SimulationState) -> None:
-        condition = getattr(self, "_simulation_state_condition", None)
-        if condition is None:  # pragma: no cover - small legacy test doubles
-            with self._dispatch_lock:
-                self._latest_simulation_state = msg
-                self._latest_simulation_state_received_monotonic = time.monotonic()
-                self._latest_simulation_state_generation = int(
-                    getattr(self, "_latest_simulation_state_generation", 0)
-                ) + 1
-            return
-        with condition:
+        with self._dispatch_lock:
             self._latest_simulation_state = msg
             self._latest_simulation_state_received_monotonic = time.monotonic()
-            self._latest_simulation_state_generation = int(
-                getattr(self, "_latest_simulation_state_generation", 0)
-            ) + 1
-            condition.notify_all()
+        self._apply_pending_scenario_config_if_safe()
 
-    def _execution_route_switch_guard_locked(self) -> str:
-        """Require a fresh, explicit stopped DT before endpoint mutation."""
+    def _on_twin_event(self, msg: TwinEvent) -> None:
+        """Cache one run-scoped typed voice target for TTS presentation.
 
-        if self._runtime_accepting_commands:
-            return "runtime_is_accepting_commands"
-        if self._active_actions or self._active_services:
-            return "active_controller_request"
-        state = self._latest_simulation_state
-        received = self._latest_simulation_state_received_monotonic
-        if state is None or received <= 0.0:
+        The event is not a command input. The bridge uses it only after the
+        already selected ``return_unused_preposition`` Action is accepted, so
+        an out-of-order observer delivery cannot create robot work or speech
+        before controller admission.
+        """
+
+        if str(getattr(msg, "event_type", "") or "").strip() != "SurgeonRequestObserved":
+            return
+        procedure_run_id = str(
+            getattr(msg, "procedure_run_id", "") or ""
+        ).strip()
+        if not valid_procedure_run_id(procedure_run_id):
+            return
+        try:
+            detail = json.loads(str(getattr(msg, "detail_json", "") or ""))
+        except (TypeError, json.JSONDecodeError):
+            return
+        if not isinstance(detail, dict):
+            return
+        if str(detail.get("active_request_event_type") or "").strip() != "voice_request":
+            return
+        raw_generation = detail.get("active_request_generation")
+        if isinstance(raw_generation, bool):
+            return
+        try:
+            request_generation = int(raw_generation)
+        except (TypeError, ValueError):
+            return
+        if request_generation <= 0:
+            return
+        requested_tool = " ".join(
+            str(detail.get("active_request_tool") or "").split()
+        )
+        if not requested_tool or len(requested_tool) > 128:
+            return
+
+        request_key = (procedure_run_id, request_generation)
+        pending_command_id = ""
+        with self._dispatch_lock:
+            targets = getattr(self, "_voice_request_targets", None)
+            if targets is None:
+                targets = OrderedDict()
+                self._voice_request_targets = targets
+            targets[request_key] = requested_tool
+            targets.move_to_end(request_key)
+            while len(targets) > _EXECUTION_ANNOUNCEMENT_MAX_FACTS:
+                targets.popitem(last=False)
+
+            pending = getattr(self, "_pending_voice_replacement_announcements", None)
+            if pending is not None:
+                pending_command_id = str(pending.pop(request_key, "") or "")
+        if pending_command_id:
+            self._publish_voice_replacement_prepare_announcement(
+                command_id=pending_command_id,
+                procedure_run_id=procedure_run_id,
+                request_generation=request_generation,
+                requested_tool=requested_tool,
+            )
+
+    def _fresh_stopped_simulation_guard_locked(self) -> str:
+        """Return the shared fresh stopped-state admission guard.
+
+        A retained ``idle`` sample is useful at process boot, but it cannot
+        authorize a route change after its producer has stopped.  Every live
+        callback records a steady-clock receive time, so this stays free of
+        wall-clock / ROS-clock skew.  The zero timestamp is kept only for
+        small source-level test doubles that assign the state directly.
+        """
+
+        state = getattr(self, "_latest_simulation_state", None)
+        if state is None:
             return "simulation_state_missing"
-        if time.monotonic() - received > 3.0:
+        received = float(
+            getattr(self, "_latest_simulation_state_received_monotonic", 0.0)
+            or 0.0
+        )
+        if received > 0.0 and (
+            time.monotonic() - received
+            > float(getattr(self, "_simulation_state_max_age_sec", 2.0))
+        ):
             return "simulation_state_stale"
-        if bool(getattr(state, "running", False)):
-            return "simulation_running"
         execution_state = str(
             getattr(state, "execution_state", "") or ""
         ).strip().casefold()
-        if execution_state not in _EXECUTION_ROUTE_SAFE_STOPPED_STATES:
+        if (
+            bool(getattr(state, "running", False))
+            or execution_state not in _EXECUTION_ROUTE_SAFE_STOPPED_STATES
+        ):
             return "simulation_not_stopped"
-        if str(getattr(state, "active_robot_task_id", "") or "").strip():
-            return "active_robot_task"
-        if bool(getattr(state, "cleaner_busy", False)):
-            return "cleaner_busy"
         return ""
+
+    def _fresh_paused_or_stopped_simulation_guard_locked(self) -> str:
+        """Return the configuration-refresh admission guard using one clock."""
+
+        state = getattr(self, "_latest_simulation_state", None)
+        if state is None:
+            return "simulation_state_missing"
+        received = float(
+            getattr(self, "_latest_simulation_state_received_monotonic", 0.0)
+            or 0.0
+        )
+        if received > 0.0 and (
+            time.monotonic() - received
+            > float(getattr(self, "_simulation_state_max_age_sec", 2.0))
+        ):
+            return "simulation_state_stale"
+        execution_state = str(
+            getattr(state, "execution_state", "") or ""
+        ).strip().casefold()
+        if execution_state == "paused":
+            return ""
+        if (
+            bool(getattr(state, "running", False))
+            or execution_state not in _SCENARIO_CONFIG_SAFE_STATES
+        ):
+            return "simulation_not_paused_or_stopped"
+        return ""
+
+    def _scenario_config_candidate(
+        self, snapshot: ScenarioConfigSnapshot
+    ) -> _ProcedureSpecCandidate:
+        """Parse and verify one ScenarioStore notice without committing it.
+
+        Topic publishers are not a filesystem authority.  The bridge therefore
+        constrains a snapshot to its boot-time spec root, verifies the authored
+        bundle identity, and confirms the revision before it can replace the
+        local command mapping.  The second digest catches a normal editor save
+        that changes YAML while ``load_bundle`` is reading it.
+        """
+
+        bundle = load_scenario_consumer_bundle(
+            snapshot,
+            fixed_spec_root=self._scenario_config_root,
+        )
+        procedure_spec = bundle.procedure_spec
+        return _ProcedureSpecCandidate(
+            spec_dir=bundle.spec_dir,
+            procedure_spec=procedure_spec,
+            instrument_names={
+                instrument.id: instrument.display_name.strip()
+                for instrument in procedure_spec.bundle.instruments
+            },
+            max_retraction_distance_mm=procedure_retraction_distance_limit_mm(
+                procedure_spec,
+                configured_limit_mm=self._configured_max_retraction_distance_mm,
+            ),
+        )
+
+    def _install_procedure_spec_locked(
+        self, candidate: _ProcedureSpecCandidate
+    ) -> None:
+        """Commit a fully loaded mapping while dispatch is demonstrably quiet."""
+
+        self._spec_dir = candidate.spec_dir
+        self._procedure_spec = candidate.procedure_spec
+        self._instrument_names = candidate.instrument_names
+        self._max_retraction_distance_mm = candidate.max_retraction_distance_mm
+        self._dispatch_ledger.clear()
+        self._clear_voice_replacement_announcement_state_locked()
+        self._last_lifecycle_control_signature = None
+
+    def _on_scenario_config(self, message: String) -> None:
+        """Observe the selected ScenarioStore revision without selecting it.
+
+        A valid revision received while the simulation is running stays
+        pending unless it reaches the explicit paused boundary.  Invalid input
+        is discarded and the last known-good local procedure mapping remains
+        in effect.
+        """
+
+        try:
+            snapshot = parse_scenario_config(message.data)
+            # Validate now so a bad publisher cannot occupy the one pending
+            # slot until the next paused/stopped transition.  It is verified
+            # again immediately before commit in case an editor saves
+            # concurrently.
+            self._scenario_config_candidate(snapshot)
+        except Exception as exc:
+            self.get_logger().warning(
+                f"execution scenario config ignored: {exc}"
+            )
+            return
+
+        with self._dispatch_lock:
+            if (
+                snapshot.revision == self._scenario_config_revision
+                and str(Path(snapshot.spec_dir).resolve()) == self._spec_dir
+            ):
+                return
+            self._pending_scenario_config = snapshot
+        self._apply_pending_scenario_config_if_safe()
+
+    def _apply_pending_scenario_config_if_safe(self) -> None:
+        """Atomically adopt a queued ScenarioStore revision when paused/stopped.
+
+        This is deliberately narrower than route or controller admission: the
+        only local facts consulted are an authoritative paused/stopped
+        simulation frame and absence of this bridge's own in-flight requests.
+        Endpoint routing remains subject to its separate stopped-only guard.
+        """
+
+        with self._dispatch_lock:
+            snapshot = self._pending_scenario_config
+            if (
+                snapshot is None
+                or self._scenario_config_switch_guard_locked()
+            ):
+                return
+
+        try:
+            candidate = self._scenario_config_candidate(snapshot)
+        except Exception as exc:
+            with self._dispatch_lock:
+                if self._pending_scenario_config == snapshot:
+                    self._pending_scenario_config = None
+            self.get_logger().warning(
+                f"execution scenario config rejected before swap: {exc}"
+            )
+            return
+
+        with self._dispatch_lock:
+            # A newer latched snapshot wins.  If work started while the YAML
+            # was loading, retain this revision for the next paused/stopped
+            # frame.
+            if self._pending_scenario_config != snapshot:
+                return
+            if self._scenario_config_switch_guard_locked():
+                return
+            self._install_procedure_spec_locked(candidate)
+            self._scenario_config_revision = snapshot.revision
+            self._pending_scenario_config = None
+        self.get_logger().info(
+            "execution scenario revision applied atomically: "
+            f"{snapshot.bundle_name}@{snapshot.revision}"
+        )
+
+    def _scenario_config_switch_guard_locked(self) -> str:
+        """Return the narrow local guard for a ScenarioStore mapping refresh.
+
+        A scenario revision changes only the bridge's local procedure mapping,
+        so an explicit ``paused`` state is a sufficient configuration boundary
+        when no bridge/proxy request is active.  It intentionally remains a
+        different guard from endpoint route selection: physical route changes
+        must stay stopped-only.
+        """
+
+        if self._active_actions or self._active_services:
+            return "active_controller_request"
+        if bool(getattr(self, "_execution_proxy_active", False)):
+            return "execution_proxy_request_active"
+        return self._fresh_paused_or_stopped_simulation_guard_locked()
+
+    def _selected_endpoint_source_for_route_locked(self, route: str) -> str:
+        """Return the currently latched source for one controller route."""
+
+        if route == "tool_transfer":
+            source = str(
+                getattr(self, "_run_endpoint_source", "")
+                or getattr(self, "_robot_endpoint_source", "")
+            ).strip()
+        elif route == "retraction":
+            source = str(
+                getattr(self, "_run_retraction_source", "")
+                or getattr(self, "_retraction_endpoint_source", "")
+            ).strip()
+        else:
+            return ""
+        try:
+            return normalize_robot_endpoint_source(source)
+        except ValueError:
+            return ""
+
+    def _active_request_endpoint_source_locked(
+        self,
+        active: ActiveAction | ActiveService,
+    ) -> str:
+        """Return the source originally selected for one tracked request.
+
+        Stop/reset deliberately clears the run-level route latch.  A request
+        that has not yet received its controller result still needs its own
+        source identity so that a dead *external* endpoint cannot indefinitely
+        block a later switch to the isolated virtual endpoint.  Old in-memory
+        records created before this field existed fall back to the route that
+        was selected before the switch; the successful switch then writes that
+        inferred value back onto the record.
+        """
+
+        stored = str(getattr(active, "endpoint_source", "") or "").strip()
+        if stored:
+            try:
+                return normalize_robot_endpoint_source(stored)
+            except ValueError:
+                return ""
+        return self._selected_endpoint_source_for_route_locked(active.route)
+
+    def _route_source_is_ready_locked(self, route: str, source: str) -> bool:
+        """Observe the selected endpoint without sending controller traffic."""
+
+        if route == "tool_transfer":
+            client = getattr(
+                self,
+                (
+                    "_external_tool_transfer_client"
+                    if source == EXTERNAL_ENDPOINT_SOURCE
+                    else "_virtual_tool_transfer_client"
+                ),
+                None,
+            )
+            readiness = "server_is_ready"
+        elif route == "retraction":
+            client = getattr(
+                self,
+                (
+                    "_external_retraction_service_client"
+                    if source == EXTERNAL_ENDPOINT_SOURCE
+                    else "_virtual_retraction_service_client"
+                ),
+                None,
+            )
+            readiness = "service_is_ready"
+        else:
+            return False
+        try:
+            return bool(getattr(client, readiness)())
+        except Exception:
+            return False
+
+    def _can_leave_orphaned_external_request_for_target_locked(
+        self,
+        active: ActiveAction | ActiveService,
+        *,
+        target_source: str,
+    ) -> bool:
+        """Allow a stopped external->virtual escape without inventing success.
+
+        The prior request remains tracked as an unresolved external recovery
+        record, so owner restart and a return to that controller stay blocked.
+        This narrow exception only lets the operator move the affected route
+        away from an endpoint that has gone away *after* local cancellation was
+        requested.  It never accepts a response, marks a robot task complete,
+        or permits a running procedure to change route.
+        """
+
+        if not bool(getattr(active, "cancelled", False)):
+            return False
+        source = self._active_request_endpoint_source_locked(active)
+        if source != EXTERNAL_ENDPOINT_SOURCE:
+            return False
+        if target_source != VIRTUAL_ENDPOINT_SOURCE:
+            return False
+        return not self._route_source_is_ready_locked(active.route, source)
+
+    def _record_active_request_sources_locked(self) -> None:
+        """Freeze legacy inferred sources before a route swap changes fallback."""
+
+        for active in (
+            *self._active_actions.values(),
+            *self._active_services.values(),
+        ):
+            if str(getattr(active, "endpoint_source", "") or "").strip():
+                continue
+            source = self._active_request_endpoint_source_locked(active)
+            if source:
+                active.endpoint_source = source
+
+    def _execution_route_switch_guard_for_target_locked(
+        self,
+        *,
+        requested_source: str,
+        requested_retraction_source: str,
+    ) -> str:
+        """Return a stopped-only route guard scoped to the requested targets.
+
+        Normal requests still require an empty bridge lane.  The sole escape
+        hatch is an already-cancelled external request whose endpoint is no
+        longer present and whose *own* target is changing to virtual.  This is
+        deliberately target-aware: a stale external handover cannot authorize
+        an external retraction switch, nor can it be erased by a later route
+        change.
+        """
+
+        for active in self._active_actions.values():
+            target = (
+                requested_source
+                if active.route == "tool_transfer"
+                else requested_retraction_source
+            )
+            if not self._can_leave_orphaned_external_request_for_target_locked(
+                active,
+                target_source=target,
+            ):
+                return "active_controller_request"
+        for active in self._active_services.values():
+            target = (
+                requested_source
+                if active.route == "tool_transfer"
+                else requested_retraction_source
+            )
+            if not self._can_leave_orphaned_external_request_for_target_locked(
+                active,
+                target_source=target,
+            ):
+                return "active_controller_request"
+        if bool(getattr(self, "_execution_proxy_active", False)):
+            return "execution_proxy_request_active"
+        return self._fresh_stopped_simulation_guard_locked()
+
+    def _execution_route_switch_guard_locked(self) -> str:
+        """Keep the one physical boundary for a fast route mutation.
+
+        Route selection is not a procedure transition.  The only facts needed
+        to change it are that the authoritative runtime is stopped and that
+        this bridge has no in-flight Action or Service request for either
+        endpoint family.  Controller limits and endpoint availability remain
+        the transport/controller boundary, not a route-change transaction.
+        """
+
+        if self._active_actions or self._active_services:
+            return "active_controller_request"
+        if bool(getattr(self, "_execution_proxy_active", False)):
+            return "execution_proxy_request_active"
+        return self._fresh_stopped_simulation_guard_locked()
 
     @staticmethod
     def _decode_execution_route_payload(raw: object) -> dict[str, object]:
@@ -1092,34 +1709,11 @@ class SurgicalInteropExecutionBridge(Node):
         return payload
 
     @staticmethod
-    def _wait_execution_route_future(future: object, timeout_sec: float):
-        """Wait without recursively spinning the current callback thread."""
-
-        deadline = time.monotonic() + max(0.01, float(timeout_sec))
-        done = getattr(future, "done", None)
-        result = getattr(future, "result", None)
-        while time.monotonic() < deadline:
-            try:
-                if callable(done) and done():
-                    return result() if callable(result) else None
-                # Small unit-test doubles may expose only ``result``. The
-                # real rclpy Future has ``done`` and is delivered by another
-                # executor thread in the re-entrant route callback group.
-                if not callable(done) and callable(result):
-                    return result()
-            except Exception:
-                return None
-            time.sleep(0.02)
-        return None
-
-    @staticmethod
-    def _route_response_json(state: dict[str, object], *, reset: bool) -> str:
+    def _route_response_json(state: dict[str, object]) -> str:
         """Serialize one bounded public result without controller detail."""
 
-        payload = dict(state)
-        payload["digital_twin_reset"] = bool(reset)
         encoded = json.dumps(
-            payload,
+            state,
             ensure_ascii=False,
             separators=(",", ":"),
             sort_keys=True,
@@ -1128,7 +1722,6 @@ class SurgicalInteropExecutionBridge(Node):
             return encoded
         return json.dumps(
             {
-                "digital_twin_reset": bool(reset),
                 "result_truncated": True,
             },
             separators=(",", ":"),
@@ -1139,160 +1732,114 @@ class SurgicalInteropExecutionBridge(Node):
         self,
         response: IntegrationDebugCommand.Response,
         reason: str,
-        *,
-        reset: bool,
     ) -> IntegrationDebugCommand.Response:
         response.accepted = False
         response.command_id = ""
         response.message = str(reason or "execution route switch rejected")[:256]
         response.result_json = self._route_response_json(
-            self._execution_route_state_snapshot(),
-            reset=reset,
+            self._execution_route_state_snapshot()
         )
         return response
 
-    def _manager_transition_ready_for_execution_route(self) -> str:
-        client = getattr(self, "_route_transition_ready_client", None)
-        if client is None or not client.wait_for_service(
-            timeout_sec=_EXECUTION_ROUTE_MANAGER_CHECK_TIMEOUT_SEC
-        ):
-            return "simulation_transition_check_unavailable"
-        result = self._wait_execution_route_future(
-            client.call_async(Trigger.Request()),
-            _EXECUTION_ROUTE_MANAGER_CHECK_TIMEOUT_SEC,
-        )
-        if result is None:
-            return "simulation_transition_check_timeout"
-        if not bool(getattr(result, "success", False)):
-            return "simulation_transition_not_ready"
-        return ""
-
-    def _request_execution_route_reset(self) -> str:
-        client = getattr(self, "_route_reset_client", None)
-        if client is None or not client.wait_for_service(
-            timeout_sec=_EXECUTION_ROUTE_MANAGER_CHECK_TIMEOUT_SEC
-        ):
-            return "simulation_reset_service_unavailable"
-        request = ControlSimulation.Request()
-        request.command = "reset"
-        request.start_phase_id = ""
-        result = self._wait_execution_route_future(
-            client.call_async(request),
-            _EXECUTION_ROUTE_MANAGER_CHECK_TIMEOUT_SEC,
-        )
-        if result is None:
-            return "simulation_reset_request_timeout"
-        if not bool(getattr(result, "success", False)):
-            return "simulation_reset_rejected"
-        return ""
-
-    def _wait_for_execution_route_reset(
+    def _handle_execution_route_switch(
         self,
         *,
-        after_generation: int,
-    ) -> str:
-        """Require the manager reset to yield a new, idle twin frame."""
+        requested_source: str,
+        requested_retraction_source: str,
+        response: IntegrationDebugCommand.Response,
+    ) -> IntegrationDebugCommand.Response:
+        """Swap one reviewed route after the stopped/no-inflight boundary.
 
-        deadline = time.monotonic() + _EXECUTION_ROUTE_RESET_TIMEOUT_SEC
-        condition = getattr(self, "_simulation_state_condition", None)
-        if condition is None:  # pragma: no cover - partial test doubles
-            with self._dispatch_lock:
-                return self._execution_route_switch_guard_locked()
-        with condition:
-            while time.monotonic() < deadline:
-                state = self._latest_simulation_state
-                generation = int(
-                    getattr(self, "_latest_simulation_state_generation", 0)
-                )
-                execution_state = str(
-                    getattr(state, "execution_state", "") or ""
-                ).strip().casefold()
-                reason = self._execution_route_switch_guard_locked()
-                if (
-                    generation > after_generation
-                    and execution_state == "idle"
-                    and not reason
-                ):
-                    return ""
-                remaining = deadline - time.monotonic()
-                if remaining <= 0.0:
-                    break
-                condition.wait(timeout=min(0.1, remaining))
-        return "simulation_reset_idle_state_timeout"
-
-    def _wait_for_preflight_route_ack(
-        self,
-        state: dict[str, object],
-        *,
-        require_initialized: bool,
-    ) -> str:
-        """Wait until preflight has atomically applied this exact route.
-
-        This is only an application barrier: controller readiness remains the
-        separate preflight start gate.
+        The source pair and revision change under the bridge lock, then one
+        latched state message informs observers and the command router.  A
+        controller still owns endpoint availability and physical safety when
+        a later Action/Service request is actually sent.
         """
 
-        client = getattr(self, "_route_preflight_ack_client", None)
-        if client is None or not client.wait_for_service(timeout_sec=1.0):
-            return "preflight_route_ack_unavailable"
-        expected_source = str(state.get("selected_source", ""))
-        expected_retraction_source = str(state.get("retraction_source", ""))
-        expected_revision = int(state.get("revision", -1))
-        expected_initialization_revision = int(
-            state.get("initialization_revision", -1)
-        )
-        deadline = time.monotonic() + _EXECUTION_ROUTE_PREFLIGHT_ACK_TIMEOUT_SEC
-        while time.monotonic() < deadline:
-            request = IntegrationDebugCommand.Request()
-            request.operation = "execution_route_preflight_ack"
-            request.payload_json = json.dumps(
-                {
-                    "source": expected_source,
-                    "retraction_source": expected_retraction_source,
-                    "revision": expected_revision,
-                    "initialization_revision": expected_initialization_revision,
-                    "require_initialized": bool(require_initialized),
-                },
-                separators=(",", ":"),
-                sort_keys=True,
-            )
-            result = self._wait_execution_route_future(
-                client.call_async(request),
-                min(1.0, max(0.05, deadline - time.monotonic())),
-            )
-            if result is not None and bool(getattr(result, "accepted", False)):
-                return ""
-            time.sleep(0.05)
-        return "preflight_route_ack_timeout"
-
-    def _mark_execution_route_initializing_locked(self) -> dict[str, object]:
-        self._route_initialization_state = "initializing"
-        self._route_initialization_revision += 1
-        return self._execution_route_state_snapshot_locked()
-
-    def _fail_closed_execution_route_initialization(self) -> dict[str, object]:
-        """Leave preflight explicitly blocked after acknowledgement loss."""
-
         with self._dispatch_lock:
-            state = self._mark_execution_route_initializing_locked()
+            reason = self._execution_route_switch_guard_for_target_locked(
+                requested_source=requested_source,
+                requested_retraction_source=requested_retraction_source,
+            )
+            if reason:
+                return self._reject_execution_route_command(
+                    response,
+                    reason,
+                )
+            previous_source = self._robot_endpoint_source
+            previous_retraction_source = getattr(
+                self, "_retraction_endpoint_source", self._robot_endpoint_source
+            )
+            # The target-aware guard may have admitted a stopped
+            # external->virtual escape for a legacy record without its own
+            # source field. Freeze that source before replacing the route so
+            # a later restart or external re-entry remains conservatively
+            # blocked until the original controller outcome is recovered.
+            self._record_active_request_sources_locked()
+            try:
+                self._set_route_source_locked(
+                    requested_source,
+                    retraction_source=requested_retraction_source,
+                    clear_admission=True,
+                )
+            except TypeError:  # pragma: no cover - focused legacy doubles
+                self._set_route_source_locked(
+                    requested_source,
+                    clear_admission=True,
+                )
+            self._run_endpoint_source = ""
+            self._run_retraction_source = ""
+            self._route_revision += 1
+            self._route_initialization_revision += 1
+            self._route_initialization_state = "initialized"
+            state = self._execution_route_state_snapshot_locked()
+
+        try:
+            persist_route_selection(
+                self._route_selection_state_path,
+                selected_source=str(state["selected_source"]),
+                retraction_source=str(state["retraction_source"]),
+                runtime_mode=self._route_selection_runtime_mode,
+            )
+        except (OSError, ValueError) as exc:
+            # The route swap itself remains valid: this tiny owner-local file
+            # is a warm-restart convenience, never an endpoint admission or
+            # controller safety condition.
+            self.get_logger().warning(
+                f"could not persist execution route selection: {exc}"
+            )
         self._publish_execution_route_state()
-        return state
+        response.accepted = True
+        response.command_id = ""
+        response.message = (
+            "execution route unchanged"
+            if (
+                previous_source == requested_source
+                and previous_retraction_source == requested_retraction_source
+            )
+            else (
+                "execution route changed to "
+                f"tool={requested_source}, retraction={requested_retraction_source}"
+            )
+        )
+        response.result_json = self._route_response_json(state)
+        return response
 
     def _handle_execution_route_command(
         self,
         request: IntegrationDebugCommand.Request,
         response: IntegrationDebugCommand.Response,
     ) -> IntegrationDebugCommand.Response:
-        """Coordinate the only stopped-only Action/Service route mutation.
+        """Coordinate the one stopped-only Action/Service route mutation.
 
-        This public boundary first proves the bridge has no active Action or
-        Service request, asks simulation_manager for an independent stopped
-        proof, requests its DT reset, then proves a new idle frame before
-        swapping the reviewed Action *and* Service pair.  No second route
-        mutation service exists that can bypass those reset steps.
+        Route selection has no Digital-Twin reset or preflight-ack phase.
+        It is accepted when the latest authoritative state is stopped and this
+        bridge has no active Action or Service request.  A cancelled request
+        stranded on a disappeared external endpoint can only be escaped by
+        moving that same route to the isolated virtual endpoint; it remains an
+        unresolved recovery record rather than a completed request.
         """
 
-        reset_completed = False
         try:
             operation = str(getattr(request, "operation", "") or "").strip().lower()
             payload = self._decode_execution_route_payload(
@@ -1303,8 +1850,7 @@ class SurgicalInteropExecutionBridge(Node):
                 response.command_id = ""
                 response.message = "execution route status"
                 response.result_json = self._route_response_json(
-                    self._execution_route_state_snapshot(),
-                    reset=False,
+                    self._execution_route_state_snapshot()
                 )
                 return response
             if operation not in {
@@ -1323,144 +1869,27 @@ class SurgicalInteropExecutionBridge(Node):
             requested_retraction_source = normalize_robot_endpoint_source(
                 str(payload.get("retraction_source", requested_source))
             )
-            with self._dispatch_lock:
-                reason = self._execution_route_switch_guard_locked()
-                reset_generation = int(
-                    getattr(self, "_latest_simulation_state_generation", 0)
-                )
-                if reason:
-                    return self._reject_execution_route_command(
-                        response,
-                        reason,
-                        reset=False,
-                    )
-            reason = self._manager_transition_ready_for_execution_route()
-            if reason:
-                return self._reject_execution_route_command(
-                    response,
-                    reason,
-                    reset=False,
-                )
-            reason = self._request_execution_route_reset()
-            if reason:
-                return self._reject_execution_route_command(
-                    response,
-                    reason,
-                    reset=False,
-                )
-            reset_completed = True
-            reason = self._wait_for_execution_route_reset(
-                after_generation=reset_generation
+            return self._handle_execution_route_switch(
+                requested_source=requested_source,
+                requested_retraction_source=requested_retraction_source,
+                response=response,
             )
-            if reason:
-                return self._reject_execution_route_command(
-                    response,
-                    reason,
-                    reset=True,
-                )
-            with self._dispatch_lock:
-                reason = self._execution_route_switch_guard_locked()
-                if reason:
-                    return self._reject_execution_route_command(
-                        response,
-                        reason,
-                        reset=True,
-                    )
-                previous_source = self._robot_endpoint_source
-                previous_retraction_source = getattr(
-                    self, "_retraction_endpoint_source", self._robot_endpoint_source
-                )
-                try:
-                    self._set_route_source_locked(
-                        requested_source,
-                        retraction_source=requested_retraction_source,
-                        clear_admission=True,
-                    )
-                except TypeError:  # pragma: no cover - focused legacy doubles
-                    self._set_route_source_locked(
-                        requested_source,
-                        clear_admission=True,
-                    )
-                self._run_endpoint_source = ""
-                self._run_retraction_source = ""
-                self._route_revision += 1
-                state = self._mark_execution_route_initializing_locked()
-            self._publish_execution_route_state()
-            reason = self._wait_for_preflight_route_ack(
-                state,
-                require_initialized=False,
-            )
-            if reason:
-                self._fail_closed_execution_route_initialization()
-                return self._reject_execution_route_command(
-                    response,
-                    reason,
-                    reset=True,
-                )
-            with self._dispatch_lock:
-                reason = self._execution_route_switch_guard_locked()
-                if reason:
-                    state = self._mark_execution_route_initializing_locked()
-                else:
-                    self._route_initialization_state = "initialized"
-                    state = self._execution_route_state_snapshot_locked()
-            self._publish_execution_route_state()
-            if reason:
-                return self._reject_execution_route_command(
-                    response,
-                    reason,
-                    reset=True,
-                )
-            reason = self._wait_for_preflight_route_ack(
-                state,
-                require_initialized=True,
-            )
-            if reason:
-                self._fail_closed_execution_route_initialization()
-                return self._reject_execution_route_command(
-                    response,
-                    reason,
-                    reset=True,
-                )
-            response.accepted = True
-            response.command_id = ""
-            response.message = (
-                "execution route initialized"
-                if (
-                    previous_source == requested_source
-                    and previous_retraction_source == requested_retraction_source
-                )
-                else (
-                    "execution route changed to "
-                    f"tool={requested_source}, retraction={requested_retraction_source} "
-                    "and initialized"
-                )
-            )
-            response.result_json = self._route_response_json(
-                state,
-                reset=True,
-            )
-            return response
         except ValueError as exc:
             return self._reject_execution_route_command(
                 response,
                 str(exc),
-                reset=reset_completed,
             )
         except Exception as exc:  # pragma: no cover - fail closed service boundary
             self.get_logger().error(f"execution route command failed: {exc}")
-            if reset_completed:
-                self._fail_closed_execution_route_initialization()
             return self._reject_execution_route_command(
                 response,
                 "execution route command failed",
-                reset=reset_completed,
             )
 
     def _on_endpoint_configuration_parameters_changed(
         self, parameters: list[Any]
     ) -> SetParametersResult:
-        """Keep endpoints fixed while safely accepting a stopped spec reload."""
+        """Keep route details and ScenarioStore bootstrap immutable at runtime."""
 
         launch_lifetime_parameters = {
             "robot_endpoint_source",
@@ -1469,13 +1898,10 @@ class SurgicalInteropExecutionBridge(Node):
             "retraction_service_name",
             "bed_robot_status_endpoint",
             "require_bed_robot_status",
-            "require_dispatch_admission_lease",
             "controller_contract_topic",
             "expected_controller_contract_id",
             "expected_capability_policy_id",
             "integration_readiness_topic",
-            "admission_lease_max_age_sec",
-            "admission_lease_source_future_tolerance_sec",
             "require_physical_stop_confirmation",
             "external_tool_handover_endpoint",
             "virtual_tool_handover_endpoint",
@@ -1492,6 +1918,7 @@ class SurgicalInteropExecutionBridge(Node):
             "enable_runtime_route_control",
             "direct_hand_state_max_age_sec",
             "direct_hand_dispatch_ledger_path",
+            "scenario_config_topic",
         }
         for parameter in parameters:
             if parameter.name in launch_lifetime_parameters:
@@ -1502,56 +1929,14 @@ class SurgicalInteropExecutionBridge(Node):
                         "changed while the bridge is running"
                     ),
                 )
-        spec_update = next(
-            (parameter for parameter in parameters if parameter.name == "spec_dir"),
-            None,
-        )
-        if spec_update is None:
-            return SetParametersResult(successful=True)
-
-        next_spec_dir = str(spec_update.value).strip()
-        if not next_spec_dir:
+        if any(parameter.name == "spec_dir" for parameter in parameters):
             return SetParametersResult(
                 successful=False,
-                reason="spec_dir must identify a procedure bundle",
+                reason=(
+                    "spec_dir is a launch-time bootstrap; ScenarioStore owns "
+                    "scenario selection through /simulation/scenario_config"
+                ),
             )
-        try:
-            next_spec = load_bundle(next_spec_dir)
-            next_instrument_names = {
-                instrument.id: instrument.display_name.strip()
-                for instrument in next_spec.bundle.instruments
-            }
-            next_max_retraction_distance_mm = procedure_retraction_distance_limit_mm(
-                next_spec,
-                configured_limit_mm=self._configured_max_retraction_distance_mm,
-            )
-        except Exception as exc:
-            return SetParametersResult(
-                successful=False,
-                reason=f"failed to reload procedure spec: {exc}",
-            )
-
-        # The manager first sends reset and closes the readiness lease.  Keep
-        # this guard locally as well: an arbitrary parameter client must never
-        # change the mapping while an Action/Service is in flight or the bridge
-        # is eligible to dispatch one.
-        with self._dispatch_lock:
-            if self._runtime_accepting_commands:
-                return SetParametersResult(
-                    successful=False,
-                    reason="spec_dir can change only while runtime dispatch is disabled",
-                )
-            if self._active_actions or self._active_services:
-                return SetParametersResult(
-                    successful=False,
-                    reason="spec_dir can change only with no active controller request",
-                )
-            self._spec_dir = next_spec_dir
-            self._procedure_spec = next_spec
-            self._instrument_names = next_instrument_names
-            self._max_retraction_distance_mm = next_max_retraction_distance_mm
-            self._dispatch_ledger.clear()
-            self._last_lifecycle_control_signature = None
         return SetParametersResult(successful=True)
 
     def _stamp(self):
@@ -1568,43 +1953,87 @@ class SurgicalInteropExecutionBridge(Node):
         return None
 
     def _direct_hand_run_guard(self, command: InternalSkillCommand) -> str:
-        """Bind every implicit command to one fresh authoritative run."""
+        """Bind every tool command to one fresh authoritative run.
+
+        The historic name is retained because direct-hand commands add their
+        episode ledger below.  The run fence intentionally applies to explicit
+        voice and policy commands too: callbacks for any of them may outlive a
+        stop/reset and must not be admitted by the next run.
+        """
 
         is_direct = command.mode == "implicit_request"
-        if not is_direct:
-            if command.procedure_run_id or command.implicit_request_generation:
-                return "unexpected_direct_hand_identity"
-            return ""
-        if (
-            not valid_procedure_run_id(command.procedure_run_id)
-            or int(command.implicit_request_generation) <= 0
-        ):
+        if not is_direct and int(command.implicit_request_generation):
+            return "unexpected_direct_hand_identity"
+        if is_direct and int(command.implicit_request_generation) <= 0:
             return "direct_hand_episode_invalid"
-        if getattr(self, "_direct_hand_dispatch_ledger", None) is None:
+        if is_direct and getattr(self, "_direct_hand_dispatch_ledger", None) is None:
             return "direct_hand_ledger_unavailable"
+        if not valid_procedure_run_id(command.procedure_run_id):
+            return "command_procedure_run_invalid"
         state = getattr(self, "_latest_simulation_state", None)
         received_at = float(
             getattr(self, "_latest_simulation_state_received_monotonic", 0.0)
         )
         if state is None or received_at <= 0.0:
-            return "direct_hand_runtime_state_missing"
+            return "command_runtime_state_missing"
         if (
             time.monotonic() - received_at
             > float(getattr(self, "_direct_hand_state_max_age_sec", 1.0))
         ):
-            return "direct_hand_runtime_state_stale"
+            return "command_runtime_state_stale"
+        execution_state = str(
+            getattr(state, "execution_state", "")
+        ).strip().casefold()
+        # Completion cleanup is deliberately the only controller-facing work
+        # admitted after the spoken finish edge.  The run remains live and its
+        # identity is still checked below, but ordinary preparation, handover,
+        # and direct-hand commands remain fail-closed until the next run.
+        finishing_cleanup = (
+            not is_direct
+            and command.action
+            in (
+                RETURN_UNUSED_PREPOSITION_ALIASES
+                | RETURN_PREPOSITION_TO_TRAY_ALIASES
+                | RETRIEVE_ALIASES
+            )
+        )
+        permitted_execution_states = {"running"}
+        if finishing_cleanup:
+            permitted_execution_states.add("finishing")
         if (
             not bool(getattr(state, "running", False))
-            or str(getattr(state, "execution_state", "")).strip().casefold()
-            != "running"
+            or execution_state not in permitted_execution_states
         ):
-            return "direct_hand_runtime_not_running"
+            return (
+                "direct_hand_runtime_not_running"
+                if is_direct
+                else "command_runtime_not_running"
+            )
         if (
             str(getattr(state, "procedure_run_id", "")).strip()
             != command.procedure_run_id
         ):
-            return "direct_hand_run_mismatch"
+            return (
+                "direct_hand_run_mismatch"
+                if is_direct
+                else "command_procedure_run_mismatch"
+            )
         return ""
+
+    def _retrieval_run_guard(self, command: InternalSkillCommand) -> str:
+        """Fail closed before a Mayo retrieval reaches the controller.
+
+        The BT normally prevents this combination, but the execution bridge
+        is the final physical admission boundary.  Recheck the latest fresh
+        Digital-Twin snapshot here so a queued/deferred retrieval cannot start
+        while the humanoid's right hand still carries a prepositioned tool.
+        """
+
+        if command.action not in RETRIEVE_ALIASES:
+            return ""
+        with self._dispatch_lock:
+            simulation_state = self._latest_simulation_state
+        return retrieval_block_reason(simulation_state)
 
     @staticmethod
     def _tool_transfer_semantic_leg(
@@ -1668,8 +2097,9 @@ class SurgicalInteropExecutionBridge(Node):
 
         ``satisfied`` means the predecessor already delivered the exact tool
         instance to the requested target. ``dispatch`` carries a source-rebased
-        request. Anything else is intentionally rejected instead of replaying
-        a stale planner source.
+        non-Mayo request. ``planner`` leaves a newly confirmed Mayo source to a
+        fresh WorldState/BT admission, where CAM4 occupancy can be checked.
+        Anything else is rejected instead of replaying a stale planner source.
         """
 
         source = source_location.strip().casefold()
@@ -1695,19 +2125,13 @@ class SurgicalInteropExecutionBridge(Node):
                 source_location_id="robot_right_hand",
             )
         elif source == "mayo":
-            # The completed automatic return is authoritative: the tool is now
-            # on Mayo.  Rebase the queued voice request onto the supported
-            # Mayo-to-robot preparation leg; the still-active DT request will
-            # dispatch robot-to-surgeon after ToolPrepared is reconciled.
-            command = replace(
-                queued.command,
-                action="prepare_tool",
-                source_location_type="mayo_stand",
-                source_location_id="mayo_stand",
-            )
+            # Never synthesize a Mayo pickup inside the execution adapter. The
+            # completed return is reconciled into WorldState first; the still
+            # active surgeon request is then reconsidered together with the
+            # pose-independent CAM4 Mayo-hand gate.
+            return "planner", queued
         else:
             return "rejected", None
-        effective_target = "robot" if source == "mayo" else target
         return (
             "dispatch",
             QueuedVoiceToolTransfer(
@@ -1715,7 +2139,7 @@ class SurgicalInteropExecutionBridge(Node):
                 request=replace(
                     queued.request,
                     source_location=source,
-                    target_location=effective_target,
+                    target_location=target,
                 ),
                 wait_for_predecessor_terminal=False,
                 same_instrument_predecessor=True,
@@ -1756,91 +2180,103 @@ class SurgicalInteropExecutionBridge(Node):
         with self._dispatch_lock:
             return self._runtime_accepting_commands
 
-    def _record_admission_payload(
+    def _defer_startup_tool_transfer(
+        self,
+        command: InternalSkillCommand,
+        request: ToolHandoverRequest,
+    ) -> bool:
+        """Hold the initial BT handover until the actor-start edge.
+
+        ``start_runtime`` deliberately does not enable any controller-facing
+        dispatch.  The scenario's first BT handover can nevertheless arrive in
+        that small interval, so retain one mapped request locally and submit
+        it through the ordinary lane only after ``start_actors``.  A second,
+        distinct request is not silently reordered or merged.
+        """
+
+        publish_pending = False
+        with self._dispatch_lock:
+            if (
+                self._runtime_accepting_commands
+                or not getattr(self, "_startup_actors_pending", False)
+            ):
+                return False
+            existing = getattr(self, "_deferred_startup_tool_transfer", None)
+            if existing is None:
+                self._deferred_startup_tool_transfer = DeferredStartupToolTransfer(
+                    command=command,
+                    request=request,
+                )
+                publish_pending = True
+            elif existing.command.command_id != command.command_id:
+                return False
+        if publish_pending:
+            self._publish_skill_status(
+                command,
+                state="pending",
+                success=True,
+                reason_code="deferred_until_start_actors",
+            )
+        return True
+
+    def _record_controller_contract_telemetry(
         self,
         payload: dict[str, Any],
         *,
-        kind: str,
         controller_source: str | None = None,
     ) -> None:
-        """Record readiness admission and compatibility telemetry leases.
+        """Retain a replay-checked controller observation for diagnostics.
 
-        Controller-contract messages remain observable for route diagnostics and
-        older integrations, but they are not execution authority.  Only an
-        invalid integration-readiness lease may disarm dispatch admission.
+        The selected Action/Service endpoint remains the execution boundary.
+        Contract observations are intentionally not consulted when dispatching
+        an otherwise valid typed request.
         """
 
-        if kind == "controller_contract":
-            source = normalize_robot_endpoint_source(
-                controller_source or self._robot_endpoint_source
-            )
-            with self._dispatch_lock:
-                leases = getattr(self, "_controller_contract_leases", None)
-                lease = (
-                    leases[source]
-                    if isinstance(leases, dict) and source in leases
-                    else {
-                        "last_accepted_stamp_sec": getattr(
-                            self,
-                            "_last_accepted_controller_contract_source_stamp_sec",
-                            0.0,
-                        )
-                    }
-                )
-            max_age_sec = self._admission_lease_max_age_sec
-            previous_stamp_sec = lease["last_accepted_stamp_sec"] or None
-        else:
-            max_age_sec = self._admission_lease_max_age_sec
-            previous_stamp_sec = (
-                self._last_accepted_integration_readiness_source_stamp_sec or None
+        source = normalize_robot_endpoint_source(
+            controller_source or self._robot_endpoint_source
+        )
+        with self._dispatch_lock:
+            leases = getattr(self, "_controller_contract_leases", None)
+            lease = (
+                leases[source]
+                if isinstance(leases, dict) and source in leases
+                else {
+                    "last_accepted_stamp_sec": getattr(
+                        self,
+                        "_last_accepted_controller_contract_source_stamp_sec",
+                        0.0,
+                    )
+                }
             )
         stamp_sec, source_error = validate_source_stamp(
             payload,
             now_sec=time.time(),
-            max_age_sec=max_age_sec,
-            future_tolerance_sec=(
-                self._admission_lease_source_future_tolerance_sec
-            ),
-            source_name=kind,
-            previous_stamp_sec=previous_stamp_sec,
+            max_age_sec=_CONTROLLER_TELEMETRY_MAX_AGE_SEC,
+            future_tolerance_sec=_CONTROLLER_TELEMETRY_FUTURE_TOLERANCE_SEC,
+            source_name="controller_contract",
+            previous_stamp_sec=lease["last_accepted_stamp_sec"] or None,
         )
         received_monotonic = time.monotonic()
         with self._dispatch_lock:
-            if kind == "controller_contract":
-                leases = getattr(self, "_controller_contract_leases", None)
-                if isinstance(leases, dict) and source in leases:
-                    lease = leases[source]
-                    lease["payload"] = payload
-                    lease["received_monotonic"] = received_monotonic
-                    lease["source_error"] = source_error
-                    if not source_error and stamp_sec is not None:
-                        lease["last_accepted_stamp_sec"] = stamp_sec
-                # Preserve the legacy inspection fields as the handover
-                # contract. Existing diagnostics/tests remain meaningful,
-                # while retraction checks use their own lease below.
-                if source == self._robot_endpoint_source:
-                    self._latest_controller_contract = payload
-                    self._latest_controller_contract_received_monotonic = (
-                        received_monotonic
-                    )
-                    self._latest_controller_contract_source_error = source_error
-                    if not source_error and stamp_sec is not None:
-                        self._last_accepted_controller_contract_source_stamp_sec = (
-                            stamp_sec
-                        )
-            else:
-                self._latest_integration_readiness = payload
-                self._latest_integration_readiness_received_monotonic = (
+            leases = getattr(self, "_controller_contract_leases", None)
+            if isinstance(leases, dict) and source in leases:
+                lease = leases[source]
+                lease["payload"] = payload
+                lease["received_monotonic"] = received_monotonic
+                lease["source_error"] = source_error
+                if not source_error and stamp_sec is not None:
+                    lease["last_accepted_stamp_sec"] = stamp_sec
+            # Preserve the active route inspection fields for diagnostics.
+            if source == self._robot_endpoint_source:
+                self._latest_controller_contract = payload
+                self._latest_controller_contract_received_monotonic = (
                     received_monotonic
                 )
-                self._latest_integration_readiness_source_error = source_error
+                self._latest_controller_contract_source_error = source_error
                 if not source_error and stamp_sec is not None:
-                    self._last_accepted_integration_readiness_source_stamp_sec = (
+                    self._last_accepted_controller_contract_source_stamp_sec = (
                         stamp_sec
                     )
-            if source_error and kind != "controller_contract":
-                self._dispatch_admission_armed = False
-                self._dispatch_admission_disarmed_reason = source_error
 
     def _on_controller_contract(
         self,
@@ -1863,121 +2299,182 @@ class SurgicalInteropExecutionBridge(Node):
         except (TypeError, ValueError):
             return
         if isinstance(payload, dict):
-            self._record_admission_payload(
+            self._record_controller_contract_telemetry(
                 payload,
-                kind="controller_contract",
                 controller_source=source,
             )
 
     def _on_integration_readiness(self, msg: String) -> None:
+        """Record preflight state as observation-only diagnostic telemetry."""
+
         try:
             payload = json.loads(msg.data)
         except (TypeError, ValueError):
+            with self._dispatch_lock:
+                self._latest_integration_readiness_error = (
+                    "integration_readiness_invalid_json"
+                )
             return
-        if isinstance(payload, dict):
-            self._record_admission_payload(payload, kind="integration_readiness")
-
-    def _integration_readiness_lease_guard(self, route: str) -> str:
         with self._dispatch_lock:
-            payload = self._latest_integration_readiness
-            receipt_monotonic = self._latest_integration_readiness_received_monotonic
-            source_error = self._latest_integration_readiness_source_error
-        if not isinstance(payload, dict) or receipt_monotonic <= 0.0:
-            return "integration_readiness_lease_missing"
-        receipt_age_sec = time.monotonic() - receipt_monotonic
-        if (
-            receipt_age_sec < 0.0
-            or receipt_age_sec > self._admission_lease_max_age_sec
-        ):
-            return "integration_readiness_lease_stale"
-        if source_error:
-            return source_error
-        _, source_error = validate_source_stamp(
-            payload,
-            now_sec=time.time(),
-            max_age_sec=self._admission_lease_max_age_sec,
-            future_tolerance_sec=(
-                self._admission_lease_source_future_tolerance_sec
-            ),
-            source_name="integration_readiness",
-        )
-        if source_error:
-            return source_error
-        if payload.get("schema") != _INTEGRATION_READINESS_SCHEMA:
-            return "integration_readiness_schema_mismatch"
-        details = payload.get("details")
-        # Live runtime route control must never admit an observation produced
-        # for the other endpoint family.  Keep the older static-route
-        # readiness contract backward compatible: a legacy producer that has
-        # no source field is still meaningful when the source cannot change.
-        if bool(getattr(self, "_enable_runtime_route_control", False)):
-            if not isinstance(details, dict):
-                return "integration_readiness_details_missing"
-            if (
-                str(details.get("robot_endpoint_source", "")).strip().casefold()
-                != self._robot_endpoint_source
-            ):
-                return "integration_readiness_endpoint_source_mismatch"
-            if (
-                str(details.get("retraction_endpoint_source", ""))
-                .strip()
-                .casefold()
-                != self._retraction_endpoint_source
-            ):
-                return "integration_readiness_retraction_source_mismatch"
-        elif isinstance(details, dict):
-            observed_source = str(
-                details.get("robot_endpoint_source", "")
-            ).strip().casefold()
-            if observed_source and observed_source != self._robot_endpoint_source:
-                return "integration_readiness_endpoint_source_mismatch"
-            observed_retraction_source = str(
-                details.get("retraction_endpoint_source", "")
-            ).strip().casefold()
-            if (
-                observed_retraction_source
-                and observed_retraction_source != self._retraction_endpoint_source
-            ):
-                return "integration_readiness_retraction_source_mismatch"
-        if payload.get("ready") is not True:
-            return "integration_readiness_not_ready"
-        checks = payload.get("checks")
-        if not isinstance(checks, dict):
-            return "integration_readiness_checks_missing"
-        # Controller contracts are compatibility telemetry, not execution
-        # authority.  Dispatch admission is based on the selected endpoint's
-        # fresh readiness projection and the direct Action/Service availability
-        # check performed by the caller.
-        required_checks = {"contract_configuration"}
-        if route == "tool_transfer":
-            required_checks.add("tool_handover_action_server")
-        if route == "retraction":
-            required_checks.add("retraction_command_service")
-        if any(checks.get(name) is not True for name in required_checks):
-            return "integration_readiness_checks_not_ready"
-        return ""
+            if not isinstance(payload, dict):
+                self._latest_integration_readiness_error = (
+                    "integration_readiness_payload_not_object"
+                )
+                return
+            self._latest_integration_readiness = payload
+            self._latest_integration_readiness_received_monotonic = time.monotonic()
+            self._latest_integration_readiness_error = ""
 
-    def _dispatch_admission_guard(self, route: str, *, allow_stop: bool = False) -> str:
-        """Require a fresh integration-readiness lease immediately before I/O.
+    def _on_execution_proxy_activity(self, msg: String) -> None:
+        """Observe only the proxy's in-flight count for stopped-route safety.
 
-        The sole exception is a retraction STOP command: suppressing a stop
-        because telemetry/lease freshness is lost would make recovery less
-        safe. A Service receipt still never claims physical stop completion.
-
-        Controller-contract payloads remain available as diagnostics for
-        backward compatibility, but their presence, freshness, and contents do
-        not authorize or block dispatch.
+        The proxy remains the command lifecycle owner.  This bridge merely
+        consumes its bounded activity projection so a route switch cannot race
+        a Service receipt or Action cancellation that the proxy is handling.
         """
 
-        if allow_stop or not bool(
-            getattr(self, "_require_dispatch_admission_lease", False)
-        ):
-            return ""
-        reason = self._integration_readiness_lease_guard(route)
+        try:
+            payload = json.loads(msg.data)
+            if (
+                not isinstance(payload, dict)
+                or payload.get("schema") != EXECUTION_PROXY_ACTIVITY_SCHEMA
+                or not isinstance(payload.get("active"), bool)
+            ):
+                raise ValueError("invalid execution proxy activity")
+            active = bool(payload["active"])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            # A malformed observer message must not select a route or block
+            # an already stopped system forever.  The proxy itself continues
+            # to own request idempotency and endpoint lifecycles.
+            return
         with self._dispatch_lock:
-            self._dispatch_admission_armed = not bool(reason)
-            self._dispatch_admission_disarmed_reason = reason
-        return reason
+            self._execution_proxy_active = active
+        self._publish_execution_route_state()
+
+    def _on_execution_proxy_lifecycle(self, msg: String) -> None:
+        """Project direct-proxy lifecycle facts into the one public trace feed.
+
+        The proxy's topic is intentionally private implementation telemetry.
+        It is the lifecycle owner for catalog-routed typed requests; this
+        bridge validates only the bounded observer shape and assigns the sole
+        public ``ExecutionTrace`` sequence.  In particular, a virtual
+        ``completed`` stage means the isolated Service handler returned, not a
+        physical bed-arm state transition.
+        """
+
+        try:
+            payload = json.loads(msg.data)
+            if (
+                not isinstance(payload, dict)
+                or payload.get("schema") != EXECUTION_PROXY_LIFECYCLE_SCHEMA
+                or payload.get("route") != "retraction"
+                or payload.get("transport") != "service"
+            ):
+                raise ValueError("invalid execution proxy lifecycle")
+            command_id = str(payload.get("command_id") or "").strip()
+            endpoint = str(payload.get("endpoint") or "").strip()
+            endpoint_source = normalize_robot_endpoint_source(
+                str(payload.get("endpoint_source") or "")
+            )
+            if (
+                not command_id
+                or len(command_id) > _EXECUTION_TRACE_MAX_COMMAND_ID_CHARS
+                or not endpoint
+                or len(endpoint) > _EXECUTION_TRACE_MAX_ENDPOINT_CHARS
+            ):
+                raise ValueError("execution proxy lifecycle text is invalid")
+            validate_endpoint_source(
+                source=endpoint_source,
+                endpoint=endpoint,
+                endpoint_kind="retraction service",
+            )
+            stage = str(payload.get("stage") or "").strip().lower()
+            evidence = str(payload.get("evidence") or "").strip().lower()
+            dispatch_submitted = payload.get("dispatch_submitted")
+            terminal = payload.get("terminal")
+            if (
+                stage not in _EXECUTION_TRACE_STAGES
+                or evidence not in _EXECUTION_TRACE_EVIDENCE
+                or not isinstance(dispatch_submitted, bool)
+                or not isinstance(terminal, bool)
+            ):
+                raise ValueError("execution proxy lifecycle state is invalid")
+            # The virtual endpoint can report completion of its own Service
+            # transaction, but it cannot report physical bed-arm completion.
+            if stage == "completed" and not (
+                endpoint_source == VIRTUAL_ENDPOINT_SOURCE
+                and evidence == "virtual_service_transaction_completed"
+                and terminal
+            ):
+                raise ValueError("execution proxy completion is not virtual")
+            if (
+                evidence == "virtual_service_transaction_completed"
+                and stage != "completed"
+            ):
+                raise ValueError("execution proxy completion evidence is invalid")
+            command = payload.get("retraction_command")
+            target_side = payload.get("retraction_target_side")
+            distance_m = payload.get("retraction_distance_m")
+            if isinstance(command, bool) or isinstance(target_side, bool):
+                raise ValueError("execution proxy retraction enum is invalid")
+            command = int(command)
+            target_side = int(target_side)
+            distance_m = float(distance_m)
+            if (
+                command < 0
+                or command > 255
+                or target_side < 0
+                or target_side > 255
+                or not math.isfinite(distance_m)
+            ):
+                raise ValueError("execution proxy retraction payload is invalid")
+            request = RetractionCommandRequest(
+                command_id=command_id,
+                command=command,
+                target_side=target_side,
+                distance_m=distance_m,
+            )
+            procedure_run_id = str(
+                payload.get("procedure_run_id") or ""
+            ).strip()
+            if procedure_run_id and not valid_procedure_run_id(procedure_run_id):
+                raise ValueError("execution proxy procedure run is invalid")
+            # The private proxy captures this at request admission.  Retain the
+            # first verified run binding so a delayed receipt from an old
+            # direct voice Service can never be relabelled as the new run.
+            with self._dispatch_lock:
+                known_run_id = getattr(
+                    self, "_execution_trace_run_by_command", {}
+                ).get(command_id, "")
+                if (
+                    known_run_id
+                    and procedure_run_id
+                    and known_run_id != procedure_run_id
+                ):
+                    raise ValueError("execution proxy procedure run mismatch")
+                if procedure_run_id:
+                    self._execution_trace_run_by_command[command_id] = (
+                        procedure_run_id
+                    )
+                else:
+                    procedure_run_id = str(known_run_id or "")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return
+
+        self._publish_execution_trace(
+            command_id=command_id,
+            route="retraction",
+            transport="service",
+            endpoint=endpoint,
+            endpoint_source=endpoint_source,
+            stage=stage,
+            dispatch_submitted=dispatch_submitted,
+            terminal=terminal,
+            evidence=evidence,
+            reason_code=str(payload.get("reason_code") or ""),
+            retraction_request=request,
+            procedure_run_id=procedure_run_id,
+        )
 
     @staticmethod
     def _source_stamp_ns(msg: BedRobotArmStateArray) -> int | None:
@@ -2205,6 +2702,32 @@ class SurgicalInteropExecutionBridge(Node):
         with self._dispatch_lock:
             self._runtime_accepting_commands = False
 
+    def _action_blocks_current_dispatch_locked(self, active: ActiveAction) -> bool:
+        """Return whether an unresolved Goal still occupies its controller lane.
+
+        Stop/reset deliberately removes the old run from UI ownership, but it
+        cannot make an accepted Action cease to exist at the controller.  A
+        cancellation request is not a terminal result, so an old dispatched
+        Goal keeps the local non-preemption invariant until a terminal
+        callback, the bounded recovery timeout, or an explicit recovery
+        resolution removes its record.  Reservations that never left this
+        process are still cleared by the before-send cancellation path.
+        """
+
+        return bool(active.dispatched or active.goal_handle is not None)
+
+    def _service_blocks_current_dispatch_locked(self, active: ActiveService) -> bool:
+        """Return whether a submitted Service still occupies its controller lane.
+
+        ROS services have no cancellation protocol.  A stopped run can be
+        visually detached, but an unresolved request must remain a lane
+        blocker rather than allowing a later procedure to overlap it.  The
+        recovery timer turns an absent receipt into explicit uncertainty; it
+        never fabricates completion to free the lane early.
+        """
+
+        return bool(active.dispatched or active.future is not None)
+
     def _begin_action_dispatch(
         self,
         route: str,
@@ -2226,6 +2749,7 @@ class SurgicalInteropExecutionBridge(Node):
                 return "duplicate_command"
             if route == "tool_transfer" and any(
                 active.route == "tool_transfer"
+                and self._action_blocks_current_dispatch_locked(active)
                 for active in self._active_actions.values()
             ):
                 return "tool_transfer_busy"
@@ -2234,11 +2758,17 @@ class SurgicalInteropExecutionBridge(Node):
                 explicit_request_generation=self._explicit_request_generation(command),
                 semantic_leg=semantic_leg,
                 alternative_semantic_legs=alternative_semantic_legs,
+                procedure_run_id=str(
+                    getattr(command, "procedure_run_id", "") or ""
+                ),
             ):
                 return "duplicate_command"
             self._active_actions[self._action_key(route, command.command_id)] = ActiveAction(
                 route=route,
                 command=command,
+                endpoint_source=self._selected_endpoint_source_for_route_locked(
+                    route
+                ),
                 semantic_leg=semantic_leg,
                 dispatch_epoch=int(getattr(self, "_dispatch_epoch", 0)),
             )
@@ -2265,13 +2795,21 @@ class SurgicalInteropExecutionBridge(Node):
                 for active in self._active_services.values()
             ):
                 return "duplicate_command"
-            if any(active.route == route for active in self._active_services.values()):
+            if any(
+                active.route == route
+                and self._service_blocks_current_dispatch_locked(active)
+                for active in self._active_services.values()
+            ):
                 return f"{route}_busy"
             if not self._dispatch_ledger.reserve(command.command_id):
                 return "duplicate_command"
             self._active_services[self._action_key(route, command.command_id)] = ActiveService(
                 route=route,
                 command=command,
+                endpoint_source=self._selected_endpoint_source_for_route_locked(
+                    route
+                ),
+                dispatch_epoch=int(getattr(self, "_dispatch_epoch", 0)),
             )
         return ""
 
@@ -2294,6 +2832,8 @@ class SurgicalInteropExecutionBridge(Node):
     def _tool_transfer_action_snapshot(
         self,
         command_id: str,
+        *,
+        expected_epoch: int | None = None,
     ) -> tuple[bool, bool, tuple[str, str] | None, int]:
         """Return immutable dispatch metadata needed by terminal/I-O gates."""
 
@@ -2301,7 +2841,10 @@ class SurgicalInteropExecutionBridge(Node):
             active = self._active_actions.get(
                 self._action_key("tool_transfer", command_id)
             )
-            if active is None:
+            if active is None or (
+                expected_epoch is not None
+                and int(active.dispatch_epoch) != int(expected_epoch)
+            ):
                 return False, False, None, -1
             return (
                 True,
@@ -2332,18 +2875,52 @@ class SurgicalInteropExecutionBridge(Node):
             )
 
     def _set_tool_transfer_goal_handle(
-        self, command_id: str, goal_handle: Any
-    ) -> tuple[bool, bool]:
-        """Attach a handle even when Cancel arrived before goal acceptance."""
+        self,
+        command_id: str,
+        goal_handle: Any,
+        *,
+        expected_epoch: int | None = None,
+    ) -> tuple[bool, bool, bool]:
+        """Attach an accepted handle and claim its one task-start projection."""
 
         with self._dispatch_lock:
             active = self._active_actions.get(
                 self._action_key("tool_transfer", command_id)
             )
-            if active is None:
-                return False, False
+            if active is None or (
+                expected_epoch is not None
+                and int(active.dispatch_epoch) != int(expected_epoch)
+            ):
+                return False, False, False
             active.goal_handle = goal_handle
-            return True, bool(active.cancelled)
+            publish_task_started = not active.task_started_published
+            active.task_started_published = True
+            return True, bool(active.cancelled), publish_task_started
+
+    def _claim_tool_transfer_task_completion(
+        self,
+        command_id: str,
+        *,
+        expected_epoch: int | None = None,
+    ) -> bool:
+        """Claim the one task-end projection for an accepted tracked Goal."""
+
+        with self._dispatch_lock:
+            active = self._active_actions.get(
+                self._action_key("tool_transfer", command_id)
+            )
+            if (
+                active is None
+                or (
+                    expected_epoch is not None
+                    and int(active.dispatch_epoch) != int(expected_epoch)
+                )
+                or not active.task_started_published
+                or active.task_completed_published
+            ):
+                return False
+            active.task_completed_published = True
+            return True
 
     def _action_state(self, route: str, command_id: str) -> tuple[bool, bool]:
         with self._dispatch_lock:
@@ -2362,13 +2939,61 @@ class SurgicalInteropExecutionBridge(Node):
             active.goal_handle = goal_handle
             return True, bool(active.cancelled)
 
-    def _clear_action(self, route: str, command_id: str) -> None:
+    def _clear_action(
+        self,
+        route: str,
+        command_id: str,
+        *,
+        expected_epoch: int | None = None,
+    ) -> None:
         with self._dispatch_lock:
-            self._active_actions.pop(self._action_key(route, command_id), None)
+            key = self._action_key(route, command_id)
+            active = self._active_actions.get(key)
+            if active is not None and (
+                expected_epoch is None
+                or int(active.dispatch_epoch) == int(expected_epoch)
+            ):
+                self._active_actions.pop(key, None)
 
-    def _clear_service(self, route: str, command_id: str) -> None:
+    def _clear_service(
+        self,
+        route: str,
+        command_id: str,
+        *,
+        expected_epoch: int | None = None,
+    ) -> None:
         with self._dispatch_lock:
-            self._active_services.pop(self._action_key(route, command_id), None)
+            key = self._action_key(route, command_id)
+            active = self._active_services.get(key)
+            if active is not None and (
+                expected_epoch is None
+                or int(active.dispatch_epoch) == int(expected_epoch)
+            ):
+                self._active_services.pop(key, None)
+
+    @staticmethod
+    def _goal_handle_is_terminal(active: ActiveAction) -> bool:
+        """Return whether ROS has already reported this tracked goal terminal.
+
+        A stopped runtime must never keep its route selector locked merely
+        because the result callback was lost after the Action status stream
+        already reported a terminal outcome.  This is only used while handling
+        a stop/reset edge; a non-terminal goal remains tracked and keeps the
+        route boundary closed.
+        """
+
+        handle = active.goal_handle
+        if handle is None:
+            return False
+        try:
+            status = int(getattr(handle, "status", GoalStatus.STATUS_UNKNOWN))
+        except (TypeError, ValueError):
+            return False
+        return status in {
+            GoalStatus.STATUS_SUCCEEDED,
+            GoalStatus.STATUS_CANCELED,
+            GoalStatus.STATUS_ABORTED,
+        }
 
     def _queue_voice_tool_transfer_preemption(
         self,
@@ -2403,6 +3028,7 @@ class SurgicalInteropExecutionBridge(Node):
                     candidate
                     for candidate in self._active_actions.values()
                     if candidate.route == "tool_transfer"
+                    and self._action_blocks_current_dispatch_locked(candidate)
                 ),
                 None,
             )
@@ -2448,6 +3074,9 @@ class SurgicalInteropExecutionBridge(Node):
                     command.command_id,
                     explicit_request_generation=generation,
                     semantic_leg=semantic_leg,
+                    procedure_run_id=str(
+                        getattr(command, "procedure_run_id", "") or ""
+                    ),
                 )
                 or (
                     queued is not None
@@ -2525,6 +3154,7 @@ class SurgicalInteropExecutionBridge(Node):
         *,
         safe_terminal: bool,
         controller_confirmed_tool_location: str = "",
+        expected_epoch: int | None = None,
     ) -> None:
         """Release one Goal and atomically reserve the latest queued voice.
 
@@ -2537,16 +3167,26 @@ class SurgicalInteropExecutionBridge(Node):
         rejected_reason = ""
         rejected_state = "rejected"
         satisfied: QueuedVoiceToolTransfer | None = None
+        planner_deferred: QueuedVoiceToolTransfer | None = None
         reserved: tuple[QueuedVoiceToolTransfer, int] | None = None
         with self._dispatch_lock:
-            self._active_actions.pop(
-                self._action_key("tool_transfer", command_id), None
-            )
+            key = self._action_key("tool_transfer", command_id)
+            active = self._active_actions.get(key)
+            if active is None or (
+                expected_epoch is not None
+                and int(active.dispatch_epoch) != int(expected_epoch)
+            ):
+                # A stopped run may receive a late Action callback after a
+                # fresh run reused the command ID.  It must never release or
+                # rebase that new run's lane.
+                return
+            self._active_actions.pop(key, None)
             queued = getattr(self, "_queued_voice_tool_transfer", None)
             if queued is None:
                 return
             if any(
                 active.route == "tool_transfer"
+                and self._action_blocks_current_dispatch_locked(active)
                 for active in self._active_actions.values()
             ):
                 # A second active Goal would violate the lane invariant.  Keep
@@ -2581,8 +3221,14 @@ class SurgicalInteropExecutionBridge(Node):
                                 self._explicit_request_generation(queued.command)
                             ),
                             semantic_leg=original_leg,
+                            procedure_run_id=str(
+                                getattr(queued.command, "procedure_run_id", "")
+                                or ""
+                            ),
                         )
                         satisfied = queued
+                    elif resolution == "planner":
+                        planner_deferred = queued
                     elif resolution != "dispatch" or resolved is None:
                         rejected = queued
                         rejected_reason = (
@@ -2590,7 +3236,10 @@ class SurgicalInteropExecutionBridge(Node):
                         )
                     else:
                         queued = resolved
-                if rejected is None and satisfied is None:
+                if (
+                    rejected is None and satisfied is None and
+                    planner_deferred is None
+                ):
                     effective_leg = self._tool_transfer_semantic_leg(
                         queued.request
                     )
@@ -2640,6 +3289,13 @@ class SurgicalInteropExecutionBridge(Node):
                 success=True,
                 reason_code="voice_request_satisfied_by_predecessor",
             )
+        if planner_deferred is not None:
+            self._publish_skill_status(
+                planner_deferred.command,
+                state="pending",
+                success=True,
+                reason_code="mayo_source_requires_fresh_planner_admission",
+            )
         if reserved is not None:
             queued, expected_epoch = reserved
             self._dispatch_reserved_tool_transfer(
@@ -2658,11 +3314,18 @@ class SurgicalInteropExecutionBridge(Node):
         """Close a locally canceled lane before any Action Goal is submitted."""
 
         tracked, cancelled, semantic_leg, _active_epoch = (
-            self._tool_transfer_action_snapshot(command.command_id)
+            self._tool_transfer_action_snapshot(
+                command.command_id,
+                expected_epoch=expected_epoch,
+            )
         )
+        if not tracked:
+            # The reservation belongs to an older stop/reset epoch.  A new
+            # run may already have reused the command ID, so do not publish or
+            # clear anything by that ID here.
+            return True
         dispatch_is_current = bool(
-            tracked
-            and not cancelled
+            not cancelled
             and (
                 expected_epoch is None
                 or self._tool_transfer_dispatch_is_current(
@@ -2695,6 +3358,7 @@ class SurgicalInteropExecutionBridge(Node):
         self._finish_tool_transfer_action(
             command.command_id,
             safe_terminal=True,
+            expected_epoch=expected_epoch,
             controller_confirmed_tool_location=(
                 semantic_leg[0] if semantic_leg is not None else ""
             ),
@@ -2711,9 +3375,16 @@ class SurgicalInteropExecutionBridge(Node):
             ):
                 return
             self._last_lifecycle_control_signature = signature
+        deferred_startup: DeferredStartupToolTransfer | None = None
         if control in {"start", "start_actors", "resume"}:
             with self._dispatch_lock:
                 self._runtime_accepting_commands = True
+                if control in {"start", "start_actors"}:
+                    deferred_startup = getattr(
+                        self, "_deferred_startup_tool_transfer", None
+                    )
+                    self._deferred_startup_tool_transfer = None
+                self._startup_actors_pending = False
                 if not getattr(self, "_run_endpoint_source", ""):
                     self._run_endpoint_source = str(
                         getattr(
@@ -2731,10 +3402,16 @@ class SurgicalInteropExecutionBridge(Node):
                     )
                 self._route_initialization_state = "running"
             self._publish_execution_route_state()
+            if deferred_startup is not None:
+                self._dispatch_tool_transfer(
+                    deferred_startup.command,
+                    deferred_startup.request,
+                )
             return
         if control == "start_runtime":
             with self._dispatch_lock:
                 self._runtime_accepting_commands = False
+                self._startup_actors_pending = True
                 # Start admission and the DT entering its initial running
                 # frame both precede actor dispatch. Latch here so a failed
                 # start cannot leave a virtual/real source ambiguous.
@@ -2753,7 +3430,11 @@ class SurgicalInteropExecutionBridge(Node):
                             EXTERNAL_ENDPOINT_SOURCE,
                         )
                     )
-                self._route_initialization_state = "running"
+                # Stable command-proxy endpoints consume this read-only route
+                # state too.  Keep it unavailable until actors start so a
+                # direct Service cannot pass the controller-facing boundary
+                # ahead of the first BT handover.
+                self._route_initialization_state = "initializing"
             self._publish_execution_route_state()
             return
         if control not in {"pause", "stop", "reset"}:
@@ -2763,26 +3444,40 @@ class SurgicalInteropExecutionBridge(Node):
             self._last_lifecycle_control_signature = None
 
         queued_voice: QueuedVoiceToolTransfer | None = None
+        deferred_startup = None
+        stopped_boundary = control in {"stop", "reset"}
+        actions: list[ActiveAction] = []
+        services: list[ActiveService] = []
+        actions_to_cancel: list[ActiveAction] = []
         with self._dispatch_lock:
             self._runtime_accepting_commands = False
+            self._startup_actors_pending = False
             self._dispatch_epoch = int(getattr(self, "_dispatch_epoch", 0)) + 1
-            actions = [
-                active
-                for active in self._active_actions.values()
-                if not active.cancelled
-            ]
-            services = [
-                active
-                for active in self._active_services.values()
-                if not active.cancelled
-            ]
+            # Snapshot every record, including a previous pause's pending
+            # cancellation.  Stop/reset removes the old run's UI ownership,
+            # but a request that already reached the controller stays tracked
+            # as recovery evidence until terminal/cancel/timeout.
+            actions = list(self._active_actions.values())
+            services = list(self._active_services.values())
+            actions_to_cancel = [active for active in actions if not active.cancelled]
             for active in actions:
                 active.cancelled = True
             for active in services:
                 active.cancelled = True
+            if stopped_boundary:
+                deadline = time.monotonic() + float(
+                    getattr(self, "_controller_recovery_timeout_sec", 15.0)
+                )
+                for active in actions:
+                    active.recovery_deadline_monotonic = deadline
+                for active in services:
+                    active.recovery_deadline_monotonic = deadline
             queued_voice = getattr(self, "_queued_voice_tool_transfer", None)
             self._queued_voice_tool_transfer = None
+            deferred_startup = getattr(self, "_deferred_startup_tool_transfer", None)
+            self._deferred_startup_tool_transfer = None
             if control in {"stop", "reset"}:
+                self._clear_voice_replacement_announcement_state_locked()
                 self._run_endpoint_source = ""
                 self._run_retraction_source = ""
                 self._route_initialization_state = (
@@ -2792,7 +3487,6 @@ class SurgicalInteropExecutionBridge(Node):
                     getattr(self, "_route_initialization_revision", 0)
                 ) + 1
             if control == "reset":
-                self._dispatch_ledger.clear()
                 self._bed_robot_revision = None
                 self._bed_robot_source_stamp_ns = None
                 self._bed_robot_epoch = 0
@@ -2804,29 +3498,146 @@ class SurgicalInteropExecutionBridge(Node):
         self._publish_execution_route_state()
 
         for active in actions:
-            if isinstance(active.command, InternalSkillCommand):
-                self._publish_skill_status(
-                    active.command,
-                    state="cancel_requested",
-                    success=False,
-                    reason_code="cancel_requested_by_runtime_control",
+            if stopped_boundary:
+                reason_code = (
+                    "controller_recovery_pending_after_stop"
+                    if control == "stop"
+                    else "controller_recovery_pending_after_reset"
                 )
-            else:
-                self._publish_group_status(
-                    active.command,
-                    state="cancel_requested",
-                    outcome="cancel_requested",
+                if isinstance(active.command, InternalSkillCommand):
+                    self._publish_skill_status(
+                        active.command,
+                        state="cancel_requested",
+                        success=False,
+                        reason_code=reason_code,
+                    )
+                    if active.command.mode == "implicit_request":
+                        ledger = getattr(self, "_direct_hand_dispatch_ledger", None)
+                        if ledger is not None:
+                            try:
+                                ledger.mark_stage(
+                                    active.command.command_id,
+                                    "interrupted_by_scenario_stop",
+                                )
+                            except Exception:  # pragma: no cover - durable audit only
+                                self.get_logger().warning(
+                                    "failed to mark direct hand request interrupted"
+                                )
+                else:
+                    self._publish_group_status(
+                        active.command,
+                        state="cancel_requested",
+                        outcome="controller_recovery_pending",
+                        terminal=False,
+                        success=False,
+                        reason_code=reason_code,
+                    )
+                self._publish_execution_trace(
+                    command_id=active.command.command_id,
+                    route=active.route,
+                    transport="action",
+                    endpoint=self._execution_trace_endpoint_for_source(
+                        active.route,
+                        self._active_request_endpoint_source_locked(active),
+                    ),
+                    endpoint_source=self._active_request_endpoint_source_locked(active),
+                    stage="unknown",
+                    dispatch_submitted=bool(
+                        active.goal_handle is not None or active.dispatched
+                    ),
                     terminal=False,
-                    success=False,
-                    reason_code="cancel_requested_by_runtime_control",
+                    evidence="response_unavailable",
+                    reason_code=reason_code,
+                    procedure_run_id=getattr(active.command, "procedure_run_id", ""),
                 )
-            if active.goal_handle is not None:
+            elif active in actions_to_cancel:
+                if isinstance(active.command, InternalSkillCommand):
+                    self._publish_skill_status(
+                        active.command,
+                        state="cancel_requested",
+                        success=False,
+                        reason_code="cancel_requested_by_runtime_control",
+                    )
+                else:
+                    self._publish_group_status(
+                        active.command,
+                        state="cancel_requested",
+                        outcome="cancel_requested",
+                        terminal=False,
+                        success=False,
+                        reason_code="cancel_requested_by_runtime_control",
+                    )
+            if active in actions_to_cancel and active.goal_handle is not None:
                 try:
                     active.goal_handle.cancel_goal_async()
                 except Exception:  # pragma: no cover - ROS transport failure
                     self.get_logger().warning(
                         f"failed to cancel {active.route} command {active.command.command_id}"
                     )
+
+        for active in services:
+            if stopped_boundary:
+                reason_code = (
+                    "controller_recovery_pending_after_stop"
+                    if control == "stop"
+                    else "controller_recovery_pending_after_reset"
+                )
+                self._publish_group_status(
+                    active.command,
+                    state="unknown",
+                    outcome="controller_recovery_pending",
+                    terminal=False,
+                    success=False,
+                    reason_code=reason_code,
+                )
+                self._publish_execution_trace(
+                    command_id=active.command.command_id,
+                    route=active.route,
+                    transport="service",
+                    endpoint=self._execution_trace_endpoint_for_source(
+                        active.route,
+                        self._active_request_endpoint_source_locked(active),
+                    ),
+                    endpoint_source=self._active_request_endpoint_source_locked(active),
+                    stage="unknown",
+                    dispatch_submitted=bool(active.dispatched),
+                    terminal=False,
+                    evidence="response_unavailable",
+                    reason_code=reason_code,
+                    procedure_run_id=getattr(active.command, "procedure_run_id", ""),
+                )
+            elif active in actions_to_cancel:
+                # `actions_to_cancel` deliberately excludes services.  Keep
+                # this branch unreachable and explicit so pause semantics do
+                # not accidentally start retaining stop-era service records.
+                continue
+
+        if not stopped_boundary:
+            # A pause is a recovery boundary, not a clean-run boundary.  A
+            # non-cancellable Service remains in the current UI lane until
+            # its real receipt arrives; stop/reset above detach the old run
+            # while retaining the controller-recovery record.
+            for active in services:
+                self._publish_group_status(
+                    active.command,
+                    state=(
+                        "unknown"
+                        if active.dispatched
+                        else "cancel_requested"
+                    ),
+                    outcome=(
+                        "awaiting_service_admission_after_pause"
+                        if active.dispatched
+                        else "cancel_requested"
+                    ),
+                    terminal=False,
+                    success=False,
+                    reason_code=(
+                        "service_not_cancellable_awaiting_response"
+                        if active.dispatched
+                        else "cancel_requested_before_service_dispatch"
+                    ),
+                )
 
         if queued_voice is not None:
             self._publish_skill_status(
@@ -2836,29 +3647,88 @@ class SurgicalInteropExecutionBridge(Node):
                 reason_code="cancelled_by_runtime_control_before_dispatch",
             )
 
-        # ROS services are not cancellable after dispatch.  Keep each call
-        # tracked until its real response arrives.
-        for active in services:
-            self._publish_group_status(
-                active.command,
-                state=(
-                    "unknown"
-                    if active.dispatched
-                    else "cancel_requested"
-                ),
-                outcome=(
-                    "awaiting_service_admission_after_stop"
-                    if active.dispatched
-                    else "cancel_requested"
-                ),
-                terminal=False,
+        if deferred_startup is not None:
+            self._publish_skill_status(
+                deferred_startup.command,
+                state="cancelled",
                 success=False,
-                reason_code=(
-                    "service_not_cancellable_awaiting_response"
-                    if active.dispatched
-                    else "cancel_requested_before_service_dispatch"
-                ),
+                reason_code="cancelled_before_start_actors",
             )
+
+    def _expire_controller_recovery(self) -> None:
+        """Release only bounded, stopped-run controller recovery records.
+
+        This intentionally does not fabricate cancellation or controller
+        completion.  It simply makes the uncertainty explicit and lets a
+        stopped operator choose a route/restart after the reviewed recovery
+        window elapsed.
+        """
+
+        now = time.monotonic()
+        expired_actions: list[ActiveAction] = []
+        expired_services: list[ActiveService] = []
+        with self._dispatch_lock:
+            for key, active in tuple(self._active_actions.items()):
+                deadline = active.recovery_deadline_monotonic
+                if (
+                    not active.cancelled
+                    or deadline is None
+                    or now < float(deadline)
+                ):
+                    continue
+                self._active_actions.pop(key, None)
+                expired_actions.append(active)
+            for key, active in tuple(self._active_services.items()):
+                deadline = active.recovery_deadline_monotonic
+                if (
+                    not active.cancelled
+                    or deadline is None
+                    or now < float(deadline)
+                ):
+                    continue
+                self._active_services.pop(key, None)
+                expired_services.append(active)
+        for active in expired_actions:
+            self._publish_execution_trace(
+                command_id=active.command.command_id,
+                route=active.route,
+                transport="action",
+                endpoint=self._execution_trace_endpoint_for_source(
+                    active.route,
+                    self._active_request_endpoint_source_locked(active),
+                ),
+                endpoint_source=self._active_request_endpoint_source_locked(active),
+                stage="unknown",
+                dispatch_submitted=bool(active.dispatched or active.goal_handle),
+                terminal=True,
+                evidence="response_unavailable",
+                reason_code="controller_recovery_timeout",
+                procedure_run_id=getattr(active.command, "procedure_run_id", ""),
+            )
+        for active in expired_services:
+            self._publish_execution_trace(
+                command_id=active.command.command_id,
+                route=active.route,
+                transport="service",
+                endpoint=self._execution_trace_endpoint_for_source(
+                    active.route,
+                    self._active_request_endpoint_source_locked(active),
+                ),
+                endpoint_source=self._active_request_endpoint_source_locked(active),
+                stage="unknown",
+                dispatch_submitted=bool(active.dispatched),
+                terminal=True,
+                evidence="response_unavailable",
+                reason_code="controller_recovery_timeout",
+                procedure_run_id=getattr(active.command, "procedure_run_id", ""),
+            )
+        if expired_actions or expired_services:
+            self.get_logger().warning(
+                "controller recovery window elapsed: "
+                f"actions={len(expired_actions)} services={len(expired_services)}"
+            )
+            self._publish_execution_route_state()
+
 
     @staticmethod
     def _skill_from_msg(msg: SkillCommand) -> InternalSkillCommand:
@@ -2907,6 +3777,9 @@ class SurgicalInteropExecutionBridge(Node):
             raw_distance_text=msg.raw_distance_text,
             rationale=msg.rationale,
             confidence=float(msg.confidence),
+            procedure_run_id=str(
+                getattr(msg, "procedure_run_id", "")
+            ).strip(),
         )
 
     def _publish_skill_status(
@@ -2921,6 +3794,7 @@ class SurgicalInteropExecutionBridge(Node):
         status = SkillStatus()
         status.stamp = self._stamp()
         status.command_id = command.command_id
+        status.procedure_run_id = command.procedure_run_id
         status.action = command.action
         status.instrument_id = command.instrument_id
         status.state = state
@@ -2954,6 +3828,7 @@ class SurgicalInteropExecutionBridge(Node):
         status.stamp = self._stamp()
         status.request_id = command.request_id
         status.command_id = command.command_id
+        status.procedure_run_id = command.procedure_run_id
         status.group_id = command.group_id
         status.operation = command.operation
         status.arm_id = command.arm_id
@@ -3022,6 +3897,74 @@ class SurgicalInteropExecutionBridge(Node):
             )
         )
 
+    def _execution_trace_endpoint_for_source(self, route: str, source: str) -> str:
+        """Return the endpoint that was bound to an old recovery record."""
+
+        try:
+            normalized = normalize_robot_endpoint_source(source)
+        except ValueError:
+            return self._execution_trace_endpoint(route)
+        if route == "tool_transfer":
+            return str(
+                getattr(
+                    self,
+                    (
+                        "_virtual_tool_handover_endpoint"
+                        if normalized == VIRTUAL_ENDPOINT_SOURCE
+                        else "_external_tool_handover_endpoint"
+                    ),
+                    self._execution_trace_endpoint(route),
+                )
+            )
+        return str(
+            getattr(
+                self,
+                (
+                    "_virtual_retraction_service_name"
+                    if normalized == VIRTUAL_ENDPOINT_SOURCE
+                    else "_external_retraction_service_name"
+                ),
+                self._execution_trace_endpoint(route),
+            )
+        )
+
+    def _execution_trace_endpoint_source(self, route: str) -> str:
+        """Return the route-family source latched for one observer event."""
+
+        if route == "retraction":
+            source = str(
+                getattr(self, "_run_retraction_source", "")
+                or getattr(
+                    self,
+                    "_retraction_endpoint_source",
+                    EXTERNAL_ENDPOINT_SOURCE,
+                )
+            )
+        else:
+            source = str(
+                getattr(self, "_run_endpoint_source", "")
+                or getattr(
+                    self,
+                    "_robot_endpoint_source",
+                    EXTERNAL_ENDPOINT_SOURCE,
+                )
+            )
+        try:
+            return normalize_robot_endpoint_source(source)
+        except ValueError:
+            return EXTERNAL_ENDPOINT_SOURCE
+
+    def _is_isolated_virtual_retraction_trace(self) -> bool:
+        """Whether this bridge dispatch used the isolated virtual Service."""
+
+        return (
+            self._execution_trace_endpoint_source("retraction")
+            == VIRTUAL_ENDPOINT_SOURCE
+            and is_isolated_virtual_endpoint(
+                self._execution_trace_endpoint("retraction")
+            )
+        )
+
     def _publish_execution_trace(
         self,
         *,
@@ -3035,6 +3978,8 @@ class SurgicalInteropExecutionBridge(Node):
         evidence: str,
         reason_code: str,
         retraction_request: RetractionCommandRequest | None = None,
+        endpoint_source: str | None = None,
+        procedure_run_id: str = "",
     ) -> None:
         """Publish a bounded fact about an outbound Action/Service lifecycle.
 
@@ -3064,15 +4009,25 @@ class SurgicalInteropExecutionBridge(Node):
             with self._dispatch_lock:
                 sequence = int(getattr(self, "_execution_trace_sequence", 0)) + 1
                 self._execution_trace_sequence = sequence
-                endpoint_source = str(
-                    getattr(self, "_run_endpoint_source", "")
-                    or getattr(self, "_robot_endpoint_source", EXTERNAL_ENDPOINT_SOURCE)
+            source = endpoint_source or self._execution_trace_endpoint_source(route)
+            try:
+                normalized_endpoint_source = normalize_robot_endpoint_source(source)
+            except ValueError:
+                normalized_endpoint_source = self._execution_trace_endpoint_source(
+                    route
                 )
             trace = ExecutionTrace()
             trace.stamp = self._stamp()
             trace.sequence = sequence
             trace.command_id = self._bounded_trace_text(
                 command_id, limit=_EXECUTION_TRACE_MAX_COMMAND_ID_CHARS
+            )
+            trace.procedure_run_id = self._bounded_trace_text(
+                procedure_run_id
+                or getattr(self, "_execution_trace_run_by_command", {}).get(
+                    trace.command_id, ""
+                ),
+                limit=64,
             )
             trace.route = self._bounded_trace_text(
                 route, limit=_EXECUTION_TRACE_MAX_ROUTE_CHARS
@@ -3083,7 +4038,7 @@ class SurgicalInteropExecutionBridge(Node):
             )
             if hasattr(trace, "endpoint_source"):
                 trace.endpoint_source = self._bounded_trace_text(
-                    endpoint_source,
+                    normalized_endpoint_source,
                     limit=16,
                 )
             trace.stage = normalized_stage
@@ -3112,6 +4067,10 @@ class SurgicalInteropExecutionBridge(Node):
                     else 0.0
                 )
             publisher.publish(trace)
+            self._publish_execution_announcement(
+                trace=trace,
+                retraction_request=retraction_request,
+            )
         except Exception:  # pragma: no cover - ROS publisher transport failure
             logger = getattr(self, "get_logger", None)
             if callable(logger):
@@ -3119,6 +4078,260 @@ class SurgicalInteropExecutionBridge(Node):
                     logger().warning("execution trace publish failed")
                 except Exception:
                     pass
+
+    def _publish_execution_announcement(
+        self,
+        *,
+        trace: ExecutionTrace,
+        retraction_request: RetractionCommandRequest | None,
+    ) -> None:
+        """Emit one small TTS fact for a verified endpoint admission.
+
+        This is deliberately not another lifecycle stream or a control path.
+        It records only the information already owned by execution at the
+        accepted controller boundary, so TTS never has to correlate a pickup,
+        a recovery, a voice proposal, and a separate trace in delivery order.
+        """
+
+        if (
+            str(getattr(trace, "stage", "")).strip().lower() != "accepted"
+            or not bool(getattr(trace, "dispatch_submitted", False))
+        ):
+            return
+        command_id = str(getattr(trace, "command_id", "") or "").strip()
+        procedure_run_id = str(
+            getattr(trace, "procedure_run_id", "") or ""
+        ).strip()
+        route = str(getattr(trace, "route", "") or "").strip()
+        if (
+            not command_id
+            or not valid_procedure_run_id(procedure_run_id)
+            or route not in {"tool_transfer", "retraction"}
+        ):
+            return
+
+        payload: dict[str, object] = {
+            "schema": _EXECUTION_ANNOUNCEMENT_SCHEMA,
+            "command_id": command_id,
+            "procedure_run_id": procedure_run_id,
+            "route": route,
+        }
+        if route == "tool_transfer":
+            with self._dispatch_lock:
+                active = self._active_actions.get(
+                    self._action_key("tool_transfer", command_id)
+                )
+            if active is None or not isinstance(active.command, InternalSkillCommand):
+                return
+            command = active.command
+            # Parking an already prepared tool is not a recovery. A manual
+            # return remains silent, except for a voice-backed replacement:
+            # after this Action is accepted, announce the requested tool's
+            # preparation now rather than waiting for its later pickup.
+            if command.action == "return_unused_preposition":
+                self._announce_voice_replacement_on_accepted_return(command)
+                return
+            if (
+                command.action == "retrieve_from_mayo"
+                and (
+                    command.voice_backed
+                    or str(command.mode or "").strip() != "recovery"
+                )
+            ):
+                return
+            payload.update(
+                {
+                    "action": str(command.action),
+                    "instrument_id": str(command.instrument_id),
+                    "request_generation": int(command.request_generation),
+                    "voice_backed": bool(command.voice_backed),
+                }
+            )
+            latest_state = getattr(self, "_latest_simulation_state", None)
+            if (
+                command.action == "retrieve_from_mayo"
+                and str(command.mode or "").strip() == "recovery"
+                and not bool(command.voice_backed)
+                and bool(getattr(latest_state, "running", False))
+                and str(
+                    getattr(latest_state, "execution_state", "") or ""
+                ).strip().casefold()
+                == "finishing"
+                and str(
+                    getattr(latest_state, "procedure_run_id", "") or ""
+                ).strip()
+                == procedure_run_id
+            ):
+                # This private presentation fact is the only tool speech that
+                # may cross the TTS finish barrier.  The Action has already
+                # been admitted by the endpoint and remains bound to this run.
+                payload["completion_cleanup"] = True
+            if (
+                str(command.action) in {"prepare_tool", "predict_tool", "tool_predict"}
+                and bool(command.voice_backed)
+                and str(command.mode or "").strip() == "explicit_request"
+                and int(command.request_generation) > 0
+            ):
+                payload["announcement_key"] = self._voice_prepare_announcement_key(
+                    procedure_run_id,
+                    int(command.request_generation),
+                )
+        else:
+            if (
+                str(getattr(trace, "transport", "")).strip().lower()
+                != "service"
+                or str(getattr(trace, "evidence", "")).strip().lower()
+                != "service_admission_only"
+                or retraction_request is None
+            ):
+                return
+            payload.update(
+                {
+                    "retraction_command": int(retraction_request.command),
+                    "target_side": int(retraction_request.target_side),
+                    "distance_m": float(retraction_request.distance_m),
+                }
+            )
+
+        self._publish_execution_announcement_payload(payload)
+
+    @staticmethod
+    def _voice_prepare_announcement_key(
+        procedure_run_id: str,
+        request_generation: int,
+    ) -> str:
+        """Return the durable TTS identity shared by both replacement legs."""
+
+        return f"voice-prepare:{procedure_run_id}:{int(request_generation)}"
+
+    def _announce_voice_replacement_on_accepted_return(
+        self,
+        command: InternalSkillCommand,
+    ) -> None:
+        """Speak the requested prepare phrase at the accepted parking leg."""
+
+        procedure_run_id = str(command.procedure_run_id or "").strip()
+        request_generation = int(command.request_generation)
+        if (
+            not bool(command.voice_backed)
+            or str(command.mode or "").strip() != "explicit_request"
+            or request_generation <= 0
+            or not valid_procedure_run_id(procedure_run_id)
+        ):
+            return
+        request_key = (procedure_run_id, request_generation)
+        requested_tool = ""
+        with self._dispatch_lock:
+            targets = getattr(self, "_voice_request_targets", None)
+            if targets is not None:
+                requested_tool = str(targets.get(request_key, "") or "")
+                if requested_tool:
+                    targets.move_to_end(request_key)
+            if not requested_tool:
+                pending = getattr(self, "_pending_voice_replacement_announcements", None)
+                if pending is None:
+                    pending = OrderedDict()
+                    self._pending_voice_replacement_announcements = pending
+                pending[request_key] = command.command_id
+                pending.move_to_end(request_key)
+                while len(pending) > _EXECUTION_ANNOUNCEMENT_MAX_FACTS:
+                    pending.popitem(last=False)
+                return
+        self._publish_voice_replacement_prepare_announcement(
+            command_id=command.command_id,
+            procedure_run_id=procedure_run_id,
+            request_generation=request_generation,
+            requested_tool=requested_tool,
+        )
+
+    def _publish_voice_replacement_prepare_announcement(
+        self,
+        *,
+        command_id: str,
+        procedure_run_id: str,
+        request_generation: int,
+        requested_tool: str,
+    ) -> None:
+        """Publish the presentation-only fact for an accepted replacement."""
+
+        if (
+            not command_id
+            or not valid_procedure_run_id(procedure_run_id)
+            or request_generation <= 0
+            or not requested_tool
+        ):
+            return
+        self._publish_execution_announcement_payload(
+            {
+                "schema": _EXECUTION_ANNOUNCEMENT_SCHEMA,
+                "command_id": command_id,
+                "procedure_run_id": procedure_run_id,
+                "route": "tool_transfer",
+                "action": "prepare_tool",
+                "instrument_id": requested_tool,
+                "request_generation": int(request_generation),
+                "voice_backed": True,
+                "announcement_key": self._voice_prepare_announcement_key(
+                    procedure_run_id,
+                    request_generation,
+                ),
+            }
+        )
+
+    def _publish_execution_announcement_payload(
+        self,
+        payload: dict[str, object],
+    ) -> None:
+        """Publish one bounded, locally de-duplicated execution TTS fact."""
+
+        command_id = str(payload.get("command_id") or "").strip()
+        procedure_run_id = str(payload.get("procedure_run_id") or "").strip()
+        route = str(payload.get("route") or "").strip()
+        if (
+            not command_id
+            or not valid_procedure_run_id(procedure_run_id)
+            or route not in {"tool_transfer", "retraction"}
+        ):
+            return
+        try:
+            request_generation = int(payload.get("request_generation", 0) or 0)
+        except (TypeError, ValueError):
+            return
+        if request_generation < 0:
+            return
+        fact_key = (
+            f"{procedure_run_id}:{route}:{command_id}:"
+            f"{request_generation}"
+        )
+        publisher = getattr(self, "_execution_announcement_pub", None)
+        if publisher is None:
+            return
+        with self._dispatch_lock:
+            announced = getattr(self, "_execution_announced_commands", None)
+            if announced is None:
+                announced = OrderedDict()
+                self._execution_announced_commands = announced
+            if fact_key in announced:
+                return
+            announced[fact_key] = None
+            while len(announced) > _EXECUTION_ANNOUNCEMENT_MAX_FACTS:
+                announced.popitem(last=False)
+        try:
+            publisher.publish(
+                String(
+                    data=json.dumps(
+                        payload,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    )
+                )
+            )
+        except Exception:  # pragma: no cover - observer publication only
+            with self._dispatch_lock:
+                getattr(self, "_execution_announced_commands", {}).pop(
+                    fact_key, None
+                )
 
     @staticmethod
     def _tool_transfer_goal(
@@ -3163,6 +4376,84 @@ class SurgicalInteropExecutionBridge(Node):
         service_request.target_side = int(request.target_side)
         service_request.distance_m = float(request.distance_m)
         return service_request
+
+    def _publish_tool_transfer_task_event(
+        self,
+        command: InternalSkillCommand,
+        *,
+        event_type: str,
+        final_state: str = "",
+        reason_code: str = "",
+        failure_detail: str = "",
+    ) -> None:
+        """Project one accepted Action boundary into the Digital Twin.
+
+        The direct execution bridge, unlike the legacy mock Action server,
+        previously published only inventory completions on ``/skill/events``.
+        That left ``active_robot_task`` empty while a controller Goal was in
+        flight, so BT could issue a second request that was rejected only by
+        this bridge's busy lane.  Keep the established RobotTaskStarted/
+        RobotTaskCompleted payload shape and publish it only after acceptance
+        or a correlated terminal Action result.
+        """
+
+        if event_type not in {"RobotTaskStarted", "RobotTaskCompleted"}:
+            raise ValueError(f"unsupported tool task event: {event_type!r}")
+
+        event = TwinEvent()
+        event.stamp = self._stamp()
+        event.procedure_run_id = command.procedure_run_id
+        event.event_type = event_type
+        event.instrument_id = command.instrument_id
+        event.instance_id = command.instrument_instance_id
+        event.phase_id = ""
+        event.location_id = ""
+        event.location_type = ""
+        event.owner = ""
+        event.status = ""
+        event.confidence = 1.0
+        # ExecuteToolHandover does not report which arm the external
+        # controller selected, so do not turn the planner hint into a physical
+        # assertion. Source/target remain the exact admitted command anchors.
+        event.arm = ""
+        event.source_location_id = command.source_location_id
+        event.source_location_type = command.source_location_type
+        event.target_location_id = command.target_location_id
+        event.target_location_type = command.target_location_type
+        event.target_owner = ""
+        event.cleaning_required = False
+        event.mode = command.mode
+        detail = {
+            "command_id": command.command_id,
+            "duration_sec": 0.0,
+            "request_generation": int(command.request_generation),
+            "source_anchor_id": command.source_location_id,
+            "target_anchor_id": command.target_location_id,
+            "task_id": command.command_id,
+            "task_type": command.action,
+            "transport": "ros2_action",
+            "voice_backed": bool(command.voice_backed),
+        }
+        if command.instrument_instance_id:
+            detail["instrument_instance_id"] = command.instrument_instance_id
+        if event_type == "RobotTaskCompleted":
+            detail["controller_final_state"] = str(final_state)
+            detail["controller_reason_code"] = str(reason_code)
+            # Preserve the controller's terminal diagnostic in the existing
+            # task-event record.  Keep the field optional so successful and
+            # legacy callers retain the established detail shape.
+            normalized_failure_detail = self._bounded_trace_text(
+                failure_detail,
+                limit=_EXECUTION_EVENT_FAILURE_DETAIL_MAX_CHARS,
+            )
+            if normalized_failure_detail:
+                detail["failure_detail"] = normalized_failure_detail
+        event.detail_json = json.dumps(
+            detail,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        self._skill_event_pub.publish(event)
 
     def _publish_tool_transfer_completed_events(
         self,
@@ -3404,6 +4695,7 @@ class SurgicalInteropExecutionBridge(Node):
 
         event = TwinEvent()
         event.stamp = self._stamp()
+        event.procedure_run_id = command.procedure_run_id
         event.event_type = event_type
         event.instrument_id = command.instrument_id
         event.instance_id = command.instrument_instance_id
@@ -3457,6 +4749,14 @@ class SurgicalInteropExecutionBridge(Node):
     def _on_skill(self, msg: SkillCommand) -> None:
         command = self._skill_from_msg(msg)
         direct_hand_error = self._direct_hand_run_guard(command)
+        if command.procedure_run_id:
+            trace_run_by_command = getattr(
+                self, "_execution_trace_run_by_command", None
+            )
+            if trace_run_by_command is None:
+                trace_run_by_command = {}
+                self._execution_trace_run_by_command = trace_run_by_command
+            trace_run_by_command[command.command_id] = command.procedure_run_id
         if direct_hand_error:
             self._publish_skill_status(
                 command,
@@ -3465,20 +4765,21 @@ class SurgicalInteropExecutionBridge(Node):
                 reason_code=direct_hand_error,
             )
             return
+        retrieval_error = self._retrieval_run_guard(command)
+        if retrieval_error:
+            self._publish_skill_status(
+                command,
+                state="rejected",
+                success=False,
+                reason_code=retrieval_error,
+            )
+            return
         if not self._tool_handover_enabled:
             self._publish_skill_status(
                 command,
                 state="rejected",
                 success=False,
                 reason_code="tool_handover_disabled_for_procedure",
-            )
-            return
-        if not self._runtime_is_accepting():
-            self._publish_skill_status(
-                command,
-                state="cancelled",
-                success=False,
-                reason_code="runtime_not_accepting_commands",
             )
             return
         instrument_name, instrument_instance_id = self._public_instrument_identity(
@@ -3498,8 +4799,21 @@ class SurgicalInteropExecutionBridge(Node):
                 reason_code=exc.code,
             )
             return
-        if self._queue_voice_tool_transfer_preemption(command, transfer_request):
+        if not self._runtime_is_accepting():
+            if self._defer_startup_tool_transfer(command, transfer_request):
+                return
+            self._publish_skill_status(
+                command,
+                state="cancelled",
+                success=False,
+                reason_code="runtime_not_accepting_commands",
+            )
             return
+        # Voice provenance never changes the Action lane's single-flight rule.
+        # If a Goal is already active, _begin_action_dispatch reports
+        # tool_transfer_busy without canceling or replacing that Goal. Any
+        # later retry is a new admission decision after the active Goal's
+        # authoritative terminal result; it is not Action preemption here.
         self._dispatch_tool_transfer(command, transfer_request)
 
     def _dispatch_tool_transfer(
@@ -3515,15 +4829,6 @@ class SurgicalInteropExecutionBridge(Node):
                 state="offline",
                 success=False,
                 reason_code="server_unavailable",
-            )
-            return
-        admission_error = self._dispatch_admission_guard("tool_transfer")
-        if admission_error:
-            self._publish_skill_status(
-                command,
-                state="rejected",
-                success=False,
-                reason_code=admission_error,
             )
             return
         dispatch_error = self._begin_action_dispatch(
@@ -3596,11 +4901,15 @@ class SurgicalInteropExecutionBridge(Node):
             # unchanged. Release through the normal terminal path so a voice
             # request queued during the wait is rebased instead of stranded.
             _tracked, _cancelled, semantic_leg, _active_epoch = (
-                self._tool_transfer_action_snapshot(command.command_id)
+                self._tool_transfer_action_snapshot(
+                    command.command_id,
+                    expected_epoch=expected_epoch,
+                )
             )
             self._finish_tool_transfer_action(
                 command.command_id,
                 safe_terminal=True,
+                expected_epoch=expected_epoch,
                 controller_confirmed_tool_location=(
                     semantic_leg[0] if semantic_leg is not None else ""
                 ),
@@ -3616,33 +4925,6 @@ class SurgicalInteropExecutionBridge(Node):
             command,
             expected_epoch=expected_epoch,
         ):
-            return
-        # A source lease may age out while waiting for the Action server or
-        # while a lifecycle callback is interleaved. Recheck at the I/O edge.
-        admission_error = self._dispatch_admission_guard("tool_transfer")
-        if admission_error:
-            if self._finish_tool_transfer_before_send_if_cancelled(
-                command,
-                expected_epoch=expected_epoch,
-            ):
-                return
-            self._publish_skill_status(
-                command,
-                state="rejected",
-                success=False,
-                reason_code=admission_error,
-            )
-            # Admission rejected before Goal submission; source is unchanged.
-            _tracked, _cancelled, semantic_leg, _active_epoch = (
-                self._tool_transfer_action_snapshot(command.command_id)
-            )
-            self._finish_tool_transfer_action(
-                command.command_id,
-                safe_terminal=True,
-                controller_confirmed_tool_location=(
-                    semantic_leg[0] if semantic_leg is not None else ""
-                ),
-            )
             return
         if self._finish_tool_transfer_before_send_if_cancelled(
             command,
@@ -3660,6 +4942,21 @@ class SurgicalInteropExecutionBridge(Node):
             self._finish_tool_transfer_action(
                 command.command_id,
                 safe_terminal=True,
+                expected_epoch=expected_epoch,
+            )
+            return
+        retrieval_error = self._retrieval_run_guard(command)
+        if retrieval_error:
+            self._publish_skill_status(
+                command,
+                state="rejected",
+                success=False,
+                reason_code=retrieval_error,
+            )
+            self._finish_tool_transfer_action(
+                command.command_id,
+                safe_terminal=True,
+                expected_epoch=expected_epoch,
             )
             return
         if command.mode == "implicit_request":
@@ -3685,6 +4982,7 @@ class SurgicalInteropExecutionBridge(Node):
                 self._finish_tool_transfer_action(
                     command.command_id,
                     safe_terminal=True,
+                    expected_epoch=expected_epoch,
                 )
                 return
             if not reservation.accepted:
@@ -3701,13 +4999,40 @@ class SurgicalInteropExecutionBridge(Node):
                 self._finish_tool_transfer_action(
                     command.command_id,
                     safe_terminal=True,
+                    expected_epoch=expected_epoch,
                 )
                 return
+        # Once a client Goal send may leave this process, retain a recovery
+        # record across stop/reset even before the asynchronous goal response
+        # supplies a GoalHandle.
+        with self._dispatch_lock:
+            active = self._active_actions.get(
+                self._action_key("tool_transfer", command.command_id)
+            )
+            can_send = bool(
+                active is not None
+                and not active.cancelled
+                and int(active.dispatch_epoch) == int(expected_epoch)
+                and int(getattr(self, "_dispatch_epoch", 0)) == int(expected_epoch)
+            )
+            if can_send:
+                active.dispatched = True
+        if not can_send:
+            self._finish_tool_transfer_action(
+                command.command_id,
+                safe_terminal=True,
+                expected_epoch=expected_epoch,
+            )
+            return
         try:
             future = self._tool_transfer_client.send_goal_async(
                 self._tool_transfer_goal(request),
-                feedback_callback=lambda feedback, command=command: (
-                    self._on_tool_transfer_feedback(command, feedback)
+                feedback_callback=lambda feedback, command=command, expected_epoch=expected_epoch: (
+                    self._on_tool_transfer_feedback(
+                        command,
+                        feedback,
+                        expected_epoch=expected_epoch,
+                    )
                 ),
             )
         except Exception:  # pragma: no cover - ROS transport failure
@@ -3731,6 +5056,7 @@ class SurgicalInteropExecutionBridge(Node):
             self._finish_tool_transfer_action(
                 command.command_id,
                 safe_terminal=False,
+                expected_epoch=expected_epoch,
             )
             return
         if command.mode == "implicit_request":
@@ -3755,18 +5081,27 @@ class SurgicalInteropExecutionBridge(Node):
             reason_code="goal_send_submitted",
         )
         future.add_done_callback(
-            lambda result, command=command: self._on_tool_transfer_goal_response(
-                command, result
+            lambda result, command=command, expected_epoch=expected_epoch: self._on_tool_transfer_goal_response(
+                command,
+                result,
+                expected_epoch=expected_epoch,
             )
         )
 
     def _on_tool_transfer_feedback(
-        self, command: InternalSkillCommand, feedback_message: Any
+        self,
+        command: InternalSkillCommand,
+        feedback_message: Any,
+        *,
+        expected_epoch: int | None = None,
     ) -> None:
-        tracked, cancel_requested = self._tool_transfer_action_state(
-            command.command_id
+        tracked, cancel_requested, _semantic_leg, action_epoch = (
+            self._tool_transfer_action_snapshot(
+                command.command_id,
+                expected_epoch=expected_epoch,
+            )
         )
-        if not tracked:
+        if not tracked or action_epoch != int(getattr(self, "_dispatch_epoch", 0)):
             return
         feedback = feedback_message.feedback
         feedback_state = str(feedback.state).strip()
@@ -3788,15 +5123,27 @@ class SurgicalInteropExecutionBridge(Node):
         )
 
     def _on_tool_transfer_goal_response(
-        self, command: InternalSkillCommand, future: Any
+        self,
+        command: InternalSkillCommand,
+        future: Any,
+        *,
+        expected_epoch: int | None = None,
     ) -> None:
         try:
             goal_handle = future.result()
         except Exception:  # pragma: no cover - ROS transport failure
-            tracked, cancel_requested = self._tool_transfer_action_state(
-                command.command_id
+            tracked, cancel_requested, _semantic_leg, action_epoch = (
+                self._tool_transfer_action_snapshot(
+                    command.command_id,
+                    expected_epoch=expected_epoch,
+                )
             )
             if not tracked:
+                return
+            # A stopped run has already asked the controller to cancel this
+            # Goal.  Keep the ambiguous record for route/restart recovery,
+            # but do not let its late transport failure poison the new run.
+            if action_epoch != int(getattr(self, "_dispatch_epoch", 0)):
                 return
             self._block_runtime_dispatch()
             self._publish_skill_status(
@@ -3827,10 +5174,23 @@ class SurgicalInteropExecutionBridge(Node):
             )
             return
         if goal_handle is None or not goal_handle.accepted:
-            tracked, cancel_requested, semantic_leg, _dispatch_epoch = (
-                self._tool_transfer_action_snapshot(command.command_id)
+            tracked, cancel_requested, semantic_leg, action_epoch = (
+                self._tool_transfer_action_snapshot(
+                    command.command_id,
+                    expected_epoch=expected_epoch,
+                )
             )
             if not tracked:
+                return
+            if action_epoch != int(getattr(self, "_dispatch_epoch", 0)):
+                # The controller explicitly rejected the late Goal, so the
+                # old recovery record can be dropped without projecting an
+                # obsolete status into the current run.
+                self._clear_action(
+                    "tool_transfer",
+                    command.command_id,
+                    expected_epoch=expected_epoch,
+                )
                 return
             if cancel_requested:
                 self._publish_skill_status(
@@ -3876,6 +5236,7 @@ class SurgicalInteropExecutionBridge(Node):
             self._finish_tool_transfer_action(
                 command.command_id,
                 safe_terminal=bool(cancel_requested),
+                expected_epoch=expected_epoch,
                 controller_confirmed_tool_location=(
                     semantic_leg[0]
                     if cancel_requested and semantic_leg is not None
@@ -3883,8 +5244,14 @@ class SurgicalInteropExecutionBridge(Node):
                 ),
             )
             return
-        tracked, cancel_requested = self._set_tool_transfer_goal_handle(
-            command.command_id, goal_handle
+        (
+            tracked,
+            cancel_requested,
+            publish_task_started,
+        ) = self._set_tool_transfer_goal_handle(
+            command.command_id,
+            goal_handle,
+            expected_epoch=expected_epoch,
         )
         if not tracked:
             try:
@@ -3892,6 +5259,35 @@ class SurgicalInteropExecutionBridge(Node):
             except Exception:  # pragma: no cover - ROS transport failure
                 pass
             return
+        _tracked, _cancelled, _semantic_leg, action_epoch = (
+            self._tool_transfer_action_snapshot(
+                command.command_id,
+                expected_epoch=expected_epoch,
+            )
+        )
+        if action_epoch != int(getattr(self, "_dispatch_epoch", 0)):
+            # The Action was accepted before a stop/pause edge.  Request its
+            # controller-side cancellation, but suppress it as stale UI work
+            # for the run that has since started.
+            try:
+                goal_handle.cancel_goal_async()
+            except Exception:  # pragma: no cover - ROS transport failure
+                self.get_logger().warning(
+                    f"failed to cancel stale tool_transfer command {command.command_id}"
+                )
+            goal_handle.get_result_async().add_done_callback(
+                lambda result, command=command, expected_epoch=expected_epoch: self._on_tool_transfer_result(
+                    command,
+                    result,
+                    expected_epoch=expected_epoch,
+                )
+            )
+            return
+        if publish_task_started:
+            self._publish_tool_transfer_task_event(
+                command,
+                event_type="RobotTaskStarted",
+            )
         if cancel_requested:
             try:
                 goal_handle.cancel_goal_async()
@@ -3918,16 +5314,25 @@ class SurgicalInteropExecutionBridge(Node):
                 reason_code="goal_accepted",
             )
         goal_handle.get_result_async().add_done_callback(
-            lambda result, command=command: self._on_tool_transfer_result(
-                command, result
+            lambda result, command=command, expected_epoch=expected_epoch: self._on_tool_transfer_result(
+                command,
+                result,
+                expected_epoch=expected_epoch,
             )
         )
 
     def _on_tool_transfer_result(
-        self, command: InternalSkillCommand, future: Any
+        self,
+        command: InternalSkillCommand,
+        future: Any,
+        *,
+        expected_epoch: int | None = None,
     ) -> None:
-        tracked, cancel_requested, semantic_leg, _dispatch_epoch = (
-            self._tool_transfer_action_snapshot(command.command_id)
+        tracked, cancel_requested, semantic_leg, action_epoch = (
+            self._tool_transfer_action_snapshot(
+                command.command_id,
+                expected_epoch=expected_epoch,
+            )
         )
         if not tracked:
             return
@@ -3935,6 +5340,17 @@ class SurgicalInteropExecutionBridge(Node):
             wrapped_result = future.result()
         except Exception:  # pragma: no cover - ROS transport failure
             wrapped_result = None
+        if action_epoch != int(getattr(self, "_dispatch_epoch", 0)):
+            # A result future is terminal by ROS Action semantics.  It closes
+            # the old recovery record, but must not reintroduce a previous
+            # action into the restarted run's status stream.
+            if wrapped_result is not None:
+                self._clear_action(
+                    "tool_transfer",
+                    command.command_id,
+                    expected_epoch=expected_epoch,
+                )
+            return
         if wrapped_result is None:
             self._block_runtime_dispatch()
             self._publish_skill_status(
@@ -3966,6 +5382,11 @@ class SurgicalInteropExecutionBridge(Node):
             return
         result = getattr(wrapped_result, "result", None)
         ros_status = int(getattr(wrapped_result, "status", GoalStatus.STATUS_UNKNOWN))
+        terminal_result_correlated = ros_status in {
+            GoalStatus.STATUS_SUCCEEDED,
+            GoalStatus.STATUS_CANCELED,
+            GoalStatus.STATUS_ABORTED,
+        }
         if result is None:
             self._block_runtime_dispatch()
             self._publish_skill_status(
@@ -3986,14 +5407,32 @@ class SurgicalInteropExecutionBridge(Node):
                 evidence="response_invalid",
                 reason_code="invalid_controller_result",
             )
+            if (
+                terminal_result_correlated
+                and self._claim_tool_transfer_task_completion(
+                    command.command_id,
+                    expected_epoch=expected_epoch,
+                )
+            ):
+                self._publish_tool_transfer_task_event(
+                    command,
+                    event_type="RobotTaskCompleted",
+                    final_state=ExecuteToolHandover.Result.FINAL_FAILED,
+                    reason_code="invalid_controller_result",
+                )
             self._finish_tool_transfer_action(
                 command.command_id,
                 safe_terminal=False,
+                expected_epoch=expected_epoch,
             )
             return
         success = bool(result.success)
         final_state = str(result.final_state).strip()
         reason_code = str(result.reason_code).strip()
+        failure_detail = self._bounded_trace_text(
+            getattr(result, "failure_detail", ""),
+            limit=_EXECUTION_EVENT_FAILURE_DETAIL_MAX_CHARS,
+        )
         expected_ros_status = {
             ExecuteToolHandover.Result.FINAL_COMPLETED: GoalStatus.STATUS_SUCCEEDED,
             ExecuteToolHandover.Result.FINAL_CANCELED: GoalStatus.STATUS_CANCELED,
@@ -4074,6 +5513,20 @@ class SurgicalInteropExecutionBridge(Node):
             evidence=("controller_result" if result_is_consistent else "response_invalid"),
             reason_code=reason_code,
         )
+        if (
+            terminal_result_correlated
+            and self._claim_tool_transfer_task_completion(
+                command.command_id,
+                expected_epoch=expected_epoch,
+            )
+        ):
+            self._publish_tool_transfer_task_event(
+                command,
+                event_type="RobotTaskCompleted",
+                final_state=final_state,
+                reason_code=reason_code,
+                failure_detail=failure_detail,
+            )
         self._finish_tool_transfer_action(
             command.command_id,
             safe_terminal=(
@@ -4084,6 +5537,7 @@ class SurgicalInteropExecutionBridge(Node):
                     ExecuteToolHandover.Result.FINAL_CANCELED,
                 }
             ),
+            expected_epoch=expected_epoch,
             controller_confirmed_tool_location=(
                 self._controller_confirmed_tool_location(
                     semantic_leg,
@@ -4098,6 +5552,30 @@ class SurgicalInteropExecutionBridge(Node):
 
     def _on_group(self, msg: BedRobotArmGroupCommand) -> None:
         command = self._group_from_msg(msg)
+        with self._dispatch_lock:
+            simulation_state = self._latest_simulation_state
+        current_run_id = str(
+            getattr(simulation_state, "procedure_run_id", "") or ""
+        ).strip()
+        if (
+            not valid_procedure_run_id(command.procedure_run_id)
+            or not bool(getattr(simulation_state, "running", False))
+            or str(getattr(simulation_state, "execution_state", "")).strip().lower()
+            != "running"
+            or command.procedure_run_id != current_run_id
+        ):
+            self._publish_group_status(
+                command,
+                state="standby",
+                outcome="rejected",
+                terminal=True,
+                success=False,
+                reason_code="command_procedure_run_mismatch",
+            )
+            return
+        self._execution_trace_run_by_command[command.command_id] = (
+            command.procedure_run_id
+        )
         try:
             request = map_group_command(
                 command,
@@ -4114,6 +5592,16 @@ class SurgicalInteropExecutionBridge(Node):
             )
             return
         is_stop_request = request.command == RETRACTION_COMMAND_STOP_RETRACTION
+        if not retraction_request_allowed_by_scenario(request, simulation_state):
+            self._publish_group_status(
+                command,
+                state="standby",
+                outcome="rejected",
+                terminal=True,
+                success=False,
+                reason_code="scenario_not_running",
+            )
+            return
         if not self._runtime_is_accepting() and not is_stop_request:
             self._publish_group_status(
                 command,
@@ -4143,9 +5631,12 @@ class SurgicalInteropExecutionBridge(Node):
         request: RetractionCommandRequest,
     ) -> None:
         is_stop_request = request.command == RETRACTION_COMMAND_STOP_RETRACTION
-        if not self._retraction_service_client.wait_for_service(
-            timeout_sec=self._server_wait_timeout_sec
-        ):
+        # This callback is part of the command executor.  Do not spend its
+        # thread polling a remote Service while a voice/BT command is waiting:
+        # route readiness is already observed independently, so admission is
+        # an immediate ``ready now`` decision and the actual response remains
+        # asynchronous below.
+        if not self._retraction_service_client.service_is_ready():
             self._publish_group_status(
                 command,
                 state="offline",
@@ -4153,19 +5644,6 @@ class SurgicalInteropExecutionBridge(Node):
                 terminal=True,
                 success=False,
                 reason_code="service_unavailable",
-            )
-            return
-        admission_error = self._dispatch_admission_guard(
-            "retraction", allow_stop=is_stop_request
-        )
-        if admission_error:
-            self._publish_group_status(
-                command,
-                state="fault",
-                outcome="rejected",
-                terminal=True,
-                success=False,
-                reason_code=admission_error,
             )
             return
         dispatch_error = self._begin_service_dispatch(
@@ -4200,25 +5678,14 @@ class SurgicalInteropExecutionBridge(Node):
             reason_code="dispatching",
         )
         canceled_before_dispatch = False
-        admission_error = self._dispatch_admission_guard(
-            "retraction", allow_stop=is_stop_request
-        )
-        if admission_error:
-            self._clear_service("retraction", command.command_id)
-            self._publish_group_status(
-                command,
-                state="fault",
-                outcome="rejected",
-                terminal=True,
-                success=False,
-                reason_code=admission_error,
-            )
-            return
+        expected_epoch: int | None = None
         try:
             with self._dispatch_lock:
                 active = self._active_services.get(
                     self._action_key("retraction", command.command_id)
                 )
+                if active is not None:
+                    expected_epoch = int(active.dispatch_epoch)
                 if active is None or active.cancelled:
                     canceled_before_dispatch = True
                     future = None
@@ -4229,7 +5696,12 @@ class SurgicalInteropExecutionBridge(Node):
                     )
                     active.future = future
         except Exception:  # pragma: no cover - ROS transport failure
-            self._clear_service("retraction", command.command_id)
+            if expected_epoch is not None:
+                self._clear_service(
+                    "retraction",
+                    command.command_id,
+                    expected_epoch=expected_epoch,
+                )
             self._publish_execution_trace(
                 command_id=command.command_id,
                 route="retraction",
@@ -4252,7 +5724,12 @@ class SurgicalInteropExecutionBridge(Node):
             )
             return
         if canceled_before_dispatch or future is None:
-            self._clear_service("retraction", command.command_id)
+            if expected_epoch is not None:
+                self._clear_service(
+                    "retraction",
+                    command.command_id,
+                    expected_epoch=expected_epoch,
+                )
             self._publish_group_status(
                 command,
                 state="canceled",
@@ -4275,8 +5752,11 @@ class SurgicalInteropExecutionBridge(Node):
             retraction_request=request,
         )
         future.add_done_callback(
-            lambda result, command=command, request=request: self._on_retraction_service_result(
-                command, result, request=request
+            lambda result, command=command, request=request, expected_epoch=expected_epoch: self._on_retraction_service_result(
+                command,
+                result,
+                request=request,
+                expected_epoch=expected_epoch,
             )
         )
 
@@ -4286,6 +5766,7 @@ class SurgicalInteropExecutionBridge(Node):
         future: Any,
         *,
         request: RetractionCommandRequest | None = None,
+        expected_epoch: int | None = None,
     ) -> None:
         """Record Service admission without inventing physical completion.
 
@@ -4298,7 +5779,16 @@ class SurgicalInteropExecutionBridge(Node):
             active = self._active_services.get(
                 self._action_key("retraction", command.command_id)
             )
+            if active is not None and (
+                expected_epoch is not None
+                and int(active.dispatch_epoch) != int(expected_epoch)
+            ):
+                active = None
             cancel_requested = bool(active.cancelled) if active is not None else False
+            service_epoch = (
+                int(active.dispatch_epoch) if active is not None else -1
+            )
+            current_epoch = int(getattr(self, "_dispatch_epoch", 0))
         if active is None:
             return
         try:
@@ -4306,6 +5796,12 @@ class SurgicalInteropExecutionBridge(Node):
         except Exception:  # pragma: no cover - ROS transport failure
             result = None
         if result is None:
+            if service_epoch != current_epoch:
+                # Stop/reset already surfaced this unresolved controller call
+                # to the operator.  Preserve its recovery record, but never
+                # let a late transport failure turn a later clean run back
+                # into a locally blocked runtime.
+                return
             self._block_runtime_dispatch()
             response_reason = (
                 "service_response_unavailable_after_stop"
@@ -4354,6 +5850,11 @@ class SurgicalInteropExecutionBridge(Node):
             or (not accepted and result_code in valid_rejection_codes)
         )
         if not valid:
+            if service_epoch != current_epoch:
+                # As with a lost response, keep the ambiguous old record for
+                # the stopped-route recovery boundary without republishing it
+                # into the next procedure run.
+                return
             self._block_runtime_dispatch()
             self._publish_group_status(
                 command,
@@ -4377,7 +5878,17 @@ class SurgicalInteropExecutionBridge(Node):
             )
             return
         message = str(getattr(result, "message", "")).strip()
-        self._clear_service("retraction", command.command_id)
+        self._clear_service(
+            "retraction",
+            command.command_id,
+            expected_epoch=expected_epoch,
+        )
+        if service_epoch != current_epoch:
+            # This is a real terminal Service receipt for a request from a
+            # prior run.  It closes that old transport record silently: stop
+            # already reported the unknown/cancel-pending state, and emitting
+            # it now would make stale UI work appear in the current run.
+            return
         if accepted and cancel_requested:
             # The controller may already execute a request admitted after the
             # local runtime stopped.  The Service has no cancellation or
@@ -4405,6 +5916,7 @@ class SurgicalInteropExecutionBridge(Node):
             )
             return
         if accepted:
+            virtual_transaction = self._is_isolated_virtual_retraction_trace()
             self._publish_group_status(
                 command,
                 state="accepted",
@@ -4422,11 +5934,27 @@ class SurgicalInteropExecutionBridge(Node):
                 endpoint=self._execution_trace_endpoint("retraction"),
                 stage="accepted",
                 dispatch_submitted=True,
-                terminal=True,
+                terminal=not virtual_transaction,
                 evidence="service_admission_only",
                 reason_code="request_accepted",
                 retraction_request=request,
             )
+            if virtual_transaction:
+                # The virtual endpoint has completed its local Service
+                # transaction.  This is intentionally not bed-arm status or
+                # controller-confirmed physical completion.
+                self._publish_execution_trace(
+                    command_id=command.command_id,
+                    route="retraction",
+                    transport="service",
+                    endpoint=self._execution_trace_endpoint("retraction"),
+                    stage="completed",
+                    dispatch_submitted=True,
+                    terminal=True,
+                    evidence="virtual_service_transaction_completed",
+                    reason_code="virtual_service_completed",
+                    retraction_request=request,
+                )
             return
         self._publish_group_status(
             command,
@@ -4453,10 +5981,9 @@ class SurgicalInteropExecutionBridge(Node):
 def main() -> None:
     rclpy.init()
     node = SurgicalInteropExecutionBridge()
-    # The stopped-only coordinator blocks briefly for manager/preflight
-    # responses.  A second executor worker keeps its re-entrant simulation
-    # state subscription live during that bounded wait; this does not create
-    # another command path or dispatch any robot request.
+    # Route-control requests and authoritative simulation-state updates can
+    # arrive concurrently.  The second worker keeps that stopped/no-inflight
+    # boundary responsive without adding a preflight or reset round trip.
     executor = MultiThreadedExecutor(num_threads=2)
     executor.add_node(node)
     try:

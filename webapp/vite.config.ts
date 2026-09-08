@@ -30,20 +30,24 @@ function runtimeControlProxy() {
 
 export default defineConfig({
   plugins: [react()],
-  optimizeDeps: {
-    include: ["roslib-monitor"],
-  },
   build: {
     manifest: true,
     chunkSizeWarningLimit: 650,
     rollupOptions: {
       input: {
         main: resolve(webappRoot, "index.html"),
-        monitor: resolve(webappRoot, "monitor/index.html"),
       },
       output: {
         codeSplitting: {
           groups: [
+            {
+              // Keep Vite's tiny preload helper independent from the main
+              // runtime group so lazy dashboard chunks stay cacheable.
+              name: "preload-runtime",
+              test: /\0(?:vite\/(?:preload-helper|modulepreload-polyfill)|rolldown\/runtime)\.js$/,
+              priority: 60,
+              includeDependenciesRecursively: false,
+            },
             {
               name: "react-vendor",
               test: /\/node_modules\/(react|react-dom|scheduler)\//,
@@ -61,9 +65,9 @@ export default defineConfig({
             },
             {
               // Runtime selection, bridge admission, and bounded payload parsing
-              // form one cacheable safety boundary shared by Mission/Debug.
+              // form one cacheable safety boundary shared by Mission and Debug.
               name: "runtime-core",
-              test: /\/src\/(?:runtimeModes|hooks\/use(?:RosBridge|RuntimeControl)|utils\/(?:display|runtimeAuthorityCopy))\.tsx?$/,
+              test: /\/src\/(?:runtimeModes|hooks\/use(?:RosBridge|RuntimeControl)|utils\/runtimeAuthorityCopy)\.tsx?$/,
               priority: 15,
             },
             {

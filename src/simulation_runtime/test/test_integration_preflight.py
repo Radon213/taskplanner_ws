@@ -4,7 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from procedure_spec import load_bundle
+from procedure_spec import load_bundle, scenario_config_payload
 
 import simulation_runtime.integration_preflight as preflight_module
 from simulation_runtime.integration_preflight import (
@@ -901,128 +901,30 @@ def _ready_snapshot_node() -> IntegrationPreflightNode:
     return node
 
 
-def test_execution_route_preflight_ack_requires_exact_revision_and_init_barrier() -> None:
-    node = IntegrationPreflightNode.__new__(IntegrationPreflightNode)
-    node._route_state_selected_source = "virtual"
-    node._route_state_revision = 7
-    node._route_state_initialization_revision = 12
-    node._route_state_initialization_state = "initializing"
-    node._route_state_initialized = False
-
-    def acknowledge(require_initialized: bool):
-        return node._handle_execution_route_preflight_ack(
-            SimpleNamespace(
-                operation="execution_route_preflight_ack",
-                payload_json=json.dumps(
-                    {
-                        "source": "virtual",
-                        "revision": 7,
-                        "initialization_revision": 12,
-                        "require_initialized": require_initialized,
-                    }
-                ),
-            ),
-            SimpleNamespace(),
-        )
-
-    assert acknowledge(False).accepted is True
-    assert acknowledge(True).accepted is False
-
-    node._route_state_initialization_state = "initialized"
-    node._route_state_initialized = True
-    accepted = acknowledge(True)
-    assert accepted.accepted is True
-    assert json.loads(accepted.result_json) == {
-        "initialization_revision": 12,
-        "initialization_state": "initialized",
-        "initialized": True,
-        "revision": 7,
-        "schema": "taskplanner.execution_route_preflight_ack.v1",
-        "selected_source": "virtual",
-        "retraction_source": "virtual",
-    }
-
-    mismatch = node._handle_execution_route_preflight_ack(
-        SimpleNamespace(
-            operation="execution_route_preflight_ack",
-            payload_json='{"source":"virtual","revision":8,"initialization_revision":12,"require_initialized":true}',
-        ),
-        SimpleNamespace(),
-    )
-    assert mismatch.accepted is False
-
-
-def test_route_without_controller_contract_metadata_can_initialize_and_ack() -> None:
-    node = IntegrationPreflightNode.__new__(IntegrationPreflightNode)
-    node._virtual_tool_handover_action_name = (
-        "/integration/virtual/surgery/tool_handover"
-    )
-    node._external_tool_handover_action_name = "/surgery/tool_handover"
-    node._virtual_retraction_service_name = (
-        "/integration/virtual/surgery/retraction/command"
-    )
-    node._external_retraction_service_name = "/surgery/retraction/command"
-    node._external_require_physical_stop_confirmation = True
-    node._route_state_revision = -1
-    node._route_state_initialization_revision = -1
-    node._route_state_selected_source = ""
-    node._route_state_retraction_source = ""
-    node._route_state_initialization_state = ""
-    node._route_state_initialized = False
-    applied = []
+def test_readiness_observer_follows_scenario_store_without_manager_reconfiguration() -> None:
+    node = _preflight_contract_state()
+    node._invalidate_bed_robot_status = lambda: None
+    node._invalidate_rfdetr_tool_location_leases = lambda: None
     warnings = []
     node.get_logger = lambda: SimpleNamespace(warning=warnings.append)
-    node._apply_execution_route_source = (
-        lambda source, *, retraction_source, invalidate: applied.append(
-            (source, retraction_source, invalidate)
-        )
-    )
-    node._on_execution_route_state(
+    bundle = "thyroidectomy_demo"
+    spec_dir = _spec_dir(bundle)
+    node._on_scenario_config(
         SimpleNamespace(
             data=json.dumps(
-                {
-                    "schema": "taskplanner.execution_route_state.v1",
-                    "revision": 8,
-                    "initialization_revision": 13,
-                    "selected_source": "virtual",
-                    "run_endpoint_source": "",
-                    "retraction_source": "virtual",
-                    "run_retraction_source": "",
-                    "initialization_state": "initialized",
-                    "tool_handover_endpoint": (
-                        "/integration/virtual/surgery/tool_handover"
-                    ),
-                    "retraction_service_name": (
-                        "/integration/virtual/surgery/retraction/command"
-                    ),
-                    "require_bed_robot_status": False,
-                    "require_physical_stop_confirmation": False,
-                    "retraction_state_machine_suppressed": True,
-                }
+                scenario_config_payload(
+                    bundle_name=bundle,
+                    spec_dir=str(spec_dir),
+                    revision="sha256:" + "0" * 64,
+                )
             )
         )
     )
 
-    response = node._handle_execution_route_preflight_ack(
-        SimpleNamespace(
-            operation="execution_route_preflight_ack",
-            payload_json=json.dumps(
-                {
-                    "source": "virtual",
-                    "retraction_source": "virtual",
-                    "revision": 8,
-                    "initialization_revision": 13,
-                    "require_initialized": True,
-                }
-            ),
-        ),
-        SimpleNamespace(),
-    )
-
     assert warnings == []
-    assert applied == [("virtual", "virtual", True)]
-    assert node._route_state_initialized is True
-    assert response.accepted is True
+    assert node._active_bundle == bundle
+    assert node._spec_dir == str(spec_dir.resolve())
+    assert node._current_scenario_runtime_requirements().rfdetr_tool_observations_required is True
 
 
 def test_same_route_revision_refreshes_scenario_retraction_suppression() -> None:

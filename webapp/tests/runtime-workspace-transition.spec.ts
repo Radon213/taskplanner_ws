@@ -42,6 +42,7 @@ type RosbridgeStubOptions = {
   simulationStateHeartbeatIntervalMs?: number;
   withholdSimulationStateSubscriptions?: number;
   onSimulationSubscription?: () => void;
+  onSimulationStatePublisher?: (publish: () => void) => void;
   surgeonLlmDecision?: unknown;
   observerAvailable?: boolean;
   publishCaptureStatus?: boolean;
@@ -68,6 +69,8 @@ type RosbridgeStubOptions = {
   liveAsrStatusMessage?: unknown;
   liveAsrStatusEnvelope?: Record<string, unknown>;
   onLiveAsrStatusPublisher?: (publish: (envelope: Record<string, unknown>) => void) => void;
+  onLiveAsrPartialPublisher?: (publish: (message: Record<string, unknown>) => void) => void;
+  onLiveAsrFinalPublisher?: (publish: (message: Record<string, unknown>) => void) => void;
   onLiveAsrControlRequest?: (args: Record<string, unknown>) => void;
   liveAsrControlResponse?:
     | Record<string, unknown>
@@ -296,12 +299,6 @@ function installRosbridgeStub(page: Page, options: RosbridgeStubOptions = {}) {
       ) {
         options.onSimulationSubscription?.();
         simulationSubscriptionCount += 1;
-        if (
-          simulationSubscriptionCount <=
-          (options.withholdSimulationStateSubscriptions ?? 0)
-        ) {
-          return;
-        }
         const simulationMessage = options.simulationStateMessage ?? {
           procedure_id: "test-procedure",
           active_bundle: "thyroidectomy_v1",
@@ -330,6 +327,8 @@ function installRosbridgeStub(page: Page, options: RosbridgeStubOptions = {}) {
           topic: message.topic,
           msg: simulationMessage,
         }));
+        options.onSimulationStatePublisher?.(publishSimulationState);
+        if (simulationSubscriptionCount <= (options.withholdSimulationStateSubscriptions ?? 0)) return;
         publishSimulationState();
         let remainingHeartbeats = Math.max(0, Math.trunc(options.simulationStateHeartbeatCount ?? 0));
         const heartbeatIntervalMs = Math.max(250, options.simulationStateHeartbeatIntervalMs ?? 1_500);
@@ -486,6 +485,28 @@ function installRosbridgeStub(page: Page, options: RosbridgeStubOptions = {}) {
           },
         }));
         options.onLiveAsrStatusPublisher?.(publish);
+        return;
+      }
+      if (
+        message.op === "subscribe" &&
+        message.topic === "/surgery/audio/partial_utterance"
+      ) {
+        options.onLiveAsrPartialPublisher?.((utterance) => socket.send(JSON.stringify({
+          op: "publish",
+          topic: message.topic,
+          msg: utterance,
+        })));
+        return;
+      }
+      if (
+        message.op === "subscribe" &&
+        message.topic === "/surgery/audio/observed_utterance"
+      ) {
+        options.onLiveAsrFinalPublisher?.((utterance) => socket.send(JSON.stringify({
+          op: "publish",
+          topic: message.topic,
+          msg: utterance,
+        })));
         return;
       }
       if (
@@ -705,7 +726,6 @@ function installRosbridgeStub(page: Page, options: RosbridgeStubOptions = {}) {
               require_bed_robot_status: selectedRouteSources.retraction === "external",
               require_physical_stop_confirmation: selectedRouteSources.retraction === "external",
               retraction_state_machine_suppressed: selectedRouteSources.retraction === "virtual",
-              digital_twin_reset: true,
             }),
           }
         : selectBundleRequest
@@ -1429,6 +1449,10 @@ test("locks all runtime entry points while a control service is pending", async 
   await page.goto("/");
   const startButton = page.getByRole("button", { name: "수술 시작", exact: true });
   await startButton.click();
+  // The manager accepts Start asynchronously.  The operator must see the
+  // lifecycle transition immediately instead of waiting for the next idle
+  // rosbridge heartbeat or the eventual service reply.
+  await expect(page.locator(".procedure-dock .dock-header h2")).toContainText("시작 중");
   await expect(page.locator(".dock-action-message.pending")).toContainText("Starting simulation");
   await startButton.evaluate((button) => {
     button.removeAttribute("disabled");
@@ -1652,7 +1676,7 @@ test("applies a stopped Live bundle only after preview with the additive service
   await expect(revision).toContainText("bundle revision applied");
 });
 
-test("keeps same-bundle reload locked while paused and makes the deferred contract explicit", async ({ page }) => {
+test("applies a same-bundle revision while paused without a restart", async ({ page }) => {
   const runtime: RuntimeStatus = {
     phase: "idle",
     active_mode: "llm-surgeon",
@@ -1663,7 +1687,14 @@ test("keeps same-bundle reload locked while paused and makes the deferred contra
   await installRosbridgeStub(page, {
     simulationState: { running: true, execution_state: "paused" },
     onSelectBundleRequest: (args) => requests.push(args),
-    selectBundleResponse: scenarioRevisionResponse(),
+    selectBundleResponse: (args) => Boolean(args.preview_only)
+      ? scenarioRevisionResponse()
+      : scenarioRevisionResponse({
+          message: "paused same-bundle revision applied without restart",
+          active_config_revision: "sha256:22222222222222222222222222222222",
+          applied: true,
+          disposition: "applied",
+        }),
   });
   await page.route("**/api/runtime/status", (route) =>
     route.fulfill({ contentType: "application/json", body: JSON.stringify(runtime) }));
@@ -1671,19 +1702,22 @@ test("keeps same-bundle reload locked while paused and makes the deferred contra
   await page.goto("/");
   await page.getByRole("button", { name: "변경 확인", exact: true }).click();
   const applyButton = page.getByRole("button", { name: "revision 적용", exact: true });
-  await expect(applyButton).toBeDisabled();
-  await expect(page.locator('[data-slot="scenario-revision-control"]')).toContainText(
-    "현재 번들의 reload는 진행 상태를 초기화합니다. 시나리오를 완전히 정지",
-  );
-  await applyButton.evaluate((button) => {
-    button.removeAttribute("disabled");
-    button.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+  await expect(applyButton).toBeEnabled();
+  await applyButton.click();
+  await expect.poll(() => requests).toHaveLength(2);
+  expect(requests[1]).toEqual({
+    bundle_name: "thyroidectomy_v1",
+    restart_if_running: false,
+    preview_only: false,
+    reload_if_changed: true,
+    expected_candidate_revision: "sha256:22222222222222222222222222222222",
   });
-  await page.waitForTimeout(100);
-  expect(requests).toHaveLength(1);
+  await expect(page.locator('[data-slot="scenario-revision-control"]')).toContainText(
+    "paused same-bundle revision applied without restart",
+  );
 });
 
-test("uses an explicit paused restart contract for a different non-Live bundle", async ({ page }) => {
+test("applies a different bundle while paused without a restart", async ({ page }) => {
   const runtime: RuntimeStatus = {
     phase: "idle",
     active_mode: "llm-surgeon",
@@ -1719,7 +1753,7 @@ test("uses an explicit paused restart contract for a different non-Live bundle",
           spec_dir: "/workspace/specs/inguinal_hernia_demo",
         })
       : scenarioRevisionResponse({
-          message: "paused scenario changed and restarted",
+          message: "paused scenario changed without restart",
           active_bundle: "inguinal_hernia_demo",
           spec_dir: "/workspace/specs/inguinal_hernia_demo",
           active_config_revision: "sha256:22222222222222222222222222222222",
@@ -1739,19 +1773,17 @@ test("uses an explicit paused restart contract for a different non-Live bundle",
   const applyButton = page.getByRole("button", { name: "revision 적용", exact: true });
   await expect(applyButton).toBeEnabled();
   await applyButton.click();
-
   await expect.poll(() => requests).toHaveLength(2);
   expect(requests[1]).toEqual({
     bundle_name: "inguinal_hernia_demo",
-    restart_if_running: true,
+    restart_if_running: false,
     preview_only: false,
     reload_if_changed: false,
     expected_candidate_revision: "sha256:22222222222222222222222222222222",
   });
   await expect(page.locator('[data-slot="scenario-revision-control"]')).toContainText(
-    "paused scenario changed and restarted",
+    "paused scenario changed without restart",
   );
-  await expect(stageHeading).toHaveText("갑상선절제술");
 });
 
 test("surfaces a backend bundle rejection without claiming that the candidate became active", async ({ page }) => {
@@ -1940,7 +1972,7 @@ test("keeps live ASR controls single-flight while the service admission is pendi
   await expect(startButton).toBeDisabled();
 });
 
-test("restarts only the ASR node and restores capture plus recording after new source proof", async ({ page }, testInfo) => {
+test("restarts only the ASR owner and restores capture plus recording after a new heartbeat", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "fhd", "One ASR hot-restart workflow run is sufficient.");
   const runtime: RuntimeStatus = {
     phase: "idle",
@@ -2077,7 +2109,7 @@ test("restarts only the ASR node and restores capture plus recording after new s
   });
   await expect.poll(() => restartPostCount).toBe(1);
   await expect(page.locator(".live-asr-message")).toContainText(
-    "ASR 노드 새로 시작 완료 · 코드 bbbbbbbb · 마이크 캡처 복원됨 · 녹화는 새 세그먼트로 복원됨",
+    "ASR 노드 새로 시작 완료 · 마이크 캡처 복원됨 · 녹화는 새 세그먼트로 복원됨",
     { timeout: 10_000 },
   );
   expect(asrControls.map((request) => request.operation)).toEqual([
@@ -2322,7 +2354,7 @@ test("reconciles an uncertain ASR restart response without repeating the POST", 
   const restartButton = page.getByRole("button", { name: "ASR 노드 새로 시작", exact: true });
   await restartButton.click();
   await expect(page.locator(".live-asr-message")).toContainText(
-    "ASR 노드 새로 시작 완료 · 코드 cccccccc",
+    "ASR 노드 새로 시작 완료",
     { timeout: 10_000 },
   );
   expect(restartPostCount).toBe(1);
@@ -2330,115 +2362,6 @@ test("reconciles an uncertain ASR restart response without repeating the POST", 
   expect(asrControls.map((request) => request.operation)).toEqual(["set_route_policy"]);
   expect(asrControls[0]?.route_policy).toBe("cloud");
   await expect(restartButton).toBeEnabled();
-});
-
-test("refuses capture restore when host and ASR source revisions differ", async ({ page }, testInfo) => {
-  test.skip(testInfo.project.name !== "fhd", "One source-proof rejection run is sufficient.");
-  const runtime: RuntimeStatus = {
-    phase: "idle",
-    active_mode: "live",
-    requested_mode: "live",
-    retryable: false,
-  };
-  const heartbeatRevision = "e".repeat(64);
-  const hostRevision = "f".repeat(64);
-  const asrControls: Record<string, unknown>[] = [];
-  let publishAsrStatus: ((envelope: Record<string, unknown>) => void) | null = null;
-  let restartPosted = false;
-  let restartedAtMs = 0;
-  let restartRequestId = "";
-  await installRosbridgeStub(page, {
-    simulationState: { running: false, execution_state: "idle" },
-    liveAsrStatus: {
-      available: true,
-      state: "LISTENING",
-      devices: [{ id: 7, name: "Test USB microphone", input_channels: 1, default_samplerate: 16_000, default: true }],
-      device_id: 7,
-      device_name: "Test USB microphone",
-      device_status: "READY",
-      route_policy: "cloud",
-      connected: true,
-      recording_active: false,
-      lan_health: { state: "UNKNOWN", age_ms: null, latency_ms: null },
-    },
-    liveAsrStatusEnvelope: {
-      node_instance_id: "55555555-5555-4555-8555-555555555555",
-      node_started_at_sec: 1_700_000_000,
-      source_revision: "1".repeat(64),
-    },
-    onLiveAsrStatusPublisher: (publish) => { publishAsrStatus = publish; },
-    onLiveAsrControlRequest: (args) => asrControls.push(args),
-  });
-  await page.route("**/api/runtime/status", (route) =>
-    route.fulfill({ contentType: "application/json", body: JSON.stringify(runtime) }));
-  await page.route("**/api/runtime/asr/restart", async (route) => {
-    restartRequestId = route.request().headers()["x-taskplanner-request-id"] ?? "";
-    expect(restartRequestId).toMatch(asrRestartRequestIdPattern);
-    restartPosted = true;
-    restartedAtMs = Date.now();
-    setTimeout(() => publishAsrStatus?.({
-      schema: "taskplanner.asr.status.v1",
-      stamp_sec: Date.now() / 1_000,
-      node_instance_id: "66666666-6666-4666-8666-666666666666",
-      node_started_at_sec: restartedAtMs / 1_000,
-      source_revision: heartbeatRevision,
-      asr: {
-        available: true,
-        state: "STOPPED",
-        devices: [{ id: 7, name: "Test USB microphone", input_channels: 1, default_samplerate: 16_000, default: true }],
-        device_id: 7,
-        device_name: "Test USB microphone",
-        device_status: "READY",
-        route_policy: "cloud",
-        connected: false,
-        recording_active: false,
-        lan_health: { state: "UNKNOWN", age_ms: null, latency_ms: null },
-      },
-    }), 80);
-    await route.fulfill({
-      status: 202,
-      contentType: "application/json",
-      body: JSON.stringify({
-        accepted: true,
-        phase: "queued",
-        generation: 12,
-        job_id: "asr-job-12",
-        request_id: restartRequestId,
-        message: "queued",
-        retryable: false,
-        source_revision: hostRevision,
-        container_started_at: null,
-        before_pid: null,
-        after_pid: null,
-      }),
-    });
-  });
-  await page.route("**/api/runtime/asr/status", (route) => route.fulfill({
-    contentType: "application/json",
-    body: JSON.stringify({
-      phase: restartPosted ? "succeeded" : "idle",
-      generation: restartPosted ? 12 : 11,
-      job_id: restartPosted ? "asr-job-12" : null,
-      request_id: restartPosted ? restartRequestId : null,
-      message: restartPosted ? "succeeded" : "idle",
-      retryable: false,
-      source_revision: restartPosted ? hostRevision : "1".repeat(64),
-      container_started_at: restartPosted ? new Date(restartedAtMs).toISOString() : null,
-      before_pid: restartPosted ? 505 : null,
-      after_pid: restartPosted ? 606 : null,
-    }),
-  }));
-
-  await page.goto("/");
-  const restartButton = page.getByRole("button", { name: "ASR 노드 새로 시작", exact: true });
-  await restartButton.click();
-  await expect(page.locator(".live-asr-message.error")).toContainText(
-    "source_revision이 일치하지 않아 코드 반영을 확인할 수 없습니다",
-    { timeout: 10_000 },
-  );
-  expect(asrControls).toEqual([]);
-  await expect(restartButton).toBeEnabled();
-  await expect(page.locator(".live-asr-message.error")).toContainText("이 버튼으로 다시 시도하세요");
 });
 
 test("refuses route or capture restore when the restarted ASR output contract is legacy", async ({ page }, testInfo) => {
@@ -2554,116 +2477,7 @@ test("refuses route or capture restore when the restarted ASR output contract is
   await expect(restartButton).toBeEnabled();
 });
 
-test("rejects a late matching-source ASR publisher with an old node start time", async ({ page }, testInfo) => {
-  test.skip(testInfo.project.name !== "fhd", "One ASR start-provenance rejection run is sufficient.");
-  const runtime: RuntimeStatus = {
-    phase: "idle",
-    active_mode: "live",
-    requested_mode: "live",
-    retryable: false,
-  };
-  const sourceRevision = "7".repeat(64);
-  const asrControls: Record<string, unknown>[] = [];
-  let publishAsrStatus: ((envelope: Record<string, unknown>) => void) | null = null;
-  let restartPosted = false;
-  let containerStartedAtMs = 0;
-  let restartRequestId = "";
-  await installRosbridgeStub(page, {
-    simulationState: { running: false, execution_state: "idle" },
-    liveAsrStatus: {
-      available: true,
-      state: "LISTENING",
-      devices: [{ id: 7, name: "Test USB microphone", input_channels: 1, default_samplerate: 16_000, default: true }],
-      device_id: 7,
-      device_name: "Test USB microphone",
-      device_status: "READY",
-      route_policy: "cloud",
-      connected: true,
-      recording_active: false,
-      lan_health: { state: "UNKNOWN", age_ms: null, latency_ms: null },
-    },
-    liveAsrStatusEnvelope: {
-      node_instance_id: "77777777-7777-4777-8777-777777777777",
-      node_started_at_sec: 1_700_000_000,
-      source_revision: "6".repeat(64),
-    },
-    onLiveAsrStatusPublisher: (publish) => { publishAsrStatus = publish; },
-    onLiveAsrControlRequest: (args) => asrControls.push(args),
-  });
-  await page.route("**/api/runtime/status", (route) =>
-    route.fulfill({ contentType: "application/json", body: JSON.stringify(runtime) }));
-  await page.route("**/api/runtime/asr/restart", async (route) => {
-    restartRequestId = route.request().headers()["x-taskplanner-request-id"] ?? "";
-    expect(restartRequestId).toMatch(asrRestartRequestIdPattern);
-    restartPosted = true;
-    containerStartedAtMs = Date.now();
-    setTimeout(() => publishAsrStatus?.({
-      schema: "taskplanner.asr.status.v1",
-      stamp_sec: Date.now() / 1_000,
-      node_instance_id: "88888888-8888-4888-8888-888888888888",
-      // A stray publisher can have a new UUID and matching source hash while
-      // still belonging to a process that predates this restart job.
-      node_started_at_sec: (containerStartedAtMs - 60_000) / 1_000,
-      source_revision: sourceRevision,
-      asr: {
-        available: true,
-        state: "STOPPED",
-        devices: [{ id: 7, name: "Test USB microphone", input_channels: 1, default_samplerate: 16_000, default: true }],
-        device_id: 7,
-        device_name: "Test USB microphone",
-        device_status: "READY",
-        route_policy: "cloud",
-        connected: false,
-        recording_active: false,
-        lan_health: { state: "UNKNOWN", age_ms: null, latency_ms: null },
-      },
-    }), 80);
-    await route.fulfill({
-      status: 202,
-      contentType: "application/json",
-      body: JSON.stringify({
-        accepted: true,
-        phase: "queued",
-        generation: 14,
-        job_id: "asr-job-14",
-        request_id: restartRequestId,
-        message: "queued",
-        retryable: false,
-        source_revision: sourceRevision,
-        container_started_at: null,
-        before_pid: null,
-        after_pid: null,
-      }),
-    });
-  });
-  await page.route("**/api/runtime/asr/status", (route) => route.fulfill({
-    contentType: "application/json",
-    body: JSON.stringify({
-      phase: restartPosted ? "succeeded" : "idle",
-      generation: restartPosted ? 14 : 13,
-      job_id: restartPosted ? "asr-job-14" : null,
-      request_id: restartPosted ? restartRequestId : null,
-      message: restartPosted ? "succeeded" : "idle",
-      retryable: false,
-      source_revision: sourceRevision,
-      container_started_at: restartPosted ? new Date(containerStartedAtMs).toISOString() : null,
-      before_pid: restartPosted ? 707 : null,
-      after_pid: restartPosted ? 808 : null,
-    }),
-  }));
-
-  await page.goto("/");
-  const restartButton = page.getByRole("button", { name: "ASR 노드 새로 시작", exact: true });
-  await restartButton.click();
-  await expect(page.locator(".live-asr-message.error")).toContainText(
-    "node_started_at_sec가 호스트 container_started_at 재시작 구간과 일치하지 않습니다",
-    { timeout: 10_000 },
-  );
-  expect(asrControls).toEqual([]);
-  await expect(restartButton).toBeEnabled();
-});
-
-test("keeps Live surgical start fail-closed when integration preflight reports a blocker", async ({ page }) => {
+test("keeps a failing Live integration preflight diagnostic-only", async ({ page }) => {
   const runtime: RuntimeStatus = {
     phase: "idle",
     active_mode: "live",
@@ -2691,20 +2505,16 @@ test("keeps Live surgical start fail-closed when integration preflight reports a
     route.fulfill({ contentType: "application/json", body: JSON.stringify(runtime) }));
 
   await page.goto("/");
-  const startButton = page.getByRole("button", { name: "준비 중", exact: true });
-  await expect(startButton).toBeDisabled();
+  const startButton = page.getByRole("button", { name: "수술 시작", exact: true });
+  await expect(startButton).toBeEnabled();
   await expect(page.locator('[data-slot="integration-readiness"]')).toContainText(
     "인식 입력",
   );
 
-  // A stale DOM action must not bypass the hook-level gate or invoke the
-  // control Service; this is still a stub-only transport assertion.
-  await startButton.evaluate((button) => {
-    button.removeAttribute("disabled");
-    button.dispatchEvent(new MouseEvent("click", { bubbles: true }));
-  });
-  await page.waitForTimeout(100);
-  expect(missionServiceCalls.filter((service) => service === "/simulation/control")).toEqual([]);
+  await startButton.click();
+  await expect.poll(() => missionServiceCalls.filter(
+    (service) => service === "/simulation/control",
+  )).toEqual(["/simulation/control"]);
 });
 
 test("reports a Live runtime-profile mismatch instead of leaving procedure start in perpetual preparation", async ({ page }) => {
@@ -2819,10 +2629,19 @@ test("shows the complete Live preflight while allowing a genuinely stopped bundl
 
   const bundleSelect = page.locator(".control-stack label").filter({ hasText: "수술" }).locator("select");
   await expect(bundleSelect).toBeEnabled();
-  await expect(page.getByRole("button", { name: "준비 중", exact: true })).toBeDisabled();
-  await expect(page.locator('[data-slot="surgical-monitor-handoff"]')).toContainText("시작 전 관제 준비");
-  await page.getByRole("button", { name: "수술 관제 열기", exact: true }).click();
-  await expect(page).toHaveURL(/workspace=monitor/);
+  await expect(page.getByRole("button", { name: "수술 시작", exact: true })).toBeEnabled();
+  await expect(page.getByRole("button", { name: "독립 SurgiMate로 이동" })).toBeVisible();
+  await page.route("http://127.0.0.1:5174/", (route) => route.fulfill({
+    contentType: "text/html",
+    body: "<main>SurgiMate same-tab navigation</main>",
+  }));
+  const pagesBeforeNavigation = page.context().pages().length;
+  await Promise.all([
+    page.waitForURL("http://127.0.0.1:5174/"),
+    page.getByRole("button", { name: "독립 SurgiMate로 이동" }).click(),
+  ]);
+  await expect(page.locator("main")).toContainText("SurgiMate same-tab navigation");
+  expect(page.context().pages()).toHaveLength(pagesBeforeNavigation);
 });
 
 test("switches a stopped Live Action route while preserving the Service route", async ({ page }) => {
@@ -2869,9 +2688,8 @@ test("switches a stopped Live Action route while preserving the Service route", 
   const routeSummary = selector.locator(".execution-route-selector-summary > div");
   await expect(routeSummary.nth(0)).toContainText("실제 통합 서버");
   await expect(routeSummary.nth(1)).toContainText("가상 실행 서버");
-  await expect(selector).toContainText("경로 변경과 초기화가 완료");
-  // The browser cannot reuse the old virtual preflight after a route reset.
-  await expect(page.getByRole("button", { name: "준비 중", exact: true })).toBeDisabled();
+  await expect(selector).toContainText("경로 변경이 완료");
+  await expect(page.getByRole("button", { name: "수술 시작", exact: true })).toBeEnabled();
   expect(missionServiceCalls.filter((service) =>
     service === "/surgery/tool_handover" ||
     service === "/surgery/retraction/command",
@@ -2925,11 +2743,11 @@ test("locks Live start and another route switch while route initialization await
   ).toBeDisabled();
   await expect(page.getByRole("button", { name: "준비 중", exact: true })).toBeDisabled();
   await expect(page.locator('[data-slot="integration-readiness"]')).toContainText(
-    "새 Action·Service 경로를 통합 시작 점검에 적용하는 중입니다",
+    "실행 경로를 준비 중입니다",
   );
 });
 
-test("does not mark a Live Action/Service route change ready without a confirmed DT reset", async ({ page }) => {
+test("marks a stopped Live Action/Service route change ready without a DT reset receipt", async ({ page }) => {
   const runtime: RuntimeStatus = {
     phase: "idle",
     active_mode: "live",
@@ -2942,7 +2760,7 @@ test("does not mark a Live Action/Service route change ready without a confirmed
     executionRouteCommandResponse: {
       accepted: true,
       command_id: "",
-      message: "route changed without reset acknowledgement",
+      message: "route changed",
       result_json: JSON.stringify({
         schema: "taskplanner.execution_route_state.v1",
         stamp_sec: Date.now() / 1_000,
@@ -2960,7 +2778,6 @@ test("does not mark a Live Action/Service route change ready without a confirmed
         require_bed_robot_status: false,
         require_physical_stop_confirmation: false,
         retraction_state_machine_suppressed: true,
-        digital_twin_reset: false,
       }),
     },
   });
@@ -2972,10 +2789,7 @@ test("does not mark a Live Action/Service route change ready without a confirmed
   await selector.getByRole("group", { name: "도구 전달 Action 서버 선택" })
     .locator('button[data-source="external"]')
     .click();
-  await expect(selector.getByRole("alert")).toContainText(
-    "did not confirm a completed digital-twin reset",
-  );
-  await expect(selector).not.toContainText("경로 변경과 초기화가 완료");
+  await expect(selector).toContainText("경로 변경이 완료");
 });
 
 test("rejects even a forced Live Action/Service route click while execution is active", async ({ page }) => {
@@ -3249,7 +3063,7 @@ test("marks a last-known VLM heartbeat stale before presenting it as healthy", a
   );
 });
 
-test("shows system-final tool ranks, VLM Mayo evidence, and actual dispatch as separate authorities", async ({ page }, testInfo) => {
+test("shows system ranks, canonical Mayo fallback, and actual dispatch as separate authorities", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "fhd", "One integrated operation-observability run is sufficient.");
   const runtime: RuntimeStatus = {
     phase: "idle",
@@ -3261,6 +3075,7 @@ test("shows system-final tool ranks, VLM Mayo evidence, and actual dispatch as s
     simulationState: { running: true, execution_state: "running" },
     simulationStateHeartbeatCount: 8,
     simulationStateHeartbeatIntervalMs: 1_000,
+    publishVlmHealth: true,
     simulationStateMessage: {
       procedure_id: "thyroidectomy_demo",
       active_bundle: "thyroidectomy_v1",
@@ -3314,11 +3129,17 @@ test("shows system-final tool ranks, VLM Mayo evidence, and actual dispatch as s
           confidence: 0.91,
           cleanliness_state: "sterile",
           contaminated: false,
-          lifecycle_stage: "mayo_recovery",
+          // Recovery policy evidence does not rewrite the physical Mayo
+          // parking lifecycle. The card must choose the populated recovery
+          // confidence rather than render the lifecycle's empty reuse field.
+          lifecycle_stage: "mayo_reuse",
           reserved_for: "",
           last_holder: "surgeon",
-          next_required_transition: "recover_left",
-          visual_anchor_id: "mayo_recovery_zone",
+          next_required_transition: "",
+          visual_anchor_id: "mayo_reuse_zone",
+          mayo_recovery_confidence: 0.91,
+          mayo_evidence_source: "vlm_mayo_policy",
+          mayo_placement_evidence: "cam4_overlay",
         },
       ],
     },
@@ -3334,7 +3155,7 @@ test("shows system-final tool ranks, VLM Mayo evidence, and actual dispatch as s
         intent: ["", "", 0],
         // T02 is physically in the rack, so a raw VLM suggestion must never
         // surface as a Mayo policy badge or observability decision.
-        mayo: [["T07", "recover", 0.91], ["T02", "reuse", 0.88]],
+        mayo: [["T02", "reuse", 0.88]],
         mayo_retrieve: ["T07", 0.91],
         u: 0.1,
         sum: "test observation",
@@ -3350,6 +3171,7 @@ test("shows system-final tool ranks, VLM Mayo evidence, and actual dispatch as s
       uncertainty: 0.1,
     },
     worldStateMessage: {
+      running: true,
       predicted_tool: "T07",
       predicted_tool_confidence: 0.5,
       predicted_tool_stability_sec: 2.3,
@@ -3410,7 +3232,7 @@ test("shows system-final tool ranks, VLM Mayo evidence, and actual dispatch as s
       },
       {
         sequence: 2,
-        command_id: "retraction-service-2",
+        command_id: "retraction-service-accepted-1",
         route: "retraction",
         transport: "service",
         endpoint: "/external/bed_robot_arm/execute_retraction",
@@ -3420,21 +3242,22 @@ test("shows system-final tool ranks, VLM Mayo evidence, and actual dispatch as s
         evidence: "service_admission_only",
         reason_code: "",
         retraction_command: 4,
-        retraction_target_side: 0,
+        retraction_target_side: 3,
         retraction_distance_m: 0.005,
       },
       {
         sequence: 3,
-        command_id: "finish-direct-teach-both-3",
+        command_id: "retraction-service-2",
         route: "retraction",
         transport: "service",
-        endpoint: "/external/bed_robot_arm/execute_retraction",
-        stage: "accepted",
+        endpoint: "/integration/virtual/retraction/command",
+        endpoint_source: "virtual",
+        stage: "completed",
         dispatch_submitted: true,
         terminal: true,
-        evidence: "service_admission_only",
-        reason_code: "",
-        retraction_command: 2,
+        evidence: "virtual_service_transaction_completed",
+        reason_code: "virtual_service_completed",
+        retraction_command: 7,
         retraction_target_side: 0,
         retraction_distance_m: 0,
       },
@@ -3444,20 +3267,21 @@ test("shows system-final tool ranks, VLM Mayo evidence, and actual dispatch as s
     route.fulfill({ contentType: "application/json", body: JSON.stringify(runtime) }));
 
   await page.goto("/");
-  const firstNextTool = page.locator('[data-slot="operation-vlm-tool-evidence"][data-vlm-next-tool-rank="1"]');
-  await expect(firstNextTool).toContainText("다음 도구 1순위");
-  await expect(firstNextTool).toContainText("50%");
-  await expect(firstNextTool).toHaveAttribute("data-next-tool-authority", "system");
+  // Mayo cards use their limited space for reuse/recovery evidence rather
+  // than a competing next-tool rank.
+  await expect(page.locator('[data-slot="operation-vlm-tool-evidence"][data-vlm-next-tool-rank="1"]')).toHaveCount(0);
   const secondNextTool = page.locator('[data-slot="operation-vlm-tool-evidence"][data-vlm-next-tool-rank="2"]');
-  await expect(secondNextTool).toContainText("다음 도구 2순위");
+  await expect(secondNextTool).toContainText("다음");
+  await expect(secondNextTool).not.toContainText("시스템 다음 도구");
   await expect(secondNextTool).toContainText("30%");
   const thirdNextTool = page.locator('[data-slot="operation-vlm-tool-evidence"][data-vlm-next-tool-rank="3"]');
-  await expect(thirdNextTool).toContainText("다음 도구 3순위");
+  await expect(thirdNextTool).toContainText("다음");
   await expect(thirdNextTool).toContainText("20%");
   await expect(page.locator('[data-vlm-next-tool-rank="4"]')).toHaveCount(0);
   const mayoRecovery = page.locator('[data-tool-holder-id="mayo"] [data-slot="operation-vlm-tool-evidence"][data-vlm-mayo="recover"]');
-  await expect(mayoRecovery).toContainText("회수 필요");
+  await expect(mayoRecovery).toContainText("회수");
   await expect(mayoRecovery).toContainText("91%");
+  await expect(mayoRecovery).toHaveAttribute("data-mayo-decision-source", "digital_twin");
   const mayoInstance = page.locator('[data-tool-holder-id="mayo"] [data-slot="stage-tool-instance-marker"]');
   await expect(mayoInstance).toHaveText("#2");
   await expect(mayoInstance).toHaveAttribute("data-tool-instance-id", "T07#2");
@@ -3477,48 +3301,21 @@ test("shows system-final tool ranks, VLM Mayo evidence, and actual dispatch as s
   const asrFinalPopup = page.locator('[data-slot="surgeon-asr-final-popup"]');
   await expect(asrFinalPopup).toBeVisible();
   await expect(asrFinalPopup).toContainText("애드슨 포셉 주세요");
-  await expect(asrFinalPopup).toContainText("액션 또는 서비스 요청이 아닙니다");
+  await expect(asrFinalPopup).not.toContainText("액션 또는 서비스 요청이 아닙니다");
 
-  const dispatchPopup = page.locator('[data-slot="operation-execution-dispatch-popup"]');
-  await expect(dispatchPopup).toHaveAttribute("data-dispatch-kind", "service");
-  await expect(dispatchPopup).toHaveAttribute("data-dispatch-state", "accepted");
-  await expect(dispatchPopup).toContainText("서비스 접수 확인 · 물리 동작 완료 아님");
-  const dispatchFeed = page.locator('[data-slot="operation-execution-dispatch-feed"]');
-  await expect(dispatchFeed).toContainText("대상 도구 · T02");
-  await expect(dispatchFeed).toContainText("/bt/skill_command");
-  await expect(dispatchFeed).toContainText("/external/bed_robot_arm/execute_retraction");
-  const handoverDispatch = dispatchFeed.locator('[data-command-id="handover-action-1"]');
-  await expect(handoverDispatch).toHaveAttribute("data-tool-instance-id", "T02#1");
-  await expect(handoverDispatch).toContainText("대상 도구 · T02 #1");
-  await expect(handoverDispatch.locator('[data-slot="operation-dispatch-tool-flow"]')).toContainText(
-    "도구 랙 · T02",
+  const dispatchReceipt = page.locator(
+    '[data-slot="operation-dispatch-area"] [data-slot="operation-execution-dispatch-row"]',
   );
-  await expect(handoverDispatch.locator('[data-slot="operation-dispatch-tool-flow"]')).toContainText("집도의");
-  await expect(handoverDispatch).toContainText("작업 경로");
-  await expect(handoverDispatch).toContainText("handover");
-  await expect(handoverDispatch).toContainText("명령 ID");
-  await expect(handoverDispatch).toContainText("handover-action-1");
-  await expect(handoverDispatch).toContainText("시퀀스");
-  await expect(handoverDispatch).toContainText("1");
-  const retractionDispatch = dispatchFeed.locator('[data-command-id="retraction-service-2"]');
-  await expect(retractionDispatch).toHaveAttribute("data-retraction-command", "4");
-  await expect(retractionDispatch).toHaveAttribute("data-retraction-target-side", "0");
-  const retractionPayload = retractionDispatch.locator(
-    '[data-slot="operation-dispatch-retraction-payload"]',
-  );
-  await expect(retractionPayload).toContainText("명령 종류");
-  await expect(retractionPayload).toContainText("리트랙션 조정");
-  await expect(retractionPayload).toContainText("대상 쪽");
-  await expect(retractionPayload).toContainText("양쪽");
-  await expect(retractionPayload).toContainText("이동 거리");
-  await expect(retractionPayload).toContainText("0.5 cm");
-  await expect(retractionDispatch.locator('[data-slot="operation-dispatch-tool-flow"]')).toHaveCount(0);
-  const finishDirectTeachDispatch = dispatchFeed.locator(
-    '[data-command-id="finish-direct-teach-both-3"]',
-  );
-  await expect(finishDirectTeachDispatch).toContainText("직접 교시 종료");
-  await expect(finishDirectTeachDispatch).toContainText("양쪽");
-  await expect(finishDirectTeachDispatch).toContainText("0 cm");
+  await expect(dispatchReceipt).toHaveAttribute("data-dispatch-kind", "service");
+  await expect(dispatchReceipt).toHaveAttribute("data-dispatch-state", "completed");
+  await expect(dispatchReceipt).toContainText("완료 확인");
+  await expect(dispatchReceipt).toContainText("가상 Service 처리 완료");
+  await expect(dispatchReceipt).not.toContainText("물리 동작");
+  const retractionPayload = dispatchReceipt.locator('[data-slot="operation-dispatch-retraction-payload"]');
+  await expect(retractionPayload).toContainText("7 · 석션");
+  await expect(retractionPayload).toContainText("target_side");
+  await expect(retractionPayload).toContainText("0");
+  await expect(retractionPayload).toContainText("0 cm");
 
   await page.getByRole("tab", { name: "VLM" }).click();
   const vlmPanel = page.locator("#observability-panel-vlm");
@@ -3535,8 +3332,232 @@ test("shows system-final tool ranks, VLM Mayo evidence, and actual dispatch as s
   await expect(systemToolRanking).toContainText("30%");
   await expect(systemToolRanking).toContainText("20%");
   const rawMayo = vlmPanel.locator(".detail-card").filter({ hasText: "Mayo VLM 원시 판단" });
-  await expect(rawMayo).toContainText("91%");
-  await expect(rawMayo).not.toContainText("88%");
+  await expect(rawMayo).toContainText("없음");
+});
+
+test("shows the Action handover instrument and path in the fixed dispatch surface", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "fhd", "One fixed Action surface check is sufficient.");
+  const runtime: RuntimeStatus = {
+    phase: "idle",
+    active_mode: "live",
+    requested_mode: "live",
+    retryable: false,
+  };
+  await installRosbridgeStub(page, {
+    simulationState: { running: true, execution_state: "running" },
+    simulationStateMessage: {
+      procedure_id: "thyroidectomy_demo",
+      active_bundle: "thyroidectomy_v1",
+      filtered_phase: "P03",
+      running: true,
+      execution_state: "running",
+      instrument_states: [{
+        instrument_id: "T07",
+        home_location_type: "rack",
+        home_location_id: "T07",
+        location_type: "rack",
+        location_id: "T07",
+        owner: "none",
+        status: "available",
+        confidence: 0.94,
+        cleanliness_state: "sterile",
+        contaminated: false,
+        lifecycle_stage: "home_rack",
+        reserved_for: "",
+        last_holder: "none",
+        next_required_transition: "",
+        visual_anchor_id: "main_tray_slot_7",
+      }],
+    },
+    skillStatusMessages: [{
+      command_id: "handover-bipolar-1",
+      action: "tool_handover",
+      instrument_id: "T07",
+      instrument_instance_id: "T07#1",
+      state: "accepted",
+      success: false,
+      message: "accepted",
+      arm: "right",
+      source_location_id: "T07",
+      source_location_type: "rack",
+      target_location_id: "surgeon",
+      target_location_type: "surgeon",
+      target_owner: "surgeon",
+      cleaning_required: false,
+      mode: "virtual",
+      progress: 0.1,
+      elapsed_sec: 0.1,
+      remaining_sec: 0.5,
+    }],
+    executionTraceMessages: [{
+      sequence: 1,
+      command_id: "handover-bipolar-1",
+      route: "tool_handover",
+      transport: "action",
+      endpoint: "/integration/virtual/surgery/tool_handover",
+      endpoint_source: "virtual",
+      stage: "accepted",
+      dispatch_submitted: true,
+      terminal: false,
+      evidence: "goal_response",
+      reason_code: "",
+    }],
+  });
+  await page.route("**/api/runtime/status", (route) =>
+    route.fulfill({ contentType: "application/json", body: JSON.stringify(runtime) }));
+
+  await page.goto("/");
+  const dispatchReceipt = page.locator(
+    '[data-slot="operation-dispatch-area"] [data-slot="operation-execution-dispatch-row"]',
+  );
+  await expect(dispatchReceipt).toHaveAttribute("data-dispatch-kind", "action");
+  await expect(dispatchReceipt).toContainText("대상 도구 · T07 #1");
+  const handoverPipeline = dispatchReceipt.locator('[data-slot="operation-tool-handover-pipeline"]');
+  await expect(handoverPipeline).toContainText("도구 랙");
+  await expect(handoverPipeline).toContainText("집도의");
+});
+
+test("hides Mayo reuse and recovery badges while the procedure is waiting", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "fhd", "One waiting-state Mayo visibility check is sufficient.");
+  const runtime: RuntimeStatus = {
+    phase: "idle",
+    active_mode: "live",
+    requested_mode: "live",
+    retryable: false,
+  };
+  await installRosbridgeStub(page, {
+    // Keep the runtime frame available, but publish the independently
+    // authoritative procedure state as waiting. The stage receives that value
+    // as `procedureRunning` and must not surface a Mayo policy badge yet.
+    simulationState: { running: true, execution_state: "running" },
+    simulationStateHeartbeatCount: 8,
+    simulationStateHeartbeatIntervalMs: 1_000,
+    simulationStateMessage: {
+      procedure_id: "thyroidectomy_demo",
+      active_bundle: "thyroidectomy_v1",
+      filtered_phase: "P03",
+      running: true,
+      execution_state: "running",
+      instrument_states: [{
+        instrument_id: "T07",
+        instance_id: "T07#2",
+        home_location_type: "rack",
+        home_location_id: "T07",
+        location_type: "mayo_stand",
+        location_id: "mayo_stand",
+        owner: "none",
+        status: "available",
+        confidence: 0.91,
+        cleanliness_state: "sterile",
+        contaminated: false,
+        lifecycle_stage: "mayo_recovery",
+        reserved_for: "",
+        last_holder: "surgeon",
+        next_required_transition: "recover_left",
+        visual_anchor_id: "mayo_recovery_zone",
+        mayo_recovery_confidence: 0.91,
+        mayo_evidence_source: "vlm_mayo_policy",
+        mayo_placement_evidence: "cam4_overlay",
+      }],
+    },
+    // Verify that neither a current raw result nor the canonical DT decision
+    // becomes a visible Mayo policy before the scenario is actually running.
+    vlmResultMessage: {
+      source: "rfdetr_tool_observation_2d",
+      schema_version: "4",
+      raw_json: JSON.stringify({
+        v: "4",
+        phase: [],
+        tool: [],
+        intent: ["", "", 0],
+        mayo: [],
+        mayo_retrieve: ["T07", 0.94],
+        u: 0.1,
+        sum: "waiting Mayo observation",
+        bed_robot_arm_group: null,
+      }),
+      summary: "waiting Mayo observation",
+      phase_ids: [],
+      phase_confidences: [],
+      observed_tool_ids: [],
+      observed_location_ids: [],
+      observed_location_types: [],
+      observed_confidences: [],
+      uncertainty: 0.1,
+    },
+    worldStateMessage: { running: false },
+  });
+  await page.route("**/api/runtime/status", (route) =>
+    route.fulfill({ contentType: "application/json", body: JSON.stringify(runtime) }));
+
+  await page.goto("/");
+  const mayoCard = page.locator('[data-tool-id="T07#2"][data-tool-holder-id="mayo"]');
+  await expect(mayoCard).toBeVisible();
+  await expect(mayoCard.locator('[data-slot="operation-vlm-tool-evidence"]')).toHaveCount(0);
+});
+
+test("keeps an accepted Service in a fixed operation status surface", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "fhd", "One receipt-view viewport is sufficient.");
+  const runtime: RuntimeStatus = {
+    phase: "idle",
+    active_mode: "live",
+    requested_mode: "live",
+    retryable: false,
+  };
+  await installRosbridgeStub(page, {
+    simulationState: { running: true, execution_state: "running" },
+    executionTraceMessages: [{
+      sequence: 1,
+      command_id: "retraction-service-receipt-1",
+      route: "retraction",
+      transport: "service",
+      endpoint: "/external/bed_robot_arm/execute_retraction",
+      stage: "accepted",
+      dispatch_submitted: true,
+      terminal: false,
+      evidence: "service_admission_only",
+      reason_code: "",
+      retraction_command: 4,
+      retraction_target_side: 3,
+      retraction_distance_m: 0.005,
+    }],
+  });
+  await page.route("**/api/runtime/status", (route) =>
+    route.fulfill({ contentType: "application/json", body: JSON.stringify(runtime) }));
+
+  await page.goto("/");
+  const receipt = page.locator(
+    '[data-slot="operation-dispatch-area"] [data-slot="operation-execution-dispatch-row"]',
+  );
+  await expect(receipt).toHaveAttribute("data-dispatch-kind", "service");
+  await expect(receipt).toHaveAttribute("data-dispatch-state", "accepted");
+  await expect(receipt).toContainText("서비스 접수 확인");
+  await expect(receipt).not.toContainText("물리 동작");
+  await expect(page.locator('[data-slot="stage-execution-dispatch-overlay"]')).toHaveCount(0);
+
+  const panelGeometry = await page.evaluate(() => {
+    const board = document.querySelector<HTMLElement>(".stage-area .foxglove-board");
+    const stageCard = document.querySelector<HTMLElement>(".stage-area .stage-card");
+    const panel = document.querySelector<HTMLElement>('[data-slot="operation-dispatch-area"]');
+    const receiptElement = document.querySelector<HTMLElement>('[data-slot="operation-execution-dispatch-row"]');
+    if (!board || !stageCard || !panel || !receiptElement) return null;
+    const boardBounds = board.getBoundingClientRect();
+    const stageCardBounds = stageCard.getBoundingClientRect();
+    const panelBounds = panel.getBoundingClientRect();
+    const receiptBounds = receiptElement.getBoundingClientRect();
+    return {
+      panelIsOutsideStageCard: !stageCard.contains(panel),
+      panelPosition: getComputedStyle(panel).position,
+      panelFollowsStage: panelBounds.top >= stageCardBounds.bottom + 1,
+      receiptDoesNotCoverBoard: receiptBounds.top >= boardBounds.bottom - 1,
+    };
+  });
+  expect(panelGeometry).toEqual({
+    panelIsOutsideStageCard: true,
+    panelPosition: "static",
+    panelFollowsStage: true,
+    receiptDoesNotCoverBoard: true,
+  });
 });
 
 test("keeps a client-sent Action with unknown remote state visible in the operation popup", async ({ page }, testInfo) => {
@@ -3568,12 +3589,14 @@ test("keeps a client-sent Action with unknown remote state visible in the operat
     route.fulfill({ contentType: "application/json", body: JSON.stringify(runtime) }));
 
   await page.goto("/");
-  const popup = page.locator('[data-slot="operation-execution-dispatch-popup"]');
-  await expect(popup).toBeVisible();
-  await expect(popup).toHaveAttribute("data-dispatch-kind", "action");
-  await expect(popup).toHaveAttribute("data-dispatch-state", "unknown");
-  await expect(popup).toContainText("상태 미확인");
-  await expect(popup).toContainText("controller_response_timeout");
+  const receipt = page.locator(
+    '[data-slot="operation-dispatch-area"] [data-slot="operation-execution-dispatch-row"]',
+  );
+  await expect(receipt).toBeVisible();
+  await expect(receipt).toHaveAttribute("data-dispatch-kind", "action");
+  await expect(receipt).toHaveAttribute("data-dispatch-state", "unknown");
+  await expect(receipt).toContainText("상태 미확인");
+  await expect(receipt).toContainText("controller_response_timeout");
 });
 
 test("uses the reducer-visible bit without re-evaluating hand evidence in the browser", async ({ page }) => {
@@ -3602,6 +3625,40 @@ test("uses the reducer-visible bit without re-evaluating hand evidence in the br
   const btPanel = page.locator("#observability-panel-bt");
   await expect(btPanel).toContainText("손 전달 신호 · 리듀서");
   await expect(btPanel).toContainText("신호 대기");
+});
+
+test("shows a reducer-confirmed handover request while the scenario is inactive as observation only", async ({ page }) => {
+  const runtime: RuntimeStatus = {
+    phase: "idle",
+    active_mode: "live",
+    requested_mode: "live",
+    retryable: false,
+  };
+  await installRosbridgeStub(page, {
+    simulationState: { running: false, execution_state: "idle" },
+    worldStateMessage: {
+      running: false,
+      execution_state: "idle",
+      implicit_request_visible: true,
+      implicit_request_tool: "",
+      implicit_request_hand_pose: "right_open_palm_up",
+      implicit_request_confidence: 0.93,
+      implicit_request_stability_sec: 0.4,
+      implicit_request_generation: 8,
+    },
+  });
+  await page.route("**/api/runtime/status", (route) =>
+    route.fulfill({ contentType: "application/json", body: JSON.stringify(runtime) }));
+
+  await page.goto("/");
+
+  const handover = page.locator('[data-slot="hand-handover-signal-popup"]');
+  await expect(handover).toBeVisible();
+  await expect(handover).toHaveAttribute("data-source", "reducer-world-state");
+  await expect(handover).toHaveAttribute("data-generation", "8");
+  await expect(handover).toContainText("암묵 전달 요청 · 관찰");
+  await expect(handover).toContainText("관찰 전용 · 시나리오 대기");
+  await expect(handover).toContainText("93%");
 });
 
 test("localizes recent LLM speech age labels with the selected language", async ({ page }) => {
@@ -3885,6 +3942,63 @@ test("bounds Live ASR device history and rendered transcript text", async ({ pag
   await expect.poll(() => page.locator("#live-asr-device option").count()).toBe(64);
   const partialText = await page.locator(".live-asr-live p strong").textContent();
   expect(partialText?.length).toBe(4_096);
+});
+
+test("shows external partial and observed final transcripts in the Live ASR panel", async ({ page }) => {
+  const runtime: RuntimeStatus = {
+    phase: "idle",
+    active_mode: "live",
+    requested_mode: "live",
+    retryable: false,
+  };
+  let publishPartial: ((message: Record<string, unknown>) => void) | null = null;
+  let publishFinal: ((message: Record<string, unknown>) => void) | null = null;
+
+  await installRosbridgeStub(page, {
+    simulationState: { running: false, execution_state: "idle" },
+    liveAsrStatus: {
+      available: true,
+      state: "STOPPED",
+      topic: "/sensors/surgeon/sentence",
+      output_mode: "typed_utterance",
+      output_topic: "/surgery/audio/admitted_utterance",
+      devices: [],
+      device_id: null,
+      device_name: "",
+      device_status: "NO_INPUT",
+      route_policy: "cloud",
+      connected: false,
+      recording_active: false,
+      partial_text: "",
+      finals: [],
+    },
+    onLiveAsrPartialPublisher: (publish) => { publishPartial = publish; },
+    onLiveAsrFinalPublisher: (publish) => { publishFinal = publish; },
+  });
+  await page.route("**/api/runtime/status", (route) =>
+    route.fulfill({ contentType: "application/json", body: JSON.stringify(runtime) }));
+  await page.goto("/");
+
+  const panel = page.locator('[data-slot="live-asr-panel"]');
+  await expect(panel).toBeVisible();
+  await expect.poll(() => Boolean(publishPartial && publishFinal)).toBe(true);
+
+  publishPartial?.({
+    stamp: { sec: 1_788_311_900, nanosec: 100_000_000 },
+    utterance_id: "external-partial-1",
+    text: "흡인기 준비",
+    is_final: false,
+  });
+  await expect(panel.locator(".live-asr-live p strong")).toHaveText("흡인기 준비");
+
+  publishFinal?.({
+    stamp: { sec: 1_788_311_901, nanosec: 200_000_000 },
+    utterance_id: "external-final-1",
+    text: "흡인기 주세요",
+    is_final: true,
+  });
+  await expect(panel.locator(".live-asr-finals")).toContainText("흡인기 주세요");
+  await expect(panel.locator(".live-asr-live p strong")).toHaveText("ASR 시작 전");
 });
 
 test("keeps Live Mission columns inside the viewport at compact and wide ratios", async ({ page }, testInfo) => {
@@ -4222,7 +4336,7 @@ test("waits for a fresh simulation state after changing bridge generation", asyn
   await expect.poll(() => releaseLiveState !== null).toBe(true);
   await expect(startButton).toBeDisabled();
   await page.waitForTimeout(250);
-  expect(serviceCalls.filter((call) => call.generation >= 2)).toEqual([]);
+  expect(serviceCalls.filter((call) => call.generation >= 2 && call.service.startsWith("/simulation/"))).toEqual([]);
 
   releaseLiveState?.();
   await expect(page.getByRole("button", { name: "수술 시작", exact: true })).toBeEnabled();
@@ -4238,6 +4352,7 @@ test("locks mission commands when the simulation-state heartbeat expires", async
   const missionServiceCalls: string[] = [];
   let missionSocketCount = 0;
   let simulationSubscriptionCount = 0;
+  let resumeState: (() => void) | undefined;
 
   await installRosbridgeStub(page, {
     simulationState: { running: true, execution_state: "running" },
@@ -4248,6 +4363,7 @@ test("locks mission commands when the simulation-state heartbeat expires", async
     onSimulationSubscription: () => {
       simulationSubscriptionCount += 1;
     },
+    onSimulationStatePublisher: (publish) => { resumeState = publish; },
   });
   await page.route("**/api/runtime/status", (route) =>
     route.fulfill({ contentType: "application/json", body: JSON.stringify(runtime) }));
@@ -4271,11 +4387,12 @@ test("locks mission commands when the simulation-state heartbeat expires", async
   await page.waitForTimeout(100);
   expect(missionServiceCalls).toEqual([]);
 
-  // If the socket itself stays open but its state subscription silently dies,
-  // fail closed first and then rebuild the transport instead of remaining
-  // stale forever. The replacement stub publishes a fresh authoritative state.
-  await expect.poll(() => missionSocketCount, { timeout: 10_000 }).toBeGreaterThanOrEqual(2);
-  await expect.poll(() => simulationSubscriptionCount).toBeGreaterThanOrEqual(2);
+  // State ownership is independent of observer/ASR/VLM transport. Preserve the
+  // socket across the old recovery deadline, then accept the owner's heartbeat.
+  await page.waitForTimeout(4_200);
+  expect(missionSocketCount).toBe(1);
+  expect(simulationSubscriptionCount).toBe(1);
+  resumeState?.();
   await expect(page.getByText("ROS 런타임 연결됨")).toBeVisible();
   await expect(page.getByRole("button", { name: "일시정지" })).toBeEnabled();
   expect(missionServiceCalls.filter((service) => service === "/simulation/control")).toEqual([]);
@@ -4336,7 +4453,7 @@ test("distinguishes an open ROS transport from missing authoritative state", asy
   await expect(page.getByRole("button", { name: "준비 중", exact: true })).toBeDisabled();
 });
 
-test("reconnects an open ROS transport when its first authoritative state never arrives", async ({ page }, testInfo) => {
+test("keeps independent owners connected when first authoritative state never arrives", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "fhd", "One real-time recovery timer run is sufficient.");
   const runtime: RuntimeStatus = {
     phase: "idle",
@@ -4346,6 +4463,7 @@ test("reconnects an open ROS transport when its first authoritative state never 
   };
   let missionSocketCount = 0;
   let simulationSubscriptionCount = 0;
+  let resumeState: (() => void) | undefined;
   await installRosbridgeStub(page, {
     simulationState: { running: false, execution_state: "idle" },
     withholdSimulationStateSubscriptions: 1,
@@ -4355,16 +4473,18 @@ test("reconnects an open ROS transport when its first authoritative state never 
     onSimulationSubscription: () => {
       simulationSubscriptionCount += 1;
     },
+    onSimulationStatePublisher: (publish) => { resumeState = publish; },
   });
   await page.route("**/api/runtime/status", (route) =>
     route.fulfill({ contentType: "application/json", body: JSON.stringify(runtime) }));
 
   await page.goto("/");
   await expect(page.getByText("브리지 연결 · 상태 대기")).toBeVisible();
-  await expect(page.getByText("ROS 재연결 중")).toBeVisible({ timeout: 10_000 });
+  await expect(page.getByText("브리지 연결 · 상태 만료")).toBeVisible({ timeout: 10_000 });
   await expect(page.getByText(/Fresh runtime state did not arrive/)).toHaveCount(0);
-  await expect.poll(() => missionSocketCount, { timeout: 12_000 }).toBeGreaterThanOrEqual(2);
-  await expect.poll(() => simulationSubscriptionCount).toBeGreaterThanOrEqual(2);
+  expect(missionSocketCount).toBe(1);
+  expect(simulationSubscriptionCount).toBe(1);
+  resumeState?.();
   await expect(page.getByText("ROS 런타임 연결됨")).toBeVisible();
   await expect(page.getByRole("button", { name: "수술 시작", exact: true })).toBeEnabled();
 });

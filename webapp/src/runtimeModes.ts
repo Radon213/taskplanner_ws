@@ -108,6 +108,48 @@ export function runtimeBridgeUrl(mode: TaskplannerRuntimeMode): string {
   return `${browserProtocol()}//${websocketHostname()}:${configuredPort(mode)}`;
 }
 
+/**
+ * The standalone Debug profile owns the public loopback Debug port (9091).
+ * Live/LLM integrated Debug is an observer beside an operational runtime; it
+ * is intentionally bound to its private upstream (9093) so the optional LAN
+ * path-router can keep serving `/live` independently.  Treating both as one
+ * generic `debug` URL made a local integrated Debug workspace repeatedly
+ * attempt a port that has no listener whenever the optional router was off.
+ */
+export function debugBridgeUrl(
+  observedRuntimeMode: "live" | "llm-surgeon" | "replay" | null,
+): string {
+  if (observedRuntimeMode === "live" || observedRuntimeMode === "llm-surgeon") {
+    const explicitUrl = import.meta.env.VITE_ROSBRIDGE_INTEGRATED_DEBUG_URL?.trim();
+    if (explicitUrl) return explicitUrl;
+    const port = import.meta.env.VITE_ROSBRIDGE_INTEGRATED_DEBUG_PORT?.trim() || "9093";
+    return `${browserProtocol()}//${websocketHostname()}:${port}`;
+  }
+  return runtimeBridgeUrl("debug");
+}
+
+/**
+ * Camera raster traffic has its own loopback-only bridge so high-rate JPEG
+ * delivery cannot queue behind mission/control subscriptions on 9090.  A
+ * deployment that terminates the browser elsewhere may override this one URL;
+ * the default remains deliberately local.
+ */
+export function liveMediaBridgeUrl(): string {
+  return import.meta.env.VITE_LIVE_MEDIA_BRIDGE_URL?.trim() || "ws://127.0.0.1:9095";
+}
+
+/**
+ * SurgiMate is intentionally a separate local browser application. Keep its
+ * default loopback-only; a remote viewer needs its own reviewed proxy rather
+ * than inheriting Taskplanner's browser/ROS routes.
+ */
+export function surgimateUrl(): string {
+  const explicitUrl = import.meta.env.VITE_SURGIMATE_URL?.trim();
+  if (explicitUrl) return explicitUrl;
+  const port = import.meta.env.VITE_SURGIMATE_PORT?.trim() || "5174";
+  return `http://127.0.0.1:${port}`;
+}
+
 export function multicamBridgeUrl(): string {
   const explicitUrl = import.meta.env.VITE_MULTICAM_ROSBRIDGE_URL?.trim();
   if (explicitUrl) return explicitUrl;
@@ -124,6 +166,18 @@ export function initialRuntimeMode(): TaskplannerRuntimeMode {
     if (isRuntimeMode(storedMode) && runtimeModeIsAvailable(storedMode)) return storedMode;
   }
   return configuredDefaultRuntimeMode();
+}
+
+/**
+ * Pick the bridge that the deployment explicitly designates for an MCAP UI
+ * replay, without inheriting a stale browser-local runtime preference.  The
+ * isolated Replay profile owns the shadow bridge; a normal Live deployment
+ * continues to replay its manually captured bag on the Live bridge.
+ */
+export function rosbagReplayRuntimeMode(): Extract<TaskplannerRuntimeMode, "live" | "shadow"> {
+  return import.meta.env.VITE_DEFAULT_RUNTIME_MODE?.trim() === "shadow"
+    ? "shadow"
+    : "live";
 }
 
 export function persistRuntimeMode(mode: TaskplannerRuntimeMode): void {

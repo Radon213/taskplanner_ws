@@ -5,6 +5,7 @@ from pathlib import Path
 
 from or_digital_twin.models import (
     ActiveRobotTask,
+    InstrumentBelief,
     LIFECYCLE_HOME_RACK,
     LIFECYCLE_MAYO_RECOVERY,
     LIFECYCLE_MAYO_REUSE,
@@ -14,7 +15,7 @@ from or_digital_twin.models import (
 )
 from or_digital_twin.twin import ORDigitalTwin
 from procedure_spec import load_bundle
-from surgical_msgs.msg import FilteredPhase, TwinEvent
+from surgical_msgs.msg import FilteredPhase, SurgeonRequest, TwinEvent
 
 
 def _demo_spec():
@@ -62,8 +63,79 @@ def _handover_active_request(twin: ORDigitalTwin) -> str:
         LIFECYCLE_PREPOSITIONED_RIGHT
     )
     twin.apply_event(_event("ToolHandoverCompleted", tool_id))
-    twin.apply_event(_event("RobotTaskCompleted", tool_id))
+    twin.apply_event(
+        _event(
+            "RobotTaskCompleted",
+            tool_id,
+            task_id=f"task:{instance_id}",
+        )
+    )
     return instance_id
+
+
+def _place_adson_duplicate_on_tray_and_mayo(
+    twin: ORDigitalTwin,
+) -> tuple[InstrumentBelief, InstrumentBelief]:
+    tray_instance = twin.instrument_states["T02#1"]
+    mayo_instance = twin.instrument_states["T02#2"]
+    twin._set_lifecycle(
+        tray_instance,
+        LIFECYCLE_HOME_RACK,
+        location_type=tray_instance.home_location_type,
+        location_id=tray_instance.home_location_id,
+        confidence=1.0,
+    )
+    twin._set_lifecycle(
+        mayo_instance,
+        LIFECYCLE_MAYO_REUSE,
+        location_type="mayo_stand",
+        location_id="mayo_stand",
+        confidence=1.0,
+        placement_evidence="controller_confirmed_unused_preposition_to_mayo",
+    )
+    return tray_instance, mayo_instance
+
+
+def test_stale_task_events_cannot_replace_or_clear_a_current_active_task() -> None:
+    twin = ORDigitalTwin(_demo_spec())
+
+    twin.apply_event(
+        _event(
+            "RobotTaskStarted",
+            "T02",
+            task_id="current-action",
+            task_type="tool_handover",
+        )
+    )
+    twin.apply_event(
+        _event(
+            "RobotTaskStarted",
+            "T02",
+            task_id="previous-action",
+            task_type="tool_handover",
+        )
+    )
+    twin.apply_event(
+        _event(
+            "RobotTaskCompleted",
+            "T02",
+            task_id="previous-action",
+        )
+    )
+
+    assert twin.state.active_robot_task is not None
+    assert twin.state.active_robot_task.task_id == "current-action"
+    assert twin.event_history[-1]["event_type"] == "RobotTaskCompletionIgnored"
+
+    twin.apply_event(
+        _event(
+            "RobotTaskCompleted",
+            "T02",
+            task_id="current-action",
+        )
+    )
+
+    assert twin.state.active_robot_task is None
 
 
 def test_inventory_count_creates_stable_instance_ids_and_keeps_type_ids() -> None:
@@ -83,12 +155,11 @@ def test_inventory_count_creates_stable_instance_ids_and_keeps_type_ids() -> Non
     assert {row["instance_id"] for row in payload} == {"T02#1", "T02#2"}
 
 
-def test_one_more_is_a_distinct_generation_and_handover_instance() -> None:
+def test_request_skips_surgeon_owned_duplicate_and_handover_uses_tray_copy() -> None:
     twin = ORDigitalTwin(_demo_spec())
 
-    # This test specifically exercises the case where the first physical
-    # instance is already committed to the surgeon and a second one is
-    # requested. Production inventory is intentionally not mutated for it.
+    # A surgeon-held instance is not a controllable pickup source.  The only
+    # new handover must use the other physical copy still on the tray.
     twin._set_lifecycle(
         twin.instrument_states["T02#1"],
         LIFECYCLE_SURGEON_OWNED,
@@ -98,17 +169,9 @@ def test_one_more_is_a_distinct_generation_and_handover_instance() -> None:
     )
 
     assert twin.update_explicit_request("Adson") == "T02"
-    first_generation = twin.state.surgeon_request_generation
-    assert twin.update_explicit_request("Adson 하나 더") == "T02"
     queued = list(twin.state.surgeon_request_queue)
-    assert [cue.instance_id for cue in queued] == ["T02#1", "T02#2"]
-    assert queued[1].generation > first_generation
-
-    # T02#1 is part of the authored initial layout and is already held by the
-    # surgeon. It satisfies the first cue without another robot handover.
-    assert twin._request_cue_committed(queued[0]) is True
-    assert twin._dequeue_active_request("already_surgeon_owned") is True
-    assert twin.state.surgeon_request_instance_id == "T02#2"
+    assert [cue.instance_id for cue in queued] == ["T02#2"]
+    assert twin.handover_allowed() is True
     assert _handover_active_request(twin) == "T02#2"
     assert twin.instrument_states["T02#1"].lifecycle_stage == (
         LIFECYCLE_SURGEON_OWNED
@@ -117,6 +180,138 @@ def test_one_more_is_a_distinct_generation_and_handover_instance() -> None:
         LIFECYCLE_SURGEON_OWNED
     )
     assert twin.state.surgeon_request_tool == ""
+
+
+def test_typed_voice_request_rejects_surgeon_only_supplier_before_queue() -> None:
+    twin = ORDigitalTwin(_demo_spec())
+    state = twin.instrument_states["T04#1"]
+    twin._set_lifecycle(
+        state,
+        LIFECYCLE_SURGEON_OWNED,
+        location_type="surgeon_hand",
+        location_id="surgeon_hand",
+        confidence=1.0,
+    )
+
+    assert twin._enqueue_surgeon_request(
+        event_type="voice_request",
+        instrument_id="T04",
+        typed_voice_execution_required=True,
+    ) is False
+    assert twin.state.surgeon_request_instance_id == ""
+    assert twin.update_resolved_voice_tool_handover("T04") == ""
+    assert list(twin.state.surgeon_request_queue) == []
+    assert twin.state.surgeon_request_instance_id == ""
+    assert twin.event_history[-1]["event_type"] == "ResolvedVoiceToolHandoverUpdated"
+    assert twin.event_history[-1]["accepted"] is False
+
+
+def test_structured_request_rejects_surgeon_only_supplier_before_history_admission() -> None:
+    twin = ORDigitalTwin(_demo_spec())
+    state = twin.instrument_states["T04#1"]
+    twin._set_lifecycle(
+        state,
+        LIFECYCLE_SURGEON_OWNED,
+        location_type="surgeon_hand",
+        location_id="surgeon_hand",
+        confidence=1.0,
+    )
+    request = SurgeonRequest()
+    request.event_type = "voice_request"
+    request.requested_tool = "T04"
+    request.ready_for_handover = True
+
+    assert twin.update_surgeon_request(request) == ""
+    assert list(twin.state.surgeon_request_queue) == []
+    assert twin.state.surgeon_request_instance_id == ""
+    assert twin.event_history[-1]["accepted"] is False
+    assert twin.event_history[-1]["reason"] == "tool_inventory_unavailable"
+
+
+def test_typed_voice_request_rejects_missing_or_unknown_supplier_before_queue() -> None:
+    missing = ORDigitalTwin(_demo_spec())
+    del missing.instrument_states["T04#1"]
+
+    assert missing.update_resolved_voice_tool_handover("T04") == ""
+    assert list(missing.state.surgeon_request_queue) == []
+    assert missing.state.surgeon_request_instance_id == ""
+
+    unknown = ORDigitalTwin(_demo_spec())
+    state = unknown.instrument_states["T04#1"]
+    state.home_location_type = "unknown"
+    state.home_location_id = "unknown"
+    state.location_type = "unknown"
+    state.location_id = "unknown"
+
+    assert unknown.update_resolved_voice_tool_handover("T04") == ""
+    assert list(unknown.state.surgeon_request_queue) == []
+    assert unknown.state.surgeon_request_instance_id == ""
+
+
+def test_typed_voice_request_accepts_canonical_tray_mayo_and_robot_sources() -> None:
+    tray = ORDigitalTwin(_demo_spec())
+    assert tray.update_resolved_voice_tool_handover("T04") == "T04"
+    assert tray.state.surgeon_request_instance_id == "T04#1"
+    assert tray.handover_allowed() is True
+
+    mayo = ORDigitalTwin(_demo_spec())
+    mayo_state = mayo.instrument_states["T04#1"]
+    mayo._set_lifecycle(
+        mayo_state,
+        LIFECYCLE_MAYO_REUSE,
+        location_type="mayo_stand",
+        location_id="mayo_stand",
+        confidence=1.0,
+    )
+    assert mayo.state.cam4_mayo_hand_present is True
+    assert mayo.update_resolved_voice_tool_handover("T04") == "T04"
+    assert mayo.state.surgeon_request_instance_id == mayo_state.instance_id
+    assert mayo.handover_allowed() is True
+
+    robot = ORDigitalTwin(_demo_spec())
+    robot_state = robot.instrument_states["T04#1"]
+    robot._set_lifecycle(
+        robot_state,
+        LIFECYCLE_PREPOSITIONED_RIGHT,
+        location_type="robot_right_hand",
+        location_id="robot_right_hand",
+        confidence=1.0,
+    )
+    assert robot.update_resolved_voice_tool_handover("T04") == "T04"
+    assert robot.state.surgeon_request_instance_id == robot_state.instance_id
+    assert robot.handover_allowed() is True
+
+    # The current controller projection still uses the legacy generic robot
+    # anchor for an owned right-hand tool. It is the same controllable source,
+    # not an unknown robot observation.
+    legacy_robot = ORDigitalTwin(_demo_spec())
+    legacy_robot_state = legacy_robot.instrument_states["T04#1"]
+    legacy_robot._set_lifecycle(
+        legacy_robot_state,
+        LIFECYCLE_PREPOSITIONED_RIGHT,
+        location_type="robot",
+        location_id="robot",
+        confidence=1.0,
+    )
+    assert legacy_robot.update_resolved_voice_tool_handover("T04") == "T04"
+    assert legacy_robot.handover_allowed() is True
+
+
+def test_voice_request_supersedes_mayo_recovery_while_cam4_has_hand() -> None:
+    twin = ORDigitalTwin(_demo_spec())
+    state = twin.instrument_states["T04#1"]
+    twin._set_lifecycle(
+        state,
+        LIFECYCLE_MAYO_RECOVERY,
+        location_type="mayo_stand",
+        location_id="mayo_stand",
+        confidence=1.0,
+    )
+
+    assert twin.state.cam4_mayo_hand_present is True
+    assert twin.update_resolved_voice_tool_handover("T04") == "T04"
+    assert twin.state.surgeon_request_instance_id == state.instance_id
+    assert twin.handover_allowed() is True
 
 
 def test_explicit_request_prefers_same_type_prepositioned_instance() -> None:
@@ -139,6 +334,61 @@ def test_explicit_request_prefers_same_type_prepositioned_instance() -> None:
     twin.normalize_for_publish()
 
     assert prepositioned.next_required_transition == ""
+
+
+def test_explicit_request_prefers_same_type_mayo_instance_over_tray() -> None:
+    twin = ORDigitalTwin(_demo_spec())
+    _tray_instance, mayo_instance = _place_adson_duplicate_on_tray_and_mayo(
+        twin
+    )
+    twin.set_cam4_mayo_hand_present(False)
+
+    assert twin.update_explicit_request("Adson") == "T02"
+    assert twin.state.surgeon_request_instance_id == mayo_instance.instance_id
+
+
+def test_explicit_voice_request_keeps_mayo_supplier_while_cam4_has_hand() -> None:
+    twin = ORDigitalTwin(_demo_spec())
+    _tray_instance, mayo_instance = _place_adson_duplicate_on_tray_and_mayo(
+        twin
+    )
+
+    assert twin.state.cam4_mayo_hand_present is True
+    assert twin.update_explicit_request("Adson") == "T02"
+    assert twin.state.surgeon_request_instance_id == mayo_instance.instance_id
+
+
+def test_cam4_hand_rebinds_uncommitted_nonvoice_request_to_tray_duplicate() -> None:
+    twin = ORDigitalTwin(_demo_spec())
+    tray_instance, mayo_instance = _place_adson_duplicate_on_tray_and_mayo(
+        twin
+    )
+    request = SurgeonRequest()
+    request.event_type = "request_tool"
+    request.requested_tool = "T02"
+    request.ready_for_handover = True
+    twin.set_cam4_mayo_hand_present(False)
+    assert twin.update_surgeon_request(request) == "T02"
+    assert twin.state.surgeon_request_instance_id == mayo_instance.instance_id
+    request_generation = twin.state.surgeon_request_generation
+
+    assert twin.set_cam4_mayo_hand_present(True)
+    assert twin.state.surgeon_request_instance_id == tray_instance.instance_id
+    assert twin.state.surgeon_request_generation == request_generation
+
+
+def test_cam4_hand_does_not_rebind_uncommitted_voice_mayo_request() -> None:
+    twin = ORDigitalTwin(_demo_spec())
+    _tray_instance, mayo_instance = _place_adson_duplicate_on_tray_and_mayo(
+        twin
+    )
+    twin.set_cam4_mayo_hand_present(False)
+    assert twin.update_explicit_request("Adson") == "T02"
+    request_generation = twin.state.surgeon_request_generation
+
+    assert twin.set_cam4_mayo_hand_present(True)
+    assert twin.state.surgeon_request_instance_id == mayo_instance.instance_id
+    assert twin.state.surgeon_request_generation == request_generation
 
 
 def test_return_unused_preposition_targets_physical_instance_with_duplicate_type() -> None:
@@ -189,6 +439,39 @@ def test_return_unused_preposition_targets_physical_instance_with_duplicate_type
     assert twin.state.right_hand_tool_instance_id == ""
 
 
+def test_controller_cancel_recovery_to_tray_overrides_mayo_origin() -> None:
+    twin = ORDigitalTwin(_demo_spec())
+    state = twin.instrument_states["T02#1"]
+    twin._set_lifecycle(
+        state,
+        LIFECYCLE_PREPOSITIONED_RIGHT,
+        location_type="robot_right_hand",
+        location_id="robot_right_hand",
+        confidence=1.0,
+    )
+    state.preposition_origin_lifecycle_stage = LIFECYCLE_MAYO_REUSE
+    state.preposition_origin_location_type = "mayo_stand"
+    state.preposition_origin_location_id = "mayo_stand"
+
+    canceled = _event(
+        "UnusedPrepositionReturned",
+        "T02",
+        controller_final_state="canceled",
+        controller_reason_code="canceled_recovered_to_tray",
+    )
+    canceled.instance_id = state.instance_id
+    canceled.source_location_type = "robot"
+    canceled.source_location_id = "robot"
+    canceled.target_location_type = "tray"
+    canceled.target_location_id = "tray"
+    twin.apply_event(canceled)
+
+    assert state.lifecycle_stage == LIFECYCLE_RETURNED_HOME
+    assert state.location_type == "tray"
+    assert state.location_id == "tray"
+    assert state.preposition_origin_lifecycle_stage == ""
+
+
 def test_legacy_return_task_prefers_prepositioned_duplicate_instance() -> None:
     twin = ORDigitalTwin(_demo_spec())
     twin._set_lifecycle(
@@ -229,7 +512,7 @@ def test_legacy_return_task_prefers_prepositioned_duplicate_instance() -> None:
 
 def test_preposition_is_not_rejected_only_for_phase_expected_list_mismatch() -> None:
     twin = ORDigitalTwin(_demo_spec())
-    twin.set_initial_phase("P06")
+    twin.set_initial_phase("P04")
     expected_types = set(twin.get_expected_instruments())
     state = next(
         candidate
@@ -437,8 +720,8 @@ def test_default_mayo_policy_never_forces_recovery_from_capacity() -> None:
     twin.state.execution_state = "running"
     selected = [
         twin.instrument_states["T02#2"],
-        twin.instrument_states["T03#1"],
         twin.instrument_states["T04#1"],
+        twin.instrument_states["T07#1"],
     ]
     for state in selected:
         twin._set_lifecycle(

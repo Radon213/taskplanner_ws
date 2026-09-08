@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from or_digital_twin.models import (
+    LIFECYCLE_HOME_RACK,
     LIFECYCLE_SURGEON_OWNED,
 )
 from or_digital_twin.twin import ORDigitalTwin
@@ -31,27 +32,56 @@ def _mayo_observation(instance_id: str, stamp_sec: int) -> ToolObservation:
     return observation
 
 
-def test_demo_starts_with_both_allis_instances_in_active_surgeon_use() -> None:
+def test_demo_starts_with_exact_four_authored_rack_tools() -> None:
     twin = ORDigitalTwin(_demo_spec())
 
-    allis_states = [
-        twin.instrument_states["T03#1"],
-        twin.instrument_states["T03#2"],
-    ]
-    assert all(
-        state.lifecycle_stage == LIFECYCLE_SURGEON_OWNED
-        and state.location_type == "surgical_field"
-        and state.location_id == "field_region_procedure"
-        and state.owner == "surgeon"
-        and state.status == "in_use"
-        and state.contaminated
-        for state in allis_states
-    )
-    assert not any(
-        state.instance_id.startswith("T03#")
-        and state.lifecycle_stage != LIFECYCLE_SURGEON_OWNED
+    assert set(twin.instrument_states) == {
+        "T02#1",
+        "T04#1",
+        "T07#1",
+        "T08#1",
+    }
+    assert [
+        (
+            state.instance_id,
+            state.lifecycle_stage,
+            state.location_type,
+            state.location_id,
+        )
         for state in twin.instrument_states.values()
+    ] == [
+        ("T02#1", LIFECYCLE_HOME_RACK, "tray_slot", "main_tray_slot_1"),
+        ("T04#1", LIFECYCLE_HOME_RACK, "tray_slot", "main_tray_slot_2"),
+        ("T07#1", LIFECYCLE_HOME_RACK, "tray_slot", "main_tray_slot_3"),
+        ("T08#1", LIFECYCLE_HOME_RACK, "tray_slot", "main_tray_slot_4"),
+    ]
+
+
+def test_paused_scenario_swap_preserves_observed_tool_state_without_reset() -> None:
+    twin = ORDigitalTwin(_demo_spec())
+    observed = twin.instrument_states["T02#1"]
+    twin._set_lifecycle(
+        observed,
+        LIFECYCLE_SURGEON_OWNED,
+        location_type="surgeon_hand",
+        location_id="surgeon_hand",
+        confidence=0.97,
     )
+    twin.state.procedure_run_id = "paused-run"
+    twin.state.running = True
+    twin.state.execution_state = "paused"
+
+    twin.swap_spec_preserving_paused_world(_demo_spec())
+
+    preserved = twin.instrument_states["T02#1"]
+    untouched = twin.instrument_states["T04#1"]
+    assert twin.state.running is True
+    assert twin.state.execution_state == "paused"
+    assert twin.state.procedure_run_id == "paused-run"
+    assert preserved.lifecycle_stage == LIFECYCLE_SURGEON_OWNED
+    assert preserved.location_type == "surgeon_hand"
+    assert preserved.location_id == "surgeon_hand"
+    assert untouched.location_id == "main_tray_slot_2"
 
 
 def test_demo_omits_bed_retractors_from_instances_and_rack_slots() -> None:
@@ -95,7 +125,7 @@ def test_demo_phase_entry_does_not_relocate_rack_tools_for_controller_retraction
 def test_demo_retractor_names_do_not_consume_handover_capacity() -> None:
     twin = ORDigitalTwin(_demo_spec())
     twin.set_initial_phase("P04")
-    for instance_id in ("T02#1", "T03#1"):
+    for instance_id in ("T02#1", "T04#1"):
         twin._set_lifecycle(
             twin.instrument_states[instance_id],
             LIFECYCLE_SURGEON_OWNED,

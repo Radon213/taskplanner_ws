@@ -86,7 +86,7 @@ RUN source /opt/ros/jazzy/setup.bash \
     && apt-get update \
     && rosdep install --from-paths src --ignore-src -r -y --skip-keys "ament_python" \
     && rm -rf /var/lib/apt/lists/* \
-    && colcon build --symlink-install --cmake-args -DBUILD_TESTING=OFF
+    && colcon build --packages-up-to btops_gateway --symlink-install --cmake-args -DBUILD_TESTING=OFF
 
 ENV TASKPLANNER_IMAGE_VERSION=${TASKPLANNER_BUILD_VERSION}
 ENV TASKPLANNER_IMAGE_GIT_SHA=${TASKPLANNER_BUILD_SHA}

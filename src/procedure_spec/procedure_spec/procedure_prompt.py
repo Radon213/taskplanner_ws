@@ -34,6 +34,7 @@ def compact_procedure_prompt(bundle_dir: str | Path) -> dict[str, Any]:
 
     tools = payload.get("tools", {})
     tool_inventory = payload.get("tool_inventory", {})
+    tool_population = payload.get("tool_population", {})
     phase_labels = payload.get("phase_labels", {})
     normal_phases = phase_labels.get("normal", {}) if isinstance(phase_labels, dict) else {}
     interrupt_phases = phase_labels.get("interrupt", {}) if isinstance(phase_labels, dict) else {}
@@ -172,9 +173,14 @@ def compact_procedure_prompt(bundle_dir: str | Path) -> dict[str, Any]:
                 "n": str(name),
                 "rt": str(tool_id),
                 "q": int(
-                    tool_inventory.get(tool_id, 1)
-                    if isinstance(tool_inventory, dict)
-                    else 1
+                    (
+                        tool_population.get(tool_id, {}).get("initial_count", 1)
+                        if isinstance(tool_population, dict)
+                        and isinstance(tool_population.get(tool_id), dict)
+                        else tool_inventory.get(tool_id, 1)
+                        if isinstance(tool_inventory, dict)
+                        else 1
+                    )
                 ),
             }
             for tool_id, name in (tools if isinstance(tools, dict) else {}).items()

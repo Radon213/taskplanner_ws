@@ -38,6 +38,8 @@ string DISTANCE_DEFAULTED="defaulted"
 builtin_interfaces/Time stamp
 string request_id
 string command_id
+# Copied from the admitted request; never inferred at callback time.
+string procedure_run_id
 string group_id
 string operation
 string arm_id

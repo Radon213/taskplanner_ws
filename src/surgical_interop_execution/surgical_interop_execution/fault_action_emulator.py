@@ -10,16 +10,24 @@ import threading
 import time
 from typing import Any
 
+from procedure_spec import get_default_spec_dir
+from procedure_spec.scenario_consumer import (
+    ScenarioConfigConsumerBinding,
+    ScenarioConsumerBundle,
+    scenario_config_apply_is_safe,
+)
 import rclpy
 from rcl_interfaces.msg import SetParametersResult
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import String
 from surgical_interop_msgs.action import ExecuteToolHandover
 from surgical_interop_msgs.msg import BedRobotArmState, BedRobotArmStateArray
 from surgical_interop_msgs.srv import ExecuteRetractionCommand
+from surgical_msgs.msg import SimulationState
 import yaml
 
 from .controller_contract import (
@@ -110,6 +118,14 @@ class EmulatorProfile:
         return cls(str(payload.get("profile_id", Path(path).stem)), routes)
 
 
+@dataclass(frozen=True, slots=True)
+class _ScenarioProjection:
+    """The small, non-endpoint portion of a selected scenario this emulator uses."""
+
+    spec_dir: str
+    procedure_type: str
+
+
 def valid_tool_transition(source: str, target: str) -> bool:
     return (source.strip().lower(), target.strip().lower()) in REVIEWED_TOOL_TRANSITIONS
 
@@ -155,30 +171,36 @@ def validate_retraction_command(
         ExecuteRetractionCommand.Request.COMMAND_ADJUST_RETRACTION,
         ExecuteRetractionCommand.Request.COMMAND_CHANGE_TOOL,
         ExecuteRetractionCommand.Request.COMMAND_STOP_RETRACTION,
+        ExecuteRetractionCommand.Request.COMMAND_SUCTION,
+        ExecuteRetractionCommand.Request.COMMAND_SUCTION_OUT,
     }
     if command not in valid_commands:
         return (
             ExecuteRetractionCommand.Response.RESULT_INVALID_COMMAND,
             "invalid_command",
         )
-    valid_target_sides = {
+    valid_finish_target_sides = {
         ExecuteRetractionCommand.Request.TARGET_NONE,
         ExecuteRetractionCommand.Request.TARGET_LEFT,
         ExecuteRetractionCommand.Request.TARGET_RIGHT,
     }
     if command == ExecuteRetractionCommand.Request.COMMAND_ADJUST_RETRACTION:
-        # The peer contract encodes a bilateral adjustment as TARGET_NONE (0).
-        if target_side not in valid_target_sides:
+        valid_adjustment_target_sides = {
+            ExecuteRetractionCommand.Request.TARGET_LEFT,
+            ExecuteRetractionCommand.Request.TARGET_RIGHT,
+            ExecuteRetractionCommand.Request.TARGET_BOTH,
+        }
+        if target_side not in valid_adjustment_target_sides:
             return (
                 ExecuteRetractionCommand.Response.RESULT_INVALID_PARAMETER,
-                "adjust_requires_target_none_for_both_or_left_right_target",
+                "adjust_requires_left_right_or_both_target",
             )
         if (
             not isfinite(distance_m)
             or not isfinite(maximum)
             or maximum <= 0.0
-            or distance_m <= 0.0
-            or distance_m > maximum
+            or distance_m == 0.0
+            or abs(distance_m) > maximum
         ):
             return (
                 ExecuteRetractionCommand.Response.RESULT_INVALID_PARAMETER,
@@ -186,12 +208,12 @@ def validate_retraction_command(
             )
         return ExecuteRetractionCommand.Response.RESULT_ACCEPTED, ""
     if command == ExecuteRetractionCommand.Request.COMMAND_FINISH_DIRECT_TEACH:
-        if target_side not in valid_target_sides or distance_m != 0.0:
+        if target_side not in valid_finish_target_sides or distance_m != 0.0:
             return (
                 ExecuteRetractionCommand.Response.RESULT_INVALID_PARAMETER,
                 (
                     "command_does_not_accept_target_or_distance"
-                    if target_side not in valid_target_sides
+                    if target_side not in valid_finish_target_sides
                     else "finish_direct_teach_requires_zero_distance"
                 ),
             )
@@ -205,7 +227,7 @@ def validate_retraction_command(
                 "change_tool_requires_zero_target_and_distance",
             )
         return ExecuteRetractionCommand.Response.RESULT_ACCEPTED, ""
-    if target_side not in valid_target_sides or distance_m != 0.0:
+    if target_side != ExecuteRetractionCommand.Request.TARGET_NONE or distance_m != 0.0:
         return (
             ExecuteRetractionCommand.Response.RESULT_INVALID_PARAMETER,
             "command_does_not_accept_target_or_distance",
@@ -233,6 +255,25 @@ class FaultActionEmulator(Node):
         self._procedure_type = str(
             self.declare_parameter("procedure_type", "nephrectomy").value
         ).strip()
+        self._scenario_config = ScenarioConfigConsumerBinding(
+            fixed_spec_root=Path(
+                self.declare_parameter(
+                    "scenario_config_spec_root",
+                    str(get_default_spec_dir().resolve().parent),
+                ).value
+            ).resolve()
+        )
+        self._scenario_config_topic = str(
+            self.declare_parameter(
+                "scenario_config_topic", "/simulation/scenario_config"
+            ).value
+        ).strip()
+        if not self._scenario_config_topic:
+            raise RuntimeError("scenario_config_topic must not be empty")
+        self._scenario_state_received = False
+        self._scenario_running = False
+        self._scenario_execution_state = ""
+        self._scenario_initial_idle = True
         self._tool_handover_endpoint = str(
             self.declare_parameter(
                 "tool_handover_endpoint", "/surgery/tool_handover"
@@ -292,6 +333,22 @@ class FaultActionEmulator(Node):
         if get_capability_policy(self._capability_policy_id) is None:
             raise RuntimeError("fault action emulator capability policy is unknown")
         self._status_pub = self.create_publisher(String, "/test/action_emulator/status", 10)
+        self.create_subscription(
+            SimulationState,
+            "/simulation/state",
+            self._on_simulation_state,
+            20,
+        )
+        self.create_subscription(
+            String,
+            self._scenario_config_topic,
+            self._on_scenario_config,
+            QoSProfile(
+                depth=1,
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            ),
+        )
         self._controller_contract_pub = None
         self._controller_contract_timer = None
         callback_group = ReentrantCallbackGroup()
@@ -344,6 +401,8 @@ class FaultActionEmulator(Node):
             "tool_handover_endpoint",
             "retraction_service_name",
             "publish_bed_robot_status",
+            "scenario_config_spec_root",
+            "scenario_config_topic",
             "controller_contract_topic",
             "controller_contract_id",
             "capability_policy_id",
@@ -401,6 +460,81 @@ class FaultActionEmulator(Node):
             self._publish_bed_robot_status,
         )
 
+    def _scenario_projection(self, bundle: ScenarioConsumerBundle) -> _ScenarioProjection:
+        """Project a validated bundle without allowing endpoint rebinding."""
+
+        spec = bundle.procedure_spec
+        requirements = spec.get_scenario_runtime_requirements()
+        return _ScenarioProjection(
+            spec_dir=bundle.spec_dir,
+            procedure_type=str(requirements.procedure_type or "").strip(),
+        )
+
+    def _scenario_config_apply_is_safe(self) -> bool:
+        """Keep status projection swaps away from active endpoint requests."""
+
+        with self._lock:
+            active_requests = bool(self._active_ids)
+        return scenario_config_apply_is_safe(
+            state_received=bool(getattr(self, "_scenario_state_received", False)),
+            scenario_running=bool(getattr(self, "_scenario_running", False)),
+            execution_state=getattr(self, "_scenario_execution_state", ""),
+            initial_idle=bool(getattr(self, "_scenario_initial_idle", False)),
+            local_busy=active_requests,
+        )
+
+    def _on_scenario_config(self, message: String) -> None:
+        """Observe ScenarioStore selection; endpoint topology remains fixed."""
+
+        try:
+            if not self._scenario_config.stage(message.data):
+                return
+        except Exception as exc:
+            self.get_logger().warning(
+                f"fault action emulator scenario config ignored: {exc}"
+            )
+            return
+        # Endpoint names remain process-lifetime.  A selected scenario only
+        # changes the local projection once this owner is paused/stopped and
+        # locally quiet; it never advertises a restart requirement.
+        self._apply_pending_scenario_config_if_safe()
+
+    def _apply_pending_scenario_config_if_safe(self) -> None:
+        """Apply only status projection fields, retaining incompatible topology."""
+
+        binding = self._scenario_config
+        snapshot = binding.pending_snapshot()
+        if snapshot is None or not self._scenario_config_apply_is_safe():
+            return
+        try:
+            resolved = binding.revalidate_pending()
+            if resolved is None:
+                return
+            snapshot, bundle = resolved
+            projection = self._scenario_projection(bundle)
+        except Exception as exc:
+            binding.discard(snapshot)
+            self.get_logger().warning(
+                f"fault action emulator scenario config rejected before swap: {exc}"
+            )
+            return
+        if not binding.commit(snapshot, bundle):
+            return
+        with self._lock:
+            self._procedure_type = projection.procedure_type
+        self.get_logger().info(
+            "fault action emulator scenario projection applied locally: "
+            f"{snapshot.bundle_name}@{snapshot.revision}"
+        )
+
+    def _on_simulation_state(self, msg: SimulationState) -> None:
+        self._scenario_state_received = True
+        self._scenario_running = bool(getattr(msg, "running", False))
+        self._scenario_execution_state = str(
+            getattr(msg, "execution_state", "") or ""
+        ).strip()
+        self._apply_pending_scenario_config_if_safe()
+
     def _count(self, route: str, outcome: str) -> None:
         values = self._route_counts.setdefault(route, {})
         values[outcome] = values.get(outcome, 0) + 1
@@ -428,6 +562,14 @@ class FaultActionEmulator(Node):
         with self._lock:
             if command_id in self._active_ids:
                 self._count(route, "rejected_duplicate_active")
+                return GoalResponse.REJECT
+            # The emulator is the common ActionServer boundary for virtual and
+            # mock clients.  Check and reserve under the same lock so distinct
+            # Goal IDs cannot overlap even when callbacks race in the
+            # MultiThreadedExecutor.  Cancel recovery retains the ID until
+            # _finish observes the terminal Action outcome.
+            if self._active_ids:
+                self._count(route, "rejected_action_inflight")
                 return GoalResponse.REJECT
             cached_result = self._completed.get((route, command_id))
             outcome = (
@@ -599,7 +741,9 @@ class FaultActionEmulator(Node):
         message.revision = self._bed_robot_revision
         message.procedure_type = self._procedure_type
         procedure_type = self._procedure_type.casefold()
-        if "thyroid" in procedure_type:
+        if not procedure_type:
+            configured_arms = ()
+        elif "thyroid" in procedure_type:
             configured_arms = (("arm_1", "army_navy"),)
         elif procedure_type == "inguinal_hernia_repair":
             configured_arms = (
@@ -643,6 +787,16 @@ class FaultActionEmulator(Node):
 
     def _publish_status(self) -> None:
         message = String()
+        scenario_config = getattr(self, "_scenario_config", None)
+        if scenario_config is None:
+            scenario_config_revision = ""
+            scenario_config_pending = None
+        else:
+            (
+                scenario_config_revision,
+                _,
+                scenario_config_pending,
+            ) = scenario_config.status()
         with self._lock:
             payload = {
                 "schema": "taskplanner.action_emulator_status.v1",
@@ -655,6 +809,12 @@ class FaultActionEmulator(Node):
                 "capability_policy_id": self._capability_policy_id,
                 "bed_robot_status_published": bool(
                     self._publish_bed_robot_status_enabled
+                ),
+                "scenario_config_revision": str(
+                    scenario_config_revision
+                ),
+                "scenario_config_pending_bundle": str(
+                    getattr(scenario_config_pending, "bundle_name", "")
                 ),
                 "active_command_ids": sorted(self._active_ids),
                 "counts": self._route_counts,

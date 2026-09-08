@@ -761,6 +761,178 @@ def test_failed_live_tick_records_health_but_publishes_no_stale_result() -> None
     assert node._last_periodic_live_image_stamp_sec is None
 
 
+def test_stale_epoch_result_is_discarded_without_marking_live_vlm_unhealthy() -> None:
+    node = RealVLMNode.__new__(RealVLMNode)
+    node._active = True
+    node._response_mode = "live"
+    node._context_mode = "actor_log"
+    node._require_field_image = True
+    node._current_image_input_error = ""
+    node._perception_generation = 3
+    node._model_input_epoch = 8
+    node._last_submitted_model_input_key = ""
+    node._exact_duplicate_suppressed_count = 0
+    node._system_prompt = "system"
+    node._developer_instruction = "developer"
+    node._select_images = lambda: (
+        [("flir", b"image", "image/jpeg")],
+        "flir_rfdetr_segmented",
+        ModelImage(
+            label="FLIR",
+            data=b"image",
+            mime_type="image/jpeg",
+            stamp_sec=71,
+            stamp_nanosec=500_000_000,
+            frame_id="flir",
+        ),
+    )
+    node.get_clock = lambda: SimpleNamespace(
+        now=lambda: SimpleNamespace(to_msg=lambda: Time(sec=71))
+    )
+    node._assemble_actor_log_context_dict = lambda: {}
+    node._actor_log_request_context_msg = lambda *_args: SimpleNamespace(
+        stamp=Time(sec=71)
+    )
+    node._request_context_pub = _Publisher()
+    node._current_model_input_signature = lambda *_args: "old-epoch-input"
+    node._next_visual_evidence_metadata = lambda *_args: (7, 1, "vlm-7-1")
+    node._publish_model_ready_image = lambda _image: None
+    node._run_model = lambda *_args: (
+        '{"v":"6"}',
+        {"v": "6"},
+        0.25,
+        "live",
+        0,
+        "",
+    )
+    node._release_dialogue_claim = lambda _correlation_id: None
+    health_calls = []
+    node._publish_health = lambda **kwargs: health_calls.append(kwargs)
+
+    node._tick_once(
+        force=False,
+        inference_trigger=INFERENCE_TRIGGER_PERIODIC_LIVE,
+    )
+
+    assert len(health_calls) == 1
+    health = health_calls[0]
+    assert health["image_source"] == "flir_rfdetr_segmented"
+    assert health["latency_sec"] == 0.25
+    assert health["output_chars"] == 0
+    assert health["parse_retry_count"] == 0
+    assert health["last_error"] == ""
+    assert health["mode"] == "stale_epoch_result_discarded"
+    assert health["healthy"] is True
+    assert health["connected"] is True
+
+
+def test_provider_change_during_model_call_discards_stale_snapshot_result() -> None:
+    """A completed old provider request is never published under new config."""
+
+    node = RealVLMNode.__new__(RealVLMNode)
+    node._inference_shutdown = threading.Event()
+    node._inference_config_epoch = 1
+    node._model_input_epoch = 8
+    node._provider_id = "ninfer"
+    node._model_id = "qwen-vlm"
+    node._active = True
+    node._response_mode = "live"
+    node._context_mode = "actor_log"
+    node._require_field_image = True
+    node._current_image_input_error = ""
+    node._perception_generation = 3
+    node._last_submitted_model_input_key = ""
+    node._exact_duplicate_suppressed_count = 0
+    node._system_prompt = "system"
+    node._developer_instruction = "developer"
+    node._select_images = lambda: (
+        [("flir", b"image", "image/jpeg")],
+        "flir_rfdetr_segmented",
+        ModelImage(
+            label="FLIR",
+            data=b"image",
+            mime_type="image/jpeg",
+            stamp_sec=71,
+            stamp_nanosec=0,
+            frame_id="flir",
+        ),
+    )
+    node.get_clock = lambda: SimpleNamespace(
+        now=lambda: SimpleNamespace(to_msg=lambda: Time(sec=71))
+    )
+    node._assemble_actor_log_context_dict = lambda: {}
+    node._actor_log_request_context_msg = lambda *_args: SimpleNamespace(
+        stamp=Time(sec=71)
+    )
+    node._request_context_pub = _Publisher()
+    node._current_model_input_signature = lambda *_args: "provider-a-input"
+    node._next_visual_evidence_metadata = lambda *_args: (8, 1, "vlm-8-1")
+    node._publish_model_ready_image = lambda _image: None
+
+    def _run_model(*_args):
+        node._inference_config_epoch += 1
+        return ('{"v":"6"}', {"v": "6"}, 0.2, "live", 0, "")
+
+    node._run_model = _run_model
+    node._release_dialogue_claim = lambda _correlation_id: None
+    health_calls = []
+    node._publish_health = lambda **kwargs: health_calls.append(kwargs)
+
+    node._tick_once(
+        force=False,
+        inference_trigger=INFERENCE_TRIGGER_PERIODIC_LIVE,
+    )
+
+    assert health_calls[-1]["mode"] == "stale_runtime_config_result_discarded"
+    assert health_calls[-1]["healthy"] is True
+
+
+def test_waiting_for_the_first_visual_frame_keeps_model_health_ready() -> None:
+    node = RealVLMNode.__new__(RealVLMNode)
+    node._active = True
+    node._response_mode = "live"
+    node._context_mode = "actor_log"
+    node._require_field_image = True
+    node._current_image_input_error = ""
+    node._last_periodic_live_image_stamp_sec = None
+    node._visual_frame_generation = 1
+    node._last_submitted_visual_generation = -1
+    node._system_prompt = "system"
+    node._developer_instruction = "developer"
+    node._select_images = lambda: ([], "missing(flir_visual)", None)
+    node.get_clock = lambda: SimpleNamespace(
+        now=lambda: SimpleNamespace(to_msg=lambda: Time(sec=71))
+    )
+    node._assemble_actor_log_context_dict = lambda: {}
+    node._actor_log_request_context_msg = lambda *_args: SimpleNamespace(
+        stamp=Time(sec=71)
+    )
+    node._request_context_pub = _Publisher()
+    health_calls = []
+    node._publish_health = lambda **kwargs: health_calls.append(kwargs)
+
+    node._tick_once(
+        force=False,
+        inference_trigger=INFERENCE_TRIGGER_PERIODIC_LIVE,
+    )
+
+    assert health_calls == [
+        {
+            "image_source": "missing(flir_visual)",
+            "latency_sec": 0.0,
+            "prompt_chars": len(node._system_prompt)
+            + len(node._developer_instruction)
+            + len(compact_prompt_json(actor_log_request_context({}, static_prompt_chars=15))),
+            "output_chars": 0,
+            "parse_retry_count": 0,
+            "last_error": "",
+            "mode": "awaiting_visual_input:no_fresh_image",
+            "healthy": True,
+            "connected": True,
+        }
+    ]
+
+
 def test_text_only_dialogue_never_publishes_visual_or_action_outputs() -> None:
     node = RealVLMNode.__new__(RealVLMNode)
     node._active = True
@@ -798,7 +970,7 @@ def test_text_only_dialogue_never_publishes_visual_or_action_outputs() -> None:
     )
     node._request_context_pub = _Publisher()
     node._current_model_input_signature = lambda *_args: "dialogue-input-1"
-    node._next_visual_evidence_metadata = lambda _key: (7, 1, "vlm-7-1")
+    node._next_visual_evidence_metadata = lambda *_args: (7, 1, "vlm-7-1")
     node._dialogue_turn_gate = SimpleNamespace(claim=lambda **_kwargs: object())
     node._publish_model_ready_image = lambda _image: None
     payload = {

@@ -1,6 +1,8 @@
 builtin_interfaces/Time stamp
 string request_id
 string command_id
+# Copied from the admitted command so delayed service receipts remain scoped.
+string procedure_run_id
 string group_id
 string operation
 string arm_id

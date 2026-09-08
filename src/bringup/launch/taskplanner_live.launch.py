@@ -79,6 +79,9 @@ def generate_launch_description() -> LaunchDescription:
     perception_location = LaunchConfiguration("perception_location")
     perception_endpoint = LaunchConfiguration("perception_endpoint")
     default_bundle = LaunchConfiguration("default_bundle")
+    speech_input_mode = LaunchConfiguration("speech_input_mode")
+    speech_input_topic = LaunchConfiguration("speech_input_topic")
+    sentence_input_topic = LaunchConfiguration("sentence_input_topic")
     robot_endpoint_source = LaunchConfiguration("robot_endpoint_source")
     retraction_endpoint_source = LaunchConfiguration("retraction_endpoint_source")
     external_controller_contract_id = LaunchConfiguration(
@@ -90,13 +93,11 @@ def generate_launch_description() -> LaunchDescription:
     controller_contract_max_age_sec = LaunchConfiguration(
         "controller_contract_max_age_sec"
     )
-    dispatch_readiness_max_age_sec = LaunchConfiguration(
-        "dispatch_readiness_max_age_sec"
-    )
-    # Procedure-specific perception is decided by integration_preflight from
-    # the *active* selected bundle.  This launch-time flag is only the explicit
-    # global opt-in for other Live procedures; tying it to default_bundle would
-    # leave a safely switched stopped demo with the wrong health requirement.
+    # Procedure-specific perception diagnostics are decided by
+    # integration_preflight from the *active* selected bundle. This launch-time
+    # flag is only the explicit global opt-in for other Live procedures; tying
+    # it to default_bundle would leave a safely switched stopped demo with the
+    # wrong diagnostic requirements.
     global_perception_required = PythonExpression(
         [
             "'",
@@ -104,11 +105,11 @@ def generate_launch_description() -> LaunchDescription:
             "'.lower() in ('true', '1', 'yes')",
         ]
     )
-    # Keep the typed RF-DETR contract armed for the external Production input
-    # when the process initially starts on a different bundle. The preflight
-    # node applies it only after the operator selects the thyroidectomy demo;
-    # otherwise a stopped-state switch could silently inherit no CAM3/CAM4
-    # location admission gate.
+    # Keep the typed RF-DETR contract visible to the external Production
+    # diagnostic observer when the process initially starts on a different
+    # bundle. The observer applies it only after the operator selects the
+    # thyroidectomy demo; otherwise a stopped-state switch could silently
+    # inherit no CAM3/CAM4 location diagnostic.
     structured_rfdetr_tool_observations_enabled = "true"
     # Keep the read-only relay alive whenever its public contract is enabled.
     # It opens native streams only for a fresh, active and locally validated
@@ -152,6 +153,27 @@ def generate_launch_description() -> LaunchDescription:
                 description=(
                     "Procedure bundle selected for the live runtime. An explicit "
                     "default_bundle:= argument still takes precedence."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "speech_input_mode",
+                default_value=_env("SPEECH_INPUT_MODE", "tagged_sentence"),
+                choices=("utterance", "tagged_sentence"),
+                description=(
+                    "Select the existing typed microphone ASR or the external "
+                    "[partial]/[final] sentence topic input."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "speech_input_topic",
+                default_value=_env(
+                    "ASR_UTTERANCE_TOPIC", "/sensors/speech/utterance"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "sentence_input_topic",
+                default_value=_env(
+                    "SENTENCE_INPUT_TOPIC", "/sensors/surgeon/sentence"
                 ),
             ),
             DeclareLaunchArgument(
@@ -231,16 +253,6 @@ def generate_launch_description() -> LaunchDescription:
                 description=(
                     "Legacy compatibility setting used for controller diagnostics "
                     "only; it never authorizes or blocks dispatch."
-                ),
-            ),
-            DeclareLaunchArgument(
-                "dispatch_readiness_max_age_sec",
-                default_value=_env(
-                    "TASKPLANNER_DISPATCH_READINESS_MAX_AGE_SEC", "3.0"
-                ),
-                description=(
-                    "Maximum age of /integration/readiness at the dispatch edge. "
-                    "This is independent of controller-contract telemetry."
                 ),
             ),
             DeclareLaunchArgument(
@@ -329,10 +341,12 @@ def generate_launch_description() -> LaunchDescription:
                     ),
                     "input_profile": "external",
                     "default_bundle": default_bundle,
+                    # Read-only probabilistic Real-to-sim projection. It is
+                    # deliberately absent from preflight and dispatch admission.
+                    "enable_tool_belief_tracker": "true",
                     "publish_shared_state": publish_shared_state,
                     "publish_shared_free_text": publish_shared_free_text,
                     "execution_backend": "external",
-                    "execution_contract": "direct",
                     # The operator's 2026-08-26 live CAM4 check accepted the
                     # pinned forced-Right/palm-facing mapping. The base launch
                     # remains fail-closed by default for mock/replay callers.
@@ -349,18 +363,9 @@ def generate_launch_description() -> LaunchDescription:
                     "controller_contract_max_age_sec": (
                         controller_contract_max_age_sec
                     ),
-                    "dispatch_readiness_max_age_sec": (
-                        dispatch_readiness_max_age_sec
-                    ),
-                    # Live is intentionally immutable to the typed ASR path.
-                    # Do not inherit generic SPEECH_INPUT_MODE or the legacy
-                    # String topic here: they are Debug/replay compatibility
-                    # controls, not a safe Live input authority.
-                    "speech_input_mode": "utterance",
-                    "speech_input_topic": _env(
-                        "ASR_UTTERANCE_TOPIC",
-                        "/sensors/surgeon/utterance",
-                    ),
+                    "speech_input_mode": speech_input_mode,
+                    "speech_input_topic": speech_input_topic,
+                    "sentence_input_topic": sentence_input_topic,
                     "speech_output_mode": "typed_utterance",
                     "speech_typed_output_topic": (
                         "/surgery/audio/admitted_utterance"
@@ -375,16 +380,29 @@ def generate_launch_description() -> LaunchDescription:
                         "TTS_ECHO_SIMILARITY_THRESHOLD", "0.88"
                     ),
                     "voice_command_input_mode": "utterance",
+                    # CommandRouter owns the admitted-ASR subscription.  The
+                    # resolver sees only a router-forwarded catalog miss and
+                    # returns a private proposal to that same router.
                     "voice_command_input_topic": (
-                        "/surgery/audio/admitted_utterance"
+                        "/surgery/voice/resolver_utterance"
                     ),
-                    # The resolver remains a proposal-only language adapter.
-                    # Only the durable VLM function gate may publish the
-                    # existing execution-intent topic in Live.
+                    "resolver_input_topic": "/surgery/voice/resolver_utterance",
+                    "resolver_output_topic": "/surgery/voice/proposal",
+                    # Exact catalog commands (currently suction) use the
+                    # lightweight direct router. They do not wait for a VLM
+                    # function call, DT receipt, or BT reconstruction.
+                    "command_router_enabled": "true",
+                    "command_router_catalog_path": _env(
+                        "COMMAND_ROUTER_CATALOG_PATH", ""
+                    ),
+                    "command_router_catalog_reload_sec": _env(
+                        "COMMAND_ROUTER_CATALOG_RELOAD_SEC", "0.5"
+                    ),
+                    # Compatibility alias for the resolver proposal channel.
+                    # No legacy composite consumer executes this output.
                     "voice_command_output_topic": "/surgery/voice/proposal",
-                    "vlm_function_gate_enabled": "true",
-                    "vlm_function_gate_ledger_path": (
-                        "/taskplanner-tts-state/vlm_function_gate.sqlite3"
+                    "legacy_voice_intent_topic": (
+                        "/surgery/voice/legacy_disabled"
                     ),
                     "enable_voice_procedure_control": "true",
                     # The operational ASR publishes an explicit
@@ -403,42 +421,10 @@ def generate_launch_description() -> LaunchDescription:
                         "ASR_RUNTIME_STATUS_SOURCE_FUTURE_TOLERANCE_SEC",
                         "0.5",
                     ),
-                    # The speech adapter remains the only ASR owner.  This
-                    # text-only VLM receives its final transcript downstream
-                    # and falls back deterministically if the local model is
-                    # unavailable or returns an invalid closed-schema answer.
-                    "retractor_voice_normalization_enabled": "true",
-                    "retractor_voice_interpreter_mode": _env(
-                        "RETRACTOR_VOICE_INTERPRETER_MODE",
-                        "vlm_with_fallback",
-                    ),
-                    "retractor_voice_vlm_base_url": vlm_base_url,
-                    "retractor_voice_vlm_model_id": vlm_model_id,
-                    "retractor_voice_vlm_api_key": _env(
-                        "RETRACTOR_VOICE_VLM_API_KEY",
-                        _env("VLM_API_KEY", ""),
-                    ),
-                    "retractor_voice_vlm_timeout_sec": _env(
-                        "RETRACTOR_VOICE_VLM_TIMEOUT_SEC", "2.0"
-                    ),
-                    # Natural-language resolver: short, fully-grounded
-                    # commands stay local for latency; models choose only an
-                    # explicit selector-required candidate ID.  No raw
-                    # transcript reaches execution.
-                    "voice_command_selector_mode": _env(
-                        "VOICE_COMMAND_SELECTOR_MODE", "openai_compatible"
-                    ),
-                    "voice_command_selector_endpoint": PythonExpression(
-                        [
-                            "'",
-                            vlm_base_url,
-                            "/v1/chat/completions'",
-                        ]
-                    ),
-                    "voice_command_selector_model": vlm_model_id,
-                    "voice_command_selector_timeout_sec": _env(
-                        "VOICE_COMMAND_SELECTOR_TIMEOUT_SEC", "0.35"
-                    ),
+                    # Natural-language resolution is intentionally local and
+                    # deterministic in Live.  No raw transcript reaches
+                    # execution and model availability cannot delay it.
+                    "voice_command_selector_mode": "deterministic",
                     "vlm_mode": vlm_mode,
                     "vlm_base_url": vlm_base_url,
                     "vlm_provider_id": vlm_provider_id,
@@ -456,7 +442,7 @@ def generate_launch_description() -> LaunchDescription:
                     "vlm_model_input_max_source_future_skew_sec": "0.25",
                     "vlm_max_output_tokens": _env(
                         "VLM_MAX_OUTPUT_TOKENS",
-                        "320",
+                        "384",
                     ),
                     "vlm_generation_seed": _env("VLM_GENERATION_SEED", "0"),
                     "vlm_response_format": _env(
@@ -528,7 +514,10 @@ def generate_launch_description() -> LaunchDescription:
                     "require_field_image": "false",
                     "require_rfdetr_applied_field_image": "false",
                     "require_rfdetr_cam4_overlay": "false",
-                    "require_integration_preflight": "true",
+                    "enable_integration_preflight_diagnostics": _env(
+                        "ENABLE_INTEGRATION_PREFLIGHT_DIAGNOSTICS",
+                        "true",
+                    ),
                     "preflight_require_perception": global_perception_required,
                     "preflight_require_rfdetr_tool_observations": (
                         structured_rfdetr_tool_observations_enabled
@@ -605,6 +594,12 @@ def generate_launch_description() -> LaunchDescription:
                         ),
                         "cam3_overlay_public_topic": (
                             "/surgery/images/cam3/overlay/compressed"
+                        ),
+                        "cam4_overlay_source_topic": (
+                            "/perception/cam_4/overlay/compressed"
+                        ),
+                        "cam4_overlay_public_topic": (
+                            "/surgery/images/cam4/overlay/compressed"
                         ),
                         "suction_overlay_source_topic": (
                             "/perception/suction/overlay/compressed"

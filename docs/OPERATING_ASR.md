@@ -14,26 +14,17 @@ scripts/taskplanner up live --build  # 새 checkout/인터페이스 변경 후 �
 scripts/taskplanner up live          # install overlay가 최신일 때
 ```
 
-launcher는 다음 순서를 보장한다.
+launcher는 Web UI와 독립 owner 집합(state-core, command, execution,
+ScenarioStore 등)을 요청한다. taskplanner-asr는 별도 owner이며, ASR·NInfer·
+camera·VLM 상태는 core 시작을 막지 않는다. 각 owner의 실제 상태는 Debug Runtime
+Owners에서 확인하고 해당 owner만 재시작한다. standalone Debug는 명시적으로
+시작할 때만 올라가며 Live warm restart에 자동으로 붙지 않는다.
 
-1. 이전 `taskplanner-runtime`, `taskplanner-asr`, perception, 통합 Debug
-   sidecar를 정지하고 제거한다.
-2. 공용 모델 제어면과 Web UI를 준비한다.
-3. `taskplanner-asr`를 시작하고 `/input/asr/runtime_status`에
-   `/taskplanner_asr` publisher가 나타날 때까지 기다린다.
-4. 그 뒤 `taskplanner-runtime`을 시작한다.
-5. 마지막으로 같은 4173 UI에서 사용할 통합 Debug sidecar를 시작한다.
-
-ASR 프로세스가 올라왔다는 것만으로 수술 시나리오가 준비된 것은 아니다.
-운영 ASR은 Puzzle AI 전송이 실제로 연결된 세션에서만 최종 문장 publisher를
-유지하며, live 런타임의 `/integration/readiness`는
-`/sensors/surgeon/sentence` publisher가 없으면 fail-closed 상태를 유지한다.
-같이 실행되는 통합 Debug sidecar의 `asr_start`는 운영 런타임이 실제로 실행
-중이거나 최신 정지 상태를 확인할 수 없을 때 거부된다. 운영 런타임이 신뢰할 수
-있는 최신 정지 상태라면 수동 제어를 활성화한 Debug 화면에서도 standalone ASR을
-시작할 수 있다. 운영 화면과 Debug는 공유 캡처 lock으로 동시에 마이크를 열지
-않으며, 운영 런타임이 다시 실행되면 운영 화면의 **수술실 음성 입력**을
-사용해야 한다. Debug의 장치 새로고침과 중지는 계속 사용할 수 있다.
+ASR 프로세스가 올라왔다는 것만으로 수술 시나리오가 준비되거나 어떤 명령이
+자동으로 허가되는 것은 아니다. 운영 ASR은 Puzzle AI 전송이 실제로 연결된
+세션에서만 최종 문장 publisher를 유지한다. 운영 화면과 standalone Debug ASR은
+공유 캡처 lock으로 동시에 마이크를 열지 않는다. Debug의 관찰은 언제든 가능하고,
+실제 개입은 authoritative paused/stopped 상태에서만 수행한다.
 
 `scripts/taskplanner up llm-surgeon`은 `taskplanner-asr`를 시작하지 않는다.
 다른 모드로 전환하거나 `scripts/taskplanner down`을 실행하면 이전 운영 ASR도
@@ -43,16 +34,19 @@ ASR 프로세스가 올라왔다는 것만으로 수술 시나리오가 준비�
 
 | 방향 | 이름 | 타입 | 의미 |
 |---|---|---|---|
-| ASR → ROS | `/sensors/surgeon/sentence` | `std_msgs/msg/String` | 서버가 확정한 비어 있지 않은 최종 문장만 발행 |
+| ASR → ROS | `/sensors/surgeon/utterance` | `surgical_msgs/msg/SpeechUtterance` | 서버가 확정한 비어 있지 않은 최종 발화와 source/time/utterance ID를 발행 |
 | ASR → ROS | `/input/asr/runtime_status` | `std_msgs/msg/String` | `taskplanner.asr.status.v1` JSON 상태, transient-local |
 | UI → ASR | `/input/asr/control` | `surgical_msgs/srv/AsrControl` | 장치 새로고침, route policy 선택, 캡처 시작·정지 |
 
-부분 인식, 토큰 스트림, 빈 문장은 ROS 문장 입력으로 발행하지 않는다. 상태
-publisher healthcheck와 최종 문장 publisher readiness는 서로 다른 검증이다.
+부분 인식, 토큰 스트림, 빈 문장은 ROS 발화 입력으로 발행하지 않는다. 상태
+publisher healthcheck와 최종 발화 publisher readiness는 서로 다른 진단이다.
+`speech_input_adapter`는 이 typed source를 한 번 검증한 뒤
+`/surgery/audio/admitted_utterance`를 발행하고, CommandRouter만 그 topic을
+명령으로 소비한다.
 
 ## 컨테이너 경계
 
-sidecar는 `taskplanner-runtime`과 같은 `taskplanner-ws:dev` 이미지, host
+sidecar는 split owner와 같은 taskplanner-ws:dev 이미지, host
 network, IPC, `ROS_DOMAIN_ID`, discovery 범위, Cyclone DDS RMW/profile을 쓴다.
 호스트 사용자와 동일한 `TASKPLANNER_UID:TASKPLANNER_GID`로 실행하고 다음만
 추가로 공유한다.
@@ -67,12 +61,10 @@ network, IPC, `ROS_DOMAIN_ID`, discovery 범위, Cyclone DDS RMW/profile을 쓴�
 목록을 별도 운영 선택지로 노출하지 않는다. 운영 기본값은 캡처 PCM·전사
 artifact를 저장하지 않으며 상태와 확정 문장만 ROS로 전달한다.
 
-운영과 standalone Debug ASR은 `/taskplanner-runs/asr/microphone.lock`을
+운영과 standalone Debug ASR은 /taskplanner-runs/asr/microphone.lock을
 공유한다. 한 쪽이 캡처 중이면 다른 쪽은 마이크를 열 수 없으며, 강제로 lock
 파일을 지워 동시 캡처를 우회해서는 안 된다. 소유 프로세스가 종료되면 advisory
-lock이 해제된다. live에 포함된 통합 Debug sidecar는 운영 상태가 실행 중이거나
-불명확할 때 `asr_start`를 거부하고, 최신 정지 상태일 때만 이 공유 lock을 통해
-Debug 캡처를 허용한다.
+lock이 해제된다.
 
 ## 환경 계약
 
@@ -86,7 +78,9 @@ Debug 캡처를 허용한다.
 | `PUZZLE_ASR_LAN_HEALTH_FAILURE_INTERVAL_SEC` | `0.5` | LAN 장애 중 빠른 재확인 시작 간격 |
 | `PUZZLE_ASR_LAN_HEALTH_TIMEOUT_SEC` | `0.5` | 한 번의 non-audio WebSocket handshake 제한 시간 |
 | `PUZZLE_ASR_LAN_HEALTH_STALE_AFTER_SEC` | `2.0` | 이 시간보다 오래된 결과를 stale로 보는 기준 |
-| `SENTENCE_INPUT_TOPIC` | `/sensors/surgeon/sentence` | 최종 문장 출력 토픽 |
+| `TASKPLANNER_ASR_ROLLOVER_AFTER_FINAL` | `false` | 기본은 하나의 지속 ASR WebSocket. `true`일 때만 nonempty server final 뒤 새 세션을 열어 비교한다. ASR sidecar 재시작 후 적용 |
+| `ASR_UTTERANCE_TOPIC` | `/sensors/surgeon/utterance` | typed 최종 발화 출력 토픽 |
+| `SENTENCE_INPUT_TOPIC` | `/sensors/surgeon/sentence` | Debug/replay legacy String input에만 사용하는 compatibility topic |
 | `TASKPLANNER_ASR_CAPTURE_LOCK` | `/taskplanner-runs/asr/microphone.lock` | 컨테이너 내부 공유 캡처 lock |
 | `TASKPLANNER_PIPEWIRE_SOCKET` | `/run/user/<uid>/pipewire-0` | 호스트 PipeWire 소켓 |
 | `TASKPLANNER_RUN_ROOT` | `${HOME}/.local/share/taskplanner/runs` | 호스트 산출물 root |
@@ -95,6 +89,11 @@ Debug 캡처를 허용한다.
 `PUZZLE_ASR_ENDPOINT=cloud`는 TLS의 worker-02 route를, `=lan`은 같은 유선망의
 `192.168.1.5:1196` route를 선택한다. Live에서만 추가되는
 `PUZZLE_ASR_ROUTE_POLICY`은 다음과 같이 동작한다.
+
+정상 server final은 문장 경계일 뿐 WebSocket 재연결 사유가 아니다.
+`TASKPLANNER_ASR_ROLLOVER_AFTER_FINAL=false`가 기본이며, `true`는 server-final
+rollover 동작을 비교해야 할 때만 사용한다. 이 값은 실행 중 세션에 적용되지 않으므로
+ASR sidecar를 재시작해야 한다.
 
 | policy | 새 마이크 세션 시작 시 동작 |
 |---|---|
@@ -141,12 +140,12 @@ bash tests/test_taskplanner_launcher.sh
 scripts/taskplanner status
 docker compose logs --tail 200 taskplanner-asr
 ros2 topic info --verbose /input/asr/runtime_status
-ros2 topic info --verbose /sensors/surgeon/sentence
+ros2 topic info --verbose /sensors/surgeon/utterance
 ```
 
 - `taskplanner-asr`가 unhealthy면 설치 overlay, ROS Domain/RMW, 상태 publisher와
   컨테이너 로그를 확인한다.
-- 상태 토픽은 보이지만 문장 publisher가 없으면 ASR 캡처/서버 연결이 아직
+- 상태 토픽은 보이지만 발화 publisher가 없으면 ASR 캡처/서버 연결이 아직
   열리지 않은 정상적인 fail-closed 상태일 수 있다.
 - `HOST_AUDIO_UNAVAILABLE`은 PipeWire 소켓 또는 사용자 UID/GID를,
   `NO_INPUT`은 Ubuntu에서 선택된 입력 장치와 USB 연결을 확인한다.

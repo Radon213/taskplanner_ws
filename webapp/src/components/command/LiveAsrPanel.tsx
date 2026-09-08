@@ -9,10 +9,16 @@ import {
   Server,
 } from "lucide-react";
 
-import type { LiveAsrControlResult, LiveAsrStatus } from "../../types";
+import { useLiveAsrStatusBridge } from "../../hooks/useLiveAsrStatusBridge";
+import type {
+  InputSourceStatus,
+  LiveAsrControlResult,
+  LiveAsrStatus,
+} from "../../types";
 import type { Language } from "../../utils/display";
 
-type LiveAsrOperation = "refresh_devices" | "set_route_policy" | "start" | "stop" | "restart_node";
+type LiveAsrInputMode = "utterance" | "tagged_sentence";
+type LiveAsrOperation = "refresh_devices" | "set_route_policy" | "set_input_mode" | "start" | "stop" | "restart_node";
 
 function formatLatency(value: number | null | undefined, language: Language): string {
   return typeof value === "number" && Number.isFinite(value)
@@ -99,16 +105,22 @@ function routeSelectionSummary(status: LiveAsrStatus, language: Language): strin
 }
 
 export function LiveAsrPanel({
-  status,
-  statusReceivedAt,
+  status: fallbackStatus,
+  statusReceivedAt: fallbackStatusReceivedAt,
+  statusBridgeUrl = "",
+  statusObservationEnabled = false,
   connected,
   pendingOperation,
   controlMessage,
   language,
   onControl,
+  inputSourceStatuses = {},
 }: {
   status: LiveAsrStatus;
   statusReceivedAt: number | null;
+  /** A dedicated lightweight socket prevents camera traffic from delaying ASR UI. */
+  statusBridgeUrl?: string;
+  statusObservationEnabled?: boolean;
   connected: boolean;
   pendingOperation: string;
   controlMessage: string;
@@ -116,15 +128,62 @@ export function LiveAsrPanel({
   onControl: (
     operation: LiveAsrOperation,
     deviceId?: number,
-    routePolicy?: LiveAsrStatus["route_policy"],
+    routePolicy?: LiveAsrStatus["route_policy"] | LiveAsrInputMode,
   ) => Promise<LiveAsrControlResult>;
+  inputSourceStatuses?: Record<string, InputSourceStatus>;
 }) {
+  const observation = useLiveAsrStatusBridge({
+    enabled: statusObservationEnabled,
+    url: statusBridgeUrl,
+  });
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  // The primary bridge remains the authoritative control path. Its latest
+  // status is a startup/reconnect fallback. A status received by a dead or
+  // stale observer must not permanently shadow the primary bridge.
+  const hasDedicatedStatus = observation.transportConnected
+    && observation.receivedAt !== null
+    && nowMs - observation.receivedAt <= 5_000;
+  const status = hasDedicatedStatus ? observation.status : fallbackStatus;
+  const selectedSourceStatus = useMemo(
+    () => Object.values(inputSourceStatuses)
+      .filter((candidate) => {
+        const sourceId = String(candidate.source_id || "").trim().toLowerCase();
+        const modality = String(candidate.modality || "").trim().toLowerCase();
+        return sourceId === "external_sentence_topic"
+          || sourceId === "external_topic"
+          || sourceId === "local_microphone"
+          || modality === "external_topic"
+          || modality === "microphone";
+      })
+      .sort((left, right) => {
+        const stamp = (candidate: InputSourceStatus) => (
+          Number(candidate.stamp?.sec ?? 0) * 1_000_000_000
+          + Number(candidate.stamp?.nanosec ?? 0)
+        );
+        return stamp(right) - stamp(left);
+      })[0],
+    [inputSourceStatuses],
+  );
+  const inferredInputMode: LiveAsrInputMode = selectedSourceStatus
+    && (
+      String(selectedSourceStatus.modality || "").toLowerCase() === "microphone"
+      || String(selectedSourceStatus.source_id || "").toLowerCase() === "local_microphone"
+    )
+    ? "utterance"
+    : selectedSourceStatus
+      ? "tagged_sentence"
+      : "utterance";
+  const [selectedInputMode, setSelectedInputMode] = useState<LiveAsrInputMode | null>(null);
+  const inputMode = selectedInputMode ?? inferredInputMode;
+  const externalInputMode = inputMode === "tagged_sentence";
+  const statusReceivedAt = hasDedicatedStatus
+    ? observation.receivedAt
+    : fallbackStatusReceivedAt;
   const preferredDeviceId = status.device_id
     ?? status.devices.find((device) => device.default)?.id
     ?? status.devices[0]?.id
     ?? -1;
   const [selectedDeviceId, setSelectedDeviceId] = useState(preferredDeviceId);
-  const [nowMs, setNowMs] = useState(() => Date.now());
 
   useEffect(() => {
     if (statusReceivedAt === null) return;
@@ -147,13 +206,23 @@ export function LiveAsrPanel({
   const selectedDevice = status.devices.find((device) => device.id === selectedDeviceId);
   const recentFinals = useMemo(() => [...status.finals].reverse().slice(0, 3), [status.finals]);
   const latestFinal = recentFinals[0];
-  const asrActive = ["STARTING", "LISTENING", "STOPPING"].includes(status.state);
-  const listening = status.state === "LISTENING";
+  const asrActive = !externalInputMode && ["STARTING", "LISTENING", "STOPPING"].includes(status.state);
+  const asrTransitioning = ["STARTING", "STOPPING"].includes(status.state);
+  const listening = !externalInputMode && status.state === "LISTENING";
+  const externalStatusFresh = Boolean(
+    selectedSourceStatus
+      && selectedSourceStatus.healthy
+      && String(selectedSourceStatus.state || "").toUpperCase() === "READY"
+      && Number(selectedSourceStatus.age_sec) >= 0
+      && Number(selectedSourceStatus.age_sec) <= 5,
+  );
   const statusFresh = statusReceivedAt !== null && nowMs - statusReceivedAt <= 5000;
-  const statusStale = statusReceivedAt !== null && !statusFresh;
+  const effectiveStatusFresh = externalInputMode ? externalStatusFresh : statusFresh;
+  const statusStale = externalInputMode ? !externalStatusFresh : statusReceivedAt !== null && !statusFresh;
   const statusAwaiting = statusReceivedAt === null;
   const lanOnlyUnavailable = status.route_policy === "lan" && status.lan_health.state !== "READY";
   const startDisabled = !connected
+    || externalInputMode
     || !statusFresh
     || !status.available
     || !selectedDevice
@@ -161,16 +230,21 @@ export function LiveAsrPanel({
     || asrActive
     || Boolean(pendingOperation);
   const stopDisabled = !connected || !asrActive || Boolean(pendingOperation);
-  const refreshDisabled = !connected || !statusFresh || asrActive || Boolean(pendingOperation);
-  const selectorDisabled = !connected || !statusFresh || asrActive || Boolean(pendingOperation);
-  const routePolicyDisabled = !connected || !statusFresh || asrActive || Boolean(pendingOperation);
-  const restartDisabled = !connected || Boolean(pendingOperation);
+  const refreshDisabled = !connected || externalInputMode || !statusFresh || asrActive || Boolean(pendingOperation);
+  const selectorDisabled = !connected || externalInputMode || !statusFresh || asrActive || Boolean(pendingOperation);
+  const routePolicyDisabled = !connected || externalInputMode || !statusFresh || asrActive || Boolean(pendingOperation);
+  const inputModeDisabled = !connected || asrActive || Boolean(pendingOperation);
+  const restartDisabled = !connected || externalInputMode || Boolean(pendingOperation);
   const restartPending = pendingOperation === "restart_node";
   const restartFeedbackIsError = controlMessage.startsWith("ASR 노드 새로 시작 실패:");
   const restartFeedbackIsSuccess = controlMessage.startsWith("ASR 노드 새로 시작 완료");
-  const restartSuccessIsCurrent = restartFeedbackIsSuccess && statusFresh;
+  const restartSuccessIsCurrent = restartFeedbackIsSuccess && effectiveStatusFresh;
   const levelPercent = Math.max(0, Math.min(100, ((status.audio_level_dbfs + 60) / 60) * 100));
-  const startBlockerMessage = statusStale
+  const startBlockerMessage = externalInputMode
+    ? language === "ko"
+      ? "외부 토픽 모드에서는 로컬 마이크 제어를 사용하지 않습니다. 외부 ASR이 /sensors/surgeon/sentence로 [partial]/[final]을 발행하는지 확인하세요."
+      : "Local microphone controls are disabled in external-topic mode. Ensure the external ASR publishes [partial]/[final] on /sensors/surgeon/sentence."
+    : statusStale
     ? language === "ko"
       ? "ASR sidecar 상태가 5초 이상 갱신되지 않았습니다. /input/asr/control을 호출하지 않습니다. sidecar가 정상 상태를 다시 발행한 뒤 재시도하세요."
       : "The ASR sidecar status is more than five seconds old. /input/asr/control will not be called until it publishes a fresh status."
@@ -192,7 +266,7 @@ export function LiveAsrPanel({
               ? language === "ko"
                 ? "LAN ASR이 아직 준비되지 않았습니다. 자동 또는 클라우드 경로를 선택하거나 LAN 상태가 준비된 뒤 시작하세요."
                 : "LAN ASR is not ready. Choose Auto or Cloud, or wait for LAN readiness before starting."
-              : asrActive
+              : asrTransitioning
                 ? language === "ko"
                   ? "ASR 세션 전환이 완료될 때까지 기다리세요."
                   : "Wait for the ASR session transition to finish."
@@ -212,7 +286,9 @@ export function LiveAsrPanel({
   const panelMessageIsError = restartFeedbackIsError
     || (!restartSuccessIsCurrent && Boolean(status.last_error || statusStale));
   const statusLabel = language === "ko"
-    ? statusStale
+    ? externalInputMode
+      ? (externalStatusFresh ? "외부 토픽 수신 중" : "외부 토픽 대기")
+      : statusStale
       ? "상태 지연"
       : statusAwaiting
         ? "상태 대기"
@@ -223,7 +299,9 @@ export function LiveAsrPanel({
             : status.state === "ERROR"
               ? "ASR 오류"
               : "ASR 정지"
-    : statusStale
+    : externalInputMode
+      ? (externalStatusFresh ? "External topic receiving" : "Waiting for external topic")
+      : statusStale
       ? "Status stale"
       : statusAwaiting
         ? "Waiting for status"
@@ -234,7 +312,9 @@ export function LiveAsrPanel({
             : status.state === "ERROR"
               ? "ASR error"
               : "ASR stopped";
-  const stateTone = statusStale ? "stale" : listening ? "active" : "idle";
+  const stateTone = externalInputMode
+    ? externalStatusFresh ? "active" : "stale"
+    : statusStale ? "stale" : listening ? "active" : "idle";
 
   return (
     <section className={`live-asr-panel ${listening ? "capturing" : ""}`} data-slot="live-asr-panel" aria-labelledby="live-asr-title">
@@ -247,7 +327,7 @@ export function LiveAsrPanel({
           aria-atomic="true"
           aria-live="polite"
           className={`live-asr-state ${stateTone}`}
-          data-status-fresh={statusFresh}
+          data-status-fresh={effectiveStatusFresh}
         >
           {pendingOperation ? <LoaderCircle className="live-asr-spinner" size={17} aria-hidden="true" /> : listening ? <Mic size={17} aria-hidden="true" /> : <MicOff size={17} aria-hidden="true" />}
           <span>{restartPending
@@ -257,6 +337,50 @@ export function LiveAsrPanel({
               : statusLabel}</span>
         </div>
       </div>
+
+      <fieldset
+        className="live-asr-route-policy live-asr-input-mode"
+        data-slot="live-asr-input-mode"
+        disabled={inputModeDisabled}
+      >
+        <legend>{language === "ko" ? "음성 입력 방식" : "Speech input mode"}</legend>
+        <div>
+          <label className={inputMode === "utterance" ? "selected" : ""}>
+            <input
+              checked={inputMode === "utterance"}
+              name="live-asr-input-mode"
+              onChange={() => {
+                void onControl("set_input_mode", -1, "utterance").then((result) => {
+                  if (result.accepted) setSelectedInputMode("utterance");
+                });
+              }}
+              type="radio"
+              value="utterance"
+            />
+            <span>
+              <strong>{language === "ko" ? "로컬 마이크" : "Local microphone"}</strong>
+              <small>{language === "ko" ? "기존 USB ASR" : "Existing USB ASR"}</small>
+            </span>
+          </label>
+          <label className={inputMode === "tagged_sentence" ? "selected" : ""}>
+            <input
+              checked={inputMode === "tagged_sentence"}
+              name="live-asr-input-mode"
+              onChange={() => {
+                void onControl("set_input_mode", -1, "tagged_sentence").then((result) => {
+                  if (result.accepted) setSelectedInputMode("tagged_sentence");
+                });
+              }}
+              type="radio"
+              value="tagged_sentence"
+            />
+            <span>
+              <strong>{language === "ko" ? "외부 토픽" : "External topic"}</strong>
+              <small>/sensors/surgeon/sentence · tagged</small>
+            </span>
+          </label>
+        </div>
+      </fieldset>
 
       <fieldset className="live-asr-route-policy" data-slot="live-asr-route-policy" disabled={routePolicyDisabled}>
         <legend>{language === "ko" ? "ASR 전송 경로" : "ASR transport route"}</legend>
@@ -272,7 +396,11 @@ export function LiveAsrPanel({
               />
               <span>
                 <strong>{routePolicyLabel(policy, language)}</strong>
-                <small>{policy === "cloud" ? "worker-02 · TLS" : policy === "lan" ? "192.168.1.5:1196" : language === "ko" ? "LAN 장애 시 클라우드" : "Cloud if LAN is unavailable"}</small>
+                <small>{policy === "cloud"
+                  ? (language === "ko" ? "설정된 클라우드 서버" : "Configured cloud server")
+                  : policy === "lan"
+                    ? (language === "ko" ? "설정된 LAN 서버" : "Configured LAN server")
+                    : language === "ko" ? "LAN 장애 시 클라우드" : "Cloud if LAN is unavailable"}</small>
               </span>
             </label>
           ))}
@@ -282,11 +410,20 @@ export function LiveAsrPanel({
       <div className={`live-asr-route-summary ${status.lan_health.state.toLowerCase()}`} data-slot="live-asr-route-summary">
         <Server size={15} aria-hidden="true" />
         <div>
-          <strong>{routeSelectionSummary(status, language)}</strong>
-          <span>{lanHealthSummary(status, language)}</span>
+          {externalInputMode ? (
+            <>
+              <strong>{language === "ko" ? "외부 ASR 토픽" : "External ASR topic"}</strong>
+              <span>{language === "ko" ? "[partial]/[final] 태그를 받아 처리합니다." : "Consumes tagged [partial]/[final] transcripts."}</span>
+            </>
+          ) : (
+            <>
+              <strong>{routeSelectionSummary(status, language)}</strong>
+              <span>{lanHealthSummary(status, language)}</span>
+            </>
+          )}
         </div>
       </div>
-      {status.route_policy !== "cloud" ? (
+      {!externalInputMode && status.route_policy !== "cloud" ? (
         <p className="live-asr-route-warning">
           {language === "ko" ? "LAN route는 평문 ws://입니다. 신뢰된 유선망에서만 사용하세요." : "The LAN route uses plaintext ws://. Use it only on a trusted wired network."}
         </p>
@@ -356,24 +493,38 @@ export function LiveAsrPanel({
 
       <div className="live-asr-live" aria-live="polite">
         <div className="live-asr-meter-copy">
-          <span><AudioLines size={15} aria-hidden="true" />{language === "ko" ? "입력 레벨" : "Input level"}</span>
-          <strong>{status.audio_level_dbfs.toFixed(1)} dBFS</strong>
+          <span><AudioLines size={15} aria-hidden="true" />{externalInputMode ? (language === "ko" ? "외부 토픽" : "External topic") : (language === "ko" ? "입력 레벨" : "Input level")}</span>
+          <strong>{externalInputMode ? (language === "ko" ? "텍스트 수신" : "Text ingress") : `${status.audio_level_dbfs.toFixed(1)} dBFS`}</strong>
         </div>
-        <div className="live-asr-meter" role="meter" aria-label={language === "ko" ? "마이크 입력 레벨" : "Microphone input level"} aria-valuemin={-60} aria-valuemax={0} aria-valuenow={Math.max(-60, Math.min(0, status.audio_level_dbfs))}>
-          <span style={{ width: `${levelPercent}%` }} />
+        <div className="live-asr-meter" role="meter" aria-label={externalInputMode ? (language === "ko" ? "외부 토픽 상태" : "External topic status") : (language === "ko" ? "마이크 입력 레벨" : "Microphone input level")} aria-valuemin={0} aria-valuemax={1} aria-valuenow={externalInputMode ? (externalStatusFresh ? 1 : 0) : Math.max(-60, Math.min(0, status.audio_level_dbfs))}>
+          <span style={{ width: `${externalInputMode ? (externalStatusFresh ? 100 : 0) : levelPercent}%` }} />
         </div>
         <p><span>{language === "ko" ? "부분 인식" : "Partial"}</span><strong>{status.partial_text || (listening ? (language === "ko" ? "음성 대기 중…" : "Waiting for speech…") : (language === "ko" ? "ASR 시작 전" : "ASR not started"))}</strong></p>
       </div>
 
       <div className="live-asr-facts">
-        <span><Server size={14} aria-hidden="true" />{status.connected ? (language === "ko" ? "ASR 서버 연결됨" : "ASR server connected") : (language === "ko" ? "ASR 서버 미연결" : "ASR server disconnected")}</span>
-        <code title={status.server_url}>{status.server_url || (language === "ko" ? "서버 주소 대기" : "Waiting for server URL")}</code>
+        <span><Server size={14} aria-hidden="true" />{externalInputMode
+          ? (externalStatusFresh
+            ? (language === "ko" ? "외부 ASR 토픽 연결됨" : "External ASR topic connected")
+            : (language === "ko" ? "외부 ASR 토픽 대기" : "Waiting for external ASR topic"))
+          : status.connected
+            ? (language === "ko" ? "ASR 서버 연결됨" : "ASR server connected")
+            : (language === "ko" ? "ASR 서버 미연결" : "ASR server disconnected")}</span>
+        <code title={externalInputMode ? "/sensors/surgeon/sentence" : status.server_url}>
+          {externalInputMode
+            ? "/sensors/surgeon/sentence"
+            : status.server_url || (language === "ko" ? "서버 주소 대기" : "Waiting for server URL")}
+        </code>
         <code>
-          {status.output_topic || status.topic || (language === "ko" ? "출력 토픽 대기" : "Waiting for output topic")}
-          {" · "}
-          {status.output_mode === "typed_utterance"
-            ? "surgical_msgs/msg/SpeechUtterance"
-            : status.output_mode === "sentence_text" ? "std_msgs/msg/String" : (language === "ko" ? "출력 형식 대기" : "Waiting for output type")}
+          {externalInputMode
+            ? "[partial] / [final] · surgical_msgs/msg/SpeechUtterance"
+            : <>
+              {status.output_topic || status.topic || (language === "ko" ? "출력 토픽 대기" : "Waiting for output topic")}
+              {" · "}
+              {status.output_mode === "typed_utterance"
+                ? "surgical_msgs/msg/SpeechUtterance"
+                : status.output_mode === "sentence_text" ? "std_msgs/msg/String" : (language === "ko" ? "출력 형식 대기" : "Waiting for output type")}
+            </>}
         </code>
         <code
           className="live-asr-runtime-revision"

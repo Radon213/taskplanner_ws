@@ -63,7 +63,7 @@ def test_bt_engine_factory_returns_fresh_flat_actions_in_contract_order() -> Non
         actions[1]._Node__parameters,  # noqa: SLF001 - launch contract audit
     )[0]
     assert parameters == {
-        "tick_rate": 0.1,
+        "tick_rate": 0.025,
         "groot2_port": 0,
         "state_change_logger": True,
     }

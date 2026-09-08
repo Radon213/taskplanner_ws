@@ -36,6 +36,7 @@ ROBOT_HANDOVER_ALIASES = frozenset(
 )
 
 RETURN_UNUSED_PREPOSITION_ALIASES = frozenset({"return_unused_preposition"})
+RETURN_PREPOSITION_TO_TRAY_ALIASES = frozenset({"return_preposition_to_tray"})
 
 RETRIEVE_ALIASES = frozenset(
     {
@@ -43,6 +44,30 @@ RETRIEVE_ALIASES = frozenset(
         "tool_retrieve",
     }
 )
+
+
+def retrieval_block_reason(simulation_state: object | None) -> str:
+    """Return the physical-route guard for a Mayo retrieval.
+
+    The Digital Twin/BT owns the normal policy decision, but the execution
+    bridge is the last boundary before an Action reaches the humanoid.  A
+    fresh state that still reports a right-hand payload therefore blocks a
+    left-hand retrieval as well.  Empty/missing state is handled by the
+    bridge's existing run/freshness guard; this helper only evaluates the
+    occupancy fact when a state is available.
+    """
+
+    if simulation_state is None:
+        return ""
+    right_hand_tool = str(
+        getattr(simulation_state, "right_hand_tool", "") or ""
+    ).strip()
+    right_hand_instance = str(
+        getattr(simulation_state, "right_hand_tool_instance_id", "") or ""
+    ).strip()
+    if right_hand_tool or right_hand_instance:
+        return "retrieve_blocked_right_hand_preposition"
+    return ""
 
 LOCATION_TRAY = "tray"
 LOCATION_MAYO = "mayo"
@@ -56,6 +81,7 @@ TRAY_PREPARE_TRANSITION = (LOCATION_TRAY, LOCATION_ROBOT)
 MAYO_PREPARE_TRANSITION = (LOCATION_MAYO, LOCATION_ROBOT)
 ROBOT_HANDOVER_TRANSITION = (LOCATION_ROBOT, LOCATION_SURGEON)
 RETURN_UNUSED_PREPOSITION_TRANSITION = (LOCATION_ROBOT, LOCATION_MAYO)
+RETURN_PREPOSITION_TO_TRAY_TRANSITION = (LOCATION_ROBOT, LOCATION_TRAY)
 RETRIEVE_TRANSITION = (LOCATION_MAYO, LOCATION_TRAY)
 
 GROUP_RETRACTION = "retraction"
@@ -83,14 +109,42 @@ RETRACTION_COMMAND_START_RETRACTION = 3
 RETRACTION_COMMAND_ADJUST_RETRACTION = 4
 RETRACTION_COMMAND_CHANGE_TOOL = 5
 RETRACTION_COMMAND_STOP_RETRACTION = 6
+RETRACTION_COMMAND_SUCTION = 7
+RETRACTION_COMMAND_SUCTION_OUT = 8
 RETRACTION_TARGET_NONE = 0
 RETRACTION_TARGET_LEFT = 1
 RETRACTION_TARGET_RIGHT = 2
-# The peer Service has no separate BOTH enum: TARGET_NONE (0) means both arms
-# for an adjustment.  Keep this semantic alias so the internal mapper can
-# retain the explicit ``both`` intent while serializing the peer-compatible
-# wire value.
-RETRACTION_TARGET_BOTH = RETRACTION_TARGET_NONE
+# The public Service keeps a distinct bilateral target so TARGET_NONE remains
+# unambiguous for commands without a target selector.
+RETRACTION_TARGET_BOTH = 3
+
+
+def retraction_request_allowed_by_scenario(
+    request: object,
+    simulation_state: object | None,
+) -> bool:
+    """Allow non-stop arm commands only in a confirmed running scenario.
+
+    Stop remains available at every lifecycle edge: delayed state telemetry
+    must never suppress a physical stop request.
+    """
+
+    try:
+        command = int(getattr(request, "command"))
+    except (TypeError, ValueError):
+        return False
+    if command == RETRACTION_COMMAND_STOP_RETRACTION:
+        return True
+    if simulation_state is None:
+        return False
+    return (
+        bool(getattr(simulation_state, "running", False))
+        and str(
+            getattr(simulation_state, "execution_state", "") or ""
+        ).strip().casefold()
+        == "running"
+        and bool(str(getattr(simulation_state, "procedure_run_id", "") or "").strip())
+    )
 
 ARM_1 = "arm_1"
 ARM_2 = "arm_2"
@@ -149,13 +203,13 @@ class DispatchLedger:
         self._command_ids: set[str] = set()
         self._command_order: deque[str] = deque()
         self._explicit_generation_legs: set[
-            tuple[int, tuple[str, str]]
+            tuple[str, int, tuple[str, str]]
         ] = set()
         # Rebased/original semantic legs are one logical reservation. Keep
         # their eviction atomic too; otherwise one delayed alternative could
         # become replayable earlier merely because the request used two legs.
         self._generation_leg_groups: deque[
-            tuple[tuple[int, tuple[str, str]], ...]
+            tuple[tuple[str, int, tuple[str, str]], ...]
         ] = deque()
 
     @classmethod
@@ -163,7 +217,8 @@ class DispatchLedger:
         cls,
         explicit_request_generation: int | None,
         semantic_leg: tuple[str, str] | None,
-    ) -> tuple[int, tuple[str, str]] | None:
+        procedure_run_id: str = "",
+    ) -> tuple[str, int, tuple[str, str]] | None:
         generation = (
             int(explicit_request_generation)
             if explicit_request_generation is not None
@@ -179,7 +234,11 @@ class DispatchLedger:
                 source_location.strip().casefold(),
                 target_location.strip().casefold(),
             )
-        return generation, normalized_leg
+        # Request generations restart from one for every procedure run.  The
+        # bridge itself stays alive across runs, so an unscoped generation
+        # would incorrectly suppress a valid action in the next run merely
+        # because its semantic leg matched an earlier one.
+        return str(procedure_run_id or "").strip(), generation, normalized_leg
 
     @classmethod
     def _generation_legs(
@@ -187,13 +246,15 @@ class DispatchLedger:
         explicit_request_generation: int | None,
         semantic_leg: tuple[str, str] | None,
         alternative_semantic_legs: tuple[tuple[str, str], ...],
-    ) -> tuple[tuple[int, tuple[str, str]], ...]:
+        procedure_run_id: str = "",
+    ) -> tuple[tuple[str, int, tuple[str, str]], ...]:
         candidates = (semantic_leg, *alternative_semantic_legs)
-        normalized: list[tuple[int, tuple[str, str]]] = []
+        normalized: list[tuple[str, int, tuple[str, str]]] = []
         for candidate in candidates:
             generation_leg = cls._generation_leg(
                 explicit_request_generation,
                 candidate,
+                procedure_run_id,
             )
             if generation_leg is not None and generation_leg not in normalized:
                 normalized.append(generation_leg)
@@ -206,6 +267,7 @@ class DispatchLedger:
         explicit_request_generation: int | None = None,
         semantic_leg: tuple[str, str] | None = None,
         alternative_semantic_legs: tuple[tuple[str, str], ...] = (),
+        procedure_run_id: str = "",
     ) -> bool:
         """Reserve a command only when it has not already been dispatched."""
 
@@ -216,6 +278,7 @@ class DispatchLedger:
             explicit_request_generation,
             semantic_leg,
             alternative_semantic_legs,
+            procedure_run_id,
         )
         if any(
             generation_leg in self._explicit_generation_legs
@@ -242,6 +305,7 @@ class DispatchLedger:
         *,
         explicit_request_generation: int | None = None,
         semantic_leg: tuple[str, str] | None = None,
+        procedure_run_id: str = "",
     ) -> bool:
         """Return whether an equivalent dispatch has already been consumed.
 
@@ -257,6 +321,7 @@ class DispatchLedger:
         generation_leg = self._generation_leg(
             explicit_request_generation,
             semantic_leg,
+            procedure_run_id,
         )
         return (
             generation_leg is not None
@@ -313,6 +378,7 @@ class InternalGroupCommand:
     raw_distance_text: str = ""
     rationale: str = ""
     confidence: float = 0.0
+    procedure_run_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -390,6 +456,8 @@ def map_skill_to_tool_handover(
         source_location, target_location = ROBOT_HANDOVER_TRANSITION
     elif action in RETURN_UNUSED_PREPOSITION_ALIASES:
         source_location, target_location = RETURN_UNUSED_PREPOSITION_TRANSITION
+    elif action in RETURN_PREPOSITION_TO_TRAY_ALIASES:
+        source_location, target_location = RETURN_PREPOSITION_TO_TRAY_TRANSITION
     elif action in RETRIEVE_ALIASES:
         source_location, target_location = RETRIEVE_TRANSITION
     else:
@@ -439,9 +507,7 @@ def map_group_command(
         raise MappingFailure("invalid_command_id")
 
     if command.group_id != GROUP_RETRACTION:
-        raise MappingFailure(
-            "suction_arm_removed" if command.group_id == "suction" else "unsupported_group"
-        )
+        raise MappingFailure("unsupported_group")
 
     operation = command.operation.strip().casefold()
     if operation == OPERATION_CHANGE_END_EFFECTOR:
@@ -537,10 +603,10 @@ def map_group_command(
     maximum = float(max_retraction_distance_mm)
     if (
         not isfinite(distance_mm)
-        or distance_mm <= 0.0
+        or distance_mm == 0.0
         or not isfinite(maximum)
         or maximum <= 0.0
-        or distance_mm > maximum
+        or abs(distance_mm) > maximum
     ):
         raise MappingFailure("invalid_retraction_distance")
 

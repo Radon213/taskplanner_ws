@@ -1,3 +1,4 @@
+import threading
 from types import SimpleNamespace
 
 from or_digital_twin.node import ORDigitalTwinNode
@@ -43,6 +44,45 @@ def test_running_start_heartbeat_preserves_state_and_acknowledges() -> None:
     assert acknowledgments == [True]
 
 
+def test_start_runtime_waits_for_start_actors_before_exposing_running() -> None:
+    state = SimpleNamespace(
+        running=False,
+        execution_state="idle",
+        procedure_run_id="",
+    )
+    node = ORDigitalTwinNode.__new__(ORDigitalTwinNode)
+
+    def set_execution_state(running: bool, execution_state: str) -> None:
+        state.running = running
+        state.execution_state = execution_state
+
+    node._twin = SimpleNamespace(
+        state=state,
+        set_initial_phase=lambda _phase: None,
+        set_execution_state=set_execution_state,
+    )
+    node._last_lifecycle_control_signature = None
+    node._pending_bed_robot_arm_group_requests = {}
+    node._reset_hand_handover_state = lambda: None
+    node._clear_tool_histories = lambda: None
+    node._clear_tool_prediction_state = lambda: None
+    node._stamp = lambda: SimpleNamespace(sec=0, nanosec=0)
+    node._stamp_sec = lambda _stamp: 0.0
+    node._publish_world_state = lambda: None
+    node._advance_visual_runtime_epoch = lambda: None
+    node._advance_skill_event_runtime_epoch = lambda: None
+
+    node._on_control(SimpleNamespace(data="start_runtime"))
+
+    assert state.running is False
+    assert state.execution_state == "starting"
+
+    node._on_control(SimpleNamespace(data="start_actors"))
+
+    assert state.running is True
+    assert state.execution_state == "running"
+
+
 def test_start_reset_start_edges_mutate_once_and_each_reset_is_applied() -> None:
     state = SimpleNamespace(running=False, execution_state="idle")
     reset_spec_calls: list[bool] = []
@@ -62,10 +102,13 @@ def test_start_reset_start_edges_mutate_once_and_each_reset_is_applied() -> None
         set_execution_state=set_execution_state,
     )
     node._last_lifecycle_control_signature = None
+    node._scenario_config_lock = threading.RLock()
+    node._pending_scenario_config = None
     node._pending_bed_robot_arm_group_requests = {}
-    node._recent_voice_intent_ids = {}
     node._reset_hand_handover_state = lambda: None
     node._clear_tool_histories = lambda: None
+    prediction_clears: list[bool] = []
+    node._clear_tool_prediction_state = lambda: prediction_clears.append(True)
     node._reset_bed_robot_controller_freshness = lambda: None
     node._stamp_all_bed_robot_arm_groups = lambda: None
     node._stamp = lambda: SimpleNamespace(sec=0, nanosec=0)
@@ -80,8 +123,9 @@ def test_start_reset_start_edges_mutate_once_and_each_reset_is_applied() -> None
     node._on_control(SimpleNamespace(data="reset"))
     node._on_control(SimpleNamespace(data="start"))
 
-    assert len(reset_spec_calls) == 2
+    assert len(reset_spec_calls) == 0
     assert len(reset_runtime_calls) == 2
     assert len(visual_epoch_advances) == 4
+    assert len(prediction_clears) == 4
     assert state.running is True
     assert state.execution_state == "running"

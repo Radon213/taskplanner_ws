@@ -1,20 +1,40 @@
-"""ROS adapter for proposal-only spoken-command interpretation."""
+"""ROS adapter for typed, grounded spoken-command interpretation."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import itertools
-import time
 
 import rclpy
 from rcl_interfaces.msg import SetParametersResult
 from rclpy.node import Node
+from rclpy.parameter import Parameter
+from rclpy.qos import (
+    DurabilityPolicy,
+    HistoryPolicy,
+    QoSProfile,
+    ReliabilityPolicy,
+)
 from std_msgs.msg import String
 
-from surgical_msgs.msg import SpeechUtterance, VoiceCommandIntent
-from procedure_spec import load_voice_command_catalog
+from surgical_msgs.msg import (
+    SpeechUtterance,
+    VoiceCommandIntent,
+)
+try:  # A focused resolver restart must still work on an old local overlay.
+    from surgical_msgs.msg import SimulationState
+except ImportError:  # pragma: no cover - generated interface availability
+    SimulationState = None  # type: ignore[assignment,misc]
+from procedure_spec import (
+    ScenarioConfigSnapshot,
+    load_voice_command_catalog,
+    parse_scenario_config,
+)
 
 from .resolver import VoiceIntentResolver
+from .scenario_reload import (
+    scenario_config_bundle_path,
+    scenario_config_reload_is_authorized,
+)
 from .selector import DeterministicCandidateSelector, OpenAICompatibleCandidateSelector
 
 
@@ -31,84 +51,32 @@ def source_observation_stamp(msg: SpeechUtterance):
     return None
 
 
-@dataclass(frozen=True, slots=True)
-class TypedSpeechAdmission:
-    accepted: bool
-    reason: str
-    stamp: object | None = None
-
-
-class RecentUtteranceIds:
-    """Suppress replays by immutable ASR utterance identifier."""
-
-    def __init__(self, retention_sec: float) -> None:
-        self._retention_sec = max(1.0, float(retention_sec))
-        self._seen: dict[str, float] = {}
-
-    def accept(self, utterance_id: str, now_monotonic: float) -> bool:
-        cutoff = float(now_monotonic) - self._retention_sec
-        self._seen = {
-            key: seen_at
-            for key, seen_at in self._seen.items()
-            if seen_at >= cutoff
-        }
-        key = str(utterance_id or "").strip()
-        if not key or key in self._seen:
-            return False
-        self._seen[key] = float(now_monotonic)
-        return True
-
-
-def evaluate_typed_speech_utterance(
-    msg: SpeechUtterance,
-    *,
-    now_sec: float,
-    max_age_sec: float,
-    max_future_skew_sec: float,
-) -> TypedSpeechAdmission:
-    """Fail closed before ASR metadata can be converted to an intent.
-
-    This is deliberately independent of the adapter.  A ROS topic is not an
-    authentication boundary, so the execution-path resolver revalidates the
-    final marker, immutable identity, source name, and source timestamp.
-    """
-
-    if not str(msg.text or "").strip():
-        return TypedSpeechAdmission(False, "empty_text")
-    if not bool(msg.is_final):
-        return TypedSpeechAdmission(False, "interim_transcript")
-    if not str(msg.utterance_id or "").strip():
-        return TypedSpeechAdmission(False, "missing_utterance_id")
-    if not str(msg.source or "").strip():
-        return TypedSpeechAdmission(False, "missing_source")
-    stamp = source_observation_stamp(msg)
-    if stamp is None:
-        return TypedSpeechAdmission(False, "missing_timestamp")
-    age_sec = float(now_sec) - _stamp_sec(stamp)
-    if age_sec > max(0.0, float(max_age_sec)):
-        return TypedSpeechAdmission(False, f"stale:{age_sec:.3f}s")
-    if age_sec < -max(0.0, float(max_future_skew_sec)):
-        return TypedSpeechAdmission(False, f"future_timestamp:{-age_sec:.3f}s")
-    return TypedSpeechAdmission(True, "accepted", stamp)
-
-
 class VoiceIntentResolverNode(Node):
-    """Convert final STT text to typed proposals without calling ROS actions."""
+    """Convert final STT text to typed intents without calling ROS actions."""
 
     def __init__(self) -> None:
         super().__init__("voice_intent_resolver")
-        self.declare_parameter("input_topic", "/surgery/audio/request_text")
-        # ``sentence_text`` remains an explicitly non-live compatibility
-        # route for Debug/replay.  ``utterance`` is the only mode that may
-        # preserve ASR authority metadata into an executable proposal.
-        self.declare_parameter("input_mode", "sentence_text")
-        self.declare_parameter("output_topic", "/surgery/voice/intent")
-        self.declare_parameter("typed_input_max_age_sec", 3.0)
-        self.declare_parameter("typed_input_max_future_skew_sec", 1.0)
-        self.declare_parameter("typed_input_dedupe_retention_sec", 120.0)
+        # The command router is the sole admitted-ASR subscriber.  It forwards
+        # only catalog misses to this private topic, so the resolver cannot
+        # become a parallel command ingress.
+        self.declare_parameter("input_topic", "/surgery/voice/resolver_utterance")
+        # ``sentence_text`` remains a Debug/replay observation route. It never
+        # reaches an executable path because the router dispatches only a
+        # proposal correlated to an utterance it forwarded itself.
+        self.declare_parameter("input_mode", "utterance")
+        # A proposal is consumed by command_router only. It is not a shared
+        # DT/BT/simulation command bus and carries no function-gate envelope.
+        self.declare_parameter("output_topic", "/surgery/voice/proposal")
         # Empty by default is fail-closed: tool aliases are derived only from
         # the active ProcedureSpec bundle, never a global T04-style mapping.
         self.declare_parameter("procedure_bundle", "")
+        # ScenarioStore is the single writer for hot scenario selection.  The
+        # resolver only observes its latched snapshot and swaps its local
+        # catalog at an authoritative paused/stopped boundary.
+        self.declare_parameter(
+            "scenario_config_topic", "/simulation/scenario_config"
+        )
+        self.declare_parameter("simulation_state_topic", "/simulation/state")
         self.declare_parameter("selector_mode", "deterministic")
         self.declare_parameter("selector_endpoint", "")
         self.declare_parameter("selector_model", "")
@@ -156,29 +124,27 @@ class VoiceIntentResolverNode(Node):
         self._input_mode = str(self.get_parameter("input_mode").value).strip().lower()
         if self._input_mode not in {"sentence_text", "utterance"}:
             raise ValueError("input_mode must be 'sentence_text' or 'utterance'")
-        self._typed_input_max_age_sec = max(
-            0.0,
-            float(self.get_parameter("typed_input_max_age_sec").value),
-        )
-        self._typed_input_max_future_skew_sec = max(
-            0.0,
-            float(
-                self.get_parameter("typed_input_max_future_skew_sec").value
-            ),
-        )
-        self._typed_input_dedupe_retention_sec = max(
-            0.0,
-            float(
-                self.get_parameter("typed_input_dedupe_retention_sec").value
-            ),
-        )
-        self._recent_utterance_ids = RecentUtteranceIds(
-            self._typed_input_dedupe_retention_sec
-        )
+        configured_input_topic = str(self.get_parameter("input_topic").value)
+        if configured_input_topic == "/surgery/audio/admitted_utterance":
+            raise ValueError(
+                "voice_intent_resolver must not subscribe to admitted ASR; "
+                "command_router owns that ingress"
+            )
+        self._scenario_config_revision = ""
+        self._scenario_config_bundle = ""
+        self._scenario_config_spec_dir = ""
+        self._pending_scenario_config: ScenarioConfigSnapshot | None = None
+        self._authoritative_state_received = False
+        self._authoritative_running = False
+        self._authoritative_execution_state = ""
         self.add_on_set_parameters_callback(self._on_parameters_changed)
-        input_topic = str(self.get_parameter("input_topic").value)
+        input_topic = configured_input_topic
         output_topic = str(self.get_parameter("output_topic").value)
-        self._publisher = self.create_publisher(VoiceCommandIntent, output_topic, 10)
+        self._publisher = self.create_publisher(
+            VoiceCommandIntent,
+            output_topic,
+            10,
+        )
         if self._input_mode == "utterance":
             self._subscription = self.create_subscription(
                 SpeechUtterance,
@@ -192,6 +158,28 @@ class VoiceIntentResolverNode(Node):
                 input_topic,
                 self._on_transcript,
                 10,
+            )
+        if SimulationState is None:
+            self.get_logger().warning(
+                "scenario-config watcher disabled: SimulationState type is unavailable"
+            )
+        else:
+            self.create_subscription(
+                SimulationState,
+                str(self.get_parameter("simulation_state_topic").value),
+                self._on_simulation_state,
+                20,
+            )
+            self.create_subscription(
+                String,
+                str(self.get_parameter("scenario_config_topic").value),
+                self._on_scenario_config,
+                QoSProfile(
+                    history=HistoryPolicy.KEEP_LAST,
+                    depth=1,
+                    reliability=ReliabilityPolicy.RELIABLE,
+                    durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                ),
             )
         self.get_logger().info(
             "voice intent resolver ready: "
@@ -291,12 +279,7 @@ class VoiceIntentResolverNode(Node):
         )
 
     def _on_parameters_changed(self, parameters) -> SetParametersResult:
-        """Atomically replace the active catalog while the runtime is stopped.
-
-        The simulation manager closes the Live admission lease before issuing
-        this update.  Reject invalid bundles instead of turning an already
-        running resolver into an unbound/global vocabulary fallback.
-        """
+        """Atomically replace the active catalog at an operator quiescence point."""
 
         procedure_bundle = next(
             (
@@ -308,27 +291,43 @@ class VoiceIntentResolverNode(Node):
         )
         if procedure_bundle is None:
             return SetParametersResult(successful=True)
-        bundle = str(procedure_bundle.value).strip()
-        if not bundle:
+        if not self._scenario_config_reload_is_safe():
             return SetParametersResult(
                 successful=False,
-                reason="procedure_bundle must identify a procedure bundle",
+                reason=(
+                    "procedure_bundle changes require an authoritative "
+                    "paused or stopped SimulationState"
+                ),
             )
+        bundle = str(procedure_bundle.value).strip()
         try:
-            (
-                procedure_id,
-                catalog_id,
-                tool_aliases,
-                ambiguous_aliases,
-                retractor_commands,
-                retractor_max_distance_m,
-                retractor_require_explicit_unit,
-            ) = self._catalog_for_bundle(bundle)
+            self._replace_resolver_bundle(bundle)
         except (OSError, ValueError) as exc:
             return SetParametersResult(
                 successful=False,
                 reason=f"failed to load procedure_bundle: {exc}",
             )
+        return SetParametersResult(successful=True)
+
+    def _replace_resolver_bundle(self, bundle: str) -> None:
+        """Build then atomically install one local resolver catalog.
+
+        The candidate is completely parsed before assignment so a malformed
+        authored revision leaves the last known-good resolver in place.
+        """
+
+        normalized_bundle = str(bundle).strip()
+        if not normalized_bundle:
+            raise ValueError("procedure_bundle must identify a procedure bundle")
+        (
+            procedure_id,
+            catalog_id,
+            tool_aliases,
+            ambiguous_aliases,
+            retractor_commands,
+            retractor_max_distance_m,
+            retractor_require_explicit_unit,
+        ) = self._catalog_for_bundle(normalized_bundle)
         requested_natural_variants = bool(
             self.get_parameter("enable_selector_natural_variants").value
         )
@@ -345,9 +344,6 @@ class VoiceIntentResolverNode(Node):
             ),
         )
         self._resolver = next_resolver
-        self._recent_utterance_ids = RecentUtteranceIds(
-            self._typed_input_dedupe_retention_sec
-        )
         if ambiguous_aliases:
             self.get_logger().warning(
                 "dropped "
@@ -357,7 +353,94 @@ class VoiceIntentResolverNode(Node):
             "voice command catalog reloaded for "
             f"{procedure_id or 'UNBOUND'}"
         )
-        return SetParametersResult(successful=True)
+
+    def _scenario_config_reload_is_safe(self) -> bool:
+        """Do not turn a configuration observer into a runtime start gate."""
+
+        return scenario_config_reload_is_authorized(
+            state_received=self._authoritative_state_received,
+            running=self._authoritative_running,
+            execution_state=self._authoritative_execution_state,
+        )
+
+    def _on_simulation_state(self, message: SimulationState) -> None:
+        self._authoritative_state_received = True
+        self._authoritative_running = bool(message.running)
+        self._authoritative_execution_state = str(
+            message.execution_state or ""
+        ).strip()
+        self._apply_pending_scenario_config_if_safe()
+
+    def _on_scenario_config(self, message: String) -> None:
+        """Observe one ScenarioStore revision; no ASR path is gated here."""
+
+        try:
+            snapshot = parse_scenario_config(message.data)
+            # Reject a stale retained revision before it can occupy the one
+            # pending slot until the next paused/stopped boundary.
+            scenario_config_bundle_path(snapshot)
+        except (OSError, RuntimeError, ValueError) as exc:
+            self.get_logger().warning(
+                f"voice scenario config ignored: {exc}",
+                throttle_duration_sec=2.0,
+            )
+            return
+        if (
+            snapshot.revision == self._scenario_config_revision
+            and snapshot.bundle_name == self._scenario_config_bundle
+            and snapshot.spec_dir == self._scenario_config_spec_dir
+        ):
+            return
+        self._pending_scenario_config = snapshot
+        self._apply_pending_scenario_config_if_safe()
+
+    def _apply_pending_scenario_config_if_safe(self) -> None:
+        snapshot = self._pending_scenario_config
+        if snapshot is None or not self._scenario_config_reload_is_safe():
+            return
+        try:
+            candidate_bundle = scenario_config_bundle_path(snapshot)
+        except (OSError, RuntimeError, ValueError) as exc:
+            self.get_logger().error(
+                f"voice scenario config rejected before reload: {exc}"
+            )
+            self._pending_scenario_config = None
+            return
+
+        configured_bundle = str(
+            self.get_parameter("procedure_bundle").value
+        ).strip()
+        if configured_bundle == candidate_bundle:
+            try:
+                # A same-bundle revision can change aliases or voice policy;
+                # ROS may elide a no-op parameter set, so reload it directly.
+                self._replace_resolver_bundle(candidate_bundle)
+            except (OSError, ValueError) as exc:
+                self.get_logger().error(
+                    f"voice scenario config reload rejected: {exc}"
+                )
+                self._pending_scenario_config = None
+                return
+        else:
+            result = self.set_parameters_atomically(
+                [Parameter(name="procedure_bundle", value=candidate_bundle)]
+            )
+            if not bool(getattr(result, "successful", False)):
+                self.get_logger().error(
+                    "voice scenario config swap rejected: "
+                    f"{getattr(result, 'reason', 'unknown reason')}"
+                )
+                self._pending_scenario_config = None
+                return
+
+        self._scenario_config_revision = snapshot.revision
+        self._scenario_config_bundle = snapshot.bundle_name
+        self._scenario_config_spec_dir = snapshot.spec_dir
+        self._pending_scenario_config = None
+        self.get_logger().info(
+            "voice scenario revision applied atomically: "
+            f"{snapshot.bundle_name}@{snapshot.revision}"
+        )
 
     def _on_transcript(self, message: String) -> None:
         self._publish_resolved(
@@ -367,31 +450,15 @@ class VoiceIntentResolverNode(Node):
         )
 
     def _on_utterance(self, message: SpeechUtterance) -> None:
-        admission = evaluate_typed_speech_utterance(
-            message,
-            now_sec=self.get_clock().now().nanoseconds / 1_000_000_000.0,
-            max_age_sec=self._typed_input_max_age_sec,
-            max_future_skew_sec=self._typed_input_max_future_skew_sec,
-        )
-        if not admission.accepted:
-            self.get_logger().warning(
-                f"rejected typed ASR utterance: {admission.reason}",
-                throttle_duration_sec=2.0,
-            )
-            return
-        if not self._recent_utterance_ids.accept(
-            message.utterance_id,
-            time.monotonic(),
-        ):
-            self.get_logger().warning(
-                "rejected typed ASR utterance: duplicate_utterance_id",
-                throttle_duration_sec=2.0,
-            )
-            return
+        # ASR final/source/freshness/TTS-echo/utterance-ID checks belong to
+        # speech_input_adapter, before command_router.  Repeating them here
+        # created a second admission boundary with drift-prone parameters.
+        # Router correlation makes this private hop non-executable on its own.
         self._publish_resolved(
             message.text,
             source=message,
-            source_stamp=admission.stamp,
+            source_stamp=source_observation_stamp(message)
+            or self.get_clock().now().to_msg(),
         )
 
     def _publish_resolved(
@@ -428,6 +495,11 @@ class VoiceIntentResolverNode(Node):
             output.source_speaker_role = str(source.speaker_role or "").strip()
             output.source_has_confidence = bool(source.has_confidence)
             output.source_confidence = float(source.confidence)
+        # The existing VoiceCommandIntent remains byte-for-byte compatible.
+        # Resolver-only proposals do not claim gateway/run/function identity.
+        output.gateway_instance_id = ""
+        output.procedure_run_id = ""
+        output.function_request_id = ""
         output.raw_text = proposal.raw_text
         output.normalized_text = proposal.normalized_text
         output.procedure_id = proposal.procedure_id

@@ -172,12 +172,12 @@ def test_bilateral_adjustment_jogs_each_arm_by_the_same_distance(tmp_path):
     trace.clear()
 
     adjusted = executor.execute(
-        _request("adjust-both", 4, target_side=0, distance_m=0.001)
+        _request("adjust-both", 4, target_side=3, distance_m=0.001)
     )
 
     _assert_success(adjusted, ExecutorState.RETRACTING)
     assert adjusted.affected_arm_id == "arm_1,arm_2"
-    assert adjusted.target_side == 0
+    assert adjusted.target_side == 3
     assert adjusted.details["distance_mm"] == 1.0
     assert trace.method_names == (
         "latest_sample",
@@ -191,6 +191,51 @@ def test_bilateral_adjustment_jogs_each_arm_by_the_same_distance(tmp_path):
     assert trace.records[4].args == ("arm_2",)
     assert dict(trace.records[2].kwargs)["distance_mm"] == 1.0
     assert dict(trace.records[4].kwargs)["distance_mm"] == -1.0
+    executor.shutdown()
+
+
+def test_negative_adjustment_reverses_each_physical_jog_and_reduces_state(tmp_path):
+    executor, _robot, _sensor, trace = _executor(tmp_path)
+    executor.start()
+    assert executor.execute(_request("teach-start-release", 1)).success
+    assert executor.execute(_request("teach-finish-release", 2)).success
+    assert executor.execute(_request("retract-start-release", 3)).success
+    assert executor.execute(
+        _request("pull-both", 4, target_side=3, distance_m=0.010)
+    ).success
+    trace.clear()
+
+    released = executor.execute(
+        _request("release-both", 4, target_side=3, distance_m=-0.004)
+    )
+
+    _assert_success(released, ExecutorState.RETRACTING)
+    assert released.details["distance_mm"] == -4.0
+    assert dict(trace.records[2].kwargs)["distance_mm"] == -4.0
+    assert dict(trace.records[4].kwargs)["distance_mm"] == 4.0
+    assert executor._cumulative_jog_mm == {"arm_1": 6.0, "arm_2": 6.0}
+    executor.shutdown()
+
+
+def test_negative_adjustment_below_baseline_is_rejected_before_motion(tmp_path):
+    executor, _robot, _sensor, trace = _executor(tmp_path)
+    executor.start()
+    assert executor.execute(_request("teach-start-underflow", 1)).success
+    assert executor.execute(_request("teach-finish-underflow", 2)).success
+    assert executor.execute(_request("retract-start-underflow", 3)).success
+    assert executor.execute(
+        _request("pull-left", 4, target_side=1, distance_m=0.003)
+    ).success
+    trace.clear()
+
+    released = executor.execute(
+        _request("release-too-far", 4, target_side=1, distance_m=-0.004)
+    )
+
+    assert released.status is ExecutionStatus.REJECTED
+    assert released.code == "cumulative_distance_underflow"
+    assert trace.records == ()
+    assert executor._cumulative_jog_mm == {"arm_1": 3.0}
     executor.shutdown()
 
 

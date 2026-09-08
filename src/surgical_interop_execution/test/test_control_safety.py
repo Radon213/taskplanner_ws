@@ -8,21 +8,18 @@ from types import SimpleNamespace
 from action_msgs.msg import GoalStatus
 from builtin_interfaces.msg import Time
 import pytest
-from procedure_spec import load_bundle
+from procedure_spec import load_bundle, scenario_config_payload
 from surgical_interop_msgs.action import ExecuteToolHandover
 from surgical_interop_msgs.msg import BedRobotArmState, BedRobotArmStateArray
 from surgical_interop_msgs.srv import ExecuteRetractionCommand
 
+from surgical_interop_execution import bridge as bridge_module
 from surgical_interop_execution.bridge import (
     ActiveAction,
     ActiveService,
     SurgicalInteropExecutionBridge,
+    _bundle_config_revision,
     procedure_retraction_distance_limit_mm,
-)
-from surgical_interop_execution.controller_contract import (
-    EIR_NUC_CAPABILITY_POLICY_ID,
-    EIR_NUC_VIRTUAL_CONTRACT_ID,
-    build_controller_contract,
 )
 from surgical_interop_execution.direct_hand_ledger import DurableDirectHandLedger
 from surgical_interop_execution.mappings import (
@@ -33,7 +30,6 @@ from surgical_interop_execution.mappings import (
     OPERATION_RETRACTION,
     RETRACTION_COMMAND_ADJUST_RETRACTION,
     RETRACTION_COMMAND_CHANGE_TOOL,
-    RETRACTION_COMMAND_STOP_RETRACTION,
     RETRACTION_TARGET_LEFT,
     RETRACTION_TARGET_NONE,
     RETRACTION_TARGET_RIGHT,
@@ -225,6 +221,7 @@ def _skill(command_id: str = "skill-1") -> InternalSkillCommand:
         target_location_id="surgeon_receive_zone",
         arm="right",
         request_generation=4,
+        procedure_run_id="a" * 32,
         mode="explicit_request",
         rationale="internal only",
         target_owner="surgeon",
@@ -359,6 +356,8 @@ def _bare_bridge() -> SurgicalInteropExecutionBridge:
     bridge._active_actions = {}
     bridge._active_services = {}
     bridge._queued_voice_tool_transfer = None
+    bridge._startup_actors_pending = False
+    bridge._deferred_startup_tool_transfer = None
     bridge._tool_handover_enabled = True
     bridge._require_bed_robot_status = True
     bridge._bed_robot_status_timeout_sec = 2.0
@@ -373,6 +372,15 @@ def _bare_bridge() -> SurgicalInteropExecutionBridge:
     bridge._bed_robot_procedure_type = ""
     bridge._bed_robot_received_monotonic = 0.0
     bridge._bed_robot_states = {}
+    bridge._stamp = lambda: Time()
+    bridge._skill_event_pub = SimpleNamespace(publish=lambda _event: None)
+    bridge._execution_trace_run_by_command = {}
+    bridge._latest_simulation_state = SimpleNamespace(
+        running=True,
+        execution_state="running",
+        procedure_run_id="a" * 32,
+    )
+    bridge._latest_simulation_state_received_monotonic = time.monotonic()
     return bridge
 
 
@@ -383,12 +391,217 @@ def _route_coordinator_bridge() -> SurgicalInteropExecutionBridge:
     bridge._robot_endpoint_source = "external"
     bridge._tool_transfer_endpoint = EXTERNAL_TOOL_HANDOVER_ENDPOINT
     bridge._retraction_service_name = EXTERNAL_RETRACTION_SERVICE_ENDPOINT
+    bridge._retraction_endpoint_source = "external"
+    bridge._route_selection_state_path = ""
+    bridge._route_selection_runtime_mode = ""
     bridge._route_revision = 4
     bridge._route_initialization_revision = 9
     bridge._route_initialization_state = "stopped"
     bridge._run_endpoint_source = ""
-    bridge._latest_simulation_state_generation = 12
     return bridge
+
+
+def _scenario_observer_bridge() -> SurgicalInteropExecutionBridge:
+    """Build the execution owner without ROS for ScenarioStore observer tests."""
+
+    bridge = _bare_bridge()
+    spec_root = (
+        Path(__file__).resolve().parents[2]
+        / "procedure_spec"
+        / "procedure_spec"
+        / "specs"
+    ).resolve()
+    bootstrap_dir = spec_root / "thyroidectomy_demo"
+    bootstrap_spec = load_bundle(bootstrap_dir)
+    bridge._spec_dir = str(bootstrap_dir)
+    bridge._scenario_config_root = spec_root
+    bridge._scenario_config_revision = ""
+    bridge._pending_scenario_config = None
+    bridge._procedure_spec = bootstrap_spec
+    bridge._instrument_names = {
+        instrument.id: instrument.display_name.strip()
+        for instrument in bootstrap_spec.bundle.instruments
+    }
+    bridge._configured_max_retraction_distance_mm = 50.0
+    bridge._max_retraction_distance_mm = procedure_retraction_distance_limit_mm(
+        bootstrap_spec,
+        configured_limit_mm=bridge._configured_max_retraction_distance_mm,
+    )
+    bridge._last_lifecycle_control_signature = None
+    bridge._latest_simulation_state = SimpleNamespace(
+        running=False,
+        execution_state="idle",
+    )
+    bridge._latest_simulation_state_received_monotonic = time.monotonic()
+    bridge.get_logger = lambda: SimpleNamespace(
+        info=lambda *args, **kwargs: None,
+        warning=lambda *args, **kwargs: None,
+    )
+    return bridge
+
+
+def _scenario_config_message(spec_dir: Path, *, revision: str | None = None):
+    resolved = spec_dir.resolve()
+    return SimpleNamespace(
+        data=json.dumps(
+            scenario_config_payload(
+                bundle_name=resolved.name,
+                spec_dir=str(resolved),
+                revision=revision or _bundle_config_revision(resolved),
+            )
+        )
+    )
+
+
+def test_execution_bridge_observes_latched_scenario_store_revision_when_stopped(
+) -> None:
+    bridge = _scenario_observer_bridge()
+    candidate = bridge._scenario_config_root / "nephrectomy"
+
+    bridge._on_scenario_config(_scenario_config_message(candidate))
+
+    assert bridge._procedure_spec.procedure_id == "nephrectomy"
+    assert bridge._spec_dir == str(candidate.resolve())
+    assert bridge._scenario_config_revision == _bundle_config_revision(candidate)
+    assert bridge._pending_scenario_config is None
+
+
+def test_execution_bridge_observes_latched_scenario_store_revision_when_paused(
+) -> None:
+    bridge = _scenario_observer_bridge()
+    bridge._latest_simulation_state = SimpleNamespace(
+        running=True,
+        execution_state="paused",
+    )
+    candidate = bridge._scenario_config_root / "nephrectomy"
+
+    bridge._on_scenario_config(_scenario_config_message(candidate))
+
+    assert bridge._procedure_spec.procedure_id == "nephrectomy"
+    assert bridge._spec_dir == str(candidate.resolve())
+    assert bridge._scenario_config_revision == _bundle_config_revision(candidate)
+    assert bridge._pending_scenario_config is None
+
+
+@pytest.mark.parametrize(
+    "blocker",
+    ["running_scenario", "active_controller_request"],
+)
+def test_execution_bridge_defers_scenario_store_revision_until_its_own_boundary(
+    blocker: str,
+) -> None:
+    bridge = _scenario_observer_bridge()
+    candidate = bridge._scenario_config_root / "nephrectomy"
+    if blocker == "running_scenario":
+        bridge._latest_simulation_state = SimpleNamespace(
+            running=True,
+            execution_state="running",
+        )
+    else:
+        bridge._active_actions[("tool_transfer", "in-flight")] = ActiveAction(
+            route="tool_transfer",
+            command=_skill("in-flight"),
+            dispatched=True,
+        )
+
+    bridge._on_scenario_config(_scenario_config_message(candidate))
+
+    assert bridge._procedure_spec.procedure_id == "thyroidectomy_demo"
+    assert bridge._pending_scenario_config is not None
+
+    bridge._active_actions.clear()
+    bridge._on_simulation_state(
+        SimpleNamespace(running=False, execution_state="halted")
+    )
+
+    assert bridge._procedure_spec.procedure_id == "nephrectomy"
+    assert bridge._pending_scenario_config is None
+
+
+@pytest.mark.parametrize(
+    "blocker",
+    ["active_action", "active_service", "execution_proxy"],
+)
+def test_execution_bridge_paused_scenario_config_waits_for_local_work_to_finish(
+    blocker: str,
+) -> None:
+    bridge = _scenario_observer_bridge()
+    bridge._latest_simulation_state = SimpleNamespace(
+        running=True,
+        execution_state="paused",
+    )
+    candidate = bridge._scenario_config_root / "nephrectomy"
+    if blocker == "active_action":
+        bridge._active_actions[("tool_transfer", "in-flight")] = ActiveAction(
+            route="tool_transfer",
+            command=_skill("in-flight"),
+            dispatched=True,
+        )
+    elif blocker == "active_service":
+        bridge._active_services[("retraction", "in-flight")] = ActiveService(
+            route="retraction",
+            command=_group("in-flight"),
+            dispatched=True,
+        )
+    else:
+        bridge._execution_proxy_active = True
+
+    bridge._on_scenario_config(_scenario_config_message(candidate))
+
+    assert bridge._procedure_spec.procedure_id == "thyroidectomy_demo"
+    assert bridge._pending_scenario_config is not None
+
+    bridge._active_actions.clear()
+    bridge._active_services.clear()
+    bridge._execution_proxy_active = False
+    bridge._on_simulation_state(
+        SimpleNamespace(running=True, execution_state="paused")
+    )
+
+    assert bridge._procedure_spec.procedure_id == "nephrectomy"
+    assert bridge._pending_scenario_config is None
+
+
+def test_execution_bridge_discards_bad_scenario_revision_and_keeps_last_good() -> None:
+    bridge = _scenario_observer_bridge()
+    candidate = bridge._scenario_config_root / "nephrectomy"
+
+    bridge._on_scenario_config(
+        _scenario_config_message(candidate, revision="sha256:" + "0" * 64)
+    )
+
+    assert bridge._procedure_spec.procedure_id == "thyroidectomy_demo"
+    assert bridge._scenario_config_revision == ""
+    assert bridge._pending_scenario_config is None
+
+
+def test_execution_bridge_rejects_scenario_path_outside_fixed_root() -> None:
+    bridge = _scenario_observer_bridge()
+    outside = bridge._scenario_config_root.parent
+    message = SimpleNamespace(
+        data=json.dumps(
+            scenario_config_payload(
+                bundle_name=outside.name,
+                spec_dir=str(outside),
+                revision="sha256:" + "0" * 64,
+            )
+        )
+    )
+
+    bridge._on_scenario_config(message)
+
+    assert bridge._procedure_spec.procedure_id == "thyroidectomy_demo"
+    assert bridge._pending_scenario_config is None
+
+
+def test_execution_bridge_rejects_direct_spec_parameter_selection() -> None:
+    bridge = _scenario_observer_bridge()
+    result = bridge._on_endpoint_configuration_parameters_changed(
+        [SimpleNamespace(name="spec_dir", value="/untrusted/bundle")]
+    )
+
+    assert result.successful is False
+    assert "ScenarioStore owns scenario selection" in result.reason
 
 
 def _direct_hand_skill(run_id: str = "a" * 32, generation: int = 1):
@@ -425,6 +638,44 @@ def test_direct_hand_command_is_bound_to_fresh_running_state() -> None:
     ) == "direct_hand_runtime_not_running"
 
 
+def test_only_completion_cleanup_returns_are_admitted_while_finishing() -> None:
+    bridge = _bare_bridge()
+    bridge._direct_hand_state_max_age_sec = 1.0
+    bridge._latest_simulation_state = SimpleNamespace(
+        running=True,
+        execution_state="finishing",
+        procedure_run_id="a" * 32,
+    )
+    bridge._latest_simulation_state_received_monotonic = time.monotonic()
+
+    cleanup = replace(
+        _skill("finish-return-to-tray"),
+        action="return_preposition_to_tray",
+        source_location_type="robot_right_hand",
+        source_location_id="robot_right_hand",
+        target_location_type="tray_slot",
+        target_location_id="main_tray_slot_4",
+        mode="recovery",
+    )
+    assert bridge._direct_hand_run_guard(cleanup) == ""
+
+    retrieval = replace(
+        cleanup,
+        command_id="finish-retrieve-from-mayo",
+        action="retrieve_from_mayo",
+        source_location_type="mayo_stand",
+        source_location_id="mayo_stand",
+        target_location_type="tray_slot",
+    )
+    assert bridge._direct_hand_run_guard(retrieval) == ""
+
+    ordinary_prepare = replace(cleanup, action="prepare_tool")
+    assert (
+        bridge._direct_hand_run_guard(ordinary_prepare)
+        == "command_runtime_not_running"
+    )
+
+
 def test_direct_hand_command_fails_closed_without_identity_or_durable_ledger() -> None:
     bridge = _bare_bridge()
     bridge._direct_hand_dispatch_ledger = DurableDirectHandLedger(":memory:")
@@ -446,50 +697,38 @@ def test_direct_hand_command_fails_closed_without_identity_or_durable_ledger() -
     ) == "direct_hand_ledger_unavailable"
 
 
-def test_public_route_coordinator_requires_idle_then_resets_and_waits_for_ack() -> None:
+def test_public_route_coordinator_uses_only_atomic_stopped_boundary() -> None:
     bridge = _route_coordinator_bridge()
     events: list[object] = []
 
     def snapshot() -> dict[str, object]:
         return {
             "selected_source": bridge._robot_endpoint_source,
+            "retraction_source": bridge._retraction_endpoint_source,
             "revision": bridge._route_revision,
             "initialization_revision": bridge._route_initialization_revision,
             "initialization_state": bridge._route_initialization_state,
         }
 
-    bridge._execution_route_switch_guard_locked = lambda: ""
-    bridge._manager_transition_ready_for_execution_route = lambda: (
-        events.append("manager-ready") or ""
-    )
-    bridge._request_execution_route_reset = lambda: events.append("reset") or ""
-    bridge._wait_for_execution_route_reset = lambda *, after_generation: (
-        events.append(("idle-frame", after_generation)) or ""
-    )
+    bridge._execution_route_switch_guard_for_target_locked = lambda **_kwargs: ""
 
-    def set_route(source: str, *, clear_admission: bool) -> None:
+    def set_route(
+        source: str,
+        *,
+        retraction_source: str,
+        clear_admission: bool,
+    ) -> None:
         events.append(("swap", source, clear_admission))
         bridge._robot_endpoint_source = source
+        bridge._retraction_endpoint_source = retraction_source
         bridge._tool_transfer_endpoint = VIRTUAL_TOOL_HANDOVER_ENDPOINT
         bridge._retraction_service_name = VIRTUAL_RETRACTION_SERVICE_ENDPOINT
 
-    def mark_initializing() -> dict[str, object]:
-        bridge._route_initialization_state = "initializing"
-        bridge._route_initialization_revision += 1
-        return snapshot()
-
     bridge._set_route_source_locked = set_route
-    bridge._mark_execution_route_initializing_locked = mark_initializing
     bridge._execution_route_state_snapshot_locked = snapshot
     bridge._execution_route_state_snapshot = snapshot
     bridge._publish_execution_route_state = lambda: events.append(
         ("publish", bridge._route_initialization_state)
-    )
-    bridge._wait_for_preflight_route_ack = (
-        lambda state, *, require_initialized: events.append(
-            ("ack", state["selected_source"], require_initialized)
-        )
-        or ""
     )
 
     response = bridge._handle_execution_route_command(
@@ -502,34 +741,37 @@ def test_public_route_coordinator_requires_idle_then_resets_and_waits_for_ack() 
 
     assert response.accepted is True
     assert events == [
-        "manager-ready",
-        "reset",
-        ("idle-frame", 12),
         ("swap", "virtual", True),
-        ("publish", "initializing"),
-        ("ack", "virtual", False),
         ("publish", "initialized"),
-        ("ack", "virtual", True),
     ]
     result = json.loads(response.result_json)
-    assert result["digital_twin_reset"] is True
+    assert "digital_twin_reset" not in result
     assert result["selected_source"] == "virtual"
     assert result["initialization_state"] == "initialized"
 
+    # The dependent methods are not merely skipped in one branch: the bridge
+    # no longer owns either a manager-reset or preflight-ack dependency.
+    assert not hasattr(
+        SurgicalInteropExecutionBridge,
+        "_manager_transition_ready_for_execution_route",
+    )
+    assert not hasattr(
+        SurgicalInteropExecutionBridge, "_request_execution_route_reset"
+    )
+    assert not hasattr(
+        SurgicalInteropExecutionBridge, "_wait_for_preflight_route_ack"
+    )
 
-def test_public_route_coordinator_rejects_active_request_before_manager_reset() -> None:
+
+def test_public_route_coordinator_rejects_active_request_without_external_waits() -> None:
     bridge = _route_coordinator_bridge()
-    bridge._execution_route_switch_guard_locked = lambda: "active_controller_request"
+    bridge._execution_route_switch_guard_for_target_locked = (
+        lambda **_kwargs: "active_controller_request"
+    )
     bridge._execution_route_state_snapshot = lambda: {
         "selected_source": "external",
         "revision": 4,
     }
-    bridge._manager_transition_ready_for_execution_route = lambda: (_ for _ in ()).throw(
-        AssertionError("manager check must not run with an active request")
-    )
-    bridge._request_execution_route_reset = lambda: (_ for _ in ()).throw(
-        AssertionError("reset must not run with an active request")
-    )
 
     response = bridge._handle_execution_route_command(
         SimpleNamespace(
@@ -541,7 +783,7 @@ def test_public_route_coordinator_rejects_active_request_before_manager_reset() 
 
     assert response.accepted is False
     assert response.message == "active_controller_request"
-    assert json.loads(response.result_json)["digital_twin_reset"] is False
+    assert "digital_twin_reset" not in json.loads(response.result_json)
 
 
 @pytest.mark.parametrize("execution_state", ["idle", "halted", "completed", "terminated"])
@@ -559,6 +801,17 @@ def test_route_switch_guard_accepts_manager_terminal_stopped_states(
     bridge._latest_simulation_state_received_monotonic = time.monotonic()
 
     assert bridge._execution_route_switch_guard_locked() == ""
+
+
+def test_paused_scenario_config_guard_does_not_relax_route_switch_boundary() -> None:
+    bridge = _bare_bridge()
+    bridge._latest_simulation_state = SimpleNamespace(
+        running=True,
+        execution_state="paused",
+    )
+
+    assert bridge._scenario_config_switch_guard_locked() == ""
+    assert bridge._execution_route_switch_guard_locked() == "simulation_not_stopped"
 
 
 def test_route_switch_guard_keeps_active_request_blocked_after_completion() -> None:
@@ -580,156 +833,219 @@ def test_route_switch_guard_keeps_active_request_blocked_after_completion() -> N
     assert bridge._execution_route_switch_guard_locked() == "active_controller_request"
 
 
-def _arm_virtual_dispatch_lease(bridge: SurgicalInteropExecutionBridge) -> None:
-    """Install only the read-only leases needed to test the I/O guard."""
+def test_target_route_guard_allows_only_a_stopped_external_orphan_to_virtual() -> None:
+    """A dead external endpoint may be escaped without calling it complete."""
 
-    bridge._require_dispatch_admission_lease = True
-    bridge._admission_lease_max_age_sec = 3.0
-    bridge._admission_lease_source_future_tolerance_sec = 0.5
-    bridge._virtual_endpoint_mode = True
-    bridge._robot_endpoint_source = "virtual"
-    bridge._tool_transfer_endpoint = VIRTUAL_TOOL_HANDOVER_ENDPOINT
-    bridge._retraction_service_name = VIRTUAL_RETRACTION_SERVICE_ENDPOINT
-    bridge._expected_controller_contract_id = EIR_NUC_VIRTUAL_CONTRACT_ID
-    bridge._expected_capability_policy_id = EIR_NUC_CAPABILITY_POLICY_ID
-    bridge._require_physical_stop_confirmation = False
-    bridge._procedure_spec = SimpleNamespace(bundle=SimpleNamespace(instruments=()))
-    bridge._latest_controller_contract = None
-    bridge._latest_controller_contract_received_monotonic = 0.0
-    bridge._latest_controller_contract_source_error = ""
-    bridge._last_accepted_controller_contract_source_stamp_sec = 0.0
-    bridge._latest_integration_readiness = None
-    bridge._latest_integration_readiness_received_monotonic = 0.0
-    bridge._latest_integration_readiness_source_error = ""
-    bridge._last_accepted_integration_readiness_source_stamp_sec = 0.0
-    bridge._dispatch_admission_armed = False
-    bridge._dispatch_admission_disarmed_reason = "admission_lease_missing"
+    bridge = _route_coordinator_bridge()
+    bridge._latest_simulation_state = SimpleNamespace(
+        running=False,
+        execution_state="idle",
+    )
+    unavailable_action = SimpleNamespace(server_is_ready=lambda: False)
+    unavailable_service = SimpleNamespace(service_is_ready=lambda: False)
+    bridge._external_tool_transfer_client = unavailable_action
+    bridge._external_retraction_service_client = unavailable_service
+    bridge._virtual_tool_transfer_client = SimpleNamespace(server_is_ready=lambda: True)
+    bridge._virtual_retraction_service_client = SimpleNamespace(
+        service_is_ready=lambda: True
+    )
+    bridge._active_actions[("tool_transfer", "stale-external")] = ActiveAction(
+        route="tool_transfer",
+        command=_skill("stale-external"),
+        endpoint_source="external",
+        cancelled=True,
+        dispatched=True,
+    )
+
+    assert bridge._execution_route_switch_guard_for_target_locked(
+        requested_source="virtual",
+        requested_retraction_source="external",
+    ) == ""
+    # The recovery record remains active for owner restart and external re-entry.
+    assert bridge._execution_route_switch_guard_locked() == "active_controller_request"
+    assert bridge._execution_route_switch_guard_for_target_locked(
+        requested_source="external",
+        requested_retraction_source="external",
+    ) == "active_controller_request"
 
 
-def test_virtual_dispatch_requires_fresh_readiness_but_not_controller_contract() -> None:
-    bridge = _bare_bridge()
-    _arm_virtual_dispatch_lease(bridge)
-    now_sec = time.time()
-    contract = build_controller_contract(
-        contract_id=EIR_NUC_VIRTUAL_CONTRACT_ID,
+def test_target_route_guard_never_bypasses_a_live_or_virtual_request() -> None:
+    bridge = _route_coordinator_bridge()
+    bridge._latest_simulation_state = SimpleNamespace(
+        running=False,
+        execution_state="idle",
+    )
+    bridge._external_tool_transfer_client = SimpleNamespace(server_is_ready=lambda: False)
+    bridge._virtual_tool_transfer_client = SimpleNamespace(server_is_ready=lambda: False)
+    bridge._external_retraction_service_client = SimpleNamespace(
+        service_is_ready=lambda: False
+    )
+    bridge._virtual_retraction_service_client = SimpleNamespace(
+        service_is_ready=lambda: False
+    )
+    bridge._active_actions[("tool_transfer", "live-external")] = ActiveAction(
+        route="tool_transfer",
+        command=_skill("live-external"),
+        endpoint_source="external",
+        cancelled=False,
+        dispatched=True,
+    )
+
+    assert bridge._execution_route_switch_guard_for_target_locked(
+        requested_source="virtual",
+        requested_retraction_source="virtual",
+    ) == "active_controller_request"
+
+
+def test_route_switch_preserves_an_escaped_legacy_external_recovery_record() -> None:
+    bridge = _route_coordinator_bridge()
+    bridge._latest_simulation_state = SimpleNamespace(
+        running=False,
+        execution_state="idle",
+    )
+    bridge._external_tool_transfer_client = SimpleNamespace(server_is_ready=lambda: False)
+    bridge._external_retraction_service_client = SimpleNamespace(
+        service_is_ready=lambda: False
+    )
+    bridge._virtual_tool_transfer_client = SimpleNamespace(server_is_ready=lambda: True)
+    bridge._virtual_retraction_service_client = SimpleNamespace(
+        service_is_ready=lambda: True
+    )
+    stale = ActiveAction(
+        route="tool_transfer",
+        command=_skill("legacy-stale-external"),
+        cancelled=True,
+        dispatched=True,
+    )
+    bridge._active_actions[("tool_transfer", stale.command.command_id)] = stale
+    bridge._execution_route_state_snapshot_locked = lambda: {
+        "selected_source": bridge._robot_endpoint_source,
+        "retraction_source": bridge._retraction_endpoint_source,
+        "revision": bridge._route_revision,
+    }
+    bridge._publish_execution_route_state = lambda: None
+
+    def set_route(source: str, *, retraction_source: str, clear_admission: bool) -> None:
+        del clear_admission
+        bridge._robot_endpoint_source = source
+        bridge._retraction_endpoint_source = retraction_source
+
+    bridge._set_route_source_locked = set_route
+    response = bridge._handle_execution_route_switch(
+        requested_source="virtual",
+        requested_retraction_source="external",
+        response=SimpleNamespace(),
+    )
+
+    assert response.accepted is True
+    assert bridge._robot_endpoint_source == "virtual"
+    # The record was not discarded or treated as completed; it stays bound to
+    # the old endpoint and continues to block a later external route/restart.
+    assert stale.endpoint_source == "external"
+    assert bridge._execution_route_switch_guard_locked() == "active_controller_request"
+
+    bridge._active_actions.clear()
+    bridge._active_actions[("tool_transfer", "stale-virtual")] = ActiveAction(
+        route="tool_transfer",
+        command=_skill("stale-virtual"),
         endpoint_source="virtual",
-        execution_mode="virtual",
-        tool_handover_endpoint=VIRTUAL_TOOL_HANDOVER_ENDPOINT,
-        retraction_service_name=VIRTUAL_RETRACTION_SERVICE_ENDPOINT,
-        capability_policy_id=EIR_NUC_CAPABILITY_POLICY_ID,
-        stamp_sec=now_sec,
+        cancelled=True,
+        dispatched=True,
     )
-    readiness = {
-        "schema": "taskplanner.integration_readiness.v1",
-        "stamp_sec": now_sec,
-        "ready": True,
-        "checks": {
-            "contract_configuration": True,
-            "tool_handover_action_server": True,
-            "retraction_command_service": True,
-        },
-    }
+    assert bridge._execution_route_switch_guard_for_target_locked(
+        requested_source="virtual",
+        requested_retraction_source="virtual",
+    ) == "active_controller_request"
 
-    assert "controller_contract" not in readiness["checks"]
-    bridge._record_admission_payload(readiness, kind="integration_readiness")
-    assert bridge._dispatch_admission_guard("tool_transfer") == ""
-    assert bridge._dispatch_admission_armed is True
 
-    # Controller-contract telemetry remains replay-checked for diagnostics,
-    # but a replay cannot revoke otherwise-current readiness authority.
-    bridge._record_admission_payload(contract, kind="controller_contract")
-    bridge._record_admission_payload(contract, kind="controller_contract")
-    assert bridge._latest_controller_contract_source_error == (
-        "controller_contract_source_stamp_not_monotonic"
+def test_route_state_projects_owner_restart_boundary_without_endpoint_gating() -> None:
+    """A stopped execution owner may restart even if an endpoint is offline."""
+
+    bridge = _route_coordinator_bridge()
+    bridge._retraction_endpoint_source = "external"
+    bridge._run_retraction_source = ""
+    bridge._controller_contract_topic = EXTERNAL_CONTROLLER_CONTRACT_TOPIC
+    bridge._expected_controller_contract_id = "eir-nuc-tool-handover.real.v1"
+    bridge._expected_capability_policy_id = "eir-nuc-tool-handover.v1"
+    bridge._retraction_controller_contract_topic = EXTERNAL_CONTROLLER_CONTRACT_TOPIC
+    bridge._retraction_expected_controller_contract_id = (
+        "eir-nuc-tool-handover.real.v1"
     )
-    assert bridge._dispatch_admission_guard("tool_transfer") == ""
-    assert bridge._dispatch_admission_armed is True
+    bridge._require_physical_stop_confirmation = True
+    bridge._virtual_endpoint_mode = False
+    bridge._retraction_workflow_state_enforced = lambda: True
+    unavailable_action = SimpleNamespace(server_is_ready=lambda: False)
+    unavailable_service = SimpleNamespace(service_is_ready=lambda: False)
+    bridge._tool_transfer_client = unavailable_action
+    bridge._retraction_service_client = unavailable_service
+    bridge._external_tool_transfer_client = unavailable_action
+    bridge._external_retraction_service_client = unavailable_service
+    bridge._virtual_tool_transfer_client = unavailable_action
+    bridge._virtual_retraction_service_client = unavailable_service
+    bridge._enable_runtime_route_control = True
+    bridge._route_command_service = object()
+    bridge._latest_simulation_state = SimpleNamespace(
+        running=False,
+        execution_state="idle",
+    )
 
-    # Suppressing a recovery STOP due to a stale telemetry lease would be less
-    # safe. This bypass does not turn a Service receipt into physical stop proof.
-    assert bridge._dispatch_admission_guard("retraction", allow_stop=True) == ""
+    state = bridge._execution_route_state_snapshot()
+
+    assert state["action_server_ready"] is False
+    assert state["retraction_service_ready"] is False
+    assert state["restart_allowed"] is True
+    assert state["restart_blocker"] == ""
+
+    bridge._active_actions[("tool_transfer", "restart-blocker")] = ActiveAction(
+        route="tool_transfer",
+        command=_skill("restart-blocker"),
+        dispatched=True,
+    )
+    state = bridge._execution_route_state_snapshot()
+    assert state["restart_allowed"] is False
+    assert state["restart_blocker"] == "active_controller_request"
+
+    bridge._active_actions.clear()
+    bridge._active_services[("retraction", "restart-blocker")] = ActiveService(
+        route="retraction",
+        command=_group("restart-blocker"),
+        dispatched=True,
+    )
+    state = bridge._execution_route_state_snapshot()
+    assert state["restart_allowed"] is False
+    assert state["restart_blocker"] == "active_controller_request"
+
+    bridge._active_services.clear()
+    bridge._latest_simulation_state.running = True
+    state = bridge._execution_route_state_snapshot()
+    assert state["restart_allowed"] is False
+    assert state["restart_blocker"] == "simulation_not_stopped"
 
 
-@pytest.mark.parametrize(
-    "failed_check",
-    ["contract_configuration", "tool_handover_action_server"],
-)
-def test_virtual_dispatch_still_requires_current_route_readiness(
-    failed_check: str,
-) -> None:
+def test_integration_readiness_is_observation_only_telemetry() -> None:
     bridge = _bare_bridge()
-    _arm_virtual_dispatch_lease(bridge)
-    now_sec = time.time()
-    checks = {
-        "contract_configuration": True,
-        "tool_handover_action_server": True,
-        "retraction_command_service": True,
-    }
-    checks[failed_check] = False
-    readiness = {
+    unreadied = {
         "schema": "taskplanner.integration_readiness.v1",
-        "stamp_sec": now_sec,
-        "ready": True,
-        "checks": checks,
+        "ready": False,
+        "checks": {"tool_handover_action_server": False},
     }
 
-    bridge._record_admission_payload(readiness, kind="integration_readiness")
-
-    assert bridge._dispatch_admission_guard("tool_transfer") == (
-        "integration_readiness_checks_not_ready"
+    bridge._on_integration_readiness(
+        SimpleNamespace(data=json.dumps(unreadied))
     )
-    assert bridge._dispatch_admission_armed is False
 
-
-def test_virtual_dispatch_does_not_require_controller_contract_lease() -> None:
-    bridge = _bare_bridge()
-    _arm_virtual_dispatch_lease(bridge)
-    now_sec = time.time()
-    readiness = {
-        "schema": "taskplanner.integration_readiness.v1",
-        "stamp_sec": now_sec,
-        "ready": True,
-        "checks": {
-            "contract_configuration": True,
-            "tool_handover_action_server": True,
-            "retraction_command_service": True,
-        },
-    }
-
-    bridge._record_admission_payload(readiness, kind="integration_readiness")
-
-    assert bridge._dispatch_admission_guard("tool_transfer") == ""
-    assert bridge._dispatch_admission_armed is True
-
-
-def test_virtual_dispatch_still_requires_a_fresh_integration_readiness_lease() -> None:
-    bridge = _bare_bridge()
-    _arm_virtual_dispatch_lease(bridge)
-
-    assert bridge._dispatch_admission_guard("tool_transfer") == (
-        "integration_readiness_lease_missing"
+    assert bridge._latest_integration_readiness == unreadied
+    assert bridge._latest_integration_readiness_error == ""
+    assert bridge._latest_integration_readiness_received_monotonic > 0.0
+    bridge._on_integration_readiness(SimpleNamespace(data="not-json"))
+    assert bridge._latest_integration_readiness == unreadied
+    assert bridge._latest_integration_readiness_error == (
+        "integration_readiness_invalid_json"
     )
-    assert bridge._dispatch_admission_armed is False
-
-    bridge._record_admission_payload(
-        {
-            "schema": "taskplanner.integration_readiness.v1",
-            "stamp_sec": time.time(),
-            "ready": True,
-            "checks": {
-                "contract_configuration": True,
-                "tool_handover_action_server": True,
-                "retraction_command_service": True,
-            },
-        },
-        kind="integration_readiness",
+    assert not hasattr(SurgicalInteropExecutionBridge, "_dispatch_admission_guard")
+    assert not hasattr(
+        SurgicalInteropExecutionBridge, "_integration_readiness_lease_guard"
     )
-    bridge._latest_integration_readiness_received_monotonic -= 4.0
-
-    assert bridge._dispatch_admission_guard("tool_transfer") == (
-        "integration_readiness_lease_stale"
-    )
-    assert bridge._dispatch_admission_armed is False
 
 
 @pytest.mark.parametrize(
@@ -744,28 +1060,23 @@ def test_tool_handover_reaches_send_goal_without_controller_contract(
     tool_handover_endpoint: str,
 ) -> None:
     bridge = _bare_bridge()
-    _arm_virtual_dispatch_lease(bridge)
     bridge._robot_endpoint_source = endpoint_source
     bridge._retraction_endpoint_source = "virtual"
     bridge._tool_transfer_endpoint = tool_handover_endpoint
     bridge._enable_runtime_route_control = True
     bridge._server_wait_timeout_sec = 0.1
-    bridge._record_admission_payload(
-        {
-            "schema": "taskplanner.integration_readiness.v1",
-            "stamp_sec": time.time(),
-            "ready": True,
-            "checks": {
-                "contract_configuration": True,
-                "tool_handover_action_server": True,
-                "retraction_command_service": True,
-            },
-            "details": {
-                "robot_endpoint_source": endpoint_source,
-                "retraction_endpoint_source": "virtual",
-            },
-        },
-        kind="integration_readiness",
+    # An explicitly unready preflight observation must never suppress a typed
+    # Action whose selected endpoint is available.
+    bridge._on_integration_readiness(
+        SimpleNamespace(
+            data=json.dumps(
+                {
+                    "schema": "taskplanner.integration_readiness.v1",
+                    "ready": False,
+                    "checks": {"tool_handover_action_server": False},
+                }
+            )
+        )
     )
     submitted: list[tuple[object, object]] = []
 
@@ -915,6 +1226,44 @@ def test_tool_handover_lane_is_fail_closed_when_disabled_for_procedure() -> None
     }
 
 
+def test_mayo_retrieval_is_rejected_while_right_hand_is_prepositioned() -> None:
+    bridge = _bare_bridge()
+    bridge._latest_simulation_state.right_hand_tool = "T04"
+    bridge._latest_simulation_state.right_hand_tool_instance_id = "T04#1"
+    command = replace(
+        _skill("retrieve-with-right-preposition"),
+        action="retrieve_from_mayo",
+        arm="left",
+        source_location_type="mayo_stand",
+        source_location_id="mayo_stand",
+        target_location_type="tray_slot",
+        target_location_id="main_tray_slot_4",
+    )
+    bridge._skill_from_msg = lambda _message: command
+    statuses = []
+    bridge._publish_skill_status = lambda command, **kwargs: statuses.append(
+        (command, kwargs)
+    )
+    bridge._dispatch_tool_transfer = lambda *_args: (_ for _ in ()).throw(
+        AssertionError("right-hand preposition reached the Action client")
+    )
+
+    bridge._on_skill(SimpleNamespace())
+
+    assert len(statuses) == 1
+    assert statuses[0][1] == {
+        "state": "rejected",
+        "success": False,
+        "reason_code": "retrieve_blocked_right_hand_preposition",
+    }
+
+
+def test_mayo_retrieval_guard_allows_an_empty_right_hand() -> None:
+    bridge = _bare_bridge()
+    command = replace(_skill("retrieve-with-empty-right"), action="retrieve_from_mayo")
+    assert bridge._retrieval_run_guard(command) == ""
+
+
 def _activate_tool_transfer(
     bridge: SurgicalInteropExecutionBridge,
     command: InternalSkillCommand,
@@ -930,6 +1279,205 @@ def _activate_tool_transfer(
         cancelled=cancel_requested,
         semantic_leg=semantic_leg,
     )
+
+
+@pytest.mark.parametrize(
+    ("ros_status", "success", "final_state", "reason_code"),
+    [
+        (
+            GoalStatus.STATUS_SUCCEEDED,
+            True,
+            ExecuteToolHandover.Result.FINAL_COMPLETED,
+            ExecuteToolHandover.Result.REASON_COMPLETED,
+        ),
+        (
+            GoalStatus.STATUS_CANCELED,
+            False,
+            ExecuteToolHandover.Result.FINAL_CANCELED,
+            ExecuteToolHandover.Result.REASON_CANCELED_SOURCE_UNCHANGED,
+        ),
+        (
+            GoalStatus.STATUS_ABORTED,
+            False,
+            ExecuteToolHandover.Result.FINAL_FAILED,
+            "controller_failed",
+        ),
+    ],
+)
+def test_accepted_tool_action_projects_one_correlated_task_boundary_pair(
+    ros_status: int,
+    success: bool,
+    final_state: str,
+    reason_code: str,
+) -> None:
+    bridge = _bare_bridge()
+    command = replace(
+        _skill(f"task-boundary-{final_state}"),
+        action="direct_handover",
+        source_location_type="robot_right_hand",
+        source_location_id="robot_right_hand",
+        mode="implicit_request",
+    )
+    _activate_tool_transfer(
+        bridge,
+        command,
+        semantic_leg=("robot", "surgeon"),
+    )
+    events = []
+    bridge._stamp = lambda: Time(sec=17, nanosec=0)
+    bridge._skill_event_pub = SimpleNamespace(publish=events.append)
+    bridge._publish_skill_status = lambda *_args, **_kwargs: None
+    bridge._publish_execution_trace = lambda **_kwargs: None
+    bridge._publish_tool_transfer_completed_events = lambda *_args, **_kwargs: None
+    bridge._publish_tool_transfer_cancel_reconciliation = (
+        lambda *_args, **_kwargs: None
+    )
+    goal_handle = _GoalHandle()
+    accepted_future = SimpleNamespace(result=lambda: goal_handle)
+
+    bridge._on_tool_transfer_goal_response(command, accepted_future)
+    # A repeated callback must not manufacture a second active-task start.
+    bridge._on_tool_transfer_goal_response(command, accepted_future)
+
+    assert [event.event_type for event in events] == ["RobotTaskStarted"]
+    started = events[0]
+    assert started.instrument_id == command.instrument_id
+    assert started.instance_id == command.instrument_instance_id
+    assert started.arm == ""
+    assert started.source_location_id == "robot_right_hand"
+    assert started.target_location_id == "surgeon_receive_zone"
+    started_detail = json.loads(started.detail_json)
+    assert started_detail["task_id"] == command.command_id
+    assert started_detail["task_type"] == "direct_handover"
+    assert started_detail["transport"] == "ros2_action"
+
+    terminal_future = SimpleNamespace(
+        result=lambda: SimpleNamespace(
+            status=ros_status,
+            result=SimpleNamespace(
+                success=success,
+                final_state=final_state,
+                reason_code=reason_code,
+            ),
+        )
+    )
+    bridge._on_tool_transfer_result(command, terminal_future)
+    # The action is no longer tracked, so a duplicate terminal callback is a
+    # no-op and cannot clear a later task with the same instrument.
+    bridge._on_tool_transfer_result(command, terminal_future)
+
+    assert [event.event_type for event in events] == [
+        "RobotTaskStarted",
+        "RobotTaskCompleted",
+    ]
+    completed_detail = json.loads(events[-1].detail_json)
+    assert completed_detail["task_id"] == command.command_id
+    assert completed_detail["controller_final_state"] == final_state
+    assert completed_detail["controller_reason_code"] == reason_code
+
+
+def test_rejected_or_unknown_goal_response_publishes_no_task_boundary() -> None:
+    for command_id, future in (
+        (
+            "task-rejected-before-accept",
+            SimpleNamespace(
+                result=lambda: SimpleNamespace(accepted=False),
+            ),
+        ),
+        (
+            "task-goal-response-unknown",
+            SimpleNamespace(
+                result=lambda: (_ for _ in ()).throw(
+                    RuntimeError("goal response lost")
+                )
+            ),
+        ),
+    ):
+        bridge = _bare_bridge()
+        command = replace(_skill(command_id), action="direct_handover")
+        _activate_tool_transfer(bridge, command)
+        events = []
+        bridge._skill_event_pub = SimpleNamespace(publish=events.append)
+        bridge._publish_skill_status = lambda *_args, **_kwargs: None
+        bridge._publish_execution_trace = lambda **_kwargs: None
+
+        bridge._on_tool_transfer_goal_response(command, future)
+
+        assert events == []
+
+
+def test_unknown_result_after_acceptance_keeps_task_active_without_false_completion() -> None:
+    bridge = _bare_bridge()
+    command = replace(
+        _skill("task-result-unknown"),
+        action="direct_handover",
+    )
+    _activate_tool_transfer(bridge, command)
+    events = []
+    bridge._skill_event_pub = SimpleNamespace(publish=events.append)
+    bridge._publish_skill_status = lambda *_args, **_kwargs: None
+    bridge._publish_execution_trace = lambda **_kwargs: None
+
+    bridge._on_tool_transfer_goal_response(
+        command,
+        SimpleNamespace(result=lambda: _GoalHandle()),
+    )
+    bridge._on_tool_transfer_result(
+        command,
+        SimpleNamespace(
+            result=lambda: (_ for _ in ()).throw(
+                RuntimeError("result response lost")
+            )
+        ),
+    )
+
+    assert [event.event_type for event in events] == ["RobotTaskStarted"]
+    assert ("tool_transfer", command.command_id) in bridge._active_actions
+    assert bridge._runtime_is_accepting() is False
+
+
+@pytest.mark.parametrize(
+    ("ros_status", "expected_event_types"),
+    [
+        (
+            GoalStatus.STATUS_ABORTED,
+            ["RobotTaskStarted", "RobotTaskCompleted"],
+        ),
+        (GoalStatus.STATUS_UNKNOWN, ["RobotTaskStarted"]),
+    ],
+)
+def test_missing_result_payload_only_completes_correlated_terminal_status(
+    ros_status: int,
+    expected_event_types: list[str],
+) -> None:
+    bridge = _bare_bridge()
+    command = replace(
+        _skill(f"task-missing-result-{ros_status}"),
+        action="direct_handover",
+    )
+    _activate_tool_transfer(bridge, command)
+    events = []
+    bridge._skill_event_pub = SimpleNamespace(publish=events.append)
+    bridge._publish_skill_status = lambda *_args, **_kwargs: None
+    bridge._publish_execution_trace = lambda **_kwargs: None
+
+    bridge._on_tool_transfer_goal_response(
+        command,
+        SimpleNamespace(result=lambda: _GoalHandle()),
+    )
+    bridge._on_tool_transfer_result(
+        command,
+        SimpleNamespace(
+            result=lambda: SimpleNamespace(status=ros_status, result=None),
+        ),
+    )
+
+    assert [event.event_type for event in events] == expected_event_types
+    if expected_event_types[-1] == "RobotTaskCompleted":
+        detail = json.loads(events[-1].detail_json)
+        assert detail["controller_final_state"] == "failed"
+        assert detail["controller_reason_code"] == "invalid_controller_result"
+    assert bridge._runtime_is_accepting() is False
 
 
 def test_public_tool_handover_state_vocabulary_is_fixed_and_minimal():
@@ -1013,14 +1561,17 @@ def test_cancel_recovery_feedback_remains_visible_until_terminal_result():
     ]
 
 
-def test_stop_requests_action_cancel_and_keeps_retraction_service_in_flight():
+def test_stop_detaches_ui_but_retains_controller_recovery_records():
     bridge = _bare_bridge()
     skill = _skill()
     service_group = _group()
     goal_handle = _GoalHandle()
     bridge._active_actions = {
         ("tool_transfer", skill.command_id): ActiveAction(
-            route="tool_transfer", command=skill, goal_handle=goal_handle
+            route="tool_transfer",
+            command=skill,
+            goal_handle=goal_handle,
+            dispatched=True,
         )
     }
     bridge._active_services = {
@@ -1029,35 +1580,244 @@ def test_stop_requests_action_cancel_and_keeps_retraction_service_in_flight():
         )
     }
     statuses = []
+    traces = []
     bridge._publish_skill_status = lambda command, **kwargs: statuses.append(
         ("skill", command.command_id, kwargs)
     )
     bridge._publish_group_status = lambda command, **kwargs: statuses.append(
         ("group", command.command_id, kwargs)
     )
+    bridge._publish_execution_trace = lambda **kwargs: traces.append(kwargs)
+    assert bridge._dispatch_ledger.reserve("prior-run-command")
 
     bridge._on_control(SimpleNamespace(data="stop:operator"))
 
     assert not bridge._runtime_accepting_commands
     assert goal_handle.cancel_calls == 1
-    assert all(active.cancelled for active in bridge._active_actions.values())
-    assert all(active.cancelled for active in bridge._active_services.values())
     assert set(bridge._active_actions) == {("tool_transfer", skill.command_id)}
-    assert set(bridge._active_services) == {
-        ("retraction", service_group.command_id)
-    }
+    assert set(bridge._active_services) == {("retraction", service_group.command_id)}
+    assert not bridge._dispatch_ledger.reserve("prior-run-command")
     assert bridge._begin_action_dispatch("tool_transfer", _skill("after-stop")) == (
         "runtime_not_accepting_commands"
     )
-    assert ("skill", "skill-1", {"state": "cancel_requested", "success": False,
-            "reason_code": "cancel_requested_by_runtime_control"}) in statuses
+    assert ("skill", "skill-1", {
+        "state": "cancel_requested",
+        "success": False,
+        "reason_code": "controller_recovery_pending_after_stop",
+    }) in statuses
     assert ("group", service_group.command_id, {
         "state": "unknown",
-        "outcome": "awaiting_service_admission_after_stop",
+        "outcome": "controller_recovery_pending",
         "terminal": False,
         "success": False,
-        "reason_code": "service_not_cancellable_awaiting_response",
+        "reason_code": "controller_recovery_pending_after_stop",
     }) in statuses
+    assert {trace["command_id"] for trace in traces} == {
+        skill.command_id,
+        service_group.command_id,
+    }
+    assert all(trace["terminal"] is False for trace in traces)
+
+
+def test_clean_start_keeps_prior_dispatched_action_as_controller_lane_blocker():
+
+    bridge = _bare_bridge()
+    bridge._publish_execution_route_state = lambda: None
+    bridge._publish_skill_status = lambda *_args, **_kwargs: None
+    prior = _skill("prior-run-handover")
+    prior_goal = _GoalHandle()
+    bridge._active_actions[("tool_transfer", prior.command_id)] = ActiveAction(
+        route="tool_transfer",
+        command=prior,
+        goal_handle=prior_goal,
+        dispatched=True,
+        dispatch_epoch=0,
+    )
+
+    bridge._on_control(SimpleNamespace(data="stop"))
+    assert prior_goal.cancel_calls == 1
+    assert set(bridge._active_actions) == {("tool_transfer", prior.command_id)}
+
+    bridge._on_control(SimpleNamespace(data="start"))
+    next_command = _skill("next-run-handover")
+
+    assert bridge._begin_action_dispatch("tool_transfer", next_command) == (
+        "tool_transfer_busy"
+    )
+    assert set(bridge._active_actions) == {("tool_transfer", prior.command_id)}
+
+
+def test_clean_start_keeps_prior_service_as_controller_lane_blocker():
+
+    bridge = _bare_bridge()
+    bridge._publish_group_status = lambda *_args, **_kwargs: None
+    prior = _group("prior-run-retraction")
+    bridge._active_services[("retraction", prior.command_id)] = ActiveService(
+        route="retraction",
+        command=prior,
+        dispatched=True,
+        dispatch_epoch=0,
+    )
+
+    bridge._on_control(SimpleNamespace(data="stop"))
+    bridge._on_control(SimpleNamespace(data="start"))
+    next_command = _group("next-run-retraction")
+
+    assert bridge._begin_service_dispatch("retraction", next_command) == (
+        "retraction_busy"
+    )
+    assert set(bridge._active_services) == {("retraction", prior.command_id)}
+
+
+def test_controller_recovery_timeout_releases_only_explicitly_unknown_records(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    bridge = _bare_bridge()
+    bridge._controller_recovery_timeout_sec = 15.0
+    action = _skill("expired-action")
+    service = _group("expired-service")
+    bridge._active_actions[("tool_transfer", action.command_id)] = ActiveAction(
+        route="tool_transfer",
+        command=action,
+        cancelled=True,
+        dispatched=True,
+        recovery_deadline_monotonic=5.0,
+    )
+    bridge._active_services[("retraction", service.command_id)] = ActiveService(
+        route="retraction",
+        command=service,
+        cancelled=True,
+        dispatched=True,
+        recovery_deadline_monotonic=5.0,
+    )
+    traces: list[dict[str, object]] = []
+    bridge._publish_execution_trace = lambda **kwargs: traces.append(kwargs)
+    bridge._publish_execution_route_state = lambda: None
+    bridge.get_logger = lambda: SimpleNamespace(warning=lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(bridge_module.time, "monotonic", lambda: 6.0)
+
+    bridge._expire_controller_recovery()
+
+    assert bridge._active_actions == {}
+    assert bridge._active_services == {}
+    assert {trace["reason_code"] for trace in traces} == {
+        "controller_recovery_timeout"
+    }
+    assert all(trace["stage"] == "unknown" for trace in traces)
+    assert all(trace["terminal"] is True for trace in traces)
+
+
+def test_stale_action_terminal_is_not_projected_into_the_restarted_run():
+    bridge = _bare_bridge()
+    command = _skill("prior-run-terminal")
+    bridge._dispatch_epoch = 1
+    bridge._active_actions[("tool_transfer", command.command_id)] = ActiveAction(
+        route="tool_transfer",
+        command=command,
+        cancelled=True,
+        dispatch_epoch=0,
+    )
+    statuses = []
+    traces = []
+    bridge._publish_skill_status = lambda *_args, **kwargs: statuses.append(kwargs)
+    bridge._publish_execution_trace = lambda **kwargs: traces.append(kwargs)
+
+    bridge._on_tool_transfer_result(
+        command,
+        SimpleNamespace(result=lambda: SimpleNamespace(status=GoalStatus.STATUS_CANCELED)),
+    )
+
+    assert ("tool_transfer", command.command_id) not in bridge._active_actions
+    assert statuses == []
+    assert traces == []
+
+
+def test_stopped_action_callback_cannot_release_a_reused_command_id():
+    bridge = _bare_bridge()
+    command = _skill("reused-handover")
+    bridge._dispatch_epoch = 1
+    current = ActiveAction(
+        route="tool_transfer",
+        command=command,
+        dispatch_epoch=1,
+    )
+    bridge._active_actions[("tool_transfer", command.command_id)] = current
+    statuses = []
+    bridge._publish_skill_status = lambda *_args, **kwargs: statuses.append(kwargs)
+
+    bridge._on_tool_transfer_result(
+        command,
+        SimpleNamespace(result=lambda: object()),
+        expected_epoch=0,
+    )
+
+    assert bridge._active_actions[("tool_transfer", command.command_id)] is current
+    assert statuses == []
+
+
+def test_stale_retraction_receipt_is_not_projected_into_the_restarted_run():
+    bridge = _bare_bridge()
+    command = _group("prior-run-retraction-terminal")
+    bridge._dispatch_epoch = 1
+    bridge._active_services[("retraction", command.command_id)] = ActiveService(
+        route="retraction",
+        command=command,
+        cancelled=True,
+        dispatched=True,
+        dispatch_epoch=0,
+    )
+    statuses = []
+    traces = []
+    bridge._publish_group_status = lambda *_args, **kwargs: statuses.append(kwargs)
+    bridge._publish_execution_trace = lambda **kwargs: traces.append(kwargs)
+
+    bridge._on_retraction_service_result(
+        command,
+        SimpleNamespace(
+            result=lambda: SimpleNamespace(
+                request_accepted=True,
+                result_code=ExecuteRetractionCommand.Response.RESULT_ACCEPTED,
+                command_id=command.command_id,
+                message="controller_received",
+            )
+        ),
+    )
+
+    assert ("retraction", command.command_id) not in bridge._active_services
+    assert bridge._runtime_is_accepting()
+    assert statuses == []
+    assert traces == []
+
+
+def test_stopped_service_callback_cannot_release_a_reused_command_id():
+    bridge = _bare_bridge()
+    command = _group("reused-retraction")
+    bridge._dispatch_epoch = 1
+    current = ActiveService(
+        route="retraction",
+        command=command,
+        dispatched=True,
+        dispatch_epoch=1,
+    )
+    bridge._active_services[("retraction", command.command_id)] = current
+    statuses = []
+    bridge._publish_group_status = lambda *_args, **kwargs: statuses.append(kwargs)
+
+    bridge._on_retraction_service_result(
+        command,
+        SimpleNamespace(
+            result=lambda: SimpleNamespace(
+                request_accepted=True,
+                result_code=ExecuteRetractionCommand.Response.RESULT_ACCEPTED,
+                command_id=command.command_id,
+                message="accepted",
+            )
+        ),
+        expected_epoch=0,
+    )
+
+    assert bridge._active_services[("retraction", command.command_id)] is current
+    assert statuses == []
 
 
 def test_retraction_service_acceptance_after_stop_preserves_unknown_physical_state():
@@ -1369,6 +2129,43 @@ def test_skill_message_voice_provenance_is_backward_safe_and_explicit() -> None:
     ).voice_backed
 
 
+def test_live_voice_ingress_never_cancels_or_replaces_an_active_tool_action() -> None:
+    bridge = _bare_bridge()
+    active = _skill("active-handover")
+    goal_handle = _GoalHandle()
+    _activate_tool_transfer(bridge, active, goal_handle=goal_handle)
+    incoming = _voice_skill("voice-while-active", 31)
+    bridge._skill_from_msg = lambda _message: incoming
+    bridge._direct_hand_run_guard = lambda _command: ""
+    bridge._public_instrument_identity = lambda _command: (
+        "Adson forceps",
+        "Adson forceps#1",
+    )
+    bridge._tool_transfer_client = SimpleNamespace(
+        wait_for_server=lambda *, timeout_sec: True
+    )
+    bridge._server_wait_timeout_sec = 0.0
+    statuses = []
+    bridge._publish_skill_status = lambda command, **kwargs: statuses.append(
+        (command.command_id, kwargs)
+    )
+
+    bridge._on_skill(SimpleNamespace())
+
+    assert goal_handle.cancel_calls == 0
+    assert bridge._queued_voice_tool_transfer is None
+    assert statuses == [
+        (
+            "voice-while-active",
+            {
+                "state": "busy",
+                "success": False,
+                "reason_code": "tool_transfer_busy",
+            },
+        )
+    ]
+
+
 def test_latest_voice_preempts_once_and_non_voice_cannot_replace_queue() -> None:
     bridge = _bare_bridge()
     active = _skill("active-handover")
@@ -1508,7 +2305,7 @@ def test_next_semantic_leg_in_same_generation_never_cancels_active_goal() -> Non
     )
 
 
-def test_same_tool_voice_waits_for_auto_return_then_rebases_from_mayo() -> None:
+def test_same_tool_voice_waits_for_auto_return_then_defers_mayo_pickup_to_planner() -> None:
     bridge = _bare_bridge()
     active = replace(
         _skill("return-bipolar"),
@@ -1588,14 +2385,15 @@ def test_same_tool_voice_waits_for_auto_return_then_rebases_from_mayo() -> None:
         ),
     )
 
-    assert len(dispatched) == 1
-    deferred_command, deferred_request = dispatched[0]
-    assert deferred_command.command_id == voice.command_id
-    assert deferred_command.action == "prepare_tool"
-    assert deferred_command.source_location_type == "mayo_stand"
-    assert deferred_command.source_location_id == "mayo_stand"
-    assert deferred_request.source_location == "mayo"
-    assert deferred_request.target_location == "robot"
+    assert dispatched == []
+    assert statuses[-1] == (
+        voice.command_id,
+        {
+            "state": "pending",
+            "success": True,
+            "reason_code": "mayo_source_requires_fresh_planner_admission",
+        },
+    )
     assert bridge._runtime_is_accepting()
 
 
@@ -2054,7 +2852,7 @@ def test_runtime_stop_discards_queued_voice_before_cancel_result() -> None:
     )
 
 
-def test_reset_clears_dedupe_ledger_but_stop_does_not():
+def test_stop_and_reset_do_not_reopen_prior_command_id():
     bridge = _bare_bridge()
     assert bridge._dispatch_ledger.reserve("command-1", explicit_request_generation=3)
 
@@ -2062,7 +2860,7 @@ def test_reset_clears_dedupe_ledger_but_stop_does_not():
     assert not bridge._dispatch_ledger.reserve("command-1", explicit_request_generation=3)
 
     bridge._on_control(SimpleNamespace(data="reset"))
-    assert bridge._dispatch_ledger.reserve("command-1", explicit_request_generation=3)
+    assert not bridge._dispatch_ledger.reserve("command-1", explicit_request_generation=3)
 
 
 def test_only_start_or_start_actors_enable_external_dispatch():
@@ -2071,12 +2869,77 @@ def test_only_start_or_start_actors_enable_external_dispatch():
 
     bridge._on_control(SimpleNamespace(data="start_runtime"))
     assert not bridge._runtime_accepting_commands
+    assert bridge._route_initialization_state == "initializing"
     bridge._on_control(SimpleNamespace(data="start_actors"))
     assert bridge._runtime_accepting_commands
+    assert bridge._route_initialization_state == "running"
     bridge._on_control(SimpleNamespace(data="stop"))
     assert not bridge._runtime_accepting_commands
     bridge._on_control(SimpleNamespace(data="start"))
     assert bridge._runtime_accepting_commands
+
+
+def test_start_runtime_defers_first_bt_handover_until_start_actors():
+    bridge = _bare_bridge()
+    bridge._runtime_accepting_commands = False
+    bridge._direct_hand_run_guard = lambda _command: ""
+    bridge._public_instrument_identity = lambda _command: (
+        "Adson forceps",
+        "Adson forceps#1",
+    )
+    bridge._queue_voice_tool_transfer_preemption = lambda *_args: False
+    bridge._publish_execution_route_state = lambda: None
+    statuses: list[tuple[str, str]] = []
+    bridge._publish_skill_status = lambda command, **kwargs: statuses.append(
+        (command.command_id, kwargs["reason_code"])
+    )
+    dispatched: list[tuple[InternalSkillCommand, ToolHandoverRequest]] = []
+    bridge._dispatch_tool_transfer = lambda command, request: dispatched.append(
+        (command, request)
+    )
+    command = _skill("startup-bipolar-handover")
+    message = SimpleNamespace(
+        **{
+            field: getattr(command, field)
+            for field in command.__dataclass_fields__
+        }
+    )
+
+    bridge._on_control(SimpleNamespace(data="start_runtime"))
+    bridge._on_skill(message)
+
+    assert dispatched == []
+    assert statuses == [
+        ("startup-bipolar-handover", "deferred_until_start_actors")
+    ]
+    assert bridge._deferred_startup_tool_transfer is not None
+
+    bridge._on_control(SimpleNamespace(data="start_actors"))
+
+    assert [item[0].command_id for item in dispatched] == [
+        "startup-bipolar-handover"
+    ]
+    assert bridge._deferred_startup_tool_transfer is None
+    assert bridge._runtime_accepting_commands
+
+
+def test_stop_discards_bt_handover_deferred_during_startup_window():
+    bridge = _bare_bridge()
+    bridge._runtime_accepting_commands = False
+    bridge._publish_execution_route_state = lambda: None
+    command = _skill("startup-cancelled-handover")
+    request = _tool_transfer_request(command)
+    statuses: list[tuple[str, str]] = []
+    bridge._publish_skill_status = lambda item, **kwargs: statuses.append(
+        (item.command_id, kwargs["reason_code"])
+    )
+
+    bridge._on_control(SimpleNamespace(data="start_runtime"))
+    assert bridge._defer_startup_tool_transfer(command, request)
+    bridge._on_control(SimpleNamespace(data="stop"))
+
+    assert bridge._deferred_startup_tool_transfer is None
+    assert ("startup-cancelled-handover", "cancelled_before_start_actors") in statuses
 
 
 def test_reset_is_repeatable_and_reopens_the_next_start_edge():
@@ -2123,7 +2986,10 @@ def test_full_lifecycle_transport_duplicates_are_edge_idempotent():
     ):
         bridge._on_control(SimpleNamespace(data=control))
 
-    assert reset_calls == [True, True]
+    # ``stop`` is now also a clean-run boundary: it clears local command
+    # dedupe records once, while its duplicated transport message remains
+    # edge-idempotent.
+    assert reset_calls == [True, True, True]
     assert bridge._runtime_accepting_commands is False
     assert bridge._last_lifecycle_control_signature == ("stop", "")
 

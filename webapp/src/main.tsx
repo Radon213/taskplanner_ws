@@ -6,6 +6,7 @@ import App from "./App";
 import "./styles.css";
 import "./styles/design-tokens.css";
 import "./styles/a-plus.css";
+import "./styles/mission-layout.css";
 
 const loadMotionFeatures = () =>
   import("./motion-features").then((module) => module.default);

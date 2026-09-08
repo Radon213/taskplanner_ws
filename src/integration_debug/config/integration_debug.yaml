@@ -10,6 +10,40 @@ action_watchdog:
   max_duration_sec: 300.0
   server_loss_grace_sec: 5.0
 
+# One narrow typed-dispatch policy for every Debug ROS write.  The gateway
+# accepts the generic shape
+# {kind, endpoint, type, payload, timeout_sec}; endpoint may be this stable
+# alias or the currently resolved ROS name.  ``legacy_operations`` exists only
+# to keep the existing browser contract working during migration.  New callers
+# should send operation=dispatch and the generic payload directly.
+dispatch:
+  legacy_operations:
+    tool_handover: tool_handover
+    retraction_command: retraction_service
+  endpoints:
+    - name: tool_handover
+      kind: action
+      type: surgical_interop_msgs/action/ExecuteToolHandover
+      endpoints:
+        external: /surgery/tool_handover
+        virtual: /integration/debug/virtual/tool_handover
+      payload_codec: tool_handover
+      physical: true
+      single_flight: true
+      timeout_sec: 300.0
+      response_semantics: action
+    - name: retraction_service
+      kind: service
+      type: surgical_interop_msgs/srv/ExecuteRetractionCommand
+      endpoints:
+        external: /surgery/retraction/command
+        virtual: /integration/debug/virtual/retraction/command
+      payload_codec: retraction_command
+      physical: true
+      single_flight: true
+      timeout_sec: 120.0
+      response_semantics: admission
+
 asr:
   topic: /sensors/surgeon/sentence
   default_endpoint: cloud
@@ -18,9 +52,9 @@ asr:
 
 surgery_record:
   input_dir: /surgery-record-inputs
-  default_endpoint: https://dev.puzzle-ai.com:6627/api/v1/surgery/img_texts
+  default_endpoint: https://192.168.1.5:6627/api/v1/surgery/img_texts
   allowed_endpoints:
-    - https://dev.puzzle-ai.com:6627/api/v1/surgery/img_texts
+    - https://192.168.1.5:6627/api/v1/surgery/img_texts
   timeout_sec: 35.0
 
 inputs:
@@ -30,17 +64,13 @@ inputs:
     expected_hz: 0.0
     stale_after_sec: 0.0
     qos: reliable_volatile
-  - name: admitted_request_text
-    topic: /surgery/audio/request_text
-    type: std_msgs/msg/String
+  # CommandRouter owns executable admitted ASR.  Debug only observes its
+  # faithful, non-executable relay after the router has received an utterance.
+  - name: observed_surgeon_utterance
+    topic: /surgery/audio/observed_utterance
+    type: surgical_msgs/msg/SpeechUtterance
     expected_hz: 0.0
     stale_after_sec: 0.0
-    qos: reliable_volatile
-  - name: debug_speech_adapter_status
-    topic: /integration/debug/speech/status
-    type: surgical_msgs/msg/InputSourceStatus
-    expected_hz: 1.0
-    stale_after_sec: 3.0
     qos: reliable_volatile
   - name: external_cv_contract
     topic: /integration/cv_contract/status
@@ -112,13 +142,7 @@ blocked_nodes:
   - surgical_interop_gateway
 
 voice:
-  request_topic: /surgery/audio/request_text
-  # Demo-bundle Debug-only software admission default for either selected
-  # endpoint. Service validation, limits, controller admission, and E-stop
-  # remain authoritative downstream.
-  retraction_state_machine_bypass_default_bundles:
-    - thyroidectomy_demo
-    - inguinal_hernia_repair_demo
+  observed_utterance_topic: /surgery/audio/observed_utterance
   default_source_location: tray
   default_target_location: surgeon
   aliases:

@@ -7,23 +7,35 @@ baseline combines a real VLM path, an OR digital twin, Behavior Tree decisions,
 mock robot skill execution, an LLM surgeon actor for validation, and a React
 operator dashboard.
 
+## Research iteration policy
+
+This workspace is a research system, not a release-engineered product. The
+binding change policy for people and coding agents is
+[`taskplanner_principles.toml`](taskplanner_principles.toml); the concise agent
+instructions are in [`AGENTS.md`](AGENTS.md). In particular, an existing ROS
+interface is connected by a hot-reloadable catalog/configuration change, a
+same-mode restart touches only the core owner, and physical controller limits
+remain the only non-negotiable safety boundary.
+
 ## Current Baseline
 
 - Runtime startup is explicit through the `live`, `llm-surgeon`, and `replay`
-  deployment profiles; `scripts/taskplanner up` defaults to `live`, the actual
-  external-integration profile. Live keeps its required read-only Debug
-  observation sidecar running, while LLM Surgeon and Replay do not start camera
-  observation by default. Provider catalogs start without loading generative
-  model weights.
+  profiles; `scripts/taskplanner up` defaults to `live`. A same-mode `up` or
+  `scripts/taskplanner restart core` restarts only the owned core. ASR,
+  browser, VLM, rosbridge, and camera sidecars have explicit independent
+  restart paths. Provider catalogs start without loading generative model
+  weights.
 - Explicit voice tool requests remain operational when the VLM is absent or
   unhealthy. VLM-dependent phase inference, next-tool prediction, and
   mid-procedure Mayo classification remain fail-closed.
-- Spoken commands use an open-natural-language / closed-typed-intent contract:
-  the resolver may understand Korean paraphrases, but Digital Twin and BT own
-  validation and execution. See
-  [`docs/VOICE_COMMAND_CONTRACT.md`](docs/VOICE_COMMAND_CONTRACT.md).
+- Exact researcher-owned voice commands use the hot-reloadable
+  [`command catalog`](src/voice_command/config/command_catalog.yaml) and go
+  directly from admitted ASR through `CommandRouter` to a typed Topic, Service,
+  or Action adapter. Digital Twin, BT, UI, and VLM observe this path rather
+  than re-admitting it. See
+  [`docs/VOICE_COMMAND_MODULARIZATION.md`](docs/VOICE_COMMAND_MODULARIZATION.md).
 - Live humanoid speech uses a durable, deduplicated Supertonic sidecar with
-  function-admission timing and typed speaker-echo suppression. See
+  typed speaker-echo suppression. See
   [`docs/OPERATING_TTS.md`](docs/OPERATING_TTS.md).
 - The LLM surgeon actor starts only in the `llm-surgeon` validation profile and
   generates public test stimuli such as speech, hand extension, Mayo placement,
@@ -40,9 +52,10 @@ operator dashboard.
 - Procedure bundles are driven by compact `vlm_procedure_prompt.yaml` files.
 - Normal recovery is Mayo-stand based: surgeon hand -> Mayo stand -> robot left
   hand -> cleaner -> rack.
-- A tool on Mayo can be requested again by voice or the direct CAM4 hand signal. The BT dispatches
-  `pick_up_from_mayo_and_handover` through the right arm, so Mayo is a reusable
-  surgeon-side pool rather than a recovery-only endpoint.
+- A tool on Mayo can be requested again by voice or the direct CAM4 hand signal,
+  including while Mayo hand occupancy is present. The BT limits that exception
+  to the requested Mayo-to-right-hand `prepare_tool` leg, followed by the
+  audited `direct_handover`, so autonomous preparation and recovery stay blocked.
 - The dashboard shows one Mayo stand. Each tool tag carries the latest
   VLM-derived reuse probability instead of separate recovery/reuse columns.
 - `retrieve_from_hand` remains only as a legacy/manual path.
@@ -68,7 +81,6 @@ operator dashboard.
   bridge, and legacy mock VLM.
 - `src/taskplanner_bt_nodes`: C++ BehaviorTree.CPP custom nodes.
 - `src/taskplanner_bt_trees`: Behavior Tree XML.
-- `src/skill_execution`: mock skill action server and `/bt/skill_command` bridge.
 - `src/surgical_interop_msgs`: external tool-handover and retraction-only ROS 2
   Service/Action/Topic definitions.
 - `src/surgical_interop_execution`: fail-closed bridge and fault emulator for
@@ -104,19 +116,24 @@ Frequently changed scenario choices belong in that same prompt file:
 
 ```yaml
 tool_placement:
-  rack_order: [T02, T03, T04, T07]
+  rack_order: [T02, T04, T07, T08]
   initial_states:
-    - instrument_id: T03
-      instance_id: T03#1
-      location_id: field_region_procedure
-      lifecycle_stage: surgeon_owned
+    - instrument_id: T02
+      instance_id: T02#1
+      location_id: main_tray_slot_1
+      lifecycle_stage: home_rack
+      confidence: 1.0
+    - instrument_id: T08
+      instance_id: T08#1
+      location_id: main_tray_slot_4
+      lifecycle_stage: home_rack
       confidence: 1.0
 
 scenario_policy:
-  requestable_tools: [T02, T04, T07]
+  requestable_tools: [T02, T04, T07, T08]
   unused_preposition_destination: mayo
-  runtime_requirements:  # complete typed capability record
-    # ...
+  # Optional automation/UI preferences.  They do not need to mirror a
+  # researcher-added CommandRouter catalog entry.
 ```
 
 `rack_order` must contain every declared tool exactly once. `initial_states`
@@ -131,24 +148,24 @@ The Web app no longer keeps per-procedure layout or tray-order copies: it
 renders the authoritative `SimulationState.layout_json`, instrument state, and
 bundle metadata published by the Digital Twin.
 
-After saving YAML, use **시나리오 revision → 변경 확인** in the operator UI.
-Preview is read-only and works while a scenario is running. Applying a changed
-active bundle requires the stopped-state contract; the server rechecks runtime
-authority and the exact candidate revision shown by preview, then reports
-whether it was applied, unchanged, deferred, or rejected. If the YAML changes
-between preview and apply, the operator must preview again. The same revision
-transaction reloads every present procedure-aware runtime and public-gateway
-consumer; absence is allowed for mode-specific nodes, but a present rejection
-rolls back the transaction. A normal scenario edit therefore does not require
-a full image rebuild.
+After saving YAML, use **시나리오 reload**. The default fast path parses the
+source YAML once, atomically replaces the active `ScenarioStore` value, keeps
+the last known-good revision on error, and announces
+`/simulation/scenario_config` for interested consumers. Labels, aliases,
+layout, and observation thresholds can reload immediately; behavior,
+initial-placement, and scenario selection apply at an explicit paused or
+stopped boundary (or at initial idle before the first lifecycle frame). The historical
+all-participant snapshot/rollback transaction is an explicit
+`bundle_reload_mode=transactional` release option, not the normal research
+path. A normal scenario edit does not require a build or full runtime restart.
 
 ### Bed-Mounted Retraction Arm Service
 
 All retractor-arm requests use the single
 `/surgery/retraction/command` (`ExecuteRetractionCommand`) Service. Its Request
 contains `protocol_version`, `source_id`, `command_id`, `command`,
-`target_side`, and `distance_m`; the six command constants cover direct-teach
-start/finish, retraction start/adjust/stop, and tool change. A 5 cm adjustment,
+`target_side`, and `distance_m`; seven command constants cover direct-teach
+start/finish, retraction start/adjust/stop, tool change, and suction. A 5 cm adjustment,
 for example, is `COMMAND_ADJUST_RETRACTION` with `TARGET_LEFT`, `TARGET_RIGHT`,
 or `TARGET_NONE` (the peer contract's bilateral value) and
 `distance_m=0.050`. With `TARGET_NONE`, the same distance is applied
@@ -165,9 +182,10 @@ Controller state is consumed from
 `arm_id`, `role`, `role_instance_id`, `state`, `direct_teach_active`, and
 `reason_code`.
 
-There is no bed-mounted suction robot-arm control path. The surgical suction
-instrument and public surgeon speech about suction remain part of the normal
-clinical/tool evidence model.
+The exact voice phrase `suction` is a catalog command that calls this Service
+directly with `protocol_version: 1`, `source_id: taskplanner`,
+`COMMAND_SUCTION`, `TARGET_NONE`, and zero distance. It is independent of
+VLM, Digital Twin, and BT workflow stages.
 
 The operator dashboard shows request-correlated speech, VLM interpretation, BT
 validation, retraction Service admission, and controller-owned retraction-arm
@@ -401,28 +419,25 @@ unavailable.
 ### Legacy sentence-only operation (Debug/replay only)
 
 An external Debug/replay source may publish one completed surgeon sentence as
-`std_msgs/msg/String` on `/sensors/surgeon/sentence`. The sentence adapter trims
-the message, suppresses short-window duplicates, and republishes admitted text
-on the internal compatibility topic `/surgery/audio/request_text`. The digital twin resolves
-explicit tool requests against the active procedure YAML and passes the
-canonical tool id to the BT. An exact retraction-arm cue from the YAML is routed
-to the retraction control lane instead of being mistaken for a handover. A
-suction utterance remains clinical/tool evidence and is never converted into a
-bed-mounted arm command.
+`std_msgs/msg/String` on `/sensors/surgeon/sentence`. The same
+`speech_input_adapter` trims it, suppresses short-window duplicates, and emits
+the normal typed `/surgery/audio/admitted_utterance` message. The sole command
+consumer remains `CommandRouter`; it makes the one-way
+`/surgery/audio/observed_utterance` relay for VLM, UI, logging, and dialogue.
+No raw-text resolver, intent topic, Digital Twin admission hop, or VLM health
+gate is part of that path.
 
-When VLM health is unavailable in Debug/replay, a sentence-backed request may bypass only the
-`vlm_unhealthy` and phase-uncertain inference gates. Tool existence, active
-bundle membership, contamination, ownership, robot/cleaner occupancy, surgeon
-two-tool capacity, and handover readiness remain mandatory. Autonomous phase
-updates, predicted-tool preparation, and probabilistic Mayo recovery do not run
-without VLM evidence. Set `VLM_MODE=voice_only` to avoid launching a VLM node;
-the same sentence-only behavior is entered automatically while `VLM_MODE=real` is
-temporarily unhealthy.
+The `suction` catalog phrase is a direct
+`ExecuteRetractionCommand` request with fixed `protocol_version: 1` and
+`command: 7`. Taskplanner forwards that typed request without interpreting its
+physical meaning; the selected external or virtual endpoint decides whether it
+supports the command and remains responsible for controller-side safety and
+completion semantics.
 
-For Live external camera/robot integration, `taskplanner_live.launch.py` uses
-only typed `SpeechUtterance` on `/sensors/surgeon/utterance`, requires a fresh
-executable `/input/asr/runtime_status`, and does not inherit `SPEECH_INPUT_MODE`
-or `SENTENCE_INPUT_TOPIC`. Follow
+For managed Live external camera/robot integration, the command owner consumes
+only typed `SpeechUtterance` on `/sensors/surgeon/utterance`; it does not
+inherit the Debug/replay sentence-text input settings. ASR availability remains
+an independently reported observation, not a global runtime-start gate. Follow
 [`docs/EXTERNAL_INPUT_CONTRACT.md`](docs/EXTERNAL_INPUT_CONTRACT.md).
 
 ## Host Build
@@ -449,45 +464,50 @@ npm install
 npm run build
 ```
 
-## Launch
+## Managed launch
 
 ```bash
-ros2 launch bringup taskplanner_mock.launch.py
+scripts/taskplanner up live
 ```
 
-Fail-closed external integration:
+LLM Surgeon simulation input is an extra independently restartable owner:
 
 ```bash
-ros2 launch bringup taskplanner_live.launch.py
+scripts/taskplanner up llm-surgeon
 ```
 
-Important launch arguments:
+The retained `taskplanner_mock.launch.py` and `taskplanner_live.launch.py`
+sources remain available for historical topology tests and migration reference.
+They are not managed deployment entry points: launching either directly creates
+the old composite graph and forfeits the owner-scoped restart/reload behavior.
 
-- `input_profile`: `simulation` or `external`; default `simulation`.
-- `execution_backend`: `mock` or `external`; default `mock`.
-- `robot_endpoint_source`: `external` (default) or `virtual`. In Live,
+For managed startup, set configuration in `.env` or the selected mode's
+orchestration environment before starting/restarting the affected owner. The
+frequently changed settings are:
+
+- `INPUT_PROFILE`: `simulation` or `external`; default `simulation`.
+- `EXECUTION_BACKEND`: `mock` or `external`; default `mock`.
+- `TASKPLANNER_ROBOT_ENDPOINT_SOURCE`: `external` (default) or `virtual`. In Live,
   `virtual` binds only `/integration/virtual/surgery/tool_handover` and
   `/integration/virtual/surgery/retraction/command`; it never falls back to
   `/surgery/*`, does not publish bed-arm status, and cannot reach a physical
-  controller. Set `TASKPLANNER_ROBOT_ENDPOINT_SOURCE=virtual` before launch
-  (for Compose, in the environment file) and restart the runtime to change it.
-- `speech_input_mode`: Live fixes this to `utterance`; `sentence_text` is
-  Debug/replay-only.
-- `speech_input_topic`: Live source, default `/sensors/surgeon/utterance`.
-- `sentence_input_topic`: legacy Debug/replay default
-  `/sensors/surgeon/sentence`.
-- `vlm_mode`: `real`, `mock`, `dual`, or `voice_only`; default `real`.
-- `vlm_base_url`: OpenAI-compatible VLM server URL.
-- `vlm_model_id`: model selected for VLM inference.
-- `vlm_response_format`: default `json_schema`.
-- `surgeon_actor_mode`: `llm` or `rule`; default `llm`.
-- `actor_base_url`: OpenAI-compatible actor LLM server URL.
-- `actor_model_id`: model selected for the surgeon actor.
-- `enable_no_image_camera`: default `true`.
-- `enable_synthetic_scene_camera`: default `false`.
-- `spec_dir`: procedure bundle directory. Live defaults to
-  `thyroidectomy_demo` through `TASKPLANNER_LIVE_DEFAULT_BUNDLE`; an explicit
-  `default_bundle:=...` launch argument is the supported Live override.
+  controller. Change this only while stopped and with no in-flight request for
+  the affected resource.
+- `SPEECH_INPUT_MODE`: Live defaults to `tagged_sentence` (external
+  `/sensors/surgeon/sentence`); select `utterance` to use the existing local
+  typed-microphone ASR path.
+- `ASR_UTTERANCE_TOPIC`: local typed-ASR source, default
+  `/sensors/surgeon/utterance`.
+- `SENTENCE_INPUT_TOPIC`: external tagged source, default
+  `/sensors/surgeon/sentence` (`[partial]`/`[final]`).
+- `VLM_MODE`, `VLM_BASE_URL`, and `VLM_MODEL_ID`: optional observation/model
+  provider configuration. A deterministic catalog command never waits for a
+  VLM reply.
+- `TASKPLANNER_LIVE_DEFAULT_BUNDLE`: initial Live bundle; a running bundle is
+  changed through `scripts/taskplanner reload config <bundle> --mode live`.
+
+For source-only Python changes, restart only the affected owner, for example
+`scripts/taskplanner restart command live`; no workspace build is needed.
 
 ## Validation Commands
 

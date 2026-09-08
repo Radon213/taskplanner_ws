@@ -164,6 +164,180 @@
   font-weight: 800 !important;
 }
 
+/* The handover card makes one Action's known source, carrier, and destination
+   legible without projecting any new controller state. The moving marker is a
+   presentation of the Action transport stage, not physical-position evidence. */
+.operation-handover-title {
+  color: var(--color-text) !important;
+  font-size: 18px !important;
+  font-weight: 800 !important;
+  letter-spacing: -0.01em;
+}
+
+.operation-handover-pipeline {
+  display: grid;
+  min-width: 0;
+  gap: 7px;
+  padding: 8px;
+  border: 1px solid color-mix(in srgb, var(--color-accent) 38%, var(--color-border));
+  border-radius: calc(var(--radius-inner) - 2px);
+  background: color-mix(in srgb, var(--color-accent) 7%, var(--color-page-raised));
+}
+
+.operation-handover-pipeline > header {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.operation-handover-pipeline > header span,
+.operation-handover-pipeline > header em {
+  overflow: hidden;
+  font-size: 10px;
+  font-style: normal;
+  font-weight: 700;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.operation-handover-pipeline > header span {
+  color: var(--color-text-secondary) !important;
+}
+
+.operation-handover-pipeline > header em {
+  color: var(--color-accent-strong);
+  text-align: end;
+}
+
+.operation-handover-pipeline-track {
+  position: relative;
+  min-width: 0;
+}
+
+.operation-handover-pipeline-line {
+  position: absolute;
+  top: 12px;
+  right: 16.667%;
+  left: 16.667%;
+  height: 1px;
+  background: color-mix(in srgb, var(--color-border-strong) 76%, var(--color-accent));
+}
+
+.operation-handover-pipeline-runner {
+  position: absolute;
+  z-index: 2;
+  top: 7px;
+  width: 11px;
+  height: 11px;
+  border: 2px solid var(--color-page-raised);
+  border-radius: 50%;
+  background: var(--color-accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-accent) 18%, transparent);
+  transform: translateX(-50%);
+}
+
+.operation-handover-pipeline > .operation-handover-pipeline-track > ol {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.operation-handover-pipeline li {
+  display: grid;
+  min-width: 0;
+  justify-items: center;
+  gap: 4px;
+  text-align: center;
+}
+
+.operation-handover-pipeline li > span {
+  display: grid;
+  width: 24px;
+  height: 24px;
+  place-items: center;
+  border: 1px solid var(--color-border-strong);
+  border-radius: 50%;
+  background: var(--color-page-raised);
+  color: var(--color-text-muted);
+  font-size: 10px;
+  font-weight: 800;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+
+.operation-handover-pipeline li > div {
+  display: grid;
+  min-width: 0;
+  gap: 1px;
+}
+
+.operation-handover-pipeline li small,
+.operation-handover-pipeline li strong {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.operation-handover-pipeline li small {
+  color: var(--color-text-muted) !important;
+  font-size: 9px !important;
+  font-weight: 600 !important;
+  line-height: 1.2;
+}
+
+.operation-handover-pipeline li strong {
+  color: var(--color-text-secondary) !important;
+  font-size: 11px !important;
+  font-weight: 700 !important;
+  line-height: 1.2;
+}
+
+.operation-handover-pipeline li.active > span {
+  border-color: var(--color-accent);
+  background: var(--color-accent);
+  color: var(--color-page-raised);
+}
+
+.operation-handover-pipeline li.active strong {
+  color: var(--color-text) !important;
+}
+
+.operation-handover-pipeline li.complete > span {
+  border-color: var(--color-success);
+  background: color-mix(in srgb, var(--color-success) 18%, var(--color-page-raised));
+  color: var(--color-success);
+}
+
+.operation-handover-pipeline li.complete strong {
+  color: var(--color-text) !important;
+}
+
+.operation-handover-pipeline li.failed > span {
+  border-color: var(--color-danger);
+  background: color-mix(in srgb, var(--color-danger) 16%, var(--color-page-raised));
+  color: var(--color-danger);
+}
+
+.operation-handover-pipeline.state-completed .operation-handover-pipeline-runner {
+  background: var(--color-success);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-success) 18%, transparent);
+}
+
+.operation-handover-pipeline.state-rejected .operation-handover-pipeline-runner,
+.operation-handover-pipeline.state-failed .operation-handover-pipeline-runner {
+  background: var(--color-danger);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-danger) 18%, transparent);
+}
+
 .operation-dispatch-retraction-payload {
   display: grid;
   min-width: 0;
@@ -258,13 +432,17 @@
 }
 
 .operation-dispatch-popup {
+  --operation-dispatch-flash: var(--color-accent);
   display: grid;
   min-width: 0;
   grid-template-columns: auto minmax(0, 1fr);
   align-items: start;
   gap: 9px;
   padding: 12px;
-  animation: operation-observability-in var(--duration-fast) var(--ease-silk) both;
+}
+
+.operation-dispatch-popup.is-tool-handover {
+  gap: 10px;
 }
 
 .operation-dispatch-popup > svg {
@@ -283,6 +461,15 @@
 .operation-dispatch-popup.state-completed,
 .operation-dispatch-row.state-completed {
   border-color: color-mix(in srgb, var(--color-success) 46%, var(--color-border));
+}
+
+.operation-dispatch-popup.state-completed {
+  --operation-dispatch-flash: var(--color-success);
+}
+
+.operation-dispatch-popup.state-rejected,
+.operation-dispatch-popup.state-failed {
+  --operation-dispatch-flash: var(--color-danger);
 }
 
 .operation-dispatch-popup.state-completed > svg,
@@ -374,6 +561,10 @@
 
   .operation-dispatch-metadata {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .operation-handover-pipeline {
+    padding: 7px;
   }
 }
 
@@ -571,6 +762,24 @@
   to {
     opacity: 1;
     transform: translateY(0);
+  }
+}
+
+@keyframes operation-dispatch-arrival {
+  0% {
+    opacity: 0.58;
+    transform: translateY(-5px) scale(0.985);
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--operation-dispatch-flash) 0%, transparent);
+  }
+  55% {
+    opacity: 1;
+    transform: translateY(0) scale(1.008);
+    box-shadow: 0 0 0 4px color-mix(in srgb, var(--operation-dispatch-flash) 24%, transparent);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+    box-shadow: var(--shadow-card);
   }
 }
 

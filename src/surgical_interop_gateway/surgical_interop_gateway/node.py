@@ -20,9 +20,15 @@ import uuid
 
 import rclpy
 from ament_index_python.packages import get_package_share_directory
-from procedure_spec import load_bundle
+from procedure_spec import (
+    ScenarioConfigSnapshot,
+    load_bundle,
+    load_scenario_consumer_bundle,
+    parse_scenario_config,
+)
 from rcl_interfaces.msg import SetParametersResult
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from surgical_interop_msgs.msg import (
     BedRobotArmStateArray,
@@ -49,6 +55,7 @@ from std_msgs.msg import String
 from surgical_msgs.msg import (
     InputSourceStatus,
     SkillStatus,
+    SpeechUtterance,
     TwinEvent,
     VLMHealth,
     VLMResult,
@@ -240,6 +247,13 @@ class SurgicalInteropGateway(Node):
                 f"{self._active_bundle!r} != {self._default_bundle!r}"
             )
         self._catalog_version = self._catalog_digest(self._procedure_spec)
+        self._scenario_config_topic = str(
+            self.declare_parameter(
+                "scenario_config_topic", "/simulation/scenario_config"
+            ).value
+        ).strip()
+        if not self._scenario_config_topic:
+            raise ValueError("scenario_config_topic must not be empty")
 
         self._lock = threading.RLock()
         self._world: CachedMessage | None = None
@@ -252,6 +266,7 @@ class SurgicalInteropGateway(Node):
         self._bed_robot_arm_source_stamp_sec: float | None = None
         self._speech_text: CachedMessage | None = None
         self._speech_sequence = 0
+        self._speech_partial: CachedMessage | None = None
         self._asr_status: CachedMessage | None = None
         self._revision = 0
         self._event_sequence = 0
@@ -262,6 +277,8 @@ class SurgicalInteropGateway(Node):
         self._last_procedure_active = False
         self._procedure_mismatch = False
         self._procedure_run_scope_mismatch = False
+        self._scenario_config_revision = ""
+        self._pending_scenario_config: ScenarioConfigSnapshot | None = None
         self.add_on_set_parameters_callback(self._on_parameters_changed)
 
         state_qos = _state_qos()
@@ -315,10 +332,19 @@ class SurgicalInteropGateway(Node):
             source_qos,
         )
         self.create_subscription(SkillStatus, "/skill/status", self._on_skill_status, source_qos)
+        # CommandRouter is the only executable ASR ingress.  The public
+        # projection observes its one-way relay so this observer cannot be
+        # revived accidentally as a second text-command path.
         self.create_subscription(
-            String,
-            "/surgery/audio/request_text",
-            self._on_speech_text,
+            SpeechUtterance,
+            "/surgery/audio/observed_utterance",
+            self._on_observed_utterance,
+            source_qos,
+        )
+        self.create_subscription(
+            SpeechUtterance,
+            "/surgery/audio/partial_utterance",
+            self._on_partial_utterance,
             source_qos,
         )
         self.create_subscription(
@@ -332,6 +358,15 @@ class SurgicalInteropGateway(Node):
             "/external/bed_robot_arms/status",
             self._on_bed_robot_arm_status,
             source_qos,
+        )
+        # ScenarioStore owns the selected bundle revision.  This gateway is a
+        # read-only observer, so it consumes the latched snapshot directly
+        # instead of being part of a static manager-side parameter fan-out.
+        self.create_subscription(
+            String,
+            self._scenario_config_topic,
+            self._on_scenario_config,
+            state_qos,
         )
         self.create_timer(self._publish_period_sec, self._publish_snapshots)
         self.get_logger().info(
@@ -413,6 +448,7 @@ class SurgicalInteropGateway(Node):
         self._bed_robot_arm_source_stamp_sec = None
         self._speech_text = None
         self._speech_sequence = 0
+        self._speech_partial = None
 
     @staticmethod
     def _positive_source_stamp_sec(stamp: Any) -> float | None:
@@ -462,11 +498,22 @@ class SurgicalInteropGateway(Node):
             return None
         return spec if str(getattr(spec, "procedure_id", "")).strip() == normalized else None
 
-    def _stopped_for_spec_reload_locked(self) -> bool:
-        """Return whether no authoritative or cached procedure run is active."""
+    def _paused_or_stopped_for_spec_reload_locked(self) -> bool:
+        """Return whether this read-only projection can refresh its catalog.
+
+        ScenarioStore makes selection at a paused or stopped intervention
+        boundary.  This gateway has no dispatch authority, so it can converge
+        its local catalog at that same paused boundary; a new catalog clears
+        any old public run scope before it is projected again.
+        """
 
         cached_world = self._world
         world = getattr(cached_world, "message", None) if cached_world else None
+        execution_state = str(
+            getattr(world, "execution_state", "") or ""
+        ).strip().casefold()
+        if execution_state == "paused":
+            return True
         return not (
             self._last_procedure_active
             or self._procedure_run_id
@@ -474,14 +521,14 @@ class SurgicalInteropGateway(Node):
         )
 
     def _on_parameters_changed(self, parameters: list[Any]) -> SetParametersResult:
-        """Atomically reload the public catalog while the runtime is stopped.
+        """Atomically reload the public catalog while paused or stopped.
 
-        SimulationManager applies ``spec_dir`` to every procedure-aware node as
-        one stopped-state transaction.  Loading before the commit lock keeps a
-        malformed YAML revision from disturbing the active projection, while a
-        second stopped-state check closes the race with a newly started run.
-        Setting the same path is intentionally not a no-op: the YAML bytes at
-        that path may represent a newer same-bundle revision.
+        ScenarioStore owns selection and this observer consumes its latched
+        revision.  Loading before the commit lock keeps a malformed YAML
+        revision from disturbing the active projection, while a second
+        paused/stopped check closes the race with a resumed run.  Setting the
+        same path is intentionally not a no-op: the YAML bytes at that path
+        may represent a newer same-bundle revision.
         """
 
         spec_update = next(
@@ -492,10 +539,13 @@ class SurgicalInteropGateway(Node):
             return SetParametersResult(successful=True)
 
         with self._lock:
-            if not self._stopped_for_spec_reload_locked():
+            if not self._paused_or_stopped_for_spec_reload_locked():
                 return SetParametersResult(
                     successful=False,
-                    reason="spec_dir can change only while the procedure is stopped",
+                    reason=(
+                        "spec_dir can change only while the procedure is paused "
+                        "or stopped"
+                    ),
                 )
 
         next_spec_dir = str(spec_update.value).strip()
@@ -521,14 +571,18 @@ class SurgicalInteropGateway(Node):
             )
 
         with self._lock:
-            if not self._stopped_for_spec_reload_locked():
+            if not self._paused_or_stopped_for_spec_reload_locked():
                 return SetParametersResult(
                     successful=False,
-                    reason="spec_dir can change only while the procedure is stopped",
+                    reason=(
+                        "spec_dir can change only while the procedure is paused "
+                        "or stopped"
+                    ),
                 )
-            self._clear_run_scoped_state_locked()
-            self._procedure_run_id = ""
-            self._procedure_run_start_source_stamp_sec = None
+            # A catalog replacement invalidates the old public run projection.
+            # This is important for a paused switch: it prevents stale VLM,
+            # ASR, or status facts from appearing under the new scenario.
+            self._end_procedure_run_locked()
             self._spec_dir = next_spec_dir
             self._spec_root = Path(next_spec_dir).parent
             self._procedure_spec = next_spec
@@ -544,6 +598,80 @@ class SurgicalInteropGateway(Node):
             )
             self._procedure_run_scope_mismatch = False
         return SetParametersResult(successful=True)
+
+    def _on_scenario_config(self, message: String) -> None:
+        """Queue one ScenarioStore revision and apply it while paused/stopped.
+
+        The topic is intentionally advisory: filesystem containment and bundle
+        identity are checked again here, and a running public procedure keeps
+        the last known-good catalog until an authoritative paused/stopped frame
+        arrives.  A same-bundle YAML edit is therefore refreshed without a
+        runtime restart, while an invalid snapshot cannot replace the current
+        public projection.
+        """
+
+        try:
+            snapshot = parse_scenario_config(message.data)
+            load_scenario_consumer_bundle(
+                snapshot,
+                fixed_spec_root=self._spec_root,
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            self.get_logger().warning(f"ignored invalid scenario config: {exc}")
+            return
+
+        with self._lock:
+            if (
+                snapshot.revision == self._scenario_config_revision
+                and snapshot.spec_dir == self._spec_dir
+            ):
+                return
+            self._pending_scenario_config = snapshot
+        self._apply_pending_scenario_config_if_paused_or_stopped()
+
+    def _apply_pending_scenario_config_if_paused_or_stopped(self) -> None:
+        """Atomically reload the queued snapshot through this node's callback."""
+
+        with self._lock:
+            # Unit-level projections and a narrowly restarted observer may
+            # observe WorldState before the ScenarioStore subscription has
+            # initialized its optional pending slot.  No pending revision is
+            # simply a no-op; it must not interfere with public observation.
+            snapshot = getattr(self, "_pending_scenario_config", None)
+            if (
+                snapshot is None
+                or not self._paused_or_stopped_for_spec_reload_locked()
+            ):
+                return
+            current_root = Path(self._spec_root).resolve()
+
+        try:
+            bundle = load_scenario_consumer_bundle(
+                snapshot,
+                fixed_spec_root=current_root,
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            with self._lock:
+                # Bad input is terminal for this revision; retain the last
+                # good catalog and allow the next ScenarioStore snapshot.
+                if self._pending_scenario_config == snapshot:
+                    self._pending_scenario_config = None
+            self.get_logger().warning(f"ignored scenario config snapshot: {exc}")
+            return
+
+        result = self.set_parameters_atomically(
+            [Parameter(name="spec_dir", value=bundle.spec_dir)]
+        )
+        if not bool(getattr(result, "successful", False)):
+            self.get_logger().warning(
+                "deferred scenario config reload rejected: "
+                f"{getattr(result, 'reason', '') or 'unknown reason'}"
+            )
+            return
+        with self._lock:
+            if self._pending_scenario_config == snapshot:
+                self._scenario_config_revision = snapshot.revision
+                self._pending_scenario_config = None
 
     def _adopt_stopped_bundle_locked(self, message: WorldState) -> bool:
         """Atomically replace the public catalog from a stopped WorldState.
@@ -653,9 +781,18 @@ class SurgicalInteropGateway(Node):
             elif not requested_active and self._last_procedure_active:
                 self._end_procedure_run_locked()
             self._world = cached
+        # A revision received during a procedure is intentionally held above;
+        # Consume it as soon as the authoritative state becomes paused/stopped.
+        self._apply_pending_scenario_config_if_paused_or_stopped()
 
     def _on_vlm_result(self, message: VLMResult) -> None:
         with self._lock:
+            if (
+                not self._last_procedure_active
+                or str(getattr(message, "procedure_run_id", "")).strip()
+                != self._procedure_run_id
+            ):
+                return
             self._clinical_sequence += 1
             self._vlm_result = self._cache(message, sequence=self._clinical_sequence)
 
@@ -666,13 +803,23 @@ class SurgicalInteropGateway(Node):
     def _on_input_status(self, source: str, message: InputSourceStatus) -> None:
         with self._lock:
             self._input_statuses[source] = self._cache(message)
+        if source == "speech_input":
+            self._publish_live_speech_snapshot()
 
     def _on_skill_status(self, message: SkillStatus) -> None:
         with self._lock:
+            if (
+                not self._last_procedure_active
+                or str(getattr(message, "procedure_run_id", "")).strip()
+                != self._procedure_run_id
+            ):
+                return
             self._skill_status = self._cache(message)
 
-    def _on_speech_text(self, message: String) -> None:
-        text = str(message.data).strip()
+    def _on_observed_utterance(self, message: SpeechUtterance) -> None:
+        if not bool(message.is_final):
+            return
+        text = str(message.text).strip()
         if not text or len(text) > _MAX_SPEECH_TEXT_CHARS:
             self.get_logger().warning("ignored empty or oversized public speech text")
             return
@@ -683,6 +830,21 @@ class SurgicalInteropGateway(Node):
                 sequence=self._speech_sequence,
                 received_stamp=self.get_clock().now().to_msg(),
             )
+            self._speech_partial = None
+        self._publish_live_speech_snapshot()
+
+    def _on_partial_utterance(self, message: SpeechUtterance) -> None:
+        """Cache external partial speech for the public read-only projection."""
+
+        if bool(message.is_final):
+            return
+        text = str(message.text).strip()
+        if not text or len(text) > _MAX_SPEECH_TEXT_CHARS:
+            self.get_logger().warning("ignored empty or oversized public partial speech text")
+            return
+        with self._lock:
+            self._speech_partial = self._cache(message)
+        self._publish_live_speech_snapshot()
 
     def _on_asr_status(self, message: String) -> None:
         raw = str(message.data)
@@ -827,15 +989,17 @@ class SurgicalInteropGateway(Node):
         preventing delayed events from the prior run from being relabeled with
         the new run identity.
 
-        TwinEvent has no source run identifier. If either source uses a zero or
-        otherwise unusable timestamp, or its clock resets so an old stamp looks
-        newer than the current run start, a delayed event cannot be
-        distinguished from a current event. In that unavoidable compatibility
-        case this method can only apply the fresh-active receipt-time gate;
-        consumers can still distinguish the accepted event using the
-        identifiers embedded in SurgeryEvent.
+        TwinEvent is structurally scoped to its originating procedure run.
+        The timestamp fence remains a second independent guard against an
+        incorrectly stamped or replayed source.
         """
 
+        if (
+            not str(getattr(message, "procedure_run_id", "")).strip()
+            or str(getattr(message, "procedure_run_id", "")).strip()
+            != str(getattr(self, "_procedure_run_id", "")).strip()
+        ):
+            return
         try:
             projection = project_event(message)
             now_monotonic_sec = self._monotonic()
@@ -925,6 +1089,30 @@ class SurgicalInteropGateway(Node):
             ),
         }
         for source in ("speech_input", "flir", "cam4"):
+            cached = input_statuses.get(source)
+            # When the selected adapter is the external tagged-sentence
+            # source, its InputSourceStatus is the authoritative health edge.
+            # A stopped local microphone ASR status may still be retained on
+            # /input/asr/runtime_status; allowing that stale local snapshot to
+            # win would mark the public speech contract unavailable even while
+            # external partial/final text is arriving.
+            if source == "speech_input" and self._is_external_speech_status(cached):
+                receipt = freshness_from_receipt(
+                    cached.received_monotonic_sec if cached else None,
+                    now_monotonic_sec,
+                    self._health_stale_after_sec,
+                )
+                if cached is None or not receipt.fresh:
+                    freshness[source] = receipt
+                    continue
+                state = str(getattr(cached.message, "state", "")).upper()
+                healthy = bool(getattr(cached.message, "healthy", False))
+                freshness[source] = Freshness(
+                    available=state not in {"", "MISSING", "DISABLED"},
+                    fresh=healthy and state in {"READY", "HEALTHY"},
+                    age_sec=float(getattr(cached.message, "age_sec", receipt.age_sec)),
+                )
+                continue
             # Live's reviewed operational ASR publishes its bounded JSON
             # runtime status rather than the replay-only InputSourceStatus
             # topic.  Keep that operational status authoritative for public
@@ -939,7 +1127,6 @@ class SurgicalInteropGateway(Node):
                     self._health_stale_after_sec,
                 )
                 continue
-            cached = input_statuses.get(source)
             receipt = freshness_from_receipt(
                 cached.received_monotonic_sec if cached else None,
                 now_monotonic_sec,
@@ -1007,6 +1194,21 @@ class SurgicalInteropGateway(Node):
             "error": SpeechRecognitionState.STATE_ERROR,
         }.get(state, SpeechRecognitionState.STATE_UNAVAILABLE)
 
+    @staticmethod
+    def _is_external_speech_status(status: CachedMessage | None) -> bool:
+        """Identify the adapter's external-topic source without guessing from health."""
+
+        if status is None:
+            return False
+        message = status.message
+        source_id = str(getattr(message, "source_id", "")).strip().casefold()
+        modality = str(getattr(message, "modality", "")).strip().casefold()
+        return (
+            source_id in {"external_sentence_topic", "external_topic", "external"}
+            or source_id.startswith("external_")
+            or modality == "external_topic"
+        )
+
     def _speech_message(
         self,
         *,
@@ -1031,6 +1233,65 @@ class SurgicalInteropGateway(Node):
             speech = self._speech_text
             status = self._asr_status
             replay_status = getattr(self, "_input_statuses", {}).get("speech_input")
+            external_partial = getattr(self, "_speech_partial", None)
+
+        # The external ASR has no local microphone session. Its source health
+        # is owned by speech_input_adapter's InputSourceStatus, while the
+        # typed partial/final callbacks carry the actual transcript text.
+        if self._is_external_speech_status(replay_status):
+            if not freshness_from_receipt(
+                replay_status.received_monotonic_sec,
+                self._monotonic(),
+                self._health_stale_after_sec,
+            ).fresh:
+                return message
+            source_message = replay_status.message
+            source_id = str(getattr(source_message, "source_id", "")).strip()
+            if source_id:
+                message.source = source_id
+            source_state = str(getattr(source_message, "state", "")).strip().casefold()
+            source_healthy = bool(getattr(source_message, "healthy", False))
+            source_ready = source_state in {
+                "ready",
+                "listening",
+                "recording",
+                "running",
+                "connected",
+            }
+            message.connected = source_healthy
+            message.state = self._public_asr_state(source_state)
+            message.available = source_healthy and source_ready
+            partial_fresh = bool(
+                external_partial
+                and freshness_from_receipt(
+                    external_partial.received_monotonic_sec,
+                    self._monotonic(),
+                    self._health_stale_after_sec,
+                ).fresh
+            )
+            if self._publish_free_text and message.available and partial_fresh:
+                partial_text = str(external_partial.message.text).strip()
+                if len(partial_text) <= _MAX_SPEECH_TEXT_CHARS:
+                    message.partial_text = partial_text
+            speech_fresh = bool(
+                speech
+                and freshness_from_receipt(
+                    speech.received_monotonic_sec,
+                    self._monotonic(),
+                    self._health_stale_after_sec,
+                ).fresh
+            )
+            if speech is not None and speech_fresh and message.available:
+                text = str(speech.message.text).strip()
+                if text:
+                    message.utterance_sequence = speech.sequence
+                    message.utterance_stamp = speech.received_stamp or stamp
+                    if self._publish_free_text:
+                        message.text = text
+                    else:
+                        message.evidence_status = GATEWAY_OBSERVED_REDACTED
+            return message
+
         using_replay_status = status is None and replay_status is not None
         if using_replay_status:
             status = replay_status
@@ -1083,7 +1344,10 @@ class SurgicalInteropGateway(Node):
         if speech is None or not speech_fresh or not message.available:
             return message
 
-        text = str(speech.message.data).strip()
+        # The command router's observed-final relay is intentionally typed as
+        # ``SpeechUtterance``.  Keep the public projection on that exact
+        # contract instead of falling back to the retired String ingress.
+        text = str(speech.message.text).strip()
         if not text:
             return message
         message.utterance_sequence = speech.sequence

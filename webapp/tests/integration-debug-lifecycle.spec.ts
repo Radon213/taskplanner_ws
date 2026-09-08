@@ -1,6 +1,7 @@
 import { expect, test, type Page, type WebSocketRoute } from "playwright/test";
 
 type DebugSocketOptions = {
+  runtimeMode?: "debug" | "live";
   respondToCommands?: boolean;
   commandResponseDelayMs?: number;
   refreshStatusOnCommand?: boolean;
@@ -11,66 +12,26 @@ type DebugSocketOptions = {
 };
 
 type RetractionVoiceStatusOptions = {
-  mode?: "buttons_only" | "voice_and_buttons";
   internalState?: string;
   allowedCommands?: string[];
   serviceReady?: boolean;
   inFlight?: boolean;
-  transcript?: string;
-  command?: string | null;
-  targetSide?: string;
-  distanceM?: number;
-  confidence?: number;
-  reason?: string;
-  interpreterSource?: string;
-  vlmInvoked?: boolean;
-  interpreterMode?: "deterministic" | "vlm_with_fallback";
-  interpreterPending?: boolean;
-  stateMachineBypassEnabled?: boolean;
-  detail?: string;
   lastRejectionReason?: string;
 };
 
 function retractionVoiceStatus({
-  mode = "buttons_only",
   internalState = "idle",
   allowedCommands = ["change_tool", "start_direct_teach"],
   serviceReady = false,
   inFlight = false,
-  transcript = "",
-  command = null,
-  targetSide = "none",
-  distanceM = 0,
-  confidence = 0,
-  reason = "empty_transcript",
-  interpreterSource = "shared_deterministic",
-  vlmInvoked = false,
-  interpreterMode = "deterministic",
-  interpreterPending = false,
-  stateMachineBypassEnabled = false,
-  detail = "deterministic_normalizer",
   lastRejectionReason = "",
 }: RetractionVoiceStatusOptions = {}): Record<string, unknown> {
   return {
-    mode,
+    mode: "direct_service_only",
     internal_state: internalState,
-    interpreter_mode: interpreterMode,
-    interpreter_pending: interpreterPending,
-    state_machine_bypass_enabled: stateMachineBypassEnabled,
     allowed_commands: allowedCommands,
     service_ready: serviceReady,
     in_flight: inFlight,
-    last_interpretation: {
-      transcript,
-      command,
-      target_side: targetSide,
-      distance_m: distanceM,
-      confidence,
-      reason,
-      interpreter_source: interpreterSource,
-      vlm_invoked: vlmInvoked,
-      detail,
-    },
     last_rejection_reason: lastRejectionReason,
   };
 }
@@ -118,11 +79,12 @@ function debugAsrStatus(): Record<string, unknown> {
 }
 
 function debugInput(name: string, topic: string): Record<string, unknown> {
+  const observedUtterance = topic === "/surgery/audio/observed_utterance";
   return {
     name,
     topic,
-    expected_type: "std_msgs/msg/String",
-    actual_types: ["std_msgs/msg/String"],
+    expected_type: observedUtterance ? "surgical_msgs/msg/SpeechUtterance" : "std_msgs/msg/String",
+    actual_types: [observedUtterance ? "surgical_msgs/msg/SpeechUtterance" : "std_msgs/msg/String"],
     publisher_count: 1,
     publishers: ["/integration_debug_test"],
     qos_profiles: ["RELIABLE"],
@@ -181,8 +143,7 @@ function debugStatus(sessionId: string, armed = false): Record<string, unknown> 
     },
     inputs: [
       debugInput("surgeon_sentence", "/sensors/surgeon/sentence"),
-      debugInput("speech_adapter_request", "/surgery/audio/request_text"),
-      debugInput("debug_speech_adapter_status", "/integration/debug/speech/status"),
+      debugInput("observed_surgeon_utterance", "/surgery/audio/observed_utterance"),
     ],
     endpoints: [],
     action: {
@@ -201,26 +162,6 @@ function debugStatus(sessionId: string, armed = false): Record<string, unknown> 
       last_sentence: "",
       last_parse: {},
       retraction: retractionVoiceStatus(),
-    },
-    vlm: {
-      base_url: "http://127.0.0.1:8010",
-      model_id: "text-command-normalizer",
-      manager_reachable: true,
-      catalog_reachable: true,
-      load_state: "LOADED",
-      loaded: true,
-      available: true,
-      runtime_managed: true,
-      probe_pending: false,
-      detail: "mock runtime ready",
-      last_probe_age_sec: 0.2,
-      micro_test: {
-        state: "IDLE",
-        transcript: "",
-        interpretation: null,
-        latency_ms: null,
-        error: "",
-      },
     },
     virtual_robot: {
       enabled: true,
@@ -322,25 +263,46 @@ function manualControlsReadyStatus(sessionId: string): Record<string, unknown> {
 }
 
 async function openDebugWorkspace(page: Page, options: DebugSocketOptions = {}) {
+  const runtimeMode = options.runtimeMode ?? "debug";
   let connectionCount = 0;
   const sockets: WebSocketRoute[] = [];
   const readOnlyServiceCalls: string[] = [];
   const subscriptionsBySocket = new Map<WebSocketRoute, Set<string>>();
   const subscriptionRequestsBySocket = new Map<WebSocketRoute, Map<string, Record<string, unknown>>>();
-  await page.addInitScript(() => {
-    window.localStorage.setItem("taskplanner.runtimeMode.live", "debug");
-  });
+  await page.addInitScript((mode: "debug" | "live") => {
+    window.localStorage.setItem("taskplanner.runtimeMode.live", mode);
+  }, runtimeMode);
   await page.route("**/api/runtime/status", (route) => route.fulfill({
     contentType: "application/json",
     body: JSON.stringify({
       phase: "idle",
-      active_mode: "debug",
-      requested_mode: "debug",
+      active_mode: runtimeMode,
+      requested_mode: runtimeMode,
       message: "Selected runtime is ready.",
       retryable: false,
     }),
   }));
-  await page.routeWebSocket(/ws:\/\/127\.0\.0\.1:9091\/?$/, (socket) => {
+  await page.route("**/api/runtime/lifecycle", (route) => route.fulfill({
+    contentType: "application/json",
+    body: JSON.stringify({
+      phase: "idle",
+      generation: 0,
+      job_id: null,
+      request_id: null,
+      operation: null,
+      active_mode: runtimeMode,
+      message: "Runtime lifecycle control is ready.",
+      retryable: false,
+      ninfer: {
+        available: true,
+        model_id: "qwen3.6-35b-a3b",
+        model_state: "loaded",
+        detail: "ready",
+      },
+    }),
+  }));
+  const debugPort = runtimeMode === "live" ? "9093" : "9091";
+  await page.routeWebSocket(new RegExp(`ws://127\\.0\\.0\\.1:${debugPort}/?$`), (socket) => {
     connectionCount += 1;
     const connection = connectionCount;
     let status: Record<string, unknown> | null = null;
@@ -489,7 +451,7 @@ async function openDebugWorkspace(page: Page, options: DebugSocketOptions = {}) 
       }
     });
   });
-  await page.goto("/");
+  await page.goto(runtimeMode === "live" ? "/?workspace=debug" : "/");
   return {
     connectionCount: () => connectionCount,
     sockets,
@@ -2128,14 +2090,14 @@ test("separates individual diagnostics, integrated scenarios, and observability"
   await page.getByRole("tab", { name: /음성 도구전달/ }).click();
   const toolPipeline = page.locator('[data-slot="debug-integration-pipeline"]');
   await expect(toolPipeline).toContainText("/sensors/surgeon/sentence");
-  await expect(toolPipeline).toContainText("/surgery/audio/request_text");
-  await expect(toolPipeline).toContainText("결정론 도구 해석");
+  await expect(toolPipeline).toContainText("/surgery/audio/observed_utterance");
+  await expect(toolPipeline).toContainText("CommandRouter catalog");
   await expect(toolPipeline).toContainText("외부 실제 서버");
-  await expect(toolPipeline).toContainText("실제 Debug 요청");
+  await expect(toolPipeline).toContainText("직접 UI 요청만 외부 서버에 전달될 수 있습니다");
 
   await page.getByRole("tab", { name: /리트랙터 6개 명령/ }).click();
   const retractorPipeline = page.locator('[data-slot="debug-integration-pipeline"]');
-  await expect(retractorPipeline).toContainText("Text VLM·결정론");
+  await expect(retractorPipeline).toContainText("CommandRouter catalog");
   await expect(retractorPipeline).toContainText("Retraction Service");
 
   await page.getByRole("tab", { name: /관측 로그/ }).click();
@@ -2143,31 +2105,29 @@ test("separates individual diagnostics, integrated scenarios, and observability"
   await expect(page.getByRole("button", { name: "ASR 시작" })).toHaveCount(0);
 });
 
-test("keeps a live Speech adapter pending until a final transcript is admitted", async ({ page }) => {
+test("keeps an observed-utterance stream pending until CommandRouter relays a final transcript", async ({ page }) => {
   const status = manualControlsReadyStatus("speech-adapter-waiting-final");
   status.inputs = [
     debugInput("surgeon_sentence", "/sensors/surgeon/sentence"),
     {
-      ...debugInput("admitted_request_text", "/surgery/audio/request_text"),
+      ...debugInput("observed_surgeon_utterance", "/surgery/audio/observed_utterance"),
       message_count: 0,
       window_message_count: 0,
       last_sample: "",
       state: "WAITING_MESSAGES",
     },
-    debugInput("debug_speech_adapter_status", "/integration/debug/speech/status"),
   ];
   await openDebugWorkspace(page, { statusForConnection: () => status });
 
   await page.getByRole("tab", { name: /음성 도구전달/ }).click();
-  const adapterStage = page.locator('[data-slot="debug-speech-adapter-stage"]');
+  const adapterStage = page.locator('[data-slot="debug-observed-utterance-stage"]');
   await expect(adapterStage).toHaveAttribute("data-stage-state", "PENDING_FINAL");
   await expect(adapterStage).toHaveClass(/pending/);
-  await expect(adapterStage).toContainText("final 문장 대기");
+  await expect(adapterStage).toContainText("final utterance 대기");
   await expect(adapterStage).not.toHaveClass(/error/);
 });
 
-test("keeps observation and Text VLM available while the operational intervention gate is closed", async ({ page }) => {
-  const commands: Array<{ operation: string; payload: Record<string, unknown> }> = [];
+test("keeps observation available while the operational intervention gate is closed", async ({ page }) => {
   const reason = "pause or stop the operational scenario before manual control";
   await openDebugWorkspace(page, {
     statusForConnection: () => {
@@ -2193,71 +2153,15 @@ test("keeps observation and Text VLM available while the operational interventio
       };
       return status;
     },
-    resultForCommand: (operation, payload) => operation === "vlm_interpret" ? {
-      state: "completed",
-      transcript: payload.text,
-      command: "unknown",
-      interpreter_source: "text_vlm",
-      vlm_invoked: true,
-      latency_ms: 12.5,
-      dispatch_performed: false,
-    } : {},
-    onCommand: (operation, payload) => commands.push({ operation, payload }),
   });
 
   const manualButton = page.getByRole("button", { name: "수동 제어 잠김" });
   await expect(manualButton).toBeDisabled();
   await page.getByRole("tab", { name: /음성 도구전달/ }).click();
   await expect(page.locator("#debug-operational-interlock")).toContainText(reason);
-  await expect(page.locator("#debug-operational-interlock")).toContainText("Text VLM 진단");
+  await expect(page.locator("#debug-operational-interlock")).toContainText("단순 상태·토픽 관찰");
   await expect(page.getByRole("button", { name: "도구 전달 요청" })).toBeDisabled();
   await expect(page.locator("#debug-coexistence-checkbox")).toHaveCount(0);
-
-  await page.getByRole("tab", { name: /Text VLM 입·출력/ }).click();
-  await page.getByLabel("확정 STT 문장").fill("현재 상태만 해석해줘");
-  await page.getByRole("button", { name: /해석만 실행/ }).click();
-  await expect(page.locator('[data-slot="debug-vlm-output-success"]')).toContainText("DISPATCH없음");
-  expect(commands).toEqual([{
-    operation: "vlm_interpret",
-    payload: { text: "현재 상태만 해석해줘", state: "idle" },
-  }]);
-});
-
-test("blocks shared VLM loading but keeps VLM observation available while running", async ({ page }) => {
-  const commands: string[] = [];
-  await openDebugWorkspace(page, {
-    statusForConnection: () => {
-      const status = manualControlsReadyStatus("running-vlm-load-locked");
-      status.runtime = {
-        ...(status.runtime as Record<string, unknown>),
-        operational_state: "running",
-        operational_running: true,
-        operational_intervention_allowed: false,
-        operational_intervention_block_reason: "pause or stop the operational scenario before manual control",
-        operational_control_window_open: false,
-        manual_control_available: false,
-        manual_control_gate: "operational_state",
-      };
-      status.vlm = {
-        ...(status.vlm as Record<string, unknown>),
-        loaded: false,
-        load_state: "UNLOADED",
-      };
-      return status;
-    },
-    onCommand: (operation) => commands.push(operation),
-  });
-
-  await page.getByRole("tab", { name: /Text VLM 입·출력/ }).click();
-  const loadButton = page.getByRole("button", { name: "구성 모델 로드" });
-  await expect(loadButton).toBeDisabled();
-  await expect(page.getByText(/공유 모델 로드는 개입 작업입니다/)).toBeVisible();
-  await loadButton.evaluate((button) => {
-    button.removeAttribute("disabled");
-    button.click();
-  });
-  await page.waitForTimeout(100);
-  expect(commands).toEqual([]);
 });
 
 test("fails closed when the optional operational intervention fields are absent", async ({ page }) => {
@@ -2326,168 +2230,27 @@ test("arms integrated Debug from a paused idle snapshot without planner acknowle
   await expect(page.getByRole("button", { name: "수동 제어 해제" })).toBeVisible();
 });
 
-test("shows a Speech adapter fault only when its dedicated heartbeat is unhealthy", async ({ page }) => {
-  const status = manualControlsReadyStatus("speech-adapter-heartbeat-fault");
+test("keeps an absent observed-utterance publisher in observation waiting state", async ({ page }) => {
+  const status = manualControlsReadyStatus("observed-utterance-waiting-publisher");
   status.inputs = [
     debugInput("surgeon_sentence", "/sensors/surgeon/sentence"),
     {
-      ...debugInput("admitted_request_text", "/surgery/audio/request_text"),
+      ...debugInput("observed_surgeon_utterance", "/surgery/audio/observed_utterance"),
+      publisher_count: 0,
+      publishers: [],
       message_count: 0,
       window_message_count: 0,
       last_sample: "",
       state: "WAITING_MESSAGES",
     },
-    {
-      ...debugInput("debug_speech_adapter_status", "/integration/debug/speech/status"),
-      publisher_count: 0,
-      publishers: [],
-      state: "WAITING_PUBLISHER",
-    },
   ];
   await openDebugWorkspace(page, { statusForConnection: () => status });
 
   await page.getByRole("tab", { name: /음성 도구전달/ }).click();
-  const adapterStage = page.locator('[data-slot="debug-speech-adapter-stage"]');
-  await expect(adapterStage).toHaveAttribute("data-stage-state", "ERROR");
-  await expect(adapterStage).toHaveClass(/error/);
-  await expect(adapterStage).toContainText("adapter WAITING_PUBLISHER");
-});
-
-test("runs an isolated Text VLM micro-test without dispatching a robot command", async ({ page }) => {
-  const commands: Array<{ operation: string; payload: Record<string, unknown> }> = [];
-  await openDebugWorkspace(page, {
-    statusForConnection: () => debugStatus("vlm-micro-test"),
-    resultForCommand: (operation, payload) => operation === "vlm_interpret" ? {
-      state: "completed",
-      transcript: payload.text,
-      command: "adjust_retraction",
-      target_side: "right",
-      distance_m: 0.05,
-      interpreter_source: "text_vlm",
-      vlm_invoked: true,
-      latency_ms: 42.5,
-      dispatch_performed: false,
-    } : {},
-    onCommand: (operation, payload) => commands.push({ operation, payload }),
-  });
-
-  await page.getByRole("tab", { name: /Text VLM 입·출력/ }).click();
-  await expect(page.locator('[data-slot="debug-vlm-output-empty"]')).toBeVisible();
-  await expect(page.getByRole("button", { name: "구성 모델 로드됨" })).toBeDisabled();
-  await page.getByLabel("확정 STT 문장").fill("리트랙션 오른쪽 5센티 더");
-  await page.getByRole("button", { name: /해석만 실행/ }).click();
-
-  await expect(page.locator('[data-slot="debug-vlm-output-success"]')).toContainText("adjust_retraction");
-  await expect(page.locator('[data-slot="debug-vlm-output-success"]')).toContainText("42.5 ms");
-  await expect(page.locator('[data-slot="debug-vlm-output-success"]')).toContainText("DISPATCH없음");
-  expect(commands).toEqual([{
-    operation: "vlm_interpret",
-    payload: { text: "리트랙션 오른쪽 5센티 더", state: "idle" },
-  }]);
-  expect(commands.map(({ operation }) => operation)).not.toContain("retraction_command");
-  expect(commands.map(({ operation }) => operation)).not.toContain("tool_handover");
-});
-
-test("shows pending as non-dispatch VLM feedback", async ({ page }) => {
-  await openDebugWorkspace(page, {
-    statusForConnection: () => {
-      const status = debugStatus("vlm-pending-fallback");
-      status.vlm = {
-        ...(status.vlm as Record<string, unknown>),
-        micro_test: {
-          state: "PENDING",
-          transcript: "리트랙션 시작",
-          interpretation: {
-            command: "start_retraction",
-            interpreter_source: "deterministic_fallback",
-            vlm_invoked: false,
-          },
-          latency_ms: null,
-          error: "",
-        },
-      };
-      return status;
-    },
-  });
-
-  await page.getByRole("tab", { name: /Text VLM 입·출력/ }).click();
-  await expect(page.locator('[data-slot="debug-vlm-output-pending"]')).toBeVisible();
-  await expect(page.getByRole("button", { name: "Text VLM 해석 중" })).toBeDisabled();
-});
-
-test("labels a deterministic fallback as a non-model VLM result", async ({ page }) => {
-  await openDebugWorkspace(page, {
-    statusForConnection: () => {
-      const status = debugStatus("vlm-fallback-result");
-      status.vlm = {
-        ...(status.vlm as Record<string, unknown>),
-        micro_test: {
-          state: "COMPLETED",
-          transcript: "리트랙션 시작",
-          interpretation: {
-            command: "start_retraction",
-            interpreter_source: "deterministic_fallback",
-            vlm_invoked: false,
-          },
-          latency_ms: 12.4,
-          error: "",
-        },
-      };
-      return status;
-    },
-  });
-
-  await page.getByRole("tab", { name: /Text VLM 입·출력/ }).click();
-  await expect(page.locator('[data-slot="debug-vlm-fallback-result"]')).toContainText("모델 출력이 아닌 fallback 결과");
-  await expect(page.locator('[data-slot="debug-vlm-fallback-result"]')).toContainText("VLM invoked no");
-  await expect(page.locator('[data-slot="debug-vlm-output-success"]')).toContainText("DISPATCH없음");
-});
-
-test("loads only the launch-configured VLM model", async ({ page }) => {
-  const commands: string[] = [];
-  await openDebugWorkspace(page, {
-    statusForConnection: () => {
-      const status = debugStatus("vlm-load-configured-model");
-      status.vlm = {
-        ...(status.vlm as Record<string, unknown>),
-        load_state: "unloaded",
-        loaded: false,
-        available: true,
-        runtime_managed: true,
-      };
-      return status;
-    },
-    onCommand: (operation) => commands.push(operation),
-  });
-
-  await page.getByRole("tab", { name: /Text VLM 입·출력/ }).click();
-  await page.getByRole("button", { name: "구성 모델 로드" }).click();
-  await expect.poll(() => commands).toEqual(["vlm_load"]);
-  await expect(page.getByLabel("확정 STT 문장")).toBeVisible();
-  await expect(page.locator('[data-slot="debug-vlm-panel"] input')).toHaveCount(0);
-});
-
-test("shows a VLM micro-test error with a retry action", async ({ page }) => {
-  await openDebugWorkspace(page, {
-    statusForConnection: () => {
-      const status = debugStatus("vlm-micro-error");
-      status.vlm = {
-        ...(status.vlm as Record<string, unknown>),
-        micro_test: {
-          state: "FAILED",
-          transcript: "리트랙션 시작",
-          interpretation: null,
-          latency_ms: null,
-          error: "TimeoutError",
-        },
-      };
-      return status;
-    },
-  });
-
-  await page.getByRole("tab", { name: /Text VLM 입·출력/ }).click();
-  await expect(page.locator('[data-slot="debug-vlm-output-error"]')).toContainText("TimeoutError");
-  await expect(page.getByRole("button", { name: "다시 해석" })).toBeEnabled();
+  const adapterStage = page.locator('[data-slot="debug-observed-utterance-stage"]');
+  await expect(adapterStage).toHaveAttribute("data-stage-state", "WAITING_ROUTER");
+  await expect(adapterStage).toHaveClass(/idle/);
+  await expect(adapterStage).toContainText("CommandRouter publisher 대기");
 });
 
 test("switches explicit endpoint source only while disarmed and without robot dispatch", async ({ page }) => {
@@ -2508,6 +2271,24 @@ test("switches explicit endpoint source only while disarmed and without robot di
   });
   expect(commands.map(({ operation }) => operation)).not.toContain("retraction_command");
   expect(commands.map(({ operation }) => operation)).not.toContain("tool_handover");
+});
+
+test("labels a disabled virtual owner as unavailable without selecting a fallback", async ({ page }) => {
+  const status = debugStatus("virtual-owner-not-started");
+  status.virtual_robot = {
+    ...(status.virtual_robot as Record<string, unknown>),
+    enabled: false,
+    selected_source: "external",
+  };
+  await openDebugWorkspace(page, { statusForConnection: () => status });
+
+  await page.getByRole("tab", { name: /Service·Action 종단/ }).click();
+  const source = page.locator('[data-slot="debug-robot-endpoint-source"]');
+  await expect(source.getByRole("button", { name: /^외부 실제 서버/ })).toHaveAttribute("aria-pressed", "true");
+  await expect(source.getByRole("button", { name: /^가상 진단 서버/ })).toBeDisabled();
+  await expect(page.locator('[data-slot="debug-virtual-owner-not-started"]')).toContainText(
+    "가상 Debug owner가 시작되지 않았습니다",
+  );
 });
 
 test("locks endpoint source switching while manual control is armed", async ({ page }) => {
@@ -2579,64 +2360,6 @@ test("uses the single retraction Service contract without legacy jog fields", as
 
 });
 
-test("toggles the Debug-only retraction state-machine admission gate", async ({ page }) => {
-  const commands: Array<{ operation: string; payload: Record<string, unknown> }> = [];
-  await openDebugWorkspace(page, {
-    statusForConnection: () => retractionServiceStatus("retraction-state-machine-bypass-session"),
-    onCommand: (operation, payload) => commands.push({ operation, payload }),
-  });
-
-  await page.getByRole("tab", { name: /리트랙터 6개 명령/ }).click();
-  const bypass = page.getByRole("button", { name: "상태머신 제한 해제" });
-  await expect(bypass).toBeEnabled();
-  await expect(bypass).toHaveAttribute("aria-pressed", "false");
-  await bypass.click();
-  await expect.poll(() => commands).toContainEqual({
-    operation: "configure_retraction_state_machine_bypass",
-    payload: { enabled: true },
-  });
-});
-
-test("shows every reviewed retraction Service command while the Debug gate is bypassed", async ({ page }) => {
-  await openDebugWorkspace(page, {
-    statusForConnection: () => {
-      const status = retractionServiceStatus("retraction-state-machine-bypass-enabled-session");
-      status.voice = {
-        auto_execute: false,
-        last_sentence: "",
-        last_parse: {},
-        retraction: retractionVoiceStatus({
-          internalState: "idle",
-          allowedCommands: [
-            "start_direct_teach",
-            "finish_direct_teach",
-            "start_retraction",
-            "adjust_retraction",
-            "change_tool",
-            "stop_retraction",
-          ],
-          stateMachineBypassEnabled: true,
-          serviceReady: true,
-        }),
-      };
-      return status;
-    },
-  });
-
-  await page.getByRole("tab", { name: /리트랙터 6개 명령/ }).click();
-  await expect(page.getByRole("button", { name: "상태머신 제한 켜기" })).toHaveAttribute("aria-pressed", "true");
-  for (const name of [
-    "직접 교시 시작",
-    "직접 교시 종료",
-    "Retraction 시작",
-    "왼쪽 5 cm 더",
-    "Tool change",
-    "Retraction 종료",
-  ]) {
-    await expect(page.getByRole("button", { name })).toBeEnabled();
-  }
-});
-
 test("allows every target field selection when finishing direct teach", async ({ page }) => {
   const commands: Array<{ operation: string; payload: Record<string, unknown> }> = [];
   await openDebugWorkspace(page, {
@@ -2693,7 +2416,6 @@ test("forces only the Debug retraction state to idle after explicit confirmation
         last_sentence: "",
         last_parse: {},
         retraction: retractionVoiceStatus({
-          mode: "voice_and_buttons",
           internalState: "retraction_active",
           allowedCommands: ["adjust_retraction", "stop_retraction"],
           serviceReady: true,
@@ -2726,7 +2448,7 @@ test("forces only the Debug retraction state to idle after explicit confirmation
   await expect(page.locator(".debug-toast[role='status']")).toContainText("accepted");
 });
 
-test("keeps retraction voice routing as a final-transcript gate without starting ASR", async ({ page }) => {
+test("keeps retraction buttons independent of the observed voice relay", async ({ page }) => {
   const commands: Array<{ operation: string; payload: Record<string, unknown> }> = [];
   await openDebugWorkspace(page, {
     statusForConnection: () => {
@@ -2736,18 +2458,9 @@ test("keeps retraction voice routing as a final-transcript gate without starting
         last_sentence: "오른쪽 5cm 더",
         last_parse: {},
         retraction: retractionVoiceStatus({
-          mode: "buttons_only",
           internalState: "retraction_active",
           allowedCommands: ["adjust_retraction", "stop_retraction"],
           serviceReady: true,
-          transcript: "오른쪽 5cm 더",
-          command: "adjust_retraction",
-          targetSide: "right",
-          distanceM: 0.05,
-          confidence: 0.96,
-          reason: "normalized_adjust_retraction_explicit_adjustment_distance",
-          detail: "deterministic_normalizer",
-          lastRejectionReason: "voice_mode_buttons_only",
         }),
       };
       status.asr = {
@@ -2764,35 +2477,14 @@ test("keeps retraction voice routing as a final-transcript gate without starting
   });
 
   await page.getByRole("tab", { name: /리트랙터 6개 명령/ }).click();
-  await expect(page.locator('[data-slot="debug-retraction-voice-mode"]')).toContainText("버튼만");
   await expect(page.locator('[data-slot="debug-retraction-voice-status"]')).toContainText("리트랙션 요청 접수");
-  await expect(page.locator('[data-slot="debug-retraction-voice-status"]')).toContainText("오른쪽 5cm 더");
-  await expect(page.getByText("voice_mode_buttons_only")).toBeVisible();
-  await expect(page.getByText("공용 결정론 정규화기 · VLM 미호출")).toBeVisible();
-  await expect(page.getByText("공용 정규화기를 직접 사용했습니다.")).toBeVisible();
-  await expect(page.locator('[data-slot="debug-retraction-voice-ownership"]')).toContainText("마이크 캡처는 STT 입력·USB 캡처 기능 하나만 사용합니다");
-  const retractionAsrLive = page.locator('[data-slot="debug-retraction-asr-live"]');
-  await expect(retractionAsrLive).toContainText("입력 레벨");
-  await expect(retractionAsrLive).toContainText("-38.2 dBFS");
-  await expect(retractionAsrLive).toContainText("부분 인식");
-  await expect(retractionAsrLive).toContainText("오른쪽 5cm 더");
-  await expect(retractionAsrLive.getByRole("meter")).toHaveAttribute("aria-valuenow", "-38.2");
+  await expect(page.locator('[data-slot="debug-retraction-voice-ownership"]')).toContainText("음성 relay는 관측 전용입니다");
+  await expect(page.locator('[data-slot="debug-retraction-voice-mode"]')).toHaveCount(0);
   await expect(page.getByRole("button", { name: "왼쪽 5 cm 더" })).toBeEnabled();
   await expect(page.getByRole("button", { name: "직접 교시 시작" })).toBeDisabled();
   await expect(page.getByRole("button", { name: "Tool change" })).toBeDisabled();
-  await expect(page.getByText(/별도 마이크나 ASR 세션을 시작·중지하지 않습니다/)).toBeVisible();
-
-  await page.locator('[aria-label="리트랙터 음성 처리 모드"]').getByRole("button", { name: /^음성 \+ 버튼/ }).click();
-  await expect.poll(() => commands).toContainEqual({
-    operation: "configure_retraction_voice",
-    payload: { enabled: true },
-  });
   expect(commands.map(({ operation }) => operation)).not.toContain("asr_start");
   expect(commands.map(({ operation }) => operation)).not.toContain("asr_stop");
-
-  await page.getByRole("tab", { name: /STT 입력·USB 캡처/ }).click();
-  await expect(page.locator('[data-slot="debug-asr-sole-owner"]')).toContainText("이 기능이 Debug 마이크 캡처를 단독 소유합니다");
-  await expect(page.getByText(/두 번째 오디오 스트림을 열지 않습니다/)).toBeVisible();
 });
 
 test("selects a reviewed Debug ASR route without sending a raw WebSocket URL", async ({ page }) => {
@@ -2829,83 +2521,201 @@ test("selects a reviewed Debug ASR route without sending a raw WebSocket URL", a
     .not.toHaveProperty("server_url");
 });
 
-test("shows Text VLM pending provenance before any retraction Service request", async ({ page }) => {
-  const commands: string[] = [];
-  await openDebugWorkspace(page, {
-    statusForConnection: () => {
-      const status = retractionServiceStatus("retraction-vlm-pending-session");
-      status.voice = {
-        auto_execute: false,
-        last_sentence: "리트랙션 시작해",
-        last_parse: {},
-        retraction: retractionVoiceStatus({
-          mode: "voice_and_buttons",
-          internalState: "taught_ready",
-          allowedCommands: ["start_direct_teach", "start_retraction"],
-          serviceReady: true,
-          transcript: "리트랙션 시작해",
-          command: "start_retraction",
-          confidence: 0.8,
-          reason: "normalized_start_retraction",
-          interpreterSource: "text_vlm_pending",
-          interpreterMode: "vlm_with_fallback",
-          interpreterPending: true,
-          detail: "text_vlm_request_submitted",
+test("observes runtime owners and delegates a scoped restart to host runtime-control", async ({ page }) => {
+  const ownerRequests: Array<{ body: unknown; requestId: string | undefined }> = [];
+  await page.route(/\/api\/runtime\/owners\?mode=live$/, (route) => route.fulfill({
+    contentType: "application/json",
+    body: JSON.stringify({
+      mode: "live",
+      owners: [
+        {
+          owner: "command",
+          mode: "live",
+          state: "running",
+          service: "taskplanner-command",
+          detail: "Up 2 minutes",
+        },
+        {
+          owner: "core",
+          mode: "live",
+          state: "running",
+          service: "taskplanner-state-core",
+          detail: "Up 2 minutes",
+        },
+        {
+          owner: "perception",
+          mode: "live",
+          state: "not-deployed",
+          service: "taskplanner-perception",
+          detail: "no owner container",
+        },
+        {
+          owner: "simulation-input",
+          mode: "live",
+          state: "not-applicable",
+          service: "",
+          detail: "mode not supported",
+        },
+        {
+          owner: "tts",
+          mode: "live",
+          state: "running",
+          service: "taskplanner-tts",
+          detail: "Up 4 minutes",
+        },
+      ],
+    }),
+  }));
+  await page.route(/\/api\/runtime\/owners\/restart$/, async (route) => {
+    const request = route.request();
+    const body = request.postDataJSON() as { owner?: string; mode?: string };
+    ownerRequests.push({
+      body,
+      requestId: request.headers()["x-taskplanner-request-id"],
+    });
+    if (body.owner === "command" || body.owner === "core") {
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({
+          accepted: true,
+          owner: body.owner,
+          mode: "live",
+          message: "The owner restarted.",
         }),
-      };
-      return status;
-    },
-    onCommand: (operation) => commands.push(operation),
+      });
+      return;
+    }
+    if (body.owner === "tts") {
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({
+          accepted: true,
+          owner: "tts",
+          mode: "live",
+          message: "The owner restarted.",
+        }),
+      });
+      return;
+    }
+    await route.fulfill({
+      status: 409,
+      contentType: "application/json",
+      body: JSON.stringify({
+        accepted: false,
+        owner: "perception",
+        mode: "live",
+        error: "The requested runtime mode is not active and ready.",
+      }),
+    });
   });
 
-  await page.getByRole("tab", { name: /리트랙터 6개 명령/ }).click();
-  const status = page.locator('[data-slot="debug-retraction-voice-status"]');
-  await expect(status).toContainText("Text VLM 해석 중");
-  await expect(status).toContainText("Text VLM 요청 제출 · 응답 대기");
-  await expect(status).toContainText("Text VLM 요청을 제출하고 비동기 응답을 기다립니다.");
-  await expect(status).toContainText("text_vlm_request_submitted");
-  await expect(page.getByRole("button", { name: "Retraction 시작" })).toBeDisabled();
-  await expect(page.locator('[aria-label="리트랙터 음성 처리 모드"]').getByRole("button", { name: /^버튼만/ })).toBeEnabled();
-  expect(commands).toEqual([]);
+  await openDebugWorkspace(page, { runtimeMode: "live" });
+
+  const panel = page.locator('[data-slot="debug-runtime-owner-panel"]');
+  await expect(panel).toHaveAttribute("data-mode", "live");
+  const commandControl = panel.locator('[data-slot="debug-command-owner-control"]');
+  await expect(commandControl).toContainText("taskplanner-command");
+  await expect(panel.locator('.debug-runtime-owner-list [data-owner="command"]')).toHaveCount(0);
+  await expect(panel.locator('[data-owner="simulation-input"]')).toHaveCount(0);
+  await expect(panel.locator('[data-owner="core"]')).toContainText("taskplanner-state-core");
+  await expect(panel.locator('[data-owner="perception"]')).toContainText("no owner container");
+  await expect(panel.getByRole("button", { name: "TTS owner만 재시작" })).toBeEnabled();
+  await expect(panel.locator('[data-owner="tts"]')).toHaveCount(0);
+  await commandControl.getByRole("button", { name: "Command owner만 재시작" }).click();
+  await expect.poll(() => ownerRequests).toHaveLength(1);
+  expect(ownerRequests[0]).toEqual({
+    body: { owner: "command", mode: "live" },
+    requestId: expect.stringMatching(/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/),
+  });
+  await expect(panel).toContainText("The owner restarted.");
+  await panel.locator('[data-owner="perception"]').getByRole("button", { name: "재시작 요청" }).click();
+  await expect.poll(() => ownerRequests).toHaveLength(2);
+  expect(ownerRequests[1]).toEqual({
+    body: { owner: "perception", mode: "live" },
+    requestId: expect.stringMatching(/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/),
+  });
+  await expect(panel).toContainText("The requested runtime mode is not active and ready.");
+  await panel.locator('[data-owner="core"]').getByRole("button", { name: "재시작 요청" }).click();
+  await expect.poll(() => ownerRequests).toHaveLength(3);
+  expect(ownerRequests[2]).toEqual({
+    body: { owner: "core", mode: "live" },
+    requestId: expect.stringMatching(/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/),
+  });
+  await expect(panel).toContainText("The owner restarted.");
+  await expect(panel.locator('[data-owner="core"]')).toBeVisible();
+  await panel.getByRole("button", { name: "TTS owner만 재시작" }).click();
+  await expect.poll(() => ownerRequests).toHaveLength(4);
+  expect(ownerRequests[3]).toEqual({
+    body: { owner: "tts", mode: "live" },
+    requestId: expect.stringMatching(/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/),
+  });
 });
 
-test("shows grounded deterministic fallback after a Text VLM transport attempt", async ({ page }) => {
-  await openDebugWorkspace(page, {
-    statusForConnection: () => {
-      const status = retractionServiceStatus("retraction-vlm-fallback-session");
-      status.voice = {
-        auto_execute: false,
-        last_sentence: "오른쪽 5cm 더",
-        last_parse: {},
-        retraction: retractionVoiceStatus({
-          mode: "voice_and_buttons",
-          internalState: "retraction_active",
-          allowedCommands: ["adjust_retraction", "stop_retraction"],
-          serviceReady: true,
-          transcript: "오른쪽 5cm 더",
-          command: "adjust_retraction",
-          targetSide: "right",
-          distanceM: 0.05,
-          confidence: 0.96,
-          reason: "normalized_adjust_retraction_explicit_adjustment_distance",
-          interpreterSource: "deterministic_fallback",
-          vlmInvoked: true,
-          interpreterMode: "vlm_with_fallback",
-          detail: "text_vlm_unavailable:TimeoutError",
-        }),
-      };
-      return status;
-    },
+test("shows only configured standalone Debug owners with scoped restart controls", async ({ page }) => {
+  const ownerRequests: Array<{ owner?: string; mode?: string }> = [];
+  await page.route(/\/api\/runtime\/owners\?mode=debug$/, (route) => route.fulfill({
+    contentType: "application/json",
+    body: JSON.stringify({
+      mode: "debug",
+      owners: [
+        {
+          owner: "command",
+          mode: "debug",
+          state: "not-applicable",
+          service: "",
+          detail: "mode not supported",
+        },
+        {
+          owner: "debug-observer",
+          mode: "debug",
+          state: "running",
+          service: "taskplanner-debug-observer",
+          detail: "Up 2 minutes",
+        },
+        {
+          owner: "debug-control",
+          mode: "debug",
+          state: "running",
+          service: "taskplanner-debug-control",
+          detail: "Up 2 minutes",
+        },
+        {
+          owner: "debug-virtual",
+          mode: "debug",
+          state: "not-deployed",
+          service: "taskplanner-debug-virtual",
+          detail: "no owner container",
+        },
+      ],
+    }),
+  }));
+  await page.route("**/api/runtime/owners/restart", async (route) => {
+    const body = route.request().postDataJSON() as { owner?: string; mode?: string };
+    ownerRequests.push(body);
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({
+        accepted: true,
+        owner: body.owner,
+        mode: body.mode,
+        message: "The owner restarted.",
+      }),
+    });
   });
 
-  await page.getByRole("tab", { name: /리트랙터 6개 명령/ }).click();
-  const status = page.locator('[data-slot="debug-retraction-voice-status"]');
-  await expect(status).toContainText("Text VLM 호출 후 공용 정규화기로 폴백");
-  await expect(status).toContainText("Text VLM 연결 또는 응답 실패로 공용 정규화기를 사용했습니다. (TimeoutError)");
-  await expect(status).toContainText("text_vlm_unavailable:TimeoutError");
+  await openDebugWorkspace(page);
+
+  const panel = page.locator('[data-slot="debug-runtime-owner-panel"]');
+  await expect(panel).toHaveAttribute("data-mode", "debug");
+  await expect(panel.locator('[data-owner="debug-observer"]')).toContainText("taskplanner-debug-observer");
+  await expect(panel.locator('[data-owner="debug-control"]')).toContainText("taskplanner-debug-control");
+  await expect(panel.locator('[data-owner="debug-virtual"]')).toContainText("taskplanner-debug-virtual");
+  await expect(panel.locator('[data-owner="command"]')).toHaveCount(0);
+  await panel.locator('[data-owner="debug-control"]').getByRole("button", { name: "재시작 요청" }).click();
+  await expect.poll(() => ownerRequests).toEqual([{ owner: "debug-control", mode: "debug" }]);
 });
 
-test("holds retraction buttons and voice enable while a Service admission response is pending", async ({ page }) => {
+test("holds retraction controls while a Service admission response is pending", async ({ page }) => {
   await openDebugWorkspace(page, {
     statusForConnection: () => {
       const status = retractionServiceStatus("retraction-in-flight-session");
@@ -2929,7 +2739,6 @@ test("holds retraction buttons and voice enable while a Service admission respon
         last_sentence: "",
         last_parse: {},
         retraction: retractionVoiceStatus({
-          mode: "buttons_only",
           internalState: "retraction_active",
           allowedCommands: ["adjust_retraction", "stop_retraction"],
           serviceReady: true,
@@ -2944,5 +2753,76 @@ test("holds retraction buttons and voice enable while a Service admission respon
   await expect(page.locator('[data-slot="debug-retraction-voice-status"]')).toContainText("접수 응답 대기");
   await expect(page.getByRole("button", { name: "왼쪽 5 cm 더" })).toBeDisabled();
   await expect(page.getByRole("button", { name: "IDLE로 강제 초기화" })).toBeDisabled();
-  await expect(page.locator('[aria-label="리트랙터 음성 처리 모드"]').getByRole("button", { name: /^음성 \+ 버튼/ })).toBeDisabled();
+});
+
+test("scopes SurgiMate lifecycle controls to standalone Debug", async ({ page }) => {
+  let running = true;
+  const actions: Array<{ action: string; requestId: string | undefined }> = [];
+  await page.route("**/api/runtime/surgimate", async (route) => {
+    if (route.request().method() === "GET") {
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({
+          active_mode: "debug",
+          status: {
+            owner: "surgimate",
+            mode: "debug",
+            state: running ? "running" : "exited",
+            service: "taskplanner-surgimate",
+            detail: running ? "Up 2 seconds" : "Exited (0)",
+          },
+        }),
+      });
+      return;
+    }
+    const payload = route.request().postDataJSON() as { action?: string };
+    const action = payload.action || "";
+    actions.push({
+      action,
+      requestId: route.request().headers()["x-taskplanner-request-id"],
+    });
+    if (action === "stop") running = false;
+    if (action === "start" || action === "restart") running = true;
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({ accepted: true, action, message: `SurgiMate ${action} complete.` }),
+    });
+  });
+
+  await openDebugWorkspace(page);
+  const panel = page.locator('[data-slot="surgimate-sidecar-panel"]');
+  await expect(panel).toBeVisible();
+  await expect(panel).toHaveAttribute("data-state", "running");
+  await expect(panel.getByRole("button", { name: "시작", exact: true })).toBeDisabled();
+
+  await panel.getByRole("button", { name: "중지", exact: true }).click();
+  await expect.poll(() => actions).toHaveLength(1);
+  await expect(panel.getByRole("button", { name: "시작", exact: true })).toBeEnabled();
+  await panel.getByRole("button", { name: "시작", exact: true }).click();
+  await expect(panel).toHaveAttribute("data-state", "running");
+  await expect(panel.getByRole("button", { name: "중지", exact: true })).toBeEnabled();
+  await panel.getByRole("button", { name: "재시작", exact: true }).click();
+  await expect.poll(() => actions).toHaveLength(3);
+  expect(actions).toEqual([
+    { action: "stop", requestId: expect.stringMatching(/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/) },
+    { action: "start", requestId: expect.stringMatching(/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/) },
+    { action: "restart", requestId: expect.stringMatching(/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/) },
+  ]);
+
+  await page.route("http://127.0.0.1:5174/", (route) => route.fulfill({
+    contentType: "text/html",
+    body: "<main>SurgiMate same-tab navigation</main>",
+  }));
+  const pagesBeforeNavigation = page.context().pages().length;
+  await Promise.all([
+    page.waitForURL("http://127.0.0.1:5174/"),
+    panel.getByRole("button", { name: "SurgiMate로 이동" }).click(),
+  ]);
+  await expect(page.locator("main")).toContainText("SurgiMate same-tab navigation");
+  expect(page.context().pages()).toHaveLength(pagesBeforeNavigation);
+
+  const otherPage = await page.context().newPage();
+  await openDebugWorkspace(otherPage, { runtimeMode: "live" });
+  await expect(otherPage.locator('[data-slot="surgimate-sidecar-panel"]')).toBeVisible();
+  await otherPage.close();
 });

@@ -7,6 +7,7 @@ import pytest
 from or_digital_twin.hand_handover_gate import (
     ContinuousHandHandoverGate,
     ExactStampHandJoiner,
+    ExactStampHandTripletJoiner,
     FrameDisposition,
     HandFrameEvidence,
     HandPerceptionPins,
@@ -109,6 +110,19 @@ def _messages(
     )
 
 
+def _keypoints(stamp: float, positions: dict[int, float]) -> SimpleNamespace:
+    return SimpleNamespace(
+        header=_header(stamp),
+        hands=[
+            SimpleNamespace(
+                hand_index=index,
+                joints_2d=[SimpleNamespace(u=position) for _ in range(21)],
+            )
+            for index, position in positions.items()
+        ],
+    )
+
+
 def _positive(stamp: float, confidence: float = 0.91) -> HandFrameEvidence:
     return HandFrameEvidence(
         stamp,
@@ -130,6 +144,16 @@ def test_exact_join_is_order_independent_and_header_strict() -> None:
     assert joiner.add_gesture(wrong_gesture) is None
 
 
+def test_exact_triplet_join_waits_for_keypoints_in_any_arrival_order() -> None:
+    gesture, facing = _messages(12.0)
+    keypoints = _keypoints(12.0, {0: 300.0})
+    joiner = ExactStampHandTripletJoiner()
+
+    assert joiner.add_facing(facing) is None
+    assert joiner.add_gesture(gesture) is None
+    assert joiner.add_keypoints(keypoints) == (gesture, facing, keypoints)
+
+
 def test_classifier_requires_exact_right_open_palm_palm_up_tuple() -> None:
     gesture, facing = _messages(20.0)
     positive = classify_hand_frame(gesture, facing, pins=PINS)
@@ -143,6 +167,7 @@ def test_classifier_requires_exact_right_open_palm_palm_up_tuple() -> None:
     gesture, facing = _messages(20.2, handedness="Left")
     unknown = classify_hand_frame(gesture, facing, pins=PINS)
     assert unknown.disposition is FrameDisposition.UNKNOWN
+    assert unknown.reason == "right_hand_unavailable"
 
 
 def test_classifier_rejects_unpinned_source_frame() -> None:
@@ -173,7 +198,85 @@ def test_classifier_fails_closed_for_ambiguous_multiple_right_hands() -> None:
     facing.hands.append(second_facing)
     evidence = classify_hand_frame(gesture, facing, pins=PINS)
     assert evidence.disposition is FrameDisposition.UNKNOWN
-    assert evidence.reason == "right_hand_ambiguous"
+    assert evidence.reason == "multiple_hands_in_mayo_frame"
+
+
+def test_classifier_ignores_multi_hand_frame_even_with_one_eligible_requester() -> None:
+    gesture, facing = _messages(30.05)
+    second_gesture, second_facing = _hand(
+        index=1,
+        gesture="Closed_Fist",
+        facing="PALM_DOWN",
+        handedness="Left",
+    )
+    gesture.hands.append(second_gesture)
+    facing.hands.append(second_facing)
+
+    evidence = classify_hand_frame(gesture, facing, pins=PINS)
+
+    assert evidence.disposition is FrameDisposition.UNKNOWN
+    assert evidence.reason == "multiple_hands_in_mayo_frame"
+
+
+def test_classifier_uses_only_leftmost_hand_when_keypoints_are_joined() -> None:
+    gesture, facing = _messages(30.07)
+    left_gesture, left_facing = _hand(index=4)
+    right_gesture, right_facing = _hand(
+        index=9,
+        gesture="Closed_Fist",
+        facing="PALM_DOWN",
+    )
+    gesture.hands = [right_gesture, left_gesture]
+    facing.hands = [right_facing, left_facing]
+
+    evidence = classify_hand_frame(
+        gesture,
+        facing,
+        keypoints_message=_keypoints(30.07, {4: 120.0, 9: 520.0}),
+        pins=PINS,
+    )
+
+    assert evidence.disposition is FrameDisposition.POSITIVE
+    assert evidence.hand_index == 4
+
+
+def test_classifier_releases_when_leftmost_hand_is_not_the_request_pose() -> None:
+    gesture, facing = _messages(30.08)
+    left_gesture, left_facing = _hand(
+        index=4,
+        gesture="Closed_Fist",
+        facing="PALM_DOWN",
+    )
+    right_gesture, right_facing = _hand(index=9)
+    gesture.hands = [left_gesture, right_gesture]
+    facing.hands = [left_facing, right_facing]
+
+    evidence = classify_hand_frame(
+        gesture,
+        facing,
+        keypoints_message=_keypoints(30.08, {4: 120.0, 9: 520.0}),
+        pins=PINS,
+    )
+
+    assert evidence.disposition is FrameDisposition.RELEASE
+    assert evidence.hand_index == 4
+
+
+def test_classifier_fails_closed_when_multi_hand_keypoints_are_incomplete() -> None:
+    gesture, facing = _messages(30.09)
+    second_gesture, second_facing = _hand(index=1)
+    gesture.hands.append(second_gesture)
+    facing.hands.append(second_facing)
+
+    evidence = classify_hand_frame(
+        gesture,
+        facing,
+        keypoints_message=_keypoints(30.09, {0: 120.0}),
+        pins=PINS,
+    )
+
+    assert evidence.disposition is FrameDisposition.UNKNOWN
+    assert evidence.reason == "hand_keypoint_index_set_mismatch"
 
 
 def test_classifier_fails_closed_for_asymmetric_hand_index_sets() -> None:
@@ -224,6 +327,122 @@ def test_gate_requires_300ms_of_receipt_time_not_a_buffered_source_burst() -> No
 
     assert update.active is False
     assert update.stability_sec == pytest.approx(0.03)
+
+
+def test_short_observed_no_hand_gap_preserves_candidate_dwell() -> None:
+    gate = ContinuousHandHandoverGate(
+        dwell_sec=0.300,
+        release_confirm_sec=0.180,
+        minimum_positive_samples=4,
+    )
+    for stamp in (10.0, 10.1, 10.2):
+        update = gate.observe(
+            _positive(stamp), source_now_sec=stamp, receipt_monotonic=stamp
+        )
+    assert update.active is False
+
+    dropout = gate.observe(
+        HandFrameEvidence(10.25, FrameDisposition.RELEASE, "observed_no_hand"),
+        source_now_sec=10.25,
+        receipt_monotonic=10.25,
+    )
+    assert dropout.active is False
+    assert dropout.reason == "transient_input_gap:observed_no_hand"
+
+    recovered = gate.observe(
+        _positive(10.30), source_now_sec=10.30, receipt_monotonic=10.30
+    )
+    assert recovered.active is True
+    assert recovered.rising_edge is True
+    assert recovered.generation == 1
+
+
+def test_short_cam4_dropout_holds_an_active_hand_signal() -> None:
+    gate = ContinuousHandHandoverGate(
+        dwell_sec=0.300,
+        release_confirm_sec=0.180,
+        minimum_positive_samples=4,
+    )
+    for stamp in (20.0, 20.1, 20.2, 20.3):
+        active = gate.observe(
+            _positive(stamp), source_now_sec=stamp, receipt_monotonic=stamp
+        )
+    assert active.active is True
+    assert active.rising_edge is True
+
+    dropped = gate.observe(
+        HandFrameEvidence(20.36, FrameDisposition.RELEASE, "observed_no_hand"),
+        source_now_sec=20.36,
+        receipt_monotonic=20.36,
+    )
+    assert dropped.active is True
+    assert dropped.rising_edge is False
+
+    resumed = gate.observe(
+        _positive(20.42), source_now_sec=20.42, receipt_monotonic=20.42
+    )
+    assert resumed.active is True
+    assert resumed.rising_edge is False
+    assert resumed.generation == 1
+
+
+def test_sustained_no_hand_confirms_release_after_bounded_grace() -> None:
+    gate = ContinuousHandHandoverGate(
+        dwell_sec=0.300,
+        release_confirm_sec=0.180,
+        minimum_positive_samples=4,
+    )
+    for stamp in (30.0, 30.1, 30.2, 30.3):
+        gate.observe(
+            _positive(stamp), source_now_sec=stamp, receipt_monotonic=stamp
+        )
+
+    for stamp in (30.36, 30.45):
+        held = gate.observe(
+            HandFrameEvidence(stamp, FrameDisposition.RELEASE, "observed_no_hand"),
+            source_now_sec=stamp,
+            receipt_monotonic=stamp,
+        )
+        assert held.active is True
+
+    released = gate.observe(
+        HandFrameEvidence(30.54, FrameDisposition.RELEASE, "observed_no_hand"),
+        source_now_sec=30.54,
+        receipt_monotonic=30.54,
+    )
+    assert released.active is False
+    assert released.reason == "observed_no_hand"
+
+
+def test_soft_classifier_dropout_is_bridged_but_multi_hand_is_not() -> None:
+    gate = ContinuousHandHandoverGate(
+        dwell_sec=0.300,
+        soft_unknown_grace_sec=0.180,
+        minimum_positive_samples=4,
+    )
+    for stamp in (40.0, 40.1, 40.2, 40.3):
+        gate.observe(
+            _positive(stamp), source_now_sec=stamp, receipt_monotonic=stamp
+        )
+
+    classifier_gap = gate.observe(
+        HandFrameEvidence(
+            40.36, FrameDisposition.UNKNOWN, "hand_classification_unknown"
+        ),
+        source_now_sec=40.36,
+        receipt_monotonic=40.36,
+    )
+    assert classifier_gap.active is True
+
+    hard_unknown = gate.observe(
+        HandFrameEvidence(
+            40.42, FrameDisposition.UNKNOWN, "multiple_hands_in_mayo_frame"
+        ),
+        source_now_sec=40.42,
+        receipt_monotonic=40.42,
+    )
+    assert hard_unknown.active is False
+    assert hard_unknown.reason == "multiple_hands_in_mayo_frame"
 
 
 def test_active_signal_expires_after_the_400ms_observation_silence_lease() -> None:
@@ -293,6 +512,30 @@ def test_gap_unknown_and_timestamp_regression_reset_dwell() -> None:
     )
     assert regression.accepted_sample is False
     assert regression.reason == "source_time_regression"
+
+
+def test_default_gap_tolerates_measured_facing_cadence_for_release_and_dwell() -> None:
+    gate = ContinuousHandHandoverGate()
+    gate.inhibit_until_release()
+
+    for stamp in (10.0, 10.403, 10.806):
+        released = gate.observe(
+            HandFrameEvidence(stamp, FrameDisposition.RELEASE, "closed_fist"),
+            source_now_sec=stamp,
+            receipt_monotonic=stamp,
+        )
+    assert released.active is False
+
+    for stamp in (11.0, 11.11, 11.25, 11.653):
+        accepted = gate.observe(
+            _positive(stamp), source_now_sec=stamp, receipt_monotonic=stamp
+        )
+
+    assert accepted.rising_edge is True
+    assert accepted.active is True
+    assert accepted.generation == 1
+    assert gate.expire(receipt_monotonic=12.056) is None
+    assert gate.expire(receipt_monotonic=12.154) is not None
 
 
 def test_episode_is_one_shot_and_only_fresh_release_rearms() -> None:

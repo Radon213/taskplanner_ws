@@ -25,6 +25,7 @@ from integration_debug.operational_asr_node import (
     OperationalAsrNode,
     _absolute_topic_name,
     _bounded_float,
+    _env_bool,
     _json_dumps,
     _source_revision,
     resolve_puzzle_asr_endpoint,
@@ -91,6 +92,8 @@ class FakeHealthMonitor:
         self.kwargs = kwargs
         self.start_calls = 0
         self.close_calls = 0
+        self.pause_calls = 0
+        self.resume_calls = 0
         self.state = LAN_HEALTH_READY
         self.latency_ms = 4.2
         self.last_error = ""
@@ -101,6 +104,12 @@ class FakeHealthMonitor:
     def close(self) -> bool:
         self.close_calls += 1
         return True
+
+    def pause(self) -> None:
+        self.pause_calls += 1
+
+    def resume(self) -> None:
+        self.resume_calls += 1
 
     def snapshot(self):
         return {
@@ -121,6 +130,7 @@ def node(monkeypatch):
     monkeypatch.setenv("PUZZLE_ASR_URL", "wss://asr.example.test/v1")
     monkeypatch.delenv("PUZZLE_ASR_LAN_URL", raising=False)
     monkeypatch.setenv("TASKPLANNER_ASR_CAPTURE_LOCK", "/tmp/test-asr.lock")
+    monkeypatch.delenv("TASKPLANNER_ASR_ROLLOVER_AFTER_FINAL", raising=False)
     monkeypatch.delenv("SENTENCE_INPUT_TOPIC", raising=False)
     monkeypatch.delenv("TASKPLANNER_ASR_OUTPUT_MODE", raising=False)
     monkeypatch.delenv("TASKPLANNER_ASR_UTTERANCE_TOPIC", raising=False)
@@ -185,6 +195,7 @@ def test_fixed_contract_and_json_safe_status(node) -> None:
     # begin recording on its own.
     assert status["asr"]["artifacts_enabled"] is True
     assert node._runtime.kwargs["recording_default_active"] is False
+    assert node._runtime.kwargs["rollover_after_final"] is False
     assert status["asr"]["endpoint_id"] == ASR_ENDPOINT_CLOUD
     assert status["asr"]["route_policy"] == ASR_ENDPOINT_CLOUD
     assert status["asr"]["lan_health"]["state"] == LAN_HEALTH_READY
@@ -255,6 +266,33 @@ def test_lan_monitor_tuning_rejects_non_finite_environment_values() -> None:
     assert _bounded_float("inf", default=1.0, minimum=0.2) == 1.0
 
 
+def test_server_final_rollover_requires_explicit_environment_opt_in(monkeypatch) -> None:
+    monkeypatch.setenv("PUZZLE_ASR_ENDPOINT", ASR_ENDPOINT_CLOUD)
+    monkeypatch.delenv("PUZZLE_ASR_ROUTE_POLICY", raising=False)
+    monkeypatch.setenv("PUZZLE_ASR_URL", "wss://asr.example.test/v1")
+    monkeypatch.setenv("TASKPLANNER_ASR_CAPTURE_LOCK", "/tmp/test-asr-rollover.lock")
+    monkeypatch.setenv("TASKPLANNER_ASR_ROLLOVER_AFTER_FINAL", "true")
+    rclpy.init(args=[])
+    created = OperationalAsrNode(
+        runtime_factory=FakeRuntime,
+        health_monitor_factory=FakeHealthMonitor,
+    )
+    try:
+        assert created._runtime.kwargs["rollover_after_final"] is True
+    finally:
+        created.close()
+        created.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+def test_environment_boolean_keeps_rollover_disabled_unless_opted_in() -> None:
+    assert _env_bool("true") is True
+    assert _env_bool("yes") is True
+    assert _env_bool("false") is False
+    assert _env_bool("unexpected") is False
+
+
 def test_lan_endpoint_is_selected_before_microphone_start(monkeypatch) -> None:
     monkeypatch.setenv("PUZZLE_ASR_ENDPOINT", ASR_ENDPOINT_LAN)
     monkeypatch.setenv("PUZZLE_ASR_URL", "wss://asr.example.test/v1")
@@ -293,6 +331,7 @@ def test_auto_policy_uses_cached_ready_lan_without_start_time_probe(node) -> Non
     assert node._runtime.start_calls == [
         {"device_id": None, "server_url": DEFAULT_LAN_SERVER_URL}
     ]
+    assert node._lan_monitor.pause_calls == 1
     status = json.loads(started.result_json)["asr"]
     assert status["route_policy"] == ASR_ROUTE_POLICY_AUTO
     assert status["endpoint_id"] == ASR_ENDPOINT_LAN
@@ -379,6 +418,19 @@ def test_start_uses_default_device_and_rejects_endpoint_override(node) -> None:
     assert "already active" in duplicate.message
 
 
+def test_failed_start_does_not_pause_lan_health_monitor(node, monkeypatch) -> None:
+    def fail_start(**_kwargs) -> None:
+        raise RuntimeError("test microphone failure")
+
+    monkeypatch.setattr(node._runtime, "start", fail_start)
+
+    rejected = invoke(node, "start")
+
+    assert rejected.accepted is False
+    assert "test microphone failure" in rejected.message
+    assert node._lan_monitor.pause_calls == 0
+
+
 def test_sentence_publisher_tracks_connection_and_stop(node) -> None:
     assert invoke(node, "start").accepted
     assert node.count_publishers(SENTENCE_TOPIC) == 0
@@ -398,8 +450,24 @@ def test_sentence_publisher_tracks_connection_and_stop(node) -> None:
     stopped = invoke(node, "stop")
     assert stopped.accepted is True
     assert node._runtime.stop_calls == 1
+    assert node._lan_monitor.resume_calls == 0
     assert node._sentence_pub is None
     assert node.count_publishers(SENTENCE_TOPIC) == 0
+
+    node._runtime.state = "STOPPED"
+    node._runtime.events.append({"type": "asr_stopped"})
+    node._drain_runtime_events()
+    assert node._lan_monitor.resume_calls == 1
+
+
+def test_terminal_runtime_error_resumes_paused_lan_health_monitor(node) -> None:
+    assert invoke(node, "start").accepted
+    assert node._lan_monitor.pause_calls == 1
+
+    node._runtime.state = "ERROR"
+    node._drain_runtime_events()
+
+    assert node._lan_monitor.resume_calls == 1
 
     # A queued pre-stop connection event must not resurrect the publisher.
     node._runtime.events.append({"type": "asr_connection", "connected": True})
@@ -450,6 +518,7 @@ def test_live_compose_defaults_to_typed_final_asr_output() -> None:
 
     assert "TASKPLANNER_ASR_OUTPUT_MODE: ${TASKPLANNER_ASR_OUTPUT_MODE:-typed_utterance}" in source
     assert "TASKPLANNER_ASR_UTTERANCE_TOPIC: ${ASR_UTTERANCE_TOPIC:-/sensors/surgeon/utterance}" in source
+    assert "TASKPLANNER_ASR_ROLLOVER_AFTER_FINAL: ${TASKPLANNER_ASR_ROLLOVER_AFTER_FINAL:-false}" in source
 
 
 def test_disconnect_removes_publisher_and_reconnect_restores_it(node) -> None:

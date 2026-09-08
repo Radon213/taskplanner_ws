@@ -1,5 +1,8 @@
 builtin_interfaces/Time stamp
 string command_id
+# Immutable execution interval that owns this result. Consumers must discard a
+# status whose value does not match their active SimulationState run.
+string procedure_run_id
 string action
 string instrument_id
 string state

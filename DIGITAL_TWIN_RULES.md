@@ -60,12 +60,16 @@ These rules are the source of truth for debugging runtime behavior.
 
 1. A direct typed CAM4 observation of the configured right hand with an open
    palm facing up for the required dwell is a handover cue. This cue bypasses
-   the VLM input, prompt, and output contracts.
+   the VLM input, prompt, and output contracts. A joined CAM4 frame containing
+   two or more detected hands is discarded as implicit-request evidence even
+   when one hand alone matches the request pose.
 2. The normal used-tool return path is not direct hand retrieval. The surgeon
    places used or reusable tools on the Mayo stand.
 3. `request_tool` may be explicit voice or an independently admitted direct-hand
    cue. A direct-hand cue does not identify a tool; the BT may use it only with
-   the independently stabilized or prepositioned candidate selected by policy.
+   an exact right-hand preposition, or, when the right hand is empty, the
+   reducer's current eligible rank-1 prediction. The rank-1 fallback does not
+   need to cross the autonomous-preparation confidence/stability threshold.
 4. Voice requests may override an anticipatory/prepositioned tool.
 5. A voice request must be visible in the UI immediately as active spoken intent.
 6. A Mayo-placed tool is assumed used/contaminated unless explicitly modeled otherwise.
@@ -75,8 +79,9 @@ These rules are the source of truth for debugging runtime behavior.
    until a human recovery event removes the contaminated tool from the field and
    either starts cleaning or provides a sterile replacement.
 9. A valid explicit voice request or direct handover cue may request a tool
-   already on Mayo. The right arm then executes
-   `pick_up_from_mayo_and_handover` instead of treating the tool as unavailable.
+   already on Mayo even while CAM4 reports a hand over the Mayo workspace. The
+   right arm first prepares that confirmed requested tool from Mayo and then
+   performs the audited direct handover leg.
 
 ## VLM Retrieval Inference Rules
 
@@ -102,7 +107,7 @@ These rules are the source of truth for debugging runtime behavior.
    reducer may promote a tool to recovery.
 7. A same-tool `reuse` assessment with confidence >= 0.5 for at least 5 seconds
    suppresses recovery promotion.
-8. VLM `tool` prediction requires confidence >= 0.8 for at least 3 seconds before
+8. VLM `tool` prediction requires confidence >= 0.65 for at least 0.3 seconds before
    BT may dispatch `predict_tool`.
 9. Stabilization must suppress one-frame noise; transient raw cues must not directly
    become BT-visible intent.
@@ -112,32 +117,41 @@ These rules are the source of truth for debugging runtime behavior.
     `surgeon_gesture` fields are invalid rather than silently ignored.
 11. Hand landmarks and facing are admitted only through the direct typed CAM4
     hand gate. The gate is tool-agnostic and does not turn a forecast into a
-    request; BT policy may act only on a separately eligible, stabilized or
-    prepositioned tool candidate.
+    request. An exact preposition remains first; an empty-right-hand request may
+    use the current eligible rank 1 while autonomous preparation retains rule 8.
 
-## Sentence-only Degraded Operation
+## Typed Speech Degraded Operation
 
-1. `/surgery/audio/request_text` is admitted public sentence evidence and may
-   directly create a canonical explicit tool request when the sentence contains an active
-   procedure instrument and command intent.
-2. Procedure-defined retraction or retractor-tool-change utterances are reserved
-   for the bed-mounted retraction control lane and must not also become
-   tool-handover requests. Suction speech is not a bed-mounted arm command; it
-   remains clinical/tool evidence and follows the ordinary explicit-request
-   guards when it identifies a procedure instrument.
-3. A sentence-backed explicit request may bypass only `vlm_unhealthy` and phase
+1. `/surgery/audio/observed_utterance` is the public, read-only speech evidence
+   topic. It carries the router's faithful final
+   `surgical_msgs/msg/SpeechUtterance` relay, including its utterance ID,
+   timestamps, source, and confidence metadata. It is not a second command
+   ingress and does not directly dispatch the Digital Twin or BT.
+2. The command router alone maps an admitted typed utterance to a typed endpoint
+   request. A routed `voice_request` for an active procedure instrument may
+   create a canonical explicit tool request; observers consume the relay only.
+3. Procedure-defined retraction or retractor-tool-change utterances are reserved
+   for the typed retraction control lane and must not also become tool-handover
+   requests. The catalog-defined `suction` command is forwarded through the
+   execution-owned `ExecuteRetractionCommand` proxy with protocol version `1`
+   and command `7`; the endpoint server remains the authority for its physical
+   meaning and admission.
+4. A router-backed explicit request may bypass only `vlm_unhealthy` and phase
    uncertainty. Every physical-state, contamination, ownership, capacity,
    readiness, and active-task guard remains mandatory.
-4. VLM absence must disable autonomous phase inference, next-tool prediction,
+5. VLM absence must disable autonomous phase inference, next-tool prediction,
    and probabilistic Mayo recovery. It must not stop explicit voice handover.
-5. Duplicate transcript and structured request messages for the same pending
-   tool are coalesced into one request.
+6. The command router correlates a resolver proposal to its original typed
+   utterance before it calls a typed endpoint. The Digital Twin receives the
+   resulting structured request only; it does not retain a raw-transcript
+   compatibility subscription.
 
 ## Bed-Mounted Retraction Arm Boundary
 
-1. Bed-mounted robot integration is retraction-only. A clinical suction
-   instrument and speech about suction remain ordinary tool evidence and must
-   never create a bed-mounted arm command or status.
+1. Bed-mounted robot integration is retraction-only. The catalog-defined
+   `suction` utterance is a typed retraction Service command, not an inferred
+   robot state or a second status channel. Other clinical/tool speech remains
+   ordinary observed evidence unless the catalog maps it to an endpoint.
 2. Direct teach, retraction, adjustment, tool change, and stop use only the
    `/surgery/retraction/command` (`ExecuteRetractionCommand`) Service. Its
    request contains only the documented version, source, command ID, command,
@@ -195,6 +209,17 @@ These rules are the source of truth for debugging runtime behavior.
 7. A handover request for a Mayo tool takes priority over a pending recovery
    candidate when no recovery action has started. Grasping the tool with the right
    hand closes its pending recovery transaction.
+8. Any detected hand in the pinned CAM4 Mayo view blocks autonomous preparation,
+   recovery, and Mayo-target manipulation. The only Mayo-source exception is a
+   confirmed tool selected by a live open-palm request or active validated voice
+   request; the exception covers its Mayo-to-right-hand preparation leg only.
+   A newer pinned empty frame clears the general block only while the RGB
+   gesture-detector health lease and source-time bounds are valid; delayed
+   replay/backlog cannot clear it. More than `0.400 s` of silence or detector-
+   health loss restores the fail-closed occupied state. An uncommitted
+   non-voice request bound to Mayo is rebound to an eligible non-Mayo duplicate
+   when one exists. A voice request retains its confirmed Mayo supplier, and an
+   active robot action is never canceled or retargeted.
 
 ## Rack and Home-Slot Rules
 
@@ -230,11 +255,13 @@ These rules are the source of truth for debugging runtime behavior.
    is active for a valid tool.
 5. `recovery` in normal flow dispatches `retrieve_from_mayo` only. Direct hand
    retrieval is reserved for legacy/manual test paths.
-6. A requested Mayo tool dispatches `pick_up_from_mayo_and_handover` with the
-   Mayo location as source, the right arm, and the surgeon receive zone as target.
+6. A requested Mayo tool uses a Mayo-to-right-hand `prepare_tool` leg followed
+   by `direct_handover`. Selection and final dispatch recheck either a live
+   open-palm episode or the active voice-request instance before applying the
+   narrow occupied-Mayo exception.
 7. `anticipatory_handover` may only fire when explicit and pending recovery conditions
    are absent and the selected tool comes from stable VLM next-tool prediction
-   (`confidence >= 0.8` for at least 3 seconds).
+   (`confidence >= 0.65` for at least 0.3 seconds).
 8. Reset returns the simulation to idle and clears transient execution state.
 9. Reset must not auto-start the BT.
 10. Switching bundles while stopped must not require relaunching the workspace.

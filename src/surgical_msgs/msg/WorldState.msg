@@ -27,6 +27,9 @@ string prepositioned_tool_instance_id
 string predicted_tool
 float32 predicted_tool_confidence
 float32 predicted_tool_stability_sec
+# DT-owned authorization for autonomous prepositioning.  The raw rank-one
+# prediction remains available for a validated direct-hand fallback.
+bool autonomous_preparation_ready
 surgical_msgs/RankedToolPrediction[] ranked_tool_predictions
 string surgeon_intent
 string surgeon_request_tool
@@ -44,6 +47,11 @@ string implicit_request_hand_pose
 float32 implicit_request_confidence
 float32 implicit_request_stability_sec
 uint64 implicit_request_generation
+# Pose-independent CAM4 Mayo-workspace occupancy. This is separate from the
+# exact open-palm handover signal above. True blocks autonomous Mayo prediction
+# and recovery; a live open-palm request or validated voice request may still
+# pick its confirmed Mayo tool for handover.
+bool cam4_mayo_hand_present
 bool cleaner_busy
 float32 cleaner_remaining_sec
 string[] pending_transition_tools

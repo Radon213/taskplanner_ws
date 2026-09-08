@@ -81,8 +81,10 @@ class LanAsrHealthMonitor:
         self._probe = probe
         self._monotonic = monotonic
         self._lock = threading.RLock()
+        self._wake = threading.Condition(self._lock)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._paused = False
         self._checking = False
         self._ready: bool | None = None
         self._checked_monotonic: float | None = None
@@ -97,6 +99,7 @@ class LanAsrHealthMonitor:
             if self._thread is not None and self._thread.is_alive():
                 return
             self._stop.clear()
+            self._paused = False
             self._thread = threading.Thread(
                 target=self._run,
                 name="taskplanner-asr-lan-health",
@@ -108,6 +111,8 @@ class LanAsrHealthMonitor:
         """Stop monitoring without blocking the operational shutdown forever."""
 
         self._stop.set()
+        with self._wake:
+            self._wake.notify_all()
         with self._lock:
             thread = self._thread
         if thread is None:
@@ -115,11 +120,35 @@ class LanAsrHealthMonitor:
         thread.join(timeout=self._timeout_sec + 1.0)
         return not thread.is_alive()
 
+    def pause(self) -> None:
+        """Suspend non-audio probes while the live ASR session owns the endpoint."""
+
+        with self._wake:
+            self._paused = True
+            self._checking = False
+            self._wake.notify_all()
+
+    def resume(self) -> None:
+        """Resume probing immediately after the live ASR session has stopped."""
+
+        with self._wake:
+            if not self._paused:
+                return
+            self._paused = False
+            # A cached probe from before an active microphone session must not
+            # decide the route for the next one.  The worker wakes now and
+            # replaces it with a fresh result.
+            self._checked_monotonic = None
+            self._checking = True
+            self._wake.notify_all()
+
     def run_once(self) -> bool:
         """Perform one probe; exposed so tests never need a real LAN endpoint."""
 
         started = self._monotonic()
         with self._lock:
+            if self._paused or self._stop.is_set():
+                return self._ready is True
             self._checking = True
         try:
             reported_latency = float(self._probe(self._url, self._timeout_sec))
@@ -155,8 +184,18 @@ class LanAsrHealthMonitor:
                 if checked is not None
                 else None
             )
-            stale = age_ms is None or age_ms > self._stale_after_sec * 1_000.0
-            if self._checking and checked is None:
+            paused = self._paused
+            stale = (
+                not paused
+                and (age_ms is None or age_ms > self._stale_after_sec * 1_000.0)
+            )
+            if paused and self._ready is True:
+                state = LAN_HEALTH_READY
+            elif paused and self._ready is False:
+                state = LAN_HEALTH_UNAVAILABLE
+            elif paused:
+                state = LAN_HEALTH_UNKNOWN
+            elif self._checking and checked is None:
                 state = LAN_HEALTH_CHECKING
             elif self._ready is True and not stale:
                 state = LAN_HEALTH_READY
@@ -174,10 +213,16 @@ class LanAsrHealthMonitor:
                 "latency_ms": self._latency_ms,
                 "consecutive_failures": self._consecutive_failures,
                 "last_error": self._last_error,
+                "probe_suspended": paused,
             }
 
     def _run(self) -> None:
         while not self._stop.is_set():
+            with self._wake:
+                while self._paused and not self._stop.is_set():
+                    self._wake.wait()
+                if self._stop.is_set():
+                    return
             cycle_started = self._monotonic()
             ready = self.run_once()
             target_period = self._interval_sec if ready else self._failure_interval_sec
@@ -186,4 +231,6 @@ class LanAsrHealthMonitor:
             # unavailable LAN on the requested fast retry cadence without
             # overlapping probes.
             delay = max(0.0, target_period - (self._monotonic() - cycle_started))
-            self._stop.wait(delay)
+            with self._wake:
+                if not self._stop.is_set() and not self._paused:
+                    self._wake.wait(timeout=delay)

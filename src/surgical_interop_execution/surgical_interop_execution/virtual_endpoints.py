@@ -18,17 +18,22 @@ EXTERNAL_RETRACTION_SERVICE_ENDPOINT = "/surgery/retraction/command"
 EXTERNAL_CONTROLLER_CONTRACT_TOPIC = "/surgery/controller_contract"
 VIRTUAL_CONTROLLER_CONTRACT_TOPIC = "/integration/virtual/surgery/controller_contract"
 
+# Command producers never select a physical or virtual controller endpoint.
+# They call these stable execution-owner proxy endpoints instead.  The
+# execution bridge remains the only owner of route selection; the proxy keeps
+# an in-flight request bound to the selected route until it reaches a terminal
+# Service receipt or Action result.
+EXECUTION_TOOL_HANDOVER_PROXY_ENDPOINT = "/taskplanner/execution/tool_handover"
+EXECUTION_RETRACTION_PROXY_SERVICE_ENDPOINT = (
+    "/taskplanner/execution/retraction/command"
+)
+
 # This compact, latched JSON projection is deliberately read-only.  It gives
 # the operator UI the independently selected Action and Service sources without
 # teaching the browser how to infer controller identity from endpoint strings.
 EXECUTION_ROUTE_STATE_SCHEMA = "taskplanner.execution_route_state.v1"
 EXECUTION_ROUTE_STATE_TOPIC = "/integration/execution_route/state"
 EXECUTION_ROUTE_COMMAND_SERVICE = "/integration/execution_route/command"
-# Read-only, bounded barrier used by the route coordinator after publishing a
-# new state.  It proves the preflight node has replaced both its Action and
-# Service clients for that exact revision before the coordinator reports a
-# successful switch.  It never evaluates controller health or sends I/O.
-EXECUTION_ROUTE_PREFLIGHT_ACK_SERVICE = "/integration/execution_route/preflight_ack"
 EXTERNAL_ENDPOINT_SOURCE = "external"
 VIRTUAL_ENDPOINT_SOURCE = "virtual"
 _ENDPOINT_SOURCES = frozenset(

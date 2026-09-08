@@ -15,6 +15,7 @@ from retraction_control.command_models import AlgorithmValidationError, ErrorCod
         (0.050, 50.0),
         (0.005, 5.0),
         (0.001, 1.0),
+        (-0.001, -1.0),
     ],
 )
 def test_si_distance_is_converted_once_at_boundary(
@@ -26,7 +27,7 @@ def test_si_distance_is_converted_once_at_boundary(
 
 @pytest.mark.parametrize(
     "distance_m",
-    [0.0, -0.001, float("nan"), float("inf"), True, "0.05"],
+    [0.0, float("nan"), float("inf"), True, "0.05"],
 )
 def test_invalid_distance_never_reaches_sdk_units(distance_m: object) -> None:
     with pytest.raises(AlgorithmValidationError) as raised:

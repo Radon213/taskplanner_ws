@@ -80,6 +80,44 @@ def test_single_and_cumulative_limits_are_inclusive_at_boundary() -> None:
     assert plan.cumulative_distance_mm == 100.0
 
 
+def test_negative_distance_releases_and_inverts_the_adapter_jog() -> None:
+    limits = JogLimits(single_jog_mm=50.0, cumulative_jog_mm=100.0)
+
+    left = build_force_jog(
+        mapping=_mapping(TargetSide.LEFT),
+        limits=limits,
+        distance_m=-0.010,
+        previous_cumulative_mm=25.0,
+    )
+    right = build_force_jog(
+        mapping=_mapping(TargetSide.RIGHT),
+        limits=limits,
+        distance_m=-0.010,
+        previous_cumulative_mm=25.0,
+    )
+
+    assert left.distance_mm == -10.0
+    assert left.signed_distance_mm == -10.0
+    assert left.cumulative_distance_mm == 15.0
+    assert right.distance_mm == -10.0
+    assert right.signed_distance_mm == 10.0
+    assert right.cumulative_distance_mm == 15.0
+
+
+def test_release_cannot_cross_the_taught_retraction_baseline() -> None:
+    with pytest.raises(AlgorithmValidationError) as raised:
+        build_force_jog(
+            mapping=_mapping(TargetSide.LEFT),
+            limits=JogLimits(single_jog_mm=50.0, cumulative_jog_mm=100.0),
+            distance_m=-0.011,
+            previous_cumulative_mm=10.0,
+        )
+
+    assert raised.value.code is ErrorCode.CUMULATIVE_DISTANCE_UNDERFLOW
+    assert raised.value.category is ErrorCategory.LIMIT
+    assert raised.value.context["previous_cumulative_mm"] == 10.0
+
+
 def test_single_jog_limit_violation_has_structured_limit_error() -> None:
     with pytest.raises(AlgorithmValidationError) as raised:
         build_force_jog(
@@ -91,6 +129,19 @@ def test_single_jog_limit_violation_has_structured_limit_error() -> None:
     assert raised.value.code is ErrorCode.DISTANCE_LIMIT_EXCEEDED
     assert raised.value.category is ErrorCategory.LIMIT
     assert raised.value.context["distance_mm"] == 50.0
+
+
+def test_single_jog_limit_applies_to_negative_distance_magnitude() -> None:
+    with pytest.raises(AlgorithmValidationError) as raised:
+        build_force_jog(
+            mapping=_mapping(TargetSide.LEFT),
+            limits=JogLimits(single_jog_mm=9.0, cumulative_jog_mm=100.0),
+            distance_m=-0.010,
+            previous_cumulative_mm=20.0,
+        )
+
+    assert raised.value.code is ErrorCode.DISTANCE_LIMIT_EXCEEDED
+    assert raised.value.context["distance_magnitude_mm"] == 10.0
 
 
 def test_cumulative_limit_violation_is_separate_from_single_limit() -> None:

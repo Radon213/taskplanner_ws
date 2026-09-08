@@ -9,10 +9,12 @@
   <buildtool_depend>ament_python</buildtool_depend>
 
   <exec_depend>auto_apms_behavior_tree</exec_depend>
+  <exec_depend>ament_index_python</exec_depend>
   <exec_depend>btops_gateway</exec_depend>
   <exec_depend>btops_interfaces</exec_depend>
   <exec_depend>bt_orchestrator</exec_depend>
   <exec_depend>hand_keypoint_interfaces</exec_depend>
+  <exec_depend>integration_debug</exec_depend>
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
   <exec_depend>or_digital_twin</exec_depend>
@@ -22,11 +24,11 @@
   <exec_depend>rclpy</exec_depend>
   <exec_depend>simulation_runtime</exec_depend>
   <exec_depend>shadow_evaluation</exec_depend>
-  <exec_depend>skill_execution</exec_depend>
   <exec_depend>surgical_interop_execution</exec_depend>
   <exec_depend>surgical_interop_gateway</exec_depend>
   <exec_depend>surgical_interop_msgs</exec_depend>
   <exec_depend>surgical_msgs</exec_depend>
+  <exec_depend>tool_belief_tracker</exec_depend>
   <exec_depend>vlm_node</exec_depend>
   <exec_depend>voice_command</exec_depend>
 

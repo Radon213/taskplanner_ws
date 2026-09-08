@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { closeSync, createReadStream, fstatSync, openSync, readFileSync, statSync } from "node:fs";
+import { createReadStream, readFileSync, statSync } from "node:fs";
 import { createServer, request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { extname, join, normalize, resolve, sep } from "node:path";
@@ -16,7 +16,6 @@ const COMPRESSIBLE_TYPES = new Set([
   "application/javascript",
   "application/json",
   "application/manifest+json",
-  "application/vnd.apple.mpegurl",
   "image/svg+xml",
   "text/css",
   "text/html",
@@ -32,12 +31,9 @@ const MIME_TYPES = Object.freeze({
   ".jpg": "image/jpeg",
   ".js": "application/javascript; charset=utf-8",
   ".json": "application/json; charset=utf-8",
-  ".m3u8": "application/vnd.apple.mpegurl; charset=utf-8",
   ".map": "application/json; charset=utf-8",
-  ".mp4": "video/mp4",
   ".png": "image/png",
   ".svg": "image/svg+xml; charset=utf-8",
-  ".ts": "video/mp2t",
   ".webp": "image/webp",
   ".woff2": "font/woff2",
   ".xml": "application/xml; charset=utf-8",
@@ -47,13 +43,8 @@ function contentType(pathname) {
   return MIME_TYPES[extname(pathname).toLowerCase()] || "application/octet-stream";
 }
 
-export function cacheControlFor(pathname, { media = false } = {}) {
+export function cacheControlFor(pathname) {
   const normalizedPath = String(pathname || "").toLowerCase();
-  if (media) {
-    return normalizedPath.endsWith(".m3u8") || normalizedPath.endsWith("health.json")
-      ? "no-store"
-      : "public, max-age=10, stale-while-revalidate=10";
-  }
   if (
     normalizedPath.endsWith(".html")
     || normalizedPath.endsWith("runtime-config.js")
@@ -124,32 +115,10 @@ function parseByteRange(value, size) {
   return { start, end };
 }
 
-function serveFile(request, response, filePath, requestPath, { media = false } = {}) {
-  const normalizedRequestPath = String(requestPath || "").toLowerCase();
-  // Native HLS clients commonly send `Range: bytes=0-` even though MPEG-TS
-  // segments are complete, independently decodable objects. Chrome's media
-  // pipeline (and some webOS generations) can reject an otherwise valid TS
-  // segment when that full object is wrapped in a 206 response or arrives
-  // while the live playlist is being atomically replaced. Read HLS objects
-  // from one file descriptor and send one coherent 200 response. Ordinary
-  // static assets retain byte ranges and streaming reads.
-  const completeHlsObject = media && (
-    normalizedRequestPath.endsWith(".m3u8") || normalizedRequestPath.endsWith(".ts")
-  );
+function serveFile(request, response, filePath, requestPath) {
   let stat;
-  let completeHlsBody = null;
   try {
-    if (completeHlsObject) {
-      const descriptor = openSync(filePath, "r");
-      try {
-        stat = fstatSync(descriptor);
-        if (stat.isFile()) completeHlsBody = readFileSync(descriptor);
-      } finally {
-        closeSync(descriptor);
-      }
-    } else {
-      stat = statSync(filePath);
-    }
+    stat = statSync(filePath);
   } catch {
     return false;
   }
@@ -158,8 +127,8 @@ function serveFile(request, response, filePath, requestPath, { media = false } =
   const etag = etagFor(stat);
   const baseHeaders = {
     ...commonHeaders(),
-    "Accept-Ranges": completeHlsObject ? "none" : "bytes",
-    "Cache-Control": cacheControlFor(requestPath, { media }),
+    "Accept-Ranges": "bytes",
+    "Cache-Control": cacheControlFor(requestPath),
     "Content-Type": contentType(filePath),
     ETag: etag,
     "Last-Modified": stat.mtime.toUTCString(),
@@ -170,7 +139,7 @@ function serveFile(request, response, filePath, requestPath, { media = false } =
     return true;
   }
 
-  const rangeHeader = completeHlsObject ? null : request.headers.range;
+  const rangeHeader = request.headers.range;
   if (rangeHeader) {
     const range = parseByteRange(rangeHeader, stat.size);
     if (!range) {
@@ -185,13 +154,6 @@ function serveFile(request, response, filePath, requestPath, { media = false } =
     });
     if (request.method === "HEAD") response.end();
     else createReadStream(filePath, range).pipe(response);
-    return true;
-  }
-
-  if (completeHlsBody) {
-    response.writeHead(200, { ...baseHeaders, "Content-Length": completeHlsBody.length });
-    if (request.method === "HEAD") response.end();
-    else response.end(completeHlsBody);
     return true;
   }
 
@@ -242,6 +204,17 @@ function runtimeProxyConfig(environment = process.env) {
   return { target: new URL(target), token };
 }
 
+export function runtimeProxyTimeoutMs(method, pathname) {
+  if (method !== "POST") return 5_000;
+  if (pathname === "/api/runtime/surgimate") return 33_000;
+  // Owner restart is deliberately synchronous so the UI can report the real
+  // outcome. The host controller bounds it to 75 seconds; keep the proxy just
+  // above that instead of falsely returning 502 while a TTS container is
+  // still completing its normal stop/start cycle.
+  if (pathname === "/api/runtime/owners/restart") return 80_000;
+  return 5_000;
+}
+
 function proxyRuntime(request, response, config) {
   if (!config) {
     sendJson(response, 503, { error: "runtime_control_unavailable" });
@@ -249,6 +222,9 @@ function proxyRuntime(request, response, config) {
   }
   const requestUrl = new URL(request.url, "http://taskplanner.local");
   const upstreamPath = requestUrl.pathname.replace(/^\/api\/runtime/, "/v1/runtime") + requestUrl.search;
+  // Slow host mutations receive endpoint-specific bounded allowances while
+  // ordinary status and transition requests retain their short proxy timeout.
+  const upstreamTimeoutMs = runtimeProxyTimeoutMs(request.method, requestUrl.pathname);
   const requester = config.target.protocol === "https:" ? httpsRequest : httpRequest;
   const upstream = requester({
     protocol: config.target.protocol,
@@ -267,7 +243,7 @@ function proxyRuntime(request, response, config) {
         : {}),
       "x-taskplanner-runtime-control-token": config.token,
     },
-    timeout: 5000,
+    timeout: upstreamTimeoutMs,
   }, (upstreamResponse) => {
     response.writeHead(upstreamResponse.statusCode || 502, {
       ...commonHeaders(),
@@ -296,11 +272,9 @@ function proxyRuntime(request, response, config) {
 
 export function createProductionServer({
   distRoot = DEFAULT_DIST_ROOT,
-  mediaRoot = process.env.MONITOR_MEDIA_ROOT || "/var/run/taskplanner-monitor-media",
   runtimeProxy = runtimeProxyConfig(),
 } = {}) {
   const absoluteDistRoot = resolve(distRoot);
-  const absoluteMediaRoot = resolve(mediaRoot);
   return createServer((request, response) => {
     if (!new Set(["GET", "HEAD", "POST"]).has(request.method || "")) {
       sendJson(response, 405, { error: "method_not_allowed" }, { Allow: "GET, HEAD, POST" });
@@ -308,42 +282,24 @@ export function createProductionServer({
     }
     const requestUrl = new URL(request.url, "http://taskplanner.local");
     if (requestUrl.pathname === "/healthz") {
-      sendJson(response, 200, {
-        service: "taskplanner-webapp",
-        build: createHash("sha256").update(absoluteDistRoot).digest("hex").slice(0, 12),
-      });
+      try {
+        // Vite's entry contains content-addressed asset references. Hash the
+        // served entry, not its directory name, so an in-place build is visible
+        // without restarting this static owner. Missing dist is not healthy.
+        const entry = readFileSync(join(absoluteDistRoot, "index.html"));
+        sendJson(response, 200, {
+          service: "taskplanner-webapp",
+          build: createHash("sha256").update(entry).digest("hex").slice(0, 12),
+        });
+      } catch {
+        sendJson(response, 503, { service: "taskplanner-webapp", error: "static_build_unavailable" });
+      }
       return;
     }
     if (requestUrl.pathname.startsWith("/api/runtime")) {
       proxyRuntime(request, response, runtimeProxy);
       return;
     }
-    if (requestUrl.pathname === "/display" || requestUrl.pathname === "/tv") {
-      response.writeHead(302, {
-        ...commonHeaders(),
-        "Cache-Control": "no-store",
-        Location: "/monitor/index.html?profile=tv",
-      });
-      response.end();
-      return;
-    }
-    if (requestUrl.pathname === "/" && /(?:web0s|webos|netcast)/i.test(String(request.headers["user-agent"] || ""))) {
-      response.writeHead(302, {
-        ...commonHeaders(),
-        "Cache-Control": "no-store",
-        Location: "/monitor/index.html?profile=tv",
-      });
-      response.end();
-      return;
-    }
-
-    if (requestUrl.pathname.startsWith("/media/")) {
-      const mediaPath = safeResolve(absoluteMediaRoot, requestUrl.pathname.slice("/media/".length));
-      if (mediaPath && serveFile(request, response, mediaPath, requestUrl.pathname, { media: true })) return;
-      sendJson(response, 404, { error: "media_not_ready" });
-      return;
-    }
-
     let pathname = requestUrl.pathname === "/" ? "/index.html" : requestUrl.pathname;
     let filePath = safeResolve(absoluteDistRoot, pathname);
     if (filePath && serveFile(request, response, filePath, pathname)) return;
@@ -362,7 +318,6 @@ function parseArguments(argv) {
     if (argv[index] === "--host") options.host = argv[index += 1];
     else if (argv[index] === "--port") options.port = Number(argv[index += 1]);
     else if (argv[index] === "--dist") options.distRoot = argv[index += 1];
-    else if (argv[index] === "--media") options.mediaRoot = argv[index += 1];
   }
   return options;
 }

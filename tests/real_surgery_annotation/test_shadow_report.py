@@ -48,6 +48,8 @@ class ShadowReportTest(unittest.TestCase):
             "runtime": {
                 "input_image_count": 10,
                 "input_transcript_count": 1,
+                "source_transcript_count": 1,
+                "observed_utterance_count": 1,
                 "vlm_result_count": 5,
                 "vlm_unhealthy_count": 0,
                 "vlm_latency_sec": {"median": 1.0, "p95": 1.2},
@@ -176,6 +178,10 @@ class ShadowReportTest(unittest.TestCase):
             evaluation=self.evaluation,
         )
         self.assertIn("Tool Decision Layers", output)
+        self.assertIn(
+            "Source transcripts / router-observed utterances: 1 / 1",
+            output,
+        )
         self.assertIn("Phase ground truth is not available", output)
         self.assertIn(
             "Skill commands / semantic admissions / duplicate-suppressed: 3 / 1 / 2",

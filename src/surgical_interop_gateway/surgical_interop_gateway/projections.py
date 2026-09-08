@@ -24,6 +24,9 @@ _SKILL_FAILURE_STATES = {
     "result_failed",
     "server_unavailable",
 }
+_RETRIEVE_TASK_TYPES = frozenset(
+    {"retrieve_from_mayo", "retrieve_from_hand", "tool_retrieve"}
+)
 
 
 def _value(message: Any, name: str, default: Any = "") -> Any:
@@ -226,8 +229,11 @@ def project_tool_predictions(world: Any) -> tuple[ToolPredictionProjection, ...]
     """
 
     if hasattr(world, "ranked_tool_predictions"):
-        raw_rows = tuple(_value(world, "ranked_tool_predictions", ()))
-        if not raw_rows or len(raw_rows) > 3:
+        # The Digital Twin can retain a longer internal distribution.  The
+        # public snapshot publishes only contiguous ranks 1–3, so discard
+        # lower-ranked rows before atomically validating the exposed set.
+        raw_rows = tuple(_value(world, "ranked_tool_predictions", ()))[:3]
+        if not raw_rows:
             return ()
 
         projections: list[ToolPredictionProjection] = []
@@ -333,11 +339,39 @@ def project_robot_end_effectors(
     """
 
     projections: list[RobotEndEffectorProjection] = []
+    active_task_type = str(
+        _value(world, "active_robot_task_type", "")
+    ).strip().casefold()
+    active_task_tool = str(
+        _value(world, "active_robot_task_tool_id", "")
+    ).strip()
+    active_task_instance = str(
+        _value(world, "active_robot_task_tool_instance_id", "")
+    ).strip()
+    retrieval_in_flight = (
+        active_task_type in _RETRIEVE_TASK_TYPES
+        and bool(active_task_tool)
+    )
     for hand in ("right", "left"):
         instrument_id = str(_value(world, f"{hand}_hand_tool", "")).strip()
         instance_id = str(
             _value(world, f"{hand}_hand_tool_instance_id", "")
         ).strip()
+        evidence_status = DT_ACCEPTED
+        # External ExecuteToolHandover reports no arm and the reducer emits
+        # the Mayo->tray retrieve completion as two back-to-back inventory
+        # events. The one-Hz public snapshot can therefore miss the brief
+        # left-hand possession entirely. An accepted retrieve task is the
+        # authoritative in-flight boundary; project its tool on ARM 1 until
+        # the subsequent controller-confirmed completion clears the task.
+        if (
+            hand == "left"
+            and retrieval_in_flight
+            and not (instrument_id or instance_id)
+        ):
+            instrument_id = active_task_tool
+            instance_id = active_task_instance
+            evidence_status = "TASK_ACCEPTED"
         projections.append(
             RobotEndEffectorProjection(
                 stamp=_value(world, "stamp", None),
@@ -347,6 +381,7 @@ def project_robot_end_effectors(
                 instrument_id=instrument_id,
                 instance_id=instance_id,
                 confidence=1.0,
+                evidence_status=evidence_status,
             )
         )
     return tuple(projections)

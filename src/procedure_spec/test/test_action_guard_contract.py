@@ -27,6 +27,7 @@ def test_action_guard_contract_has_no_phase_uncertainty_handover_veto() -> None:
         "explicit_request_priority",
         "unused_preposition_destination",
         "runtime_requirements",
+        "extensions",
     }
 
 

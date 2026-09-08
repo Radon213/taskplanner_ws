@@ -16,6 +16,7 @@ from .models import (
     HumanoidPolicy,
     InitialInstrumentState,
     InitialPlacement,
+    InstrumentPopulationSpec,
     InstrumentSpec,
     MockObservation,
     MockPerceptionScenario,
@@ -82,7 +83,30 @@ def _scenario_policy_payload(policy: dict) -> dict:
 
     authored = policy.get("scenario_policy")
     if isinstance(authored, dict):
-        return authored
+        payload = dict(authored)
+        runtime_requirements = payload.get("runtime_requirements")
+        if isinstance(runtime_requirements, dict):
+            known_runtime = set(ScenarioRuntimeRequirements.__dataclass_fields__)
+            unknown_runtime = {
+                key: value
+                for key, value in runtime_requirements.items()
+                if key not in known_runtime
+            }
+            payload["runtime_requirements"] = {
+                key: value
+                for key, value in runtime_requirements.items()
+                if key in known_runtime
+            }
+            if unknown_runtime:
+                extensions = payload.get("extensions", {})
+                if not isinstance(extensions, dict):
+                    extensions = {}
+                extensions = dict(extensions)
+                extensions.setdefault(
+                    "runtime_requirements_extensions", unknown_runtime
+                )
+                payload["extensions"] = extensions
+        return payload
     action = policy.get("action_guard", {})
     humanoid = policy.get("humanoid_policy", {})
     return {
@@ -202,6 +226,18 @@ def load_bundle(bundle_dir: str | Path | None = None) -> ProcedureSpec:
                 requestable=_instrument_requestable(instrument),
                 role=str(instrument.get("role", "")),
                 handover_profile=str(instrument["handover_profile"]),
+                population=InstrumentPopulationSpec(
+                    initial_count=int(instrument.get("inventory_count", 1)),
+                    capacity=int(
+                        instrument.get(
+                            "inventory_capacity",
+                            instrument.get("inventory_count", 1),
+                        )
+                    ),
+                    exchangeable=bool(
+                        instrument.get("exchangeable_population", False)
+                    ),
+                ),
             )
             for instrument in instruments["instruments"]
         ],
@@ -282,6 +318,7 @@ def load_bundle(bundle_dir: str | Path | None = None) -> ProcedureSpec:
                 if isinstance(runtime_requirements, dict)
                 else None
             ),
+            extensions=dict(scenario_policy.get("extensions", {})),
         ),
         bed_robot_arm_groups=BedRobotArmProcedureSpec(
             directions=[str(item) for item in bed_robot_arm_groups.get("direction_enum", [])],

@@ -2,13 +2,11 @@ cmake_minimum_required(VERSION 3.16)
 project(surgical_msgs)
 
 find_package(ament_cmake REQUIRED)
-find_package(action_msgs REQUIRED)
 find_package(builtin_interfaces REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 find_package(std_msgs REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
-  "action/ExecuteSkill.action"
   "msg/BTDecision.msg"
   "msg/BTContextSnapshot.msg"
   "msg/BedRobotArmGroupActionProposal.msg"
@@ -44,7 +42,6 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/ToolObservation.msg"
   "msg/TwinEvent.msg"
   "msg/VLMHealth.msg"
-  "msg/VLMFunctionCallStatus.msg"
   "msg/VLMInferenceProposal.msg"
   "msg/VLMRequestContext.msg"
   "msg/VLMReducerDecision.msg"
@@ -62,7 +59,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/SelectShadowCase.srv"
   "srv/SelectModelProvider.srv"
   "srv/SelectSimulationBundle.srv"
-  DEPENDENCIES action_msgs builtin_interfaces std_msgs
+  DEPENDENCIES builtin_interfaces std_msgs
 )
 
 ament_export_dependencies(rosidl_default_runtime)

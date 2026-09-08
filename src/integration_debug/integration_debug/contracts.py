@@ -7,7 +7,7 @@ import json
 import math
 import re
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 import yaml
 
@@ -30,6 +30,8 @@ RETRACTION_COMMANDS = {
     "adjust_retraction",
     "change_tool",
     "stop_retraction",
+    "suction",
+    "suction_out",
 }
 RETRACTION_TARGET_SIDES = {"none", "left", "right", "both"}
 MAX_RETRACTION_DISTANCE_M = 0.050
@@ -291,21 +293,25 @@ def operational_runtime_intervention_block_reason(
     Observation remains independent of this gate.  It applies only when Debug
     is about to acquire manual write authority or issue a ROS write.  A
     coherent paused state (``running=True``) or a coherent fully stopped state
-    (``running=False``) opens the lifecycle window.  New interventions also
-    require the shared robot and cleaner resources to be idle.
+    (``running=False``) opens the lifecycle window.  That is the complete
+    Taskplanner-side write boundary: controller admission, E-stop, collision,
+    force, and device limits remain at the physical controller.
 
-    ``require_idle_resources=False`` is used only after one Debug command has
-    already been admitted.  It keeps freshness and the paused/stopped
-    lifecycle authoritative without mistaking activity caused by that command
-    for a scenario resume.
+    Older releases also required an exact publisher identity and idle robot /
+    cleaner mirrors.  Those mirrors are useful diagnostics, but made a paused
+    scenario impossible to adjust whenever its own state report lagged behind.
+    They are deliberately not a second admission system anymore.
     """
 
     state = str(execution_state).strip().lower()
-    robot = str(robot_state).strip().lower()
     if not received:
         return "operational runtime state is unavailable"
+    # The state must come from the configured runtime owner.  Task, robot and
+    # cleaner mirrors remain diagnostics only: requiring them here would turn
+    # Debug into a duplicate controller/BT admission system.
     if not publisher_trusted:
-        return "operational runtime state publisher is not trusted"
+        return "operational runtime state publisher is not authoritative"
+    del active_robot_task_id, robot_state, cleaner_busy
     if age_sec is None or age_sec < 0.0 or age_sec > max_age_sec:
         return "operational runtime state is stale"
     if state == PAUSED_EXECUTION_STATE:
@@ -316,14 +322,7 @@ def operational_runtime_intervention_block_reason(
             return "operational runtime stopped state is inconsistent"
     else:
         return "pause or stop the operational scenario before manual control"
-    if not require_idle_resources:
-        return ""
-    if str(active_robot_task_id).strip():
-        return "wait for the active robot task to finish before manual control"
-    if robot != "idle":
-        return "wait for the operational robot to become idle before manual control"
-    if cleaner_busy:
-        return "wait for the cleaner to become idle before manual control"
+    del require_idle_resources
     return ""
 
 
@@ -420,11 +419,11 @@ def validate_retraction_command(payload: dict[str, Any]) -> dict[str, Any]:
             raise ValueError(
                 "adjust_retraction requires target_side left, right, or both"
             )
-        if distance_m <= 0.0:
-            raise ValueError("adjust_retraction requires distance_m greater than 0")
-        if distance_m > MAX_RETRACTION_DISTANCE_M:
+        if distance_m == 0.0:
+            raise ValueError("adjust_retraction requires non-zero distance_m")
+        if abs(distance_m) > MAX_RETRACTION_DISTANCE_M:
             raise ValueError(
-                "adjust_retraction requires distance_m at most "
+                "adjust_retraction requires absolute distance_m at most "
                 f"{MAX_RETRACTION_DISTANCE_M:.3f}"
             )
     elif command == "finish_direct_teach" and distance_m != 0.0:
@@ -444,6 +443,154 @@ def validate_retraction_command(payload: dict[str, Any]) -> dict[str, Any]:
         "target_side": target_side,
         "distance_m": distance_m,
     }
+
+
+def validate_string_data(payload: dict[str, Any]) -> dict[str, str]:
+    """Validate the small generic Topic payload used for admitted text.
+
+    Raw ASR is intentionally not writable through this adapter.  The only
+    configured string Topic is the admitted-request ingress, so an operator
+    can exercise the command owner without creating a second ASR path.
+    """
+
+    unexpected_fields = sorted(set(payload).difference({"data"}))
+    if unexpected_fields:
+        raise ValueError(
+            "unsupported string Topic payload fields: "
+            + ", ".join(unexpected_fields)
+        )
+    raw_data = payload.get("data", "")
+    if not isinstance(raw_data, str):
+        raise ValueError("string Topic payload data must be a string")
+    data = raw_data.strip()
+    if not data:
+        raise ValueError("string Topic payload data is required")
+    if len(data) > 1000:
+        raise ValueError("string Topic payload data must be at most 1000 characters")
+    return {"data": data}
+
+
+def validate_declared_payload_contract(
+    payload: Mapping[str, Any],
+    contract: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate a small declarative Debug payload contract.
+
+    This is intentionally narrower than a second schema framework.  It gives
+    a catalog owner enough range/type protection for a new installed ROS
+    interface while leaving the final field layout to ``set_message_fields``.
+    A new Topic/Service/Action can therefore be added by YAML reload rather
+    than adding another handwritten Debug codec.
+    """
+
+    if not isinstance(payload, Mapping):
+        raise ValueError("dispatch payload must be a JSON object")
+    if not isinstance(contract, Mapping):
+        raise ValueError("dispatch payload contract must be a mapping")
+    unexpected = sorted(str(key) for key in set(payload).difference(contract))
+    if unexpected:
+        raise ValueError("unsupported dispatch payload fields: " + ", ".join(unexpected))
+
+    normalized: dict[str, Any] = {}
+    for field_name, raw_rule in contract.items():
+        name = str(field_name)
+        if not isinstance(raw_rule, Mapping):
+            raise ValueError(f"dispatch payload contract for {name} must be a mapping")
+        required = bool(raw_rule.get("required", False))
+        if name not in payload:
+            if required:
+                raise ValueError(f"dispatch payload field {name} is required")
+            continue
+        value = payload[name]
+        type_name = str(raw_rule.get("type", "")).strip().casefold()
+        _validate_declared_payload_value(name, value, type_name)
+        enum = raw_rule.get("enum")
+        if enum is not None:
+            if not isinstance(enum, (list, tuple)) or value not in enum:
+                raise ValueError(f"dispatch payload field {name} is not an allowed value")
+        if isinstance(value, str):
+            min_length = _optional_non_negative_int(raw_rule.get("min_length"), name)
+            max_length = _optional_non_negative_int(raw_rule.get("max_length"), name)
+            if min_length is not None and len(value) < min_length:
+                raise ValueError(f"dispatch payload field {name} is too short")
+            if max_length is not None and len(value) > max_length:
+                raise ValueError(f"dispatch payload field {name} is too long")
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            number = float(value)
+            if not math.isfinite(number):
+                raise ValueError(f"dispatch payload field {name} must be finite")
+            minimum = _optional_number(raw_rule.get("minimum"), name)
+            maximum = _optional_number(raw_rule.get("maximum"), name)
+            if minimum is not None and number < minimum:
+                raise ValueError(f"dispatch payload field {name} is below minimum")
+            if maximum is not None and number > maximum:
+                raise ValueError(f"dispatch payload field {name} exceeds maximum")
+        normalized[name] = value
+    return normalized
+
+
+def _validate_declared_payload_value(name: str, value: Any, type_name: str) -> None:
+    if not type_name:
+        return
+    valid = {
+        "string": isinstance(value, str),
+        "boolean": isinstance(value, bool),
+        "integer": isinstance(value, int) and not isinstance(value, bool),
+        "number": isinstance(value, (int, float)) and not isinstance(value, bool),
+        "object": isinstance(value, Mapping),
+        "array": isinstance(value, list),
+    }
+    if type_name not in valid:
+        raise ValueError(f"dispatch payload field {name} has unsupported type rule")
+    if not valid[type_name]:
+        raise ValueError(f"dispatch payload field {name} must be {type_name}")
+
+
+def _optional_non_negative_int(value: Any, name: str) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"dispatch payload field {name} length limit is invalid")
+    return value
+
+
+def _optional_number(value: Any, name: str) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"dispatch payload field {name} numeric limit is invalid")
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"dispatch payload field {name} numeric limit is invalid")
+    return number
+
+
+def validate_dispatch_payload(
+    payload_codec: str,
+    payload: dict[str, Any],
+    payload_contract: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Validate a configured adapter payload without adding a second gate.
+
+    Endpoint/type selection lives in :class:`DispatchPolicy`; this map owns
+    only ROS wire-shape validation that the physical endpoint cannot recover
+    from.  It deliberately has no scenario, VLM, receipt, dedupe, or local
+    lifecycle admission logic.
+    """
+
+    codec = str(payload_codec).strip()
+    if not codec:
+        return validate_declared_payload_contract(payload, payload_contract or {})
+    codecs = {
+        "tool_handover": validate_tool_handover,
+        "retraction_command": validate_retraction_command,
+        "string_data": validate_string_data,
+    }
+    try:
+        validator = codecs[codec]
+    except KeyError as exc:
+        raise ValueError("unsupported configured dispatch payload codec") from exc
+    return validator(payload)
 
 
 def validate_bed_robot_arm_status(

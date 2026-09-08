@@ -1,0 +1,90 @@
+# Taskplanner research architecture policy
+#
+# This file is deliberately human-readable TOML so people and coding agents can
+# use the same source of truth.  It is an engineering policy, not a runtime
+# safety controller configuration.
+
+[workspace]
+profile = "research"
+primary_goal = "fast, local, reversible iteration"
+authoritative_policy_file = "taskplanner_principles.toml"
+breaking_compatibility_allowed = true
+legacy_policy = "Migrate once, retain a tagged release, then delete the live compatibility path."
+
+[ownership]
+rule = "Each concept has one runtime owner. Observers project state but do not re-admit or re-dispatch it."
+command_owner = "command_router"
+scenario_owner = "scenario_store"
+route_owner = "execution_router"
+physical_owner = "external_controller_or_physical_adapter"
+
+[commands]
+existing_ros_type_change = "catalog_reload"
+new_python_adapter_change = "restart_adapter_only_when_existing_installed_entrypoint_is_used"
+new_installed_python_entrypoint_change = "build_adapter_package_only"
+new_custom_ros_idl_change = "build_interface_and_direct_consumers_only"
+deterministic_command_path = "ingress -> command_router -> typed_adapter -> endpoint"
+deterministic_commands_must_not_require = ["vlm_reply", "scenario_command_allowlist", "bt_intermediate_hop", "digital_twin_receipt"]
+ingress_checks = ["final_utterance", "source", "freshness", "tts_echo", "utterance_id_dedupe"]
+boundary_checks = ["ros_type", "finite_values", "basic_range", "endpoint_availability", "command_id"]
+server_idempotency_owner = "external_controller_or_endpoint_server"
+
+[scenario]
+configuration_owner = "scenario_store"
+reload_strategy = "parse_minimally_then_atomic_swap_keep_last_good"
+required_validation = ["yaml_parse", "nonempty_unique_ids", "referenced_id_exists", "finite_numeric_values"]
+optional_lint = ["ui_layout_completeness", "inventory_naming_style", "catalog_cross_checks", "historical_compatibility"]
+live_reload_changes = ["labels", "aliases", "ui_layout", "observation_thresholds"]
+paused_or_stopped_changes = ["behavior_policy", "tool_initial_layout", "phase_transition_policy", "scenario_selection"]
+automatic_reset_on_reload = false
+start_behavior = "begin_from_current_quiescent_twin_state"
+canonical_layout_reset = "explicit_reset_only"
+
+[execution]
+explicit_operator_command_during_running_scenario = "allow_if_target_server_admits"
+autonomous_workflow_command = "scenario_policy_controls"
+route_change_requires = ["stopped", "no_inflight_for_target_resource"]
+route_change_must_not_require = ["digital_twin_reset", "duplicate_preflight_ack", "ui_admission"]
+
+[debug]
+observer_access = "always_on_read_only"
+intervention_requires = ["authoritative_paused_or_stopped_state"]
+physical_write_requires = ["explicit_arm", "paused_or_stopped", "single_flight_per_resource"]
+dispatch_shape = "kind_endpoint_type_payload_timeout"
+
+[physical_safety]
+never_remove = [
+  "controller_estop",
+  "controller_collision_force_velocity_joint_workspace_limits",
+  "physical_endpoint_type_and_payload_validation",
+  "command_id_idempotency",
+  "action_feedback_result_cancel",
+  "ambiguous_completion_recovery"
+]
+not_a_taskplanner_start_gate = ["asr_health", "camera_health", "vlm_health", "unrelated_service_health"]
+
+[runtime]
+same_mode_restart = "restart_core_only"
+config_change = "reload_owner_only"
+asr_change = "restart_asr_only"
+ui_change = "web_hmr_or_web_build_only"
+owner_launch_registry = "runtime_owner_launch is registry_and_dispatch_only"
+owner_launch_wiring = "one runtime_owners module per independently restartable owner"
+runtime_policy_projection = "publish read_only current policy state; browser presentation must not mirror mutable policy constants"
+build_trigger = ["custom_ros_idl", "cpp_abi", "new_or_changed_installed_console_or_launch_entrypoint"]
+never_auto_do_on_warm_restart = ["workspace_wide_build", "sidecar_recreate", "bytecode_deletion", "full_graph_uniqueness_check", "source_hash_census"]
+
+[validation]
+default_tier = "focused_smoke_under_10_seconds"
+release_tier = "optional_manual_or_ci_contract_suite"
+diagnostics = "report_health_without_globally_blocking_unrelated_work"
+
+[ui_iteration]
+shared_policy_file = "../ui_iteration_principles.toml"
+presentation_only_definition = "A value already exists in normalized browser state or a current view model."
+presentation_only_owner = "webapp presentation selectors and scoped components"
+presentation_only_must_not = ["restart_ros", "restart_asr", "restart_vlm", "rebuild_workspace", "run_release_suite", "send_action_or_service"]
+development_path = "taskplanner ui dev"
+static_publish_path = "taskplanner ui apply"
+fast_validation = "focused projection or DOM smoke under 10 seconds"
+release_validation = "explicit full Playwright and bundle checks only"

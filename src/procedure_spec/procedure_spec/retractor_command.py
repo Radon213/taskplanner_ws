@@ -130,6 +130,7 @@ _DIRECT_TEACH_TERMS = (
     "directteach",
     "directteech",
     "directteaching",
+    "teaching",
     "가르치기",
     "가르치",
     "가르쳐",
@@ -151,6 +152,7 @@ _RETRACTION_TERMS = (
     "리트렉타",
     "견인",
     "retraction",
+    "retration",
     "retracton",
     "retractoin",
     "retracion",
@@ -255,6 +257,8 @@ _ADJUSTMENT_TERMS = (
     "이동",
     "당겨",
     "당기",
+    "땡겨",
+    "땡기",
     "끌어",
     "밀어",
     "조금",
@@ -269,6 +273,14 @@ _ADJUSTMENT_TERMS = (
     "move",
     "pull",
     "shift",
+)
+_LESS_PULL_TERMS = (
+    "덜당겨",
+    "덜당기",
+    "덜땡겨",
+    "덜땡기",
+    "lesspull",
+    "pullless",
 )
 _LEFT_TERMS = (
     "왼쪽",
@@ -479,6 +491,18 @@ def _distance_m(spaced: str) -> tuple[float | None, str]:
     return DEFAULT_ADJUSTMENT_DISTANCE_M, "default_adjustment_distance"
 
 
+def _is_less_pull_intent(compact: str, spaced: str) -> bool:
+    """Return whether a pull adjustment explicitly asks for less tension.
+
+    The sign is derived from an explicit lexical cue rather than accepting a
+    spoken negative number.  This keeps malformed/signed measurements
+    rejected while encoding ``1 cm 덜 당겨줘`` as the existing adjustment
+    command with ``distance_m=-0.01``.
+    """
+
+    return _contains_any(compact, spaced, _LESS_PULL_TERMS)
+
+
 def _is_adjustment_intent(
     compact: str,
     spaced: str,
@@ -670,6 +694,9 @@ def normalize_retractor_adjustment_parameters(
     distance_m, distance_reason = _distance_m(spaced)
     if distance_m is None:
         return _rejected(distance_reason)
+    less_pull = _is_less_pull_intent(compact, spaced)
+    if less_pull:
+        distance_m = -distance_m
     return NormalizedRetractionCommand(
         command=RetractionCommand.ADJUST_RETRACTION,
         target_side=target_side,
@@ -679,7 +706,10 @@ def normalize_retractor_adjustment_parameters(
             if distance_reason == "explicit_adjustment_distance"
             else 0.90
         ),
-        reason=f"grounded_adjust_retraction_{distance_reason}",
+        reason=(
+            f"grounded_adjust_retraction_{distance_reason}"
+            + ("_less_pull" if less_pull else "")
+        ),
     )
 
 

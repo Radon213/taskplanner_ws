@@ -136,7 +136,7 @@ class SmokeHarness(Node):
         )
         self._control_client = self.create_client(ControlSimulation, "/simulation/control")
         self._override_client = self.create_client(
-            InjectSurgeonOverride, "/simulation/inject_surgeon_override"
+            InjectSurgeonOverride, "/simulation/operational_surgeon_override"
         )
 
     def _on_catalog(self, msg: CatalogSnapshot) -> None:

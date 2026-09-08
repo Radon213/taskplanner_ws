@@ -19,6 +19,7 @@ from vlm_node.real_vlm import (
     dynamic_cam4_crop_xywh,
     explicit_phase_start_floor_context,
     image_samples_are_aligned,
+    periodic_live_timer_required,
     should_run_periodic_live_frame,
     should_trigger_replay_frame,
     should_trigger_source_time_live_frame,
@@ -47,6 +48,13 @@ def test_periodic_live_inference_does_not_repeat_a_stalled_frame() -> None:
     assert not should_run_periodic_live_frame(71.518, 71.518)
     assert should_run_periodic_live_frame(71.518, 77.504)
     assert should_run_periodic_live_frame(77.504, 0.0)
+
+
+def test_source_time_live_inference_does_not_need_a_periodic_timer() -> None:
+    assert not periodic_live_timer_required("live", True)
+    assert not periodic_live_timer_required("live", False)
+    assert not periodic_live_timer_required("replay", True)
+    assert periodic_live_timer_required("oracle", True)
 
 
 def test_source_frame_freshness_uses_replay_clock_lag() -> None:
@@ -246,7 +254,7 @@ def _sample(
 def test_source_time_live_scheduler_admits_every_frame_without_period_throttle() -> None:
     node = RealVLMNode.__new__(RealVLMNode)
     node._inference_backpressure = InferenceBackpressure()
-    node._source_time_triggered_live = True
+    node._source_time_triggered_live = False
     node._response_mode = "live"
     node._active = True
     node._publish_period_sec = 1.0

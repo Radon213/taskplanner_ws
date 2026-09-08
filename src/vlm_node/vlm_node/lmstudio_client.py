@@ -209,8 +209,15 @@ class LMStudioClient:
                 developer_prompt=developer_prompt,
                 user_context_json=user_context_json,
                 images=images,
+                explicit_cache_boundary=self._provider_id == "ninfer",
             ),
         }
+        if self._provider_id == "ninfer":
+            # Keep the immutable instruction prefix reusable while the user
+            # context and images continue to change every frame. NInfer's
+            # explicit mode disables its automatic boundary at the changing
+            # user suffix; exact published prefixes remain readable.
+            body["prompt_cache_options"] = {"mode": "explicit"}
         if generation_seed is not None:
             body["seed"] = generation_seed
         # NInfer intentionally does not implement constrained JSON decoding;
@@ -257,6 +264,7 @@ class LMStudioClient:
         developer_prompt: str,
         user_context_json: str,
         images: list[tuple[str, bytes, str]],
+        explicit_cache_boundary: bool = False,
     ) -> list[dict[str, Any]]:
         user_content: list[dict[str, Any]] = [
             {
@@ -281,9 +289,23 @@ class LMStudioClient:
                 }
             )
 
-        system_content = system_prompt
-        if developer_prompt:
-            system_content = f"{system_prompt}\n\n{developer_prompt}"
+        if explicit_cache_boundary:
+            # NInfer accepts typed text parts for system messages. Put the
+            # marker after the stable procedure prompt so a retry-specific
+            # developer suffix does not invalidate the reusable prefix.
+            system_content: Any = [
+                {
+                    "type": "text",
+                    "text": system_prompt,
+                    "prompt_cache_breakpoint": {"mode": "explicit"},
+                }
+            ]
+            if developer_prompt:
+                system_content.append({"type": "text", "text": developer_prompt})
+        else:
+            system_content = system_prompt
+            if developer_prompt:
+                system_content = f"{system_prompt}\n\n{developer_prompt}"
 
         return [
             {"role": "system", "content": system_content},

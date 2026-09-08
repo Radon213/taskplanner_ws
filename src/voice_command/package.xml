@@ -2,17 +2,20 @@
 <package format="3">
   <name>voice_command</name>
   <version>0.1.0</version>
-  <description>Proposal-only natural-language voice intent resolution for Taskplanner.</description>
+  <description>Direct typed voice intent resolution and hot-reloadable command routing for Taskplanner.</description>
   <maintainer email="codex@example.invalid">Taskplanner maintainers</maintainer>
   <license>Apache-2.0</license>
 
   <buildtool_depend>ament_python</buildtool_depend>
 
   <exec_depend>rclpy</exec_depend>
+  <exec_depend>ament_index_python</exec_depend>
   <exec_depend>procedure_spec</exec_depend>
   <exec_depend>std_msgs</exec_depend>
   <exec_depend>surgical_interop_msgs</exec_depend>
   <exec_depend>surgical_msgs</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
+  <exec_depend>rosidl_runtime_py</exec_depend>
 
   <test_depend>python3-pytest</test_depend>
 

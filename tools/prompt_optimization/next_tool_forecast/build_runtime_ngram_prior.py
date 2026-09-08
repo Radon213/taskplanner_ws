@@ -72,9 +72,8 @@ def _runtime_tool_mapping() -> dict[str, str]:
 
     The frozen prior models future scrub-nurse-to-surgeon handovers.  A tool
     can be present in the procedure inventory yet deliberately unavailable for
-    a new handover (for example, a field-deployed, surgeon-owned Allis).  It
-    must then form a history boundary, rather than leaking into a generated
-    candidate or joining the transitions on either side of it.
+    a new handover. It must then form a history boundary, rather than leaking
+    into a generated candidate or joining the transitions on either side of it.
     """
 
     prompt = load_yaml(PROCEDURE_PROMPT_PATH)
@@ -82,20 +81,25 @@ def _runtime_tool_mapping() -> dict[str, str]:
     if not isinstance(raw_tools, Mapping):
         raise RuntimeNgramPriorBuildError("procedure prompt has no tools mapping")
     runtime_ids = {str(tool_id) for tool_id in raw_tools}
-    raw_requestable = prompt.get("requestable_tools")
+    raw_scenario_policy = prompt.get("scenario_policy")
+    if not isinstance(raw_scenario_policy, Mapping):
+        raise RuntimeNgramPriorBuildError(
+            "procedure prompt has no scenario_policy mapping"
+        )
+    raw_requestable = raw_scenario_policy.get("requestable_tools")
     if not isinstance(raw_requestable, list):
         raise RuntimeNgramPriorBuildError(
-            "procedure prompt has no requestable_tools list"
+            "procedure prompt scenario_policy has no requestable_tools list"
         )
     requestable_ids = {str(tool_id).strip() for tool_id in raw_requestable}
     if not requestable_ids or "" in requestable_ids:
         raise RuntimeNgramPriorBuildError(
-            "procedure prompt requestable_tools must contain runtime IDs"
+            "procedure prompt scenario_policy.requestable_tools must contain runtime IDs"
         )
     unknown_requestable = sorted(requestable_ids - runtime_ids)
     if unknown_requestable:
         raise RuntimeNgramPriorBuildError(
-            "procedure prompt requestable_tools contains unknown runtime IDs: "
+            "procedure prompt scenario_policy.requestable_tools contains unknown runtime IDs: "
             + ", ".join(unknown_requestable)
         )
     refs = tool_ref_mapping()  # Runtime Txx -> observable catalog ID.

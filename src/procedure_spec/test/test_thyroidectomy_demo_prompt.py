@@ -110,17 +110,27 @@ def test_demo_prompt_contains_rack_inventory_without_bed_arm_retractors() -> Non
 
     assert spec.list_instrument_ids() == [
         "T02",
-        "T03",
         "T04",
         "T07",
+        "T08",
     ]
     assert spec.get_tool_inventory() == {
         "T02": 1,
-        "T03": 2,
         "T04": 1,
         "T07": 1,
+        "T08": 1,
     }
-    assert sum(spec.get_tool_inventory().values()) == 5
+    assert spec.get_tool_inventory_capacity() == {
+        "T02": 2,
+        "T04": 2,
+        "T07": 2,
+        "T08": 2,
+    }
+    assert all(
+        spec.is_exchangeable_population(tool_id)
+        for tool_id in ("T02", "T04", "T07", "T08")
+    )
+    assert sum(spec.get_tool_inventory().values()) == 4
     assert spec.resolve_instrument_alias("Yankauer suction") is None
     assert spec.resolve_instrument_alias("Army navy retractor") is None
     assert spec.resolve_instrument_alias("thyroid retractor") is None
@@ -131,18 +141,20 @@ def test_demo_prompt_contains_rack_inventory_without_bed_arm_retractors() -> Non
         for placement in spec.bundle.initial_placements
     ] == [
         ("T02", "main_tray_slot_1"),
-        ("T03", "main_tray_slot_2"),
-        ("T04", "main_tray_slot_3"),
-        ("T07", "main_tray_slot_4"),
+        ("T04", "main_tray_slot_2"),
+        ("T07", "main_tray_slot_3"),
+        ("T08", "main_tray_slot_4"),
     ]
     requestable = {
         instrument.id
         for instrument in spec.bundle.instruments
         if instrument.requestable
     }
-    assert requestable == {"T02", "T04", "T07"}
+    assert requestable == {"T02", "T04", "T07", "T08"}
     assert spec.resolve_instrument_alias("아드손") == "T02"
     assert spec.resolve_instrument_alias("애드손") == "T02"
+    assert spec.resolve_instrument_alias("Bipolar Forceps") == "T07"
+    assert spec.resolve_instrument_alias("모스키토") == "T08"
     assert [
         location.id
         for location in spec.bundle.locations
@@ -157,8 +169,7 @@ def test_demo_prompt_contains_rack_inventory_without_bed_arm_retractors() -> Non
         for state in spec.get_initial_instrument_states()
     ] == [
         ("T02#1", "main_tray_slot_1", "home_rack"),
-        ("T03#1", "field_region_procedure", "surgeon_owned"),
-        ("T03#2", "field_region_procedure", "surgeon_owned"),
+        ("T08#1", "main_tray_slot_4", "home_rack"),
     ]
     deployed_instances = {
         state.instance_id for state in spec.get_initial_instrument_states()
@@ -253,7 +264,7 @@ def test_tool_voice_aliases_cannot_impersonate_another_tools_builtin_name(
         _build_with_tool_voice_aliases(tmp_path, {"T02": ["Bovie"]})
 
 
-def test_demo_mock_bootstrap_does_not_overwrite_instance_level_field_setup() -> None:
+def test_demo_mock_bootstrap_contains_only_current_home_rack_inventory() -> None:
     bundle_dir = _spec_root() / "thyroidectomy_demo"
     display_catalog = yaml.safe_load(
         (bundle_dir.parent / "display_catalog.yaml").read_text(encoding="utf-8")
@@ -261,7 +272,12 @@ def test_demo_mock_bootstrap_does_not_overwrite_instance_level_field_setup() -> 
     raw_bundle = build_raw_bundle_from_prompt(bundle_dir, display_catalog)
     bootstrap = raw_bundle["mock_perception"]["stages"][0]["observations"]
 
-    assert [row["instrument_id"] for row in bootstrap] == ["T02", "T04", "T07"]
+    assert [row["instrument_id"] for row in bootstrap] == [
+        "T02",
+        "T04",
+        "T07",
+        "T08",
+    ]
     assert all(row["instrument_id"] != "T03" for row in bootstrap)
     summary = raw_bundle["mock_perception"]["stages"][0]["scene_summary"]
     assert "Only unambiguous home-rack instruments" in summary
@@ -390,7 +406,7 @@ def test_demo_prompt_keeps_bed_arm_retraction_out_of_rack_handover_patterns() ->
             "high",
         ],
         [
-            "T03",
+            "T02",
             "T07",
             "a visibly equivalent focal control can be followed by bipolar",
             "medium",
@@ -405,11 +421,11 @@ def test_demo_prompt_keeps_bed_arm_retraction_out_of_rack_handover_patterns() ->
     assert compact["phase_groups"]["M02"]["members"] == ["P04", "P05"]
     assert compact["roles"]["P03"] == {
         "entry_handover": ["T02"],
-        "tissue_handling": ["T02", "T03"],
+        "tissue_handling": ["T02"],
         "dissection_or_hemostasis": ["T04", "T07"],
     }
     assert compact["roles"]["P06"] == {
-        "focal_control": ["T03"],
+        "focal_control": ["T02"],
         "localized_treatment_alternatives": ["T07", "T04"],
     }
     assert compact["bed_robot_arm_groups"]["groups"]["retraction"] == {
@@ -428,6 +444,8 @@ def test_demo_prompt_keeps_bed_arm_retraction_out_of_rack_handover_patterns() ->
     assert compact["bed_robot_arm_groups"]["end_effector_transitions"] == []
     assert "T05" not in serialized
     assert "T11" not in serialized
+    assert "T03" not in serialized
+    assert "Allis" not in serialized
     assert "energy tool is merely exchanged" in compact["exclude"]["P06"][0]
     assert "specimen is separated" in compact["cues"]["P07"][1]
 
@@ -435,7 +453,7 @@ def test_demo_prompt_keeps_bed_arm_retraction_out_of_rack_handover_patterns() ->
 def test_remaining_tool_use_includes_authored_phase_roles() -> None:
     spec = load_bundle(_spec_root() / "thyroidectomy_demo")
 
-    assert set(spec.get_expected_instruments("P04")) == {"T02", "T03"}
+    assert set(spec.get_expected_instruments("P04")) == {"T02"}
     remaining = set(spec.get_remaining_expected_instruments("P03"))
     assert {"T04", "T07"}.issubset(remaining)
     assert {"T05", "T11"}.isdisjoint(remaining)
@@ -479,8 +497,8 @@ def test_demo_prompt_encodes_cross_case_functional_handover_patterns() -> None:
     assert [row[3] for row in compact["seq"]["P03"][:4]] == ["high"] * 4
     assert [row[:2] for row in compact["seq"]["P05"][:3]] == [
         ["T02", "T07"],
-        ["T07", "T03"],
-        ["T02", "T03"],
+        ["T02", "T04"],
+        ["T02", "T02"],
     ]
     assert compact["roles"]["P03"]["entry_handover"] == ["T02"]
     assert compact["handover_patterns"]["primary"] == [

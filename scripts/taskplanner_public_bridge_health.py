@@ -42,7 +42,12 @@ def read_http_headers(connection, *, limit: int = MAX_RESPONSE_HEADER_BYTES) -> 
     return bytes(response[:end])
 
 
-def validate_websocket_upgrade(response: bytes, key: str) -> None:
+def validate_websocket_upgrade(
+    response: bytes,
+    key: str,
+    *,
+    contract: str = PUBLIC_BRIDGE_CONTRACT,
+) -> None:
     try:
         lines = response.decode("iso-8859-1").split("\r\n")
     except UnicodeDecodeError as error:
@@ -81,11 +86,19 @@ def validate_websocket_upgrade(response: bytes, key: str) -> None:
     ).decode("ascii")
     if exactly_one("Sec-WebSocket-Accept") != expected_accept:
         raise ValueError("invalid Sec-WebSocket-Accept header")
-    if exactly_one(PUBLIC_BRIDGE_CONTRACT_HEADER) != PUBLIC_BRIDGE_CONTRACT:
+    if exactly_one(PUBLIC_BRIDGE_CONTRACT_HEADER) != contract:
         raise ValueError("invalid public bridge contract header")
 
 
-def probe(host: str, port: int, path: str, origin: str, timeout: float) -> None:
+def probe(
+    host: str,
+    port: int,
+    path: str,
+    origin: str,
+    timeout: float,
+    *,
+    contract: str = PUBLIC_BRIDGE_CONTRACT,
+) -> None:
     key = base64.b64encode(os.urandom(16)).decode("ascii")
     request = (
         f"GET {path} HTTP/1.1\r\n"
@@ -100,7 +113,7 @@ def probe(host: str, port: int, path: str, origin: str, timeout: float) -> None:
         connection.settimeout(timeout)
         connection.sendall(request)
         response = read_http_headers(connection)
-    validate_websocket_upgrade(response, key)
+    validate_websocket_upgrade(response, key, contract=contract)
 
 
 def parse_args() -> argparse.Namespace:
@@ -110,6 +123,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--path", default="/")
     parser.add_argument("--origin", default="http://127.0.0.1")
     parser.add_argument("--timeout", default=1.0, type=float)
+    parser.add_argument("--contract", default=PUBLIC_BRIDGE_CONTRACT)
     return parser.parse_args()
 
 
@@ -118,11 +132,18 @@ def main() -> int:
     if not (1 <= args.port <= 65535):
         print("public bridge health port is invalid", file=sys.stderr)
         return 2
-    if not args.path.startswith("/") or args.timeout <= 0:
+    if not args.path.startswith("/") or args.timeout <= 0 or not args.contract:
         print("public bridge health arguments are invalid", file=sys.stderr)
         return 2
     try:
-        probe(args.host, args.port, args.path, args.origin, args.timeout)
+        probe(
+            args.host,
+            args.port,
+            args.path,
+            args.origin,
+            args.timeout,
+            contract=args.contract,
+        )
     except (OSError, ValueError) as error:
         print(f"public bridge health failed: {error}", file=sys.stderr)
         return 1

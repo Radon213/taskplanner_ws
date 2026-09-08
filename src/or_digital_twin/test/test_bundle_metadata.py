@@ -40,9 +40,9 @@ def test_bundle_metadata_exposes_display_details_and_distinct_defaults() -> None
         for instrument in demo["instruments"]
     ] == [
         ("T02", "tray_slot", "main_tray_slot_1"),
-        ("T03", "tray_slot", "main_tray_slot_2"),
-        ("T04", "tray_slot", "main_tray_slot_3"),
-        ("T07", "tray_slot", "main_tray_slot_4"),
+        ("T04", "tray_slot", "main_tray_slot_2"),
+        ("T07", "tray_slot", "main_tray_slot_3"),
+        ("T08", "tray_slot", "main_tray_slot_4"),
     ]
     assert standard["default_phase_id"] == "P01"
     assert standard["display_name"] == "Thyroidectomy"

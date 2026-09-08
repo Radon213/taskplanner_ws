@@ -70,10 +70,11 @@ def test_prediction_is_compact_and_cannot_mutate_the_precompiled_lookup() -> Non
     assert second == {
         "id": "thyroidectomy_demo_handover_ngram_calibration_v1",
         "match": "phase+last3",
-        "support": 4,
+        "support": 8,
         "candidates": [
-            ["T07", 0.75],
-            ["T02", 0.25],
+            ["T08", 0.5],
+            ["T07", 0.375],
+            ["T02", 0.125],
         ],
     }
     assert set(second) == {"id", "match", "support", "candidates"}

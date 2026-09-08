@@ -127,6 +127,16 @@ def test_web_readiness_rejects_wrong_root_content_type(monkeypatch):
     )
 
 
+def test_campaign_uses_split_owner_plane_not_retired_monolith():
+    required = campaign.required_campaign_services("llm-surgeon")
+
+    assert "webapp" in required
+    assert "taskplanner-state-core" in required
+    assert "taskplanner-command" in required
+    assert "taskplanner-simulation-input" in required
+    assert "taskplanner-runtime" not in required
+
+
 def test_parse_memory_bytes_supports_docker_units():
     assert campaign.parse_memory_bytes("512B / 1GiB") == 512
     assert campaign.parse_memory_bytes("1.5MiB / 31.25GiB") == 1572864
@@ -140,7 +150,7 @@ def test_memory_growth_uses_stable_windows_and_enforces_limit():
             {
                 "elapsed_sec": float(index * 10),
                 "containers": [
-                    {"container": "taskplanner-runtime", "memory_used_bytes": value}
+                    {"container": "taskplanner-state-core", "memory_used_bytes": value}
                 ],
             }
         )
@@ -162,7 +172,7 @@ def test_memory_growth_reports_short_smoke_as_not_evaluated():
             {
                 "elapsed_sec": 1.0,
                 "containers": [
-                    {"container": "taskplanner-runtime", "memory_used_bytes": 100}
+                    {"container": "taskplanner-state-core", "memory_used_bytes": 100}
                 ],
             }
         ],

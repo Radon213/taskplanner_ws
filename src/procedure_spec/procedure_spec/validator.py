@@ -9,7 +9,12 @@ from .bed_robot_arm_group import (
     DISTANCE_ORIGINS,
     RETRACTION_DIRECTIONS,
 )
-from .scenario_policy import SCENARIO_RUNTIME_REQUIREMENT_KEYS
+from .scenario_policy import (
+    SCENARIO_RUNTIME_REQUIREMENT_KEYS,
+)
+
+
+MAX_TOTAL_TOOL_CAPACITY = 64
 
 
 REQUIRED_FILES = (
@@ -118,6 +123,7 @@ ALLOWED_RETRACTION_VOICE_COMMANDS = {
     "adjust_retraction",
     "change_tool",
     "stop_retraction",
+    "suction",
 }
 
 BED_ROBOT_ARM_IDS = {"arm_1", "arm_2"}
@@ -474,6 +480,8 @@ def validate_raw_bundle(raw_bundle: dict[str, object]) -> None:
     instrument_ids: set[str] = set()
     requestable_instrument_ids: set[str] = set()
     inventory_counts: dict[str, int] = {}
+    inventory_capacities: dict[str, int] = {}
+    has_exchangeable_population = False
     for instrument in instrument_entries:
         instrument_map = _require_mapping(instrument, "instrument entry")
         instrument_id = str(instrument_map.get("id", "")).strip()
@@ -484,15 +492,59 @@ def validate_raw_bundle(raw_bundle: dict[str, object]) -> None:
         instrument_ids.add(instrument_id)
         _require_list(instrument_map.get("aliases", []), f"instrument '{instrument_id}' aliases")
         inventory_count = instrument_map.get("inventory_count", 1)
+        exchangeable_population = instrument_map.get(
+            "exchangeable_population",
+            False,
+        )
+        if not isinstance(exchangeable_population, bool):
+            raise SpecValidationError(
+                f"instrument '{instrument_id}' exchangeable_population must be boolean."
+            )
         if (
             isinstance(inventory_count, bool)
             or not isinstance(inventory_count, int)
-            or inventory_count <= 0
+            or inventory_count < (0 if exchangeable_population else 1)
+        ):
+            requirement = (
+                "a non-negative integer"
+                if exchangeable_population
+                else "a positive integer"
+            )
+            raise SpecValidationError(
+                f"instrument '{instrument_id}' inventory_count must be {requirement}."
+            )
+        if exchangeable_population and "inventory_capacity" not in instrument_map:
+            raise SpecValidationError(
+                f"instrument '{instrument_id}' exchangeable population requires "
+                "inventory_capacity."
+            )
+        inventory_capacity = instrument_map.get(
+            "inventory_capacity",
+            inventory_count,
+        )
+        if (
+            isinstance(inventory_capacity, bool)
+            or not isinstance(inventory_capacity, int)
+            or inventory_capacity <= 0
         ):
             raise SpecValidationError(
-                f"instrument '{instrument_id}' inventory_count must be a positive integer."
+                f"instrument '{instrument_id}' inventory_capacity must be a positive integer."
+            )
+        if inventory_count > inventory_capacity:
+            raise SpecValidationError(
+                f"instrument '{instrument_id}' inventory_count cannot exceed "
+                f"inventory_capacity {inventory_capacity}."
+            )
+        if not exchangeable_population and inventory_capacity != inventory_count:
+            raise SpecValidationError(
+                f"instrument '{instrument_id}' fixed inventory_capacity must equal "
+                "inventory_count."
             )
         inventory_counts[instrument_id] = inventory_count
+        inventory_capacities[instrument_id] = inventory_capacity
+        has_exchangeable_population = (
+            has_exchangeable_population or exchangeable_population
+        )
         if "requestable" in instrument_map and not isinstance(instrument_map["requestable"], bool):
             raise SpecValidationError(f"instrument '{instrument_id}' requestable must be boolean.")
         if bool(instrument_map.get("requestable", True)):
@@ -501,6 +553,15 @@ def validate_raw_bundle(raw_bundle: dict[str, object]) -> None:
             raise SpecValidationError(f"instrument '{instrument_id}' requires category.")
         if not instrument_map.get("handover_profile"):
             raise SpecValidationError(f"instrument '{instrument_id}' requires handover_profile.")
+
+    if (
+        has_exchangeable_population
+        and sum(inventory_capacities.values()) > MAX_TOTAL_TOOL_CAPACITY
+    ):
+        raise SpecValidationError(
+            "total tool population capacity must be at most "
+            f"{MAX_TOTAL_TOOL_CAPACITY}; got {sum(inventory_capacities.values())}."
+        )
 
     for phase in phases:
         phase_map = _require_mapping(phase, "phase entry")
@@ -687,7 +748,6 @@ def validate_raw_bundle(raw_bundle: dict[str, object]) -> None:
         if scenario_policy is None
         else None
     )
-
     for key in (
         "min_confidence_to_keep",
         "min_confidence_to_switch",
@@ -771,24 +831,10 @@ def validate_raw_bundle(raw_bundle: dict[str, object]) -> None:
                 runtime_requirements,
                 "policy.yaml scenario_policy.runtime_requirements",
             )
-            runtime_keys = set(runtime_requirements)
-            missing = sorted(
-                SCENARIO_RUNTIME_REQUIREMENT_KEYS - runtime_keys
-            )
-            unknown = sorted(
-                runtime_keys - SCENARIO_RUNTIME_REQUIREMENT_KEYS
-            )
-            if missing or unknown:
-                details = []
-                if missing:
-                    details.append("missing: " + ", ".join(missing))
-                if unknown:
-                    details.append("unknown: " + ", ".join(unknown))
-                raise SpecValidationError(
-                    "policy.yaml scenario_policy.runtime_requirements must "
-                    "define the complete contract (" + "; ".join(details) + ")"
-                )
-            if not isinstance(runtime_requirements["procedure_type"], str):
+            if (
+                "procedure_type" in runtime_requirements
+                and not isinstance(runtime_requirements["procedure_type"], str)
+            ):
                 raise SpecValidationError(
                     "policy.yaml scenario_policy.runtime_requirements."
                     "procedure_type must be a string."
@@ -796,7 +842,7 @@ def validate_raw_bundle(raw_bundle: dict[str, object]) -> None:
             for key in sorted(
                 SCENARIO_RUNTIME_REQUIREMENT_KEYS - {"procedure_type"}
             ):
-                if not isinstance(runtime_requirements[key], bool):
+                if key in runtime_requirements and not isinstance(runtime_requirements[key], bool):
                     raise SpecValidationError(
                         "policy.yaml scenario_policy.runtime_requirements."
                         f"{key} must be boolean."

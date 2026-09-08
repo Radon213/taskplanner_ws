@@ -1,11 +1,9 @@
 import { useId } from "react";
-import { useReducedMotion } from "framer-motion";
 import {
   Box,
   CheckCircle2,
   CircleDashed,
   LoaderCircle,
-  RotateCcw,
   ServerCog,
   ShieldAlert,
   WifiOff,
@@ -29,14 +27,29 @@ export type ExecutionEndpointServerHealth = {
   retractionServiceReady: boolean;
 };
 
+type ExecutionRouteOperation = "tool" | "retraction";
+
+export type ExecutionRouteSourceReadiness = Readonly<
+  Partial<Record<ExecutionEndpointSource, ExecutionEndpointReadiness>>
+>;
+
+/**
+ * A route source can expose an Action but not a Service (or the reverse).
+ * Keep those two availability facts separate so the operating UI never
+ * presents one operation as selectable based on the other's server health.
+ */
+export type ExecutionRouteSourceReadinessByOperation = Readonly<{
+  toolHandover: ExecutionRouteSourceReadiness;
+  retraction: ExecutionRouteSourceReadiness;
+}>;
+
 /**
  * Parent-owned transition state. A route selection is not considered ready
- * until the server reports the requested configuration and reset outcome.
+ * until the server reports the requested stopped-state configuration.
  */
 export type ExecutionRouteTransitionState =
   | "idle"
   | "switching"
-  | "resetting"
   | "ready"
   | "failed";
 
@@ -57,8 +70,8 @@ export type ExecutionRouteSelectorProps = Omit<
   procedureStopped: boolean;
   /** Bridge/control-plane readiness, not physical controller readiness. */
   connected: boolean;
-  /** Per-source route-selection availability from the bounded server projection. */
-  sourceReadiness?: Readonly<Partial<Record<ExecutionEndpointSource, ExecutionEndpointReadiness>>>;
+  /** Per-operation, per-source availability from the bounded server projection. */
+  sourceReadiness?: ExecutionRouteSourceReadinessByOperation;
   /** Supplemental graph health; it never substitutes for the post-switch preflight. */
   sourceHealth?: Readonly<
     Partial<Record<ExecutionEndpointSource, ExecutionEndpointServerHealth>>
@@ -167,24 +180,19 @@ function transitionCopy(
       ? "선택한 실행 서버를 적용하는 중입니다."
       : "Applying the selected execution server.";
   }
-  if (state === "resetting") {
-    return language === "ko"
-      ? "수술 실행 및 디지털 트윈 상태를 초기화하는 중입니다."
-      : "Resetting procedure execution and digital-twin state.";
-  }
   if (state === "ready") {
     return language === "ko"
-      ? "경로 변경과 초기화가 완료되었습니다. 새 통합 시작 점검을 확인한 뒤 시작하세요."
-      : "Route change and reset completed. Verify a fresh integration start check before starting.";
+      ? "경로 변경이 완료되었습니다. endpoint가 요청을 수락하면 바로 시작할 수 있습니다."
+      : "Route change completed. Start is available when the endpoint admits the request.";
   }
   if (state === "failed") {
     return language === "ko"
-      ? "경로 변경 또는 초기화가 완료되지 않았습니다. 현재 적용 경로를 확인하세요."
-      : "The route change or reset did not finish. Verify the currently applied route.";
+      ? "경로 변경이 완료되지 않았습니다. 현재 적용 경로를 확인하세요."
+      : "The route change did not finish. Verify the currently applied route.";
   }
   return language === "ko"
-    ? "선택하면 현재 수술 실행과 디지털 트윈 진행 상태가 초기화됩니다."
-    : "Selecting a route resets the current procedure execution and digital-twin progress.";
+    ? "경로 변경은 실행과 대상 resource가 완전히 정지된 상태에서만 허용됩니다."
+    : "A route change is allowed only when execution and its target resource are stopped.";
 }
 
 function lockReason(
@@ -204,10 +212,10 @@ function lockReason(
       ? "운영 연결 상태를 확인한 뒤 서버를 바꿀 수 있습니다."
       : "Verify the operational connection before changing servers.";
   }
-  if (transitionState === "switching" || transitionState === "resetting") {
+  if (transitionState === "switching") {
     return language === "ko"
-      ? "현재 경로 변경과 초기화 결과를 확인하는 중입니다."
-      : "Waiting for the current route change and reset result.";
+      ? "현재 경로 변경 결과를 확인하는 중입니다."
+      : "Waiting for the current route change result.";
   }
   return disabledReason;
 }
@@ -225,7 +233,7 @@ export function ExecutionRouteSelector({
   selectedRetractionSource,
   procedureStopped,
   connected,
-  sourceReadiness = {},
+  sourceReadiness = { toolHandover: {}, retraction: {} },
   sourceHealth = {},
   transitionState = "idle",
   transitionMessage = "",
@@ -234,12 +242,11 @@ export function ExecutionRouteSelector({
   className,
   ...sectionProps
 }: ExecutionRouteSelectorProps) {
-  const reducedMotion = useReducedMotion();
   const lockNoteId = useId();
   const selectionHelpId = useId();
   const selectedTool = selectedSource ?? currentSource;
   const selectedRetraction = selectedRetractionSource ?? currentRetractionSource;
-  const isTransitioning = transitionState === "switching" || transitionState === "resetting";
+  const isTransitioning = transitionState === "switching";
   const normalizedDisabledReason = safeOperatorMessage(disabledReason);
   const selectionLockReason = lockReason(
     language,
@@ -253,11 +260,20 @@ export function ExecutionRouteSelector({
     language,
     safeOperatorMessage(transitionMessage),
   );
-  const noRouteReady = SOURCE_OPTIONS.every(
-    (option) => (sourceReadiness[option.id] ?? "unknown") !== "ready",
+  const readinessFor = (
+    kind: ExecutionRouteOperation,
+    source: ExecutionEndpointSource,
+  ): ExecutionEndpointReadiness => {
+    const operation = kind === "tool" ? "toolHandover" : "retraction";
+    return sourceReadiness[operation][source] ?? "unknown";
+  };
+  const noRouteReady = (["toolHandover", "retraction"] as const).every(
+    (operation) => SOURCE_OPTIONS.every(
+      (option) => (sourceReadiness[operation][option.id] ?? "unknown") !== "ready",
+    ),
   );
   const sourceOptions = (
-    kind: "tool" | "retraction",
+    kind: ExecutionRouteOperation,
     selected: ExecutionEndpointSource | null,
   ) => (
     <div
@@ -278,7 +294,7 @@ export function ExecutionRouteSelector({
       <div className="execution-route-selector-options">
         {SOURCE_OPTIONS.map((option) => {
           const Icon = option.icon;
-          const readiness = sourceReadiness[option.id] ?? "unknown";
+          const readiness = readinessFor(kind, option.id);
           const health = sourceHealth[option.id];
           const optionSelected = selected === option.id;
           const optionUnavailable = readiness !== "ready";
@@ -325,7 +341,6 @@ export function ExecutionRouteSelector({
       {...sectionProps}
       aria-busy={isTransitioning}
       className={["execution-route-selector", className].filter(Boolean).join(" ")}
-      data-motion={reducedMotion ? "reduced" : "full"}
       data-slot="execution-route-selector"
       data-transition-state={transitionState}
     >
@@ -366,12 +381,12 @@ export function ExecutionRouteSelector({
       {sourceOptions("tool", selectedTool)}
       {sourceOptions("retraction", selectedRetraction)}
 
-      <div className="execution-route-selector-reset-note" id={selectionHelpId} role="note">
-        <RotateCcw aria-hidden="true" size={16} />
+      <div className="execution-route-selector-boundary-note" id={selectionHelpId} role="note">
+        <ShieldAlert aria-hidden="true" size={16} />
         <span>
           {language === "ko"
-            ? "서버를 바꾸면 현재 수술 실행과 디지털 트윈 진행 상태가 초기화됩니다."
-            : "Changing the server resets the current procedure execution and digital-twin progress."}
+            ? "서버 변경은 수술 실행과 대상 resource에 진행 중인 요청이 없을 때만 허용됩니다. 현재 시나리오·디지털 트윈 상태를 자동 초기화하지 않습니다."
+            : "Changing servers requires stopped execution with no in-flight target request. It does not reset scenario or digital-twin state."}
         </span>
       </div>
 

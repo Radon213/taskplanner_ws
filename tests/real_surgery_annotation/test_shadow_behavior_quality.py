@@ -10,10 +10,43 @@ from tools.real_surgery_annotation.shadow_contract import (
     BEHAVIOR_QUALITY_SCHEMA_V1,
     validate_behavior_quality_report,
 )
-from tools.real_surgery_annotation.shadow_evaluate import evaluate_shadow
+from tools.real_surgery_annotation.shadow_evaluate import (
+    OBSERVED_UTTERANCE_MESSAGE_TYPE,
+    OBSERVED_UTTERANCE_TOPIC,
+    _runtime_metrics,
+    evaluate_shadow,
+)
 
 
 class ShadowBehaviorQualityTest(unittest.TestCase):
+    def test_runtime_metrics_counts_only_typed_router_observations(self) -> None:
+        runtime = _runtime_metrics(
+            [
+                {
+                    "layer": "input_transcript",
+                    "topic": "/surgery/transcript",
+                    "message_type": "std_msgs/msg/String",
+                    "payload": {},
+                },
+                {
+                    "layer": "input_transcript",
+                    "topic": OBSERVED_UTTERANCE_TOPIC,
+                    "message_type": OBSERVED_UTTERANCE_MESSAGE_TYPE,
+                    "payload": {},
+                },
+                {
+                    "layer": "input_transcript",
+                    "topic": OBSERVED_UTTERANCE_TOPIC,
+                    "message_type": "std_msgs/msg/String",
+                    "payload": {},
+                },
+            ],
+            trace_errors=[],
+        )
+
+        self.assertEqual(runtime["source_transcript_count"], 1)
+        self.assertEqual(runtime["observed_utterance_count"], 1)
+
     @staticmethod
     def _request(event_id: str, start_sec: float) -> dict:
         return {

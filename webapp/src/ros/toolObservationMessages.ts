@@ -534,7 +534,11 @@ export function normalizeTypedRfdetrToolDetections(
   expected: RfdetrToolViewConfig,
   receivedAt = Date.now(),
 ): TypedRfdetrToolDetectionFrame | null {
-  if (!isBoundedRosPayload(message)) return null;
+  // Only the small fields consumed below belong to this projection. Traversing
+  // the entire wire object rejects valid lossless masks (>256 RLE entries) and
+  // spends UI time walking pixels that this observer never retains or renders.
+  // Each consumed string/vector/instance list is bounded independently below.
+  if (!message || typeof message !== "object" || Array.isArray(message)) return null;
   const candidate = message as RosTypedRfdetrToolObservationArray;
   const header = candidate.header;
   const sourceStamp = header?.stamp;

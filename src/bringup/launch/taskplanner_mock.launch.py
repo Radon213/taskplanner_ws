@@ -70,20 +70,16 @@ def _bed_robot_contract_configuration(context):
             "retraction_workflow_state_enforced",
             "true" if runtime.retraction_workflow_state_enforced else "false",
         ),
-        SetLaunchConfiguration(
-            "retractor_legacy_raw_voice_enabled",
-            (
-                "true"
-                if runtime.legacy_raw_retractor_voice_enabled
-                else "false"
-            ),
-        ),
     ]
 
 
 def generate_launch_description() -> LaunchDescription:
     spec_dir = LaunchConfiguration("spec_dir")
+    bundle_snapshot_root = LaunchConfiguration("bundle_snapshot_root")
     default_bundle = LaunchConfiguration("default_bundle")
+    enable_tool_belief_tracker = LaunchConfiguration(
+        "enable_tool_belief_tracker"
+    )
     publish_shared_state = LaunchConfiguration("publish_shared_state")
     publish_shared_free_text = LaunchConfiguration("publish_shared_free_text")
     enable_rosbridge = LaunchConfiguration("enable_rosbridge")
@@ -92,7 +88,6 @@ def generate_launch_description() -> LaunchDescription:
     rosbridge_service_timeout = LaunchConfiguration("rosbridge_service_timeout")
     input_profile = LaunchConfiguration("input_profile")
     execution_backend = LaunchConfiguration("execution_backend")
-    execution_contract = LaunchConfiguration("execution_contract")
     robot_endpoint_source = LaunchConfiguration(
         "robot_endpoint_source", default="external"
     )
@@ -110,9 +105,6 @@ def generate_launch_description() -> LaunchDescription:
     )
     controller_contract_max_age_sec = LaunchConfiguration(
         "controller_contract_max_age_sec"
-    )
-    dispatch_readiness_max_age_sec = LaunchConfiguration(
-        "dispatch_readiness_max_age_sec"
     )
     asr_runtime_status_topic = LaunchConfiguration("asr_runtime_status_topic")
     require_asr_runtime_status = LaunchConfiguration("require_asr_runtime_status")
@@ -149,9 +141,6 @@ def generate_launch_description() -> LaunchDescription:
     procedure_phase_inference_enabled = LaunchConfiguration(
         "procedure_phase_inference_enabled"
     )
-    retractor_legacy_raw_voice_enabled = LaunchConfiguration(
-        "retractor_legacy_raw_voice_enabled"
-    )
     speech_input_mode = LaunchConfiguration("speech_input_mode")
     speech_input_topic = LaunchConfiguration("speech_input_topic")
     sentence_input_topic = LaunchConfiguration("sentence_input_topic")
@@ -182,11 +171,13 @@ def generate_launch_description() -> LaunchDescription:
     voice_command_input_mode = LaunchConfiguration("voice_command_input_mode")
     voice_command_input_topic = LaunchConfiguration("voice_command_input_topic")
     voice_command_output_topic = LaunchConfiguration("voice_command_output_topic")
-    vlm_function_gate_enabled = LaunchConfiguration(
-        "vlm_function_gate_enabled"
-    )
-    vlm_function_gate_ledger_path = LaunchConfiguration(
-        "vlm_function_gate_ledger_path"
+    resolver_input_topic = LaunchConfiguration("resolver_input_topic")
+    resolver_output_topic = LaunchConfiguration("resolver_output_topic")
+    legacy_voice_intent_topic = LaunchConfiguration("legacy_voice_intent_topic")
+    command_router_enabled = LaunchConfiguration("command_router_enabled")
+    command_router_catalog_path = LaunchConfiguration("command_router_catalog_path")
+    command_router_catalog_reload_sec = LaunchConfiguration(
+        "command_router_catalog_reload_sec"
     )
     voice_intent_require_source_metadata = LaunchConfiguration(
         "voice_intent_require_source_metadata"
@@ -200,18 +191,6 @@ def generate_launch_description() -> LaunchDescription:
     )
     hand_mapping_operator_approved = LaunchConfiguration(
         "hand_mapping_operator_approved"
-    )
-    retractor_voice_normalization_enabled = LaunchConfiguration(
-        "retractor_voice_normalization_enabled"
-    )
-    retractor_voice_interpreter_mode = LaunchConfiguration(
-        "retractor_voice_interpreter_mode"
-    )
-    retractor_voice_vlm_base_url = LaunchConfiguration("retractor_voice_vlm_base_url")
-    retractor_voice_vlm_model_id = LaunchConfiguration("retractor_voice_vlm_model_id")
-    retractor_voice_vlm_api_key = LaunchConfiguration("retractor_voice_vlm_api_key")
-    retractor_voice_vlm_timeout_sec = LaunchConfiguration(
-        "retractor_voice_vlm_timeout_sec"
     )
     voice_command_selector_mode = LaunchConfiguration("voice_command_selector_mode")
     voice_command_selector_endpoint = LaunchConfiguration(
@@ -321,8 +300,8 @@ def generate_launch_description() -> LaunchDescription:
     require_rfdetr_cam4_overlay = LaunchConfiguration(
         "require_rfdetr_cam4_overlay"
     )
-    require_integration_preflight = LaunchConfiguration(
-        "require_integration_preflight"
+    enable_integration_preflight_diagnostics = LaunchConfiguration(
+        "enable_integration_preflight_diagnostics"
     )
     preflight_require_perception = LaunchConfiguration(
         "preflight_require_perception"
@@ -435,33 +414,9 @@ def generate_launch_description() -> LaunchDescription:
             "'.lower() in ('true', '1', 'yes')",
         ]
     )
-    mock_legacy_execution_enabled = PythonExpression(
-        [
-            "'",
-            execution_backend,
-            "' == 'mock' and ('",
-            execution_contract,
-            "' == 'legacy' or '",
-            bed_robot_contract_enabled,
-            "'.lower() != 'true')",
-        ]
-    )
-    legacy_execution_bridge_enabled = PythonExpression(
-        [
-            "'",
-            execution_contract,
-            "' == 'legacy' or ('",
-            execution_backend,
-            "' == 'mock' and '",
-            bed_robot_contract_enabled,
-            "'.lower() != 'true')",
-        ]
-    )
     direct_execution_bridge_enabled = PythonExpression(
         [
             "'",
-            execution_contract,
-            "' == 'direct' and ('",
             execution_backend,
             "' != 'mock' or '",
             bed_robot_contract_enabled,
@@ -514,8 +469,6 @@ def generate_launch_description() -> LaunchDescription:
     robot_contract_emulator_enabled = PythonExpression(
         [
             "'",
-            execution_contract,
-            "' == 'direct' and '",
             execution_backend,
             "' == 'mock' and '",
             bed_robot_contract_enabled,
@@ -561,18 +514,6 @@ def generate_launch_description() -> LaunchDescription:
             "'.strip().lower() == 'virtual' else '",
             external_capability_policy_id,
             "'",
-        ]
-    )
-    # This switch keeps the dispatch-time integration-readiness lease armed.
-    # Controller-contract payloads are route diagnostics only and must not be
-    # reintroduced as a launch-selectable admission requirement.
-    dispatch_admission_lease_required = PythonExpression(
-        [
-            "'",
-            robot_endpoint_source,
-            "'.strip().lower() == 'virtual' or '",
-            execution_backend,
-            "'.strip().lower() == 'external'",
         ]
     )
     physical_stop_confirmation_required = PythonExpression(
@@ -648,6 +589,14 @@ def generate_launch_description() -> LaunchDescription:
         [
             DeclareLaunchArgument("default_bundle", default_value="thyroidectomy"),
             DeclareLaunchArgument(
+                "enable_tool_belief_tracker",
+                default_value="false",
+                description=(
+                    "Publish advisory fixed-inventory tool-location beliefs. "
+                    "This observer is not a procedure-start or dispatch gate."
+                ),
+            ),
+            DeclareLaunchArgument(
                 "publish_shared_state",
                 default_value=EnvironmentVariable(
                     "PUBLISH_SHARED_STATE",
@@ -667,20 +616,20 @@ def generate_launch_description() -> LaunchDescription:
                 ),
             ),
             DeclareLaunchArgument("spec_dir", default_value=spec_default),
+            DeclareLaunchArgument(
+                "bundle_snapshot_root",
+                default_value="/tmp/taskplanner-procedure-snapshots",
+                description=(
+                    "Private content-addressed ProcedureSpec snapshot root shared "
+                    "by SimulationManager and hot-reload participants."
+                ),
+            ),
             DeclareLaunchArgument("enable_rosbridge", default_value="true"),
             DeclareLaunchArgument("rosbridge_port", default_value="9090"),
             DeclareLaunchArgument("rosbridge_address", default_value="127.0.0.1"),
             DeclareLaunchArgument("rosbridge_service_timeout", default_value="30.0"),
             DeclareLaunchArgument("input_profile", default_value="simulation"),
             DeclareLaunchArgument("execution_backend", default_value="mock"),
-            DeclareLaunchArgument(
-                "execution_contract",
-                default_value="direct",
-                description=(
-                    "direct uses the focused public robot contracts; legacy is "
-                    "retained only for humanoid compatibility."
-                ),
-            ),
             DeclareLaunchArgument(
                 "robot_endpoint_source",
                 default_value="external",
@@ -735,17 +684,6 @@ def generate_launch_description() -> LaunchDescription:
                 description=(
                     "Legacy compatibility setting for controller diagnostics only; "
                     "it never authorizes or blocks dispatch."
-                ),
-            ),
-            DeclareLaunchArgument(
-                "dispatch_readiness_max_age_sec",
-                default_value=EnvironmentVariable(
-                    "TASKPLANNER_DISPATCH_READINESS_MAX_AGE_SEC",
-                    default_value="3.0",
-                ),
-                description=(
-                    "Maximum age of /integration/readiness at the dispatch edge. "
-                    "This is independent of controller-contract telemetry."
                 ),
             ),
             DeclareLaunchArgument(
@@ -823,23 +761,62 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument(
                 "voice_command_input_topic",
-                default_value="/surgery/audio/request_text",
-            ),
-            DeclareLaunchArgument(
-                "voice_command_output_topic",
-                default_value="/surgery/voice/intent",
-            ),
-            DeclareLaunchArgument(
-                "vlm_function_gate_enabled",
-                default_value="false",
+                default_value="/surgery/voice/resolver_utterance",
                 description=(
-                    "Join the exact VLM function call, typed ASR turn, and "
-                    "resolver proposal before publishing an executable intent."
+                    "Deprecated resolver-input alias. The command router is "
+                    "the sole /surgery/audio/admitted_utterance subscriber."
                 ),
             ),
             DeclareLaunchArgument(
-                "vlm_function_gate_ledger_path",
-                default_value="/tmp/taskplanner-vlm-function-gate.sqlite3",
+                "voice_command_output_topic",
+                default_value="/surgery/voice/proposal",
+                description=(
+                    "Deprecated resolver-output alias. Proposals return only "
+                    "to command_router."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "resolver_input_topic",
+                # Honour the short-lived legacy argument as the default so
+                # historical ``ros2 launch ... voice_command_input_topic:=``
+                # invocations either retain their private wiring or fail
+                # clearly if they try to attach the resolver to admitted ASR.
+                default_value=voice_command_input_topic,
+                description="Private command_router -> resolver input.",
+            ),
+            DeclareLaunchArgument(
+                "resolver_output_topic",
+                default_value=voice_command_output_topic,
+                description="Private resolver -> command_router proposal output.",
+            ),
+            DeclareLaunchArgument(
+                "legacy_voice_intent_topic",
+                default_value="/surgery/voice/legacy_disabled",
+                description=(
+                    "Retired composite-launch intent bus. New voice commands "
+                    "are dispatched only by command_router."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "command_router_enabled",
+                default_value="false",
+                description=(
+                    "Run the hot-reload direct command router for exact "
+                    "catalog commands. It consumes typed, post-echo-guard ASR "
+                    "and owns its typed endpoint dispatch."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "command_router_catalog_path",
+                default_value="",
+                description=(
+                    "Optional YAML command catalog. Empty uses voice_command's "
+                    "installed default catalog."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "command_router_catalog_reload_sec",
+                default_value="0.5",
             ),
             DeclareLaunchArgument(
                 "voice_intent_require_source_metadata",
@@ -865,7 +842,7 @@ def generate_launch_description() -> LaunchDescription:
                 default_value="false",
                 description=(
                     "Permit validated typed voice lifecycle proposals to use "
-                    "the normal integration-preflight-gated simulation control path."
+                    "the normal simulation control path."
                 ),
             ),
             DeclareLaunchArgument(
@@ -877,26 +854,6 @@ def generate_launch_description() -> LaunchDescription:
                     "unavailable. Live opts in; supplied low confidence is "
                     "still rejected."
                 ),
-            ),
-            DeclareLaunchArgument(
-                "retractor_voice_normalization_enabled", default_value="true"
-            ),
-            DeclareLaunchArgument(
-                "retractor_voice_interpreter_mode",
-                default_value="deterministic",
-                choices=("deterministic", "vlm_with_fallback"),
-                description=(
-                    "Use the dedicated text-only VLM normalizer when configured; "
-                    "deterministic normalization remains the safe fallback."
-                ),
-            ),
-            DeclareLaunchArgument(
-                "retractor_voice_vlm_base_url", default_value="http://127.0.0.1:8001"
-            ),
-            DeclareLaunchArgument("retractor_voice_vlm_model_id", default_value=""),
-            DeclareLaunchArgument("retractor_voice_vlm_api_key", default_value=""),
-            DeclareLaunchArgument(
-                "retractor_voice_vlm_timeout_sec", default_value="2.0"
             ),
             DeclareLaunchArgument(
                 "voice_command_selector_mode",
@@ -918,7 +875,7 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("vlm_model_id", default_value="unsloth/gemma-4-E4B-it-NVFP4"),
             DeclareLaunchArgument("vlm_api_mode", default_value="openai_compat"),
             DeclareLaunchArgument("vlm_publish_period_sec", default_value="1.0"),
-            DeclareLaunchArgument("vlm_max_output_tokens", default_value="320"),
+            DeclareLaunchArgument("vlm_max_output_tokens", default_value="384"),
             DeclareLaunchArgument("vlm_generation_seed", default_value="0"),
             DeclareLaunchArgument("vlm_response_format", default_value="json_schema"),
             DeclareLaunchArgument("vlm_reasoning_effort", default_value="none"),
@@ -1197,8 +1154,12 @@ def generate_launch_description() -> LaunchDescription:
                 default_value="false",
             ),
             DeclareLaunchArgument(
-                "require_integration_preflight",
+                "enable_integration_preflight_diagnostics",
                 default_value="false",
+                description=(
+                    "Run the optional read-only integration readiness observer. "
+                    "Its reports never gate scenario, voice, or dispatch control."
+                ),
             ),
             DeclareLaunchArgument(
                 "preflight_require_perception",
@@ -1208,8 +1169,8 @@ def generate_launch_description() -> LaunchDescription:
                 "preflight_require_rfdetr_tool_observations",
                 default_value="false",
                 description=(
-                    "Require fresh typed CAM3/CAM4 RF-DETR tool observations "
-                    "for integration-start admission."
+                    "Include fresh typed CAM3/CAM4 RF-DETR tool observations "
+                    "in optional integration diagnostics."
                 ),
             ),
             DeclareLaunchArgument(
@@ -1299,6 +1260,39 @@ def generate_launch_description() -> LaunchDescription:
                 ],
                 output="screen",
             ),
+            Node(
+                package="tool_belief_tracker",
+                executable="tool_belief_tracker_node",
+                name="tool_belief_tracker",
+                condition=IfCondition(enable_tool_belief_tracker),
+                parameters=[
+                    PathJoinSubstitution(
+                        [
+                            FindPackageShare("tool_belief_tracker"),
+                            "config",
+                            "default.yaml",
+                        ]
+                    ),
+                    {
+                        "spec_dir": spec_dir,
+                        "bundle_snapshot_root": bundle_snapshot_root,
+                        "cam3_pose_topic": "/perception/cam_3/tool/poses",
+                        "cam4_pose_topic": "/perception/cam_4/tool/poses",
+                        "cam3_health_topic": "/perception/cam_3/tool/health",
+                        "cam4_health_topic": "/perception/cam_4/tool/health",
+                        "skill_command_topic": "/bt/skill_command",
+                        "skill_status_topic": "/skill/status",
+                        "skill_event_topic": "/skill/events",
+                        "simulation_state_topic": "/simulation/state",
+                        "output_topic": "/surgery/perception/tool_beliefs",
+                    }
+                ],
+                output="screen",
+                # This observer owns no control authority. If it fails, only
+                # its process is restarted; the planner keeps running.
+                respawn=True,
+                respawn_delay=1.0,
+            ),
             *build_bt_engine_actions(),
             Node(
                 package="simulation_runtime",
@@ -1324,9 +1318,9 @@ def generate_launch_description() -> LaunchDescription:
                 ],
                 output="screen",
             ),
-            # The sole normal text-to-command boundary.  It understands
-            # natural Korean paraphrases but publishes proposal-only typed
-            # intents; Digital Twin and BT retain execution authority.
+            # The sole normal text-to-command boundary. It understands
+            # natural Korean paraphrases and publishes one typed intent lane;
+            # Digital Twin and BT retain endpoint execution authority.
             Node(
                 package="voice_command",
                 executable="voice_intent_resolver",
@@ -1335,20 +1329,11 @@ def generate_launch_description() -> LaunchDescription:
                 parameters=[
                     {
                         "input_mode": voice_command_input_mode,
-                        "input_topic": voice_command_input_topic,
-                        "output_topic": voice_command_output_topic,
-                        "typed_input_max_age_sec": ParameterValue(
-                            voice_intent_max_age_sec,
-                            value_type=float,
-                        ),
-                        "typed_input_max_future_skew_sec": ParameterValue(
-                            voice_intent_future_tolerance_sec,
-                            value_type=float,
-                        ),
-                        "typed_input_dedupe_retention_sec": ParameterValue(
-                            voice_intent_dedupe_retention_sec,
-                            value_type=float,
-                        ),
+                        # Never attach this resolver directly to admitted ASR:
+                        # CommandRouter owns that ingress and forwards only
+                        # catalog misses to this private channel.
+                        "input_topic": resolver_input_topic,
+                        "output_topic": resolver_output_topic,
                         # Bind aliases to this exact ProcedureSpec bundle;
                         # never fall back to a global T-ID vocabulary.
                         "procedure_bundle": spec_dir,
@@ -1363,30 +1348,23 @@ def generate_launch_description() -> LaunchDescription:
                 ],
                 output="screen",
             ),
+            # Exact deterministic commands belong to the lightweight router,
+            # not the VLM/DT/BT admission chain. It reads the same typed ASR
+            # stream after the ASR-owned TTS echo guard.
             Node(
                 package="voice_command",
-                executable="vlm_function_admission_gate",
-                name="vlm_function_admission_gate",
-                condition=IfCondition(vlm_function_gate_enabled),
+                executable="command_router",
+                name="command_router",
+                condition=IfCondition(command_router_enabled),
                 parameters=[
                     {
-                        "ledger_path": vlm_function_gate_ledger_path,
-                        "proposal_topic": "/surgery/voice/proposal",
-                        "admitted_speech_topic": (
-                            "/surgery/audio/admitted_utterance"
-                        ),
-                        "vlm_reply_topic": "/vlm/humanoid_reply",
-                        "intent_output_topic": "/surgery/voice/intent",
-                        "reply_output_topic": "/tts/admitted_reply",
-                        "gateway_topic": "/surgery/gateway_info",
-                        "tts_status_topic": "/tts/playback_status",
-                        "twin_event_topic": "/twin/events",
-                        "retractor_status_topic": (
-                            "/bed_robot_arm_group/voice_normalization_status"
-                        ),
-                        "retry_period_sec": 0.5,
-                        "input_max_age_sec": ParameterValue(
-                            voice_intent_max_age_sec,
+                        "input_topic": speech_typed_output_topic,
+                        "resolver_input_topic": resolver_input_topic,
+                        "resolver_output_topic": resolver_output_topic,
+                        "procedure_bundle": spec_dir,
+                        "catalog_path": command_router_catalog_path,
+                        "catalog_reload_sec": ParameterValue(
+                            command_router_catalog_reload_sec,
                             value_type=float,
                         ),
                     }
@@ -1777,13 +1755,16 @@ def generate_launch_description() -> LaunchDescription:
                                 "'.lower() == 'true' else 'disabled'",
                             ]
                         ),
-                        "tool_predict_evidence_confidence_threshold": 0.5,
-                        "tool_predict_confidence_threshold": 0.55,
-                        "tool_predict_stability_sec": 0.30,
+                        "ngram_prepare_probability_threshold": 0.125,
+                        "ngram_recovery_probability_threshold": 0.391,
+                        "ngram_recovery_enabled_tools": ["T02", "T08"],
+                        "ngram_policy_stability_sec": 0.30,
                         "hand_handover_dwell_sec": 0.300,
                         "hand_handover_release_sec": 0.500,
-                        "hand_handover_max_positive_gap_sec": 0.200,
-                        "hand_handover_observation_timeout_sec": 0.400,
+                        "hand_handover_release_confirm_sec": 0.180,
+                        "hand_handover_soft_unknown_grace_sec": 0.180,
+                        "hand_handover_max_positive_gap_sec": 0.500,
+                        "hand_handover_observation_timeout_sec": 0.500,
                         "hand_handover_minimum_positive_samples": 4,
                         "hand_handover_minimum_palm_up_score": 0.0,
                         "hand_expected_source_frame_id": (
@@ -1813,40 +1794,6 @@ def generate_launch_description() -> LaunchDescription:
                         "phase_authority": PythonExpression(
                             ["'legacy_estimator' if '", validation_mode, "' == 'demo' else 'reducer'"]
                         ),
-                    }
-                ],
-                output="screen",
-            ),
-            Node(
-                package="skill_execution",
-                executable="mock_skill_server",
-                name="mock_skill_server",
-                condition=IfCondition(mock_legacy_execution_enabled),
-                parameters=[
-                    {
-                        "action_name": "/skill/execute",
-                        "rack_pick_sec": 1.0,
-                        "rack_to_handover_sec": 1.2,
-                        "surgeon_handover_sec": 1.0,
-                        "mayo_recovery_pickup_sec": 1.0,
-                        "cleaner_insert_sec": 0.8,
-                        "cleaning_hold_sec": 4.5,
-                        "cleaner_to_rack_sec": 1.0,
-                        "mayo_dwell_sec": 0.8,
-                    }
-                ],
-                output="screen",
-            ),
-            Node(
-                package="skill_execution",
-                executable="skill_action_bridge",
-                name="skill_action_bridge",
-                condition=IfCondition(legacy_execution_bridge_enabled),
-                parameters=[
-                    {
-                        "action_name": "/skill/execute",
-                        "min_repeat_interval_sec": 2.0,
-                        "server_wait_timeout_sec": 3.0,
                     }
                 ],
                 output="screen",
@@ -1971,10 +1918,6 @@ def generate_launch_description() -> LaunchDescription:
                         "require_bed_robot_status": ParameterValue(
                             PythonExpression(["False"]), value_type=bool
                         ),
-                        "require_dispatch_admission_lease": ParameterValue(
-                            dispatch_admission_lease_required,
-                            value_type=bool,
-                        ),
                         "controller_contract_topic": controller_contract_topic,
                         "external_controller_contract_topic": (
                             "/surgery/controller_contract"
@@ -2008,10 +1951,6 @@ def generate_launch_description() -> LaunchDescription:
                             )
                         ),
                         "integration_readiness_topic": "/integration/readiness",
-                        "admission_lease_max_age_sec": ParameterValue(
-                            dispatch_readiness_max_age_sec,
-                            value_type=float,
-                        ),
                         "require_physical_stop_confirmation": ParameterValue(
                             physical_stop_confirmation_required,
                             value_type=bool,
@@ -2040,22 +1979,6 @@ def generate_launch_description() -> LaunchDescription:
                         "visual_direction_confidence_threshold": 0.75,
                         # real_vlm: 20 sec per attempt * 3 attempts + margin
                         "vlm_proposal_timeout_sec": 70.0,
-                        "retractor_voice_normalization_enabled": ParameterValue(
-                            retractor_voice_normalization_enabled,
-                            value_type=bool,
-                        ),
-                        "retractor_legacy_raw_voice_enabled": ParameterValue(
-                            retractor_legacy_raw_voice_enabled,
-                            value_type=bool,
-                        ),
-                        "retractor_voice_interpreter_mode": retractor_voice_interpreter_mode,
-                        "retractor_voice_vlm_base_url": retractor_voice_vlm_base_url,
-                        "retractor_voice_vlm_model_id": retractor_voice_vlm_model_id,
-                        "retractor_voice_vlm_api_key": retractor_voice_vlm_api_key,
-                        "retractor_voice_vlm_timeout_sec": ParameterValue(
-                            retractor_voice_vlm_timeout_sec,
-                            value_type=float,
-                        ),
                         "require_voice_intent_source_metadata": ParameterValue(
                             voice_intent_require_source_metadata,
                             value_type=bool,
@@ -2089,7 +2012,7 @@ def generate_launch_description() -> LaunchDescription:
                 package="simulation_runtime",
                 executable="integration_preflight",
                 name="integration_preflight",
-                condition=IfCondition(require_integration_preflight),
+                condition=IfCondition(enable_integration_preflight_diagnostics),
                 parameters=[
                     {
                         # Count the actual admitted source. A typed Live ASR
@@ -2151,8 +2074,8 @@ def generate_launch_description() -> LaunchDescription:
                             value_type=bool,
                         ),
                         # Controller contracts remain bridge/controller
-                        # telemetry; integration-start admission is based on
-                        # discovery of the selected Action and Service only.
+                        # telemetry. This observer reports selected Action and
+                        # Service discovery but never admits a scenario start.
                         "require_controller_contract": False,
                         "controller_contract_topic": controller_contract_topic,
                         "external_controller_contract_topic": (
@@ -2255,13 +2178,10 @@ def generate_launch_description() -> LaunchDescription:
                 parameters=[
                     {
                         "default_bundle": default_bundle,
+                        "bundle_snapshot_root": bundle_snapshot_root,
                         "surgeon_actor_mode": surgeon_actor_mode,
                         "manual_override_actor_mute_sec": 8.0,
                         "execution_backend": execution_backend,
-                        "require_integration_preflight": ParameterValue(
-                            require_integration_preflight,
-                            value_type=bool,
-                        ),
                         "enable_runtime_route_control": ParameterValue(
                             enable_runtime_route_control,
                             value_type=bool,
@@ -2270,7 +2190,12 @@ def generate_launch_description() -> LaunchDescription:
                             LaunchConfiguration("enable_voice_procedure_control"),
                             value_type=bool,
                         ),
-                        "voice_intent_topic": "/surgery/voice/intent",
+                        # This composite launch no longer consumes resolver
+                        # proposals as a second executable voice lane. The
+                        # command owner routes correlated proposals directly
+                        # to their typed endpoints. Keep the retired input
+                        # isolated for historical replay only.
+                        "voice_intent_topic": legacy_voice_intent_topic,
                         "voice_procedure_min_confidence": ParameterValue(
                             speech_min_confidence,
                             value_type=float,

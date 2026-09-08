@@ -22,18 +22,19 @@ from typing import Any
 from surgical_interop_gateway.public_bridge_policy import (
     PUBLIC_BRIDGE_CONTRACT,
     PUBLIC_BRIDGE_CONTRACT_HEADER,
+    PUBLIC_BRIDGE_NODE_NAME,
     PUBLIC_MAX_CLIENTS,
     PUBLIC_MAX_INCOMING_BYTES,
     PUBLIC_MAX_INCOMING_QUEUE,
     PUBLIC_MAX_OUTGOING_BINARY_MESSAGES,
     PUBLIC_MAX_OUTGOING_MESSAGE_BYTES,
     PUBLIC_MAX_OUTGOING_QUEUE,
-    PUBLIC_MAX_OUTGOING_STATE_MESSAGE_BYTES,
     PUBLIC_MAX_SUBSCRIPTION_IDS_PER_TOPIC,
     PUBLIC_LOOPBACK_ADDRESS,
     origin_is_allowed,
     parse_allowed_origins,
     peer_is_loopback,
+    public_outgoing_message_limit,
     restrict_public_incoming_message,
     restrict_public_subscription_request,
     restrict_public_rosbridge_protocol,
@@ -345,10 +346,10 @@ def main() -> None:
             if not self._public_admitted:
                 return
             binary = compression in {"cbor", "cbor-raw"}
-            message_limit = (
-                PUBLIC_MAX_OUTGOING_MESSAGE_BYTES
-                if binary
-                else PUBLIC_MAX_OUTGOING_STATE_MESSAGE_BYTES
+            topic = self.protocol.public_outgoing_topic()
+            message_limit = public_outgoing_message_limit(
+                topic=topic,
+                binary=binary,
             )
             if _wire_size(message) > message_limit:
                 self.__class__.node_handle.get_logger().warning(
@@ -363,7 +364,7 @@ def main() -> None:
                     (
                         message,
                         binary,
-                        self.protocol.public_outgoing_topic() if binary else None,
+                        topic,
                     ),
                 )
                 if not enqueued:
@@ -409,7 +410,7 @@ def main() -> None:
         def __init__(self) -> None:
             # Mirror the small upstream constructor while intentionally
             # omitting its services_glob.append('/rosapi/*').
-            upstream.Node.__init__(self, "public_read_only_rosbridge")
+            upstream.Node.__init__(self, PUBLIC_BRIDGE_NODE_NAME)
             upstream.RosbridgeWebSocket.node_handle = self
             upstream.RosbridgeWebSocket.client_manager = upstream.ClientManager(self)
             upstream.RosbridgeWebSocket.event_loop = asyncio.get_event_loop()

@@ -58,13 +58,6 @@ def _harness(*, armed: bool = False, virtual_enabled: bool = True):
     harness._bed_robot_arm_status_revision = None
     harness._bed_robot_arm_status_summary = {}
     harness._retraction_state = RetractionState.RETRACTION_ACTIVE
-    harness._retraction_voice_auto_dispatch = True
-    harness._retraction_voice_generation = 4
-    harness._operational_active_bundle = "thyroidectomy_demo"
-    harness._retraction_state_machine_bypass_default_bundles = frozenset(
-        {"thyroidectomy_demo", "inguinal_hernia_repair_demo"}
-    )
-    harness._retraction_state_machine_bypass_enabled = False
     harness._last_retraction_rejection_reason = "old"
     harness.events = []
     harness._record = lambda event, payload: harness.events.append((event, payload))
@@ -73,11 +66,6 @@ def _harness(*, armed: bool = False, virtual_enabled: bool = True):
     )
     harness._robot_source_snapshot = IntegrationDebugNode._robot_source_snapshot.__get__(
         harness
-    )
-    harness._default_retraction_state_machine_bypass_for_bundle = (
-        IntegrationDebugNode._default_retraction_state_machine_bypass_for_bundle.__get__(
-            harness
-        )
     )
     return harness
 
@@ -100,9 +88,6 @@ def test_explicit_source_switch_moves_all_three_selected_interfaces() -> None:
     assert harness._retraction_client is harness._virtual_retraction_client
     assert harness._retraction_service_name.endswith("/virtual/retraction/command")
     assert harness._retraction_state is RetractionState.IDLE
-    assert harness._retraction_voice_auto_dispatch is False
-    assert harness._retraction_state_machine_bypass_enabled is True
-    assert harness._retraction_voice_generation == 5
     assert status["selected_source"] == "virtual"
     assert status["tool_handover_ready"] is True
     assert status["retraction_service_ready"] is True
@@ -130,12 +115,11 @@ def test_source_switch_never_auto_falls_back_and_requires_disarmed_session() -> 
     assert disabled._robot_endpoint_source == "external"
 
 
-def test_switching_back_to_external_keeps_demo_admission_bypass() -> None:
+def test_switching_back_to_external_keeps_endpoint_owners_separate() -> None:
     harness = _harness()
     IntegrationDebugNode._configure_robot_endpoint_source(
         harness, {"source": "virtual"}
     )
-    assert harness._retraction_state_machine_bypass_enabled is True
 
     accepted, _command_id, _message, _status = (
         IntegrationDebugNode._configure_robot_endpoint_source(
@@ -145,7 +129,8 @@ def test_switching_back_to_external_keeps_demo_admission_bypass() -> None:
 
     assert accepted is True
     assert harness._robot_endpoint_source == "external"
-    assert harness._retraction_state_machine_bypass_enabled is True
+    assert harness._tool_client is harness._external_tool_client
+    assert harness._retraction_client is harness._external_retraction_client
 
 
 def test_readiness_reports_selected_source_without_mixing_clients() -> None:

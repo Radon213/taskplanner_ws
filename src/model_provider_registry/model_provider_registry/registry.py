@@ -777,11 +777,36 @@ class ModelProviderRegistry:
                 model_id,
                 normalized_command,
             )
-        return self._control_vllm_manager(
+        result = self._control_vllm_manager(
             provider,
             model_id,
             normalized_command,
         )
+        # Manager APIs commonly acknowledge a load/unload asynchronously.
+        # Retain that accepted transition locally so the next catalog/health
+        # read cannot falsely report the previous model state while the
+        # provider is still loading. The inference owner uses this state as a
+        # readiness gate; it does not issue a request until the provider
+        # independently reports the selected model ready.
+        self._remember_manager_runtime_result(result)
+        return result
+
+    def _remember_manager_runtime_result(
+        self,
+        result: RuntimeControlResult,
+    ) -> None:
+        if not result.success:
+            return
+        normalized_state = _load_state({"state": result.state})
+        if normalized_state == "unknown":
+            return
+        key = self._runtime_key(result.provider_id, result.model_id)
+        with self._runtime_lock:
+            self._runtime_overrides[key] = _RuntimeOverride(
+                state=normalized_state,
+                detail=str(result.message or "").strip(),
+                updated_at=time.monotonic(),
+            )
 
     def _control_vllm_manager(
         self,
@@ -825,6 +850,7 @@ class ModelProviderRegistry:
                 if isinstance(payload, dict)
                 else ""
             ) or "unknown"
+            normalized_state = _load_state({"state": state})
             detail = (
                 str(payload.get("detail", "")).strip()
                 if isinstance(payload, dict)
@@ -834,7 +860,7 @@ class ModelProviderRegistry:
                 True,
                 provider.provider_id,
                 model_id,
-                state,
+                normalized_state,
                 detail or f"{command} accepted",
             )
         except requests.RequestException as exc:
@@ -1410,11 +1436,22 @@ class ModelProviderRegistry:
                         override.state in {"loaded", "unloaded"}
                         and load_state == override.state
                     )
+                    source_completed_transition = (
+                        override.state in {"loading", "waking"}
+                        and load_state == "loaded"
+                    ) or (
+                        override.state in {"unloading", "suspending"}
+                        and load_state == "unloaded"
+                    )
                     expired = (
                         override.state not in _TRANSITIONAL_STATES
                         and age_sec > 60.0
                     )
-                    if source_has_terminal_state or expired:
+                    if (
+                        source_has_terminal_state
+                        or source_completed_transition
+                        or expired
+                    ):
                         self._runtime_overrides.pop(key, None)
                     else:
                         load_state = override.state

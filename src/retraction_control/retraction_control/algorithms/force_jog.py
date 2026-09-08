@@ -53,13 +53,13 @@ def _finite(value: Real, *, name: str) -> float:
 
 
 def meters_to_millimeters(distance_m: Real) -> float:
-    """Convert the public SI distance exactly once at the control boundary."""
+    """Convert a non-zero signed public SI distance at the control boundary."""
 
     distance = _finite(distance_m, name="distance_m")
-    if distance <= 0.0:
+    if distance == 0.0:
         raise AlgorithmValidationError(
             ErrorCode.INVALID_DISTANCE,
-            "distance_m must be positive",
+            "distance_m must be non-zero",
             field="distance_m",
         )
     return distance * 1000.0
@@ -75,14 +75,14 @@ def validate_jog_limits(
     previous_cumulative_mm: Real,
     limits: JogLimits,
 ) -> float:
-    """Return the new cumulative magnitude or raise a structured limit error."""
+    """Apply one signed jog delta to the cumulative extra-pull magnitude."""
 
     distance = _finite(distance_mm, name="distance_mm")
     previous = _finite(previous_cumulative_mm, name="previous_cumulative_mm")
-    if distance <= 0.0:
+    if distance == 0.0:
         raise AlgorithmValidationError(
             ErrorCode.INVALID_DISTANCE,
-            "distance_mm must be positive",
+            "distance_mm must be non-zero",
             field="distance_mm",
         )
     if previous < 0.0:
@@ -108,7 +108,8 @@ def validate_jog_limits(
             field="limits",
             category=ErrorCategory.LIMIT,
         )
-    if distance > single_limit:
+    distance_magnitude = abs(distance)
+    if distance_magnitude > single_limit:
         raise AlgorithmValidationError(
             ErrorCode.DISTANCE_LIMIT_EXCEEDED,
             "requested jog exceeds the approved single-command limit",
@@ -116,10 +117,22 @@ def validate_jog_limits(
             category=ErrorCategory.LIMIT,
             context={
                 "distance_mm": distance,
+                "distance_magnitude_mm": distance_magnitude,
                 "single_jog_mm": single_limit,
             },
         )
     cumulative = previous + distance
+    if cumulative < 0.0:
+        raise AlgorithmValidationError(
+            ErrorCode.CUMULATIVE_DISTANCE_UNDERFLOW,
+            "requested release exceeds the accumulated extra pull",
+            field="distance_m",
+            category=ErrorCategory.LIMIT,
+            context={
+                "previous_cumulative_mm": previous,
+                "distance_mm": distance,
+            },
+        )
     if cumulative > cumulative_limit:
         raise AlgorithmValidationError(
             ErrorCode.CUMULATIVE_DISTANCE_LIMIT_EXCEEDED,

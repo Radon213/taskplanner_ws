@@ -3,6 +3,7 @@ import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   chmodSync,
+  existsSync,
   mkdtempSync,
   mkdirSync,
   readFileSync,
@@ -59,12 +60,13 @@ test("production startup keeps argv intact and rebuilds only when source changes
     ["tsconfig.json", "{}\n"],
     ["vite.config.ts", "export default {};\n"],
     ["scripts/start-production.sh", readFileSync(START_SCRIPT, "utf8")],
+    ["scripts/start-development.sh", readFileSync(new URL("./start-development.sh", import.meta.url), "utf8")],
+    ["scripts/apply-build.sh", readFileSync(new URL("./apply-build.sh", import.meta.url), "utf8")],
+    ["scripts/webapp-build-state.sh", readFileSync(new URL("./webapp-build-state.sh", import.meta.url), "utf8")],
     ["scripts/serve-production.mjs", "export {};\n"],
     ["scripts/check-dev-server-contract.mjs", "export {};\n"],
-    ["scripts/check-monitor-bundle.cjs", "module.exports = {};\n"],
     ["src/main.tsx", "export const revision = 1;\n"],
     ["public/runtime-config.js", "window.RUNTIME_CONFIG = {};\n"],
-    ["monitor/index.html", '<main class="app-shell"></main>\n'],
   ]) writeFixtureFile(root, relativePath, body);
 
   const fakeBin = join(root, "fake-bin");
@@ -82,9 +84,9 @@ test("production startup keeps argv intact and rebuilds only when source changes
 set -euo pipefail
 node -e 'require("node:fs").appendFileSync(process.env.TASKPLANNER_TEST_NPM_LOG, JSON.stringify(process.argv.slice(1)) + "\\n")' "$@"
 if [[ "\${1:-}" == "run" && "\${2:-}" == "build:runtime" ]]; then
-  mkdir -p dist/monitor
+  rm -rf dist
+  mkdir -p dist
   printf '<main id="root"></main>\\n' > dist/index.html
-  printf '<main class="app-shell"></main>\\n' > dist/monitor/index.html
 fi
 `);
   writeExecutable(join(fakeBin, "setpriv"), `#!/usr/bin/env bash
@@ -109,17 +111,18 @@ exec "\$@"
   };
 
   runStartup(root, environment);
-  const firstStamp = readFileSync(join(root, "dist/.taskplanner-source.sha256"), "utf8");
+  const firstStamp = readFileSync(join(root, ".taskplanner/build-source.sha256"), "utf8");
+  assert.equal(existsSync(join(root, "dist/.taskplanner-source.sha256")), false);
   runStartup(root, environment);
   assert.equal(
-    readFileSync(join(root, "dist/.taskplanner-source.sha256"), "utf8"),
+    readFileSync(join(root, ".taskplanner/build-source.sha256"), "utf8"),
     firstStamp,
   );
 
   writeFixtureFile(root, "index.html", '<main id="root" data-revision="2"></main>\n');
   runStartup(root, environment);
   assert.notEqual(
-    readFileSync(join(root, "dist/.taskplanner-source.sha256"), "utf8"),
+    readFileSync(join(root, ".taskplanner/build-source.sha256"), "utf8"),
     firstStamp,
   );
 
@@ -140,8 +143,6 @@ exec "\$@"
       "127.0.0.1",
       "--port",
       portArgument,
-      "--media",
-      "/var/run/taskplanner-monitor-media",
     ]);
   }
 

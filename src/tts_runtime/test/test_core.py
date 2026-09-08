@@ -11,6 +11,7 @@ import wave
 import pytest
 
 from tts_runtime.core import (
+    COMPLETION_CLEANUP_REPLY_ID_PREFIX,
     DeterministicWavCache,
     PlaybackDispatcher,
     PlaybackResult,
@@ -18,9 +19,11 @@ from tts_runtime.core import (
     ReplyRequest,
     RuntimeConfig,
     SynthesisResult,
+    TTS_PRIORITY_AUTONOMOUS,
     cache_key_for,
     supertonic_model_manifest_sha256,
 )
+from tts_runtime.announcements import lifecycle_announcement_request
 
 
 class FakeSynthesizer:
@@ -171,6 +174,7 @@ def request(
     *,
     text: str = "안녕하세요",
     timing: str = "immediate",
+    priority: int = 50,
 ) -> ReplyRequest:
     return ReplyRequest(
         reply_id=reply_id,
@@ -187,6 +191,7 @@ def request(
             '{"tool_id":"T07"}' if timing != "immediate" else ""
         ),
         function_request_id=f"function:{reply_id}" if timing != "immediate" else "",
+        priority=priority,
     )
 
 
@@ -429,6 +434,91 @@ def test_admission_timing_waits_durably_until_release(
     ]
     assert dispatcher.release_waiting("gated") is None
     assert len(player.calls) == 1
+    dispatcher.close()
+
+
+def test_procedure_finishing_fails_pending_tool_audio_but_allows_lifecycle_audio(
+    tmp_path: Path,
+) -> None:
+    dispatcher, store, _synth, player, events = runtime(tmp_path)
+    autonomous = request(
+        "autonomous-before-finish",
+        text="보비를 준비하겠습니다.",
+        priority=TTS_PRIORITY_AUTONOMOUS,
+    )
+    waiting = request(
+        "waiting-before-finish",
+        text="모스키토를 전달드리겠습니다.",
+        timing="on_function_accepted",
+    )
+    dispatcher.submit(autonomous)
+    dispatcher.submit(waiting)
+
+    failed = dispatcher.begin_procedure_finishing("gateway-1", "run-1")
+
+    assert [event.reply_id for event in failed] == [
+        "autonomous-before-finish",
+        "waiting-before-finish",
+    ]
+    assert store.get(autonomous.reply_id).error_code == "procedure_finishing_barrier"
+    assert store.get(waiting.reply_id).error_code == "procedure_finishing_barrier"
+    assert not player.calls
+
+    finishing = lifecycle_announcement_request(
+        event="procedure_finishing",
+        gateway_instance_id="gateway-1",
+        procedure_run_id="run-1",
+    )
+    assert finishing is not None
+    dispatcher.start()
+    dispatcher.submit(finishing)
+    dispatcher.wait_idle()
+
+    assert player.calls
+    assert states(events, autonomous.reply_id) == ["queued", "failed"]
+    assert states(events, waiting.reply_id) == ["waiting_function_accepted", "failed"]
+    assert states(events, finishing.reply_id) == ["queued", "playing", "played"]
+    dispatcher.close()
+
+
+def test_procedure_finishing_rejects_new_non_lifecycle_audio(
+    tmp_path: Path,
+) -> None:
+    dispatcher, store, _synth, player, events = runtime(tmp_path)
+    dispatcher.start()
+    dispatcher.begin_procedure_finishing("gateway-1", "run-1")
+
+    with pytest.raises(ValueError, match="procedure finishing barrier"):
+        dispatcher.submit(request("tool-after-finish", text="애드슨을 전달드리겠습니다."))
+
+    cleanup = request(
+        f"{COMPLETION_CLEANUP_REPLY_ID_PREFIX}adson",
+        text="애드슨을 회수하겠습니다.",
+        priority=TTS_PRIORITY_AUTONOMOUS,
+    )
+    dispatcher.submit(cleanup)
+
+    stop = lifecycle_announcement_request(
+        event="procedure_stop",
+        gateway_instance_id="gateway-1",
+        procedure_run_id="run-1",
+    )
+    record = lifecycle_announcement_request(
+        event="surgery_record_completed",
+        gateway_instance_id="gateway-1",
+        procedure_run_id="run-1",
+        correlation_id="record-1",
+    )
+    assert stop is not None and record is not None
+    dispatcher.submit(stop)
+    dispatcher.submit(record)
+    dispatcher.wait_idle()
+
+    assert store.get("tool-after-finish") is None
+    assert states(events, cleanup.reply_id)[-1] == "played"
+    assert states(events, stop.reply_id)[-1] == "played"
+    assert states(events, record.reply_id)[-1] == "played"
+    assert len(player.calls) == 3
     dispatcher.close()
 
 
@@ -959,6 +1049,47 @@ def test_cache_key_covers_voice_and_generation_settings() -> None:
     assert key != cache_key_for(
         "문장", RuntimeConfig(model_identity="model-b")
     )
+
+
+def test_terminal_history_retention_never_removes_pending_playback(tmp_path: Path) -> None:
+    store = PlaybackStore(tmp_path / "retention.sqlite3")
+    config = RuntimeConfig(model_identity="test-model")
+    for reply_id in ("oldest", "middle", "newest"):
+        item = request(reply_id)
+        store.insert(item, config, cache_key_for(item.text, config))
+        assert store.transition(
+            reply_id,
+            expected_state="queued",
+            state="played",
+            message="played",
+        ) is not None
+    pending = request("pending", timing="on_function_accepted")
+    store.insert(pending, config, cache_key_for(pending.text, config))
+
+    assert store.prune_terminal_history(
+        keep_recent=2,
+        max_age_sec=1_000_000_000.0,
+        now_unix_sec=time.time(),
+    ) == 1
+    assert store.get("oldest") is None
+    assert store.get("middle") is not None
+    assert store.get("newest") is not None
+    assert store.get("pending") is not None
+
+    with store._lock:
+        store._connection.execute(
+            "UPDATE playback_jobs SET updated_unix_sec = ? WHERE reply_id = ?",
+            (1.0, "middle"),
+        )
+    assert store.prune_terminal_history(
+        keep_recent=8,
+        max_age_sec=10.0,
+        now_unix_sec=100.0,
+    ) == 1
+    assert store.get("middle") is None
+    assert store.get("newest") is not None
+    assert store.get("pending") is not None
+    store.close()
 
 
 def test_model_manifest_is_path_independent_and_content_sensitive(

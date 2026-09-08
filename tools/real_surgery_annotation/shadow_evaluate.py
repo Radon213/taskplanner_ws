@@ -64,6 +64,8 @@ UNUSED_PREPOSITION_RETURN_ACTIONS = {"return_unused_preposition"}
 # speech/vision evidence. Admit only a narrow early match so a response at the
 # boundary is not mislabeled as missed, while preserving the signed offset.
 REQUEST_HANDOVER_EARLY_MATCH_TOLERANCE_SEC = 1.5
+OBSERVED_UTTERANCE_TOPIC = "/surgery/audio/observed_utterance"
+OBSERVED_UTTERANCE_MESSAGE_TYPE = "surgical_msgs/msg/SpeechUtterance"
 REQUEST_EVENT_TYPES = {
     "explicit_tool_request",
     "implicit_tool_request",
@@ -2756,9 +2758,10 @@ def _runtime_metrics(
             and record.get("topic") == "/surgery/transcript"
             for record in trace_records
         ),
-        "admitted_speech_count": sum(
+        "observed_utterance_count": sum(
             record.get("layer") == "input_transcript"
-            and record.get("topic") == "/surgery/audio/request_text"
+            and record.get("topic") == OBSERVED_UTTERANCE_TOPIC
+            and record.get("message_type") == OBSERVED_UTTERANCE_MESSAGE_TYPE
             for record in trace_records
         ),
         "vlm_result_count": len(vlm_result_times),

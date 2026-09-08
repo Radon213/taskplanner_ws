@@ -89,7 +89,9 @@ VARIANTS = (
 CALIBRATION_SPLIT = "development_calibration"
 DEVELOPMENT_CHALLENGE_SPLIT = "development_challenge"
 FINAL_HOLDOUT_SPLIT = "final_holdout"
-INITIAL_SURGEON_OWNED = {"allis_forceps": 2}
+# The current thyroidectomy_demo starts with no surgeon-owned rack tools.
+# Keep this evaluation baseline aligned with the authored initial placement.
+INITIAL_SURGEON_OWNED: dict[str, int] = {}
 
 
 class StateContextError(RuntimeError):

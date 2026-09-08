@@ -2209,7 +2209,7 @@ def test_pnu_compatibility_names_respect_demo_bed_arm_rack_exclusion() -> None:
     # subset happens to be an alias in each active procedure catalog.
     assert (
         sum(demo_spec.resolve_instrument_alias(name) is not None for name in raw_names)
-        == 2
+        == 3
     )
     assert (
         sum(
@@ -2223,14 +2223,14 @@ def test_pnu_compatibility_names_respect_demo_bed_arm_rack_exclusion() -> None:
     } == {
         "#15 Scalpel": None,
         "Adson forceps": "T02",
-        "Allis clamp forceps": "T03",
+        "Allis clamp forceps": None,
         "Army navy retractor": None,
         "Bipolar cautery": "T07",
         "Bovie surgical cautery": "T04",
-        "Mosquito forceps": None,
+        "Mosquito forceps": "T08",
         "Thyroid retractor": None,
     }
-    assert {"T05", "T11"}.isdisjoint(demo_spec.list_instrument_ids())
+    assert demo_spec.list_instrument_ids() == ["T02", "T04", "T07", "T08"]
     normal_resolved = {
         name: normal_spec.resolve_instrument_alias(name) for name in compatibility_names
     }

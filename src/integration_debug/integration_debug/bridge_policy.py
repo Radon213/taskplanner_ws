@@ -7,42 +7,12 @@ from typing import Any
 
 
 DEBUG_TOPICS_PUBLISH_ALLOWLIST = ("/integration/debug/heartbeat",)
-DEBUG_MULTICAM_SUBSCRIBE_ALLOWLIST = (
-    # Browser rendering uses VIPLab's timestamp-preserving synchronized plane.
-    # Driver-native `/camera/*` inputs stay server-side and there is no
-    # `/preview/*` fallback in the Taskplanner input contract.
-    "/synced/*",
-    "/multicam_node/*",
-    "/world_anchor_node/status",
-)
-DEBUG_TF_SUBSCRIBE_ALLOWLIST = (
-    # The dedicated Debug TF tab is observation-only.  Keep this exact rather
-    # than widening to `/tf*`: `/tf_static` carries retained calibration/anchor
-    # transforms while `/tf` carries live tool frames.
-    "/tf_static",
-    "/tf",
-)
-DEBUG_PERCEPTION_SUBSCRIBE_ALLOWLIST = (
-    # Read-only PNU bridge evidence.  Keep these exact so enabling the Debug
-    # overlay cannot widen the browser onto unrelated /surgery control topics.
-    "/surgery/perception/cam4/semantics/json",
-    "/surgery/perception/cam4/mayo_tool_observations",
-    "/surgery/perception/cam4/observations",
-    "/surgery/perception/cam4/tool_poses",
-    "/surgery/perception/cam4/blood_semantics/json",
-    "/surgery/perception/rfdetr/diagnostics/json",
-    "/surgery/perception/rfdetr/health",
-    # A single server-composited CAM3+CAM4 raster and its compact typed
-    # status replace per-camera/base/layer image fan-out in Debug. The browser
-    # remains a read-only observer and cannot alter composition or inference.
-    "/perception/debug/final_overlay/compressed",
-    "/perception/debug/final_overlay/status",
-)
-DEBUG_TOPICS_SUBSCRIBE_ALLOWLIST = (
-    "/integration/debug/status",
-    "/integration/debug/events",
-    "/integration/debug/readiness",
-) + DEBUG_MULTICAM_SUBSCRIBE_ALLOWLIST + DEBUG_TF_SUBSCRIBE_ALLOWLIST + DEBUG_PERCEPTION_SUBSCRIBE_ALLOWLIST
+# Debug observation is intentionally graph-wide.  This is a research browser
+# and a new diagnostic topic should be inspectable immediately without a
+# Python allowlist edit, rebuild, or bridge restart.  Write authority remains
+# separate: browser publication is limited to the heartbeat and every command
+# Service still enters the paused/stopped+arm gateway.
+DEBUG_TOPICS_SUBSCRIBE_ALLOWLIST = ("*",)
 DEBUG_MULTICAM_SERVICES_ALLOWLIST = (
     # The browser maps the original world_console keys b/x/w/p to these exact
     # Trigger calls.  No robot-control Action or service is admitted here.
@@ -84,15 +54,9 @@ DEBUG_ROSAPI_TOPICS_GLOB = "[" + ", ".join(DEBUG_TOPICS_SUBSCRIBE_ALLOWLIST) + "
 # subscribe to camera/TF/status topics and call the observer's own read-only
 # rosapi topic-list service.  In particular it cannot advertise or publish,
 # call world-anchor/debug services, or use any Action protocol capability.
-MULTICAM_OBSERVER_TOPICS_SUBSCRIBE_ALLOWLIST = (
-    # The always-on browser observer follows the same synchronized-only input
-    # contract. A stale client cannot fall back to driver-native `/camera/*`
-    # or the retired `/preview/*` namespace.
-    "/synced/*",
-    "/multicam_node/*",
-    "/tf_static",
-    "/world_anchor_node/status",
-)
+# The always-on observer has the same read-only graph visibility as Debug.
+# It cannot advertise, publish, call mutable services, or use Actions.
+MULTICAM_OBSERVER_TOPICS_SUBSCRIBE_ALLOWLIST = ("*",)
 MULTICAM_OBSERVER_TOPICS_PUBLISH_ALLOWLIST: tuple[str, ...] = ()
 MULTICAM_OBSERVER_SERVICES_ALLOWLIST = (
     "/multicam_observer/rosapi/topics",

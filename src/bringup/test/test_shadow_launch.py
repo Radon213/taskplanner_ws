@@ -250,6 +250,51 @@ def test_shadow_launch_exposes_strict_replay_controls():
     assert perform_substitutions(
         context, voice_parameters["selector_mode"]
     ).startswith("deterministic")
+    def _scalar(value) -> str:
+        return perform_substitutions(context, value).splitlines()[0]
+
+    assert _scalar(voice_parameters["input_topic"]) == "/surgery/voice/resolver_utterance"
+    assert _scalar(voice_parameters["output_topic"]) == "/surgery/voice/proposal"
+
+    speech_adapter = next(
+        entity
+        for entity in description.entities
+        if isinstance(entity, Node)
+        and entity.node_package == "simulation_runtime"
+        and entity.node_executable == "speech_input_adapter"
+    )
+    speech_parameters = {
+        "".join(part.text for part in key): value
+        for key, value in speech_adapter._Node__parameters[0].items()
+    }
+    assert _scalar(speech_parameters["input_topic"]) == "/shadow/speech/utterance"
+    assert _scalar(speech_parameters["typed_output_topic"]) == "/surgery/audio/admitted_utterance"
+    assert _scalar(speech_parameters["output_mode"]) == "typed_utterance"
+
+    command_router = next(
+        entity
+        for entity in description.entities
+        if isinstance(entity, Node)
+        and entity.node_package == "voice_command"
+        and entity.node_executable == "command_router"
+    )
+    router_parameters = {
+        "".join(part.text for part in key): value
+        for key, value in command_router._Node__parameters[0].items()
+    }
+    assert {
+        name: _scalar(value)
+        for name, value in router_parameters.items()
+    } == {
+        "input_topic": "/surgery/audio/admitted_utterance",
+        "observed_utterance_topic": "/surgery/audio/observed_utterance",
+        "resolver_input_topic": "/surgery/voice/resolver_utterance",
+        "resolver_output_topic": "/surgery/voice/proposal",
+        "procedure_bundle": "/tmp/test-procedure-bundle",
+    }
+    shadow_source = Path(module.__file__).read_text(encoding="utf-8")
+    assert "/surgery/audio/request_text" not in shadow_source
+    assert "/surgery/voice/intent" not in shadow_source
 
 
 def test_shadow_spec_dir_follows_default_bundle(monkeypatch):

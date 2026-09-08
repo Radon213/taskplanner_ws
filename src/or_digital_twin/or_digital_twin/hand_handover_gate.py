@@ -1,10 +1,12 @@
 """Fail-closed CAM4 right-hand handover-signal fusion.
 
 The hand classifier supplies only a binary human signal.  It never chooses a
-tool and it never publishes a robot command.  Gesture and facing observations
-are joined only when their source headers are identical, then a source- and
-receipt-time dwell gate turns the exact Right/Open_Palm/PALM_UP tuple into one
-episode.
+tool and it never publishes a robot command.  Gesture, facing, and 2-D
+keypoint observations are joined only when their source headers are identical.
+When several hands are visible, the leftmost hand in CAM4's image (by robust
+palm-centre ``u``) is the sole surgeon-intent candidate.  A source- and
+receipt-time dwell gate then turns that candidate's exact
+Right/Open_Palm/PALM_UP tuple into one episode.
 """
 
 from __future__ import annotations
@@ -137,6 +139,61 @@ class ExactStampHandJoiner:
             cache.pop(min(cache), None)
 
 
+class ExactStampHandTripletJoiner:
+    """Bounded, order-independent exact-header join for hand evidence.
+
+    Gesture and palm-facing arrays have no image coordinates.  The matching
+    ``HandKeypoints`` array supplies the 2-D landmarks for choosing the
+    leftmost hand, so a frame is consumed only after all three observations
+    share one exact source header.
+    """
+
+    def __init__(self, *, max_pending: int = 32) -> None:
+        self._max_pending = max(4, int(max_pending))
+        self._gestures: dict[tuple[int, int, str], Any] = {}
+        self._facings: dict[tuple[int, int, str], Any] = {}
+        self._keypoints: dict[tuple[int, int, str], Any] = {}
+
+    def clear(self) -> None:
+        self._gestures.clear()
+        self._facings.clear()
+        self._keypoints.clear()
+
+    def add_gesture(self, message: Any) -> tuple[Any, Any, Any] | None:
+        return self._add(message, self._gestures)
+
+    def add_facing(self, message: Any) -> tuple[Any, Any, Any] | None:
+        return self._add(message, self._facings)
+
+    def add_keypoints(self, message: Any) -> tuple[Any, Any, Any] | None:
+        return self._add(message, self._keypoints)
+
+    def _add(
+        self,
+        message: Any,
+        own: dict[tuple[int, int, str], Any],
+    ) -> tuple[Any, Any, Any] | None:
+        key = _stamp_key(message)
+        if key is None or key in own:
+            return None
+        own[key] = message
+        gesture = self._gestures.get(key)
+        facing = self._facings.get(key)
+        keypoints = self._keypoints.get(key)
+        if gesture is None or facing is None or keypoints is None:
+            self._trim_all()
+            return None
+        self._gestures.pop(key, None)
+        self._facings.pop(key, None)
+        self._keypoints.pop(key, None)
+        return (gesture, facing, keypoints)
+
+    def _trim_all(self) -> None:
+        for cache in (self._gestures, self._facings, self._keypoints):
+            while len(cache) > self._max_pending:
+                cache.pop(min(cache), None)
+
+
 def validate_hand_health(
     payload: Any,
     *,
@@ -200,18 +257,28 @@ def classify_hand_frame(
     gesture_message: Any,
     facing_message: Any,
     *,
+    keypoints_message: Any | None = None,
     pins: HandPerceptionPins,
     minimum_gesture_score: float = 0.5,
     minimum_handedness_score: float = 0.5,
     minimum_palm_up_score: float = 0.0,
 ) -> HandFrameEvidence:
-    """Classify one exact-stamp pair without carrying frame-local IDs forward."""
+    """Classify one exact-stamp hand frame without carrying IDs forward."""
 
     gesture_key = _stamp_key(gesture_message)
     facing_key = _stamp_key(facing_message)
     if gesture_key is None or facing_key is None or gesture_key != facing_key:
         return HandFrameEvidence(0.0, FrameDisposition.UNKNOWN, "header_mismatch")
     source_stamp_sec = stamp_key_sec(gesture_key)
+    if (
+        keypoints_message is not None
+        and _stamp_key(keypoints_message) != gesture_key
+    ):
+        return HandFrameEvidence(
+            source_stamp_sec,
+            FrameDisposition.UNKNOWN,
+            "hand_keypoint_header_mismatch",
+        )
     if gesture_key[2] != pins.source_frame_id:
         return HandFrameEvidence(
             source_stamp_sec,
@@ -303,8 +370,64 @@ def classify_hand_frame(
             "hand_index_set_mismatch",
         )
     common_indices = sorted(set(gestures) & set(facings))
+    selected_indices = common_indices
+    if keypoints_message is None:
+        if len(gesture_hands) >= 2:
+            # No coordinates are available to choose a requester.  Retain the
+            # fail-closed outcome for callers that have not joined keypoints.
+            return HandFrameEvidence(
+                source_stamp_sec,
+                FrameDisposition.UNKNOWN,
+                "multiple_hands_in_mayo_frame",
+            )
+    else:
+        keypoint_hands = list(getattr(keypoints_message, "hands", ()))
+        keypoints = by_index(keypoint_hands)
+        if keypoints is None or set(keypoints) != set(gestures):
+            return HandFrameEvidence(
+                source_stamp_sec,
+                FrameDisposition.UNKNOWN,
+                "hand_keypoint_index_set_mismatch",
+            )
+
+        def palm_centre_u(hand: Any) -> float | None:
+            try:
+                joints = tuple(hand.joints_2d)
+            except (AttributeError, TypeError):
+                return None
+            # Wrist plus the four finger-MCP anchors yields a stable palm
+            # location even when a fingertip reaches across another hand.
+            values: list[float] = []
+            for joint_index in (0, 5, 9, 13, 17):
+                if joint_index >= len(joints):
+                    return None
+                value = _finite(getattr(joints[joint_index], "u", None))
+                if value is None:
+                    return None
+                values.append(value)
+            values.sort()
+            return values[len(values) // 2]
+
+        positions = {
+            index: palm_centre_u(keypoints[index]) for index in common_indices
+        }
+        if not positions or any(
+            position is None for position in positions.values()
+        ):
+            return HandFrameEvidence(
+                source_stamp_sec,
+                FrameDisposition.UNKNOWN,
+                "leftmost_hand_position_unavailable",
+            )
+        selected_indices = [
+            min(
+                common_indices,
+                key=lambda index: (float(positions[index]), index),
+            )
+        ]
+
     eligible: list[tuple[int, Any, Any, float, float, float]] = []
-    for index in common_indices:
+    for index in selected_indices:
         gesture = gestures[index]
         facing = facings[index]
         if not bool(getattr(gesture, "has_handedness", False)):
@@ -405,14 +528,43 @@ def classify_hand_frame(
 
 
 class ContinuousHandHandoverGate:
-    """Dual-clock dwell, one-shot episode latch, and fresh-release debounce."""
+    """Dual-clock hand-request gate with asymmetric input-loss handling.
+
+    A positive hand signal must satisfy the complete dwell requirement before
+    it can create an episode.  The reverse direction is deliberately
+    asymmetric: a *known* non-request pose withdraws immediately, while a
+    short CAM4 absence or classifier dropout is held for a bounded grace
+    window.  This keeps one missing perception frame from restarting the
+    dwell clock without treating provenance failures, multiple hands, or a
+    deliberate closed/palm-down pose as a request.
+
+    ``release_sec`` remains the longer fresh-release interval used to rearm a
+    one-shot episode after a completed delivery.  ``release_confirm_sec`` is
+    only the short deassertion confirmation interval for a transient no-hand
+    observation.
+    """
+
+    _SOFT_UNKNOWN_REASONS = frozenset(
+        {
+            # The exact joined CAM4 frame is intact, but the classifier did
+            # not provide a conclusive label for this frame.
+            "hand_classification_unknown",
+            # One normal hand may temporarily fail the forced-right label
+            # check during motion/occlusion.  Ambiguous and multi-hand frames
+            # are intentionally not included here.
+            "right_hand_unavailable",
+        }
+    )
+    _TRANSIENT_RELEASE_REASONS = frozenset({"observed_no_hand"})
 
     def __init__(
         self,
         *,
         dwell_sec: float = 0.300,
         release_sec: float = 0.500,
-        max_positive_gap_sec: float = 0.200,
+        release_confirm_sec: float = 0.180,
+        soft_unknown_grace_sec: float = 0.180,
+        max_positive_gap_sec: float = 0.500,
         max_source_age_sec: float = 0.500,
         future_tolerance_sec: float = 0.500,
         max_receipt_silence_sec: float = 0.500,
@@ -420,6 +572,14 @@ class ContinuousHandHandoverGate:
     ) -> None:
         self.dwell_sec = max(0.001, float(dwell_sec))
         self.release_sec = max(0.001, float(release_sec))
+        self.release_confirm_sec = min(
+            self.release_sec,
+            max(0.001, float(release_confirm_sec)),
+        )
+        self.soft_unknown_grace_sec = max(
+            0.001,
+            float(soft_unknown_grace_sec),
+        )
         self.max_positive_gap_sec = max(0.001, float(max_positive_gap_sec))
         self.max_source_age_sec = max(0.001, float(max_source_age_sec))
         self.future_tolerance_sec = max(0.0, float(future_tolerance_sec))
@@ -435,6 +595,10 @@ class ContinuousHandHandoverGate:
         self._release_since_receipt: float | None = None
         self._last_release_stamp: float | None = None
         self._last_release_receipt: float | None = None
+        self._transient_loss_since: float | None = None
+        self._transient_loss_since_receipt: float | None = None
+        self._last_transient_loss_stamp: float | None = None
+        self._last_transient_loss_receipt: float | None = None
         self._first_positive_stamp: float | None = None
         self._first_positive_receipt: float | None = None
         self._last_positive_stamp: float | None = None
@@ -449,6 +613,7 @@ class ContinuousHandHandoverGate:
     def withdraw(self, *, preserve_episode: bool = True) -> None:
         self._reset_positive_run()
         self._reset_release_run()
+        self._reset_transient_loss()
         if not preserve_episode:
             self._episode_latched = False
             self._inhibited_until_release = False
@@ -460,6 +625,7 @@ class ContinuousHandHandoverGate:
         self._inhibited_until_release = True
         self._reset_positive_run()
         self._reset_release_run()
+        self._reset_transient_loss()
 
     def _reset_positive_run(self) -> None:
         self._first_positive_stamp = None
@@ -476,6 +642,177 @@ class ContinuousHandHandoverGate:
         self._release_since_receipt = None
         self._last_release_stamp = None
         self._last_release_receipt = None
+
+    def _reset_transient_loss(self) -> None:
+        self._transient_loss_since = None
+        self._transient_loss_since_receipt = None
+        self._last_transient_loss_stamp = None
+        self._last_transient_loss_receipt = None
+
+    def _transient_loss_is_within_grace(
+        self,
+        *,
+        stamp: float,
+        receipt: float,
+        grace_sec: float,
+    ) -> bool:
+        """Advance a dual-clock transient-loss run and report whether to hold.
+
+        The source and local receipt clocks must both remain inside the grace
+        interval.  A time regression or a discontinuity starts a fresh run;
+        it never extends a previous grace period across missing input.
+        """
+
+        continuous = bool(
+            self._last_transient_loss_stamp is not None
+            and self._last_transient_loss_receipt is not None
+            and stamp >= self._last_transient_loss_stamp
+            and receipt >= self._last_transient_loss_receipt
+            and stamp - self._last_transient_loss_stamp
+            <= self.max_positive_gap_sec
+            and receipt - self._last_transient_loss_receipt
+            <= self.max_positive_gap_sec
+        )
+        if not continuous:
+            self._transient_loss_since = stamp
+            self._transient_loss_since_receipt = receipt
+        self._last_transient_loss_stamp = stamp
+        self._last_transient_loss_receipt = receipt
+        source_span = max(
+            0.0,
+            stamp
+            - (
+                self._transient_loss_since
+                if self._transient_loss_since is not None
+                else stamp
+            ),
+        )
+        receipt_span = max(
+            0.0,
+            receipt
+            - (
+                self._transient_loss_since_receipt
+                if self._transient_loss_since_receipt is not None
+                else receipt
+            ),
+        )
+        return not (
+            source_span + 1e-9 >= grace_sec
+            and receipt_span + 1e-9 >= grace_sec
+        )
+
+    def _continue_release_run(
+        self,
+        *,
+        stamp: float,
+        receipt: float,
+        initial_stamp: float | None = None,
+        initial_receipt: float | None = None,
+    ) -> None:
+        """Track a confirmed release for episode rearming.
+
+        When an ``observed_no_hand`` gap outlives its small confirmation
+        window, its original first-missing frame is retained as the release
+        start.  That prevents the release rearm timer from gaining an extra
+        artificial delay after a genuine absence has already been observed.
+        """
+
+        continuous = bool(
+            self._last_release_stamp is not None
+            and self._last_release_receipt is not None
+            and stamp >= self._last_release_stamp
+            and receipt >= self._last_release_receipt
+            and stamp - self._last_release_stamp <= self.max_positive_gap_sec
+            and receipt - self._last_release_receipt
+            <= self.max_positive_gap_sec
+        )
+        if not continuous:
+            self._release_since = (
+                float(initial_stamp) if initial_stamp is not None else stamp
+            )
+            self._release_since_receipt = (
+                float(initial_receipt)
+                if initial_receipt is not None
+                else receipt
+            )
+        self._last_release_stamp = stamp
+        self._last_release_receipt = receipt
+
+        if not (self._episode_latched or self._inhibited_until_release):
+            return
+        release_source_span = max(
+            0.0,
+            stamp
+            - (
+                self._release_since
+                if self._release_since is not None
+                else stamp
+            ),
+        )
+        release_receipt_span = max(
+            0.0,
+            receipt
+            - (
+                self._release_since_receipt
+                if self._release_since_receipt is not None
+                else receipt
+            ),
+        )
+        if (
+            release_source_span + 1e-9 >= self.release_sec
+            and release_receipt_span + 1e-9 >= self.release_sec
+        ):
+            self._episode_latched = False
+            self._inhibited_until_release = False
+            self._reset_release_run()
+
+    def _hold_transient_loss(
+        self,
+        *,
+        evidence: HandFrameEvidence,
+        stamp: float,
+        receipt: float,
+        grace_sec: float,
+    ) -> HandGateUpdate:
+        """Hold prior positive evidence until a bounded input-loss grace ends."""
+
+        if self._transient_loss_is_within_grace(
+            stamp=stamp,
+            receipt=receipt,
+            grace_sec=grace_sec,
+        ):
+            return self._update(
+                accepted=True,
+                rising=False,
+                reason=f"transient_input_gap:{evidence.reason}",
+                disposition=evidence.disposition,
+            )
+
+        initial_stamp = self._transient_loss_since
+        initial_receipt = self._transient_loss_since_receipt
+        self._reset_transient_loss()
+        if evidence.disposition is FrameDisposition.RELEASE:
+            self._reset_positive_run()
+            self._continue_release_run(
+                stamp=stamp,
+                receipt=receipt,
+                initial_stamp=initial_stamp,
+                initial_receipt=initial_receipt,
+            )
+            return self._update(
+                accepted=True,
+                rising=False,
+                reason=evidence.reason,
+                disposition=evidence.disposition,
+            )
+
+        self.withdraw(preserve_episode=True)
+        return self._update(
+            accepted=True,
+            rising=False,
+            reason=evidence.reason,
+            disposition=evidence.disposition,
+        )
 
     def _update(self, *, accepted: bool, rising: bool, reason: str, disposition: FrameDisposition) -> HandGateUpdate:
         return HandGateUpdate(
@@ -543,6 +880,16 @@ class ContinuousHandHandoverGate:
         self._last_receipt_monotonic = receipt
 
         if evidence.disposition is FrameDisposition.UNKNOWN:
+            if evidence.reason in self._SOFT_UNKNOWN_REASONS:
+                return self._hold_transient_loss(
+                    evidence=evidence,
+                    stamp=stamp,
+                    receipt=receipt,
+                    grace_sec=self.soft_unknown_grace_sec,
+                )
+            # Missing provenance, multiple hands, an ambiguous requester, and
+            # time validation failures are not perception dropouts.  They are
+            # deliberately fail-closed and never inherit a prior request.
             self.withdraw(preserve_episode=True)
             return self._update(
                 accepted=True,
@@ -551,47 +898,19 @@ class ContinuousHandHandoverGate:
                 disposition=evidence.disposition,
             )
         if evidence.disposition is FrameDisposition.RELEASE:
+            if evidence.reason in self._TRANSIENT_RELEASE_REASONS:
+                return self._hold_transient_loss(
+                    evidence=evidence,
+                    stamp=stamp,
+                    receipt=receipt,
+                    grace_sec=self.release_confirm_sec,
+                )
+            self._reset_transient_loss()
+            # A known non-request pose is a deliberate gesture edge, not an
+            # occlusion.  It withdraws immediately while the longer release
+            # run remains responsible for rearming the one-shot episode.
             self._reset_positive_run()
-            if self._episode_latched or self._inhibited_until_release:
-                release_continuous = bool(
-                    self._last_release_stamp is not None
-                    and self._last_release_receipt is not None
-                    and stamp - self._last_release_stamp
-                    <= self.max_positive_gap_sec
-                    and receipt - self._last_release_receipt
-                    <= self.max_positive_gap_sec
-                    and receipt >= self._last_release_receipt
-                )
-                if not release_continuous:
-                    self._release_since = stamp
-                    self._release_since_receipt = receipt
-                self._last_release_stamp = stamp
-                self._last_release_receipt = receipt
-                release_source_span = max(
-                    0.0,
-                    stamp
-                    - (
-                        self._release_since
-                        if self._release_since is not None
-                        else stamp
-                    ),
-                )
-                release_receipt_span = max(
-                    0.0,
-                    receipt
-                    - (
-                        self._release_since_receipt
-                        if self._release_since_receipt is not None
-                        else receipt
-                    ),
-                )
-                if (
-                    release_source_span + 1e-9 >= self.release_sec
-                    and release_receipt_span + 1e-9 >= self.release_sec
-                ):
-                    self._episode_latched = False
-                    self._inhibited_until_release = False
-                    self._reset_release_run()
+            self._continue_release_run(stamp=stamp, receipt=receipt)
             return self._update(
                 accepted=True,
                 rising=False,
@@ -600,6 +919,7 @@ class ContinuousHandHandoverGate:
             )
 
         self._reset_release_run()
+        self._reset_transient_loss()
         if self._inhibited_until_release:
             self._reset_positive_run()
             return self._update(

@@ -73,6 +73,7 @@ class FakeAsrWsClient:
     def __init__(self, **kwargs) -> None:
         self.kwargs = kwargs
         self.fed = []
+        self.local_onsets = []
         self.started = False
         self.stopped = False
         self.__class__.instances.append(self)
@@ -80,8 +81,25 @@ class FakeAsrWsClient:
     def start(self) -> None:
         self.started = True
 
-    def feed(self, pcm: bytes) -> None:
+    def feed(
+        self,
+        pcm: bytes,
+        *,
+        captured_monotonic_ns: int | None = None,
+    ) -> None:
+        del captured_monotonic_ns
         self.fed.append(pcm)
+
+    def note_local_audio_onset(
+        self,
+        captured_monotonic_ns: int,
+        *,
+        dbfs: float,
+        threshold_dbfs: float,
+    ) -> None:
+        self.local_onsets.append(
+            (captured_monotonic_ns, dbfs, threshold_dbfs)
+        )
 
     def stop(self, *, flush_timeout_sec: float = 4.0) -> None:
         del flush_timeout_sec
@@ -92,6 +110,13 @@ class FakeAsrWsClient:
             "sent_chunks": 0,
             "responses": 0,
             "dropped_chunks": 0,
+            "ingress_dropped_chunks": 0,
+            "stale_ingress_dropped_chunks": 0,
+            "queue_dropped_chunks": 0,
+            "stale_queue_dropped_chunks": 0,
+            "pcm_ingress_max_age_ms": (
+                asr_runtime.DEFAULT_PCM_INGRESS_MAX_AGE_SEC * 1_000.0
+            ),
             "sessions": 0,
             "padded_final_bytes": 0,
             "pending_chunks": 0,
@@ -122,6 +147,32 @@ class FakeSendSocket:
         if self.fail:
             raise RuntimeError("test send failure")
         self.sent.append(value)
+
+
+class FakeSessionSocket(FakeSendSocket):
+    def __init__(self, responses=()) -> None:
+        super().__init__()
+        self._responses = iter(responses)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        try:
+            return next(self._responses)
+        except StopIteration as exc:
+            raise StopAsyncIteration from exc
+
+
+class FakeWebSocketContext:
+    def __init__(self, socket) -> None:
+        self.socket = socket
+
+    async def __aenter__(self):
+        return self.socket
+
+    async def __aexit__(self, _exc_type, _exc, _traceback) -> bool:
+        return False
 
 
 def test_websocket_url_rejects_all_inline_credential_channels() -> None:
@@ -161,6 +212,93 @@ def test_zip_transport_config_uses_server_vad_and_handoff_keywords() -> None:
     assert keywords["직접 교시"] == 9
 
 
+def test_pcm_callback_ingress_uses_one_scheduled_drain_and_drops_stale_audio() -> None:
+    """A busy event loop must not accumulate one callback per audio block."""
+
+    client = asr_runtime.AsrWsClient(
+        url="wss://asr.example.test/v1",
+        websockets_module=object(),
+        on_final=lambda _text: None,
+        on_partial=lambda _text: None,
+        on_connection=lambda _connected: None,
+        on_error=lambda _message: None,
+        queue_max=8,
+        ingress_max_age_sec=0.05,
+    )
+
+    class Loop:
+        def __init__(self) -> None:
+            self.callbacks = []
+
+        def is_closed(self) -> bool:
+            return False
+
+        def call_soon_threadsafe(self, callback) -> None:
+            self.callbacks.append(callback)
+
+    loop = Loop()
+    client._loop = loop
+    client._queue = asyncio.Queue(maxsize=8)
+    client._ready.set()
+    now_ns = asr_runtime.time.monotonic_ns()
+
+    client.feed(b"stale", captured_monotonic_ns=now_ns - 100_000_000)
+    client.feed(b"fresh", captured_monotonic_ns=now_ns)
+
+    # The second PortAudio callback only appends; the originally queued drain
+    # will take both blocks together when the event loop gets CPU time.
+    assert len(loop.callbacks) == 1
+    loop.callbacks[0]()
+
+    assert client._queue.get_nowait()[1] == b"fresh"
+    assert client._queue.empty()
+    stats = client.stats()
+    assert stats["stale_ingress_dropped_chunks"] == 1
+    assert stats["pending_chunks"] == 0
+
+
+def test_default_pcm_ingress_keeps_ten_seconds_before_capacity_eviction() -> None:
+    """The default count cap must not preempt the ten-second stale policy."""
+
+    client = asr_runtime.AsrWsClient(
+        url="wss://asr.example.test/v1",
+        websockets_module=object(),
+        on_final=lambda _text: None,
+        on_partial=lambda _text: None,
+        on_connection=lambda _connected: None,
+        on_error=lambda _message: None,
+    )
+
+    class Loop:
+        def __init__(self) -> None:
+            self.callbacks = []
+
+        def is_closed(self) -> bool:
+            return False
+
+        def call_soon_threadsafe(self, callback) -> None:
+            self.callbacks.append(callback)
+
+    loop = Loop()
+    client._loop = loop
+    client._queue = asyncio.Queue(maxsize=client._queue_max)
+    client._ready.set()
+    now_ns = asr_runtime.time.monotonic_ns()
+
+    # 100 callback blocks at the normal 100 ms cadence span 9.9 seconds.
+    for index in range(100):
+        client.feed(
+            bytes([index]),
+            captured_monotonic_ns=now_ns - (99 - index) * 100_000_000,
+        )
+
+    assert client._queue_max >= 100
+    assert len(loop.callbacks) == 1
+    loop.callbacks[0]()
+    assert client._queue.qsize() == 100
+    assert client.stats()["dropped_chunks"] == 0
+
+
 def test_final_response_reports_uncorrelated_latest_pcm_interval(monkeypatch) -> None:
     finals = []
     metadata = []
@@ -188,10 +326,203 @@ def test_final_response_reports_uncorrelated_latest_pcm_interval(monkeypatch) ->
             "response_latency_ms": 275.4,
             "latency_basis": "latest_pcm_send_complete_to_final_receive",
             "latency_correlated": False,
+            "last_changed_partial_to_final_ms": None,
         }
     ]
     assert errors == []
     assert client.stats()["responses"] == 1
+
+
+def test_final_response_reports_last_changed_partial_to_final_interval(monkeypatch) -> None:
+    finals = []
+    metadata = []
+    partials = []
+    client = asr_runtime.AsrWsClient(
+        url="wss://asr.example.test/v1",
+        websockets_module=object(),
+        on_final=finals.append,
+        on_final_metadata=metadata.append,
+        on_partial=partials.append,
+        on_connection=lambda _connected: None,
+        on_error=lambda _message: None,
+    )
+    client._last_audio_sent_monotonic_ns = 9_000_000_000
+    timestamps = iter((10_000_000_000, 10_275_400_000))
+    monkeypatch.setattr(asr_runtime.time, "monotonic_ns", lambda: next(timestamps))
+
+    asyncio.run(
+        client._receiver(
+            FakeResponseSocket(
+                [
+                    json.dumps({"partial": "Kelly", "is_final": 0}),
+                    json.dumps({"partial": "Kelly please", "is_final": 1}),
+                ]
+            )
+        )
+    )
+
+    assert partials == ["Kelly"]
+    assert finals == ["Kelly please"]
+    assert metadata[0]["last_changed_partial_to_final_ms"] == 275.4
+
+
+def test_first_changed_partial_reports_approximate_local_onset_latency(monkeypatch) -> None:
+    partials = []
+    client = asr_runtime.AsrWsClient(
+        url="wss://asr.example.test/v1",
+        websockets_module=object(),
+        on_final=lambda _text: None,
+        on_partial=partials.append,
+        on_connection=lambda _connected: None,
+        on_error=lambda _message: None,
+    )
+    client.note_local_audio_onset(
+        10_000_000_000,
+        dbfs=-21.4,
+        threshold_dbfs=-45.0,
+    )
+    monkeypatch.setattr(asr_runtime.time, "monotonic_ns", lambda: 10_612_300_000)
+
+    asyncio.run(
+        client._receiver(
+            FakeResponseSocket([json.dumps({"partial": "Kelly", "is_final": 0})])
+        )
+    )
+
+    assert partials == ["Kelly"]
+    stats = client.stats()
+    assert stats["local_onset_to_first_partial_ms"] == 612.3
+    assert stats["local_onset_basis"] == (
+        "audio_callback_dbfs_threshold_crossing_approximate"
+    )
+    assert stats["local_onset_dbfs"] == -21.4
+    assert stats["local_onset_threshold_dbfs"] == -45.0
+
+
+def test_opt_in_server_final_rollover_preserves_subchunk_pcm_without_eof() -> None:
+    client = asr_runtime.AsrWsClient(
+        url="wss://asr.example.test/v1",
+        websockets_module=None,
+        on_final=lambda _text: None,
+        on_partial=lambda _text: None,
+        on_connection=lambda _connected: None,
+        on_error=lambda _message: None,
+        rollover_after_final=True,
+    )
+    socket = FakeSessionSocket(
+        [json.dumps({"partial": "Kelly please", "is_final": 1})]
+    )
+
+    class OneSessionWebsockets:
+        def connect(self, *_args, **_kwargs):
+            return FakeWebSocketContext(socket)
+
+    client._websockets = OneSessionWebsockets()
+
+    async def run_session() -> bytes:
+        queued = b"queued-after-final"
+        client._queue = asyncio.Queue()
+        client._queue.put_nowait(queued)
+        client._send_buffer.extend(b"previous-remainder")
+        await client._session()
+        retained = bytes(client._send_buffer)
+        while not client._queue.empty():
+            retained += client._queue.get_nowait()
+        return retained
+
+    retained = asyncio.run(run_session())
+
+    assert retained == b"previous-remainderqueued-after-final"
+    assert client.stats()["normal_rollovers"] == 1
+    assert not any(
+        isinstance(value, str) and '"eof"' in value for value in socket.sent
+    )
+
+
+def test_empty_server_final_keeps_the_existing_session() -> None:
+    client = asr_runtime.AsrWsClient(
+        url="wss://asr.example.test/v1",
+        websockets_module=object(),
+        on_final=lambda _text: None,
+        on_partial=lambda _text: None,
+        on_connection=lambda _connected: None,
+        on_error=lambda _message: None,
+    )
+
+    async def receive_empty_final() -> bool:
+        rollover_requested = asyncio.Event()
+        await client._receiver(
+            FakeResponseSocket([json.dumps({"partial": "", "is_final": 1})]),
+            rollover_requested,
+        )
+        return rollover_requested.is_set()
+
+    assert asyncio.run(receive_empty_final()) is False
+
+
+def test_nonempty_server_final_keeps_the_existing_session_by_default() -> None:
+    client = asr_runtime.AsrWsClient(
+        url="wss://asr.example.test/v1",
+        websockets_module=object(),
+        on_final=lambda _text: None,
+        on_partial=lambda _text: None,
+        on_connection=lambda _connected: None,
+        on_error=lambda _message: None,
+    )
+
+    async def receive_final() -> bool:
+        rollover_requested = asyncio.Event()
+        await client._receiver(
+            FakeResponseSocket([json.dumps({"partial": "Kelly please", "is_final": 1})]),
+            rollover_requested,
+        )
+        return rollover_requested.is_set()
+
+    assert asyncio.run(receive_final()) is False
+
+
+def test_opt_in_normal_final_opens_next_session_without_reconnect_backoff(monkeypatch) -> None:
+    client = asr_runtime.AsrWsClient(
+        url="wss://asr.example.test/v1",
+        websockets_module=None,
+        on_final=lambda _text: None,
+        on_partial=lambda _text: None,
+        on_connection=lambda _connected: None,
+        on_error=lambda _message: None,
+        rollover_after_final=True,
+    )
+    first = FakeSessionSocket(
+        [json.dumps({"partial": "Kelly please", "is_final": 1})]
+    )
+    second = FakeSessionSocket()
+
+    class TwoSessionWebsockets:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def connect(self, *_args, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return FakeWebSocketContext(first)
+            if self.calls == 2:
+                client._stopping = True
+                return FakeWebSocketContext(second)
+            raise AssertionError("unexpected third ASR session")
+
+    web = TwoSessionWebsockets()
+    client._websockets = web
+    sleeps = []
+
+    async def record_sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(asr_runtime.asyncio, "sleep", record_sleep)
+
+    asyncio.run(client._run())
+
+    assert web.calls == 2
+    assert client.stats()["normal_rollovers"] == 1
+    assert sleeps == []
 
 
 def test_final_before_any_pcm_preserves_single_argument_callback(monkeypatch) -> None:
@@ -259,19 +590,19 @@ def test_input_format_falls_back_to_native_stereo() -> None:
     assert selected.block_frames == 4_800
     assert selected.requires_conversion
     assert info["name"] == "USB Native Stereo"
-    assert sounddevice.checked == [(16_000, 1), (48_000, 1), (48_000, 2)]
+    assert sounddevice.checked == [(16_000, 2), (16_000, 1), (48_000, 2)]
 
 
-def test_input_format_keeps_direct_16khz_mono_when_supported() -> None:
-    sounddevice = FakeSoundDevice({(16_000, 1), (48_000, 2)})
+def test_input_format_prefers_direct_16khz_stereo_when_supported() -> None:
+    sounddevice = FakeSoundDevice({(16_000, 1), (16_000, 2), (48_000, 2)})
 
     selected, _info = _select_input_format(sounddevice, 0)
 
     assert selected.sample_rate == 16_000
-    assert selected.channels == 1
+    assert selected.channels == 2
     assert selected.block_frames == 1_600
-    assert not selected.requires_conversion
-    assert sounddevice.checked == [(16_000, 1)]
+    assert selected.requires_conversion
+    assert sounddevice.checked == [(16_000, 2)]
 
 
 def test_wpctl_properties_create_ubuntu_logical_input(monkeypatch) -> None:
@@ -514,6 +845,22 @@ def test_resampler_downmixes_native_stereo_to_16khz_mono() -> None:
     assert np.all(converted == 2_000)
 
 
+def test_resampler_uses_the_active_channel_when_the_other_is_silent() -> None:
+    block = np.empty((480, 2), dtype=np.int16)
+    block[:, 0] = 0
+    block[:, 1] = 3_000
+    converter = Pcm16MonoResampler(
+        np,
+        input_sample_rate=48_000,
+        input_channels=2,
+    )
+
+    converted = np.frombuffer(converter.process(block), dtype="<i2")
+
+    assert converted.shape == (160,)
+    assert np.all(converted == 3_000)
+
+
 def test_resampler_is_continuous_across_irregular_callback_boundaries() -> None:
     frame_count = 1_003
     left = np.linspace(-20_000, 20_000, frame_count, dtype=np.int16)
@@ -570,15 +917,22 @@ def test_runtime_uses_native_capture_but_feeds_and_records_wire_format(
     assert snapshot["input_channels"] == 2
     assert snapshot["input_block_frames"] == 4_800
     assert snapshot["resampling"] is True
+    assert snapshot["local_onset_threshold_dbfs"] == -45.0
+    assert snapshot["local_onset_basis"] == (
+        "audio_callback_dbfs_threshold_crossing_approximate"
+    )
 
     native_block = np.empty((480, 2), dtype=np.int16)
     native_block[:, 0] = 1_000
     native_block[:, 1] = 3_000
     sounddevice.streams[0].callback(native_block, 480, None, None)
     client = FakeAsrWsClient.instances[0]
+    assert client.kwargs["rollover_after_final"] is False
     assert len(client.fed) == 1
     assert len(client.fed[0]) == 160 * 2
     assert np.all(np.frombuffer(client.fed[0], dtype="<i2") == 2_000)
+    assert len(client.local_onsets) == 1
+    assert client.local_onsets[0][2] == -45.0
     client.kwargs["on_final_metadata"](
         {
             "response_latency_ms": 184.2,
@@ -588,8 +942,17 @@ def test_runtime_uses_native_capture_but_feeds_and_records_wire_format(
     )
     client.kwargs["on_final"]("Alice and mass")
     final = runtime.snapshot()["finals"][-1]
+    # The command lane uses the same canonical final as the postprocess
+    # diagnostic field, so every downstream consumer receives one text.
     assert final["text"] == "Allis and 메스"
+    assert final["raw_text"] == "Alice and mass"
+    assert final["corrected_text"] == "Allis and 메스"
     assert final["postprocess_corrections"] == 2
+    assert final["postprocess_command_correction_pairs"] == (
+        ("Alice", "Allis"),
+        ("mass", "메스"),
+    )
+    assert final["postprocess_applied_to_command"] is True
     assert final["response_latency_ms"] == 184.2
     assert final["latency_correlated"] is False
 
@@ -603,6 +966,43 @@ def test_runtime_uses_native_capture_but_feeds_and_records_wire_format(
     assert sounddevice.streams[0].closed
     assert client.stopped
     assert stopped["connected"] is False
+
+
+def test_artifact_recording_keeps_a_bounded_newest_pcm_window(monkeypatch, tmp_path) -> None:
+    """Long recordings must not grow the ASR owner heap for an entire run."""
+
+    sounddevice = FakeSoundDevice({(48_000, 2)}, name="default")
+    monkeypatch.setattr(
+        asr_runtime,
+        "_optional_audio_modules",
+        lambda: (np, sounddevice, object(), ""),
+    )
+    monkeypatch.setattr(
+        asr_runtime,
+        "_query_pipewire_default_source",
+        lambda: {"name": "Analog Input - Test Mic", "input_channels": 1},
+    )
+    runtime = asr_runtime.AsrMicrophoneRuntime(
+        default_url="wss://asr.example.test/v1",
+        topic="/sensors/surgeon/sentence",
+        output_dir=tmp_path,
+        recording_max_seconds=1.0,
+    )
+
+    with runtime._lock:
+        runtime._recording_active = True
+        # Five 0.25 second callback windows exceed the one-second cap.
+        for _ in range(5):
+            runtime._append_recording_pcm(b"\x01\x00" * 4_000)
+
+    snapshot = runtime.snapshot()
+    assert snapshot["recording_max_sec"] == 1.0
+    assert snapshot["recording_buffered_sec"] <= 1.0
+    assert snapshot["recording_dropped_sec"] == 0.25
+    assert snapshot["recording_truncated"] is True
+    assert [event["type"] for event in runtime.drain_events()].count(
+        "asr_recording_window_truncated"
+    ) == 1
 
 
 def test_concurrent_stop_cannot_be_undone_by_inflight_start(

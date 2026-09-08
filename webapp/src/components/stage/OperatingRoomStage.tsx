@@ -9,8 +9,18 @@ import type {
   StageToolChipPlacement,
   useDigitalTwinViewModel,
 } from "../../hooks/useDigitalTwinViewModel";
-import type { RankedToolPrediction } from "../../types";
-import type { TypedRfdetrToolDetections } from "../../hooks/useRosBridge";
+import type { RankedToolPrediction, VLMResult } from "../../types";
+import type { CameraPreviewContracts } from "../../ros/cameraPreviewContracts";
+import type { LiveCameraMediaStore } from "../../ros/liveCameraMedia";
+import type { TypedRfdetrObservationStore } from "../../ros/typedRfdetrObservationStore";
+import type { ToolBeliefRuntime } from "../../ros/toolBeliefMessages";
+import type { ToolPolicyStatus } from "../../ros/toolPolicyMessages";
+import type {
+  RosbagStageCameraId,
+  RosbagStageCameraSlot,
+  RosbagUiAuditEventName,
+  RosbagUiPresentation,
+} from "../../ros/rosbagUiAuditMessages";
 import { MOTION_DURATION, SILK_EASE } from "../../motion-system";
 import { BedRobotArmCard } from "./BedRobotArmCard";
 import {
@@ -18,17 +28,26 @@ import {
   type HandHandoverSignal,
 } from "../command/HandHandoverSignalStatus";
 import {
-  OperationExecutionDispatchPopup,
   SurgeonFinalSentencePopup,
-  VlmToolEvidenceBadges,
-  type ExecutionDispatchEvent,
-  type VlmOperationObservations,
 } from "../observability/OperationVlmObservability";
+import type { OperationAsrFinalPresentation } from "../../presentation/operationPresentation";
+import {
+  mayoObservedToolIds,
+  projectToolCardPresentation,
+  systemToolPredictionsById,
+  toolDemandForecastById,
+} from "../../presentation/toolCardPresentation";
 import {
   StageCameraToggleViewport,
   StageCameraViewport,
   type StageCameraFrames,
 } from "./StageCameraViewport";
+import { StageToolCard } from "./StageToolCard";
+import {
+  aggregateRackTools,
+  projectToolBeliefsOntoStage,
+  TOOL_BELIEF_STAGE_STALE_AFTER_MS,
+} from "./toolBeliefStageProjection";
 
 type ViewModel = ReturnType<typeof useDigitalTwinViewModel>;
 
@@ -43,266 +62,6 @@ type BoardMetrics = {
   width: number;
   height: number;
 };
-
-type QuantifiedToolChipPlacement = StageToolChipPlacement & {
-  quantity?: number;
-  count?: number;
-  instanceIds?: string[];
-};
-
-type DisplayToolChipPlacement = StageToolChipPlacement & {
-  quantity: number;
-  instanceIds: string[];
-};
-
-type SystemSurgeonRequest = {
-  confirmed: boolean;
-  requestedTool: string;
-};
-
-type SurgeonFinalSentence = {
-  eventKey: string;
-  text: string;
-};
-
-const HIGHLIGHT_PRIORITY: Record<StageToolChipPlacement["highlight"], number> = {
-  requested: 2,
-  predicted: 1,
-  normal: 0,
-};
-
-type SystemToolPrediction = {
-  rank: number;
-  confidence: number;
-};
-
-function systemToolPredictionsById(
-  predictions: readonly RankedToolPrediction[],
-): ReadonlyMap<string, SystemToolPrediction> {
-  const rows = [...predictions]
-    .filter((prediction) => {
-      const rank = Number(prediction.rank);
-      const confidence = Number(prediction.confidence);
-      return (
-        Number.isInteger(rank)
-        && rank >= 1
-        && rank <= 3
-        && Boolean(prediction.instrument_id.trim())
-        && Number.isFinite(confidence)
-        && confidence >= 0
-        && confidence <= 1
-      );
-    })
-    .sort((left, right) => left.rank - right.rank)
-    .slice(0, 3);
-  const byId = new Map<string, SystemToolPrediction>();
-  for (const prediction of rows) {
-    if (byId.has(prediction.instrument_id)) continue;
-    byId.set(prediction.instrument_id, {
-      rank: prediction.rank,
-      confidence: prediction.confidence,
-    });
-  }
-  return byId;
-}
-
-function normalizedToolGroupKey(value: string): string {
-  return value.trim().replace(/\s+/g, " ").toLocaleLowerCase();
-}
-
-function quantityForChip(chip: QuantifiedToolChipPlacement): number {
-  const rawQuantity = chip.quantity ?? chip.count ?? 1;
-  return Number.isFinite(rawQuantity) ? Math.max(1, Math.floor(rawQuantity)) : 1;
-}
-
-function quantityStackSpread(quantity: number): number {
-  return Math.min(10, Math.max(0, quantity - 1) * 4);
-}
-
-function quantityStackLayerOffset(layerDepth: number, quantity: number): number {
-  const layerCount = Math.max(1, quantity - 1);
-  return (quantityStackSpread(quantity) * layerDepth) / layerCount;
-}
-
-function instanceIdsForChip(chip: QuantifiedToolChipPlacement): string[] {
-  const ids = chip.instanceIds?.filter(Boolean) ?? [];
-  return ids.length ? ids : chip.id ? [chip.id] : [];
-}
-
-function toolInstanceMarker(instanceId: string | undefined, instrumentId: string): string {
-  const normalized = instanceId?.trim() ?? "";
-  if (!normalized || normalized === instrumentId.trim()) return "";
-  const markerIndex = normalized.lastIndexOf("#");
-  if (markerIndex >= 0 && markerIndex < normalized.length - 1) {
-    return normalized.slice(markerIndex, markerIndex + 17);
-  }
-  return normalized.slice(0, 16);
-}
-
-function showToolInstanceMarker(chip: DisplayToolChipPlacement): boolean {
-  const instanceId = chip.displayInstanceId?.trim() ?? "";
-  if (!instanceId || !chip.instanceIds.includes(instanceId)) return false;
-  return (
-    chip.active
-    || chip.highlight !== "normal"
-    // Leaving the rack is itself the spatial transition operators need to
-    // disambiguate, even when a display catalog has not yet mapped the raw
-    // lifecycle to a highlighted visual state.
-    || chip.holderId !== "rack"
-  );
-}
-
-function mergeToolBadges(chips: StageToolChipPlacement[]): StageToolChipBadge[] {
-  const badges = new Map<string, StageToolChipBadge>();
-  for (const chip of chips) {
-    for (const badge of chip.footerBadges) {
-      badges.set(`${badge.tone}:${badge.label}`, badge);
-    }
-  }
-  return [...badges.values()];
-}
-
-function rankedRackRepresentative(chips: QuantifiedToolChipPlacement[]): QuantifiedToolChipPlacement | undefined {
-  return [...chips].sort((left, right) => {
-    if (left.active !== right.active) return left.active ? -1 : 1;
-    const highlightDelta = HIGHLIGHT_PRIORITY[right.highlight] - HIGHLIGHT_PRIORITY[left.highlight];
-    if (highlightDelta) return highlightDelta;
-    return left.gridIndex - right.gridIndex || left.id.localeCompare(right.id);
-  })[0];
-}
-
-function aggregateRackTools(chips: StageToolChipPlacement[], vm: ViewModel): DisplayToolChipPlacement[] {
-  const quantifiedChips = chips as QuantifiedToolChipPlacement[];
-  const chipsByLabel = new Map<string, QuantifiedToolChipPlacement[]>();
-  for (const chip of quantifiedChips) {
-    const key = normalizedToolGroupKey(chip.label) || chip.id;
-    chipsByLabel.set(key, [...(chipsByLabel.get(key) ?? []), chip]);
-  }
-
-  const inventoryByLabel = new Map<
-    string,
-    { id: string; label: string; count: number }
-  >();
-  const selectedBundleInstruments = vm.layout.metadata?.bundles?.find(
-    (bundle) => bundle.id === vm.activeBundle,
-  )?.instruments;
-  const inventoryInstruments = selectedBundleInstruments?.length
-    ? selectedBundleInstruments
-    : vm.layout.metadata?.instruments ?? [];
-  for (const instrument of inventoryInstruments) {
-    const label = vm.displayToolName(instrument.id);
-    inventoryByLabel.set(normalizedToolGroupKey(label) || instrument.id, {
-      id: instrument.id,
-      label,
-      count: Math.max(1, Math.floor(instrument.inventory_count ?? 1)),
-    });
-  }
-
-  const rackPlacements: DisplayToolChipPlacement[] = [];
-  const processedRackLabels = new Set<string>();
-
-  for (const [labelKey, group] of chipsByLabel) {
-    const rackChips = group.filter((chip) => chip.holderId === "rack");
-    const inventory = inventoryByLabel.get(labelKey);
-    const outsideQuantity = group
-      .filter((chip) => chip.holderId !== "rack")
-      .reduce((total, chip) => total + quantityForChip(chip), 0);
-    const rackQuantity = inventory
-      ? Math.max(0, inventory.count - outsideQuantity)
-      : rackChips.reduce((total, chip) => total + quantityForChip(chip), 0);
-    if (rackQuantity <= 0) continue;
-
-    const representative = rankedRackRepresentative(rackChips);
-    if (representative) {
-      rackPlacements.push({
-        ...representative,
-        quantity: rackQuantity,
-        instanceIds: [...new Set(rackChips.flatMap(instanceIdsForChip))],
-        contaminated: rackChips.some((chip) => chip.contaminated),
-        active: rackChips.some((chip) => chip.active),
-        footerBadges: mergeToolBadges(rackChips),
-      });
-      processedRackLabels.add(labelKey);
-      continue;
-    }
-
-    const source = group[0];
-    const slot = vm.boardRackSlots.find(
-      (candidate) => candidate.instrumentId === inventory?.id || normalizedToolGroupKey(candidate.label) === labelKey,
-    );
-    if (!source || !slot) continue;
-    rackPlacements.push({
-      ...source,
-      id: `rack-inventory-${inventory?.id ?? labelKey}`,
-      instrumentId: inventory?.id ?? source.instrumentId,
-      label: inventory?.label ?? source.label,
-      holderId: "rack",
-      holderLabel: vm.language === "ko" ? "랙" : "Rack",
-      left: slot.rect.left,
-      top: slot.rect.top,
-      width: slot.rect.width,
-      height: slot.rect.height,
-      scale: 1,
-      compact: false,
-      gridIndex: vm.boardRackSlots.findIndex((candidate) => candidate.id === slot.id),
-      displayState: "waiting",
-      highlight: "normal",
-      lifecycle: vm.ui.waitingState,
-      footerBadges: [{ label: vm.ui.waitingState, tone: "neutral" }],
-      contaminated: false,
-      active: false,
-      layoutVariant: "card",
-      density: "regular",
-      quantity: rackQuantity,
-      instanceIds: [],
-    });
-    processedRackLabels.add(labelKey);
-  }
-
-  for (const [labelKey, inventory] of inventoryByLabel) {
-    if (processedRackLabels.has(labelKey) || chipsByLabel.has(labelKey)) continue;
-    const slot = vm.boardRackSlots.find((candidate) => candidate.instrumentId === inventory.id);
-    if (!slot) continue;
-    rackPlacements.push({
-      id: `rack-inventory-${inventory.id}`,
-      instrumentId: inventory.id,
-      label: inventory.label,
-      shortLabel: slot.shortLabel,
-      holderId: "rack",
-      holderLabel: vm.language === "ko" ? "랙" : "Rack",
-      left: slot.rect.left,
-      top: slot.rect.top,
-      width: slot.rect.width,
-      height: slot.rect.height,
-      scale: 1,
-      compact: false,
-      gridIndex: vm.boardRackSlots.findIndex((candidate) => candidate.id === slot.id),
-      displayState: "waiting",
-      highlight: "normal",
-      lifecycle: vm.ui.waitingState,
-      footerBadges: [{ label: vm.ui.waitingState, tone: "neutral" }],
-      contaminated: false,
-      active: false,
-      layoutVariant: "card",
-      density: "regular",
-      quantity: inventory.count,
-      instanceIds: [],
-    });
-  }
-
-  const nonRackPlacements = quantifiedChips
-    .filter((chip) => chip.holderId !== "rack")
-    .map((chip) => ({
-      ...chip,
-      quantity: quantityForChip(chip),
-      instanceIds: instanceIdsForChip(chip),
-    }));
-
-  return [
-    ...rackPlacements.sort((left, right) => left.gridIndex - right.gridIndex),
-    ...nonRackPlacements,
-  ];
-}
 
 function chipAttentionBadges(chip: StageToolChipPlacement, vm: ViewModel): StageToolChipBadge[] {
   const badges: StageToolChipBadge[] = [];
@@ -362,6 +121,16 @@ function voiceAgeLabel(occurredAt: number | undefined, nowMs: number, language: 
   return language === "ko" ? `${elapsedSec}초 전` : `${elapsedSec}s ago`;
 }
 
+function VoiceAge({ occurredAt, language }: { occurredAt: number; language: "ko" | "en" }) {
+  const [nowMs, setNowMs] = useState(Date.now());
+  useEffect(() => {
+    setNowMs(Date.now());
+    const timer = window.setInterval(() => setNowMs(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [occurredAt]);
+  return <time>{voiceAgeLabel(occurredAt, nowMs, language)}</time>;
+}
+
 function PhaseStepper({ steps, label }: { steps: StagePhaseStep[]; label: string }) {
   return (
     <div className="phase-stepper" aria-label={label} role="list">
@@ -378,49 +147,132 @@ function PhaseStepper({ steps, label }: { steps: StagePhaseStep[]; label: string
 export function OperatingRoomStage({
   vm,
   cameraFrames,
-  typedRfdetrToolDetections,
-  systemSurgeonRequest,
+  cameraMediaStore,
+  cameraPreviewContracts,
+  typedRfdetrObservationStore,
+  toolBeliefs,
+  procedureRunning,
+  surgeonRequestedTool,
   asrFinalSentence,
   handHandoverSignal,
-  vlmObservations,
+  vlmResult,
   systemToolPredictions = [],
-  executionDispatch,
+  toolPolicyStatus,
   onStageAspectChange,
+  replayOnly = false,
+  replayPresentation,
+  onReplayStageCameraChange,
 }: {
   vm: ViewModel;
   cameraFrames?: StageCameraFrames;
-  /** Local typed RF-DETR facts for their matching CAM3/CAM4 raw frames. */
-  typedRfdetrToolDetections?: TypedRfdetrToolDetections;
-  systemSurgeonRequest: SystemSurgeonRequest;
-  /** A finalized ASR transcript, displayed only as observer evidence. */
-  asrFinalSentence?: SurgeonFinalSentence | null;
+  cameraMediaStore?: LiveCameraMediaStore;
+  cameraPreviewContracts?: CameraPreviewContracts;
+  /** Latest-only typed facts; updates are isolated from the Stage/root tree. */
+  typedRfdetrObservationStore?: TypedRfdetrObservationStore;
+  /** Fixed-inventory, observation-only semantic location probabilities. */
+  toolBeliefs?: ToolBeliefRuntime | null;
+  procedureRunning: boolean;
+  surgeonRequestedTool: string;
+  /** Observer-only final transcript already formatted by the presentation owner. */
+  asrFinalSentence: OperationAsrFinalPresentation | null;
   /** Reducer-authoritative direct hand-perception gate state. */
   handHandoverSignal: HandHandoverSignal;
-  vlmObservations: VlmOperationObservations;
+  vlmResult: VLMResult;
   /** Reducer-accepted system-final ranking; never raw VLM candidates. */
   systemToolPredictions?: readonly RankedToolPrediction[];
-  executionDispatch: ExecutionDispatchEvent | null;
+  /** Current DT policy snapshot, already scoped to this procedure run. */
+  toolPolicyStatus?: ToolPolicyStatus | null;
   onStageAspectChange?: (ratio: number) => void;
+  replayOnly?: boolean;
+  replayPresentation?: RosbagUiPresentation;
+  onReplayStageCameraChange?: (
+    event: Extract<
+      RosbagUiAuditEventName,
+      "stage_camera_selected" | "stage_camera_inspection_changed"
+    >,
+    slot: RosbagStageCameraSlot,
+    camera: RosbagStageCameraId,
+    inspecting: boolean,
+  ) => void;
 }) {
   const reduceMotion = useReducedMotion();
   const boardRef = useRef<HTMLDivElement>(null);
   const boardMetricsRef = useRef<BoardMetrics>({ width: 1, height: 1 });
   const previousToolRectsRef = useRef<Record<string, ToolMotionSnapshot>>({});
   const [nowMs, setNowMs] = useState(Date.now());
+  useEffect(() => {
+    if (toolBeliefs?.enabled !== true || !toolBeliefs.snapshot) return;
+    const receivedAt = toolBeliefs.snapshot.receivedAt;
+    const now = Date.now();
+    setNowMs(now);
+    // Freshness only changes at the expiry boundary. A permanent 2 Hz clock
+    // unnecessarily reprojects every tool and camera in the operating room.
+    const delay = Math.max(0, receivedAt + TOOL_BELIEF_STAGE_STALE_AFTER_MS - now) + 1;
+    const timer = window.setTimeout(() => setNowMs(Date.now()), delay);
+    return () => window.clearTimeout(timer);
+  }, [toolBeliefs?.enabled, toolBeliefs?.snapshot?.receivedAt]);
+  const toolBeliefProjection = useMemo(
+    () => projectToolBeliefsOntoStage({
+      activeBundle: vm.activeBundle,
+      holders: vm.boardHolders,
+      nowMs,
+      placements: vm.toolChipPlacements,
+      rackSlots: vm.boardRackSlots,
+      runtime: toolBeliefs,
+    }),
+    [
+      nowMs,
+      toolBeliefs,
+      vm.activeBundle,
+      vm.boardHolders,
+      vm.boardRackSlots,
+      vm.toolChipPlacements,
+    ],
+  );
   const displayToolPlacements = useMemo(
-    () => aggregateRackTools(vm.toolChipPlacements, vm),
-    [vm],
+    () => aggregateRackTools(
+      toolBeliefProjection.placements,
+      vm,
+      toolBeliefProjection.rackSlots,
+      toolBeliefProjection.hiddenInventoryCounts,
+      toolBeliefProjection.exchangeableActiveCounts,
+    ),
+    [toolBeliefProjection, vm],
   );
   const systemPredictionByToolId = useMemo(
     () => systemToolPredictionsById(systemToolPredictions),
     [systemToolPredictions],
   );
+  const demandForecastByToolId = useMemo(
+    () => toolDemandForecastById(vlmResult),
+    [vlmResult],
+  );
+  const mayoObservedToolIdSet = useMemo(
+    () => mayoObservedToolIds(vlmResult),
+    [vlmResult],
+  );
   const cameraLiveLabel = vm.language === "ko" ? "영상 수신 중" : "Live";
   const cameraWaitingLabel = vm.language === "ko" ? "연결 대기" : "Waiting";
-  const surgeonRequestConfirmed = systemSurgeonRequest.confirmed;
+  const cameraLiveLabels = {
+    cam3: cameraPreviewContracts?.cam3.semantic === "operator_overlay"
+      ? vm.language === "ko" ? "인식 오버레이 수신 중" : "Detection overlay live"
+      : cameraLiveLabel,
+    cam4: cameraPreviewContracts?.cam4.semantic === "operator_overlay"
+      ? vm.language === "ko" ? "인식 오버레이 수신 중" : "Detection overlay live"
+      : cameraLiveLabel,
+  };
+  const cameraEmptyLabels = {
+    cam3: cameraPreviewContracts?.cam3.semantic === "operator_overlay"
+      ? vm.language === "ko" ? "인식 오버레이 없음 · 자동 재연결 중" : "Detection overlay missing · reconnecting"
+      : cameraWaitingLabel,
+    cam4: cameraPreviewContracts?.cam4.semantic === "operator_overlay"
+      ? vm.language === "ko" ? "인식 오버레이 없음 · 자동 재연결 중" : "Detection overlay missing · reconnecting"
+      : cameraWaitingLabel,
+  };
+  const surgeonRequestConfirmed = procedureRunning && Boolean(surgeonRequestedTool);
   const handHandoverActive = handHandoverSignal.active;
-  const confirmedRequestTool = systemSurgeonRequest.requestedTool
-    ? vm.displayToolName(systemSurgeonRequest.requestedTool)
+  const confirmedRequestTool = surgeonRequestedTool
+    ? vm.displayToolName(surgeonRequestedTool)
     : vm.ui.none;
   const asrFinalEventKey = asrFinalSentence?.eventKey ?? "";
   const [visibleAsrFinalEventKey, setVisibleAsrFinalEventKey] = useState("");
@@ -461,22 +313,12 @@ export function OperatingRoomStage({
     .slice(0, 1);
   const displayedSurgeonAlerts = surgeonRequestConfirmed ? [] : surgeonAlertBubbles;
   const surgeonHolder = vm.boardHolders.find((holder) => holder.id === "surgeon");
-  const surgeonAlertClockKey = surgeonAlertBubbles
-    .map((bubble) => `${bubble.id}:${bubble.occurredAt ?? 0}`)
-    .join("|");
   const interruptAlertKey = vm.stage.interruptAlert
     ? vm.stage.interruptAlert.eventKey
     : "";
   const [hiddenInterruptAlertKey, setHiddenInterruptAlertKey] = useState("");
   const visibleInterruptAlert =
     vm.stage.interruptAlert && hiddenInterruptAlertKey !== interruptAlertKey ? vm.stage.interruptAlert : null;
-
-  useEffect(() => {
-    if (!surgeonAlertBubbles.some((bubble) => bubble.occurredAt)) return;
-    setNowMs(Date.now());
-    const timer = window.setInterval(() => setNowMs(Date.now()), 1000);
-    return () => window.clearInterval(timer);
-  }, [surgeonAlertClockKey]);
 
   useEffect(() => {
     if (!interruptAlertKey) {
@@ -528,12 +370,6 @@ export function OperatingRoomStage({
           </div>
           <PhaseStepper steps={vm.stage.phaseSteps} label={vm.ui.phaseOverview} />
         </div>
-        <OperationExecutionDispatchPopup
-          event={executionDispatch}
-          language={vm.language}
-          className="stage-execution-dispatch-popup"
-        />
-
         {vm.boardBedRobotArms.length ? (
           <div
             className="bed-robot-arm-rail"
@@ -650,21 +486,27 @@ export function OperatingRoomStage({
             <span />
           </div>
           <StageCameraToggleViewport
-            frames={{
-              cam2: cameraFrames?.cam2,
-              flir: cameraFrames?.flir,
-            }}
+            frames={{ cam2: cameraFrames?.cam2, flir: cameraFrames?.flir }}
+            mediaStore={cameraMediaStore}
             cameraIds={["cam2", "flir"]}
+            sourceContracts={cameraPreviewContracts}
             initialCamera="flir"
             language={vm.language}
             liveLabel={cameraLiveLabel}
             emptyLabel={cameraWaitingLabel}
             className="surgical-bed-camera-view"
+            replayOnly={replayOnly}
+            replaySelectedCamera={replayPresentation?.stageSurgicalBedCamera}
+            replayInspectionOpen={replayPresentation?.stageSurgicalBedInspecting}
+            replaySlot="surgical_bed"
+            onReplayPresentationChange={onReplayStageCameraChange}
           />
         </div>
 
         <div
-          className={`mayo-stand-group ${vm.boardMayoStand.active ? "active" : ""}`}
+          className={`mayo-stand-group ${
+            vm.boardMayoStand.active || toolBeliefProjection.projectedHolderIds.has("mayo") ? "active" : ""
+          }`}
           style={{
             left: `${vm.boardMayoStand.rect.left}%`,
             top: `${vm.boardMayoStand.rect.top}%`,
@@ -681,7 +523,9 @@ export function OperatingRoomStage({
           return (
             <div
               key={holder.id}
-              className={`holder-zone ${holder.tone} ${holder.active ? "active" : ""} ${
+              className={`holder-zone ${holder.tone} ${
+                holder.active || toolBeliefProjection.projectedHolderIds.has(holder.id) ? "active" : ""
+              } ${
                 holder.id === "surgeon" && (surgeonRequestConfirmed || displayedSurgeonAlerts.length || visibleAsrFinalSentence)
                   ? "has-evidence"
                   : ""
@@ -724,19 +568,23 @@ export function OperatingRoomStage({
         })}
 
         <StageCameraToggleViewport
-          frames={{
-            cam1: cameraFrames?.cam1,
-            // CAM4 is reviewed from the surgeon-side mini-view. Typed RF-DETR
-            // facts stay tied to the matching raw CAM4 frame.
-            cam4: cameraFrames?.cam4,
-          }}
-          typedRfdetrDetections={typedRfdetrToolDetections}
+          frames={{ cam1: cameraFrames?.cam1, cam4: cameraFrames?.cam4 }}
+          mediaStore={cameraMediaStore}
+          typedRfdetrObservationStore={typedRfdetrObservationStore}
+          sourceContracts={cameraPreviewContracts}
           cameraIds={["cam1", "cam4"]}
           initialCamera="cam1"
           language={vm.language}
           liveLabel={cameraLiveLabel}
+          liveLabels={cameraLiveLabels}
           emptyLabel={cameraWaitingLabel}
+          emptyLabels={cameraEmptyLabels}
           className="independent-stage-camera cam1-stage-camera"
+          replayOnly={replayOnly}
+          replaySelectedCamera={replayPresentation?.stageIndependentCamera}
+          replayInspectionOpen={replayPresentation?.stageIndependentInspecting}
+          replaySlot="independent"
+          onReplayPresentationChange={onReplayStageCameraChange}
           style={{
             left: `${vm.boardCameraRects.cam1.left}%`,
             top: `${vm.boardCameraRects.cam1.top}%`,
@@ -748,10 +596,16 @@ export function OperatingRoomStage({
         <StageCameraViewport
           cameraId="cam3"
           frame={cameraFrames?.cam3}
-          typedRfdetrDetection={typedRfdetrToolDetections?.cam3}
-          liveLabel={cameraLiveLabel}
-          emptyLabel={cameraWaitingLabel}
+          mediaStore={cameraMediaStore}
+          typedRfdetrObservationStore={typedRfdetrObservationStore}
+          sourceContract={cameraPreviewContracts?.cam3}
+          liveLabel={cameraLiveLabels.cam3}
+          emptyLabel={cameraEmptyLabels.cam3}
           className="independent-stage-camera cam3-stage-camera"
+          replayOnly={replayOnly}
+          replayInspectionOpen={replayPresentation?.stageCam3Inspecting}
+          replaySlot="cam3"
+          onReplayPresentationChange={onReplayStageCameraChange}
           style={{
             left: `${vm.boardCameraRects.cam3.left}%`,
             top: `${vm.boardCameraRects.cam3.top}%`,
@@ -761,7 +615,7 @@ export function OperatingRoomStage({
         />
 
         <div className="rack-slots-layer" aria-hidden="true">
-          {vm.boardRackSlots.map((slot) => (
+          {toolBeliefProjection.rackSlots.map((slot) => (
             <span
               key={slot.id}
               className={slot.occupied ? "occupied" : "vacant"}
@@ -786,122 +640,39 @@ export function OperatingRoomStage({
 
         <div className="stage-tools board-tools">
           {displayToolPlacements.map((chip) => {
-            const footerBadges = [...chip.footerBadges, ...chipAttentionBadges(chip, vm)];
-            const instanceMarker = showToolInstanceMarker(chip)
-              ? toolInstanceMarker(chip.displayInstanceId, chip.instrumentId)
-              : "";
             const systemPrediction = systemPredictionByToolId.get(chip.instrumentId);
-            const mayoDecision = chip.mayoDecisionEligible === true
-              ? vlmObservations.mayoDecisions.find(
-                (decision) => decision.toolId === chip.instrumentId,
-              ) ?? null
-              : null;
+            const presentation = projectToolCardPresentation({
+              chip,
+              procedureRunning,
+              demandForecastReady: vm.vlmStatus.demandForecastReady,
+              demandForecastByToolId,
+              mayoObservedToolIdSet,
+              systemPrediction,
+              toolPolicyStatus,
+            });
+            const footerBadges = [
+              ...chip.footerBadges,
+              ...chipAttentionBadges(chip, vm),
+              ...(presentation.evidence.mayoObserved
+                ? [{
+                    label: vm.language === "ko" ? "메이요 관측" : "Mayo observed",
+                    tone: "neutral" as const,
+                  }]
+                : []),
+            ];
             const previousRect = previousToolRects[chip.id];
             const moveDurationMs = toolMoveDurationMs(chip, previousRect, boardMetricsRef.current, Boolean(reduceMotion));
             return (
-              <m.div
+              <StageToolCard
                 key={chip.id}
-                layout
-                className="tool-chip-anchor"
-                data-tool-id={chip.id}
-                data-tool-holder-id={chip.holderId}
-                data-move-duration-ms={moveDurationMs}
-                data-grid-index={chip.gridIndex}
-                data-compact={chip.compact ? "true" : "false"}
-                data-tool-count={chip.quantity}
-                data-tool-instance-ids={chip.instanceIds.join(",")}
-                style={
-                  {
-                    ...anchorStyleForChip(chip, moveDurationMs),
-                    "--tool-stack-spread": `${quantityStackSpread(chip.quantity)}px`,
-                  } as CSSProperties
-                }
-                transition={{
-                  layout: {
-                    duration: reduceMotion ? 0.01 : moveDurationMs / 1000,
-                    ease: SILK_EASE,
-                  },
-                }}
-                title={chip.label}
-              >
-                {chip.quantity > 1 ? (
-                  <span className="tool-chip-stack-layers" aria-hidden="true">
-                    {Array.from({ length: chip.quantity - 1 }, (_, index) => {
-                      const layerDepth = chip.quantity - 1 - index;
-                      return (
-                        <span
-                          className="tool-chip-stack-layer"
-                          key={`${chip.id}-quantity-layer-${layerDepth}`}
-                          style={
-                            {
-                              "--tool-stack-offset": `${quantityStackLayerOffset(layerDepth, chip.quantity)}px`,
-                            } as CSSProperties
-                          }
-                        />
-                      );
-                    })}
-                  </span>
-                ) : null}
-                <m.article
-                  className={`tool-chip ${chip.layoutVariant} ${chip.displayState} ${chip.highlight} ${chip.active ? "active" : ""} ${
-                    chip.contaminated ? "contaminated" : ""
-                  } ${chip.compact ? "compact" : ""} ${chip.quantity > 1 ? "quantity-stack" : ""} density-${chip.density}`}
-                  initial={{ opacity: 0, scale: reduceMotion ? 1 : 0.96 }}
-                  animate={{ opacity: 1, scale: 1 }}
-                  transition={{ duration: reduceMotion ? 0.01 : MOTION_DURATION.normal, ease: SILK_EASE }}
-                >
-                  <div className="tool-chip-header">
-                    <strong>
-                      <span className="chip-label-full">{chip.label}</span>
-                      <span className="chip-label-short">{chip.shortLabel}</span>
-                    </strong>
-                    {instanceMarker ? (
-                      <span
-                        className="tool-instance-marker"
-                        data-slot="stage-tool-instance-marker"
-                        data-tool-instance-id={chip.displayInstanceId}
-                        aria-label={
-                          vm.language === "ko"
-                            ? `${chip.label} 인스턴스 ${instanceMarker}`
-                            : `${chip.label} instance ${instanceMarker}`
-                        }
-                      >
-                        {instanceMarker}
-                      </span>
-                    ) : null}
-                  </div>
-                  <VlmToolEvidenceBadges
-                    evidence={{
-                      nextToolProbability: systemPrediction?.confidence ?? null,
-                      nextToolRank: systemPrediction?.rank ?? null,
-                      mayoDecision,
-                    }}
-                    language={vm.language}
-                    showMayoDecision={chip.mayoDecisionEligible === true}
-                    nextToolAuthority="system"
-                    className="stage-tool-vlm-evidence"
-                  />
-                  {chip.quantity > 1 ? (
-                    <span
-                      className="tool-quantity-badge"
-                      aria-label={
-                        vm.language === "ko"
-                          ? `${chip.label} ${chip.quantity}개`
-                          : `${chip.quantity} ${chip.label} instruments`
-                      }
-                    >
-                      ×{chip.quantity}
-                    </span>
-                  ) : null}
-                  <div className="tool-chip-footer-badges" aria-label={`${chip.label} status`}>
-                    {footerBadges.map((badge) => (
-                      <span key={`${chip.id}-${badge.label}`} className={badge.tone}>
-                        {badge.label}
-                      </span>
-                    ))}
-                  </div>
-                </m.article>
-              </m.div>
+                anchorStyle={anchorStyleForChip(chip, moveDurationMs)}
+                chip={chip}
+                footerBadges={footerBadges}
+                language={vm.language}
+                moveDurationMs={moveDurationMs}
+                presentation={presentation}
+                reduceMotion={Boolean(reduceMotion)}
+              />
             );
           })}
         </div>
@@ -922,9 +693,7 @@ export function OperatingRoomStage({
             >
               {visibleAsrFinalSentence ? (
                 <SurgeonFinalSentencePopup
-                  eventKey={visibleAsrFinalSentence.eventKey}
-                  text={visibleAsrFinalSentence.text}
-                  language={vm.language}
+                  sentence={visibleAsrFinalSentence}
                   className="stage-asr-final-popup"
                 />
               ) : null}
@@ -949,6 +718,7 @@ export function OperatingRoomStage({
                 <HandHandoverSignalPopup
                   signal={handHandoverSignal}
                   language={vm.language}
+                  observationOnly={!procedureRunning}
                   className="stage-hand-handover-popup"
                 />
               ) : null}
@@ -972,7 +742,7 @@ export function OperatingRoomStage({
                       >
                         <span>
                           <b>{bubble.title}</b>
-                          {bubble.occurredAt ? <time>{voiceAgeLabel(bubble.occurredAt, nowMs, vm.language)}</time> : null}
+                          {bubble.occurredAt ? <VoiceAge occurredAt={bubble.occurredAt} language={vm.language} /> : null}
                         </span>
                         <strong>{bubble.text}</strong>
                       </m.div>

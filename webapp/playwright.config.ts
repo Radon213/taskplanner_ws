@@ -27,8 +27,8 @@ export default defineConfig({
     trace: "retain-on-failure",
   },
   webServer: {
-    // The regression suite exercises the deliberately optional Lab/TV
-    // surfaces. Normal Production/dev startup omits this opt-in and renders
+    // The regression suite exercises deliberately optional Lab surfaces.
+    // Normal Production/dev startup omits this opt-in and renders
     // only the Live Mission core.
     command: `VITE_ENABLE_OPTIONAL_UI=true npm run dev -- --host 127.0.0.1 --port ${webPort}`,
     url: baseURL,

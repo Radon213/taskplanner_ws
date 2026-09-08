@@ -20,7 +20,9 @@ Replay의 전체 trace를 수술 종료 후 후처리하여, 별도의 수술기
 
 1. **집도의 원본 발화**
    - `/surgery/transcript`만 사용한다.
-   - 이 발화를 재발행한 `/surgery/audio/request_text`는 중복이므로 제외한다.
+   - 명령 경로와 분리된 관찰이 필요하면
+     `/surgery/audio/observed_utterance`를 사용하고 원본 transcript와 중복 집계하지
+     않는다.
    - transcript JSON 안의 `start_sec`를 타임스탬프로 사용한다.
 2. **VLM 임상 관찰**
    - `/vlm/result`의 `vlm_raw` layer만 사용한다.

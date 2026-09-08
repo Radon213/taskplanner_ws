@@ -5,12 +5,20 @@ import pytest
 from surgical_interop_execution.controller_contract import (
     EIR_NUC_CAPABILITY_POLICY_ID,
     EIR_NUC_VIRTUAL_CONTRACT_ID,
+    RETRACTION_SERVICE_V1_ABI,
     TOOL_HANDOVER_ACTION_ABI_FINGERPRINT,
     VIRTUAL_EMULATOR_CAPABILITY_POLICY_ID,
     build_controller_contract,
     controller_contract_mismatches,
     validate_source_stamp,
 )
+
+
+def test_retraction_contract_names_both_suction_wire_commands() -> None:
+    request_declarations = RETRACTION_SERVICE_V1_ABI["request"]
+
+    assert "uint8 COMMAND_SUCTION=7" in request_declarations
+    assert "uint8 COMMAND_SUCTION_OUT=8" in request_declarations
 
 
 def _virtual_contract() -> dict[str, object]:

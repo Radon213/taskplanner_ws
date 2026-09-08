@@ -1,0 +1,30 @@
+# Explicit opt-in overlay for `scripts/taskplanner ui dev`.
+#
+# It changes only the dashboard process. The base service keeps host networking
+# and the exact VITE/runtime-control environment, so HMR observes the running
+# ROS plane without restarting ASR, VLM, rosbridge, or any runtime owner.
+services:
+  webapp:
+    command:
+      - bash
+      - /workspaces/taskplanner_ws/webapp/scripts/start-development.sh
+    environment:
+      TASKPLANNER_WEBAPP_MODE: development
+    healthcheck:
+      # Vite has no production `/healthz` route. Verify its HMR client plus
+      # the dashboard entry point instead, while retaining the same
+      # loopback-only port contract.
+      test:
+        - CMD
+        - python3
+        - -c
+        - >-
+          import urllib.request;
+          root=urllib.request.urlopen('http://127.0.0.1:4173/',timeout=2).read(524289);
+          hmr=urllib.request.urlopen('http://127.0.0.1:4173/@vite/client',timeout=2).read(524289);
+          raise SystemExit(0 if b'id="root"' in root and b'createHotContext' in hmr else 1)
+      interval: 3s
+      start_interval: 1s
+      timeout: 3s
+      retries: 12
+      start_period: 30s

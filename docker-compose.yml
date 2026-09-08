@@ -1,6 +1,181 @@
 x-taskplanner-workspace-entrypoint: &taskplanner-workspace-entrypoint
   - /workspaces/taskplanner_ws/docker/entrypoint.sh
 
+x-taskplanner-owner-base: &taskplanner-owner-base
+  image: taskplanner-ws:dev
+  entrypoint: *taskplanner-workspace-entrypoint
+  restart: "no"
+  user: "${TASKPLANNER_UID:-1000}:${TASKPLANNER_GID:-1000}"
+  stop_signal: SIGINT
+  stop_grace_period: 15s
+  working_dir: /workspaces/taskplanner_ws
+  network_mode: host
+  ipc: host
+  read_only: true
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  tmpfs:
+    - /tmp:size=256m,mode=1777
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  volumes: &taskplanner-owner-volumes
+    - .:/workspaces/taskplanner_ws:ro
+
+x-taskplanner-owner-command: &taskplanner-owner-command >
+  bash -lc "case \"$${TASKPLANNER_RUNTIME_MODE:-}\" in
+    live|llm-surgeon|debug) ;;
+    *) echo 'split runtime owner requires scripts/taskplanner up live|llm-surgeon|debug' >&2; exit 2 ;;
+  esac &&
+  launch_path=install/docker/bringup/share/bringup/launch/$${TASKPLANNER_OWNER_LAUNCH} &&
+  if [ ! -e \"$${launch_path}\" ]; then
+    echo \"owner launch is not installed: $${TASKPLANNER_OWNER_LAUNCH}; run the scoped ROS build\" >&2;
+    exit 78;
+  fi &&
+  source /opt/ros/jazzy/setup.bash &&
+  source /opt/btops_ws/install/setup.bash &&
+  source install/docker/setup.bash &&
+  exec ros2 launch bringup \"$${TASKPLANNER_OWNER_LAUNCH}\"
+    runtime_profile:=\"$${TASKPLANNER_RUNTIME_MODE}\""
+
+x-taskplanner-owner-environment: &taskplanner-owner-environment
+  HOME: /tmp/taskplanner-owner
+  ROS_LOG_DIR: /tmp/ros-logs
+  PYTHONDONTWRITEBYTECODE: "1"
+
+x-taskplanner-operational-environment: &taskplanner-operational-environment
+  ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}
+  ROS_AUTOMATIC_DISCOVERY_RANGE: ${ROS_AUTOMATIC_DISCOVERY_RANGE:-LOCALHOST}
+  RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}
+  # This is a container-only path.  Never inherit a host-shell file:// URI
+  # because a scoped Live runtime recreate would then fail before launch.
+  CYCLONEDDS_URI: ${TASKPLANNER_CONTAINER_CYCLONEDDS_URI:-file:///workspaces/taskplanner_ws/config/cyclonedds_lan.xml}
+  ROSBRIDGE_PORT: ${ROSBRIDGE_PORT:-9090}
+  ROSBRIDGE_ADDRESS: ${ROSBRIDGE_ADDRESS:-127.0.0.1}
+  ROSBRIDGE_SERVICE_TIMEOUT: ${ROSBRIDGE_SERVICE_TIMEOUT:-30.0}
+  # Every operational owner receives the launcher-owned mode marker.  Its
+  # lightweight owner command rejects an unreviewed or mixed mode before ROS
+  # launch, without requiring a monolithic runtime container.
+  TASKPLANNER_RUNTIME_MODE: ${TASKPLANNER_RUNTIME_MODE:-}
+  INPUT_PROFILE: ${INPUT_PROFILE:-simulation}
+  EXECUTION_BACKEND: ${EXECUTION_BACKEND:-mock}
+  TASKPLANNER_DEFAULT_BUNDLE: ${TASKPLANNER_DEFAULT_BUNDLE:-thyroidectomy}
+  # This is the only default consumed by the external Live launch branch.
+  # Keep it distinct from mock/replay's generic TASKPLANNER_DEFAULT_BUNDLE.
+  TASKPLANNER_LIVE_DEFAULT_BUNDLE: ${TASKPLANNER_LIVE_DEFAULT_BUNDLE:-thyroidectomy_demo}
+  # Live controller mode is deliberately scoped to the Live environment.
+  # A generic shell export from a Debug/replay session must never redirect
+  # this service to the virtual endpoint pair.
+  TASKPLANNER_ROBOT_ENDPOINT_SOURCE: ${TASKPLANNER_LIVE_ROBOT_ENDPOINT_SOURCE:-external}
+  TASKPLANNER_RETRACTION_ENDPOINT_SOURCE: ${TASKPLANNER_LIVE_RETRACTION_ENDPOINT_SOURCE:-${TASKPLANNER_LIVE_ROBOT_ENDPOINT_SOURCE:-external}}
+  TASKPLANNER_EXTERNAL_CONTROLLER_CONTRACT_ID: ${TASKPLANNER_LIVE_EXTERNAL_CONTROLLER_CONTRACT_ID:-eir-nuc-tool-handover.real.v1}
+  TASKPLANNER_EXTERNAL_CAPABILITY_POLICY_ID: ${TASKPLANNER_LIVE_EXTERNAL_CAPABILITY_POLICY_ID:-eir-nuc-tool-handover.v1}
+  SPEECH_INPUT_MODE: ${SPEECH_INPUT_MODE:-tagged_sentence}
+  SENTENCE_INPUT_TOPIC: ${SENTENCE_INPUT_TOPIC:-/sensors/surgeon/sentence}
+  SPEECH_MIN_CONFIDENCE: ${SPEECH_MIN_CONFIDENCE:-0.55}
+  SPEECH_MAX_AGE_SEC: ${SPEECH_MAX_AGE_SEC:-3.0}
+  SPEECH_SOURCE_TIMEOUT_SEC: ${SPEECH_SOURCE_TIMEOUT_SEC:-5.0}
+  VLM_MODE: ${VLM_MODE:-real}
+  VLM_BASE_URL: ${VLM_BASE_URL:-http://127.0.0.1:8080}
+  VLM_PROVIDER_ID: ${VLM_PROVIDER_ID:-ninfer}
+  VLM_API_KEY: ${VLM_API_KEY:-}
+  VLM_MODEL_ID: ${VLM_MODEL_ID:-qwen3.6-35b-a3b}
+  VLM_API_MODE: ${VLM_API_MODE:-openai_compat}
+  VLM_PUBLISH_PERIOD_SEC: ${VLM_PUBLISH_PERIOD_SEC:-1.0}
+  VLM_IMAGE_STALE_SEC: ${VLM_IMAGE_STALE_SEC:-3.0}
+  VLM_MAX_OUTPUT_TOKENS: ${VLM_MAX_OUTPUT_TOKENS:-384}
+  VLM_GENERATION_SEED: ${VLM_GENERATION_SEED:-0}
+  VLM_RESPONSE_FORMAT: ${VLM_RESPONSE_FORMAT:-json_schema}
+  VLM_REASONING_EFFORT: ${VLM_REASONING_EFFORT:-none}
+  VLM_CONTEXT_MODE: ${VLM_CONTEXT_MODE:-actor_log}
+  TASKPLANNER_TTS_REPLY_OUTBOX_PATH: /taskplanner-tts-state/vlm_reply_outbox.sqlite3
+  TASKPLANNER_DIRECT_HAND_LEDGER_PATH: /taskplanner-execution-state/direct_hand_dispatch.sqlite3
+  SURGEON_ACTOR_MODE: ${SURGEON_ACTOR_MODE:-llm}
+  ACTOR_BASE_URL: ${ACTOR_BASE_URL:-http://127.0.0.1:1234}
+  ACTOR_PROVIDER_ID: ${ACTOR_PROVIDER_ID:-auto}
+  ACTOR_API_KEY: ${ACTOR_API_KEY:-}
+  ACTOR_MODEL_ID: ${ACTOR_MODEL_ID:-google/gemma-4-12b-qat}
+  ACTOR_RESPONSE_FORMAT: ${ACTOR_RESPONSE_FORMAT:-json_schema}
+  ACTOR_REASONING_EFFORT: ${ACTOR_REASONING_EFFORT:-none}
+  ENABLE_NO_IMAGE_CAMERA: ${ENABLE_NO_IMAGE_CAMERA:-true}
+  ENABLE_SYNTHETIC_SCENE_CAMERA: ${ENABLE_SYNTHETIC_SCENE_CAMERA:-false}
+  FIELD_SNAPSHOT_URL: ${FIELD_SNAPSHOT_URL:-}
+  MODEL_PROVIDER_DISCOVERY_TIMEOUT_SEC: ${MODEL_PROVIDER_DISCOVERY_TIMEOUT_SEC:-2.5}
+  MODEL_PROVIDER_RUNTIME_TIMEOUT_SEC: ${MODEL_PROVIDER_RUNTIME_TIMEOUT_SEC:-900}
+  LMSTUDIO_BASE_URL: ${LMSTUDIO_BASE_URL:-http://127.0.0.1:1234}
+  LMSTUDIO_API_KEY: ${LMSTUDIO_API_KEY:-}
+  LMSTUDIO_PROVIDER_ENABLED: ${LMSTUDIO_PROVIDER_ENABLED:-false}
+  LMSTUDIO_PROVIDER_MANAGED: ${LMSTUDIO_PROVIDER_MANAGED:-true}
+  UNSLOTH_BASE_URL: ${UNSLOTH_BASE_URL:-http://127.0.0.1:8888}
+  UNSLOTH_API_KEY: ${UNSLOTH_API_KEY:-${VLM_API_KEY:-}}
+  UNSLOTH_PROVIDER_ENABLED: ${UNSLOTH_PROVIDER_ENABLED:-false}
+  UNSLOTH_PROVIDER_MANAGED: ${UNSLOTH_PROVIDER_MANAGED:-true}
+  VLLM_BASE_URL: ${VLLM_BASE_URL:-http://127.0.0.1:8001}
+  VLLM_API_KEY: ${VLLM_API_KEY:-}
+  VLLM_PROVIDER_ENABLED: ${VLLM_PROVIDER_ENABLED:-false}
+  VLLM_PROVIDER_MANAGED: ${VLLM_PROVIDER_MANAGED:-true}
+  NINFER_BASE_URL: ${NINFER_BASE_URL:-http://127.0.0.1:8080}
+  NINFER_API_KEY: ${NINFER_API_KEY:-}
+  NINFER_PROVIDER_ENABLED: ${NINFER_PROVIDER_ENABLED:-true}
+  NINFER_PROVIDER_MANAGED: ${NINFER_PROVIDER_MANAGED:-true}
+  NINFER_MANAGER_ENABLED: ${NINFER_MANAGER_ENABLED:-true}
+  ENABLE_RFDETR_PERCEPTION: ${ENABLE_RFDETR_PERCEPTION:-false}
+  # Empty new-axis values preserve the legacy backend and endpoint aliases.
+  PERCEPTION_PROVIDER: ${PERCEPTION_PROVIDER:-}
+  PERCEPTION_LOCATION: ${PERCEPTION_LOCATION:-}
+  PERCEPTION_ENDPOINT: ${PERCEPTION_ENDPOINT:-}
+  PERCEPTION_BACKEND: ${PERCEPTION_BACKEND:-local}
+  REQUIRE_PERCEPTION_ON_START: ${REQUIRE_PERCEPTION_ON_START:-false}
+  RFDETR_SERVICE_URL: ${RFDETR_SERVICE_URL-}
+  PNU_SERVICE_URL: ${PNU_SERVICE_URL:-}
+  PNU_CLIENT_API_TOKEN_FILE: ${PNU_CLIENT_API_TOKEN_FILE:-}
+  PNU_ALLOW_INSECURE_REMOTE_HTTP: ${PNU_ALLOW_INSECURE_REMOTE_HTTP:-false}
+  PNU_ALLOW_UNAUTHENTICATED_REMOTE: ${PNU_ALLOW_UNAUTHENTICATED_REMOTE:-false}
+  PNU_EXPECTED_MODEL_DIGESTS_JSON: ${PNU_EXPECTED_MODEL_DIGESTS_JSON:-{}}
+  PNU_EXPECTED_TOOL_SUPPORT_PLANE_CONFIG_VERSION: ${PNU_EXPECTED_TOOL_SUPPORT_PLANE_CONFIG_VERSION:-}
+  PNU_TOOL_SUPPORT_PLANE_NORMAL: ${PNU_TOOL_SUPPORT_PLANE_NORMAL:-}
+  PNU_DEPTH_SCALE_M_PER_UNIT: ${PNU_DEPTH_SCALE_M_PER_UNIT:-0.0}
+  PNU_DEPTH_SCALE_VALIDATED: ${PNU_DEPTH_SCALE_VALIDATED:-false}
+  PNU_DEPTH_ALIGNMENT_VALIDATED: ${PNU_DEPTH_ALIGNMENT_VALIDATED:-false}
+  PNU_DEPTH_ALIGNMENT_ID: ${PNU_DEPTH_ALIGNMENT_ID:-}
+  PNU_REQUIRE_METRIC_3D_ON_START: ${PNU_REQUIRE_METRIC_3D_ON_START:-false}
+  RFDETR_PREFLIGHT_TIMEOUT_SEC: ${RFDETR_PREFLIGHT_TIMEOUT_SEC:-2.0}
+  FLIR_INPUT_TOPIC: ${FLIR_INPUT_TOPIC:-/synced/flir/color/image_raw/compressed}
+  CAM4_INPUT_TOPIC: ${CAM4_INPUT_TOPIC:-/synced/cam_4/color/image_raw/compressed}
+  CAM3_INPUT_TOPIC: ${CAM3_INPUT_TOPIC:-/synced/cam_3/color/image_raw/compressed}
+  TASKPLANNER_RFDETR_SOURCE_HOST: ${TASKPLANNER_RFDETR_SOURCE_HOST:-192.168.1.7}
+  CAM3_TOOL_OBSERVATIONS_TOPIC: ${CAM3_TOOL_OBSERVATIONS_TOPIC:-/perception/cam_3/tool/observations}
+  CAM4_TOOL_OBSERVATIONS_TOPIC: ${CAM4_TOOL_OBSERVATIONS_TOPIC:-/perception/cam_4/tool/observations}
+  CAM3_TOOL_OBSERVATIONS_EXPECTED_MODEL_VERSION: ${CAM3_TOOL_OBSERVATIONS_EXPECTED_MODEL_VERSION:-}
+  CAM4_TOOL_OBSERVATIONS_EXPECTED_MODEL_VERSION: ${CAM4_TOOL_OBSERVATIONS_EXPECTED_MODEL_VERSION:-}
+  SEGMENTED_FLIR_TOPIC: ${SEGMENTED_FLIR_TOPIC:-/surgery/images/flir/segmented/compressed}
+  CAM4_SEMANTICS_TOPIC: ${CAM4_SEMANTICS_TOPIC:-/surgery/perception/cam4/semantics/json}
+  CV_CONTRACT_STATUS_TOPIC: ${CV_CONTRACT_STATUS_TOPIC:-/integration/cv_contract/status}
+  CV_CAM4_RGB_TOPIC: ${CV_CAM4_RGB_TOPIC:-/synced/cam_4/color/image_raw/compressed}
+  CV_CAM4_RGB_ALIAS_TOPIC: ${CV_CAM4_RGB_ALIAS_TOPIC:-/surgery/images/cam4/compressed}
+  CV_CAM4_CAMERA_INFO_TOPIC: ${CV_CAM4_CAMERA_INFO_TOPIC:-/synced/cam_4/color/camera_info}
+  CV_CAM4_NATIVE_DEPTH_COMPRESSED_TOPIC: ${CV_CAM4_NATIVE_DEPTH_COMPRESSED_TOPIC:-/synced/cam_4/depth/image_rect_raw/compressedDepth}
+  CV_CAM4_DEPTH_CAMERA_INFO_TOPIC: ${CV_CAM4_DEPTH_CAMERA_INFO_TOPIC:-/synced/cam_4/depth/camera_info}
+  CV_CAM4_DEPTH_TO_COLOR_EXTRINSICS_TOPIC: ${CV_CAM4_DEPTH_TO_COLOR_EXTRINSICS_TOPIC:-/synced/cam_4/extrinsics/depth_to_color}
+  CV_CAM4_ALIGNED_DEPTH_COMPRESSED_TOPIC: ${CV_CAM4_ALIGNED_DEPTH_COMPRESSED_TOPIC:-/synced/cam_4/aligned_depth_to_color/image_raw/compressedDepth}
+  CV_CAM4_ALIGNED_DEPTH_CAMERA_INFO_TOPIC: ${CV_CAM4_ALIGNED_DEPTH_CAMERA_INFO_TOPIC:-/synced/cam_4/aligned_depth_to_color/camera_info}
+  CV_HANDOVER_TRAY_RGB_TOPIC: ${CV_HANDOVER_TRAY_RGB_TOPIC:-/surgery/images/tray/compressed}
+  CV_HANDOVER_TRAY_CAMERA_INFO_TOPIC: ${CV_HANDOVER_TRAY_CAMERA_INFO_TOPIC:-/surgery/cameras/tray/color/camera_info}
+  CV_HANDOVER_TRAY_ALIGNED_DEPTH_TOPIC: ${CV_HANDOVER_TRAY_ALIGNED_DEPTH_TOPIC:-/surgery/cameras/tray/aligned_depth}
+  # The read-only public state gateway is always discoverable by default;
+  # inactive scenarios publish explicit empty/unknown snapshots.
+  PUBLISH_SHARED_STATE: ${PUBLISH_SHARED_STATE:-true}
+  # Free-form ASR/VLM text can contain PHI and requires explicit opt-in.
+  # Typed state, availability, confidence, and sequence remain public.
+  PUBLISH_SHARED_FREE_TEXT: ${PUBLISH_SHARED_FREE_TEXT:-false}
+  # Camera aliases are demand-driven and forward compressed payloads only
+  # while a subscriber is matched, avoiding idle duplicate DDS traffic.
+  PUBLISH_CAMERA_ALIASES: ${PUBLISH_CAMERA_ALIASES:-true}
+  # Default is fail-closed. The reviewed Live demo env may opt in to an
+  # idle FLIR preview without opening CAM4 or any control capability.
+  PUBLISH_FLIR_WHILE_IDLE: ${PUBLISH_FLIR_WHILE_IDLE:-false}
+
 services:
   vllm-manager:
     # Experimental providers are intentionally absent from Production.  They
@@ -152,7 +327,7 @@ services:
       TASKPLANNER_LIVE_DEFAULT_BUNDLE: ${TASKPLANNER_LIVE_DEFAULT_BUNDLE:-thyroidectomy_demo}
       # The development profile retains its explicit generic selection.
       TASKPLANNER_ROBOT_ENDPOINT_SOURCE: ${TASKPLANNER_ROBOT_ENDPOINT_SOURCE:-external}
-      SPEECH_INPUT_MODE: ${SPEECH_INPUT_MODE:-utterance}
+      SPEECH_INPUT_MODE: ${SPEECH_INPUT_MODE:-tagged_sentence}
       SENTENCE_INPUT_TOPIC: ${SENTENCE_INPUT_TOPIC:-/sensors/surgeon/sentence}
       SPEECH_MIN_CONFIDENCE: ${SPEECH_MIN_CONFIDENCE:-0.55}
       SPEECH_MAX_AGE_SEC: ${SPEECH_MAX_AGE_SEC:-3.0}
@@ -165,19 +340,13 @@ services:
       VLM_API_MODE: ${VLM_API_MODE:-openai_compat}
       VLM_PUBLISH_PERIOD_SEC: ${VLM_PUBLISH_PERIOD_SEC:-1.0}
       VLM_IMAGE_STALE_SEC: ${VLM_IMAGE_STALE_SEC:-3.0}
-      VLM_MAX_OUTPUT_TOKENS: ${VLM_MAX_OUTPUT_TOKENS:-320}
+      VLM_MAX_OUTPUT_TOKENS: ${VLM_MAX_OUTPUT_TOKENS:-384}
       VLM_GENERATION_SEED: ${VLM_GENERATION_SEED:-0}
       VLM_RESPONSE_FORMAT: ${VLM_RESPONSE_FORMAT:-json_schema}
       VLM_REASONING_EFFORT: ${VLM_REASONING_EFFORT:-none}
       VLM_CONTEXT_MODE: ${VLM_CONTEXT_MODE:-actor_log}
       TASKPLANNER_TTS_REPLY_OUTBOX_PATH: /taskplanner-tts-state/vlm_reply_outbox.sqlite3
       TASKPLANNER_DIRECT_HAND_LEDGER_PATH: /taskplanner-execution-state/direct_hand_dispatch.sqlite3
-      TASKPLANNER_ODT_VOICE_RECEIPT_LEDGER_PATH: /taskplanner-execution-state/odt_voice_intent_receipts.sqlite3
-      RETRACTOR_VOICE_INTERPRETER_MODE: ${RETRACTOR_VOICE_INTERPRETER_MODE:-vlm_with_fallback}
-      RETRACTOR_VOICE_VLM_BASE_URL: ${RETRACTOR_VOICE_VLM_BASE_URL:-${VLM_BASE_URL:-http://127.0.0.1:8001}}
-      RETRACTOR_VOICE_VLM_MODEL_ID: ${RETRACTOR_VOICE_VLM_MODEL_ID:-${VLM_MODEL_ID:-unsloth/gemma-4-E4B-it-NVFP4}}
-      RETRACTOR_VOICE_VLM_API_KEY: ${RETRACTOR_VOICE_VLM_API_KEY:-${VLM_API_KEY:-}}
-      RETRACTOR_VOICE_VLM_TIMEOUT_SEC: ${RETRACTOR_VOICE_VLM_TIMEOUT_SEC:-2.0}
       SURGEON_ACTOR_MODE: ${SURGEON_ACTOR_MODE:-llm}
       ACTOR_BASE_URL: ${ACTOR_BASE_URL:-http://127.0.0.1:1234}
       ACTOR_PROVIDER_ID: ${ACTOR_PROVIDER_ID:-auto}
@@ -484,7 +653,11 @@ services:
       ROSBRIDGE_SHADOW_PORT: ${ROSBRIDGE_SHADOW_PORT:-9099}
     depends_on:
       ninfer-manager:
-        condition: service_healthy
+        # The manager accepts requests before its optional model worker is
+        # loaded.  Do not hold the ROS core behind a GPU/model warm-up: model
+        # state remains visible as unloaded/loading/failed through the normal
+        # provider catalog while deterministic ROS/voice paths come online.
+        condition: service_started
       webapp:
         condition: service_started
     # ros2 launch rejects an empty `name:=` token. Optional perception routes
@@ -591,6 +764,9 @@ services:
       PUZZLE_ASR_LAN_HEALTH_FAILURE_INTERVAL_SEC: ${PUZZLE_ASR_LAN_HEALTH_FAILURE_INTERVAL_SEC:-0.5}
       PUZZLE_ASR_LAN_HEALTH_TIMEOUT_SEC: ${PUZZLE_ASR_LAN_HEALTH_TIMEOUT_SEC:-0.5}
       PUZZLE_ASR_LAN_HEALTH_STALE_AFTER_SEC: ${PUZZLE_ASR_LAN_HEALTH_STALE_AFTER_SEC:-2.0}
+      # Keep one persistent ASR WebSocket by default. Enable only to compare
+      # server-final rollover behavior after restarting the ASR sidecar.
+      TASKPLANNER_ASR_ROLLOVER_AFTER_FINAL: ${TASKPLANNER_ASR_ROLLOVER_AFTER_FINAL:-false}
       # Live command admission consumes final ASR envelopes, not a raw String.
       # Debug/replay keeps its explicit sentence_text compatibility mode.
       TASKPLANNER_ASR_OUTPUT_MODE: ${TASKPLANNER_ASR_OUTPUT_MODE:-typed_utterance}
@@ -623,16 +799,16 @@ services:
 
   taskplanner-tts:
     profiles:
-      # Audio playback is an operator accessory, not a planner boot
-      # dependency. Enable it through TASKPLANNER_LIVE_ENABLE_TTS/ops only.
+      # This is a dedicated Live audio owner. The launcher selects the `ops`
+      # profile only to keep it isolated from the split ROS-owner profile.
       - ops
     build:
       context: .
       dockerfile: docker/tts-runtime/Dockerfile
     image: taskplanner-tts:0.1.0
     entrypoint: *taskplanner-workspace-entrypoint
-    # Optional Ops accessories must not resurrect after a host reboot merely
-    # because an operator enabled them in an earlier session.
+    # Live startup explicitly owns this sidecar. It does not resurrect on its
+    # own after a host reboot, and it never gates the command/runtime owners.
     restart: "no"
     stop_signal: SIGINT
     stop_grace_period: 20s
@@ -659,12 +835,17 @@ services:
       TASKPLANNER_TTS_VOICE_ID: ${TASKPLANNER_TTS_VOICE_ID:-F1}
       TASKPLANNER_TTS_LANGUAGE: ${TASKPLANNER_TTS_LANGUAGE:-ko}
       TASKPLANNER_TTS_STEPS: ${TASKPLANNER_TTS_STEPS:-8}
+      TASKPLANNER_TTS_PREWARM_STEPS: ${TASKPLANNER_TTS_PREWARM_STEPS:-100}
       TASKPLANNER_TTS_SPEED: ${TASKPLANNER_TTS_SPEED:-1.05}
       TASKPLANNER_TTS_SILENCE_DURATION: ${TASKPLANNER_TTS_SILENCE_DURATION:-0.3}
       TASKPLANNER_TTS_OUTPUT_TARGET: ${TASKPLANNER_TTS_OUTPUT_TARGET:-}
       TASKPLANNER_TTS_SYNTHESIS_TIMEOUT_SEC: ${TASKPLANNER_TTS_SYNTHESIS_TIMEOUT_SEC:-120.0}
       TASKPLANNER_TTS_WAIT_TIMEOUT_SEC: ${TASKPLANNER_TTS_WAIT_TIMEOUT_SEC:-120.0}
       TASKPLANNER_TTS_GATEWAY_INFO_TIMEOUT_SEC: ${TASKPLANNER_TTS_GATEWAY_INFO_TIMEOUT_SEC:-3.0}
+      TASKPLANNER_TTS_ENABLE_VLM_FREE_SPEECH: ${TASKPLANNER_TTS_ENABLE_VLM_FREE_SPEECH:-false}
+      # Optional comma-separated ``instrument=spoken Korean name`` overrides.
+      # The TTS owner applies them without changing scenario or command logic.
+      TASKPLANNER_TTS_TOOL_ALIASES: ${TASKPLANNER_TTS_TOOL_ALIASES:-}
     healthcheck:
       # The ACK publisher is created only after both reviewed phrases complete
       # a real Supertonic prewarm (or validate as cache hits), so endpoint
@@ -691,7 +872,7 @@ services:
       source /opt/btops_ws/install/setup.bash &&
       source install/docker/setup.bash &&
       exec ros2 run tts_runtime tts_runtime_node --ros-args
-      -p input_topic:=/tts/admitted_reply
+      -p input_topic:=/vlm/humanoid_reply
       -p database_path:=/taskplanner-tts-state/playback.sqlite3
       -p cache_dir:=/taskplanner-tts-cache/wav
       -p model_dir:=/models/supertonic-3
@@ -700,227 +881,306 @@ services:
       -p voice_id:=$${TASKPLANNER_TTS_VOICE_ID}
       -p language:=$${TASKPLANNER_TTS_LANGUAGE}
       -p steps:=$${TASKPLANNER_TTS_STEPS}
+      -p prewarm_steps:=$${TASKPLANNER_TTS_PREWARM_STEPS}
       -p speed:=$${TASKPLANNER_TTS_SPEED}
       -p silence_duration:=$${TASKPLANNER_TTS_SILENCE_DURATION}
       $${TASKPLANNER_TTS_OUTPUT_TARGET:+-p output_target:=$${TASKPLANNER_TTS_OUTPUT_TARGET}}
       -p synthesis_timeout_sec:=$${TASKPLANNER_TTS_SYNTHESIS_TIMEOUT_SEC}
       -p waiting_timeout_sec:=$${TASKPLANNER_TTS_WAIT_TIMEOUT_SEC}
-      -p gateway_info_timeout_sec:=$${TASKPLANNER_TTS_GATEWAY_INFO_TIMEOUT_SEC}"
+      -p gateway_info_timeout_sec:=$${TASKPLANNER_TTS_GATEWAY_INFO_TIMEOUT_SEC}
+      -p enable_vlm_free_speech:=$${TASKPLANNER_TTS_ENABLE_VLM_FREE_SPEECH}"
 
-  taskplanner-runtime:
-    profiles:
-      - live
-      - llm-surgeon
-    build:
-      context: .
-      dockerfile: Dockerfile
-      additional_contexts:
-        btops_ws: ${BTOPS_LOCAL_CONTEXT:-../btops_ws}
-      args:
-        BTOPS_LOCAL_CONTEXT: ${BTOPS_LOCAL_CONTEXT:-../btops_ws}
-        BTOPS_REF: ${BTOPS_REF:-main}
-        AUTO_APMS_REPO_URL: ${AUTO_APMS_REPO_URL:-https://github.com/AutoAPMS/auto-apms.git}
-        AUTO_APMS_REF: ${AUTO_APMS_REF:-19ac8d558e35f657b8464694c5ddc524c6c31861}
-        TASKPLANNER_BUILD_VERSION: ${TASKPLANNER_BUILD_VERSION:-0.1.0-dev}
-        TASKPLANNER_BUILD_SHA: ${TASKPLANNER_BUILD_SHA:-unknown}
-        TASKPLANNER_SHADOW_CONTRACT_VERSION: ${TASKPLANNER_SHADOW_CONTRACT_VERSION:-shadow-rfdetr-preflight-v1}
-    image: taskplanner-ws:dev
-    entrypoint: *taskplanner-workspace-entrypoint
-    restart: "no"
-    # Durable VLM/function and Digital Twin receipt ledgers are prepared by
-    # the launcher as host-user-owned 0700 state. Run the planner under that
-    # same identity so owner validation remains strict and host files never
-    # become root-owned.
-    user: "${TASKPLANNER_UID:-1000}:${TASKPLANNER_GID:-1000}"
-    # Give ros2 launch its native interrupt so every child can flush state and
-    # exit before Docker's grace deadline instead of being force-killed at 10s.
-    stop_signal: SIGINT
-    stop_grace_period: 15s
-    working_dir: /workspaces/taskplanner_ws
-    network_mode: host
-    ipc: host
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+  # Canonical modular runtime. These services are started explicitly as one
+  # mode-owned set by scripts/taskplanner; the profile alone never auto-starts
+  # them. Each service shares the verified overlay but owns one ROS node lane,
+  # so source-only changes can be activated with a scoped owner restart.
+  taskplanner-state-core:
+    <<: *taskplanner-owner-base
+    profiles: [owners]
+    environment:
+      <<: [*taskplanner-operational-environment, *taskplanner-owner-environment]
+      TASKPLANNER_OWNER_LAUNCH: taskplanner_state_core.launch.py
+    command: *taskplanner-owner-command
+
+  taskplanner-command:
+    <<: *taskplanner-owner-base
+    profiles: [owners]
+    environment:
+      <<: [*taskplanner-operational-environment, *taskplanner-owner-environment]
+      TASKPLANNER_OWNER_LAUNCH: taskplanner_command.launch.py
+    command: *taskplanner-owner-command
+
+  taskplanner-tool-state:
+    <<: *taskplanner-owner-base
+    profiles: [owners]
+    environment:
+      <<: [*taskplanner-operational-environment, *taskplanner-owner-environment]
+      TASKPLANNER_OWNER_LAUNCH: taskplanner_tool_state.launch.py
+    command: *taskplanner-owner-command
+
+  taskplanner-perception:
+    <<: *taskplanner-owner-base
+    profiles: [owners]
+    # This is the only split owner that needs perception credentials and the
+    # VLM/TTS reply outbox.  Keeping both off command, state, and browser
+    # owners makes a perception/VLM experiment independently restartable.
     volumes:
-      - .:/workspaces/taskplanner_ws
-      - taskplanner_web_node_modules:/workspaces/taskplanner_ws/webapp/node_modules
+      - .:/workspaces/taskplanner_ws:ro
       - ${PNU_SECRET_ROOT:-${HOME}/.config/taskplanner/perception}:/run/taskplanner/perception:ro
       - ${TASKPLANNER_TTS_STATE_DIR:-${HOME}/.local/state/taskplanner/tts_runtime}:/taskplanner-tts-state
+    environment:
+      <<: [*taskplanner-operational-environment, *taskplanner-owner-environment]
+      TASKPLANNER_OWNER_LAUNCH: taskplanner_perception.launch.py
+    command: *taskplanner-owner-command
+
+  # This tiny projection consumes the already-published external 1.7 CAM4
+  # typed observations.  It intentionally has no VLM credentials, model
+  # outbox, local detector, or ScenarioStore dependency, so changing it can
+  # restart one owner without recreating the loaded VLM process.
+  taskplanner-cam4-mayo:
+    <<: *taskplanner-owner-base
+    profiles: [owners]
+    environment:
+      <<: [*taskplanner-operational-environment, *taskplanner-owner-environment]
+      TASKPLANNER_OWNER_LAUNCH: taskplanner_cam4_mayo.launch.py
+    command: *taskplanner-owner-command
+
+  taskplanner-projection:
+    <<: *taskplanner-owner-base
+    profiles: [owners]
+    environment:
+      <<: [*taskplanner-operational-environment, *taskplanner-owner-environment]
+      TASKPLANNER_OWNER_LAUNCH: taskplanner_projection.launch.py
+    command: *taskplanner-owner-command
+
+  taskplanner-execution:
+    <<: *taskplanner-owner-base
+    profiles: [owners]
+    # Route selection and in-flight ledgers belong solely to execution.  No
+    # other resident owner needs write access to this state directory.
+    volumes:
+      - .:/workspaces/taskplanner_ws:ro
       - ${TASKPLANNER_EXECUTION_STATE_DIR:-${HOME}/.local/state/taskplanner/execution}:/taskplanner-execution-state
     environment:
+      <<: [*taskplanner-operational-environment, *taskplanner-owner-environment]
+      TASKPLANNER_OWNER_LAUNCH: taskplanner_execution.launch.py
+    command: *taskplanner-owner-command
+
+  taskplanner-operator-bridge:
+    <<: *taskplanner-owner-base
+    profiles: [owners]
+    environment:
+      <<: [*taskplanner-operational-environment, *taskplanner-owner-environment]
+      TASKPLANNER_OWNER_LAUNCH: taskplanner_operator_bridge.launch.py
+    command: *taskplanner-owner-command
+
+  taskplanner-scenario:
+    <<: *taskplanner-owner-base
+    profiles: [owners]
+    volumes:
+      - .:/workspaces/taskplanner_ws:ro
+      - ${TASKPLANNER_SCENARIO_STATE_DIR:-${HOME}/.local/state/taskplanner/scenario}:/taskplanner-scenario-state
+    environment:
+      <<: [*taskplanner-operational-environment, *taskplanner-owner-environment]
+      TASKPLANNER_OWNER_LAUNCH: taskplanner_scenario.launch.py
+      TASKPLANNER_SCENARIO_SELECTION_STATE_PATH: /taskplanner-scenario-state/selected_bundle.json
+    command: *taskplanner-owner-command
+
+  taskplanner-simulation-input:
+    <<: *taskplanner-owner-base
+    profiles: [owners]
+    environment:
+      <<: [*taskplanner-operational-environment, *taskplanner-owner-environment]
+      TASKPLANNER_OWNER_LAUNCH: taskplanner_simulation_input.launch.py
+    command: *taskplanner-owner-command
+
+  # This observer has no scenario, controller, model, microphone, or browser
+  # authority. It stays idle until its explicit ROS service starts a local
+  # rosbag2 process, then writes only to its private host-owned MCAP directory.
+  taskplanner-rosbag-recorder:
+    <<: *taskplanner-owner-base
+    profiles: [owners]
+    stop_grace_period: 30s
+    volumes:
+      - .:/workspaces/taskplanner_ws:ro
+      - ${TASKPLANNER_ROSBAG_STATE_DIR:-${HOME}/.local/state/taskplanner/rosbag2}:/taskplanner-rosbags
+    environment:
+      <<: *taskplanner-owner-environment
       ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}
       ROS_AUTOMATIC_DISCOVERY_RANGE: ${ROS_AUTOMATIC_DISCOVERY_RANGE:-LOCALHOST}
       RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}
-      # This is a container-only path.  Never inherit a host-shell file:// URI
-      # because a scoped Live runtime recreate would then fail before launch.
       CYCLONEDDS_URI: ${TASKPLANNER_CONTAINER_CYCLONEDDS_URI:-file:///workspaces/taskplanner_ws/config/cyclonedds_lan.xml}
-      ROSBRIDGE_PORT: ${ROSBRIDGE_PORT:-9090}
-      ROSBRIDGE_ADDRESS: ${ROSBRIDGE_ADDRESS:-127.0.0.1}
+      TASKPLANNER_RUNTIME_MODE: ${TASKPLANNER_RUNTIME_MODE:-live}
+      TASKPLANNER_OWNER_LAUNCH: taskplanner_rosbag_recorder.launch.py
+      TASKPLANNER_ROSBAG_OUTPUT_DIR: /taskplanner-rosbags
+      TASKPLANNER_ROSBAG_HOST_OUTPUT_DIR: ${TASKPLANNER_ROSBAG_STATE_DIR:-${HOME}/.local/state/taskplanner/rosbag2}
+      TASKPLANNER_ROSBAG_MIN_FREE_BYTES: ${TASKPLANNER_ROSBAG_MIN_FREE_BYTES:-21474836480}
+      TASKPLANNER_ROSBAG_MAX_BAG_BYTES: ${TASKPLANNER_ROSBAG_MAX_BAG_BYTES:-17179869184}
+      TASKPLANNER_ROSBAG_MAX_CACHE_BYTES: ${TASKPLANNER_ROSBAG_MAX_CACHE_BYTES:-536870912}
+    command: *taskplanner-owner-command
+
+  # Always-on in Live, but isolated from Debug and synthetic modes.  This
+  # owner receives only ROS discovery, one private output directory, and one
+  # read-only API-key file; model, microphone, controller, and PNU credentials
+  # are deliberately outside its environment and mount surface.
+  taskplanner-surgery-record:
+    <<: *taskplanner-owner-base
+    profiles: [owners]
+    stop_grace_period: 45s
+    volumes:
+      - .:/workspaces/taskplanner_ws:ro
+      - ${TASKPLANNER_SURGERY_RECORD_STATE_DIR:-${HOME}/.local/state/taskplanner/surgery-record}:/taskplanner-surgery-record
+      - ${PUZZLE_SURGERY_RECORD_API_KEY_FILE:-${HOME}/.config/taskplanner/secrets/puzzle-surgery-record-api-key}:/run/taskplanner-secrets/puzzle-surgery-record-api-key:ro
+    environment:
+      <<: *taskplanner-owner-environment
+      ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}
+      ROS_AUTOMATIC_DISCOVERY_RANGE: ${ROS_AUTOMATIC_DISCOVERY_RANGE:-LOCALHOST}
+      RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}
+      CYCLONEDDS_URI: ${TASKPLANNER_CONTAINER_CYCLONEDDS_URI:-file:///workspaces/taskplanner_ws/config/cyclonedds_lan.xml}
+      TASKPLANNER_RUNTIME_MODE: ${TASKPLANNER_RUNTIME_MODE:-live}
+      TASKPLANNER_OWNER_LAUNCH: taskplanner_surgery_record.launch.py
+      TASKPLANNER_SURGERY_RECORD_OUTPUT_DIR: /taskplanner-surgery-record/records
+      TASKPLANNER_SURGERY_RECORD_INPUT_DIR: ${TASKPLANNER_SURGERY_RECORD_INPUT_DIR:-/workspaces/taskplanner_ws/reports/surgery_records/0704_6_17_clinical_prompt_v1}
+      TASKPLANNER_SURGERY_RECORD_PROCEDURES: ${TASKPLANNER_SURGERY_RECORD_PROCEDURES:-thyroidectomy,thyroidectomy_demo}
+      PUZZLE_SURGERY_RECORD_ENDPOINT: ${PUZZLE_SURGERY_RECORD_ENDPOINT:-https://192.168.1.5:6627/api/v1/surgery/img_texts}
+      PUZZLE_SURGERY_RECORD_API_KEY_FILE: /run/taskplanner-secrets/puzzle-surgery-record-api-key
+      # Trust only the Puzzle private CA for this least-privilege HTTPS owner.
+      # Do not disable certificate or hostname verification for the LAN API.
+      SSL_CERT_FILE: /workspaces/taskplanner_ws/config/puzzle_surgery_record_root_ca.pem
+      PUZZLE_SURGERY_RECORD_ROOM_NAME: ${PUZZLE_SURGERY_RECORD_ROOM_NAME:-Preclinical Center}
+      PUZZLE_SURGERY_RECORD_TIMEOUT_SEC: ${PUZZLE_SURGERY_RECORD_TIMEOUT_SEC:-35.0}
+      PUZZLE_SURGERY_RECORD_SHUTDOWN_WAIT_SEC: ${PUZZLE_SURGERY_RECORD_SHUTDOWN_WAIT_SEC:-40.0}
+    command: *taskplanner-owner-command
+
+  # The read-only Debug observer stays separate from all Debug write and
+  # optional-device capabilities.  It has only source/install read access and
+  # a small run-root for bounded local status/event records; PipeWire, record
+  # API keys, PNU secrets, and VLM/NInfer settings are intentionally absent.
+  taskplanner-debug-observer:
+    <<: *taskplanner-owner-base
+    profiles: [owners]
+    volumes:
+      - .:/workspaces/taskplanner_ws:ro
+      - ${TASKPLANNER_RUN_ROOT:-${HOME}/.local/share/taskplanner/runs}:/taskplanner-runs
+    environment:
+      <<: *taskplanner-owner-environment
+      ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}
+      ROS_AUTOMATIC_DISCOVERY_RANGE: ${ROS_AUTOMATIC_DISCOVERY_RANGE:-SUBNET}
+      RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}
+      CYCLONEDDS_URI: ${TASKPLANNER_CONTAINER_CYCLONEDDS_URI-${CYCLONEDDS_URI:-}}
+      TASKPLANNER_RUNTIME_MODE: ${TASKPLANNER_RUNTIME_MODE:-debug}
+      TASKPLANNER_OWNER_LAUNCH: taskplanner_debug_observer.launch.py
+      TASKPLANNER_RUN_ROOT: /taskplanner-runs
+      TASKPLANNER_DEBUG_NETWORK_SETTINGS: ${TASKPLANNER_DEBUG_NETWORK_SETTINGS:-/taskplanner-runs/debug/network-settings.json}
+      TASKPLANNER_DEBUG_NETWORK_INTERFACE: ${TASKPLANNER_DEBUG_NETWORK_INTERFACE:-}
+      TASKPLANNER_DEBUG_LOCK_TO_RUNTIME_NETWORK: ${TASKPLANNER_DEBUG_LOCK_TO_RUNTIME_NETWORK:-false}
+      TASKPLANNER_DEBUG_ROBOT_ENDPOINT_SOURCE: ${TASKPLANNER_DEBUG_ROBOT_ENDPOINT_SOURCE:-virtual}
+      ROSBRIDGE_DEBUG_PORT: ${ROSBRIDGE_DEBUG_UPSTREAM_PORT:-9093}
+      ROSBRIDGE_ADDRESS: 127.0.0.1
       ROSBRIDGE_SERVICE_TIMEOUT: ${ROSBRIDGE_SERVICE_TIMEOUT:-30.0}
-      # `taskplanner-runtime` is shared by Live and LLM Surgeon.  Require an
-      # explicit launcher-owned mode so a raw Compose recreate cannot start a
-      # mock runtime while a stale UI marker still claims Live.
-      TASKPLANNER_RUNTIME_MODE: ${TASKPLANNER_RUNTIME_MODE:-}
-      INPUT_PROFILE: ${INPUT_PROFILE:-simulation}
-      EXECUTION_BACKEND: ${EXECUTION_BACKEND:-mock}
-      TASKPLANNER_DEFAULT_BUNDLE: ${TASKPLANNER_DEFAULT_BUNDLE:-thyroidectomy}
-      # This is the only default consumed by the external Live launch branch.
-      # Keep it distinct from mock/replay's generic TASKPLANNER_DEFAULT_BUNDLE.
-      TASKPLANNER_LIVE_DEFAULT_BUNDLE: ${TASKPLANNER_LIVE_DEFAULT_BUNDLE:-thyroidectomy_demo}
-      # Live controller mode is deliberately scoped to the Live environment.
-      # A generic shell export from a Debug/replay session must never redirect
-      # this service to the virtual endpoint pair.
-      TASKPLANNER_ROBOT_ENDPOINT_SOURCE: ${TASKPLANNER_LIVE_ROBOT_ENDPOINT_SOURCE:-external}
-      TASKPLANNER_RETRACTION_ENDPOINT_SOURCE: ${TASKPLANNER_LIVE_RETRACTION_ENDPOINT_SOURCE:-${TASKPLANNER_LIVE_ROBOT_ENDPOINT_SOURCE:-external}}
-      TASKPLANNER_EXTERNAL_CONTROLLER_CONTRACT_ID: ${TASKPLANNER_LIVE_EXTERNAL_CONTROLLER_CONTRACT_ID:-eir-nuc-tool-handover.real.v1}
-      TASKPLANNER_EXTERNAL_CAPABILITY_POLICY_ID: ${TASKPLANNER_LIVE_EXTERNAL_CAPABILITY_POLICY_ID:-eir-nuc-tool-handover.v1}
-      SPEECH_INPUT_MODE: ${SPEECH_INPUT_MODE:-utterance}
-      SENTENCE_INPUT_TOPIC: ${SENTENCE_INPUT_TOPIC:-/sensors/surgeon/sentence}
-      SPEECH_MIN_CONFIDENCE: ${SPEECH_MIN_CONFIDENCE:-0.55}
-      SPEECH_MAX_AGE_SEC: ${SPEECH_MAX_AGE_SEC:-3.0}
-      SPEECH_SOURCE_TIMEOUT_SEC: ${SPEECH_SOURCE_TIMEOUT_SEC:-5.0}
-      VLM_MODE: ${VLM_MODE:-real}
-      VLM_BASE_URL: ${VLM_BASE_URL:-http://127.0.0.1:8080}
-      VLM_PROVIDER_ID: ${VLM_PROVIDER_ID:-ninfer}
-      VLM_API_KEY: ${VLM_API_KEY:-}
-      VLM_MODEL_ID: ${VLM_MODEL_ID:-qwen3.6-35b-a3b}
-      VLM_API_MODE: ${VLM_API_MODE:-openai_compat}
-      VLM_PUBLISH_PERIOD_SEC: ${VLM_PUBLISH_PERIOD_SEC:-1.0}
-      VLM_IMAGE_STALE_SEC: ${VLM_IMAGE_STALE_SEC:-3.0}
-      VLM_MAX_OUTPUT_TOKENS: ${VLM_MAX_OUTPUT_TOKENS:-320}
-      VLM_GENERATION_SEED: ${VLM_GENERATION_SEED:-0}
-      VLM_RESPONSE_FORMAT: ${VLM_RESPONSE_FORMAT:-json_schema}
-      VLM_REASONING_EFFORT: ${VLM_REASONING_EFFORT:-none}
-      VLM_CONTEXT_MODE: ${VLM_CONTEXT_MODE:-actor_log}
-      TASKPLANNER_TTS_REPLY_OUTBOX_PATH: /taskplanner-tts-state/vlm_reply_outbox.sqlite3
-      TASKPLANNER_DIRECT_HAND_LEDGER_PATH: /taskplanner-execution-state/direct_hand_dispatch.sqlite3
-      TASKPLANNER_ODT_VOICE_RECEIPT_LEDGER_PATH: /taskplanner-execution-state/odt_voice_intent_receipts.sqlite3
-      RETRACTOR_VOICE_INTERPRETER_MODE: ${RETRACTOR_VOICE_INTERPRETER_MODE:-vlm_with_fallback}
-      RETRACTOR_VOICE_VLM_BASE_URL: ${RETRACTOR_VOICE_VLM_BASE_URL:-${VLM_BASE_URL:-http://127.0.0.1:8080}}
-      RETRACTOR_VOICE_VLM_MODEL_ID: ${RETRACTOR_VOICE_VLM_MODEL_ID:-${VLM_MODEL_ID:-qwen3.6-35b-a3b}}
-      RETRACTOR_VOICE_VLM_API_KEY: ${RETRACTOR_VOICE_VLM_API_KEY:-${VLM_API_KEY:-}}
-      RETRACTOR_VOICE_VLM_TIMEOUT_SEC: ${RETRACTOR_VOICE_VLM_TIMEOUT_SEC:-2.0}
-      SURGEON_ACTOR_MODE: ${SURGEON_ACTOR_MODE:-llm}
-      ACTOR_BASE_URL: ${ACTOR_BASE_URL:-http://127.0.0.1:1234}
-      ACTOR_PROVIDER_ID: ${ACTOR_PROVIDER_ID:-auto}
-      ACTOR_API_KEY: ${ACTOR_API_KEY:-}
-      ACTOR_MODEL_ID: ${ACTOR_MODEL_ID:-google/gemma-4-12b-qat}
-      ACTOR_RESPONSE_FORMAT: ${ACTOR_RESPONSE_FORMAT:-json_schema}
-      ACTOR_REASONING_EFFORT: ${ACTOR_REASONING_EFFORT:-none}
-      ENABLE_NO_IMAGE_CAMERA: ${ENABLE_NO_IMAGE_CAMERA:-true}
-      ENABLE_SYNTHETIC_SCENE_CAMERA: ${ENABLE_SYNTHETIC_SCENE_CAMERA:-false}
-      FIELD_SNAPSHOT_URL: ${FIELD_SNAPSHOT_URL:-}
-      MODEL_PROVIDER_DISCOVERY_TIMEOUT_SEC: ${MODEL_PROVIDER_DISCOVERY_TIMEOUT_SEC:-2.5}
-      MODEL_PROVIDER_RUNTIME_TIMEOUT_SEC: ${MODEL_PROVIDER_RUNTIME_TIMEOUT_SEC:-900}
-      LMSTUDIO_BASE_URL: ${LMSTUDIO_BASE_URL:-http://127.0.0.1:1234}
-      LMSTUDIO_API_KEY: ${LMSTUDIO_API_KEY:-}
-      LMSTUDIO_PROVIDER_ENABLED: ${LMSTUDIO_PROVIDER_ENABLED:-false}
-      LMSTUDIO_PROVIDER_MANAGED: ${LMSTUDIO_PROVIDER_MANAGED:-true}
-      UNSLOTH_BASE_URL: ${UNSLOTH_BASE_URL:-http://127.0.0.1:8888}
-      UNSLOTH_API_KEY: ${UNSLOTH_API_KEY:-${VLM_API_KEY:-}}
-      UNSLOTH_PROVIDER_ENABLED: ${UNSLOTH_PROVIDER_ENABLED:-false}
-      UNSLOTH_PROVIDER_MANAGED: ${UNSLOTH_PROVIDER_MANAGED:-true}
-      VLLM_BASE_URL: ${VLLM_BASE_URL:-http://127.0.0.1:8001}
-      VLLM_API_KEY: ${VLLM_API_KEY:-}
-      VLLM_PROVIDER_ENABLED: ${VLLM_PROVIDER_ENABLED:-false}
-      VLLM_PROVIDER_MANAGED: ${VLLM_PROVIDER_MANAGED:-true}
-      NINFER_BASE_URL: ${NINFER_BASE_URL:-http://127.0.0.1:8080}
-      NINFER_API_KEY: ${NINFER_API_KEY:-}
-      NINFER_PROVIDER_ENABLED: ${NINFER_PROVIDER_ENABLED:-true}
-      NINFER_PROVIDER_MANAGED: ${NINFER_PROVIDER_MANAGED:-true}
-      NINFER_MANAGER_ENABLED: ${NINFER_MANAGER_ENABLED:-true}
-      ENABLE_RFDETR_PERCEPTION: ${ENABLE_RFDETR_PERCEPTION:-false}
-      # Empty new-axis values preserve the legacy backend and endpoint aliases.
-      PERCEPTION_PROVIDER: ${PERCEPTION_PROVIDER:-}
-      PERCEPTION_LOCATION: ${PERCEPTION_LOCATION:-}
-      PERCEPTION_ENDPOINT: ${PERCEPTION_ENDPOINT:-}
-      PERCEPTION_BACKEND: ${PERCEPTION_BACKEND:-local}
-      REQUIRE_PERCEPTION_ON_START: ${REQUIRE_PERCEPTION_ON_START:-false}
-      RFDETR_SERVICE_URL: ${RFDETR_SERVICE_URL-}
-      PNU_SERVICE_URL: ${PNU_SERVICE_URL:-}
-      PNU_CLIENT_API_TOKEN_FILE: ${PNU_CLIENT_API_TOKEN_FILE:-}
-      PNU_ALLOW_INSECURE_REMOTE_HTTP: ${PNU_ALLOW_INSECURE_REMOTE_HTTP:-false}
-      PNU_ALLOW_UNAUTHENTICATED_REMOTE: ${PNU_ALLOW_UNAUTHENTICATED_REMOTE:-false}
-      PNU_EXPECTED_MODEL_DIGESTS_JSON: ${PNU_EXPECTED_MODEL_DIGESTS_JSON:-{}}
-      PNU_EXPECTED_TOOL_SUPPORT_PLANE_CONFIG_VERSION: ${PNU_EXPECTED_TOOL_SUPPORT_PLANE_CONFIG_VERSION:-}
-      PNU_TOOL_SUPPORT_PLANE_NORMAL: ${PNU_TOOL_SUPPORT_PLANE_NORMAL:-}
-      PNU_DEPTH_SCALE_M_PER_UNIT: ${PNU_DEPTH_SCALE_M_PER_UNIT:-0.0}
-      PNU_DEPTH_SCALE_VALIDATED: ${PNU_DEPTH_SCALE_VALIDATED:-false}
-      PNU_DEPTH_ALIGNMENT_VALIDATED: ${PNU_DEPTH_ALIGNMENT_VALIDATED:-false}
-      PNU_DEPTH_ALIGNMENT_ID: ${PNU_DEPTH_ALIGNMENT_ID:-}
-      PNU_REQUIRE_METRIC_3D_ON_START: ${PNU_REQUIRE_METRIC_3D_ON_START:-false}
-      RFDETR_PREFLIGHT_TIMEOUT_SEC: ${RFDETR_PREFLIGHT_TIMEOUT_SEC:-2.0}
-      FLIR_INPUT_TOPIC: ${FLIR_INPUT_TOPIC:-/synced/flir/color/image_raw/compressed}
-      CAM4_INPUT_TOPIC: ${CAM4_INPUT_TOPIC:-/synced/cam_4/color/image_raw/compressed}
-      CAM3_INPUT_TOPIC: ${CAM3_INPUT_TOPIC:-/synced/cam_3/color/image_raw/compressed}
-      TASKPLANNER_RFDETR_SOURCE_HOST: ${TASKPLANNER_RFDETR_SOURCE_HOST:-192.168.1.7}
-      CAM3_TOOL_OBSERVATIONS_TOPIC: ${CAM3_TOOL_OBSERVATIONS_TOPIC:-/perception/cam_3/tool/observations}
-      CAM4_TOOL_OBSERVATIONS_TOPIC: ${CAM4_TOOL_OBSERVATIONS_TOPIC:-/perception/cam_4/tool/observations}
-      CAM3_TOOL_OBSERVATIONS_EXPECTED_MODEL_VERSION: ${CAM3_TOOL_OBSERVATIONS_EXPECTED_MODEL_VERSION:-}
-      CAM4_TOOL_OBSERVATIONS_EXPECTED_MODEL_VERSION: ${CAM4_TOOL_OBSERVATIONS_EXPECTED_MODEL_VERSION:-}
-      SEGMENTED_FLIR_TOPIC: ${SEGMENTED_FLIR_TOPIC:-/surgery/images/flir/segmented/compressed}
-      CAM4_SEMANTICS_TOPIC: ${CAM4_SEMANTICS_TOPIC:-/surgery/perception/cam4/semantics/json}
-      CV_CONTRACT_STATUS_TOPIC: ${CV_CONTRACT_STATUS_TOPIC:-/integration/cv_contract/status}
-      CV_CAM4_RGB_TOPIC: ${CV_CAM4_RGB_TOPIC:-/synced/cam_4/color/image_raw/compressed}
-      CV_CAM4_RGB_ALIAS_TOPIC: ${CV_CAM4_RGB_ALIAS_TOPIC:-/surgery/images/cam4/compressed}
-      CV_CAM4_CAMERA_INFO_TOPIC: ${CV_CAM4_CAMERA_INFO_TOPIC:-/synced/cam_4/color/camera_info}
-      CV_CAM4_NATIVE_DEPTH_COMPRESSED_TOPIC: ${CV_CAM4_NATIVE_DEPTH_COMPRESSED_TOPIC:-/synced/cam_4/depth/image_rect_raw/compressedDepth}
-      CV_CAM4_DEPTH_CAMERA_INFO_TOPIC: ${CV_CAM4_DEPTH_CAMERA_INFO_TOPIC:-/synced/cam_4/depth/camera_info}
-      CV_CAM4_DEPTH_TO_COLOR_EXTRINSICS_TOPIC: ${CV_CAM4_DEPTH_TO_COLOR_EXTRINSICS_TOPIC:-/synced/cam_4/extrinsics/depth_to_color}
-      CV_CAM4_ALIGNED_DEPTH_COMPRESSED_TOPIC: ${CV_CAM4_ALIGNED_DEPTH_COMPRESSED_TOPIC:-/synced/cam_4/aligned_depth_to_color/image_raw/compressedDepth}
-      CV_CAM4_ALIGNED_DEPTH_CAMERA_INFO_TOPIC: ${CV_CAM4_ALIGNED_DEPTH_CAMERA_INFO_TOPIC:-/synced/cam_4/aligned_depth_to_color/camera_info}
-      CV_HANDOVER_TRAY_RGB_TOPIC: ${CV_HANDOVER_TRAY_RGB_TOPIC:-/surgery/images/tray/compressed}
-      CV_HANDOVER_TRAY_CAMERA_INFO_TOPIC: ${CV_HANDOVER_TRAY_CAMERA_INFO_TOPIC:-/surgery/cameras/tray/color/camera_info}
-      CV_HANDOVER_TRAY_ALIGNED_DEPTH_TOPIC: ${CV_HANDOVER_TRAY_ALIGNED_DEPTH_TOPIC:-/surgery/cameras/tray/aligned_depth}
-      # The read-only public state gateway is always discoverable by default;
-      # inactive scenarios publish explicit empty/unknown snapshots.
-      PUBLISH_SHARED_STATE: ${PUBLISH_SHARED_STATE:-true}
-      # Free-form ASR/VLM text can contain PHI and requires explicit opt-in.
-      # Typed state, availability, confidence, and sequence remain public.
-      PUBLISH_SHARED_FREE_TEXT: ${PUBLISH_SHARED_FREE_TEXT:-false}
-      # Camera aliases are demand-driven and forward compressed payloads only
-      # while a subscriber is matched, avoiding idle duplicate DDS traffic.
-      PUBLISH_CAMERA_ALIASES: ${PUBLISH_CAMERA_ALIASES:-true}
-      # Default is fail-closed. The reviewed Live demo env may opt in to an
-      # idle FLIR preview without opening CAM4 or any control capability.
-      PUBLISH_FLIR_WHILE_IDLE: ${PUBLISH_FLIR_WHILE_IDLE:-false}
-    depends_on:
-      ninfer-manager:
-        condition: service_healthy
-      webapp:
-        condition: service_started
-    # Keep optional perception routes out of argv when unset; an empty
-    # `perception_endpoint:=` makes ros2 launch fail before runtime readiness.
+      TASKPLANNER_DEBUG_ROSBRIDGE_EXECUTABLE: ${TASKPLANNER_DEBUG_ROSBRIDGE_EXECUTABLE:-secure_debug_rosbridge}
     command: >
-      bash -lc "case '${TASKPLANNER_RUNTIME_MODE:-}' in
-        live)
-          if [ '${INPUT_PROFILE:-}' != 'external' ] || [ '${EXECUTION_BACKEND:-}' != 'action' ]; then
-            echo 'Live runtime contract mismatch; use scripts/taskplanner up live' >&2;
-            exit 2;
-          fi;
-          if [ '${VLM_PROVIDER_ID:-ninfer}' != 'ninfer' ] || [ '${VLM_MODEL_ID:-qwen3.6-35b-a3b}' != 'qwen3.6-35b-a3b' ]; then
-            echo 'Live model contract mismatch; require ninfer/qwen3.6-35b-a3b' >&2;
-            exit 2;
-          fi ;;
-        llm-surgeon)
-          if [ '${INPUT_PROFILE:-}' != 'simulation' ] || [ '${EXECUTION_BACKEND:-}' != 'mock' ]; then
-            echo 'LLM Surgeon runtime contract mismatch; use scripts/taskplanner up llm-surgeon' >&2;
-            exit 2;
-          fi ;;
-        *)
-          echo 'taskplanner-runtime requires a reviewed runtime mode; use scripts/taskplanner up <mode>' >&2;
-          exit 2 ;;
-      esac &&
-      if [ ! -f install/docker/setup.bash ] || [ ! -e install/docker/bringup/share/bringup/launch/taskplanner_live.launch.py ]; then
-        echo 'Taskplanner container install/docker/setup.bash is missing; rerun launcher with --build' >&2;
+      bash -lc "if [ ! -f install/docker/setup.bash ] || [ ! -e install/docker/bringup/share/bringup/launch/taskplanner_debug_observer.launch.py ] || [ ! -x install/docker/integration_debug/lib/integration_debug/integration_debug_observer ]; then
+        echo 'Taskplanner Debug observer install is missing; run the scoped observer build' >&2;
         exit 2;
       fi &&
+      source /opt/ros/jazzy/setup.bash &&
+      source /opt/btops_ws/install/setup.bash &&
       source install/docker/setup.bash &&
-      if [ '${INPUT_PROFILE:-simulation}' = 'external' ]; then
-        exec ros2 launch bringup taskplanner_live.launch.py default_bundle:=$${TASKPLANNER_LIVE_DEFAULT_BUNDLE:-thyroidectomy_demo} publish_shared_state:=$${PUBLISH_SHARED_STATE:-true} publish_shared_free_text:=$${PUBLISH_SHARED_FREE_TEXT:-false} publish_camera_aliases:=$${PUBLISH_CAMERA_ALIASES:-true} publish_flir_while_idle:=$${PUBLISH_FLIR_WHILE_IDLE:-false} perception_backend:=$${PERCEPTION_BACKEND:-local} $${PERCEPTION_PROVIDER:+perception_provider:=$${PERCEPTION_PROVIDER}} $${PERCEPTION_LOCATION:+perception_location:=$${PERCEPTION_LOCATION}} $${PERCEPTION_ENDPOINT:+perception_endpoint:=$${PERCEPTION_ENDPOINT}} $${RFDETR_SERVICE_URL:+rfdetr_service_url:=$${RFDETR_SERVICE_URL}} $${PNU_SERVICE_URL:+pnu_service_url:=$${PNU_SERVICE_URL}};
-      else
-        exec ros2 launch bringup taskplanner_mock.launch.py default_bundle:=$${TASKPLANNER_DEFAULT_BUNDLE:-thyroidectomy} publish_shared_free_text:=$${PUBLISH_SHARED_FREE_TEXT:-false} enable_rosbridge:=true rosbridge_port:=${ROSBRIDGE_PORT:-9090} rosbridge_address:=${ROSBRIDGE_ADDRESS:-127.0.0.1} input_profile:=${INPUT_PROFILE:-simulation} execution_backend:=${EXECUTION_BACKEND:-mock} speech_input_mode:=${SPEECH_INPUT_MODE:-utterance} sentence_input_topic:=${SENTENCE_INPUT_TOPIC:-/sensors/surgeon/sentence} speech_min_confidence:=${SPEECH_MIN_CONFIDENCE:-0.55} speech_max_age_sec:=${SPEECH_MAX_AGE_SEC:-3.0} speech_source_timeout_sec:=${SPEECH_SOURCE_TIMEOUT_SEC:-5.0} vlm_mode:=${VLM_MODE:-real} vlm_base_url:=${VLM_BASE_URL:-http://127.0.0.1:8080} vlm_provider_id:=${VLM_PROVIDER_ID:-ninfer} vlm_model_id:=${VLM_MODEL_ID:-qwen3.6-35b-a3b} vlm_api_mode:=${VLM_API_MODE:-openai_compat} vlm_publish_period_sec:=${VLM_PUBLISH_PERIOD_SEC:-1.0} vlm_image_stale_sec:=${VLM_IMAGE_STALE_SEC:-3.0} vlm_max_output_tokens:=${VLM_MAX_OUTPUT_TOKENS:-320} vlm_generation_seed:=${VLM_GENERATION_SEED:-0} vlm_response_format:=${VLM_RESPONSE_FORMAT:-json_schema} vlm_reasoning_effort:=${VLM_REASONING_EFFORT:-none} vlm_context_mode:=${VLM_CONTEXT_MODE:-actor_log} surgeon_actor_mode:=${SURGEON_ACTOR_MODE:-llm} actor_base_url:=${ACTOR_BASE_URL:-http://127.0.0.1:1234} actor_provider_id:=${ACTOR_PROVIDER_ID:-auto} actor_model_id:=${ACTOR_MODEL_ID:-google/gemma-4-12b-qat} actor_response_format:=${ACTOR_RESPONSE_FORMAT:-json_schema} actor_reasoning_effort:=${ACTOR_REASONING_EFFORT:-none} enable_rfdetr_perception:=${ENABLE_RFDETR_PERCEPTION:-true} perception_backend:=${PERCEPTION_BACKEND:-local} $${PERCEPTION_PROVIDER:+perception_provider:=$${PERCEPTION_PROVIDER}} $${PERCEPTION_LOCATION:+perception_location:=$${PERCEPTION_LOCATION}} $${PERCEPTION_ENDPOINT:+perception_endpoint:=$${PERCEPTION_ENDPOINT}} rfdetr_service_url:=${RFDETR_SERVICE_URL:-http://127.0.0.1:8010} $${PNU_SERVICE_URL:+pnu_service_url:=$${PNU_SERVICE_URL}} flir_input_topic:=${FLIR_INPUT_TOPIC:-/synced/flir/color/image_raw/compressed} cam4_input_topic:=${CAM4_INPUT_TOPIC:-/synced/cam_4/color/image_raw/compressed} field_image_topic:=${SEGMENTED_FLIR_TOPIC:-/surgery/images/field/compressed} cam4_semantics_topic:=${CAM4_SEMANTICS_TOPIC:-/surgery/perception/cam4/semantics/json} cv_contract_status_topic:=${CV_CONTRACT_STATUS_TOPIC:-/integration/cv_contract/status} cv_cam4_rgb_topic:=${CV_CAM4_RGB_TOPIC:-/synced/cam_4/color/image_raw/compressed} cv_cam4_rgb_alias_topic:=${CV_CAM4_RGB_ALIAS_TOPIC:-/surgery/images/cam4/compressed} cv_cam4_camera_info_topic:=${CV_CAM4_CAMERA_INFO_TOPIC:-/synced/cam_4/color/camera_info} cv_cam4_native_depth_compressed_topic:=${CV_CAM4_NATIVE_DEPTH_COMPRESSED_TOPIC:-/synced/cam_4/depth/image_rect_raw/compressedDepth} cv_cam4_depth_camera_info_topic:=${CV_CAM4_DEPTH_CAMERA_INFO_TOPIC:-/synced/cam_4/depth/camera_info} cv_cam4_depth_to_color_extrinsics_topic:=${CV_CAM4_DEPTH_TO_COLOR_EXTRINSICS_TOPIC:-/synced/cam_4/extrinsics/depth_to_color} cv_cam4_aligned_depth_compressed_topic:=${CV_CAM4_ALIGNED_DEPTH_COMPRESSED_TOPIC:-/synced/cam_4/aligned_depth_to_color/image_raw/compressedDepth} cv_cam4_aligned_depth_camera_info_topic:=${CV_CAM4_ALIGNED_DEPTH_CAMERA_INFO_TOPIC:-/synced/cam_4/aligned_depth_to_color/camera_info} cv_handover_tray_rgb_topic:=${CV_HANDOVER_TRAY_RGB_TOPIC:-/surgery/images/tray/compressed} cv_handover_tray_camera_info_topic:=${CV_HANDOVER_TRAY_CAMERA_INFO_TOPIC:-/surgery/cameras/tray/color/camera_info} cv_handover_tray_aligned_depth_topic:=${CV_HANDOVER_TRAY_ALIGNED_DEPTH_TOPIC:-/surgery/cameras/tray/aligned_depth} enable_no_image_camera:=${ENABLE_NO_IMAGE_CAMERA:-true} enable_synthetic_scene_camera:=${ENABLE_SYNTHETIC_SCENE_CAMERA:-false} $${FIELD_SNAPSHOT_URL:+field_snapshot_url:=$${FIELD_SNAPSHOT_URL}};
-      fi"
+      exec python3 scripts/run_integration_debug.py
+      --settings $${TASKPLANNER_DEBUG_NETWORK_SETTINGS}
+      -- ros2 launch bringup taskplanner_debug_observer.launch.py
+      rosbridge_port:=$${ROSBRIDGE_DEBUG_PORT}
+      rosbridge_address:=$${ROSBRIDGE_ADDRESS}
+      rosbridge_service_timeout:=$${ROSBRIDGE_SERVICE_TIMEOUT}
+      rosbridge_executable:=$${TASKPLANNER_DEBUG_ROSBRIDGE_EXECUTABLE}
+      run_root:=$${TASKPLANNER_RUN_ROOT}"
+
+  # Explicit Debug writes are a separate process.  It deliberately has no
+  # browser bridge, microphone, PNU/VLM client, record uploader, or privileged
+  # mount; the node's paused/stopped and arm/single-flight rules remain the
+  # admission boundary for the endpoint it calls.
+  taskplanner-debug-control:
+    <<: *taskplanner-owner-base
+    profiles: [owners]
+    volumes:
+      - .:/workspaces/taskplanner_ws:ro
+      - ${TASKPLANNER_RUN_ROOT:-${HOME}/.local/share/taskplanner/runs}:/taskplanner-runs
+    environment:
+      <<: *taskplanner-owner-environment
+      ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}
+      ROS_AUTOMATIC_DISCOVERY_RANGE: ${ROS_AUTOMATIC_DISCOVERY_RANGE:-SUBNET}
+      RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}
+      CYCLONEDDS_URI: ${TASKPLANNER_CONTAINER_CYCLONEDDS_URI-${CYCLONEDDS_URI:-}}
+      TASKPLANNER_RUNTIME_MODE: ${TASKPLANNER_RUNTIME_MODE:-debug}
+      TASKPLANNER_OWNER_LAUNCH: taskplanner_debug_control.launch.py
+      TASKPLANNER_RUN_ROOT: /taskplanner-runs
+      TASKPLANNER_DEBUG_ROBOT_ENDPOINT_SOURCE: ${TASKPLANNER_DEBUG_ROBOT_ENDPOINT_SOURCE:-virtual}
+      TASKPLANNER_DEBUG_ENABLE_VIRTUAL_ROBOT: ${TASKPLANNER_DEBUG_ENABLE_VIRTUAL_ROBOT:-true}
+    command: >
+      bash -lc "if [ ! -f install/docker/setup.bash ] || [ ! -e install/docker/bringup/share/bringup/launch/taskplanner_debug_control.launch.py ] || [ ! -x install/docker/integration_debug/lib/integration_debug/integration_debug_control ]; then
+        echo 'Taskplanner Debug control install is missing; run the scoped control build' >&2;
+        exit 2;
+      fi &&
+      source /opt/ros/jazzy/setup.bash &&
+      source /opt/btops_ws/install/setup.bash &&
+      source install/docker/setup.bash &&
+      exec ros2 launch bringup taskplanner_debug_control.launch.py
+      robot_endpoint_source:=$${TASKPLANNER_DEBUG_ROBOT_ENDPOINT_SOURCE}
+      virtual_robot_enabled:=$${TASKPLANNER_DEBUG_ENABLE_VIRTUAL_ROBOT}
+      run_root:=$${TASKPLANNER_RUN_ROOT}"
+
+  # The virtual robot is deliberately its own Debug-only owner.  It has no
+  # browser bridge, device mount, writable state, or model/network secret;
+  # the registry decides whether it is included for a virtual Debug session.
+  taskplanner-debug-virtual:
+    <<: *taskplanner-owner-base
+    profiles: [owners]
+    environment:
+      <<: *taskplanner-owner-environment
+      ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}
+      ROS_AUTOMATIC_DISCOVERY_RANGE: ${ROS_AUTOMATIC_DISCOVERY_RANGE:-SUBNET}
+      RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}
+      CYCLONEDDS_URI: ${TASKPLANNER_CONTAINER_CYCLONEDDS_URI-${CYCLONEDDS_URI:-}}
+      TASKPLANNER_RUNTIME_MODE: ${TASKPLANNER_RUNTIME_MODE:-debug}
+      TASKPLANNER_OWNER_LAUNCH: taskplanner_debug_virtual.launch.py
+    command: *taskplanner-owner-command
+
+  # SurgiMate remains a separately built, browser-only application.  The
+  # Taskplanner owner plane only starts/stops this one static server; it never
+  # imports its source or grants it ROS, control, model, or credential access.
+  taskplanner-surgimate:
+    profiles: [owners]
+    image: taskplanner-ws:dev
+    entrypoint: []
+    restart: "no"
+    user: "${TASKPLANNER_UID:-1000}:${TASKPLANNER_GID:-1000}"
+    working_dir: /opt/surgimate
+    network_mode: host
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    volumes:
+      - ../modules/surgimate_0820:/opt/surgimate:ro
+    environment:
+      HOST: 127.0.0.1
+      PORT: "5174"
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - >-
+          const http=require("node:http"); const request=http.get("http://127.0.0.1:"+(process.env.PORT||"5174")+"/",(response)=>{response.resume();process.exit(response.statusCode===200?0:1)}); request.setTimeout(2000,()=>{request.destroy();process.exit(1)}); request.on("error",()=>process.exit(1));
+      interval: 5s
+      timeout: 3s
+      retries: 6
+      start_period: 5s
+    command: ["node", "server.mjs"]
 
   public-rosbridge:
     profiles:
@@ -985,6 +1245,133 @@ services:
       echo 'public_rosbridge executable unavailable after 300 seconds' >&2;
       exit 2"
 
+  # SurgiMate remains a read-only public ROS projection on 9092.  Its UI
+  # replay journal therefore uses this distinct loopback-only bridge, which
+  # can publish one bounded String audit topic and nothing operational.
+  rosbag-ui-audit-bridge:
+    profiles:
+      - live
+      - replay
+    image: taskplanner-ws:dev
+    entrypoint: *taskplanner-workspace-entrypoint
+    restart: unless-stopped
+    stop_signal: SIGINT
+    stop_grace_period: 10s
+    user: "${TASKPLANNER_UID:-1000}:${TASKPLANNER_GID:-1000}"
+    working_dir: /workspaces/taskplanner_ws
+    network_mode: host
+    ipc: host
+    read_only: true
+    mem_limit: 192m
+    memswap_limit: 192m
+    pids_limit: 64
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+    volumes:
+      - .:/workspaces/taskplanner_ws:ro
+    environment:
+      ROS_DOMAIN_ID: ${ROSBAG_UI_AUDIT_ROS_DOMAIN_ID:-${ROS_DOMAIN_ID:-0}}
+      ROS_AUTOMATIC_DISCOVERY_RANGE: ${ROSBAG_UI_AUDIT_ROS_AUTOMATIC_DISCOVERY_RANGE:-${ROS_AUTOMATIC_DISCOVERY_RANGE:-LOCALHOST}}
+      RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}
+      CYCLONEDDS_URI: ${ROSBAG_UI_AUDIT_CYCLONEDDS_URI-${TASKPLANNER_CONTAINER_CYCLONEDDS_URI-${CYCLONEDDS_URI:-}}}
+      ROS_LOG_DIR: /tmp/ros-logs
+      ROSBAG_UI_AUDIT_ALLOWED_ORIGINS: "${ROSBAG_UI_AUDIT_ALLOWED_ORIGINS:-http://127.0.0.1:5174,http://localhost:5174}"
+      ROSBAG_UI_AUDIT_PORT: ${ROSBAG_UI_AUDIT_PORT:-9096}
+      ENABLE_ROSBAG_UI_AUDIT_BRIDGE: ${ENABLE_ROSBAG_UI_AUDIT_BRIDGE:-true}
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          python3 /workspaces/taskplanner_ws/scripts/taskplanner_public_bridge_health.py
+          --port "$${ROSBAG_UI_AUDIT_PORT}" --origin http://127.0.0.1:5174
+          --contract rosbag-ui-audit-v1 --timeout 1
+      interval: 5s
+      start_interval: 1s
+      timeout: 2s
+      retries: 60
+      start_period: 5s
+    command: >
+      bash -lc "for attempt in $$(seq 1 150); do
+        if [ -f install/docker/setup.bash ]; then
+          source install/docker/setup.bash;
+          if [ -x install/docker/surgical_interop_gateway/lib/surgical_interop_gateway/rosbag_ui_audit_rosbridge ]; then
+            exec /workspaces/taskplanner_ws/install/docker/surgical_interop_gateway/lib/surgical_interop_gateway/rosbag_ui_audit_rosbridge --port $${ROSBAG_UI_AUDIT_PORT} --address 127.0.0.1 --websocket_ping_interval 20.0 --websocket_ping_timeout 30.0;
+          fi;
+        fi;
+        sleep 2;
+      done;
+      echo 'rosbag_ui_audit_rosbridge executable unavailable after 300 seconds' >&2;
+      exit 2"
+
+  # Browser camera media is isolated from the full-control operator rosbridge.
+  # This loopback-only sidecar admits exactly the five existing Live compressed
+  # source topics and coalesces each topic to its latest pending frame.  It
+  # never decodes/resizes/transcodes source JPEG bytes and is deliberately not
+  # routed through the public 9092 LAN proxy.
+  local-media-rosbridge:
+    profiles:
+      - live
+    image: taskplanner-ws:dev
+    entrypoint: *taskplanner-workspace-entrypoint
+    restart: unless-stopped
+    stop_signal: SIGINT
+    stop_grace_period: 10s
+    user: "${TASKPLANNER_UID:-1000}:${TASKPLANNER_GID:-1000}"
+    working_dir: /workspaces/taskplanner_ws
+    network_mode: host
+    ipc: host
+    read_only: true
+    mem_limit: 512m
+    memswap_limit: 512m
+    pids_limit: 128
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+    volumes:
+      - .:/workspaces/taskplanner_ws:ro
+    environment:
+      ROS_DOMAIN_ID: ${LOCAL_MEDIA_ROS_DOMAIN_ID:-${ROS_DOMAIN_ID:-0}}
+      ROS_AUTOMATIC_DISCOVERY_RANGE: ${LOCAL_MEDIA_ROS_AUTOMATIC_DISCOVERY_RANGE:-${ROS_AUTOMATIC_DISCOVERY_RANGE:-LOCALHOST}}
+      RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}
+      CYCLONEDDS_URI: ${LOCAL_MEDIA_CYCLONEDDS_URI-${TASKPLANNER_CONTAINER_CYCLONEDDS_URI-${CYCLONEDDS_URI:-}}}
+      ROS_LOG_DIR: /tmp/ros-logs
+      # `public_rosbridge` reads this name; it is scoped to this container and
+      # only permits the local 4173 UI origins by default.
+      PUBLIC_ROSBRIDGE_ALLOWED_ORIGINS: "${LOCAL_MEDIA_ROSBRIDGE_ALLOWED_ORIGINS:-http://127.0.0.1:4173,http://localhost:4173}"
+      PUBLIC_ROSBRIDGE_PORT: ${LOCAL_MEDIA_ROSBRIDGE_PORT:-9095}
+      TASKPLANNER_BOUNDED_ROSBRIDGE_PROFILE: local-media
+      ENABLE_LOCAL_MEDIA_ROSBRIDGE: ${ENABLE_LOCAL_MEDIA_ROSBRIDGE:-true}
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          python3 /workspaces/taskplanner_ws/scripts/taskplanner_public_bridge_health.py
+          --port "$${PUBLIC_ROSBRIDGE_PORT}" --contract local-media-subscribe-v1 --timeout 1
+      interval: 5s
+      start_interval: 1s
+      timeout: 2s
+      retries: 60
+      start_period: 5s
+    command: >
+      bash -lc "for attempt in $$(seq 1 150); do
+        if [ -f install/docker/setup.bash ]; then
+          source install/docker/setup.bash;
+          if [ -x install/docker/surgical_interop_gateway/lib/surgical_interop_gateway/public_rosbridge ]; then
+            exec /workspaces/taskplanner_ws/install/docker/surgical_interop_gateway/lib/surgical_interop_gateway/public_rosbridge --port $${PUBLIC_ROSBRIDGE_PORT} --address 127.0.0.1 --websocket_ping_interval 20.0 --websocket_ping_timeout 30.0;
+          fi;
+        fi;
+        sleep 2;
+      done;
+      echo 'local media rosbridge executable unavailable after 300 seconds' >&2;
+      exit 2"
+
   multicam-observer:
     profiles:
       - debug
@@ -1046,130 +1433,6 @@ services:
       rosbridge_address:=$${ROSBRIDGE_ADDRESS}
       rosbridge_service_timeout:=$${ROSBRIDGE_SERVICE_TIMEOUT}"
 
-  integration-debug:
-    profiles:
-      - debug
-    build:
-      context: .
-      dockerfile: Dockerfile
-      additional_contexts:
-        btops_ws: ${BTOPS_LOCAL_CONTEXT:-../btops_ws}
-      args:
-        BTOPS_LOCAL_CONTEXT: ${BTOPS_LOCAL_CONTEXT:-../btops_ws}
-        BTOPS_REF: ${BTOPS_REF:-main}
-        AUTO_APMS_REPO_URL: ${AUTO_APMS_REPO_URL:-https://github.com/AutoAPMS/auto-apms.git}
-        AUTO_APMS_REF: ${AUTO_APMS_REF:-19ac8d558e35f657b8464694c5ddc524c6c31861}
-        TASKPLANNER_BUILD_VERSION: ${TASKPLANNER_BUILD_VERSION:-0.1.0-dev}
-        TASKPLANNER_BUILD_SHA: ${TASKPLANNER_BUILD_SHA:-unknown}
-        TASKPLANNER_SHADOW_CONTRACT_VERSION: ${TASKPLANNER_SHADOW_CONTRACT_VERSION:-shadow-rfdetr-preflight-v1}
-    image: taskplanner-ws:dev
-    entrypoint: *taskplanner-workspace-entrypoint
-    restart: "no"
-    stop_signal: SIGINT
-    stop_grace_period: 45s
-    user: "${TASKPLANNER_UID:-1000}:${TASKPLANNER_GID:-1000}"
-    working_dir: /workspaces/taskplanner_ws
-    network_mode: host
-    ipc: host
-    volumes:
-      - .:/workspaces/taskplanner_ws
-      - ${TASKPLANNER_RUN_ROOT:-${HOME}/.local/share/taskplanner/runs}:/taskplanner-runs
-      - ${TASKPLANNER_SURGERY_RECORD_SOURCE_DIR:-../taskplanner_ws/reports/surgery_records/0704_6_17_clinical_prompt_v1}:/surgery-record-inputs:ro
-      - ${PUZZLE_SURGERY_RECORD_API_KEY_FILE:-${HOME}/.config/taskplanner/secrets/puzzle-surgery-record-api-key}:/run/taskplanner-secrets/puzzle-surgery-record-api-key:ro
-      - ${PNU_SECRET_ROOT:-${HOME}/.config/taskplanner/perception}:/run/taskplanner/perception:ro
-      # Follow Ubuntu's PipeWire-selected logical input instead of exposing
-      # stale/raw ALSA endpoints captured when the container was created.
-      - ${TASKPLANNER_PIPEWIRE_SOCKET:-/run/user/1000/pipewire-0}:/run/taskplanner-pipewire/pipewire-0
-    environment:
-      XDG_RUNTIME_DIR: /run/taskplanner-pipewire
-      ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}
-      ROS_AUTOMATIC_DISCOVERY_RANGE: ${ROS_AUTOMATIC_DISCOVERY_RANGE:-SUBNET}
-      RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}
-      CYCLONEDDS_URI: ${TASKPLANNER_CONTAINER_CYCLONEDDS_URI-${CYCLONEDDS_URI:-}}
-      # Keep Debug behind the loopback path router. 9091 remains the external
-      # endpoint while this sidecar owns its isolated upstream socket.
-      ROSBRIDGE_DEBUG_PORT: ${ROSBRIDGE_DEBUG_UPSTREAM_PORT:-9093}
-      # Remote access must traverse integration-debug-lan-proxy. Never let a
-      # shell-level override expose the unauthenticated bridge on every NIC.
-      ROSBRIDGE_ADDRESS: 127.0.0.1
-      ROSBRIDGE_SERVICE_TIMEOUT: ${ROSBRIDGE_SERVICE_TIMEOUT:-30.0}
-      TASKPLANNER_RUN_ROOT: /taskplanner-runs
-      TASKPLANNER_DEBUG_NETWORK_SETTINGS: ${TASKPLANNER_DEBUG_NETWORK_SETTINGS:-/taskplanner-runs/debug/network-settings.json}
-      TASKPLANNER_DEBUG_NETWORK_INTERFACE: ${TASKPLANNER_DEBUG_NETWORK_INTERFACE:-}
-      # Operational sidecars ignore saved standalone Domain/discovery values so
-      # they cannot escape the planner's fail-closed node detection domain.
-      TASKPLANNER_DEBUG_LOCK_TO_RUNTIME_NETWORK: ${TASKPLANNER_DEBUG_LOCK_TO_RUNTIME_NETWORK:-false}
-      TASKPLANNER_DEBUG_ALLOW_PLANNER_COEXISTENCE: ${TASKPLANNER_DEBUG_ALLOW_PLANNER_COEXISTENCE:-false}
-      TASKPLANNER_DEBUG_ROBOT_ENDPOINT_SOURCE: ${TASKPLANNER_DEBUG_ROBOT_ENDPOINT_SOURCE:-virtual}
-      # Live sets this false so the Debug observation sidecar cannot publish a
-      # no-motion emulator contract on the real external controller topics.
-      TASKPLANNER_DEBUG_ENABLE_VIRTUAL_ROBOT: ${TASKPLANNER_DEBUG_ENABLE_VIRTUAL_ROBOT:-true}
-      # Live/LLM select a separate bridge executable whose allowlist omits all
-      # world-anchor mutation services. Standalone Debug keeps the explicit
-      # operator policy.
-      TASKPLANNER_DEBUG_ROSBRIDGE_EXECUTABLE: ${TASKPLANNER_DEBUG_ROSBRIDGE_EXECUTABLE:-secure_debug_rosbridge}
-      TASKPLANNER_DEBUG_ALLOW_SELF_RESTART: "true"
-      RETRACTOR_VOICE_INTERPRETER_MODE: ${RETRACTOR_VOICE_INTERPRETER_MODE:-vlm_with_fallback}
-      RETRACTOR_VOICE_VLM_BASE_URL: ${RETRACTOR_VOICE_VLM_BASE_URL:-http://127.0.0.1:8080}
-      RETRACTOR_VOICE_VLM_MODEL_ID: ${RETRACTOR_VOICE_VLM_MODEL_ID:-qwen3.6-35b-a3b}
-      RETRACTOR_VOICE_VLM_API_KEY: ${RETRACTOR_VOICE_VLM_API_KEY:-${VLM_API_KEY:-}}
-      RETRACTOR_VOICE_VLM_TIMEOUT_SEC: ${RETRACTOR_VOICE_VLM_TIMEOUT_SEC:-2.0}
-      # Standalone Debug may own one read-only PNU ROS adapter without starting
-      # any planner or motion node. Operational sidecars leave this disabled.
-      ENABLE_PNU_DEBUG_PERCEPTION: ${ENABLE_PNU_DEBUG_PERCEPTION:-false}
-      PERCEPTION_PROVIDER: ${PERCEPTION_PROVIDER:-disabled}
-      PERCEPTION_LOCATION: ${PERCEPTION_LOCATION:-local}
-      PERCEPTION_ENDPOINT: ${PERCEPTION_ENDPOINT:-}
-      PNU_SERVICE_URL: ${PNU_SERVICE_URL:-}
-      PNU_CLIENT_API_TOKEN_FILE: ${PNU_CLIENT_API_TOKEN_FILE:-}
-      PNU_ALLOW_INSECURE_REMOTE_HTTP: ${PNU_ALLOW_INSECURE_REMOTE_HTTP:-false}
-      PNU_ALLOW_UNAUTHENTICATED_REMOTE: ${PNU_ALLOW_UNAUTHENTICATED_REMOTE:-false}
-      PNU_DEBUG_REQUESTED_ALGORITHMS: ${PNU_DEBUG_REQUESTED_ALGORITHMS:-tool,blood}
-      PNU_EXPECTED_MODEL_DIGESTS_JSON: ${PNU_EXPECTED_MODEL_DIGESTS_JSON:-{}}
-      PNU_EXPECTED_TOOL_SUPPORT_PLANE_CONFIG_VERSION: ${PNU_EXPECTED_TOOL_SUPPORT_PLANE_CONFIG_VERSION:-}
-      PNU_TOOL_SUPPORT_PLANE_NORMAL: ${PNU_TOOL_SUPPORT_PLANE_NORMAL:-}
-      PNU_DEPTH_SCALE_M_PER_UNIT: ${PNU_DEPTH_SCALE_M_PER_UNIT:-0.0}
-      PNU_DEPTH_SCALE_VALIDATED: ${PNU_DEPTH_SCALE_VALIDATED:-false}
-      PNU_DEPTH_ALIGNMENT_VALIDATED: ${PNU_DEPTH_ALIGNMENT_VALIDATED:-false}
-      PNU_DEPTH_ALIGNMENT_ID: ${PNU_DEPTH_ALIGNMENT_ID:-}
-      PNU_DEBUG_MAX_RATE_HZ: ${PNU_DEBUG_MAX_RATE_HZ:-5.0}
-      CV_CAM4_RGB_TOPIC: ${CV_CAM4_RGB_TOPIC:-/synced/cam_4/color/image_raw/compressed}
-      CV_CAM4_CAMERA_INFO_TOPIC: ${CV_CAM4_CAMERA_INFO_TOPIC:-/synced/cam_4/color/camera_info}
-      CV_CAM4_ALIGNED_DEPTH_COMPRESSED_TOPIC: ${CV_CAM4_ALIGNED_DEPTH_COMPRESSED_TOPIC:-/synced/cam_4/aligned_depth_to_color/image_raw/compressedDepth}
-      CV_CAM4_ALIGNED_DEPTH_CAMERA_INFO_TOPIC: ${CV_CAM4_ALIGNED_DEPTH_CAMERA_INFO_TOPIC:-/synced/cam_4/aligned_depth_to_color/camera_info}
-      CAM4_OVERLAY_TOPIC: ${CAM4_OVERLAY_TOPIC:-/surgery/images/cam4/detection_overlay/compressed}
-      CAM4_POSE_OVERLAY_TOPIC: ${CAM4_POSE_OVERLAY_TOPIC:-/surgery/images/cam4/pose_overlay/compressed}
-      TASKPLANNER_SURGERY_RECORD_INPUT_DIR: /surgery-record-inputs
-      # Standalone Debug may select only these same reviewed ASR routes.
-      # The browser sends an endpoint identifier, never a free-form URL.
-      PUZZLE_ASR_ENDPOINT: ${PUZZLE_ASR_ENDPOINT:-cloud}
-      PUZZLE_ASR_URL: ${PUZZLE_ASR_URL:-wss://arpa.worker-02.puzzle-ai.com}
-      PUZZLE_ASR_LAN_URL: ${PUZZLE_ASR_LAN_URL:-ws://192.168.1.5:1196/}
-      TASKPLANNER_ASR_CAPTURE_LOCK: ${TASKPLANNER_ASR_CAPTURE_LOCK:-/taskplanner-runs/asr/microphone.lock}
-      PUZZLE_SURGERY_RECORD_ENDPOINT: ${PUZZLE_SURGERY_RECORD_ENDPOINT:-https://dev.puzzle-ai.com:6627/api/v1/surgery/img_texts}
-      PUZZLE_SURGERY_RECORD_API_KEY_FILE: /run/taskplanner-secrets/puzzle-surgery-record-api-key
-      # Live alone enables voice-pause-triggered submission. Standalone Debug
-      # remains manual so an API test cannot be confused with an operative run.
-      TASKPLANNER_SURGERY_RECORD_AUTO_POST: ${TASKPLANNER_SURGERY_RECORD_AUTO_POST:-false}
-      PUZZLE_SURGERY_RECORD_ROOM_NAME: ${PUZZLE_SURGERY_RECORD_ROOM_NAME:-Preclinical Center}
-      TASKPLANNER_SURGERY_RECORD_OUTPUT_DIR: /taskplanner-runs/surgery-records
-      TASKPLANNER_SURGERY_RECORD_PROCEDURES: ${TASKPLANNER_SURGERY_RECORD_PROCEDURES:-thyroidectomy,thyroidectomy_demo}
-    command: >
-      bash -lc "if [ ! -f install/docker/setup.bash ] || [ ! -x install/docker/integration_debug/lib/integration_debug/integration_debug_node ]; then
-        echo 'Taskplanner container install/docker/setup.bash is missing; rerun launcher with --build' >&2;
-        exit 2;
-      fi &&
-      source install/docker/setup.bash &&
-      exec python3 scripts/run_integration_debug.py
-      --settings $${TASKPLANNER_DEBUG_NETWORK_SETTINGS}
-      -- ros2 launch integration_debug taskplanner_debug.launch.py
-      rosbridge_port:=$${ROSBRIDGE_DEBUG_PORT}
-      rosbridge_address:=$${ROSBRIDGE_ADDRESS}
-      rosbridge_service_timeout:=$${ROSBRIDGE_SERVICE_TIMEOUT}
-      rosbridge_executable:=$${TASKPLANNER_DEBUG_ROSBRIDGE_EXECUTABLE}
-      enable_virtual_robot:=$${TASKPLANNER_DEBUG_ENABLE_VIRTUAL_ROBOT:-true}
-      run_root:=$${TASKPLANNER_RUN_ROOT}"
-
   webapp-lan-proxy:
     profiles:
       - ops
@@ -1228,7 +1491,12 @@ services:
       - --interface
       - ${TASKPLANNER_DEBUG_NETWORK_INTERFACE:-enp13s0}
       - --route
-      - ${ROSBRIDGE_DEBUG_PORT:-9091}=127.0.0.1:${ROSBRIDGE_DEBUG_PORT:-9091}
+      - ${ROSBRIDGE_DEBUG_PORT:-9091}=127.0.0.1:${ROSBRIDGE_DEBUG_UPSTREAM_PORT:-9093}
+      # Remote Live browsers use the explicit path chosen in runtimeModes.ts.
+      # Keep the generic bridge loopback-only; this LAN proxy admits only the
+      # selected wired subnet and forwards the reviewed Live path.
+      - --route
+      - ${ROSBRIDGE_DEBUG_PORT:-9091}/live=127.0.0.1:${ROSBRIDGE_PORT:-9090}
 
   public-rosbridge-lan-proxy:
     profiles:
@@ -1298,76 +1566,6 @@ services:
       - --route
       - ${ROSBRIDGE_DEBUG_PORT:-9091}/multicam=127.0.0.1:${ROSBRIDGE_MULTICAM_PORT:-9094}
 
-  monitor-media-gateway:
-    profiles:
-      - ops
-    build:
-      context: .
-      dockerfile: docker/monitor-media/Dockerfile
-      args:
-        TASKPLANNER_BASE_IMAGE: ${TASKPLANNER_BASE_IMAGE:-taskplanner-ws:dev}
-    image: taskplanner-monitor-media:0.1.0
-    entrypoint: *taskplanner-workspace-entrypoint
-    restart: "no"
-    working_dir: /workspaces/taskplanner_ws
-    network_mode: host
-    read_only: true
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
-    pids_limit: 128
-    mem_limit: 512m
-    cpus: 1.5
-    stop_grace_period: 5s
-    volumes:
-      - .:/workspaces/taskplanner_ws:ro
-      - taskplanner_monitor_media:/var/run/taskplanner-monitor-media
-    tmpfs:
-      - /tmp:size=128m,mode=1777
-    environment:
-      ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}
-      ROS_AUTOMATIC_DISCOVERY_RANGE: ${ROS_AUTOMATIC_DISCOVERY_RANGE:-LOCALHOST}
-      RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}
-      CYCLONEDDS_URI: ${TASKPLANNER_CONTAINER_CYCLONEDDS_URI:-file:///workspaces/taskplanner_ws/config/cyclonedds_lan.xml}
-      ROS_LOG_DIR: /tmp/ros-logs
-      MONITOR_MEDIA_INPUT_TOPIC: ${MONITOR_MEDIA_INPUT_TOPIC:-/surgery/images/flir/compressed}
-      MONITOR_MEDIA_WIDTH: ${MONITOR_MEDIA_WIDTH:-1280}
-      MONITOR_MEDIA_HEIGHT: ${MONITOR_MEDIA_HEIGHT:-720}
-      MONITOR_MEDIA_FRAME_RATE: ${MONITOR_MEDIA_FRAME_RATE:-5}
-      MONITOR_MEDIA_BITRATE_KBPS: ${MONITOR_MEDIA_BITRATE_KBPS:-2400}
-      MONITOR_MEDIA_SEGMENT_SECONDS: ${MONITOR_MEDIA_SEGMENT_SECONDS:-1}
-      MONITOR_MEDIA_PLAYLIST_SEGMENTS: ${MONITOR_MEDIA_PLAYLIST_SEGMENTS:-3}
-    healthcheck:
-      test:
-        - CMD
-        - python3
-        - -c
-        - >-
-          import json,time,pathlib;
-          path=pathlib.Path('/var/run/taskplanner-monitor-media/health.json');
-          state=json.loads(path.read_text(encoding='utf-8'));
-          valid=state.get('service') == 'taskplanner-monitor-media' and state.get('state') in {'waiting_for_camera','starting_encoder','streaming','camera_stale','encoder_error'} and time.time()-float(state.get('updated_unix_sec',0)) < 5;
-          raise SystemExit(0 if valid else 1)
-      interval: 5s
-      start_interval: 1s
-      timeout: 3s
-      retries: 6
-      start_period: 10s
-    command: >
-      bash -lc "source /opt/ros/jazzy/setup.bash &&
-      source /opt/btops_ws/install/setup.bash &&
-      source /workspaces/taskplanner_ws/install/docker/setup.bash &&
-      exec python3 -m surgical_interop_gateway.monitor_media_gateway --ros-args
-      -p output_root:=/var/run/taskplanner-monitor-media
-      -p input_topic:=$${MONITOR_MEDIA_INPUT_TOPIC}
-      -p width:=$${MONITOR_MEDIA_WIDTH}
-      -p height:=$${MONITOR_MEDIA_HEIGHT}
-      -p frame_rate:=$${MONITOR_MEDIA_FRAME_RATE}
-      -p bitrate_kbps:=$${MONITOR_MEDIA_BITRATE_KBPS}
-      -p segment_seconds:=$${MONITOR_MEDIA_SEGMENT_SECONDS}
-      -p playlist_segments:=$${MONITOR_MEDIA_PLAYLIST_SEGMENTS}"
-
   webapp:
     build:
       context: .
@@ -1399,7 +1597,6 @@ services:
     volumes:
       - .:/workspaces/taskplanner_ws
       - taskplanner_web_node_modules:/workspaces/taskplanner_ws/webapp/node_modules
-      - taskplanner_monitor_media:/var/run/taskplanner-monitor-media:ro
       - ${TASKPLANNER_RUNTIME_CONTROL_TOKEN_FILE:-${HOME}/.config/taskplanner/secrets/runtime-control-token}:/run/taskplanner-secrets/runtime-control-token:ro
     environment:
       # The static server has no ROS dependency. Avoid coupling Web startup to
@@ -1427,28 +1624,32 @@ services:
       VITE_ROSBRIDGE_SHADOW_PORT: ${ROSBRIDGE_SHADOW_PORT:-9099}
       VITE_ROSBRIDGE_DEBUG_URL: ${VITE_ROSBRIDGE_DEBUG_URL:-}
       VITE_ROSBRIDGE_DEBUG_PORT: ${ROSBRIDGE_DEBUG_PORT:-9091}
+      VITE_SURGIMATE_URL: ${VITE_SURGIMATE_URL:-}
+      VITE_SURGIMATE_PORT: "5174"
+      # Camera frames use the dedicated loopback-only bounded media socket;
+      # all state/control traffic stays on the normal runtime rosbridge.
+      VITE_LIVE_MEDIA_BRIDGE_URL: ${VITE_LIVE_MEDIA_BRIDGE_URL:-}
       VITE_EXTERNAL_CAM1_TOPIC: ${VITE_EXTERNAL_CAM1_TOPIC:-/synced/cam_1/color/image_raw/compressed}
       VITE_EXTERNAL_CAM2_TOPIC: ${VITE_EXTERNAL_CAM2_TOPIC:-/synced/cam_2/color/image_raw/compressed}
-      VITE_EXTERNAL_CAM3_TOPIC: ${VITE_EXTERNAL_CAM3_TOPIC:-/synced/cam_3/color/image_raw/compressed}
-      VITE_EXTERNAL_CAM4_TOPIC: ${VITE_EXTERNAL_CAM4_TOPIC:-/synced/cam_4/color/image_raw/compressed}
+      VITE_EXTERNAL_CAM3_OPERATOR_OVERLAY_TOPIC: ${VITE_EXTERNAL_CAM3_OPERATOR_OVERLAY_TOPIC:-/perception/cam_3/overlay/compressed}
+      VITE_EXTERNAL_CAM4_OPERATOR_OVERLAY_TOPIC: ${VITE_EXTERNAL_CAM4_OPERATOR_OVERLAY_TOPIC:-/perception/cam_4/overlay/compressed}
       VITE_EXTERNAL_FLIR_TOPIC: ${VITE_EXTERNAL_FLIR_TOPIC:-/synced/flir/color/image_raw/compressed}
       WEBAPP_INSTALL_ON_START: ${WEBAPP_INSTALL_ON_START:-false}
       # Rebuild only when the source fingerprint changes. A normal runtime
       # restart serves the existing dist bundle immediately.
       WEBAPP_BUILD_ON_START: ${WEBAPP_BUILD_ON_START:-false}
-      MONITOR_MEDIA_ROOT: /var/run/taskplanner-monitor-media
     healthcheck:
-      # Core health covers the static UI only. Runtime-control and TV/HLS are
-      # optional Ops-plane dependencies and report their own degraded state.
+      # Core health covers the static UI only. Runtime-control reports its own
+      # degraded state and does not block dashboard availability.
       test:
         - CMD
         - python3
         - -c
         - >-
-          import json,urllib.request;
-          ui=[urllib.request.urlopen('http://127.0.0.1:4173'+path,timeout=2) for path in ('/','/monitor/index.html','/monitor/runtime-config.js','/healthz')];
+          import urllib.request;
+          ui=[urllib.request.urlopen('http://127.0.0.1:4173'+path,timeout=2) for path in ('/','/healthz')];
           ui_bodies=[response.read(524289) for response in ui];
-          valid_ui=all(response.status == 200 for response in ui) and [response.headers.get_content_type() for response in ui] == ['text/html','text/html','application/javascript','application/json'] and all(0 < len(body) <= 524288 for body in ui_bodies) and b'id="root"' in ui_bodies[0] and b'class="app-shell"' in ui_bodies[1];
+          valid_ui=all(response.status == 200 for response in ui) and [response.headers.get_content_type() for response in ui] == ['text/html','application/json'] and all(0 < len(body) <= 524288 for body in ui_bodies) and b'id="root"' in ui_bodies[0];
           raise SystemExit(0 if valid_ui else 1)
       interval: 5s
       start_interval: 1s
@@ -1460,5 +1661,4 @@ services:
       - /workspaces/taskplanner_ws/webapp/scripts/start-production.sh
 
 volumes:
-  taskplanner_monitor_media:
   taskplanner_web_node_modules:

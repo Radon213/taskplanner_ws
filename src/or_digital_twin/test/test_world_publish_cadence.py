@@ -194,6 +194,7 @@ def _signature_node() -> ORDigitalTwinNode:
         implicit_request_hand_pose="open_hand",
         implicit_request_confidence=0.7,
         implicit_request_stability_sec=0.5,
+        cam4_mayo_hand_present=True,
     )
     node = ORDigitalTwinNode.__new__(ORDigitalTwinNode)
     node._twin = SimpleNamespace(state=state)
@@ -287,6 +288,11 @@ def _signature_node() -> ORDigitalTwinNode:
             node._twin.state,
             "implicit_request_stability_sec",
             4.0,
+        ),
+        lambda node: setattr(
+            node._twin.state,
+            "cam4_mayo_hand_present",
+            False,
         ),
     ],
 )

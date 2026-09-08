@@ -48,3 +48,10 @@ test("non-Live modes cannot select an RF-DETR worker through the Mission plan", 
     }
   }
 });
+
+test("Live core observes VLM runtime status without enabling model controls", () => {
+  const plan = missionSubscriptionPlan("live", "live-core");
+
+  expect(plan.modelStatusObservation).toBe(true);
+  expect(plan.modelControls).toBe(false);
+});

@@ -3,30 +3,34 @@
 from __future__ import annotations
 
 from collections import deque
-import copy
 from dataclasses import asdict
 import json
 import math
-import os
 from pathlib import Path
 import threading
 import time
 import uuid
 
-from hand_keypoint_interfaces.msg import HandFacingArray, HandGestureArray
+from hand_keypoint_interfaces.msg import (
+    HandFacingArray,
+    HandGestureArray,
+    HandKeypoints,
+)
 from procedure_spec import (
     ProcedurePriorScorer,
+    ScenarioConfigSnapshot,
     compact_procedure_prompt,
     discover_prompt_bundle_dirs,
     get_default_spec_dir,
     load_bundle,
     load_frozen_handover_ngram_prior,
-    load_voice_command_catalog,
+    load_scenario_consumer_bundle,
+    parse_scenario_config,
 )
 import rclpy
 from rcl_interfaces.msg import SetParametersResult
-from rclpy.clock import Clock, ClockType
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from rclpy.qos import (
     DurabilityPolicy,
     HistoryPolicy,
@@ -34,7 +38,8 @@ from rclpy.qos import (
     ReliabilityPolicy,
 )
 from std_msgs.msg import String
-from surgical_interop_msgs.msg import BedRobotArmStateArray, GatewayInfo
+from surgical_interop_msgs.msg import BedRobotArmStateArray
+from surgical_perception_msgs.msg import TrackedToolBeliefArray
 from surgical_msgs.msg import (
     BedRobotArmGroupActionProposal,
     BedRobotArmGroupCommand,
@@ -58,7 +63,6 @@ from surgical_msgs.msg import (
     SurgeonRequest,
     ToolObservation,
     TwinEvent,
-    VoiceCommandIntent,
     VLMInferenceProposal,
     VLMHealth,
     VLMRequestContext,
@@ -69,7 +73,7 @@ from surgical_msgs.msg import (
 
 from .hand_handover_gate import (
     ContinuousHandHandoverGate,
-    ExactStampHandJoiner,
+    ExactStampHandTripletJoiner,
     FrameDisposition,
     HandFrameEvidence,
     HandPerceptionPins,
@@ -79,73 +83,88 @@ from .hand_handover_gate import (
     validate_hand_health,
 )
 from .models import RankedToolPredictionBelief
-from .twin import ORDigitalTwin
-from .voice_intent_receipt import (
-    GatewayLeaseAuthority,
-    VoiceIntentReceiptDraft,
-    VoiceIntentReceiptKey,
-    VoiceIntentReceiptLedger,
-    voice_intent_fingerprint,
+from .ngram_policy import arbitrate_ngram_intent
+from .tool_policy_status import (
+    TOOL_POLICY_PARAMETER_NAMES,
+    TOOL_POLICY_STATUS_TOPIC,
+    tool_policy_status_payload,
 )
-
-
+from .twin import CAM4_TYPED_MAYO_OBSERVATION_SOURCE, ORDigitalTwin
 WORLD_STATE_MAINTENANCE_PERIOD_SEC = 0.5
 HAND_HANDOVER_WATCHDOG_PERIOD_SEC = 0.1
 WORLD_STATE_IDLE_CHECKPOINT_SEC = 2.0
+VLM_STARTUP_HEALTH_GRACE_SEC = 6.0
 WORLD_STATE_KNOWN_INACTIVE = frozenset(
     {"idle", "halted", "completed", "terminated"}
 )
-
-
-def _normalize_ranked_tool_distribution(
-    rows: list[tuple[str, float]],
-    *,
-    limit: int = 3,
-) -> list[tuple[str, float]]:
-    """Normalize unique candidates into display-stable percentage points."""
-
-    scores: dict[str, float] = {}
-    order: dict[str, int] = {}
-    for index, (raw_tool_id, raw_score) in enumerate(rows):
-        tool_id = str(raw_tool_id).strip()
-        try:
-            score = float(raw_score)
-        except (TypeError, ValueError):
-            continue
-        if not tool_id or not math.isfinite(score) or score < 0.0:
-            continue
-        order.setdefault(tool_id, index)
-        scores[tool_id] = max(scores.get(tool_id, 0.0), min(1.0, score))
-    ranked = sorted(
-        scores,
-        key=lambda tool_id: (-scores[tool_id], order[tool_id], tool_id),
-    )[: max(0, int(limit))]
-    if not ranked:
-        return []
-    total = sum(scores[tool_id] for tool_id in ranked)
-    raw_units = [
-        (
-            scores[tool_id] / total * 100.0
-            if total > 0.0
-            else 100.0 / len(ranked)
-        )
-        for tool_id in ranked
-    ]
-    units = [int(math.floor(value)) for value in raw_units]
-    remainder = 100 - sum(units)
-    allocation_order = sorted(
-        range(len(ranked)),
-        key=lambda index: (
-            -(raw_units[index] - units[index]),
-            index,
-        ),
-    )
-    for index in allocation_order[:remainder]:
-        units[index] += 1
-    return [
-        (tool_id, unit / 100.0)
-        for tool_id, unit in zip(ranked, units, strict=True)
-    ]
+HAND_HANDOVER_GATE_PARAMETER_BINDINGS = {
+    "hand_handover_dwell_sec": "dwell_sec",
+    "hand_handover_release_sec": "release_sec",
+    "hand_handover_release_confirm_sec": "release_confirm_sec",
+    "hand_handover_soft_unknown_grace_sec": "soft_unknown_grace_sec",
+    "hand_handover_max_positive_gap_sec": "max_positive_gap_sec",
+    "hand_handover_max_source_age_sec": "max_source_age_sec",
+    "hand_handover_future_tolerance_sec": "future_tolerance_sec",
+    "hand_handover_observation_timeout_sec": "max_receipt_silence_sec",
+    "hand_handover_minimum_positive_samples": "minimum_positive_samples",
+}
+DIRECT_DELIVERY_TASK_TYPES = frozenset(
+    {
+        "direct_handover",
+        "mayo_handover",
+        "pick_up_and_handover",
+        "pick_up_from_mayo_and_handover",
+        "predicted_tool_handover",
+        "put_down_and_handover",
+        "replace_and_handover",
+        "tool_handover",
+    }
+)
+DIRECT_DELIVERY_TARGET_ANCHORS = frozenset(
+    {"handover_zone", "surgeon", "surgeon_hand", "surgeon_receive_zone"}
+)
+SKILL_EVENTS_REQUIRING_CURRENT_RUN = frozenset(
+    {
+        "RobotTaskStarted",
+        "RobotTaskCompleted",
+        "RobotGraspedTool",
+        "ToolPrepared",
+        "ToolHandoverCompleted",
+        "ShadowAdditionalToolHandoverCompleted",
+        "PredictedToolReturnedToRack",
+        "UnusedPrepositionReturned",
+        "ToolReceivedFromSurgeon",
+        "ToolRetrievedFromMayo",
+        "ToolSentToCleaner",
+        "ToolCleaningProgress",
+        "ToolCleaningCompleted",
+        "ToolReturnedToTray",
+    }
+)
+FINISHING_SKILL_TASK_TYPES = frozenset(
+    {
+        "return_unused_preposition",
+        "return_preposition_to_tray",
+        "retrieve_from_mayo",
+        "tool_retrieve",
+    }
+)
+BELIEF_OWNED_TOOL_LOCATION_EVENTS = frozenset(
+    {
+        "RobotGraspedTool",
+        "ToolPrepared",
+        "ToolHandoverCompleted",
+        "ShadowAdditionalToolHandoverCompleted",
+        "ToolReceivedFromSurgeon",
+        "ToolRetrievedFromMayo",
+        "ToolSentToCleaner",
+        "ToolCleaningProgress",
+        "ToolCleaningCompleted",
+        "ToolReturnedToTray",
+        "PredictedToolReturnedToRack",
+        "UnusedPrepositionReturned",
+    }
+)
 
 
 class ORDigitalTwinNode(Node):
@@ -174,18 +193,25 @@ class ORDigitalTwinNode(Node):
     def __init__(self) -> None:
         super().__init__("or_digital_twin")
         self.declare_parameter("spec_dir", str(get_default_spec_dir()))
+        self.declare_parameter(
+            "scenario_config_topic", "/simulation/scenario_config"
+        )
         self.declare_parameter("vlm_recent_event_count", 6)
         self.declare_parameter("validation_mode", "bt_twin")
         self.declare_parameter("phase_authority", "reducer")
         self.declare_parameter("vlm_mode", "mock")
         self.declare_parameter("vlm_health_timeout_sec", 6.0)
         self.declare_parameter("vlm_evidence_max_gap_sec", 2.5)
-        self.declare_parameter("mayo_retrieve_confidence_threshold", 0.5)
-        self.declare_parameter("mayo_reuse_suppress_threshold", 0.5)
-        self.declare_parameter("mayo_stability_sec", 5.0)
-        self.declare_parameter("tool_predict_evidence_confidence_threshold", 0.5)
-        self.declare_parameter("tool_predict_confidence_threshold", 0.55)
-        self.declare_parameter("tool_predict_stability_sec", 0.30)
+        # Autonomous tool policy is DT-owned and derives only from the frozen
+        # 0704 handover n-gram distribution.  VLM tool/Mayo scores remain
+        # observability input, never an action-policy input.
+        self.declare_parameter("ngram_prepare_probability_threshold", 0.125)
+        self.declare_parameter("ngram_recovery_probability_threshold", 0.391)
+        self.declare_parameter(
+            "ngram_recovery_enabled_tools",
+            ["T02", "T08"],
+        )
+        self.declare_parameter("ngram_policy_stability_sec", 0.30)
         self.declare_parameter(
             "hand_gesture_topic",
             "/perception/cam_4/hand/gestures",
@@ -195,16 +221,25 @@ class ORDigitalTwinNode(Node):
             "/perception/cam_4/hand/facing",
         )
         self.declare_parameter(
+            "hand_keypoints_topic",
+            "/perception/cam_4/hand/keypoints",
+        )
+        self.declare_parameter(
             "hand_health_topic",
             "/perception/cam_4/hand/health",
         )
         self.declare_parameter("hand_handover_dwell_sec", 0.300)
         self.declare_parameter("hand_handover_release_sec", 0.500)
-        self.declare_parameter("hand_handover_max_positive_gap_sec", 0.200)
+        # CAM4 may miss an isolated frame while a requester is already
+        # holding the exact pose.  These two short windows are intentionally
+        # separate from the longer fresh-release rearm interval above.
+        self.declare_parameter("hand_handover_release_confirm_sec", 0.180)
+        self.declare_parameter("hand_handover_soft_unknown_grace_sec", 0.180)
+        self.declare_parameter("hand_handover_max_positive_gap_sec", 0.500)
         self.declare_parameter("hand_handover_max_source_age_sec", 0.500)
         self.declare_parameter("hand_handover_future_tolerance_sec", 0.500)
         self.declare_parameter("hand_handover_health_timeout_sec", 2.0)
-        self.declare_parameter("hand_handover_observation_timeout_sec", 0.400)
+        self.declare_parameter("hand_handover_observation_timeout_sec", 0.500)
         self.declare_parameter("hand_handover_minimum_positive_samples", 4)
         self.declare_parameter("hand_handover_minimum_gesture_score", 0.5)
         self.declare_parameter("hand_handover_minimum_handedness_score", 0.5)
@@ -252,14 +287,6 @@ class ORDigitalTwinNode(Node):
         )
         self.declare_parameter("accept_validation_actor_events", False)
         self.declare_parameter("accept_non_override_structured_requests", False)
-        self.declare_parameter(
-            "enable_legacy_raw_tool_handover_compatibility",
-            False,
-        )
-        self.declare_parameter(
-            "enable_legacy_raw_procedure_completion_compatibility",
-            False,
-        )
         self.declare_parameter("evaluation_observation_topic", "")
         self.declare_parameter("allow_shadow_type_instance_requests", False)
         self.declare_parameter("allow_open_set_phase_bootstrap", False)
@@ -271,27 +298,15 @@ class ORDigitalTwinNode(Node):
             "cam4_mayo_observation_future_tolerance_sec",
             0.5,
         )
-        # Live uses a typed ASR envelope.  Debug/replay can explicitly retain
-        # the legacy String path by leaving this false in its launch profile.
-        self.declare_parameter("require_voice_intent_source_metadata", False)
-        self.declare_parameter("voice_intent_max_age_sec", 3.0)
-        self.declare_parameter("voice_intent_future_tolerance_sec", 1.0)
-        self.declare_parameter("voice_intent_dedupe_retention_sec", 120.0)
-        self.declare_parameter("voice_gateway_info_timeout_sec", 3.0)
-        default_voice_receipt_dir = str(
-            os.environ.get("TASKPLANNER_EXECUTION_STATE_DIR", "") or ""
-        ).strip() or f"/tmp/taskplanner-odt-voice-receipts-{os.getuid()}"
         self.declare_parameter(
-            "voice_intent_receipt_ledger_path",
-            os.environ.get(
-                "TASKPLANNER_ODT_VOICE_RECEIPT_LEDGER_PATH",
-                (
-                    f"{default_voice_receipt_dir}/"
-                    "odt_voice_intent_receipts.sqlite3"
-                ),
-            ),
+            "tool_belief_topic",
+            "/surgery/perception/tool_beliefs",
         )
         self._spec_dir = str(self.get_parameter("spec_dir").value)
+        self._scenario_config_root = Path(self._spec_dir).resolve().parent
+        self._scenario_config_revision = ""
+        self._pending_scenario_config: ScenarioConfigSnapshot | None = None
+        self._scenario_config_lock = threading.RLock()
         self._vlm_recent_event_count = max(1, int(self.get_parameter("vlm_recent_event_count").value))
         self._validation_mode = str(self.get_parameter("validation_mode").value)
         self._phase_authority = str(self.get_parameter("phase_authority").value)
@@ -301,19 +316,40 @@ class ORDigitalTwinNode(Node):
             0.5,
             float(self.get_parameter("vlm_evidence_max_gap_sec").value),
         )
-        self._mayo_retrieve_threshold = float(self.get_parameter("mayo_retrieve_confidence_threshold").value)
-        self._mayo_reuse_threshold = float(self.get_parameter("mayo_reuse_suppress_threshold").value)
-        self._mayo_stability_sec = max(0.1, float(self.get_parameter("mayo_stability_sec").value))
-        self._tool_predict_evidence_threshold = float(
-            self.get_parameter("tool_predict_evidence_confidence_threshold").value
+        self._ngram_prepare_probability_threshold = max(
+            0.0,
+            min(
+                1.0,
+                float(
+                    self.get_parameter(
+                        "ngram_prepare_probability_threshold"
+                    ).value
+                ),
+            ),
         )
-        self._tool_predict_threshold = float(self.get_parameter("tool_predict_confidence_threshold").value)
-        self._tool_predict_stability_sec = max(0.1, float(self.get_parameter("tool_predict_stability_sec").value))
+        self._ngram_recovery_probability_threshold = max(
+            0.0,
+            min(
+                1.0,
+                float(
+                    self.get_parameter(
+                        "ngram_recovery_probability_threshold"
+                    ).value
+                ),
+            ),
+        )
+        self._ngram_policy_stability_sec = max(
+            0.1,
+            float(self.get_parameter("ngram_policy_stability_sec").value),
+        )
         self._hand_gesture_topic = str(
             self.get_parameter("hand_gesture_topic").value
         ).strip()
         self._hand_facing_topic = str(
             self.get_parameter("hand_facing_topic").value
+        ).strip()
+        self._hand_keypoints_topic = str(
+            self.get_parameter("hand_keypoints_topic").value
         ).strip()
         self._hand_health_topic = str(
             self.get_parameter("hand_health_topic").value
@@ -327,6 +363,22 @@ class ORDigitalTwinNode(Node):
             float(
                 self.get_parameter(
                     "hand_handover_observation_timeout_sec"
+                ).value
+            ),
+        )
+        self._hand_source_max_age_sec = max(
+            0.0,
+            float(
+                self.get_parameter(
+                    "hand_handover_max_source_age_sec"
+                ).value
+            ),
+        )
+        self._hand_source_future_tolerance_sec = max(
+            0.0,
+            float(
+                self.get_parameter(
+                    "hand_handover_future_tolerance_sec"
                 ).value
             ),
         )
@@ -402,47 +454,15 @@ class ORDigitalTwinNode(Node):
                 ).value
             ),
         )
-        self._hand_handover_gate = ContinuousHandHandoverGate(
-            dwell_sec=float(
-                self.get_parameter("hand_handover_dwell_sec").value
-            ),
-            release_sec=float(
-                self.get_parameter("hand_handover_release_sec").value
-            ),
-            max_positive_gap_sec=float(
-                self.get_parameter("hand_handover_max_positive_gap_sec").value
-            ),
-            max_source_age_sec=float(
-                self.get_parameter("hand_handover_max_source_age_sec").value
-            ),
-            future_tolerance_sec=float(
-                self.get_parameter("hand_handover_future_tolerance_sec").value
-            ),
-            max_receipt_silence_sec=self._hand_observation_timeout_sec,
-            minimum_positive_samples=int(
-                self.get_parameter(
-                    "hand_handover_minimum_positive_samples"
-                ).value
-            ),
+        self._hand_handover_gate_config = self._hand_handover_gate_config_from_parameters()
+        self._hand_handover_gate = self._build_hand_handover_gate(
+            self._hand_handover_gate_config
         )
         self._accept_validation_actor_events = bool(
             self.get_parameter("accept_validation_actor_events").value
         )
         self._accept_non_override_structured_requests = bool(
             self.get_parameter("accept_non_override_structured_requests").value
-        )
-        # Raw text remains available for observation only.  It cannot become
-        # an action input without one of these explicit migration-only
-        # switches; normal execution starts at /surgery/voice/intent.
-        self._enable_legacy_raw_tool_handover_compatibility = bool(
-            self.get_parameter(
-                "enable_legacy_raw_tool_handover_compatibility"
-            ).value
-        )
-        self._enable_legacy_raw_procedure_completion_compatibility = bool(
-            self.get_parameter(
-                "enable_legacy_raw_procedure_completion_compatibility"
-            ).value
         )
         self._bed_robot_status_timeout_sec = max(
             0.1,
@@ -476,52 +496,9 @@ class ORDigitalTwinNode(Node):
                 ).value
             ),
         )
-        self._require_voice_intent_source_metadata = bool(
-            self.get_parameter("require_voice_intent_source_metadata").value
-        )
-        self._voice_intent_max_age_sec = max(
-            0.0,
-            float(self.get_parameter("voice_intent_max_age_sec").value),
-        )
-        self._voice_intent_future_tolerance_sec = max(
-            0.0,
-            float(
-                self.get_parameter(
-                    "voice_intent_future_tolerance_sec"
-                ).value
-            ),
-        )
-        self._voice_intent_dedupe_retention_sec = max(
-            1.0,
-            float(
-                self.get_parameter(
-                    "voice_intent_dedupe_retention_sec"
-                ).value
-            ),
-        )
-        self._voice_intent_receipt_ledger = VoiceIntentReceiptLedger(
-            str(
-                self.get_parameter(
-                    "voice_intent_receipt_ledger_path"
-                ).value
-            )
-        )
-        self._voice_gateway_info_timeout_sec = max(
-            0.1,
-            float(
-                self.get_parameter("voice_gateway_info_timeout_sec").value
-            ),
-        )
-        self._voice_gateway_authority = GatewayLeaseAuthority(
-            timeout_sec=self._voice_gateway_info_timeout_sec
-        )
-        # Gateway epoch updates, lease expiry, and one complete gated
-        # admission share this lock.  This makes the exact lease checked for a
-        # first writer remain authoritative through reducer mutation and the
-        # durable receipt commit, even under a multi-threaded executor.
-        self._voice_gated_admission_lock = threading.RLock()
-        self._voice_gated_mutation_dirty = False
-        self._voice_gated_mutation_fatal = False
+        self._tool_belief_topic = str(
+            self.get_parameter("tool_belief_topic").value
+        ).strip()
         self._twin = ORDigitalTwin(
             load_bundle(self._spec_dir),
             allow_shadow_type_instance_requests=bool(
@@ -533,9 +510,16 @@ class ORDigitalTwinNode(Node):
                 self.get_parameter("allow_open_set_phase_bootstrap").value
             ),
         )
-        # Voice tool IDs are procedure-local.  This uses the same shared
-        # catalog helper as the resolver, not a global T-ID alias table.
-        self._voice_command_catalog = load_voice_command_catalog(self._spec_dir)
+        requestable_tool_ids = set(
+            self._twin.spec.list_requestable_instrument_ids()
+        )
+        self._ngram_recovery_enabled_tools = frozenset(
+            str(tool_id).strip()
+            for tool_id in self.get_parameter(
+                "ngram_recovery_enabled_tools"
+            ).value
+            if str(tool_id).strip() in requestable_tool_ids
+        )
         self._stamp_all_bed_robot_arm_groups()
         self._prior_scorer = ProcedurePriorScorer(self._twin.spec, compact_procedure_prompt(self._spec_dir))
         self._handover_ngram_prior = load_frozen_handover_ngram_prior(
@@ -545,8 +529,10 @@ class ORDigitalTwinNode(Node):
         self._bundle_metadata_cache = self._build_bundle_metadata()
         self._important_events: deque[SimulationEvent] = deque(maxlen=self._vlm_recent_event_count)
         self._validated_tool_request_history: deque[dict] = deque(maxlen=12)
-        self._recent_voice_intent_ids: dict[str, float] = {}
         self._completed_handover_history: deque[dict] = deque(maxlen=12)
+        # The n-gram deque is intentionally short, but repeat policy means
+        # "completed at least once in this phase" for the whole current run.
+        self._completed_handover_tools_by_phase: dict[str, set[str]] = {}
         self._latest_outward_signal: SurgeonOutwardSignal | None = None
         self._vlm_health_by_topic: dict[str, tuple[VLMHealth, float]] = {}
         self._input_source_status_by_id: dict[str, InputSourceStatus] = {}
@@ -555,7 +541,7 @@ class ORDigitalTwinNode(Node):
         ] = {}
         self._visual_runtime_epoch_floor = 0
         self._visual_runtime_source_stamp_floor_sec = 0.0
-        self._cam4_mayo_source_epoch_floor = 0
+        self._cam4_mayo_source_epoch_floor_by_source: dict[str, int] = {}
         self._cam4_mayo_admission_by_channel: dict[
             str, tuple[int, int, float]
         ] = {}
@@ -564,15 +550,31 @@ class ORDigitalTwinNode(Node):
         self._last_world_emit_signature: tuple | None = None
         self._last_world_emit_monotonic = 0.0
         self._vlm_evidence_blocked = False
+        # A VLM produces inference health only after it receives an admitted
+        # scenario request.  Keep this separate from visual-result freshness:
+        # an idle model or the first request in flight is not a failed model.
+        self._vlm_health_run_started_monotonic: float | None = None
         self._perception_health_seen = False
         self._perception_enabled = True
-        self._mayo_retrieve_stability: dict[str, dict] = {}
-        self._mayo_reuse_stability: dict[str, dict] = {}
-        self._tool_predict_stability: dict[str, dict] = {}
-        self._tool_prediction_last_sample_by_source: dict[
-            str, tuple[float, str]
-        ] = {}
-        self._hand_handover_joiner = ExactStampHandJoiner(max_pending=32)
+        self._ngram_preparation_stability: dict[str, dict] = {}
+        self._ngram_recovery_stability: dict[str, dict] = {}
+        # ``/skill/events`` has no explicit procedure-run field. Do not let a
+        # delayed callback from a preceding runtime enter the fresh Twin:
+        # every mutating task event must cross this current-run fence first.
+        self._skill_event_runtime_epoch = 0
+        self._skill_event_source_stamp_floor_ns = self._event_stamp_ns(
+            self._stamp()
+        )
+        self._current_run_skill_task_ids: set[str] = set()
+        # Fail closed until the pinned CAM4 gesture detector publishes a fresh
+        # empty frame while its RGB inference health lease is valid.  The
+        # hand-free state itself is leased: silence or detector-health loss
+        # re-latches occupancy instead of leaving Mayo motion enabled.
+        self._cam4_mayo_hand_present = True
+        self._cam4_mayo_hand_source_stamp_ns: int | None = None
+        self._cam4_mayo_hand_received_monotonic = 0.0
+        self._twin.state.cam4_mayo_hand_present = True
+        self._hand_handover_joiner = ExactStampHandTripletJoiner(max_pending=32)
         self._hand_health_payload: dict | None = None
         self._hand_health_received_monotonic = 0.0
         self._hand_health_ready = False
@@ -586,7 +588,31 @@ class ORDigitalTwinNode(Node):
         self._world_pub = self.create_publisher(WorldState, "/twin/world_state", 20)
         self._tool_pub = self.create_publisher(InstrumentState, "/twin/tool_states", 50)
         self._event_pub = self.create_publisher(TwinEvent, "/twin/events", 50)
-        self._simulation_state_pub = self.create_publisher(SimulationState, "/simulation/state", 20)
+        self._tool_policy_status_pub = self.create_publisher(
+            String,
+            TOOL_POLICY_STATUS_TOPIC,
+            QoSProfile(
+                history=HistoryPolicy.KEEP_LAST,
+                depth=1,
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            ),
+        )
+        self._last_tool_policy_status_json = ""
+        # ScenarioStore may restart independently while the Twin stays live.
+        # Retaining one authoritative lifecycle frame lets that small config
+        # owner immediately distinguish a stopped/paused boundary from a
+        # running procedure instead of treating startup silence as idle.
+        self._simulation_state_pub = self.create_publisher(
+            SimulationState,
+            "/simulation/state",
+            QoSProfile(
+                history=HistoryPolicy.KEEP_LAST,
+                depth=1,
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            ),
+        )
         self._simulation_event_pub = self.create_publisher(SimulationEvent, "/simulation/event", 50)
         self._vlm_context_summary_pub = self.create_publisher(String, "/twin/vlm_context_summary", 10)
         self._vlm_request_context_pub = self.create_publisher(VLMRequestContext, "/twin/vlm_request_context", 10)
@@ -601,12 +627,13 @@ class ORDigitalTwinNode(Node):
         self.create_subscription(PhaseTransitionCue, "/surgeon/phase_transition_cue", self._on_phase_transition_cue, 20)
         self.create_subscription(PhaseEvidence, "/vlm/phase_evidence", self._on_phase_evidence, 20)
         self.create_subscription(ToolObservation, "/vlm/tool_observations", self._on_observation, 50)
-        self.create_subscription(
-            ToolObservation,
-            "/surgery/perception/cam4/mayo_tool_observations",
-            self._on_cam4_mayo_observation,
-            50,
-        )
+        if self._tool_belief_topic:
+            self.create_subscription(
+                TrackedToolBeliefArray,
+                self._tool_belief_topic,
+                self._on_tool_beliefs,
+                20,
+            )
         evaluation_observation_topic = str(
             self.get_parameter("evaluation_observation_topic").value
         ).strip()
@@ -641,6 +668,12 @@ class ORDigitalTwinNode(Node):
             HandFacingArray,
             self._hand_facing_topic,
             self._on_hand_facing,
+            hand_qos,
+        )
+        self.create_subscription(
+            HandKeypoints,
+            self._hand_keypoints_topic,
+            self._on_hand_keypoints,
             hand_qos,
         )
         self.create_subscription(
@@ -717,43 +750,29 @@ class ORDigitalTwinNode(Node):
             self._on_bed_robot_arm_controller_status,
             20,
         )
-        voice_gateway_qos = QoSProfile(
+        # ODT is an observer/state owner, not a voice-command gateway.  It
+        # receives typed SurgeonRequest state updates after command_router
+        # has dispatched them; no ASR or raw-transcript subscription is
+        # created here.
+        self.create_subscription(SurgeonRequest, "/surgeon/request", self._on_surgeon_request, 20)
+        self.create_subscription(FilteredPhase, "/phase/filtered", self._on_phase, 20)
+        self.create_subscription(String, "/simulation/control_state", self._on_control, 20)
+        scenario_config_qos = QoSProfile(
             history=HistoryPolicy.KEEP_LAST,
             depth=1,
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
         )
         self.create_subscription(
-            GatewayInfo,
-            "/surgery/gateway_info",
-            self._on_voice_gateway_info,
-            voice_gateway_qos,
+            String,
+            str(self.get_parameter("scenario_config_topic").value),
+            self._on_scenario_config,
+            scenario_config_qos,
         )
-        self.create_subscription(
-            VoiceCommandIntent,
-            "/surgery/voice/intent",
-            self._on_voice_command_intent,
-            20,
-        )
-        self.create_subscription(String, "/surgery/audio/request_text", self._on_request, 20)
-        self.create_subscription(SurgeonRequest, "/surgeon/request", self._on_surgeon_request, 20)
-        self.create_subscription(FilteredPhase, "/phase/filtered", self._on_phase, 20)
-        self.create_subscription(String, "/simulation/control_state", self._on_control, 20)
 
         self.create_timer(
             WORLD_STATE_MAINTENANCE_PERIOD_SEC,
             self._on_world_state_timer,
-        )
-        self._voice_gateway_watchdog_clock = Clock(
-            clock_type=ClockType.STEADY_TIME
-        )
-        self._voice_gateway_watchdog_timer = self.create_timer(
-            min(
-                0.5,
-                max(0.1, self._voice_gateway_info_timeout_sec / 4.0),
-            ),
-            self._on_voice_gateway_watchdog,
-            clock=self._voice_gateway_watchdog_clock,
         )
         # Health is latched at 1 Hz, while gesture/facing frames arrive near
         # 15 Hz. Keep their leases separate and withdraw a vanished live hand
@@ -764,37 +783,187 @@ class ORDigitalTwinNode(Node):
         )
         self._publish_world_state()
 
+    def _hand_handover_gate_config_from_parameters(self) -> dict[str, float | int]:
+        """Read the one timing owner for CAM4 hand-request admission.
+
+        These values deliberately live together: changing a timing value
+        rebuilds the pure gate and clears only the current implicit-hand
+        evidence.  It does not affect an already dispatched robot Action.
+        """
+
+        return self._normalize_hand_handover_gate_config(
+            {
+                "dwell_sec": self.get_parameter(
+                    "hand_handover_dwell_sec"
+                ).value,
+                "release_sec": self.get_parameter(
+                    "hand_handover_release_sec"
+                ).value,
+                "release_confirm_sec": self.get_parameter(
+                    "hand_handover_release_confirm_sec"
+                ).value,
+                "soft_unknown_grace_sec": self.get_parameter(
+                    "hand_handover_soft_unknown_grace_sec"
+                ).value,
+                "max_positive_gap_sec": self.get_parameter(
+                    "hand_handover_max_positive_gap_sec"
+                ).value,
+                "max_source_age_sec": self.get_parameter(
+                    "hand_handover_max_source_age_sec"
+                ).value,
+                "future_tolerance_sec": self.get_parameter(
+                    "hand_handover_future_tolerance_sec"
+                ).value,
+                "max_receipt_silence_sec": self.get_parameter(
+                    "hand_handover_observation_timeout_sec"
+                ).value,
+                "minimum_positive_samples": self.get_parameter(
+                    "hand_handover_minimum_positive_samples"
+                ).value,
+            }
+        )
+
+    @staticmethod
+    def _normalize_hand_handover_gate_config(
+        values: dict[str, object],
+    ) -> dict[str, float | int]:
+        """Validate timing independently from the surrounding ROS node."""
+
+        def positive(name: str) -> float:
+            value = float(values[name])
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be a finite value greater than zero")
+            return value
+
+        def nonnegative(name: str) -> float:
+            value = float(values[name])
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(
+                    f"{name} must be a finite value greater than or equal to zero"
+                )
+            return value
+
+        release_sec = positive("release_sec")
+        release_confirm_sec = positive("release_confirm_sec")
+        return {
+            "dwell_sec": positive("dwell_sec"),
+            "release_sec": release_sec,
+            "release_confirm_sec": min(release_sec, release_confirm_sec),
+            "soft_unknown_grace_sec": positive("soft_unknown_grace_sec"),
+            "max_positive_gap_sec": positive("max_positive_gap_sec"),
+            "max_source_age_sec": nonnegative("max_source_age_sec"),
+            "future_tolerance_sec": nonnegative("future_tolerance_sec"),
+            "max_receipt_silence_sec": positive("max_receipt_silence_sec"),
+            "minimum_positive_samples": max(
+                2, int(values["minimum_positive_samples"])
+            ),
+        }
+
+    @staticmethod
+    def _build_hand_handover_gate(
+        values: dict[str, float | int],
+    ) -> ContinuousHandHandoverGate:
+        return ContinuousHandHandoverGate(**values)
+
+    def _replace_hand_handover_gate(
+        self,
+        values: dict[str, float | int],
+    ) -> None:
+        """Apply live hand-gate timing without restarting the state owner."""
+
+        self._hand_handover_gate_config = values
+        self._hand_observation_timeout_sec = float(
+            values["max_receipt_silence_sec"]
+        )
+        self._hand_source_max_age_sec = float(values["max_source_age_sec"])
+        self._hand_source_future_tolerance_sec = float(
+            values["future_tolerance_sec"]
+        )
+        self._hand_handover_gate = self._build_hand_handover_gate(values)
+        # A timing update is a new admission epoch.  It never alters an active
+        # robot task, but cannot carry the old candidate into the new timing
+        # regime.
+        self._withdraw_hand_handover_evidence()
+
     def _on_parameters_changed(self, params):
+        # Keep the generic parameter callback usable in the small pure-node
+        # tests too: those tests construct a partial node solely to exercise a
+        # different parameter family, before hand-gate state has been built.
+        # Only hydrate this timing owner when one of its parameters is changed.
+        gate_values: dict[str, float | int] | None = None
+        gate_changed = False
         for parameter in params:
+            config_key = HAND_HANDOVER_GATE_PARAMETER_BINDINGS.get(
+                parameter.name
+            )
+            if config_key is not None:
+                if gate_values is None:
+                    gate_values = dict(self._hand_handover_gate_config)
+                gate_values[config_key] = parameter.value
+                gate_changed = True
+        if gate_changed:
+            try:
+                gate_values = self._normalize_hand_handover_gate_config(
+                    gate_values or {}
+                )
+            except (TypeError, ValueError) as exc:
+                return SetParametersResult(
+                    successful=False,
+                    reason=f"invalid hand handover timing: {exc}",
+                )
+
+        for parameter in params:
+            if parameter.name in HAND_HANDOVER_GATE_PARAMETER_BINDINGS:
+                continue
             if parameter.name == "spec_dir":
                 try:
                     next_spec_dir = str(parameter.value)
                     next_spec = load_bundle(next_spec_dir)
-                    next_voice_catalog = load_voice_command_catalog(
-                        next_spec_dir
+                    state = self._twin.state
+                    paused_quiescent = bool(
+                        state.running
+                        and state.execution_state == "paused"
+                        and getattr(state, "active_robot_task", None) is None
+                        and not bool(getattr(state, "cleaner_busy", False))
+                        and not self._pending_bed_robot_arm_group_requests
                     )
+                    if state.running and not paused_quiescent:
+                        raise ValueError(
+                            "scenario config requires stopped or quiescent paused state"
+                        )
+                    if paused_quiescent:
+                        self._twin.swap_spec_preserving_paused_world(next_spec)
+                    else:
+                        self._twin.reset_spec(next_spec)
+                        self._stamp_all_bed_robot_arm_groups()
+                    # Commit the selected bundle only after its world swap
+                    # completed.  A rejected runtime update must keep the
+                    # last-good configuration and world together.
                     self._spec_dir = next_spec_dir
-                    self._twin.reset_spec(next_spec)
-                    self._voice_command_catalog = next_voice_catalog
-                    self._stamp_all_bed_robot_arm_groups()
                     self._prior_scorer = ProcedurePriorScorer(self._twin.spec, compact_procedure_prompt(self._spec_dir))
                     self._handover_ngram_prior = load_frozen_handover_ngram_prior(
                         self._twin.spec,
                         self._spec_dir,
                     )
+                    requestable_tool_ids = set(
+                        self._twin.spec.list_requestable_instrument_ids()
+                    )
+                    self._ngram_recovery_enabled_tools = frozenset(
+                        tool_id
+                        for tool_id in self._ngram_recovery_enabled_tools
+                        if tool_id in requestable_tool_ids
+                    )
                     self._bundle_metadata_cache = self._build_bundle_metadata()
                     self._important_events.clear()
-                    self._validated_tool_request_history.clear()
-                    self._recent_voice_intent_ids.clear()
-                    self._completed_handover_history.clear()
-                    self._mayo_retrieve_stability.clear()
-                    self._mayo_reuse_stability.clear()
-                    self._tool_predict_stability.clear()
-                    self._tool_prediction_last_sample_by_source.clear()
+                    self._clear_tool_histories()
+                    self._ngram_preparation_stability.clear()
+                    self._ngram_recovery_stability.clear()
                     self._reset_hand_handover_state()
                     self._advance_visual_runtime_epoch()
+                    self._advance_skill_event_runtime_epoch()
                     self._pending_bed_robot_arm_group_requests.clear()
-                    self._reset_bed_robot_controller_freshness()
+                    if not paused_quiescent:
+                        self._reset_bed_robot_controller_freshness()
                     self._phase_entered_ros_sec = self._stamp_sec(self._stamp())
                     self._last_lifecycle_control_signature = None
                     self._publish_world_state()
@@ -814,18 +983,40 @@ class ORDigitalTwinNode(Node):
                 self._vlm_mode = str(parameter.value)
             elif parameter.name == "vlm_health_timeout_sec":
                 self._vlm_health_timeout_sec = max(0.5, float(parameter.value))
-            elif parameter.name == "mayo_retrieve_confidence_threshold":
-                self._mayo_retrieve_threshold = float(parameter.value)
-            elif parameter.name == "mayo_reuse_suppress_threshold":
-                self._mayo_reuse_threshold = float(parameter.value)
-            elif parameter.name == "mayo_stability_sec":
-                self._mayo_stability_sec = max(0.1, float(parameter.value))
-            elif parameter.name == "tool_predict_evidence_confidence_threshold":
-                self._tool_predict_evidence_threshold = float(parameter.value)
-            elif parameter.name == "tool_predict_confidence_threshold":
-                self._tool_predict_threshold = float(parameter.value)
-            elif parameter.name == "tool_predict_stability_sec":
-                self._tool_predict_stability_sec = max(0.1, float(parameter.value))
+            elif parameter.name == "ngram_prepare_probability_threshold":
+                self._ngram_prepare_probability_threshold = max(
+                    0.0, min(1.0, float(parameter.value))
+                )
+            elif parameter.name == "ngram_recovery_probability_threshold":
+                self._ngram_recovery_probability_threshold = max(
+                    0.0, min(1.0, float(parameter.value))
+                )
+            elif parameter.name == "ngram_recovery_enabled_tools":
+                values = [
+                    str(tool_id).strip()
+                    for tool_id in parameter.value
+                    if str(tool_id).strip()
+                ]
+                requestable_tool_ids = set(
+                    self._twin.spec.list_requestable_instrument_ids()
+                )
+                unknown = sorted(set(values) - requestable_tool_ids)
+                if unknown:
+                    return SetParametersResult(
+                        successful=False,
+                        reason=(
+                            "ngram_recovery_enabled_tools contains unknown "
+                            "instrument IDs: " + ", ".join(unknown)
+                        ),
+                    )
+                self._ngram_recovery_enabled_tools = frozenset(values)
+                # Re-enabling a tool starts a fresh probability dwell instead
+                # of inheriting time accumulated while recovery was disabled.
+                self._ngram_recovery_stability.clear()
+            elif parameter.name == "ngram_policy_stability_sec":
+                self._ngram_policy_stability_sec = max(
+                    0.1, float(parameter.value)
+                )
             elif parameter.name == "vlm_evidence_max_gap_sec":
                 self._vlm_evidence_max_gap_sec = max(
                     0.5,
@@ -838,14 +1029,6 @@ class ORDigitalTwinNode(Node):
                 self._accept_validation_actor_events = bool(parameter.value)
             elif parameter.name == "accept_non_override_structured_requests":
                 self._accept_non_override_structured_requests = bool(parameter.value)
-            elif parameter.name == "enable_legacy_raw_tool_handover_compatibility":
-                self._enable_legacy_raw_tool_handover_compatibility = bool(
-                    parameter.value
-                )
-            elif parameter.name == "enable_legacy_raw_procedure_completion_compatibility":
-                self._enable_legacy_raw_procedure_completion_compatibility = bool(
-                    parameter.value
-                )
             elif parameter.name == "bed_robot_status_timeout_sec":
                 self._bed_robot_status_timeout_sec = max(
                     0.1, float(parameter.value)
@@ -869,35 +1052,73 @@ class ORDigitalTwinNode(Node):
                 self._cam4_mayo_observation_future_tolerance_sec = max(
                     0.0, float(parameter.value)
                 )
-            elif parameter.name == "require_voice_intent_source_metadata":
-                self._require_voice_intent_source_metadata = bool(parameter.value)
-            elif parameter.name == "voice_intent_max_age_sec":
-                self._voice_intent_max_age_sec = max(0.0, float(parameter.value))
-            elif parameter.name == "voice_intent_future_tolerance_sec":
-                self._voice_intent_future_tolerance_sec = max(
-                    0.0, float(parameter.value)
-                )
-            elif parameter.name == "voice_intent_dedupe_retention_sec":
-                self._voice_intent_dedupe_retention_sec = max(
-                    1.0, float(parameter.value)
-                )
-            elif parameter.name == "voice_intent_receipt_ledger_path":
-                return SetParametersResult(
-                    successful=False,
-                    reason=(
-                        "voice_intent_receipt_ledger_path is immutable after "
-                        "startup"
-                    ),
-                )
-            elif parameter.name == "voice_gateway_info_timeout_sec":
-                return SetParametersResult(
-                    successful=False,
-                    reason=(
-                        "voice_gateway_info_timeout_sec is immutable after "
-                        "startup"
-                    ),
-                )
+        if gate_changed:
+            self._replace_hand_handover_gate(gate_values or {})
+        if any(parameter.name in TOOL_POLICY_PARAMETER_NAMES for parameter in params):
+            self._publish_tool_policy_status(force=True)
         return SetParametersResult(successful=True)
+
+    def _on_scenario_config(self, message: String) -> None:
+        """Apply ScenarioStore selection at a stopped or quiescent pause boundary."""
+
+        try:
+            snapshot = parse_scenario_config(message.data)
+            load_scenario_consumer_bundle(
+                snapshot,
+                fixed_spec_root=self._scenario_config_root,
+            )
+        except Exception as exc:
+            self.get_logger().warning(
+                f"digital twin scenario config ignored: {exc}",
+                throttle_duration_sec=2.0,
+            )
+            return
+        with self._scenario_config_lock:
+            if snapshot.revision == self._scenario_config_revision:
+                return
+            self._pending_scenario_config = snapshot
+        self._apply_pending_scenario_config_if_quiescent()
+
+    def _apply_pending_scenario_config_if_quiescent(self) -> None:
+        with self._scenario_config_lock:
+            snapshot = self._pending_scenario_config
+            state = self._twin.state
+            paused_quiescent = bool(
+                state.running
+                and state.execution_state == "paused"
+                and state.active_robot_task is None
+                and not state.cleaner_busy
+                and not self._pending_bed_robot_arm_group_requests
+            )
+            if snapshot is None or (state.running and not paused_quiescent):
+                return
+        try:
+            bundle = load_scenario_consumer_bundle(
+                snapshot,
+                fixed_spec_root=self._scenario_config_root,
+            )
+            result = self.set_parameters_atomically(
+                [Parameter(name="spec_dir", value=bundle.spec_dir)]
+            )
+        except Exception as exc:  # pragma: no cover - rclpy transport failure
+            self.get_logger().error(
+                f"digital twin scenario config swap failed: {exc}"
+            )
+            return
+        if not bool(getattr(result, "successful", False)):
+            self.get_logger().error(
+                "digital twin scenario config swap rejected: "
+                f"{getattr(result, 'reason', 'unknown reason')}"
+            )
+            return
+        with self._scenario_config_lock:
+            self._scenario_config_revision = snapshot.revision
+            if self._pending_scenario_config is snapshot:
+                self._pending_scenario_config = None
+        self.get_logger().info(
+            "digital twin scenario revision applied atomically: "
+            f"{snapshot.bundle_name}@{snapshot.revision}"
+        )
 
     def _stamp(self):
         return self.get_clock().now().to_msg()
@@ -957,6 +1178,7 @@ class ORDigitalTwinNode(Node):
                 detail={
                     "gesture_topic": self._hand_gesture_topic,
                     "facing_topic": self._hand_facing_topic,
+                    "keypoints_topic": self._hand_keypoints_topic,
                     "health_topic": self._hand_health_topic,
                     "mapping_operator_approved": bool(
                         self._hand_mapping_operator_approved
@@ -976,26 +1198,201 @@ class ORDigitalTwinNode(Node):
         self._publish_world_state_if_dirty()
 
     def _on_hand_gesture(self, msg: HandGestureArray) -> None:
-        pair = self._hand_handover_joiner.add_gesture(msg)
-        if pair is not None:
-            self._on_hand_observation_pair(*pair)
+        occupancy_changed = self._update_cam4_mayo_hand_presence(msg)
+        triplet = self._hand_handover_joiner.add_gesture(msg)
+        if triplet is not None:
+            self._on_hand_observation_triplet(*triplet)
+        if occupancy_changed:
+            self._publish_world_state_if_dirty()
+
+    def _project_cam4_mayo_hand_presence(self, present: bool) -> bool:
+        """Apply the occupancy bit and reconcile one uncommitted request."""
+
+        present = bool(present)
+        state = self._twin.state
+        occupancy_changed = bool(
+            getattr(state, "cam4_mayo_hand_present", True)
+        ) != present
+        self._cam4_mayo_hand_present = present
+        reconcile = getattr(self._twin, "set_cam4_mayo_hand_present", None)
+        if callable(reconcile):
+            request_changed = bool(reconcile(present))
+        else:
+            state.cam4_mayo_hand_present = present
+            request_changed = False
+        return occupancy_changed or request_changed
+
+    def _update_cam4_mayo_hand_presence(
+        self,
+        msg: HandGestureArray,
+    ) -> bool:
+        """Project any pinned CAM4 hand detection into Mayo occupancy.
+
+        Gesture class, palm facing, handedness, and pose confidence are
+        intentionally irrelevant here.  CAM4's configured field of view is
+        the Mayo work surface; a non-empty detector result therefore blocks a
+        new Mayo manipulation.  Invalid, duplicate, or older frames never
+        clear a previously observed hand.
+        """
+
+        key = stamp_key(msg)
+        pins = self._hand_perception_pins
+        if key is None or key[2] != pins.source_frame_id:
+            return False
+        if (
+            str(getattr(msg, "model_name", "")) != pins.gesture_model_name
+            or str(getattr(msg, "model_version", ""))
+            != pins.gesture_model_version
+            or str(getattr(msg, "model_asset_sha256", ""))
+            != pins.gesture_model_sha256
+        ):
+            return False
+        present = bool(getattr(msg, "hands", ()))
+        stamp_ns = int(key[0]) * 1_000_000_000 + int(key[1])
+        last_stamp_ns = getattr(
+            self, "_cam4_mayo_hand_source_stamp_ns", None
+        )
+        if present:
+            # Any pinned non-empty detection is safe to consume even when it
+            # is delayed or out of order: the only consequence is blocking a
+            # new Mayo motion. Never let source rewind hide a detected hand.
+            if last_stamp_ns is None or stamp_ns > int(last_stamp_ns):
+                self._cam4_mayo_hand_source_stamp_ns = stamp_ns
+            return self._project_cam4_mayo_hand_presence(True)
+        if last_stamp_ns is not None and stamp_ns <= int(last_stamp_ns):
+            # A duplicate/rewound empty result cannot retain an earlier
+            # hand-free lease.
+            return self._project_cam4_mayo_hand_presence(True)
+        receipt_monotonic = time.monotonic()
+        source_stamp_sec = stamp_key_sec(key)
+        source_now_sec = float(self._stamp_sec(self._stamp()))
+        empty_source_time_fresh = bool(
+            math.isfinite(source_stamp_sec)
+            and math.isfinite(source_now_sec)
+            and source_stamp_sec > 0.0
+            and source_now_sec - source_stamp_sec
+            <= float(getattr(self, "_hand_source_max_age_sec", 0.5))
+            and source_stamp_sec - source_now_sec
+            <= float(
+                getattr(self, "_hand_source_future_tolerance_sec", 0.5)
+            )
+        )
+        if (
+            not empty_source_time_fresh
+            or not self._cam4_mayo_hand_detector_ready(
+                now_monotonic=receipt_monotonic
+            )
+        ):
+            # A producer may continue emitting empty arrays while reporting
+            # that RGB/gesture inference is unavailable, or a delayed replay
+            # may deliver an old empty result. Neither is evidence that the
+            # physical Mayo workspace is hand-free now.
+            return self._project_cam4_mayo_hand_presence(True)
+        # Only a fully admitted empty frame may advance the clear-side order
+        # and receipt leases. Rejected replay/future data cannot renew or
+        # poison them.
+        self._cam4_mayo_hand_source_stamp_ns = stamp_ns
+        self._cam4_mayo_hand_received_monotonic = receipt_monotonic
+        return self._project_cam4_mayo_hand_presence(False)
+
+    def _cam4_mayo_hand_detector_ready(
+        self,
+        *,
+        now_monotonic: float | None = None,
+    ) -> bool:
+        """Validate only the RGB gesture-detector health needed for occupancy.
+
+        Palm-facing, depth, handedness, and mapping health intentionally do
+        not participate: Mayo occupancy is pose-independent.  The gesture
+        model provenance and receipt lease remain mandatory before an empty
+        frame can clear the fail-closed latch.
+        """
+
+        payload = getattr(self, "_hand_health_payload", None)
+        if not isinstance(payload, dict):
+            return False
+        if payload.get("schema") != "pnu.hand_keypoint_health.v1":
+            return False
+        for field in (
+            "gesture_rgb_ready",
+            "gesture_model_ready",
+            "gesture_inference_ready",
+        ):
+            if payload.get(field) is not True:
+                return False
+        pins = self._hand_perception_pins
+        if payload.get("gesture_model_version") != pins.gesture_model_version:
+            return False
+        if payload.get("gesture_model_asset_sha256") != pins.gesture_model_sha256:
+            return False
+        received_monotonic = float(
+            getattr(self, "_hand_health_received_monotonic", 0.0)
+        )
+        now = (
+            time.monotonic()
+            if now_monotonic is None
+            else float(now_monotonic)
+        )
+        return bool(
+            received_monotonic > 0.0
+            and now >= received_monotonic
+            and now - received_monotonic
+            <= float(getattr(self, "_hand_health_timeout_sec", 2.0))
+        )
+
+    def _expire_cam4_mayo_hand_free_lease(self) -> bool:
+        """Re-latch occupancy when fresh healthy empty-frame evidence ends."""
+
+        state = self._twin.state
+        if bool(getattr(state, "cam4_mayo_hand_present", True)):
+            return False
+        now_monotonic = time.monotonic()
+        received_monotonic = float(
+            getattr(self, "_cam4_mayo_hand_received_monotonic", 0.0)
+        )
+        observation_fresh = bool(
+            received_monotonic > 0.0
+            and now_monotonic >= received_monotonic
+            and now_monotonic - received_monotonic
+            <= float(getattr(self, "_hand_observation_timeout_sec", 0.4))
+        )
+        if observation_fresh and self._cam4_mayo_hand_detector_ready(
+            now_monotonic=now_monotonic
+        ):
+            return False
+        return self._project_cam4_mayo_hand_presence(True)
 
     def _on_hand_facing(self, msg: HandFacingArray) -> None:
-        pair = self._hand_handover_joiner.add_facing(msg)
-        if pair is not None:
-            self._on_hand_observation_pair(*pair)
+        triplet = self._hand_handover_joiner.add_facing(msg)
+        if triplet is not None:
+            self._on_hand_observation_triplet(*triplet)
 
-    def _on_hand_observation_pair(
+    def _on_hand_keypoints(self, msg: HandKeypoints) -> None:
+        triplet = self._hand_handover_joiner.add_keypoints(msg)
+        if triplet is not None:
+            self._on_hand_observation_triplet(*triplet)
+
+    def _on_hand_observation_triplet(
         self,
         gesture_msg: HandGestureArray,
         facing_msg: HandFacingArray,
+        keypoints_msg: HandKeypoints,
     ) -> None:
+        state = self._twin.state
+        if self._active_robot_task_is_direct_delivery():
+            # The receiving hand is part of the in-flight delivery, not a new
+            # request. Drop the queued pair and require a fresh release before
+            # the direct-hand channel can arm again after task completion.
+            self._suspend_hand_handover_state()
+            self._publish_world_state_if_dirty()
+            return
         key = stamp_key(gesture_msg)
         if key is None:
             return
         evidence = classify_hand_frame(
             gesture_msg,
             facing_msg,
+            keypoints_message=keypoints_msg,
             pins=self._hand_perception_pins,
             minimum_gesture_score=self._hand_minimum_gesture_score,
             minimum_handedness_score=self._hand_minimum_handedness_score,
@@ -1007,10 +1404,12 @@ class ORDigitalTwinNode(Node):
                 FrameDisposition.UNKNOWN,
                 self._hand_health_reason,
             )
-        state = self._twin.state
-        if not bool(state.running) or str(state.execution_state) != "running":
-            self._suspend_hand_handover_state()
-            return
+        # Hand perception is an observer input, not an execution request.  Keep
+        # its reducer-visible evidence live while the scenario is idle or
+        # paused so an operator can verify the external CAM4 path before a
+        # run.  Direct delivery remains independently gated in
+        # ORDigitalTwin.direct_hand_preposition_ready(), which requires the
+        # running execution state before any action can be selected or sent.
         update = self._hand_handover_gate.observe(
             evidence,
             source_now_sec=self._stamp_sec(self._stamp()),
@@ -1020,6 +1419,19 @@ class ORDigitalTwinNode(Node):
 
     def _apply_hand_handover_update(self, update, evidence) -> None:
         state = self._twin.state
+        right_hand_tool = str(
+            getattr(state, "right_hand_tool", "") or ""
+        ).strip()
+        repeat_handover_requires_voice = bool(
+            update.active
+            and right_hand_tool
+            and self._repeat_handover_requires_explicit_voice(
+                right_hand_tool
+            )
+        )
+        signal_active = bool(
+            update.active and not repeat_handover_requires_voice
+        )
         before = (
             bool(state.implicit_request_visible),
             str(state.implicit_request_hand_pose),
@@ -1027,11 +1439,12 @@ class ORDigitalTwinNode(Node):
             float(state.implicit_request_stability_sec),
             int(state.implicit_request_generation),
         )
-        if update.active:
+        if signal_active:
             state.implicit_request_visible = True
             # A hand shape cannot identify an instrument. Selection remains a
-            # separate reducer/BT decision: prepared right-hand tool first,
-            # otherwise the independently stabilized next-tool prediction.
+            # separate reducer/BT decision: prepared right-hand tool first;
+            # when the robot is empty, the reducer's current eligible rank 1.
+            # Autonomous preparation keeps its independent policy threshold.
             state.implicit_request_tool = ""
             state.implicit_request_hand_pose = "open_receive"
             state.implicit_request_confidence = max(
@@ -1066,6 +1479,29 @@ class ORDigitalTwinNode(Node):
                 "request_created": False,
                 "tool_resolved": False,
             }
+            if repeat_handover_requires_voice:
+                detail["required_request_source"] = "voice"
+                self._publish_reducer_decision_event(
+                    input_type="hand_handover_signal",
+                    input_id=input_id,
+                    input_source="cam4_hand_perception",
+                    accepted=False,
+                    reason=(
+                        "automatic_repeat_handover_requires_explicit_voice"
+                    ),
+                    affected_tool=right_hand_tool,
+                    detail=detail,
+                )
+                after = (
+                    bool(state.implicit_request_visible),
+                    str(state.implicit_request_hand_pose),
+                    float(state.implicit_request_confidence),
+                    float(state.implicit_request_stability_sec),
+                    int(state.implicit_request_generation),
+                )
+                if after != before:
+                    self._publish_world_state_if_dirty()
+                return
             self._publish_reducer_decision_event(
                 input_type="hand_handover_signal",
                 input_id=input_id,
@@ -1110,6 +1546,12 @@ class ORDigitalTwinNode(Node):
         if gate is not None:
             gate.reset_all()
         self._withdraw_hand_handover_evidence()
+        # Permit a restarted source epoch to establish a new monotonic frame.
+        # A reset invalidates any earlier hand-free lease, so remain occupied
+        # until the restarted detector supplies fresh healthy empty evidence.
+        self._cam4_mayo_hand_source_stamp_ns = None
+        self._cam4_mayo_hand_received_monotonic = 0.0
+        self._project_cam4_mayo_hand_presence(True)
         if hasattr(self._twin.state, "implicit_request_generation"):
             self._twin.state.implicit_request_generation = 0
 
@@ -1124,8 +1566,22 @@ class ORDigitalTwinNode(Node):
             gate.inhibit_until_release()
         self._withdraw_hand_handover_evidence()
 
+    def _active_robot_task_is_direct_delivery(self) -> bool:
+        task = getattr(self._twin.state, "active_robot_task", None)
+        if task is None or not str(getattr(task, "task_id", "")).strip():
+            return False
+        task_type = str(getattr(task, "task_type", "")).strip().lower()
+        target_anchor = str(
+            getattr(task, "target_anchor_id", "")
+        ).strip().lower()
+        return (
+            task_type in DIRECT_DELIVERY_TASK_TYPES
+            or target_anchor in DIRECT_DELIVERY_TARGET_ANCHORS
+        )
+
     def _expire_hand_handover_evidence(self) -> None:
         self._refresh_hand_health_admission()
+        self._expire_cam4_mayo_hand_free_lease()
         update = self._hand_handover_gate.expire(
             receipt_monotonic=time.monotonic()
         )
@@ -1170,6 +1626,7 @@ class ORDigitalTwinNode(Node):
         getattr(self, "_visual_admission_by_channel", {}).clear()
         getattr(self, "_cam4_mayo_admission_by_channel", {}).clear()
         getattr(self, "_accepted_cam4_mayo_episodes", set()).clear()
+        getattr(self, "_cam4_mayo_source_epoch_floor_by_source", {}).clear()
         # CAM4 owns an independent process epoch, so the shared VLM runtime
         # counter cannot order it.  A source-time floor at each lifecycle edge
         # prevents an in-flight frame from the preceding run crossing reset.
@@ -1179,6 +1636,110 @@ class ORDigitalTwinNode(Node):
             )
         except Exception:
             self._visual_runtime_source_stamp_floor_sec = time.time()
+
+    @staticmethod
+    def _event_stamp_ns(stamp) -> int:
+        """Return a positive source timestamp or zero when it is unusable."""
+
+        try:
+            sec = int(getattr(stamp, "sec", 0))
+            nanosec = int(getattr(stamp, "nanosec", 0))
+        except (TypeError, ValueError):
+            return 0
+        if sec < 0 or nanosec < 0:
+            return 0
+        return sec * 1_000_000_000 + nanosec
+
+    def _advance_skill_event_runtime_epoch(self) -> None:
+        """Invalidate every Action event chain from the preceding run."""
+
+        self._skill_event_runtime_epoch = max(
+            0,
+            int(getattr(self, "_skill_event_runtime_epoch", 0)),
+        ) + 1
+        self._current_run_skill_task_ids = set()
+        try:
+            self._skill_event_source_stamp_floor_ns = self._event_stamp_ns(
+                self._stamp()
+            )
+        except Exception:
+            # A missing clock must never turn a prior action into a current
+            # one. The zero floor still combines with the fresh run and
+            # command-chain checks below.
+            self._skill_event_source_stamp_floor_ns = 0
+
+    @staticmethod
+    def _skill_event_detail(message: TwinEvent) -> dict:
+        try:
+            detail = json.loads(message.detail_json) if message.detail_json else {}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+        return detail if isinstance(detail, dict) else {}
+
+    @staticmethod
+    def _skill_event_task_id(detail: dict) -> str:
+        return str(
+            detail.get("task_id") or detail.get("command_id") or ""
+        ).strip()
+
+    def _admit_current_run_skill_event(
+        self,
+        message: TwinEvent,
+        detail: dict,
+    ) -> tuple[bool, str]:
+        """Admit only Action events proven to belong to the current run."""
+
+        event_type = str(message.event_type or "").strip()
+        if event_type not in SKILL_EVENTS_REQUIRING_CURRENT_RUN:
+            return True, ""
+        # Partial Node fixtures use ``__new__`` and deliberately have no
+        # runtime epoch. Production construction always initializes it.
+        if not hasattr(self, "_skill_event_runtime_epoch"):
+            return True, ""
+
+        state = self._twin.state
+        execution_state = str(
+            getattr(state, "execution_state", "")
+        ).strip().lower()
+        if (
+            not bool(getattr(state, "running", False))
+            or execution_state not in {"running", "finishing"}
+            or not str(getattr(state, "procedure_run_id", "")).strip()
+        ):
+            return False, "skill_event_without_current_running_procedure"
+
+        event_run_id = str(
+            getattr(message, "procedure_run_id", "")
+            or detail.get("procedure_run_id", "")
+        ).strip()
+        if event_run_id != str(state.procedure_run_id).strip():
+            return False, "skill_event_procedure_run_mismatch"
+
+        source_stamp_ns = self._event_stamp_ns(message.stamp)
+        source_floor_ns = int(
+            getattr(self, "_skill_event_source_stamp_floor_ns", 0)
+        )
+        if source_stamp_ns <= 0:
+            return False, "skill_event_missing_source_stamp"
+        if source_floor_ns > 0 and source_stamp_ns <= source_floor_ns:
+            return False, "skill_event_precedes_current_runtime_epoch"
+
+        task_id = self._skill_event_task_id(detail)
+        if not task_id:
+            return False, "skill_event_missing_command_id"
+        if event_type == "RobotTaskStarted":
+            if execution_state == "finishing":
+                # Completion may start only its own constrained cleanup legs.
+                # A normal prepare/handover request is still forbidden after
+                # the spoken finish boundary, while this set can drain held
+                # tools and the frozen Mayo-to-tray target snapshot.
+                task_type = str(detail.get("task_type", "")).strip()
+                if task_type not in FINISHING_SKILL_TASK_TYPES:
+                    return False, "skill_task_start_after_finish_requested"
+            return True, ""
+        if task_id not in getattr(self, "_current_run_skill_task_ids", set()):
+            return False, "skill_event_without_current_task_start"
+        return True, ""
 
     def _reject_visual_evidence(
         self,
@@ -1392,10 +1953,13 @@ class ORDigitalTwinNode(Node):
         ):
             return reject("cam4_source_precedes_runtime_epoch")
 
-        epoch_floor = max(
-            0,
-            int(getattr(self, "_cam4_mayo_source_epoch_floor", 0)),
+        epoch_floors = getattr(
+            self, "_cam4_mayo_source_epoch_floor_by_source", None
         )
+        if epoch_floors is None:
+            epoch_floors = {}
+            self._cam4_mayo_source_epoch_floor_by_source = epoch_floors
+        epoch_floor = max(0, int(epoch_floors.get(source, 0)))
         if source_epoch < epoch_floor:
             return reject("stale_cam4_source_epoch")
         tracker = getattr(self, "_cam4_mayo_admission_by_channel", None)
@@ -1403,9 +1967,13 @@ class ORDigitalTwinNode(Node):
             tracker = {}
             self._cam4_mayo_admission_by_channel = tracker
         if source_epoch > epoch_floor:
-            self._cam4_mayo_source_epoch_floor = source_epoch
-            tracker.clear()
-            getattr(self, "_accepted_cam4_mayo_episodes", set()).clear()
+            epoch_floors[source] = source_epoch
+            source_channel_prefix = f"cam4_tool:{source}:"
+            for tracked_channel in tuple(tracker):
+                if tracked_channel.startswith(source_channel_prefix):
+                    tracker.pop(tracked_channel, None)
+            if source == "cam4_rfdetr_mayo_observation":
+                getattr(self, "_accepted_cam4_mayo_episodes", set()).clear()
 
         previous = tracker.get(channel)
         if previous is not None:
@@ -1466,26 +2034,49 @@ class ORDigitalTwinNode(Node):
             self._vlm_evidence_blocked = False
             return
         now = time.monotonic()
+        state = self._twin.state
+        execution_active = bool(getattr(state, "running", False)) and str(
+            getattr(state, "execution_state", "")
+        ).strip().lower() in {"starting", "running"}
+        started_at = getattr(self, "_vlm_health_run_started_monotonic", None)
+        if execution_active and started_at is None:
+            # A state-core restart can reconcile into an already-running
+            # scenario without observing its original start control frame.
+            # Give the reattached VLM health lease one normal timeout window.
+            started_at = now
+            self._vlm_health_run_started_monotonic = now
+        startup_grace = max(
+            float(getattr(self, "_vlm_health_timeout_sec", VLM_STARTUP_HEALTH_GRACE_SEC)),
+            VLM_STARTUP_HEALTH_GRACE_SEC,
+        )
+        startup_waiting = bool(
+            execution_active
+            and started_at is not None
+            and now - float(started_at) <= startup_grace
+        )
         unhealthy = False
         for topic in required_topics:
             sample = getattr(self, "_vlm_health_by_topic", {}).get(topic)
             if sample is None:
-                unhealthy = True
+                # No VLM request is deliberately made while idle.  At start,
+                # the initial request may still be queued/in flight, so only
+                # treat a missing health lease as a fault after its bounded
+                # first-response window.
+                unhealthy = unhealthy or (execution_active and not startup_waiting)
                 continue
             health, received_at = sample
             if now - received_at > float(
                 getattr(self, "_vlm_health_timeout_sec", 6.0)
             ):
-                unhealthy = True
+                unhealthy = unhealthy or (execution_active and not startup_waiting)
                 continue
             if not bool(health.connected and health.healthy) or bool(health.last_error):
                 unhealthy = True
-        if not self._source_is_ready("vlm"):
-            unhealthy = True
+        # ``/input/vlm/status`` measures *result freshness*.  It is expected
+        # to be MISSING/STALE while an intentionally idle VLM has no scenario
+        # request, and while the first current-epoch inference is in flight.
+        # Do not relabel those expected evidence states as a model fault.
         if unhealthy:
-            self._clear_tool_prediction_state()
-            self._mayo_retrieve_stability.clear()
-            self._mayo_reuse_stability.clear()
             if (
                 not getattr(self, "_vlm_evidence_blocked", False)
                 and hasattr(self._twin, "clear_perception_evidence")
@@ -1618,33 +2209,28 @@ class ORDigitalTwinNode(Node):
             str(state.predicted_tool),
             float(state.predicted_tool_confidence),
             float(state.predicted_tool_stability_sec),
+            bool(getattr(state, "autonomous_preparation_ready", False)),
             ranked,
             bool(state.implicit_request_visible),
             str(state.implicit_request_tool),
             str(state.implicit_request_hand_pose),
             float(state.implicit_request_confidence),
             float(state.implicit_request_stability_sec),
+            bool(state.cam4_mayo_hand_present),
         )
 
     def _run_time_based_maintenance(self) -> bool:
         before = self._world_maintenance_signature()
         bed_expired = self._expire_bed_robot_controller_status()
-        self._expire_stale_vlm_evidence(
-            self._stamp_sec(self._stamp()),
-        )
         self._expire_hand_handover_evidence()
         self._refresh_vlm_safety_flags()
+        policy_changed = self._refresh_ngram_tool_policy(
+            now_sec=self._monotonic_sec(),
+        )
         return bool(
             bed_expired
+            or policy_changed
             or self._world_maintenance_signature() != before
-        )
-
-    def _voice_world_publish_blocked(self) -> bool:
-        """Keep an uncommitted or unrestorable voice mutation non-public."""
-
-        return bool(
-            getattr(self, "_voice_gated_mutation_dirty", False)
-            or getattr(self, "_voice_gated_mutation_fatal", False)
         )
 
     def _world_state_emit_due(
@@ -1677,8 +2263,6 @@ class ORDigitalTwinNode(Node):
         )
 
     def _on_world_state_timer(self) -> None:
-        if self._voice_world_publish_blocked():
-            return
         self._run_time_based_maintenance()
         signature = self._world_maintenance_signature()
         if self._world_state_emit_due(
@@ -1688,16 +2272,12 @@ class ORDigitalTwinNode(Node):
             self._emit_world_state()
 
     def _on_hand_handover_watchdog(self) -> None:
-        if self._voice_world_publish_blocked():
-            return
         before = self._world_maintenance_signature()
         self._expire_hand_handover_evidence()
         if self._world_maintenance_signature() != before:
             self._emit_world_state()
 
     def _publish_world_state_if_dirty(self) -> None:
-        if self._voice_world_publish_blocked():
-            return
         self._run_time_based_maintenance()
         signature = self._world_maintenance_signature()
         if (
@@ -1708,23 +2288,15 @@ class ORDigitalTwinNode(Node):
 
     def _publish_world_state(self) -> None:
         """Run maintenance and immediately emit a semantic state edge."""
-
-        if self._voice_world_publish_blocked():
-            return
         self._run_time_based_maintenance()
         self._emit_world_state()
 
     def _emit_world_state(self) -> None:
-        if self._voice_world_publish_blocked():
-            return
         # Normalization may update public fields outside the compact cadence
         # signature. Run it only on an actual emission so an inactive skipped
-        # checkpoint cannot hide an untracked semantic mutation.
-        if (
-            not bool(self._twin.state.running)
-            or str(self._twin.state.execution_state) != "running"
-        ):
-            self._suspend_hand_handover_state()
+        # checkpoint cannot hide an untracked semantic mutation.  Do not clear
+        # the direct-hand evidence here: it is safe, read-only observability
+        # while inactive, whereas actual direct delivery is gated by the Twin.
         self._twin.normalize_for_publish()
         world = WorldState()
         world.stamp = self._stamp()
@@ -1759,6 +2331,9 @@ class ORDigitalTwinNode(Node):
         world.predicted_tool = self._twin.state.predicted_tool
         world.predicted_tool_confidence = float(self._twin.state.predicted_tool_confidence)
         world.predicted_tool_stability_sec = float(self._twin.state.predicted_tool_stability_sec)
+        world.autonomous_preparation_ready = bool(
+            getattr(self._twin.state, "autonomous_preparation_ready", False)
+        )
         world.ranked_tool_predictions = []
         for belief in self._twin.state.ranked_tool_predictions:
             prediction = RankedToolPrediction()
@@ -1796,6 +2371,9 @@ class ORDigitalTwinNode(Node):
         )
         world.implicit_request_generation = int(
             self._twin.state.implicit_request_generation
+        )
+        world.cam4_mayo_hand_present = bool(
+            self._twin.state.cam4_mayo_hand_present
         )
         world.cleaner_busy = bool(self._twin.state.cleaner_busy)
         world.cleaner_remaining_sec = float(self._twin.state.cleaner_remaining_sec)
@@ -1976,11 +2554,30 @@ class ORDigitalTwinNode(Node):
             sort_keys=True,
         )
         self._simulation_state_pub.publish(simulation)
+        self._publish_tool_policy_status()
         self._publish_perception_scene(world)
         self._publish_vlm_context(world)
         # Commit the gate only after the entire public output bundle succeeds.
         self._last_world_emit_signature = self._world_maintenance_signature()
         self._last_world_emit_monotonic = self._monotonic_sec()
+
+    def _publish_tool_policy_status(self, *, force: bool = False) -> None:
+        publisher = getattr(self, "_tool_policy_status_pub", None)
+        if publisher is None:
+            return  # Partial pure-node test fixtures have no ROS publishers.
+        payload = tool_policy_status_payload(
+            state=self._twin.state,
+            instruments=self._twin.instrument_states,
+            prepare_probability_threshold=self._ngram_prepare_probability_threshold,
+            recovery_probability_threshold=self._ngram_recovery_probability_threshold,
+            dwell_sec=self._ngram_policy_stability_sec,
+            recovery_enabled_tools=self._ngram_recovery_enabled_tools,
+            recovery_dwell=self._ngram_recovery_stability,
+        )
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        if force or encoded != getattr(self, "_last_tool_policy_status_json", ""):
+            publisher.publish(String(data=encoded))
+            self._last_tool_policy_status_json = encoded
 
     def _stamp_all_bed_robot_arm_groups(self) -> None:
         for belief in self._twin.state.bed_robot_arm_groups.values():
@@ -2138,6 +2735,30 @@ class ORDigitalTwinNode(Node):
         handover_history = getattr(self, "_completed_handover_history", None)
         if handover_history is not None:
             handover_history.clear()
+        completed_by_phase = getattr(
+            self,
+            "_completed_handover_tools_by_phase",
+            None,
+        )
+        if completed_by_phase is not None:
+            completed_by_phase.clear()
+
+    def _record_completed_handover_phase(self, tool_id: str) -> None:
+        resolved = self._twin.spec.resolve_instrument_alias(str(tool_id)) or str(
+            tool_id
+        )
+        phase_id = str(self._twin._active_context_phase_id() or "").strip()
+        if not resolved or not phase_id:
+            return
+        completed_by_phase = getattr(
+            self,
+            "_completed_handover_tools_by_phase",
+            None,
+        )
+        if completed_by_phase is None:
+            completed_by_phase = {}
+            self._completed_handover_tools_by_phase = completed_by_phase
+        completed_by_phase.setdefault(phase_id, set()).add(resolved)
 
     def _context_tool_rows(self, world: WorldState) -> tuple[list[str], list[str], list[dict]]:
         active_tool_ids: list[str] = []
@@ -2312,6 +2933,7 @@ class ORDigitalTwinNode(Node):
         detail = self._augment_event_detail(event_type, raw_detail, **detail_context)
         event = TwinEvent()
         event.stamp = self._stamp()
+        event.procedure_run_id = str(self._twin.state.procedure_run_id or "")
         event.event_type = event_type
         event.instrument_id = kwargs.get("instrument_id", "")
         event.instance_id = kwargs.get("instance_id", "")
@@ -2334,6 +2956,7 @@ class ORDigitalTwinNode(Node):
 
         simulation_event = SimulationEvent()
         simulation_event.stamp = event.stamp
+        simulation_event.procedure_run_id = event.procedure_run_id
         simulation_event.event_type = event.event_type
         simulation_event.instrument_id = event.instrument_id
         simulation_event.from_anchor = event.source_location_id or event.location_id
@@ -2699,144 +3322,559 @@ class ORDigitalTwinNode(Node):
         stamp = self._stamp()
         return float(stamp.sec) + float(stamp.nanosec) / 1_000_000_000.0
 
-    def _update_stability(
+    def _configured_completed_repeat_handover_exclusions(
         self,
+        phase_id: str = "",
+    ) -> frozenset[str]:
+        """Return phase-configured tools already handed over in this run."""
+
+        resolved_phase = str(
+            phase_id or self._twin._active_context_phase_id() or ""
+        ).strip()
+        configured = (
+            self._twin.spec.get_scenario_policy()
+            .automatic_repeat_handover_exclusions(resolved_phase)
+        )
+        completed_in_phase = set(
+            getattr(self, "_completed_handover_tools_by_phase", {}).get(
+                resolved_phase,
+                set(),
+            )
+        )
+        return frozenset(configured & completed_in_phase)
+
+    def _automatic_repeat_handover_exclusions(
+        self,
+        phase_id: str = "",
+    ) -> frozenset[str]:
+        """Return completed Mayo tools excluded from automatic repeat use."""
+
+        configured_completed = (
+            self._configured_completed_repeat_handover_exclusions(phase_id)
+        )
+        mayo_reuse_tools = {
+            state.instrument_id
+            for state in self._twin.instrument_states.values()
+            if str(getattr(state, "lifecycle_stage", "")) == "mayo_reuse"
+            and str(getattr(state, "location_type", "")) == "mayo_stand"
+            and str(getattr(state, "location_id", "")) == "mayo_stand"
+        }
+        return frozenset(configured_completed & mayo_reuse_tools)
+
+    def _repeat_handover_requires_explicit_voice(
+        self,
+        tool_id: str,
+        phase_id: str = "",
+    ) -> bool:
+        """Keep a completed Mayo repeat voice-only after robot pickup."""
+
+        normalized_tool_id = str(tool_id or "").strip()
+        if normalized_tool_id not in (
+            self._configured_completed_repeat_handover_exclusions(phase_id)
+        ):
+            return False
+        if normalized_tool_id in self._automatic_repeat_handover_exclusions(
+            phase_id
+        ):
+            return True
+
+        right_hand_instance_id = str(
+            getattr(
+                self._twin.state,
+                "right_hand_tool_instance_id",
+                "",
+            )
+            or ""
+        ).strip()
+        right_hand_state = self._twin.instrument_states.get(
+            right_hand_instance_id
+        )
+        if (
+            right_hand_state is None
+            or str(getattr(right_hand_state, "instrument_id", ""))
+            != normalized_tool_id
+            or str(getattr(right_hand_state, "lifecycle_stage", ""))
+            != "prepositioned_right"
+        ):
+            return False
+        origin_lifecycle = str(
+            getattr(
+                right_hand_state,
+                "preposition_origin_lifecycle_stage",
+                "",
+            )
+            or ""
+        ).strip()
+        origin_location_type = str(
+            getattr(
+                right_hand_state,
+                "preposition_origin_location_type",
+                "",
+            )
+            or ""
+        ).strip().casefold()
+        origin_location_id = str(
+            getattr(
+                right_hand_state,
+                "preposition_origin_location_id",
+                "",
+            )
+            or ""
+        ).strip().casefold()
+        return bool(
+            origin_lifecycle in {"mayo_reuse", "mayo_recovery"}
+            or "mayo" in origin_location_type
+            or "mayo" in origin_location_id
+        )
+
+    def _ngram_tool_prediction(self) -> tuple[str, float, dict]:
+        """Return the DT-owned 0704 n-gram prediction and raw probabilities.
+
+        VLM ``tool`` rows, procedure-path forecasts, and authored phase-role
+        expectations deliberately do not enter this calculation.  The raw
+        per-tool probabilities remain visible even when a tool is unavailable
+        or excluded from automatic repeat handover; the rank-one scalar used
+        for a direct hand fallback is selected only from eligible, physically
+        handover-capable inventory.
+        """
+
+        requestable_ids = list(
+            self._twin.spec.list_requestable_instrument_ids()
+        )
+        runtime_evidence = self._runtime_prior_evidence()
+        ngram_prior = getattr(self, "_handover_ngram_prior", None)
+        ngram_result = (
+            ngram_prior.predict(
+                phase_id=runtime_evidence.get("current_phase", ""),
+                completed_handovers=runtime_evidence.get(
+                    "completed_handovers", []
+                ),
+            )
+            if ngram_prior is not None
+            else None
+        )
+        scores = {tool_id: 0.0 for tool_id in requestable_ids}
+        if not isinstance(ngram_result, dict):
+            return "", 0.0, {
+                "ngram": scores,
+                "ranked_distribution": [],
+                "eligible_candidates": [],
+                "candidate_lifecycles": {},
+                "automatic_repeat_handover_exclusions": [],
+                "match": "",
+                "support": 0,
+                "has_ngram_evidence": False,
+            }
+
+        for item in ngram_result.get("candidates", []):
+            if not isinstance(item, (list, tuple)) or len(item) != 2:
+                continue
+            tool_id = (
+                self._twin.spec.resolve_instrument_alias(str(item[0]))
+                or str(item[0])
+            )
+            if tool_id not in scores:
+                continue
+            try:
+                probability = float(item[1])
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(probability):
+                scores[tool_id] = max(0.0, min(1.0, probability))
+
+        automatic_repeat_exclusions = self._automatic_repeat_handover_exclusions(
+            str(runtime_evidence.get("current_phase", "") or "")
+        )
+
+        handover_lifecycles = {
+            "home_rack",
+            "returned_home",
+            "mayo_reuse",
+            "prepositioned_right",
+        }
+        candidate_lifecycles = {
+            tool_id: sorted(
+                {
+                    str(getattr(state, "lifecycle_stage", "") or "")
+                    for state in self._twin._instances_for_type(tool_id)
+                }
+            )
+            for tool_id in requestable_ids
+        }
+        eligible_ids = [
+            tool_id
+            for tool_id in requestable_ids
+            if tool_id not in automatic_repeat_exclusions
+            if any(
+                str(getattr(state, "lifecycle_stage", ""))
+                in handover_lifecycles
+                for state in self._twin._instances_for_type(tool_id)
+            )
+        ]
+        # ``ngram`` remains the immutable raw statistical evidence used by
+        # recovery.  The public ranked projection is an automatic-action
+        # candidate list, so a voice-only repeat must not remain rank one and
+        # disagree with the selected scalar prediction.
+        ranked_distribution = sorted(
+            (
+                (tool_id, score)
+                for tool_id, score in scores.items()
+                if tool_id not in automatic_repeat_exclusions
+            ),
+            key=lambda item: (-item[1], requestable_ids.index(item[0])),
+        )
+        if not eligible_ids:
+            return "", 0.0, {
+                "ngram": scores,
+                "ranked_distribution": ranked_distribution,
+                "eligible_candidates": eligible_ids,
+                "candidate_lifecycles": candidate_lifecycles,
+                "automatic_repeat_handover_exclusions": sorted(
+                    automatic_repeat_exclusions
+                ),
+                "match": str(ngram_result.get("match", "")),
+                "support": int(ngram_result.get("support", 0) or 0),
+                "has_ngram_evidence": True,
+            }
+        selected_tool, selected_probability = max(
+            ((tool_id, scores[tool_id]) for tool_id in eligible_ids),
+            key=lambda item: (item[1], -eligible_ids.index(item[0])),
+        )
+        if selected_probability <= 0.0:
+            selected_tool = ""
+        return selected_tool, selected_probability, {
+            "ngram": scores,
+            "ranked_distribution": ranked_distribution,
+            "eligible_candidates": eligible_ids,
+            "candidate_lifecycles": candidate_lifecycles,
+            "automatic_repeat_handover_exclusions": sorted(
+                automatic_repeat_exclusions
+            ),
+            "match": str(ngram_result.get("match", "")),
+            "support": int(ngram_result.get("support", 0) or 0),
+            "has_ngram_evidence": True,
+        }
+
+    @staticmethod
+    def _update_ngram_probability_dwell(
         tracker: dict[str, dict],
         *,
-        tool_id: str,
-        confidence: float,
-        threshold: float,
-        stability_sec: float,
+        key: str,
+        probability: float,
+        condition: bool,
         now_sec: float,
-        received_sec: float | None = None,
-    ) -> tuple[bool, float]:
-        received_at = now_sec if received_sec is None else received_sec
-        max_gap_sec = getattr(self, "_vlm_evidence_max_gap_sec", 2.5)
-        if not tool_id or confidence < threshold:
-            if tool_id:
-                tracker.pop(tool_id, None)
-            return (False, 0.0)
-        entry = tracker.get(tool_id)
-        if (
-            entry is None
-            or now_sec - float(entry.get("last_seen", now_sec))
-            > max_gap_sec
-        ):
-            entry = {
-                "first_seen": now_sec,
-                "last_seen": now_sec,
-                "last_received": received_at,
-                "confidence": confidence,
-            }
-            tracker[tool_id] = entry
-        else:
-            last_seen = float(entry.get("last_seen", now_sec))
-            entry["last_received"] = max(
-                received_at,
-                float(entry.get("last_received", received_at)),
-            )
-            if now_sec < last_seen:
-                duration = max(
-                    0.0,
-                    last_seen - float(entry.get("first_seen", last_seen)),
-                )
-                return (duration >= stability_sec, duration)
-            entry["last_seen"] = now_sec
-            entry["confidence"] = confidence
-        duration = max(0.0, now_sec - float(entry["first_seen"]))
-        return (duration >= stability_sec, duration)
+    ) -> float:
+        """Track continuous satisfaction of an n-gram probability predicate."""
 
-    def _clear_stale_tool_prediction(self, now_sec: float) -> None:
-        max_gap_sec = getattr(self, "_vlm_evidence_max_gap_sec", 2.5)
-        for tool_id, entry in list(self._tool_predict_stability.items()):
-            last_received = float(
-                entry.get("last_received", entry.get("last_seen", now_sec))
-            )
-            if (
-                now_sec >= last_received
-                and now_sec - last_received
-                > max_gap_sec
-            ):
-                self._tool_predict_stability.pop(tool_id, None)
-        if not self._twin.state.predicted_tool:
-            self._twin.state.ranked_tool_predictions = []
-            return
-        entry = self._tool_predict_stability.get(self._twin.state.predicted_tool)
+        if not condition:
+            tracker.pop(key, None)
+            return 0.0
+        entry = tracker.get(key)
         if entry is None:
-            self._twin.state.predicted_tool = ""
-            self._twin.state.predicted_tool_confidence = 0.0
-            self._twin.state.predicted_tool_stability_sec = 0.0
-            self._twin.state.ranked_tool_predictions = []
+            entry = {"first_seen": now_sec, "last_seen": now_sec}
+            tracker[key] = entry
+        else:
+            entry["last_seen"] = max(
+                now_sec, float(entry.get("last_seen", now_sec))
+            )
+        entry["probability"] = probability
+        return max(0.0, now_sec - float(entry["first_seen"]))
 
-    def _expire_stale_vlm_evidence(self, now_sec: float) -> None:
-        """Withdraw VLM-owned tool evidence when the VLM stops publishing."""
-        self._clear_stale_tool_prediction(now_sec)
+    def _refresh_ngram_mayo_recovery(
+        self,
+        *,
+        scores: dict[str, float],
+        has_ngram_evidence: bool,
+        preparation_tool_id: str,
+        now_sec: float,
+    ) -> bool:
+        """Queue at most one DT-arbitrated low-probability Mayo recovery.
+
+        Completion cleanup remains a terminal lifecycle obligation, while a
+        running procedure uses only the per-tool 0704 n-gram probability.
+        Neither path consults ``future_use_expected`` nor a VLM Mayo vote.
+        A simultaneously ready preparation wins before a recovery transaction
+        is opened, so the BT never receives two competing autonomous intents.
+        """
+
+        state = self._twin.state
+        execution_state = str(state.execution_state)
+
+        if execution_state == "finishing":
+            # Voice completion has its own frozen instance snapshot.  Do not
+            # reuse the running n-gram allowlist here: that would either omit
+            # a legitimate Mayo target or start recovering Bovie/bipolar after
+            # the user explicitly excluded them from terminal cleanup.
+            self._ngram_recovery_stability.clear()
+            candidates = sorted(
+                (
+                    tool_state
+                    for instance_id in self._twin.completion_recovery_target_instances
+                    if (
+                        tool_state := self._twin.get_instrument_state(instance_id)
+                    )
+                    is not None
+                    and str(getattr(tool_state, "lifecycle_stage", ""))
+                    in {"mayo_reuse", "mayo_recovery"}
+                    and str(getattr(tool_state, "location_type", ""))
+                    == "mayo_stand"
+                    and str(getattr(tool_state, "location_id", ""))
+                    == "mayo_stand"
+                ),
+                key=lambda tool_state: (
+                    float(getattr(tool_state, "last_update_sec", 0.0)),
+                    tool_state.instance_id,
+                ),
+            )
+            for candidate in candidates:
+                if self._twin.queue_autonomous_mayo_recovery(
+                    candidate.instance_id,
+                    reason="completion_cleanup",
+                ):
+                    return True
+            return False
+
+        mayo_states = [
+            tool_state
+            for tool_state in self._twin.instrument_states.values()
+            if tool_state.instrument_id
+            in self._ngram_recovery_enabled_tools
+            and str(getattr(tool_state, "lifecycle_stage", ""))
+            == "mayo_reuse"
+            and str(getattr(tool_state, "location_type", "")) == "mayo_stand"
+            and str(getattr(tool_state, "location_id", "")) == "mayo_stand"
+        ]
+        valid_instance_ids = {tool_state.instance_id for tool_state in mayo_states}
+        for instance_id in list(self._ngram_recovery_stability):
+            if instance_id not in valid_instance_ids:
+                self._ngram_recovery_stability.pop(instance_id, None)
+
+        if (
+            execution_state != "running"
+            or not bool(state.running)
+            or not has_ngram_evidence
+        ):
+            # Paused/idle wall time is not procedure evidence.  Otherwise a
+            # recovery candidate becomes instantly ready on resume/start.
+            self._ngram_recovery_stability.clear()
+            return False
+
+        ready: list[tuple[float, float, str]] = []
+        for candidate in mayo_states:
+            probability = float(scores.get(candidate.instrument_id, 0.0))
+            dwell_sec = self._update_ngram_probability_dwell(
+                self._ngram_recovery_stability,
+                key=candidate.instance_id,
+                probability=probability,
+                condition=(
+                    probability
+                    <= self._ngram_recovery_probability_threshold
+                ),
+                now_sec=now_sec,
+            )
+            if dwell_sec >= self._ngram_policy_stability_sec:
+                ready.append(
+                    (
+                        probability,
+                        float(getattr(candidate, "last_update_sec", 0.0)),
+                        candidate.instance_id,
+                    )
+                )
+        selected_recovery = sorted(ready)[0] if ready else None
+        intent = arbitrate_ngram_intent(
+            preparation_tool_id=preparation_tool_id,
+            recovery_tool_id=(
+                selected_recovery[2] if selected_recovery is not None else ""
+            ),
+            preparation_probability=(
+                float(scores.get(preparation_tool_id, 0.0))
+                if preparation_tool_id
+                else 0.0
+            ),
+            recovery_probability=(
+                selected_recovery[0]
+                if selected_recovery is not None
+                else 1.0
+            ),
+        )
+        if intent.action != "recover" or selected_recovery is None:
+            return False
+
+        probability, _last_update, instance_id = selected_recovery
+        if intent.tool_id == instance_id:
+            if self._twin.queue_autonomous_mayo_recovery(
+                instance_id,
+                reason=(
+                    "ngram_probability_"
+                    f"{probability:.3f}_le_"
+                    f"{self._ngram_recovery_probability_threshold:.3f}"
+                ),
+            ):
+                return True
+        return False
+
+    def _refresh_ngram_tool_policy(self, *, now_sec: float) -> bool:
+        """Project immutable 0704 n-gram evidence into the DT world state."""
+
+        state = self._twin.state
+        if not (
+            bool(state.running)
+            and str(state.execution_state).strip().lower() == "running"
+            and str(state.procedure_run_id).strip()
+        ):
+            return self._clear_inactive_tool_policy_state()
+        before = (
+            str(getattr(state, "predicted_tool", "")),
+            float(getattr(state, "predicted_tool_confidence", 0.0)),
+            float(getattr(state, "predicted_tool_stability_sec", 0.0)),
+            bool(getattr(state, "autonomous_preparation_ready", False)),
+            tuple(
+                (
+                    row.rank,
+                    row.instrument_id,
+                    row.confidence,
+                    row.stability_sec,
+                )
+                for row in getattr(state, "ranked_tool_predictions", [])
+            ),
+            tuple(state.active_recovery_tool_instances),
+        )
+        tool_id, probability, detail = self._ngram_tool_prediction()
+        for tracked_tool in list(self._ngram_preparation_stability):
+            if tracked_tool != tool_id:
+                self._ngram_preparation_stability.pop(tracked_tool, None)
+        stability_sec = self._update_ngram_probability_dwell(
+            self._ngram_preparation_stability,
+            key=tool_id,
+            probability=probability,
+            condition=bool(
+                bool(state.running)
+                and str(state.execution_state) == "running"
+                and tool_id
+                and probability >= self._ngram_prepare_probability_threshold
+            ),
+            now_sec=now_sec,
+        ) if tool_id else 0.0
+
+        state.predicted_tool = tool_id
+        state.predicted_tool_confidence = probability if tool_id else 0.0
+        state.predicted_tool_stability_sec = stability_sec
+        state.autonomous_preparation_ready = bool(
+            bool(state.running)
+            and str(state.execution_state) == "running"
+            and tool_id
+            and probability >= self._ngram_prepare_probability_threshold
+            and stability_sec >= self._ngram_policy_stability_sec
+            and not state.active_recovery_tool_instances
+        )
+        state.ranked_tool_predictions = [
+            RankedToolPredictionBelief(
+                rank=rank,
+                instrument_id=candidate_id,
+                confidence=candidate_probability,
+                stability_sec=(
+                    stability_sec if candidate_id == tool_id else 0.0
+                ),
+            )
+            for rank, (candidate_id, candidate_probability) in enumerate(
+                detail.get("ranked_distribution", []), start=1
+            )
+        ]
+        recovery_changed = self._refresh_ngram_mayo_recovery(
+            scores=detail.get("ngram", {}),
+            has_ngram_evidence=bool(detail.get("has_ngram_evidence", False)),
+            preparation_tool_id=(
+                tool_id if state.autonomous_preparation_ready else ""
+            ),
+            now_sec=now_sec,
+        )
+        if recovery_changed:
+            state.autonomous_preparation_ready = False
+        after = (
+            str(state.predicted_tool),
+            float(state.predicted_tool_confidence),
+            float(state.predicted_tool_stability_sec),
+            bool(state.autonomous_preparation_ready),
+            tuple(
+                (
+                    row.rank,
+                    row.instrument_id,
+                    row.confidence,
+                    row.stability_sec,
+                )
+                for row in state.ranked_tool_predictions
+            ),
+            tuple(state.active_recovery_tool_instances),
+        )
+        return bool(recovery_changed or after != before)
 
     def _clear_tool_prediction_state(self) -> None:
-        self._tool_predict_stability.clear()
-        getattr(
-            self,
-            "_tool_prediction_last_sample_by_source",
-            {},
-        ).clear()
+        self._ngram_preparation_stability.clear()
+        self._ngram_recovery_stability.clear()
         self._twin.state.predicted_tool = ""
         self._twin.state.predicted_tool_confidence = 0.0
         self._twin.state.predicted_tool_stability_sec = 0.0
+        self._twin.state.autonomous_preparation_ready = False
         self._twin.state.ranked_tool_predictions = []
 
-    def _tool_prediction_sample_status(
-        self,
-        *,
-        source: str,
-        now_sec: float,
-        payload: dict,
-    ) -> str:
-        """Admit at most one temporal sample per source observation."""
+    def _clear_inactive_tool_policy_state(self) -> bool:
+        """Remove run-scoped policy display state while preserving tool belief.
 
-        tracker = getattr(
-            self,
-            "_tool_prediction_last_sample_by_source",
-            None,
-        )
-        if tracker is None:
-            tracker = {}
-            self._tool_prediction_last_sample_by_source = tracker
-        source_key = source or "unknown"
-        signature = json.dumps(
-            self._vlm_tool_rows(payload),
-            ensure_ascii=True,
-            separators=(",", ":"),
-        )
-        previous = tracker.get(source_key)
-        if previous is not None:
-            previous_stamp, _previous_signature = previous
-            if now_sec < previous_stamp - 1e-6:
-                return "stale_out_of_order_tool_prediction"
-            if abs(now_sec - previous_stamp) <= 1e-6:
-                return "duplicate_tool_prediction_observation"
-        tracker[source_key] = (now_sec, signature)
-        return "accepted"
+        This is deliberately a confidence/evidence reset only.  It never
+        relocates an instrument, so stop/reset cannot create an artificial
+        tray/Mayo transition.
+        """
 
-    def _vlm_tool_rows(self, payload: dict) -> list[list]:
-        raw = payload.get("tool", [])
-        if str(payload.get("v", "")) in {"3", "4", "5", "6"}:
-            rows: list[list] = []
-            if not isinstance(raw, list):
-                return rows
-            for item in raw:
-                if not isinstance(item, list) or len(item) != 2 or not str(item[0]):
-                    continue
-                try:
-                    confidence = float(item[1])
-                except (TypeError, ValueError):
-                    continue
-                if not math.isfinite(confidence):
-                    continue
-                rows.append([str(item[0]), confidence])
-            return rows
-        if isinstance(raw, list) and len(raw) == 2 and str(raw[0]):
-            return [[str(raw[0]), float(raw[1])]]
-        return []
+        state = self._twin.state
+        before = (
+            str(state.predicted_tool),
+            float(state.predicted_tool_confidence),
+            float(state.predicted_tool_stability_sec),
+            bool(state.autonomous_preparation_ready),
+            tuple(
+                (row.rank, row.instrument_id, row.confidence, row.stability_sec)
+                for row in state.ranked_tool_predictions
+            ),
+            tuple(
+                (
+                    instrument.instance_id,
+                    instrument.mayo_reuse_confidence,
+                    instrument.mayo_reuse_stability_sec,
+                    instrument.mayo_recovery_confidence,
+                    instrument.mayo_recovery_stability_sec,
+                    instrument.mayo_evidence_source,
+                )
+                for instrument in self._twin.instrument_states.values()
+            ),
+        )
+        self._clear_tool_prediction_state()
+        # VLM Mayo rows are now observability-only and no longer own an
+        # automatic policy clock.  Keeping retired VLM stability maps here
+        # made an inactive/reset transition depend on fields that no longer
+        # exist on this owner.
+        self._twin.clear_all_mayo_policy_evidence()
+        after = (
+            str(state.predicted_tool),
+            float(state.predicted_tool_confidence),
+            float(state.predicted_tool_stability_sec),
+            bool(state.autonomous_preparation_ready),
+            tuple(
+                (row.rank, row.instrument_id, row.confidence, row.stability_sec)
+                for row in state.ranked_tool_predictions
+            ),
+            tuple(
+                (
+                    instrument.instance_id,
+                    instrument.mayo_reuse_confidence,
+                    instrument.mayo_reuse_stability_sec,
+                    instrument.mayo_recovery_confidence,
+                    instrument.mayo_recovery_stability_sec,
+                    instrument.mayo_evidence_source,
+                )
+                for instrument in self._twin.instrument_states.values()
+            ),
+        )
+        return after != before
 
     def _fused_tool_prediction(
         self,
@@ -2844,209 +3882,10 @@ class ORDigitalTwinNode(Node):
         now_sec: float,
         received_sec: float | None = None,
     ) -> tuple[str, float, dict]:
-        vlm_rows = self._vlm_tool_rows(payload)
-        vlm_scores = {
-            self._twin.spec.resolve_instrument_alias(str(tool_id)) or str(tool_id): float(confidence)
-            for tool_id, confidence in vlm_rows
-            if str(tool_id)
-        }
-        runtime_evidence = self._runtime_prior_evidence()
-        prior_result = self._prior_scorer.score(runtime_evidence)
-        prior = prior_result.get("tool", [])
-        prior_evidence = prior_result.get("evidence", {})
-        path_forecast = (
-            prior_evidence.get("procedure_path_forecast", {})
-            if isinstance(prior_evidence, dict)
-            else {}
-        )
-        prior_scores = {
-            self._twin.spec.resolve_instrument_alias(str(item[0])) or str(item[0]): float(item[1])
-            for item in prior
-            if isinstance(item, list) and len(item) == 2 and str(item[0])
-        }
-        ngram_result = None
-        ngram_prior = getattr(self, "_handover_ngram_prior", None)
-        if ngram_prior is not None:
-            ngram_result = ngram_prior.predict(
-                phase_id=runtime_evidence.get("current_phase", ""),
-                completed_handovers=runtime_evidence.get(
-                    "completed_handovers", []
-                ),
-            )
-        ngram_scores = {
-            self._twin.spec.resolve_instrument_alias(str(item[0]))
-            or str(item[0]): float(item[1])
-            for item in (
-                ngram_result.get("candidates", [])
-                if isinstance(ngram_result, dict)
-                else []
-            )
-            if isinstance(item, list) and len(item) == 2 and str(item[0])
-        }
+        """Backward-compatible name for the n-gram-only prediction lookup."""
 
-        # The final reducer hard-gates every source against current inventory
-        # and the procedure's requestable contract.  This is deliberately
-        # stricter than retaining a visually suggested but unavailable tool:
-        # ranked_tool_predictions is consumed by implicit handover policy.
-        handover_lifecycles = {
-            "home_rack",
-            "returned_home",
-            "mayo_reuse",
-            "prepositioned_right",
-        }
-        available_types = {
-            tool_id
-            for tool_id in self._twin.get_available_instruments()
-            if any(
-                str(getattr(state, "lifecycle_stage", ""))
-                in handover_lifecycles
-                for state in self._twin._instances_for_type(tool_id)
-            )
-        }
-        eligible_ids = [
-            instrument_id
-            for instrument_id in self._twin.spec.list_requestable_instrument_ids()
-            if instrument_id in available_types
-        ]
-        eligible = set(eligible_ids)
-        path_tool = self._twin.spec.resolve_instrument_alias(
-            str(path_forecast.get("tool", ""))
-        ) or str(path_forecast.get("tool", ""))
-        path_confidence = max(
-            0.0,
-            min(1.0, float(path_forecast.get("confidence", 0.0) or 0.0)),
-        )
-        path_available = path_tool in eligible
-        fused_scores: dict[str, float] = {}
-        candidate_lifecycles: dict[str, list[str]] = {}
-        for tool_id in eligible_ids:
-            instances = self._twin._instances_for_type(tool_id)
-            candidate_lifecycles[tool_id] = sorted(
-                {
-                    str(getattr(state, "lifecycle_stage", "") or "")
-                    for state in instances
-                }
-            )
-            vlm_score = max(0.0, min(1.0, float(vlm_scores.get(tool_id, 0.0))))
-            prior_score = max(0.0, min(1.0, float(prior_scores.get(tool_id, 0.0))))
-            ngram_score = max(
-                0.0,
-                min(1.0, float(ngram_scores.get(tool_id, 0.0))),
-            )
-            remaining = 1.0 - vlm_score
-            prior_nudge = 0.15 * prior_score * remaining
-            # Frozen 0704 n-gram is a bounded ranking prior.  Alone it cannot
-            # satisfy the 0.5 evidence threshold, so it can prepare a ranking
-            # but cannot independently accrue action-policy readiness.
-            ngram_nudge = 0.25 * ngram_score * remaining
-            agreement_nudge = (
-                0.05 * remaining
-                if vlm_score >= 0.35
-                and max(prior_score, ngram_score) >= 0.35
-                else 0.0
-            )
-            fused_scores[tool_id] = min(
-                1.0,
-                max(0.001, vlm_score + prior_nudge + ngram_nudge + agreement_nudge),
-            )
-            if tool_id == path_tool and path_available:
-                fused_scores[tool_id] = max(
-                    fused_scores[tool_id],
-                    path_confidence,
-                )
-        if not fused_scores:
-            return "", 0.0, {
-                "vlm": vlm_scores,
-                "prior": prior_scores,
-                "ngram": ngram_scores,
-                "candidate_lifecycles": candidate_lifecycles,
-                "fused": {},
-                "ranked_distribution": [],
-                "eligible_candidates": eligible_ids,
-                "degraded": True,
-                "degraded_reason": "fewer_than_three_eligible_tools",
-                "procedure_path_forecast": path_forecast,
-                "path_available": path_available,
-            }
-        selected_tool, selected_confidence = max(
-            fused_scores.items(),
-            key=lambda item: (item[1], -eligible_ids.index(item[0])),
-        )
-        # Readiness measures continuity of the current top candidate. A
-        # different winner invalidates the previous candidate's preparation
-        # clock instead of letting intermittent ranked appearances accumulate.
-        for tracked_tool in list(self._tool_predict_stability):
-            if tracked_tool != selected_tool:
-                self._tool_predict_stability.pop(tracked_tool, None)
-        if selected_confidence >= self._tool_predict_evidence_threshold:
-            entry = self._tool_predict_stability.get(selected_tool)
-            if entry is not None and not bool(entry.get("evidence_ready", True)):
-                self._tool_predict_stability.pop(selected_tool, None)
-            _, selected_duration = self._update_stability(
-                self._tool_predict_stability,
-                tool_id=selected_tool,
-                confidence=selected_confidence,
-                threshold=self._tool_predict_evidence_threshold,
-                stability_sec=self._tool_predict_stability_sec,
-                now_sec=now_sec,
-                received_sec=received_sec,
-            )
-            self._tool_predict_stability[selected_tool]["evidence_ready"] = True
-        else:
-            selected_duration = 0.0
-            self._tool_predict_stability[selected_tool] = {
-                "first_seen": now_sec,
-                "last_seen": now_sec,
-                "last_received": (
-                    now_sec if received_sec is None else received_sec
-                ),
-                "confidence": selected_confidence,
-                "evidence_ready": False,
-            }
-        durations = {
-            tool_id: (
-                selected_duration if tool_id == selected_tool else 0.0
-            )
-            for tool_id in fused_scores
-        }
-        ranked_distribution = _normalize_ranked_tool_distribution(
-            list(fused_scores.items()),
-            limit=3,
-        )
-        vlm_top = max(vlm_scores.items(), key=lambda item: item[1])[0] if vlm_scores else ""
-        prior_top = max(prior_scores.items(), key=lambda item: item[1])[0] if prior_scores else ""
-        strong_new_consensus = bool(
-            selected_tool
-            and selected_tool == vlm_top
-            and selected_tool == prior_top
-        )
-        return selected_tool, selected_confidence, {
-            "vlm": vlm_scores,
-            "prior": prior_scores,
-            "ngram": ngram_scores,
-            "candidate_lifecycles": candidate_lifecycles,
-            "fused": fused_scores,
-            "ranked_distribution": ranked_distribution,
-            "eligible_candidates": eligible_ids,
-            "filtered_candidates": sorted(
-                (set(vlm_scores) | set(prior_scores) | set(ngram_scores))
-                - eligible
-            ),
-            "degraded": len(eligible_ids) < 3,
-            "degraded_reason": (
-                "fewer_than_three_eligible_tools"
-                if len(eligible_ids) < 3
-                else ""
-            ),
-            "durations_sec": durations,
-            "selected": selected_tool,
-            "selected_duration_sec": durations.get(selected_tool, 0.0),
-            "vlm_top": vlm_top,
-            "prior_top": prior_top,
-            "strong_new_consensus": strong_new_consensus,
-            "procedure_path_forecast": path_forecast,
-            "path_available": path_available,
-        }
+        del payload, now_sec, received_sec
+        return self._ngram_tool_prediction()
 
     def _handle_vlm_tool_prediction(
         self,
@@ -3055,115 +3894,39 @@ class ORDigitalTwinNode(Node):
         now_sec: float,
         received_sec: float | None = None,
     ) -> None:
-        if (
-            not self._twin.state.predicted_tool
-            and not getattr(self._twin.state, "ranked_tool_predictions", [])
-        ):
-            # A reset/interrupt may clear reducer state outside this callback.
-            # Never carry the previous run's continuity clock into a new rank 1.
-            self._tool_predict_stability.clear()
-        sample_status = self._tool_prediction_sample_status(
-            source=str(msg.source),
-            now_sec=now_sec,
-            payload=payload,
-        )
-        if sample_status != "accepted":
-            self._publish_reducer_decision_event(
-                input_type="vlm_tool_prediction",
-                input_id=f"tool_prediction_ignored:{now_sec:.3f}",
-                input_source=msg.source,
-                accepted=False,
-                reason=sample_status,
-                detail={"tool_rows": self._vlm_tool_rows(payload)},
-            )
-            return
+        """Keep the schema ingress, but do not admit VLM tool scores to policy.
 
-        # Legacy/replay rows pass through the same inventory and ranking gate
-        # as live schema-v4 output.  No public system-final path may bypass the
-        # exact-three/availability contract merely because its wire shape is
-        # older.
-        tool_id, confidence, fusion_detail = self._fused_tool_prediction(
-            payload,
-            now_sec,
-            received_sec,
-        )
-        if not tool_id:
-            self._clear_stale_tool_prediction(now_sec)
-            return
-        duration = float(
-            fusion_detail.get("selected_duration_sec", 0.0)
-        )
-        policy_ready = bool(
-            confidence >= self._tool_predict_threshold
-            and duration >= self._tool_predict_stability_sec
-        )
-        self._clear_stale_tool_prediction(now_sec)
-        changed = self._twin.state.predicted_tool != tool_id
-        self._twin.state.predicted_tool = tool_id
-        self._twin.state.predicted_tool_confidence = confidence
-        self._twin.state.predicted_tool_stability_sec = duration
-        ranked_rows = [
-            (str(candidate_id), float(candidate_probability))
-            for candidate_id, candidate_probability in fusion_detail.get(
-                "ranked_distribution", []
-            )
-        ]
-        if not ranked_rows:
-            ranked_rows = _normalize_ranked_tool_distribution(
-                [
-                    (str(candidate_id), float(candidate_confidence))
-                    for candidate_id, candidate_confidence in fusion_detail.get(
-                        "fused", {}
-                    ).items()
-                ],
-                limit=3,
-            )
-        self._twin.state.ranked_tool_predictions = [
-            RankedToolPredictionBelief(
-                rank=rank,
-                instrument_id=candidate_id,
-                confidence=candidate_confidence,
-                stability_sec=duration if rank == 1 else 0.0,
-            )
-            for rank, (candidate_id, candidate_confidence) in enumerate(
-                ranked_rows, start=1
-            )
-        ]
-        self._publish_reducer_decision_event(
-            input_type="vlm_tool_prediction",
-            input_id=f"tool_prediction:{tool_id}:{now_sec:.3f}",
-            input_source=msg.source,
-            accepted=True,
-            reason="verified_tool_prediction_evidence",
-            affected_tool=tool_id,
-            detail={
-                "confidence": confidence,
-                "duration_sec": round(duration, 3),
-                "evidence_confidence_threshold": self._tool_predict_evidence_threshold,
-                "policy_confidence_threshold": self._tool_predict_threshold,
-                "threshold_sec": self._tool_predict_stability_sec,
-                "policy_ready": policy_ready,
-                "fusion": fusion_detail,
-            },
-        )
-        if changed:
-            self._publish_event(
-                "VLMToolPredictionEvidenceUpdated",
-                instrument_id=tool_id,
-                confidence=confidence,
-                detail={
-                    "source": msg.source,
-                    "duration_sec": round(duration, 3),
-                    "evidence_confidence_threshold": self._tool_predict_evidence_threshold,
-                    "policy_confidence_threshold": self._tool_predict_threshold,
-                    "threshold_sec": self._tool_predict_stability_sec,
-                    "policy_ready": policy_ready,
-                },
-                mode="evidence_only",
-            )
+        The current automatic policy is entirely regenerated from the frozen
+        0704 n-gram table.  This compatibility entry point intentionally
+        ignores ``payload['tool']`` and every VLM confidence so a fresh VLM
+        frame cannot alter preparation or recovery eligibility.
+        """
+
+        del payload, msg, received_sec
+        self._refresh_ngram_tool_policy(now_sec=now_sec)
+        return
 
     def _on_vlm_result(self, msg: VLMResult) -> None:
         source = str(msg.source or "unknown_vlm")
+        state = self._twin.state
+        current_run_id = str(getattr(state, "procedure_run_id", "") or "").strip()
+        if (
+            bool(getattr(state, "running", False))
+            and str(getattr(state, "execution_state", "")).strip().lower()
+            == "running"
+            and (
+                not current_run_id
+                or str(getattr(msg, "procedure_run_id", "") or "").strip()
+                != current_run_id
+            )
+        ):
+            self._reject_visual_evidence(
+                channel="vlm_result",
+                source=source,
+                reason="vlm_procedure_run_mismatch",
+                message=msg,
+            )
+            return
         if self._perception_gate_active():
             self._reject_visual_evidence(
                 channel="vlm_result",
@@ -3208,168 +3971,158 @@ class ORDigitalTwinNode(Node):
                 ]},
             )
             return
-        now_sec = self._stamp_sec(msg.stamp)
-        received_sec = self._stamp_sec(self._stamp())
+        # Use the same monotonic clock as the periodic DT policy refresh.
+        # VLM header timestamps are not a policy time base anymore.
+        now_sec = self._monotonic_sec()
+        received_sec = None
         self._handle_vlm_tool_prediction(
             payload,
             msg,
             now_sec,
             received_sec,
         )
-        mayo_rows: dict[str, tuple[str, float]] = {}
-        for item in payload.get("mayo", []):
-            if not isinstance(item, list) or len(item) != 3:
-                continue
-            tool_id = self._twin.spec.resolve_instrument_alias(str(item[0])) or str(item[0])
-            decision = str(item[1]).strip().lower()
-            try:
-                confidence = float(item[2])
-            except (TypeError, ValueError):
-                continue
-            if not tool_id or decision not in {"recover", "reuse"}:
-                continue
-            current_state = self._twin.get_instrument_state(
-                tool_id,
-                allowed_lifecycles={"mayo_reuse", "mayo_recovery"},
-            )
-            if not self._is_canonical_mayo_policy_state(current_state):
-                # Do not accumulate an off-Mayo proposal and later apply it
-                # after a placement update.  Policy evidence starts only once
-                # the current DT snapshot independently confirms Mayo.
-                self._mayo_retrieve_stability.pop(tool_id, None)
-                self._mayo_reuse_stability.pop(tool_id, None)
-                self._twin.clear_mayo_policy_evidence(tool_id)
-                continue
-            mayo_rows[tool_id] = (decision, confidence)
-
-        retrieve = payload.get("mayo_retrieve", ["", 0.0])
-        if isinstance(retrieve, list) and len(retrieve) == 2:
-            retrieve_tool = (
-                self._twin.spec.resolve_instrument_alias(str(retrieve[0]))
-                or str(retrieve[0])
-            )
-            try:
-                retrieve_confidence = float(retrieve[1])
-            except (TypeError, ValueError):
-                retrieve_confidence = 0.0
-            current_state = self._twin.get_instrument_state(
-                retrieve_tool,
-                allowed_lifecycles={"mayo_reuse", "mayo_recovery"},
-            ) if retrieve_tool else None
-            if retrieve_tool and not self._is_canonical_mayo_policy_state(current_state):
-                self._mayo_retrieve_stability.pop(retrieve_tool, None)
-                self._mayo_reuse_stability.pop(retrieve_tool, None)
-                self._twin.clear_mayo_policy_evidence(retrieve_tool)
-            elif retrieve_tool and retrieve_tool not in mayo_rows:
-                mayo_rows[retrieve_tool] = ("recover", retrieve_confidence)
-
-        observed_tools = set(mayo_rows)
-        for tool_id, (decision, confidence) in mayo_rows.items():
-            if decision == "reuse":
-                tracker = self._mayo_reuse_stability
-                opposite_tracker = self._mayo_retrieve_stability
-                threshold = self._mayo_reuse_threshold
-            else:
-                tracker = self._mayo_retrieve_stability
-                opposite_tracker = self._mayo_reuse_stability
-                threshold = self._mayo_retrieve_threshold
-            opposite_tracker.pop(tool_id, None)
-            stable, duration = self._update_stability(
-                tracker,
-                tool_id=tool_id,
-                confidence=confidence,
-                threshold=threshold,
-                stability_sec=self._mayo_stability_sec,
-                now_sec=now_sec,
-                received_sec=received_sec,
-            )
-            current_state = self._twin.get_instrument_state(
-                tool_id,
-                allowed_lifecycles={"mayo_reuse", "mayo_recovery"},
-            )
-            if not self._is_canonical_mayo_policy_state(current_state):
-                self._mayo_retrieve_stability.pop(tool_id, None)
-                self._mayo_reuse_stability.pop(tool_id, None)
-                self._twin.clear_mayo_policy_evidence(tool_id)
-                continue
-            instance_id = current_state.instance_id if current_state else tool_id
-            proposal_id = (
-                f"mayo_policy:{instance_id}:{decision}:"
-                f"{now_sec:.3f}:{confidence:.2f}"
-            )
-            result = self._twin.record_mayo_policy_evidence(
-                instrument_id=instance_id,
-                evidence_type=decision,
-                confidence=confidence,
-                stability_sec=duration,
-                source="vlm_mayo_policy",
-                proposal_id=proposal_id,
-                stamp_sec=now_sec,
-            )
-            if not result:
-                continue
-            result["policy_ready"] = bool(stable)
-            self._publish_vlm_reducer_decision(result)
-            self._publish_event(
-                "VLMMayoPolicyEvidenceVerified",
-                instrument_id=tool_id,
-                instance_id=str(result.get("instance_id", "")),
-                location_id=str(result.get("location_id", "mayo_stand")),
-                location_type=str(result.get("location_type", "mayo_stand")),
-                confidence=confidence,
-                detail=result,
-                mode="evidence_only",
-            )
-
-        for tracker in (
-            self._mayo_retrieve_stability,
-            self._mayo_reuse_stability,
-        ):
-            for tracked_tool, entry in list(tracker.items()):
-                if (
-                    tracked_tool not in observed_tools
-                    and now_sec - float(entry.get("last_seen", now_sec)) > 2.5
-                ):
-                    tracker.pop(tracked_tool, None)
-                    self._twin.clear_mayo_policy_evidence(tracked_tool)
+        # VLM Mayo reuse/recovery votes are intentionally no longer consumed
+        # by the Digital Twin.  Autonomous tool policy has already been
+        # refreshed from the frozen 0704 n-gram distribution above.
         self._publish_world_state()
-
-    @staticmethod
-    def _is_canonical_mayo_policy_state(state) -> bool:
-        return bool(
-            state is not None
-            and str(getattr(state, "lifecycle_stage", ""))
-            in {"mayo_reuse", "mayo_recovery"}
-            and str(getattr(state, "location_type", "")) == "mayo_stand"
-            and str(getattr(state, "location_id", "")) == "mayo_stand"
-        )
+        return
 
     def _on_observation(self, msg: ToolObservation) -> None:
-        source = (
-            str(getattr(msg, "source", ""))
-            or "vlm_cam4_mayo_observation"
-            if msg.location_type == "mayo_stand"
-            else "legacy_tool_observation"
-        )
-        self._reconcile_tool_observation(msg, source=source)
+        """Keep raw visual observations out of the location-state reducer.
+
+        ToolObservation is an input to the probabilistic belief tracker, not
+        a competing Digital Twin location authority.  It is retained as a ROS
+        subscription for wire compatibility and VLM observability, but it may
+        not mutate an instrument lifecycle.  The committed tracker projection
+        below is the only perception-to-Twin location path.
+        """
+
+        del msg
 
     def _on_cam4_mayo_observation(
         self,
         msg: ToolObservation,
     ) -> None:
-        self._reconcile_tool_observation(
-            msg,
-            source="cam4_rfdetr_mayo_observation",
+        # This callback intentionally remains harmless for tests/manual
+        # invocation after the dedicated subscription was retired.  CAM4
+        # frames influence Twin location only after the tracker has weighted
+        # occlusion/context and emitted a committed belief.
+        del msg
+
+    def _on_tool_beliefs(self, msg: TrackedToolBeliefArray) -> None:
+        """Project committed belief rows without re-admitting raw evidence."""
+
+        if not bool(getattr(msg, "observation_only", False)):
+            return
+        state = self._twin.state
+        if str(getattr(msg, "procedure_id", "")).strip() != str(
+            state.procedure_id
+        ).strip():
+            return
+        # A stale snapshot from a preceding Reset/run must not replay its
+        # committed placement into the fresh inventory.  Before a run begins
+        # the Twin already represents the operator-verified start layout, so
+        # there is nothing for an unbound tracker snapshot to project.
+        run_id = str(getattr(msg, "procedure_run_id", "")).strip()
+        if not run_id or run_id != str(state.procedure_run_id or "").strip():
+            return
+        header = getattr(msg, "header", None)
+        source_stamp_sec = self._stamp_sec(
+            getattr(header, "stamp", self._stamp())
         )
+        changed = False
+        for belief in getattr(msg, "tools", ()):
+            committed_location_id = str(
+                getattr(belief, "committed_location_id", "")
+            ).strip()
+            if not committed_location_id:
+                continue
+            try:
+                existence_probability = float(
+                    getattr(belief, "existence_probability", 0.0)
+                )
+            except (TypeError, ValueError):
+                existence_probability = 0.0
+            if not math.isfinite(existence_probability) or existence_probability < 0.85:
+                # An inactive exchangeable capacity slot cannot become a Twin
+                # instance merely because a snapshot contains its logical ID.
+                continue
+            result = self._twin.project_committed_tool_belief(
+                instrument_id=str(getattr(belief, "instrument_id", "")),
+                instance_id=str(getattr(belief, "instance_id", "")),
+                committed_location_id=committed_location_id,
+                confidence=float(
+                    getattr(belief, "committed_location_probability", 0.0)
+                ),
+                proposal_id=(
+                    f"tool-belief:{run_id}:{getattr(belief, 'track_id', '')}:"
+                    f"{committed_location_id}"
+                ),
+                source_stamp_sec=source_stamp_sec,
+                evidence_sources=tuple(
+                    str(item)
+                    for item in getattr(belief, "evidence_sources", ())
+                ),
+            )
+            if result.get("event_type") == "ToolBeliefProjectionAccepted":
+                changed = True
+                if committed_location_id == "surgeon":
+                    accepted_tool_id = str(
+                        result.get("instrument_id", belief.instrument_id)
+                    ).strip()
+                    if accepted_tool_id:
+                        self._append_tool_history(
+                            "_completed_handover_history",
+                            accepted_tool_id,
+                            getattr(header, "stamp", self._stamp()),
+                        )
+                        self._record_completed_handover_phase(
+                            accepted_tool_id
+                        )
+                self._publish_reducer_decision_event(
+                    input_type="tool_belief_commit",
+                    input_id=str(result.get("proposal_id", "")),
+                    input_source="tool_belief_tracker",
+                    accepted=True,
+                    reason=str(result.get("reducer_reason", "")),
+                    affected_tool=str(result.get("instrument_id", "")),
+                    detail=result,
+                )
+                self._publish_event(
+                    "ToolBeliefProjectionAccepted",
+                    instrument_id=str(result.get("instrument_id", "")),
+                    instance_id=str(result.get("instance_id", "")),
+                    location_id=str(result.get("location_id", "")),
+                    location_type=str(result.get("location_type", "")),
+                    confidence=float(result.get("confidence", 0.0)),
+                    mode="observation_projection",
+                    detail=result,
+                )
+        if changed:
+            self._publish_world_state()
 
     def _reconcile_tool_observation(
         self,
         msg: ToolObservation,
         *,
         source: str,
+        cam4_mayo_channel: bool = False,
     ) -> None:
-        resolved_source = str(getattr(msg, "source", "")) or source
-        is_cam4_detector = source == "cam4_rfdetr_mayo_observation"
+        # Callers map each input lane to its authority source before this
+        # point.  Do not re-read ``msg.source`` here: a generic VLM-topic
+        # payload must not relabel itself as the dedicated typed CAM4 lane.
+        resolved_source = source
+        is_cam4_detector = bool(
+            cam4_mayo_channel
+            and source
+            in {
+                "cam4_rfdetr_mayo_observation",
+                CAM4_TYPED_MAYO_OBSERVATION_SOURCE,
+            }
+        )
+        is_legacy_cam4_detector = (
+            source == "cam4_rfdetr_mayo_observation"
+        )
         if is_cam4_detector:
             if self._camera_gate_active("cam4"):
                 self._reject_visual_evidence(
@@ -3390,7 +4143,8 @@ class ORDigitalTwinNode(Node):
         resolved_tool = self._twin.spec.resolve_instrument_alias(msg.instrument_id) or msg.instrument_id
         admission_channel = (
             f"{'cam4' if is_cam4_detector else 'vlm'}_tool:"
-            f"{resolved_tool}:{msg.location_type}:{msg.location_id}"
+            f"{resolved_source}:{resolved_tool}:{msg.location_type}:"
+            f"{msg.location_id}"
         )
         placement_episode_started_sec: float | None = None
         placement_episode_id = ""
@@ -3401,26 +4155,27 @@ class ORDigitalTwinNode(Node):
                 source=resolved_source,
             ):
                 return
-            episode_metadata = self._cam4_mayo_episode_metadata(msg)
-            if episode_metadata is None:
-                self._reject_visual_evidence(
-                    channel=admission_channel,
-                    source=resolved_source,
-                    reason="invalid_cam4_presence_episode",
-                    message=msg,
+            if is_legacy_cam4_detector:
+                episode_metadata = self._cam4_mayo_episode_metadata(msg)
+                if episode_metadata is None:
+                    self._reject_visual_evidence(
+                        channel=admission_channel,
+                        source=resolved_source,
+                        reason="invalid_cam4_presence_episode",
+                        message=msg,
+                    )
+                    return
+                placement_episode_started_sec, placement_episode_id = (
+                    episode_metadata
                 )
-                return
-            placement_episode_started_sec, placement_episode_id = (
-                episode_metadata
-            )
-            if placement_episode_id in getattr(
-                self,
-                "_accepted_cam4_mayo_episodes",
-                set(),
-            ):
-                # Renewals keep source freshness visible to admission, but an
-                # already-consumed physical placement episode is idempotent.
-                return
+                if placement_episode_id in getattr(
+                    self,
+                    "_accepted_cam4_mayo_episodes",
+                    set(),
+                ):
+                    # Renewals keep source freshness visible to admission, but
+                    # an already-consumed local-detector episode is idempotent.
+                    return
         elif not self._admit_visual_evidence(
             msg,
             channel=admission_channel,
@@ -3483,19 +4238,31 @@ class ORDigitalTwinNode(Node):
         self._publish_world_state()
 
     def _on_skill_event(self, msg: TwinEvent) -> None:
-        self._twin.apply_event(msg)
-        if msg.event_type == "ToolHandoverCompleted" and msg.instrument_id:
-            self._append_tool_history(
-                "_completed_handover_history",
-                msg.instrument_id,
-                msg.stamp,
-            )
-        try:
-            detail = json.loads(msg.detail_json) if msg.detail_json else {}
-            if not isinstance(detail, dict):
-                detail = {"detail": detail}
-        except Exception:
-            detail = {"detail_json": msg.detail_json}
+        detail = self._skill_event_detail(msg)
+        admitted, _reason = self._admit_current_run_skill_event(msg, detail)
+        if not admitted:
+            return
+        belief_owned_location_event = (
+            msg.event_type in BELIEF_OWNED_TOOL_LOCATION_EVENTS
+        )
+        # Tool location has exactly one runtime owner.  Skill events remain
+        # visible in the audit stream, while the belief tracker consumes them
+        # as weighted evidence and later publishes the only committed location
+        # projection.  Robot task lifecycle events still enter the Twin here.
+        if not belief_owned_location_event:
+            self._twin.apply_event(msg)
+        task_id = self._skill_event_task_id(detail)
+        if msg.event_type == "RobotTaskStarted" and task_id:
+            self._current_run_skill_task_ids.add(task_id)
+        elif msg.event_type == "RobotTaskCompleted" and task_id:
+            self._current_run_skill_task_ids.discard(task_id)
+        if (
+            msg.event_type == "RobotTaskStarted"
+            and self._active_robot_task_is_direct_delivery()
+        ):
+            self._suspend_hand_handover_state()
+        if not isinstance(detail, dict):
+            detail = {"detail": detail}
         detail.update(self._twin.request_queue_summary())
         msg.detail_json = json.dumps(
             self._augment_event_detail(
@@ -3513,6 +4280,7 @@ class ORDigitalTwinNode(Node):
         self._event_pub.publish(msg)
         simulation_event = SimulationEvent()
         simulation_event.stamp = msg.stamp
+        simulation_event.procedure_run_id = msg.procedure_run_id
         simulation_event.event_type = msg.event_type
         simulation_event.instrument_id = msg.instrument_id
         simulation_event.from_anchor = msg.source_location_id or msg.location_id
@@ -3525,6 +4293,13 @@ class ORDigitalTwinNode(Node):
         self._publish_world_state()
 
     def _on_bed_robot_arm_group_request(self, msg: BedRobotArmGroupRequest) -> None:
+        if (
+            not bool(self._twin.state.running)
+            or str(self._twin.state.execution_state).strip().lower() != "running"
+            or str(getattr(msg, "procedure_run_id", "")).strip()
+            != str(self._twin.state.procedure_run_id).strip()
+        ):
+            return
         group_id = str(msg.group_id or "").strip().lower()
         if group_id != "retraction":
             self._twin.update_bed_robot_arm_group_request(msg)
@@ -3814,6 +4589,13 @@ class ORDigitalTwinNode(Node):
         return expired
 
     def _on_bed_robot_arm_group_status(self, msg: BedRobotArmGroupStatus) -> None:
+        if (
+            not bool(self._twin.state.running)
+            or str(self._twin.state.execution_state).strip().lower() != "running"
+            or str(getattr(msg, "procedure_run_id", "")).strip()
+            != str(self._twin.state.procedure_run_id).strip()
+        ):
+            return
         if not int(msg.stamp.sec) and not int(msg.stamp.nanosec):
             msg.stamp = self._stamp()
         status_changed = self._twin.update_bed_robot_arm_group_status(msg)
@@ -3877,750 +4659,8 @@ class ORDigitalTwinNode(Node):
         )
         self._publish_world_state()
 
-    @staticmethod
-    def _voice_gateway_stamp_ns(message: GatewayInfo) -> int:
-        stamp = getattr(message, "stamp", None)
-        return int(getattr(stamp, "sec", 0)) * 1_000_000_000 + int(
-            getattr(stamp, "nanosec", 0)
-        )
-
-    def _voice_gated_lock(self):
-        lock = getattr(self, "_voice_gated_admission_lock", None)
-        if lock is None:
-            # Production initializes this before subscriptions.  The fallback
-            # keeps pure callback fixtures made with __new__ safe as well.
-            lock = threading.RLock()
-            self._voice_gated_admission_lock = lock
-        return lock
-
-    def _on_voice_gateway_info(self, message: GatewayInfo) -> None:
-        with self._voice_gated_lock():
-            authority = getattr(self, "_voice_gateway_authority", None)
-            if authority is None:
-                return
-            now_stamp = self._stamp()
-            now_ns = int(
-                getattr(now_stamp, "sec", 0)
-            ) * 1_000_000_000 + int(getattr(now_stamp, "nanosec", 0))
-            authority.observe(
-                gateway_instance_id=str(
-                    getattr(message, "gateway_instance_id", "") or ""
-                ),
-                procedure_run_id=str(
-                    getattr(message, "procedure_run_id", "") or ""
-                ),
-                procedure_type=str(
-                    getattr(message, "procedure_type", "") or ""
-                ),
-                catalog_version=str(
-                    getattr(message, "catalog_version", "") or ""
-                ),
-                schema_version=str(
-                    getattr(message, "schema_version", "") or ""
-                ),
-                interface_version=str(
-                    getattr(message, "interface_version", "") or ""
-                ),
-                procedure_active=bool(
-                    getattr(message, "procedure_active", False)
-                ),
-                revision=int(getattr(message, "revision", 0)),
-                source_stamp_ns=self._voice_gateway_stamp_ns(message),
-                now_ns=now_ns,
-                received_monotonic=time.monotonic(),
-                expected_procedure_type=str(
-                    self._twin.spec.procedure_id or ""
-                ).strip(),
-            )
-
-    def _on_voice_gateway_watchdog(self) -> None:
-        with self._voice_gated_lock():
-            authority = getattr(self, "_voice_gateway_authority", None)
-            if authority is not None:
-                authority.expire(now_monotonic=time.monotonic())
-
-    def _gated_voice_scope_rejection_reason(
-        self, msg: VoiceCommandIntent
-    ) -> str:
-        authority = getattr(self, "_voice_gateway_authority", None)
-        if authority is None:
-            return "gateway_lease_unavailable"
-        return authority.rejection_reason(
-            gateway_instance_id=str(
-                getattr(msg, "gateway_instance_id", "") or ""
-            ),
-            procedure_run_id=str(
-                getattr(msg, "procedure_run_id", "") or ""
-            ),
-            twin_procedure_run_id=str(
-                getattr(self._twin.state, "procedure_run_id", "") or ""
-            ),
-            expected_procedure_type=str(
-                self._twin.spec.procedure_id or ""
-            ),
-            now_monotonic=time.monotonic(),
-        )
-
-    def _voice_intent_source_rejection_reason(
-        self, msg: VoiceCommandIntent
-    ) -> str:
-        """Validate the immutable ASR envelope on Live execution paths.
-
-        This intentionally runs at the Digital Twin as a second boundary.
-        ROS topic typing alone cannot prove that a proposal came from the
-        admitted ASR stream, and resolving a legacy ``String`` at receipt time
-        would otherwise launder stale or replayed speech into a fresh intent.
-        """
-
-        if not bool(
-            getattr(self, "_require_voice_intent_source_metadata", False)
-        ):
-            return ""
-        utterance_id = str(getattr(msg, "utterance_id", "") or "").strip()
-        source = str(getattr(msg, "source", "") or "").strip()
-        if not utterance_id:
-            return "voice_intent_missing_utterance_id"
-        if not source:
-            return "voice_intent_missing_source"
-        if not bool(getattr(msg, "source_is_final", False)):
-            return "voice_intent_source_not_final"
-        header = getattr(msg, "header", None)
-        stamp = getattr(header, "stamp", None)
-        if stamp is None:
-            return "voice_intent_missing_source_timestamp"
-        # Do not use ``_stamp_sec`` here: its general Twin helper substitutes
-        # the local clock for a zero stamp, which is appropriate for some
-        # state observations but would launder an absent ASR source time.
-        try:
-            source_sec = float(stamp.sec) + float(stamp.nanosec) / 1_000_000_000.0
-        except (AttributeError, TypeError, ValueError):
-            source_sec = 0.0
-        if source_sec <= 0.0:
-            return "voice_intent_missing_source_timestamp"
-        now_stamp = self._stamp()
-        try:
-            now_sec = (
-                float(now_stamp.sec)
-                + float(now_stamp.nanosec) / 1_000_000_000.0
-            )
-        except (AttributeError, TypeError, ValueError):
-            now_sec = 0.0
-        if now_sec <= 0.0:
-            return "voice_intent_unavailable_local_clock"
-        age_sec = now_sec - source_sec
-        if age_sec > float(
-            getattr(self, "_voice_intent_max_age_sec", 3.0)
-        ):
-            return f"voice_intent_stale:{age_sec:.3f}s"
-        if age_sec < -float(
-            getattr(self, "_voice_intent_future_tolerance_sec", 1.0)
-        ):
-            return f"voice_intent_future_timestamp:{-age_sec:.3f}s"
-
-        now_monotonic = time.monotonic()
-        retention_sec = max(
-            1.0,
-            float(getattr(self, "_voice_intent_dedupe_retention_sec", 120.0)),
-        )
-        seen = getattr(self, "_recent_voice_intent_ids", None)
-        if seen is None:
-            seen = {}
-            self._recent_voice_intent_ids = seen
-        cutoff = now_monotonic - retention_sec
-        expired = [
-            key for key, seen_at in seen.items() if seen_at < cutoff
-        ]
-        for key in expired:
-            seen.pop(key, None)
-        gateway_instance_id = str(
-            getattr(msg, "gateway_instance_id", "") or ""
-        ).strip()
-        function_request_id = str(
-            getattr(msg, "function_request_id", "") or ""
-        ).strip()
-        scope_prefix = (
-            gateway_instance_id
-            if gateway_instance_id and function_request_id
-            else "legacy"
-        )
-        replay_key = f"{scope_prefix}:{source}:{utterance_id}"
-        if replay_key in seen:
-            return "voice_intent_duplicate_utterance_id"
-        seen[replay_key] = now_monotonic
-        return ""
-
-    def _on_voice_command_intent(self, msg: VoiceCommandIntent) -> None:
-        """Admit only executable, already-grounded tool handover proposals.
-
-        Natural language, ASR repair, and ambiguity handling belong upstream in
-        the voice resolver.  The digital twin receives a closed semantic frame
-        and must never use raw or normalized transcript text to fill a tool
-        slot.  A proposal that needs confirmation, clarification, or repair is
-        observable here but cannot queue a handover.
-        """
-
-        function_request_id = str(
-            getattr(msg, "function_request_id", "") or ""
-        ).strip()
-        if function_request_id:
-            self._on_gated_voice_command_intent(msg)
-            return
-
-        instrument_id, detail, mode = self._process_voice_command_intent(
-            msg
-        )
-        self._publish_event(
-            "VoiceCommandIntentObserved",
-            instrument_id=instrument_id,
-            detail=detail,
-            mode=mode,
-        )
-
-    @staticmethod
-    def _voice_intent_receipt_fingerprint(
-        msg: VoiceCommandIntent,
-    ) -> str:
-        header = getattr(msg, "header", None)
-        stamp = getattr(header, "stamp", None)
-        return voice_intent_fingerprint(
-            {
-                "utterance_id": getattr(msg, "utterance_id", ""),
-                "source_stamp_sec": getattr(stamp, "sec", 0),
-                "source_stamp_nanosec": getattr(stamp, "nanosec", 0),
-                "source": getattr(msg, "source", ""),
-                "source_is_final": getattr(msg, "source_is_final", False),
-                "source_speaker_role": getattr(
-                    msg, "source_speaker_role", ""
-                ),
-                "source_has_confidence": getattr(
-                    msg, "source_has_confidence", False
-                ),
-                "source_confidence": getattr(
-                    msg, "source_confidence", 0.0
-                ),
-                "procedure_id": getattr(msg, "procedure_id", ""),
-                "catalog_id": getattr(msg, "catalog_id", ""),
-                "intent": getattr(msg, "intent", ""),
-                "tool_id": getattr(msg, "tool_id", ""),
-                "retractor_command": getattr(
-                    msg, "retractor_command", ""
-                ),
-                "target_side": getattr(msg, "target_side", ""),
-                "distance_m": getattr(msg, "distance_m", 0.0),
-                "urgency": getattr(msg, "urgency", ""),
-                "provenance": getattr(msg, "provenance", ""),
-                "requires_confirmation": getattr(
-                    msg, "requires_confirmation", False
-                ),
-                "disposition": getattr(msg, "disposition", ""),
-                "reason": getattr(msg, "reason", ""),
-                # raw_text, normalized_text, and evidence_spans are omitted
-                # by construction and also ignored by the pure hasher.
-            }
-        )
-
-    def _capture_gated_voice_reducer_state(self) -> dict[str, object]:
-        """Snapshot every in-memory object a gated admission may mutate."""
-
-        return {
-            "twin": copy.deepcopy(self._twin.__dict__),
-            "validated_tool_request_history": copy.deepcopy(
-                getattr(self, "_validated_tool_request_history", deque())
-            ),
-            "tool_predict_stability": copy.deepcopy(
-                getattr(self, "_tool_predict_stability", {})
-            ),
-            "tool_prediction_last_sample_by_source": copy.deepcopy(
-                getattr(
-                    self,
-                    "_tool_prediction_last_sample_by_source",
-                    {},
-                )
-            ),
-            "recent_voice_intent_ids": copy.deepcopy(
-                getattr(self, "_recent_voice_intent_ids", {})
-            ),
-        }
-
-    def _restore_gated_voice_reducer_state(
-        self, snapshot: dict[str, object]
-    ) -> None:
-        """Restore a failed first writer without replacing the Twin object."""
-
-        twin_state = snapshot["twin"]
-        if not isinstance(twin_state, dict):
-            raise TypeError("invalid gated voice Twin snapshot")
-        self._twin.__dict__.clear()
-        self._twin.__dict__.update(twin_state)
-        self._validated_tool_request_history = snapshot[
-            "validated_tool_request_history"
-        ]
-        self._tool_predict_stability = snapshot["tool_predict_stability"]
-        self._tool_prediction_last_sample_by_source = snapshot[
-            "tool_prediction_last_sample_by_source"
-        ]
-        self._recent_voice_intent_ids = snapshot[
-            "recent_voice_intent_ids"
-        ]
-
-    def _voice_receipt_first_writer(
-        self,
-        *,
-        ledger: VoiceIntentReceiptLedger,
-        key: VoiceIntentReceiptKey,
-        utterance_id: str,
-        fingerprint: str,
-        build_receipt,
-    ):
-        """Commit a first writer or roll its reducer mutation back in full."""
-
-        mutation_snapshot: dict[str, object] | None = None
-
-        def guarded_build_receipt() -> VoiceIntentReceiptDraft:
-            nonlocal mutation_snapshot
-            # World-state timers and direct publications check this before
-            # maintenance/normalization, so no reducer edge can escape while
-            # the SQLite transaction is still rollback-capable.
-            self._voice_gated_mutation_dirty = True
-            mutation_snapshot = self._capture_gated_voice_reducer_state()
-            return build_receipt()
-
-        try:
-            result = ledger.first_writer(
-                key=key,
-                utterance_id=utterance_id,
-                fingerprint_sha256=fingerprint,
-                build_receipt=guarded_build_receipt,
-            )
-        except BaseException as first_writer_error:
-            restore_error: BaseException | None = None
-            receipt_state_ambiguous = False
-            if mutation_snapshot is not None:
-                try:
-                    self._restore_gated_voice_reducer_state(
-                        mutation_snapshot
-                    )
-                except BaseException as error:
-                    restore_error = error
-                    self._voice_gated_mutation_fatal = True
-                try:
-                    # SQLite normally leaves no row after a failed pre-COMMIT
-                    # sync/transaction.  If a lower-level COMMIT reports an
-                    # error after making the row visible, or the connection is
-                    # too damaged to prove absence, stop this admission path
-                    # permanently for the process instead of replaying an ACK
-                    # whose reducer mutation was rolled back.
-                    receipt_state_ambiguous = ledger.lookup(key) is not None
-                except BaseException:
-                    receipt_state_ambiguous = True
-                if receipt_state_ambiguous:
-                    self._voice_gated_mutation_fatal = True
-            self._voice_gated_mutation_dirty = False
-            if restore_error is not None:
-                raise RuntimeError(
-                    "gated voice reducer rollback failed; world publication "
-                    "is latched fail-closed"
-                ) from restore_error
-            if receipt_state_ambiguous:
-                raise RuntimeError(
-                    "gated voice receipt commit outcome is ambiguous; world "
-                    "publication is latched fail-closed"
-                ) from first_writer_error
-            raise
-        self._voice_gated_mutation_dirty = False
-        return result
-
-    def _on_gated_voice_command_intent(
-        self, msg: VoiceCommandIntent
-    ) -> None:
-        with self._voice_gated_lock():
-            self._on_gated_voice_command_intent_locked(msg)
-
-    def _on_gated_voice_command_intent_locked(
-        self, msg: VoiceCommandIntent
-    ) -> None:
-        """Apply/replay one durable first-writer receipt for a VLM function.
-
-        Exact retries intentionally bypass source freshness, transient dedupe,
-        and reducer mutation.  A different payload under the same scoped key
-        is a collision: the immutable first receipt is re-emitted and the
-        conflicting payload is never evaluated.
-        """
-
-        if bool(getattr(self, "_voice_gated_mutation_fatal", False)):
-            instrument_id, detail, mode = self._process_voice_command_intent(
-                msg,
-                forced_rejection_reason=(
-                    "gated_voice_intent_reducer_rollback_fatal"
-                ),
-                publish_world_state_on_accept=False,
-            )
-            self._publish_event(
-                "VoiceCommandIntentObserved",
-                instrument_id=instrument_id,
-                detail=detail,
-                mode=mode,
-            )
-            return
-
-        gateway_instance_id = str(
-            getattr(msg, "gateway_instance_id", "") or ""
-        ).strip()
-        procedure_run_id = str(
-            getattr(msg, "procedure_run_id", "") or ""
-        ).strip()
-        function_request_id = str(
-            getattr(msg, "function_request_id", "") or ""
-        ).strip()
-        utterance_id = str(
-            getattr(msg, "utterance_id", "") or ""
-        ).strip()
-        missing = [
-            field_name
-            for field_name, value in (
-                ("gateway_instance_id", gateway_instance_id),
-                ("procedure_run_id", procedure_run_id),
-                ("function_request_id", function_request_id),
-                ("utterance_id", utterance_id),
-            )
-            if not value
-        ]
-        if missing:
-            instrument_id, detail, mode = self._process_voice_command_intent(
-                msg,
-                forced_rejection_reason=(
-                    "gated_voice_intent_missing_scope:"
-                    + ",".join(missing)
-                ),
-            )
-            self._publish_event(
-                "VoiceCommandIntentObserved",
-                instrument_id=instrument_id,
-                detail=detail,
-                mode=mode,
-            )
-            return
-
-        ledger = getattr(self, "_voice_intent_receipt_ledger", None)
-        if ledger is None:
-            instrument_id, detail, mode = self._process_voice_command_intent(
-                msg,
-                forced_rejection_reason=(
-                    "gated_voice_intent_receipt_ledger_unavailable"
-                ),
-            )
-            self._publish_event(
-                "VoiceCommandIntentObserved",
-                instrument_id=instrument_id,
-                detail=detail,
-                mode=mode,
-            )
-            return
-
-        key = VoiceIntentReceiptKey(
-            gateway_instance_id,
-            procedure_run_id,
-            function_request_id,
-        )
-        fingerprint = self._voice_intent_receipt_fingerprint(msg)
-
-        def receipt_draft(
-            forced_rejection_reason: str,
-        ) -> VoiceIntentReceiptDraft:
-            instrument_id, detail, mode = self._process_voice_command_intent(
-                msg,
-                forced_rejection_reason=forced_rejection_reason,
-                publish_world_state_on_accept=False,
-            )
-            # Persist the fully augmented event detail.  Replaying it later is
-            # therefore byte-equivalent apart from the new TwinEvent stamp.
-            stored_detail = self._augment_event_detail(
-                "VoiceCommandIntentObserved",
-                detail,
-                instrument_id=instrument_id,
-                mode=mode,
-            )
-            return VoiceIntentReceiptDraft(
-                instrument_id=instrument_id,
-                mode=mode,
-                detail=stored_detail,
-                accepted=bool(detail.get("accepted", False)),
-            )
-
-        scope_rejection_reason = self._gated_voice_scope_rejection_reason(msg)
-        if scope_rejection_reason:
-            result = self._voice_receipt_first_writer(
-                ledger=ledger,
-                key=key,
-                utterance_id=utterance_id,
-                fingerprint=fingerprint,
-                build_receipt=lambda: receipt_draft(
-                    scope_rejection_reason
-                ),
-            )
-            receipt = result.receipt
-            if receipt.accepted:
-                # An earlier accepted first writer is immutable, but it must
-                # not be replayed after timeout, idle, epoch change, or scope
-                # poisoning. Emit only the current fail-closed rejection.
-                instrument_id, detail, mode = (
-                    self._process_voice_command_intent(
-                        msg,
-                        forced_rejection_reason=scope_rejection_reason,
-                        publish_world_state_on_accept=False,
-                    )
-                )
-                self._publish_event(
-                    "VoiceCommandIntentObserved",
-                    instrument_id=instrument_id,
-                    detail=detail,
-                    mode=mode,
-                )
-            else:
-                self._publish_event(
-                    "VoiceCommandIntentObserved",
-                    instrument_id=receipt.instrument_id,
-                    detail=receipt.detail(),
-                    mode=receipt.mode,
-                )
-            return
-
-        def build_receipt() -> VoiceIntentReceiptDraft:
-            # Recheck inside the first-writer transaction. This closes the
-            # small window in a multi-threaded executor where a gateway
-            # timeout/scope callback could race the preflight above.
-            return receipt_draft(
-                self._gated_voice_scope_rejection_reason(msg)
-            )
-
-        result = self._voice_receipt_first_writer(
-            ledger=ledger,
-            key=key,
-            utterance_id=utterance_id,
-            fingerprint=fingerprint,
-            build_receipt=build_receipt,
-        )
-        # For both exact duplicates and collisions, result.receipt is always
-        # the immutable first writer.  This is the durable ACK the upstream
-        # gate can safely correlate; collision data is not reflected into it.
-        receipt = result.receipt
-        if result.is_new and receipt.accepted:
-            # Reducer mutation happened while constructing the first writer.
-            # Publish public state only after the receipt commit, then publish
-            # the receipt ACK. A crash can therefore never expose an ACK ahead
-            # of its durable first-writer record.
-            self._publish_world_state()
-        self._publish_event(
-            "VoiceCommandIntentObserved",
-            instrument_id=receipt.instrument_id,
-            detail=receipt.detail(),
-            mode=receipt.mode,
-        )
-
-    def _process_voice_command_intent(
-        self,
-        msg: VoiceCommandIntent,
-        *,
-        forced_rejection_reason: str = "",
-        publish_world_state_on_accept: bool = True,
-    ) -> tuple[str, dict, str]:
-        """Validate and, on acceptance, mutate the handover reducer once."""
-
-        intent = str(getattr(msg, "intent", "") or "").strip().lower()
-        disposition = str(
-            getattr(msg, "disposition", "") or ""
-        ).strip().lower()
-        requires_confirmation = bool(
-            getattr(msg, "requires_confirmation", False)
-        )
-        tool_id = str(getattr(msg, "tool_id", "") or "").strip()
-        raw_text = str(getattr(msg, "raw_text", "") or "")
-        normalized_text = str(getattr(msg, "normalized_text", "") or "")
-        procedure_id = str(getattr(msg, "procedure_id", "") or "").strip()
-        catalog_id = str(getattr(msg, "catalog_id", "") or "").strip()
-        urgency = str(getattr(msg, "urgency", "") or "").strip().lower()
-        provenance = str(getattr(msg, "provenance", "") or "")
-        function_request_id = str(
-            getattr(msg, "function_request_id", "") or ""
-        ).strip()
-        gateway_instance_id = str(
-            getattr(msg, "gateway_instance_id", "") or ""
-        ).strip()
-        procedure_run_id = str(
-            getattr(msg, "procedure_run_id", "") or ""
-        ).strip()
-        resolver_reason = str(getattr(msg, "reason", "") or "")
-        source_rejection_reason = (
-            ""
-            if forced_rejection_reason
-            else self._voice_intent_source_rejection_reason(msg)
-        )
-        active_procedure_id = str(self._twin.spec.procedure_id or "").strip()
-        active_catalog = getattr(self, "_voice_command_catalog", None)
-        active_catalog_id = str(
-            getattr(active_catalog, "catalog_id", "") or ""
-        ).strip()
-        catalog_matches_active_spec = bool(
-            active_catalog_id
-            and str(getattr(active_catalog, "procedure_id", "") or "").strip()
-            == active_procedure_id
-        )
-
-        resolved = ""
-        rejection_reason = ""
-        if forced_rejection_reason:
-            rejection_reason = forced_rejection_reason
-        elif source_rejection_reason:
-            rejection_reason = source_rejection_reason
-        elif intent != "tool_handover":
-            rejection_reason = "intent_not_owned_by_digital_twin_handover_consumer"
-        elif requires_confirmation:
-            rejection_reason = "voice_intent_requires_confirmation"
-        elif disposition != "propose":
-            rejection_reason = f"non_executable_voice_intent_disposition:{disposition or 'missing'}"
-        elif not tool_id:
-            rejection_reason = "missing_canonical_tool_id"
-        elif not catalog_matches_active_spec:
-            rejection_reason = "active_voice_catalog_binding_unavailable"
-        elif procedure_id != active_procedure_id:
-            rejection_reason = "voice_intent_procedure_id_mismatch"
-        elif catalog_id != active_catalog_id:
-            rejection_reason = "voice_intent_catalog_id_mismatch"
-        elif urgency not in {"routine", "urgent"}:
-            rejection_reason = "voice_intent_urgency_is_not_recognized"
-        else:
-            # update_resolved_voice_tool_handover accepts canonical catalogue
-            # IDs only and deliberately receives no transcript text.
-            resolved = self._twin.update_resolved_voice_tool_handover(tool_id)
-            if not resolved:
-                rejection_reason = "unknown_or_unavailable_canonical_tool_id"
-
-        accepted = bool(resolved)
-        request_generation = (
-            int(self._twin.state.surgeon_request_generation)
-            if accepted
-            else 0
-        )
-        if accepted:
-            self._append_tool_history(
-                "_validated_tool_request_history",
-                resolved,
-                self._stamp(),
-            )
-            self._clear_tool_prediction_state()
-            if publish_world_state_on_accept:
-                self._publish_world_state()
-
-        detail = {
-            "intent": intent,
-            "disposition": disposition,
-            "requires_confirmation": requires_confirmation,
-            "tool_id": tool_id,
-            "procedure_id": procedure_id,
-            "catalog_id": catalog_id,
-            "resolved_tool": resolved,
-            "accepted": accepted,
-            # This is the exact reducer-assigned generation consumed by the
-            # downstream handover path. Rejected observations must never
-            # correlate a spoken turn with an executable request.
-            "request_generation": request_generation,
-            # Urgency is audit-only. The handover frame and downstream
-            # action/service receive no speed, force, or timing override.
-            "urgency": urgency,
-            "urgency_applied_to_execution": False,
-            "reason": rejection_reason or resolver_reason or "accepted",
-            "resolver_reason": resolver_reason,
-            # Never persist the transcript on TwinEvent. The resolver owns
-            # transcript retention; ODT records only presence for audit.
-            "raw_text_present": bool(raw_text),
-            "normalized_text_present": bool(normalized_text),
-            "provenance": provenance,
-            "function_request_id": function_request_id,
-            "gateway_instance_id": gateway_instance_id,
-            "procedure_run_id": procedure_run_id,
-            "utterance_id": str(
-                getattr(msg, "utterance_id", "") or ""
-            ).strip(),
-            "source": str(getattr(msg, "source", "") or "").strip(),
-            "source_is_final": bool(
-                getattr(msg, "source_is_final", False)
-            ),
-        }
-        return resolved or tool_id, detail, "voice_command_intent"
-
-    def _on_request(self, msg: String) -> None:
-        resolved = ""
-        shadow_assumptions: list[dict] = []
-        completion_requested = bool(
-            getattr(
-                self,
-                "_enable_legacy_raw_procedure_completion_compatibility",
-                False,
-            )
-        )
-        if completion_requested:
-            completion_requested = self._twin.is_explicit_procedure_completion_request(
-                msg.data
-            )
-        if completion_requested:
-            request = SurgeonRequest()
-            request.stamp = self._stamp()
-            request.event_type = "request_procedure_completion"
-            request.voice_text = msg.data
-            request.note = "explicit public voice completion signal"
-            self._twin.update_surgeon_request(request)
-            self._clear_tool_prediction_state()
-        elif bool(
-            getattr(
-                self,
-                "_enable_legacy_raw_tool_handover_compatibility",
-                False,
-            )
-        ) and self._twin.is_explicit_voice_tool_request(msg.data):
-            resolved = self._twin.update_explicit_request(msg.data)
-            shadow_assumptions = self._twin.drain_shadow_assumption_audit()
-            if resolved:
-                self._append_tool_history(
-                    "_validated_tool_request_history",
-                    resolved,
-                    self._stamp(),
-                )
-                self._clear_tool_prediction_state()
-        for index, assumption in enumerate(shadow_assumptions):
-            event_type = str(assumption.get("event_type", "shadow_assumption"))
-            self._publish_reducer_decision_event(
-                input_type="shadow_state_assumption",
-                input_id=f"{event_type}:{resolved}:{index}",
-                input_source="public_voice_request",
-                accepted=True,
-                reason=str(assumption.get("reason", "")),
-                affected_tool=str(
-                    assumption.get("instrument_id")
-                    or assumption.get("incoming_request_tool")
-                    or resolved
-                ),
-                detail=assumption,
-            )
-        self._publish_event(
-            "VoiceTranscriptObserved",
-            instrument_id=resolved,
-            detail={
-                "text": msg.data,
-                "resolved_tool": resolved,
-                "command_type": (
-                    "procedure_completion"
-                    if completion_requested
-                    else "tool_request"
-                    if resolved
-                    else "observation"
-                ),
-                "shadow_assumptions": shadow_assumptions,
-            },
-            mode="voice_request",
-        )
-        if completion_requested or resolved:
-            self._publish_world_state()
-
+    # Voice command admission is owned by command_router. ODT receives
+    # only the resulting typed state updates and has no receipt/gateway path.
     def _on_surgeon_request(self, msg: SurgeonRequest) -> None:
         if (
             not bool(msg.override)
@@ -4695,6 +4735,7 @@ class ORDigitalTwinNode(Node):
         lifecycle_commands = {
             "start",
             "start_runtime",
+            "start_actors",
             "pause",
             "resume",
             "stop",
@@ -4751,48 +4792,69 @@ class ORDigitalTwinNode(Node):
             "reset",
         }:
             self._advance_visual_runtime_epoch()
+            self._advance_skill_event_runtime_epoch()
         if command in {"start", "start_runtime"}:
+            self._vlm_health_run_started_monotonic = time.monotonic()
             self._pending_bed_robot_arm_group_requests.clear()
-            self._recent_voice_intent_ids.clear()
             self._reset_hand_handover_state()
             self._clear_tool_histories()
-            self._twin.reset_spec(self._twin.spec, seed_from_perception=False)
+            # A new run must earn its n-gram dwell from zero.  Retaining the
+            # previous run's first_seen timestamp made preparation immediately
+            # ready after Reset (observed as 224 s / 55 s at run start).
+            self._clear_inactive_tool_policy_state()
+            # Start begins a new execution run from the current stopped Twin
+            # state.  It must not erase real-to-sim observations, instrument
+            # placement, or a researcher-authored pre-start adjustment.  The
+            # explicit `reset` control below is the only canonical-layout
+            # operation.
             self._twin.state.procedure_run_id = uuid.uuid4().hex
-            self._reset_bed_robot_controller_freshness()
-            self._stamp_all_bed_robot_arm_groups()
             self._phase_entered_ros_sec = self._stamp_sec(self._stamp())
             if start_phase_id:
                 self._twin.set_initial_phase(start_phase_id)
                 self._phase_entered_ros_sec = self._stamp_sec(self._stamp())
+            # ``start_runtime`` is deliberately emitted before the behaviour
+            # tree and controller-facing actors are ready.  Keeping the Twin
+            # in a distinct transitional state prevents UI/hand/VLM paths
+            # from treating the optimistic start acknowledgement as a fully
+            # executable procedure.  The manager sends ``start_actors`` only
+            # after the executor has confirmed that it is running.
+            self._twin.set_execution_state(
+                command == "start",
+                "running" if command == "start" else "starting",
+            )
+        elif command == "start_actors":
             self._twin.set_execution_state(True, "running")
         elif command == "pause":
+            self._vlm_health_run_started_monotonic = None
             self._suspend_hand_handover_state()
+            self._clear_inactive_tool_policy_state()
             self._twin.set_execution_state(True, "paused")
         elif command == "resume":
+            self._vlm_health_run_started_monotonic = time.monotonic()
             self._twin.set_execution_state(True, "running")
         elif command == "stop":
+            self._vlm_health_run_started_monotonic = None
             self._pending_bed_robot_arm_group_requests.clear()
             self._reset_hand_handover_state()
+            self._clear_inactive_tool_policy_state()
             self._twin.set_execution_state(False, "halted")
         elif command == "reset":
+            self._vlm_health_run_started_monotonic = None
             self._last_lifecycle_control_signature = None
             self._pending_bed_robot_arm_group_requests.clear()
-            self._recent_voice_intent_ids.clear()
             self._reset_hand_handover_state()
             self._clear_tool_histories()
+            self._clear_inactive_tool_policy_state()
             self._twin.reset_runtime()
             self._reset_bed_robot_controller_freshness()
             self._stamp_all_bed_robot_arm_groups()
             self._phase_entered_ros_sec = self._stamp_sec(self._stamp())
             self._twin.set_execution_state(False, "idle")
+        if command in {"stop", "reset"}:
+            self._apply_pending_scenario_config_if_quiescent()
         self._publish_world_state()
 
     def destroy_node(self):
-        with self._voice_gated_lock():
-            ledger = getattr(self, "_voice_intent_receipt_ledger", None)
-            if ledger is not None:
-                ledger.close()
-                self._voice_intent_receipt_ledger = None
         return super().destroy_node()
 
 

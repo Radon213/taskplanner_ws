@@ -4,10 +4,12 @@ string action
 string instrument_id
 string instrument_instance_id
 uint64 request_generation
-# Direct-hand replay fence. Both fields stay empty/zero for every non-direct
-# command. Together they identify one hand-signal episode within one accepted
-# procedure run across BT and execution-bridge process restarts.
+# Immutable execution interval for every command. Consumers must reject a
+# command whose run is not the currently active procedure run.
 string procedure_run_id
+# Direct-hand replay fence. This field stays zero for every non-direct command
+# and identifies one hand-signal episode within the run above across BT and
+# execution-bridge process restarts.
 uint64 implicit_request_generation
 # True only for a validated typed voice request. This provenance permits the
 # execution bridge to preempt a lower-priority humanoid tool-transfer Action;

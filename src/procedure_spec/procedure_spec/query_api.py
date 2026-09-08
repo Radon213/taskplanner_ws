@@ -5,7 +5,11 @@ from __future__ import annotations
 from collections.abc import Iterable
 import re
 
-from .models import InitialInstrumentState, ProcedureBundle
+from .models import (
+    InitialInstrumentState,
+    InstrumentPopulationSpec,
+    ProcedureBundle,
+)
 from .scenario_policy import ScenarioPolicy
 
 
@@ -201,6 +205,42 @@ class ProcedureSpec:
             instrument_id: int(instrument.inventory_count)
             for instrument_id, instrument in self._instruments.items()
         }
+
+    def get_tool_population(
+        self,
+        instrument_id: str,
+    ) -> InstrumentPopulationSpec:
+        """Return initial and observational bounds for an instrument type."""
+
+        instrument = self._instruments[instrument_id]
+        if instrument.population is not None:
+            return instrument.population
+        count = int(instrument.inventory_count)
+        return InstrumentPopulationSpec(
+            initial_count=count,
+            capacity=count,
+            exchangeable=False,
+        )
+
+    def get_tool_populations(self) -> dict[str, InstrumentPopulationSpec]:
+        return {
+            instrument_id: self.get_tool_population(instrument_id)
+            for instrument_id in self._instruments
+        }
+
+    def get_inventory_capacity(self, instrument_id: str) -> int:
+        """Return the observational slot capacity for an instrument type."""
+
+        return int(self.get_tool_population(instrument_id).capacity)
+
+    def get_tool_inventory_capacity(self) -> dict[str, int]:
+        return {
+            instrument_id: self.get_inventory_capacity(instrument_id)
+            for instrument_id in self._instruments
+        }
+
+    def is_exchangeable_population(self, instrument_id: str) -> bool:
+        return bool(self.get_tool_population(instrument_id).exchangeable)
 
     def list_ambiguous_instrument_aliases(self) -> dict[str, tuple[str, ...]]:
         return {

@@ -44,7 +44,7 @@ def test_surgeon_state_replays_only_past_confirmed_transfers() -> None:
     context = state.surgeon_state(events, 2.5)
     assert context["last_incoming_tool"] == "bovie"
     assert context["recent_incoming_tools"] == ["bovie"]
-    assert context["event_sourced_surgeon_owned"] == [{"tool_id": "allis_forceps", "count": 2}]
+    assert context["event_sourced_surgeon_owned"] == []
 
 
 def test_candidate_distribution_uses_specific_then_fallback() -> None:

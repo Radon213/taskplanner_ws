@@ -332,14 +332,13 @@ def _probe_runtime_command(args: argparse.Namespace, spec_dir) -> list[str]:
         f"default_bundle:={args.spec_name}",
         "enable_rosbridge:=false",
         "execution_backend:=mock",
-        "execution_contract:=direct",
         "robot_endpoint_source:=virtual",
         "retraction_endpoint_source:=virtual",
         "enable_runtime_route_control:=false",
-        # Virtual dispatch is lease-gated too.  Without the matching publisher
-        # the Action bridge correctly rejects every probe command as
-        # integration_readiness_lease_missing.
-        "require_integration_preflight:=true",
+        # Keep the optional observer enabled so this isolated probe reports
+        # synthetic CAM3/CAM4 diagnostics. The execution bridge does not use
+        # integration readiness as an Action admission lease.
+        "enable_integration_preflight_diagnostics:=true",
         "preflight_require_rfdetr_tool_observations:=true",
         f"cam3_tool_observations_topic:={PROBE_CAM3_TOOL_OBSERVATIONS_TOPIC}",
         f"cam4_tool_observations_topic:={PROBE_CAM4_TOOL_OBSERVATIONS_TOPIC}",

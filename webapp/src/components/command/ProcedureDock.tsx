@@ -1,12 +1,9 @@
 import { lazy, Suspense, useEffect, useRef, useState } from "react";
-import { AnimatePresence, useReducedMotion } from "framer-motion";
-import * as m from "framer-motion/m";
 import {
   CheckCircle2,
   CircleX,
   Clock3,
   GitBranch,
-  Monitor,
   Pause,
   Play,
   RadioTower,
@@ -18,28 +15,30 @@ import {
 import { SafetyConfirmationDialog } from "../common/SafetyConfirmationDialog";
 import {
   ExecutionRouteSelector,
-  type ExecutionEndpointReadiness,
   type ExecutionEndpointServerHealth,
   type ExecutionEndpointSource,
+  type ExecutionRouteSourceReadinessByOperation,
   type ExecutionRouteTransitionState,
 } from "./ExecutionRouteSelector";
 import {
-  integrationReadinessBlockReason,
   type ControlCommand,
   type ExecutionRouteInitializationState,
-  type IntegrationReadiness,
-  type IntegrationReadinessBlockReason,
-  type IntegrationReadinessChecklistItem,
   type RuntimeAuthorityStatus,
 } from "../../hooks/useRosBridge";
+import {
+  integrationReadinessDiagnosticReason,
+  type IntegrationReadiness,
+  type IntegrationReadinessDiagnosticReason,
+  type IntegrationReadinessChecklistItem,
+} from "../../ros/runtimeAdmissionMessages";
 import type { useDigitalTwinViewModel } from "../../hooks/useDigitalTwinViewModel";
 import type { RuntimeTransitionStatus } from "../../hooks/useRuntimeControl";
-import { shimmer, statusSwap } from "../../motion-system";
 import type { TaskplannerRuntimeMode } from "../../runtimeModes";
 import type {
   ScenarioRevisionApplyAdmission,
   ScenarioRevisionState,
 } from "../../ros/scenarioRevision";
+import type { RosbagRecordingStatus } from "../../ros/rosbagRecordingMessages";
 import { runtimeAuthorityCopy } from "../../utils/runtimeAuthorityCopy";
 
 type ViewModel = ReturnType<typeof useDigitalTwinViewModel>;
@@ -88,7 +87,7 @@ function integrationCheckLabel(check: string, language: ViewModel["language"]) {
 }
 
 function integrationReadinessCopy(
-  blocker: ReturnType<typeof integrationReadinessBlockReason>,
+  blocker: ReturnType<typeof integrationReadinessDiagnosticReason>,
   readiness: IntegrationReadiness | null,
   bundle: string,
   language: ViewModel["language"],
@@ -96,28 +95,28 @@ function integrationReadinessCopy(
   const isKorean = language === "ko";
   if (blocker === "missing") {
     return isKorean
-      ? "통합 시작 점검 상태를 기다리는 중입니다. 새 점검 결과가 도착할 때까지 수술 시작을 잠급니다."
-      : "Waiting for the integration-start check. Start remains locked until a fresh result arrives.";
+      ? "통합 점검 상태를 기다리는 중입니다. 이 정보는 관찰용이며 수술 시작을 잠그지 않습니다."
+      : "Waiting for the integration diagnostic. It is observational and does not lock Start.";
   }
   if (blocker === "stale") {
     return isKorean
-      ? "통합 시작 점검 상태가 만료되었습니다. 새 점검 결과가 도착할 때까지 수술 시작을 잠급니다."
-      : "The integration-start check expired. Start remains locked until a fresh result arrives.";
+      ? "통합 점검 상태가 만료되었습니다. 새 결과가 오면 표시를 갱신하지만 수술 시작을 잠그지 않습니다."
+      : "The integration diagnostic expired. A fresh result will update this display, but Start remains available.";
   }
   if (blocker === "bundle_mismatch") {
     const selected = bundle || (isKorean ? "선택된 수술" : "the selected procedure");
     const observed = readiness?.activeBundle || (isKorean ? "확인되지 않음" : "unconfirmed");
     return isKorean
-      ? `통합 점검은 ${observed} 기준입니다. ${selected}에 대한 새 점검 결과가 올 때까지 수술 시작을 잠급니다.`
-      : `The integration check is for ${observed}. Start remains locked until ${selected} has a fresh check.`;
+      ? `통합 점검은 ${observed} 기준입니다. ${selected}의 관찰 상태는 새 결과가 오면 갱신됩니다.`
+      : `The integration diagnostic is for ${observed}. ${selected} updates when fresh observation arrives.`;
   }
   if (blocker === "not_ready") {
     const missing = readiness?.missing
       .map((check) => integrationCheckLabel(check, language))
       .join(isKorean ? " · " : ", ");
     return isKorean
-      ? `통합 시작 점검이 아직 통과하지 않았습니다${missing ? `: ${missing}` : ""}.`
-      : `The integration-start check has not passed${missing ? `: ${missing}` : ""}.`;
+      ? `통합 점검에서 주의가 필요합니다${missing ? `: ${missing}` : ""}. 실행 endpoint가 요청을 수락하면 시작할 수 있습니다.`
+      : `The integration diagnostic needs attention${missing ? `: ${missing}` : ""}. Start remains available if the execution endpoint admits the request.`;
   }
   const actionSource = readiness?.robotEndpointSource ?? "external";
   const retractionSource = readiness?.retractionEndpointSource ?? actionSource;
@@ -141,14 +140,31 @@ function integrationReadinessCopy(
 }
 
 function integrationReadinessStateCopy(
-  blocker: IntegrationReadinessBlockReason | null,
+  blocker: IntegrationReadinessDiagnosticReason | null,
   language: ViewModel["language"],
 ) {
   const isKorean = language === "ko";
   if (blocker === null) return isKorean ? "통과" : "Passed";
-  if (blocker === "not_ready") return isKorean ? "미통과" : "Blocked";
+  if (blocker === "not_ready") return isKorean ? "주의 필요" : "Needs attention";
   if (blocker === "bundle_mismatch") return isKorean ? "번들 불일치" : "Bundle mismatch";
   return isKorean ? "점검 대기" : "Check pending";
+}
+
+function rosbagRecordingStateCopy(
+  status: RosbagRecordingStatus | null,
+  language: ViewModel["language"],
+) {
+  const isKorean = language === "ko";
+  if (!status) return isKorean ? "상태 수신 대기" : "Waiting for recorder status";
+  const labels: Record<RosbagRecordingStatus["state"], readonly [string, string]> = {
+    idle: ["대기", "Idle"],
+    starting: ["녹화 시작 중", "Starting recording"],
+    recording: ["녹화 중", "Recording"],
+    stopping: ["저장 중", "Saving"],
+    saved: ["저장됨", "Saved"],
+    failed: ["녹화 오류", "Recording error"],
+  };
+  return labels[status.state][isKorean ? 0 : 1];
 }
 
 function integrationReasonCopy(
@@ -199,7 +215,7 @@ function integrationTimestampCopy(stampSec: number | undefined, language: ViewMo
 
 function integrationPreflightItems(
   readiness: IntegrationReadiness | null,
-  blocker: IntegrationReadinessBlockReason | null,
+  blocker: IntegrationReadinessDiagnosticReason | null,
 ): readonly PreflightDisplayItem[] {
   const received = new Map(
     readiness?.checklist
@@ -254,7 +270,7 @@ function IntegrationPreflightPanel({
   language,
 }: {
   readiness: IntegrationReadiness | null;
-  blocker: IntegrationReadinessBlockReason | null;
+  blocker: IntegrationReadinessDiagnosticReason | null;
   selectedBundle: string;
   language: ViewModel["language"];
 }) {
@@ -342,12 +358,17 @@ export function ProcedureDock({
   onApplyBundle,
   startPhase,
   setStartPhase,
+  transportConnected,
   connected,
   runtimeAuthorityStatus,
   actionPending,
   actionMessage,
   runtimeMessage,
   runtimeReady,
+  rosbagRecording,
+  rosbagRecordingControlPending,
+  rosbagRecordingControlMessage,
+  onRosbagRecordingControl,
   integrationReadiness,
   integrationReadinessReceivedAt,
   executionRoute,
@@ -356,7 +377,6 @@ export function ProcedureDock({
   isPaused,
   canPauseResume,
   onControl,
-  onOpenMonitor,
 }: {
   vm: ViewModel;
   url: string;
@@ -375,12 +395,18 @@ export function ProcedureDock({
   onApplyBundle: () => void;
   startPhase: string;
   setStartPhase: (phaseId: string) => void;
+  /** Transport is enough for the independent recorder Service; no scenario state is required. */
+  transportConnected: boolean;
   connected: boolean;
   runtimeAuthorityStatus: RuntimeAuthorityStatus;
   actionPending: string;
   actionMessage: string;
   runtimeMessage: string;
   runtimeReady: boolean;
+  rosbagRecording: RosbagRecordingStatus | null;
+  rosbagRecordingControlPending: string;
+  rosbagRecordingControlMessage: string;
+  onRosbagRecordingControl: (enabled: boolean) => void | Promise<unknown>;
   integrationReadiness: IntegrationReadiness | null;
   integrationReadinessReceivedAt: number | null;
   /** Live-only, server-confirmed Action/Service route selection surface. */
@@ -388,9 +414,7 @@ export function ProcedureDock({
     currentSource: ExecutionEndpointSource | null;
     currentRetractionSource: ExecutionEndpointSource | null;
     initializationState: ExecutionRouteInitializationState | null;
-    sourceReadiness: Readonly<
-      Partial<Record<ExecutionEndpointSource, ExecutionEndpointReadiness>>
-    >;
+    sourceReadiness: ExecutionRouteSourceReadinessByOperation;
     sourceHealth: Readonly<
       Partial<Record<ExecutionEndpointSource, ExecutionEndpointServerHealth>>
     >;
@@ -408,11 +432,8 @@ export function ProcedureDock({
   isPaused: boolean;
   canPauseResume: boolean;
   onControl: (command: ControlCommand) => void;
-  /** Opens the read-only SurgiMate workspace; it never starts or controls a run. */
-  onOpenMonitor?: () => void;
 }) {
   const [resetConfirmationOpen, setResetConfirmationOpen] = useState(false);
-  const reducedMotion = useReducedMotion();
   const runtimeSwitchPending = runtimeTransition.phase === "starting";
   const runtimeSwitchStartedAtRef = useRef<number | null>(null);
   const [runtimeSwitchNow, setRuntimeSwitchNow] = useState(() => Date.now());
@@ -444,8 +465,23 @@ export function ProcedureDock({
     runtimeTransition.diagnosticCode === "runtime_profile_mismatch";
   const startInFlight = executionState === "starting" || actionPending.toLowerCase().includes("starting");
   const commandBusy = Boolean(actionPending);
+  const rosbagRecordingActive = Boolean(rosbagRecording?.recordingActive);
+  const rosbagRecordingTransitioning =
+    rosbagRecording?.state === "starting" || rosbagRecording?.state === "stopping";
+  const rosbagRecordingDisabled =
+    !transportConnected || Boolean(rosbagRecordingControlPending) || rosbagRecordingTransitioning;
+  const rosbagRecordingStatusCopy = rosbagRecordingStateCopy(rosbagRecording, vm.language);
+  const rosbagRecordingDetail = rosbagRecordingControlMessage
+    || rosbagRecording?.message
+    || (transportConnected
+      ? vm.language === "ko"
+        ? "수동으로 시작·종료합니다. 시나리오 상태와 무관합니다."
+        : "Start and stop manually; scenario state is not used."
+      : vm.language === "ko"
+        ? "ROS 전송 연결이 준비되면 사용할 수 있습니다."
+        : "Available when the ROS transport is connected.");
   const integrationStartBlocker = runtimeMode === "live"
-    ? integrationReadinessBlockReason(
+    ? integrationReadinessDiagnosticReason(
         integrationReadiness,
         integrationReadinessReceivedAt,
         activeBundle,
@@ -455,8 +491,8 @@ export function ProcedureDock({
   const liveRouteInitializing =
     runtimeMode === "live" && executionRoute?.initializationState === "initializing";
   const routeInitializationMessage = vm.language === "ko"
-    ? "새 Action·Service 경로를 통합 시작 점검에 적용하는 중입니다. 적용 확인 전에는 수술 시작이 잠깁니다."
-    : "Applying the new Action/Service route to the integration start check. Start remains locked until it is acknowledged.";
+    ? "실행 경로를 준비 중입니다. 준비가 완료될 때까지 시작할 수 없습니다."
+    : "Preparing the execution route. Start is unavailable until preparation completes.";
   const integrationReadinessMessage = integrationReadinessCopy(
     integrationStartBlocker,
     integrationReadiness,
@@ -464,15 +500,15 @@ export function ProcedureDock({
     vm.language,
   );
   const runtimeProfileMismatchMessage = vm.language === "ko"
-    ? "표시된 실제 통합 모드와 실행 중인 런타임 프로필이 다릅니다. 통합 점검 발행자가 없으므로 시작하지 않습니다. ‘현재 모드 시작’으로 검증된 런타임을 다시 시작하세요."
-    : "The displayed Live mode does not match the running runtime profile. No integration preflight publisher is available, so start remains locked. Restart the displayed mode through the runtime control.";
+    ? "표시된 실제 통합 모드와 실행 중인 런타임 프로필이 다릅니다. ‘현재 모드 시작’으로 올바른 런타임을 다시 시작하세요."
+    : "The displayed Live mode does not match the running runtime profile. Restart the displayed mode through runtime control.";
   const effectiveIntegrationReadinessMessage = runtimeProfileMismatch
     ? runtimeProfileMismatchMessage
     : liveRouteInitializing
       ? routeInitializationMessage
       : integrationReadinessMessage;
-  const liveStartGateBlocked = runtimeProfileMismatch || Boolean(integrationStartBlocker) || liveRouteInitializing;
-  const liveResumeGateBlocked = runtimeMode === "live" && isPaused && liveStartGateBlocked;
+  const liveStartControlBlocked = runtimeProfileMismatch || liveRouteInitializing;
+  const liveResumeControlBlocked = runtimeMode === "live" && isPaused && liveStartControlBlocked;
   const runtimeModeLocked =
     !allowRuntimeModeSelection ||
     runtimeStatusChecking ||
@@ -484,9 +520,9 @@ export function ProcedureDock({
     scenarioRevision.phase === "previewing" || scenarioRevision.phase === "applying";
   const bundleSelectDisabled = formDisabled || bundleRevisionBusy;
   const phaseSelectDisabled = disabled || commandBusy || isRunning || startInFlight;
-  const startDisabled = disabled || commandBusy || !runtimeReady || liveStartGateBlocked || isRunning || startInFlight;
+  const startDisabled = disabled || commandBusy || !runtimeReady || liveStartControlBlocked || isRunning || startInFlight;
   const pauseResumeDisabled =
-    disabled || commandBusy || startInFlight || !canPauseResume || liveResumeGateBlocked;
+    disabled || commandBusy || startInFlight || !canPauseResume || liveResumeControlBlocked;
   const resetDisabled = disabled || commandBusy || startInFlight;
   const stopDisabled =
     !connected || runtimeStatusChecking || runtimeSwitchPending || (!isRunning && !isPaused && !startInFlight && !commandBusy);
@@ -601,20 +637,6 @@ export function ProcedureDock({
   const operationLabel = runtimeSwitchPending
     ? vm.language === "ko" ? "런타임을 안전하게 전환하는 중" : "Switching runtime safely"
     : vm.language === "ko" ? "제어 요청 결과를 확인하는 중" : "Waiting for control result";
-  const monitorHandoffCopy = runtimeMode !== "live"
-    ? null
-    : startInFlight
-      ? vm.language === "ko"
-        ? ["시작 승인 확인 중", "승인되면 수술 관제는 공개 상태를 자동 수신합니다."]
-        : ["Confirming start admission", "SurgiMate receives the public state after admission."]
-      : isRunning
-        ? vm.language === "ko"
-          ? ["실행 상태 관찰 가능", "수술 관제는 읽기 전용 공개 상태를 표시합니다."]
-          : ["Run state available", "SurgiMate displays the read-only public state."]
-        : vm.language === "ko"
-          ? ["시작 전 관제 준비", "수술 시작 후 공개 상태가 수술 관제에 표시됩니다."]
-          : ["Monitoring ready", "The public state appears in SurgiMate after surgery starts."];
-
   return (
     <>
       <aside
@@ -651,7 +673,7 @@ export function ProcedureDock({
             className={[
               "dock-action-message",
               "integration-readiness-message",
-              liveStartGateBlocked ? "error" : "pending",
+              liveStartControlBlocked ? "error" : "pending",
             ].join(" ")}
             data-slot="integration-readiness"
             id="integration-readiness-status"
@@ -660,7 +682,7 @@ export function ProcedureDock({
             {effectiveIntegrationReadinessMessage}
           </div>
           <IntegrationPreflightPanel
-            blocker={liveRouteInitializing ? "missing" : integrationStartBlocker}
+            blocker={integrationStartBlocker}
             language={vm.language}
             readiness={integrationReadiness}
             selectedBundle={bundle}
@@ -683,25 +705,16 @@ export function ProcedureDock({
         </>
       ) : null}
 
-      <AnimatePresence initial={false}>
-        {operationBusy ? (
-          <m.div
-            {...statusSwap}
-            aria-label={operationLabel}
-            aria-valuetext={operationLabel}
-            className="operation-progress"
-            key="operation-progress"
-            role="progressbar"
-          >
-            <m.span
-              animate={reducedMotion ? undefined : shimmer.animate}
-              aria-hidden="true"
-              className="operation-progress-bar"
-              transition={reducedMotion ? undefined : shimmer.transition}
-            />
-          </m.div>
-        ) : null}
-      </AnimatePresence>
+      {operationBusy ? (
+        <div
+          aria-label={operationLabel}
+          aria-valuetext={operationLabel}
+          className="operation-progress"
+          role="progressbar"
+        >
+          <span aria-hidden="true" className="operation-progress-bar" />
+        </div>
+      ) : null}
 
       <div className="control-stack">
         <label className="field">
@@ -834,30 +847,96 @@ export function ProcedureDock({
             ))}
           </select>
         </label>
+
+        {runtimeMode === "live" ? (
+          <section
+            aria-busy={Boolean(rosbagRecordingControlPending)}
+            className={[
+              "rosbag-recording-control",
+              rosbagRecordingActive ? "is-recording" : "",
+              rosbagRecording?.state === "failed" ? "is-failed" : "",
+            ].filter(Boolean).join(" ")}
+            data-slot="rosbag-recording-control"
+          >
+            <div className="rosbag-recording-heading">
+              <div>
+                <p>ROSbag2 · MCAP</p>
+                <strong>{rosbagRecordingStatusCopy}</strong>
+              </div>
+              <span aria-label={rosbagRecordingStatusCopy} data-state={rosbagRecording?.state ?? "unknown"}>
+                {rosbagRecordingActive
+                  ? vm.language === "ko" ? "수동 녹화" : "Manual recording"
+                  : vm.language === "ko" ? "독립 제어" : "Independent control"}
+              </span>
+            </div>
+            <p className="rosbag-recording-note" id="rosbag-recording-note">
+              {vm.language === "ko"
+                ? "표시되는 ROS 상태·영상은 기록됩니다. 화면 픽셀 캡처가 아니며, 재생에는 동일 앱 빌드가 필요합니다."
+                : "Visible ROS state and video are recorded, not screen pixels. Replay needs the same app build."}
+            </p>
+            <button
+              aria-describedby="rosbag-recording-note rosbag-recording-status"
+              aria-pressed={rosbagRecordingActive}
+              className={[
+                "button",
+                "rosbag-recording-toggle",
+                rosbagRecordingActive ? "button-stop" : "button-secondary",
+              ].join(" ")}
+              disabled={rosbagRecordingDisabled}
+              onClick={() => void onRosbagRecordingControl(!rosbagRecordingActive)}
+              type="button"
+            >
+              {rosbagRecordingActive ? (
+                <Square aria-hidden="true" size={16} />
+              ) : (
+                <RadioTower aria-hidden="true" size={16} />
+              )}
+              {rosbagRecordingControlPending
+                ? vm.language === "ko"
+                  ? rosbagRecordingControlPending === "start" ? "녹화 시작 중" : "저장 중"
+                  : rosbagRecordingControlPending === "start" ? "Starting recording" : "Saving recording"
+                : rosbagRecordingActive
+                  ? vm.language === "ko" ? "녹화 종료" : "Stop recording"
+                  : vm.language === "ko" ? "녹화 시작" : "Start recording"}
+            </button>
+            <div
+              aria-atomic="true"
+              aria-live={rosbagRecording?.state === "failed" ? "assertive" : "polite"}
+              className="rosbag-recording-status"
+              id="rosbag-recording-status"
+              role={rosbagRecording?.state === "failed" ? "alert" : "status"}
+            >
+              <span>{rosbagRecordingDetail}</span>
+              {rosbagRecording?.outputDir ? (
+                <code title={rosbagRecording.outputDir}>{rosbagRecording.outputDir}</code>
+              ) : null}
+            </div>
+          </section>
+        ) : null}
       </div>
 
         <div className="transport-controls" aria-label={vm.ui.control}>
         <button
           aria-describedby={runtimeProfileMismatch
             ? "runtime-transition-status"
-            : liveStartGateBlocked ? "integration-readiness-status" : undefined}
+            : liveStartControlBlocked ? "integration-readiness-status" : undefined}
           className="button button-primary"
           disabled={startDisabled}
           onClick={() => onControl("start")}
-          title={liveStartGateBlocked ? effectiveIntegrationReadinessMessage : undefined}
+          title={liveStartControlBlocked ? effectiveIntegrationReadinessMessage : undefined}
           type="button"
         >
           <Play aria-hidden="true" size={17} />
           {runtimeProfileMismatch
             ? vm.language === "ko" ? "런타임 복구 필요" : "Runtime recovery required"
-            : runtimeReady && !liveStartGateBlocked ? vm.ui.start : vm.ui.preparing}
+            : runtimeReady && !liveStartControlBlocked ? vm.ui.start : vm.ui.preparing}
         </button>
         <button
           className="button button-secondary"
           disabled={pauseResumeDisabled}
-          aria-describedby={liveResumeGateBlocked ? "integration-readiness-status" : undefined}
+          aria-describedby={liveResumeControlBlocked ? "integration-readiness-status" : undefined}
           onClick={() => onControl(isPaused ? "resume" : "pause")}
-          title={liveResumeGateBlocked ? effectiveIntegrationReadinessMessage : undefined}
+          title={liveResumeControlBlocked ? effectiveIntegrationReadinessMessage : undefined}
           type="button"
         >
           {isPaused ? <Play aria-hidden="true" size={17} /> : <Pause aria-hidden="true" size={17} />}
@@ -880,19 +959,6 @@ export function ProcedureDock({
             : vm.ui.stop}
         </button>
         </div>
-        {runtimeMode === "live" && monitorHandoffCopy && onOpenMonitor ? (
-          <section className="monitor-handoff" data-slot="surgical-monitor-handoff">
-            <div>
-              <span>{vm.language === "ko" ? "수술 관제 연결" : "Surgical monitoring"}</span>
-              <strong>{monitorHandoffCopy[0]}</strong>
-              <small>{monitorHandoffCopy[1]}</small>
-            </div>
-            <button className="button button-quiet" onClick={onOpenMonitor} type="button">
-              <Monitor aria-hidden="true" size={16} />
-              {vm.language === "ko" ? "수술 관제 열기" : "Open SurgiMate"}
-            </button>
-          </section>
-        ) : null}
         {runtimeMode === "live" ? (
           <small className="runtime-mode-lock-note" id="live-stop-scope-note" role="status">
             {vm.language === "ko"

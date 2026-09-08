@@ -7,8 +7,8 @@ target: first_subsequent_supported_scrub_nurse_to_surgeon_handover_regardless_of
 metadata:
   fit_partition: development_calibration
   fit_source: reviewed_confirmed_scrub_nurse_to_surgeon_transitions
-  eligible_transition_count: 74
-  unsupported_transition_count: 34
+  eligible_transition_count: 82
+  unsupported_transition_count: 26
   history_boundary: unsupported_or_unknown_handover_resets_suffix
   model_visible_fields:
   - id
@@ -103,6 +103,8 @@ rules:
   history:
   - T02
   outcomes:
+  - tool: T08
+    count: 4
   - tool: T07
     count: 3
   - tool: T02
@@ -119,17 +121,62 @@ rules:
   phase: P05
   history: []
   outcomes:
-  - tool: T07
-    count: 6
   - tool: T04
+    count: 1
+- match: phase+last3
+  phase: P05
+  history:
+  - T02
+  - T02
+  - T07
+  outcomes:
+  - tool: T08
+    count: 1
+- match: phase+last3
+  phase: P05
+  history:
+  - T02
+  - T07
+  outcomes:
+  - tool: T08
     count: 3
+- match: phase+last3
+  phase: P05
+  history:
+  - T02
+  - T07
+  - T08
+  outcomes:
+  - tool: T04
+    count: 2
+  - tool: T07
+    count: 2
+- match: phase+last3
+  phase: P05
+  history:
+  - T02
+  - T08
+  outcomes:
+  - tool: T07
+    count: 4
+- match: phase+last3
+  phase: P06
+  history:
+  - T02
+  - T08
+  - T07
+  outcomes:
+  - tool: T04
+    count: 4
 - match: phase+last3
   phase: P06
   history:
   - T07
+  - T08
+  - T07
   outcomes:
   - tool: T04
-    count: 6
+    count: 2
 - match: phase+last2
   phase: P03
   history: []
@@ -199,6 +246,8 @@ rules:
   history:
   - T02
   outcomes:
+  - tool: T08
+    count: 4
   - tool: T07
     count: 3
   - tool: T02
@@ -215,13 +264,38 @@ rules:
   phase: P05
   history: []
   outcomes:
-  - tool: T07
-    count: 6
   - tool: T04
-    count: 3
+    count: 1
+- match: phase+last2
+  phase: P05
+  history:
+  - T02
+  - T07
+  outcomes:
+  - tool: T08
+    count: 4
+- match: phase+last2
+  phase: P05
+  history:
+  - T02
+  - T08
+  outcomes:
+  - tool: T07
+    count: 4
+- match: phase+last2
+  phase: P05
+  history:
+  - T07
+  - T08
+  outcomes:
+  - tool: T04
+    count: 2
+  - tool: T07
+    count: 2
 - match: phase+last2
   phase: P06
   history:
+  - T08
   - T07
   outcomes:
   - tool: T04
@@ -274,16 +348,32 @@ rules:
   outcomes:
   - tool: T07
     count: 4
+  - tool: T08
+    count: 4
   - tool: T02
     count: 1
 - match: phase+last1
   phase: P05
   history: []
   outcomes:
+  - tool: T04
+    count: 1
+- match: phase+last1
+  phase: P05
+  history:
+  - T07
+  outcomes:
+  - tool: T08
+    count: 4
+- match: phase+last1
+  phase: P05
+  history:
+  - T08
+  outcomes:
   - tool: T07
     count: 6
   - tool: T04
-    count: 3
+    count: 2
 - match: phase+last1
   phase: P06
   history:
@@ -309,12 +399,16 @@ rules:
     count: 9
   - tool: T07
     count: 4
+  - tool: T08
+    count: 4
 - match: phase
   phase: P05
   history: []
   outcomes:
   - tool: T07
     count: 6
+  - tool: T08
+    count: 4
   - tool: T04
     count: 3
 - match: phase
@@ -329,15 +423,17 @@ rules:
   - tool: T02
     count: 18
   - tool: T07
-    count: 11
+    count: 5
   - tool: T04
-    count: 3
+    count: 1
 - match: last3
   history:
   - T02
   outcomes:
   - tool: T02
     count: 6
+  - tool: T08
+    count: 4
   - tool: T04
     count: 3
   - tool: T07
@@ -359,6 +455,14 @@ rules:
   outcomes:
   - tool: T07
     count: 3
+- match: last3
+  history:
+  - T02
+  - T02
+  - T07
+  outcomes:
+  - tool: T08
+    count: 1
 - match: last3
   history:
   - T02
@@ -376,6 +480,38 @@ rules:
     count: 4
 - match: last3
   history:
+  - T02
+  - T07
+  outcomes:
+  - tool: T08
+    count: 3
+- match: last3
+  history:
+  - T02
+  - T07
+  - T08
+  outcomes:
+  - tool: T04
+    count: 2
+  - tool: T07
+    count: 2
+- match: last3
+  history:
+  - T02
+  - T08
+  outcomes:
+  - tool: T07
+    count: 4
+- match: last3
+  history:
+  - T02
+  - T08
+  - T07
+  outcomes:
+  - tool: T04
+    count: 4
+- match: last3
+  history:
   - T04
   - T07
   - T04
@@ -387,7 +523,7 @@ rules:
   - T07
   outcomes:
   - tool: T04
-    count: 11
+    count: 5
 - match: last3
   history:
   - T07
@@ -395,21 +531,31 @@ rules:
   outcomes:
   - tool: T04
     count: 1
+- match: last3
+  history:
+  - T07
+  - T08
+  - T07
+  outcomes:
+  - tool: T04
+    count: 2
 - match: last2
   history: []
   outcomes:
   - tool: T02
     count: 18
   - tool: T07
-    count: 11
+    count: 5
   - tool: T04
-    count: 3
+    count: 1
 - match: last2
   history:
   - T02
   outcomes:
   - tool: T02
     count: 6
+  - tool: T08
+    count: 4
   - tool: T04
     count: 3
   - tool: T07
@@ -430,6 +576,20 @@ rules:
   outcomes:
   - tool: T07
     count: 5
+- match: last2
+  history:
+  - T02
+  - T07
+  outcomes:
+  - tool: T08
+    count: 4
+- match: last2
+  history:
+  - T02
+  - T08
+  outcomes:
+  - tool: T07
+    count: 4
 - match: last2
   history:
   - T04
@@ -442,7 +602,7 @@ rules:
   - T07
   outcomes:
   - tool: T04
-    count: 11
+    count: 5
 - match: last2
   history:
   - T07
@@ -452,15 +612,31 @@ rules:
     count: 3
   - tool: T04
     count: 1
+- match: last2
+  history:
+  - T07
+  - T08
+  outcomes:
+  - tool: T04
+    count: 2
+  - tool: T07
+    count: 2
+- match: last2
+  history:
+  - T08
+  - T07
+  outcomes:
+  - tool: T04
+    count: 6
 - match: last1
   history: []
   outcomes:
   - tool: T02
     count: 18
   - tool: T07
-    count: 11
+    count: 5
   - tool: T04
-    count: 3
+    count: 1
 - match: last1
   history:
   - T02
@@ -470,6 +646,8 @@ rules:
   - tool: T02
     count: 6
   - tool: T07
+    count: 4
+  - tool: T08
     count: 4
 - match: last1
   history:
@@ -487,6 +665,16 @@ rules:
   outcomes:
   - tool: T04
     count: 15
+  - tool: T08
+    count: 4
+- match: last1
+  history:
+  - T08
+  outcomes:
+  - tool: T07
+    count: 6
+  - tool: T04
+    count: 2
 - match: global
   history: []
   outcomes:
@@ -496,3 +684,5 @@ rules:
     count: 27
   - tool: T07
     count: 20
+  - tool: T08
+    count: 8

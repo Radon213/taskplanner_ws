@@ -14,6 +14,7 @@ from vlm_node.real_vlm import (
     INFERENCE_TRIGGER_PERIODIC_LIVE,
     INFERENCE_TRIGGER_SPEECH,
     VLM_PROMPT_MAX_CHARS,
+    _minimal_typed_tool_detection_context,
     InferenceBackpressure,
     RealVLMNode,
     actor_log_model_context,
@@ -632,6 +633,150 @@ def test_actor_log_prompt_budget_keeps_typed_rfdetr_boxes_ahead_of_long_asr() ->
     assert perception["freshness"]["cam_3"]["status"] == "fresh"
     assert perception["tool_detection_views"][0]["instances"][0]["tool_id"] == "T02"
     assert "ambient ambient ambient" not in compact_prompt_json(request_context)
+
+
+def test_actor_log_tight_context_keeps_three_distinct_cam4_mayo_tools() -> None:
+    """A compact Live request retains the bounded Mayo-facing CAM4 set."""
+
+    cam4_instances = [
+        {
+            "tool_id": tool_id,
+            "class_name": class_name,
+            "confidence": confidence,
+            "bbox_xyxy_norm": bbox,
+            "center_uv_norm": center,
+            "image_region": "middle_right",
+        }
+        for tool_id, class_name, confidence, bbox, center in (
+            ("T04", "Bovie", 0.842, [0.10, 0.10, 0.26, 0.72], [0.18, 0.41]),
+            ("T07", "Bipolar Forceps", 0.841, [0.34, 0.12, 0.48, 0.72], [0.41, 0.42]),
+            ("T08", "Mosquito Forceps", 0.897, [0.61, 0.09, 0.76, 0.71], [0.69, 0.40]),
+        )
+    ]
+    perception = {
+        "schema": "taskplanner.rfdetr_multiview_tool_context.v1",
+        "source": "rfdetr_tool_observation_2d",
+        "ground_truth": False,
+        "mask_rle_forwarded_to_vlm": False,
+        "flir_reference_stamp_sec": 42.0,
+        "max_source_skew_sec": 0.2,
+        "freshness": {
+            "cam_3": {"status": "fresh", "received_age_sec": 0.01},
+            "cam_4": {"status": "fresh", "received_age_sec": 0.02},
+        },
+        "visual_alignment": {
+            "cam_3": {
+                "status": "aligned",
+                "detector_stamp_sec": 42.0,
+                "offset_sec": 0.0,
+            },
+            "cam_4": {
+                "status": "aligned",
+                "detector_stamp_sec": 42.01,
+                "offset_sec": 0.01,
+            },
+        },
+        "tool_detection_views": [
+            {
+                "view": "cam_3",
+                "source_stamp_sec": 42.0,
+                "sequence": 17,
+                "model_version": "rfdetr-small",
+                "ontology_version": "tool-v1",
+                "detection_status": "detections",
+                "truncated": False,
+                "instances": [
+                    {
+                        "tool_id": "T02",
+                        "class_name": "Adson Forceps",
+                        "confidence": 0.91,
+                        "bbox_xyxy_norm": [0.1, 0.2, 0.4, 0.6],
+                        "center_uv_norm": [0.25, 0.4],
+                        "image_region": "middle_left",
+                    },
+                    {
+                        "tool_id": "T01",
+                        "class_name": "Allis Forceps",
+                        "confidence": 0.8,
+                        "bbox_xyxy_norm": [0.5, 0.2, 0.7, 0.6],
+                        "center_uv_norm": [0.6, 0.4],
+                        "image_region": "middle_left",
+                    },
+                ],
+            },
+            {
+                "view": "cam_4",
+                "source_stamp_sec": 42.01,
+                "sequence": 18,
+                "model_version": "rfdetr-small",
+                "ontology_version": "tool-v1",
+                "detection_status": "detections",
+                "truncated": False,
+                "instances": cam4_instances,
+            },
+        ],
+    }
+
+    # The direct compact form is the final tight-prompt fallback.  It keeps
+    # CAM3's historical one-row budget while retaining the three separately
+    # observed Mayo instruments on CAM4.
+    reduced = _minimal_typed_tool_detection_context(perception)
+    reduced_views = {
+        row["view"]: row
+        for row in reduced["tool_detection_views"]
+    }
+    assert [row["tool_id"] for row in reduced_views["cam_3"]["instances"]] == [
+        "T02"
+    ]
+    assert [row["tool_id"] for row in reduced_views["cam_4"]["instances"]] == [
+        "T04",
+        "T07",
+        "T08",
+    ]
+
+    # A long ASR row forces the actor-log request reducer, yet the bounded
+    # typed CAM4 set still survives under the complete prompt budget.
+    request_context = actor_log_request_context(
+        {
+            "proc": "thyroidectomy_demo",
+            "phase_search_mode": "temporal_prior",
+            "evidence_window": {
+                "speech": [{"text": "ambient " * 2_000, "at": 42.0}],
+                "skill_status": [],
+            },
+            "visual_input": {
+                "image_source": "flir_cam4_rfdetr_segmented",
+                "image_layout": "flir_left_cam4_right",
+                "cam4_image_forwarded_to_vlm": True,
+                "detector_advisory": True,
+            },
+            "observable_perception": perception,
+            "digital_twin": {
+                "hands": {"right": "", "left": ""},
+                "tools": [{"id": f"T{index:02d}"} for index in range(64)],
+            },
+        },
+        static_prompt_chars=14_000,
+    )
+    request_views = {
+        row["view"]
+        : row
+        for row in request_context["observable_perception"]["tool_detection_views"]
+    }
+
+    assert 14_000 + len(compact_prompt_json(request_context)) <= VLM_PROMPT_MAX_CHARS
+    assert [row["tool_id"] for row in request_views["cam_3"]["instances"]] == [
+        "T02"
+    ]
+    assert [row["tool_id"] for row in request_views["cam_4"]["instances"]] == [
+        "T04",
+        "T07",
+        "T08",
+    ]
+    assert (
+        len(request_context["evidence_window"]["speech"][-1]["text"])
+        <= 160
+    )
 
 
 def test_model_context_excludes_ranked_feedback_but_keeps_public_evidence() -> None:
@@ -1382,8 +1527,33 @@ def test_new_public_transcript_queues_one_nonblocking_inference() -> None:
     node._active = True
     node._response_mode = "live"
 
-    node._on_request_text(SimpleNamespace(data="Bovie"))
-    node._on_request_text(SimpleNamespace(data="Bovie"))
+    utterance = SimpleNamespace(
+        utterance_id="utterance-1",
+        text="Bovie",
+        speaker_role="surgeon",
+        is_final=True,
+        end_stamp=Time(sec=10),
+        stamp=Time(sec=10),
+        language="ko",
+        source="test",
+    )
+    node._gateway_instance_id = "gateway-1"
+    node._procedure_run_id = "run-1"
+    seen_utterance_ids: set[str] = set()
+
+    def enqueue_once(**kwargs):
+        utterance_id = kwargs["utterance_id"]
+        if utterance_id in seen_utterance_ids:
+            return None
+        seen_utterance_ids.add(utterance_id)
+        return SimpleNamespace(text=kwargs["text"], utterance_id=utterance_id)
+
+    node._dialogue_turn_gate = SimpleNamespace(
+        enqueue=enqueue_once
+    )
+
+    node._on_speech_utterance(utterance)
+    node._on_speech_utterance(utterance)
 
     assert node._inference_backpressure.snapshot()["pending_trigger"] == (
         INFERENCE_TRIGGER_SPEECH
@@ -1401,7 +1571,6 @@ def test_voice_twin_event_and_text_topic_trigger_only_once() -> None:
     )
 
     node._ingest_public_twin_event(voice_event, {"voice_text": "Adson"})
-    node._on_request_text(SimpleNamespace(data="Adson"))
 
     assert node._inference_backpressure.snapshot()["pending_trigger"] == (
         INFERENCE_TRIGGER_SPEECH
@@ -1451,7 +1620,8 @@ def test_real_vlm_does_not_subscribe_to_validation_truth_topics() -> None:
     assert '"/surgeon/outward_signal"' not in init_source
     assert '"/surgeon/request"' not in init_source
     assert '"/bt/decision"' not in init_source
-    assert '"/surgery/audio/request_text"' in init_source
+    assert '"/surgery/audio/observed_utterance"' in init_source
+    assert '"/surgery/audio/request_text"' not in init_source
 
 
 def test_public_perception_context_is_bounded_observer_evidence() -> None:

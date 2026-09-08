@@ -1921,64 +1921,33 @@
 }
 
 .debug-pipeline-card,
-.debug-vlm-runtime-card,
-.debug-vlm-output-card,
 .debug-endpoint-source-card {
   display: grid;
   gap: 12px;
 }
 
-.debug-vlm-skeleton {
+.debug-panel-skeleton {
   display: grid;
   min-height: 124px;
   align-content: center;
   gap: 10px;
 }
 
-.debug-vlm-skeleton > span {
+.debug-panel-skeleton > span {
   display: block;
   height: 14px;
   border-radius: 999px;
   background: linear-gradient(90deg, color-mix(in srgb, var(--line) 72%, transparent), color-mix(in srgb, var(--soft) 14%, transparent), color-mix(in srgb, var(--line) 72%, transparent));
   background-size: 200% 100%;
-  animation: debug-vlm-shimmer 1.35s linear infinite;
+  animation: debug-panel-shimmer 1.35s linear infinite;
 }
 
-.debug-vlm-skeleton > span:nth-child(2) {
+.debug-panel-skeleton > span:nth-child(2) {
   width: 82%;
 }
 
-.debug-vlm-skeleton > span:nth-child(3) {
+.debug-panel-skeleton > span:nth-child(3) {
   width: 58%;
-}
-
-.debug-vlm-output {
-  display: grid;
-  gap: 10px;
-}
-
-.debug-vlm-runtime-actions {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 8px;
-}
-
-.debug-vlm-runtime-actions .button {
-  min-height: 44px;
-}
-
-.debug-vlm-output > code {
-  display: block;
-  max-height: 280px;
-  padding: 12px;
-  overflow: auto;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  background: color-mix(in srgb, var(--bg) 64%, transparent);
-  color: var(--clinical-strong);
-  font-size: 11px;
-  line-height: 1.55;
-  white-space: pre-wrap;
 }
 
 .debug-empty-state .button {
@@ -1999,7 +1968,7 @@
   50% { opacity: 0.52; }
 }
 
-@keyframes debug-vlm-shimmer {
+@keyframes debug-panel-shimmer {
   to { background-position: -200% 0; }
 }
 
@@ -2057,14 +2026,11 @@
     width: 100%;
   }
 
-  .debug-vlm-runtime-actions {
-    grid-template-columns: 1fr;
-  }
 }
 
 @media (prefers-reduced-motion: reduce) {
   .debug-flow-strip li.pending > span,
-  .debug-vlm-skeleton > span {
+  .debug-panel-skeleton > span {
     animation-duration: 0.01ms;
     animation-iteration-count: 1;
   }

@@ -32,6 +32,461 @@ taskplanner_compose_stop_remove() {
     rm -f "${services[@]}"
 }
 
+taskplanner_runtime_service_for_mode() {
+  # The service that represents a selected mode is an owner-registry fact,
+  # not a second launcher-maintained table.  `anchor` returns
+  # owner|service|compose-profile|restart-strategy.
+  local anchor owner service _profile _strategy
+  anchor="$(
+    python3 "${ROOT_DIR}/scripts/taskplanner_owner_registry.py" \
+      --root "${ROOT_DIR}" anchor --mode "$1"
+  )" || return 1
+  IFS='|' read -r owner service _profile _strategy <<<"${anchor}"
+  [[ -n "${owner}" && -n "${service}" ]] || return 1
+  printf '%s\n' "${service}"
+}
+
+taskplanner_runtime_compose_profile_for_mode() {
+  local anchor _owner _service profile _strategy
+  # Replay's anchor shares the state-core registry entry, but it is launched
+  # by the replay Compose profile rather than the operational `owners`
+  # profile. Resolve this mode-level exception before consulting the owner
+  # profile so a Live/LLM owner declaration cannot redirect replay.
+  if [[ "$1" == "replay" ]]; then
+    printf '%s\n' replay
+    return 0
+  fi
+  anchor="$(
+    python3 "${ROOT_DIR}/scripts/taskplanner_owner_registry.py" \
+      --root "${ROOT_DIR}" anchor --mode "$1"
+  )" || return 1
+  IFS='|' read -r _owner _service profile _strategy <<<"${anchor}"
+  if [[ -n "${profile}" ]]; then
+    printf '%s\n' "${profile}"
+    return 0
+  fi
+  return 1
+}
+
+taskplanner_same_mode_core_running() {
+  local mode="$1"
+  local service
+  service="$(taskplanner_runtime_service_for_mode "${mode}")" || return 1
+  [[ "${DRY_RUN:-false}" != "true" ]] || return 1
+
+  # This is intentionally a small ownership check, not a full preflight.  A
+  # warm restart is allowed to restart its already-owned core while VLM, ASR,
+  # camera, browser, and bridge status continue to be reported independently.
+  python3 - "${RUNTIME_CONTROL_STATE_FILE}" "${ROOT_DIR}" "${mode}" "${service}" <<'PY'
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+state_file = Path(sys.argv[1])
+root = Path(sys.argv[2]).resolve()
+mode = sys.argv[3]
+service = sys.argv[4]
+try:
+    payload = json.loads(state_file.read_text(encoding="utf-8"))
+except (OSError, ValueError):
+    raise SystemExit(1)
+if not isinstance(payload, dict) or payload.get("mode") != mode:
+    raise SystemExit(1)
+try:
+    result = subprocess.run(
+        [
+            "docker",
+            "ps",
+            "--filter",
+            f"label=com.docker.compose.project.working_dir={root}",
+            "--filter",
+            f"label=com.docker.compose.service={service}",
+            "--filter",
+            "status=running",
+            "--format",
+            "{{.ID}}",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=1.0,
+    )
+except (OSError, subprocess.TimeoutExpired):
+    raise SystemExit(1)
+raise SystemExit(0 if result.returncode == 0 and len(result.stdout.split()) == 1 else 1)
+PY
+}
+
+taskplanner_missing_split_owner_services() {
+  # Print split owner services missing from an otherwise active mode. This is
+  # deliberately a container-only reconciliation check. It does not inspect
+  # ROS topics, VLM/ASR/camera health, or a scenario preflight: each remains
+  # an independent owner concern. It prevents a same-mode warm restart from
+  # reporting success while a command, execution, ScenarioStore, or
+  # operator-bridge owner stays down.
+
+  local mode="$1"
+  local running_services service anchor_service
+  case "${mode}" in
+    live|llm-surgeon|debug) ;;
+    *) return 0 ;;
+  esac
+  [[ "${DRY_RUN:-false}" != "true" ]] || return 0
+
+  running_services="$(
+    docker ps \
+      --filter "label=com.docker.compose.project.working_dir=${ROOT_DIR}" \
+      --filter status=running \
+      --format '{{.Label "com.docker.compose.service"}}'
+  )" || return 1
+
+  anchor_service="$(taskplanner_runtime_service_for_mode "${mode}")" || return 1
+  while IFS= read -r service; do
+    [[ -n "${service}" && "${service}" != "${anchor_service}" ]] || continue
+    if ! grep -Fqx "${service}" <<<"${running_services}"; then
+      printf '%s\n' "${service}"
+    fi
+  done < <(taskplanner_owner_services_for_mode "${mode}")
+}
+
+taskplanner_restore_missing_split_owners() {
+  # Start only missing split owners before the narrow core warm restart.
+
+  local mode="$1"
+  local missing_output service
+  local -a missing_services=()
+  [[ "${mode}" == "live" || "${mode}" == "llm-surgeon" || "${mode}" == "debug" ]] || return 0
+  if [[ "${DRY_RUN:-false}" == "true" ]]; then
+    # A dry run cannot inspect the running set.  Keep its advertised scope
+    # truthful: the normal same-mode path never plans/builds or touches a
+    # sidecar, and this reconciliation only happens when a concrete owner is
+    # observed missing.
+    return 0
+  fi
+  missing_output="$(taskplanner_missing_split_owner_services "${mode}")" ||
+    die "could not inspect split owner state for ${mode}"
+  while IFS= read -r service; do
+    [[ -n "${service}" ]] && missing_services+=("${service}")
+  done <<<"${missing_output}"
+  ((${#missing_services[@]} > 0)) || return 0
+
+  printf 'Taskplanner %s: restoring missing owner(s): %s\n' \
+    "${mode}" "${missing_services[*]}"
+  if [[ "${mode}" == "debug" ]]; then
+    run_or_print \
+      "${COMPOSE[@]}" --profile debug --profile owners \
+      up -d --no-deps "${missing_services[@]}"
+  else
+    run_or_print \
+      "${COMPOSE[@]}" --profile "${mode}" --profile owners \
+      up -d --no-deps "${missing_services[@]}"
+  fi
+}
+
+taskplanner_reload_runtime_config() {
+  local mode="$1"
+  local bundle_name="$2"
+  local owner_target owner_profile service request command
+  case "${mode}" in
+    live|llm-surgeon) ;;
+    *) die "config reload is available only for live or llm-surgeon" ;;
+  esac
+  [[ "${bundle_name}" =~ ^[A-Za-z][A-Za-z0-9_-]{0,127}$ ]] ||
+    die "config bundle name must use letters, numbers, underscores, or hyphens"
+  owner_target="$(taskplanner_scenario_reload_target "${mode}")" ||
+    die "could not resolve the ${mode} scenario configuration owner"
+  IFS='|' read -r owner_profile service <<<"${owner_target}"
+  [[ -n "${owner_profile}" && -n "${service}" ]] ||
+    die "scenario configuration owner has an incomplete runtime mapping"
+  printf -v request \
+    '{bundle_name: "%s", restart_if_running: false, preview_only: false, reload_if_changed: true, expected_candidate_revision: ""}' \
+    "${bundle_name}"
+  command='set -e
+set +u
+source /opt/ros/jazzy/setup.bash
+source /opt/btops_ws/install/setup.bash
+source /workspaces/taskplanner_ws/install/docker/setup.bash
+set -u
+ros2 service call "$1" "$2" "$3"'
+  run_or_print \
+    "${COMPOSE[@]}" --profile "${owner_profile}" exec -T "${service}" \
+    bash -lc "${command}" taskplanner-config-reload \
+    /simulation/select_bundle surgical_msgs/srv/SelectSimulationBundle "${request}"
+}
+
+_taskplanner_package_contract_tool() {
+  local action="$1"
+  local mode="$2"
+  local explicit_rebuild="$3"
+  local expected_generation="$4"
+  shift 4
+  local -a command=(
+    python3
+    "${ROOT_DIR}/scripts/taskplanner_package_plan.py"
+    "${action}"
+    --root "${ROOT_DIR}"
+    --install-root "${CONTAINER_INSTALL_ROOT}"
+    --mode "${mode}"
+  )
+  if [[ "${explicit_rebuild}" == "true" ]]; then
+    command+=(--explicit-rebuild)
+  fi
+  if [[ -n "${expected_generation}" ]]; then
+    command+=(--expected-generation "${expected_generation}")
+  fi
+  command+=("$@")
+  "${command[@]}"
+}
+
+taskplanner_prepare_mode_build_plan() {
+  local mode="$1"
+  local explicit_rebuild="${2:-false}"
+  taskplanner_select_mode_build_roots "${mode}" || return
+  local output kind value
+  output="$(_taskplanner_package_contract_tool \
+    plan "${mode}" "${explicit_rebuild}" "" \
+    "${TASKPLANNER_SELECTED_BUILD_ROOT_PACKAGES[@]}")" || return
+
+  TASKPLANNER_MODE_BUILD_PACKAGES=()
+  TASKPLANNER_CHANGED_BUILD_PACKAGES=()
+  TASKPLANNER_BUILD_PACKAGES=()
+  TASKPLANNER_MODE_BUILD_BASELINE_PACKAGES=()
+  TASKPLANNER_MODE_BUILD_GENERATION=""
+  TASKPLANNER_MODE_BUILD_MISSING_STAMP=false
+  TASKPLANNER_MODE_BUILD_MISMATCHED_STAMP=false
+  TASKPLANNER_MODE_BUILD_MISSING_ARTIFACT=false
+  while IFS=$'\t' read -r kind value; do
+    case "${kind}" in
+      GENERATION) TASKPLANNER_MODE_BUILD_GENERATION="${value}" ;;
+      MODE) TASKPLANNER_MODE_BUILD_PACKAGES+=("${value}") ;;
+      CHANGED) TASKPLANNER_CHANGED_BUILD_PACKAGES+=("${value}") ;;
+      BUILD) TASKPLANNER_BUILD_PACKAGES+=("${value}") ;;
+      BASELINE) TASKPLANNER_MODE_BUILD_BASELINE_PACKAGES+=("${value}") ;;
+      MISSING_STAMP) TASKPLANNER_MODE_BUILD_MISSING_STAMP=true ;;
+      MISMATCHED_STAMP) TASKPLANNER_MODE_BUILD_MISMATCHED_STAMP=true ;;
+      MISSING_ARTIFACT) TASKPLANNER_MODE_BUILD_MISSING_ARTIFACT=true ;;
+      "") ;;
+      *) return 1 ;;
+    esac
+  done <<<"${output}"
+  [[ "${TASKPLANNER_MODE_BUILD_GENERATION}" =~ ^[0-9a-f]{64}$ ]] || return 1
+  ((${#TASKPLANNER_MODE_BUILD_PACKAGES[@]} > 0)) || return 1
+}
+
+taskplanner_prepare_owner_build_plan() {
+  # An owner-local installed entrypoint build is intentionally narrower than a
+  # mode build.  The owner registry supplies its direct package roots, and the
+  # package planner adds only their local dependency/build-consumer closure.
+  # This keeps a new command adapter or owner launch file from forcing every
+  # ROS process through the selected mode's contract.
+  local mode="$1"
+  local owner="$2"
+  local explicit_rebuild="${3:-false}"
+  local output kind value
+  mapfile -t TASKPLANNER_OWNER_BUILD_ROOT_PACKAGES < <(
+    taskplanner_owner_build_roots "${owner}" "${mode}"
+  )
+  ((${#TASKPLANNER_OWNER_BUILD_ROOT_PACKAGES[@]} > 0)) || return 1
+  output="$(_taskplanner_package_contract_tool \
+    plan "${mode}" "${explicit_rebuild}" "" \
+    "${TASKPLANNER_OWNER_BUILD_ROOT_PACKAGES[@]}")" || return
+
+  TASKPLANNER_MODE_BUILD_PACKAGES=()
+  TASKPLANNER_CHANGED_BUILD_PACKAGES=()
+  TASKPLANNER_BUILD_PACKAGES=()
+  TASKPLANNER_MODE_BUILD_BASELINE_PACKAGES=()
+  TASKPLANNER_MODE_BUILD_GENERATION=""
+  TASKPLANNER_MODE_BUILD_MISSING_STAMP=false
+  TASKPLANNER_MODE_BUILD_MISMATCHED_STAMP=false
+  TASKPLANNER_MODE_BUILD_MISSING_ARTIFACT=false
+  while IFS=$'\t' read -r kind value; do
+    case "${kind}" in
+      GENERATION) TASKPLANNER_MODE_BUILD_GENERATION="${value}" ;;
+      MODE) TASKPLANNER_MODE_BUILD_PACKAGES+=("${value}") ;;
+      CHANGED) TASKPLANNER_CHANGED_BUILD_PACKAGES+=("${value}") ;;
+      BUILD) TASKPLANNER_BUILD_PACKAGES+=("${value}") ;;
+      BASELINE) TASKPLANNER_MODE_BUILD_BASELINE_PACKAGES+=("${value}") ;;
+      MISSING_STAMP) TASKPLANNER_MODE_BUILD_MISSING_STAMP=true ;;
+      MISMATCHED_STAMP) TASKPLANNER_MODE_BUILD_MISMATCHED_STAMP=true ;;
+      MISSING_ARTIFACT) TASKPLANNER_MODE_BUILD_MISSING_ARTIFACT=true ;;
+      "") ;;
+      *) return 1 ;;
+    esac
+  done <<<"${output}"
+  [[ "${TASKPLANNER_MODE_BUILD_GENERATION}" =~ ^[0-9a-f]{64}$ ]] || return 1
+}
+
+taskplanner_record_mode_package_contracts() {
+  local mode="$1"
+  taskplanner_select_mode_build_roots "${mode}" || return
+  _taskplanner_package_contract_tool \
+    record "${mode}" false "${TASKPLANNER_MODE_BUILD_GENERATION}" \
+    "${TASKPLANNER_SELECTED_BUILD_ROOT_PACKAGES[@]}"
+}
+
+taskplanner_record_owner_package_contracts() {
+  local mode="$1"
+  ((${#TASKPLANNER_OWNER_BUILD_ROOT_PACKAGES[@]} > 0)) || return 1
+  _taskplanner_package_contract_tool \
+    record "${mode}" false "${TASKPLANNER_MODE_BUILD_GENERATION}" \
+    "${TASKPLANNER_OWNER_BUILD_ROOT_PACKAGES[@]}"
+}
+
+taskplanner_resume_candidate() {
+  local mode="$1"
+  local service
+  service="$(taskplanner_runtime_service_for_mode "${mode}")" || return 1
+  [[ "${DRY_RUN:-false}" != "true" ]] || return 1
+
+  # A reboot can discard /run's active-mode marker while Compose restart
+  # policies keep the browser/ASR/bridge sidecars alive.  This is deliberately
+  # a small container-state probe: it must not inspect the ROS graph, source
+  # tree, or unrelated health surfaces before restoring the stopped owner.
+  python3 - "${ROOT_DIR}" "${mode}" "${service}" <<'PY'
+import subprocess
+import sys
+from pathlib import Path
+
+root = str(Path(sys.argv[1]).resolve())
+mode = sys.argv[2]
+service = sys.argv[3]
+
+def running(name: str) -> bool:
+    try:
+        result = subprocess.run(
+            [
+                "docker", "ps",
+                "--filter", f"label=com.docker.compose.project.working_dir={root}",
+                "--filter", f"label=com.docker.compose.service={name}",
+                "--filter", "status=running",
+                "--format", "{{.ID}}",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=1.0,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        raise SystemExit(1)
+    return result.returncode == 0 and bool(result.stdout.split())
+
+# Never convert a genuinely running runtime into a "resume".  The integrated
+# Debug observer is intentionally *not* a core here: Live can preserve that
+# observer across a reboot and still restore its stopped core without tearing
+# down the operator's view.
+if any(running(name) for name in ("taskplanner-state-core", "shadow-runner")):
+    raise SystemExit(1)
+
+# Require an actual mode-scoped control-plane sidecar; a standalone Debug UI
+# alone is not evidence that a Live/Surgeon/Replay core can be safely resumed.
+# Live accepts either its public bridge or ASR owner so a reboot can preserve
+# one while the other was intentionally stopped by the operator.
+sidecars = {"public-rosbridge"}
+if mode == "live":
+    sidecars.add("taskplanner-asr")
+raise SystemExit(0 if any(running(name) for name in sidecars) else 1)
+PY
+}
+
+taskplanner_assert_resume_safe() {
+  local mode="$1"
+  if [[ "${DRY_RUN:-false}" == "true" ]]; then
+    print_command verify-stopped-core-resume "${mode}"
+    return 0
+  fi
+  taskplanner_resume_candidate "${mode}" ||
+    die "resume requires a stopped core and at least one preserved ${mode} control-plane sidecar; use 'up ${mode}' for a cold start"
+}
+
+taskplanner_resume_owner_service() {
+  local mode="$1"
+  local service="$2"
+  local profile record container_id container_state
+  case "${service}" in
+    taskplanner-state-core|taskplanner-command|taskplanner-tool-state|taskplanner-perception|taskplanner-cam4-mayo|taskplanner-projection|taskplanner-execution|taskplanner-operator-bridge|taskplanner-scenario|taskplanner-simulation-input|taskplanner-surgery-record)
+      profile=owners
+      ;;
+    *) profile="${mode}" ;;
+  esac
+
+  # Do not let Compose reconcile a retained sidecar merely because a source
+  # mount/config timestamp changed. A stopped retained container is started by
+  # ID; Compose is used only when that owner no longer has a container at all.
+  if [[ "${DRY_RUN:-false}" == "true" ]]; then
+    print_command preserve-or-start-owner "${mode}" "${service}"
+    return 0
+  fi
+  record="$(
+    docker ps -a \
+      --filter "label=com.docker.compose.project.working_dir=${ROOT_DIR}" \
+      --filter "label=com.docker.compose.service=${service}" \
+      --format '{{.ID}}\t{{.State}}'
+  )" || die "could not inspect retained ${service} owner for resume"
+  if [[ -z "${record}" ]]; then
+    run_or_print "${COMPOSE[@]}" --profile "${profile}" up -d --no-deps "${service}"
+    return 0
+  fi
+  [[ "${record}" != *$'\n'* ]] ||
+    die "resume found more than one retained ${service} owner"
+  IFS=$'\t' read -r container_id container_state <<<"${record}"
+  [[ -n "${container_id}" && -n "${container_state}" ]] ||
+    die "resume could not read the retained ${service} owner state"
+  case "${container_state}" in
+    running)
+      return 0
+      ;;
+    created|exited)
+      run_or_print docker start "${container_id}"
+      return 0
+      ;;
+    *)
+      die "resume cannot safely take over ${service} while it is ${container_state}"
+      ;;
+  esac
+}
+
+taskplanner_resume_stopped_core() {
+  local mode="$1"
+  local service owner_service
+  local -a owner_services=()
+  service="$(taskplanner_runtime_service_for_mode "${mode}")" || return 1
+
+  # Resume owns only the stopped runtime plane.  In particular it never
+  # removes/recreates webapp, public rosbridge, or an already-running ASR
+  # container, and it never runs a source/build/preflight census.
+  taskplanner_assert_resume_safe "${mode}" || return
+  if [[ "${mode}" == "live" || "${mode}" == "llm-surgeon" ]]; then
+    mapfile -t owner_services < <(taskplanner_owner_services_for_mode "${mode}")
+    ((${#owner_services[@]} > 0)) ||
+      die "runtime owner registry returned no ${mode} services"
+    for owner_service in "${owner_services[@]}"; do
+      taskplanner_resume_owner_service "${mode}" "${owner_service}"
+    done
+  else
+    taskplanner_resume_owner_service "${mode}" "${service}"
+  fi
+
+  # ASR and NInfer are independent producers, not prerequisites for restoring
+  # the stopped state/command/execution owner set.  A model-server or capture
+  # failure must therefore be visible in its own owner status without holding
+  # the entire Taskplanner down after a reboot.  Keep the convenience resume
+  # attempt, but make it explicitly best-effort *after* the core plane exists.
+  if ! taskplanner_resume_owner_service "${mode}" ninfer-manager; then
+    printf 'warning: could not resume optional NInfer manager; continue with owner-local status\n' >&2
+  fi
+  if mode_uses_operational_asr_sidecar "${mode}"; then
+    if ! taskplanner_resume_owner_service live taskplanner-asr; then
+      printf 'warning: could not resume optional ASR owner; continue with owner-local status\n' >&2
+    elif [[ "${TASKPLANNER_LIVE_ASR_AUTO_START:-true}" == "true" ]]; then
+      if ! start_operational_asr_capture; then
+        printf 'warning: ASR capture did not resume; continue with owner-local status\n' >&2
+      fi
+    fi
+  fi
+  write_active_runtime_mode "${mode}"
+}
+
 webapp_build_is_current() {
   (
     cd "${ROOT_DIR}/webapp"
@@ -39,26 +494,73 @@ webapp_build_is_current() {
   )
 }
 
+taskplanner_apply_webapp_bundle() {
+  local -a profile_args=("$@")
+  local container_id user_spec
+  user_spec="$(id -u):$(id -g)"
+
+  # Build inside the webapp's existing Compose environment so Vite receives
+  # the same browser configuration as the static server. This path changes no
+  # Compose service: `exec` uses a running webapp and `run --no-deps` is only
+  # a short-lived webapp build process for a stopped dashboard.
+  if [[ "${DRY_RUN:-false}" == "true" ]]; then
+    run_or_print \
+      "${COMPOSE[@]}" "${profile_args[@]}" \
+      exec -T --user "${user_spec}" webapp bash scripts/apply-build.sh
+    return 0
+  fi
+
+  container_id="$(
+    "${COMPOSE[@]}" "${profile_args[@]}" ps -q webapp 2>/dev/null || true
+  )"
+  if [[ -n "${container_id}" ]] &&
+      [[ "$(docker inspect --format '{{.State.Running}}' "${container_id}" 2>/dev/null || true)" == "true" ]]; then
+    run_or_print \
+      "${COMPOSE[@]}" "${profile_args[@]}" \
+      exec -T --user "${user_spec}" webapp bash scripts/apply-build.sh
+  else
+    run_or_print \
+      "${COMPOSE[@]}" "${profile_args[@]}" \
+      run --rm --no-deps --user "${user_spec}" webapp bash scripts/apply-build.sh
+  fi
+}
+
 refresh_webapp_if_stale() {
   local -a profile_args=("$@")
   if webapp_build_is_current; then
     return 0
   fi
-  printf 'Taskplanner webapp source/build stamp changed; rebuilding the browser bundle\n'
-  # Isolate --force-recreate to the static UI. The following normal `up`
-  # remains responsible for aggregate health waiting and must not recreate
-  # NInfer or another preserved sidecar just because frontend source changed.
-  run_or_print \
-    "${COMPOSE[@]}" "${profile_args[@]}" \
-    up -d "${BUILD_ARGS[@]}" --no-deps --force-recreate webapp
+  printf 'Taskplanner webapp source/build stamp changed; applying browser bundle without restarting owners\n'
+  taskplanner_apply_webapp_bundle "${profile_args[@]}"
+  if [[ "${DRY_RUN:-false}" != "true" ]] && ! webapp_build_is_current; then
+    die "webapp source/build stamp remains stale after web-only apply"
+  fi
 }
 
 warm_restart_runtime_service() {
   local mode="$1"
   local service="$2"
-  local previous_container current_container
+  local requested_profile="${3:-}"
+  local profile previous_container current_container
+  if [[ -n "${requested_profile}" ]]; then
+    profile="${requested_profile}"
+  else
+    profile="$(taskplanner_runtime_compose_profile_for_mode "${mode}")" || return 1
+  fi
+  if [[ "${DRY_RUN:-false}" == "true" ]]; then
+    # The real path recreates only when Compose input changed, otherwise it
+    # restarts the existing container.  Show both possible core-only actions
+    # without querying Docker from a dry run.
+    run_or_print \
+      "${COMPOSE[@]}" --profile "${profile}" \
+      up -d --no-deps "${service}"
+    run_or_print \
+      "${COMPOSE[@]}" --profile "${profile}" \
+      restart "${service}"
+    return 0
+  fi
   previous_container="$(
-    "${COMPOSE[@]}" --profile "${mode}" ps -q "${service}"
+    "${COMPOSE[@]}" --profile "${profile}" ps -q "${service}"
   )"
   [[ -n "${previous_container}" ]] || return 1
 
@@ -66,15 +568,15 @@ warm_restart_runtime_service() {
   # changed. If the contract is unchanged, restart the existing container so
   # bind-mounted Python/launch/config edits still take effect without a remove.
   run_or_print \
-    "${COMPOSE[@]}" --profile "${mode}" \
+    "${COMPOSE[@]}" --profile "${profile}" \
     up -d --no-deps "${service}"
   current_container="$(
-    "${COMPOSE[@]}" --profile "${mode}" ps -q "${service}"
+    "${COMPOSE[@]}" --profile "${profile}" ps -q "${service}"
   )"
   [[ -n "${current_container}" ]] || return 1
   if [[ "${current_container}" == "${previous_container}" ]]; then
     run_or_print \
-      "${COMPOSE[@]}" --profile "${mode}" \
+      "${COMPOSE[@]}" --profile "${profile}" \
       restart "${service}"
   fi
 }
@@ -83,12 +585,13 @@ taskplanner_cross_warm_restart_boundary() {
   local mode="$1"
   local service="$2"
 
-  # Stable I/O preservation is valid only after the caller selected the
-  # healthy same-mode path. Recheck the stopped reservation immediately before
-  # the first authoritative mutation; every fallible sidecar/build preflight
-  # must already have completed.
-  RUNTIME_FAILURE_CLEANUP_SERVICES=("${service}")
+  # This boundary still owns only state-core and never changes the endpoint
+  # route.  Before destroying the Twin's volatile task state, however, reject
+  # a *positive* in-flight report from the independent execution owner.  The
+  # launcher supplies this narrow hook; it deliberately does not become a
+  # global readiness/preflight dependency for ASR, VLM, camera, or DT health.
   verify_same_mode_warm_restart_interlock "${mode}" || return
+  RUNTIME_FAILURE_CLEANUP_SERVICES=("${service}")
   RUNTIME_FAILURE_CLEANUP_ARMED=true
   clear_active_runtime_mode || return
   warm_restart_runtime_service "${mode}" "${service}"
@@ -96,27 +599,41 @@ taskplanner_cross_warm_restart_boundary() {
 
 run_serial_workspace_build() {
   local mode="$1"
-  local build_command
+  local build_command package_args="" package_name
+  local build_preamble="if [ -f ${CONTAINER_INSTALL_REL}/setup.bash ]; then source ${CONTAINER_INSTALL_REL}/setup.bash; fi &&"
   local -a build_profile_args=(--profile "${mode}" --profile dev)
+  ((${#TASKPLANNER_BUILD_PACKAGES[@]} > 0)) ||
+    die "no packages were selected for the ${mode} build"
+  for package_name in "${TASKPLANNER_BUILD_PACKAGES[@]}"; do
+    [[ "${package_name}" =~ ^[a-z][a-z0-9_]*$ ]] ||
+      die "invalid package in the ${mode} build plan: ${package_name}"
+    printf -v package_args '%s %q' "${package_args}" "${package_name}"
+  done
   if mode_requires_integrated_debug_observer "${mode}" &&
       [[ "${INTEGRATED_DEBUG_ENABLED:-true}" == "true" ]]; then
     build_profile_args+=(--profile debug)
   fi
 
   if [[ "${mode}" == "debug" ]]; then
-    build_command="colcon --log-base log/docker build --build-base build/docker --install-base ${CONTAINER_INSTALL_REL} --symlink-install --packages-up-to integration_debug vlm_node hand_keypoint_interfaces surgical_perception_msgs --cmake-args -DBUILD_TESTING=OFF && test -f ${CONTAINER_INSTALL_REL}/setup.bash && test -x ${CONTAINER_INSTALL_REL}/integration_debug/lib/integration_debug/integration_debug_node && test -x ${CONTAINER_INSTALL_REL}/vlm_node/lib/vlm_node/pnu_perception_bridge && test -f ${CONTAINER_INSTALL_REL}/hand_keypoint_interfaces/share/ament_index/resource_index/packages/hand_keypoint_interfaces && test -f ${CONTAINER_INSTALL_REL}/surgical_perception_msgs/share/ament_index/resource_index/packages/surgical_perception_msgs"
+    build_command="${build_preamble} colcon --log-base log/docker build --build-base build/docker --install-base ${CONTAINER_INSTALL_REL} --symlink-install --packages-select${package_args} --cmake-args -DBUILD_TESTING=OFF && test -f ${CONTAINER_INSTALL_REL}/setup.bash && test -x ${CONTAINER_INSTALL_REL}/integration_debug/lib/integration_debug/integration_debug_observer && test -x ${CONTAINER_INSTALL_REL}/integration_debug/lib/integration_debug/integration_debug_control && test -e ${CONTAINER_INSTALL_REL}/bringup/share/bringup/launch/taskplanner_debug_observer.launch.py && test -e ${CONTAINER_INSTALL_REL}/bringup/share/bringup/launch/taskplanner_debug_control.launch.py"
+    if taskplanner_owner_is_enabled debug-virtual debug; then
+      build_command+=" && test -x ${CONTAINER_INSTALL_REL}/surgical_interop_execution/lib/surgical_interop_execution/fault_action_emulator && test -e ${CONTAINER_INSTALL_REL}/bringup/share/bringup/launch/taskplanner_debug_virtual.launch.py"
+    fi
+  elif [[ "${mode}" == "live" ]]; then
+    build_command="${build_preamble} colcon --log-base log/docker build --build-base build/docker --install-base ${CONTAINER_INSTALL_REL} --symlink-install --packages-select${package_args} --cmake-args -DBUILD_TESTING=OFF && test -f ${CONTAINER_INSTALL_REL}/setup.bash && for launch in taskplanner_state_core.launch.py taskplanner_command.launch.py taskplanner_tool_state.launch.py taskplanner_perception.launch.py taskplanner_cam4_mayo.launch.py taskplanner_projection.launch.py taskplanner_execution.launch.py taskplanner_operator_bridge.launch.py taskplanner_scenario.launch.py taskplanner_surgery_record.launch.py taskplanner_rosbag_recorder.launch.py; do test -e ${CONTAINER_INSTALL_REL}/bringup/share/bringup/launch/\"\${launch}\"; done && test -x ${CONTAINER_INSTALL_REL}/integration_debug/lib/integration_debug/operational_asr_node && test -x ${CONTAINER_INSTALL_REL}/integration_debug/lib/integration_debug/operational_surgery_record && test -x ${CONTAINER_INSTALL_REL}/integration_debug/lib/integration_debug/operational_rosbag_recorder && test -x ${CONTAINER_INSTALL_REL}/voice_command/lib/voice_command/voice_intent_resolver && test -x ${CONTAINER_INSTALL_REL}/voice_command/lib/voice_command/command_router"
+    if mode_uses_tts_sidecar "${mode}"; then
+      build_command+=" && test -x ${CONTAINER_INSTALL_REL}/tts_runtime/lib/tts_runtime/tts_runtime_node"
+    fi
+  elif [[ "${mode}" == "llm-surgeon" ]]; then
+    build_command="${build_preamble} colcon --log-base log/docker build --build-base build/docker --install-base ${CONTAINER_INSTALL_REL} --symlink-install --packages-select${package_args} --cmake-args -DBUILD_TESTING=OFF && test -f ${CONTAINER_INSTALL_REL}/setup.bash && for launch in taskplanner_state_core.launch.py taskplanner_command.launch.py taskplanner_tool_state.launch.py taskplanner_perception.launch.py taskplanner_cam4_mayo.launch.py taskplanner_projection.launch.py taskplanner_execution.launch.py taskplanner_operator_bridge.launch.py taskplanner_scenario.launch.py taskplanner_simulation_input.launch.py; do test -e ${CONTAINER_INSTALL_REL}/bringup/share/bringup/launch/\"\${launch}\"; done && test -x ${CONTAINER_INSTALL_REL}/voice_command/lib/voice_command/voice_intent_resolver"
   else
-    # Dedicated container build and install roots prevent a host ROS build from
-    # replacing the Jazzy-generated interfaces consumed by runtime containers.
-    # Bind-mounted containers still share one atomic container-only overlay.
-    build_command="colcon --log-base log/docker build --build-base build/docker --install-base ${CONTAINER_INSTALL_REL} --symlink-install --cmake-args -DBUILD_TESTING=OFF && test -f ${CONTAINER_INSTALL_REL}/setup.bash && test -e ${CONTAINER_INSTALL_REL}/bringup/share/bringup/launch/taskplanner_live.launch.py && test -x ${CONTAINER_INSTALL_REL}/integration_debug/lib/integration_debug/operational_asr_node && test -x ${CONTAINER_INSTALL_REL}/voice_command/lib/voice_command/vlm_function_admission_gate"
+    build_command="${build_preamble} colcon --log-base log/docker build --build-base build/docker --install-base ${CONTAINER_INSTALL_REL} --symlink-install --packages-select${package_args} --cmake-args -DBUILD_TESTING=OFF && test -f ${CONTAINER_INSTALL_REL}/setup.bash && test -e ${CONTAINER_INSTALL_REL}/bringup/share/bringup/launch/taskplanner_shadow.launch.py && test -x ${CONTAINER_INSTALL_REL}/shadow_evaluation/lib/shadow_evaluation/interactive_replay_controller"
   fi
 
-  # Every runtime container bind-mounts this workspace, including build/docker,
-  # install/docker, and log/docker. Build once in a foreground one-off
-  # container and wait for its artifact checks before starting any reader.
-  # The process-wide launcher lock also prevents a second launcher invocation
-  # from starting services in the middle of this critical section.
+  # Build only changed packages plus their selected-mode reverse dependencies.
+  # Every runtime container bind-mounts the same build/install/log roots, so the
+  # launcher still stops all readers and performs this once in a foreground
+  # container before any service consumes the updated overlay.
   run_or_print \
     "${COMPOSE[@]}" "${build_profile_args[@]}" \
     run --rm --no-deps "${BUILD_ARGS[@]}" -T \
@@ -126,18 +643,49 @@ run_serial_workspace_build() {
     taskplanner-dev bash -lc "${build_command}"
 
   if [[ "${DRY_RUN}" != "true" ]]; then
-    if [[ "${mode}" == "debug" ]]; then
-      record_debug_install_contract
-    else
-      record_runtime_install_contract
-    fi
-    printf 'Taskplanner workspace build complete (%s)\n' "${mode}"
+    taskplanner_record_mode_package_contracts "${mode}"
+    printf 'Taskplanner scoped workspace build complete (%s: %s)\n' \
+      "${mode}" "${TASKPLANNER_BUILD_PACKAGES[*]}"
+  fi
+}
+
+taskplanner_build_selected_owner() {
+  # Do not stop the runtime plane for this path. Owner code is source-mounted;
+  # existing processes keep their loaded modules while colcon writes only the
+  # selected package closure. The selected owner is restarted after the build
+  # returns, which is the point at which it observes the new installed entry
+  # point. A future Compose overlay-generation mount can make the install swap
+  # atomic without broadening the command surface.
+  local mode="$1"
+  local owner="$2"
+  local package_args="" package_name build_command
+  ((${#TASKPLANNER_BUILD_PACKAGES[@]} > 0)) || return 0
+  for package_name in "${TASKPLANNER_BUILD_PACKAGES[@]}"; do
+    [[ "${package_name}" =~ ^[a-z][a-z0-9_]*$ ]] ||
+      die "invalid package in the ${owner} owner build plan: ${package_name}"
+    printf -v package_args '%s %q' "${package_args}" "${package_name}"
+  done
+  build_command="if [ -f ${CONTAINER_INSTALL_REL}/setup.bash ]; then source ${CONTAINER_INSTALL_REL}/setup.bash; fi && colcon --log-base log/docker build --build-base build/docker --install-base ${CONTAINER_INSTALL_REL} --symlink-install --packages-select${package_args} --cmake-args -DBUILD_TESTING=OFF && test -f ${CONTAINER_INSTALL_REL}/setup.bash"
+  if [[ "${owner}" == "rosbag-recorder" ]]; then
+    build_command+=" && test -x ${CONTAINER_INSTALL_REL}/integration_debug/lib/integration_debug/operational_rosbag_recorder && test -e ${CONTAINER_INSTALL_REL}/bringup/share/bringup/launch/taskplanner_rosbag_recorder.launch.py"
+  fi
+  run_or_print \
+    "${COMPOSE[@]}" --profile "${mode}" --profile dev \
+    run --rm --no-deps -T \
+    --user "$(id -u):$(id -g)" \
+    -e HOME=/tmp/taskplanner-owner-builder \
+    -e TASKPLANNER_SKIP_WORKSPACE_SETUP=true \
+    taskplanner-dev bash -lc "${build_command}"
+  if [[ "${DRY_RUN}" != "true" ]]; then
+    taskplanner_record_owner_package_contracts "${mode}"
+    printf 'Taskplanner %s: owner-local package build complete (%s: %s)\n' \
+      "${mode}" "${owner}" "${TASKPLANNER_BUILD_PACKAGES[*]}"
   fi
 }
 
 build_runtime_images_once() {
   local mode="$1"
-  # Only an explicit --build refreshes images. A stale --ensure-build must
+  # Only an explicit --image-build refreshes images. A stale --ensure-build must
   # rebuild the isolated install/docker overlay without paying for unrelated
   # NInfer/accessory image builds.
   ((${#BUILD_ARGS[@]} > 0)) || return 0
@@ -146,12 +694,6 @@ build_runtime_images_once() {
   if mode_uses_tts_sidecar "${mode}"; then
     image_profile_args+=(--profile ops)
     image_services+=(taskplanner-tts)
-  fi
-  if mode_uses_ops_plane "${mode}"; then
-    if ! mode_uses_tts_sidecar "${mode}"; then
-      image_profile_args+=(--profile ops)
-    fi
-    image_services+=(monitor-media-gateway)
   fi
   if [[ "${local_object_perception_enabled:-false}" == "true" ]]; then
     image_profile_args+=(--profile lab)
@@ -172,284 +714,53 @@ build_runtime_images_once() {
   BUILD_ARGS=()
 }
 
+build_shared_runtime_image_once() {
+  local mode="$1"
+  ((${#BUILD_ARGS[@]} > 0)) || return 0
+  # When no package contract is stale there is no foreground colcon builder
+  # (`compose run --build`) to refresh the shared taskplanner-ws image.
+  run_or_print \
+    "${COMPOSE[@]}" --profile "${mode}" --profile dev \
+    build taskplanner-dev
+}
+
 taskplanner_build_selected_runtime() {
   local mode="$1"
-  [[ "${BUILD_REQUESTED}" == "true" ]] || return 0
-  run_serial_workspace_build "${mode}" || return
-  build_runtime_images_once "${mode}"
-}
-
-wait_for_websocket_endpoint() {
-  local host="$1"
-  local port="$2"
-  local path="$3"
-  local label="$4"
-  local timeout_sec="${5:-${WAIT_TIMEOUT_SEC}}"
-  local owner_container_id="${6:-}"
-  if [[ "${DRY_RUN}" == "true" ]]; then
-    printf '+ wait-for-websocket %q %q %q %q\n' \
-      "${host}" "${port}" "${path}" "${label}"
-    return 0
-  fi
-  [[ "${port}" =~ ^[0-9]+$ ]] || die "${label} port is not numeric: ${port}"
-  (( port >= 1 && port <= 65535 )) || die "${label} port is invalid: ${port}"
-  [[ "${path}" == /* ]] || die "${label} websocket path must start with /"
-  python3 - "${host}" "${port}" "${path}" "${timeout_sec}" "${label}" "${owner_container_id}" <<'PY'
-import base64
-import os
-import socket
-import subprocess
-import sys
-import time
-
-host, port_raw, path, timeout_raw, label, owner_container_id = sys.argv[1:]
-port = int(port_raw)
-timeout = max(1.0, float(timeout_raw))
-deadline = time.monotonic() + timeout
-last_error = "endpoint did not accept a websocket handshake"
-
-while time.monotonic() < deadline:
-    if owner_container_id:
-        try:
-            inspected = subprocess.run(
-                [
-                    "docker",
-                    "inspect",
-                    "--format",
-                    "{{.State.Running}}",
-                    owner_container_id,
-                ],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=0.75,
-            )
-        except (OSError, subprocess.TimeoutExpired) as error:
-            raise SystemExit(f"{label} owner state could not be checked: {error}")
-        if inspected.returncode != 0 or inspected.stdout.strip() != "true":
-            raise SystemExit(f"{label} owner container exited before the endpoint became ready")
-    try:
-        key = base64.b64encode(os.urandom(16)).decode("ascii")
-        request = (
-            f"GET {path} HTTP/1.1\r\n"
-            f"Host: {host}:{port}\r\n"
-            "Upgrade: websocket\r\n"
-            "Connection: Upgrade\r\n"
-            f"Sec-WebSocket-Key: {key}\r\n"
-            "Sec-WebSocket-Version: 13\r\n\r\n"
-        ).encode("ascii")
-        with socket.create_connection((host, port), timeout=1.0) as connection:
-            connection.settimeout(1.0)
-            connection.sendall(request)
-            response = bytearray()
-            while b"\r\n\r\n" not in response and len(response) < 8192:
-                chunk = connection.recv(4096)
-                if not chunk:
-                    break
-                response.extend(chunk)
-        status_line = bytes(response).split(b"\r\n", 1)[0]
-        if status_line.startswith((b"HTTP/1.1 101 ", b"HTTP/1.0 101 ")):
-            print(f"{label}: websocket ready on {host}:{port}{path}")
-            raise SystemExit(0)
-        last_error = f"unexpected handshake response: {status_line[:120]!r}"
-    except OSError as error:
-        last_error = str(error)
-    time.sleep(0.1)
-
-raise SystemExit(f"{label} was not ready after {timeout:g}s: {last_error}")
-PY
-}
-
-wait_for_mode_rosbridge() {
-  local mode="$1"
-  local router_port runtime_service owner_container_id=""
-  local websocket_path="/"
-  case "${mode}" in
-    live)
-      runtime_service="taskplanner-runtime"
-      if mode_uses_ops_plane "${mode}"; then
-        router_port="$(
-          compose_environment_value \
-            "${mode}" webapp VITE_ROSBRIDGE_TAILSCALE_PORT 9091
-        )"
-        websocket_path="$(
-          compose_environment_value \
-            "${mode}" webapp VITE_ROSBRIDGE_LIVE_TAILSCALE_PATH /live
-        )"
-      else
-        router_port="$(
-          compose_environment_value \
-            "${mode}" taskplanner-runtime ROSBRIDGE_PORT 9090
-        )"
-      fi
-      ;;
-    llm-surgeon)
-      runtime_service="taskplanner-runtime"
-      router_port="$(
-        compose_environment_value \
-          "${mode}" webapp VITE_ROSBRIDGE_TAILSCALE_PORT 9091
-      )"
-      websocket_path="$(
-        compose_environment_value \
-          "${mode}" webapp VITE_ROSBRIDGE_LLM_TAILSCALE_PATH /llm
-      )"
-      ;;
-    replay)
-      runtime_service="shadow-runner"
-      router_port="$(
-        compose_environment_value \
-          "${mode}" webapp VITE_ROSBRIDGE_TAILSCALE_PORT 9091
-      )"
-      websocket_path="$(
-        compose_environment_value \
-          "${mode}" webapp VITE_ROSBRIDGE_SHADOW_TAILSCALE_PATH /shadow
-      )"
-      ;;
-    debug)
-      runtime_service="integration-debug"
-      router_port="$(
-        compose_environment_value \
-          "${mode}" webapp VITE_ROSBRIDGE_TAILSCALE_PORT 9091
-      )"
-      ;;
-    *)
-      die "unsupported ROS bridge readiness mode: ${mode}"
-      ;;
-  esac
-  local timeout_sec="${TASKPLANNER_ROSBRIDGE_WAIT_TIMEOUT_SEC:-30}"
-  [[ "${timeout_sec}" =~ ^[0-9]+$ && "${timeout_sec}" -ge 1 ]] ||
-    die "TASKPLANNER_ROSBRIDGE_WAIT_TIMEOUT_SEC must be a positive integer"
-  if [[ "${DRY_RUN}" != "true" ]]; then
-    owner_container_id="$(
-      "${COMPOSE[@]}" --profile "${mode}" ps -q "${runtime_service}"
-    )"
-    [[ -n "${owner_container_id}" ]] ||
-      die "${mode} runtime container is unavailable before ROS bridge readiness"
-  fi
-  wait_for_websocket_endpoint \
-    127.0.0.1 "${router_port}" "${websocket_path}" \
-    "${mode} ROS bridge router" "${timeout_sec}" "${owner_container_id}"
-}
-
-wait_for_multicam_observer() {
-  local mode="$1"
-  local router_port
-  router_port="$(
-    compose_environment_value \
-      "${mode}" webapp VITE_ROSBRIDGE_DEBUG_PORT 9091
-  )"
-  # Camera publishers and /multicam_node/capture_status are intentionally not
-  # boot prerequisites. The operator UI reports their absence separately;
-  # startup only verifies that the read-only observer websocket is reachable.
-  wait_for_websocket_endpoint \
-    127.0.0.1 "${router_port}" /multicam "multicam observer" \
-    "${TASKPLANNER_MULTICAM_OBSERVER_WAIT_TIMEOUT_SEC:-8}"
-}
-
-wait_for_mode_semantic_ready() {
-  local mode="$1"
-  local service topic message_type control_service control_service_type
-  local expected_case="" expected_bundle=""
-  case "${mode}" in
-    live|llm-surgeon)
-      service="taskplanner-runtime"
-      topic="/simulation/state"
-      message_type="surgical_msgs/msg/SimulationState"
-      control_service="/simulation/control"
-      control_service_type="surgical_msgs/srv/ControlSimulation"
-      # The external Live launch consumes its own bundle variable. Do not
-      # validate it against the mock/replay default.
-      expected_bundle="$(
-        compose_environment_value \
-          "${mode}" taskplanner-runtime TASKPLANNER_LIVE_DEFAULT_BUNDLE thyroidectomy_demo
-      )"
-      ;;
-    replay)
-      service="shadow-runner"
-      topic="/shadow/replay_state"
-      message_type="surgical_msgs/msg/ShadowReplayState"
-      control_service="/shadow/control_replay"
-      control_service_type="surgical_msgs/srv/ControlShadowReplay"
-      expected_case="$(
-        compose_environment_value \
-          "${mode}" shadow-runner SHADOW_CASE_ID "${SHADOW_CASE_ID:-0704_6}"
-      )"
-      ;;
-    debug)
-      service="integration-debug"
-      topic="/integration/debug/status"
-      message_type="std_msgs/msg/String"
-      control_service="/integration/debug/check_readiness"
-      control_service_type="std_srvs/srv/Trigger"
-      ;;
-    *)
-      die "unsupported semantic readiness mode: ${mode}"
-      ;;
-  esac
-  if [[ "${DRY_RUN}" == "true" ]]; then
-    printf '+ wait-for-ros-semantic-ready %q %q %q %q %q %q %q\n' \
-      "${mode}" "${service}" "${topic}" "${message_type}" \
-      "${control_service}" "${control_service_type}" "${expected_bundle}"
-    return 0
-  fi
-
-  local timeout_sec="${TASKPLANNER_SEMANTIC_READY_TIMEOUT_SEC:-30}"
-  [[ "${timeout_sec}" =~ ^[0-9]+$ && "${timeout_sec}" -ge 1 ]] ||
-    die "TASKPLANNER_SEMANTIC_READY_TIMEOUT_SEC must be a positive integer"
-  local deadline=$((SECONDS + timeout_sec))
-  while (( SECONDS < deadline )); do
-    if "${COMPOSE[@]}" --profile "${mode}" exec -T "${service}" \
-        bash -lc 'set -o pipefail
-          source /opt/ros/jazzy/setup.bash
-          source /opt/btops_ws/install/setup.bash
-          source /workspaces/taskplanner_ws/install/docker/setup.bash
-          actual_type="$(timeout 8 ros2 service type "$1")"
-          [[ "${actual_type}" == "$2" ]]
-          if [[ "$5" == "live" || "$5" == "llm-surgeon" ]]; then
-            publisher_info="$(timeout 8 ros2 topic info --no-daemon -v "$3")"
-            [[ "$(grep -c "Node name: or_digital_twin$" <<<"${publisher_info}")" == "1" ]]
-            [[ "$(awk "/^Publisher count:/{print \$3; exit}" <<<"${publisher_info}")" == "1" ]]
-            transition_service="/simulation/check_transition_ready"
-            transition_type="std_srvs/srv/Trigger"
-            [[ "$(timeout 8 ros2 service type "${transition_service}")" == "${transition_type}" ]]
-            timeout 8 ros2 service call "${transition_service}" "${transition_type}" "{}" |
-              grep -Eq "success=(True|true)"
-          elif [[ "$5" == "debug" ]]; then
-            timeout 8 ros2 service call "$1" "$2" "{}" |
-              grep -Eq "success=(True|False), message="
-          fi
-          timeout 8 ros2 topic echo --once --no-daemon --spin-time 1 --timeout 5 --flow-style --full-length "$3" "$4" |
-            python3 /workspaces/taskplanner_ws/scripts/taskplanner_ros_readiness.py --mode "$5" --expected-case "$6" --expected-bundle "$7"' \
-        -- "${control_service}" "${control_service_type}" "${topic}" \
-        "${message_type}" "${mode}" "${expected_case}" "${expected_bundle}"; then
-      printf '%s ROS semantic readiness: received %s\n' "${mode}" "${topic}"
-      return 0
+  if [[ "${BUILD_REQUESTED}" == "true" ]]; then
+    if ((${#TASKPLANNER_BUILD_PACKAGES[@]} > 0)); then
+      run_serial_workspace_build "${mode}" || return
     fi
-    sleep 0.2
-  done
-  die "${mode} ROS semantic readiness timed out waiting for ${topic}"
+  fi
+
+  if [[ "${IMAGE_BUILD_REQUESTED:-false}" == "true" ]]; then
+    # A foreground ROS build with --build already constructs taskplanner-dev.
+    # Image-only work still needs that one explicit shared image build.
+    if [[ "${BUILD_REQUESTED}" != "true" ]] || \
+        ((${#TASKPLANNER_BUILD_PACKAGES[@]} == 0)); then
+      build_shared_runtime_image_once "${mode}" || return
+    fi
+    build_runtime_images_once "${mode}"
+  fi
 }
 
 taskplanner_finalize_runtime_readiness() {
   local mode="$1"
-  local integrated_debug_enabled="$2"
+  # Retain the stable call signature while the integrated observer is an
+  # independently reported plane rather than a launcher admission barrier.
+  local _integrated_debug_enabled="$2"
   shift 2
   local -a status_profile_args=("$@")
 
   if [[ "${DRY_RUN}" != "true" ]]; then
     "${COMPOSE[@]}" "${status_profile_args[@]}" ps
   fi
-  wait_for_mode_rosbridge "${mode}" || return
-  wait_for_mode_semantic_ready "${mode}" || return
-  if [[ "${integrated_debug_enabled}" == "true" ]]; then
-    wait_for_mode_rosbridge debug || return
-    wait_for_mode_semantic_ready debug || return
-  fi
+  # Compose has accepted the selected owner set.  Do not turn independent
+  # rosbridge, ScenarioStore, VLM, ASR, perception, or Debug observations
+  # into a global start barrier: each owner publishes its actual status and
+  # can be restarted by itself.  The execution path still checks its own
+  # controller/type/idempotency contract at dispatch time.
   write_active_runtime_mode "${mode}" || return
   RUNTIME_FAILURE_CLEANUP_ARMED=false
-  if mode_uses_multicam_observer "${mode}"; then
-    run_best_effort \
-      "multicam observer is unavailable; camera monitoring remains degraded" \
-      wait_for_multicam_observer "${mode}"
-  fi
+  printf 'Taskplanner %s: owner start requested; inspect owner status for independent readiness\n' \
+    "${mode}"
 }

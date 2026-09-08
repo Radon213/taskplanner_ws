@@ -114,6 +114,7 @@ class MockVLMNode(Node):
         command.stamp = proposal.stamp
         command.request_id = request_id
         command.command_id = f"mock-vlm-{request_id}"
+        command.procedure_run_id = msg.procedure_run_id
         command.group_id = "retraction"
         command.operation = "retraction"
         command.adjustment_mode = msg.adjustment_mode
@@ -590,6 +591,14 @@ class MockVLMNode(Node):
     ) -> None:
         result = VLMResult()
         result.stamp = stamp
+        latest_state = self._latest_state
+        result.procedure_run_id = (
+            str(latest_state.procedure_run_id or "").strip()
+            if latest_state is not None
+            and bool(latest_state.running)
+            and str(latest_state.execution_state or "").strip().lower() == "running"
+            else ""
+        )
         result.source = source
         result.schema_version = "mock-1"
         result.raw_json = raw_json

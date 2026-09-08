@@ -1,7 +1,6 @@
 import threading
 
 from integration_debug.node import IntegrationDebugNode
-from integration_debug.retractor_health import VLMRuntimeStatus
 
 
 def _operational_status(
@@ -57,6 +56,37 @@ def test_integrated_manual_write_uses_state_gate_without_planner_ack() -> None:
     assert IntegrationDebugNode._manual_write_block_reason(harness) == (
         "pause or stop the operational scenario before manual control"
     )
+
+
+def test_integrated_nonphysical_write_uses_authoritative_state_without_arm() -> None:
+    class Harness:
+        pass
+
+    harness = Harness()
+    harness._network_locked_to_runtime = True
+    harness._lock = threading.RLock()
+    harness._armed = False
+    harness._fault_locked = True
+    harness._manual_control_scope = "none"
+    harness._operational_runtime_status = lambda: _operational_status(allowed=True)
+
+    assert IntegrationDebugNode._debug_write_block_reason(
+        harness,
+        physical=False,
+        operation="voice_request",
+    ) == ""
+
+    harness._operational_runtime_status = lambda: _operational_status(
+        allowed=False,
+        control_window_open=False,
+        execution_state="running",
+        reason="pause or stop the operational scenario before manual control",
+    )
+    assert IntegrationDebugNode._debug_write_block_reason(
+        harness,
+        physical=False,
+        operation="voice_request",
+    ) == "pause or stop the operational scenario before manual control"
 
 
 def test_blocker_discovery_uses_state_gate_only_for_integrated_debug() -> None:
@@ -271,7 +301,7 @@ def test_admitted_command_accepts_matching_operational_task_identity() -> None:
     assert harness.cancelled == []
 
 
-def test_other_operational_task_revokes_and_cancels_debug_command() -> None:
+def test_other_operational_task_mirror_does_not_revoke_debug_command() -> None:
     status = _operational_status(
         allowed=False,
         control_window_open=True,
@@ -282,13 +312,12 @@ def test_other_operational_task_revokes_and_cancels_debug_command() -> None:
 
     IntegrationDebugNode._check_runtime_safety(harness)
 
-    assert harness._armed is False
-    assert harness.events[-1][0] == "operational_intervention_gate_closed"
-    assert "not owned" in harness.events[-1][1]["reason"]
-    assert harness.cancelled == ["debug-A"]
+    assert harness._armed is True
+    assert harness.events == []
+    assert harness.cancelled == []
 
 
-def test_cleaner_activity_revokes_even_a_matching_debug_command() -> None:
+def test_cleaner_activity_mirror_does_not_revoke_debug_command() -> None:
     status = _operational_status(
         allowed=False,
         control_window_open=True,
@@ -300,12 +329,12 @@ def test_cleaner_activity_revokes_even_a_matching_debug_command() -> None:
 
     IntegrationDebugNode._check_runtime_safety(harness)
 
-    assert harness._armed is False
-    assert "cleaner activity" in harness.events[-1][1]["reason"]
-    assert harness.cancelled == ["debug-A"]
+    assert harness._armed is True
+    assert harness.events == []
+    assert harness.cancelled == []
 
 
-def test_robot_fault_revokes_even_a_matching_debug_command() -> None:
+def test_robot_fault_mirror_does_not_revoke_debug_command() -> None:
     status = _operational_status(
         allowed=False,
         control_window_open=True,
@@ -316,9 +345,9 @@ def test_robot_fault_revokes_even_a_matching_debug_command() -> None:
 
     IntegrationDebugNode._check_runtime_safety(harness)
 
-    assert harness._armed is False
-    assert "cannot be owned" in harness.events[-1][1]["reason"]
-    assert harness.cancelled == ["debug-A"]
+    assert harness._armed is True
+    assert harness.events == []
+    assert harness.cancelled == []
 
 
 def test_standalone_runtime_monitor_disarms_even_a_legacy_acked_session() -> None:
@@ -331,120 +360,6 @@ def test_standalone_runtime_monitor_disarms_even_a_legacy_acked_session() -> Non
 
     assert harness._armed is False
     assert harness.events[-1][0] == "planner_coexistence_changed"
-
-
-def test_vlm_observation_refresh_remains_available_without_manual_authority() -> None:
-    class Harness:
-        pass
-
-    harness = Harness()
-    harness._submit_vlm_observation = lambda **_kwargs: True
-    harness._vlm_status_snapshot = lambda: {"loaded": True}
-
-    accepted, command_id, message, result = (
-        IntegrationDebugNode._handle_vlm_command(harness, "vlm_refresh", {})
-    )
-
-    assert accepted is True
-    assert command_id == ""
-    assert message == "VLM refresh submitted"
-    assert result == {"loaded": True}
-
-
-def test_integrated_vlm_load_requires_paused_or_stopped_armed_authority() -> None:
-    class Runtime:
-        calls = 0
-
-        @classmethod
-        def load(cls):
-            cls.calls += 1
-            raise AssertionError("blocked VLM load must not reach the shared runtime")
-
-    class Harness:
-        pass
-
-    harness = Harness()
-    harness._network_locked_to_runtime = True
-    harness._lock = threading.RLock()
-    harness._fault_locked = False
-    harness._armed = True
-    harness._manual_control_scope = "all"
-    harness._vlm_runtime = Runtime()
-    harness._vlm_status_snapshot = lambda: {"load_state": "loaded"}
-    harness._operational_runtime_status = lambda: _operational_status(
-        allowed=False,
-        control_window_open=False,
-        execution_state="running",
-        reason="pause or stop the operational scenario before manual control",
-    )
-    harness._manual_write_block_reason = (
-        IntegrationDebugNode._manual_write_block_reason.__get__(harness)
-    )
-
-    accepted, command_id, message, result = (
-        IntegrationDebugNode._handle_vlm_command(harness, "vlm_load", {})
-    )
-
-    assert accepted is False
-    assert command_id == ""
-    assert message == "pause or stop the operational scenario before manual control"
-    assert result == {"load_state": "loaded"}
-    assert Runtime.calls == 0
-
-    harness._operational_runtime_status = lambda: _operational_status(allowed=True)
-    harness._armed = False
-    accepted, _command_id, message, _result = (
-        IntegrationDebugNode._handle_vlm_command(harness, "vlm_load", {})
-    )
-
-    assert accepted is False
-    assert message == "manual control is not armed"
-    assert Runtime.calls == 0
-
-
-def test_integrated_vlm_load_reaches_shared_runtime_after_gate() -> None:
-    class Runtime:
-        calls = 0
-
-        @classmethod
-        def load(cls):
-            cls.calls += 1
-            return VLMRuntimeStatus(
-                manager_reachable=True,
-                catalog_reachable=True,
-                load_state="loading",
-                loaded=False,
-                available=True,
-                runtime_managed=True,
-                detail="loading fixed model",
-            )
-
-    class Harness:
-        pass
-
-    harness = Harness()
-    harness._network_locked_to_runtime = True
-    harness._manual_write_block_reason = lambda operation="": (
-        "" if operation == "vlm_load" else "unexpected operation"
-    )
-    harness._vlm_runtime = Runtime()
-    harness._lock = threading.RLock()
-    harness._pending_vlm_observation = None
-    harness._vlm_explicit_probe_requested = False
-    harness._last_vlm_observation_submitted_monotonic = 3.0
-    harness._apply_vlm_observation = lambda runtime, _health: None
-    harness._vlm_status_snapshot = lambda: {"load_state": "loading"}
-
-    accepted, command_id, message, result = (
-        IntegrationDebugNode._handle_vlm_command(harness, "vlm_load", {})
-    )
-
-    assert accepted is True
-    assert command_id == ""
-    assert message == "loading fixed model"
-    assert result == {"load_state": "loading"}
-    assert Runtime.calls == 1
-    assert harness._last_vlm_observation_submitted_monotonic == 0.0
 
 
 def test_operational_asr_recording_controls_remain_observation_only() -> None:

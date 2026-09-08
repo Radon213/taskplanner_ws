@@ -1,0 +1,76 @@
+.tts-playback-status {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-card);
+  background: var(--color-surface-raised);
+  color: var(--color-text);
+}
+
+.tts-playback-status > header {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+}
+
+.tts-playback-status > header > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--color-text-muted);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+}
+
+.tts-playback-status > header > strong,
+.tts-playback-status > p,
+.tts-playback-status dd {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tts-playback-status > header > strong {
+  font-size: 13px;
+}
+
+.tts-playback-status.success > header > svg { color: var(--color-success); }
+.tts-playback-status.active > header > svg { color: var(--color-accent); }
+.tts-playback-status.error > header > svg { color: var(--color-danger); }
+.tts-playback-status.waiting > header > svg { color: var(--color-text-muted); }
+
+.tts-playback-status > p,
+.tts-playback-status > small {
+  margin: 0;
+  color: var(--color-text-muted);
+  font-size: 12px;
+}
+
+.tts-playback-status dl {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 4px;
+  margin: 0;
+}
+
+.tts-playback-status dl > div {
+  min-width: 0;
+  padding: 4px 8px;
+  border-radius: var(--radius-inner);
+  background: var(--color-surface-muted);
+}
+
+.tts-playback-status dt {
+  color: var(--color-text-muted);
+  font-size: 11px;
+}
+
+.tts-playback-status dd {
+  margin: 2px 0 0;
+  font-size: 11px;
+  font-weight: 750;
+}

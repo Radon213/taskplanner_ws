@@ -5,6 +5,13 @@ Status: 2026-08-27 working-tree baseline, sixth change-isolation pass applied
 This review treats the complete dirty working tree as the baseline. It does not
 assume that `HEAD` describes the current product.
 
+> **Current policy override.** This is a historical review of extraction work.
+> [`taskplanner_principles.toml`](../taskplanner_principles.toml) and
+> [`AGENTS.md`](../AGENTS.md) are the binding policy for new work. In
+> particular, references below to full reload transactions, duplicated
+> preflight acknowledgements, static command lists, or Debug resource-idle
+> gates describe legacy/opt-in paths unless they explicitly say otherwise.
+
 ## Production boundary applied in this pass
 
 Production Live owns only these long-running services by default:
@@ -16,7 +23,7 @@ Production Live owns only these long-running services by default:
 5. the read-only public rosbridge.
 
 Local RF-DETR is no longer a selectable browser/runtime profile. PNU, vLLM,
-TTS, multicamera operations, HLS/TV media, Integrated Debug and LAN/Tailnet
+TTS, multicamera operations, Integrated Debug and LAN/Tailnet
 proxies remain Lab/Ops capabilities rather than Production boot dependencies.
 
 RF-DETR inference belongs to the configured `192.168.1.7` deployment inventory.
@@ -34,11 +41,11 @@ not reasons to rebuild a container image on an ordinary source-only restart.
 
 | Boundary | Extracted artifact | Focused regression | Status |
 | --- | --- | --- | --- |
-| ROS graph drift | `docs/contracts/taskplanner_public_ros_graph.snapshot.yaml` (263 lines), explanatory `README.md` (25), and `test_public_ros_graph_snapshot.py` (622) | 7 graph tests; 64 total bringup tests | Complete as a validation snapshot. It fixes the Mock 29-node base, rosbridge process, Live one-node overlay, endpoint bindings, and 24 Topic / 4 Service / 3 Action declarations. The required execution-route state, stopped-only command and preflight-ACK interfaces are witnessed against runtime constants, publisher/server/client direction, node owners and the Web consumer. Launch and node code remain the only runtime owners; the manifest has `runtime_authority: false` and no runtime consumer. |
+| public ROS interface reference | `docs/contracts/taskplanner_public_ros_graph.snapshot.yaml` and `test_public_ros_graph_snapshot.py` | diagnostic source smoke | The YAML declares only intentionally documented public Topics, Services, and Actions. It is non-authoritative, has no runtime reader, and is not a release gate. Historical launch topology is retained as an advisory example only; adding an internal node, command router, or binding does not require updating it. The smoke test checks that declared interfaces still have source-level implementation witnesses. |
 | BT runtime launch core | `bringup/runtime_core_launch.py` (35) and `test_runtime_core_launch.py` (91) | 2 focused factory/order tests; 64 total bringup tests | First incremental common-graph extraction complete. The factory owns the unconditional `btops_gateway` and `tree_executor` actions and returns fresh flat actions in their original order. Mock remains the public compatibility entrypoint and Live still includes Mock once, so there is no nested launch, duplicated node, copied argument set or changed ROS graph. |
-| readiness calculation | `simulation_runtime/readiness_evaluator.py` (526) and `test_readiness_evaluator.py` (290) | 8 focused evaluator tests; 63 combined preflight/readiness passes | Pure evaluation extraction complete. The module has no ROS import or mutable state, produces the fail-closed checklist/snapshot, preserves the former preflight imports, and gates a required bed-arm status on its actual validity and wall-clock lease age. `integration_preflight.py` still owns observation, leases, route transactions and publication. |
+| readiness calculation | `simulation_runtime/readiness_evaluator.py` (526) and `test_readiness_evaluator.py` (290) | 8 focused evaluator tests; 63 combined preflight/readiness passes | Pure evaluation extraction complete. The module has no ROS import or mutable state and produces the diagnostic checklist/snapshot, including actual validity and wall-clock lease age for a required bed-arm status. `integration_preflight.py` owns read-only observation and publication; route transactions remain with the execution router. |
 | browser admission parsing | `webapp/src/ros/runtimeAdmissionMessages.ts` (483), `rosMessageBounds.ts` (41), and `runtime-admission-messages.spec.ts` (251) | 9 cases across 3 configured viewports | Readiness, execution-route and route-command-result normalization is extracted and bounded. Schema, freshness, cross-field agreement, collection size, string size and nesting depth fail closed before UI state changes. Authored scenario suppression is accepted without a duplicated bundle allow-list. This is presentation admission only and never replaces server preflight. |
-| launcher mode and execution layers | `scripts/lib/taskplanner_mode_policy.sh` (257), `scripts/lib/taskplanner_execution.sh` (455), `test_taskplanner_mode_policy.sh` (183), and `test_taskplanner_execution.sh` (188) | focused shell contracts, full launcher dry-runs and runtime-control/readiness tests passed | Mode identity, pinned Live model/perception/camera settings and service selection remain declarative policy. Compose initialization/convergence, serialized build, stale-Web refresh, the same-mode warm boundary and launcher route/semantic readiness now have one execution owner. The 2,122-line entrypoint retains transition authorization, sequencing and failure ownership. |
+| launcher mode and execution layers | `scripts/lib/taskplanner_mode_policy.sh`, `scripts/lib/taskplanner_execution.sh`, `test_taskplanner_mode_policy.sh`, and `test_taskplanner_execution.sh` | focused shell contracts and launcher dry-runs | Mode identity and service ownership remain declarative. Cold ABI/IDL builds stay in the launcher, while same-mode core restart, ASR restart, and scenario configuration reload have explicit owner-only paths. |
 | browser observation and command-wire adapters | `webapp/src/ros/liveAsrMessages.ts` (175), `bedRobotArmMessages.ts` (148), `toolObservationMessages.ts` (609), and `modelCatalogMessages.ts` (380) | 10 focused new pure cases plus runtime build, static guards and affected browser flows passed | Bounded ASR JSON, complete procedure-bound bed-arm snapshots, typed RF-DETR/VLM tool facts and model/parameter wire contracts have feature-level owners. `useRosBridge` imports them while retaining the only WebSocket, generation/freshness refs, Service cancellation and action admission authority. |
 
 ## Third-pass latency and control boundaries
@@ -50,9 +57,10 @@ Debug boundaries that are expected to change frequently.
 | Boundary | Single owner / contract | Behavior now |
 | --- | --- | --- |
 | repeated mode selection | `taskplanner_runtime_control.runtime_request_is_already_ready` | An unambiguous healthy request for the already-active mode is a `202`, idle no-op. It does not require a stopped scenario and does not invoke Compose. Conflicting markers, contracts or running candidates fail closed to the normal transition path. |
-| same-mode source restart | `taskplanner_same_mode_warm_restart_allowed` plus `warm_restart_runtime_service` | A healthy operational profile preserves NInfer, ASR, Web and public rosbridge while restarting/recreating only the ROS core. An explicit build, mode change, unhealthy runtime or standalone Debug still uses the full reviewed path. |
-| scenario edit discovery and apply | `SelectSimulationBundle` revision fields and `SimulationManager` | YAML content, including the shared display catalog, has a deterministic SHA-256 revision. Preview is read-only and available while running. An unchanged revision is a no-op. A changed same-bundle revision is deferred, not queued, while running/paused and may reload in place only while idle/fully stopped. A different non-Live bundle may switch from paused only with explicit `restart_if_running=true`; starting/running always defers it. Live cross-bundle switching remains fully-stopped-only. |
-| Debug observation versus intervention | `integration_debug` operational-state gate | Standalone Debug remains its own mode. Integrated observation/status and VLM refresh/interpret paths do not acquire control authority and remain usable during a procedure. ROS publish, Action, Service, shared VLM load, USB ASR start and manual-control writes require a fresh trusted authoritative state that is paused or fully stopped, no active robot task, and idle robot/cleaner resources. Resume, stale state or publisher change disarms and cancels the Debug control window. |
+| owner-only restart | `scripts/taskplanner restart core|asr`, `reload config`, and `warm_restart_runtime_service` | A same-mode request restarts/recreates only its core and never scans package/source contracts or restarts sidecars. ASR and configuration reload remain explicit owner operations. |
+| scenario edit discovery and apply | `SelectSimulationBundle` revision fields and `ScenarioStore` | Preview is read-only and available while running. The default `fast` path parses a candidate minimally and atomically swaps the ScenarioStore while preserving the last good bundle. Any bundle selection applies at an explicit paused or stopped boundary (and at initial idle before a lifecycle frame); resident owners converge from the retained snapshot without a topology restart. The former all-participant transaction remains an explicit `transactional` opt-in. |
+| Debug observation versus intervention | `integration_debug` operational-state gate | Standalone Debug remains its own mode. Graph-wide read-only observation remains usable during a procedure. Debug writes require fresh authoritative paused/stopped state; a physical write additionally requires explicit arm and single-flight ownership. Resume, stale state or publisher change disarms the Debug control window. |
+| Live surgery-record submission | dedicated `surgery-record` owner plus Manager terminal receipt | Live always starts one least-privilege record owner. Voice and UI Stop share the same run-bound receipt; natural completion uses that receipt too. Pause/reset/raw Twin state cannot POST. The owner mounts only one private state directory and one read-only API-key file, and Debug/manual record testing remains separate. |
 
 ## Fourth-pass revision and ownership boundaries
 
@@ -64,7 +72,7 @@ turning stable geometry or every ROS topic into a separate module.
 | operator scenario revision | `webapp/src/ros/scenarioRevision.ts` and `SelectSimulationBundle` | Bundle selection is no longer an implicit apply. The operator explicitly previews a bounded coherent server response, sees active and candidate revisions, then receives an apply affordance only from fresh authoritative runtime state. Apply carries the previewed candidate revision and rejects a changed candidate. Preview remains read-only while running; the server remains final admission authority. |
 | procedure tool placement | `procedure_spec` bundle `tool_placement` | `rack_order` and per-instance `initial_states` now own editable placement. The procedure scene, Mock bootstrap and Digital Twin layout metadata derive from the same bundle, while lifecycle/location contradictions fail validation. Web no longer carries procedure-specific copied layout tables and scales its rack from authoritative slots, including more than ten tools; stable OR geometry remains a code fallback. |
 | authored scenario policy | each shipped procedure bundle `scenario_policy` and `runtime_requirements` | All shipped bundles carry their behavior and lane requirements explicitly. Shadow launch reads the bundle contract rather than matching bundle names, so adding a procedure does not require another launch allow-list. |
-| revision transaction participants | `SimulationManager` participant transaction | Every present procedure-aware participant, including the public surgical interoperability gateway, reloads in the same stopped-only transaction. Mode-specific absence is allowed; a present rejection always aborts and rolls back earlier participants. Same-path revisions are re-read and malformed YAML preserves current state. |
+| revision transaction participants | `SimulationManager` participant transaction | This retained stopped-only transaction is available only with `bundle_reload_mode=transactional`, for changes that genuinely need coordinated endpoint mutation. Normal scenario edits use the fast ScenarioStore path; malformed YAML always preserves current state. |
 
 ## Fifth-pass change-isolation boundaries
 
@@ -99,7 +107,7 @@ turning unsupported behavior into more modules.
 | scenario runtime lanes | `procedure_spec.ScenarioRuntimeRequirements` | launch, preflight, bed-arm orchestration and execution bridge |
 | procedure tool placement | `procedure_spec` bundle `tool_placement` | procedure scene, Mock bootstrap, Digital Twin layout and Web rendering |
 | scenario revision admission | `SimulationManager` plus procedure-aware reload participants | Web preview/apply client and runtime consumers |
-| typed RF-DETR admission | `simulation_runtime.perception_readiness` | integration preflight |
+| typed RF-DETR diagnostics | `simulation_runtime.perception_readiness` | integration preflight |
 | perception provider/location | `simulation_runtime.cv_contract` | launcher and contract monitor |
 | readiness calculation | `simulation_runtime.readiness_evaluator` | integration preflight ROS/state-machine shell |
 | runtime graph truth | launch files and endpoint-owning nodes | validation-only graph snapshot test |
@@ -133,10 +141,10 @@ The following remain fail-closed runtime/controller boundaries:
 
 - typed schema, procedure/run binding and bounded payload validation;
 - source freshness, monotonicity and duplicate/idempotency checks;
-- stopped-only execution-route changes and route ACK;
+- stopped-only execution-route changes and no in-flight target resource;
 - route-suppression projection refreshed after every validated route selection,
   including a scenario switch that reuses the same procedure revision;
-- current integration preflight;
+- physical endpoint discovery and local payload admission (integration preflight is diagnostic by default);
 - Action/Service discovery and request admission;
 - Debug intervention admission from fresh authoritative paused/stopped state,
   including resource-idle, single-in-flight and fault-lock checks;
@@ -148,11 +156,13 @@ procedure and must not itself be treated as control authority.
 
 ## Build and restart changes
 
-- A normal Live start is a scoped warm restart; it does not issue a global
-  Compose `down` and does not unload an already healthy NInfer model.
-- Re-selecting an already healthy mode is cheaper than a warm restart: the
-  runtime controller acknowledges it as an idle no-op. A deliberate source
-  refresh uses the same-mode warm-core path and keeps the stable I/O plane.
+- A same-mode `scripts/taskplanner up live` is a core-only warm restart. It
+  does not issue a global Compose `down`, scan source/package stamps, rebuild,
+  restart ASR/UI/VLM/rosbridge, or unload an already healthy NInfer model.
+- `scripts/taskplanner restart core`, `restart asr`, and `reload config <bundle>`
+  express the owner to change directly. They avoid the general launcher path;
+  ASR restarts resume capture and config reload calls the running scenario
+  owner without a process restart.
 - A reboot exposed stale optional-container restart policies. Lab/Ops
   accessories now use `restart: "no"`; enabling Debug, TTS, multicamera, media
   or LAN/Tailnet proxies once must not resurrect them at the next host reboot.
@@ -160,12 +170,13 @@ procedure and must not itself be treated as control authority.
   `build/docker`, `log/docker` and `install/docker` roots. ROS containers invoke
   the bind-mounted source `docker/entrypoint.sh`, so an old image cannot source
   a host-built overlay or restore a stale ABI through its baked entrypoint.
-- `--ensure-build` fingerprints ABI/IDL/C++/entry-point inputs; symlink-installed
-  Python, launch and configuration edits do not force a full rebuild.
+- `--ensure-build` fingerprints ABI/IDL/C++/entry-point inputs only on a cold
+  start. An already-running same-mode core takes the fast restart path; use
+  explicit `--build` for a deliberate ABI/IDL/C++ rebuild.
 - Explicit `--build` builds each image once instead of forwarding `--build` to
   every later Compose `up` call.
-- vendored rosbridge source is excluded from colcon because the image already
-  installs the Jazzy rosbridge package.
+- rosbridge is supplied by the Jazzy apt package; the workspace no longer
+  carries a duplicate vendor tree.
 - generated reports and test evidence are excluded from Docker context.
 - static web startup has its own argv-safe script and rebuilds the bundle only
   when its source fingerprint changes. Its `/healthz` reports static serving
@@ -287,14 +298,13 @@ modularized by this pass:
   node;
 - `or_digital_twin/twin.py` and `or_digital_twin/node.py`: state reduction and
   ROS projection remain broad at 6,195 and 4,818 lines respectively;
-- `bringup/taskplanner_mock.launch.py` (2,302 lines): still supplies most of the
-  common 29-node graph used by Live as well as Mock/Lab. The BT engine pair is
-  now composed by `bringup.runtime_core_launch`; the remaining graph and its
-  large argument surface are still monolithic;
+- `bringup/taskplanner_mock.launch.py` (2,302 lines): retained only as a
+  source-only validation harness. Its skill execution lane now uses the same
+  direct interop adapter as managed owners; managed startup and scoped builds
+  do not load this composite graph;
 - `simulation_runtime/integration_preflight.py` (2,499 lines): pure readiness
   calculation is extracted, while ROS discovery, evidence receipt, freshness
-  leases, stopped-route transactions and publication remain around one
-  fail-closed mutable state machine;
+  leases and publication remain around one read-only diagnostic state machine;
 - `scripts/taskplanner` (2,122 lines): the 257-line mode policy and 455-line
   execution layer are extracted, but Production, Lab, Debug and release
   transitions still share one authorization/sequencing entrypoint;

@@ -10,6 +10,8 @@ from unittest.mock import patch
 
 from tools.real_surgery_annotation.run_shadow_replay import (
     CRITICAL_NODES,
+    OBSERVED_UTTERANCE_MESSAGE_TYPE,
+    OBSERVED_UTTERANCE_TOPIC,
     _RuntimeResourceLock,
     _build_parser,
     _model_preflight,
@@ -468,7 +470,7 @@ except RuntimeError as exc:
         self.assertEqual(result["loaded_models"], ["vision-model"])
         self.assertEqual(result["load_state_source"], "vllm_manager_status")
 
-    def test_public_input_integrity_requires_admitted_speech(self) -> None:
+    def test_public_input_integrity_requires_observed_typed_utterance(self) -> None:
         bag_info = {
             "topics": {
                 "/cam": {"message_count": 1},
@@ -487,7 +489,7 @@ except RuntimeError as exc:
         )
         self.assertFalse(result["ok"])
         self.assertIn(
-            "admitted_speech_count_mismatch:expected=1,recorded=0",
+            "observed_utterance_count_mismatch:expected=1,recorded=0",
             result["errors"],
         )
 
@@ -503,7 +505,8 @@ except RuntimeError as exc:
             {"layer": "input_transcript", "topic": "/transcript"},
             {
                 "layer": "input_transcript",
-                "topic": "/surgery/audio/request_text",
+                "topic": OBSERVED_UTTERANCE_TOPIC,
+                "message_type": OBSERVED_UTTERANCE_MESSAGE_TYPE,
             },
         ]
         result = _validate_public_input_trace(
@@ -513,7 +516,37 @@ except RuntimeError as exc:
             source_transcript_topic="/transcript",
         )
         self.assertTrue(result["ok"])
-        self.assertEqual(result["admitted_speech_count"], 1)
+        self.assertEqual(result["observed_utterance_count"], 1)
+
+    def test_public_input_integrity_rejects_untyped_observed_text(self) -> None:
+        bag_info = {
+            "topics": {
+                "/cam": {"message_count": 1},
+                "/transcript": {"message_count": 1},
+            }
+        }
+        records = [
+            {"layer": "input_image", "topic": "/cam"},
+            {"layer": "input_transcript", "topic": "/transcript"},
+            {
+                "layer": "input_transcript",
+                "topic": OBSERVED_UTTERANCE_TOPIC,
+                "message_type": "std_msgs/msg/String",
+            },
+        ]
+
+        result = _validate_public_input_trace(
+            records,
+            bag_info=bag_info,
+            field_image_topic="/cam",
+            source_transcript_topic="/transcript",
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertIn(
+            "observed_utterance_count_mismatch:expected=1,recorded=0",
+            result["errors"],
+        )
 
     def test_public_input_integrity_accepts_interactive_topic_remap(self) -> None:
         bag_info = {
@@ -527,7 +560,8 @@ except RuntimeError as exc:
             {"layer": "input_transcript", "topic": "/transcript"},
             {
                 "layer": "input_transcript",
-                "topic": "/surgery/audio/request_text",
+                "topic": OBSERVED_UTTERANCE_TOPIC,
+                "message_type": OBSERVED_UTTERANCE_MESSAGE_TYPE,
             },
         ]
 
@@ -686,7 +720,8 @@ except RuntimeError as exc:
             {"layer": "input_transcript", "topic": "/transcript"},
             {
                 "layer": "input_transcript",
-                "topic": "/surgery/audio/request_text",
+                "topic": OBSERVED_UTTERANCE_TOPIC,
+                "message_type": OBSERVED_UTTERANCE_MESSAGE_TYPE,
             },
             {
                 "layer": "vlm_request",

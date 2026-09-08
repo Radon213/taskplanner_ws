@@ -228,7 +228,7 @@
   opacity: 0.62;
 }
 
-.execution-route-selector-reset-note,
+.execution-route-selector-boundary-note,
 .execution-route-selector-lock,
 .execution-route-selector-feedback {
   display: grid;
@@ -242,16 +242,16 @@
   background: color-mix(in srgb, var(--color-page-raised) 46%, transparent);
 }
 
-.execution-route-selector-reset-note {
+.execution-route-selector-boundary-note {
   color: var(--color-warning-text);
 }
 
-.execution-route-selector-reset-note > svg {
+.execution-route-selector-boundary-note > svg {
   margin-top: 1px;
   color: var(--color-warning);
 }
 
-.execution-route-selector-reset-note span,
+.execution-route-selector-boundary-note span,
 .execution-route-selector-lock span {
   color: var(--color-text-secondary);
   font-size: 11px;
@@ -273,8 +273,7 @@
   color: var(--color-text-muted);
 }
 
-.execution-route-selector-feedback.switching,
-.execution-route-selector-feedback.resetting {
+.execution-route-selector-feedback.switching {
   border-color: color-mix(in srgb, var(--color-accent) 44%, var(--color-border));
   color: var(--color-accent-strong);
 }
@@ -312,15 +311,4 @@
   .execution-route-selector-option:hover:not(:disabled) {
     transform: none;
   }
-}
-
-.execution-route-selector[data-motion="reduced"] *,
-.execution-route-selector[data-motion="reduced"] .execution-route-selector-spinner {
-  animation-duration: 0.01ms;
-  animation-iteration-count: 1;
-  transition-duration: 0.01ms;
-}
-
-.execution-route-selector[data-motion="reduced"] .execution-route-selector-option:hover:not(:disabled) {
-  transform: none;
 }

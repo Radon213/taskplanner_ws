@@ -45,7 +45,7 @@ Runtime feature ownership is deliberately split:
 - **Production (`live`)** owns only Digital Twin/BT execution coordination,
   typed ASR, one fixed NInfer VLM provider, public ROSBridge, the Mission UI,
   and direct CAM3/CAM4 RF-DETR topic consumption.
-- **Ops (`ops`)** owns optional multicamera, TV/HLS, media, TTS, proxy and
+- **Ops (`ops`)** owns optional multicamera, TTS, proxy and
   integration-diagnostics surfaces.
 - **Lab (`lab`)** owns mock/shadow actors, provider comparison, local/PNU
   perception adapters, replay, synthetic cameras, training and evaluation.
@@ -109,7 +109,8 @@ Real VLM public inputs include:
 - `/twin/events`
 - `/bt/decision`
 - `/skill/status`
-- admitted public voice transcript
+- `/surgery/audio/observed_utterance`
+  (`surgical_msgs/msg/SpeechUtterance` router observation relay)
 - retraction-arm requests derived from speech and controller-owned arm status
 
 The real VLM does not subscribe to validation-only `/surgeon/state`,
@@ -161,7 +162,6 @@ Inputs:
 
 - `/surgeon/actor_event`
 - `/surgeon/request`
-- `/surgery/audio/request_text`
 - `/vlm/result`
 - `/vlm/tool_observations`
 - `/skill/events`
@@ -180,9 +180,12 @@ Outputs:
 
 Important reducer behavior:
 
-- An admitted public surgeon sentence can become a canonical explicit request without
-  passing through the VLM.
-- Matching transcript and `/surgeon/request` messages are coalesced.
+- The Digital Twin is not a speech ingress. The command router turns a matching
+  admitted `SpeechUtterance` into the typed `/surgeon/request` endpoint path;
+  `/surgery/audio/observed_utterance` is only the public VLM/logging/Debug relay.
+- The command router correlates a resolver proposal to the original typed
+  utterance before dispatch, so the Digital Twin receives one structured request
+  path rather than a raw-transcript compatibility path.
 - VLM failure degrades to explicit voice handover; inferred phase, prediction,
   and Mayo classification remain closed.
 
@@ -226,20 +229,12 @@ Responsibilities:
 - dispatch `/bt/skill_command`;
 - publish `/bt/decision`.
 
-### `skill_execution`
+### `surgical_interop_execution`
 
-Mock robot execution and action bridge.
-
-Executables:
-
-- `skill_action_bridge`
-- `mock_skill_server`
-
-The bridge converts `/bt/skill_command` into `/skill/execute` ROS action goals.
-The action interface remains wire-compatible and uses the `action` string
-`pick_up_from_mayo_and_handover` for the Mayo-to-surgeon path. The mock server
-always completes configured actions and emits public `/skill/status` plus
-`/skill/events`.
+The single execution adapter converts `/bt/skill_command` into the reviewed
+tool-handover Action and maps bed-arm commands to the retraction Service. It
+emits the public `/skill/status` and `/skill/events` projections without a
+second mock Action server or bridge.
 
 Bed-mounted robot-arm integration is a separate, retraction-only lane. It maps
 internal validated requests onto the single `/surgery/retraction/command`
@@ -291,7 +286,6 @@ Important services/actions:
 - `ControlSimulation.srv`
 - `SelectSimulationBundle.srv`
 - `InjectSurgeonOverride.srv`
-- `ExecuteSkill.action`
 
 ### `bringup`
 
@@ -307,14 +301,15 @@ Executables:
 - `taskplanner_thyroidectomy_llm_e2e_probe`
 - `taskplanner_thyroidectomy_prediction_probe`
 
-Launch:
+Managed launch:
 
-- `taskplanner_live.launch.py` — fixed Production wrapper.
-- `taskplanner_mock.launch.py`
+- `scripts/taskplanner up live` — the Live owner plane.
+- `scripts/taskplanner up llm-surgeon` — the Live owner plane plus simulation input.
 
-The historical `taskplanner_mock.launch.py` is the reusable Lab/base graph.
-Production pins its inputs and disables its mock/local provider branches through
-`taskplanner_live.launch.py`; operators do not select those branches at runtime.
+The historical `taskplanner_mock.launch.py` and `taskplanner_live.launch.py`
+remain only for explicitly invoked legacy probes and topology-reference tests.
+Managed operators do not start either composite graph; they use the split
+owner plane and owner-scoped restart/reload commands instead.
 
 ### `webapp`
 
@@ -329,7 +324,7 @@ Main responsibilities:
 - itemized integration preflight and execution route state;
 - on-demand live camera preview.
 
-Debug, Multicam, Shadow, raw observability, model controls and TV/HLS are lazy
+Debug, Multicam, Shadow, raw observability, and model controls are lazy
 optional workspaces and do not create Production subscriptions by default.
 
 ## 3. Default Runtime
@@ -386,8 +381,18 @@ llm_surgeon_actor
   -> /surgeon/actor_event
   -> /surgeon/request
   -> /surgeon/state
-  -> /surgery/audio/request_text
+  -> /sensors/speech/utterance (surgical_msgs/msg/SpeechUtterance)
+speech_input_adapter
+  -> /surgery/audio/admitted_utterance
+command_router
+  -> /surgery/audio/observed_utterance (read-only VLM/logging/Debug relay)
+  -> typed endpoint adapters (for example /simulation/inject_surgeon_override)
+  -> /surgeon/request
 ```
+
+Archived raw-text traces and reports remain historical evaluation artifacts; they
+are not active runtime contracts. Current replay validation expects the typed
+router observation relay above.
 
 The actor may know hidden ground-truth phase internally, but that hidden state is
 used only for validation scoring.
@@ -452,15 +457,16 @@ public actor events + VLM proposals + skill events + control state
   -> BT tree
   -> /bt/decision
   -> /bt/skill_command
-  -> /skill/execute
+  -> surgical_interop_execution
+  -> /surgery/tool_handover or /surgery/retraction/command
   -> /skill/status + /skill/events
   -> or_digital_twin
 ```
 
 ## 5. Known Boundaries
 
-- The deployed robot action server is not implemented in this repository. The
-  current action server is a deterministic mock server.
+- The deployed robot capability server is not implemented in this repository;
+  the isolated virtual fault emulator is used for local validation.
 - VLM quality depends on the selected local provider/model and structured JSON
   behavior. Provider discovery confirms API reachability, not task suitability.
 - The no-image camera is a test replacement for the unavailable surgery video

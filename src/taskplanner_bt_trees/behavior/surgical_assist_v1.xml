@@ -3,8 +3,15 @@
   <BehaviorTree ID="TaskplannerAssistDemo">
     <KeepRunningUntilFailure>
       <Sequence name="TaskplannerAssistTick">
+        <!-- RosSubscriberNode is success/failure-only.  The retry wrapper
+             therefore needs one bounded yield when there is no sample; it is
+             not a handover policy delay.  25 ms matches one 40 Hz executor
+             period, prevents a busy-spin, and is skipped as soon as a fresh
+             WorldState is available on the next tick. -->
         <RetryUntilSuccessful num_attempts="-1">
-          <LoadWorldState />
+          <Delay delay_msec="25">
+            <LoadWorldState />
+          </Delay>
         </RetryUntilSuccessful>
         <IsProcedureActive />
         <Fallback name="DecisionRoot">

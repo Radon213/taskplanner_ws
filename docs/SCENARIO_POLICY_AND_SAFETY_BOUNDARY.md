@@ -1,8 +1,24 @@
 # Scenario Policy and Safety Boundary
 
+> **Current-policy note (2026-08-27).**
+> [`taskplanner_principles.toml`](../taskplanner_principles.toml) is the
+> binding policy. This document remains useful for the authored policy model,
+> but its older references to mandatory integration preflight and route ACK are
+> historical transactional-mode behavior. The normal path is minimal ScenarioStore
+> validation plus an atomic fast reload; endpoint route changes need only stopped
+> state and no in-flight request for the affected resource.
+
 The planner now treats authored scenario choices and physical/runtime safety as
 different contracts. A scenario change should normally be a YAML edit and unit
 test, not a new gate in the Digital Twin, BT, launch file and UI.
+
+ScenarioStore parses the next bundle before atomically publishing it and keeps
+the last-good bundle on an error. A stopped Twin takes the new authored layout.
+A quiescent paused Twin keeps matching observed/authoritative tool placements
+and swaps only the scenario configuration; an active robot, Action, Service or
+execution proxy defers that swap. Starting a procedure likewise uses the
+current quiescent Twin state. **Reset** is the explicit operation that restores
+the canonical authored layout.
 
 ## Scenario policy (editable per bundle)
 
@@ -20,18 +36,20 @@ decision means “not part of this scenario”, not “unsafe hardware state”.
 policy lives under `scenario_policy:` in the procedure bundle; code should query
 the facade instead of reading several YAML sections independently.
 
-`scenario_policy.runtime_requirements` is the single typed selection record for
-runtime feature lanes and Taskplanner-owned workflow ordering. It selects such
-things as the tool-handover Action lane, retraction Service lane, image/dialogue
-VLM lanes, perception, voice routing and whether Taskplanner enforces its local
-retraction workflow state. It is not a safety approval and cannot bypass any
+`scenario_policy.runtime_requirements` is the single typed configuration record
+for resident feature owners and Taskplanner-owned workflow ordering. It controls
+behavior such as tool-handover and retraction policy, image/dialogue VLM use,
+perception, voice resolution and local retraction workflow state. It never
+creates or removes a node at scenario selection time, so changing a bundle does
+not imply a topology restart. It is not a safety approval and cannot bypass any
 admission check below.
 
 To add or change a scenario, edit the complete `runtime_requirements` mapping in
-that bundle's `vlm_procedure_prompt.yaml` and add/update the resolver contract
-test. Existing bundles without the mapping use centralized compatibility
-defaults in `procedure_spec.scenario_policy`; launch, preflight, orchestrator and
-execution bridge code must not add bundle-name switches.
+that bundle's `vlm_procedure_prompt.yaml` and add/update the focused catalog or
+scenario test that owns the changed behavior. Existing bundles without the
+mapping use centralized compatibility defaults in `procedure_spec.scenario_policy`;
+launch, preflight, orchestrator and execution bridge code must not add
+bundle-name switches.
 
 ## Runtime admission (fail closed)
 
@@ -40,9 +58,9 @@ runtime interlocks:
 
 - typed request/schema validation and active-procedure binding;
 - authoritative execution state and stopped-only route changes;
-- fresh integration preflight and route ACK. A validated route selection must
-  refresh its suppression projection even when a scenario switch reuses the
-  same procedure revision; stale or mismatched projection closes readiness;
+- endpoint availability and request admission. Integration preflight is
+  diagnostic by default; the legacy route-ACK transaction is an explicit
+  opt-in for coordinated endpoint mutation;
 - Action/Service discovery and request admission;
 - source timestamp, freshness, monotonicity and duplicate/idempotency checks;
 - controller-owned completion/state feedback.
@@ -67,8 +85,8 @@ reimplement those controls.
 1. Define a typed ROS message, Service or Action contract and one owner.
 2. Add a small adapter/subscriber package; do not add another parser to the
    Digital Twin, BT, launch script and webapp simultaneously.
-3. Select the capability in `scenario_policy.runtime_requirements`; do not add
-   a bundle-name condition to a consumer.
+3. Configure the resident capability in `scenario_policy.runtime_requirements`;
+   do not add a bundle-name condition to a launch file or consumer.
 4. Keep physical admission in the execution bridge/controller boundary.
 5. Add contract and policy tests; Production starts no Lab provider by default.
 

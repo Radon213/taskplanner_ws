@@ -144,6 +144,11 @@ class TwinState:
     predicted_tool: str = ""
     predicted_tool_confidence: float = 0.0
     predicted_tool_stability_sec: float = 0.0
+    # The Digital Twin alone decides when the frozen 0704 n-gram top candidate
+    # has crossed the autonomous-preparation probability/dwell policy.  Keep
+    # the raw rank-one fields separate so a direct, validated hand request can
+    # still use the highest n-gram candidate below that autonomous threshold.
+    autonomous_preparation_ready: bool = False
     ranked_tool_predictions: list[RankedToolPredictionBelief] = field(
         default_factory=list
     )
@@ -160,6 +165,10 @@ class TwinState:
     implicit_request_confidence: float = 0.0
     implicit_request_stability_sec: float = 0.0
     implicit_request_generation: int = 0
+    # CAM4 observes the Mayo work surface. Keep it occupied unless a fresh,
+    # pinned, healthy empty-frame lease proves the hand has left; startup,
+    # detector silence, and health loss cannot authorize Mayo manipulation.
+    cam4_mayo_hand_present: bool = True
     surgeon_request_queue: deque[SurgeonRequestCue] = field(default_factory=deque)
     cleaner_busy: bool = False
     cleaner_remaining_sec: float = 0.0

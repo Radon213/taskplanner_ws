@@ -31,8 +31,8 @@ const DISPOSITION_COPY: Record<string, readonly [string, string]> = {
   unchanged: ["최신 상태", "Up to date"],
   applied: ["적용 완료", "Applied"],
   deferred: ["적용 보류", "Deferred"],
+  deferred_paused_or_stopped_required: ["일시정지·정지 후 적용 가능", "Pause or stop scenario to apply"],
   blocked: ["적용 차단", "Blocked"],
-  restart_required: ["재기동 필요", "Restart required"],
   rejected: ["서버 거부", "Rejected"],
 };
 
@@ -60,10 +60,7 @@ function localizedAdmissionReason(reason: string, language: Language): string {
     "Wait for the current runtime request to finish.": "현재 실행 요청이 끝난 뒤 적용할 수 있습니다.",
     "Preview this bundle revision before applying it.": "먼저 선택한 번들의 변경 사항을 확인하세요.",
     "The selected bundle already matches the active revision.": "선택한 번들은 이미 현재 revision과 같습니다.",
-    "Reloading the active bundle resets procedure state. Fully stop the scenario before applying it.": "현재 번들의 reload는 진행 상태를 초기화합니다. 시나리오를 완전히 정지한 뒤 적용하세요.",
-    "Wait until all Live robot, recovery, and cleaner work is idle.": "Live 로봇·회수·정리 작업이 모두 idle이 될 때까지 기다리세요.",
-    "Fully stop the Live scenario and active work before changing bundles.": "Live 시나리오와 활성 작업을 완전히 정지한 뒤 번들을 바꿀 수 있습니다.",
-    "Pause or fully stop the scenario before changing bundles.": "시나리오를 일시정지하거나 완전히 정지한 뒤 번들을 바꿀 수 있습니다.",
+    "Pause or stop the scenario before changing bundles.": "시나리오를 일시정지하거나 완전히 정지한 뒤 번들을 바꿀 수 있습니다.",
   };
   return known[reason] ?? reason;
 }

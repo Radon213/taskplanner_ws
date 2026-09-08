@@ -1,5 +1,6 @@
 from collections import deque
 import json
+from pathlib import Path
 
 import pytest
 
@@ -7,6 +8,8 @@ from surgical_interop_gateway.public_bridge_policy import (
     PUBLIC_ALLOWED_INCOMING_OPERATIONS,
     PUBLIC_BRIDGE_CONTRACT,
     PUBLIC_BRIDGE_CONTRACT_HEADER,
+    PUBLIC_BRIDGE_NODE_NAME,
+    PUBLIC_BRIDGE_PROFILE,
     PUBLIC_ALLOWED_COMPRESSIONS,
     PUBLIC_CAMERA_COMPRESSION,
     PUBLIC_CAMERA_QOS,
@@ -20,17 +23,22 @@ from surgical_interop_gateway.public_bridge_policy import (
     PUBLIC_MAX_OUTGOING_BINARY_MESSAGES,
     PUBLIC_MAX_OUTGOING_MESSAGE_BYTES,
     PUBLIC_MAX_OUTGOING_QUEUE,
+    PUBLIC_MAX_OUTGOING_RECEIPT_MESSAGE_BYTES,
     PUBLIC_MAX_OUTGOING_STATE_MESSAGE_BYTES,
     PUBLIC_MAX_SUBSCRIPTION_IDS_PER_TOPIC,
     PUBLIC_EVENT_QOS,
     PUBLIC_REJECTED_OPERATION,
+    PUBLIC_RECEIPT_TOPIC,
     PUBLIC_LOOPBACK_ADDRESS,
+    LOCAL_MEDIA_CAMERA_TOPICS,
     PUBLIC_STATE_TOPICS,
     PUBLIC_SNAPSHOT_QOS,
     PUBLIC_SUBSCRIBE_ALLOWLIST,
     origin_is_allowed,
     parse_allowed_origins,
     peer_is_loopback,
+    public_outgoing_message_limit,
+    resolve_bridge_profile,
     restrict_public_subscription_request,
     restrict_public_incoming_message,
     restrict_public_rosbridge_protocol,
@@ -96,17 +104,43 @@ def test_public_bridge_has_exact_reviewed_topic_allowlist() -> None:
         "/surgery/clinical_observations",
         "/surgery/health",
         "/surgery/events",
+        "/surgery/record/receipt",
     )
     assert PUBLIC_CAMERA_TOPICS == (
         "/surgery/images/flir/compressed",
         "/surgery/images/cam4/compressed",
+        "/surgery/images/cam4/overlay/compressed",
         "/surgery/images/cam3/overlay/compressed",
         "/surgery/images/suction/overlay/compressed",
         "/surgery/images/right_ee/overlay/compressed",
     )
     assert PUBLIC_SUBSCRIBE_ALLOWLIST == PUBLIC_STATE_TOPICS + PUBLIC_CAMERA_TOPICS
-    assert len(PUBLIC_SUBSCRIBE_ALLOWLIST) == len(set(PUBLIC_SUBSCRIBE_ALLOWLIST)) == 16
+    assert len(PUBLIC_SUBSCRIBE_ALLOWLIST) == len(set(PUBLIC_SUBSCRIBE_ALLOWLIST)) == 18
     assert not any("*" in topic or "?" in topic or "[" in topic for topic in PUBLIC_SUBSCRIBE_ALLOWLIST)
+
+
+def test_local_media_profile_is_exactly_the_live_source_surface() -> None:
+    profile = resolve_bridge_profile("local-media")
+
+    assert PUBLIC_BRIDGE_PROFILE.name == "public"
+    assert PUBLIC_BRIDGE_CONTRACT == "public-subscribe-v1"
+    assert PUBLIC_BRIDGE_NODE_NAME == "public_read_only_rosbridge"
+    assert profile.contract == "local-media-subscribe-v1"
+    assert profile.node_name == "local_media_rosbridge"
+    assert profile.state_topics == ()
+    assert profile.camera_topics == LOCAL_MEDIA_CAMERA_TOPICS == (
+        "/synced/cam_1/color/image_raw/compressed",
+        "/synced/cam_2/color/image_raw/compressed",
+        "/perception/cam_3/overlay/compressed",
+        "/perception/cam_4/overlay/compressed",
+        "/synced/flir/color/image_raw/compressed",
+    )
+    assert len(profile.camera_topics) == len(set(profile.camera_topics)) == 5
+
+
+def test_unknown_bridge_profile_fails_closed() -> None:
+    with pytest.raises(ValueError, match="unsupported bounded rosbridge profile"):
+        resolve_bridge_profile("anything-goes")
 
 
 def test_public_bridge_policy_cannot_be_widened_by_parameters() -> None:
@@ -130,7 +164,8 @@ def test_public_bridge_excludes_internal_control_and_raw_sensor_topics() -> None
         "/simulation/state",
         "/simulation/control_state",
         "/sensors/surgeon/sentence",
-        "/surgery/audio/request_text",
+        "/surgery/audio/admitted_utterance",
+        "/surgery/audio/observed_utterance",
         "/external/bed_robot_arms/status",
         "/synced/flir/color/image_raw/compressed",
         "/synced/cam_4/color/image_raw/compressed",
@@ -139,6 +174,7 @@ def test_public_bridge_excludes_internal_control_and_raw_sensor_topics() -> None
         "/perception/right_ee/overlay/compressed",
         "/surgery/images/flir/segmented/compressed",
         "/surgery/retraction/command",
+        "/surgery/record/post_status",
         "/rosapi/topics",
     }
     assert denied.isdisjoint(PUBLIC_SUBSCRIBE_ALLOWLIST)
@@ -200,7 +236,7 @@ def test_camera_subscription_is_latest_only_even_if_client_requests_unbounded() 
         assert (
             restricted["throttle_rate"]
             == PUBLIC_CAMERA_MIN_THROTTLE_MS
-            == 100
+            == 0
         )
         assert restricted["qos"] == PUBLIC_CAMERA_QOS
 
@@ -247,10 +283,14 @@ def test_public_subscription_qos_is_fixed_by_topic_class() -> None:
     event = restrict_public_subscription_request(
         {"op": "subscribe", "topic": "/surgery/events", "qos": hostile}
     )
+    receipt = restrict_public_subscription_request(
+        {"op": "subscribe", "topic": "/surgery/record/receipt", "qos": hostile}
+    )
 
     assert camera["qos"] == PUBLIC_CAMERA_QOS
     assert snapshot["qos"] == PUBLIC_SNAPSHOT_QOS
     assert event["qos"] == PUBLIC_EVENT_QOS
+    assert receipt["qos"] == PUBLIC_SNAPSHOT_QOS
 
 
 def test_all_client_camera_requests_are_forced_to_cbor_not_png() -> None:
@@ -267,7 +307,7 @@ def test_all_client_camera_requests_are_forced_to_cbor_not_png() -> None:
             )
             assert restricted["compression"] == "cbor"
             assert restricted["queue_length"] == 1
-            assert restricted["throttle_rate"] == 100
+            assert restricted["throttle_rate"] == 0
 
 
 @pytest.mark.parametrize("compression", ("png", "zip", "", None, 7))
@@ -292,12 +332,35 @@ def test_public_bridge_resource_limits_are_small_and_finite() -> None:
     assert PUBLIC_MAX_INCOMING_QUEUE == 32
     assert PUBLIC_MAX_OUTGOING_MESSAGE_BYTES == 4 * 1024 * 1024
     assert PUBLIC_MAX_OUTGOING_STATE_MESSAGE_BYTES == 256 * 1024
-    assert PUBLIC_MAX_OUTGOING_QUEUE == 16
+    assert PUBLIC_MAX_OUTGOING_QUEUE == 18
     assert PUBLIC_MAX_OUTGOING_BINARY_MESSAGES == 1
+    assert PUBLIC_MAX_OUTGOING_RECEIPT_MESSAGE_BYTES == 1_024 * 1_024
+    assert public_outgoing_message_limit(
+        topic="/surgery/context", binary=False
+    ) == PUBLIC_MAX_OUTGOING_STATE_MESSAGE_BYTES
+    assert public_outgoing_message_limit(
+        topic=PUBLIC_RECEIPT_TOPIC, binary=False
+    ) == PUBLIC_MAX_OUTGOING_RECEIPT_MESSAGE_BYTES
+    assert public_outgoing_message_limit(
+        topic=PUBLIC_RECEIPT_TOPIC, binary=True
+    ) == PUBLIC_MAX_OUTGOING_MESSAGE_BYTES
 
     tornado_settings = {"websocket_max_message_size": 500_000_000}
     _bound_public_tornado_settings(tornado_settings)
     assert tornado_settings["websocket_max_message_size"] == 64 * 1024
+
+
+def test_receipt_text_egress_keeps_its_topic_specific_limit() -> None:
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "surgical_interop_gateway"
+        / "public_rosbridge.py"
+    ).read_text(encoding="utf-8")
+
+    assert "topic = self.protocol.public_outgoing_topic()" in source
+    assert "message_limit = public_outgoing_message_limit(" in source
+    assert "topic=topic," in source
+    assert "message,\n                        binary,\n                        topic," in source
 
 
 def test_public_outgoing_queue_preserves_state_burst_and_latest_per_camera() -> None:
@@ -324,10 +387,11 @@ def test_public_outgoing_queue_preserves_state_burst_and_latest_per_camera() -> 
     assert binary_frames == {
         flir: b"flir-2",
         PUBLIC_CAMERA_TOPICS[1]: b"camera-1",
-        PUBLIC_CAMERA_TOPICS[2]: b"camera-2",
-        PUBLIC_CAMERA_TOPICS[3]: b"camera-3",
-        PUBLIC_CAMERA_TOPICS[4]: b"camera-4",
-    }
+            PUBLIC_CAMERA_TOPICS[2]: b"camera-2",
+            PUBLIC_CAMERA_TOPICS[3]: b"camera-3",
+            PUBLIC_CAMERA_TOPICS[4]: b"camera-4",
+            PUBLIC_CAMERA_TOPICS[5]: b"camera-5",
+        }
     assert len(outgoing) == PUBLIC_MAX_OUTGOING_QUEUE
 
 

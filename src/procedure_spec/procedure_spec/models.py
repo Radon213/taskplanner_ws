@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any, Mapping
 
 
 @dataclass(slots=True)
@@ -16,6 +17,23 @@ class PhaseSpec:
     min_duration_sec: float = 0.0
 
 
+@dataclass(frozen=True, slots=True)
+class InstrumentPopulationSpec:
+    """Population bounds for one exchangeable instrument type.
+
+    ``initial_count`` remains the number of controller-addressable instances
+    materialized at scenario start. ``capacity`` is the larger bounded logical
+    slot budget used when physical identity is intentionally exchangeable. A
+    tracker may observe dormant slots, while a control owner must admit them
+    through its own typed-evidence guards before using them. Legacy fixed
+    inventories use equal values and ``exchangeable=False``.
+    """
+
+    initial_count: int
+    capacity: int
+    exchangeable: bool = False
+
+
 @dataclass(slots=True)
 class InstrumentSpec:
     id: str
@@ -27,6 +45,7 @@ class InstrumentSpec:
     requestable: bool = True
     role: str = ""
     handover_profile: str = ""
+    population: InstrumentPopulationSpec | None = None
 
 
 @dataclass(slots=True)
@@ -106,7 +125,6 @@ class ScenarioRuntimeRequirements:
     surgeon_actor_enabled: bool = True
     phase_inference_enabled: bool = True
     retraction_workflow_state_enforced: bool = True
-    legacy_raw_retractor_voice_enabled: bool = False
 
     @property
     def bed_robot_contract_enabled(self) -> bool:
@@ -131,6 +149,11 @@ class ScenarioPolicySpec:
     explicit_request_priority: bool = True
     unused_preposition_destination: str = "mayo"
     runtime_requirements: ScenarioRuntimeRequirements | None = None
+    # Keep experiment-specific scenario knobs with the authored bundle rather
+    # than rejecting the whole YAML until every consumer grows a field.  Core
+    # runtime code reads only its explicit fields; adapters may opt into an
+    # extension at their own boundary.
+    extensions: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)

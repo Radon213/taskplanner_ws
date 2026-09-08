@@ -11,7 +11,7 @@ from or_digital_twin.models import (
     LIFECYCLE_RETURNED_HOME,
     LIFECYCLE_SURGEON_OWNED,
 )
-from or_digital_twin.twin import ORDigitalTwin
+from or_digital_twin.twin import ORDigitalTwin, VOICE_PREPARED_RESERVATION
 from procedure_spec import load_bundle
 from surgical_msgs.msg import SurgeonRequest, TwinEvent
 
@@ -224,6 +224,242 @@ def test_authoritative_prepare_overrides_stale_nonvoice_surgeon_belief() -> None
     assert state.lifecycle_stage == LIFECYCLE_PREPOSITIONED_RIGHT
     assert state.location_type == "robot"
     assert "right_arm_overloaded" in twin.state.safety_flags
+
+
+def test_voice_prepare_completion_consumes_request_but_not_handover() -> None:
+    twin = _twin()
+    state = twin.instrument_states["T04#1"]
+    assert twin.update_resolved_voice_tool_handover("T04") == "T04"
+    generation = twin.state.surgeon_request_generation
+    started = _event("RobotTaskStarted", "T04", "T04#1")
+    started.detail_json = json.dumps(
+        {
+            "task_id": "controller-voice-prepare-1",
+            "command_id": "controller-voice-prepare-1",
+            "task_type": "prepare_tool",
+            "request_generation": generation,
+        }
+    )
+    twin.apply_event(started)
+    prepared = _authoritative_completion(
+        command_id="controller-voice-prepare-1",
+        request_generation=generation,
+        event_type="ToolPrepared",
+        source_location="tray",
+        target_location="robot",
+        projection_step="prepared",
+    )
+    detail = json.loads(prepared.detail_json)
+    # Match the real controller projection: task provenance belongs to the
+    # preceding RobotTaskStarted event, not ToolPrepared.detail_json.
+    assert "task_type" not in detail
+
+    twin.apply_event(prepared)
+
+    assert state.lifecycle_stage == LIFECYCLE_PREPOSITIONED_RIGHT
+    assert twin.state.right_hand_tool_instance_id == state.instance_id
+    assert twin.state.surgeon_request_tool == ""
+    assert state.reserved_for == "voice_prepared"
+    assert any(
+        event["event_type"] == "SurgeonRequestDequeued"
+        and event["reason"] == "voice_requested_tool_prepared"
+        and event["completed_generation"] == generation
+        for event in twin.event_history
+    )
+
+
+def test_tracker_commit_before_tool_prepared_keeps_voice_reservation() -> None:
+    """The live tracker projection precedes the controller ToolPrepared receipt."""
+
+    twin = _twin()
+    state = twin.instrument_states["T04#1"]
+    assert twin.update_resolved_voice_tool_handover("T04") == "T04"
+    generation = twin.state.surgeon_request_generation
+    started = _event("RobotTaskStarted", "T04", "T04#1")
+    started.detail_json = json.dumps(
+        {
+            "task_id": "controller-voice-prepare-tracker-first",
+            "command_id": "controller-voice-prepare-tracker-first",
+            "task_type": "prepare_tool",
+            "request_generation": generation,
+        }
+    )
+    twin.apply_event(started)
+
+    projected = twin.project_committed_tool_belief(
+        instrument_id="T04",
+        instance_id="T04#1",
+        committed_location_id="robot",
+        confidence=0.93,
+        evidence_sources=("skill:accepted", "skill:moving_to_target"),
+    )
+
+    assert projected["accepted"] is True
+    assert twin.state.surgeon_request_tool == ""
+    assert state.reserved_for == VOICE_PREPARED_RESERVATION
+
+    twin.apply_event(
+        _authoritative_completion(
+            command_id="controller-voice-prepare-tracker-first",
+            request_generation=generation,
+            event_type="ToolPrepared",
+            source_location="tray",
+            target_location="robot",
+            projection_step="prepared",
+        )
+    )
+
+    assert state.reserved_for == VOICE_PREPARED_RESERVATION
+    assert twin._derive_next_required_transition(state) == ""
+
+
+def test_voice_prepared_reservation_clears_when_the_tool_leaves_robot_right_hand() -> None:
+    twin = _twin()
+    state = twin.instrument_states["T04#1"]
+    twin._set_lifecycle(
+        state,
+        LIFECYCLE_PREPOSITIONED_RIGHT,
+        location_type="robot_right_hand",
+        location_id="robot_right_hand",
+        confidence=1.0,
+    )
+    state.reserved_for = "voice_prepared"
+
+    twin._set_lifecycle(
+        state,
+        LIFECYCLE_SURGEON_OWNED,
+        location_type="surgeon_hand",
+        location_id="surgeon_hand",
+        confidence=1.0,
+    )
+
+    assert state.reserved_for == ""
+
+
+def test_voice_request_for_exact_prepared_tool_remains_pending_for_delivery() -> None:
+    twin = _twin()
+    state = twin.instrument_states["T04#1"]
+    twin._set_lifecycle(
+        state,
+        LIFECYCLE_PREPOSITIONED_RIGHT,
+        location_type="robot_right_hand",
+        location_id="robot_right_hand",
+        confidence=1.0,
+    )
+    twin._recompute_transient_state()
+
+    assert twin.update_resolved_voice_tool_handover("T04") == "T04"
+
+    assert twin.state.surgeon_request_tool == "T04"
+    assert twin.state.right_hand_tool_instance_id == state.instance_id
+    assert not any(
+        event["event_type"] == "SurgeonRequestDequeued"
+        and event["reason"] == "voice_requested_tool_already_prepared"
+        for event in twin.event_history
+    )
+
+
+def test_failed_unused_return_releases_voice_request_without_replaying_action() -> None:
+    twin = _twin()
+    held = twin.instrument_states["T07#1"]
+    twin._set_lifecycle(
+        held,
+        LIFECYCLE_PREPOSITIONED_RIGHT,
+        location_type="robot_right_hand",
+        location_id="robot_right_hand",
+        confidence=1.0,
+    )
+    twin._recompute_transient_state()
+    assert twin.update_resolved_voice_tool_handover("T04") == "T04"
+    generation = twin.state.surgeon_request_generation
+
+    started = _event("RobotTaskStarted", "T07", "T07#1")
+    started.detail_json = json.dumps(
+        {
+            "task_id": "return-t07-failed",
+            "command_id": "return-t07-failed",
+            "task_type": "return_unused_preposition",
+            "request_generation": generation,
+        }
+    )
+    twin.apply_event(started)
+    completed = _event("RobotTaskCompleted", "T07", "T07#1")
+    completed.detail_json = json.dumps(
+        {
+            "task_id": "return-t07-failed",
+            "command_id": "return-t07-failed",
+            "task_type": "return_unused_preposition",
+            "request_generation": generation,
+            "controller_final_state": "failed",
+            "controller_reason_code": "eir_execution_failed",
+        }
+    )
+
+    twin.apply_event(completed)
+
+    assert twin.state.active_robot_task is None
+    assert twin.state.surgeon_request_tool == ""
+    assert twin.state.surgeon_request_generation == 0
+    assert held.lifecycle_stage == LIFECYCLE_PREPOSITIONED_RIGHT
+    assert twin.state.right_hand_tool_instance_id == held.instance_id
+    assert any(
+        event["event_type"] == "SurgeonRequestAbortedAfterPredecessorFailure"
+        and event["request_generation"] == generation
+        for event in twin.event_history
+    )
+    assert any(
+        event["event_type"] == "SurgeonRequestDequeued"
+        and event["reason"] == "return_unused_preposition_failed"
+        for event in twin.event_history
+    )
+
+
+def test_failed_unused_return_cannot_clear_newer_voice_generation() -> None:
+    twin = _twin()
+    held = twin.instrument_states["T07#1"]
+    twin._set_lifecycle(
+        held,
+        LIFECYCLE_PREPOSITIONED_RIGHT,
+        location_type="robot_right_hand",
+        location_id="robot_right_hand",
+        confidence=1.0,
+    )
+    twin._recompute_transient_state()
+    assert twin.update_resolved_voice_tool_handover("T04") == "T04"
+    stale_generation = twin.state.surgeon_request_generation
+
+    started = _event("RobotTaskStarted", "T07", "T07#1")
+    started.detail_json = json.dumps(
+        {
+            "task_id": "return-t07-stale",
+            "task_type": "return_unused_preposition",
+            "request_generation": stale_generation,
+        }
+    )
+    twin.apply_event(started)
+    assert twin.update_resolved_voice_tool_handover("T02") == "T02"
+    current_generation = twin.state.surgeon_request_generation
+    assert current_generation != stale_generation
+
+    completed = _event("RobotTaskCompleted", "T07", "T07#1")
+    completed.detail_json = json.dumps(
+        {
+            "task_id": "return-t07-stale",
+            "command_id": "return-t07-stale",
+            "task_type": "return_unused_preposition",
+            "request_generation": stale_generation,
+            "controller_final_state": "failed",
+            "controller_reason_code": "eir_execution_failed",
+        }
+    )
+    twin.apply_event(completed)
+
+    assert twin.state.surgeon_request_tool == "T02"
+    assert twin.state.surgeon_request_generation == current_generation
+    assert any(
+        event["event_type"] == "StaleSurgeonRequestCompletionIgnored"
+        for event in twin.event_history
+    )
 
 
 def test_authoritative_unused_return_overrides_right_arm_belief_and_parks_on_mayo() -> None:

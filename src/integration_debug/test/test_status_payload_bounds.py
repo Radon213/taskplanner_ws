@@ -142,9 +142,36 @@ def test_retraction_service_request_uses_the_single_public_contract() -> None:
             "distance_m": 0.001,
         },
     )
-    # The peer Service uses TARGET_NONE (0) to encode a bilateral adjustment.
-    assert bilateral.target_side == ExecuteRetractionCommand.Request.TARGET_NONE
+    assert bilateral.target_side == ExecuteRetractionCommand.Request.TARGET_BOTH
     assert bilateral.distance_m == 0.001
+
+    release = IntegrationDebugNode._build_retraction_service_request(
+        object(),
+        "debug-command-release",
+        {
+            "command": "adjust_retraction",
+            "target_side": "left",
+            "distance_m": -0.01,
+        },
+    )
+    assert release.command == (
+        ExecuteRetractionCommand.Request.COMMAND_ADJUST_RETRACTION
+    )
+    assert release.target_side == ExecuteRetractionCommand.Request.TARGET_LEFT
+    assert release.distance_m == -0.01
+
+    suction_out = IntegrationDebugNode._build_retraction_service_request(
+        object(),
+        "debug-command-suction-out",
+        {
+            "command": "suction_out",
+            "target_side": "none",
+            "distance_m": 0.0,
+        },
+    )
+    assert suction_out.command == ExecuteRetractionCommand.Request.COMMAND_SUCTION_OUT
+    assert suction_out.target_side == ExecuteRetractionCommand.Request.TARGET_NONE
+    assert suction_out.distance_m == 0.0
 
     # Direct-teach completion is a session-level peer operation.  Every Debug
     # field selection must therefore remain usable while serializing the
@@ -240,6 +267,41 @@ def test_retraction_service_admission_never_claims_physical_completion() -> None
             },
         )
     ]
+
+
+def test_suction_service_admission_preserves_retraction_lifecycle_state() -> None:
+    class Harness:
+        pass
+
+    harness = Harness()
+    harness._lock = threading.RLock()
+    harness._active_command_id = "debug-suction-out"
+    harness._active_route = "retraction_service"
+    harness._active_goal_handle = object()
+    harness._retraction_state = RetractionState.RETRACTION_ACTIVE
+    harness._last_retraction_rejection_reason = ""
+    harness._action_status = {
+        "command": "suction_out",
+        "response_semantics": "admission",
+        "started_monotonic": time.monotonic() - 0.1,
+        "progress": 0.0,
+        "success": False,
+        "terminal": False,
+    }
+    harness._record = lambda *_args: None
+
+    IntegrationDebugNode._finish_retraction_service_admission(
+        harness,
+        "debug-suction-out",
+        request_accepted=True,
+        result_code=ExecuteRetractionCommand.Response.RESULT_ACCEPTED,
+        state="accepted",
+        reason_code="RESULT_ACCEPTED",
+        response_message="accepted",
+    )
+
+    assert harness._retraction_state is RetractionState.RETRACTION_ACTIVE
+    assert harness._last_retraction_rejection_reason == ""
 
 
 def test_manual_session_transitions_publish_status_without_waiting_for_timer() -> None:

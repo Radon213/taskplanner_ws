@@ -18,6 +18,10 @@ DISPOSITION_REJECT: Final = "reject"
 DISPOSITION_NO_COMMAND: Final = "no_command"
 
 INTENT_TOOL_HANDOVER: Final = "tool_handover"
+# A retrieval request is distinct from handover even though both carry one
+# grounded tool ID.  The command router maps it to the existing surgeon-return
+# override path; no new ROS interface is required.
+INTENT_TOOL_RETRIEVE: Final = "tool_retrieve"
 INTENT_RETRACTOR_COMMAND: Final = "retractor_command"
 # Procedure lifecycle proposals are intentionally distinct from robot actions.
 # The simulation manager re-admits them against the live integration contract
@@ -112,6 +116,7 @@ class VoiceIntentProposal:
         *,
         evidence_spans: tuple[str, ...],
         reason: str = "missing_tool_id",
+        intent: str = INTENT_TOOL_HANDOVER,
         procedure_id: str = "",
         catalog_id: str = "",
     ) -> "VoiceIntentProposal":
@@ -120,7 +125,7 @@ class VoiceIntentProposal:
             normalized_text=normalized_text,
             procedure_id=procedure_id,
             catalog_id=catalog_id,
-            intent=INTENT_TOOL_HANDOVER,
+            intent=intent,
             disposition=DISPOSITION_CLARIFY,
             reason=reason,
             evidence_spans=evidence_spans,

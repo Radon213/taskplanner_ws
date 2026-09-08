@@ -3,12 +3,14 @@ from __future__ import annotations
 from dataclasses import asdict
 import json
 from pathlib import Path
+import shutil
 import threading
 from types import SimpleNamespace
 
 from builtin_interfaces.msg import Time
-from procedure_spec import load_bundle
+from procedure_spec import compute_bundle_config_revision, load_bundle
 from surgical_interop_msgs.msg import BedRobotArmState, BedRobotArmStateArray
+from surgical_msgs.msg import SpeechUtterance
 from std_msgs.msg import String
 
 from surgical_interop_gateway.projections import (
@@ -54,6 +56,69 @@ def test_public_catalog_carries_target_site_and_approach_metadata() -> None:
     assert message.procedure_target_site_ko == "Right Lobectomy"
     assert message.procedure_approach == "Open"
     assert message.procedure_approach_ko == "Open"
+    assert [entry.instrument_id for entry in message.instruments] == [
+        "T02",
+        "T04",
+        "T07",
+        "T08",
+    ]
+    mosquito = next(
+        entry for entry in message.instruments if entry.instrument_id == "T08"
+    )
+    assert mosquito.display_name == "Mosquito forceps"
+    assert mosquito.display_name_ko == "모스키토 포셉"
+    assert mosquito.inventory_count == 1
+    assert mosquito.requestable is True
+
+
+def test_scenario_snapshot_applies_through_local_parameter_owner_when_boundary_permits(
+    tmp_path: Path,
+) -> None:
+    """Gateway follows ScenarioStore without manager-side static fan-out."""
+
+    source_root = (
+        Path(__file__).parents[2]
+        / "procedure_spec"
+        / "procedure_spec"
+        / "specs"
+    )
+    bundle_dir = tmp_path / "thyroidectomy_demo"
+    shutil.copytree(source_root / "thyroidectomy_demo", bundle_dir)
+    shutil.copyfile(source_root / "display_catalog.yaml", tmp_path / "display_catalog.yaml")
+    revision = compute_bundle_config_revision(bundle_dir)
+    node = SurgicalInteropGateway.__new__(SurgicalInteropGateway)
+    node._lock = threading.RLock()
+    node._spec_root = tmp_path
+    node._spec_dir = str(bundle_dir)
+    node._scenario_config_revision = ""
+    node._pending_scenario_config = None
+    node._paused_or_stopped_for_spec_reload_locked = lambda: True
+    warnings: list[str] = []
+    node.get_logger = lambda: SimpleNamespace(warning=warnings.append)
+    applied: list[list[object]] = []
+    node.set_parameters_atomically = lambda parameters: (
+        applied.append(parameters) or SimpleNamespace(successful=True, reason="")
+    )
+
+    node._on_scenario_config(
+        String(
+            data=json.dumps(
+                {
+                    "schema": "taskplanner.scenario_config.v1",
+                    "bundle_name": "thyroidectomy_demo",
+                    "spec_dir": str(bundle_dir),
+                    "revision": revision,
+                }
+            )
+        )
+    )
+
+    assert len(applied) == 1
+    assert applied[0][0].name == "spec_dir"
+    assert applied[0][0].value == str(bundle_dir.resolve())
+    assert node._scenario_config_revision == revision
+    assert node._pending_scenario_config is None
+    assert warnings == []
 
 
 def test_context_is_only_dt_accepted_state_not_planner_predictions():
@@ -156,6 +221,26 @@ def test_tool_prediction_projects_reducer_accepted_top_three():
     assert [row.stability_sec for row in projected] == [3.4, 0.0, 0.0]
 
 
+def test_tool_prediction_discards_lower_ranked_internal_candidates():
+    world = SimpleNamespace(
+        stamp=SimpleNamespace(sec=4, nanosec=0),
+        predicted_tool="T02",
+        predicted_tool_confidence=0.91,
+        predicted_tool_stability_sec=3.4,
+        ranked_tool_predictions=[
+            SimpleNamespace(rank=1, instrument_id="T02", confidence=0.91, stability_sec=3.4),
+            SimpleNamespace(rank=2, instrument_id="T04", confidence=0.73, stability_sec=0.0),
+            SimpleNamespace(rank=3, instrument_id="T07", confidence=0.61, stability_sec=0.0),
+            SimpleNamespace(rank=4, instrument_id="T08", confidence=0.55, stability_sec=0.0),
+        ],
+    )
+
+    projected = project_tool_predictions(world)
+
+    assert [row.rank for row in projected] == [1, 2, 3]
+    assert [row.instrument_id for row in projected] == ["T02", "T04", "T07"]
+
+
 def test_normalized_ranked_distribution_accepts_distinct_scalar_policy_confidence():
     world = SimpleNamespace(
         stamp=SimpleNamespace(sec=4, nanosec=0),
@@ -184,10 +269,6 @@ def test_ranked_prediction_snapshot_fails_closed_as_one_unit():
         [valid_rows[0], SimpleNamespace(rank=3, instrument_id="T04", confidence=0.73, stability_sec=0.0)],
         [valid_rows[0], SimpleNamespace(rank=2, instrument_id="T02", confidence=0.73, stability_sec=0.0)],
         [valid_rows[0], SimpleNamespace(rank=2, instrument_id="T04", confidence=0.99, stability_sec=0.0)],
-        valid_rows + [
-            SimpleNamespace(rank=3, instrument_id="T07", confidence=0.61, stability_sec=0.0),
-            SimpleNamespace(rank=4, instrument_id="T08", confidence=0.55, stability_sec=0.0),
-        ],
     ]
     for rows in malformed_snapshots:
         world = SimpleNamespace(
@@ -266,6 +347,47 @@ def test_robot_end_effectors_distinguish_holding_from_known_empty():
     ]
     assert projected[0]["instrument_id"] == "T04"
     assert projected[0]["instance_id"] == "T04#1"
+    assert projected[1]["instrument_id"] == ""
+
+
+def test_robot_end_effectors_projects_accepted_mayo_retrieval_on_left_hand():
+    world = SimpleNamespace(
+        stamp=SimpleNamespace(sec=5, nanosec=0),
+        right_hand_tool="",
+        right_hand_tool_instance_id="",
+        left_hand_tool="",
+        left_hand_tool_instance_id="",
+        active_robot_task_type="retrieve_from_mayo",
+        active_robot_task_tool_id="T07",
+        active_robot_task_tool_instance_id="T07#1",
+    )
+
+    projected = [asdict(item) for item in project_robot_end_effectors(world)]
+
+    assert projected[0]["end_effector_id"] == "right_hand"
+    assert projected[0]["state"] == "EMPTY"
+    assert projected[1]["end_effector_id"] == "left_hand"
+    assert projected[1]["state"] == "HOLDING"
+    assert projected[1]["instrument_id"] == "T07"
+    assert projected[1]["instance_id"] == "T07#1"
+    assert projected[1]["evidence_status"] == "TASK_ACCEPTED"
+
+
+def test_robot_end_effectors_does_not_project_non_retrieval_task_on_left_hand():
+    world = SimpleNamespace(
+        stamp=SimpleNamespace(sec=5, nanosec=0),
+        right_hand_tool="",
+        right_hand_tool_instance_id="",
+        left_hand_tool="",
+        left_hand_tool_instance_id="",
+        active_robot_task_type="tool_handover",
+        active_robot_task_tool_id="T07",
+        active_robot_task_tool_instance_id="T07#1",
+    )
+
+    projected = [asdict(item) for item in project_robot_end_effectors(world)]
+
+    assert projected[1]["state"] == "EMPTY"
     assert projected[1]["instrument_id"] == ""
 
 
@@ -794,7 +916,10 @@ def test_world_start_adopts_twin_run_before_first_event_and_does_not_reset_twice
     first_run_id = node._procedure_run_id
     node._on_event(
         SimpleNamespace(
-            event_type="PhaseTransitionAccepted", stamp=Time(sec=10), confidence=1.0
+            event_type="PhaseTransitionAccepted",
+            procedure_run_id="twin-run-1",
+            stamp=Time(sec=10),
+            confidence=1.0,
         )
     )
     node._on_world(
@@ -807,7 +932,10 @@ def test_world_start_adopts_twin_run_before_first_event_and_does_not_reset_twice
     )
     node._on_event(
         SimpleNamespace(
-            event_type="PhaseTransitionAccepted", stamp=Time(sec=11), confidence=1.0
+            event_type="PhaseTransitionAccepted",
+            procedure_run_id="twin-run-1",
+            stamp=Time(sec=11),
+            confidence=1.0,
         )
     )
 
@@ -909,7 +1037,12 @@ def test_event_identity_tracks_new_twin_run_across_gateway_restart():
         )
     )
     node._on_event(
-        SimpleNamespace(event_type="RunStarted", stamp=Time(sec=10), confidence=1.0)
+        SimpleNamespace(
+            event_type="RunStarted",
+            procedure_run_id="twin-run-1",
+            stamp=Time(sec=10),
+            confidence=1.0,
+        )
     )
     first_run_id = first_process_events[-1].procedure_run_id
     node._on_world(
@@ -929,7 +1062,12 @@ def test_event_identity_tracks_new_twin_run_across_gateway_restart():
         )
     )
     node._on_event(
-        SimpleNamespace(event_type="RunStarted", stamp=Time(sec=20), confidence=1.0)
+        SimpleNamespace(
+            event_type="RunStarted",
+            procedure_run_id="twin-run-2",
+            stamp=Time(sec=20),
+            confidence=1.0,
+        )
     )
     second_run_event = first_process_events[-1]
 
@@ -947,7 +1085,12 @@ def test_event_identity_tracks_new_twin_run_across_gateway_restart():
         )
     )
     restarted._on_event(
-        SimpleNamespace(event_type="RunStarted", stamp=Time(sec=30), confidence=1.0)
+        SimpleNamespace(
+            event_type="RunStarted",
+            procedure_run_id="twin-run-2",
+            stamp=Time(sec=30),
+            confidence=1.0,
+        )
     )
 
     assert first_run_id == "twin-run-1"
@@ -964,12 +1107,45 @@ def test_gateway_rejects_stamped_event_older_than_current_run_start():
 
     node._on_event(
         SimpleNamespace(
-            event_type="OldRunEvent", stamp=Time(sec=99), confidence=1.0
+            event_type="OldRunEvent",
+            procedure_run_id="run-test",
+            stamp=Time(sec=99),
+            confidence=1.0,
         )
     )
     node._on_event(
         SimpleNamespace(
-            event_type="CurrentRunEvent", stamp=Time(sec=100), confidence=1.0
+            event_type="CurrentRunEvent",
+            procedure_run_id="run-test",
+            stamp=Time(sec=100),
+            confidence=1.0,
+        )
+    )
+
+    assert [message.event_type for message in published] == ["CurrentRunEvent"]
+    assert published[0].procedure_run_id == "run-test"
+    assert node._event_sequence == 1
+
+
+def test_gateway_rejects_prior_run_event_even_with_a_current_timestamp():
+    node, published = _event_test_node(
+        running=True, received_at=9.0, now=10.0, source_stamp_sec=100
+    )
+
+    node._on_event(
+        SimpleNamespace(
+            event_type="PriorRunEvent",
+            procedure_run_id="old-run",
+            stamp=Time(sec=100),
+            confidence=1.0,
+        )
+    )
+    node._on_event(
+        SimpleNamespace(
+            event_type="CurrentRunEvent",
+            procedure_run_id="run-test",
+            stamp=Time(sec=100),
+            confidence=1.0,
         )
     )
 
@@ -1111,6 +1287,47 @@ def test_stopped_same_bundle_spec_dir_update_reloads_edited_yaml(monkeypatch):
     assert node._speech_text is None
 
 
+def test_paused_spec_dir_update_refreshes_catalog_without_a_stopped_transition(
+    monkeypatch,
+):
+    node = _lifecycle_test_node()
+    node._last_procedure_active = True
+    node._procedure_run_id = "twin-run-1"
+    node._world = SimpleNamespace(
+        message=SimpleNamespace(
+            running=True,
+            execution_state="paused",
+            procedure_id="thyroidectomy",
+            procedure_run_id="twin-run-1",
+        )
+    )
+    revised_spec = SimpleNamespace(procedure_id="thyroidectomy", revision="paused")
+    node._catalog_digest = lambda spec: f"sha256:{spec.revision}"
+    monkeypatch.setattr(
+        "surgical_interop_gateway.node.load_bundle",
+        lambda spec_dir: (
+            revised_spec
+            if str(spec_dir) == "/specs/thyroidectomy"
+            else None
+        ),
+    )
+
+    result = node._on_parameters_changed(
+        [SimpleNamespace(name="spec_dir", value="/specs/thyroidectomy")]
+    )
+
+    assert result.successful is True
+    assert node._procedure_spec is revised_spec
+    assert node._catalog_version == "sha256:paused"
+    assert node._procedure_run_id == ""
+    assert node._last_procedure_active is False
+    assert node._procedure_mismatch is False
+    assert node._vlm_result is None
+    assert node._skill_status is None
+    assert node._bed_robot_arm_status is None
+    assert node._speech_text is None
+
+
 def test_spec_dir_update_is_rejected_while_a_procedure_is_active(monkeypatch):
     node = _lifecycle_test_node()
     original_spec = node._procedure_spec
@@ -1119,6 +1336,7 @@ def test_spec_dir_update_is_rejected_while_a_procedure_is_active(monkeypatch):
     node._world = SimpleNamespace(
         message=SimpleNamespace(
             running=True,
+            execution_state="running",
             procedure_id="thyroidectomy",
             procedure_run_id="twin-run-1",
         )
@@ -1135,7 +1353,7 @@ def test_spec_dir_update_is_rejected_while_a_procedure_is_active(monkeypatch):
     )
 
     assert result.successful is False
-    assert "only while the procedure is stopped" in result.reason
+    assert "only while the procedure is paused or stopped" in result.reason
     assert node._procedure_spec is original_spec
     assert node._catalog_version == "sha256:test"
 
@@ -1301,8 +1519,13 @@ def _speech_input_test_node():
     node._lock = threading.RLock()
     node._speech_text = None
     node._speech_sequence = 0
+    node._speech_partial = None
     node._asr_status = None
+    node._input_statuses = {}
     node._monotonic = lambda: 4.0
+    node.get_clock = lambda: SimpleNamespace(
+        now=lambda: SimpleNamespace(to_msg=lambda: Time(sec=12))
+    )
     warnings: list[str] = []
     node.get_logger = lambda: SimpleNamespace(warning=warnings.append)
     return node, warnings
@@ -1395,10 +1618,11 @@ def test_stopped_or_stale_operational_asr_does_not_satisfy_public_speech_health(
 
 def test_gateway_speech_boundary_rejects_oversized_final_text():
     node, warnings = _speech_input_test_node()
-    message = String()
-    message.data = "x" * 2001
+    message = SpeechUtterance()
+    message.is_final = True
+    message.text = "x" * 2001
 
-    node._on_speech_text(message)
+    node._on_observed_utterance(message)
 
     assert node._speech_text is None
     assert warnings
@@ -1411,14 +1635,13 @@ def _speech_projection_test_node(*, publish_free_text: bool):
     node._procedure_run_id = "run-1"
     node._catalog_version = "sha256:test"
     node._health_stale_after_sec = 6.0
-    text = String()
-    text.data = "보비 주세요"
-    node._speech_text = SimpleNamespace(
-        message=text,
-        sequence=3,
-        received_monotonic_sec=3.0,
-        received_stamp=Time(sec=12),
-    )
+    # Exercise the real typed callback instead of placing a retired
+    # ``std_msgs/String`` directly in the cache.  This catches a projection
+    # regression whenever the ingress contract changes again.
+    utterance = SpeechUtterance()
+    utterance.is_final = True
+    utterance.text = "보비 주세요"
+    node._on_observed_utterance(utterance)
     node._asr_status = SimpleNamespace(
         received_monotonic_sec=3.0,
         message={
@@ -1453,7 +1676,7 @@ def test_public_speech_matches_final_latency_and_receipt_stamp():
     assert message.connected is True
     assert message.state == message.STATE_LISTENING
     assert message.text == "보비 주세요"
-    assert message.utterance_sequence == 3
+    assert message.utterance_sequence == 1
     assert message.utterance_stamp.sec == 12
     assert message.latency_available is True
     assert round(message.response_latency_ms, 1) == 184.2
@@ -1482,6 +1705,56 @@ def test_public_speech_projects_live_partial_text_and_microphone_levels():
     assert message.partial_text == "갑상선 절제술 시"
 
 
+def test_public_speech_projects_external_topic_partial_and_final():
+    node, _ = _speech_input_test_node()
+    node._publish_free_text = True
+    node._gateway_instance_id = "gateway-1"
+    node._procedure_run_id = "run-1"
+    node._catalog_version = "sha256:test"
+    node._health_stale_after_sec = 6.0
+    node._input_statuses = {
+        "speech_input": SimpleNamespace(
+            received_monotonic_sec=3.0,
+            message=SimpleNamespace(
+                source_id="external_sentence_topic",
+                modality="speech",
+                state="READY",
+                healthy=True,
+            ),
+        )
+    }
+    partial = SpeechUtterance()
+    partial.is_final = False
+    partial.text = "흡인기 준비"
+    node._on_partial_utterance(partial)
+
+    partial_message = node._speech_message(
+        stamp=Time(sec=20),
+        revision=4,
+        procedure_type="thyroidectomy",
+        procedure_active=True,
+    )
+    assert partial_message.available is True
+    assert partial_message.connected is True
+    assert partial_message.state == partial_message.STATE_READY
+    assert partial_message.partial_text == "흡인기 준비"
+    assert partial_message.audio_level_available is False
+
+    final = SpeechUtterance()
+    final.is_final = True
+    final.text = "흡인기 주세요"
+    node._on_observed_utterance(final)
+    final_message = node._speech_message(
+        stamp=Time(sec=21),
+        revision=5,
+        procedure_type="thyroidectomy",
+        procedure_active=True,
+    )
+    assert final_message.text == "흡인기 주세요"
+    assert final_message.partial_text == ""
+    assert final_message.utterance_sequence == 1
+
+
 def test_public_speech_redacts_text_by_default_but_keeps_typed_metadata():
     node = _speech_projection_test_node(publish_free_text=False)
 
@@ -1495,7 +1768,7 @@ def test_public_speech_redacts_text_by_default_but_keeps_typed_metadata():
     assert message.available is True
     assert message.connected is True
     assert message.text == ""
-    assert message.utterance_sequence == 3
+    assert message.utterance_sequence == 1
     assert message.utterance_stamp.sec == 12
     assert message.latency_available is True
     assert round(message.response_latency_ms, 1) == 184.2
@@ -1528,7 +1801,7 @@ def test_public_speech_uses_replay_input_status_when_operational_asr_is_absent()
     assert message.state == message.STATE_READY
     assert message.source == "recorded_transcript:0704_6:run-1"
     assert message.text == "보비 주세요"
-    assert message.utterance_sequence == 3
+    assert message.utterance_sequence == 1
     assert message.latency_available is False
 
 

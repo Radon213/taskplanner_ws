@@ -18,6 +18,14 @@ export type InstrumentState = {
   preposition_origin_location_type?: string;
   preposition_origin_location_id?: string;
   preposition_origin_lifecycle_stage?: string;
+  /** Canonical Mayo placement facts published by the Digital Twin. */
+  procedure_future_use_expected?: boolean;
+  mayo_placement_evidence?: string;
+  mayo_reuse_confidence?: number;
+  mayo_reuse_stability_sec?: number;
+  mayo_recovery_confidence?: number;
+  mayo_recovery_stability_sec?: number;
+  mayo_evidence_source?: string;
 };
 
 export type RosTime = {
@@ -51,6 +59,7 @@ export type BedRobotArmStateArray = {
 };
 
 export type SimulationState = {
+  procedure_run_id?: string;
   procedure_id: string;
   active_bundle: string;
   running: boolean;
@@ -132,6 +141,7 @@ export type RankedToolPrediction = {
 
 export type SimulationEvent = {
   ui_id?: string;
+  procedure_run_id?: string;
   event_type: string;
   instrument_id: string;
   from_anchor: string;
@@ -142,6 +152,7 @@ export type SimulationEvent = {
 };
 
 export type SurgeonState = {
+  procedure_run_id?: string;
   procedure_id: string;
   phase_id: string;
   intent: string;
@@ -154,6 +165,7 @@ export type SurgeonState = {
 };
 
 export type SurgeonLLMDecision = {
+  procedure_run_id?: string;
   model_id: string;
   raw_json: string;
   accepted: boolean;
@@ -234,6 +246,11 @@ export type LiveAsrStatus = {
   peak_level_dbfs: number;
   elapsed_sec: number;
   partial_text: string;
+  /** Approximate local audio-onset to first changed partial diagnostic. */
+  local_onset_to_first_partial_ms: number | null;
+  local_onset_basis: string;
+  local_onset_dbfs: number | null;
+  local_onset_threshold_dbfs: number | null;
   finals: LiveAsrFinal[];
   last_error: string;
   sample_rate: number;
@@ -248,6 +265,29 @@ export type LiveAsrStatus = {
 export type LiveAsrControlResult = {
   accepted: boolean;
   message: string;
+};
+
+export type TtsPlaybackStatus = {
+  stampSec: number;
+  sequence: number;
+  replyId: string;
+  turnId: string;
+  utteranceId: string;
+  procedureRunId: string;
+  state: "queued" | "waiting_function_accepted" | "waiting_function_completed" |
+    "playing" | "played" | "duplicate_suppressed" | "failed";
+  timing: "immediate" | "on_function_accepted" | "on_function_completed";
+  text: string;
+  voiceId: string;
+  outputDevice: string;
+  synthLatencyMs: number;
+  audioDurationSec: number;
+  playbackLatencyMs: number;
+  terminal: boolean;
+  success: boolean;
+  errorCode: string;
+  message: string;
+  receivedAt: number;
 };
 
 export type ShadowReplayState = {
@@ -308,6 +348,7 @@ export type ModelSelection = {
 export type ModelRuntimeCommand = "load" | "unload" | "sleep" | "wake";
 
 export type BTDecision = {
+  procedure_run_id?: string;
   decision: string;
   selected_tool: string;
   selected_tool_instance_id?: string;
@@ -323,6 +364,7 @@ export type BTDecision = {
 
 export type SkillStatus = {
   command_id: string;
+  procedure_run_id?: string;
   action: string;
   instrument_id: string;
   instrument_instance_id?: string;
@@ -352,9 +394,12 @@ export type ExecutionTrace = {
   stamp?: RosTime;
   sequence: number;
   command_id: string;
+  procedure_run_id: string;
   route: string;
   transport: "action" | "service" | string;
   endpoint: string;
+  /** Endpoint family selected by the bridge, for example `virtual`. */
+  endpoint_source?: string;
   stage: string;
   dispatch_submitted: boolean;
   terminal: boolean;
@@ -399,6 +444,7 @@ export type InputSourceStatus = {
 
 export type VLMResult = {
   stamp?: RosTime;
+  procedure_run_id?: string;
   source: string;
   source_epoch?: number;
   source_sequence?: number;

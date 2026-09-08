@@ -1,4 +1,4 @@
-"""Pure, fail-closed joins for admission-gated humanoid replies.
+"""Pure, fail-closed playback-evidence joins for validated humanoid replies.
 
 This module consumes facts that have already been published by Taskplanner. It
 never calls an Action or Service and therefore cannot cause robot motion.
@@ -10,12 +10,50 @@ from collections import OrderedDict
 from dataclasses import dataclass
 import json
 import threading
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Mapping
 
 from .core import PlaybackEvent
 
 
 HANDOVER_ACTIONS = frozenset({"pick_up_and_handover", "direct_handover"})
+DIRECT_HANDOVER_FUNCTION = "request_tool_handover"
+DIRECT_RETRACTION_FUNCTION = "adjust_retraction"
+
+
+@dataclass(frozen=True)
+class PresentationEvidence:
+    """Non-executable reply timing rule for one already-known evidence type.
+
+    This intentionally is not a command registry.  It has no endpoint, schema,
+    admission, or dispatch information: it only says which published evidence
+    a pending spoken reply may wait for.
+    """
+
+    timings: frozenset[str]
+    matcher_name: str
+
+
+_PRESENTATION_EVIDENCE: Mapping[str, PresentationEvidence] = {
+    DIRECT_HANDOVER_FUNCTION: PresentationEvidence(
+        timings=frozenset({"on_function_accepted", "on_function_completed"}),
+        matcher_name="handover",
+    ),
+    DIRECT_RETRACTION_FUNCTION: PresentationEvidence(
+        timings=frozenset({"on_function_accepted"}),
+        matcher_name="retraction",
+    ),
+}
+
+
+def presentation_evidence_for(
+    function_call_name: str,
+) -> PresentationEvidence | None:
+    """Return a local display rule, never a command admission decision."""
+
+    return _PRESENTATION_EVIDENCE.get(str(function_call_name or "").strip())
+
+
+ReceiptMatcher = Callable[[PlaybackEvent, dict[str, object]], bool]
 
 
 @dataclass(frozen=True)
@@ -56,6 +94,48 @@ def parse_function_arguments(value: str) -> dict[str, object] | None:
     except (TypeError, json.JSONDecodeError):
         return None
     return parsed if isinstance(parsed, dict) else None
+
+
+def direct_reply_timing(
+    *,
+    timing: str,
+    function_call_name: str,
+    function_arguments_json: str,
+) -> str:
+    """Choose a playable timing for a raw VLM reply on the direct voice lane.
+
+    The retired function-admission gate used to create one request ID shared by
+    a VLM function and the command it admitted.  The deterministic voice lane
+    deliberately has no such join.  Tool handover still has a useful
+    independent join through the admitted ASR utterance, typed intent, and
+    action evidence.  Other function-timed replies therefore become immediate
+    playback instead of waiting for a request ID that no direct command owns.
+
+    Invalid timing values are intentionally returned unchanged: the playback
+    boundary remains responsible for rejecting malformed message data rather
+    than silently treating it as an immediate reply.
+    """
+
+    normalized_timing = str(timing or "").strip()
+    if normalized_timing not in {
+        "on_function_accepted",
+        "on_function_completed",
+    }:
+        return normalized_timing
+    evidence = presentation_evidence_for(function_call_name)
+    if evidence is None or normalized_timing not in evidence.timings:
+        return "immediate"
+    arguments = parse_function_arguments(function_arguments_json)
+    if not isinstance(arguments, dict):
+        return "immediate"
+    if str(function_call_name or "").strip() == DIRECT_HANDOVER_FUNCTION:
+        if not str(arguments.get("tool_id", "")).strip():
+            return "immediate"
+        return normalized_timing
+    # Direct typed retraction derives its id from the accepted ASR utterance,
+    # not from a VLM presentation hint. Do not leave a raw reply waiting for a
+    # request it cannot prove belongs to it.
+    return "immediate"
 
 
 def _base_tool_id(value: str) -> str:
@@ -107,6 +187,13 @@ class AuthoritativeTimingCorrelator:
         self._statuses: OrderedDict[tuple[str, str], SkillStatusFact] = OrderedDict()
         self._traces: OrderedDict[tuple[str, str], ExecutionTraceFact] = OrderedDict()
         self._retraction_statuses: OrderedDict[str, RetractionStatusFact] = OrderedDict()
+        # A deliberately tiny, local presentation map selects receipt
+        # evidence. It is separate from command routing and cannot make a
+        # VLM-proposed name executable.
+        self._receipt_matchers: Mapping[str, ReceiptMatcher] = {
+            "handover": self._handover_ready,
+            "retraction": self._retraction_ready,
+        }
 
     def reset(self) -> None:
         with self._lock:
@@ -330,14 +417,14 @@ class AuthoritativeTimingCorrelator:
             arguments = parse_function_arguments(job.function_arguments_json)
             if arguments is None:
                 continue
-            ready = False
-            if job.function_call_name == "request_tool_handover":
-                ready = self._handover_ready(job, arguments)
-            elif job.function_call_name == "adjust_retraction":
-                ready = self._retraction_ready(job, arguments)
-            elif job.function_call_name == "request_tool_retrieval":
-                # No typed voice-to-execution path currently exists.
-                ready = False
+            evidence = presentation_evidence_for(job.function_call_name)
+            if (
+                evidence is None
+                or job.timing not in evidence.timings
+            ):
+                continue
+            matcher = self._receipt_matchers.get(evidence.matcher_name)
+            ready = bool(matcher is not None and matcher(job, arguments))
             if ready and self._release_waiting(job.reply_id) is not None:
                 released.append(job.reply_id)
         return released

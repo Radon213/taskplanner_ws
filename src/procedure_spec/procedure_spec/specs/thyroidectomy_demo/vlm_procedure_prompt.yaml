@@ -86,52 +86,50 @@ phase_labels_ko:
 
 tools:
   T02: "Adson forceps"
-  T03: "Allis clamp forceps"
   T04: "Bovie surgical cautery"
   T07: "Bipolar cautery"
+  T08: "Mosquito forceps"
 
 # Procedure-local ASR variants remain editable data. They augment canonical
 # names only; the voice catalog still removes aliases shared by multiple tools.
 tool_voice_aliases:
   T02: ["아드손", "애드손", "에드슨", "에드손"]
+  # The external CAM4 typed detector publishes this clinical class label.
+  # Keep the adapter-free ID resolution in the editable scenario vocabulary.
+  T07: ["Bipolar Forceps"]
 
 # Single owner for home-rack order and per-instance starting placement. The
 # Digital Twin, generated observations and Web stage all consume this result.
 tool_placement:
-  rack_order: [T02, T03, T04, T07]
+  rack_order: [T02, T04, T07, T08]
   initial_states:
     - instrument_id: T02
       instance_id: T02#1
       location_id: main_tray_slot_1
       lifecycle_stage: home_rack
       confidence: 1.0
-    - instrument_id: T03
-      instance_id: T03#1
-      location_id: field_region_procedure
-      lifecycle_stage: surgeon_owned
-      confidence: 1.0
-    - instrument_id: T03
-      instance_id: T03#2
-      location_id: field_region_procedure
-      lifecycle_stage: surgeon_owned
+    - instrument_id: T08
+      instance_id: T08#1
+      location_id: main_tray_slot_4
+      lifecycle_stage: home_rack
       confidence: 1.0
 
-# Physical rack inventory confirmed from the demonstration setup. Army-Navy and
-# thyroid retractors are controller-owned bed-arm end-effectors, not rack tools
-# or surgeon/humanoid handover candidates. Clinical suction remains a surgical
-# cue and is not represented as a bed-robot command.
-tool_inventory:
-  T02: 1
-  T03: 2
-  T04: 1
-  T07: 1
+# The controller still materializes one addressable instance of each tool at
+# scenario start. Perception may observe one extra same-type logical slot, and
+# the Digital Twin may admit a fresh typed CAM4 Mayo observation for that slot
+# within this bound. Slot labels are exchangeable and do not claim stable
+# physical identity.
+# Army-Navy and thyroid retractors remain controller-owned bed-arm end-effectors.
+tool_population:
+  T02: {initial_count: 1, capacity: 2}
+  T04: {initial_count: 1, capacity: 2}
+  T07: {initial_count: 1, capacity: 2}
+  T08: {initial_count: 1, capacity: 2}
 
 # Scenario choices are editable here and are not physical-safety interlocks.
-# Exact EIR-NUC reviewed handover capability set. Both T03 instances are
-# already surgeon-owned in the field and may not be synthesized as a
-# humanoid/external robot handover request.
+# Installed commands are discovered by the command router, not this scenario.
 scenario_policy:
-  requestable_tools: [T02, T04, T07]
+  requestable_tools: [T02, T04, T07, T08]
   handover_arm: right
   recovery_arm: left
   require_cleaning_after_surgeon_use: true
@@ -140,6 +138,15 @@ scenario_policy:
   allow_prepositioning_when_uncertain: false
   explicit_request_priority: true
   unused_preposition_destination: mayo
+  extensions:
+    # Spoken procedure completion recovers only the other Mayo tools. Bovie
+    # and bipolar remain on Mayo and do not delay the terminal record.
+    completion_cleanup_excluded_tools: [T04, T07]
+    # In the reviewed P03 demonstration, Adson is handed over once. If that
+    # completed tool returns to Mayo, keep it available for a deliberate voice
+    # request but exclude it from anticipatory and open-palm repeat handovers.
+    automatic_repeat_handover_exclusions_by_phase:
+      P03: [T02]
   # Runtime lane selection is scenario configuration, not motion authority.
   # External endpoint, Service admission, stopped-route, freshness, and
   # idempotency checks remain fail-closed in their owning components.
@@ -156,7 +163,6 @@ scenario_policy:
     surgeon_actor_enabled: true
     phase_inference_enabled: true
     retraction_workflow_state_enforced: false
-    legacy_raw_retractor_voice_enabled: false
 
 # Common request-order priors for anticipatory preparation. These paths carry
 # no case id or timestamp and are never sufficient to authorize a handover.
@@ -233,14 +239,14 @@ phase_flow:
       transition_cues:
         anatomy: "the exposed central target remains accessible under fixed retraction"
         action: "direct target grasping and tissue-directed manipulation become sustained"
-        tool_cue: "T02 or T03 may engage the target; the handover itself is not the boundary"
+        tool_cue: "T02 may engage the target; the handover itself is not the boundary"
 
     - from: "P05"
       to: "P06"
       transition_cues:
         anatomy: "a small focal tissue point is isolated under stable exposure"
         action: "persistent localized clamp or equivalent control replaces broad target manipulation"
-        tool_cue: "T03 or an equivalent control may isolate the focal point; T07/T04 can follow in either order or after a delay"
+        tool_cue: "T02 or an equivalent control may isolate the focal point; T07/T04 can follow in either order or after a delay"
 
     - from: "P06"
       to: "P07"
@@ -296,7 +302,7 @@ phase_details:
       - "a small focal target is already under sustained localized control"
     tool_roles:
       entry_handover: [T02]
-      tissue_handling: [T02, T03]
+      tissue_handling: [T02]
       dissection_or_hemostasis: [T04, T07]
     expected_tool_sequence:
       - current: "T02"
@@ -340,7 +346,7 @@ phase_details:
       - "a bed-arm retractor is only approaching or rotating and has not yet established stable exposure"
       - "stable exposure is already followed by sustained central target manipulation"
     tool_roles:
-      subsequent_target_handling: [T02, T03]
+      subsequent_target_handling: [T02]
     expected_tool_sequence:
       - current: "T02"
         next: "T02"
@@ -355,22 +361,14 @@ phase_details:
       - "the tool is only entering or aligning after a handover"
       - "a small focal point is already under persistent localized clamp or equivalent control"
     tool_roles:
-      target_grasp_or_traction: [T02, T03]
+      target_grasp_or_traction: [T02]
       optional_dissection_energy: [T04, T07]
-      possible_focal_control_preparation: [T03]
+      possible_focal_control_preparation: [T02]
     expected_tool_sequence:
       - current: "T02"
         next: "T07"
         strength: "high"
         cue: "focal bipolar treatment commonly follows target traction before clamp placement"
-      - current: "T07"
-        next: "T03"
-        strength: "high"
-        cue: "a small focal point may become ready for Allis control after bipolar work"
-      - current: "T02"
-        next: "T03"
-        strength: "medium"
-        cue: "Allis can provide firmer control when a small focal point is isolated"
       - current: "T02"
         next: "T04"
         strength: "medium"
@@ -386,20 +384,20 @@ phase_details:
       - "localized energy treatment may follow, but the stable focal-control state is the causal boundary"
     exclusion_cues:
       - "an energy tool is merely exchanged or used without a visible focal-control state"
-      - "broad Allis traction or ordinary target manipulation is present without focal isolation"
+      - "broad traction or ordinary target manipulation is present without focal isolation"
     tool_roles:
-      focal_control: [T03]
+      focal_control: [T02]
       localized_treatment_alternatives: [T07, T04]
     expected_tool_sequence:
       - current: "T07"
         next: "T04"
         strength: "high"
         cue: "broader treatment commonly follows precise energy when further division is needed"
-      - current: "T03"
+      - current: "T02"
         next: "T07"
         strength: "medium"
         cue: "a visibly equivalent focal control can be followed by bipolar"
-      - current: "T03"
+      - current: "T02"
         next: "T04"
         strength: "medium"
         cue: "a visibly equivalent focal control can be followed by Bovie"

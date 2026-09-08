@@ -22,6 +22,7 @@ setup(
     entry_points={
         "console_scripts": [
             "surgical_interop_execution_bridge = surgical_interop_execution.bridge:main",
+            "execution_command_proxy = surgical_interop_execution.command_proxy:main",
             "fault_action_emulator = surgical_interop_execution.fault_action_emulator:main",
         ],
     },

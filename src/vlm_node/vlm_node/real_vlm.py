@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
+import copy
 from dataclasses import asdict, dataclass
 import hashlib
 from io import BytesIO
@@ -13,19 +14,24 @@ from pathlib import Path
 import re
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 from procedure_spec import (
     BedRobotArmGroupNormalizationError,
     FrozenHandoverNgramPrior,
+    FrozenToolDemandPrior,
     ProcedurePriorScorer,
+    ScenarioConfigSnapshot,
     compact_procedure_prompt,
     get_default_spec_dir,
     infer_retraction_direction,
     load_bundle,
     load_frozen_handover_ngram_prior,
+    load_frozen_tool_demand_prior,
+    load_scenario_consumer_bundle,
     normalize_retraction_request,
+    parse_scenario_config,
 )
 import requests
 import rclpy
@@ -82,11 +88,13 @@ from .prompt_builder import PromptBuilder
 from .reply_outbox import ReplyCollisionError, ReplyEnvelope, ReplyOutbox
 from .rfdetr_contract import (
     RFDETR_FLIR_SEGMENTED_FRAME_MARKER,
+    canonical_rfdetr_tool_label,
     frame_id_has_rfdetr_marker,
     parse_cam4_semantics_json,
     summarize_rfdetr_tool_observations,
 )
 from .schema import (
+    BED_ROBOT_ARM_GROUP_REQUIRED_FIELDS,
     SchemaValidationError,
     compact_vlm_json_schema,
     normalize_mayo_semantics,
@@ -125,6 +133,15 @@ ACTOR_LOG_EVIDENCE_LIMITS = {
     "skill_status": 4,
 }
 ACTOR_LOG_EVENT_LIMIT = 4
+# The live prompt's right CAM4 panel is the Mayo view.  Retain a small,
+# instance-level set there when request context must be compacted: a single
+# detector row cannot represent the three distinct instruments that may be on
+# the stand.  CAM3 keeps its historical one-row budget.  With the two
+# supported views this is bounded to four detector rows total.
+ACTOR_LOG_TIGHT_TYPED_INSTANCE_LIMITS = {
+    "cam_3": 1,
+    "cam_4": 3,
+}
 HANDOVER_SKILL_ACTIONS = {
     "handover",
     "direct_handover",
@@ -132,10 +149,81 @@ HANDOVER_SKILL_ACTIONS = {
     "pick_up_from_mayo_and_handover",
     "put_down_and_handover",
 }
-NINFER_DIALOGUE_HANDOVER_MIN_CONFIDENCE = 0.5
 NINFER_IGNORED_DIALOGUE_EXTENSION_FIELDS = frozenset(
     {"phase_alt", "tool_alt"}
 )
+
+# These are visual/presentation hints only.  They have no command schema,
+# endpoint, admission, or dispatch authority; typed ASR and the endpoint
+# adapters own all executable behavior.
+_DIALOGUE_PRESENTATION_HINT_TIMINGS: dict[str, frozenset[str]] = {
+    "request_tool_handover": frozenset(
+        {"on_function_accepted", "on_function_completed"}
+    ),
+    "adjust_retraction": frozenset({"on_function_accepted"}),
+}
+
+
+def _normalize_dialogue_presentation_hint(
+    value: object,
+    *,
+    expected_turn_id: str,
+    canonical_tool_id: Callable[[object], str],
+) -> dict[str, object] | None:
+    """Keep only a known non-executable presentation hint.
+
+    The wire field remains named ``function_call`` for HumanoidReply
+    compatibility.  This normalizer deliberately never accepts an arbitrary
+    name or gives the result an execution schema; it only bounds the evidence
+    label a reply may wait for.
+    """
+
+    if not isinstance(value, dict):
+        return None
+    turn_id = str(value.get("turn_id", "") or "").strip()
+    name = str(value.get("name", "") or "").strip()
+    arguments = value.get("arguments")
+    if turn_id != str(expected_turn_id or "").strip():
+        return None
+    if name not in _DIALOGUE_PRESENTATION_HINT_TIMINGS:
+        return None
+    if not isinstance(arguments, dict):
+        return None
+    if name == "request_tool_handover":
+        tool_id = canonical_tool_id(arguments.get("tool_id", ""))
+        if not tool_id:
+            return None
+        return {
+            "turn_id": turn_id,
+            "name": name,
+            "arguments": {"tool_id": tool_id},
+        }
+
+    # Retraction timing is presentation-only too.  Preserve a very small,
+    # JSON-safe summary for audit while the actual typed retraction adapter
+    # independently validates command, side, distance, state, and request id.
+    command = str(arguments.get("command", "adjust_retraction") or "").strip()
+    if command != "adjust_retraction":
+        return None
+    normalized_arguments: dict[str, object] = {"command": command}
+    target_side = str(arguments.get("target_side", "") or "").strip().lower()
+    if target_side:
+        if target_side not in {"left", "right", "both", "none"}:
+            return None
+        normalized_arguments["target_side"] = target_side
+    if "distance_m" in arguments:
+        try:
+            distance_m = float(arguments["distance_m"])
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(distance_m) or distance_m < 0.0:
+            return None
+        normalized_arguments["distance_m"] = distance_m
+    return {
+        "turn_id": turn_id,
+        "name": name,
+        "arguments": normalized_arguments,
+    }
 
 
 def compact_prompt_json(data: dict[str, Any]) -> str:
@@ -259,16 +347,10 @@ def _repair_ninfer_dialogue_envelope(
     Without a claimed turn all dialogue output is suppressed. With a claim,
     omission means null and existing objects inherit only system-owned fields.
 
-    A high-confidence handover intent may be promoted to the equivalent typed
-    function call. This does not itself admit an action: the downstream gate
-    still requires the independent resolver proposal for the same utterance,
-    exact tool arguments, active run scope, and TTL. Function-bound speech is
-    delayed until that independent admission is accepted.
-
     Explicit non-empty turn ids and model-owned content remain untouched so a
-    stale turn, unsupported function, or malformed reply still fails closed.
-    The only semantic promotion is the bounded handover intent described above;
-    delivery metadata is runtime-owned and may be completed or delayed.
+    stale turn or malformed reply still fails closed.  In particular, an
+    NInfer ``intent`` observation never becomes a function/presentation hint:
+    the deterministic typed-ASR lane owns executable semantics.
     """
 
     if str(payload.get("v", "")) not in {"5", "6"}:
@@ -280,6 +362,31 @@ def _repair_ninfer_dialogue_envelope(
     # every other unknown field still reaches strict schema validation.
     for field in NINFER_IGNORED_DIALOGUE_EXTENSION_FIELDS:
         repaired.pop(field, None)
+    # A short, non-authoritative clinical summary is often the final JSON
+    # field emitted by NInfer.  If its tail is omitted, the bounded JSON
+    # parser retains the complete visual/Mayo observation before it.  Preserve
+    # that observation with an explicit blank summary rather than discarding
+    # it; this never fabricates a command, lifecycle, ownership, or reply.
+    if "sum" not in repaired or not isinstance(repaired.get("sum"), str):
+        repaired["sum"] = ""
+    # A missing or incomplete retraction proposal never becomes a command.
+    # NInfer can omit this nullable structural field, or emit only a fragment
+    # of it, while still returning usable visual/Mayo evidence.  Normalize
+    # only that omission/fragment to the explicit no-proposal value at this
+    # live-provider boundary.  A complete supplied value still goes through
+    # strict schema and endpoint-adapter validation unchanged.
+    bed_robot_arm_group = repaired.get("bed_robot_arm_group")
+    if (
+        "bed_robot_arm_group" not in repaired
+        or (
+            isinstance(bed_robot_arm_group, dict)
+            and not BED_ROBOT_ARM_GROUP_REQUIRED_FIELDS.issubset(
+                bed_robot_arm_group
+            )
+        )
+    ):
+        repaired["bed_robot_arm_group"] = None
+
     dialogue_fields = ("function_call", "humanoid_reply")
     for field in dialogue_fields:
         if field not in repaired:
@@ -302,31 +409,6 @@ def _repair_ninfer_dialogue_envelope(
         else:
             repaired["humanoid_reply"] = None
 
-    if repaired.get("function_call") is None:
-        intent = repaired.get("intent")
-        if isinstance(intent, list) and len(intent) == 3:
-            intent_name = str(intent[0] or "").strip().lower()
-            intent_tool_id = str(intent[1] or "").strip()
-            intent_confidence = intent[2]
-            try:
-                confidence = float(intent_confidence)
-            except (TypeError, ValueError):
-                confidence = -1.0
-            if (
-                not isinstance(intent_confidence, bool)
-                and math.isfinite(confidence)
-                and NINFER_DIALOGUE_HANDOVER_MIN_CONFIDENCE
-                <= confidence
-                <= 1.0
-                and intent_name == "handover"
-                and intent_tool_id
-            ):
-                repaired["function_call"] = {
-                    "turn_id": clean_turn_id,
-                    "name": "request_tool_handover",
-                    "arguments": {"tool_id": intent_tool_id},
-                }
-
     for field in dialogue_fields:
         value = repaired.get(field)
         if not isinstance(value, dict):
@@ -347,7 +429,12 @@ def _repair_ninfer_dialogue_envelope(
         normalized_reply = dict(reply)
         if "speak" not in normalized_reply or normalized_reply["speak"] is None:
             normalized_reply["speak"] = True
-        function_present = isinstance(repaired.get("function_call"), dict)
+        function_hint = repaired.get("function_call")
+        function_present = bool(
+            isinstance(function_hint, dict)
+            and str(function_hint.get("name", "") or "").strip()
+            in _DIALOGUE_PRESENTATION_HINT_TIMINGS
+        )
         timing = normalized_reply.get("timing")
         if timing is None or (
             isinstance(timing, str) and not timing.strip()
@@ -921,9 +1008,10 @@ def _minimal_typed_tool_detection_context(
     """Keep usable CAM3/CAM4 location facts when a Live prompt is tight.
 
     This is deliberately a *typed* reduction, not a detector-image fallback.
-    A single highest-confidence box per view together with its freshness and
-    source provenance is more useful to the VLM than a long ambient ASR
-    transcript, while remaining below the smallest supported runtime budget.
+    CAM3 retains its highest-confidence box and the Mayo-facing CAM4 retains
+    up to three distinct boxes, together with freshness and source provenance.
+    That remains bounded to four rows across the two supported views and is
+    more useful to the VLM than a long ambient ASR transcript.
     """
 
     if (
@@ -995,7 +1083,11 @@ def _minimal_typed_tool_detection_context(
             raw_instances = raw_view.get("instances")
             instances: list[dict[str, Any]] = []
             if isinstance(raw_instances, list):
-                for raw_instance in raw_instances[:1]:
+                instance_limit = ACTOR_LOG_TIGHT_TYPED_INSTANCE_LIMITS.get(
+                    str(raw_view.get("view", "")).strip(),
+                    1,
+                )
+                for raw_instance in raw_instances[:instance_limit]:
                     if not isinstance(raw_instance, dict):
                         continue
                     instance = {
@@ -1157,24 +1249,38 @@ def actor_log_request_context(
     detection_views = perception.get("tool_detection_views")
     if isinstance(detection_views, list):
         # Each view is confidence-sorted by the typed contract.  Drop the
-        # weakest remaining row first, while retaining the view's alignment
-        # state so a tight prompt never turns missing detector evidence into a
-        # false absence claim.
+        # weakest remaining row first, while retaining one CAM3 and up to
+        # three Mayo-facing CAM4 rows.  Keep the view's alignment state so a
+        # tight prompt never turns fresh detector evidence into a false
+        # absence claim.
         while len(compact_prompt_json(minimal)) > available_chars:
-            candidates = [
-                view.get("instances")
+            candidate_views = [
+                view
                 for view in detection_views
                 if isinstance(view, dict)
                 and isinstance(view.get("instances"), list)
-                # Preserve one actual typed location fact per observed view.
-                # The final budget fallback can reduce whole views if needed,
-                # but must not silently turn a fresh detection into an empty
-                # detector frame.
-                and len(view.get("instances")) > 1
+                and len(view["instances"])
+                > ACTOR_LOG_TIGHT_TYPED_INSTANCE_LIMITS.get(
+                    str(view.get("view", "")).strip(),
+                    1,
+                )
             ]
-            if not candidates:
+            if not candidate_views:
                 break
-            min(candidates, key=len).pop()
+            # Rows are confidence-sorted, so pop the weakest row from the
+            # view with the most removable rows above its bounded floor.
+            view = max(
+                candidate_views,
+                key=lambda row: (
+                    len(row["instances"])
+                    - ACTOR_LOG_TIGHT_TYPED_INSTANCE_LIMITS.get(
+                        str(row.get("view", "")).strip(),
+                        1,
+                    ),
+                    len(row["instances"]),
+                ),
+            )
+            view["instances"].pop()
 
     if len(compact_prompt_json(minimal)) > available_chars:
         visual.pop("sources", None)
@@ -1290,6 +1396,9 @@ DEFAULT_CAM4_CROP_XYWH_NORM = (0.32, 0.18, 0.62, 0.78)
 # context to remain useful.  This stays bounded below the single-view limit.
 DEFAULT_MULTIVIEW_IMAGE_MAX_SIDE_PX = 1024
 MAX_PUBLIC_PERCEPTION_INSTANCES = 24
+# A UI sidecar should stay compact even if a future procedure has a large
+# requestable catalog.  The score is advisory; it is never a dispatch list.
+MAX_TOOL_DEMAND_FORECAST_ROWS = 16
 IMAGE_PAIR_BUFFER_LENGTH = 32
 PERCEPTION_PAIR_BUFFER_LENGTH = 64
 CLINICAL_ANALYSIS_MAX_CHARS = 320
@@ -1306,6 +1415,22 @@ INFERENCE_TRIGGER_SOURCE_FRAME = "source_frame_live"
 INFERENCE_TRIGGER_FORCED = "forced"
 INFERENCE_FAILURE_HISTORY_LENGTH = 32
 INFERENCE_FAILURE_LOG_REPEAT_SEC = 30.0
+
+
+def periodic_live_timer_required(
+    response_mode: str,
+    source_time_triggered_live: bool,
+) -> bool:
+    """Keep a timer only for the deterministic oracle compatibility mode.
+
+    Live inference is source-frame driven unconditionally.  The old
+    ``source_time_triggered_live`` switch is retained as a launch/API
+    compatibility parameter, but must not re-enable a fixed-period request
+    loop that limits throughput.
+    """
+
+    normalized_mode = str(response_mode or "").strip().lower()
+    return normalized_mode == "oracle"
 
 
 def normalize_clinical_analysis(value: Any) -> str:
@@ -1441,6 +1566,42 @@ class InferenceFailure:
     latency_sec: float
     retry_count: int
     recorded_monotonic: float
+
+
+@dataclass(frozen=True, slots=True)
+class InferenceRuntimeSnapshot:
+    """One coherent, immutable model request configuration.
+
+    Parameter callbacks may replace a provider, model, prompt, and client
+    while the latest-frame worker is waiting on a model response.  Capturing
+    this small snapshot prevents one request from accidentally combining the
+    old client with the new model id (or vice versa), and its epochs make a
+    completed old request safely discardable.
+    """
+
+    config_epoch: int
+    model_input_epoch: int
+    provider_id: str
+    model_id: str
+    response_mode: str
+    task_profile: str
+    context_mode: str
+    model_runtime_state: str
+    model_runtime_detail: str
+    client: Any
+    replay_payload: dict[str, Any] | None
+    system_prompt: str
+    developer_instruction: str
+    api_mode: str
+    request_timeout_sec: float
+    max_output_tokens: int
+    temperature: float
+    top_p: float
+    generation_seed: int | None
+    response_format: str
+    reasoning_effort: str
+    retry_count: int
+    json_schema: dict[str, Any]
 
 
 class InferenceBackpressure:
@@ -2406,6 +2567,17 @@ class RealVLMNode(Node):
         self._inference_wakeup = threading.Event()
         self._inference_shutdown = threading.Event()
         self._inference_worker: threading.Thread | None = None
+        # Configuration changes are infrequent, but model requests run on a
+        # dedicated worker.  One lock plus a monotonic configuration epoch is
+        # enough to make provider/model selection atomic without turning every
+        # perception callback into a coordinated transaction.
+        self._inference_config_lock = threading.RLock()
+        self._inference_config_epoch = 0
+        self._selected_model_runtime_state = "ready"
+        self._selected_model_runtime_detail = ""
+        self._selected_model_runtime_provider_id = ""
+        self._selected_model_runtime_model_id = ""
+        self._selected_model_runtime_checked_monotonic = 0.0
         self._inference_retry_lock = threading.Lock()
         self._inference_retry_timer: threading.Timer | None = None
         self._inference_failures: deque[InferenceFailure] = deque(
@@ -2413,13 +2585,21 @@ class RealVLMNode(Node):
         )
         self._inference_failure_count = 0
         self.declare_parameter("spec_dir", str(get_default_spec_dir()))
+        self.declare_parameter(
+            "scenario_config_topic", "/simulation/scenario_config"
+        )
+        # CommandRouter is the only command ingress subscriber.  Dialogue/VLM
+        # observes its relay and has no route back into command admission.
+        self.declare_parameter(
+            "speech_observation_topic", "/surgery/audio/observed_utterance"
+        )
         self.declare_parameter("base_url", "http://127.0.0.1:8001")
         self.declare_parameter("provider_id", os.environ.get("VLM_PROVIDER_ID", "vllm"))
         self.declare_parameter("api_key", "")
         self.declare_parameter("model_id", "unsloth/gemma-4-E4B-it-NVFP4")
         self.declare_parameter("api_mode", "openai_compat")
         self.declare_parameter("request_timeout_sec", 20.0)
-        self.declare_parameter("max_output_tokens", 320)
+        self.declare_parameter("max_output_tokens", 384)
         self.declare_parameter("temperature", 0.0)
         self.declare_parameter("top_p", 1.0)
         self.declare_parameter("generation_seed", 0)
@@ -2494,6 +2674,9 @@ class RealVLMNode(Node):
         self.declare_parameter("context_mode", "world")
         self.declare_parameter("open_set_phase_bootstrap_observations", 0)
         self.declare_parameter("handover_ngram_prior_enabled", True)
+        # Advisory, display-only future-demand prior.  It is deliberately
+        # independent of CAM/Mayo observation and command admission.
+        self.declare_parameter("tool_demand_prior_enabled", True)
         self.declare_parameter(
             "tts_reply_outbox_path",
             os.environ.get(
@@ -2583,6 +2766,30 @@ class RealVLMNode(Node):
             legacy_api_key=initial_api_key,
         )
         self._load_parameters()
+        # ScenarioStore owns selection.  This VLM accepts retained revisions
+        # only from the launch-time spec root and only adopts them across a
+        # local quiescent boundary; it never asks SimulationManager to select,
+        # reset, or otherwise reconcile a scenario.
+        self._scenario_config_root = Path(self._spec_dir).resolve().parent
+        self._scenario_config_topic = str(
+            self.get_parameter("scenario_config_topic").value
+        ).strip()
+        if not self._scenario_config_topic:
+            raise ValueError("scenario_config_topic must not be empty")
+        self._speech_observation_topic = str(
+            self.get_parameter("speech_observation_topic").value
+        ).strip()
+        if not self._speech_observation_topic:
+            raise ValueError("speech_observation_topic must not be empty")
+        self._scenario_config_revision = ""
+        self._pending_scenario_config: ScenarioConfigSnapshot | None = None
+        self._scenario_state_received = False
+        self._scenario_running = False
+        self._scenario_execution_state = ""
+        # A focused VLM restart starts without active inference.  It may
+        # consume the retained ScenarioStore revision before its first state
+        # heartbeat, but a seen active state always wins over this bootstrap.
+        self._scenario_initial_idle = True
         self.add_on_set_parameters_callback(self._on_parameters_changed)
         self._reply_outbox = ReplyOutbox(
             str(self.get_parameter("tts_reply_outbox_path").value)
@@ -2670,6 +2877,20 @@ class RealVLMNode(Node):
             20,
             callback_group=state_group,
         )
+        # Retained configuration notice from the one ScenarioStore owner.
+        # This is observation/configuration only; VLM health or availability
+        # is never fed back into deterministic command admission.
+        self.create_subscription(
+            String,
+            self._scenario_config_topic,
+            self._on_scenario_config,
+            QoSProfile(
+                depth=1,
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            ),
+            callback_group=state_group,
+        )
         self.create_subscription(
             TwinEvent,
             "/twin/events",
@@ -2708,15 +2929,8 @@ class RealVLMNode(Node):
         )
         self.create_subscription(
             SpeechUtterance,
-            "/surgery/audio/admitted_utterance",
+            self._speech_observation_topic,
             self._on_speech_utterance,
-            20,
-            callback_group=state_group,
-        )
-        self.create_subscription(
-            String,
-            "/surgery/audio/request_text",
-            self._on_request_text,
             20,
             callback_group=state_group,
         )
@@ -2832,12 +3046,8 @@ class RealVLMNode(Node):
             callback_group=state_group,
         )
 
-        self._timer = self.create_timer(
-            self._publish_period_sec,
-            self._tick,
-            callback_group=self._inference_callback_group,
-            clock=Clock(clock_type=ClockType.STEADY_TIME),
-        )
+        self._timer = None
+        self._configure_periodic_live_timer()
         self._reply_retry_timer = self.create_timer(
             self._reply_retry_period_sec,
             self._republish_pending_humanoid_replies,
@@ -2857,7 +3067,53 @@ class RealVLMNode(Node):
         )
         self._inference_worker.start()
 
+    def _configure_periodic_live_timer(self) -> None:
+        """Use frame completion/events for Live source-time inference.
+
+        A periodic timer is retained only for the explicit compatibility
+        fallback (oracle or Live with ``source_time_triggered_live=False``).
+        In the normal Live path, every completed request drains the newest
+        pending frame through ``_run_inference_chain``; a one-second timer
+        would only wake the executor and add no useful inference work.
+        """
+
+        timer = getattr(self, "_timer", None)
+        required = periodic_live_timer_required(
+            getattr(self, "_response_mode", "live"),
+            getattr(self, "_source_time_triggered_live", True),
+        )
+        if required:
+            if timer is None:
+                self._timer = self.create_timer(
+                    self._publish_period_sec,
+                    self._tick,
+                    callback_group=self._inference_callback_group,
+                    clock=Clock(clock_type=ClockType.STEADY_TIME),
+                )
+            return
+        if timer is not None:
+            timer.cancel()
+            self._timer = None
+
     def _load_parameters(self, overrides: dict[str, Any] | None = None) -> None:
+        """Atomically replace request-facing model configuration.
+
+        The public ROS parameter callback still validates and owns parameter
+        changes.  This lock only protects the inference worker from observing
+        an intermediate collection of mutable instance attributes.
+        """
+
+        lock = getattr(self, "_inference_config_lock", None)
+        if lock is None:  # lightweight unit stubs built with ``__new__``
+            self._load_parameters_locked(overrides)
+            return
+        with lock:
+            self._load_parameters_locked(overrides)
+
+    def _load_parameters_locked(
+        self,
+        overrides: dict[str, Any] | None = None,
+    ) -> None:
         override_values = overrides or {}
 
         def param_value(name: str) -> Any:
@@ -3037,7 +3293,11 @@ class RealVLMNode(Node):
         self._handover_ngram_prior_enabled = bool(
             param_value("handover_ngram_prior_enabled")
         )
+        self._tool_demand_prior_enabled = bool(
+            param_value("tool_demand_prior_enabled")
+        )
         self._handover_ngram_prior: FrozenHandoverNgramPrior | None = None
+        self._tool_demand_prior: FrozenToolDemandPrior | None = None
         if self._context_mode != "actor_log" and self._response_mode == "live":
             self.get_logger().warning(
                 "live VLM context is restricted to public evidence; "
@@ -3049,6 +3309,11 @@ class RealVLMNode(Node):
             self._prior_scorer = ProcedurePriorScorer(self._spec, self._procedure_prompt)
             if self._handover_ngram_prior_enabled:
                 self._handover_ngram_prior = load_frozen_handover_ngram_prior(
+                    self._spec,
+                    self._spec_dir,
+                )
+            if self._tool_demand_prior_enabled:
+                self._tool_demand_prior = load_frozen_tool_demand_prior(
                     self._spec,
                     self._spec_dir,
                 )
@@ -3083,6 +3348,40 @@ class RealVLMNode(Node):
             provider_id=self._provider_id,
         )
         self._replay_payload = self._load_replay_payload(self._replay_response_path)
+        runtime_state_lookup = getattr(self._provider_registry, "runtime_state", None)
+        known_runtime_state = (
+            runtime_state_lookup(self._provider_id, self._model_id)
+            if callable(runtime_state_lookup)
+            else None
+        )
+        if known_runtime_state is not None:
+            self._selected_model_runtime_provider_id = self._provider_id
+            self._selected_model_runtime_model_id = self._model_id
+            self._selected_model_runtime_state = str(
+                known_runtime_state[0]
+            ).strip().lower() or "unknown"
+            self._selected_model_runtime_detail = str(
+                known_runtime_state[1]
+            ).strip()
+            self._selected_model_runtime_checked_monotonic = time.monotonic()
+        elif (
+            self._provider_id
+            != str(
+                getattr(self, "_selected_model_runtime_provider_id", "")
+            ).strip().lower()
+            or self._model_id
+            != str(
+                getattr(self, "_selected_model_runtime_model_id", "")
+            ).strip()
+        ):
+            self._selected_model_runtime_provider_id = ""
+            self._selected_model_runtime_model_id = ""
+            self._selected_model_runtime_state = "ready"
+            self._selected_model_runtime_detail = ""
+        self._inference_config_epoch = max(
+            0,
+            int(getattr(self, "_inference_config_epoch", 0)),
+        ) + 1
 
     def _load_replay_payload(self, replay_path: str) -> dict[str, Any] | None:
         if not replay_path.strip():
@@ -3200,15 +3499,116 @@ class RealVLMNode(Node):
             "phase_start_floor limits phase only, never tool/intent. Not ground truth; use allowed_normal_phase_ids, never earlier. Interrupts need visible evidence. "
             "NEXT-TOOL FORECAST: tool is only a horizon-free forecast of the first subsequent new handover, regardless of elapsed time, not a label for the tool currently in use; it answers which additional instrument the assistant should prepare next and does not inventory visible instruments. Predict before a spoken request. Select the most plausible subsequent additional tool from visible task trajectory, broad procedure-role transitions, and public history; distinguish instruments already held or prepositioned. Unless public evidence specifically supports another instance, an already active type must stay below 0.65; forecast a plausible unused tool instead. forecast_constraints is public DT context: currently_in_use lists surgeon-held tools and counts; prepositioned is robot-held; available_for_next_handover comes from digital_twin.forecast_inventory.available: rack_available unused stock plus mayo_reuse surgeon-used tools expected later when trajectory supports imminent reuse. A tool type may appear in available and unavailable, but a forecast must have available count >0. This evidence never authorizes action; the reducer and BT, not the VLM, validate availability. Independently of your phase candidate, match the longest suffix against every procedure chain. frozen_ngram_prior is an advisory aggregate phase/history statistic, not a request. Do not choose the next tool solely from your phase output or the n-gram prior. No-history entry_handover is not a confirmed request; keep every weak candidate below 0.65. Spoken tool is the current request, so forecast the following one. Do not memorize case timing. "
             "INTENT: only current admitted public speech naming a runtime instrument may produce [\"handover\",tool_id,confidence]. Match obvious ASR near-homophones and Korean/English transliterations to the listed runtime tool names, but do not turn procedure-start, continue, phase, anatomy, or completion speech into a tool request. "
-            "DIALOGUE: Only pending_dialogue_turn may be answered; speech history never may. Null pending means both new fields are null. Otherwise copy turn_id exactly and emit one concise same-language speak=true reply. Questions use null function_call and immediate timing. Supported direct requests only: request_tool_handover with arguments exactly {tool_id}, or adjust_retraction with arguments exactly {command:'adjust_retraction',target_side:'left|right|both',distance_m:positive meters}. Use only slots explicit in the pending utterance and procedure rules; otherwise ask an immediate clarification with null function_call. Pair valid calls with on_function_accepted future wording and never claim completion. For a Korean request_tool_handover with grounded tool_id T07, use exactly the reply text 바이폴라 전달드리겠습니다. Tool retrieval is not a dialogue function because the current typed execution contract cannot correlate it safely; return an immediate clarification with null function_call instead. "
-            "BED RETRACTION: null unless a pending public fine-adjustment request has direction evidence. Copy request_id, adjustment_mode, target_retractor_id, and surgeon_view exactly. For thyroidectomy_demo only, a terse explicit-distance request with target_retractor_id right_malleable and no spoken direction uses the reviewed default direction right. For single, emit one of up/down/left/right with axis none. For multi, emit direction none with axis left_right or up_down. Preserve grounded distance text. Never propose tool change or any non-retraction operation. "
+            "DIALOGUE: Only pending_dialogue_turn may be answered; speech history never may. Null pending means both new fields are null. Otherwise copy turn_id exactly and emit one concise same-language speak=true reply. Questions use null function_call and immediate timing. "
+            "function_call is a non-executable presentation hint, never a command: it may only be request_tool_handover with one grounded tool_id or adjust_retraction with a compact observed summary, for the same turn. Unknown names and incomplete hints are discarded. Typed ASR, the deterministic resolver, and typed endpoint adapters own command admission and dispatch. Use only slots explicit in the pending utterance and procedure rules; otherwise ask an immediate clarification with null function_call. Pair a valid handover hint with on_function_accepted future wording and never claim completion. For a Korean handover request with grounded tool_id T07, use exactly the reply text 바이폴라 전달드리겠습니다. Tool retrieval is not a dialogue hint; return an immediate clarification with null function_call instead. "
+            "BED RETRACTION: null unless a pending public fine-adjustment request has direction evidence. Copy request_id, adjustment_mode, target_retractor_id, and surgeon_view exactly. For thyroidectomy_demo only, a terse explicit-distance request with target_retractor_id left_malleable and no spoken direction uses the reviewed default direction left. For single, emit one of up/down/left/right with axis none. For multi, emit direction none with axis left_right or up_down. Preserve grounded distance text. Never propose tool change or any non-retraction operation. "
             "UNCERTAINTY: calculate u independently on every frame: 0.00-0.25 clear, 0.26-0.45 for usable adjacent-phase ambiguity, 0.46-0.79 weak/conflicting, and 0.80-1.00 only when the relevant view is unusable. Do not copy the structural 0.50 value. "
             "mayo is always an array of three-value rows: [[\"Txx\",\"reuse\",0.80]], never [\"Txx\"], [\"tool name\"], or [\"tool name (Txx)\"]. Empty Mayo is []. "
             "phase and tool use two-value rows: [[\"Pxx\",0.80]] and [[\"Txx\",0.70]], never flat pairs. Pxx/Txx are shape placeholders only; replace them with exact ids and never emit xx. "
             "Final audit: mayo must come only from Mayo pixels; phase/tool may combine public evidence; output only JSON."
         )
 
+    def _scenario_config_candidate(self, snapshot: ScenarioConfigSnapshot) -> str:
+        """Load one ScenarioStore revision beneath this VLM's fixed root.
+
+        The topic does not grant filesystem authority.  It names only a direct
+        child bundle of the root chosen when this owner launched, and the
+        authored bundle is parsed before the existing local parameter reload
+        path is allowed to adopt it.
+        """
+
+        return load_scenario_consumer_bundle(
+            snapshot,
+            fixed_spec_root=self._scenario_config_root,
+        ).spec_dir
+
+    def _scenario_config_apply_is_safe(self) -> bool:
+        """Allow a local prompt/spec swap only while execution is quiescent."""
+
+        if not bool(getattr(self, "_scenario_state_received", False)):
+            return bool(getattr(self, "_scenario_initial_idle", False)) and not bool(
+                getattr(self, "_active", False)
+            )
+        state = str(
+            getattr(self, "_scenario_execution_state", "") or ""
+        ).strip().casefold()
+        if state == "paused":
+            return True
+        return (
+            not bool(getattr(self, "_scenario_running", False))
+            and state
+            in {"idle", "stopped", "halted", "completed", "terminated", "error", "failed"}
+        )
+
+    def _on_scenario_config(self, message: String) -> None:
+        """Stage the selected revision without making it a command gate."""
+
+        try:
+            snapshot = parse_scenario_config(message.data)
+            # Verify before retaining the revision, then verify again at the
+            # commit boundary in case an authored YAML save races this callback.
+            self._scenario_config_candidate(snapshot)
+        except Exception as exc:
+            self.get_logger().warning(f"VLM scenario config ignored: {exc}")
+            return
+        if (
+            snapshot.revision == getattr(self, "_scenario_config_revision", "")
+            and str(Path(snapshot.spec_dir).resolve())
+            == str(Path(getattr(self, "_spec_dir", "")).resolve())
+        ):
+            return
+        self._pending_scenario_config = snapshot
+        self._apply_pending_scenario_config_if_safe()
+
+    def _apply_pending_scenario_config_if_safe(self) -> None:
+        """Commit one staged revision through the existing local reload path."""
+
+        snapshot = getattr(self, "_pending_scenario_config", None)
+        if snapshot is None or not self._scenario_config_apply_is_safe():
+            return
+        try:
+            candidate = self._scenario_config_candidate(snapshot)
+        except Exception as exc:
+            if getattr(self, "_pending_scenario_config", None) == snapshot:
+                self._pending_scenario_config = None
+            self.get_logger().warning(
+                f"VLM scenario config rejected before local swap: {exc}"
+            )
+            return
+
+        result = self.set_parameters_atomically(
+            [Parameter(name="spec_dir", value=candidate)]
+        )
+        if not bool(getattr(result, "successful", False)):
+            self.get_logger().warning(
+                "VLM scenario config local swap rejected: "
+                f"{getattr(result, 'reason', '') or 'unknown reason'}"
+            )
+            return
+        if getattr(self, "_pending_scenario_config", None) == snapshot:
+            self._scenario_config_revision = snapshot.revision
+            self._pending_scenario_config = None
+        self.get_logger().info(
+            "VLM scenario revision applied locally: "
+            f"{snapshot.bundle_name}@{snapshot.revision}"
+        )
+
     def _on_parameters_changed(self, params):
+        immutable_topics = {
+            "scenario_config_topic",
+            "speech_observation_topic",
+        }
+        changed_topics = sorted(
+            parameter.name for parameter in params if parameter.name in immutable_topics
+        )
+        if changed_topics:
+            return SetParametersResult(
+                successful=False,
+                reason=(
+                    "subscription topics are process-lifetime; restart the VLM "
+                    "owner to rebind " + ", ".join(changed_topics)
+                ),
+            )
         reload_required = False
         overrides = {parameter.name: parameter.value for parameter in params}
         spec_changed = "spec_dir" in overrides
@@ -3261,11 +3661,13 @@ class RealVLMNode(Node):
                 "context_mode",
                 "open_set_phase_bootstrap_observations",
                 "handover_ngram_prior_enabled",
+                "tool_demand_prior_enabled",
             }:
                 reload_required = True
         if reload_required:
             try:
                 self._load_parameters(overrides)
+                self._configure_periodic_live_timer()
                 self._reset_model_input_dedupe(advance_epoch=True)
                 if spec_changed:
                     self._last_lifecycle_control_signature = None
@@ -3481,6 +3883,30 @@ class RealVLMNode(Node):
             response.success = False
             response.message = result.reason or "Provider selection was rejected"
             return response
+        selected_runtime_state = (
+            runtime.state
+            if runtime_note
+            else (
+                str(catalog_model.load_state)
+                if catalog_model is not None and catalog_model.runtime_managed
+                else "ready"
+            )
+        )
+        selected_runtime_detail = (
+            runtime.message
+            if runtime_note
+            else (
+                str(catalog_model.detail)
+                if catalog_model is not None
+                else ""
+            )
+        )
+        self._set_selected_model_runtime_state(
+            provider_id=self._provider_id,
+            model_id=self._model_id,
+            state=selected_runtime_state,
+            detail=selected_runtime_detail,
+        )
         response.success = True
         response.provider_id = self._provider_id
         response.model_id = self._model_id
@@ -3502,6 +3928,18 @@ class RealVLMNode(Node):
         response.state = result.state
         response.message = result.message
         if result.success:
+            if (
+                str(getattr(self, "_provider_id", "")).strip().lower()
+                == str(result.provider_id).strip().lower()
+                and str(getattr(self, "_model_id", "")).strip()
+                == str(result.model_id).strip()
+            ):
+                self._set_selected_model_runtime_state(
+                    provider_id=result.provider_id,
+                    model_id=result.model_id,
+                    state=result.state,
+                    detail=result.message,
+                )
             self._reset_model_input_dedupe(advance_epoch=True)
         return response
 
@@ -3576,8 +4014,7 @@ class RealVLMNode(Node):
 
     def _queue_source_time_live_frame(self, sample: ImageSample) -> None:
         if (
-            not getattr(self, "_source_time_triggered_live", False)
-            or self._response_mode != "live"
+            self._response_mode != "live"
             or not self._active
         ):
             return
@@ -3702,6 +4139,20 @@ class RealVLMNode(Node):
         worker = getattr(self, "_inference_worker", None)
         if shutdown is not None:
             shutdown.set()
+        # Serialize shutdown with the final stale-result fence. A request that
+        # was already in flight may finish after the bounded join below, but
+        # its snapshot can no longer publish into a destroyed ROS node.
+        config_lock = getattr(self, "_inference_config_lock", None)
+        if config_lock is not None:
+            with config_lock:
+                self._inference_config_epoch = max(
+                    0,
+                    int(getattr(self, "_inference_config_epoch", 0)),
+                ) + 1
+                self._model_input_epoch = max(
+                    0,
+                    int(getattr(self, "_model_input_epoch", 0)),
+                ) + 1
         self._cancel_inference_retry()
         if wakeup is not None:
             wakeup.set()
@@ -4006,6 +4457,9 @@ class RealVLMNode(Node):
         execution_state = str(
             getattr(msg, "execution_state", "") or ""
         ).strip().lower()
+        self._scenario_state_received = True
+        self._scenario_running = bool(getattr(msg, "running", False))
+        self._scenario_execution_state = execution_state
         if (
             bool(getattr(msg, "running", False))
             and execution_state == "running"
@@ -4024,6 +4478,7 @@ class RealVLMNode(Node):
             self._stop_lifecycle()
         self._track_authoritative_phase()
         self._publish_context_summaries()
+        self._apply_pending_scenario_config_if_safe()
 
     def _on_event(self, msg: TwinEvent) -> None:
         digest = EventDigest()
@@ -4386,10 +4841,6 @@ class RealVLMNode(Node):
             if self._append_public_speech(voice_text):
                 self._trigger_inference_for_public_speech()
 
-    def _on_request_text(self, msg: String) -> None:
-        if self._append_public_speech(msg.data):
-            self._trigger_inference_for_public_speech()
-
     def _trigger_inference_for_public_speech(self) -> None:
         if not self._active or self._response_mode != "live":
             return
@@ -4400,6 +4851,11 @@ class RealVLMNode(Node):
 
     def _on_bed_robot_arm_group_request(self, msg: BedRobotArmGroupRequest) -> None:
         """Track only VLM-routed fine retraction-adjustment requests."""
+        active_run_id = str(getattr(self, "_procedure_run_id", "") or "").strip()
+        if not active_run_id or str(
+            getattr(msg, "procedure_run_id", "") or ""
+        ).strip() != active_run_id:
+            return
         if str(msg.group_id) != "retraction" or str(msg.operation) not in {
             "retraction",
             "retraction_adjustment",
@@ -4446,6 +4902,11 @@ class RealVLMNode(Node):
         self._last_bed_robot_arm_group_proposal_request_id = ""
 
     def _on_bed_robot_arm_group_status(self, msg: BedRobotArmGroupStatus) -> None:
+        active_run_id = str(getattr(self, "_procedure_run_id", "") or "").strip()
+        if not active_run_id or str(
+            getattr(msg, "procedure_run_id", "") or ""
+        ).strip() != active_run_id:
+            return
         if str(msg.group_id) != "retraction":
             return
         pending = self._latest_bed_robot_arm_group_request
@@ -4582,8 +5043,21 @@ class RealVLMNode(Node):
             self._last_submitted_live_image_stamp_sec = None
             self._reset_source_time_live_trigger(reset_stamp=True)
             self._reset_fast_cam4_mayo_observations()
+        if command in {"start", "start_actors", "resume"}:
+            self._scenario_initial_idle = False
+        elif command in {"pause", "stop", "reset"}:
+            self._scenario_initial_idle = True
+        self._apply_pending_scenario_config_if_safe()
 
     def _reset_model_input_dedupe(self, *, advance_epoch: bool) -> None:
+        lock = getattr(self, "_inference_config_lock", None)
+        if lock is None:
+            self._reset_model_input_dedupe_locked(advance_epoch=advance_epoch)
+            return
+        with lock:
+            self._reset_model_input_dedupe_locked(advance_epoch=advance_epoch)
+
+    def _reset_model_input_dedupe_locked(self, *, advance_epoch: bool) -> None:
         if advance_epoch:
             self._model_input_epoch = (
                 max(0, int(getattr(self, "_model_input_epoch", 0))) + 1
@@ -4598,6 +5072,206 @@ class RealVLMNode(Node):
             self._reset_inference_failure_log_throttle()
         self._last_submitted_model_input_key = ""
 
+    def _capture_inference_runtime_snapshot(self) -> InferenceRuntimeSnapshot:
+        """Take a coherent model/provider view for exactly one request."""
+
+        lock = getattr(self, "_inference_config_lock", None)
+        if lock is None:  # supports focused ``RealVLMNode.__new__`` tests
+            return self._capture_inference_runtime_snapshot_locked()
+        with lock:
+            return self._capture_inference_runtime_snapshot_locked()
+
+    def _capture_inference_runtime_snapshot_locked(self) -> InferenceRuntimeSnapshot:
+        provider_id = str(getattr(self, "_provider_id", "")).strip().lower()
+        model_id = str(getattr(self, "_model_id", "")).strip()
+        runtime_state = "ready"
+        runtime_detail = ""
+        if (
+            provider_id
+            and model_id
+            and provider_id
+            == str(
+                getattr(self, "_selected_model_runtime_provider_id", "")
+            ).strip().lower()
+            and model_id
+            == str(
+                getattr(self, "_selected_model_runtime_model_id", "")
+            ).strip()
+        ):
+            runtime_state = str(
+                getattr(self, "_selected_model_runtime_state", "ready")
+            ).strip().lower() or "unknown"
+            runtime_detail = str(
+                getattr(self, "_selected_model_runtime_detail", "")
+            ).strip()
+        schema = getattr(self, "_json_schema", {})
+        replay_payload = getattr(self, "_replay_payload", None)
+        return InferenceRuntimeSnapshot(
+            config_epoch=max(
+                0,
+                int(getattr(self, "_inference_config_epoch", 0)),
+            ),
+            model_input_epoch=max(
+                0,
+                int(getattr(self, "_model_input_epoch", 0)),
+            ),
+            provider_id=provider_id,
+            model_id=model_id,
+            response_mode=str(getattr(self, "_response_mode", "live")).strip(),
+            task_profile=str(
+                getattr(self, "_task_profile", VLM_TASK_PROFILE_FULL)
+            ).strip(),
+            context_mode=str(getattr(self, "_context_mode", "")).strip(),
+            model_runtime_state=runtime_state,
+            model_runtime_detail=runtime_detail,
+            client=getattr(self, "_client", None),
+            replay_payload=(
+                copy.deepcopy(replay_payload)
+                if isinstance(replay_payload, dict)
+                else None
+            ),
+            system_prompt=str(getattr(self, "_system_prompt", "")),
+            developer_instruction=str(
+                getattr(self, "_developer_instruction", "")),
+            api_mode=str(getattr(self, "_api_mode", "")),
+            request_timeout_sec=float(
+                getattr(self, "_request_timeout_sec", 0.0)
+            ),
+            max_output_tokens=int(getattr(self, "_max_output_tokens", 0)),
+            temperature=float(getattr(self, "_temperature", 0.0)),
+            top_p=float(getattr(self, "_top_p", 1.0)),
+            generation_seed=getattr(self, "_generation_seed", None),
+            response_format=str(getattr(self, "_response_format", "")),
+            reasoning_effort=str(getattr(self, "_reasoning_effort", "")),
+            retry_count=max(0, int(getattr(self, "_retry_count", 0))),
+            json_schema=copy.deepcopy(schema) if isinstance(schema, dict) else {},
+        )
+
+    def _inference_snapshot_is_current(
+        self,
+        snapshot: InferenceRuntimeSnapshot,
+    ) -> bool:
+        shutdown = getattr(self, "_inference_shutdown", None)
+        if shutdown is not None and shutdown.is_set():
+            return False
+        lock = getattr(self, "_inference_config_lock", None)
+        if lock is None:
+            return (
+                snapshot.config_epoch
+                == max(0, int(getattr(self, "_inference_config_epoch", 0)))
+                and snapshot.model_input_epoch
+                == max(0, int(getattr(self, "_model_input_epoch", 0)))
+            )
+        with lock:
+            return (
+                snapshot.config_epoch
+                == max(0, int(getattr(self, "_inference_config_epoch", 0)))
+                and snapshot.model_input_epoch
+                == max(0, int(getattr(self, "_model_input_epoch", 0)))
+            )
+
+    def _set_selected_model_runtime_state(
+        self,
+        *,
+        provider_id: str,
+        model_id: str,
+        state: str,
+        detail: str = "",
+    ) -> None:
+        """Record selected-model lifecycle without changing model config."""
+
+        normalized_provider = str(provider_id or "").strip().lower()
+        normalized_model = str(model_id or "").strip()
+        normalized_state = str(state or "unknown").strip().lower() or "unknown"
+        lock = getattr(self, "_inference_config_lock", None)
+        if lock is None:
+            self._selected_model_runtime_provider_id = normalized_provider
+            self._selected_model_runtime_model_id = normalized_model
+            self._selected_model_runtime_state = normalized_state
+            self._selected_model_runtime_detail = str(detail or "").strip()
+            self._selected_model_runtime_checked_monotonic = time.monotonic()
+            return
+        with lock:
+            self._selected_model_runtime_provider_id = normalized_provider
+            self._selected_model_runtime_model_id = normalized_model
+            self._selected_model_runtime_state = normalized_state
+            self._selected_model_runtime_detail = str(detail or "").strip()
+            self._selected_model_runtime_checked_monotonic = time.monotonic()
+
+    def _refresh_selected_model_runtime_state(
+        self,
+        snapshot: InferenceRuntimeSnapshot,
+    ) -> InferenceRuntimeSnapshot:
+        """Refresh a selected transitional model at a bounded cadence.
+
+        A successful lifecycle request may return ``loading`` before the
+        provider's catalog exposes the ready model.  We deliberately do not
+        send inference traffic during that interval, but we also avoid a
+        blocking probe for every camera frame.
+        """
+
+        if snapshot.model_runtime_state not in {
+            "loading",
+            "waking",
+            "unloading",
+            "suspending",
+        }:
+            return snapshot
+        now = time.monotonic()
+        lock = getattr(self, "_inference_config_lock", None)
+        if lock is not None:
+            with lock:
+                last_checked = float(
+                    getattr(
+                        self,
+                        "_selected_model_runtime_checked_monotonic",
+                        0.0,
+                    )
+                )
+        else:
+            last_checked = float(
+                getattr(self, "_selected_model_runtime_checked_monotonic", 0.0)
+            )
+        if now - last_checked < 0.5:
+            return snapshot
+        try:
+            probe = self._provider_registry.probe(snapshot.provider_id)
+            model = self._provider_registry.matching_model(
+                snapshot.provider_id,
+                snapshot.model_id,
+                probe.models,
+            )
+            if model is not None:
+                self._set_selected_model_runtime_state(
+                    provider_id=snapshot.provider_id,
+                    model_id=snapshot.model_id,
+                    state=str(model.load_state),
+                    detail=str(model.detail),
+                )
+            elif not probe.reachable:
+                # Provider reachability is a separate signal. Keep the
+                # transition state rather than fabricating an unloaded model.
+                self._set_selected_model_runtime_state(
+                    provider_id=snapshot.provider_id,
+                    model_id=snapshot.model_id,
+                    state=snapshot.model_runtime_state,
+                    detail=str(probe.detail),
+                )
+        except Exception as exc:
+            # Retain the known lifecycle state; a transient catalog failure is
+            # not permission to send into a model that is still loading.
+            self._set_selected_model_runtime_state(
+                provider_id=snapshot.provider_id,
+                model_id=snapshot.model_id,
+                state=snapshot.model_runtime_state,
+                detail=str(exc),
+            )
+        return self._capture_inference_runtime_snapshot()
+
+    @staticmethod
+    def _model_runtime_ready(snapshot: InferenceRuntimeSnapshot) -> bool:
+        return snapshot.model_runtime_state in {"", "ready", "loaded", "unknown"}
+
     def _release_dialogue_claim(self, correlation_id: str) -> bool:
         dialogue_gate = getattr(self, "_dialogue_turn_gate", None)
         if dialogue_gate is None:
@@ -4607,12 +5281,34 @@ class RealVLMNode(Node):
     def _next_visual_evidence_metadata(
         self,
         model_input_key: str,
+        runtime_snapshot: InferenceRuntimeSnapshot | None = None,
     ) -> tuple[int, int, str]:
-        epoch = max(0, int(getattr(self, "_model_input_epoch", 0)))
-        sequence = max(0, int(getattr(self, "_vlm_result_sequence", 0))) + 1
-        self._vlm_result_sequence = sequence
-        correlation_id = f"vlm-{epoch}-{sequence}-{model_input_key[:12]}"
-        return epoch, sequence, correlation_id
+        lock = getattr(self, "_inference_config_lock", None)
+
+        def next_metadata() -> tuple[int, int, str]:
+            epoch = (
+                runtime_snapshot.model_input_epoch
+                if runtime_snapshot is not None
+                else max(0, int(getattr(self, "_model_input_epoch", 0)))
+            )
+            # Do not allocate evidence metadata against an epoch that moved
+            # between the snapshot and this call. The caller will discard the
+            # request before publish, but keeping the current sequence intact
+            # avoids a misleading mixed-epoch correlation id.
+            if runtime_snapshot is not None and epoch != max(
+                0,
+                int(getattr(self, "_model_input_epoch", 0)),
+            ):
+                return epoch, 0, ""
+            sequence = max(0, int(getattr(self, "_vlm_result_sequence", 0))) + 1
+            self._vlm_result_sequence = sequence
+            correlation_id = f"vlm-{epoch}-{sequence}-{model_input_key[:12]}"
+            return epoch, sequence, correlation_id
+
+        if lock is None:
+            return next_metadata()
+        with lock:
+            return next_metadata()
 
     @staticmethod
     def _set_visual_evidence_metadata(
@@ -4633,35 +5329,26 @@ class RealVLMNode(Node):
         self,
         request_context_json: str,
         images: list[tuple[str, bytes, str]],
+        runtime_snapshot: InferenceRuntimeSnapshot | None = None,
     ) -> str:
+        snapshot = runtime_snapshot or self._capture_inference_runtime_snapshot()
         return model_input_signature(
-            runtime_epoch=int(getattr(self, "_model_input_epoch", 0)),
+            runtime_epoch=snapshot.model_input_epoch,
             request_config={
-                "provider_id": str(getattr(self, "_provider_id", "")),
-                "model_id": str(getattr(self, "_model_id", "")),
-                "api_mode": str(getattr(self, "_api_mode", "")),
-                "response_format": str(
-                    getattr(self, "_response_format", "")
-                ),
-                "reasoning_effort": str(
-                    getattr(self, "_reasoning_effort", "")
-                ),
-                "temperature": float(getattr(self, "_temperature", 0.0)),
-                "top_p": float(getattr(self, "_top_p", 1.0)),
-                "max_output_tokens": int(
-                    getattr(self, "_max_output_tokens", 0)
-                ),
-                "generation_seed": getattr(
-                    self,
-                    "_generation_seed",
-                    None,
-                ),
-                "json_schema": getattr(self, "_json_schema", {}),
+                "config_epoch": snapshot.config_epoch,
+                "provider_id": snapshot.provider_id,
+                "model_id": snapshot.model_id,
+                "api_mode": snapshot.api_mode,
+                "response_format": snapshot.response_format,
+                "reasoning_effort": snapshot.reasoning_effort,
+                "temperature": snapshot.temperature,
+                "top_p": snapshot.top_p,
+                "max_output_tokens": snapshot.max_output_tokens,
+                "generation_seed": snapshot.generation_seed,
+                "json_schema": snapshot.json_schema,
             },
-            system_prompt=str(getattr(self, "_system_prompt", "")),
-            developer_instruction=str(
-                getattr(self, "_developer_instruction", "")
-            ),
+            system_prompt=snapshot.system_prompt,
+            developer_instruction=snapshot.developer_instruction,
             request_context_json=request_context_json,
             observation_metadata=dict(
                 getattr(self, "_current_visual_input", {})
@@ -4859,6 +5546,9 @@ class RealVLMNode(Node):
 
         msg = VLMRequestContext()
         msg.stamp = self._world.stamp
+        msg.procedure_run_id = str(
+            getattr(self, "_procedure_run_id", "") or ""
+        ).strip()
         msg.procedure_id = self._world.procedure_id
         msg.filtered_phase = self._world.filtered_phase
         msg.phase_confidence = float(self._world.phase_confidence)
@@ -5213,7 +5903,9 @@ class RealVLMNode(Node):
                     # procedure runtime ID.  Only add an ID when the procedure
                     # aliases resolve it; never invent one from a class index.
                     tool_id = self._canonical_tool_id(
-                        instance.get("class_name", "")
+                        canonical_rfdetr_tool_label(
+                            instance.get("class_name", "")
+                        )
                     )
                     if tool_id:
                         instance["tool_id"] = tool_id
@@ -5457,6 +6149,9 @@ class RealVLMNode(Node):
     ) -> VLMRequestContext:
         msg = VLMRequestContext()
         msg.stamp = observation_stamp
+        msg.procedure_run_id = str(
+            getattr(self, "_procedure_run_id", "") or ""
+        ).strip()
         msg.procedure_id = self._spec.procedure_id
         if self._world is not None:
             msg.filtered_phase = self._authoritative_runtime_phase()
@@ -5695,40 +6390,22 @@ class RealVLMNode(Node):
             canonical.get("mayo_retrieve", ["", 0.0]),
         )
         if version in {"5", "6"} and isinstance(canonical.get("function_call"), dict):
-            function_call = dict(canonical["function_call"])
-            function_name = str(function_call.get("name", "")).strip()
-            arguments = function_call.get("arguments", {})
-            if not isinstance(arguments, dict):
-                arguments = {}
-            if function_name == "request_tool_handover":
-                tool_id = self._canonical_tool_id(arguments.get("tool_id", ""))
-                if tool_id:
-                    function_call["arguments"] = {"tool_id": tool_id}
-                    canonical["function_call"] = function_call
-                else:
-                    canonical["function_call"] = None
-            elif function_name == "adjust_retraction":
-                command = str(arguments.get("command", "")).strip()
-                target_side = str(arguments.get("target_side", "")).strip().lower()
-                raw_distance = arguments.get("distance_m")
-                if (
-                    command == "adjust_retraction"
-                    and target_side in {"left", "right", "both"}
-                    and isinstance(raw_distance, (int, float))
-                    and not isinstance(raw_distance, bool)
-                    and math.isfinite(float(raw_distance))
-                    and float(raw_distance) > 0.0
-                ):
-                    function_call["arguments"] = {
-                        "command": command,
-                        "distance_m": float(raw_distance),
-                        "target_side": target_side,
-                    }
-                    canonical["function_call"] = function_call
-                else:
-                    canonical["function_call"] = None
-            else:
-                canonical["function_call"] = None
+            function_hint = _normalize_dialogue_presentation_hint(
+                canonical["function_call"],
+                expected_turn_id=str(
+                    canonical["function_call"].get("turn_id", "") or ""
+                ).strip(),
+                canonical_tool_id=self._canonical_tool_id,
+            )
+            canonical["function_call"] = function_hint
+            if function_hint is None:
+                reply = canonical.get("humanoid_reply")
+                if isinstance(reply, dict) and str(
+                    reply.get("timing", "") or ""
+                ).strip() != "immediate":
+                    canonical_reply = dict(reply)
+                    canonical_reply["timing"] = "immediate"
+                    canonical["humanoid_reply"] = canonical_reply
         return canonical
 
     def _actor_log_prior_evidence(
@@ -6463,18 +7140,18 @@ class RealVLMNode(Node):
         if request is None:
             return None
         spoken_direction = infer_retraction_direction(request.voice_text)
-        thyroid_default_right = bool(
+        thyroid_default_left = bool(
             not spoken_direction
             and str(request.procedure_id) == "thyroidectomy_demo"
             and str(request.adjustment_mode) == "single"
-            and str(request.target_retractor_id) == "right_malleable"
+            and str(request.target_retractor_id) == "left_malleable"
         )
-        if not spoken_direction and not thyroid_default_right:
+        if not spoken_direction and not thyroid_default_left:
             return None
         try:
             normalized = normalize_retraction_request(
                 request.voice_text,
-                vlm_direction="RIGHT" if thyroid_default_right else "",
+                vlm_direction="LEFT" if thyroid_default_left else "",
             )
         except BedRobotArmGroupNormalizationError:
             return None
@@ -6574,6 +7251,129 @@ class RealVLMNode(Node):
         if fallback_phase and not self._spec.is_interrupt_phase(fallback_phase):
             return [[fallback_phase, 0.35]]
         return []
+
+    def _tool_demand_forecast(
+        self,
+        context_dict: dict[str, Any],
+    ) -> list[list[Any]]:
+        """Return the compact, display-only future surgeon-demand score.
+
+        This is intentionally a different question from camera observation,
+        Mayo placement, inventory, or robot availability.  The frozen 0704
+        prior supplies the dominant future-handover probability; authored
+        phase membership and current surgeon ownership provide small,
+        deterministic context signals.  No result from this helper is read by
+        the Digital Twin reducer or command path.
+        """
+
+        prior = getattr(self, "_tool_demand_prior", None)
+        if prior is None or not isinstance(context_dict, dict):
+            return []
+
+        digital_twin = context_dict.get("digital_twin", {})
+        if not isinstance(digital_twin, dict):
+            digital_twin = {}
+        candidates = context_dict.get("candidates", {})
+        candidates = candidates if isinstance(candidates, dict) else {}
+        evidence = candidates.get("evidence", {})
+        evidence = evidence if isinstance(evidence, dict) else {}
+        phase_id = self._canonical_phase_id(evidence.get("current_phase", ""))
+        if not phase_id:
+            phase_id = self._canonical_phase_id(
+                self._authoritative_runtime_phase()
+            )
+        if not phase_id:
+            return []
+
+        completed_handovers = digital_twin.get("completed_handovers", [])
+        if not isinstance(completed_handovers, (list, tuple)):
+            completed_handovers = []
+        prediction = prior.predict(
+            phase_id=phase_id,
+            completed_handovers=completed_handovers,
+        )
+        if not isinstance(prediction, dict):
+            return []
+
+        requestable_ids = sorted(
+            {
+                tool_id
+                for raw_tool_id in self._spec.list_requestable_instrument_ids()
+                if (tool_id := self._canonical_tool_id(raw_tool_id))
+            }
+        )[:MAX_TOOL_DEMAND_FORECAST_ROWS]
+        if not requestable_ids:
+            return []
+
+        historical: dict[str, float] = {}
+        probabilities = prediction.get("probabilities", [])
+        for row in probabilities if isinstance(probabilities, list) else []:
+            if not isinstance(row, list) or len(row) < 2:
+                continue
+            tool_id = self._canonical_tool_id(row[0])
+            if tool_id not in requestable_ids:
+                continue
+            try:
+                probability = float(row[1])
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(probability):
+                historical[tool_id] = max(0.0, min(1.0, probability))
+
+        try:
+            current_phase_tools = {
+                self._canonical_tool_id(tool_id)
+                for tool_id in self._spec.get_expected_instruments(phase_id)
+            }
+            remaining_phase_tools = {
+                self._canonical_tool_id(tool_id)
+                for tool_id in self._spec.get_remaining_expected_instruments(
+                    phase_id,
+                    include_current=True,
+                )
+            }
+        except KeyError:
+            current_phase_tools = set()
+            remaining_phase_tools = set()
+        current_phase_tools.discard("")
+        remaining_phase_tools.discard("")
+
+        surgeon_owned: set[str] = set()
+        tools = digital_twin.get("tools", [])
+        for row in tools if isinstance(tools, list) else []:
+            if not isinstance(row, dict):
+                continue
+            if (
+                str(row.get("lc", "")) != "surgeon_owned"
+                and str(row.get("own", "")) != "surgeon"
+            ):
+                continue
+            tool_id = self._canonical_tool_id(row.get("id", ""))
+            if tool_id in requestable_ids:
+                surgeon_owned.add(tool_id)
+
+        forecast: list[list[Any]] = []
+        for tool_id in requestable_ids:
+            # The 0704-conditioned future-use likelihood is dominant.  The
+            # authored sequence distinguishes the current phase from a later
+            # one, while a tool actively held by the surgeon contributes a
+            # small continued-use signal.  Location, availability, Mayo state,
+            # and every camera/perception field are deliberately absent.
+            phase_signal = (
+                1.0
+                if tool_id in current_phase_tools
+                else 0.35 if tool_id in remaining_phase_tools else 0.0
+            )
+            surgeon_signal = 1.0 if tool_id in surgeon_owned else 0.0
+            score = (
+                0.75 * historical.get(tool_id, 0.0)
+                + 0.15 * phase_signal
+                + 0.10 * surgeon_signal
+            )
+            forecast.append(
+                [tool_id, round(max(0.0, min(1.0, score)), 3)]
+            )
+        return forecast
 
     def _stabilize_actor_log_payload(self, payload: dict[str, Any], context_dict: dict[str, Any]) -> dict[str, Any]:
         if str(payload.get("v", "")) not in {"3", "4", "5", "6"}:
@@ -6721,8 +7521,37 @@ class RealVLMNode(Node):
             stabilized,
             context_dict,
         )
+        # Keep the CAM4-corroborated rows available to the observer even when
+        # the pre-inference DT has not yet adopted the same Mayo placement.
+        # `mayo` below remains the strict policy channel: only that field is
+        # consumed by the DT reducer.  This sidecar stays inside the existing
+        # VLMResult JSON and is presentation-only, so a first camera sighting
+        # cannot both move an instrument and affect its lifecycle policy.
+        observation_payload = {
+            "mayo": [
+                list(row)
+                for row in stabilized.get("mayo", [])
+                if isinstance(row, list)
+            ],
+            "mayo_retrieve": list(stabilized.get("mayo_retrieve", ["", 0.0]))
+            if isinstance(stabilized.get("mayo_retrieve"), list)
+            else ["", 0.0],
+        }
+        self._suppress_non_mayo_recovery_candidates(
+            observation_payload,
+            context_dict,
+            retain_current_stand=False,
+        )
+        stabilized["mayo_observation"] = observation_payload["mayo"]
         self._retain_mayo_policy_for_current_stand(stabilized, context_dict)
         self._suppress_non_mayo_recovery_candidates(stabilized, context_dict)
+        # Keep future re-use demand separate from CAM4-calibrated Mayo
+        # observation and from the strict DT Mayo policy above.  This existing
+        # VLMResult JSON sidecar is presentation-only and avoids any ROS ABI
+        # or controller-policy change.
+        stabilized["tool_demand_forecast"] = self._tool_demand_forecast(
+            context_dict
+        )
 
         stabilized["sum"] = normalize_clinical_analysis(
             stabilized.get("sum", "")
@@ -6813,6 +7642,179 @@ class RealVLMNode(Node):
         else:
             payload["mayo_retrieve"] = [retrieve_tool, retrieve[1]]
 
+    def _mayo_corroboration_rows(
+        self,
+        perception: dict[str, Any],
+    ) -> tuple[bool, list[dict[str, Any]]]:
+        """Normalize one confirmed CAM4 observation into Mayo evidence rows.
+
+        The legacy semantic summary and the public typed RF-DETR context are
+        interchangeable *evidence providers* here.  This method intentionally
+        does not inspect a detector implementation name or model version: the
+        configured typed topic and its self-identifying schema already form the
+        provenance boundary.  The typed path still requires fresh CAM4 data and
+        derives the same count, dwell, and confidence fields consumed by the
+        existing corroboration policy below.
+        """
+
+        alignment = perception.get("alignment", {})
+        if (
+            perception.get("schema") == "taskplanner.cam4_semantics.v1"
+            and perception.get("source") == "cam4_rfdetr_small"
+            and isinstance(alignment, dict)
+            and alignment.get("status") == "aligned"
+        ):
+            rows = perception.get("tools", [])
+            return True, rows if isinstance(rows, list) else []
+
+        if (
+            perception.get("schema")
+            != "taskplanner.rfdetr_multiview_tool_context.v1"
+            or perception.get("source") != "rfdetr_tool_observation_2d"
+            or perception.get("ground_truth") is not False
+        ):
+            return False, []
+
+        views = perception.get("tool_detection_views", [])
+        if not isinstance(views, list):
+            return False, []
+        cam4_view = next(
+            (
+                view
+                for view in views
+                if isinstance(view, dict)
+                and str(view.get("view", "")).strip() == "cam_4"
+            ),
+            None,
+        )
+        if cam4_view is None:
+            return False, []
+        freshness = cam4_view.get("freshness")
+        if not isinstance(freshness, dict):
+            freshness = (
+                perception.get("freshness", {}).get("cam_4", {})
+                if isinstance(perception.get("freshness"), dict)
+                else {}
+            )
+        if (
+            not isinstance(freshness, dict)
+            or freshness.get("status") != "fresh"
+        ):
+            return False, []
+        if str(cam4_view.get("detection_status", "")).strip() not in {
+            "detections",
+            "no_detections",
+        }:
+            return False, []
+        reference_stamp_sec = _finite_float(
+            cam4_view.get("source_stamp_sec")
+        )
+        if reference_stamp_sec is None:
+            return False, []
+        raw_instances = cam4_view.get("instances", [])
+        if not isinstance(raw_instances, list):
+            return False, []
+
+        current: dict[str, dict[str, float | int]] = {}
+        for instance in raw_instances:
+            if not isinstance(instance, dict):
+                continue
+            tool_id = self._canonical_tool_id(
+                instance.get("tool_id")
+                or canonical_rfdetr_tool_label(
+                    instance.get("class_name", "")
+                )
+            )
+            confidence = _finite_float(instance.get("confidence"))
+            if not tool_id or confidence is None:
+                continue
+            evidence = current.setdefault(
+                tool_id,
+                {"count": 0, "max_confidence": 0.0},
+            )
+            evidence["count"] = int(evidence["count"]) + 1
+            evidence["max_confidence"] = max(
+                float(evidence["max_confidence"]),
+                min(1.0, max(0.0, confidence)),
+            )
+
+        # The typed public context deliberately contains only the newest
+        # frame.  Derive presence dwell from the bounded, source-stamped CAM4
+        # buffer so the existing policy sees exactly the same stable-count and
+        # duration evidence as it does for legacy semantic summaries.
+        histories: dict[str, list[tuple[float, float]]] = {}
+        start_sec = reference_stamp_sec - CAM4_MAYO_STABILITY_WINDOW_SEC
+        buffer = getattr(self, "_perception_buffers", {}).get(
+            "rfdetr_cam_4_tools"
+        )
+        latest = getattr(self, "_latest_perception", {}).get(
+            "rfdetr_cam_4_tools"
+        )
+        samples = list(buffer) if buffer else []
+        if latest is not None and (
+            not samples or samples[-1] is not latest
+        ):
+            samples.append(latest)
+        for _received_at, sample in samples:
+            if not isinstance(sample, dict):
+                continue
+            sample_stamp_sec = _finite_float(
+                sample.get("source_stamp_sec")
+            )
+            if (
+                sample_stamp_sec is None
+                or sample_stamp_sec < start_sec
+                or sample_stamp_sec
+                > reference_stamp_sec
+                + self._perception_image_max_skew_sec
+            ):
+                continue
+            sample_instances = sample.get("instances", [])
+            if not isinstance(sample_instances, list):
+                continue
+            per_sample: dict[str, float] = {}
+            for instance in sample_instances:
+                if not isinstance(instance, dict):
+                    continue
+                tool_id = self._canonical_tool_id(
+                    instance.get("tool_id")
+                    or canonical_rfdetr_tool_label(
+                        instance.get("class_name", "")
+                    )
+                )
+                confidence = _finite_float(instance.get("confidence"))
+                if not tool_id or confidence is None:
+                    continue
+                per_sample[tool_id] = max(
+                    per_sample.get(tool_id, 0.0),
+                    min(1.0, max(0.0, confidence)),
+                )
+            for tool_id, confidence in per_sample.items():
+                histories.setdefault(tool_id, []).append(
+                    (sample_stamp_sec, confidence)
+                )
+
+        rows: list[dict[str, Any]] = []
+        for tool_id in sorted(current):
+            history = histories.get(tool_id, [])
+            rows.append(
+                {
+                    "name": tool_id,
+                    "count": int(current[tool_id]["count"]),
+                    "max_confidence": round(
+                        float(current[tool_id]["max_confidence"]), 4
+                    ),
+                    "stable_sample_count": len(history),
+                    "stable_duration_sec": round(
+                        max(0.0, history[-1][0] - history[0][0])
+                        if history
+                        else 0.0,
+                        6,
+                    ),
+                }
+            )
+        return True, rows
+
     def _corroborate_mayo_with_cam4_semantics(
         self,
         payload: dict[str, Any],
@@ -6827,13 +7829,7 @@ class RealVLMNode(Node):
         )
         if not isinstance(perception, dict):
             perception = {}
-        alignment = perception.get("alignment", {})
-        aligned = (
-            perception.get("schema") == "taskplanner.cam4_semantics.v1"
-            and perception.get("source") == "cam4_rfdetr_small"
-            and isinstance(alignment, dict)
-            and alignment.get("status") == "aligned"
-        )
+        aligned, rows = self._mayo_corroboration_rows(perception)
         visual_input = (
             context_dict.get("visual_input", {})
             if isinstance(context_dict, dict)
@@ -6888,7 +7884,6 @@ class RealVLMNode(Node):
             return
 
         detected: dict[str, dict[str, Any]] = {}
-        rows = perception.get("tools", []) if aligned else []
         for row in rows if isinstance(rows, list) else []:
             if not isinstance(row, dict):
                 continue
@@ -7022,10 +8017,15 @@ class RealVLMNode(Node):
         self,
         payload: dict[str, Any],
         context_dict: dict[str, Any],
+        *,
+        retain_current_stand: bool = True,
     ) -> None:
-        # The DT fact is the hard admission boundary.  Keep this guard here in
-        # addition to the stabilizer call so direct callers cannot bypass it.
-        self._retain_mayo_policy_for_current_stand(payload, context_dict)
+        # The DT fact is the hard admission boundary for the policy field.
+        # The post-corroboration observer sidecar deliberately skips only this
+        # one admission check; all scenario and physical-location suppressions
+        # below still apply before UI presentation.
+        if retain_current_stand:
+            self._retain_mayo_policy_for_current_stand(payload, context_dict)
         candidates = (
             context_dict.get("candidates", {})
             if isinstance(context_dict, dict)
@@ -7079,20 +8079,17 @@ class RealVLMNode(Node):
         digital_twin = context_dict.get("digital_twin", {}) if isinstance(context_dict, dict) else {}
         hands = digital_twin.get("hands", {}) if isinstance(digital_twin, dict) else {}
         tools = digital_twin.get("tools", []) if isinstance(digital_twin, dict) else []
+        perception = (
+            context_dict.get("observable_perception", {})
+            if isinstance(context_dict, dict)
+            else {}
+        )
+        _, cam4_rows = self._mayo_corroboration_rows(
+            perception if isinstance(perception, dict) else {}
+        )
         stable_cam4_tools = {
             self._canonical_tool_id(row.get("name", ""))
-            for row in (
-                context_dict.get("observable_perception", {}).get(
-                    "tools",
-                    [],
-                )
-                if isinstance(context_dict, dict)
-                and isinstance(
-                    context_dict.get("observable_perception", {}),
-                    dict,
-                )
-                else []
-            )
+            for row in cam4_rows
             if isinstance(row, dict)
             and int(row.get("stable_sample_count", 0) or 0)
             >= CAM4_MAYO_MIN_STABLE_SAMPLES
@@ -7128,8 +8125,16 @@ class RealVLMNode(Node):
                 "dropped_floor",
             }:
                 blocked_tools.add(tool_id)
+            # A fresh, stable CAM4 row is a fixed-Mayo-view observation. It
+            # can contradict a stale rack/tray location in the pre-inference
+            # DT for the observer sidecar, but it never overrides an actively
+            # controlled robot/cleaner/floor location.
+            if (
+                location_type == "tray_slot"
+                and tool_id not in stable_cam4_tools
+            ):
+                blocked_tools.add(tool_id)
             if location_type in {
-                "tray_slot",
                 "robot_right_hand",
                 "robot_left_hand",
                 "cleaner_slot",
@@ -7172,23 +8177,31 @@ class RealVLMNode(Node):
         context_json: str,
         images: list[tuple[str, bytes, str]],
         claimed_dialogue_turn_id: str = "",
+        runtime_snapshot: InferenceRuntimeSnapshot | None = None,
     ) -> tuple[str, dict[str, Any] | None, float, str, int, str]:
+        snapshot = runtime_snapshot or self._capture_inference_runtime_snapshot()
         retries_used = 0
-        if self._response_mode == "replay":
-            if self._replay_payload is None:
+        if snapshot.response_mode == "replay":
+            if snapshot.replay_payload is None:
                 raise RuntimeError("response_mode=replay requires replay_response_path")
-            raw = json.dumps(self._replay_payload, separators=(",", ":"), sort_keys=True)
+            raw = json.dumps(
+                snapshot.replay_payload,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
             normalized_raw, payload = self._normalize_model_raw_text(
                 raw,
                 claimed_dialogue_turn_id=claimed_dialogue_turn_id,
+                runtime_snapshot=snapshot,
             )
             return normalized_raw, payload, 0.0, "replay", retries_used, ""
-        if self._response_mode == "oracle":
+        if snapshot.response_mode == "oracle":
             payload = self._fallback_payload(json.loads(context_json))
             raw = json.dumps(payload, separators=(",", ":"), sort_keys=True)
             normalized_raw, payload = self._normalize_model_raw_text(
                 raw,
                 claimed_dialogue_turn_id=claimed_dialogue_turn_id,
+                runtime_snapshot=snapshot,
             )
             return normalized_raw, payload, 0.0, "oracle", retries_used, ""
 
@@ -7196,12 +8209,12 @@ class RealVLMNode(Node):
         last_raw_text = ""
         transport_failed = False
         started_monotonic = time.monotonic()
-        for attempt in range(self._retry_count + 1):
-            developer_prompt = self._developer_instruction
+        for attempt in range(snapshot.retry_count + 1):
+            developer_prompt = snapshot.developer_instruction
             if attempt > 0:
                 validation_error = last_error.split(";", 1)[0].strip()[:180]
                 if (
-                    getattr(self, "_task_profile", VLM_TASK_PROFILE_FULL)
+                    snapshot.task_profile
                     == VLM_TASK_PROFILE_TOOL_FORECAST_ONLY
                 ):
                     developer_prompt += (
@@ -7210,7 +8223,7 @@ class RealVLMNode(Node):
                         "tool/u JSON object with nested candidate rows."
                     )
                 else:
-                    context_mode = getattr(self, "_context_mode", "")
+                    context_mode = snapshot.context_mode
                     schema_version = (
                         "6"
                         if context_mode == "actor_log"
@@ -7222,25 +8235,28 @@ class RealVLMNode(Node):
                         f"schema-v{schema_version} JSON object only; do not simplify any array shape."
                     )
             try:
-                response = self._client.request_json(
-                    system_prompt=self._system_prompt,
+                if snapshot.client is None:
+                    raise RuntimeError("VLM client is not configured")
+                response = snapshot.client.request_json(
+                    system_prompt=snapshot.system_prompt,
                     developer_prompt=developer_prompt,
                     user_context_json=context_json,
                     images=images,
-                    model_id=self._model_id,
-                    temperature=self._temperature,
-                    top_p=self._top_p,
-                    max_output_tokens=self._max_output_tokens,
-                    api_mode=self._api_mode,
-                    response_format=self._response_format,
-                    json_schema=self._json_schema,
-                    reasoning_effort=self._reasoning_effort,
-                    generation_seed=self._generation_seed,
+                    model_id=snapshot.model_id,
+                    temperature=snapshot.temperature,
+                    top_p=snapshot.top_p,
+                    max_output_tokens=snapshot.max_output_tokens,
+                    api_mode=snapshot.api_mode,
+                    response_format=snapshot.response_format,
+                    json_schema=snapshot.json_schema,
+                    reasoning_effort=snapshot.reasoning_effort,
+                    generation_seed=snapshot.generation_seed,
                 )
                 last_raw_text = response.raw_text
                 normalized_raw, payload = self._normalize_model_raw_text(
                     response.raw_text,
                     claimed_dialogue_turn_id=claimed_dialogue_turn_id,
+                    runtime_snapshot=snapshot,
                 )
                 return normalized_raw, payload, response.latency_sec, response.mode, attempt, ""
             except (requests.RequestException, SchemaValidationError, json.JSONDecodeError, RuntimeError, ValueError) as exc:  # type: ignore[name-defined]
@@ -7275,18 +8291,18 @@ class RealVLMNode(Node):
         raw_text: str,
         *,
         claimed_dialogue_turn_id: str = "",
+        runtime_snapshot: InferenceRuntimeSnapshot | None = None,
     ) -> tuple[str, dict[str, Any]]:
+        snapshot = runtime_snapshot or self._capture_inference_runtime_snapshot()
         if (
-            getattr(self, "_task_profile", VLM_TASK_PROFILE_FULL)
+            snapshot.task_profile
             == VLM_TASK_PROFILE_TOOL_FORECAST_ONLY
         ):
             return normalize_tool_forecast_raw_text(raw_text)
         if (
-            str(getattr(self, "_response_mode", "")).strip().lower() == "live"
-            and str(getattr(self, "_provider_id", "")).strip().lower()
-            == "ninfer"
-            and str(getattr(self, "_context_mode", "")).strip().lower()
-            == "actor_log"
+            snapshot.response_mode.strip().lower() == "live"
+            and snapshot.provider_id == "ninfer"
+            and snapshot.context_mode.strip().lower() == "actor_log"
         ):
             payload = _repair_ninfer_dialogue_envelope(
                 parse_json_payload(raw_text),
@@ -7330,6 +8346,9 @@ class RealVLMNode(Node):
         force: bool = False,
         inference_trigger: str = "",
     ) -> bool:
+        shutdown = getattr(self, "_inference_shutdown", None)
+        if shutdown is not None and shutdown.is_set():
+            return False
         trigger = str(inference_trigger).strip()
         if not trigger:
             trigger = (
@@ -7341,14 +8360,7 @@ class RealVLMNode(Node):
             trigger == INFERENCE_TRIGGER_PERIODIC_LIVE
             and (
                 getattr(self, "_response_mode", "live") == "replay"
-                or (
-                    getattr(self, "_response_mode", "live") == "live"
-                    and getattr(
-                        self,
-                        "_source_time_triggered_live",
-                        False,
-                    )
-                )
+                or getattr(self, "_response_mode", "live") == "live"
             )
         ):
             return False
@@ -7370,65 +8382,102 @@ class RealVLMNode(Node):
 
         current_trigger: str | None = initial_trigger
         while current_trigger is not None:
+            shutdown = getattr(self, "_inference_shutdown", None)
+            if shutdown is not None and shutdown.is_set():
+                self._inference_backpressure.complete(drop_pending=True)
+                return
             try:
                 self._tick_once(
                     force=current_trigger != INFERENCE_TRIGGER_PERIODIC_LIVE,
                     inference_trigger=current_trigger,
                 )
             except Exception as exc:  # pragma: no cover - final node boundary
-                self._record_inference_failure(
-                    trigger=current_trigger,
-                    mode="unhandled_exception",
-                    error=str(exc),
-                    image_source="",
-                    latency_sec=0.0,
-                    prompt_chars=0,
-                    retry_count=0,
-                    connected=False,
-                )
+                if shutdown is None or not shutdown.is_set():
+                    self._record_inference_failure(
+                        trigger=current_trigger,
+                        mode="unhandled_exception",
+                        error=str(exc),
+                        image_source="",
+                        latency_sec=0.0,
+                        prompt_chars=0,
+                        retry_count=0,
+                        connected=False,
+                    )
             finally:
-                failure_backoff = getattr(
-                    self,
-                    "_transport_failure_backoff",
-                    None,
-                )
-                backoff_remaining = (
-                    failure_backoff.remaining()
-                    if failure_backoff is not None
-                    else 0.0
-                )
-                if backoff_remaining > 0.0:
-                    retryable_current = (
-                        current_trigger
-                        if current_trigger != INFERENCE_TRIGGER_FORCED
-                        else ""
-                    )
-                    pending_trigger = self._inference_backpressure.defer_until_ready(
-                        retryable_current
-                    )
-                    if pending_trigger == INFERENCE_TRIGGER_FORCED:
-                        # An operator request queued while ordinary inference
-                        # was failing must retain the forced backoff bypass.
-                        # Wake the single consumer immediately instead of
-                        # inheriting the transport retry delay.
-                        self._cancel_inference_retry()
-                        wakeup = getattr(self, "_inference_wakeup", None)
-                        if wakeup is not None:
-                            wakeup.set()
-                    elif pending_trigger:
-                        self._schedule_inference_retry(backoff_remaining)
+                if shutdown is not None and shutdown.is_set():
+                    self._inference_backpressure.complete(drop_pending=True)
                     current_trigger = None
                 else:
-                    current_trigger = self._inference_backpressure.complete()
+                    failure_backoff = getattr(
+                        self,
+                        "_transport_failure_backoff",
+                        None,
+                    )
+                    backoff_remaining = (
+                        failure_backoff.remaining()
+                        if failure_backoff is not None
+                        else 0.0
+                    )
+                    if backoff_remaining > 0.0:
+                        retryable_current = (
+                            current_trigger
+                            if current_trigger != INFERENCE_TRIGGER_FORCED
+                            else ""
+                        )
+                        pending_trigger = self._inference_backpressure.defer_until_ready(
+                            retryable_current
+                        )
+                        if pending_trigger == INFERENCE_TRIGGER_FORCED:
+                            # An operator request queued while ordinary inference
+                            # was failing must retain the forced backoff bypass.
+                            # Wake the single consumer immediately instead of
+                            # inheriting the transport retry delay.
+                            self._cancel_inference_retry()
+                            wakeup = getattr(self, "_inference_wakeup", None)
+                            if wakeup is not None:
+                                wakeup.set()
+                        elif pending_trigger:
+                            self._schedule_inference_retry(backoff_remaining)
+                        current_trigger = None
+                    else:
+                        current_trigger = self._inference_backpressure.complete()
 
     def _tick_once(
         self,
         force: bool = False,
         inference_trigger: str = INFERENCE_TRIGGER_PERIODIC_LIVE,
     ) -> None:
+        shutdown = getattr(self, "_inference_shutdown", None)
+        if shutdown is not None and shutdown.is_set():
+            return
+        runtime_snapshot = self._capture_inference_runtime_snapshot()
+        runtime_snapshot = self._refresh_selected_model_runtime_state(
+            runtime_snapshot
+        )
+        if not self._model_runtime_ready(runtime_snapshot):
+            runtime_state = runtime_snapshot.model_runtime_state or "unknown"
+            runtime_detail = runtime_snapshot.model_runtime_detail
+            # Provider connection, selected-model lifecycle, and camera input
+            # are distinct states.  Loading is expected and must not become a
+            # transport failure/backoff merely because the model worker has
+            # not finished coming online yet.
+            self._publish_health(
+                image_source="",
+                latency_sec=0.0,
+                prompt_chars=0,
+                output_chars=0,
+                parse_retry_count=0,
+                last_error=(
+                    runtime_detail if runtime_state == "error" else ""
+                ),
+                mode=f"awaiting_model_runtime:{runtime_state}",
+                healthy=runtime_state != "error",
+                connected=True,
+            )
+            return
         if not force and not self._active:
             return
-        if self._response_mode == "replay" and not force:
+        if runtime_snapshot.response_mode == "replay" and not force:
             return
         perception_generation = getattr(
             self,
@@ -7447,10 +8496,10 @@ class RealVLMNode(Node):
             context_stamp.sec = int(model_image.stamp_sec)
             context_stamp.nanosec = int(model_image.stamp_nanosec)
         submitted_dialogue_turn_id = ""
-        if self._context_mode == "actor_log":
+        if runtime_snapshot.context_mode == "actor_log":
             context_dict = self._assemble_actor_log_context_dict()
-            static_prompt_chars = len(self._system_prompt) + len(
-                self._developer_instruction
+            static_prompt_chars = len(runtime_snapshot.system_prompt) + len(
+                runtime_snapshot.developer_instruction
             )
             model_context_dict = actor_log_request_context(
                 context_dict,
@@ -7495,30 +8544,38 @@ class RealVLMNode(Node):
             # published from this image-free request.
             self._current_image_input_error = ""
             image_source = "dialogue_text_only"
-        prompt_chars = len(self._system_prompt) + len(self._developer_instruction) + len(request_context_json)
+        prompt_chars = (
+            len(runtime_snapshot.system_prompt)
+            + len(runtime_snapshot.developer_instruction)
+            + len(request_context_json)
+        )
         raw_json = ""
         payload: dict[str, Any] | None = None
         latency_sec = 0.0
-        mode = self._response_mode
+        mode = runtime_snapshot.response_mode
         parse_retry_count = 0
         last_error = ""
         healthy = True
         connected = True
         if self._current_image_input_error:
+            # The model client is still live; only the next visual request is
+            # waiting for a usable frame.  Reporting this as ``healthy=False``
+            # conflated camera readiness with NInfer/model failure and caused
+            # an expected start-of-run frame gap to latch ``vlm_unhealthy``.
             self._publish_health(
                 image_source=image_source,
                 latency_sec=0.0,
                 prompt_chars=prompt_chars,
                 output_chars=0,
                 parse_retry_count=0,
-                last_error=self._current_image_input_error,
-                mode="missing_visual_input",
-                healthy=False,
+                last_error="",
+                mode="awaiting_visual_input:missing_visual_input",
+                healthy=True,
                 connected=True,
             )
             return
         if (
-            self._response_mode == "live"
+            runtime_snapshot.response_mode == "live"
             and self._require_field_image
             and not dialogue_text_only
             and not is_model_ready_visual_source(image_source)
@@ -7529,15 +8586,16 @@ class RealVLMNode(Node):
                 prompt_chars=prompt_chars,
                 output_chars=0,
                 parse_retry_count=0,
-                last_error="no fresh segmented or raw FLIR image",
-                mode="no_fresh_image",
-                healthy=False,
+                last_error="",
+                mode="awaiting_visual_input:no_fresh_image",
+                healthy=True,
                 connected=True,
             )
             return
         model_input_key = self._current_model_input_signature(
             request_context_json,
             images,
+            runtime_snapshot,
         )
         if model_input_key == getattr(
             self,
@@ -7559,7 +8617,7 @@ class RealVLMNode(Node):
             )
             return
         self._last_submitted_model_input_key = model_input_key
-        if self._context_mode != "actor_log":
+        if runtime_snapshot.context_mode != "actor_log":
             # Publish the exact compact context that is about to be submitted
             # so the operations UI exposes the same typed RF-DETR facts the
             # Live VLM receives.  This remains a read-only observer topic.
@@ -7568,7 +8626,10 @@ class RealVLMNode(Node):
             source_epoch,
             source_sequence,
             correlation_id,
-        ) = self._next_visual_evidence_metadata(model_input_key)
+        ) = self._next_visual_evidence_metadata(
+            model_input_key,
+            runtime_snapshot,
+        )
         if submitted_dialogue_turn_id:
             claimed_turn = self._dialogue_turn_gate.claim(
                 turn_id=submitted_dialogue_turn_id,
@@ -7584,6 +8645,7 @@ class RealVLMNode(Node):
                 request_context_json,
                 images,
                 submitted_dialogue_turn_id,
+                runtime_snapshot,
             )
         except Exception as exc:  # pragma: no cover - safety net
             last_error = str(exc)
@@ -7594,20 +8656,43 @@ class RealVLMNode(Node):
             mode = "unhandled_model_exception"
         if mode == "inference_transport_failed":
             connected = False
+        if not self._inference_snapshot_is_current(runtime_snapshot):
+            # A parameter/model selection or owner shutdown overlapped the
+            # request.  Never publish a result obtained with a mixed or stale
+            # provider snapshot, and do not report that expected discard as a
+            # provider transport failure.
+            shutdown = getattr(self, "_inference_shutdown", None)
+            if shutdown is None or not shutdown.is_set():
+                self._publish_health(
+                    image_source=image_source,
+                    latency_sec=latency_sec,
+                    prompt_chars=prompt_chars,
+                    output_chars=0,
+                    parse_retry_count=parse_retry_count,
+                    last_error="",
+                    mode="stale_runtime_config_result_discarded",
+                    healthy=True,
+                    connected=connected,
+                )
+            self._release_dialogue_claim(correlation_id)
+            return
         if (
             self._require_field_image
             and perception_generation
             != getattr(self, "_perception_generation", 0)
         ):
+            # A lifecycle/perception epoch moved while the request was in
+            # flight.  Its result cannot be used, but this does not say
+            # anything about model or transport availability.
             self._publish_health(
                 image_source="",
                 latency_sec=latency_sec,
                 prompt_chars=prompt_chars,
                 output_chars=0,
                 parse_retry_count=parse_retry_count,
-                last_error="visual assistance mode changed during inference",
-                mode="visual_contract_changed",
-                healthy=False,
+                last_error="",
+                mode="visual_input_superseded",
+                healthy=True,
                 connected=connected,
             )
             self._release_dialogue_claim(correlation_id)
@@ -7616,17 +8701,44 @@ class RealVLMNode(Node):
             0,
             int(getattr(self, "_model_input_epoch", 0)),
         ):
-            self._publish_health(
-                image_source=image_source,
-                latency_sec=latency_sec,
-                prompt_chars=prompt_chars,
-                output_chars=0,
-                parse_retry_count=parse_retry_count,
-                last_error="inference completed after runtime epoch changed",
-                mode="stale_epoch_result_discarded",
-                healthy=False,
-                connected=connected,
+            # An epoch transition fences old visual evidence; it is not by
+            # itself a model/transport failure.  In particular, Stop/Reset
+            # followed by Start commonly overlaps one already-submitted
+            # inference.  Keep discarding that old result, but retain a ready
+            # health lease so the new scenario is not blocked by an artificial
+            # ``vlm_unhealthy`` flag while its first current-epoch request is
+            # in flight.  Genuine failed responses still report unhealthy.
+            live_failure = self._response_mode == "live" and (
+                payload is None
+                or not healthy
+                or last_error
+                or mode in {"last_good", "oracle_fallback"}
             )
+            if live_failure:
+                self._record_inference_failure(
+                    trigger=inference_trigger,
+                    mode=mode,
+                    error=last_error
+                    or f"unsafe VLM fallback mode: {mode}",
+                    image_source=image_source,
+                    latency_sec=latency_sec,
+                    prompt_chars=prompt_chars,
+                    retry_count=parse_retry_count,
+                    connected=connected,
+                    output_chars=len(raw_json),
+                )
+            else:
+                self._publish_health(
+                    image_source=image_source,
+                    latency_sec=latency_sec,
+                    prompt_chars=prompt_chars,
+                    output_chars=0,
+                    parse_retry_count=parse_retry_count,
+                    last_error="",
+                    mode="stale_epoch_result_discarded",
+                    healthy=True,
+                    connected=connected,
+                )
             self._release_dialogue_claim(correlation_id)
             return
         if self._response_mode == "live" and (
@@ -7838,29 +8950,23 @@ class RealVLMNode(Node):
         function_request_id = ""
         function_is_valid = function_call is None
         if isinstance(function_call, dict):
-            function_call_name = str(function_call.get("name", "")).strip()
-            function_turn_id = str(function_call.get("turn_id", "")).strip()
-            function_is_valid = bool(
-                function_call_name
-                in {"request_tool_handover", "adjust_retraction"}
-                and function_turn_id == clean_claimed_turn_id
-                and timing in {"on_function_accepted", "on_function_completed"}
+            function_hint = _normalize_dialogue_presentation_hint(
+                function_call,
+                expected_turn_id=clean_claimed_turn_id,
+                canonical_tool_id=self._canonical_tool_id,
             )
-            if function_is_valid:
+            if function_hint is not None:
+                function_call_name = str(function_hint["name"])
+                function_is_valid = timing in _DIALOGUE_PRESENTATION_HINT_TIMINGS[
+                    function_call_name
+                ]
+            else:
+                function_is_valid = False
+            if function_is_valid and function_hint is not None:
                 function_arguments_json = json.dumps(
-                    function_call.get("arguments", {}),
+                    function_hint["arguments"],
                     separators=(",", ":"),
                     sort_keys=True,
-                )
-                function_request_id = (
-                    stable_dialogue_reply_id(
-                        turn.procedure_run_id,
-                        turn.utterance_id,
-                        gateway_instance_id=str(
-                            getattr(self, "_gateway_instance_id", "") or ""
-                        ),
-                    )
-                    + ":function"
                 )
         elif timing != "immediate":
             function_is_valid = False
@@ -8107,6 +9213,7 @@ class RealVLMNode(Node):
         command.stamp = stamp
         command.request_id = request_id
         command.command_id = f"vlm-{request_id}"
+        command.procedure_run_id = request.procedure_run_id
         command.group_id = "retraction"
         command.operation = "retraction"
         command.adjustment_mode = str(request.adjustment_mode)
@@ -8351,6 +9458,9 @@ class RealVLMNode(Node):
 
         result = VLMResult()
         result.stamp = observation_stamp
+        result.procedure_run_id = str(
+            getattr(self, "_procedure_run_id", "") or ""
+        ).strip()
         procedure_id = str(
             getattr(getattr(self, "_spec", None), "procedure_id", "unknown")
         )
@@ -8483,6 +9593,9 @@ class RealVLMNode(Node):
 
         result = VLMResult()
         result.stamp = stamp
+        result.procedure_run_id = str(
+            getattr(self, "_procedure_run_id", "") or ""
+        ).strip()
         self._set_visual_evidence_metadata(
             result,
             source=phase_evidence.source,

@@ -1229,7 +1229,7 @@ def generate_launch_description() -> LaunchDescription:
                     "next-tool benchmark and does not replace the normal profile."
                 ),
             ),
-            DeclareLaunchArgument("vlm_max_output_tokens", default_value="320"),
+            DeclareLaunchArgument("vlm_max_output_tokens", default_value="384"),
             DeclareLaunchArgument("vlm_generation_seed", default_value="0"),
             DeclareLaunchArgument("vlm_response_mode", default_value="live"),
             DeclareLaunchArgument("vlm_replay_response_path", default_value=""),
@@ -1432,7 +1432,7 @@ def generate_launch_description() -> LaunchDescription:
                 parameters=[
                     {
                         **use_sim_time,
-                        "tick_rate": 0.1,
+                        "tick_rate": 0.025,
                         "groot2_port": ParameterValue(
                             groot2_port,
                             value_type=int,
@@ -1463,8 +1463,13 @@ def generate_launch_description() -> LaunchDescription:
                 parameters=[
                     {
                         **use_sim_time,
+                        # Preserve the recorded typed envelope.  The router is
+                        # the only consumer of this admitted ingress; Shadow
+                        # must not recreate the old raw-text command lane.
+                        "input_mode": "utterance",
                         "input_topic": "/shadow/speech/utterance",
-                        "output_topic": "/surgery/audio/request_text",
+                        "output_mode": "typed_utterance",
+                        "typed_output_topic": "/surgery/audio/admitted_utterance",
                         "required_speaker_role": "surgeon",
                         "accept_missing_confidence": True,
                         "require_timestamp": True,
@@ -1474,8 +1479,27 @@ def generate_launch_description() -> LaunchDescription:
                 ],
                 output="screen",
             ),
+            # Router is the sole admitted-ASR subscriber.  It immediately
+            # executes exact catalog matches and forwards only catalog misses
+            # to the resolver's private typed ingress.
+            Node(
+                package="voice_command",
+                executable="command_router",
+                name="command_router",
+                parameters=[
+                    {
+                        "input_topic": "/surgery/audio/admitted_utterance",
+                        "observed_utterance_topic": "/surgery/audio/observed_utterance",
+                        "resolver_input_topic": "/surgery/voice/resolver_utterance",
+                        "resolver_output_topic": "/surgery/voice/proposal",
+                        "procedure_bundle": spec_dir,
+                    }
+                ],
+                output="screen",
+            ),
             # Shadow replay keeps model selection disabled by default while
-            # exercising the same natural-language-to-typed-intent boundary.
+            # exercising the same private resolver proposal route as the
+            # modular command owner. Resolver output returns only to router.
             Node(
                 package="voice_command",
                 executable="voice_intent_resolver",
@@ -1483,8 +1507,9 @@ def generate_launch_description() -> LaunchDescription:
                 parameters=[
                     {
                         **use_sim_time,
-                        "input_topic": "/surgery/audio/request_text",
-                        "output_topic": "/surgery/voice/intent",
+                        "input_mode": "utterance",
+                        "input_topic": "/surgery/voice/resolver_utterance",
+                        "output_topic": "/surgery/voice/proposal",
                         "procedure_bundle": spec_dir,
                         "selector_mode": "deterministic",
                     }
@@ -1734,9 +1759,10 @@ def generate_launch_description() -> LaunchDescription:
                         "validation_mode": "bt_twin",
                         "vlm_mode": "real",
                         "phase_authority": "reducer",
-                        "tool_predict_evidence_confidence_threshold": 0.5,
-                        "tool_predict_confidence_threshold": 0.55,
-                        "tool_predict_stability_sec": 0.30,
+                        "ngram_prepare_probability_threshold": 0.125,
+                        "ngram_recovery_probability_threshold": 0.391,
+                        "ngram_recovery_enabled_tools": ["T02", "T08"],
+                        "ngram_policy_stability_sec": 0.30,
                         "hand_mapping_operator_approved": False,
                         "accept_validation_actor_events": False,
                         "accept_non_override_structured_requests": False,
@@ -1775,11 +1801,6 @@ def generate_launch_description() -> LaunchDescription:
                     {
                         **use_sim_time,
                         "spec_dir": spec_dir,
-                        # Replay keeps the same single transcript path, but
-                        # does not make live model calls while evaluating a
-                        # recorded case.
-                        "retractor_voice_normalization_enabled": True,
-                        "retractor_voice_interpreter_mode": "deterministic",
                     }
                 ],
                 output="screen",

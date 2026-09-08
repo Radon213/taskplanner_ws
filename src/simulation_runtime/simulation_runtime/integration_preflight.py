@@ -1,4 +1,9 @@
-"""Fail-closed readiness gate for the external Taskplanner runtime."""
+"""Read-only integration-readiness observer for the Taskplanner runtime.
+
+The observer reports missing dependencies for diagnosis.  It does not own
+scenario admission, lifecycle transitions, or endpoint dispatch: those remain
+with ScenarioStore, the state core, and the typed endpoint adapter.
+"""
 
 from __future__ import annotations
 
@@ -20,7 +25,6 @@ from rclpy.qos import (
 )
 from surgical_perception_msgs.msg import ToolObservation2DArray
 from surgical_msgs.msg import VLMRequestContext
-from surgical_msgs.srv import IntegrationDebugCommand
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
 from surgical_interop_msgs.action import ExecuteToolHandover
@@ -32,6 +36,8 @@ from procedure_spec import (
     ScenarioRuntimeRequirements,
     get_default_spec_dir,
     load_bundle,
+    load_scenario_consumer_bundle,
+    parse_scenario_config,
 )
 from surgical_interop_execution.controller_contract import (
     EIR_NUC_CAPABILITY_POLICY_ID,
@@ -44,7 +50,6 @@ from surgical_interop_execution.controller_contract import (
     validate_source_stamp,
 )
 from surgical_interop_execution.virtual_endpoints import (
-    EXECUTION_ROUTE_PREFLIGHT_ACK_SERVICE,
     EXECUTION_ROUTE_STATE_TOPIC,
     EXTERNAL_CONTROLLER_CONTRACT_TOPIC,
     EXTERNAL_ENDPOINT_SOURCE,
@@ -389,6 +394,7 @@ class IntegrationPreflightNode(Node):
         self.declare_parameter("active_bundle", "")
         self.declare_parameter("procedure_type", "")
         self.declare_parameter("contract_transitioning", False)
+        self.declare_parameter("scenario_config_topic", "/simulation/scenario_config")
 
         self._sentence_topic = str(self.get_parameter("sentence_topic").value)
         self._speech_source_topic = str(
@@ -614,6 +620,7 @@ class IntegrationPreflightNode(Node):
             float(self.get_parameter("controller_contract_max_age_sec").value),
         )
         self._spec_dir = str(self.get_parameter("spec_dir").value).strip()
+        self._scenario_config_root = Path(self._spec_dir).resolve().parent
         self._active_bundle = str(
             self.get_parameter("active_bundle").value
         ).strip()
@@ -624,6 +631,9 @@ class IntegrationPreflightNode(Node):
         self._contract_transitioning = bool(
             self.get_parameter("contract_transitioning").value
         )
+        self._scenario_config_topic = str(
+            self.get_parameter("scenario_config_topic").value
+        ).strip()
         self._bed_robot_arm_status_max_age_sec = max(
             0.1,
             float(self.get_parameter("bed_robot_arm_status_max_age_sec").value),
@@ -752,6 +762,21 @@ class IntegrationPreflightNode(Node):
             str(self.get_parameter("readiness_topic").value),
             10,
         )
+        if self._scenario_config_topic:
+            # ScenarioStore publishes a latched, read-only identity.  The
+            # readiness observer follows it directly instead of making the
+            # lifecycle manager reconfigure a second scenario contract.
+            self.create_subscription(
+                String,
+                self._scenario_config_topic,
+                self._on_scenario_config,
+                QoSProfile(
+                    history=QoSHistoryPolicy.KEEP_LAST,
+                    depth=1,
+                    reliability=QoSReliabilityPolicy.RELIABLE,
+                    durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+                ),
+            )
         self.create_subscription(
             String,
             str(self.get_parameter("rfdetr_health_topic").value),
@@ -761,7 +786,8 @@ class IntegrationPreflightNode(Node):
         # Subscribe whenever typed topics are configured, rather than only
         # when the launch default happens to be the demo. After a safe
         # stopped-state selection, the demo must receive fresh CAM3/CAM4 facts
-        # before it passes preflight; no detector image or mask is retained.
+        # before diagnostics report them current; no detector image or mask is
+        # retained.
         if self._cam3_tool_observations_topic:
             self.create_subscription(
                 ToolObservation2DArray,
@@ -834,16 +860,6 @@ class IntegrationPreflightNode(Node):
             str(self.get_parameter("readiness_service").value),
             self._handle_readiness,
         )
-        if self._enable_runtime_route_control:
-            # This is a read-only application barrier for the bridge's route
-            # coordinator.  It never evaluates controller health or issues
-            # Action/Service I/O; it only proves this preflight node consumed
-            # the exact latched Action+Service route revision.
-            self.create_service(
-                IntegrationDebugCommand,
-                EXECUTION_ROUTE_PREFLIGHT_ACK_SERVICE,
-                self._handle_execution_route_preflight_ack,
-            )
         self.create_timer(1.0, self._publish_readiness)
 
     def _current_scenario_runtime_requirements(
@@ -856,6 +872,64 @@ class IntegrationPreflightNode(Node):
             getattr(self, "_active_bundle", ""),
             spec_dir=getattr(self, "_spec_dir", ""),
         )
+
+    def _on_scenario_config(self, message: String) -> None:
+        """Follow ScenarioStore's selected bundle as a diagnostics consumer.
+
+        This callback has no Action/Service calls and never pauses, resets, or
+        dispatches a procedure.  ScenarioStore has already limited selection
+        to a stopped lifecycle; this observer only refreshes which optional
+        checks it displays for the selected local bundle.
+        """
+
+        try:
+            published = parse_scenario_config(message.data)
+            bundle = load_scenario_consumer_bundle(
+                published,
+                fixed_spec_root=self._scenario_config_root,
+            )
+            spec_dir = Path(bundle.spec_dir)
+            runtime_requirements = _runtime_requirements_for_bundle(
+                published.bundle_name,
+                spec_dir=str(spec_dir),
+            )
+            procedure_type, require_tool_handover, require_retraction, require_bed = (
+                _expected_contract_for_runtime_requirements(runtime_requirements)
+            )
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            self.get_logger().warning(
+                f"ignoring invalid ScenarioStore readiness snapshot: {exc}"
+            )
+            return
+
+        previous_identity = (
+            self._active_bundle,
+            self._spec_dir,
+            self._procedure_type,
+            self._require_tool_handover_action_server,
+            self._require_retraction_service,
+            self._require_bed_robot_arm_status,
+        )
+        self._active_bundle = published.bundle_name
+        self._spec_dir = str(spec_dir)
+        self._procedure_type = procedure_type
+        self._require_tool_handover_action_server = require_tool_handover
+        self._require_retraction_service = require_retraction
+        self._require_bed_robot_arm_status = require_bed
+        self._scenario_runtime_requirements = runtime_requirements
+        self._contract_transitioning = False
+        current_identity = (
+            self._active_bundle,
+            self._spec_dir,
+            self._procedure_type,
+            self._require_tool_handover_action_server,
+            self._require_retraction_service,
+            self._require_bed_robot_arm_status,
+        )
+        if current_identity != previous_identity:
+            self._invalidate_bed_robot_status()
+        if current_identity[:2] != previous_identity[:2]:
+            self._invalidate_rfdetr_tool_location_leases()
 
     def _apply_execution_route_source(
         self,
@@ -1069,136 +1143,6 @@ class IntegrationPreflightNode(Node):
         self._route_state_retraction_source = state.retraction_source
         self._route_state_initialization_state = state.initialization_state
         self._route_state_initialized = state_is_initialized
-
-    @staticmethod
-    def _execution_route_preflight_ack_payload(
-        raw: object,
-    ) -> tuple[str, str, int, int, bool]:
-        """Validate the bridge's small, read-only barrier request."""
-
-        text = str(raw or "")
-        if len(text) > 1024:
-            raise ValueError("execution route acknowledgement payload is too large")
-        try:
-            payload = json.loads(text or "{}")
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                "execution route acknowledgement payload is invalid"
-            ) from exc
-        if not isinstance(payload, dict):
-            raise ValueError("execution route acknowledgement payload is invalid")
-        source = str(payload.get("source", "")).strip().casefold()
-        if source not in _ROBOT_ENDPOINT_SOURCES:
-            raise ValueError("execution route acknowledgement source is invalid")
-        retraction_source = str(
-            payload.get("retraction_source", source)
-        ).strip().casefold()
-        if retraction_source not in _ROBOT_ENDPOINT_SOURCES:
-            raise ValueError(
-                "execution route acknowledgement retraction_source is invalid"
-            )
-        values: list[int] = []
-        for field in ("revision", "initialization_revision"):
-            value = payload.get(field)
-            if isinstance(value, bool):
-                raise ValueError(f"execution route acknowledgement {field} is invalid")
-            try:
-                parsed = int(value)
-            except (TypeError, ValueError) as exc:
-                raise ValueError(
-                    f"execution route acknowledgement {field} is invalid"
-                ) from exc
-            if parsed < 0:
-                raise ValueError(f"execution route acknowledgement {field} is invalid")
-            values.append(parsed)
-        require_initialized = payload.get("require_initialized")
-        if not isinstance(require_initialized, bool):
-            raise ValueError(
-                "execution route acknowledgement require_initialized is invalid"
-            )
-        return (
-            source,
-            retraction_source,
-            values[0],
-            values[1],
-            require_initialized,
-        )
-
-    def _handle_execution_route_preflight_ack(
-        self,
-        request: IntegrationDebugCommand.Request,
-        response: IntegrationDebugCommand.Response,
-    ) -> IntegrationDebugCommand.Response:
-        """Report whether one exact route projection has been consumed.
-
-        The response deliberately has no endpoint or controller-health
-        details.  Controller readiness remains a fresh start-time preflight
-        check, not a source-selector availability check.
-        """
-
-        response.command_id = ""
-        try:
-            if (
-                str(getattr(request, "operation", "") or "").strip().lower()
-                != "execution_route_preflight_ack"
-            ):
-                raise ValueError("unsupported execution route acknowledgement")
-            (
-                source,
-                retraction_source,
-                revision,
-                initialization_revision,
-                require_initialized,
-            ) = (
-                self._execution_route_preflight_ack_payload(
-                    getattr(request, "payload_json", "")
-                )
-            )
-            initialized = bool(getattr(self, "_route_state_initialized", False))
-            current_source = str(
-                getattr(self, "_route_state_selected_source", "")
-            )
-            current_retraction_source = str(
-                getattr(self, "_route_state_retraction_source", current_source)
-            )
-            current_revision = int(getattr(self, "_route_state_revision", -1))
-            current_initialization_revision = int(
-                getattr(self, "_route_state_initialization_revision", -1)
-            )
-            current_state = str(
-                getattr(self, "_route_state_initialization_state", "")
-            )
-            response.accepted = bool(
-                current_source == source
-                and current_retraction_source == retraction_source
-                and current_revision == revision
-                and current_initialization_revision == initialization_revision
-                and (not require_initialized or initialized)
-            )
-            response.message = (
-                "execution route preflight applied"
-                if response.accepted
-                else "execution route preflight not applied"
-            )
-            response.result_json = json.dumps(
-                {
-                    "schema": "taskplanner.execution_route_preflight_ack.v1",
-                    "selected_source": current_source,
-                    "retraction_source": current_retraction_source,
-                    "revision": current_revision,
-                    "initialization_revision": current_initialization_revision,
-                    "initialization_state": current_state,
-                    "initialized": initialized,
-                },
-                separators=(",", ":"),
-                sort_keys=True,
-            )[:2048]
-            return response
-        except ValueError as exc:
-            response.accepted = False
-            response.message = str(exc)[:256]
-            response.result_json = "{}"
-            return response
 
     def _on_contract_parameters_changed(self, parameters) -> SetParametersResult:
         candidate = {
@@ -2287,7 +2231,7 @@ class IntegrationPreflightNode(Node):
             source_name="cv_contract_status",
         )
         # Preserve contract mismatch diagnostics for operators, but do not
-        # feed them back into integration-start admission.
+        # feed them back into scenario, voice, or dispatch admission.
         _, _, controller_contract_mismatches = (
             self._controller_contract_readiness()
         )

@@ -1,0 +1,228 @@
+schema = "taskplanner.runtime-owners.v1"
+default_mode = "live"
+
+# This registry describes operational restart boundaries. It does not grant
+# ROS or physical-control authority. Live and LLM Surgeon start the registered
+# split owner set. The retired monolith is not a startup, status, or reload
+# fallback: a missing owner is reported as unavailable/not-deployed.  Owner
+# keys are the canonical CLI/API names.  Keep an alias only while people and
+# local scripts migrate; never use it as a second runtime identity.
+
+[aliases]
+core = "state-core"
+bridge = "operator-bridge"
+
+# The one owner whose container marks a selected runtime mode.  This prevents
+# launcher/controller code from carrying a second hard-coded service map.  An
+# anchor is an observation/restart boundary only; it does not grant authority
+# over other owners or turn their health into a startup gate.
+[runtime_mode_anchors]
+live = "state-core"
+llm-surgeon = "state-core"
+replay = "state-core"
+debug = "debug-observer"
+
+[owners.state-core]
+description = "BT, Digital Twin, lifecycle, and orchestration state core"
+modes = ["live", "llm-surgeon", "replay"]
+services = { live = "taskplanner-state-core", "llm-surgeon" = "taskplanner-state-core", replay = "shadow-runner" }
+compose_profile = "owners"
+restart_strategy = "core"
+restart_impact = "stateful-core"
+affected_owners = []
+build_roots = ["bringup", "or_digital_twin", "bt_orchestrator", "simulation_runtime", "taskplanner_bt_trees"]
+
+[owners.command]
+description = "Typed speech admission, command routing, and language proposal adapters"
+modes = ["live", "llm-surgeon"]
+service = "taskplanner-command"
+compose_profile = "owners"
+launch_file = "taskplanner_command.launch.py"
+restart_strategy = "dedicated"
+restart_impact = "owner-only"
+affected_owners = []
+build_roots = ["bringup", "voice_command", "simulation_runtime"]
+
+[owners.tool-state]
+description = "Tool belief and inventory state"
+modes = ["live", "llm-surgeon"]
+service = "taskplanner-tool-state"
+compose_profile = "owners"
+launch_file = "taskplanner_tool_state.launch.py"
+restart_strategy = "dedicated"
+restart_impact = "owner-only"
+affected_owners = []
+build_roots = ["bringup", "tool_belief_tracker", "surgical_perception_msgs"]
+
+[owners.perception]
+description = "Taskplanner-side perception and model observation adapters"
+modes = ["live", "llm-surgeon"]
+service = "taskplanner-perception"
+compose_profile = "owners"
+launch_file = "taskplanner_perception.launch.py"
+restart_strategy = "dedicated"
+restart_impact = "owner-only"
+affected_owners = []
+build_roots = ["bringup", "vlm_node", "phase_estimator", "simulation_runtime"]
+
+[owners.cam4-mayo]
+description = "Typed 1.7 CAM4 Mayo observation projection"
+modes = ["live", "llm-surgeon"]
+service = "taskplanner-cam4-mayo"
+compose_profile = "owners"
+launch_file = "taskplanner_cam4_mayo.launch.py"
+restart_strategy = "dedicated"
+restart_impact = "owner-only"
+affected_owners = []
+build_roots = ["bringup", "vlm_node"]
+note = "No VLM, local RF-DETR, Action, or Service dependency; scenario aliases are optional retained input."
+
+[owners.projection]
+description = "Read-only surgical state projection"
+modes = ["live", "llm-surgeon"]
+service = "taskplanner-projection"
+compose_profile = "owners"
+launch_file = "taskplanner_projection.launch.py"
+restart_strategy = "dedicated"
+restart_impact = "owner-only"
+affected_owners = []
+build_roots = ["bringup", "surgical_interop_gateway"]
+
+[owners.execution]
+description = "Execution routing and typed endpoint adapters"
+modes = ["live", "llm-surgeon"]
+service = "taskplanner-execution"
+compose_profile = "owners"
+launch_file = "taskplanner_execution.launch.py"
+restart_strategy = "dedicated"
+restart_impact = "idle-execution-resource"
+affected_owners = []
+build_roots = ["bringup", "surgical_interop_execution"]
+
+[owners.operator-bridge]
+description = "Operator mission rosbridge and rosapi"
+modes = ["live", "llm-surgeon"]
+service = "taskplanner-operator-bridge"
+compose_profile = "owners"
+launch_file = "taskplanner_operator_bridge.launch.py"
+restart_strategy = "dedicated"
+restart_impact = "owner-only"
+affected_owners = []
+build_roots = ["bringup"]
+
+[owners.scenario]
+description = "ScenarioStore and scenario selection lifecycle"
+modes = ["live", "llm-surgeon"]
+service = "taskplanner-scenario"
+compose_profile = "owners"
+restart_strategy = "dedicated"
+launch_file = "taskplanner_scenario.launch.py"
+note = "Standalone ScenarioStore is the sole scenario selection and reload owner."
+restart_impact = "owner-only"
+affected_owners = []
+build_roots = ["bringup", "simulation_runtime", "procedure_spec"]
+
+[owners.simulation-input]
+description = "Synthetic cameras and surgeon actor inputs"
+modes = ["llm-surgeon"]
+service = "taskplanner-simulation-input"
+compose_profile = "owners"
+launch_file = "taskplanner_simulation_input.launch.py"
+restart_strategy = "dedicated"
+restart_impact = "owner-only"
+affected_owners = []
+build_roots = ["bringup", "simulation_runtime", "vlm_node"]
+
+[owners.asr]
+description = "Operational microphone and ASR transport"
+modes = ["live"]
+service = "taskplanner-asr"
+restart_strategy = "asr"
+restart_impact = "owner-only"
+affected_owners = []
+build_roots = ["integration_debug"]
+
+[owners.tts]
+description = "Local Supertonic playback and deterministic Korean execution announcements"
+modes = ["live"]
+service = "taskplanner-tts"
+compose_profile = "ops"
+restart_strategy = "sidecar"
+restart_impact = "audio-only"
+affected_owners = []
+build_roots = ["tts_runtime"]
+note = "Always starts with Live, prewarms the local model, and observes execution only; it never admits or blocks an Action or Service."
+
+[owners.surgery-record]
+description = "Run-bound surgery timeline and secured HTTPS submission"
+modes = ["live"]
+service = "taskplanner-surgery-record"
+compose_profile = "owners"
+launch_file = "taskplanner_surgery_record.launch.py"
+restart_strategy = "dedicated"
+restart_impact = "owner-only"
+affected_owners = []
+build_roots = ["bringup", "integration_debug"]
+note = "Unconditional Live owner. Pause is non-terminal; only settled stop/completed receipts can submit."
+
+[owners.rosbag-recorder]
+description = "Manual all-graph rosbag2 MCAP recorder"
+modes = ["live"]
+service = "taskplanner-rosbag-recorder"
+compose_profile = "owners"
+launch_file = "taskplanner_rosbag_recorder.launch.py"
+restart_strategy = "dedicated"
+restart_impact = "observer-only"
+affected_owners = []
+build_roots = ["bringup", "integration_debug"]
+note = "Starts idle in Live and records only while the operator explicitly enables it; it is never coupled to scenario lifecycle."
+
+[owners.debug-observer]
+description = "Read-only Debug state and topic observer"
+modes = ["debug", "live", "llm-surgeon"]
+services = { debug = "taskplanner-debug-observer", live = "taskplanner-debug-observer", "llm-surgeon" = "taskplanner-debug-observer" }
+compose_profile = "owners"
+launch_file = "taskplanner_debug_observer.launch.py"
+restart_strategy = "dedicated"
+restart_impact = "observer-only"
+affected_owners = []
+build_roots = ["bringup", "integration_debug"]
+note = "Observer capability only: no USB ASR, record uploader, VLM client, PNU worker, or network-settings writer."
+
+[owners.debug-control]
+description = "Explicit paused/stopped Debug typed-dispatch control"
+modes = ["debug"]
+service = "taskplanner-debug-control"
+compose_profile = "owners"
+launch_file = "taskplanner_debug_control.launch.py"
+restart_strategy = "dedicated"
+restart_impact = "debug-write-owner"
+affected_owners = []
+build_roots = ["bringup", "integration_debug"]
+note = "Separate from the observer; controller admission and Debug paused/stopped/arm rules remain authoritative."
+
+[owners.debug-virtual]
+description = "Optional virtual Debug robot endpoints"
+modes = ["debug"]
+service = "taskplanner-debug-virtual"
+compose_profile = "owners"
+launch_file = "taskplanner_debug_virtual.launch.py"
+restart_strategy = "dedicated"
+restart_impact = "virtual-endpoint-owner"
+affected_owners = ["debug-control"]
+build_roots = ["bringup", "integration_debug", "surgical_interop_execution"]
+enabled_when_env = "TASKPLANNER_DEBUG_ENABLE_VIRTUAL_ROBOT"
+enabled_when_value = "true"
+enabled_when_default = "true"
+note = "Debug-only virtual endpoint provider. It is omitted when TASKPLANNER_DEBUG_ENABLE_VIRTUAL_ROBOT=false and is never part of Live."
+
+[owners.surgimate]
+description = "Isolated SurgiMate 0820 static monitoring application"
+modes = ["live", "debug", "replay"]
+service = "taskplanner-surgimate"
+compose_profile = "owners"
+restart_strategy = "sidecar"
+restart_impact = "observer-only"
+affected_owners = []
+build_roots = []
+note = "Read-only clinical browser monitor copied into ARPA-H/modules on fixed local port 5174; Live and Replay add only a bounded private UI-journal observer lane."

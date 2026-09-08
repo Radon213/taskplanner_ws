@@ -79,15 +79,18 @@ def test_source_and_command_identifiers_are_closed_and_bounded(
     assert raised.value.field == field
 
 
-def test_unknown_command_maps_to_service_invalid_command_result() -> None:
+@pytest.mark.parametrize("command", [7, 8, 99])
+def test_non_arm_command_maps_to_service_invalid_command_result(command: int) -> None:
     with pytest.raises(CommandValidationError) as raised:
-        CommandRequest(1, "taskplanner", "cmd-x", 99, 0, 0.0)  # type: ignore[arg-type]
+        CommandRequest(  # type: ignore[arg-type]
+            1, "taskplanner", f"cmd-{command}", command, 0, 0.0
+        )
 
     assert raised.value.code is ErrorCode.INVALID_COMMAND
     assert raised.value.result_code is ResultCode.INVALID_COMMAND
 
 
-@pytest.mark.parametrize("side", [3, 4, -1])
+@pytest.mark.parametrize("side", [4, -1])
 def test_adjustment_rejects_unknown_wire_target_side(side: TargetSide | int) -> None:
     with pytest.raises(CommandValidationError) as raised:
         CommandRequest(  # type: ignore[arg-type]
@@ -113,8 +116,16 @@ def test_adjustment_accepts_bilateral_target_side() -> None:
     assert request.target_side is TargetSide.BOTH
 
 
-@pytest.mark.parametrize("distance", [0.0, -0.001, float("nan"), float("inf")])
-def test_adjustment_requires_positive_finite_distance(distance: float) -> None:
+def test_adjustment_accepts_negative_distance_as_release() -> None:
+    request = CommandRequest(
+        1, "taskplanner", "cmd-release", 4, 1, -0.001  # type: ignore[arg-type]
+    )
+
+    assert request.distance_m == -0.001
+
+
+@pytest.mark.parametrize("distance", [0.0, float("nan"), float("inf")])
+def test_adjustment_requires_nonzero_finite_distance(distance: float) -> None:
     with pytest.raises(CommandValidationError) as raised:
         CommandRequest(  # type: ignore[arg-type]
             1, "taskplanner", "cmd-adjust", 4, 1, distance
@@ -160,7 +171,7 @@ def test_finish_direct_teach_accepts_none_or_either_target_side(
     assert request.target_side is side
 
 
-def test_wire_rejects_legacy_bilateral_target_side_value() -> None:
+def test_finish_direct_teach_rejects_bilateral_target_side() -> None:
     with pytest.raises(CommandValidationError) as raised:
         CommandRequest(
             protocol_version=1,
@@ -171,7 +182,7 @@ def test_wire_rejects_legacy_bilateral_target_side_value() -> None:
             distance_m=0.0,
         )
 
-    assert raised.value.code is ErrorCode.INVALID_TARGET_SIDE
+    assert raised.value.code is ErrorCode.TARGET_SIDE_NOT_ALLOWED
 
 
 def test_finish_direct_teach_still_rejects_a_distance() -> None:

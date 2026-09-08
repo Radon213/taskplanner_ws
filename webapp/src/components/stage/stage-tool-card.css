@@ -1,0 +1,381 @@
+/* Mayo-specific card layout is owned by StageToolCard. Base tool-card tokens
+ * remain in the stage stylesheet because rack, robot and surgeon cards share
+ * them. Keep generic children in their existing flex order; Mayo alone gets a
+ * compact, two-line scan layout. */
+.stage-tool-card-meta {
+  display: contents;
+}
+
+.stage-tool-card-meta > .stage-tool-vlm-evidence {
+  order: -1;
+}
+
+.stage-tool-card.mayoList {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-areas:
+    "name"
+    "meta";
+  grid-template-rows: auto minmax(0, 1fr);
+  align-content: stretch;
+  align-items: start;
+  min-height: 0;
+  max-height: 100%;
+  gap: 1px;
+  padding: 2px 5px;
+  border-radius: var(--radius-inner);
+  box-shadow: var(--shadow-card);
+}
+
+.stage-tool-card.mayoList .tool-chip-header {
+  grid-area: name;
+  width: 100%;
+  min-width: 0;
+  min-height: 0;
+  margin: 0;
+  justify-content: flex-start;
+}
+
+.stage-tool-card.mayoList .tool-chip-header strong {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--color-text);
+  font-size: 12px;
+  line-height: 1.2;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.stage-tool-card.mayoList .chip-label-full {
+  display: none;
+}
+
+.stage-tool-card.mayoList .chip-label-short {
+  display: none;
+}
+
+.stage-tool-card.mayoList .chip-label-mayo-compact {
+  display: inline;
+}
+
+.stage-tool-card.mayoList .stage-tool-card-meta {
+  grid-area: meta;
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  max-height: 100%;
+  align-self: stretch;
+  align-items: center;
+  align-content: start;
+  flex-wrap: wrap;
+  justify-content: flex-start;
+  gap: 3px;
+  overflow: auto;
+  scrollbar-width: thin;
+  pointer-events: auto;
+}
+
+.stage-tool-card.mayoList .stage-tool-card-meta:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: -2px;
+}
+
+.stage-tool-card.mayoList .tool-chip-footer-badges {
+  display: flex;
+  flex: 0 1 auto;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 3px;
+  overflow: visible;
+  order: 1;
+}
+
+.stage-tool-card.mayoList .tool-chip-footer-badges > span {
+  flex: 0 0 auto;
+  max-width: none;
+  padding: 1px 3px;
+  font-size: 11px;
+  line-height: 1.1;
+}
+
+.stage-tool-card.mayoList .stage-tool-vlm-evidence {
+  display: flex;
+  flex: 1 0 100%;
+  min-width: 0;
+  max-width: 100%;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-start;
+  gap: 3px;
+  order: 0;
+}
+
+.stage-tool-card.mayoList .operation-vlm-tool-badge {
+  display: inline-grid;
+  min-width: 0;
+  width: auto;
+  max-width: 100%;
+  grid-template-columns: auto minmax(0, 1fr) max-content;
+  flex: 0 1 auto;
+  gap: 2px;
+  padding: 2px 4px;
+  font-size: 10px;
+}
+
+.stage-tool-card.mayoList .operation-vlm-tool-badge > span,
+.stage-tool-card.mayoList .operation-vlm-tool-badge > strong {
+  min-width: 0;
+}
+
+.stage-tool-card.mayoList .operation-vlm-tool-badge > strong {
+  overflow: visible;
+  text-overflow: clip;
+  white-space: nowrap;
+}
+
+.tool-demand-label-compact {
+  display: none;
+}
+
+/* The numeric reuse forecast is the time-sensitive Mayo signal. Let the
+ * descriptive text yield first, never the percentage, so cards remain
+ * readable when a dense stage is rendered on a narrower desktop viewport. */
+.stage-tool-card.mayoList .operation-vlm-tool-badge.demand {
+  grid-template-columns: minmax(0, 1fr) max-content;
+}
+
+.stage-tool-card.mayoList .operation-vlm-tool-badge.demand > svg {
+  display: none;
+}
+
+.stage-tool-confirmation {
+  display: grid;
+  flex: 0 1 94px;
+  min-width: 62px;
+  max-width: 100%;
+  gap: 2px;
+  padding: 2px 4px;
+  border: 1px solid color-mix(in srgb, var(--color-accent) 44%, var(--color-border));
+  border-radius: var(--radius-inner);
+  background: color-mix(in srgb, var(--color-accent) 8%, var(--color-page-raised));
+  color: var(--color-accent-strong);
+  font-size: 9px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.1;
+  overflow: hidden;
+}
+
+.stage-tool-confirmation.recovery {
+  border-color: color-mix(in srgb, var(--color-warning) 50%, var(--color-border));
+  background: color-mix(in srgb, var(--color-warning) 9%, var(--color-page-raised));
+  color: var(--color-warning-text);
+}
+
+.stage-tool-confirmation.reuse,
+.stage-tool-confirmation.ready {
+  border-color: color-mix(in srgb, var(--color-success) 50%, var(--color-border));
+  background: color-mix(in srgb, var(--color-success) 9%, var(--color-page-raised));
+  color: var(--color-success-text);
+}
+
+.stage-tool-confirmation-copy {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 2px;
+}
+
+.stage-tool-confirmation-copy > svg {
+  flex: 0 0 auto;
+}
+
+.stage-tool-confirmation-label,
+.stage-tool-confirmation-copy > strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.stage-tool-confirmation-copy > strong {
+  color: var(--color-text);
+  font-weight: 800;
+}
+
+.stage-tool-confirmation-label-compact {
+  display: none;
+}
+
+.stage-tool-confirmation-track {
+  display: block;
+  width: 100%;
+  height: 2px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: color-mix(in srgb, currentColor 20%, transparent);
+}
+
+.stage-tool-confirmation-remaining {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border-radius: inherit;
+  background: currentColor;
+  transform-origin: left center;
+}
+
+.stage-tool-card.mayoList .has-demand-forecast .stage-tool-vlm-evidence {
+  flex-grow: 1;
+}
+
+.stage-tool-card.mayoList.quantity-stack .tool-chip-header {
+  padding-right: 28px;
+}
+
+.stage-tool-card.mayoList .tool-quantity-badge {
+  top: 3px;
+  right: 4px;
+  min-width: 24px;
+  height: 18px;
+  padding: 0 4px;
+  font-size: 9px;
+}
+
+.stage-tool-card.mayoList.density-comfortable {
+  gap: 4px;
+  padding: 7px 9px;
+}
+
+.stage-tool-card.mayoList.density-comfortable .tool-chip-header strong {
+  font-size: 14px;
+  line-height: 1.2;
+}
+
+.stage-tool-card.mayoList.density-comfortable .tool-chip-footer-badges {
+  gap: 4px;
+}
+
+.stage-tool-card.mayoList.density-comfortable .tool-chip-footer-badges > span {
+  padding: 2px 6px;
+  font-size: 11px;
+}
+
+.stage-tool-card.mayoList.density-comfortable .operation-vlm-tool-badge {
+  gap: 3px;
+  padding: 3px 5px;
+  font-size: 11px;
+}
+
+.stage-tool-card.mayoList.density-comfortable .stage-tool-confirmation {
+  padding: 3px 5px;
+  font-size: 10px;
+}
+
+.stage-tool-card.mayoList.density-dense {
+  gap: 1px;
+  padding: 2px 5px;
+}
+
+.stage-tool-card.mayoList.density-dense .tool-chip-header strong {
+  font-size: 12px;
+}
+
+.stage-tool-card.mayoList.density-dense .chip-label-full {
+  display: none;
+}
+
+.stage-tool-card.mayoList.density-dense .chip-label-mayo-compact {
+  display: inline;
+}
+
+.stage-tool-card.mayoList.density-dense .stage-tool-card-meta {
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.stage-tool-card.mayoList.density-dense .tool-chip-footer-badges,
+.stage-tool-card.mayoList.density-dense .stage-tool-vlm-evidence {
+  flex-basis: auto;
+}
+
+.stage-tool-card.mayoList.density-dense .stage-tool-vlm-evidence {
+  justify-content: flex-end;
+}
+
+.stage-tool-card.mayoList.density-dense .tool-chip-footer-badges > span,
+.stage-tool-card.mayoList.density-dense .operation-vlm-tool-badge {
+  font-size: 11px;
+}
+
+.stage-tool-card.mayoList.density-dense .operation-vlm-tool-badge {
+  gap: 2px;
+  padding: 1px 3px;
+}
+
+.stage-tool-card.mayoList.density-dense .stage-tool-confirmation {
+  min-width: 54px;
+  padding: 1px 3px;
+  font-size: 11px;
+}
+
+.stage-tool-card.mayoList.density-dense .stage-tool-confirmation-label-full,
+.stage-tool-card.mayoList.density-micro .stage-tool-confirmation-label-full {
+  display: none;
+}
+
+.stage-tool-card.mayoList.density-dense .stage-tool-confirmation-label-compact,
+.stage-tool-card.mayoList.density-micro .stage-tool-confirmation-label-compact {
+  display: inline;
+}
+
+.stage-tool-card.mayoList.density-dense .tool-demand-label-full,
+.stage-tool-card.mayoList.density-micro .tool-demand-label-full {
+  display: none;
+}
+
+.stage-tool-card.mayoList.density-dense .tool-demand-label-compact,
+.stage-tool-card.mayoList.density-micro .tool-demand-label-compact {
+  display: inline;
+}
+
+.stage-tool-card.mayoList.density-micro {
+  gap: 1px;
+  padding: 1px 3px;
+}
+
+.stage-tool-card.mayoList.density-micro .tool-chip-header strong {
+  font-size: 11px;
+}
+
+.stage-tool-card.mayoList.density-micro .chip-label-full {
+  display: none;
+}
+
+.stage-tool-card.mayoList.density-micro .chip-label-mayo-compact {
+  display: inline;
+}
+
+.stage-tool-card.mayoList.density-micro .tool-chip-footer-badges {
+  gap: 2px;
+}
+
+/* Density changes spacing, not which clinical/research signals exist. Keep
+ * both reuse probability and the countdown reachable; an unusually crowded
+ * slot scrolls its metadata instead of hiding one signal with display:none. */
+.stage-tool-card.mayoList.density-micro .has-demand-forecast .stage-tool-vlm-evidence,
+.stage-tool-card.mayoList.density-micro .has-confirmation .stage-tool-vlm-evidence {
+  flex: 1 1 auto;
+}
+
+.stage-tool-card.mayoList.density-micro .tool-chip-footer-badges > span,
+.stage-tool-card.mayoList.density-micro .operation-vlm-tool-badge,
+.stage-tool-card.mayoList.density-micro .stage-tool-confirmation {
+  padding: 1px 4px;
+  font-size: 11px;
+}

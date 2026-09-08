@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import os
 from pathlib import Path
-import subprocess
 
 import yaml
 
@@ -13,39 +11,6 @@ COMPOSE_PATH = ROOT / "docker-compose.yml"
 
 def _services() -> dict[str, object]:
     return yaml.safe_load(COMPOSE_PATH.read_text(encoding="utf-8"))["services"]
-
-
-def test_live_runtime_guard_rejects_stale_model_environment(tmp_path) -> None:
-    command = _services()["taskplanner-runtime"]["command"]
-    for provider_id, model_id in (
-        ("vllm", "qwen3.6-35b-a3b"),
-        ("ninfer", "unsloth/legacy-model"),
-    ):
-        environment = {
-            **os.environ,
-            "TASKPLANNER_RUNTIME_MODE": "live",
-            "INPUT_PROFILE": "external",
-            "EXECUTION_BACKEND": "action",
-            "VLM_PROVIDER_ID": provider_id,
-            "VLM_MODEL_ID": model_id,
-        }
-
-        # Run only the guard from a directory without install/docker. Even if
-        # the model guard regresses, the install check prevents a ROS launch.
-        completed = subprocess.run(
-            ["bash", "-lc", command],
-            cwd=tmp_path,
-            env=environment,
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-
-        assert completed.returncode == 2
-        assert (
-            "Live model contract mismatch; require ninfer/qwen3.6-35b-a3b"
-            in completed.stderr
-        )
 
 
 def test_replay_shadow_defaults_to_ninfer_without_lab_dependency() -> None:

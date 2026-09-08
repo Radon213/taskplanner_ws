@@ -20,6 +20,7 @@ setup(
     entry_points={
         "console_scripts": [
             "simulation_manager = simulation_runtime.simulation_manager:main",
+            "scenario_store = simulation_runtime.scenario_store_node:main",
             "mock_surgeon = simulation_runtime.mock_surgeon:main",
             "surgeon_actor = simulation_runtime.surgeon_actor:main",
             "llm_surgeon_actor = simulation_runtime.llm_surgeon_actor:main",

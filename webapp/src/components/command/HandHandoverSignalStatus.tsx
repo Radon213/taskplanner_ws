@@ -27,6 +27,8 @@ type HandHandoverSignalPopupProps = Omit<
 > & {
   signal: HandHandoverSignal;
   language: Language;
+  /** Observation may be visible while scenario execution remains inactive. */
+  observationOnly?: boolean;
 };
 
 function normalizeToken(value: string): string {
@@ -102,6 +104,7 @@ export function HandHandoverSignalStatus({
 export function HandHandoverSignalPopup({
   signal,
   language,
+  observationOnly = false,
   className = "",
   ...props
 }: HandHandoverSignalPopupProps) {
@@ -122,14 +125,31 @@ export function HandHandoverSignalPopup({
     >
       <Hand aria-hidden="true" size={20} strokeWidth={2.2} />
       <div>
-        <span>{language === "ko" ? "손 전달 신호 확인" : "Hand handover signal confirmed"}</span>
+        <span>
+          {language === "ko"
+            ? observationOnly
+              ? "암묵 전달 요청 · 관찰"
+              : "암묵 전달 요청 확인"
+            : observationOnly
+              ? "Implicit handover request · observing"
+              : "Implicit handover request confirmed"}
+        </span>
         <strong>
           {language === "ko"
             ? "오른손 펼침 · 손바닥 위"
             : "Right hand open · palm up"}
         </strong>
         <small>
-          {[details, language === "ko" ? "리듀서 게이트 통과" : "Reducer gate passed"]
+          {[
+            details,
+            observationOnly
+              ? language === "ko"
+                ? "관찰 전용 · 시나리오 대기"
+                : "Observation only · scenario inactive"
+              : language === "ko"
+                ? "리듀서 게이트 통과"
+                : "Reducer gate passed",
+          ]
             .filter(Boolean)
             .join(" · ")}
         </small>

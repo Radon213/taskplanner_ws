@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 from datetime import datetime, timezone
+import importlib.util
 import json
 import math
 import os
@@ -13,12 +14,14 @@ from pathlib import Path
 import re
 import statistics
 import subprocess
+import sys
 import time
 from urllib.error import URLError
 from urllib.request import urlopen
 
 
 ROOT = Path(__file__).resolve().parents[1]
+OWNER_REGISTRY_PATH = ROOT / "scripts" / "taskplanner_owner_registry.py"
 WEBAPP_BASE_URL = "http://127.0.0.1:4173"
 WEBAPP_STATIC_PROBES = (
     ("/", "text/html", b'id="root"'),
@@ -43,6 +46,36 @@ MEMORY_MULTIPLIERS = {
     "GIB": 1024**3,
     "TIB": 1024**4,
 }
+
+
+def _owner_registry_module():
+    """Load the canonical owner inventory without duplicating its table here."""
+
+    spec = importlib.util.spec_from_file_location(
+        "taskplanner_release_owner_registry", OWNER_REGISTRY_PATH
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("cannot load Taskplanner owner registry")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def required_campaign_services(mode: str = "llm-surgeon") -> set[str]:
+    """Return the UI plus registry-owned services the campaign actually starts."""
+
+    registry_module = _owner_registry_module()
+    registry = registry_module.load_registry(
+        ROOT / "config" / "taskplanner_runtime_owners.toml"
+    )
+    services = {
+        owner.service_for(mode)
+        for owner in registry.values()
+        if mode in owner.modes and owner.restart_strategy != "asr"
+    }
+    services.discard("")
+    return {"webapp", *services}
 
 
 def command_environment() -> dict[str, str]:
@@ -299,14 +332,17 @@ def summarize_memory_growth(
     }
 
 
-def wait_until_ready(timeout_sec: float) -> tuple[bool, list[str], str]:
+def wait_until_ready(
+    timeout_sec: float, *, mode: str = "llm-surgeon"
+) -> tuple[bool, list[str], str]:
     deadline = time.monotonic() + timeout_sec
     last_services: list[str] = []
     last_web_error = "web readiness not checked"
+    required_services = required_campaign_services(mode)
     while time.monotonic() < deadline:
         last_services = running_services()
         web_is_ready, last_web_error = web_readiness()
-        if web_is_ready and {"webapp", "taskplanner-runtime"}.issubset(last_services):
+        if web_is_ready and required_services.issubset(last_services):
             return True, last_services, ""
         time.sleep(1.0)
     return False, last_services, last_web_error
@@ -340,7 +376,7 @@ def main() -> int:
                 timeout=args.startup_timeout_sec + 120,
             )
             ready, services, web_error = (
-                wait_until_ready(args.startup_timeout_sec)
+                wait_until_ready(args.startup_timeout_sec, mode="llm-surgeon")
                 if up.returncode == 0
                 else (False, [], "launcher failed before readiness checks")
             )
@@ -368,7 +404,7 @@ def main() -> int:
                 timeout=args.startup_timeout_sec + 120,
             )
             ready, _, web_error = (
-                wait_until_ready(args.startup_timeout_sec)
+                wait_until_ready(args.startup_timeout_sec, mode="llm-surgeon")
                 if up.returncode == 0
                 else (False, [], "launcher failed before readiness checks")
             )
@@ -381,10 +417,9 @@ def main() -> int:
                 while time.monotonic() - soak_started < soak_duration:
                     services = running_services()
                     web_is_ready, web_error = web_readiness()
-                    healthy = web_is_ready and {
-                        "webapp",
-                        "taskplanner-runtime",
-                    }.issubset(services)
+                    healthy = web_is_ready and required_campaign_services(
+                        "llm-surgeon"
+                    ).issubset(services)
                     soak_rows.append(
                         {
                             "sampled_at_utc": datetime.now(timezone.utc).isoformat(),

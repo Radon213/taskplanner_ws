@@ -5,7 +5,9 @@ REPO_ROOT="${TASKPLANNER_WS_ROOT:-$(cd -- "${SCRIPT_DIR}/.." && pwd)}"
 LOG_DIR="${TASKPLANNER_LOG_DIR:-${REPO_ROOT}/reports/event_logs}"
 
 get_runtime_container() {
-  docker ps --format '{{.Names}}' | grep -E 'taskplanner.*runtime|taskplanner-runtime' | head -1
+  docker ps \
+    --filter "label=com.docker.compose.service=taskplanner-state-core" \
+    --format '{{.Names}}' | head -1
 }
 
 ros_exec() {
@@ -132,7 +134,10 @@ control_sim() {
 select_bundle() {
   local BUNDLE="$1"
 
-  ros_exec "ros2 service call /simulation/select_bundle surgical_msgs/srv/SelectSimulationBundle \"{bundle_name: '$BUNDLE', restart_if_running: true}\""
+  # ScenarioStore owns the atomic config swap.  A manual selection must not
+  # turn into an implicit runtime restart; the server admits it only at its
+  # paused/stopped boundary and keeps the last-good bundle on rejection.
+  ros_exec "ros2 service call /simulation/select_bundle surgical_msgs/srv/SelectSimulationBundle \"{bundle_name: '$BUNDLE', restart_if_running: false, preview_only: false, reload_if_changed: true, expected_candidate_revision: ''}\""
 }
 
 prepare_test() {
@@ -380,21 +385,6 @@ check_log_core() {
 
   grep -n -C 8 -E 'RobotTaskStarted|RobotGraspedTool|ToolHandoverCompleted|RobotTaskCompleted|SurgeonRequestObserved|SurgeonActorEventObserved|ToolReceivedFromSurgeon|ToolReturnedToTray|return_tool|instrument_id' "$FILE"
 }
-
-# ============================================================
-# OVERRIDE: robust runtime container finder
-# ============================================================
-get_runtime_container() {
-  unset DOCKER_HOST
-
-  if docker ps --format '{{.Names}}' | grep -q '^taskplanner_ws-taskplanner-runtime-1$'; then
-    echo "taskplanner_ws-taskplanner-runtime-1"
-    return 0
-  fi
-
-  docker ps --format '{{.Names}}' | grep -E 'taskplanner.*runtime|runtime' | head -1
-}
-
 
 # ============================================================
 # OVERRIDE: robust logging utilities

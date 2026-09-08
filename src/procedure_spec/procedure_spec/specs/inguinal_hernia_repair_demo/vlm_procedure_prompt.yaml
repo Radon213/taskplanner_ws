@@ -47,7 +47,6 @@ scenario_policy:
     surgeon_actor_enabled: false
     phase_inference_enabled: false
     retraction_workflow_state_enforced: false
-    legacy_raw_retractor_voice_enabled: false
 
 phase_inference_policy:
   primary_evidence: "Operator-selected phase only."

@@ -1,0 +1,559 @@
+.debug-runtime-owners-card {
+  margin-top: 10px;
+  padding: 0;
+  overflow: hidden;
+}
+
+.debug-runtime-owners-summary {
+  display: grid;
+  min-height: 64px;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  color: var(--text);
+  cursor: pointer;
+  list-style: none;
+}
+
+.debug-runtime-owners-summary::-webkit-details-marker {
+  display: none;
+}
+
+.debug-runtime-owners-summary:hover {
+  background: var(--state-hover);
+}
+
+.debug-runtime-owners-summary:focus-visible,
+.debug-runtime-owners-refresh:focus-visible,
+.debug-runtime-owner-restart:focus-visible,
+.debug-runtime-global-controls-actions > .button:focus-visible,
+.debug-runtime-lifecycle-actions > .button:focus-visible {
+  outline: 2px solid var(--robot);
+  outline-offset: -2px;
+}
+
+.debug-runtime-owners-icon {
+  display: grid;
+  width: 34px;
+  height: 34px;
+  place-items: center;
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--robot) 10%, transparent);
+  color: var(--robot-strong);
+}
+
+.debug-runtime-owners-summary-copy {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.debug-runtime-owners-summary-copy > span,
+.debug-runtime-owners-summary-copy > small {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.debug-runtime-owners-summary-copy > strong {
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1.25;
+}
+
+.debug-runtime-owners-summary-copy > small {
+  letter-spacing: 0;
+}
+
+.debug-runtime-owners-phase {
+  display: inline-flex;
+  min-height: 30px;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-inner);
+  color: var(--soft);
+  font-size: 10px;
+  font-weight: 700;
+  text-align: center;
+}
+
+.debug-runtime-owners-phase.ready {
+  border-color: color-mix(in srgb, var(--robot) 34%, var(--line));
+  color: var(--robot-strong);
+}
+
+.debug-runtime-owners-phase.unavailable {
+  border-color: color-mix(in srgb, var(--warning) 42%, var(--line));
+  color: var(--warning);
+}
+
+.debug-runtime-owners-content {
+  display: grid;
+  gap: 10px;
+  padding: 10px 14px 14px;
+  border-top: 1px solid var(--line);
+}
+
+.debug-runtime-owners-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.debug-runtime-owners-toolbar > p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.debug-runtime-owners-refresh {
+  min-width: 112px;
+  flex: 0 0 auto;
+}
+
+.debug-runtime-global-controls {
+  display: grid;
+  min-width: 0;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid color-mix(in srgb, var(--robot) 46%, var(--line));
+  border-radius: var(--radius-inner);
+  background: color-mix(in srgb, var(--robot) 8%, var(--surface-2));
+}
+
+.debug-runtime-global-controls-heading {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+}
+
+.debug-runtime-global-controls-icon {
+  display: grid;
+  width: 30px;
+  height: 30px;
+  place-items: center;
+  border-radius: calc(var(--radius-inner) - 2px);
+  background: color-mix(in srgb, var(--robot) 18%, transparent);
+  color: var(--robot-strong);
+}
+
+.debug-runtime-global-controls-heading > div {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.debug-runtime-global-controls-heading > div > span,
+.debug-runtime-global-controls-heading small {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.07em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.debug-runtime-global-controls-heading strong {
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.25;
+}
+
+.debug-runtime-global-controls-heading small {
+  letter-spacing: 0;
+}
+
+.debug-runtime-global-controls-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.debug-runtime-global-controls-actions > .button {
+  min-height: 34px;
+  font-size: 10px;
+}
+
+.debug-runtime-lifecycle {
+  display: grid;
+  min-width: 0;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid color-mix(in srgb, var(--robot) 34%, var(--line));
+  border-radius: var(--radius-inner);
+  background: color-mix(in srgb, var(--robot) 5%, var(--surface-2));
+}
+
+.debug-runtime-lifecycle-heading {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+}
+
+.debug-runtime-lifecycle-icon {
+  display: grid;
+  width: 30px;
+  height: 30px;
+  place-items: center;
+  border-radius: calc(var(--radius-inner) - 2px);
+  background: color-mix(in srgb, var(--robot) 15%, transparent);
+  color: var(--robot-strong);
+}
+
+.debug-runtime-lifecycle-heading > div {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.debug-runtime-lifecycle-heading > div > span,
+.debug-runtime-lifecycle-heading small {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.07em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.debug-runtime-lifecycle-heading strong {
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.25;
+}
+
+.debug-runtime-lifecycle-heading small {
+  letter-spacing: 0;
+}
+
+.debug-runtime-lifecycle-state {
+  display: inline-flex;
+  min-height: 26px;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  padding: 3px 7px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-inner);
+  color: var(--soft);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 9px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.debug-runtime-lifecycle-state.succeeded,
+.debug-runtime-lifecycle-state.idle {
+  border-color: color-mix(in srgb, var(--robot) 38%, var(--line));
+  color: var(--robot-strong);
+}
+
+.debug-runtime-lifecycle-state.failed {
+  border-color: color-mix(in srgb, var(--warning) 42%, var(--line));
+  color: var(--warning);
+}
+
+.debug-runtime-lifecycle-facts {
+  display: grid;
+  grid-template-columns: minmax(0, 1.5fr) repeat(2, minmax(0, 1fr));
+  gap: 6px;
+  margin: 0;
+}
+
+.debug-runtime-lifecycle-facts > div {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+  padding: 6px 7px;
+  border: 1px solid color-mix(in srgb, var(--line) 84%, transparent);
+  border-radius: calc(var(--radius-inner) - 2px);
+  background: color-mix(in srgb, var(--surface-1) 70%, transparent);
+}
+
+.debug-runtime-lifecycle-facts dt {
+  color: var(--muted);
+  font-size: 8px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+}
+
+.debug-runtime-lifecycle-facts dd {
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 10px;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.debug-runtime-lifecycle-detail {
+  margin: 0;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.debug-runtime-lifecycle-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.debug-runtime-lifecycle-actions > .button {
+  min-width: 0;
+  min-height: 34px;
+  padding-inline: 7px;
+  font-size: 10px;
+}
+
+.debug-runtime-tts-actions,
+.debug-runtime-command-actions {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.debug-runtime-tts-actions > .button,
+.debug-runtime-command-actions > .button {
+  min-height: 44px;
+  font-size: 12px;
+}
+
+.debug-runtime-clean-restart {
+  border-color: color-mix(in srgb, var(--warning) 40%, var(--line));
+}
+
+.debug-runtime-owner-list {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.debug-runtime-owner-list > li {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-inner);
+  background: color-mix(in srgb, var(--surface-2) 72%, transparent);
+}
+
+.debug-runtime-owner-copy {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.debug-runtime-owner-copy > div {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 7px;
+}
+
+.debug-runtime-owner-copy strong {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.debug-runtime-owner-state {
+  display: inline-flex;
+  min-height: 20px;
+  align-items: center;
+  padding: 2px 6px;
+  border-radius: calc(var(--radius-inner) - 2px);
+  background: color-mix(in srgb, var(--text) 7%, transparent);
+  color: var(--soft);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 9px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.debug-runtime-owner-copy code,
+.debug-runtime-owner-copy p {
+  display: block;
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.debug-runtime-owner-copy code {
+  color: var(--robot-strong);
+  font-size: 10px;
+}
+
+.debug-runtime-owner-copy p {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.debug-runtime-owner-restart {
+  min-width: 128px;
+  flex: 0 0 auto;
+}
+
+.debug-runtime-owners-empty {
+  display: flex;
+  min-height: 62px;
+  align-items: center;
+  gap: 9px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-inner);
+  background: color-mix(in srgb, var(--surface-2) 72%, transparent);
+  color: var(--robot-strong);
+}
+
+.debug-runtime-owners-empty.error {
+  border-color: color-mix(in srgb, var(--warning) 42%, var(--line));
+  color: var(--warning);
+}
+
+.debug-runtime-owners-empty > div {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.debug-runtime-owners-empty strong {
+  color: var(--text);
+  font-size: 11px;
+}
+
+.debug-runtime-owners-empty span {
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.4;
+}
+
+.debug-runtime-owners-notice {
+  display: flex;
+  min-height: 36px;
+  align-items: center;
+  gap: 7px;
+  margin: 0;
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-inner);
+  background: color-mix(in srgb, var(--surface-2) 72%, transparent);
+  color: var(--soft);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.4;
+}
+
+.debug-runtime-owners-notice.success {
+  border-color: color-mix(in srgb, var(--robot) 34%, var(--line));
+  color: var(--robot-strong);
+}
+
+.debug-runtime-owners-notice.error {
+  border-color: color-mix(in srgb, var(--warning) 42%, var(--line));
+  color: var(--warning);
+}
+
+@media (max-width: 760px) {
+  .debug-runtime-owners-summary {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .debug-runtime-owners-phase {
+    grid-column: 2;
+    justify-self: start;
+  }
+
+  .debug-runtime-owners-toolbar,
+  .debug-runtime-owner-list > li {
+    align-items: stretch;
+  }
+
+  .debug-runtime-owners-toolbar {
+    display: grid;
+  }
+
+  .debug-runtime-lifecycle-heading {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .debug-runtime-global-controls-heading {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .debug-runtime-lifecycle-state {
+    grid-column: 2;
+    justify-self: start;
+  }
+
+  .debug-runtime-global-controls-heading .debug-runtime-lifecycle-state {
+    grid-column: 2;
+    justify-self: start;
+  }
+
+  .debug-runtime-lifecycle-facts,
+  .debug-runtime-lifecycle-actions,
+  .debug-runtime-global-controls-actions {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .debug-runtime-lifecycle-detail {
+    overflow: visible;
+    text-overflow: clip;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  .debug-runtime-owners-refresh,
+  .debug-runtime-owner-restart {
+    width: 100%;
+  }
+
+  .debug-runtime-owner-list > li {
+    grid-template-columns: 1fr;
+  }
+
+  .debug-runtime-owner-copy code,
+  .debug-runtime-owner-copy p {
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .debug-runtime-owners-summary,
+  .debug-runtime-owners-refresh,
+  .debug-runtime-owner-restart {
+    transition-duration: 0.01ms;
+  }
+}

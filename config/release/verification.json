@@ -23,7 +23,6 @@
     "procedure_spec",
     "shadow_evaluation",
     "simulation_runtime",
-    "skill_execution",
     "surgical_interop_execution",
     "surgical_interop_gateway",
     "surgical_interop_msgs",

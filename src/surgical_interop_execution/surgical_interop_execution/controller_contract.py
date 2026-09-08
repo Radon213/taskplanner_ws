@@ -46,8 +46,11 @@ REVIEWED_TOOL_TRANSITIONS = frozenset(
     }
 )
 
-# Keep this field-level fingerprint independent from comments and generated
-# language bindings.  Both peers can compute it before any Action Goal is sent.
+# Keep this declaration-level fingerprint independent from comments and
+# generated language bindings. Constants are part of the reviewed wire
+# contract: changing a command/status numeric value or a state string must
+# invalidate the fingerprint just as changing a field does. Both peers can
+# compute it before any Action Goal is sent.
 TOOL_HANDOVER_ACTION_ABI = {
     "goal": (
         "string command_id",
@@ -57,12 +60,28 @@ TOOL_HANDOVER_ACTION_ABI = {
         "string target_location",
     ),
     "result": (
+        "string FINAL_COMPLETED=completed",
+        "string FINAL_CANCELED=canceled",
+        "string FINAL_FAILED=failed",
+        "string REASON_COMPLETED=completed",
+        "string REASON_CANCELED_SOURCE_UNCHANGED=canceled_source_unchanged",
+        "string REASON_CANCELED_RECOVERED_TO_TRAY=canceled_recovered_to_tray",
+        "string REASON_CANCEL_RECOVERY_FAILED=cancel_recovery_failed",
         "bool success",
         "string final_state",
         "string reason_code",
         "string failure_detail",
     ),
     "feedback": (
+        "string STATE_MOVING_TO_SOURCE=moving_to_source",
+        "string STATE_GRASPING=grasping",
+        "string STATE_MOVING_TO_TARGET=moving_to_target",
+        "string STATE_WAITING_FOR_TAKEOVER=waiting_for_takeover",
+        "string STATE_PLACING=placing",
+        "string STATE_HOLDING=holding",
+        "string STATE_STOPPING=stopping",
+        "string STATE_RETREATING=retreating",
+        "string STATE_RECOVERING_TO_TRAY=recovering_to_tray",
         "string state",
         "float32 progress",
     ),
@@ -70,6 +89,19 @@ TOOL_HANDOVER_ACTION_ABI = {
 
 RETRACTION_SERVICE_V1_ABI = {
     "request": (
+        "uint16 PROTOCOL_VERSION_V1=1",
+        "uint8 COMMAND_START_DIRECT_TEACH=1",
+        "uint8 COMMAND_FINISH_DIRECT_TEACH=2",
+        "uint8 COMMAND_START_RETRACTION=3",
+        "uint8 COMMAND_ADJUST_RETRACTION=4",
+        "uint8 COMMAND_CHANGE_TOOL=5",
+        "uint8 COMMAND_STOP_RETRACTION=6",
+        "uint8 COMMAND_SUCTION=7",
+        "uint8 COMMAND_SUCTION_OUT=8",
+        "uint8 TARGET_NONE=0",
+        "uint8 TARGET_LEFT=1",
+        "uint8 TARGET_RIGHT=2",
+        "uint8 TARGET_BOTH=3",
         "uint16 protocol_version",
         "string source_id",
         "string command_id",
@@ -78,6 +110,11 @@ RETRACTION_SERVICE_V1_ABI = {
         "float64 distance_m",
     ),
     "response": (
+        "uint16 RESULT_ACCEPTED=0",
+        "uint16 RESULT_INVALID_COMMAND=1",
+        "uint16 RESULT_INVALID_PARAMETER=2",
+        "uint16 RESULT_REJECTED=3",
+        "uint16 RESULT_ERROR=255",
         "bool request_accepted",
         "uint16 result_code",
         "string command_id",

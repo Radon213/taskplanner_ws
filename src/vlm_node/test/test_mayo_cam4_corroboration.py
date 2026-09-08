@@ -173,6 +173,63 @@ def _aligned_context(
     }
 
 
+def _typed_cam4_frame(
+    stamp_sec: float,
+    instances: list[dict[str, object]],
+) -> dict[str, object]:
+    return {
+        "schema": "taskplanner.rfdetr_tool_observation_2d.v1",
+        "source": "rfdetr_tool_observation_2d",
+        "view": "cam_4",
+        "source_stamp_sec": stamp_sec,
+        "instances": instances,
+    }
+
+
+def _typed_cam4_context(
+    stamp_sec: float,
+    instances: list[dict[str, object]],
+    *,
+    freshness: str = "fresh",
+) -> dict[str, object]:
+    return {
+        "observable_perception": {
+            "schema": "taskplanner.rfdetr_multiview_tool_context.v1",
+            "source": "rfdetr_tool_observation_2d",
+            "ground_truth": False,
+            "freshness": {"cam_4": {"status": freshness}},
+            "tool_detection_views": [
+                {
+                    "view": "cam_4",
+                    "source_stamp_sec": stamp_sec,
+                    "model_version": "external-1.7-rfdetr-rollout",
+                    "detection_status": (
+                        "detections" if instances else "no_detections"
+                    ),
+                    "freshness": {"status": freshness},
+                    "instances": instances,
+                }
+            ],
+        }
+    }
+
+
+def _typed_bovie(confidence: float = 0.91) -> dict[str, object]:
+    return {
+        "class_name": "Bovie surgical cautery",
+        "confidence": confidence,
+        "frame_local_instance_id": 1,
+    }
+
+
+def _typed_bipolar_forceps(confidence: float = 0.91) -> dict[str, object]:
+    return {
+        "class_name": "Bipolar Forceps",
+        "confidence": confidence,
+        "frame_local_instance_id": 7,
+    }
+
+
 def test_aligned_cam4_intersects_mayo_rows_and_retrieve_candidate() -> None:
     payload = {
         "mayo": [
@@ -196,6 +253,116 @@ def test_aligned_cam4_intersects_mayo_rows_and_retrieve_candidate() -> None:
 
     assert payload["mayo"] == [["T04", "recover", 0.91]]
     assert payload["mayo_retrieve"] == ["T04", 0.91]
+
+
+def test_external_typed_cam4_corroborates_mayo_without_provider_pin() -> None:
+    node = _node()
+    node._perception_buffers = {
+        "rfdetr_cam_4_tools": deque(
+            [
+                (44.1, _typed_cam4_frame(44.1, [_typed_bovie(0.84)])),
+                (44.4, _typed_cam4_frame(44.4, [_typed_bovie(0.88)])),
+                (44.7, _typed_cam4_frame(44.7, [_typed_bovie(0.91)])),
+            ]
+        )
+    }
+    node._latest_perception = {}
+    payload = {
+        "mayo": [["T04", "recover", 0.97]],
+        "mayo_retrieve": ["T04", 0.97],
+    }
+
+    node._corroborate_mayo_with_cam4_semantics(
+        payload,
+        _typed_cam4_context(44.7, [_typed_bovie(0.91)]),
+    )
+
+    assert payload["mayo"] == [["T04", "recover", 0.91]]
+    assert payload["mayo_retrieve"] == ["T04", 0.97]
+
+
+def test_stable_external_typed_cam4_inserts_fail_closed_reuse() -> None:
+    node = _node()
+    node._perception_buffers = {
+        "rfdetr_cam_4_tools": deque(
+            [
+                (44.1, _typed_cam4_frame(44.1, [_typed_bovie(0.84)])),
+                (44.4, _typed_cam4_frame(44.4, [_typed_bovie(0.88)])),
+                (44.7, _typed_cam4_frame(44.7, [_typed_bovie(0.91)])),
+            ]
+        )
+    }
+    node._latest_perception = {}
+    payload = {"mayo": [], "mayo_retrieve": ["", 0.0]}
+
+    node._corroborate_mayo_with_cam4_semantics(
+        payload,
+        _typed_cam4_context(44.7, [_typed_bovie(0.91)]),
+    )
+
+    assert payload["mayo"] == [["T04", "reuse", 0.91]]
+    assert payload["mayo_retrieve"] == ["", 0.0]
+
+
+def test_external_typed_cam4_normalizes_bipolar_forceps_to_demo_tool_id() -> None:
+    node = _demo_node()
+    node._perception_buffers = {
+        "rfdetr_cam_4_tools": deque(
+            [
+                (44.1, _typed_cam4_frame(44.1, [_typed_bipolar_forceps(0.84)])),
+                (44.4, _typed_cam4_frame(44.4, [_typed_bipolar_forceps(0.88)])),
+                (44.7, _typed_cam4_frame(44.7, [_typed_bipolar_forceps(0.91)])),
+            ]
+        )
+    }
+    node._latest_perception = {}
+    payload = {"mayo": [], "mayo_retrieve": ["", 0.0]}
+
+    node._corroborate_mayo_with_cam4_semantics(
+        payload,
+        _typed_cam4_context(44.7, [_typed_bipolar_forceps(0.91)]),
+    )
+
+    assert payload["mayo"] == [["T07", "reuse", 0.91]]
+    assert payload["mayo_retrieve"] == ["", 0.0]
+
+
+def test_external_typed_cam4_requires_same_fresh_stable_evidence() -> None:
+    node = _node()
+    node._perception_buffers = {
+        "rfdetr_cam_4_tools": deque(
+            [
+                (44.5, _typed_cam4_frame(44.5, [_typed_bovie(0.91)])),
+                (44.7, _typed_cam4_frame(44.7, [_typed_bovie(0.91)])),
+            ]
+        )
+    }
+    node._latest_perception = {}
+    payload = {"mayo": [], "mayo_retrieve": ["", 0.0]}
+
+    node._corroborate_mayo_with_cam4_semantics(
+        payload,
+        _typed_cam4_context(44.7, [_typed_bovie(0.91)]),
+    )
+
+    assert payload["mayo"] == []
+    assert payload["mayo_retrieve"] == ["", 0.0]
+
+    payload = {
+        "mayo": [["T04", "recover", 0.91]],
+        "mayo_retrieve": ["T04", 0.91],
+    }
+    node._corroborate_mayo_with_cam4_semantics(
+        payload,
+        _typed_cam4_context(
+            44.7,
+            [_typed_bovie(0.91)],
+            freshness="stale",
+        ),
+    )
+
+    assert payload["mayo"] == []
+    assert payload["mayo_retrieve"] == ["", 0.0]
 
 
 def test_aligned_cam4_detection_count_limits_duplicate_mayo_rows() -> None:
@@ -369,7 +536,7 @@ def test_demo_procedure_context_exposes_recurring_chains_and_alternatives() -> N
         "id": "P04",
         "name": "Fixed retraction and exposure establishment",
         "next": ["P05"],
-        "tools": ["T02", "T03"],
+        "tools": ["T02"],
         "cue": [
             "a controller-owned bed-arm retractor is seated at the wound edge and persistently changes field geometry",
             "exposure establishment is dominant; sustained direct target manipulation has not yet begun",
@@ -379,12 +546,12 @@ def test_demo_procedure_context_exposes_recurring_chains_and_alternatives() -> N
             "stable exposure is already followed by sustained central target manipulation",
         ],
         "alt": [["T02", "T02"]],
-        "roles": {"subsequent_target_handling": ["T02", "T03"]},
+        "roles": {"subsequent_target_handling": ["T02"]},
     }
-    assert phases["P05"]["chain"] == [["T02", "T07", "T03"]]
+    assert phases["P05"]["chain"] == [["T02", "T07"]]
     assert phases["P06"]["chain"] == [["T07", "T04"]]
     assert all(
-        tool_id not in {"T05", "T11"}
+        tool_id not in {"T03", "T05", "T11"}
         for phase in phases.values()
         for tool_id in phase["tools"]
     )
@@ -657,6 +824,65 @@ def test_actor_log_stabilization_applies_cam4_mayo_corroboration() -> None:
 
     assert stabilized["mayo"] == [["T02", "reuse", 0.84]]
     assert stabilized["mayo_retrieve"] == ["", 0.0]
+
+
+def test_actor_log_exposes_calibrated_mayo_observation_before_dt_policy_admission() -> None:
+    """The observer can show a stable CAM4 row without widening DT policy."""
+
+    node = _node()
+    samples = [
+        (44.2, _typed_cam4_frame(44.2, [_typed_bovie()])),
+        (44.5, _typed_cam4_frame(44.5, [_typed_bovie()])),
+        (44.8, _typed_cam4_frame(44.8, [_typed_bovie()])),
+    ]
+    node._perception_buffers = {
+        "rfdetr_cam_4_tools": deque(samples, maxlen=64),
+    }
+    node._latest_perception = {"rfdetr_cam_4_tools": samples[-1]}
+    payload = {
+        "v": "4",
+        "phase": [["P02", 0.82]],
+        "tool": [],
+        "intent": ["none", "", 0.0],
+        "mayo": [],
+        "mayo_retrieve": ["", 0.0],
+        "u": 0.2,
+        "sum": "The field appears stable.",
+        "bed_robot_arm_group": None,
+    }
+    context = {
+        "phase_search_mode": "temporal_prior",
+        "evidence_window": {"speech": []},
+        "candidates": {
+            "phase": [["P02", 0.9]],
+            "tool": [],
+            "evidence": {
+                "current_phase": "P02",
+                "allowed_next": ["P03"],
+                "phase_search_mode": "temporal_prior",
+            },
+        },
+        "digital_twin": {
+            "hands": {},
+            "tools": [
+                {
+                    "id": "T04",
+                    "lc": "home_rack",
+                    "lt": "tray_slot",
+                    "loc": "main_tray_slot_1",
+                },
+            ],
+        },
+        **_typed_cam4_context(44.8, [_typed_bovie()]),
+    }
+
+    stabilized = node._stabilize_actor_log_payload(payload, context)
+
+    # The strict policy field remains empty until the next DT snapshot itself
+    # adopts Mayo. The UI-only sidecar contains the same detector-calibrated
+    # reuse result for the observation-projected Mayo card.
+    assert stabilized["mayo"] == []
+    assert stabilized["mayo_observation"] == [["T04", "reuse", 0.91]]
 
 
 def test_schema_v4_corroborated_mayo_rows_publish_tool_observations() -> None:

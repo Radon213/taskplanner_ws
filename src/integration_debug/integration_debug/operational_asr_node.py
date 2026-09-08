@@ -129,6 +129,19 @@ def _bounded_float(value: Any, *, default: float, minimum: float) -> float:
     return max(minimum, parsed)
 
 
+def _env_bool(value: Any, *, default: bool = False) -> bool:
+    """Parse a deployment boolean without making an invalid value fatal."""
+
+    if isinstance(value, bool):
+        return value
+    normalized = str(value or "").strip().casefold()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"", "0", "false", "no", "off"}:
+        return False
+    return default
+
+
 def _event_stamp_sec(value: Any) -> float | None:
     """Parse the ASR runtime's UTC final-event timestamp without guessing."""
 
@@ -190,6 +203,7 @@ class OperationalAsrNode(Node):
         self._control_lock = threading.RLock()
         self._close_lock = threading.Lock()
         self._closed = False
+        self._lan_monitor_paused = False
         self._capture_requested = False
         self._sentence_pub: Any | None = None
         self._utterance_counter = itertools.count(1)
@@ -254,6 +268,13 @@ class OperationalAsrNode(Node):
         self.declare_parameter(
             "capture_lock_path",
             os.environ.get("TASKPLANNER_ASR_CAPTURE_LOCK", DEFAULT_CAPTURE_LOCK),
+        )
+        self.declare_parameter(
+            "rollover_after_final",
+            _env_bool(
+                os.environ.get("TASKPLANNER_ASR_ROLLOVER_AFTER_FINAL"),
+                default=False,
+            ),
         )
         # Partial transcripts and microphone level feedback are operator-facing
         # live signals. Ten updates per second keeps the monitor responsive
@@ -353,6 +374,11 @@ class OperationalAsrNode(Node):
             .get_parameter_value()
             .string_value
         )
+        rollover_after_final = (
+            self.get_parameter("rollover_after_final")
+            .get_parameter_value()
+            .bool_value
+        )
         status_period_sec = max(
             0.1,
             self.get_parameter("status_period_sec")
@@ -370,6 +396,7 @@ class OperationalAsrNode(Node):
             save_artifacts=True,
             recording_default_active=False,
             capture_lock_path=capture_lock_path,
+            rollover_after_final=rollover_after_final,
         )
         self._status_pub = self.create_publisher(
             String,
@@ -404,6 +431,24 @@ class OperationalAsrNode(Node):
         """Read the monitor cache without performing network I/O."""
 
         return dict(self._lan_monitor.snapshot())
+
+    def _pause_lan_monitor_for_session(self) -> None:
+        """Suppress route-only health traffic while one ASR session is active."""
+
+        with self._control_lock:
+            if self._closed or self._lan_monitor_paused:
+                return
+            self._lan_monitor.pause()
+            self._lan_monitor_paused = True
+
+    def _resume_lan_monitor_after_session(self) -> None:
+        """Restore a fresh preflight probe exactly once after a session ends."""
+
+        with self._control_lock:
+            if self._closed or not self._lan_monitor_paused:
+                return
+            self._lan_monitor.resume()
+            self._lan_monitor_paused = False
 
     def _resolve_route_for_policy(self) -> tuple[str, str, str]:
         """Resolve the next concrete route from the cached health result."""
@@ -609,6 +654,10 @@ class OperationalAsrNode(Node):
                     device_id=None if device_id == -1 else device_id,
                     server_url=server_url,
                 )
+                # Route choice is fixed for this microphone session, so the
+                # readiness probe adds no value while it repeatedly opens a
+                # second WebSocket to the same ASR endpoint.
+                self._pause_lan_monitor_for_session()
                 self._endpoint = endpoint
                 self._server_url = server_url
                 self._selection_reason = selection_reason
@@ -733,7 +782,15 @@ class OperationalAsrNode(Node):
                 with self._publisher_lock:
                     self._capture_requested = False
                 self._sync_sentence_publisher(False)
+                # Resume only after the runtime has really torn its live
+                # socket down; a fresh probe then serves the next start.
+                self._resume_lan_monitor_after_session()
         snapshot = self._runtime.snapshot()
+        if str(snapshot.get("state", "")) in {"STOPPED", "ERROR"}:
+            # A failed websocket teardown can put the runtime in ERROR before
+            # it emits an asr_stopped event.  Do not leave preflight probing
+            # suspended in that terminal state.
+            self._resume_lan_monitor_after_session()
         self._sync_sentence_publisher(bool(snapshot.get("connected", False)))
 
     def _typed_final_message(

@@ -57,6 +57,8 @@ DEFAULT_REPLAY_TOPICS = (
     "/surgery/flir/image/compressed",
     "/surgery/transcript",
 )
+OBSERVED_UTTERANCE_TOPIC = "/surgery/audio/observed_utterance"
+OBSERVED_UTTERANCE_MESSAGE_TYPE = "surgical_msgs/msg/SpeechUtterance"
 DEFAULT_CAM4_IMAGE_TOPIC = "/surgery/cam4/color/image/compressed"
 DEFAULT_CAM4_BBOXES_TOPIC = "/surgery/cam4/tools/bboxes/json"
 DEFAULT_CAM4_SEGMENTATION_TOPIC = "/surgery/cam4/tools/segmentation/json"
@@ -673,9 +675,10 @@ def _validate_public_input_trace(
         and record.get("topic") == source_transcript_topic
         for record in trace_records
     )
-    admitted_speech = sum(
+    observed_utterances = sum(
         record.get("layer") == "input_transcript"
-        and record.get("topic") == "/surgery/audio/request_text"
+        and record.get("topic") == OBSERVED_UTTERANCE_TOPIC
+        and record.get("message_type") == OBSERVED_UTTERANCE_MESSAGE_TYPE
         for record in trace_records
     )
     expected_flir_images = expected_images
@@ -848,10 +851,10 @@ def _validate_public_input_trace(
             f"expected={expected_transcripts},"
             f"recorded={recorded_source_transcripts}"
         )
-    if expected_transcripts and admitted_speech != expected_transcripts:
+    if expected_transcripts and observed_utterances != expected_transcripts:
         errors.append(
-            "admitted_speech_count_mismatch:"
-            f"expected={expected_transcripts},recorded={admitted_speech}"
+            "observed_utterance_count_mismatch:"
+            f"expected={expected_transcripts},recorded={observed_utterances}"
         )
     perception_pipeline_requested = bool(
         cam4_image_topic
@@ -955,7 +958,7 @@ def _validate_public_input_trace(
         ),
         "expected_source_transcript_count": expected_transcripts,
         "recorded_source_transcript_count": recorded_source_transcripts,
-        "admitted_speech_count": admitted_speech,
+        "observed_utterance_count": observed_utterances,
         "errors": errors,
         "warnings": warnings,
     }

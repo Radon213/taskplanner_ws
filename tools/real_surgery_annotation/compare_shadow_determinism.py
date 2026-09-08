@@ -223,7 +223,7 @@ def semantic_evaluation_signature(report: dict[str, Any]) -> dict[str, Any]:
                 "input_image_count",
                 "input_transcript_count",
                 "source_transcript_count",
-                "admitted_speech_count",
+                "observed_utterance_count",
                 "vlm_result_count",
                 "vlm_result_during_input_count",
                 "vlm_unhealthy_count",

@@ -1,5 +1,4 @@
 import type { SimulationState } from "../types";
-import type { TaskplannerRuntimeMode } from "../runtimeModes";
 
 export const SELECT_BUNDLE_SERVICE = "/simulation/select_bundle";
 export const SELECT_BUNDLE_SERVICE_TYPE = "surgical_msgs/srv/SelectSimulationBundle";
@@ -15,9 +14,9 @@ export type ScenarioRevisionDisposition =
   | "change_available"
   | "unchanged"
   | "applied"
+  | "deferred_paused_or_stopped_required"
   | "deferred"
   | "blocked"
-  | "restart_required"
   | "rejected"
   | (string & {});
 
@@ -136,21 +135,12 @@ export function scenarioRevisionPreviewRequest(bundleName: string) {
   };
 }
 
-function fullyStopped(state: SimulationState): boolean {
+function pausedOrStopped(state: SimulationState): boolean {
   const executionState = state.execution_state.trim().toLowerCase();
+  if (executionState === "paused") return true;
   return (
     !state.running &&
-    ["idle", "halted", "terminated"].includes(executionState)
-  );
-}
-
-function liveResourcesIdle(state: SimulationState): boolean {
-  return (
-    state.robot_state.trim().toLowerCase() === "idle" &&
-    !state.active_robot_task_id &&
-    !state.cleaner_busy &&
-    state.pending_transition_tools.length === 0 &&
-    state.active_recovery_tools.length === 0
+    ["idle", "halted", "completed", "terminated"].includes(executionState)
   );
 }
 
@@ -160,14 +150,12 @@ function liveResourcesIdle(state: SimulationState): boolean {
  * admission authority and rechecks the same transition at call time.
  */
 export function scenarioRevisionApplyAdmission({
-  runtimeMode,
   state,
   selectedBundle,
   revision,
   stateFresh,
   commandPending,
 }: {
-  runtimeMode: TaskplannerRuntimeMode;
   state: SimulationState;
   selectedBundle: string;
   revision: ScenarioRevisionState;
@@ -203,53 +191,14 @@ export function scenarioRevisionApplyAdmission({
   ) {
     return blocked("Preview this bundle revision before applying it.");
   }
-  if (revision.result.disposition === "restart_required") {
-    return blocked(revision.result.message || "This bundle requires a runtime restart.");
-  }
-
-  const sameBundle = selectedBundle === activeBundle;
-  if (sameBundle) {
-    if (!fullyStopped(state)) {
-      return blocked(
-        "Reloading the active bundle resets procedure state. Fully stop the scenario before applying it.",
-      );
-    }
-    if (runtimeMode === "live" && !liveResourcesIdle(state)) {
-      return blocked("Wait until all Live robot, recovery, and cleaner work is idle.");
-    }
-    return {
-      allowed: true,
-      reason: "",
-      restartIfRunning: false,
-      reloadIfChanged: true,
-    };
-  }
-
-  const executionState = state.execution_state.trim().toLowerCase();
-  const paused = state.running && executionState === "paused";
-  if (runtimeMode !== "live" && paused) {
-    return {
-      allowed: true,
-      reason: "",
-      restartIfRunning: true,
-      reloadIfChanged: false,
-    };
-  }
-  if (!fullyStopped(state)) {
-    return blocked(
-      runtimeMode === "live"
-        ? "Fully stop the Live scenario and active work before changing bundles."
-        : "Pause or fully stop the scenario before changing bundles.",
-    );
-  }
-  if (runtimeMode === "live" && !liveResourcesIdle(state)) {
-    return blocked("Wait until all Live robot, recovery, and cleaner work is idle.");
+  if (!pausedOrStopped(state)) {
+    return blocked("Pause or stop the scenario before changing bundles.");
   }
   return {
     allowed: true,
     reason: "",
     restartIfRunning: false,
-    reloadIfChanged: false,
+    reloadIfChanged: selectedBundle === activeBundle,
   };
 }
 

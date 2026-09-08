@@ -162,7 +162,7 @@ function simulationStateFor(
     }
     if (trace.stage === "rejected") return "rejected";
     if (trace.stage === "failed") return "failed";
-    if (trace.stage === "canceled") return "canceled";
+    if (trace.stage === "canceled" || trace.stage === "cancelled") return "canceled";
     return "unknown";
   }
 

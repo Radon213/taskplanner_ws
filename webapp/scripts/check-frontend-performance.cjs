@@ -244,7 +244,8 @@ for (const rejectedTransitionGuard of [
 }
 
 for (const workspaceRuntimeGuard of [
-  '() => navigateWorkspace("monitor")',
+  'const exitMulticamWorkspace = useCallback(',
+  'navigateWorkspace("mission", "replace")',
   'setRuntimeMode(runtimeTransition.activeMode)',
 ]) {
   if (!app.includes(workspaceRuntimeGuard)) {

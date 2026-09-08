@@ -17,7 +17,10 @@ from simulation_runtime.speech_input_adapter import (
     evaluate_utterance,
     normalize_sentence_text,
     normalize_tts_echo_text,
+    parse_tagged_sentence,
+    tagged_sentence_utterance,
 )
+from std_msgs.msg import String
 from surgical_msgs.msg import BedRobotArmGroupRequest, SpeechUtterance
 
 
@@ -131,6 +134,170 @@ def test_typed_source_is_required_when_live_policy_requests_it() -> None:
 
 def test_sentence_text_is_normalized_without_asr_metadata() -> None:
     assert normalize_sentence_text("  Bovie   please \n") == "Bovie please"
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected_text", "expected_final"),
+    [
+        ("[partial]  보비   준비", "보비 준비", False),
+        (" [FINAL] 보비 주세요 ", "보비 주세요", True),
+    ],
+)
+def test_tagged_sentence_parser_removes_marker_and_preserves_finality(
+    raw: str,
+    expected_text: str,
+    expected_final: bool,
+) -> None:
+    parsed = parse_tagged_sentence(raw)
+
+    assert parsed is not None
+    assert parsed.text == expected_text
+    assert parsed.is_final is expected_final
+
+
+def test_tagged_sentence_parser_does_not_guess_untagged_finality() -> None:
+    assert parse_tagged_sentence("보비 주세요") is None
+
+
+def test_tagged_sentence_builds_typed_receipt_envelope() -> None:
+    parsed = parse_tagged_sentence("[final] 보비 주세요")
+    assert parsed is not None
+
+    message = tagged_sentence_utterance(
+        parsed,
+        stamp=Time(sec=42, nanosec=7),
+        utterance_id="external-42-7-1",
+        source="external_sentence_topic",
+    )
+
+    assert message.text == "보비 주세요"
+    assert message.is_final is True
+    assert message.stamp == Time(sec=42, nanosec=7)
+    assert message.utterance_id == "external-42-7-1"
+    assert message.speaker_role == "surgeon"
+    assert message.has_confidence is False
+
+
+def _tagged_adapter_harness() -> tuple[SimpleNamespace, list, list, list[str]]:
+    finals: list[SpeechUtterance] = []
+    partials: list[SpeechUtterance] = []
+    rejected: list[str] = []
+    adapter = SimpleNamespace(
+        _input_mode="tagged_sentence",
+        _received_count=0,
+        _accepted_count=0,
+        _last_source="",
+        _last_observation_stamp=None,
+        _last_accepted_monotonic=0.0,
+        _last_detail="",
+        _sentence_source_id="external_sentence_topic",
+        _tagged_sequence=0,
+        _recent_sentences=RecentSentences(retention_sec=1.0),
+        _enable_tts_echo_guard=False,
+        _tts_echo_guard=TTSEchoGuard(),
+        _transcript_pub=SimpleNamespace(publish=finals.append),
+        _partial_pub=SimpleNamespace(publish=partials.append),
+        get_clock=lambda: SimpleNamespace(
+            now=lambda: SimpleNamespace(to_msg=lambda: Time(sec=42, nanosec=7))
+        ),
+        _reject=rejected.append,
+        _publish_status=lambda: None,
+        _tts_echo_detail=SpeechInputAdapterNode._tts_echo_detail,
+    )
+    return adapter, finals, partials, rejected
+
+
+def test_tagged_partial_is_observed_but_not_admitted_as_a_command() -> None:
+    adapter, finals, partials, rejected = _tagged_adapter_harness()
+
+    SpeechInputAdapterNode._on_sentence(
+        adapter,
+        String(data="[partial] 보비 준비"),
+    )
+
+    assert finals == []
+    assert rejected == []
+    assert len(partials) == 1
+    assert partials[0].text == "보비 준비"
+    assert partials[0].is_final is False
+    assert adapter._last_detail == "accepted_partial_tagged_sentence"
+
+
+def test_tagged_final_is_admitted_without_the_marker() -> None:
+    adapter, finals, partials, rejected = _tagged_adapter_harness()
+
+    SpeechInputAdapterNode._on_sentence(
+        adapter,
+        String(data="[final] 보비 주세요"),
+    )
+
+    assert partials == []
+    assert rejected == []
+    assert len(finals) == 1
+    assert finals[0].text == "보비 주세요"
+    assert finals[0].is_final is True
+    assert adapter._last_detail == "accepted_final_tagged_sentence"
+
+
+def test_untagged_sentence_is_rejected_in_tagged_mode() -> None:
+    adapter, finals, partials, rejected = _tagged_adapter_harness()
+
+    SpeechInputAdapterNode._on_sentence(adapter, String(data="보비 주세요"))
+
+    assert finals == []
+    assert partials == []
+    assert rejected == ["missing_transcript_tag"]
+
+
+def test_adapter_mode_status_identifies_external_and_local_ingress() -> None:
+    external = SimpleNamespace(
+        _input_mode="tagged_sentence",
+        _sentence_source_id="external_sentence_topic",
+    )
+    local = SimpleNamespace(
+        _input_mode="utterance",
+        _sentence_source_id="external_sentence_topic",
+    )
+
+    assert SpeechInputAdapterNode._mode_source_id(external) == (
+        "external_sentence_topic"
+    )
+    assert SpeechInputAdapterNode._mode_source_id(local) == "local_microphone"
+
+
+def test_adapter_input_mode_can_switch_without_recreating_ingress() -> None:
+    published_statuses: list[object] = []
+    adapter = SimpleNamespace(
+        _input_mode="tagged_sentence",
+        _recent_ids=RecentUtteranceIds(retention_sec=120.0),
+        _recent_sentences=RecentSentences(retention_sec=1.0),
+        _last_source="external_sentence_topic",
+        _last_observation_stamp=Time(sec=42),
+        _last_accepted_monotonic=123.0,
+        _last_detail="accepted_final_tagged_sentence",
+        _publish_status=lambda: published_statuses.append(True),
+        _waiting_detail=lambda: "waiting_for_final_surgeon_utterance",
+    )
+
+    result = SpeechInputAdapterNode._on_parameters_changed(
+        adapter,
+        [SimpleNamespace(name="input_mode", value="utterance")],
+    )
+
+    assert result.successful is True
+    assert adapter._input_mode == "utterance"
+    assert adapter._last_source == ""
+    assert adapter._last_observation_stamp is None
+    assert adapter._last_accepted_monotonic == 0.0
+    assert adapter._last_detail == "waiting_for_final_surgeon_utterance"
+    assert published_statuses == [True]
+
+    rejected = SpeechInputAdapterNode._on_parameters_changed(
+        adapter,
+        [SimpleNamespace(name="input_mode", value="unknown")],
+    )
+    assert rejected.successful is False
+    assert adapter._input_mode == "utterance"
 
 
 def test_sentence_text_deduplication_is_short_and_case_insensitive() -> None:

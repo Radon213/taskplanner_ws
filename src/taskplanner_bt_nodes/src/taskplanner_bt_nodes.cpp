@@ -1,7 +1,7 @@
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
-#include <limits>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -31,21 +31,20 @@ namespace
 
 std::atomic<uint64_t> skill_command_sequence{0};
 
-// Preparing a tool is reversible and lower risk than handing it to the surgeon.
-// A candidate that remains the reducer's winner across several BT ticks may
-// occupy the single right-hand preparation slot; handover keeps stricter guards.
-constexpr double kPreparationMinConfidence = 0.65;
-constexpr double kPreparationMinStabilitySec = 0.3;
-// Replacement is driven by the reducer's system-final rank 1, not the raw VLM
-// rank 1. The reducer resets this continuity clock whenever its winner changes.
-constexpr double kSystemTopReplacementMinStabilitySec = 2.0;
-// The CAM4 reducer has already required an exact Right/Open_Palm/PALM_UP join,
-// pinned provenance, and source-time dwell. Repeat the policy threshold here
-// so no alternate WorldState producer can bypass the 300 ms admission rule.
-constexpr double kHandHandoverMinConfidence = 0.50;
-constexpr double kHandHandoverMinStabilitySec = 0.30;
-constexpr double kImplicitPredictionMinConfidence = 0.55;
-constexpr double kImplicitPredictionMinStabilitySec = 0.30;
+// CAM4 admission is owned by the Digital Twin's continuous hand gate.  The
+// BT consumes only its normalized visible/open_receive state; duplicating
+// dwell or confidence thresholds here would make a valid hand signal wait a
+// second time after the reducer already admitted it.
+// Active/paused WorldState is emitted at 0.5 s cadence. A cached sample older
+// than this cannot safely authorize Mayo motion if the Digital Twin process
+// has stopped publishing.
+constexpr int64_t kWorldStateMaxReceiptAgeNs = 1500000000LL;
+
+int64_t steadyNowNs()
+{
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+    std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 template <typename T>
 bool readBlackboard(const BT::TreeNode & node, const std::string & key, T & out)
 {
@@ -204,18 +203,44 @@ bool directHandSignalActive(const BT::TreeNode & node)
   std::string execution_state;
   std::string implicit_tool;
   std::string hand_pose;
-  double confidence = 0.0;
-  double stability_sec = 0.0;
   readBlackboard(node, "runtime.execution_state", execution_state);
   readBlackboard(node, "request.implicit_visible", visible);
   readBlackboard(node, "request.implicit_tool", implicit_tool);
   readBlackboard(node, "request.implicit_hand_pose", hand_pose);
-  readBlackboard(node, "request.implicit_confidence", confidence);
-  readBlackboard(node, "request.implicit_stability_sec", stability_sec);
   return execution_state == "running" && visible && implicit_tool.empty() &&
-         hand_pose == "open_receive" &&
-         confidence >= kHandHandoverMinConfidence &&
-         stability_sec >= kHandHandoverMinStabilitySec;
+         hand_pose == "open_receive";
+}
+
+bool mayoWorkspaceOccupied(const BT::TreeNode & node)
+{
+  bool present = true;
+  readBlackboard(node, "perception.cam4_mayo_hand_present", present);
+  return present;
+}
+
+bool isMayoAnchor(const std::string & value)
+{
+  static const std::unordered_set<std::string> mayo_anchors = {
+    "mayo", "mayo_stand", "mayo_reuse_zone", "mayo_recovery_zone"};
+  return mayo_anchors.count(value) > 0;
+}
+
+bool commandTouchesMayoWorkspace(
+  const std::string & action, const std::string & selected_lifecycle,
+  const std::string & source_location_id,
+  const std::string & source_location_type,
+  const std::string & target_location_id,
+  const std::string & target_location_type)
+{
+  return
+    action == "retrieve_from_mayo" ||
+    action == "return_unused_preposition" ||
+    selected_lifecycle == "mayo_reuse" ||
+    selected_lifecycle == "mayo_recovery" ||
+    isMayoAnchor(source_location_id) ||
+    isMayoAnchor(source_location_type) ||
+    isMayoAnchor(target_location_id) ||
+    isMayoAnchor(target_location_type);
 }
 
 bool isExactRightHandPreposition(
@@ -260,8 +285,11 @@ bool isExactRightHandPreposition(
 
 std::string findActiveInstanceForType(
   const BT::TreeNode & node, const std::string & instrument_type,
-  const std::unordered_set<std::string> & allowed_lifecycles = {})
+  const std::unordered_set<std::string> & allowed_lifecycles = {},
+  bool prefer_mayo = false, bool allow_occupied_mayo = false)
 {
+  std::string first_eligible;
+  const bool mayo_occupied = mayoWorkspaceOccupied(node);
   for (const auto & tool_id : allTools(node)) {
     if (!toolMatchesType(node, tool_id, instrument_type) || !toolIsActive(node, tool_id)) {
       continue;
@@ -270,10 +298,84 @@ std::string findActiveInstanceForType(
       allowed_lifecycles.empty() ||
       allowed_lifecycles.count(toolLifecycle(node, tool_id)) > 0)
     {
-      return tool_id;
+      const auto lifecycle = toolLifecycle(node, tool_id);
+      const bool on_mayo =
+        lifecycle == "mayo_reuse" || lifecycle == "mayo_recovery";
+      if (mayo_occupied && on_mayo && !allow_occupied_mayo) {
+        continue;
+      }
+      if (!prefer_mayo) {
+        return tool_id;
+      }
+      if (on_mayo) {
+        return tool_id;
+      }
+      if (first_eligible.empty()) {
+        first_eligible = tool_id;
+      }
     }
   }
-  return {};
+  return first_eligible;
+}
+
+bool operatorRequestedMayoPickup(
+  const BT::TreeNode & node, const std::string & selected_tool)
+{
+  if (!toolIsActive(node, selected_tool)) {
+    return false;
+  }
+  const auto lifecycle = toolLifecycle(node, selected_tool);
+  const bool on_mayo =
+    lifecycle == "mayo_reuse" || lifecycle == "mayo_recovery";
+  if (!on_mayo) {
+    return false;
+  }
+
+  std::string location_id;
+  std::string location_type;
+  std::string owner;
+  std::string active_task_id;
+  std::string robot_state;
+  bool cleaner_busy = false;
+  readBlackboard(node, makeToolKey(selected_tool, "location"), location_id);
+  readBlackboard(node, makeToolKey(selected_tool, "location_type"), location_type);
+  readBlackboard(node, makeToolKey(selected_tool, "owner"), owner);
+  readBlackboard(node, "robot.active_task_id", active_task_id);
+  readBlackboard(node, "robot.state", robot_state);
+  readBlackboard(node, "cleaner.busy", cleaner_busy);
+  if (
+    (!isMayoAnchor(location_id) && !isMayoAnchor(location_type)) ||
+    (!owner.empty() && owner != "none") || !active_task_id.empty() ||
+    cleaner_busy || robot_state == "fault")
+  {
+    return false;
+  }
+
+  std::string explicit_request;
+  std::string surgeon_request;
+  std::string surgeon_instance;
+  std::string surgeon_intent;
+  bool voice_backed = false;
+  bool ready_for_handover = false;
+  bool handover_hint = false;
+  readBlackboard(node, "request.explicit_tool", explicit_request);
+  readBlackboard(node, "request.surgeon_tool", surgeon_request);
+  readBlackboard(node, "request.surgeon_instance", surgeon_instance);
+  readBlackboard(node, "surgeon.intent", surgeon_intent);
+  readBlackboard(node, "request.voice_backed", voice_backed);
+  readBlackboard(node, "surgeon.ready_handover", ready_for_handover);
+  readBlackboard(node, "state.handover_hint", handover_hint);
+  const auto selected_tool_type = toolTypeId(node, selected_tool);
+  const bool voice_explicit_selection =
+    voice_backed && ready_for_handover && handover_hint &&
+    surgeon_intent == "voice_request" &&
+    !surgeon_instance.empty() && surgeon_instance == selected_tool &&
+    (
+      (!explicit_request.empty() && explicit_request == selected_tool_type) ||
+      (!surgeon_request.empty() && surgeon_request == selected_tool_type)
+    );
+
+  return voice_explicit_selection;
 }
 
 bool hasBlockingSafetyFlag(const BT::TreeNode & node, bool allow_vlm_unhealthy = false)
@@ -345,10 +447,6 @@ bool toolIsAnticipatoryCandidate(const BT::TreeNode & node, const std::string & 
   bool contaminated = false;
   readBlackboard(node, makeToolKey(tool_id, "status"), status);
   readBlackboard(node, makeToolKey(tool_id, "contaminated"), contaminated);
-  bool future_use_expected = false;
-  readBlackboard(
-    node, makeToolKey(tool_id, "future_use_expected"),
-    future_use_expected);
   const auto lifecycle = toolLifecycle(node, tool_id);
   const auto next_required_transition = toolNextRequiredTransition(node, tool_id);
 
@@ -359,7 +457,7 @@ bool toolIsAnticipatoryCandidate(const BT::TreeNode & node, const std::string & 
     return false;
   }
   if (lifecycle == "mayo_reuse") {
-    return future_use_expected;
+    return true;
   }
   return lifecycle == "home_rack" || lifecycle == "returned_home";
 }
@@ -367,15 +465,28 @@ bool toolIsAnticipatoryCandidate(const BT::TreeNode & node, const std::string & 
 std::string findAnticipatoryInstanceForType(
   const BT::TreeNode & node, const std::string & instrument_type)
 {
+  std::string first_eligible;
+  const bool mayo_occupied = mayoWorkspaceOccupied(node);
   for (const auto & tool_id : allTools(node)) {
     if (
       toolMatchesType(node, tool_id, instrument_type) &&
       toolIsAnticipatoryCandidate(node, tool_id))
     {
-      return tool_id;
+      // A reusable Mayo instance avoids an unnecessary tray/rack round trip.
+      // Eligibility is still decided above, so a Mayo recovery candidate is
+      // never promoted into anticipatory preparation by this preference.
+      if (toolLifecycle(node, tool_id) == "mayo_reuse") {
+        if (mayo_occupied) {
+          continue;
+        }
+        return tool_id;
+      }
+      if (first_eligible.empty()) {
+        first_eligible = tool_id;
+      }
     }
   }
-  return {};
+  return first_eligible;
 }
 
 bool explicitRequestReplacesPreposition(const BT::TreeNode & node)
@@ -408,10 +519,18 @@ bool systemTopPredictionReplacesPreposition(const BT::TreeNode & node)
 {
   std::string predicted_tool;
   std::string prepositioned_tool;
-  double stability_sec = 0.0;
+  std::string prepositioned_instance;
+  std::string preposition_reservation;
+  bool autonomous_ready = false;
   readBlackboard(node, "prediction.tool", predicted_tool);
   readBlackboard(node, "robot.prepositioned_tool", prepositioned_tool);
-  readBlackboard(node, "prediction.stability_sec", stability_sec);
+  readBlackboard(node, "robot.prepositioned_instance", prepositioned_instance);
+  readBlackboard(node, "prediction.autonomous_ready", autonomous_ready);
+  if (!prepositioned_instance.empty()) {
+    readBlackboard(
+      node, makeToolKey(prepositioned_instance, "reserved_for"),
+      preposition_reservation);
+  }
   const auto replacement_instance = findAnticipatoryInstanceForType(
     node, predicted_tool);
   const bool replacement_available = !replacement_instance.empty();
@@ -419,130 +538,15 @@ bool systemTopPredictionReplacesPreposition(const BT::TreeNode & node)
     !predicted_tool.empty() && !prepositioned_tool.empty() &&
     predicted_tool != prepositioned_tool &&
     replacement_available &&
-    stability_sec >= kSystemTopReplacementMinStabilitySec;
+    autonomous_ready &&
+    preposition_reservation != "voice_prepared";
 }
 
-struct RecoveryPolicyCandidate
+bool isVoicePreparedPreposition(const BT::TreeNode & node, const std::string & tool_id)
 {
-  std::string tool_id;
-  std::string basis;
-};
-
-RecoveryPolicyCandidate selectRecoveryPolicyCandidate(const BT::TreeNode & node)
-{
-  std::string execution_state;
-  std::string explicit_request;
-  std::string surgeon_request;
-  std::string implicit_request;
-  std::string predicted_tool;
-  std::string prepositioned_tool;
-  std::string active_task_id;
-  std::string left_hand_tool;
-  bool cleaner_busy = false;
-  readBlackboard(node, "runtime.execution_state", execution_state);
-  readBlackboard(node, "request.explicit_tool", explicit_request);
-  readBlackboard(node, "request.surgeon_tool", surgeon_request);
-  readBlackboard(node, "request.implicit_tool", implicit_request);
-  readBlackboard(node, "prediction.tool", predicted_tool);
-  readBlackboard(node, "robot.prepositioned_tool", prepositioned_tool);
-  readBlackboard(node, "robot.active_task_id", active_task_id);
-  readBlackboard(node, "robot.left_hand_tool", left_hand_tool);
-  readBlackboard(node, "cleaner.busy", cleaner_busy);
-  if (
-    execution_state != "running" && execution_state != "finishing")
-  {
-    return {};
-  }
-  if (
-    !active_task_id.empty() || !left_hand_tool.empty() || cleaner_busy ||
-    hasBlockingSafetyFlag(node))
-  {
-    return {};
-  }
-  std::vector<std::string> mayo_tools;
-  for (const auto & tool_id : allTools(node)) {
-    const auto lifecycle = toolLifecycle(node, tool_id);
-    if (
-      toolIsActive(node, tool_id) &&
-      (lifecycle == "mayo_reuse" || lifecycle == "mayo_recovery"))
-    {
-      mayo_tools.push_back(tool_id);
-    }
-  }
-  if (mayo_tools.empty()) {
-    return {};
-  }
-
-  const auto oldest = [&node](
-      const std::vector<std::string> & candidates,
-      const std::string & basis) -> RecoveryPolicyCandidate
-    {
-      std::string selected;
-      double selected_stamp = std::numeric_limits<double>::max();
-      for (const auto & tool_id : candidates) {
-        double stamp = 0.0;
-        readBlackboard(node, makeToolKey(tool_id, "last_observed_sec"), stamp);
-        if (selected.empty() || stamp < selected_stamp) {
-          selected = tool_id;
-          selected_stamp = stamp;
-        }
-      }
-      return {selected, basis};
-    };
-
-  if (execution_state == "finishing") {
-    return oldest(mayo_tools, "completion_cleanup");
-  }
-
-  const std::unordered_set<std::string> protected_types = {
-    explicit_request, surgeon_request, implicit_request, predicted_tool, prepositioned_tool};
-  std::vector<std::string> stable_recovery_candidates;
-  std::vector<std::string> capacity_candidates;
-  for (const auto & tool_id : mayo_tools) {
-    const auto tool_type = toolTypeId(node, tool_id);
-    if (!tool_type.empty() && protected_types.count(tool_type) > 0) {
-      continue;
-    }
-    bool future_use_expected = true;
-    double reuse_confidence = 0.0;
-    double reuse_stability_sec = 0.0;
-    double recovery_confidence = 0.0;
-    double recovery_stability_sec = 0.0;
-    std::string placement_evidence;
-    readBlackboard(
-      node, makeToolKey(tool_id, "future_use_expected"), future_use_expected);
-    readBlackboard(
-      node, makeToolKey(tool_id, "mayo_reuse_confidence"), reuse_confidence);
-    readBlackboard(
-      node, makeToolKey(tool_id, "mayo_reuse_stability_sec"), reuse_stability_sec);
-    readBlackboard(
-      node, makeToolKey(tool_id, "mayo_recovery_confidence"), recovery_confidence);
-    readBlackboard(
-      node, makeToolKey(tool_id, "mayo_recovery_stability_sec"), recovery_stability_sec);
-    readBlackboard(
-      node, makeToolKey(tool_id, "mayo_placement_evidence"), placement_evidence);
-
-    const bool stable_reuse =
-      reuse_confidence >= 0.5 && reuse_stability_sec >= 5.0;
-    const bool stable_recovery =
-      recovery_confidence >= 0.5 && recovery_stability_sec >= 5.0;
-    if (!future_use_expected && stable_recovery && !stable_reuse) {
-      stable_recovery_candidates.push_back(tool_id);
-    }
-    if (
-      mayo_tools.size() > 2 && !future_use_expected && !stable_reuse &&
-      !placement_evidence.empty())
-    {
-      capacity_candidates.push_back(tool_id);
-    }
-  }
-  if (!stable_recovery_candidates.empty()) {
-    return oldest(stable_recovery_candidates, "stable_vlm_recovery_evidence");
-  }
-  if (!capacity_candidates.empty()) {
-    return oldest(capacity_candidates, "mayo_capacity_soft_limit");
-  }
-  return {};
+  std::string reservation;
+  readBlackboard(node, makeToolKey(tool_id, "reserved_for"), reservation);
+  return reservation == "voice_prepared";
 }
 
 bool hasRecoveryContext(const BT::TreeNode & node)
@@ -605,7 +609,7 @@ bool hasRecoveryContext(const BT::TreeNode & node)
     (surgeon_intent == "return_tool" || surgeon_intent == "extend_hand_for_retrieval" ||
     surgeon_intent == "awaiting_retrieval") &&
     toolIsRecoverableFromSurgeon(node, surgeon_request_instance);
-  return explicit_recovery || !selectRecoveryPolicyCandidate(node).tool_id.empty();
+  return explicit_recovery;
 }
 
 bool hasActiveRobotTask(const BT::TreeNode & node)
@@ -641,10 +645,25 @@ public:
 
   BT::NodeStatus onTick(const std::shared_ptr<surgical_msgs::msg::WorldState> & last_msg_ptr) override
   {
+    const auto now_ns = steadyNowNs();
     if (last_msg_ptr) {
       last_world_state_ = last_msg_ptr;
+      last_world_state_receipt_ns_ = now_ns;
     }
-    if (!last_world_state_) {
+    const bool receipt_fresh =
+      last_world_state_receipt_ns_ >= 0 &&
+      now_ns >= last_world_state_receipt_ns_ &&
+      now_ns - last_world_state_receipt_ns_ <= kWorldStateMaxReceiptAgeNs;
+    if (!last_world_state_ || !receipt_fresh) {
+      writeBlackboard(
+        *this, "perception.cam4_mayo_hand_present", true);
+      writeBlackboard(*this, "bt.action", std::string{});
+      writeBlackboard(
+        *this, "bt.blocking_guard", std::string("world_state_stale"));
+      clearCommandFields(*this, true);
+      // RosSubscriberNode can return only a completed status.  The tree's
+      // dedicated bounded input-yield wrapper converts this into the next
+      // executor tick without spinning or treating it as an Action failure.
       return BT::NodeStatus::FAILURE;
     }
     return applyWorldState(*last_world_state_);
@@ -692,6 +711,9 @@ private:
     writeBlackboard(
       *this, "request.implicit_generation",
       static_cast<int64_t>(msg.implicit_request_generation));
+    writeBlackboard(
+      *this, "perception.cam4_mayo_hand_present",
+      static_cast<bool>(msg.cam4_mayo_hand_present));
     writeBlackboard(*this, "surgeon.intent", msg.surgeon_intent);
     writeBlackboard(*this, "surgeon.ready_handover", static_cast<bool>(msg.surgeon_ready_for_handover));
     writeBlackboard(*this, "surgeon.ready_retrieval", static_cast<bool>(msg.surgeon_ready_for_retrieval));
@@ -707,8 +729,9 @@ private:
       *this, "robot.prepositioned_instance",
       msg.prepositioned_tool_instance_id);
     writeBlackboard(*this, "prediction.tool", msg.predicted_tool);
-    writeBlackboard(*this, "prediction.confidence", static_cast<double>(msg.predicted_tool_confidence));
-    writeBlackboard(*this, "prediction.stability_sec", static_cast<double>(msg.predicted_tool_stability_sec));
+    writeBlackboard(
+      *this, "prediction.autonomous_ready",
+      static_cast<bool>(msg.autonomous_preparation_ready));
     writeBlackboard(*this, "robot.active_task_id", msg.active_robot_task_id);
     writeBlackboard(*this, "robot.active_task_type", msg.active_robot_task_type);
     writeBlackboard(*this, "robot.active_task_tool_id", msg.active_robot_task_tool_id);
@@ -747,6 +770,7 @@ private:
       writeBlackboard(*this, makeToolKey(instance_id, "location"), instrument.location_id);
       writeBlackboard(*this, makeToolKey(instance_id, "location_type"), instrument.location_type);
       writeBlackboard(*this, makeToolKey(instance_id, "owner"), instrument.owner);
+      writeBlackboard(*this, makeToolKey(instance_id, "reserved_for"), instrument.reserved_for);
       writeBlackboard(*this, makeToolKey(instance_id, "available"), isAvailableStatus(instrument.status));
       writeBlackboard(*this, makeToolKey(instance_id, "contaminated"), static_cast<bool>(instrument.contaminated));
       writeBlackboard(*this, makeToolKey(instance_id, "cleanliness"), instrument.cleanliness_state);
@@ -754,30 +778,6 @@ private:
       writeBlackboard(
         *this, makeToolKey(instance_id, "next_required_transition"),
         instrument.next_required_transition);
-      writeBlackboard(
-        *this, makeToolKey(instance_id, "future_use_expected"),
-        static_cast<bool>(instrument.procedure_future_use_expected));
-      writeBlackboard(
-        *this, makeToolKey(instance_id, "mayo_placement_evidence"),
-        instrument.mayo_placement_evidence);
-      writeBlackboard(
-        *this, makeToolKey(instance_id, "last_observed_sec"),
-        static_cast<double>(instrument.last_observed_sec));
-      writeBlackboard(
-        *this, makeToolKey(instance_id, "mayo_reuse_confidence"),
-        static_cast<double>(instrument.mayo_reuse_confidence));
-      writeBlackboard(
-        *this, makeToolKey(instance_id, "mayo_reuse_stability_sec"),
-        static_cast<double>(instrument.mayo_reuse_stability_sec));
-      writeBlackboard(
-        *this, makeToolKey(instance_id, "mayo_recovery_confidence"),
-        static_cast<double>(instrument.mayo_recovery_confidence));
-      writeBlackboard(
-        *this, makeToolKey(instance_id, "mayo_recovery_stability_sec"),
-        static_cast<double>(instrument.mayo_recovery_stability_sec));
-      writeBlackboard(
-        *this, makeToolKey(instance_id, "mayo_evidence_source"),
-        instrument.mayo_evidence_source);
       writeBlackboard(
         *this, makeToolKey(instance_id, "preposition_origin_location"),
         instrument.preposition_origin_location_id);
@@ -801,6 +801,7 @@ private:
   }
 
   std::shared_ptr<surgical_msgs::msg::WorldState> last_world_state_;
+  int64_t last_world_state_receipt_ns_{-1};
   std::string last_procedure_id_;
   int64_t bundle_generation_ = 0;
   std::unordered_set<std::string> previous_tools_;
@@ -864,29 +865,14 @@ public:
 
   BT::NodeStatus tick() override
   {
-    std::string predicted_tool;
-    double prediction_confidence = 0.0;
-    double prediction_stability_sec = 0.0;
-    readBlackboard(*this, "prediction.tool", predicted_tool);
-    readBlackboard(*this, "prediction.confidence", prediction_confidence);
-    readBlackboard(*this, "prediction.stability_sec", prediction_stability_sec);
-    if (!directHandSignalActive(*this)) {
+    if (hasActiveRobotTask(*this) || !directHandSignalActive(*this)) {
       return BT::NodeStatus::FAILURE;
     }
-    if (isExactRightHandPreposition(*this)) {
-      return BT::NodeStatus::SUCCESS;
-    }
-    // A rank can exist only to keep operator probabilities complete.  An
-    // unresolved request may use rank 1 only after the independent reducer
-    // evidence and persistence thresholds have made it policy-ready.
-    if (
-      predicted_tool.empty() ||
-      prediction_confidence < kImplicitPredictionMinConfidence ||
-      prediction_stability_sec < kImplicitPredictionMinStabilitySec)
-    {
-      return BT::NodeStatus::FAILURE;
-    }
-    return BT::NodeStatus::SUCCESS;
+    // An implicit open-hand signal is delivery-only: it may hand over the
+    // exact instance already prepared in the robot's right hand, but must
+    // never turn the current rank-1 prediction into a new pickup command.
+    return isExactRightHandPreposition(*this) ?
+      BT::NodeStatus::SUCCESS : BT::NodeStatus::FAILURE;
   }
 };
 
@@ -935,7 +921,7 @@ public:
     const bool immediately_usable =
       lifecycle == "home_rack" || lifecycle == "returned_home" || lifecycle == "prepositioned_right";
     const bool on_mayo = lifecycle == "mayo_reuse" || lifecycle == "mayo_recovery";
-    if (lifecycle == "surgeon_owned" || on_mayo) {
+    if (on_mayo) {
       return BT::NodeStatus::SUCCESS;
     }
     return immediately_usable && !contaminated ? BT::NodeStatus::SUCCESS : BT::NodeStatus::FAILURE;
@@ -972,20 +958,19 @@ public:
     const bool direct_hand_preposition_selected =
       directHandSignalActive(*this) &&
       isExactRightHandPreposition(*this, selected_tool);
+    // The visual signal only releases a tool already prepared in the right
+    // hand. It is not an authorization to pick up the rank-1 prediction.
     if (hasBlockingSafetyFlag(
-        *this, voice_backed_selected || direct_hand_preposition_selected))
+        *this,
+        voice_backed_selected || direct_hand_preposition_selected))
     {
       return BT::NodeStatus::FAILURE;
     }
-    if (hasActiveRobotTask(*this) && !voice_backed_selected) {
+    if (hasActiveRobotTask(*this)) {
       return BT::NodeStatus::FAILURE;
     }
     if (!toolIsActive(*this, selected_tool)) {
       return BT::NodeStatus::FAILURE;
-    }
-    const auto lifecycle = toolLifecycle(*this, selected_tool);
-    if (lifecycle == "surgeon_owned" && !voice_backed_selected) {
-      return BT::NodeStatus::SUCCESS;
     }
     bool allowed = false;
     readBlackboard(*this, "action.guard.handover_allowed", allowed);
@@ -1020,7 +1005,12 @@ public:
       selected_tool.empty() || execution_state != "running" ||
       robot_state == "fault" || hasActiveRobotTask(*this) ||
       cleaner_busy || !right_hand_tool.empty() ||
-      hasBlockingSafetyFlag(*this))
+      // The n-gram readiness bit is owned by the Digital Twin and does not
+      // consume VLM output.  Keep a VLM outage observable, but do not make a
+      // slow first current-epoch inference delay this deterministic,
+      // right-hand-only preparation.  All other blocking flags still apply;
+      // recovery keeps its separate VLM-health gate.
+      hasBlockingSafetyFlag(*this, true))
     {
       return BT::NodeStatus::FAILURE;
     }
@@ -1065,7 +1055,7 @@ public:
     const auto requested_tool_type = toolTypeId(*this, tool_id);
     if (
       !right_hand_instance.empty() &&
-      toolIsActive(*this, right_hand_instance) &&
+      isExactRightHandPreposition(*this, right_hand_instance) &&
       (
         right_hand_tool == requested_tool_type ||
         toolMatchesType(*this, right_hand_instance, requested_tool_type)
@@ -1078,7 +1068,15 @@ public:
         std::string("explicit_request_preposition_match"));
       return BT::NodeStatus::SUCCESS;
     }
-    if (!surgeon_instance.empty() && toolIsActive(*this, surgeon_instance)) {
+    // Digital Twin is the sole owner of supply selection for an explicit
+    // request.  In particular, do not select an arbitrary active instance by
+    // type here: that could turn a surgeon-owned or unknown instance into a
+    // robot source after the Twin has rejected it.
+    if (
+      !surgeon_instance.empty() &&
+      toolIsActive(*this, surgeon_instance) &&
+      toolMatchesType(*this, surgeon_instance, requested_tool_type))
+    {
       writeBlackboard(*this, "selected.tool", surgeon_instance);
       writeBlackboard(*this, "selected.policy_transition", std::string{});
       writeBlackboard(*this, "selected.policy_basis", std::string("explicit_request"));
@@ -1087,16 +1085,7 @@ public:
     if (tool_id.empty()) {
       return BT::NodeStatus::FAILURE;
     }
-    const auto selected_instance =
-      toolIsActive(*this, tool_id) ?
-      tool_id : findActiveInstanceForType(*this, tool_id);
-    if (selected_instance.empty()) {
-      return BT::NodeStatus::FAILURE;
-    }
-    writeBlackboard(*this, "selected.tool", selected_instance);
-    writeBlackboard(*this, "selected.policy_transition", std::string{});
-    writeBlackboard(*this, "selected.policy_basis", std::string("explicit_request"));
-    return BT::NodeStatus::SUCCESS;
+    return BT::NodeStatus::FAILURE;
   }
 };
 
@@ -1125,18 +1114,9 @@ public:
       selected_instance = prepositioned_instance;
       policy_basis = "hand_signal_preposition_match";
     } else {
-      readBlackboard(*this, "prediction.tool", tool_type);
-      policy_basis = "hand_signal_prediction_fallback";
-    }
-    if (tool_type.empty()) {
       return BT::NodeStatus::FAILURE;
     }
-    if (selected_instance.empty()) {
-      selected_instance = findActiveInstanceForType(
-        *this, tool_type,
-        {"home_rack", "returned_home", "mayo_reuse"});
-    }
-    if (selected_instance.empty()) {
+    if (tool_type.empty() || selected_instance.empty()) {
       return BT::NodeStatus::FAILURE;
     }
     writeBlackboard(*this, "selected.tool", selected_instance);
@@ -1172,12 +1152,11 @@ public:
     readBlackboard(*this, "surgeon.intent", surgeon_intent);
     std::string prepositioned_tool;
     std::string predicted_tool;
-    double prediction_confidence = 0.0;
-    double prediction_stability_sec = 0.0;
+    bool autonomous_preparation_ready = false;
     readBlackboard(*this, "robot.prepositioned_tool", prepositioned_tool);
     readBlackboard(*this, "prediction.tool", predicted_tool);
-    readBlackboard(*this, "prediction.confidence", prediction_confidence);
-    readBlackboard(*this, "prediction.stability_sec", prediction_stability_sec);
+    readBlackboard(
+      *this, "prediction.autonomous_ready", autonomous_preparation_ready);
     const bool active_return_intent =
       !surgeon_request.empty() &&
       (surgeon_intent == "return_tool" || surgeon_intent == "extend_hand_for_retrieval");
@@ -1190,10 +1169,7 @@ public:
       return BT::NodeStatus::FAILURE;
     }
 
-    if (
-      !predicted_tool.empty() &&
-      prediction_confidence >= kPreparationMinConfidence &&
-      prediction_stability_sec >= kPreparationMinStabilitySec)
+    if (!predicted_tool.empty() && autonomous_preparation_ready)
     {
       const auto predicted_instance = findAnticipatoryInstanceForType(
         *this, predicted_tool);
@@ -1228,11 +1204,54 @@ public:
     readBlackboard(*this, "runtime.execution_state", execution_state);
     readBlackboard(*this, "robot.left_hand_tool", left_hand_tool);
     readBlackboard(*this, "cleaner.busy", cleaner_busy);
+    if (mayoWorkspaceOccupied(*this)) {
+      writeBlackboard(
+        *this, "bt.blocking_guard", std::string("cam4_mayo_hand_present"));
+      return BT::NodeStatus::FAILURE;
+    }
     if (
       (execution_state != "running" && execution_state != "finishing") ||
       hasActiveRobotTask(*this) || !left_hand_tool.empty() || cleaner_busy ||
       hasBlockingSafetyFlag(*this))
     {
+      return BT::NodeStatus::FAILURE;
+    }
+
+    // Spoken completion can leave a tool prepared in the right hand. Return
+    // that held tool before any Mayo-to-tray cleanup: otherwise the left arm
+    // can start recovering a Mayo tool while the right hand still carries the
+    // prepared item that completion is meant to clear first.
+    if (execution_state == "finishing") {
+      for (const auto & tool_id : allTools(*this)) {
+        const auto lifecycle = toolLifecycle(*this, tool_id);
+        const auto transition = toolNextRequiredTransition(*this, tool_id);
+        if (lifecycle != "prepositioned_right") {
+          continue;
+        }
+        if (transition == "return_unused_preposition") {
+          return selectTool(
+            tool_id, "return_unused_preposition", "completion_release_excluded_preposition");
+        }
+        if (transition == "return_preposition_to_tray") {
+          return selectTool(
+            tool_id, "return_preposition_to_tray", "completion_return_preposition_to_tray");
+        }
+      }
+    }
+
+    // Retrieval uses the left hand, but the Mayo lane is single-capacity:
+    // never start a second transfer while the right hand still holds a
+    // prepositioned tool.  Completion cleanup above is intentionally allowed
+    // to return that right-hand tool first; the next BT tick can then retry the
+    // queued Mayo recovery with an empty right hand.
+    std::string right_hand_tool;
+    std::string right_hand_instance;
+    readBlackboard(*this, "robot.right_hand_tool", right_hand_tool);
+    readBlackboard(*this, "robot.right_hand_instance", right_hand_instance);
+    if (!right_hand_tool.empty() || !right_hand_instance.empty()) {
+      writeBlackboard(
+        *this, "bt.blocking_guard",
+        std::string("retrieve_blocked_right_hand_preposition"));
       return BT::NodeStatus::FAILURE;
     }
 
@@ -1286,6 +1305,24 @@ public:
       }
     }
 
+    // Spoken completion freezes the eligible Mayo *instances* in the DT.
+    // Those targets keep their evidence-derived mayo_reuse label, while their
+    // next transition carries the terminal recovery authorization.  Select
+    // exactly that transition so a later generic Mayo observation cannot add
+    // a new cleanup item.
+    if (execution_state == "finishing") {
+      for (const auto & tool_id : allTools(*this)) {
+        const auto lifecycle = toolLifecycle(*this, tool_id);
+        if (
+          (lifecycle == "mayo_reuse" || lifecycle == "mayo_recovery") &&
+          toolNextRequiredTransition(*this, tool_id) == "recover_left")
+        {
+          return selectTool(
+            tool_id, "recover_left", "completion_frozen_mayo_target");
+        }
+      }
+    }
+
     for (const auto & tool_id : allTools(*this)) {
       const auto lifecycle = toolLifecycle(*this, tool_id);
       if (lifecycle == "mayo_recovery") {
@@ -1313,18 +1350,14 @@ public:
       for (const auto & tool_id : allTools(*this)) {
         if (
           toolLifecycle(*this, tool_id) == "prepositioned_right" &&
-          toolMatchesType(*this, tool_id, prepositioned_tool))
+          toolMatchesType(*this, tool_id, prepositioned_tool) &&
+          !isVoicePreparedPreposition(*this, tool_id))
         {
           return selectTool(
-            tool_id, "return_unused_preposition", "system_top_replacement_stable_2s");
+            tool_id, "return_unused_preposition",
+            "dt_authorized_prediction_replacement");
         }
       }
-    }
-
-    const auto policy_candidate = selectRecoveryPolicyCandidate(*this);
-    if (!policy_candidate.tool_id.empty()) {
-      return selectTool(
-        policy_candidate.tool_id, "recover_left", policy_candidate.basis);
     }
 
     return BT::NodeStatus::FAILURE;
@@ -1435,7 +1468,6 @@ public:
     std::string explicit_request;
     std::string surgeon_request;
     std::string surgeon_intent;
-    std::string predicted_tool;
     std::string prepositioned_tool;
     std::string owner;
     const auto lifecycle = toolLifecycle(*this, selected_tool);
@@ -1443,8 +1475,7 @@ public:
     bool cleaner_busy = false;
     bool ready_for_handover = false;
     bool voice_backed = false;
-    double prediction_confidence = 0.0;
-    double prediction_stability_sec = 0.0;
+    bool handover_hint = false;
     readBlackboard(*this, "robot.state", robot_state);
     readBlackboard(*this, "robot.active_task_id", active_task_id);
     readBlackboard(*this, "request.explicit_tool", explicit_request);
@@ -1452,11 +1483,9 @@ public:
     readBlackboard(*this, "surgeon.intent", surgeon_intent);
     readBlackboard(*this, "surgeon.ready_handover", ready_for_handover);
     readBlackboard(*this, "request.voice_backed", voice_backed);
-    readBlackboard(*this, "prediction.tool", predicted_tool);
-    readBlackboard(*this, "prediction.confidence", prediction_confidence);
-    readBlackboard(*this, "prediction.stability_sec", prediction_stability_sec);
     readBlackboard(*this, "robot.prepositioned_tool", prepositioned_tool);
     readBlackboard(*this, "cleaner.busy", cleaner_busy);
+    readBlackboard(*this, "state.handover_hint", handover_hint);
     readBlackboard(*this, makeToolKey(selected_tool, "contaminated"), contaminated);
     readBlackboard(*this, makeToolKey(selected_tool, "owner"), owner);
     const auto selected_tool_type = toolTypeId(*this, selected_tool);
@@ -1469,18 +1498,10 @@ public:
       );
     const bool exact_right_hand_preposition =
       isExactRightHandPreposition(*this, selected_tool);
-    const auto implicit_target =
-      exact_right_hand_preposition ? prepositioned_tool : predicted_tool;
-    const bool implicit_candidate_supported =
-      exact_right_hand_preposition ||
-      (
-        prediction_confidence >= kImplicitPredictionMinConfidence &&
-        prediction_stability_sec >= kImplicitPredictionMinStabilitySec
-      );
     const bool implicit_request_selected =
       directHandSignalActive(*this) &&
-      implicit_candidate_supported &&
-      selected_tool_type == implicit_target;
+      exact_right_hand_preposition &&
+      selected_tool_type == prepositioned_tool;
     const bool voice_backed_explicit_request =
       explicit_request_selected && voice_backed;
     const bool active_tool = toolIsActive(*this, selected_tool);
@@ -1488,13 +1509,13 @@ public:
     const bool holder_available = prepositioned_right ?
       exact_right_hand_preposition : (owner.empty() || owner == "none");
     const bool usable_lifecycle = lifecycle == "home_rack" || lifecycle == "returned_home" || prepositioned_right;
-    const bool surgeon_owned = lifecycle == "surgeon_owned";
     const bool on_mayo = lifecycle == "mayo_reuse" || lifecycle == "mayo_recovery";
     const bool direct_hand_preposition_selected =
       implicit_request_selected && exact_right_hand_preposition;
-    // VLM health is irrelevant only for a tool already held in the verified
-    // right-hand preparation slot. Prediction fallback still fails closed:
-    // unhealthy VLM evidence is withdrawn before this branch can select it.
+    const bool operator_requested_mayo_handover =
+      on_mayo && operatorRequestedMayoPickup(*this, selected_tool);
+    // A direct hand signal may only release the exact tool already prepared
+    // in the right hand. It never authorizes a new rank-1 pickup.
     const bool blocked_by_safety = hasBlockingSafetyFlag(
       *this,
       voice_backed_explicit_request || direct_hand_preposition_selected);
@@ -1502,21 +1523,23 @@ public:
       (explicit_request_selected && ready_for_handover) ||
       implicit_request_selected ||
       (!explicit_request_selected && !implicit_request_selected);
-    const bool robot_task_slot_available =
-      active_task_id.empty() || voice_backed_explicit_request;
+    const bool robot_task_slot_available = active_task_id.empty();
+    // `handover_hint` is not advisory.  It is the Digital Twin's authoritative
+    // supply admission for the current explicit request.  BT only consumes
+    // that decision; it must not re-select a surgeon-owned or unknown source.
+    const bool source_admitted = !explicit_request_selected || handover_hint;
     const bool mayo_handover_allowed =
-      on_mayo && holder_available && robot_task_slot_available && !cleaner_busy &&
+      on_mayo &&
+      (!mayoWorkspaceOccupied(*this) || operator_requested_mayo_handover) &&
+      holder_available &&
+      robot_task_slot_available && !cleaner_busy &&
       robot_state != "fault" && request_ready;
-    const bool stale_surgeon_owned_voice_retry_allowed =
-      surgeon_owned && voice_backed_explicit_request && robot_task_slot_available &&
-      !cleaner_busy && robot_state != "fault" && request_ready;
 
     const bool allowed =
       active_tool &&
+      source_admitted &&
       !blocked_by_safety &&
       (
-        (surgeon_owned && !voice_backed_explicit_request) ||
-        stale_surgeon_owned_voice_retry_allowed ||
         mayo_handover_allowed ||
         (
           usable_lifecycle && holder_available && !contaminated && robot_task_slot_available &&
@@ -1524,6 +1547,17 @@ public:
         )
       );
 
+    if (explicit_request_selected && !source_admitted) {
+      writeBlackboard(
+        *this, "bt.blocking_guard", std::string("requested_tool_not_robot_reachable"));
+    }
+    if (
+      on_mayo && mayoWorkspaceOccupied(*this) &&
+      !operator_requested_mayo_handover)
+    {
+      writeBlackboard(
+        *this, "bt.blocking_guard", std::string("cam4_mayo_hand_present"));
+    }
     writeBlackboard(*this, "action.guard.handover_allowed", allowed);
     return BT::NodeStatus::SUCCESS;
   }
@@ -1556,11 +1590,31 @@ public:
     readBlackboard(*this, "selected.tool", selected_tool);
     const auto lifecycle = toolLifecycle(*this, selected_tool);
     auto next_required_transition = toolNextRequiredTransition(*this, selected_tool);
+    const bool voice_prepared_preposition =
+      isVoicePreparedPreposition(*this, selected_tool);
     std::string policy_basis;
     readBlackboard(*this, "selected.policy_basis", policy_basis);
     if (next_required_transition.empty()) {
       readBlackboard(
         *this, "selected.policy_transition", next_required_transition);
+    }
+    const bool operator_requested_mayo_handover =
+      (mode == "explicit_request" || mode == "implicit_request") &&
+      operatorRequestedMayoPickup(*this, selected_tool);
+
+    if (
+      mayoWorkspaceOccupied(*this) &&
+      !operator_requested_mayo_handover &&
+      (
+        lifecycle == "mayo_reuse" || lifecycle == "mayo_recovery" ||
+        next_required_transition == "return_unused_preposition"
+      ))
+    {
+      writeBlackboard(*this, "bt.action", std::string{});
+      clearCommandFields(*this, false);
+      writeBlackboard(
+        *this, "bt.blocking_guard", std::string("cam4_mayo_hand_present"));
+      return BT::NodeStatus::FAILURE;
     }
 
     writeBlackboard(*this, "bt.decision", decision);
@@ -1621,28 +1675,23 @@ public:
     readBlackboard(*this, makeToolKey(selected_tool, "home_type"), home_location_type);
     readBlackboard(*this, makeToolKey(selected_tool, "contaminated"), contaminated);
     std::string right_hand_instance;
+    bool voice_backed = false;
     readBlackboard(
       *this, "robot.right_hand_instance", right_hand_instance);
-    bool voice_backed = false;
     readBlackboard(*this, "request.voice_backed", voice_backed);
-
     if (mode == "explicit_request" || mode == "implicit_request") {
-      const bool stale_surgeon_owned_voice_retry =
-        mode == "explicit_request" && voice_backed && lifecycle == "surgeon_owned";
-      if (lifecycle == "surgeon_owned" && !stale_surgeon_owned_voice_retry) {
+      if (lifecycle == "surgeon_owned") {
         writeBlackboard(*this, "bt.action", std::string{});
-        writeBlackboard(*this, "bt.decision_reason", std::string("requested tool already surgeon-side"));
-        writeBlackboard(*this, "bt.rationale", std::string("requested tool already surgeon-side"));
-        clearCommandFields(*this, false);
         writeBlackboard(
-          *this, "bt.mode",
-          mode == "implicit_request" ?
-          std::string("implicit_fulfilled") : std::string("explicit_fulfilled"));
-        return BT::NodeStatus::SUCCESS;
+          *this, "bt.blocking_guard", std::string("requested_tool_not_robot_reachable"));
+        writeBlackboard(
+          *this, "bt.decision_reason", std::string("requested tool is surgeon-owned"));
+        writeBlackboard(
+          *this, "bt.rationale", std::string("requested tool is surgeon-owned"));
+        return BT::NodeStatus::FAILURE;
       }
       const bool on_mayo =
-        lifecycle == "mayo_reuse" || lifecycle == "mayo_recovery" ||
-        stale_surgeon_owned_voice_retry;
+        lifecycle == "mayo_reuse" || lifecycle == "mayo_recovery";
       if (contaminated && !on_mayo) {
         return BT::NodeStatus::FAILURE;
       }
@@ -1650,10 +1699,19 @@ public:
         mode == "implicit_request" &&
         directHandSignalActive(*this) &&
         isExactRightHandPreposition(*this, selected_tool);
+      if (mode == "implicit_request" && !exact_direct_hand_preposition) {
+        writeBlackboard(*this, "bt.action", std::string{});
+        writeBlackboard(
+          *this, "bt.blocking_guard",
+          std::string("implicit_request_requires_prepositioned_right_tool"));
+        return BT::NodeStatus::FAILURE;
+      }
       const bool explicit_right_hand_selection =
         mode == "explicit_request" &&
-        (right_hand_instance == selected_tool ||
-        lifecycle == "prepositioned_right");
+        right_hand_instance == selected_tool &&
+        isExactRightHandPreposition(*this, selected_tool);
+      const bool voice_explicit_request =
+        mode == "explicit_request" && voice_backed;
       if (exact_direct_hand_preposition || explicit_right_hand_selection)
       {
         writeBlackboard(*this, "bt.action", std::string("direct_handover"));
@@ -1665,7 +1723,8 @@ public:
           !explicitRequestReplacesPreposition(*this))
         {
           // A direct hand signal is not an explicit request for a different
-          // tool. Let the recovery branch wait for a 2 s system-top change.
+          // tool. Let the DT-authorized replacement path settle the existing
+          // preposition before an autonomous replacement is attempted.
           writeBlackboard(
             *this, "bt.blocking_guard",
             std::string("non_explicit_request_waiting_for_system_top_replacement"));
@@ -1675,6 +1734,11 @@ public:
           writeBlackboard(
             *this, "bt.blocking_guard",
             std::string("active_tool_action"));
+          return BT::NodeStatus::FAILURE;
+        }
+        if (mayoWorkspaceOccupied(*this)) {
+          writeBlackboard(
+            *this, "bt.blocking_guard", std::string("cam4_mayo_hand_present"));
           return BT::NodeStatus::FAILURE;
         }
         const auto held_lifecycle = toolLifecycle(*this, right_hand_instance);
@@ -1714,18 +1778,16 @@ public:
       } else if (on_mayo) {
         // The public interface supports Mayo -> robot preparation and robot ->
         // surgeon handover as two audited transitions, not an atomic composite.
-        // Keep the current request pending; after ToolPrepared updates this
-        // instance to prepositioned_right, the next tick uses direct_handover.
-        writeBlackboard(
-          *this, "bt.action", std::string("prepare_tool"));
-        writeBlackboard(
-          *this, "bt.source_location_id",
-          stale_surgeon_owned_voice_retry || tool_location.empty() ?
-          std::string("mayo_stand") : tool_location);
-        writeBlackboard(
-          *this, "bt.source_location_type",
-          stale_surgeon_owned_voice_retry || tool_location_type.empty() ?
-          std::string("mayo_stand") : tool_location_type);
+        // A voice request completes at the controller-confirmed preparation
+        // transition; an implicit hand signal may later request handover.
+        if (tool_location.empty() || tool_location_type.empty()) {
+          writeBlackboard(
+            *this, "bt.blocking_guard", std::string("requested_tool_location_unconfirmed"));
+          return BT::NodeStatus::FAILURE;
+        }
+        writeBlackboard(*this, "bt.action", std::string("prepare_tool"));
+        writeBlackboard(*this, "bt.source_location_id", tool_location);
+        writeBlackboard(*this, "bt.source_location_type", tool_location_type);
         writeBlackboard(*this, "bt.arm", std::string("right"));
         writeBlackboard(*this, "bt.target_location_id", std::string("robot_right_hand"));
         writeBlackboard(*this, "bt.target_location_type", std::string("robot_right_hand"));
@@ -1733,23 +1795,43 @@ public:
         writeBlackboard(*this, "bt.cleaning_required", false);
         writeBlackboard(
           *this, "bt.decision_reason",
-          stale_surgeon_owned_voice_retry ?
-          std::string("validated voice request overrides stale surgeon ownership; retry from Mayo") :
           std::string("requested tool is on Mayo; prepare it before handover"));
         writeBlackboard(
           *this, "bt.rationale",
-          stale_surgeon_owned_voice_retry ?
-          std::string("validated voice request overrides stale surgeon ownership; retry from Mayo") :
           std::string("requested tool is on Mayo; prepare it before handover"));
         return BT::NodeStatus::SUCCESS;
       } else {
+        if (
+          (lifecycle != "home_rack" && lifecycle != "returned_home") ||
+          tool_location.empty() || tool_location_type.empty())
+        {
+          writeBlackboard(
+            *this, "bt.blocking_guard", std::string("requested_tool_not_robot_reachable"));
+          return BT::NodeStatus::FAILURE;
+        }
+        if (voice_explicit_request) {
+          writeBlackboard(*this, "bt.action", std::string("prepare_tool"));
+          writeBlackboard(*this, "bt.source_location_id", tool_location);
+          writeBlackboard(*this, "bt.source_location_type", tool_location_type);
+          writeBlackboard(*this, "bt.arm", std::string("right"));
+          writeBlackboard(
+            *this, "bt.target_location_id", std::string("robot_right_hand"));
+          writeBlackboard(
+            *this, "bt.target_location_type", std::string("robot_right_hand"));
+          writeBlackboard(
+            *this, "bt.target_owner", std::string("robot_right_hand"));
+          writeBlackboard(*this, "bt.cleaning_required", false);
+          writeBlackboard(
+            *this, "bt.decision_reason",
+            std::string("voice-requested tool is prepared for a later hand signal"));
+          writeBlackboard(
+            *this, "bt.rationale",
+            std::string("voice-requested tool is prepared for a later hand signal"));
+          return BT::NodeStatus::SUCCESS;
+        }
         writeBlackboard(*this, "bt.action", std::string("pick_up_and_handover"));
-        writeBlackboard(
-          *this, "bt.source_location_id",
-          tool_location.empty() ? home_location_id : tool_location);
-        writeBlackboard(
-          *this, "bt.source_location_type",
-          tool_location_type.empty() ? home_location_type : tool_location_type);
+        writeBlackboard(*this, "bt.source_location_id", tool_location);
+        writeBlackboard(*this, "bt.source_location_type", tool_location_type);
       }
       writeBlackboard(*this, "bt.arm", std::string("right"));
       writeBlackboard(*this, "bt.target_location_id", std::string("surgeon_receive_zone"));
@@ -1790,23 +1872,45 @@ public:
     }
 
     if (mode == "recovery") {
-      if (next_required_transition == "return_unused_preposition") {
+      if (
+        next_required_transition == "return_unused_preposition" ||
+        next_required_transition == "return_preposition_to_tray")
+      {
+        if (
+          next_required_transition == "return_unused_preposition" &&
+          voice_prepared_preposition)
+        {
+          writeBlackboard(
+            *this, "bt.blocking_guard",
+            std::string("voice_prepared_waiting_for_hand"));
+          writeBlackboard(*this, "bt.action", std::string{});
+          return BT::NodeStatus::FAILURE;
+        }
         if (lifecycle != "prepositioned_right") {
           return BT::NodeStatus::FAILURE;
         }
-        writeBlackboard(*this, "bt.action", std::string("return_unused_preposition"));
+        const bool return_to_mayo =
+          next_required_transition == "return_unused_preposition";
+        writeBlackboard(
+          *this, "bt.action",
+          return_to_mayo ? std::string("return_unused_preposition") :
+          std::string("return_preposition_to_tray"));
         writeBlackboard(*this, "bt.arm", std::string("right"));
         writeBlackboard(*this, "bt.source_location_id", std::string("robot_right_hand"));
         writeBlackboard(*this, "bt.source_location_type", std::string("robot_right_hand"));
         writeBlackboard(
-          *this, "bt.target_location_id", std::string("mayo_stand"));
+          *this, "bt.target_location_id",
+          return_to_mayo ? std::string("mayo_stand") : home_location_id);
         writeBlackboard(
-          *this, "bt.target_location_type", std::string("mayo_stand"));
+          *this, "bt.target_location_type",
+          return_to_mayo ? std::string("mayo_stand") : home_location_type);
         writeBlackboard(*this, "bt.target_owner", std::string("none"));
         writeBlackboard(*this, "bt.cleaning_required", false);
         const auto return_reason =
-          policy_basis == "system_top_replacement_stable_2s" ?
-          std::string("system top prediction changed for 2 s; park current preparation on Mayo") :
+          !return_to_mayo ?
+          std::string("completion cleanup returns prepared recovery tool directly to tray") :
+          policy_basis == "dt_authorized_prediction_replacement" ?
+          std::string("DT-authorized n-gram prediction changed; park current preparation on Mayo") :
           policy_basis == "explicit_request_replacement" ?
           std::string("explicit request changed tools; park current preparation on Mayo") :
           std::string("unused prepositioned tool must be parked on Mayo to free the right hand");
@@ -1876,6 +1980,10 @@ public:
       firstInputOrBlackboard(*this, "target_location_id", "bt.target_location_id");
     const auto target_location_type =
       firstInputOrBlackboard(*this, "target_location_type", "bt.target_location_type");
+    std::string source_location_id;
+    std::string source_location_type;
+    readBlackboard(*this, "bt.source_location_id", source_location_id);
+    readBlackboard(*this, "bt.source_location_type", source_location_type);
     const auto mode = firstInputOrBlackboard(*this, "mode", "bt.mode");
     const auto arm = firstInputOrBlackboard(*this, "arm", "bt.arm");
     const auto selected_tool_lifecycle =
@@ -1884,21 +1992,13 @@ public:
       firstInputOrBlackboard(*this, "next_required_transition", "bt.next_required_transition");
 
     std::string selected_tool;
-    std::string explicit_request;
-    std::string surgeon_request;
-    std::string surgeon_intent;
     std::string right_hand_instance;
     std::string left_hand_instance;
     std::string procedure_run_id;
-    bool voice_backed = false;
     int64_t bundle_generation = 0;
     int64_t request_generation = 0;
     int64_t implicit_request_generation = 0;
     readBlackboard(*this, "selected.tool", selected_tool);
-    readBlackboard(*this, "request.explicit_tool", explicit_request);
-    readBlackboard(*this, "request.surgeon_tool", surgeon_request);
-    readBlackboard(*this, "surgeon.intent", surgeon_intent);
-    readBlackboard(*this, "request.voice_backed", voice_backed);
     readBlackboard(*this, "robot.right_hand_instance", right_hand_instance);
     readBlackboard(*this, "robot.left_hand_instance", left_hand_instance);
     readBlackboard(*this, "runtime.procedure_run_id", procedure_run_id);
@@ -1907,21 +2007,46 @@ public:
     readBlackboard(
       *this, "request.implicit_generation", implicit_request_generation);
 
-    const bool validated_voice_request_present =
-      !explicit_request.empty() ||
-      (isExplicitSurgeonIntent(surgeon_intent) && !surgeon_request.empty());
-    const bool voice_backed_selected =
-      decision == "explicit_request" && voice_backed && validated_voice_request_present;
-    // A new robot->Mayo Goal must never preempt or overlap another tracked
-    // external tool Action. The triggering request remains pending and is
-    // reconsidered after the terminal result is projected into WorldState.
+    // Defense in depth: even if a stale recovery decision reaches dispatch
+    // after the Twin has reserved a voice-prepared tool, never park it until
+    // the surgeon signals or explicitly requests a replacement.
     if (
-      hasActiveRobotTask(*this) &&
-      action == "return_unused_preposition")
+      decision == "recovery" &&
+      action == "return_unused_preposition" &&
+      isVoicePreparedPreposition(*this, selected_tool))
     {
+      writeBlackboard(
+        *this, "bt.blocking_guard",
+        std::string("voice_prepared_waiting_for_hand"));
       return BT::NodeStatus::FAILURE;
     }
-    if (hasActiveRobotTask(*this) && !voice_backed_selected) {
+
+    const bool operator_requested_mayo_handover =
+      (decision == "explicit_request" || decision == "implicit_request") &&
+      action == "prepare_tool" &&
+      (selected_tool_lifecycle == "mayo_reuse" ||
+      selected_tool_lifecycle == "mayo_recovery") &&
+      (isMayoAnchor(source_location_id) || isMayoAnchor(source_location_type)) &&
+      target_location_id == "robot_right_hand" &&
+      target_location_type == "robot_right_hand" &&
+      operatorRequestedMayoPickup(*this, selected_tool);
+
+    if (
+      mayoWorkspaceOccupied(*this) &&
+      !operator_requested_mayo_handover &&
+      commandTouchesMayoWorkspace(
+        action, selected_tool_lifecycle, source_location_id,
+        source_location_type, target_location_id, target_location_type))
+    {
+      writeBlackboard(
+        *this, "bt.blocking_guard", std::string("cam4_mayo_hand_present"));
+      return BT::NodeStatus::FAILURE;
+    }
+
+    // No request provenance can preempt or overlap a tracked external tool
+    // Action. Any later retry is a new admission decision after the active
+    // Action's terminal result has been projected into WorldState.
+    if (hasActiveRobotTask(*this)) {
       return BT::NodeStatus::FAILURE;
     }
 
@@ -2018,6 +2143,7 @@ public:
   bool setMessage(surgical_msgs::msg::BTDecision & msg) override
   {
     msg.stamp = toBuiltinTime(context_.getCurrentTime());
+    readBlackboard(*this, "runtime.procedure_run_id", msg.procedure_run_id);
     msg.decision = firstInputOrBlackboard(*this, "decision", "bt.decision");
     msg.action = firstInputOrBlackboard(*this, "action", "bt.action");
     msg.rationale = firstInputOrBlackboard(*this, "rationale", "bt.rationale");
@@ -2090,26 +2216,30 @@ public:
     int64_t request_generation = 0;
     readBlackboard(*this, "request.generation", request_generation);
     msg.request_generation = static_cast<uint64_t>(std::max<int64_t>(0, request_generation));
-    msg.procedure_run_id = "";
+    // Every emitted execution command is bound to the exact accepted
+    // procedure interval.  This is not limited to direct-hand commands:
+    // a late explicit/prediction callback must never be admissible in the
+    // next run either.
+    readBlackboard(*this, "runtime.procedure_run_id", msg.procedure_run_id);
+    if (msg.procedure_run_id.empty()) {
+      return false;
+    }
     msg.implicit_request_generation = 0;
     readBlackboard(*this, "bt.cleaning_required", msg.cleaning_required);
     if (msg.mode == "implicit_request") {
-      std::string procedure_run_id;
       int64_t implicit_request_generation = 0;
-      readBlackboard(*this, "runtime.procedure_run_id", procedure_run_id);
       readBlackboard(
         *this, "request.implicit_generation", implicit_request_generation);
-      if (procedure_run_id.empty() || implicit_request_generation <= 0) {
+      if (implicit_request_generation <= 0) {
         return false;
       }
-      msg.procedure_run_id = procedure_run_id;
       msg.implicit_request_generation = static_cast<uint64_t>(
         implicit_request_generation);
       // A stable ID lets the bridge/controller recognize a replay after a BT
       // restart. The durable bridge ledger separately fences all handover
       // variants to one handover per run/episode.
       msg.command_id =
-        "skill-hand-" + procedure_run_id + "-" +
+        "skill-hand-" + msg.procedure_run_id + "-" +
         std::to_string(implicit_request_generation) + "-" + msg.action;
     } else {
       const auto sequence =

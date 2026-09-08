@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import type {
   BedRobotArmState,
@@ -171,6 +171,86 @@ export type StageToolChipBadge = {
   tone: "neutral" | "active" | "warning" | "danger" | "predicted" | "reuse" | "recovery";
 };
 
+/**
+ * A current Digital Twin Mayo decision. This is presentation data copied from
+ * the typed `InstrumentState`, never a second policy decision in the UI.
+ */
+export type StageMayoDecision = {
+  disposition: "recover" | "reuse";
+  confidence: number;
+  /** Reducer-measured continuous evidence time for this exact decision. */
+  stabilitySec: number;
+  source: "digital_twin";
+  evidence: string;
+};
+
+function isResolvedMayoConfidence(value: unknown): value is number {
+  // ROS defaults an unset numeric field to zero.  Treat that as no typed
+  // evaluation rather than presenting a false `reuse 0%` result.  A genuine
+  // zero-confidence model observation remains visible through the observed
+  // VLM row; this guard applies only to the DT fallback.
+  return typeof value === "number" && Number.isFinite(value) && value > 0 && value <= 1;
+}
+
+function resolvedMayoStability(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+    ? value
+    : 0;
+}
+
+function canonicalMayoDecisionForInstrument(
+  instrument: InstrumentState,
+): StageMayoDecision | undefined {
+  if (!isMayoDecisionEligible(instrument)) return undefined;
+  const evidenceSource = instrument.mayo_evidence_source?.trim() ?? "";
+  if (!evidenceSource) return undefined;
+
+  // The typed reducer records a recover/reuse vote without changing the
+  // placement lifecycle.  A recovery vote can therefore coexist with the
+  // `mayo_reuse` lifecycle; choose the populated evidence field, not the
+  // placement label.  This keeps a verified recovery from rendering as a
+  // misleading reuse 0% card.
+  const recoveryConfidence = isResolvedMayoConfidence(instrument.mayo_recovery_confidence)
+    ? instrument.mayo_recovery_confidence
+    : undefined;
+  const reuseConfidence = isResolvedMayoConfidence(instrument.mayo_reuse_confidence)
+    ? instrument.mayo_reuse_confidence
+    : undefined;
+  if (recoveryConfidence === undefined && reuseConfidence === undefined) return undefined;
+  const disposition = recoveryConfidence !== undefined && (
+    reuseConfidence === undefined || recoveryConfidence >= reuseConfidence
+  )
+    ? "recover"
+    : "reuse";
+  const confidence = disposition === "recover" ? recoveryConfidence : reuseConfidence;
+  if (confidence === undefined) return undefined;
+  const stabilitySec = disposition === "recover"
+    ? resolvedMayoStability(instrument.mayo_recovery_stability_sec)
+    : resolvedMayoStability(instrument.mayo_reuse_stability_sec);
+  const evidence = [evidenceSource, instrument.mayo_placement_evidence]
+    .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+    .join(" · ");
+  return {
+    disposition,
+    confidence,
+    stabilitySec,
+    source: "digital_twin",
+    evidence,
+  };
+}
+
+function canonicalMayoDecisionForDisplayGroup(
+  instruments: readonly InstrumentState[],
+): StageMayoDecision | undefined {
+  return instruments
+    .map(canonicalMayoDecisionForInstrument)
+    .filter((decision): decision is StageMayoDecision => Boolean(decision))
+    .sort((left, right) =>
+      right.confidence - left.confidence ||
+      (left.disposition === "recover" ? -1 : 1),
+    )[0];
+}
+
 export type StageToolChipDensity = "comfortable" | "regular" | "dense" | "micro";
 
 export type StageToolChipPlacement = {
@@ -181,6 +261,10 @@ export type StageToolChipPlacement = {
   shortLabel: string;
   /** Physical instances represented by this visual card. */
   instanceIds?: string[];
+  /** Per-instance surgeon_owned flags, aligned with instanceIds. */
+  s?: boolean[];
+  /** Observation-only slots of this type are exchangeable, not physical IDs. */
+  exchangeable?: boolean;
   /** Instance represented by the card's current active/recovery state. */
   displayInstanceId?: string;
   /** Visual-only inventory count; the digital-twin instances remain separate. */
@@ -197,8 +281,8 @@ export type StageToolChipPlacement = {
   displayState: StageToolDisplayState;
   highlight: "requested" | "predicted" | "normal";
   lifecycle: string;
-  /** The represented DT instance is physically confirmed on canonical Mayo. */
-  mayoDecisionEligible?: boolean;
+  /** Canonical Mayo decision when the typed DT message provided a confidence. */
+  canonicalMayoDecision?: StageMayoDecision;
   footerBadges: StageToolChipBadge[];
   contaminated: boolean;
   active: boolean;
@@ -473,6 +557,8 @@ const TERMINAL_SKILL_STATES = new Set([
   "dispatch_failed",
   "server_unavailable",
   "rejected",
+  "canceled",
+  "cancelled",
 ]);
 
 const STAGE_TOP = 3;
@@ -534,10 +620,14 @@ const RACK_LEFT =
 const MAYO_LABEL_SPACE = 4.4;
 const MAYO_PAD_X = 1;
 const MAYO_PAD_BOTTOM = 0.9;
+// Four Mayo tools can carry a name, state, and VLM decision at once. Reserve
+// enough of the operator board for those two-line cards instead of shrinking
+// them into unreadable 20px cells.
+const MAYO_EXTRA_CONTENT_HEIGHT = 8;
 const CLEANER_HOLDER_H = SINGLE_TOOL_HOLDER_H + 1.1;
 const HAND_HOLDER_H = SINGLE_TOOL_HOLDER_H;
 const CLEANER_TOP = STAGE_BOTTOM - RACK_PADDING_Y - CLEANER_HOLDER_H;
-const MAYO_STAND_TOP = CLEANER_TOP - MAYO_LABEL_SPACE;
+const MAYO_STAND_TOP = CLEANER_TOP - MAYO_LABEL_SPACE - MAYO_EXTRA_CONTENT_HEIGHT;
 const BED_BOTTOM =
   MAYO_STAND_TOP - STAGE_GAP * DEFAULT_STAGE_ASPECT_RATIO;
 const MAYO_STAND_LEFT = BED_LEFT;
@@ -755,14 +845,17 @@ function mayoListRectForHolder(
   holderRects: Record<StageHolderId, StageHolderRect>,
 ): StageHolderRect & { scale: number; compact: boolean; gridIndex: number } {
   const contentRect = contentRectForHolder(holderId, holderRects[holderId]);
-  const columnCount = count <= 1 ? 1 : 2;
+  // Mayo is a scan-first list. Keep up to three tool types in one full-width
+  // column so Korean instrument names and the reuse/recovery confidence do
+  // not collapse into a narrow grid at desktop widths.
+  const columnCount = count <= 3 ? 1 : 2;
   const rowCount = Math.max(1, Math.ceil(count / columnCount));
   const rowGap = rowCount > 1 ? 0.45 : 0;
   const columnGap = columnCount > 1 ? 0.8 : 0;
   const rowHeight = Math.max(1.9, (contentRect.height - rowGap * (rowCount - 1)) / rowCount);
   const rowWidth =
     columnCount === 1
-      ? contentRect.width * 0.5
+      ? contentRect.width
       : (contentRect.width - columnGap) / columnCount;
   const gridWidth = rowWidth * columnCount + columnGap * (columnCount - 1);
   const startLeft = contentRect.left + (contentRect.width - gridWidth) / 2;
@@ -907,16 +1000,14 @@ function footerBadgesForInstrument(
       isActiveRecoveryInstrument(instrument, activeRecoveryToolIds) ||
       instrument.lifecycle_stage === "mayo_recovery" ||
       instrument.next_required_transition === "recover_left";
-    const decisionBadge: StageToolChipBadge = finalRecovery
-      ? {
+    // VLM evidence is shown beside the name by the stage observer.  Do not
+    // spend the constrained Mayo card on a generic "pending" tag.
+    const badges: StageToolChipBadge[] = finalRecovery
+      ? [{
           label: language === "ko" ? "회수 예정" : "Recovery scheduled",
           tone: "recovery",
-        }
-      : {
-          label: language === "ko" ? "판단 대기" : "Decision pending",
-          tone: "neutral",
-        };
-    const badges: StageToolChipBadge[] = [decisionBadge];
+        }]
+      : [];
     if (instrument.contaminated) {
       badges.push({ label: ui.contaminated, tone: "danger" });
     }
@@ -1053,9 +1144,9 @@ function placeholderInstrumentStates(metadata: LayoutDisplayMetadata | undefined
   });
 }
 
-function runtimeLayout(bundleName: string, state: SimulationState): LayoutBundle {
-  if (state.layout_json) {
-    const parsed = parseBoundedJson(state.layout_json);
+function runtimeLayout(bundleName: string, layoutJson: string | undefined): LayoutBundle {
+  if (layoutJson) {
+    const parsed = parseBoundedJson(layoutJson);
     if (isLayoutBundle(parsed)) {
       const parsedProcedureId = parsed.metadata?.procedure?.id ?? "";
       if (!bundleName || !parsedProcedureId || parsedProcedureId === bundleName) {
@@ -1928,19 +2019,30 @@ export function useDigitalTwinViewModel({
     return () => window.clearTimeout(timer);
   }, [vlmHealthReceivedAt, vlmShouldRun]);
 
+  // Scenario layout and tool-name formatting change with metadata, not every
+  // VLM/BT/ASR update. Keep these references stable for the stage and operation
+  // presentation consumers, and parse the layout only when its JSON changes.
+  const layout = useMemo(
+    () => runtimeLayout(activeBundle, simulationState.layout_json),
+    [activeBundle, simulationState.layout_json],
+  );
+  const toolDisplayById = useMemo(
+    () => new Map((layout.metadata?.instruments ?? []).map((instrument) => [instrument.id, instrument])),
+    [layout],
+  );
+  const localizedToolName = useCallback((instrumentId: string) =>
+    localizedDisplayName(toolDisplayById.get(instrumentId), language, displayToolName(instrumentId, language)),
+  [language, toolDisplayById]);
+
   const viewModel = useMemo(() => {
     const ui = getUiCopy(language);
     // Runtime layout_json is the only procedure-specific layout projection.
     // The local generator is a transport/bootstrap fallback, not another
     // editable per-bundle catalog.
-    const layout = runtimeLayout(activeBundle, simulationState);
     const metadata = layout.metadata;
     const catalog = metadata?.display_catalog;
     const phaseDisplayById = new Map((metadata?.phases ?? []).map((phase) => [phase.id, phase]));
-    const toolDisplayById = new Map((metadata?.instruments ?? []).map((instrument) => [instrument.id, instrument]));
     const bundleDisplayById = new Map((metadata?.bundles ?? []).map((bundle) => [bundle.id, bundle]));
-    const localizedToolName = (instrumentId: string) =>
-      localizedDisplayName(toolDisplayById.get(instrumentId), language, displayToolName(instrumentId, language));
     const localizedPhaseName = (phaseId: string) =>
       localizedDisplayName(phaseDisplayById.get(phaseId), language, displayPhaseName(phaseId, language));
     const localizedBundleName = (bundleName: string) =>
@@ -2338,6 +2440,7 @@ export function useDigitalTwinViewModel({
           contaminated && !representativeBadges.some((badge) => badge.tone === "danger")
             ? [...representativeBadges, { label: ui.contaminated, tone: "danger" as const }]
             : representativeBadges;
+        const canonicalMayoDecision = canonicalMayoDecisionForDisplayGroup(group.instruments);
         const visualId =
           group.instruments.length > 1
             ? `${holderId}:${group.id}`
@@ -2348,6 +2451,7 @@ export function useDigitalTwinViewModel({
           label,
           shortLabel: toolShortLabel(label),
           instanceIds: group.instruments.map(instrumentInstanceKey),
+          s: group.instruments.map((candidate) => candidate.lifecycle_stage === "surgeon_owned"),
           displayInstanceId: instrumentInstanceKey(instrument),
           quantity: group.instruments.length,
           holderId,
@@ -2369,7 +2473,7 @@ export function useDigitalTwinViewModel({
             language,
             titleize(displayLifecycleForInstrument(instrument, activeRecoveryToolIds)),
           ),
-          mayoDecisionEligible: group.instruments.some(isMayoDecisionEligible),
+          canonicalMayoDecision,
           footerBadges,
           contaminated,
           active,
@@ -2484,12 +2588,12 @@ export function useDigitalTwinViewModel({
       activeHolderIds.add(arm.includes("left") ? "humanoid_left" : "humanoid_right");
     }
 
-    const skillState = skillStatus.state || "";
+    const skillState = skillStatus.state.trim().toLowerCase();
     const skillIsInFlight =
       runtimeAllowsActiveTask && Boolean(skillStatus.action) && !TERMINAL_SKILL_STATES.has(skillState);
     const activeActionId = skillIsInFlight
       ? skillStatus.action
-      : runtimeAllowsActiveTask
+      : runtimeAllowsActiveTask && Boolean(simulationState.active_robot_task_id)
         ? simulationState.active_robot_task_type
         : "";
     const robotTaskLabel =
@@ -2512,7 +2616,7 @@ export function useDigitalTwinViewModel({
           : "";
     const activeActionToolId = skillIsInFlight
       ? skillStatus.instrument_id
-      : runtimeAllowsActiveTask
+      : runtimeAllowsActiveTask && Boolean(simulationState.active_robot_task_id)
         ? simulationState.active_robot_task_tool_id
         : "";
     const humanoidActionToolLabel = activeActionToolId
@@ -2712,6 +2816,8 @@ export function useDigitalTwinViewModel({
 
     const hasVlmHealth = vlmHealthReceivedAt !== null;
     const vlmHealthFresh = hasVlmHealth && nowMs - vlmHealthReceivedAt <= VLM_HEALTH_MAX_AGE_MS;
+    const hasVlmResult = vlmResultReceivedAt !== null;
+    const vlmResultFresh = hasVlmResult && nowMs - vlmResultReceivedAt <= VLM_HEALTH_MAX_AGE_MS;
     const vlmHealthStale = vlmShouldRun && hasVlmHealth && !vlmHealthFresh;
     const vlmConnectionLabel = !vlmShouldRun
       ? hasVlmHealth && vlmHealth.connected
@@ -2783,6 +2889,14 @@ export function useDigitalTwinViewModel({
       className: vlmClassName,
       healthAge: elapsedLabel(vlmHealthReceivedAt, language),
       resultAge: elapsedLabel(vlmResultReceivedAt, language),
+      // Demand forecasts are read directly from the current VLM result. The
+      // health heartbeat remains visible separately, but a stale result must
+      // never keep a historical surgeon-demand probability on the stage.
+      demandForecastReady: Boolean(vlmShouldRun && vlmResultFresh),
+      // This is the configured model reported by VLM health. Its actual load
+      // state remains a catalog fact and is deliberately shown separately.
+      modelId: vlmHealth.model_id.trim(),
+      lastError: vlmHealth.last_error.trim(),
       detail: vlmWaitingForImage
         ? language === "ko"
           ? "카메라 프레임이 다시 들어오면 VLM 추론을 자동으로 재개합니다."
@@ -2880,6 +2994,9 @@ export function useDigitalTwinViewModel({
       anchorLabel: anchorNameForId,
     };
   }, [
+    layout,
+    localizedToolName,
+    toolDisplayById,
     language,
     activeBundle,
     simulationState,

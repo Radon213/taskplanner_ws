@@ -237,6 +237,59 @@ button {
   white-space: nowrap;
 }
 
+.ribbon-model-control.read-only {
+  align-items: stretch;
+}
+
+.ribbon-model-control.read-only .ribbon-model-label {
+  align-self: center;
+}
+
+.vlm-runtime-readout {
+  display: grid;
+  min-width: 0;
+  flex: 1 1 auto;
+  gap: 2px;
+  line-height: 1.25;
+}
+
+.vlm-runtime-identity,
+.vlm-runtime-facts {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.vlm-runtime-identity {
+  color: var(--soft);
+  font-size: 12px;
+}
+
+.vlm-runtime-provider {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.vlm-runtime-model {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.vlm-runtime-facts {
+  flex-wrap: wrap;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 500;
+}
+
 .provider-model-select-shell {
   position: relative;
   display: block;
@@ -862,13 +915,6 @@ button {
   color: var(--robot-strong);
 }
 
-.mission-layout {
-  display: grid;
-  grid-template-columns: minmax(280px, 0.85fr) minmax(640px, 2.1fr) minmax(300px, 0.92fr);
-  gap: 14px;
-  margin-top: 14px;
-}
-
 .dock {
   min-width: 0;
   padding: 16px;
@@ -1173,17 +1219,14 @@ button {
 
 .integration-preflight-header span,
 .integration-preflight-meta,
-.integration-preflight-panel li small,
-.monitor-handoff span,
-.monitor-handoff small {
+.integration-preflight-panel li small {
   color: var(--muted);
   font-size: 10px;
   font-weight: 600;
   line-height: 1.3;
 }
 
-.integration-preflight-header strong,
-.monitor-handoff strong {
+.integration-preflight-header strong {
   color: var(--text);
   font-size: 13px;
   line-height: 1.2;
@@ -1291,8 +1334,7 @@ button {
   color: var(--color-danger-text);
 }
 
-.integration-preflight-panel li > div,
-.monitor-handoff > div {
+.integration-preflight-panel li > div {
   display: grid;
   min-width: 0;
   gap: 2px;
@@ -1597,32 +1639,103 @@ button {
   grid-column: auto;
 }
 
-.monitor-handoff {
+.rosbag-recording-control {
   display: grid;
-  min-width: 0;
-  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  margin-top: 4px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.035);
+}
+
+.rosbag-recording-control.is-recording {
+  border-color: color-mix(in srgb, var(--warning) 56%, var(--line));
+}
+
+.rosbag-recording-control.is-failed {
+  border-color: color-mix(in srgb, var(--warning) 72%, var(--line));
+}
+
+.rosbag-recording-heading {
+  display: flex;
   align-items: center;
-  gap: 10px;
-  margin-top: 10px;
-  padding: 10px;
-  border: 1px solid rgba(105, 193, 255, 0.24);
-  border-radius: var(--radius);
-  background: rgba(105, 193, 255, 0.06);
+  justify-content: space-between;
+  gap: 8px;
 }
 
-.monitor-handoff .button {
+.rosbag-recording-heading > div {
+  display: grid;
+  gap: 4px;
   min-width: 0;
-  white-space: nowrap;
 }
 
-@media (max-width: 420px) {
-  .monitor-handoff {
-    grid-template-columns: 1fr;
-  }
+.rosbag-recording-heading p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
 
-  .monitor-handoff .button {
-    width: 100%;
-  }
+.rosbag-recording-heading strong {
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1.2;
+}
+
+.rosbag-recording-heading > span {
+  flex: 0 0 auto;
+  padding: 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.2;
+}
+
+.rosbag-recording-control.is-recording .rosbag-recording-heading > span {
+  border-color: color-mix(in srgb, var(--warning) 58%, var(--line));
+  color: var(--warning);
+}
+
+.rosbag-recording-note,
+.rosbag-recording-status {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.rosbag-recording-toggle {
+  min-height: 44px;
+  width: 100%;
+}
+
+.rosbag-recording-toggle.button-stop {
+  border: 1px solid color-mix(in srgb, var(--warning) 58%, var(--line));
+  background: color-mix(in srgb, var(--warning) 14%, transparent);
+  color: var(--text);
+}
+
+.rosbag-recording-status {
+  display: grid;
+  gap: 4px;
+}
+
+.rosbag-recording-status[role="alert"] span {
+  color: var(--warning);
+}
+
+.rosbag-recording-status code {
+  overflow: hidden;
+  color: var(--soft);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .command-status {
@@ -3338,10 +3451,6 @@ button {
 }
 
 @media (max-width: 1280px) {
-  .mission-layout {
-    grid-template-columns: minmax(260px, 0.85fr) minmax(560px, 1.8fr);
-  }
-
   .surgeon-dock {
     grid-column: 1 / -1;
     display: grid;
@@ -3367,7 +3476,6 @@ button {
 
 @media (max-width: 960px) {
   .top-ribbon,
-  .mission-layout,
   .observability-panel {
     grid-template-columns: 1fr;
   }
@@ -3658,14 +3766,6 @@ body {
 .button-quiet {
   border-color: rgba(129, 157, 198, 0.26);
   background: rgba(255, 255, 255, 0.04);
-}
-
-.mission-layout {
-  display: grid;
-  grid-template-columns: minmax(720px, 1fr) clamp(320px, 24vw, 380px);
-  gap: 16px;
-  align-items: start;
-  margin-top: 16px;
 }
 
 .board-column,
@@ -5071,122 +5171,6 @@ body {
   text-align: center;
 }
 
-.tool-chip.mayoList {
-  flex-direction: row;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  padding: 8px 10px;
-  border-radius: 10px;
-  box-shadow: 0 6px 14px rgba(0, 0, 0, 0.18);
-}
-
-.tool-chip.mayoList .tool-chip-header {
-  flex: 1 1 auto;
-  justify-content: flex-start;
-  min-width: 0;
-}
-
-.tool-chip.mayoList .tool-chip-header strong {
-  display: block;
-  width: 100%;
-  color: var(--color-text);
-  font-size: 13px;
-  line-height: 1.15;
-  text-align: left;
-}
-
-.tool-chip.mayoList .chip-label-full {
-  display: inline;
-}
-
-.tool-chip.mayoList .chip-label-short {
-  display: none;
-}
-
-.tool-chip.mayoList .tool-chip-footer-badges {
-  flex: 0 0 auto;
-  max-width: 48%;
-  justify-content: flex-end;
-  gap: 4px;
-}
-
-.tool-chip.mayoList .tool-chip-footer-badges > span {
-  max-width: 100%;
-  padding: 3px 7px;
-  font-size: 10px;
-  line-height: 1.1;
-}
-
-.tool-chip.mayoList.density-comfortable {
-  flex-direction: column;
-  align-items: flex-start;
-  justify-content: center;
-  gap: 10px;
-  padding: 10px 12px;
-}
-
-.tool-chip.mayoList.density-comfortable .tool-chip-header {
-  width: 100%;
-}
-
-.tool-chip.mayoList.density-comfortable .tool-chip-header strong {
-  font-size: 15px;
-  line-height: 1.18;
-}
-
-.tool-chip.mayoList.density-comfortable .tool-chip-footer-badges {
-  width: 100%;
-  max-width: 100%;
-  justify-content: flex-start;
-  gap: 5px;
-}
-
-.tool-chip.mayoList.density-comfortable .tool-chip-footer-badges > span {
-  padding: 4px 8px;
-  font-size: 11px;
-}
-
-.tool-chip.mayoList.density-dense {
-  gap: 5px;
-  padding: 5px 7px;
-}
-
-.tool-chip.mayoList.density-dense .tool-chip-header strong {
-  font-size: 11px;
-  line-height: 1.1;
-}
-
-.tool-chip.mayoList.density-dense .tool-chip-footer-badges {
-  max-width: 42%;
-  gap: 2px;
-}
-
-.tool-chip.mayoList.density-dense .tool-chip-footer-badges > span {
-  padding: 2px 5px;
-  font-size: 8px;
-}
-
-.tool-chip.mayoList.density-micro {
-  gap: 4px;
-  padding: 4px 6px;
-}
-
-.tool-chip.mayoList.density-micro .tool-chip-header strong {
-  font-size: 9px;
-  line-height: 1.05;
-}
-
-.tool-chip.mayoList.density-micro .tool-chip-footer-badges {
-  max-width: 38%;
-  gap: 2px;
-}
-
-.tool-chip.mayoList.density-micro .tool-chip-footer-badges > span {
-  padding: 1px 4px;
-  font-size: 7px;
-}
-
 .tool-chip.handover {
   border-color: rgba(107, 184, 255, 0.56);
   background: rgba(60, 122, 196, 0.26);
@@ -5261,14 +5245,7 @@ body {
   border-radius: 10px;
 }
 
-@media (max-width: 1280px) {
-  .mission-layout {
-    grid-template-columns: minmax(620px, 1fr) clamp(300px, 28vw, 360px);
-  }
-}
-
 @media (max-width: 960px) {
-  .mission-layout,
   .observability-panel {
     grid-template-columns: 1fr;
   }
@@ -5488,26 +5465,9 @@ body {
   min-height: 0;
 }
 
-.mission-layout {
-  grid-template-columns: minmax(0, 1fr);
-  grid-template-areas:
-    "stage"
-    "surgeon"
-    "runtime"
-    "timeline";
-}
-
 @media (min-width: 1280px) {
   .app-shell {
     width: min(100%, 2560px);
-  }
-
-  .mission-layout {
-    grid-template-columns: minmax(600px, 1.58fr) minmax(250px, 0.48fr) minmax(300px, 0.56fr);
-    grid-template-areas:
-      "stage surgeon runtime"
-      "timeline timeline timeline";
-    align-items: stretch;
   }
 
   .runtime-area {
@@ -5699,13 +5659,6 @@ body {
     padding: 16px;
   }
 
-  .mission-layout {
-    min-height: 0;
-    margin-top: 0;
-    grid-template-rows: minmax(0, 1fr) clamp(168px, 19vh, 248px);
-    gap: 14px;
-  }
-
   .top-ribbon {
     min-height: 74px;
   }
@@ -5724,14 +5677,10 @@ body {
   .explain-panel {
     padding: 14px;
   }
+
 }
 
 @media (min-width: 1920px) and (min-height: 1000px) {
-  .mission-layout {
-    grid-template-columns: minmax(900px, 1.7fr) minmax(320px, 0.5fr) minmax(400px, 0.62fr);
-    grid-template-rows: minmax(0, 1fr) clamp(148px, 14vh, 196px);
-  }
-
   .timeline-area .timeline-strip {
     --timeline-card-width: calc((100% - 84px) / 8);
     gap: 12px;
@@ -7465,6 +7414,17 @@ body {
   object-fit: cover;
 }
 
+/* Live media uses two persistent image slots. A decoded successor becomes
+ * visible before the previous JPEG is hidden, so a 15 Hz source never exposes
+ * the browser's transient empty decode surface. */
+.stage-camera-canvas .stage-camera-frame-buffer {
+  visibility: hidden;
+}
+
+.stage-camera-canvas .stage-camera-frame-buffer[data-active="true"] {
+  visibility: visible;
+}
+
 .stage-camera-canvas .stage-camera-overlay {
   z-index: 2;
   pointer-events: none;
@@ -8216,13 +8176,6 @@ textarea {
   color: var(--color-accent-strong);
 }
 
-.mission-layout.live-stage-expanded {
-  grid-template-areas:
-    "stage"
-    "runtime"
-    "timeline";
-}
-
 /* Production separates deployment configuration from observed typed-message
    health. The card does not attest a DDS publisher IP or expose local controls. */
 .typed-rfdetr-status {
@@ -8432,6 +8385,10 @@ textarea {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 8px;
+}
+
+.live-asr-input-mode > div {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
 .live-asr-route-policy label {
@@ -8726,21 +8683,8 @@ textarea {
 }
 
 @media (min-width: 1280px) {
-  .mission-layout.live-stage-expanded {
-    grid-template-columns: minmax(0, 1fr) minmax(300px, 0.56fr);
-    grid-template-areas:
-      "stage runtime"
-      "timeline timeline";
-  }
-
   .mission-layout.live-stage-expanded .runtime-area {
     grid-template-rows: auto auto minmax(0, 1fr);
-  }
-}
-
-@media (min-width: 1920px) and (min-height: 1000px) {
-  .mission-layout.live-stage-expanded {
-    grid-template-columns: minmax(0, 2.18fr) minmax(400px, 0.62fr);
   }
 }
 

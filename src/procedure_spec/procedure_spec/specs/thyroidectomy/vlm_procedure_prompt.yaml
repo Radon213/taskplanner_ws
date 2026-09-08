@@ -73,7 +73,6 @@ scenario_policy:
     surgeon_actor_enabled: true
     phase_inference_enabled: true
     retraction_workflow_state_enforced: true
-    legacy_raw_retractor_voice_enabled: false
 
 bed_robot_arm_groups:
   direction_enum: [UP, DOWN, LEFT, RIGHT, LEFT_RIGHT, UP_DOWN]

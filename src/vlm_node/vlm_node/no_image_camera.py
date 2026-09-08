@@ -8,13 +8,23 @@ from typing import Iterable
 
 from PIL import Image, ImageDraw, ImageFont
 from procedure_spec import get_default_spec_dir, load_bundle
+from procedure_spec.scenario_consumer import (
+    ScenarioConfigConsumerBinding,
+    scenario_config_apply_is_safe,
+)
 import rclpy
 from rcl_interfaces.msg import SetParametersResult
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.parameter import Parameter
+from rclpy.qos import (
+    DurabilityPolicy,
+    QoSProfile,
+    ReliabilityPolicy,
+    qos_profile_sensor_data,
+)
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
-from surgical_msgs.msg import SkillStatus
+from surgical_msgs.msg import SimulationState, SkillStatus
 
 
 RECOVERY_ACTIONS = {
@@ -55,6 +65,9 @@ class NoImageCameraNode(Node):
         self.declare_parameter("label", "")
         self.declare_parameter("jpeg_quality", 88)
         self.declare_parameter("spec_dir", str(get_default_spec_dir()))
+        self.declare_parameter(
+            "scenario_config_topic", "/simulation/scenario_config"
+        )
         self.declare_parameter("actor_overlay_topic", "/surgeon/actor_overlay")
         self.declare_parameter("skill_status_topic", "/skill/status")
 
@@ -65,6 +78,21 @@ class NoImageCameraNode(Node):
         self._label = str(self.get_parameter("label").value)
         self._jpeg_quality = int(self.get_parameter("jpeg_quality").value)
         self._spec_dir = str(self.get_parameter("spec_dir").value)
+        # This renderer does not own scenario selection.  Keep its accepted
+        # bundle root immutable for the process lifetime so a retained
+        # ScenarioStore message cannot redirect it to arbitrary local files.
+        self._scenario_config = ScenarioConfigConsumerBinding.from_spec_dir(
+            self._spec_dir
+        )
+        self._scenario_config_topic = str(
+            self.get_parameter("scenario_config_topic").value
+        ).strip()
+        if not self._scenario_config_topic:
+            raise ValueError("scenario_config_topic must not be empty")
+        self._scenario_state_received = False
+        self._scenario_running = False
+        self._scenario_execution_state = ""
+        self._scenario_initial_idle = True
         self._mayo_tools: list[str] = []
         self._actor_mayo_tools: set[str] = set()
         self._mayo_removed_by_skill: set[str] = set()
@@ -90,6 +118,23 @@ class NoImageCameraNode(Node):
             self._on_skill_status,
             20,
         )
+        self.create_subscription(
+            SimulationState,
+            "/simulation/state",
+            self._on_simulation_state,
+            20,
+        )
+        self.create_subscription(String, "/simulation/control_state", self._on_control, 20)
+        self.create_subscription(
+            String,
+            self._scenario_config_topic,
+            self._on_scenario_config,
+            QoSProfile(
+                depth=1,
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            ),
+        )
         self._timer = self.create_timer(self._period_sec(), self._publish)
         self.add_on_set_parameters_callback(self._on_parameters_changed)
 
@@ -97,6 +142,14 @@ class NoImageCameraNode(Node):
         return 1.0 / max(self._fps, 1.0)
 
     def _on_parameters_changed(self, params):
+        if any(parameter.name == "scenario_config_topic" for parameter in params):
+            return SetParametersResult(
+                successful=False,
+                reason=(
+                    "scenario_config_topic is process-lifetime; restart this "
+                    "perception node to rebind it"
+                ),
+            )
         rebuild_image = False
         rebuild_timer = False
         for parameter in params:
@@ -115,6 +168,9 @@ class NoImageCameraNode(Node):
             elif parameter.name == "spec_dir":
                 self._spec_dir = str(parameter.value)
                 self._tool_display_names = self._load_tool_display_names(self._spec_dir)
+                binding = getattr(self, "_scenario_config", None)
+                if binding is not None:
+                    binding.note_local_spec_dir(self._spec_dir)
                 self._mayo_tools = []
                 self._actor_mayo_tools.clear()
                 self._mayo_removed_by_skill.clear()
@@ -131,6 +187,77 @@ class NoImageCameraNode(Node):
             self._timer.cancel()
             self._timer = self.create_timer(self._period_sec(), self._publish)
         return SetParametersResult(successful=True)
+
+    def _on_scenario_config(self, message: String) -> None:
+        """Stage the selected scenario; this image source never selects it."""
+
+        try:
+            if not self._scenario_config.stage(message.data):
+                return
+        except Exception as exc:
+            self.get_logger().warning(
+                f"no-image camera scenario config ignored: {exc}"
+            )
+            return
+        self._apply_pending_scenario_config_if_safe()
+
+    def _apply_pending_scenario_config_if_safe(self) -> None:
+        """Apply one staged revision through the local overlay reload hook."""
+
+        binding = getattr(self, "_scenario_config", None)
+        if binding is None:
+            return
+        snapshot = binding.pending_snapshot()
+        if snapshot is None or not scenario_config_apply_is_safe(
+            state_received=bool(getattr(self, "_scenario_state_received", False)),
+            scenario_running=bool(getattr(self, "_scenario_running", False)),
+            execution_state=getattr(self, "_scenario_execution_state", ""),
+            initial_idle=bool(getattr(self, "_scenario_initial_idle", False)),
+        ):
+            return
+        try:
+            resolved = binding.revalidate_pending()
+            if resolved is None:
+                return
+            snapshot, bundle = resolved
+        except Exception as exc:
+            binding.discard(snapshot)
+            self.get_logger().warning(
+                f"no-image camera scenario config rejected before local swap: {exc}"
+            )
+            return
+        result = self.set_parameters_atomically(
+            [Parameter(name="spec_dir", value=bundle.spec_dir)]
+        )
+        if not bool(getattr(result, "successful", False)):
+            self.get_logger().warning(
+                "no-image camera scenario config local swap rejected: "
+                f"{getattr(result, 'reason', '') or 'unknown reason'}"
+            )
+            return
+        if not binding.commit(snapshot, bundle):
+            return
+        self.get_logger().info(
+            "no-image camera scenario revision applied locally: "
+            f"{snapshot.bundle_name}@{snapshot.revision}"
+        )
+
+    def _on_simulation_state(self, msg: SimulationState) -> None:
+        self._scenario_state_received = True
+        self._scenario_running = bool(getattr(msg, "running", False))
+        self._scenario_execution_state = str(
+            getattr(msg, "execution_state", "") or ""
+        ).strip()
+        self._apply_pending_scenario_config_if_safe()
+
+    def _on_control(self, msg: String) -> None:
+        command, _, _detail = str(msg.data or "").strip().partition(":")
+        command = command.strip().casefold()
+        if command in {"start", "start_actors", "start_runtime", "resume"}:
+            self._scenario_initial_idle = False
+        elif command in {"pause", "stop", "reset"}:
+            self._scenario_initial_idle = True
+        self._apply_pending_scenario_config_if_safe()
 
     def _load_tool_display_names(self, spec_dir: str) -> dict[str, str]:
         try:

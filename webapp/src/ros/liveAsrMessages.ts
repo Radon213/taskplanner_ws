@@ -20,6 +20,18 @@ type RosString = {
   data?: string;
 };
 
+type RosTime = {
+  sec?: number;
+  nanosec?: number;
+};
+
+type SpeechUtteranceWire = {
+  stamp?: RosTime;
+  utterance_id?: string;
+  text?: string;
+  is_final?: boolean;
+};
+
 /** Stable empty projection used while the ASR status topic is unavailable. */
 export const DEFAULT_LIVE_ASR_STATUS: LiveAsrStatus = {
   schema: "taskplanner.asr.status.v1",
@@ -45,6 +57,10 @@ export const DEFAULT_LIVE_ASR_STATUS: LiveAsrStatus = {
   peak_level_dbfs: -99,
   elapsed_sec: 0,
   partial_text: "",
+  local_onset_to_first_partial_ms: null,
+  local_onset_basis: "",
+  local_onset_dbfs: null,
+  local_onset_threshold_dbfs: null,
   finals: [],
   last_error: "",
   sample_rate: 16000,
@@ -121,6 +137,69 @@ function normalizeLiveAsrFinal(value: unknown): LiveAsrFinal | null {
   };
 }
 
+function rosTimeIso(value: RosTime | undefined): string {
+  const seconds = finiteNumber(value?.sec);
+  const nanoseconds = finiteNumber(value?.nanosec);
+  const milliseconds = seconds * 1_000 + nanoseconds / 1_000_000;
+  return milliseconds > 0 && Number.isFinite(milliseconds)
+    ? new Date(milliseconds).toISOString()
+    : "";
+}
+
+/** Normalize the non-executable partial transcript emitted by the adapter. */
+export function normalizeExternalAsrPartial(message: unknown): string | null {
+  if (!isBoundedRosPayload(message) || !message || typeof message !== "object") {
+    return null;
+  }
+  const utterance = message as SpeechUtteranceWire;
+  if (utterance.is_final !== false) return null;
+  const text = String(utterance.text ?? "").trim();
+  if (!text || text.length > MAX_LIVE_ASR_DISPLAY_TEXT_CHARS) return null;
+  return text;
+}
+
+/** Normalize one CommandRouter-observed final for the recent-final list. */
+export function normalizeExternalAsrFinal(message: unknown): LiveAsrFinal | null {
+  if (!isBoundedRosPayload(message) || !message || typeof message !== "object") {
+    return null;
+  }
+  const utterance = message as SpeechUtteranceWire;
+  if (utterance.is_final !== true || !String(utterance.utterance_id ?? "").trim()) {
+    return null;
+  }
+  const text = String(utterance.text ?? "").trim();
+  if (!text || text.length > MAX_LIVE_ASR_DISPLAY_TEXT_CHARS) return null;
+  return {
+    stamp: rosTimeIso(utterance.stamp),
+    text,
+    response_latency_ms: null,
+    latency_basis: "external_ros_topic",
+    latency_correlated: false,
+  };
+}
+
+/** Overlay external ROS transcripts without losing the ASR runtime heartbeat. */
+export function mergeExternalAsrTranscripts(
+  status: LiveAsrStatus,
+  partialText: string | null,
+  externalFinals: readonly LiveAsrFinal[],
+): LiveAsrStatus {
+  const finals = [...status.finals];
+  for (const externalFinal of externalFinals) {
+    const duplicateIndex = finals.findIndex((candidate) => (
+      candidate.stamp === externalFinal.stamp
+      && candidate.text === externalFinal.text
+    ));
+    if (duplicateIndex >= 0) finals.splice(duplicateIndex, 1);
+    finals.push(externalFinal);
+  }
+  return {
+    ...status,
+    partial_text: partialText === null ? status.partial_text : partialText,
+    finals: finals.slice(-MAX_LIVE_ASR_FINALS),
+  };
+}
+
 /**
  * Validate the versioned JSON envelope published on the read-only ASR status
  * topic. Malformed or oversized messages are rejected instead of being mixed
@@ -183,6 +262,13 @@ export function normalizeLiveAsrStatus(message: unknown): LiveAsrStatus | null {
       peak_level_dbfs: finiteNumber(snapshot.peak_level_dbfs, -99),
       elapsed_sec: Math.max(0, finiteNumber(snapshot.elapsed_sec)),
       partial_text: String(snapshot.partial_text ?? "").slice(0, MAX_LIVE_ASR_DISPLAY_TEXT_CHARS),
+      local_onset_to_first_partial_ms: (() => {
+        const value = optionalFiniteNumber(snapshot.local_onset_to_first_partial_ms);
+        return value === null ? null : Math.max(0, value);
+      })(),
+      local_onset_basis: String(snapshot.local_onset_basis ?? "").slice(0, 256),
+      local_onset_dbfs: optionalFiniteNumber(snapshot.local_onset_dbfs),
+      local_onset_threshold_dbfs: optionalFiniteNumber(snapshot.local_onset_threshold_dbfs),
       finals: rawFinals.map(normalizeLiveAsrFinal).filter((value): value is LiveAsrFinal => value !== null),
       last_error: String(snapshot.last_error ?? "").slice(0, MAX_LIVE_ASR_DISPLAY_TEXT_CHARS),
       sample_rate: Math.max(0, finiteNumber(snapshot.sample_rate, 16000)),

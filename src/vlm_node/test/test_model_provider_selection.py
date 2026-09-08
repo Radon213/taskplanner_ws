@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from types import SimpleNamespace
 
 from model_provider_registry import (
@@ -113,6 +114,9 @@ def test_offline_managed_model_selection_starts_runtime(monkeypatch):
     assert registry.ensure_calls == [
         ("ninfer", "qwen-vlm", "qwen-vlm")
     ]
+    snapshot = node._capture_inference_runtime_snapshot()
+    assert snapshot.model_runtime_state == "loading"
+    assert not node._model_runtime_ready(snapshot)
 
 
 def test_unreachable_external_provider_remains_rejected():
@@ -156,3 +160,43 @@ def test_unreachable_external_provider_remains_rejected():
     assert not result.success
     assert "unavailable" in result.message
     assert registry.ensure_calls == []
+
+
+def test_inference_snapshot_is_fenced_by_config_input_and_shutdown_epochs():
+    """Late responses must not cross a provider change or owner teardown."""
+
+    node = RealVLMNode.__new__(RealVLMNode)
+    node._provider_id = "ninfer"
+    node._model_id = "qwen-vlm"
+    node._inference_config_epoch = 12
+    node._model_input_epoch = 34
+    node._inference_shutdown = threading.Event()
+
+    snapshot = node._capture_inference_runtime_snapshot()
+    assert node._inference_snapshot_is_current(snapshot)
+
+    node._inference_config_epoch += 1
+    assert not node._inference_snapshot_is_current(snapshot)
+
+    snapshot = node._capture_inference_runtime_snapshot()
+    node._model_input_epoch += 1
+    assert not node._inference_snapshot_is_current(snapshot)
+
+    snapshot = node._capture_inference_runtime_snapshot()
+    node._inference_shutdown.set()
+    assert not node._inference_snapshot_is_current(snapshot)
+
+
+def test_loading_selected_model_is_not_inference_ready():
+    """Provider connectivity does not imply that its selected model is usable."""
+
+    node = RealVLMNode.__new__(RealVLMNode)
+    node._provider_id = "ninfer"
+    node._model_id = "qwen-vlm"
+    node._selected_model_runtime_provider_id = "ninfer"
+    node._selected_model_runtime_model_id = "qwen-vlm"
+    node._selected_model_runtime_state = "loading"
+
+    assert not node._model_runtime_ready(
+        node._capture_inference_runtime_snapshot()
+    )

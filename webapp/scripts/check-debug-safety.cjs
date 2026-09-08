@@ -30,11 +30,11 @@ if (bridge.includes('name: "/integration/readiness"')) {
 if (bridge.includes('name: "/sensors/surgeon/sentence"')) {
   violations.push("Debug UI must not publish surgeon sentences directly through ROSBridge");
 }
-if (!workspace.includes('runCommand("publish_voice_command", { text: normalized })')) {
-  violations.push("Manual sentences must pass through the backend debug command gate");
+if (workspace.includes("publish_voice_command") || bridge.includes("publish_voice_command")) {
+  violations.push("Debug must not restore the legacy raw-text voice injection path");
 }
-if (!workspace.includes("!interventionAllowed || !status.session.armed || !sentence.trim() || sentencePending")) {
-  violations.push("Manual sentence submission must be disabled while manual control is disarmed");
+if (!workspace.includes("/surgery/audio/observed_utterance")) {
+  violations.push("Debug must display the CommandRouter observed-utterance relay");
 }
 if (!workspace.includes('disabled={!connected || !interventionAllowed || !armed || pending} onClick={() => void invoke("publish_once"')) {
   violations.push("One-shot dummy output must require the backend intervention gate and armed manual control");
@@ -68,9 +68,6 @@ if (!bridge.includes("operational_control_window_open?: boolean")) {
 }
 if (!bridge.includes("startsOperationalIntervention(operation, payload)")) {
   violations.push("The Debug command client must gate intervention-starting operations before transport");
-}
-if (!bridge.includes('"vlm_load",')) {
-  violations.push("Shared VLM load must use the operational intervention gate");
 }
 if (!workspace.includes('"운영 시나리오 일시정지 · 신규 개입 가능"')) {
   violations.push("Debug UI must identify a paused operational intervention window");

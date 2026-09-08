@@ -10,31 +10,39 @@ import {
   type ErrorInfo,
   type ReactNode,
 } from "react";
-import { useReducedMotion } from "framer-motion";
-import * as m from "framer-motion/m";
-
 import { ProcedureDock } from "./components/command/ProcedureDock";
 import { LiveAsrPanel } from "./components/command/LiveAsrPanel";
 import {
   type HandHandoverSignal,
 } from "./components/command/HandHandoverSignalStatus";
 import { StatusRibbon } from "./components/command/StatusRibbon";
-import { TypedRfdetrObservationStatus } from "./components/observability/TypedRfdetrObservationStatus";
-import {
-  deriveVlmOperationObservations,
-  executionDispatchEventFromTrace,
-  latestActualDispatch,
-  OperationExecutionDispatchFeed,
-  type ExecutionDispatchEvent,
-} from "./components/observability/OperationVlmObservability";
+import { SurgeryRecordResponseModal } from "./components/observability/SurgeryRecordResponseModal";
+import { ToolBeliefPanel } from "./components/stage/ToolBeliefPanel";
 import { useDigitalTwinViewModel } from "./hooks/useDigitalTwinViewModel";
 import { useRosBridge } from "./hooks/useRosBridge";
 import { useRuntimeControl } from "./hooks/useRuntimeControl";
+import { useRosbagUiAuditReplay } from "./hooks/useRosbagUiReplay";
+import type { RuntimeOwnerMode } from "./hooks/useRuntimeOwnerControl";
+import { deriveOperationPresentation } from "./presentation/operationPresentation";
+import {
+  initialRosbagUiReplayState,
+  isRosbagPresentationReplayEnabled,
+  reduceRosbagUiReplayState,
+  type RosbagUiReplayState,
+} from "./presentation/rosbagUiReplay";
+import type {
+  RosbagStageCameraId,
+  RosbagStageCameraSlot,
+  RosbagUiAuditEventName,
+  RosbagUiPresentation,
+} from "./ros/rosbagUiAuditMessages";
 import {
   initialRuntimeMode,
   lastMissionModeStorageKey,
   persistRuntimeMode,
+  rosbagReplayRuntimeMode,
   runtimeBridgeUrl,
+  surgimateUrl,
   type TaskplannerRuntimeMode,
 } from "./runtimeModes";
 import {
@@ -44,9 +52,8 @@ import {
   runtimeModeIsAvailable,
 } from "./runtimeFeatures";
 import { type Language } from "./utils/display";
-import { shimmer } from "./motion-system";
 
-type PrimaryWorkspace = "mission" | "monitor" | "multicam" | "debug";
+type PrimaryWorkspace = "mission" | "multicam" | "debug";
 type WorkspaceHistoryAction = "push" | "replace" | "none";
 type MissionRuntimeMode = Exclude<TaskplannerRuntimeMode, "debug">;
 type RuntimeTransitionSafety = {
@@ -56,6 +63,19 @@ type RuntimeTransitionSafety = {
   actionPending: boolean;
 };
 
+type RosbagUiAuditPublisher = (
+  event: RosbagUiAuditEventName,
+  presentation: RosbagUiPresentation,
+  value?: string,
+) => void;
+
+function runtimeOwnerModeFor(runtimeMode: TaskplannerRuntimeMode): RuntimeOwnerMode | null {
+  if (runtimeMode === "live") return "live";
+  if (runtimeMode === "llm") return "llm-surgeon";
+  if (runtimeMode === "shadow") return "replay";
+  return "debug";
+}
+
 const DebugWorkspace = lazy(() =>
   import("./components/debug/DebugWorkspace").then((module) => ({
     default: module.DebugWorkspace,
@@ -64,11 +84,6 @@ const DebugWorkspace = lazy(() =>
 const MulticamOpsWorkspace = lazy(() =>
   import("./components/multicam/MulticamOpsWorkspace").then((module) => ({
     default: module.MulticamOpsWorkspace,
-  })),
-);
-const SurgiMateMonitorWorkspace = lazy(() =>
-  import("./components/monitor/SurgiMateMonitorWorkspace").then((module) => ({
-    default: module.SurgiMateMonitorWorkspace,
   })),
 );
 const ShadowReplayDock = lazy(() =>
@@ -86,6 +101,11 @@ const ObservabilityPanel = lazy(() =>
     default: module.ObservabilityPanel,
   })),
 );
+const OperationExecutionDispatchFeed = lazy(() =>
+  import("./components/observability/OperationVlmObservability").then((module) => ({
+    default: module.OperationExecutionDispatchFeed,
+  })),
+);
 const OperatingRoomStage = lazy(() =>
   import("./components/stage/OperatingRoomStage").then((module) => ({
     default: module.OperatingRoomStage,
@@ -94,6 +114,16 @@ const OperatingRoomStage = lazy(() =>
 const VlmStructuredToolDetectionEvidencePanel = lazy(() =>
   import("./components/observability/VlmStructuredToolDetectionEvidencePanel").then((module) => ({
     default: module.VlmStructuredToolDetectionEvidencePanel,
+  })),
+);
+const TypedRfdetrObservationStatus = lazy(() =>
+  import("./components/observability/TypedRfdetrObservationStatus").then((module) => ({
+    default: module.TypedRfdetrObservationStatus,
+  })),
+);
+const TtsPlaybackStatusCard = lazy(() =>
+  import("./components/observability/TtsPlaybackStatusCard").then((module) => ({
+    default: module.TtsPlaybackStatusCard,
   })),
 );
 
@@ -112,8 +142,6 @@ function WorkspaceLoading({
   onExit?: () => void;
   exitLabel?: string;
 }) {
-  const reduceMotion = useReducedMotion();
-  const shimmerMotion = reduceMotion ? {} : shimmer;
   return (
     <div className="app-shell" data-slot="workspace-loading-state">
       <main aria-busy={!error} aria-live="polite" className="debug-main" id="workspace-loading-main">
@@ -134,9 +162,9 @@ function WorkspaceLoading({
             </div>
           ) : (
             <>
-              <m.div className="debug-skeleton-title" {...shimmerMotion} />
-              <m.div className="debug-skeleton-row" {...shimmerMotion} />
-              <m.div className="debug-skeleton-row short" {...shimmerMotion} />
+              <div className="debug-skeleton-title" />
+              <div className="debug-skeleton-row" />
+              <div className="debug-skeleton-row short" />
               <span className="sr-only">{label}</span>
               {onExit ? (
                 <button className="runtime-transition-retry" onClick={onExit} type="button">
@@ -187,17 +215,24 @@ class WorkspaceErrorBoundary extends Component<{
 
 function workspaceFromLocation(optionalUiEnabled: boolean): PrimaryWorkspace {
   if (typeof window === "undefined") return "mission";
-  if (!optionalUiEnabled) return "mission";
   const pathname = window.location.pathname.replace(/\/+$/, "") || "/";
   if (pathname === "/debug") return "debug";
   const requested = new URLSearchParams(window.location.search).get("workspace");
-  return requested === "monitor" || requested === "multicam" || requested === "debug"
-    ? requested
-    : "mission";
+  if (requested === "debug") return "debug";
+  if (!optionalUiEnabled) return "mission";
+  return requested === "multicam" ? requested : "mission";
 }
 
 export default function App() {
-  const [runtimeMode, setRuntimeMode] = useState<TaskplannerRuntimeMode>(initialRuntimeMode);
+  // Replay uses the deployment's explicit replay bridge (shadow in the
+  // isolated Replay profile, Live otherwise), never a stale Debug/LLM
+  // browser preference. Both the screen projection and the audit listener
+  // must observe the same bag playback graph.
+  const [replayPresentationOnly] = useState(() => isRosbagPresentationReplayEnabled());
+  const [replayRuntimeMode] = useState(() => rosbagReplayRuntimeMode());
+  const [runtimeMode, setRuntimeMode] = useState<TaskplannerRuntimeMode>(() =>
+    replayPresentationOnly ? replayRuntimeMode : initialRuntimeMode(),
+  );
   const {
     status: runtimeTransition,
     refresh: refreshRuntimeControl,
@@ -212,6 +247,11 @@ export default function App() {
     if (typeof window === "undefined") return "ko";
     return window.localStorage.getItem("taskplanner.language") === "en" ? "en" : "ko";
   });
+  const [rosbagUiReplayState, setRosbagUiReplayState] = useState<RosbagUiReplayState>(() =>
+    initialRosbagUiReplayState({ language, workspace }),
+  );
+  const rosbagUiReplayStateRef = useRef(rosbagUiReplayState);
+  const rosbagUiAuditPublisherRef = useRef<RosbagUiAuditPublisher | null>(null);
   const [lastMissionMode, setLastMissionMode] = useState<MissionRuntimeMode>(() => {
     if (!OPTIONAL_OPERATIONS_UI_ENABLED) return "live";
     if (typeof window === "undefined") return "live";
@@ -219,20 +259,43 @@ export default function App() {
     return stored === "live" || stored === "llm" || stored === "shadow" ? stored : "live";
   });
 
-  useEffect(() => {
-    window.localStorage.setItem("taskplanner.language", language);
-    document.documentElement.lang = language;
-  }, [language]);
+  const commitRosbagUiReplayState = useCallback((next: RosbagUiReplayState) => {
+    rosbagUiReplayStateRef.current = next;
+    setRosbagUiReplayState(next);
+  }, []);
+
+  const applyRosbagUiAuditReplay = useCallback((event: Parameters<typeof reduceRosbagUiReplayState>[1]) => {
+    if (!replayPresentationOnly) return;
+    const next = reduceRosbagUiReplayState(rosbagUiReplayStateRef.current, event);
+    commitRosbagUiReplayState(next);
+    setLanguage(next.presentation.language);
+    setWorkspace(next.presentation.workspace);
+  }, [commitRosbagUiReplayState, replayPresentationOnly]);
+
+  useRosbagUiAuditReplay({
+    enabled: replayPresentationOnly,
+    url: runtimeBridgeUrl(replayRuntimeMode),
+    onAudit: applyRosbagUiAuditReplay,
+  });
 
   useEffect(() => {
+    if (!replayPresentationOnly) {
+      window.localStorage.setItem("taskplanner.language", language);
+    }
+    document.documentElement.lang = language;
+  }, [language, replayPresentationOnly]);
+
+  useEffect(() => {
+    if (replayPresentationOnly) return;
     persistRuntimeMode(runtimeMode);
     if (runtimeMode !== "debug" && runtimeModeIsAvailable(runtimeMode)) {
       setLastMissionMode(runtimeMode);
       window.localStorage.setItem(lastMissionModeStorageKey(), runtimeMode);
     }
-  }, [runtimeMode]);
+  }, [replayPresentationOnly, runtimeMode]);
 
   useEffect(() => {
+    if (replayPresentationOnly) return;
     if (
       (workspace !== "mission" && workspace !== "debug") ||
       runtimeTransition.phase !== "idle" ||
@@ -242,15 +305,60 @@ export default function App() {
       return;
     }
     setRuntimeMode(runtimeTransition.activeMode);
-  }, [runtimeMode, runtimeTransition.activeMode, runtimeTransition.phase, workspace]);
+  }, [replayPresentationOnly, runtimeMode, runtimeTransition.activeMode, runtimeTransition.phase, workspace]);
+
+  const registerRosbagUiAuditPublisher = useCallback((publisher: RosbagUiAuditPublisher | null) => {
+    rosbagUiAuditPublisherRef.current = publisher;
+  }, []);
+
+  const recordUiPresentation = useCallback((
+    event: RosbagUiAuditEventName,
+    presentation: RosbagUiPresentation,
+    value = "",
+  ) => {
+    if (replayPresentationOnly) return;
+    commitRosbagUiReplayState({
+      ...rosbagUiReplayStateRef.current,
+      presentation,
+    });
+    rosbagUiAuditPublisherRef.current?.(event, presentation, value);
+  }, [commitRosbagUiReplayState, replayPresentationOnly]);
+
+  const updateRosbagUiReplaySelections = useCallback((update: {
+    bundle?: string;
+    startPhase?: string;
+  }) => {
+    const current = rosbagUiReplayStateRef.current;
+    commitRosbagUiReplayState({
+      ...current,
+      ...update,
+    });
+  }, [commitRosbagUiReplayState]);
+
+  const handleLanguageChange = useCallback((nextLanguage: Language) => {
+    if (replayPresentationOnly) return;
+    const nextPresentation = {
+      ...rosbagUiReplayStateRef.current.presentation,
+      language: nextLanguage,
+    };
+    setLanguage(nextLanguage);
+    recordUiPresentation("language_selected", nextPresentation, nextLanguage);
+  }, [recordUiPresentation, replayPresentationOnly]);
 
   const navigateWorkspace = useCallback((
     next: PrimaryWorkspace,
     historyAction: WorkspaceHistoryAction = "push",
   ) => {
-    const availableNext = next === "mission" || optionalUiEnabled
+    const availableNext = next === "mission" || next === "debug" || optionalUiEnabled
       ? next
       : "mission";
+    if (!replayPresentationOnly) {
+      const nextPresentation = {
+        ...rosbagUiReplayStateRef.current.presentation,
+        workspace: availableNext,
+      };
+      recordUiPresentation("workspace_selected", nextPresentation, availableNext);
+    }
     if (typeof window !== "undefined") {
       const location = new URL(window.location.href);
       if (location.pathname.replace(/\/+$/, "") === "/debug") location.pathname = "/";
@@ -267,15 +375,7 @@ export default function App() {
       if (historyAction === "replace") window.history.replaceState(nextState, "", location);
     }
     setWorkspace(availableNext);
-  }, [optionalUiEnabled]);
-
-  const exitMonitorWorkspace = useCallback(() => {
-    if (typeof window !== "undefined" && window.history.state?.taskplannerWorkspaceEntry === "monitor") {
-      window.history.back();
-      return;
-    }
-    navigateWorkspace("mission", "replace");
-  }, [navigateWorkspace]);
+  }, [optionalUiEnabled, recordUiPresentation, replayPresentationOnly]);
 
   const exitMulticamWorkspace = useCallback(() => {
     if (typeof window !== "undefined" && window.history.state?.taskplannerWorkspaceEntry === "multicam") {
@@ -302,7 +402,7 @@ export default function App() {
   }, [navigateWorkspace, optionalUiEnabled]);
 
   useEffect(() => {
-    if (!optionalUiEnabled && workspace !== "mission") {
+    if (!optionalUiEnabled && workspace !== "mission" && workspace !== "debug") {
       navigateWorkspace("mission", "replace");
     }
   }, [navigateWorkspace, optionalUiEnabled, workspace]);
@@ -315,9 +415,7 @@ export default function App() {
       ? "mission-main"
       : workspace === "multicam"
         ? "multicam-main"
-        : workspace === "monitor"
-          ? "surgimate-monitor-main"
-          : "";
+        : "";
     const focusFrame = window.requestAnimationFrame(() => {
       if (workspace === "debug") {
         document.querySelector<HTMLElement>("[data-slot='debug-workspace'] .debug-main")?.focus({ preventScroll: true });
@@ -338,6 +436,7 @@ export default function App() {
     mode: TaskplannerRuntimeMode,
     safety?: RuntimeTransitionSafety,
   ) => {
+    if (replayPresentationOnly) return false;
     if (mode !== "live" && !optionalUiEnabled) return false;
     if (
       runtimeTransition.phase === "checking" ||
@@ -365,31 +464,12 @@ export default function App() {
     runtimeTransition.activeMode,
     runtimeTransition.phase,
     optionalUiEnabled,
+    replayPresentationOnly,
   ]);
 
-  if (optionalUiEnabled && workspace === "monitor") {
-    return (
-      <WorkspaceErrorBoundary
-        key="monitor-workspace-boundary"
-        errorMessage={language === "ko" ? "수술 관제 화면을 불러오지 못했습니다." : "Could not load SurgiMate monitoring."}
-        reloadLabel={language === "ko" ? "페이지 다시 불러오기" : "Reload page"}
-        onExit={exitMonitorWorkspace}
-        exitLabel={language === "ko" ? "미션 화면" : "Mission"}
-      >
-        <Suspense
-          fallback={(
-            <WorkspaceLoading
-              label={language === "ko" ? "수술 관제 화면을 불러오는 중입니다." : "Loading SurgiMate monitoring."}
-              onExit={exitMonitorWorkspace}
-              exitLabel={language === "ko" ? "미션 화면" : "Mission"}
-            />
-          )}
-        >
-          <SurgiMateMonitorWorkspace language={language} onExit={exitMonitorWorkspace} />
-        </Suspense>
-      </WorkspaceErrorBoundary>
-    );
-  }
+  const openSurgiMate = useCallback(() => {
+    window.location.assign(surgimateUrl());
+  }, []);
 
   if (optionalUiEnabled && workspace === "multicam") {
     return (
@@ -405,10 +485,7 @@ export default function App() {
     );
   }
 
-  if (
-    optionalUiEnabled &&
-    (runtimeMode === "debug" || (workspace === "debug" && runtimeMode === "live"))
-  ) {
+  if (runtimeMode === "debug" || (workspace === "debug" && runtimeMode === "live")) {
     return (
       <WorkspaceErrorBoundary
         key="debug-workspace-boundary"
@@ -435,6 +512,7 @@ export default function App() {
             onExit={runtimeMode === "debug"
               ? () => void requestRuntimeMode(lastMissionMode)
               : exitIntegratedDebugWorkspace}
+            runtimeOwnerMode={runtimeOwnerModeFor(runtimeMode)}
           />
         </Suspense>
       </WorkspaceErrorBoundary>
@@ -451,18 +529,19 @@ export default function App() {
       reloadLabel={language === "ko" ? "페이지 다시 불러오기" : "Reload page"}
     >
       <MissionWorkspace
-        runtimeMode={runtimeMode === "debug" ? "live" : runtimeMode}
+        runtimeMode={runtimeMode}
         onRuntimeModeChange={requestRuntimeMode}
         runtimeTransition={runtimeTransition}
         language={language}
-        onLanguageChange={setLanguage}
+        onLanguageChange={handleLanguageChange}
         optionalUiEnabled={optionalUiEnabled}
-        onMonitor={optionalUiEnabled
-          ? () => navigateWorkspace("monitor")
-          : undefined}
-        onIntegratedDebug={optionalUiEnabled
-          ? () => navigateWorkspace("debug")
-          : undefined}
+        onOpenSurgiMate={openSurgiMate}
+        onIntegratedDebug={() => navigateWorkspace("debug")}
+        replayPresentationOnly={replayPresentationOnly}
+        rosbagUiReplayState={rosbagUiReplayState}
+        onRosbagUiPresentationEvent={recordUiPresentation}
+        onRosbagUiReplaySelectionsChange={updateRosbagUiReplaySelections}
+        onRegisterRosbagUiAuditPublisher={registerRosbagUiAuditPublisher}
       />
     </WorkspaceErrorBoundary>
   );
@@ -475,8 +554,13 @@ function MissionWorkspace({
   language,
   onLanguageChange,
   optionalUiEnabled,
-  onMonitor,
+  onOpenSurgiMate,
   onIntegratedDebug,
+  replayPresentationOnly,
+  rosbagUiReplayState,
+  onRosbagUiPresentationEvent,
+  onRosbagUiReplaySelectionsChange,
+  onRegisterRosbagUiAuditPublisher,
 }: {
   runtimeMode: Exclude<TaskplannerRuntimeMode, "debug">;
   onRuntimeModeChange: (
@@ -487,22 +571,62 @@ function MissionWorkspace({
   language: Language;
   onLanguageChange: (language: Language) => void;
   optionalUiEnabled: boolean;
-  onMonitor?: () => void;
+  onOpenSurgiMate: () => void;
   onIntegratedDebug?: () => void;
+  replayPresentationOnly: boolean;
+  rosbagUiReplayState: RosbagUiReplayState;
+  onRosbagUiPresentationEvent: (
+    event: RosbagUiAuditEventName,
+    presentation: RosbagUiPresentation,
+    value?: string,
+  ) => void;
+  onRosbagUiReplaySelectionsChange: (update: {
+    bundle?: string;
+    startPhase?: string;
+  }) => void;
+  onRegisterRosbagUiAuditPublisher: (publisher: RosbagUiAuditPublisher | null) => void;
 }) {
   const rosBridgeReady =
-    runtimeTransition.phase === "idle" &&
-    runtimeTransition.activeMode === runtimeMode;
-  const runtimeProfileMismatch =
+    replayPresentationOnly || (
+      runtimeTransition.phase === "idle" &&
+      runtimeTransition.activeMode === runtimeMode
+    );
+  const runtimeProfileMismatch = !replayPresentationOnly &&
     runtimeTransition.diagnosticCode === "runtime_profile_mismatch";
   const ros = useRosBridge(
     runtimeMode,
     rosBridgeReady,
-    runtimeTransition.phase === "checking" || runtimeTransition.phase === "starting",
+    !replayPresentationOnly && (
+      runtimeTransition.phase === "checking" || runtimeTransition.phase === "starting"
+    ),
     runtimeProfileMismatch,
-    missionObservationProfile(runtimeTransition.activeMode),
+    replayPresentationOnly
+      ? "extended"
+      : missionObservationProfile(runtimeTransition.activeMode),
+    {
+      replayPresentationOnly,
+      rosbagUiPresentation: rosbagUiReplayState.presentation,
+    },
   );
+  useEffect(() => {
+    if (replayPresentationOnly) {
+      onRegisterRosbagUiAuditPublisher(null);
+      return undefined;
+    }
+    const publisher: RosbagUiAuditPublisher = (event, presentation, value = "") => {
+      ros.publishRosbagUiAudit(event, { presentation, value });
+    };
+    onRegisterRosbagUiAuditPublisher(publisher);
+    return () => {
+      onRegisterRosbagUiAuditPublisher(null);
+    };
+  }, [onRegisterRosbagUiAuditPublisher, replayPresentationOnly, ros.publishRosbagUiAudit]);
   const [stageAspectRatio, setStageAspectRatio] = useState(1.55);
+  const handleStageAspectChange = useCallback((ratio: number) => {
+    setStageAspectRatio((current) => (
+      Math.abs(current - ratio) > 0.01 ? ratio : current
+    ));
+  }, []);
 
   useEffect(() => {
     const nextUrl = runtimeBridgeUrl(runtimeMode);
@@ -535,60 +659,24 @@ function MissionWorkspace({
     }),
     [ros.worldState],
   );
-  const vlmOperationObservations = useMemo(
-    () => deriveVlmOperationObservations(ros.vlmResult),
-    [ros.vlmResult],
-  );
-  const executionDispatchEvents = useMemo<ExecutionDispatchEvent[]>(
-    () => ros.executionTraces.flatMap((trace) => {
-      const commandId = trace.command_id.trim();
-      const status = commandId ? ros.skillStatusByCommand[commandId] : undefined;
-      const toolId = status?.instrument_id?.trim() ?? "";
-      const event = executionDispatchEventFromTrace(trace, language, {
-        toolId,
-        toolLabel: toolId ? vm.displayToolName(toolId) : "",
-        toolInstanceId: status?.instrument_instance_id,
-        sourceLocationId: status?.source_location_id,
-        sourceLocationType: status?.source_location_type,
-        targetLocationId: status?.target_location_id,
-        targetLocationType: status?.target_location_type,
-        targetOwner: status?.target_owner,
-      });
-      return event ? [event] : [];
-    }),
-    [language, ros.executionTraces, ros.skillStatusByCommand, vm],
-  );
-  const latestExecutionDispatch = useMemo(
-    () => latestActualDispatch(executionDispatchEvents),
-    [executionDispatchEvents],
-  );
-  const fusedSurgeonRequest = useMemo(
-    () => ({
-      confirmed:
-        ros.worldState.running &&
-        Boolean(ros.worldState.surgeon_request_tool),
-      requestedTool: ros.worldState.surgeon_request_tool,
+  const operationPresentation = useMemo(
+    () => deriveOperationPresentation({
+      executionTraces: ros.executionTraces,
+      skillStatusByCommand: ros.skillStatusByCommand,
+      asrFinals: ros.liveAsrStatus.finals,
+      language,
+      displayToolName: vm.displayToolName,
     }),
     [
-      ros.worldState.running,
-      ros.worldState.surgeon_request_tool,
+      language,
+      ros.executionTraces,
+      ros.liveAsrStatus.finals,
+      ros.skillStatusByCommand,
+      vm.displayToolName,
     ],
   );
-  const asrFinalSentence = useMemo(() => {
-    const finals = ros.liveAsrStatus.finals;
-    const final = finals[finals.length - 1];
-    const text = final?.text.trim() ?? "";
-    if (!text) return null;
-    // A final ASR transcript is observer evidence only.  It is intentionally
-    // not derived from a proposed/rejected intent and does not imply dispatch.
-    const stamp = final?.stamp.trim() ?? "";
-    return {
-      eventKey: stamp ? `asr:${stamp}:${text}` : `asr-text:${text}`,
-      text,
-    };
-  }, [ros.liveAsrStatus.finals]);
-
   useEffect(() => {
+    if (replayPresentationOnly) return;
     const runtimeBusy =
       ros.simulationState.running ||
       ["starting", "running", "finishing"].includes(
@@ -603,6 +691,7 @@ function MissionWorkspace({
     ros.simulationState.execution_state,
     ros.simulationState.running,
     vm.defaultStartPhaseId,
+    replayPresentationOnly,
   ]);
 
   const shadowTransportActive =
@@ -623,6 +712,11 @@ function MissionWorkspace({
   const controlStartInFlight =
     ros.simulationState.execution_state === "starting" ||
     ros.actionPending.toLowerCase().includes("starting");
+  const activeProcedureRunId =
+    ros.simulationState.running
+    && ros.simulationState.execution_state.trim().toLowerCase() === "running"
+      ? ros.simulationState.procedure_run_id?.trim() || ""
+      : "";
   // Server-route selection has its own stopped-state contract.  A completed
   // procedure is stopped and the ROS coordinator accepts it; do not inherit
   // the stricter bundle-picker affordance here.
@@ -647,15 +741,26 @@ function MissionWorkspace({
     !ros.executionRouteState?.runEndpointSource &&
     !liveExecutionRouteInitializing;
   const executionRouteSourceReadiness = useMemo(() => {
-    // This describes whether the server has enabled the stopped-only selector,
-    // not remote Action/Service health. A fresh integration preflight remains
-    // the authoritative readiness check after either source is selected.
-    const selectable = ros.executionRouteState?.routeControlEnabled === true;
-    return {
-      external: selectable ? "ready" as const : "unknown" as const,
-      virtual: selectable ? "ready" as const : "unknown" as const,
+    const routeControlEnabled = ros.executionRouteState?.routeControlEnabled === true;
+    const sourceHealth = ros.executionRouteState?.sourceEndpointReadiness ?? {};
+    const readiness = (available: boolean | undefined) => {
+      if (!routeControlEnabled || available === undefined) return "unknown" as const;
+      return available ? "ready" as const : "unavailable" as const;
     };
-  }, [ros.executionRouteState?.routeControlEnabled]);
+    return {
+      toolHandover: {
+        external: readiness(sourceHealth.external?.actionServerReady),
+        virtual: readiness(sourceHealth.virtual?.actionServerReady),
+      },
+      retraction: {
+        external: readiness(sourceHealth.external?.retractionServiceReady),
+        virtual: readiness(sourceHealth.virtual?.retractionServiceReady),
+      },
+    };
+  }, [
+    ros.executionRouteState?.routeControlEnabled,
+    ros.executionRouteState?.sourceEndpointReadiness,
+  ]);
   const executionRouteSourceHealth =
     ros.executionRouteState?.sourceEndpointReadiness ?? {};
   const executionRouteDisabledReason = !ros.executionRouteState
@@ -679,6 +784,63 @@ function MissionWorkspace({
   const beginControl = useCallback((command: Parameters<typeof ros.control>[0]) => {
     void ros.control(command);
   }, [ros]);
+  const updateRosbagPresentation = useCallback((
+    event: RosbagUiAuditEventName,
+    nextPresentation: RosbagUiPresentation,
+    value = "",
+  ) => {
+    if (replayPresentationOnly) return;
+    onRosbagUiPresentationEvent(event, nextPresentation, value);
+  }, [onRosbagUiPresentationEvent, replayPresentationOnly]);
+  const handleStageCameraPresentation = useCallback((
+    event: Extract<
+      RosbagUiAuditEventName,
+      "stage_camera_selected" | "stage_camera_inspection_changed"
+    >,
+    slot: RosbagStageCameraSlot,
+    camera: RosbagStageCameraId,
+    inspecting: boolean,
+  ) => {
+    if (replayPresentationOnly) return;
+    const current = rosbagUiReplayState.presentation;
+    const nextPresentation: RosbagUiPresentation = slot === "surgical_bed"
+      ? {
+        ...current,
+        stageSurgicalBedCamera: camera === "cam2" || camera === "flir"
+          ? camera
+          : current.stageSurgicalBedCamera,
+        stageSurgicalBedInspecting: inspecting,
+      }
+      : slot === "independent"
+        ? {
+          ...current,
+          stageIndependentCamera: camera === "cam1" || camera === "cam4"
+            ? camera
+            : current.stageIndependentCamera,
+          stageIndependentInspecting: inspecting,
+        }
+        : {
+          ...current,
+          stageCam3Inspecting: inspecting,
+        };
+    updateRosbagPresentation(event, nextPresentation, `${slot}:${camera}:${inspecting ? "open" : "closed"}`);
+  }, [replayPresentationOnly, rosbagUiReplayState.presentation, updateRosbagPresentation]);
+  const handleSurgeryRecordPresentation = useCallback((
+    event: Extract<
+      RosbagUiAuditEventName,
+      "surgery_record_opened" | "surgery_record_tab_selected" | "surgery_record_closed"
+    >,
+    visible: boolean,
+    tab: RosbagUiPresentation["surgeryRecordTab"],
+  ) => {
+    if (replayPresentationOnly) return;
+    const nextPresentation: RosbagUiPresentation = {
+      ...rosbagUiReplayState.presentation,
+      surgeryRecordVisible: visible,
+      surgeryRecordTab: tab,
+    };
+    updateRosbagPresentation(event, nextPresentation, visible ? tab : "closed");
+  }, [replayPresentationOnly, rosbagUiReplayState.presentation, updateRosbagPresentation]);
   const runtimeTransitionSafety: RuntimeTransitionSafety = {
     isRunning: controlIsRunning,
     isPaused: controlIsPaused,
@@ -709,12 +871,11 @@ function MissionWorkspace({
         }
         experimentalControlsEnabled={optionalUiEnabled}
         integratedDebugAvailable={
-          optionalUiEnabled &&
           runtimeMode === "live" &&
           runtimeTransition.activeMode === "live"
         }
         onIntegratedDebug={onIntegratedDebug}
-        onMonitor={onMonitor}
+        onOpenSurgiMate={onOpenSurgiMate}
       />
 
       <main
@@ -744,20 +905,47 @@ function MissionWorkspace({
                 cam4: ros.cam4Image,
                 flir: ros.flirImage,
               }}
-              typedRfdetrToolDetections={
-                optionalUiEnabled ? ros.typedRfdetrToolDetections : undefined
+              cameraMediaStore={runtimeMode === "live" && !replayPresentationOnly
+                ? ros.cameraMediaStore
+                : undefined}
+              cameraPreviewContracts={ros.cameraPreviewContracts}
+              typedRfdetrObservationStore={
+                optionalUiEnabled ? ros.typedRfdetrObservationStore : undefined
               }
-              systemSurgeonRequest={fusedSurgeonRequest}
-              asrFinalSentence={asrFinalSentence}
+              toolBeliefs={runtimeMode === "live" ? ros.toolBeliefs : undefined}
+              procedureRunning={ros.worldState.running}
+              surgeonRequestedTool={ros.worldState.surgeon_request_tool}
+              asrFinalSentence={operationPresentation.asrFinal}
               handHandoverSignal={handHandoverSignal}
-              vlmObservations={vlmOperationObservations}
+              vlmResult={ros.vlmResult}
               systemToolPredictions={ros.worldState.ranked_tool_predictions}
-              executionDispatch={latestExecutionDispatch}
-              onStageAspectChange={(ratio) => {
-                setStageAspectRatio((current) => (Math.abs(current - ratio) > 0.01 ? ratio : current));
-              }}
+              toolPolicyStatus={ros.toolPolicyStatus}
+              onStageAspectChange={handleStageAspectChange}
+              replayOnly={replayPresentationOnly}
+              replayPresentation={rosbagUiReplayState.presentation}
+              onReplayStageCameraChange={handleStageCameraPresentation}
             />
           </Suspense>
+          <div
+            className={`stage-observer-area ${runtimeMode === "live" ? "with-tool-beliefs" : ""}`}
+            data-slot="stage-observer-area"
+          >
+            <div className="operation-dispatch-area" data-slot="operation-dispatch-area">
+              <Suspense fallback={null}>
+                <OperationExecutionDispatchFeed
+                  className="stage-operation-dispatch-feed"
+                  events={operationPresentation.dispatches.filter((event) => event.state !== "proposed")}
+                  language={language}
+                  maxEntries={1}
+                />
+              </Suspense>
+            </div>
+            {runtimeMode === "live" ? (
+              <div className="tool-belief-area" data-slot="tool-belief-area">
+                <ToolBeliefPanel language={vm.language} runtime={ros.toolBeliefs} />
+              </div>
+            ) : null}
+          </div>
         </div>
 
         {runtimeMode !== "live" ? (
@@ -821,8 +1009,10 @@ function MissionWorkspace({
                 runtimeTransitionSafety,
               )
             }
-            bundle={ros.bundle}
+            bundle={replayPresentationOnly ? rosbagUiReplayState.bundle : ros.bundle}
             onBundleChange={(nextBundle) => {
+              if (replayPresentationOnly) return;
+              onRosbagUiReplaySelectionsChange({ bundle: nextBundle });
               ros.setBundleSelection(nextBundle);
             }}
             activeBundle={ros.activeBundle}
@@ -830,14 +1020,23 @@ function MissionWorkspace({
             scenarioRevisionAdmission={ros.scenarioRevisionAdmission}
             onPreviewBundle={() => void ros.previewBundle()}
             onApplyBundle={() => void ros.applyBundle()}
-            startPhase={ros.startPhase}
-            setStartPhase={ros.setStartPhase}
+            startPhase={replayPresentationOnly ? rosbagUiReplayState.startPhase : ros.startPhase}
+            setStartPhase={(nextPhase) => {
+              if (replayPresentationOnly) return;
+              onRosbagUiReplaySelectionsChange({ startPhase: nextPhase });
+              ros.setStartPhase(nextPhase);
+            }}
+            transportConnected={ros.transportConnected}
             connected={ros.connected}
             runtimeAuthorityStatus={ros.runtimeAuthorityStatus}
             actionPending={ros.actionPending}
             actionMessage={ros.actionMessage}
             runtimeMessage={ros.runtimeMessage}
             runtimeReady={ros.simulationReady}
+            rosbagRecording={ros.rosbagRecording}
+            rosbagRecordingControlPending={ros.rosbagRecordingControlPending}
+            rosbagRecordingControlMessage={ros.rosbagRecordingControlMessage}
+            onRosbagRecordingControl={(enabled) => void ros.controlRosbagRecording(enabled)}
             integrationReadiness={ros.integrationReadiness}
             integrationReadinessReceivedAt={ros.integrationReadinessReceivedAt}
             executionRoute={{
@@ -866,23 +1065,32 @@ function MissionWorkspace({
             isPaused={controlIsPaused}
             canPauseResume={controlCanPauseResume}
             onControl={beginControl}
-            onOpenMonitor={optionalUiEnabled ? onMonitor : undefined}
           />
           {runtimeMode === "live" ? (
             <LiveAsrPanel
               status={ros.liveAsrStatus}
               statusReceivedAt={ros.liveAsrStatusReceivedAt}
-              connected={ros.connected}
+              statusBridgeUrl={ros.url}
+              statusObservationEnabled={rosBridgeReady}
+              connected={ros.transportConnected}
               pendingOperation={ros.liveAsrControlPending}
               controlMessage={ros.liveAsrControlMessage}
               language={language}
+              inputSourceStatuses={ros.inputSourceStatuses}
               onControl={ros.controlLiveAsr}
             />
           ) : null}
-          <TypedRfdetrObservationStatus
-            detections={ros.typedRfdetrToolDetections}
-            language={language}
-          />
+          {runtimeMode === "live" ? (
+            <Suspense fallback={null}>
+              <TtsPlaybackStatusCard status={ros.ttsPlaybackStatus} language={language} />
+            </Suspense>
+          ) : null}
+          <Suspense fallback={null}>
+            <TypedRfdetrObservationStatus
+              observationStore={ros.typedRfdetrObservationStore}
+              language={language}
+            />
+          </Suspense>
           {optionalUiEnabled ? (
             <>
               <Suspense fallback={null}>
@@ -891,10 +1099,6 @@ function MissionWorkspace({
                   language={language}
                 />
               </Suspense>
-              <OperationExecutionDispatchFeed
-                events={executionDispatchEvents}
-                language={language}
-              />
               <Suspense fallback={null}>
                 <ObservabilityPanel
                   vm={vm}
@@ -917,6 +1121,14 @@ function MissionWorkspace({
         </div>
 
       </main>
+      <SurgeryRecordResponseModal
+        activeProcedureRunId={activeProcedureRunId}
+        language={language}
+        receipt={ros.surgeryRecordReceipt}
+        replayOnly={replayPresentationOnly}
+        replayPresentation={rosbagUiReplayState.presentation}
+        onReplayPresentationChange={handleSurgeryRecordPresentation}
+      />
     </div>
   );
 }

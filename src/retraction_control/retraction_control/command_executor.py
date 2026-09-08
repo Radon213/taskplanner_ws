@@ -50,8 +50,7 @@ COMMAND_STOP_RETRACTION = 6
 TARGET_NONE = 0
 TARGET_LEFT = 1
 TARGET_RIGHT = 2
-# The peer Service uses TARGET_NONE (0) to request a bilateral adjustment.
-TARGET_BOTH = TARGET_NONE
+TARGET_BOTH = 3
 
 
 class ExecutorState(str, Enum):
@@ -976,10 +975,10 @@ class CommandExecutor:
 
     def _plan_adjustments(self, request: object) -> tuple[ForceJogPlan, ...]:
         side = _enum_int(_value(request, "target_side", TARGET_NONE), "target_side")
-        if side not in {TARGET_NONE, TARGET_LEFT, TARGET_RIGHT}:
+        if side not in {TARGET_LEFT, TARGET_RIGHT, TARGET_BOTH}:
             raise _ExecutionRejected(
                 "invalid_target_side",
-                "adjust retraction requires TARGET_NONE (both), LEFT, or RIGHT",
+                "adjust retraction requires LEFT, RIGHT, or TARGET_BOTH",
             )
         sides = (TARGET_LEFT, TARGET_RIGHT) if side == TARGET_BOTH else (side,)
         plans: list[ForceJogPlan] = []

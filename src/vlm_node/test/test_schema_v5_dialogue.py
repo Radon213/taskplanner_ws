@@ -96,8 +96,11 @@ def test_v5_allows_independent_function_call_or_reply() -> None:
     assert validate_payload(reply_only)["function_call"] is None
 
 
-@pytest.mark.parametrize("field", ["function_call", "humanoid_reply"])
-def test_v5_requires_explicit_nullable_dialogue_fields(field: str) -> None:
+@pytest.mark.parametrize(
+    "field",
+    ["bed_robot_arm_group", "function_call", "humanoid_reply"],
+)
+def test_v5_requires_explicit_nullable_structural_fields(field: str) -> None:
     payload = _base_v5()
     payload.pop(field)
 

@@ -28,7 +28,7 @@ def _compose_config(
 ) -> dict[str, object]:
     return {
         "services": {
-            "taskplanner-runtime": {
+            "taskplanner-perception": {
                 "environment": {
                     "PNU_EXPECTED_MODEL_DIGESTS_JSON": json.dumps(
                         digests, separators=(",", ":")
@@ -106,7 +106,7 @@ def test_compose_pin_preflight_hashes_local_read_only_model_files(
 
     outcome = check_compose_model_pins(
         _compose_config(tmp_path, digests),
-        consumer_service="taskplanner-runtime",
+        consumer_service="taskplanner-perception",
         worker_service="pnu-perception",
         verify_local_files=True,
     )
@@ -127,7 +127,7 @@ def test_compose_pin_preflight_rejects_mismatch_and_writable_mount(
     with pytest.raises(PreflightError) as mismatch:
         check_compose_model_pins(
             _compose_config(tmp_path, wrong),
-            consumer_service="taskplanner-runtime",
+            consumer_service="taskplanner-perception",
             worker_service="pnu-perception",
             verify_local_files=True,
         )
@@ -137,7 +137,7 @@ def test_compose_pin_preflight_rejects_mismatch_and_writable_mount(
     with pytest.raises(PreflightError) as writable:
         check_compose_model_pins(
             _compose_config(tmp_path, wrong, read_only=False),
-            consumer_service="taskplanner-runtime",
+            consumer_service="taskplanner-perception",
             worker_service="pnu-perception",
             verify_local_files=True,
         )

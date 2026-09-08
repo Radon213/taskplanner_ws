@@ -1,4 +1,5 @@
 from dataclasses import asdict
+from types import SimpleNamespace
 
 import pytest
 
@@ -31,6 +32,7 @@ from surgical_interop_execution.mappings import (
     map_group_command,
     map_skill_to_tool_handover,
     public_instrument_instance_id,
+    retrieval_block_reason,
 )
 
 
@@ -95,6 +97,16 @@ def test_unused_prepared_tool_maps_to_robot_to_mayo():
     assert request.target_location == "mayo"
 
 
+def test_prepared_recovery_tool_maps_to_robot_to_tray():
+    request = map_skill_to_tool_handover(
+        _skill("return_preposition_to_tray"),
+        instrument_name="Mosquito forceps",
+        instrument_instance_id="Mosquito forceps#1",
+    )
+    assert request.source_location == "robot"
+    assert request.target_location == "tray"
+
+
 @pytest.mark.parametrize("action", ["retrieve_from_mayo", "tool_retrieve"])
 def test_retrieve_aliases_map_to_mayo_to_tray(action):
     request = map_skill_to_tool_handover(
@@ -104,6 +116,19 @@ def test_retrieve_aliases_map_to_mayo_to_tray(action):
     )
     assert request.source_location == "mayo"
     assert request.target_location == "tray"
+
+
+def test_retrieval_block_reason_requires_a_right_hand_payload() -> None:
+    assert retrieval_block_reason(SimpleNamespace()) == ""
+    assert retrieval_block_reason(
+        SimpleNamespace(right_hand_tool="", right_hand_tool_instance_id="")
+    ) == ""
+    assert retrieval_block_reason(
+        SimpleNamespace(right_hand_tool="T04", right_hand_tool_instance_id="T04#1")
+    ) == "retrieve_blocked_right_hand_preposition"
+    assert retrieval_block_reason(
+        SimpleNamespace(right_hand_tool="", right_hand_tool_instance_id="T04#1")
+    ) == "retrieve_blocked_right_hand_preposition"
 
 
 @pytest.mark.parametrize("action", ["predict_tool", "prepare_tool", "tool_predict"])
@@ -282,6 +307,19 @@ def test_retraction_move_projects_to_single_service_command_fields():
     }
 
 
+def test_negative_retraction_distance_is_preserved_for_release() -> None:
+    request = map_group_command(
+        _group(OPERATION_RETRACTION, distance_mm=-8.0)
+    )
+
+    assert request == RetractionCommandRequest(
+        command_id="group-1",
+        command=RETRACTION_COMMAND_ADJUST_RETRACTION,
+        target_side=RETRACTION_TARGET_LEFT,
+        distance_m=-0.008,
+    )
+
+
 def test_right_retraction_move_maps_to_right_target_side():
     request = map_group_command(
         _group(
@@ -416,8 +454,8 @@ def test_finish_direct_teach_rejects_unknown_arm_selector():
         )
 
 
-def test_suction_group_is_explicitly_rejected_at_public_boundary():
-    with pytest.raises(MappingFailure, match="suction_arm_removed"):
+def test_raw_suction_group_is_rejected_at_public_boundary():
+    with pytest.raises(MappingFailure, match="unsupported_group"):
         map_group_command(
             _group(
                 OPERATION_RETRACTION,
@@ -492,7 +530,7 @@ def test_tool_change_never_discards_unrepresented_arm_or_tool_fields():
         )
 
 
-def test_retraction_requires_a_positive_finite_distance():
+def test_retraction_requires_a_nonzero_finite_distance():
     with pytest.raises(MappingFailure, match="invalid_retraction_distance"):
         map_group_command(
             _group(
@@ -517,6 +555,15 @@ def test_retraction_distance_is_bounded_by_configured_public_limit():
             _group(
                 OPERATION_RETRACTION,
                 distance_mm=MAX_RETRACTION_DISTANCE_MM + 0.1,
+                target_retractor_id="right_malleable",
+                direction="right",
+            )
+        )
+    with pytest.raises(MappingFailure, match="invalid_retraction_distance"):
+        map_group_command(
+            _group(
+                OPERATION_RETRACTION,
+                distance_mm=-(MAX_RETRACTION_DISTANCE_MM + 0.1),
                 target_retractor_id="right_malleable",
                 direction="right",
             )
@@ -548,6 +595,30 @@ def test_dispatch_ledger_suppresses_a_reissued_explicit_request_generation():
     assert ledger.reserve("command-1", explicit_request_generation=12)
     assert not ledger.reserve("command-2", explicit_request_generation=12)
     assert ledger.reserve("command-3", explicit_request_generation=13)
+
+
+def test_dispatch_ledger_scopes_explicit_request_generation_to_procedure_run():
+    ledger = DispatchLedger(max_entries=4)
+    leg = ("robot", "mayo")
+
+    assert ledger.reserve(
+        "previous-run-return",
+        explicit_request_generation=1,
+        semantic_leg=leg,
+        procedure_run_id="run-previous",
+    )
+    assert not ledger.reserve(
+        "same-run-replay",
+        explicit_request_generation=1,
+        semantic_leg=leg,
+        procedure_run_id="run-previous",
+    )
+    assert ledger.reserve(
+        "new-run-return",
+        explicit_request_generation=1,
+        semantic_leg=leg,
+        procedure_run_id="run-current",
+    )
 
 
 @pytest.mark.parametrize(

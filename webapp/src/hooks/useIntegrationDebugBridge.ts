@@ -97,10 +97,39 @@ export interface DebugInputStatus {
 }
 
 export interface DebugEndpointStatus {
-  name: "tool_handover" | "retraction_service" | "bed_robot_arm_status";
+  /** Stable catalog alias; Debug must not infer behavior from its spelling. */
+  name: string;
   endpoint: string;
-  kind: "action" | "service" | "topic";
+  kind: "action" | "service" | "topic" | (string & {});
   ready: boolean;
+  type?: string;
+  physical?: boolean;
+  single_flight?: boolean;
+  timeout_sec?: number;
+  response_semantics?: "action" | "admission" | "none" | (string & {});
+  command_id_field?: string;
+}
+
+export interface DebugCapabilityStatus {
+  name: "observer" | "control" | "asr" | "record" | "network" | (string & {});
+  enabled: boolean;
+  state: "enabled" | "not_started" | (string & {});
+  description: string;
+  /** The smallest runtime owner which must be restarted to activate it. */
+  restart_scope: string;
+}
+
+export interface DebugToolCatalogProfile {
+  catalog_id: string;
+  instrument_id: string;
+  instance_ids: string[];
+}
+
+/** Optional read-only catalog projection supplied by a scenario/catalog owner. */
+export interface DebugToolCatalogProjection {
+  source?: string;
+  revision?: string;
+  profiles: DebugToolCatalogProfile[];
 }
 
 export type DebugActionState =
@@ -140,65 +169,19 @@ export interface DebugActionStatus {
   source?: string;
 }
 
-export interface DebugRetractionVoiceInterpretation {
-  transcript: string;
-  command: string | null;
-  target_side: string;
-  distance_m: number;
-  confidence: number;
-  reason: string;
-  /** Provenance such as text_vlm, deterministic_fallback, or shared_deterministic. */
-  interpreter_source: string;
-  /** True only after a model transport attempt actually occurred. */
-  vlm_invoked: boolean;
-  /** Bounded machine-readable outcome used to explain VLM success or fallback. */
-  detail?: string;
-}
-
 export interface DebugRetractionVoiceStatus {
   /**
-   * This gate only decides whether a final sentence admitted by the speech
-   * adapter on /surgery/audio/request_text may be normalized and submitted.
-   * It never owns microphone capture or the ASR process.
+   * Direct Service bookkeeping only. CommandRouter owns spoken-command
+   * admission; Debug observes its SpeechUtterance relay separately.
    */
-  mode: "buttons_only" | "voice_and_buttons" | (string & {});
+  mode: "direct_service_only" | (string & {});
   /** Local Debug bookkeeping derived from Service admission, never robot pose. */
   internal_state: string;
-  /** Debug-only override that exposes the full closed Service command set. */
-  state_machine_bypass_enabled?: boolean;
-  /** Selected runtime policy; voice mode alone never changes this setting. */
-  interpreter_mode?: "deterministic" | "vlm_with_fallback" | (string & {});
-  /** A final transcript is being interpreted asynchronously; no Service call yet. */
-  interpreter_pending?: boolean;
-  interpreter_pending_age_sec?: number | null;
   /** Commands admitted by the shared local policy for the current internal state. */
   allowed_commands: string[];
   service_ready: boolean;
   in_flight: boolean;
-  last_interpretation: DebugRetractionVoiceInterpretation;
-  last_rejection_reason: string;
-}
-
-export interface DebugVlmStatus {
-  base_url?: string;
-  model_id?: string;
-  manager_reachable?: boolean;
-  catalog_reachable?: boolean;
-  load_state?: string;
-  loaded?: boolean;
-  available?: boolean;
-  runtime_managed?: boolean;
-  probe_pending?: boolean;
-  detail?: string;
-  last_probe_age_sec?: number | null;
-  /** This result is interpretation-only and must never imply Service dispatch. */
-  micro_test?: {
-    state?: string;
-    transcript?: string;
-    interpretation?: Record<string, unknown> | string | null;
-    latency_ms?: number | null;
-    error?: string;
-  };
+  last_rejection_reason?: string;
 }
 
 export interface DebugVirtualRobotStatus {
@@ -456,6 +439,10 @@ export interface IntegrationDebugStatus {
     };
     network: DebugNetworkStatus;
   };
+  /** Per-owner lifecycle projection. Absent only while older backends roll out. */
+  capabilities?: DebugCapabilityStatus[];
+  /** Current scenario/catalog projection when a catalog owner exposes one. */
+  tool_catalog?: DebugToolCatalogProjection;
   inputs: DebugInputStatus[];
   endpoints: DebugEndpointStatus[];
   action: DebugActionStatus;
@@ -472,8 +459,6 @@ export interface IntegrationDebugStatus {
     };
     retraction?: DebugRetractionVoiceStatus;
   };
-  /** Optional while the backend rolls out isolated VLM diagnostics. */
-  vlm?: DebugVlmStatus;
   /** Optional while the explicit external/virtual endpoint selector rolls out. */
   virtual_robot?: DebugVirtualRobotStatus;
   asr: DebugAsrStatus;
@@ -538,6 +523,15 @@ function hasRequiredDebugStatusShape(value: unknown): value is IntegrationDebugS
     && (runtime.manual_control_gate === undefined
       || typeof runtime.manual_control_gate === "string")
     && isRecord(network) && Array.isArray(network.addresses)
+    && (value.capabilities === undefined || (Array.isArray(value.capabilities)
+      && value.capabilities.every((capability) => isRecord(capability)
+        && typeof capability.name === "string"
+        && typeof capability.enabled === "boolean"
+        && typeof capability.state === "string"
+        && typeof capability.description === "string"
+        && typeof capability.restart_scope === "string")))
+    && (value.tool_catalog === undefined || (isRecord(value.tool_catalog)
+      && Array.isArray(value.tool_catalog.profiles)))
     && isRecord(action) && typeof action.state === "string"
     && typeof action.progress === "number" && Number.isFinite(action.progress) && action.progress >= 0 && action.progress <= 1
     && typeof action.success === "boolean" && typeof action.terminal === "boolean" && typeof action.recovery_required === "boolean"
@@ -556,31 +550,7 @@ function parseStatus(raw: unknown): IntegrationDebugStatus | null {
     const value = JSON.parse(raw) as unknown;
     if (!isBoundedDebugPayload(value) || !hasRequiredDebugStatusShape(value)) return null;
 
-    const endpoints = Array.isArray(value.endpoints)
-      ? value.endpoints.filter((endpoint) => {
-          const name = String(endpoint?.name || "").toLowerCase();
-          const path = String(endpoint?.endpoint || "").toLowerCase();
-          return name !== "suction" && !path.includes("/suction");
-        })
-      : [];
-    const action = value.action?.route === "suction"
-      ? {
-          route: "",
-          command_id: "",
-          state: "idle",
-          progress: 0,
-          success: false,
-          terminal: true,
-          reason_code: "",
-          recovery_required: false,
-        }
-      : value.action;
-
-    return {
-      ...value,
-      endpoints,
-      action,
-    };
+    return value;
   } catch {
     return null;
   }
@@ -594,16 +564,12 @@ function startsOperationalIntervention(
     "arm",
     "asr_start",
     "publish_once",
-    "publish_voice_command",
+    "dispatch",
     "retraction_command",
     "tool_handover",
-    "vlm_load",
   ].includes(operation)) return true;
   if ([
     "configure_output",
-    "configure_retraction_state_machine_bypass",
-    "configure_retraction_voice",
-    "configure_voice",
   ].includes(operation)) return payload.enabled === true;
   return false;
 }

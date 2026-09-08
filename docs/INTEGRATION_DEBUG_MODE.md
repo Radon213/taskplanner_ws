@@ -1,88 +1,92 @@
 # Taskplanner 독립 Debug 모드와 선택적 통합 관측
 
-통합 디버그 모드는 전체 시나리오, BT, Digital Twin, 시각 schema-v4 VLM,
-Surgeon Actor를 실행하지 않고 외부 기관과 ROS 2 입출력 및 개별 로봇 기능을
-확인하는 운영 모드다. 단, 리트랙터 음성 명령용 text-only VLM은 독립
-micro-test와 음성 통합 시험에서 사용할 수 있다. 조그는 디버그 모드의
-리트랙터 수동 기능으로 포함된다.
+> **Current-policy note (2026-08-27).** Debug observation is graph-wide and
+> always read-only. Debug intervention requires authoritative paused/stopped
+> state; a physical intervention also requires an explicit arm and a single
+> in-flight command. Older prose below that adds active-task, robot/cleaner-idle,
+> duplicate-preflight, or static read allowlist gates is historical and must
+> not be copied into new work. See
+> [`taskplanner_principles.toml`](../taskplanner_principles.toml).
+
+Debug은 단일 all-in-one runtime이 아니라 독립 capability owner들의 조합이다.
+`debug-observer`는 현재 ROS graph와 화면 evidence를 읽기만 하며, `debug-control`
+만 typed write를 보낸다. `debug-virtual`은 외부 endpoint와 충돌하지 않는 로컬
+Action/Service emulator다. ASR, record, VLM, network capability는 observer에
+포함되지 않으며 필요한 경우에만 각각 별도로 시작한다.
 
 ## 실행
 
-기본 실행은 실제 외부 통합을 위한 Live 모드다. 인자를 생략해도 같은 모드가
-시작된다.
+Standalone Debug는 `scripts/taskplanner up debug`로 시작한다. 같은 4173 UI를
+사용하며, current-state observation은 running scenario와 분리되어 read-only로
+가능하다. 기존 mode에 optional observer capability를 붙인 경우에도 observer는
+그 mode의 ASR, VLM, record, perception, 또는 robot owner를 시작하거나 재시작하지
+않는다.
 
-```bash
-scripts/taskplanner up --build       # 최초 build가 필요한 경우
-scripts/taskplanner up               # 이후 기본 Live 기동
+`debug-control`의 write는 authoritative state가 paused 또는 stopped일 때만
+가능하다. physical Action/Service에는 explicit arm과 대상 resource의 single-flight
+보호가 추가된다. 상태 없음·stale·실행 중에는 새 write만 거부하고 observer는 계속
+동작한다. Controller E-stop, type/range validation, idempotency, feedback/result,
+cancel은 endpoint/controller에 남는다.
+
+## Typed dispatch 경계
+
+Debug gateway의 새 개입 API는 `operation=dispatch`와 아래 한 가지 JSON shape만
+사용한다.
+
+```json
+{
+  "kind": "service",
+  "endpoint": "retraction_service",
+  "type": "surgical_interop_msgs/srv/ExecuteRetractionCommand",
+  "payload": {
+    "command": "start_retraction",
+    "target_side": "none",
+    "distance_m": 0.0
+  },
+  "timeout_sec": 120.0
+}
 ```
 
-기본 Live는 `integration-debug`, multicam, LAN 라우터를 자동 시작하지 않는다.
-Debug는 지금처럼 별도의 엔지니어링 런타임 프로파일이며, **독립 Debug** 전환은
-현재 미션이 완전히 정지된 상태에서만 Live/LLM/Replay core를 standalone
-`debug` 프로파일로 교체한다. 같은 4173 Web UI를 재사용하고 별도 4174 UI는
-실행하지 않는다.
+`endpoint`는 임의 ROS 이름이 아니라
+[`integration_debug.yaml`](../src/integration_debug/config/integration_debug.yaml)의
+선언된 alias 또는 현재 선택된 exact ROS endpoint여야 한다. `kind`, ROS type,
+payload codec, physical 여부, single-flight, timeout 상한도 같은 선언에서 확인한다.
+따라서 기존 타입의 새 Debug endpoint는 YAML policy와 해당 typed adapter만 추가하면
+되고, browser operation switch·receipt·scenario allowlist를 늘리지 않는다.
 
-Debug 화면의 입력·토픽·endpoint·Action 상태 관찰은 수동 제어 권한과 무관하게
-언제든 사용할 수 있다. standalone Debug는 operational core가 없는 완전 정지
-환경에서 graph exclusivity와 armed 세션을 확인한 뒤에만 쓰기를 연다. Lab/Ops에서
-`TASKPLANNER_LIVE_ENABLE_INTEGRATED_DEBUG=true`를 명시해 관측 sidecar를 붙인
-경우에도 관찰은 실행 중 사용할 수 있지만, 실제 쓰기는 `/simulation/state`의
-최신 일시정지(`running=true, execution_state=paused`) 또는 완전 정지 상태와
-활성 task 없음, robot·cleaner idle을 모두 확인해야 한다. 상태 없음·stale·실행
-중은 fail-closed다.
+- 관측은 항상 읽기 전용이며 arm이 필요 없다.
+- 모든 Topic/Service/Action write는 integrated profile에서 authoritative
+  `/simulation/state`의 fresh paused 또는 stopped 상태를 요구한다.
+- physical Action/Service는 여기에 explicit arm과 single-flight를
+  추가한다. controller의 E-stop, range/type validation, idempotency, Action
+  cancel/result는 그대로 endpoint server가 소유한다.
+- Debug는 `/surgery/audio/observed_utterance`를 읽을 수 있지만 음성 명령을
+  재실행하지 않는다. `CommandRouter`만 `/surgery/audio/admitted_utterance`를
+  소비해 catalog dispatch를 수행한다.
+- Debug의 local retraction state는 상태 표시용이다. command 순서 허용 여부는
+  controller Service가 판단하며 Debug는 두 번째 retraction state-machine gate를
+  만들지 않는다.
 
-전체 운영 런타임을 실행하지 않는 개별 기능 시험은 다음 standalone 명령을
-사용한다. 같은 4173 UI를 사용하며, 이미 `taskplanner-runtime` 또는
-`shadow-runner`가 실행 중이면 시작을 거부한다.
-
-```bash
-scripts/taskplanner up debug --build
-```
-
-Debug Mode의 마이크 캡처는 Ubuntu가 현재 선택한 PipeWire 입력을 따른다.
-시작 시 `${XDG_RUNTIME_DIR}/pipewire-0`을 확인하고, UI에는 해당 논리 입력만
-표시한다(예: `Analog Input - Shure MVX2U GEN 2`). Raw ALSA endpoint는 숨기며
-명령 서비스로 직접 선택할 수도 없다. Ubuntu에서 기본 입력을 변경한 뒤에는
-**STT 입력·USB 캡처 → 장치 새로고침**을 누르면 되고, USB hotplug 때문에 컨테이너를
-다시 생성할 필요는 없다.
-
-- 통합/standalone 공용 UI: 로컬 `http://127.0.0.1:4173`, 유선 LAN `http://192.168.1.4:4173`
-- 운영 ROSBridge: `ws://127.0.0.1:9090`
+- 통합/standalone 공용 UI: 로컬 `http://127.0.0.1:4173`, 유선 LAN
+  `http://192.168.1.4:4173`
 - Debug ROSBridge: `ws://127.0.0.1:9091`
-- 기본 포트와 ROS 도메인은 `docker/orchestration/debug.env`와 로컬 `.env`에서 바꿀 수 있다.
-- standalone Debug 프로파일은 `webapp`, `integration-debug`, multicam observer와
-  로컬 NInfer manager/control plane을 시작한다. 모델을 자동 load/unload하지
-  않으며 이미 loaded인 worker를 보존한다. 화면의 **구성 모델 로드**를 명시적으로
-  누른 경우에만 launch에 고정된 managed model의 load를 요청한다.
-- `live`는 기본적으로 `integration-debug`와 multicam observer를 시작하지 않는다.
-  Lab/Ops에서 각각 명시적으로 켠 경우에만 관측 sidecar로 붙이며, Production
-  readiness에는 포함하지 않는다. Live가 외부 typed RF-DETR 관측을 소비하므로
-  Debug 쪽 로컬 PNU/RF-DETR worker를 중복 기동하지 않는다.
-- `llm-surgeon`과 `replay`는 외부 카메라 observer와 `integration-debug`를
-  자동 기동하지 않는다. 두 모드는 자체 ROSBridge를 LAN/Tailnet 경로 라우터로
-  계속 제공하지만, 그것은 Debug 관측 runtime을 의미하지 않는다.
+- observer에는 PipeWire socket, ASR endpoint, record API key, PNU/VLM credential,
+  또는 perception-worker mount가 없다.
+- Debug capability의 재시작은 해당 owner만 대상으로 한다. owner/profile 목록과
+  정확한 명령은 [`RUNTIME_OWNER_CONTROL.md`](RUNTIME_OWNER_CONTROL.md)를 따른다.
+- Debug는 이미 실행 중인 외부 perception worker를 읽기만 하며 로컬 PNU/RF-DETR
+  worker를 중복 시작하지 않는다.
 
-standalone Debug는 런처로 명시적으로 시작하거나 상단 **독립 Debug** 전환을
-사용한다. 선택적 integrated sidecar를 켠 Lab/Ops 환경에서만 **통합 관측**이
-운영 core를 유지한 채 같은 작업공간을 연다. Debug 작업공간을 나갈 때 연속 더미
-발행을 정지하고 수동 제어를 해제한다.
+### 외부 인식 overlay
 
-### PNU CAM4 인식 오버레이
+Debug observer는 PNU, RF-DETR, VLM, 카메라 worker를 시작하지 않는다. 이미 graph에
+발행되는 CAM3/CAM4 overlay·pose·health 토픽을 read-only로 구독해 “파이프라인이
+멈춤”과 “현재 기물이 검출되지 않음”을 구분한다. 새 관측 토픽은 secure bridge의
+read-only 구독으로 확인하며, 인식을 바꾸거나 worker를 추가로 띄우지 않는다.
 
-standalone `debug` 프로파일은 Taskplanner/BT/DT/로봇 실행 계층 없이
-`debug_pnu_perception_bridge` 하나를 추가로 실행한다. 기본값은 이 PC에서 파일과
-SHA-256을 검증한 local worker의 `tool,blood`만 요청하며, Docker readiness도 이
-Taskplanner subset만 `ready=true`이면 통과한다. worker v1 capability가 호환성상
-legacy `hand`를 계속 광고하더라도 Taskplanner는 이를 요청·검증·발행하지 않는다.
-
-입력은 VIPLab CAM4의 실제 RGB, color CameraInfo, depth-to-color 정렬
-`compressedDepth`, 정렬 CameraInfo 네 토픽이다. 검증된 현재 D455 계약에 한해
-`0.001 m/unit`과 alignment provenance를 사용한다. 결과가 0건이어도 worker가 해당
-알고리즘을 실제 실행했다면 같은 source stamp의 투명 overlay frame을 발행한다.
-Debug UI는 health/diagnostics의 실행 모델과 0건 상태를 함께 표시하므로 “파이프라인이
-멈춤”과 “현재 기물이 검출되지 않음”을 구분할 수 있다.
-
-Debug 브라우저가 구독할 수 있는 인식 토픽은 exact read-only allowlist다.
+browser write는 선언된 typed-dispatch endpoint로만 가능하며,
+`/integration/debug/command`의 paused/stopped 경계를 통과한다. physical endpoint에는
+explicit arm과 resource single-flight도 추가로 필요하다.
 
 | 화면 증거 | ROS 토픽 |
 |---|---|
@@ -93,38 +97,15 @@ Debug 브라우저가 구독할 수 있는 인식 토픽은 exact read-only allo
 | Tool/Blood 모델 준비, 최근 frame 상태 | `/surgery/perception/rfdetr/health` |
 | Blood 요약 | `/surgery/perception/cam4/blood_semantics/json` |
 
-이 토픽들은 publish allowlist에 들어가지 않으며 Debug 브라우저는 인식 결과를
-변조할 수 없다. PNU adapter도 카메라를 구독하고 관찰 결과만 발행하며 planner,
-Action, Service 또는 물리 로봇 명령을 시작하지 않는다.
-
-외부 PC worker를 쓸 때는 Taskplanner PC에서 다음처럼 명시한다. remote 선택은
-local `pnu-perception` 컨테이너를 중지한 채 시작하지 않으며, endpoint 실패 시
-local로 자동 fallback하지 않는다.
-
-```bash
-ENABLE_PNU_DEBUG_PERCEPTION=true \
-PERCEPTION_PROVIDER=pnu_hand_blood \
-PERCEPTION_LOCATION=remote \
-PERCEPTION_ENDPOINT=https://PNU_WORKER_DNS_NAME:8443 \
-PNU_SECRET_ROOT=/absolute/path/to/perception-secret \
-PNU_CLIENT_API_TOKEN_FILE=/run/taskplanner/perception/token \
-scripts/taskplanner up debug --build
-```
-
-원격 endpoint는 기본적으로 HTTPS여야 한다. TLS proxy 전의 격리된 신뢰 유선
-LAN 시험에서만 `http://WORKER_LAN_IP:8020`과
-`PNU_ALLOW_INSECURE_REMOTE_HTTP=true`를 함께 사용한다. 이 전송 예외는 별도
-bearer 인증 요구를 해제하지 않는다.
-
-요청하는 Tool/Blood 모델 경로나 digest를 바꿀 때는 worker readiness와 bridge의
-`PNU_EXPECTED_MODEL_DIGESTS_JSON`을 함께 검토한다. 일시적으로 인식 계층을 완전히
-빼려면 `ENABLE_PNU_DEBUG_PERCEPTION=false scripts/taskplanner up debug`를 사용한다.
+이 예시 토픽들은 Debug browser가 변경할 수 없는 외부 관측이다. 인식 worker의
+배포·인증·모델 선택은 해당 인식 owner의 책임이며 Debug owner의 환경이나 재시작
+범위에 들어가지 않는다.
 
 ## LLM Surgeon·Replay와 LAN 경로
 
 `scripts/taskplanner up llm-surgeon`과 `scripts/taskplanner up replay`는
 데모/재생용 core만 시작한다. 두 모드에는 Live의 외부 카메라 observer,
-`integration-debug` 관측 sidecar, 운영 ASR가 포함되지 않는다. 따라서 실제
+`debug-observer`, `debug-control`, 운영 ASR가 포함되지 않는다. 따라서 실제
 VIPLab 입력과 CAM4 인식 overlay를 확인하려면 Live를 사용해야 한다.
 
 모든 모드의 브라우저와 ROSBridge 원격 접속은 같은 LAN/Tailnet 경로 라우터를
@@ -140,7 +121,10 @@ VIPLab 입력과 CAM4 인식 overlay를 확인하려면 Live를 사용해야 한
 - **ROS Domain ID**: `0`–`232` 사이의 정수를 직접 입력한다. 상대 기관 컴퓨터와 반드시 같은 값을 사용한다.
 - **상대 컴퓨터 핑 테스트**: 상대 IPv4 주소에 ICMP Echo를 3회 보내 응답 수, 손실률, 평균 RTT를 표시한다. 핑은 DDS 설정을 변경하지 않는다.
 
-DDS 설정은 이미 시작된 ROS 2 프로세스에서 안전하게 교체할 수 없으므로, **적용하고 재연결**을 누르면 설정을 저장한 뒤 `integration-debug` 런타임 컨테이너만 재시작한다. 웹 UI는 유지되며 ROSBridge에 자동 재연결한다. 수동 제어가 활성화되어 있거나 Action이 실행 중이거나 연속 더미 토픽을 발행 중일 때에는 설정 변경을 거부한다.
+DDS 설정은 이미 시작된 ROS 2 프로세스에서 안전하게 교체할 수 없다. 네트워크
+capability owner가 배포된 경우에만 **적용하고 재연결**은 그 owner만 재시작한다.
+`debug-observer`와 `debug-control`은 네트워크 설정을 바꾸지 않으며, 웹 UI는
+ROSBridge에 자동 재연결한다.
 
 설정은 `${TASKPLANNER_RUN_ROOT}/debug/network-settings.json`에 보존되어 다음
 standalone 디버그 모드 시작에도 적용된다. 운영 런타임에 통합된 sidecar는 과거에
@@ -179,11 +163,10 @@ Replay, Debug 모드 사이를 전환해도 LAN UI 주소는 유지된다. 주�
 서브넷은 각각 `TASKPLANNER_WEBAPP_LAN_ADDRESS`,
 `TASKPLANNER_WEBAPP_LAN_NETWORK`로만 명시적으로 변경할 수 있다.
 
-`integration-debug-lan-proxy`는 Live, LLM Surgeon, Replay, standalone Debug와
-독립적으로 선택한 유선 인터페이스의 `ROSBRIDGE_DEBUG_PORT` 경로만 노출한다.
-유선 IPv4가 바뀌면 이 ROS
-리스너는 자동으로 다시 바인딩되며, 재시작되어도 4173 UI 연결에는 영향을 주지
-않는다.
+Live/LLM/Replay의 LAN proxy와 standalone Debug bridge는 분리한다. standalone
+Debug는 observer가 제공하는 `ROSBRIDGE_DEBUG_PORT`(기본 9091)를 직접 사용하며,
+Live/LLM/Replay의 proxy restart를 요구하지 않는다. 유선 IPv4와 proxy 설정은
+network capability owner의 범위이며 observer/control owner가 바꾸지 않는다.
 
 Tailnet에서 허용된 TCP는 호스트의 loopback으로 전달되므로, Tailscale IPv4
 접속도 같은 `ROSBRIDGE_DEBUG_PORT`의 loopback 경로 라우터를 통과한다. `/`는
@@ -200,9 +183,8 @@ Debug 화면을 열 수 있으므로, 신뢰된 통합 시험망에서만 실행
 
 | 토픽 | 타입 | 기본 QoS | 화면에서 확인하는 값 |
 |---|---|---|---|
-| `/sensors/surgeon/sentence` | `std_msgs/msg/String` | reliable / volatile / depth 20 | publisher, 실측 Hz, 최근 문장, freshness |
-| `/surgery/audio/request_text` | `std_msgs/msg/String` | reliable / volatile / depth 20 | speech adapter가 입장을 허용한 정규화 문장, publisher, 수신 횟수 |
-| `/integration/debug/speech/status` | `surgical_msgs/msg/InputSourceStatus` | reliable / volatile / depth 10 | Debug speech adapter 전용 heartbeat 및 최근 수신/허용/거부 횟수와 사유. 운영 adapter의 `/input/speech/status`와 분리해 상태를 섞지 않는다. |
+| `/sensors/surgeon/utterance` | `surgical_msgs/msg/SpeechUtterance` | reliable / volatile / depth 20 | typed ASR source, publisher, freshness |
+| `/surgery/audio/observed_utterance` | `surgical_msgs/msg/SpeechUtterance` | reliable / volatile / depth 20 | CommandRouter의 read-only relay, 최근 admitted utterance |
 | `/integration/cv_contract/status` | `std_msgs/msg/String` | reliable / transient local / depth 1 | CV 계약 상태의 publisher, 실측 Hz, 최근 JSON, freshness |
 | `/synced/cam_1/status` | `std_msgs/msg/String` | reliable / transient local / depth 1 | 원본 RGB publisher, 소스 실측 Hz·payload·누적 발행/드롭, 원본 QoS, freshness |
 | `/synced/cam_2/status` | `std_msgs/msg/String` | reliable / transient local / depth 1 | 원본 RGB publisher, 소스 실측 Hz·payload·누적 발행/드롭, 원본 QoS, freshness |
@@ -227,7 +209,7 @@ timestamp-preserving CompressedImage만 구독하며 `/camera/*` 또는
 
 `cv_contract_monitor`와 Debug gateway는 reliable / transient local / depth 1로
 snapshot QoS를 맞춘다. 따라서 gateway가 늦게 시작해도 마지막 CV 계약 상태를 받을
-수 있다. 반면 surgeon sentence와 admitted text 같은 실시간 문자열은 reliable /
+수 있다. 반면 ASR source와 observed utterance 같은 실시간 메시지는 reliable /
 volatile / depth 20을 유지해 과거 발화를 새 세션 명령으로 재생하지 않는다.
 
 ## 선택 가능한 로봇 종단
@@ -251,16 +233,19 @@ retraction admission state는 `idle`로 초기화되고 음성 자동 송신은 
 `distance_m`만 포함한다. 직접 교시 종료는 Debug 입력에서
 `target_side=none|left|right|both`를 허용하되, 배포된 로봇 peer와의 호환을
 위해 Service wire에서는 세션 단위 종료를 뜻하는 `TARGET_NONE`으로 정규화한다.
-조정은 `left|right|both`를 허용하며 `both`는 각 팔에 같은 거리를 적용한다.
+조정은 `left|right|both`를 허용하며 `both`는 Service wire의
+`TARGET_BOTH=3`으로 직렬화되고 각 팔에 같은 거리를 적용한다.
 5 cm 조절은 `distance_m=0.050`이다. Service 화면은
 `request_accepted`, `result_code`, 응답 `command_id`, `message`만 표시한다.
 이는 Request admission 확인일 뿐, 물리 동작의 완료·진행률·상태·Tool 부착을
 의미하지 않는다. 문서에 없는 자세, 속도 또는 상세 제어 상태는 Taskplanner가
 만들지 않는다.
 
-석션 로봇암 제어와 상태 UI는 제공하지 않는다. 임상 도구인 석션과 석션
-관련 음성은 도구 전달 및 공개 증거 경로에서 계속 사용할 수 있지만,
-bed-mounted robot-arm 또는 의료기기 흡입 제어 명령으로 변환하지 않는다.
+`suction`은 Debug-specific parser가 아니라 CommandRouter catalog의 typed Service
+command다. catalog는 `protocol_version: 1`, `command: 7`, `target_side: 0`,
+`distance_m: 0.0`을 execution-owner proxy로 보낸다. selected external or virtual
+endpoint가 command 7을 지원하는지와 실제 physical behavior는 Taskplanner가
+추정하지 않는다.
 
 기존 Tool Change와 Retraction Adjustment의 별도 form/Action Cancel은 더 이상
 제공하지 않는다. 상태 화면은 `stamp`, `revision`, `procedure_type` 및 각 arm의
@@ -274,24 +259,16 @@ bed-mounted robot-arm 또는 의료기기 흡입 제어 명령으로 변환하�
 watchdog, Cancel 및 복구 카드는 계속 Action인 `/surgery/tool_handover`에만
 적용된다.
 
-운영 프로파일의 Debug sidecar는 쓰기 개입에만 `/simulation/state` interlock을
-사용한다. 최신 상태가 `running=true, execution_state=paused`이거나,
-`running=false`와 명시적인 완전 정지 state가 일치하고, 활성 로봇 task 없음,
-`robot_state=idle`, cleaner 비활성까지 모두 확인될 때
-`operational_intervention_allowed=true`가 된다. 완전 정지 여부 자체는 기존
-`operational_runtime_stopped`로 별도 표시한다. 여기에 Fault가 없고 진행 중
-Action도 없어야 `manual_control_available=true`가 되어 수동 제어를 활성화할 수
-있다. 실행 중, 상태 미수신, freshness 만료 또는 신뢰할 수 없는 publisher는 모두
-구체적인 `operational_intervention_block_reason`과 함께 fail-closed 처리한다.
-Fault나 진행 중 Action 등 다른 조건이 남아 있으면 별도의 **수동 잠금** 상태를
-표시한다. 수동 Action·Service·더미 토픽·문장·마이크 명령은 Debug 화면에
-**개입 가능**과 **수동 활성화 가능**이 모두 표시된 뒤 시험한다. 운영 컨테이너
-자체를 종료할 필요는 없다.
+`debug-control` owner는 쓰기 개입에만 `/simulation/state`의 최신 paused 또는
+stopped 상태를 확인한다. physical Action/Service에는 explicit arm과 대상 resource의
+single-flight가 더해진다. 카메라·ASR·VLM·record health, UI 상태, 시나리오의
+별도 policy는 이 admission을 막지 않는다. 실행 중·상태 미수신·freshness 만료는
+`operational_intervention_block_reason`으로 표시하고 새 write만 거부한다. observer
+관측과 VLM/ASR/record capability의 상태 표시는 계속 가능하다.
 
-VLM 상태 새로고침과 text-only 해석 micro-test는 관찰 경로이므로 실행 중에도
-사용할 수 있고 ROS Service·Action을 발행하지 않는다. 반면 공유 inference
-runtime의 모델을 실제로 적재하는 `vlm_load`는 자원 상태를 바꾸는 개입이므로
-같은 paused/fully-stopped gate와 armed 세션을 요구한다.
+VLM capability가 별도로 실행 중이면 observer는 그 상태를 읽을 수 있지만,
+VLM은 음성 명령 경로에 포함되지 않는다. 모델을 실제로 적재하거나 교체하는
+작업은 resource state를 바꾸는 개입이므로 paused/stopped와 arm 경계를 따른다.
 
 운영 프로파일은 추가로 `TASKPLANNER_DEBUG_ALLOW_PLANNER_COEXISTENCE=false`와
 runtime network lock을 적용한다. UI 확인만으로 불명확한 상태를 승인하거나
@@ -321,30 +298,16 @@ Subscriber 수는 DDS discovery 확인값이며, 상대 기관의 실제 callbac
 
 ## 문장·USB 마이크 입력
 
-**USB 음성·로그** 탭에서 완성 문장을 직접 입력해
-`/sensors/surgeon/sentence`로 발행할 수 있다. standalone Debug에서는 호스트에
-연결한 USB 마이크로 Puzzle AI WebSocket ASR도 시험할 수 있다. live 운영
-런타임이 실제로 실행 중이거나 운영 상태를 신뢰할 수 없을 때는 `asr_start`를
-거부하며, 같은 UI의 운영 화면 **수술실 음성 입력**에서 USB ASR을 시작해야 한다.
-운영 런타임이 신뢰할 수 있는 최신 paused 또는 완전 정지 상태이고 공유 자원이
-idle이면, 수동 제어를 활성화한 뒤 통합 Debug sidecar에서도 standalone USB
-ASR을 시작할 수 있다. 운영 화면과
-Debug는 공유 캡처 lock으로 동시에 마이크를 열지 않는다. 이 구분은 Debug
-publisher가 운영 preflight를 대신 만족한 직후 시나리오 interlock으로 사라지는
-경로를 막는다. 브라우저는
-이 토픽을 직접 advertise하지 않고 `publish_voice_command` 백엔드
-명령을 통해 수동 제어·Fault·운영 시나리오 interlock을 다시 확인한 후
-발행한다. 마이크 세션은 사용자가 명시적으로 시작할 때만 열리고,
-서버가 `is_final`로 확정한 비어 있지 않은 문장만 같은 ROS 토픽으로
-발행한다. 중간 인식 문장은 화면 진단용으로만 표시하며 ROS에
-발행하지 않는다.
+`debug-observer`는 USB 장치·PipeWire·ASR WebSocket을 열지 않는다. 화면은
+typed source `/sensors/surgeon/utterance`와 CommandRouter의 read-only
+`/surgery/audio/observed_utterance`를 관찰할 수 있다. USB capture와 final
+발행은 명시적으로 시작한 `asr` capability owner에만 있다. observer container에는
+PipeWire socket이나 ASR endpoint 환경변수가 없다.
 
-standalone Debug 마이크 시작 전에는 화면 최상단의 **수동 제어 활성화**가 필요하다. 이 전역
-제어는 조그 탭 안에 중복 표시하지 않는다. 수동 제어 해제, UI
-heartbeat timeout, Fault 또는 런타임 종료 시 마이크를 자동 중지한다. 자체 ASR
-publisher가 존재한다는 이유만으로 입력 준비 완료로 보지 않으며, WebSocket이
-실제로 연결된 `LISTENING` 상태일 때만 readiness를 만족한다. LAN 프록시는
-인증 경계가 아니므로 마이크와 전사 원문은 신뢰된 격리 시험망에서만 사용한다.
+ASR owner가 있을 때만 화면의 **ASR 시작**을 표시한다. `LISTENING`은 실제
+WebSocket 연결을 뜻하며, observer가 `WAITING_PUBLISHER`인 것은 관찰 기능의
+실패가 아니다. LAN 프록시는 인증 경계가 아니므로 마이크와 전사 원문은 신뢰된
+격리 시험망에서만 사용한다.
 
 ASR 세션이 멈춰 있을 때만 화면의 **클라우드** 또는 **LAN 192.168.1.5** route를
 선택할 수 있다. 이 선택은 `cloud`/`lan` 식별자만 Debug backend로 전달하며, 브라우저가
@@ -364,28 +327,43 @@ Debug 컨테이너는 raw `/dev/snd` 대신 호스트 PipeWire socket을 사용�
 
 세션 종료 후 WAV와 확정 문장 TXT가 `${TASKPLANNER_RUN_ROOT}/debug/<session-id>/asr/`에 저장된다. 이는 음성 개인정보가 될 수 있으므로 실제 임상망이 아니라 비식별 통합 시험에서만 사용하고, 세션 산출물의 접근·보존 정책을 별도로 적용한다. 현재 ASR WebSocket 계약에는 별도 애플리케이션 인증이 정의되어 있지 않으며 URL query/userinfo에 자격증명을 넣는 방식은 거부한다.
 
-도구 전달용 **음성 즉시 실행**과 리트랙터용 **음성 + 버튼**은 서로 다른
-게이트다. 전자는 설정된 도구 별칭만 결정적으로 변환한다. 후자는 조그·수동
-실행 탭에서 별도로 켜며, USB ASR 탭이 이미 발행한 final 문장을 text-only
-VLM에 비동기로 전달한다. 리트랙터 음성 게이트는 별도 마이크나 ASR 세션을
-열지 않으며, standalone Debug의 마이크 캡처 소유자는 **USB 음성·로그** 탭
-하나뿐이다. 같은 탭의 수동 문장 입력도 동일한 final 문장 토픽을 사용하므로
-해당 게이트가 켜져 있으면 리트랙터 음성 입력으로 처리된다. VLM 응답은 6개
-명령의 폐쇄형 스키마, 현재 Debug 내부 상태, 원문
-근거를 다시 검증한 뒤에만 단일 `/surgery/retraction/command` Service 요청이
-된다. 디버그 화면의 **상태머신 제한 해제**를 켜면 이 로컬 lifecycle allow-list만
-우회하여 6개 명령을 임의 순서로 시험할 수 있다. 수동 제어, 단일 in-flight 요청,
-Service 스키마·파라미터 검증, 상대 Service의 응답 확인은 계속 적용되며 이
-토글은 세션 종료/수동 해제 시 꺼진다. 운영 프로파일에는 이 기능이 없다. 모델이
-없거나 timeout·형식 오류가 나면 동일한 공용 결정론 정규화기로 폴백하고, 화면과
-이벤트 로그에 `interpreter_source`와 `vlm_invoked`를 표시한다. Service 응답은
-요청 접수 여부일 뿐 물리 실행·완료를 뜻하지 않는다.
+Debug에서 들어온 final speech도 `speech_input_adapter`를 거쳐 typed
+`/surgery/audio/admitted_utterance`가 된 뒤에만 처리한다. `CommandRouter`가
+catalog match를 정확히 한 번 dispatch하고 observer는
+`/surgery/audio/observed_utterance`만 읽는다. VLM text interpretation, local
+voice state machine, and an additional retraction voice lane are not Debug
+command paths. Manual typed dispatch remains a separate `debug-control`
+operation and cannot replay an observed utterance. Service response is request
+admission only, not physical execution or completion.
 
 ## 수술기록 생성 API 시험
 
-**수술기록 API** 탭은 권위 있는 `0704_6`–`0704_17` UTF-8 전달용 TXT 12개를 read-only로 표시하고, 선택한 파일 전체를 JSON의 `text` 필드에 넣어 단일 `POST`로 전송한다. `roomName` 기본값은 전임상센터의 영문명인 `Preclinical Center`이며 `surgeryCode`, `date`, HTTPS endpoint는 제출마다 확인한다. `X-API-Key`는 호스트의 mode-0600 비밀 파일에서 백엔드만 읽고 read-only로 마운트한다. 키 값·길이·해시·파일 경로는 브라우저 payload, 상태 snapshot, 이벤트 로그와 요청 이력에 포함하지 않으며 화면에는 설정 여부만 표시한다. 파일 문자 수·바이트 수·SHA-256과 API 제한(65,535자, JSON body 1 MB)을 전송 전에 표시한다.
+이 절의 수동 TXT 전송 시험과 Live 자동 수술기록 owner는 서로 다른 경계다.
+Live에서는 전용 `surgery-record` owner가 항상 시작되며, 음성·버튼이 공통으로
+호출하는 `/simulation/control`의 성공 결과를 SimulationManager가 실행기 정착까지
+확인한 뒤 `/simulation/lifecycle_terminal`로 투영한다. 같은
+`procedure_run_id`의 `stop/halted` 또는 `completed/completed`만 로컬 0600 파일 저장과
+HTTPS POST를 승인한다. `pause`는 현재 timeline을 유지하며 저장·POST하지 않고,
+`reset/idle`, 실패한 Stop, raw `halted` 프레임도 승인 근거가 아니다. 이 owner는
+Debug observer나 Debug 수동 record capability 안에서 중복 생성되지 않는다.
 
-통합 수신 시험에서 `https://dev.puzzle-ai.com:6627/api/v1/surgery/img_texts`가 실제 요청을 수신하는 주소로 확인되어 현재 canonical endpoint로 사용한다. 서버도 이 endpoint만 allowlist하며, 다른 호스트·경로와 HTTP redirect로 TXT가 전송되는 것을 거부한다. 성공 `201`은 접수 ID와 수신 시각을 확인하는 것이며, 문서에는 생성 결과 조회·다운로드 endpoint가 없다. 따라서 화면은 실제 응답에 결과 본문이 포함되지 않은 이상 “기록 생성 완료”라고 표시하지 않는다. 30초 전후 timeout은 서버가 이미 접수했을 가능성이 있어 자동 재전송하지 않는다.
+**수술기록 API** 탭은 `record` capability owner가 명시적으로 시작된 경우에만
+전송 제어를 표시한다. `debug-observer`에는 record 입력 마운트·API key·HTTP client가
+없다. record owner는 CommandRouter의 read-only
+`/surgery/audio/observed_utterance`를 timeline 관측값으로만 읽고, 권위 있는
+`0704_6`–`0704_17` UTF-8 전달용 TXT 12개를
+read-only로 표시하고, 선택한 파일 전체를 JSON의 `text` 필드에 넣어 단일 `POST`로
+전송한다. `roomName` 기본값은 전임상센터의 영문명인 `Preclinical Center`이며
+`surgeryCode`, `date`, HTTPS endpoint는 제출마다 확인한다. `X-API-Key`는 호스트의
+mode-0600 비밀 파일에서 백엔드만 읽고 read-only로 마운트한다. 키 값·길이·해시·파일
+경로는 browser payload, status snapshot, 이벤트 로그와 요청 이력에 포함하지 않으며
+화면에는 설정 여부만 표시한다.
+
+현재 수술기록 canonical endpoint는 `https://192.168.1.5:6627/api/v1/surgery/img_texts`다. 서버는 이 endpoint만 allowlist하며, 다른 호스트·경로와 HTTP redirect로 TXT가 전송되는 것을 거부한다. 성공 `201`은 접수 ID와 수신 시각을 확인하는 것이며, 문서에는 생성 결과 조회·다운로드 endpoint가 없다. 따라서 화면은 실제 응답에 결과 본문이 포함되지 않은 이상 “기록 생성 완료”라고 표시하지 않는다. 30초 전후 timeout은 서버가 이미 접수했을 가능성이 있어 자동 재전송하지 않는다.
+
+SurgiMate용 read-only 결과는 `/surgery/record/receipt`의 `std_msgs/msg/String` JSON으로 한 번만 발행한다. schema는 `taskplanner.surgery_record.receipt.v1`이며 `SUCCEEDED`, `FAILED`, `REMOTE_STATE_UNKNOWN`의 HTTPS 종료 결과만 reliable / transient-local / depth 1로 유지한다. `record_text`에는 terminal 시점에 생성한 수술기록 원문 전체를 메모리에서 담고, `response`에는 서버가 실제로 반환한 원문(서버가 수술기록 본문을 포함한 경우 그 본문 포함)을 16 KiB 이내로 전달한다. receipt 전용 1 MiB rosbridge frame 한도는 65,535자 원문이 JSON envelope 안에서도 버려지지 않게 하며, 자격증명·endpoint·로컬 `output_path`는 제거한다. 기존 `/surgery/record/post_status`는 private operator 상태 토픽으로 유지한다.
+
+서버가 Puzzle private CA 체인을 사용하므로 Live `surgery-record` owner는 `config/puzzle_surgery_record_root_ca.pem`만 전용 신뢰 앵커로 사용한다. 2026-08-28에 확인한 CA SHA-256 fingerprint는 `E1:0D:AD:91:50:41:81:C9:92:0C:51:36:7B:F1:B1:70:7F:86:FB:35:F8:CF:13:EA:C5:10:5C:10:C6:02:90:3E`다. TLS 및 IP SAN 검증을 끄지 않는다.
 
 현재 LAN UI/ROSBridge는 사용자 인증과 TLS를 추가하지 않으므로 신뢰된 격리 시험망에서 비식별 TXT만 전송한다. 외부 운영 전에는 canonical endpoint, 중복 키, timeout 후 조회/reconcile, 결과 schema, API 키 회전·폐기 정책을 Puzzle AI 측과 확정해야 한다.
 
@@ -393,41 +371,36 @@ Service 스키마·파라미터 검증, 상대 Service의 응답 확인은 계�
 
 | 방향 | 이름 | 타입 | 실제 QoS/호출 주체 | 의미 |
 |---|---|---|---|---|
-| gateway → browser | `/integration/debug/status` | `std_msgs/msg/String` | reliable / volatile / depth 10 | UI가 소비하는 `taskplanner.integration_debug.status.v1` 전체 snapshot |
-| gateway → ROS | `/integration/debug/events` | `std_msgs/msg/String` | reliable / volatile / depth 50 | 개별 검증 이벤트 JSON; UI는 주로 status의 bounded `recent_events`를 사용 |
-| gateway → browser | `/integration/debug/readiness` | `std_msgs/msg/String` | reliable / volatile / depth 10 | sentence publisher, Tool Action, retraction Service, bed-arm status 네 가지 readiness |
-| browser → gateway | `/integration/debug/heartbeat` | `std_msgs/msg/String` | reliable / volatile / browser queue 1, gateway depth 5 | 현재 Debug 세션 ID를 담은 UI 생존 신호 |
-| browser → gateway | `/integration/debug/command` | `surgical_msgs/srv/IntegrationDebugCommand` | 운영 통합 Debug bridge의 유일한 mutation Service; standalone bridge는 별도로 world-anchor 4개 Trigger도 허용 | arm/disarm, 수동 문장·출력, Action/Service 요청을 서버 interlock 뒤에서 중계 |
-| ROS client → gateway | `/integration/debug/check_readiness` | `std_srvs/srv/Trigger` | Service; 현재 secure browser allowlist에는 없음 | 현재 Debug readiness를 즉시 질의하고 readiness topic에도 발행 |
+| observer → browser | `/integration/debug/status` | `std_msgs/msg/String` | reliable / volatile / depth 10 | UI가 소비하는 public `taskplanner.integration_debug.status.v1`; observer input telemetry와 최신 control projection을 합성 |
+| observer → ROS | `/integration/debug/events` | `std_msgs/msg/String` | reliable / volatile / depth 50 | observer 이벤트 JSON |
+| observer → browser | `/integration/debug/readiness` | `std_msgs/msg/String` | reliable / volatile / depth 10 | read-only observer readiness |
+| browser → owners | `/integration/debug/heartbeat` | `std_msgs/msg/String` | reliable / volatile / browser queue 1, owner depth 5 | 현재 Debug 세션 ID를 담은 UI 생존 신호 |
+| browser → control | `/integration/debug/command` | `surgical_msgs/srv/IntegrationDebugCommand` | `debug-control`의 유일한 mutation Service | arm/disarm, 더미 출력, 직접 Action/Service 요청을 typed dispatch로 중계 |
+| control → observer | `/integration/debug/control/{status,events,readiness}` | `std_msgs/msg/String` | reliable / volatile | private owner projection; browser는 이 토픽을 직접 소비하지 않음 |
+| ROS client → observer/control | `/integration/debug/check_readiness`, `/integration/debug/control/check_readiness` | `std_srvs/srv/Trigger` | Service | 각 owner의 readiness를 즉시 질의 |
 
-`status` JSON의 최상위 필드는 `schema`, `stamp_sec`, `session`, `runtime`,
-`inputs`, `endpoints`, `action`, `outputs`, `voice`, `vlm`, `virtual_robot`,
-`asr`, `surgery_record`, `recent_events`다. 운영 interlock 진단에는
-`runtime.operational_running`, `operational_active_robot_task_id`,
-`operational_robot_state`, `operational_cleaner_busy`,
-`operational_state_publishers`, `operational_state_expected_publisher`,
-`operational_state_publisher_trusted`, `operational_state_age_sec`,
-`operational_state_fresh`, `operational_runtime_stopped`,
+`status` JSON의 최상위 필드는 `schema`, `capabilities`, `stamp_sec`, `session`,
+`runtime`, `inputs`, `endpoints`, `action`, `outputs`, `voice`, `vlm`,
+`virtual_robot`, `asr`, `surgery_record`, `recent_events`다. `capabilities[]`의
+`enabled`, `state`, `restart_scope`는 각 owner가 실제로 시작됐는지와 필요한
+최소 재시작 범위를 표시한다. observer가 control private status를 3초 안에 받으면
+session/action/typed endpoint projection을 public status에 합성하며, 늦거나 없으면
+observer-only 상태를 정확히 표시한다. 운영 interlock 진단에는
+`runtime.operational_state_fresh`, `operational_runtime_stopped`,
 `operational_intervention_allowed`, `operational_intervention_block_reason`,
-`operational_control_window_open`, `manual_control_gate`를 함께 사용한다.
-리트랙터 해석 상태는 `voice.retraction` 아래의 `mode`, `internal_state`,
-`interpreter_mode`, `interpreter_pending`, `interpreter_pending_age_sec`,
-`state_machine_bypass_enabled`, `allowed_commands`, `service_ready`, `in_flight`,
-`last_interpretation`, `last_rejection_reason`으로 전달된다. Service 응답은 `action`의
-`response_semantics=admission`, `request_accepted`, `result_code`,
-`response_message`로 구분한다.
-
-리트랙터 패널의 `force_retraction_idle`은 Debug 내부 admission 상태만
-`idle`로 초기화하는 복구용 UI 명령이다. 진행 중 Action/Service 요청이 없어야
-하며 `remote_motion_stopped_confirmed=true` 확인이 필요하다. 실행 시 수동 제어와
-리트랙터 음성 전송 권한을 해제하고, 외부 Service 또는 로봇에는 어떤 명령도
-보내지 않는다. 따라서 상대 로봇의 정지나 물리 상태를 증명하는 기능이 아니다.
+`manual_control_gate`를 함께 사용한다.
+`voice` status는 최근 observed utterance와 CommandRouter의 read-only result
+projection만 표시한다. Debug는 별도의 음성 해석기, command 순서 allowlist,
+또는 local admission state machine을 보유하지 않는다. Service 응답은
+`action`의 `response_semantics=admission`, `request_accepted`, `result_code`,
+`response_message`로 구분한다. Controller Service는 command ordering과 physical
+state를 단독으로 판단한다.
 
 브라우저는 `/surgery/tool_handover` Action이나
 `/surgery/retraction/command` Service를 직접 호출하지 않는다. 브라우저가 직접
 publish하는 ROS 토픽도 heartbeat 하나뿐이다. 모든 수동 요청은
-`/integration/debug/command`를 통과한 뒤 gateway가 상대 Action/Service client가
-되어 전송한다. 따라서 브라우저 통합 테스트는 아래 다섯 op만 있으면 충분하다:
+`/integration/debug/command`를 통과한 뒤 control owner가 상대 Action/Service
+client가 되어 전송한다. 따라서 브라우저 통합 테스트는 아래 다섯 op만 있으면 충분하다:
 status/readiness subscribe, heartbeat advertise/publish, command Service call. 상대
 로봇 계약 테스트는 내장 `virtual` 종단이나 별도 ROS harness의 fake server를
 사용한다.
@@ -441,12 +414,12 @@ status/readiness subscribe, heartbeat advertise/publish, command Service call. �
 | Debug 운영 interlock | `/simulation/state`의 안전 정지 sample | status의 `runtime.operational_*` | trusted publisher, fresh age, stopped 조건이 모두 분리되어 표시 | 아니요 |
 | Debug bed-arm 상태 | 선택한 external 또는 virtual bed status sample | status의 `endpoints[name=bed_robot_arm_status]`, `virtual_robot` | schema/revision/role 검증 및 선택 종단 freshness 갱신 | 내장 virtual 또는 fake publisher만 |
 | Debug 더미 출력 | `/integration/debug/command`의 `publish_once` 또는 `configure_output` | 선택한 `/surgery/*` 공개 토픽 | 서버가 동시 publisher를 거부하고 subscriber/callback에서 dummy marker 확인 | 아니요 |
-| Debug 수동 문장 | command Service의 `publish_voice_command` | `/sensors/surgeon/sentence` | final 문장 1회 및 status의 last sentence 갱신 | 아니요 |
-| Debug 리트랙터 해석 단위 시험 | ROS 없는 interpreter 함수에 final text와 local state 입력 | 폐쇄형 6-command 결과 또는 rejection | side 누락·양측·범위 밖 거리 거부; Service client 호출 0회 | 아니요 |
+| Debug 음성 관찰 | typed ASR sample | `/surgery/audio/observed_utterance`, status의 last utterance | observer가 command를 재실행하지 않고 변경 없는 relay를 표시 | 아니요 |
+| Catalog Service command 단위 시험 | admitted `SpeechUtterance` 하나 | typed request 하나 또는 catalog miss | exact phrase는 한 번 dispatch, 비명령은 0회 dispatch | fake server만 |
 | Debug 리트랙터 통합 시험 | `virtual` 선택 + command Service 요청 | 내장 Service가 받은 admission 결과와 Debug status | 정확한 enum/side/metres/command_id; state는 `request_accepted + RESULT_ACCEPTED`일 때만 전이 | 아니요 |
 | Debug Tool Action 통합 시험 | `virtual` 선택 + command Service 요청 | 내장 Action feedback/result와 Debug status | Goal field·command_id 상관, terminal Result 및 watchdog 경계 확인 | 아니요 |
-| Live STT 어댑터 단위 시험 | `/sensors/surgeon/sentence` 완성 String | `/surgery/audio/request_text`, `/input/speech/status` | 공백 정규화, 빈 문장·1초 내 동일 문장 거부, accepted count 1 증가 | 아니요 |
-| Live 리트랙터 경로 통합 시험 | final sentence → `/surgery/audio/request_text`; fake controller status와 fake Service | `/surgeon/bed_robot_arm_group_request` → `/bt/bed_robot_arm_group_command` → Service Request → `/bed_robot_arm_group/status` | VLM/폴백 provenance, 6명령 매핑, 한 Service lane, admission-only state 전이 확인 | fake server만 |
+| ASR adapter 단위 시험 | complete `SpeechUtterance` 또는 legacy sentence compatibility input | `/surgery/audio/admitted_utterance`, `/input/speech/status` | final/source/freshness/echo/dedupe를 한 번 적용 | 아니요 |
+| Voice Service 통합 시험 | admitted utterance + fake Service | execution-owner proxy → fake Service Request | catalog payload, one dispatch, endpoint admission response를 분리해 확인 | fake server만 |
 | Mock 직접 계약 시험 | `fault_action_emulator`의 fake Action/Service와 bed-arm status | Live와 동일 public 종단 | 외부 하드웨어 없이 public wire contract와 실패 주입 검증 | 아니요 |
 
 Live의 리트랙터 음성 경로에서 각 노드가 소유하는 실제 ROS 인터페이스는 다음과
@@ -454,10 +427,10 @@ Live의 리트랙터 음성 경로에서 각 노드가 소유하는 실제 ROS �
 
 | 소유 노드 | 구독/서버 입력 | 발행/client 출력 |
 |---|---|---|
-| `taskplanner_asr` | `/input/asr/control` (`AsrControl` Service) | `/input/asr/runtime_status` String snapshot, 연결 중에만 `/sensors/surgeon/sentence` String |
-| `speech_input_adapter` | `/sensors/surgeon/sentence` String, `/simulation/control_state` String | `/surgery/audio/request_text` String, `/input/speech/status` `InputSourceStatus` |
-| `bed_robot_arm_group_orchestrator` | request/proposal/group status/world/controller status/audio text/control state | `/surgeon/bed_robot_arm_group_request`, `/bt/bed_robot_arm_group_command`, `/bed_robot_arm_group/status`, `/bed_robot_arm_group/voice_normalization_status` |
-| `surgical_interop_execution_bridge` | `/bt/skill_command`, `/bt/bed_robot_arm_group_command`, `/simulation/control_state`, `/external/bed_robot_arms/status` | `/skill/status`, `/skill/events`, `/bed_robot_arm_group/status`; `/surgery/tool_handover` Action client; `/surgery/retraction/command` Service client |
+| `taskplanner_asr` | `/input/asr/control` (`AsrControl` Service) | `/input/asr/runtime_status` snapshot, typed `/sensors/surgeon/utterance` |
+| `speech_input_adapter` | typed ASR source 또는 legacy sentence compatibility input | `/surgery/audio/admitted_utterance`, `/input/speech/status` `InputSourceStatus` |
+| `CommandRouter` | `/surgery/audio/admitted_utterance`, hot-reloadable catalog | `/surgery/audio/observed_utterance`, exact typed endpoint request |
+| execution owner | typed proxy request, route state, controller status | selected `/surgery/tool_handover` Action client 또는 `/surgery/retraction/command` Service client |
 | 상대 또는 mock controller | `/surgery/tool_handover` Action server, `/surgery/retraction/command` Service server | `/external/bed_robot_arms/status` controller-owned 상태 |
 
 세션 이벤트는 `${TASKPLANNER_RUN_ROOT}/debug/<session-id>/events.jsonl`에 JSONL로 남는다.

@@ -25,6 +25,11 @@ ros2 interface show surgical_perception_msgs/msg/ToolObservation2DArray
 - enum의 zero 값은 의도적으로 invalid다.
 - `/surgery/perception/surgical_tools/states`는 향후 common-frame cross-view fusion용으로
   예약하며 v1 publisher가 발행하지 않는다.
+- `TrackedToolBeliefArray`: active procedure가 고정한 instance만 대상으로 `tray`,
+  `mayo`, `field`, `surgeon`, `robot`, `cleaner`, `unknown`의 정규화 확률을 발행한다.
+  detector에만 있는 신규 도구 track을 만들지 않으며, Action admission, Digital Twin
+  mutation, 물리 제어 권한을 갖지 않는다. 구분할 수 없는 동일 도구 instance에는
+  대칭 evidence를 적용한다.
 
 외부 계약의 정본은
 [`PNU_CVLAB_SURGICAL_TOOL_INTERFACE_CONTRACT_V1.md`](../../../PNU_CVLAB_SURGICAL_TOOL_INTERFACE_CONTRACT_V1.md)를

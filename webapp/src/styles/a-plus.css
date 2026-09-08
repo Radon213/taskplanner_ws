@@ -494,21 +494,6 @@ body {
   font-size: max(12px, 100%);
 }
 
-.mission-layout {
-  grid-template-areas:
-    "stage"
-    "surgeon"
-    "runtime"
-    "timeline";
-}
-
-.mission-layout.live-stage-expanded {
-  grid-template-areas:
-    "stage"
-    "runtime"
-    "timeline";
-}
-
 .stage-area:focus-visible {
   border-radius: var(--radius-card);
 }
@@ -625,6 +610,12 @@ body {
     );
   background-size: 220% 100%;
   opacity: 0.82;
+  animation: operation-progress-sweep 1.2s linear infinite;
+}
+
+@keyframes operation-progress-sweep {
+  from { background-position: 200% 0; }
+  to { background-position: -200% 0; }
 }
 
 /* The stage is an at-a-glance spatial map, so its embedded source strip must
@@ -1072,16 +1063,6 @@ body {
 @media (min-width: 1280px) {
   /* Landscape monitoring prioritizes an undistorted operating-room board.
      The detailed event timeline remains available in compact layouts. */
-  .mission-layout {
-    grid-template-columns: minmax(600px, 1.58fr) minmax(250px, 0.48fr) minmax(300px, 0.56fr);
-    grid-template-areas: "stage surgeon runtime";
-  }
-
-  .mission-layout.live-stage-expanded {
-    grid-template-columns: minmax(0, 1fr) minmax(300px, 0.56fr);
-    grid-template-areas: "stage runtime";
-  }
-
   .timeline-area {
     display: none;
   }
@@ -1142,10 +1123,6 @@ body {
     height: 100dvh;
     grid-template-rows: auto minmax(0, 1fr);
     overflow: hidden;
-  }
-
-  .mission-layout {
-    grid-template-rows: minmax(0, 1fr);
   }
 
   .ops-app-shell,
@@ -1250,9 +1227,9 @@ body {
     display: none;
   }
 
-  /* Live adds the read-only integrated-observation entry. Keep all three
-     44px targets within a phone viewport instead of retaining the desktop
-     378px three-column minimum. */
+  /* Keep Mission, integrated observation, and the independent SurgiMate
+     launch action as 44px targets on a phone instead of retaining the
+     desktop three-column minimum. */
   .workspace-navigation.with-integrated-debug {
     min-width: 0;
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1445,5 +1422,49 @@ body {
   .mission-app-shell {
     height: min(1080px, 100dvh);
     min-height: 0;
+  }
+}
+
+/* The OR board and the observer-only location belief are independent
+   surfaces. Keep the board bounded here, and give the separate belief row its
+   own scroll container on FHD external monitors. */
+@media (min-width: 1440px) and (min-height: 850px) {
+  .stage-area .stage-card {
+    grid-template-rows: auto minmax(360px, 1fr);
+    gap: 10px;
+    overflow: auto;
+    overscroll-behavior: contain;
+    scrollbar-width: thin;
+  }
+
+  .stage-area .stage-chrome {
+    margin-bottom: 0;
+  }
+
+  .stage-area .foxglove-board {
+    min-height: 360px;
+    height: auto;
+    aspect-ratio: auto;
+    align-self: stretch;
+  }
+
+  .tool-belief-area {
+    min-height: 0;
+  }
+
+  .tool-belief-area .tool-belief-panel {
+    min-height: 0;
+    height: 100%;
+    margin: 0;
+    overflow: hidden;
+  }
+
+  .tool-belief-area .tool-belief-panel:has(.tool-belief-table-scroll) {
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+
+  .tool-belief-area .tool-belief-table-scroll {
+    min-height: 0;
+    overflow-y: auto;
   }
 }

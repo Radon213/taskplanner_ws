@@ -5,6 +5,7 @@ import json
 from tts_runtime.core import PlaybackEvent
 from tts_runtime.correlation import (
     AuthoritativeTimingCorrelator,
+    direct_reply_timing,
     filter_waiting_for_active_run,
 )
 
@@ -16,6 +17,7 @@ def waiting_job(
     function_name: str = "request_tool_handover",
     arguments: dict[str, object] | None = None,
     timing: str = "on_function_accepted",
+    function_request_id: str | None = None,
 ) -> PlaybackEvent:
     if arguments is None:
         arguments = {"tool_id": "T07"}
@@ -28,7 +30,11 @@ def waiting_job(
         procedure_run_id="run-1",
         function_call_name=function_name,
         function_arguments_json=json.dumps(arguments, separators=(",", ":")),
-        function_request_id=f"function:{reply_id}",
+        function_request_id=(
+            f"function:{reply_id}"
+            if function_request_id is None
+            else function_request_id
+        ),
         state=f"waiting_function_{timing.removeprefix('on_function_')}",
         timing=timing,
         text="확인했습니다",
@@ -61,6 +67,60 @@ def harness(*jobs: PlaybackEvent):
         release_waiting=release,
     )
     return correlator, pending, released
+
+
+def test_direct_reply_timing_keeps_only_utterance_correlatable_handover_waiting() -> None:
+    assert (
+        direct_reply_timing(
+            timing="on_function_accepted",
+            function_call_name="request_tool_handover",
+            function_arguments_json='{"tool_id":"T07"}',
+        )
+        == "on_function_accepted"
+    )
+    assert (
+        direct_reply_timing(
+            timing="on_function_completed",
+            function_call_name="request_tool_handover",
+            function_arguments_json='{"tool_id":"T07"}',
+        )
+        == "on_function_completed"
+    )
+
+
+def test_direct_reply_timing_plays_uncorrelated_function_reply_immediately() -> None:
+    # The retired VLM gate was the only owner that made this request ID match
+    # the direct deterministic command.  Do not leave a reply waiting for it.
+    assert (
+        direct_reply_timing(
+            timing="on_function_accepted",
+            function_call_name="adjust_retraction",
+            function_arguments_json=(
+                '{"command":"adjust_retraction","target_side":"left",'
+                '"distance_m":0.005}'
+            ),
+        )
+        == "immediate"
+    )
+    assert (
+        direct_reply_timing(
+            timing="on_function_accepted",
+            function_call_name="request_tool_handover",
+            function_arguments_json="not-json",
+        )
+        == "immediate"
+    )
+
+
+def test_direct_reply_timing_keeps_invalid_timing_for_playback_validation() -> None:
+    assert (
+        direct_reply_timing(
+            timing="later",
+            function_call_name="request_tool_handover",
+            function_arguments_json='{"tool_id":"T07"}',
+        )
+        == "later"
+    )
 
 
 def add_voice_and_handover_command(
@@ -104,6 +164,25 @@ def test_handover_acceptance_requires_status_and_goal_response_trace() -> None:
     assert result == ["reply-1"]
     assert released == ["reply-1"]
     assert not pending
+
+
+def test_direct_handover_playback_join_does_not_need_retired_gate_request_id() -> None:
+    # The direct lane joins typed utterance/action evidence.  A raw VLM reply
+    # therefore cannot be left waiting for the request ID once minted by the
+    # retired function-admission gate.
+    job = waiting_job(function_request_id="unrelated-vlm-request")
+    correlator, _pending, released = harness(job)
+    add_voice_and_handover_command(correlator)
+    correlator.observe_skill_status(
+        command_id="command-1", state="accepted", success=True
+    )
+    correlator.observe_execution_trace(
+        command_id="command-1",
+        stage="accepted",
+        terminal=False,
+        evidence="goal_response",
+    )
+    assert released == ["reply-1"]
 
 
 def test_accepted_fact_survives_later_feedback_and_topic_reordering() -> None:
@@ -325,6 +404,36 @@ def test_retraction_completion_and_tool_retrieval_remain_fail_closed() -> None:
     )
     assert released == []
     assert set(pending) == {"retraction", "retrieval"}
+
+
+def test_unknown_presentation_hint_cannot_reuse_handover_evidence() -> None:
+    job = waiting_job(function_name="handover_alias")
+    pending = {job.reply_id: job}
+    released: list[str] = []
+
+    def release(reply_id: str):
+        value = pending.pop(reply_id, None)
+        if value is not None:
+            released.append(reply_id)
+        return value
+
+    correlator = AuthoritativeTimingCorrelator(
+        waiting_provider=lambda: list(pending.values()),
+        release_waiting=release,
+    )
+    add_voice_and_handover_command(correlator)
+    correlator.observe_skill_status(
+        command_id="command-1", state="accepted", success=True
+    )
+    correlator.observe_execution_trace(
+        command_id="command-1",
+        stage="accepted",
+        terminal=False,
+        evidence="goal_response",
+    )
+
+    assert released == []
+    assert set(pending) == {"reply-1"}
 
 
 def test_invalid_function_arguments_fail_closed() -> None:

@@ -1,4 +1,5 @@
 import threading
+import time
 
 from integration_debug.asr_health_monitor import (
     LAN_HEALTH_READY,
@@ -43,6 +44,7 @@ def test_monitor_caches_websocket_handshake_without_audio() -> None:
         "latency_ms": 12.4,
         "consecutive_failures": 0,
         "last_error": "",
+        "probe_suspended": False,
     }
 
 
@@ -87,4 +89,39 @@ def test_monitor_worker_probes_immediately_and_stops_bounded() -> None:
     monitor.start()
 
     assert called.wait(timeout=1.0)
+    assert monitor.close() is True
+
+
+def test_monitor_pauses_active_session_probes_and_resumes_immediately() -> None:
+    first_probe = threading.Event()
+    resumed_probe = threading.Event()
+    calls: list[int] = []
+
+    def probe(_url: str, _timeout_sec: float) -> float:
+        calls.append(1)
+        if len(calls) == 1:
+            first_probe.set()
+        else:
+            resumed_probe.set()
+        return 1.0
+
+    monitor = LanAsrHealthMonitor(
+        url="ws://192.168.1.5:1196/",
+        interval_sec=10.0,
+        timeout_sec=0.1,
+        probe=probe,
+    )
+    monitor.start()
+    assert first_probe.wait(timeout=1.0)
+
+    monitor.pause()
+    time.sleep(0.05)
+    assert calls == [1]
+    assert monitor.snapshot()["state"] == LAN_HEALTH_READY
+    assert monitor.snapshot()["probe_suspended"] is True
+
+    monitor.resume()
+    assert resumed_probe.wait(timeout=1.0)
+    assert calls == [1, 1]
+    assert monitor.snapshot()["probe_suspended"] is False
     assert monitor.close() is True

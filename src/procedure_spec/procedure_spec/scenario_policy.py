@@ -1,15 +1,19 @@
-"""Single query boundary for authored scenario choices.
+"""Scenario preferences, deliberately separate from command admission.
 
-This module deliberately does not contain physical safety logic.  A positive
-scenario decision only says that the active procedure wants a capability; the
-runtime still has to pass controller, Service admission, execution-state,
-freshness, idempotency, and preflight interlocks.
+The procedure bundle describes a demonstration's default behaviour.  It is
+*not* an API allowlist.  A researcher must be able to add a ROS Action,
+Service, Topic, or command-router entry without editing every scenario YAML.
+Concrete transport adapters and the downstream controller remain responsible
+for type validation, availability, idempotency, and physical safety.
+
+``ScenarioPolicy`` therefore exposes only scenario-owned tool and retraction
+preferences.  It never discovers, validates, or admits a general command.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, fields
-from typing import Iterable
+from typing import Iterable, Mapping
 
 from .models import (
     ProcedureBundle,
@@ -18,14 +22,14 @@ from .models import (
 )
 
 
+# These are transport/controller responsibilities.  In particular, scenario
+# policy is not allowed to add a second preflight, freshness, or endpoint
+# allowlist around an explicit operator/client request.
 PRESERVED_RUNTIME_INTERLOCKS = frozenset(
     {
         "controller_admission",
         "service_admission",
         "execution_state",
-        "stopped_state_route_change",
-        "preflight_ack",
-        "freshness",
         "idempotency",
     }
 )
@@ -52,7 +56,6 @@ _COMPATIBILITY_RUNTIME_REQUIREMENTS = {
         surgeon_actor_enabled=True,
         phase_inference_enabled=True,
         retraction_workflow_state_enforced=True,
-        legacy_raw_retractor_voice_enabled=False,
     ),
     "thyroidectomy_demo": ScenarioRuntimeRequirements(
         procedure_type="thyroidectomy",
@@ -67,7 +70,6 @@ _COMPATIBILITY_RUNTIME_REQUIREMENTS = {
         surgeon_actor_enabled=True,
         phase_inference_enabled=True,
         retraction_workflow_state_enforced=False,
-        legacy_raw_retractor_voice_enabled=False,
     ),
     "nephrectomy": ScenarioRuntimeRequirements(
         procedure_type="nephrectomy",
@@ -82,7 +84,6 @@ _COMPATIBILITY_RUNTIME_REQUIREMENTS = {
         surgeon_actor_enabled=True,
         phase_inference_enabled=True,
         retraction_workflow_state_enforced=True,
-        legacy_raw_retractor_voice_enabled=False,
     ),
     "inguinal_hernia_repair_demo": ScenarioRuntimeRequirements(
         procedure_type="inguinal_hernia_repair",
@@ -97,7 +98,6 @@ _COMPATIBILITY_RUNTIME_REQUIREMENTS = {
         surgeon_actor_enabled=False,
         phase_inference_enabled=False,
         retraction_workflow_state_enforced=False,
-        legacy_raw_retractor_voice_enabled=False,
     ),
 }
 
@@ -130,7 +130,6 @@ class ScenarioPolicy:
     """Read-only policy facade assembled from one procedure bundle."""
 
     def __init__(self, bundle: ProcedureBundle):
-        self._bundle = bundle
         self._requestable_instrument_ids = frozenset(
             instrument.id for instrument in bundle.instruments if instrument.requestable
         )
@@ -187,8 +186,60 @@ class ScenarioPolicy:
         return self._runtime_requirements
 
     @property
+    def extensions(self) -> Mapping[str, object]:
+        """Return scenario-local experimental configuration verbatim."""
+
+        return self._spec.extensions
+
+    @property
     def requestable_instrument_ids(self) -> frozenset[str]:
         return self._requestable_instrument_ids
+
+    def automatic_repeat_handover_exclusions(
+        self,
+        phase_id: str,
+    ) -> frozenset[str]:
+        """Return tools requiring an explicit request for repeat handover.
+
+        This scenario preference affects automatic selection only. It neither
+        rejects explicit requests nor changes the frozen statistical prior
+        consumed by recovery policy.
+        """
+
+        raw_by_phase = self.extensions.get(
+            "automatic_repeat_handover_exclusions_by_phase",
+            {},
+        )
+        if not isinstance(raw_by_phase, Mapping):
+            return frozenset()
+        raw_tools = raw_by_phase.get(str(phase_id or "").strip(), ())
+        if not isinstance(raw_tools, (list, tuple, set, frozenset)):
+            return frozenset()
+        return frozenset(
+            tool_id
+            for raw_tool_id in raw_tools
+            if (tool_id := str(raw_tool_id or "").strip())
+            in self._requestable_instrument_ids
+        )
+
+    def completion_cleanup_excluded_tools(self) -> frozenset[str]:
+        """Return scenario-authored tools left on Mayo at voice completion.
+
+        This is deliberately a small, static scenario preference.  The Twin
+        snapshots *instances currently on Mayo* when completion is requested;
+        it does not use an initial UV position, a future-use prediction, or a
+        later perception frame to decide the terminal cleanup set.
+        """
+
+        raw_tools = self.extensions.get("completion_cleanup_excluded_tools", ())
+        if not isinstance(raw_tools, (list, tuple, set, frozenset)):
+            return frozenset()
+        return frozenset(
+            tool_id
+            for raw_tool_id in raw_tools
+            if (tool_id := str(raw_tool_id or "").strip())
+            in self._requestable_instrument_ids
+        )
 
     def check_instrument_request(self, instrument_id: str) -> ScenarioPolicyDecision:
         normalized = str(instrument_id or "").strip()

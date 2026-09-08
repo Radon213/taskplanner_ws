@@ -30,8 +30,14 @@ CAMERA_BBOX_ONTOLOGY_VERSION = "mayo-bbox-3class-v1"
 # function of a model-training label.
 CAM4_PROCEDURE_INSTRUMENT_BY_CLASS = {
     "Adson": "Adson forceps",
+    "Adson Forceps": "Adson forceps",
     "Bovie": "Bovie surgical cautery",
+    "Bovie surgical cautery": "Bovie surgical cautery",
     "Bipolar": "Bipolar cautery",
+    "Bipolar Forceps": "Bipolar cautery",
+    "Bipolar cautery": "Bipolar cautery",
+    "Mosquito": "Mosquito forceps",
+    "Mosquito Forceps": "Mosquito forceps",
 }
 FLIR_CLASS_NAMES = (
     "#15 Scalpel",
@@ -336,6 +342,25 @@ def _finite_confidence(value: Any) -> float | None:
 
 def _bounded_label(value: Any) -> str:
     return str(value or "").strip()[:80]
+
+
+def canonical_rfdetr_tool_label(value: object) -> str:
+    """Normalize a typed detector label to its clinical instrument name.
+
+    This is a bounded, exact-label adapter at the public typed-observation
+    boundary. It does not inspect a detector implementation, class index, or
+    model version, and leaves unknown labels untouched for the active
+    procedure to decide whether they are usable.
+    """
+
+    label = _bounded_label(value)
+    normalized = " ".join(label.split()).casefold()
+    if not normalized:
+        return ""
+    for detector_label, clinical_name in CAM4_PROCEDURE_INSTRUMENT_BY_CLASS.items():
+        if normalized == " ".join(detector_label.split()).casefold():
+            return clinical_name
+    return label
 
 
 def summarize_cam4_detections(

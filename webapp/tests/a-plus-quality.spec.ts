@@ -306,6 +306,30 @@ test("landscape monitoring keeps the operating-room stage proportionate", async 
   expect(bounds.ratio).toBeCloseTo(1.55, 1);
 });
 
+test("keeps tool location belief as a separate live Mission surface", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "fhd", "One live Mission layout run is sufficient.");
+  await installIsolatedStubs(page, "live");
+  await page.goto("/");
+
+  const panel = page.locator('[data-slot="tool-belief-panel"]');
+  await expect(panel).toBeVisible();
+  await expect(page.locator('.stage-area .stage-card [data-slot="tool-belief-panel"]')).toHaveCount(0);
+  await expect(page.locator('[data-slot="tool-belief-area"] > [data-slot="tool-belief-panel"]')).toHaveCount(1);
+
+  const geometry = await page.evaluate(() => {
+    const stage = document.querySelector<HTMLElement>(".stage-area .stage-card");
+    const panelElement = document.querySelector<HTMLElement>('[data-slot="tool-belief-panel"]');
+    if (!stage || !panelElement) return null;
+    const stageBounds = stage.getBoundingClientRect();
+    const panelBounds = panelElement.getBoundingClientRect();
+    return {
+      panelStartsAfterStage: panelBounds.top >= stageBounds.bottom - 1,
+      panelWidthMatchesStage: Math.abs(panelBounds.width - stageBounds.width) <= 1,
+    };
+  });
+  expect(geometry).toEqual({ panelStartsAfterStage: true, panelWidthMatchesStage: true });
+});
+
 test("caps the fixed Mission canvas instead of stretching it on UHD displays", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "fhd", "One UHD layout run is sufficient for the canvas-height regression.");
   await page.setViewportSize({ width: 3840, height: 2160 });

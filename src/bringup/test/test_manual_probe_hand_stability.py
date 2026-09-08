@@ -280,11 +280,11 @@ def test_probe_launch_is_pinned_to_virtual_endpoints() -> None:
     command = _probe_runtime_command(args, "/tmp/spec")
 
     assert "execution_backend:=mock" in command
-    assert "execution_contract:=direct" in command
     assert "robot_endpoint_source:=virtual" in command
     assert "retraction_endpoint_source:=virtual" in command
     assert "enable_runtime_route_control:=false" in command
-    assert "require_integration_preflight:=true" in command
+    assert "enable_integration_preflight_diagnostics:=true" in command
+    assert not any("require_integration_preflight" in item for item in command)
     assert "preflight_require_rfdetr_tool_observations:=true" in command
     assert (
         f"cam3_tool_observations_topic:={PROBE_CAM3_TOOL_OBSERVATIONS_TOPIC}"

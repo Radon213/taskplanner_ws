@@ -67,7 +67,6 @@ class RuntimeControlApiTests(unittest.TestCase):
             launcher_log_file=root / "runtime-control-launch.log",
             popen_factory=popen_factory,
             mode_running_probe=lambda _mode: True,
-            required_plane_probe=lambda _mode: True,
             transition_interlock_probe=lambda _mode: True,
             running_modes_probe=lambda: set(),
         )
@@ -87,11 +86,20 @@ class RuntimeControlApiTests(unittest.TestCase):
     def write_active_mode(self, mode: str) -> None:
         self.controller._state_file.write_text(json.dumps({"mode": mode}), encoding="utf-8")
 
-    def request(self, method: str, path: str, payload: object | None = None, token: bool = True):
+    def request(
+        self,
+        method: str,
+        path: str,
+        payload: object | None = None,
+        token: bool = True,
+        extra_headers: dict[str, str] | None = None,
+    ):
         body = None if payload is None else json.dumps(payload).encode("utf-8")
         headers = {"Content-Type": "application/json"} if body is not None else {}
         if token:
             headers[runtime_control.TOKEN_HEADER] = self.token
+        if extra_headers:
+            headers.update(extra_headers)
         request = Request(f"{self.base_url}{path}", data=body, headers=headers, method=method)
         return urlopen(request, timeout=2)
 
@@ -99,6 +107,155 @@ class RuntimeControlApiTests(unittest.TestCase):
         with self.assertRaises(HTTPError) as context:
             self.request("GET", "/v1/runtime/status", token=False)
         self.assertEqual(context.exception.code, 401)
+        context.exception.close()
+
+    def test_owner_status_uses_one_registry_projection_contract(self) -> None:
+        owner_rows = [
+            {
+                "owner": "command",
+                "mode": "live",
+                "state": "running",
+                "service": "taskplanner-command",
+                "detail": "Up 2 seconds",
+            }
+        ]
+        with patch.object(
+            self.controller, "owner_status", return_value=owner_rows
+        ) as status:
+            with self.request("GET", "/v1/runtime/owners?mode=live") as response:
+                self.assertEqual(response.status, 200)
+                payload = json.loads(response.read())
+        self.assertEqual(payload, {"mode": "live", "owners": owner_rows})
+        status.assert_called_once_with("live")
+
+    def test_owner_restart_requires_fixed_schema_and_request_id(self) -> None:
+        request_id = "12345678-1234-4123-8123-123456789abc"
+        with patch.object(
+            self.controller,
+            "restart_owner",
+            return_value=(True, "The owner restarted."),
+        ) as restart:
+            with self.request(
+                "POST",
+                "/v1/runtime/owners/restart",
+                {"owner": "command", "mode": "live"},
+                extra_headers={runtime_control.REQUEST_ID_HEADER: request_id},
+            ) as response:
+                self.assertEqual(response.status, 200)
+                payload = json.loads(response.read())
+        self.assertEqual(
+            payload,
+            {
+                "accepted": True,
+                "owner": "command",
+                "mode": "live",
+                "message": "The owner restarted.",
+            },
+        )
+        restart.assert_called_once_with("command", "live")
+
+        with self.assertRaises(HTTPError) as context:
+            self.request(
+                "POST",
+                "/v1/runtime/owners/restart",
+                {"owner": "command", "mode": "live", "shell": "id"},
+                extra_headers={runtime_control.REQUEST_ID_HEADER: request_id},
+            )
+        self.assertEqual(context.exception.code, 400)
+        context.exception.close()
+
+    def test_surgimate_endpoint_has_fixed_schema_and_debug_action_contract(self) -> None:
+        request_id = "12345678-1234-4123-8123-123456789abc"
+        row = {
+            "owner": "surgimate",
+            "mode": "debug",
+            "state": "running",
+            "service": "taskplanner-surgimate",
+            "detail": "Up 2 seconds",
+        }
+        with patch.object(self.controller, "surgimate_status", return_value=row) as status:
+            with self.request("GET", "/v1/runtime/surgimate") as response:
+                self.assertEqual(response.status, 200)
+                payload = json.loads(response.read())
+        self.assertEqual(payload["status"], row)
+        status.assert_called_once_with()
+
+        with patch.object(
+            self.controller,
+            "control_surgimate",
+            return_value=(True, "SurgiMate restarted."),
+        ) as control:
+            with self.request(
+                "POST",
+                "/v1/runtime/surgimate",
+                {"action": "restart"},
+                extra_headers={runtime_control.REQUEST_ID_HEADER: request_id},
+            ) as response:
+                self.assertEqual(response.status, 200)
+                payload = json.loads(response.read())
+        self.assertEqual(
+            payload,
+            {
+                "accepted": True,
+                "action": "restart",
+                "message": "SurgiMate restarted.",
+            },
+        )
+        control.assert_called_once_with("restart")
+
+        with self.assertRaises(HTTPError) as context:
+            self.request(
+                "POST",
+                "/v1/runtime/surgimate",
+                {"action": "restart", "shell": "id"},
+                extra_headers={runtime_control.REQUEST_ID_HEADER: request_id},
+            )
+        self.assertEqual(context.exception.code, 400)
+        context.exception.close()
+
+    def test_lifecycle_uses_one_allowlisted_operation_and_request_id(self) -> None:
+        request_id = "12345678-1234-4123-8123-123456789abc"
+        snapshot = runtime_control.RuntimeLifecycleSnapshot(
+            phase="queued",
+            generation=1,
+            job_id="job",
+            request_id=request_id,
+            operation="qwen_load",
+            active_mode="live",
+            message="Runtime lifecycle request is queued.",
+            retryable=False,
+            ninfer=runtime_control.NInferSnapshot(
+                available=True,
+                model_id="qwen3.6-35b-a3b",
+                model_state="unloaded",
+                detail="ready",
+            ),
+        )
+        with patch.object(
+            self.controller,
+            "start_lifecycle",
+            return_value=(True, snapshot),
+        ) as lifecycle:
+            with self.request(
+                "POST",
+                "/v1/runtime/lifecycle",
+                {"operation": "qwen_load"},
+                extra_headers={runtime_control.REQUEST_ID_HEADER: request_id},
+            ) as response:
+                self.assertEqual(response.status, 202)
+                payload = json.loads(response.read())
+        self.assertTrue(payload["accepted"])
+        self.assertEqual(payload["operation"], "qwen_load")
+        lifecycle.assert_called_once_with("qwen_load", request_id)
+
+        with self.assertRaises(HTTPError) as context:
+            self.request(
+                "POST",
+                "/v1/runtime/lifecycle",
+                {"operation": "qwen_load", "shell": "id"},
+                extra_headers={runtime_control.REQUEST_ID_HEADER: request_id},
+            )
+        self.assertEqual(context.exception.code, 400)
         context.exception.close()
 
     def test_transition_is_allowlisted_and_serialized(self) -> None:
@@ -114,13 +271,13 @@ class RuntimeControlApiTests(unittest.TestCase):
         self.assertEqual(payload["phase"], "starting")
         self.assertEqual(
             self.commands,
-            [[str(Path(self.tempdir.name) / "scripts" / "taskplanner"), "up", "replay", "--ensure-build"]],
+            [[str(Path(self.tempdir.name) / "scripts" / "taskplanner"), "up", "replay"]],
         )
         self.assertEqual(
             self.environments[0]["TASKPLANNER_RUNTIME_EXPECTED_ACTIVE_MODE"], ""
         )
         self.assertEqual(
-            self.environments[0]["TASKPLANNER_RUNTIME_REQUIRE_STOPPED"], "1"
+            self.environments[0]["TASKPLANNER_RUNTIME_REQUIRE_EXECUTION_IDLE"], "1"
         )
 
         with self.assertRaises(HTTPError) as context:
@@ -145,13 +302,13 @@ class RuntimeControlApiTests(unittest.TestCase):
         context.exception.close()
         self.assertEqual(self.commands, [])
 
-    def test_live_transition_defaults_to_virtual_endpoint(self) -> None:
+    def test_live_transition_defaults_to_external_endpoint(self) -> None:
         accepted, snapshot = self.controller.start_transition("live")
         self.assertTrue(accepted)
         self.assertEqual(snapshot.phase, "starting")
         self.assertEqual(
             self.environments[0]["TASKPLANNER_LIVE_ROBOT_ENDPOINT_SOURCE"],
-            "virtual",
+            "external",
         )
         self.process.done.set()
 
@@ -201,19 +358,67 @@ class RuntimeControlApiTests(unittest.TestCase):
         self.assertIsNone(payload["requested_mode"])
         self.assertEqual(self.commands, [])
 
-    def test_same_mode_degraded_required_plane_is_not_a_noop(self) -> None:
+    def test_same_mode_optional_sidecar_degradation_is_an_idle_noop(self) -> None:
         self.write_active_mode("live")
         self.controller._running_modes_probe = lambda: {"live"}
         self.controller._mode_contract_probe = lambda _mode: True
-        self.controller._required_plane_probe = lambda _mode: False
-        self.controller._transition_interlock_probe = lambda _mode: False
+        # ASR/VLM/UI/public rosbridge health has an independent owner/restart
+        # path and is not even part of the mode-controller constructor.
+        self.controller._transition_interlock_probe = Mock(
+            side_effect=AssertionError("sidecar degradation must not request a core stop")
+        )
 
         accepted, snapshot = self.controller.start_transition("live")
 
-        self.assertFalse(accepted)
+        self.assertTrue(accepted)
         self.assertEqual(snapshot.phase, "idle")
-        self.assertIn("Stop the active runtime", snapshot.message)
+        self.assertIn("already ready", snapshot.message)
         self.assertEqual(self.commands, [])
+        self.controller._transition_interlock_probe.assert_not_called()
+        controller_source = Path(runtime_control.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("required_plane", controller_source)
+
+    def test_same_mode_reconciles_a_missing_split_owner_without_a_global_gate(self) -> None:
+        self.write_active_mode("live")
+        self.controller._running_modes_probe = lambda: {"live"}
+        self.controller._mode_contract_probe = lambda _mode: True
+        self.controller._transition_interlock_probe = Mock(return_value=True)
+        self.controller._owner_status_probe = lambda _root, _mode: [
+            {
+                "owner": "core",
+                "mode": "live",
+                "state": "running",
+                "service": "taskplanner-state-core",
+                "detail": "Up 1 second",
+            },
+            {
+                "owner": "command",
+                "mode": "live",
+                "state": "exited",
+                "service": "taskplanner-command",
+                "detail": "Exited (1)",
+            },
+            {
+                "owner": "asr",
+                "mode": "live",
+                "state": "exited",
+                "service": "taskplanner-asr",
+                "detail": "Exited (1)",
+            },
+        ]
+
+        accepted, snapshot = self.controller.start_transition("live")
+
+        self.assertTrue(accepted)
+        self.assertEqual(snapshot.phase, "starting")
+        self.assertEqual(snapshot.active_mode, "live")
+        self.assertIn("Starting", snapshot.message)
+        self.assertEqual(
+            self.commands,
+            [[str(Path(self.tempdir.name) / "scripts" / "taskplanner"), "up", "live"]],
+        )
+        self.controller._transition_interlock_probe.assert_called_once_with("live")
+        self.process.done.set()
 
     def test_debug_transition_carries_the_reviewed_replace_flag(self) -> None:
         accepted, snapshot = self.controller.start_transition("debug")
@@ -225,7 +430,6 @@ class RuntimeControlApiTests(unittest.TestCase):
                 str(Path(self.tempdir.name) / "scripts" / "taskplanner"),
                 "up",
                 "debug",
-                "--ensure-build",
                 "--replace-active",
             ]],
         )
@@ -266,6 +470,8 @@ class RuntimeControlApiTests(unittest.TestCase):
         self.controller._phase = "failed"
         self.controller._requested_mode = "live"
         self.write_active_mode("live")
+        self.controller._running_modes_probe = lambda: {"live"}
+        self.controller._mode_contract_probe = lambda mode: mode == "live"
 
         snapshot = self.controller.snapshot()
 
@@ -273,6 +479,34 @@ class RuntimeControlApiTests(unittest.TestCase):
         self.assertEqual(snapshot.active_mode, "live")
         self.assertIsNone(snapshot.requested_mode)
         self.assertFalse(snapshot.retryable)
+
+    def test_ready_direct_launch_supersedes_an_older_failed_mode_request(self) -> None:
+        self.controller._phase = "failed"
+        self.controller._requested_mode = "debug"
+        self.write_active_mode("live")
+        self.controller._running_modes_probe = lambda: {"live"}
+        self.controller._mode_contract_probe = lambda mode: mode == "live"
+
+        snapshot = self.controller.snapshot()
+
+        self.assertEqual(snapshot.phase, "idle")
+        self.assertEqual(snapshot.active_mode, "live")
+        self.assertIsNone(snapshot.requested_mode)
+        self.assertFalse(snapshot.retryable)
+
+    def test_failed_state_stays_closed_when_marker_and_discovery_disagree(self) -> None:
+        self.controller._phase = "failed"
+        self.controller._requested_mode = "debug"
+        self.write_active_mode("live")
+        self.controller._running_modes_probe = lambda: {"debug"}
+        self.controller._mode_contract_probe = lambda mode: mode == "live"
+
+        snapshot = self.controller.snapshot()
+
+        self.assertEqual(snapshot.phase, "failed")
+        self.assertEqual(snapshot.active_mode, "live")
+        self.assertEqual(snapshot.requested_mode, "debug")
+        self.assertTrue(snapshot.retryable)
 
     def test_transition_timeout_terminates_launcher_and_unlocks_retry(self) -> None:
         root = Path(self.tempdir.name) / "timeout"
@@ -383,33 +617,47 @@ class RuntimeControlApiTests(unittest.TestCase):
         )
         self.assertTrue(snapshot.retryable)
 
-    def test_transition_rejects_running_paused_and_unknown_active_state(self) -> None:
+    def test_transition_interlock_scopes_unknown_activity_to_operational_routes(self) -> None:
         self.write_active_mode("replay")
-        for probe_result in (False, None):
-            with self.subTest(probe_result=probe_result):
-                self.controller._transition_interlock_probe = (
-                    lambda _mode, result=probe_result: result
-                )
-                accepted, snapshot = self.controller.start_transition("debug")
-                self.assertFalse(accepted)
-                self.assertEqual(snapshot.phase, "idle")
-                self.assertEqual(snapshot.active_mode, "replay")
-                self.assertEqual(self.commands, [])
+        self.controller._transition_interlock_probe = lambda _mode: False
+        accepted, snapshot = self.controller.start_transition("debug")
+        self.assertFalse(accepted)
+        self.assertEqual(snapshot.phase, "idle")
+        self.assertEqual(snapshot.active_mode, "replay")
+        self.assertIn("endpoint request", snapshot.message)
+        self.assertEqual(self.commands, [])
 
-    def test_http_transition_returns_conflict_for_unsafe_active_state(self) -> None:
+        # Replay has no operational execution owner, so an unavailable probe
+        # remains irrelevant to the Debug observer transition.
+        self.controller._transition_interlock_probe = lambda _mode: None
+        accepted, snapshot = self.controller.start_transition("debug")
+        self.assertTrue(accepted)
+        self.assertEqual(snapshot.phase, "starting")
+        self.process.done.set()
+
+    def test_transition_rejects_unknown_activity_for_an_operational_route(self) -> None:
+        self.write_active_mode("live")
+        self.controller._running_modes_probe = lambda: {"live"}
+        self.controller._transition_interlock_probe = lambda _mode: None
+
+        accepted, snapshot = self.controller.start_transition("debug")
+
+        self.assertFalse(accepted)
+        self.assertEqual(snapshot.phase, "idle")
+        self.assertEqual(snapshot.active_mode, "live")
+        self.assertIn("activity is unavailable", snapshot.message)
+        self.assertEqual(self.commands, [])
+
+    def test_http_transition_returns_conflict_for_active_endpoint_request(self) -> None:
         self.write_active_mode("replay")
-        for probe_result in (False, None):
-            with self.subTest(probe_result=probe_result):
-                self.controller._transition_interlock_probe = (
-                    lambda _mode, result=probe_result: result
-                )
-                with self.assertRaises(HTTPError) as context:
-                    self.request("POST", "/v1/runtime/transition", {"mode": "debug"})
-                self.assertEqual(context.exception.code, 409)
-                context.exception.close()
-                self.assertEqual(self.commands, [])
+        self.controller._transition_interlock_probe = lambda _mode: False
+        with self.assertRaises(HTTPError) as context:
+            self.request("POST", "/v1/runtime/transition", {"mode": "debug"})
+        self.assertEqual(context.exception.code, 409)
+        context.exception.close()
+        self.assertEqual(self.commands, [])
 
-    def test_http_transition_accepts_fresh_stopped_active_state(self) -> None:
+    def test_http_transition_accepts_idle_execution_owner(self) -> None:
         self.write_active_mode("replay")
         self.controller._transition_interlock_probe = lambda _mode: True
         with self.request(
@@ -422,7 +670,7 @@ class RuntimeControlApiTests(unittest.TestCase):
             "replay",
         )
 
-    def test_transition_accepts_fresh_stopped_active_state(self) -> None:
+    def test_transition_accepts_idle_execution_owner(self) -> None:
         self.write_active_mode("replay")
         self.controller._transition_interlock_probe = lambda _mode: True
         accepted, snapshot = self.controller.start_transition("debug")
@@ -457,31 +705,278 @@ class RuntimeControlApiTests(unittest.TestCase):
                 self.assertEqual(self.commands, [])
 
 
+class SurgiMateControlTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.root = Path(self.tempdir.name)
+        self.state_file = self.root / "active-runtime-mode.json"
+        self.state_file.write_text('{"mode":"debug"}', encoding="utf-8")
+        self.commands: list[list[str]] = []
+
+        def command_runner(command: list[str], **_kwargs: object):
+            self.commands.append(command)
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        self.rows = [
+            {
+                "owner": "debug-observer",
+                "mode": "debug",
+                "state": "running",
+                "service": "taskplanner-debug-observer",
+                "detail": "Up 2 seconds",
+            },
+            {
+                "owner": "surgimate",
+                "mode": "debug",
+                "state": "exited",
+                "service": "taskplanner-surgimate",
+                "detail": "Exited (0)",
+            },
+        ]
+        self.controller = runtime_control.RuntimeController(
+            root=self.root,
+            state_file=self.state_file,
+            launcher=self.root / "scripts" / "taskplanner",
+            mode_running_probe=lambda _mode: True,
+            mode_contract_probe=lambda _mode: True,
+            running_modes_probe=lambda: {"debug"},
+            owner_status_probe=lambda _root, _mode: self.rows,
+            command_runner=command_runner,
+        )
+
+    def tearDown(self) -> None:
+        self.tempdir.cleanup()
+
+    def test_fixed_debug_cli_controls_only_the_surgimate_sidecar(self) -> None:
+        accepted, message = self.controller.control_surgimate("restart")
+
+        self.assertTrue(accepted)
+        self.assertEqual(message, "SurgiMate restarted.")
+        self.assertEqual(
+            self.commands,
+            [[
+                str(self.root / "scripts" / "taskplanner"),
+                "surgimate",
+                "restart",
+                "--mode",
+                "debug",
+            ]],
+        )
+        self.assertFalse(any(command[0] == "docker" for command in self.commands))
+
+    def test_live_allows_only_the_scoped_surgimate_restart(self) -> None:
+        self.state_file.write_text('{"mode":"live"}', encoding="utf-8")
+        self.controller._running_modes_probe = lambda: {"live"}
+
+        accepted, message = self.controller.control_surgimate("start")
+        self.assertFalse(accepted)
+        self.assertIn("only be restarted", message)
+        self.assertEqual(self.commands, [])
+
+        accepted, message = self.controller.control_surgimate("restart")
+        self.assertTrue(accepted)
+        self.assertEqual(message, "SurgiMate restarted.")
+        self.assertEqual(
+            self.commands,
+            [[
+                str(self.root / "scripts" / "taskplanner"),
+                "restart",
+                "surgimate",
+                "live",
+            ]],
+        )
+        with self.assertRaises(ValueError):
+            self.controller.control_surgimate("shell")
+
+    def test_status_uses_the_active_live_sidecar_projection(self) -> None:
+        self.state_file.write_text('{"mode":"live"}', encoding="utf-8")
+        self.controller._running_modes_probe = lambda: {"live"}
+        live_row = {
+            "owner": "surgimate",
+            "mode": "live",
+            "state": "running",
+            "service": "taskplanner-surgimate",
+            "detail": "Up 2 seconds",
+        }
+        self.controller._owner_status_probe = lambda _root, mode: (
+            [live_row] if mode == "live" else self.rows
+        )
+
+        self.assertEqual(self.controller.surgimate_status(), live_row)
+
+    def test_sidecar_is_excluded_from_generic_owner_actions_and_readiness(self) -> None:
+        self.assertTrue(runtime_control.runtime_owner_plane_ready(self.rows, "debug"))
+        generic_rows = self.controller.owner_status("debug")
+        self.assertEqual([row["owner"] for row in generic_rows], ["debug-observer"])
+        with self.assertRaises(ValueError):
+            self.controller.restart_owner("surgimate", "debug")
+
+    def test_generic_owner_status_omits_non_restartable_mode_rows(self) -> None:
+        rows = [
+            *self.rows,
+            {
+                "owner": "command",
+                "mode": "debug",
+                "state": "not-applicable",
+                "service": "",
+                "detail": "mode not supported",
+            },
+            {
+                "owner": "debug-virtual",
+                "mode": "debug",
+                "state": "disabled",
+                "service": "taskplanner-debug-virtual",
+                "detail": "disabled by TASKPLANNER_DEBUG_ENABLE_VIRTUAL_ROBOT",
+            },
+        ]
+        self.controller._owner_status_probe = lambda _root, _mode: rows
+
+        self.assertEqual(
+            [row["owner"] for row in self.controller.owner_status("debug")],
+            ["debug-observer"],
+        )
+
+    def test_disabled_optional_owner_is_not_a_runtime_readiness_failure(self) -> None:
+        rows = [
+            *self.rows,
+            {
+                "owner": "debug-virtual",
+                "mode": "debug",
+                "state": "disabled",
+                "service": "taskplanner-debug-virtual",
+                "detail": "disabled by TASKPLANNER_DEBUG_ENABLE_VIRTUAL_ROBOT",
+            },
+        ]
+        self.assertTrue(runtime_control.runtime_owner_plane_ready(rows, "debug"))
+
+
+class TtsOwnerControlTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.root = Path(self.tempdir.name)
+        self.state_file = self.root / "active-runtime-mode.json"
+        self.state_file.write_text('{"mode":"live"}', encoding="utf-8")
+        self.commands: list[list[str]] = []
+
+        def command_runner(command: list[str], **_kwargs: object):
+            self.commands.append(command)
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        self.rows = [
+            {
+                "owner": "tts",
+                "mode": "live",
+                "state": "running",
+                "service": "taskplanner-tts",
+                "detail": "Up 2 seconds (healthy)",
+            },
+            {
+                "owner": "surgimate",
+                "mode": "live",
+                "state": "running",
+                "service": "taskplanner-surgimate",
+                "detail": "Up 2 seconds",
+            },
+        ]
+        self.controller = runtime_control.RuntimeController(
+            root=self.root,
+            state_file=self.state_file,
+            launcher=self.root / "scripts" / "taskplanner",
+            mode_running_probe=lambda _mode: True,
+            mode_contract_probe=lambda _mode: True,
+            running_modes_probe=lambda: {"live"},
+            owner_status_probe=lambda _root, _mode: self.rows,
+            command_runner=command_runner,
+        )
+
+    def tearDown(self) -> None:
+        self.tempdir.cleanup()
+
+    def test_tts_uses_generic_owner_status_and_scoped_restart(self) -> None:
+        self.assertEqual(
+            [row["owner"] for row in self.controller.owner_status("live")],
+            ["tts"],
+        )
+
+        accepted, message = self.controller.restart_owner("tts", "live")
+
+        self.assertTrue(accepted)
+        self.assertEqual(message, "The owner restarted.")
+        self.assertEqual(
+            self.commands,
+            [[
+                str(self.root / "scripts" / "taskplanner"),
+                "restart",
+                "tts",
+                "live",
+            ]],
+        )
+
+
 class RuntimeStateInterlockTests(unittest.TestCase):
-    def test_final_gate_allows_only_same_freshly_stopped_runtime(self) -> None:
+    def test_final_gate_keeps_single_runtime_identity_and_fails_closed_for_active_route_unknowns(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
             root = Path(temporary_dir)
             state_file = root / "active-runtime-mode.json"
+            state_file.write_text('{"mode":"live"}', encoding="utf-8")
+
+            safe, reason = runtime_control.final_transition_interlock_is_safe(
+                root,
+                state_file,
+                "live",
+                running_modes_probe=lambda: {"live"},
+                execution_idle_probe=lambda _mode: True,
+            )
+            self.assertTrue(safe)
+            self.assertIn("no execution endpoint request", reason)
+
+            safe, reason = runtime_control.final_transition_interlock_is_safe(
+                root,
+                state_file,
+                "live",
+                running_modes_probe=lambda: {"live"},
+                execution_idle_probe=lambda _mode: False,
+            )
+            self.assertFalse(safe)
+            self.assertIn("in flight", reason)
+
+            # The affected Live execution owner is unknown, so route
+            # replacement must fail closed without involving any other owner.
+            safe, reason = runtime_control.final_transition_interlock_is_safe(
+                root,
+                state_file,
+                "live",
+                running_modes_probe=lambda: {"live"},
+                execution_idle_probe=lambda _mode: None,
+            )
+            self.assertFalse(safe)
+            self.assertIn("activity is unavailable", reason)
+
+            # A stopped state-core anchor does not prove that its separate
+            # execution owner is idle. Keep the same targeted failure mode
+            # until that owner can report its own state.
+            safe, reason = runtime_control.final_transition_interlock_is_safe(
+                root,
+                state_file,
+                "live",
+                running_modes_probe=lambda: set(),
+                execution_idle_probe=lambda _mode: None,
+            )
+            self.assertFalse(safe)
+            self.assertIn("activity is unavailable", reason)
+
+            # Replay has no operational execution owner. An unavailable probe
+            # there is not a global readiness barrier.
             state_file.write_text('{"mode":"replay"}', encoding="utf-8")
-            safe, _reason = runtime_control.final_transition_interlock_is_safe(
+            safe, reason = runtime_control.final_transition_interlock_is_safe(
                 root,
                 state_file,
                 "replay",
                 running_modes_probe=lambda: {"replay"},
-                inactive_probe=lambda _mode: True,
+                execution_idle_probe=lambda _mode: None,
             )
             self.assertTrue(safe)
-
-            for inactive in (False, None):
-                with self.subTest(inactive=inactive):
-                    safe, _reason = runtime_control.final_transition_interlock_is_safe(
-                        root,
-                        state_file,
-                        "replay",
-                        running_modes_probe=lambda: {"replay"},
-                        inactive_probe=lambda _mode, value=inactive: value,
-                    )
-                    self.assertFalse(safe)
+            self.assertIn("no operational execution endpoint owner", reason)
 
     def test_final_gate_detects_runtime_appearing_after_empty_probe(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
@@ -502,73 +997,6 @@ class RuntimeStateInterlockTests(unittest.TestCase):
             )
             self.assertFalse(safe)
 
-    def test_final_gate_treats_live_and_llm_as_shared_core(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary_dir:
-            root = Path(temporary_dir)
-            state_file = root / "active-runtime-mode.json"
-            state_file.write_text('{"mode":"llm-surgeon"}', encoding="utf-8")
-            safe, _reason = runtime_control.final_transition_interlock_is_safe(
-                root,
-                state_file,
-                "llm-surgeon",
-                running_modes_probe=lambda: {"llm-surgeon"},
-                inactive_probe=lambda mode: mode == "llm-surgeon",
-                reservation_probe=lambda mode: mode == "llm-surgeon",
-            )
-            self.assertTrue(safe)
-
-    def test_final_gate_requires_atomic_operational_reservation(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary_dir:
-            root = Path(temporary_dir)
-            state_file = root / "active-runtime-mode.json"
-            state_file.write_text('{"mode":"live"}', encoding="utf-8")
-            for reserved in (False, None):
-                with self.subTest(reserved=reserved):
-                    safe, reason = runtime_control.final_transition_interlock_is_safe(
-                        root,
-                        state_file,
-                        "live",
-                        running_modes_probe=lambda: {"live"},
-                        inactive_probe=lambda _mode: True,
-                        reservation_probe=lambda _mode, value=reserved: value,
-                    )
-                    self.assertFalse(safe)
-                    self.assertIn("could not be reserved", reason)
-
-            safe, reason = runtime_control.final_transition_interlock_is_safe(
-                root,
-                state_file,
-                "live",
-                running_modes_probe=lambda: {"live"},
-                inactive_probe=lambda _mode: True,
-                reservation_probe=lambda _mode: True,
-            )
-            self.assertTrue(safe)
-            self.assertIn("transition-reserved", reason)
-
-    def test_final_operational_gate_calls_only_reservation_and_preserves_marker(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary_dir:
-            root = Path(temporary_dir)
-            state_file = root / "active-runtime-mode.json"
-            state_file.write_text('{"mode":"live"}', encoding="utf-8")
-            calls: list[str] = []
-
-            safe, _reason = runtime_control.final_transition_interlock_is_safe(
-                root,
-                state_file,
-                "live",
-                running_modes_probe=lambda: {"live"},
-                inactive_probe=lambda _mode: calls.append("inactive") or True,
-                reservation_probe=lambda _mode: calls.append("reserve") or False,
-            )
-
-            self.assertFalse(safe)
-            self.assertEqual(calls, ["reserve"])
-            self.assertEqual(
-                json.loads(state_file.read_text(encoding="utf-8")),
-                {"mode": "live"},
-            )
-
     def test_final_gate_rejects_marker_or_candidate_change(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
             root = Path(temporary_dir)
@@ -579,294 +1007,74 @@ class RuntimeStateInterlockTests(unittest.TestCase):
                 state_file,
                 "replay",
                 running_modes_probe=lambda: {"replay"},
-                inactive_probe=lambda _mode: True,
+                execution_idle_probe=lambda _mode: True,
             )
             self.assertFalse(safe)
 
-    def test_live_state_requires_consistent_inactive_fields(self) -> None:
-        self.assertTrue(
-            runtime_control.mode_state_is_inactive(
-                "live", {"running": False, "execution_state": "idle"}
-            )
-        )
-        for payload in (
-            {"running": True, "execution_state": "running"},
-            {"running": False, "execution_state": "running"},
-            {"running": False, "execution_state": "starting"},
-            {"execution_state": "idle"},
-        ):
-            self.assertFalse(runtime_control.mode_state_is_inactive("live", payload))
-
-    def test_operational_probe_rejects_early_halted_while_termination_pending(self) -> None:
-        service_result = subprocess.CompletedProcess(
-            args=[],
-            returncode=0,
-            stdout=(
-                "response:\nstd_srvs.srv.Trigger_Response("
-                "success=False, message='simulation operation is still pending: stop')\n"
-            ),
-            stderr="",
-        )
-        with patch.object(
-            runtime_control,
-            "_running_mode_container_id",
-            return_value="runtime-container",
-        ), patch.object(
-            runtime_control.subprocess,
-            "run",
-            return_value=service_result,
-        ):
-            self.assertFalse(
-                runtime_control.probe_mode_inactive(Path("/workspace"), "live")
-            )
-
-    def test_operational_probe_allows_only_manager_confirmed_settled_state(self) -> None:
-        service_result = subprocess.CompletedProcess(
-            args=[],
-            returncode=0,
-            stdout=(
-                "response:\nstd_srvs.srv.Trigger_Response("
-                "success=True, message='"
-                f"{runtime_control.TRANSITION_PROTOCOL_MARKER} "
-                "transition ready; executor=terminated')\n"
-            ),
-            stderr="",
-        )
-        with patch.object(
-            runtime_control,
-            "_running_mode_container_id",
-            return_value="runtime-container",
-        ), patch.object(
-            runtime_control.subprocess,
-            "run",
-            return_value=service_result,
-        ):
-            self.assertTrue(
-                runtime_control.probe_mode_inactive(
-                    Path("/workspace"), "llm-surgeon"
+    def test_execution_route_state_parser_uses_only_active_request_facts(self) -> None:
+        def sample(active_count: int, proxy_active: bool, **extra: object) -> dict[str, str]:
+            return {
+                "data": json.dumps(
+                    {
+                        "schema": runtime_control.EXECUTION_ROUTE_STATE_SCHEMA,
+                        "active_request_count": active_count,
+                        "execution_proxy_active": proxy_active,
+                        # Deliberately contradictory legacy convenience fields:
+                        # neither is a mode-transition precondition now.
+                        "restart_allowed": False,
+                        "restart_blocker": "simulation_not_stopped",
+                        **extra,
+                    }
                 )
+            }
+
+        self.assertTrue(runtime_control.execution_route_state_is_idle(sample(0, False)))
+        self.assertFalse(runtime_control.execution_route_state_is_idle(sample(1, False)))
+        self.assertFalse(runtime_control.execution_route_state_is_idle(sample(0, True)))
+        self.assertIsNone(runtime_control.execution_route_state_is_idle({"data": "{}"}))
+        self.assertIsNone(
+            runtime_control.execution_route_state_is_idle(
+                sample(-1, False)
             )
+        )
 
-    def test_operational_reservation_uses_dedicated_trigger(self) -> None:
-        service_result = subprocess.CompletedProcess(
-            args=[],
-            returncode=0,
-            stdout=(
-                "response:\nstd_srvs.srv.Trigger_Response(success=True, message='"
-                f"{runtime_control.TRANSITION_PROTOCOL_MARKER} reserved')\n"
-            ),
-            stderr="",
-        )
-        with patch.object(
-            runtime_control,
-            "_running_mode_container_id",
-            return_value="runtime-container",
-        ), patch.object(
-            runtime_control.subprocess,
-            "run",
-            return_value=service_result,
-        ) as run:
-            self.assertTrue(
-                runtime_control.reserve_mode_transition(Path("/workspace"), "live")
-            )
-        self.assertIn(
-            runtime_control.TRANSITION_RESERVE_SERVICE,
-            run.call_args.args[0],
-        )
-        command = run.call_args.args[0]
-        self.assertNotIn("service type", command[5])
-        self.assertIn("timeout 4 ros2 service call", command[5])
-        self.assertIn(
-            "/workspaces/taskplanner_ws/install/docker/setup.bash",
-            command[5],
-        )
-        self.assertNotIn(
-            "/workspaces/taskplanner_ws/install/setup.bash",
-            command[5],
-        )
-        self.assertEqual(run.call_args.kwargs["timeout"], 6.0)
-
-    def test_operational_trigger_fails_closed_on_protocol_and_transport_errors(self) -> None:
-        cases = (
-            subprocess.CompletedProcess([], 0, "success: true\nmessage: old contract\n", ""),
-            subprocess.CompletedProcess(
-                [],
-                0,
-                (
-                    f"{runtime_control.TRANSITION_PROTOCOL_MARKER}\n"
-                    "success: true\nmessage: old contract\n"
-                ),
-                "",
-            ),
-            subprocess.CompletedProcess(
-                [],
-                0,
-                f"message: {runtime_control.TRANSITION_PROTOCOL_MARKER}\n",
-                "",
-            ),
-            subprocess.CompletedProcess(
-                [],
-                0,
-                f"success: false\nmessage: {runtime_control.TRANSITION_PROTOCOL_MARKER}\n",
-                "",
-            ),
-            subprocess.CompletedProcess([], 2, "", "wrong or missing service type"),
-        )
-        for result in cases:
-            with self.subTest(result=result):
-                with patch.object(
-                    runtime_control.subprocess, "run", return_value=result
-                ):
-                    self.assertIsNot(
-                        runtime_control._call_operational_trigger(
-                            "runtime-container", runtime_control.TRANSITION_READY_SERVICE
-                        ),
-                        True,
-                    )
-
-        with patch.object(
-            runtime_control.subprocess,
-            "run",
-            side_effect=subprocess.TimeoutExpired("docker", 6.0),
-        ):
-            self.assertIsNone(
-                runtime_control._call_operational_trigger(
-                    "runtime-container", runtime_control.TRANSITION_READY_SERVICE
-                )
-            )
-
-    def test_replay_probe_retains_typed_topic_sample(self) -> None:
+    def test_execution_owner_probe_reads_latched_route_state_not_simulation_trigger(self) -> None:
         topic_result = subprocess.CompletedProcess(
             args=[],
             returncode=0,
-            stdout="state: ready\nrunning: false\npaused: false\n",
+            stdout=(
+                "data: '{\"schema\":\"taskplanner.execution_route_state.v1\","
+                "\"active_request_count\":1,\"execution_proxy_active\":false}'\n"
+            ),
             stderr="",
         )
         with patch.object(
             runtime_control,
-            "_running_mode_container_id",
-            return_value="shadow-container",
+            "_running_owner_container_id",
+            return_value="execution-container",
         ), patch.object(
             runtime_control.subprocess,
             "run",
             return_value=topic_result,
         ) as run:
-            self.assertTrue(
-                runtime_control.probe_mode_inactive(Path("/workspace"), "replay")
-            )
-        self.assertIn("ros2 topic echo", run.call_args.args[0][5])
-        self.assertIn(
-            "/workspaces/taskplanner_ws/install/docker/setup.bash",
-            run.call_args.args[0][5],
-        )
-        self.assertNotIn(
-            "/workspaces/taskplanner_ws/install/setup.bash",
-            run.call_args.args[0][5],
-        )
+            self.assertFalse(runtime_control.execution_owner_is_idle(Path("/workspace"), "live"))
+        command = run.call_args.args[0]
+        self.assertIn("ros2 topic echo", command[5])
+        self.assertIn(runtime_control.EXECUTION_ROUTE_STATE_TOPIC, command)
+        self.assertIn(runtime_control.EXECUTION_ROUTE_STATE_TYPE, command)
+        self.assertNotIn("ros2 service call", command[5])
+        self.assertNotIn("check_transition_ready", command)
+        self.assertEqual(run.call_args.kwargs["timeout"], 3.0)
 
-    def test_replay_state_rejects_running_paused_and_unknown(self) -> None:
-        self.assertTrue(
-            runtime_control.mode_state_is_inactive(
-                "replay",
-                {"state": "stopped", "running": False, "paused": False},
-            )
-        )
-        for payload in (
-            {"state": "running", "running": True, "paused": False},
-            {"state": "paused", "running": False, "paused": True},
-            {"state": "starting", "running": False, "paused": False},
-            {"state": "stopped", "running": False},
-        ):
-            self.assertFalse(runtime_control.mode_state_is_inactive("replay", payload))
-
-    def test_debug_state_requires_disarmed_monitor_only(self) -> None:
-        def status(state: str, armed: bool) -> dict[str, str]:
-            return {"data": json.dumps({"session": {"state": state, "armed": armed}})}
-
-        self.assertTrue(
-            runtime_control.mode_state_is_inactive(
-                "debug", status("MONITOR_ONLY", False)
-            )
-        )
-        self.assertFalse(
-            runtime_control.mode_state_is_inactive("debug", status("ARMED", True))
-        )
-        self.assertFalse(
-            runtime_control.mode_state_is_inactive("debug", status("BUSY", False))
-        )
-
-
-class RequiredPlaneProbeTests(unittest.TestCase):
-    @staticmethod
-    def docker_result(*services: str, unhealthy: str | None = None):
-        lines = []
-        for service in services:
-            health = "(unhealthy)" if service == unhealthy else "(healthy)"
-            lines.append(f"{service}\trunning\tUp 10 seconds {health}")
-        return subprocess.CompletedProcess([], 0, "\n".join(lines) + "\n", "")
-
-    def test_live_requires_every_healthy_mandatory_sidecar(self) -> None:
-        required = (
-            "ninfer-manager",
-            "webapp",
-            "public-rosbridge",
-            "taskplanner-asr",
-        )
+    def test_execution_owner_observation_is_not_required_for_non_operational_modes(self) -> None:
+        self.assertTrue(runtime_control.execution_owner_is_idle(Path("/workspace"), "replay"))
+        self.assertTrue(runtime_control.execution_owner_is_idle(Path("/workspace"), "debug"))
         with patch.object(
-            runtime_control.subprocess,
-            "run",
-            return_value=self.docker_result(*required),
+            runtime_control,
+            "_running_owner_container_id",
+            return_value=None,
         ):
-            self.assertTrue(
-                runtime_control.mode_required_plane_ready(
-                    Path("/workspace"), "live"
-                )
-            )
-
-        with patch.object(
-            runtime_control.subprocess,
-            "run",
-            return_value=self.docker_result(*required[:-1]),
-        ):
-            self.assertFalse(
-                runtime_control.mode_required_plane_ready(
-                    Path("/workspace"), "live"
-                )
-            )
-
-        with patch.object(
-            runtime_control.subprocess,
-            "run",
-            return_value=self.docker_result(*required, unhealthy="taskplanner-asr"),
-        ):
-            self.assertFalse(
-                runtime_control.mode_required_plane_ready(
-                    Path("/workspace"), "live"
-                )
-            )
-
-    def test_non_live_operational_plane_does_not_require_asr(self) -> None:
-        result = self.docker_result(
-            "ninfer-manager", "webapp", "public-rosbridge"
-        )
-        with patch.object(runtime_control.subprocess, "run", return_value=result):
-            self.assertTrue(
-                runtime_control.mode_required_plane_ready(
-                    Path("/workspace"), "replay"
-                )
-            )
-
-    def test_required_plane_probe_transport_failure_is_unknown(self) -> None:
-        with patch.object(
-            runtime_control.subprocess,
-            "run",
-            side_effect=subprocess.TimeoutExpired("docker", 1.0),
-        ):
-            self.assertIsNone(
-                runtime_control.mode_required_plane_ready(
-                    Path("/workspace"), "live"
-                )
-            )
+            self.assertIsNone(runtime_control.execution_owner_is_idle(Path("/workspace"), "live"))
 
 
 class RosbridgeRouteProbeTests(unittest.TestCase):
@@ -874,8 +1082,8 @@ class RosbridgeRouteProbeTests(unittest.TestCase):
         root = Path("/workspace")
         with patch.object(
             runtime_control,
-            "_running_mode_container_id",
-            return_value="runtime-container",
+            "_running_service_container_id",
+            return_value="operator-bridge-container",
         ), patch.object(
             runtime_control,
             "_container_environment",
@@ -972,217 +1180,46 @@ class RosbridgeRouteProbeTests(unittest.TestCase):
         self.assertIn(b"Host: 127.0.0.1:19091", connection.sent)
 
 
-class FakeAsrDocker:
-    def __init__(self, root: Path) -> None:
-        self.root = root.resolve()
-        self.container_id = "a" * 12
-        self.image_id = "sha256:" + "c" * 64
-        self.user = "1000:1000"
-        self.commands: list[list[str]] = []
-        self.restarted = False
-        self.initial_status = "running"
-        self.initial_running = True
-        self.initial_restarting = False
-        self.initial_pid = 101
-        self.initial_health = "healthy"
-        self.restart_seen = threading.Event()
-        self.restart_gate: threading.Event | None = None
-        self.import_returncode = 0
-        self.after_health = "healthy"
-        self.graph_timeout = False
-        self.topic_graph_outputs = [
-            """Type: std_msgs/msg/String
-Publisher count: 1
-Node name: taskplanner_asr
-Node namespace: /
-Endpoint type: PUBLISHER
-GID: 01.10.2d.67.14.cc.59.b2.e9.63.7d.02.00.00.16.03
-Subscription count: 0
-"""
-        ]
-        self.service_graph_outputs = [
-            """Type: surgical_msgs/srv/AsrControl
-Clients count: 0
-Services count: 1
-"""
-        ]
-        self.node_graph_outputs = [
-            """/taskplanner_asr
-  Subscribers:
+class AsrRestartOwnerTests(unittest.TestCase):
+    """The dashboard must be only a client of the CLI ASR owner command."""
 
-  Publishers:
-    /input/asr/runtime_status: std_msgs/msg/String
-  Service Servers:
-    /input/asr/control: surgical_msgs/srv/AsrControl
-    /taskplanner_asr/get_parameters: rcl_interfaces/srv/GetParameters
-  Service Clients:
-
-  Action Servers:
-
-  Action Clients:
-"""
-        ]
-
-    def __call__(self, command: list[str], **_kwargs: object):
-        self.commands.append(command)
-        if command[:2] == ["docker", "ps"]:
-            return subprocess.CompletedProcess(command, 0, f"{self.container_id}\n", "")
-        if command[:3] == ["docker", "inspect", "--format"]:
-            if command[3] == "{{json .Config.Labels}}":
-                labels = {
-                    "com.docker.compose.project.working_dir": str(self.root),
-                    "com.docker.compose.service": runtime_control.ASR_COMPOSE_SERVICE,
-                }
-                return subprocess.CompletedProcess(command, 0, json.dumps(labels), "")
-            if command[3] == "{{json .Image}}":
-                return subprocess.CompletedProcess(
-                    command, 0, json.dumps(self.image_id), ""
-                )
-            if command[3] == "{{json .Config.User}}":
-                return subprocess.CompletedProcess(
-                    command, 0, json.dumps(self.user), ""
-                )
-            if command[3] == "{{json .Config.WorkingDir}}":
-                return subprocess.CompletedProcess(
-                    command, 0, json.dumps("/workspaces/taskplanner_ws"), ""
-                )
-            if command[3] == "{{json .Mounts}}":
-                mounts = [
-                    {
-                        "Type": "bind",
-                        "Source": str(self.root),
-                        "Destination": "/workspaces/taskplanner_ws",
-                        "RW": True,
-                    }
-                ]
-                return subprocess.CompletedProcess(
-                    command, 0, json.dumps(mounts), ""
-                )
-            state = {
-                "Status": "running" if self.restarted else self.initial_status,
-                "Running": True if self.restarted else self.initial_running,
-                "Restarting": False if self.restarted else self.initial_restarting,
-                "Pid": 202 if self.restarted else self.initial_pid,
-                "StartedAt": (
-                    "2026-08-27T01:02:04.000000000Z"
-                    if self.restarted
-                    else "2026-08-27T01:02:03.000000000Z"
-                ),
-                "Health": {
-                    "Status": (
-                        self.after_health if self.restarted else self.initial_health
-                    )
-                },
-            }
-            return subprocess.CompletedProcess(command, 0, json.dumps(state), "")
-        if command[:2] == ["docker", "exec"]:
-            shell_command = command[5]
-            if shell_command == runtime_control.ASR_TOPIC_GRAPH_PROBE_SHELL:
-                if self.graph_timeout:
-                    raise subprocess.TimeoutExpired(
-                        command, float(_kwargs.get("timeout", 0.0))
-                    )
-                output = self.topic_graph_outputs.pop(0)
-                if not self.topic_graph_outputs:
-                    self.topic_graph_outputs.append(output)
-                return subprocess.CompletedProcess(command, 0, output, "")
-            if shell_command == runtime_control.ASR_SERVICE_GRAPH_PROBE_SHELL:
-                output = self.service_graph_outputs.pop(0)
-                if not self.service_graph_outputs:
-                    self.service_graph_outputs.append(output)
-                return subprocess.CompletedProcess(command, 0, output, "")
-            if shell_command == runtime_control.ASR_NODE_GRAPH_PROBE_SHELL:
-                output = self.node_graph_outputs.pop(0)
-                if not self.node_graph_outputs:
-                    self.node_graph_outputs.append(output)
-                return subprocess.CompletedProcess(command, 0, output, "")
-            if shell_command != runtime_control.ASR_IMPORT_PROBE_SHELL:
-                raise AssertionError(f"unexpected docker exec: {command!r}")
-            return subprocess.CompletedProcess(
-                command,
-                self.import_returncode,
-                f"{runtime_control.ASR_EXPECTED_IMPORT_PATH}\n",
-                "import failed" if self.import_returncode else "",
-            )
-        if command[:2] == ["docker", "restart"]:
-            self.restart_seen.set()
-            if self.restart_gate is not None:
-                self.restart_gate.wait(timeout=2)
-            self.restarted = True
-            return subprocess.CompletedProcess(command, 0, f"{self.container_id}\n", "")
-        if command[:2] == ["docker", "run"]:
-            return subprocess.CompletedProcess(
-                command, 0, f"{runtime_control.ASR_EXPECTED_IMPORT_PATH}\n", ""
-            )
-        raise AssertionError(f"unexpected command: {command!r}")
-
-
-class AsrRestartApiTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
         self.root = Path(self.tempdir.name)
         self.state_file = self.root / "active-runtime-mode.json"
         self.state_file.write_text('{"mode":"live"}', encoding="utf-8")
-        self.docker = FakeAsrDocker(self.root)
-        self.source_revision = "b" * 64
+        self.commands: list[list[str]] = []
+        self.returncode = 0
+        self.started = threading.Event()
+        self.release: threading.Event | None = None
+
+        def command_runner(command: list[str], **_kwargs: object):
+            self.commands.append(command)
+            self.started.set()
+            if self.release is not None:
+                self.release.wait(timeout=2)
+            return subprocess.CompletedProcess(
+                command,
+                self.returncode,
+                "",
+                "owner restart failed" if self.returncode else "",
+            )
+
         self.controller = runtime_control.RuntimeController(
             root=self.root,
             state_file=self.state_file,
             launcher=self.root / "scripts" / "taskplanner",
             mode_running_probe=lambda _mode: True,
             mode_contract_probe=lambda _mode: True,
-            required_plane_probe=lambda _mode: True,
             running_modes_probe=lambda: {"live"},
-            command_runner=self.docker,
-            asr_install_contract_probe=lambda: True,
-            asr_source_revision_probe=lambda: self.source_revision,
-            asr_restart_health_timeout_sec=0.2,
-            asr_restart_poll_interval_sec=0.001,
-            asr_graph_verify_timeout_sec=0.05,
-            asr_graph_verify_poll_interval_sec=0.001,
+            command_runner=command_runner,
+            asr_restart_command_timeout_sec=1,
         )
-        self.token = "a" * 48
-        self.server = runtime_control.create_server(
-            "127.0.0.1", 0, self.controller, self.token
-        )
-        self.server_thread = threading.Thread(
-            target=self.server.serve_forever, daemon=True
-        )
-        self.server_thread.start()
-        self.base_url = f"http://127.0.0.1:{self.server.server_port}"
 
     def tearDown(self) -> None:
-        if self.docker.restart_gate is not None:
-            self.docker.restart_gate.set()
-        self.server.shutdown()
-        self.server.server_close()
-        self.server_thread.join(timeout=2)
+        if self.release is not None:
+            self.release.set()
         self.tempdir.cleanup()
-
-    def request(
-        self,
-        method: str,
-        path: str,
-        payload: object | None = None,
-        *,
-        token: bool = True,
-        request_id: str | None = "11111111-1111-4111-8111-111111111111",
-    ):
-        body = None if payload is None else json.dumps(payload).encode("utf-8")
-        headers = {"Content-Type": "application/json"} if body is not None else {}
-        if token:
-            headers[runtime_control.TOKEN_HEADER] = self.token
-        if path == "/v1/runtime/asr/restart" and request_id is not None:
-            headers[runtime_control.REQUEST_ID_HEADER] = request_id
-        return urlopen(
-            Request(
-                f"{self.base_url}{path}",
-                data=body,
-                headers=headers,
-                method=method,
-            ),
-            timeout=2,
-        )
 
     def wait_for_terminal(self):
         deadline = time.monotonic() + 2
@@ -1191,550 +1228,169 @@ class AsrRestartApiTests(unittest.TestCase):
             if snapshot.phase in {"succeeded", "failed"}:
                 return snapshot
             time.sleep(0.005)
-        self.fail("ASR restart did not reach a terminal state")
+        self.fail("ASR owner restart did not reach a terminal state")
 
-    def test_restart_is_async_allowlisted_and_reports_verified_new_process(self) -> None:
-        gate = threading.Event()
-        self.docker.restart_gate = gate
-
-        with self.request("GET", "/v1/runtime/asr/status") as response:
-            baseline = json.loads(response.read())
-        self.assertEqual(baseline["generation"], 0)
-        self.assertIsNone(baseline["request_id"])
-
-        with self.request("POST", "/v1/runtime/asr/restart", {}) as response:
-            self.assertEqual(response.status, 202)
-            accepted = json.loads(response.read())
-        self.assertTrue(accepted["accepted"])
-        self.assertEqual(accepted["phase"], "queued")
-        self.assertEqual(accepted["generation"], 1)
-        self.assertRegex(accepted["job_id"], r"^[0-9a-f]{32}$")
-        self.assertEqual(
-            accepted["request_id"], "11111111-1111-4111-8111-111111111111"
-        )
-        self.assertTrue(self.docker.restart_seen.wait(timeout=1))
-
-        with self.request("GET", "/v1/runtime/asr/status") as response:
-            in_progress = json.loads(response.read())
-        self.assertEqual(in_progress["job_id"], accepted["job_id"])
-        self.assertEqual(in_progress["phase"], "restarting")
-        self.assertEqual(in_progress["request_id"], accepted["request_id"])
-
-        gate.set()
-        snapshot = self.wait_for_terminal()
-        self.assertEqual(snapshot.phase, "succeeded")
-        self.assertEqual(snapshot.source_revision, self.source_revision)
-        self.assertEqual(snapshot.request_id, accepted["request_id"])
-        self.assertEqual(snapshot.before_pid, 101)
-        self.assertEqual(snapshot.after_pid, 202)
-        self.assertEqual(
-            snapshot.container_started_at, "2026-08-27T01:02:04.000000000Z"
-        )
-        self.assertTrue((self.state_file.parent / "launcher.lock").exists())
-
-        restart_commands = [
-            command
-            for command in self.docker.commands
-            if command[:2] == ["docker", "restart"]
-        ]
-        self.assertEqual(
-            restart_commands,
-            [["docker", "restart", "--time", "45", self.docker.container_id]],
-        )
-        resolve_command = next(
-            command
-            for command in self.docker.commands
-            if command[:2] == ["docker", "ps"]
-        )
-        self.assertIn(
-            f"label=com.docker.compose.project.working_dir={self.root.resolve()}",
-            resolve_command,
-        )
-        self.assertIn(
-            "label=com.docker.compose.service=taskplanner-asr", resolve_command
+    def test_dashboard_uses_the_exact_cli_owner_restart(self) -> None:
+        accepted, queued = self.controller.start_asr_restart(
+            "11111111-1111-4111-8111-111111111111"
         )
 
-    def test_restart_and_mode_transition_are_mutually_serialized(self) -> None:
-        gate = threading.Event()
-        self.docker.restart_gate = gate
-        with self.request("POST", "/v1/runtime/asr/restart", {}) as response:
-            first = json.loads(response.read())
-        self.assertTrue(self.docker.restart_seen.wait(timeout=1))
-
-        with self.assertRaises(HTTPError) as duplicate_error:
-            self.request(
-                "POST",
-                "/v1/runtime/asr/restart",
-                {},
-                request_id="22222222-2222-4222-8222-222222222222",
-            )
-        self.assertEqual(duplicate_error.exception.code, 409)
-        duplicate = json.loads(duplicate_error.exception.read())
-        duplicate_error.exception.close()
-        self.assertFalse(duplicate["accepted"])
-        self.assertEqual(duplicate["job_id"], first["job_id"])
-        self.assertEqual(duplicate["request_id"], first["request_id"])
-        self.assertNotEqual(
-            duplicate["request_id"], "22222222-2222-4222-8222-222222222222"
-        )
-
-        with self.assertRaises(HTTPError) as transition_error:
-            self.request("POST", "/v1/runtime/transition", {"mode": "replay"})
-        self.assertEqual(transition_error.exception.code, 409)
-        transition = json.loads(transition_error.exception.read())
-        transition_error.exception.close()
-        self.assertIn("ASR node restart", transition["message"])
-        gate.set()
-        self.assertEqual(self.wait_for_terminal().phase, "succeeded")
-
-    def test_stopped_container_uses_same_image_isolated_preflight_then_recovers(self) -> None:
-        self.docker.initial_status = "exited"
-        self.docker.initial_running = False
-        self.docker.initial_pid = 0
-        self.docker.initial_health = "unavailable"
-
-        accepted, _snapshot = self.controller.start_asr_restart()
-        self.assertTrue(accepted)
-        snapshot = self.wait_for_terminal()
-
-        self.assertEqual(snapshot.phase, "succeeded")
-        self.assertEqual(snapshot.before_pid, 0)
-        self.assertEqual(snapshot.after_pid, 202)
-        isolated_commands = [
-            command
-            for command in self.docker.commands
-            if command[:2] == ["docker", "run"]
-        ]
-        self.assertEqual(len(isolated_commands), 1)
-        isolated = isolated_commands[0]
-        self.assertIn("--rm", isolated)
-        self.assertIn("--read-only", isolated)
-        self.assertIn("--network", isolated)
-        self.assertEqual(isolated[isolated.index("--network") + 1], "none")
-        self.assertEqual(isolated[isolated.index("--user") + 1], self.docker.user)
-        self.assertIn(self.docker.image_id, isolated)
-        self.assertEqual(isolated.count("--volume"), 1)
-        self.assertIn(
-            f"{self.root.resolve()}:/workspaces/taskplanner_ws:rw", isolated
-        )
-        self.assertFalse(any("/taskplanner-runs" in value for value in isolated))
-        self.assertFalse(any("Downloads" in value for value in isolated))
-        preflight_execs = [
-            command
-            for command in self.docker.commands
-            if command[:2] == ["docker", "exec"]
-            and command[5] == runtime_control.ASR_IMPORT_PROBE_SHELL
-        ]
-        self.assertEqual(preflight_execs, [])
-        self.assertEqual(
-            [
-                command
-                for command in self.docker.commands
-                if command[:2] == ["docker", "restart"]
-            ],
-            [["docker", "restart", "--time", "45", self.docker.container_id]],
-        )
-
-    def test_restarting_crash_loop_uses_isolated_preflight(self) -> None:
-        self.docker.initial_status = "restarting"
-        self.docker.initial_running = True
-        self.docker.initial_restarting = True
-        self.docker.initial_pid = 0
-        self.docker.initial_health = "starting"
-
-        accepted, _snapshot = self.controller.start_asr_restart()
-        self.assertTrue(accepted)
-        snapshot = self.wait_for_terminal()
-
-        self.assertEqual(snapshot.phase, "succeeded")
-        self.assertTrue(
-            any(
-                command[:2] == ["docker", "run"]
-                for command in self.docker.commands
-            )
-        )
-
-    def test_stopped_recovery_rejects_nonimmutable_image_before_docker_run(self) -> None:
-        self.docker.initial_status = "exited"
-        self.docker.initial_running = False
-        self.docker.initial_pid = 0
-        self.docker.image_id = "taskplanner-ws:dev"
-
-        accepted, _snapshot = self.controller.start_asr_restart()
-        self.assertTrue(accepted)
-        snapshot = self.wait_for_terminal()
-
-        self.assertEqual(snapshot.phase, "failed")
-        self.assertIn("identity", snapshot.message)
-        self.assertFalse(
-            any(
-                command[:2] in (["docker", "run"], ["docker", "restart"])
-                for command in self.docker.commands
-            )
-        )
-
-    def test_restart_requires_token_exact_empty_object_and_live_mode(self) -> None:
-        with self.assertRaises(HTTPError) as unauthorized:
-            self.request("POST", "/v1/runtime/asr/restart", {}, token=False)
-        self.assertEqual(unauthorized.exception.code, 401)
-        unauthorized.exception.close()
-
-        for request_id in (
-            None,
-            "",
-            "not-a-uuid",
-            "11111111-1111-1111-8111-111111111111",
-            "11111111-1111-4111-8111-11111111111A",
-            "11111111-1111-4111-8111-111111111111 ",
-        ):
-            with self.subTest(request_id=request_id), self.assertRaises(
-                HTTPError
-            ) as invalid_request_id:
-                self.request(
-                    "POST",
-                    "/v1/runtime/asr/restart",
-                    {},
-                    request_id=request_id,
-                )
-            self.assertEqual(invalid_request_id.exception.code, 400)
-            invalid_request_id.exception.close()
-
-        for invalid_payload in ({"service": "other"}, [], "{}"):
-            with self.subTest(payload=invalid_payload), self.assertRaises(
-                HTTPError
-            ) as invalid:
-                self.request("POST", "/v1/runtime/asr/restart", invalid_payload)
-            self.assertEqual(invalid.exception.code, 400)
-            invalid.exception.close()
-
-        self.state_file.write_text('{"mode":"debug"}', encoding="utf-8")
-        self.controller._running_modes_probe = lambda: {"debug"}
-        rejected_request_id = "33333333-3333-4333-8333-333333333333"
-        with self.assertRaises(HTTPError) as wrong_mode:
-            self.request(
-                "POST",
-                "/v1/runtime/asr/restart",
-                {},
-                request_id=rejected_request_id,
-            )
-        self.assertEqual(wrong_mode.exception.code, 409)
-        payload = json.loads(wrong_mode.exception.read())
-        wrong_mode.exception.close()
-        self.assertFalse(payload["accepted"])
-        self.assertEqual(payload["phase"], "failed")
-        self.assertEqual(payload["request_id"], rejected_request_id)
-        with self.request("GET", "/v1/runtime/asr/status") as response:
-            persisted = json.loads(response.read())
-        self.assertIsNone(persisted["request_id"])
-        self.assertEqual(self.docker.commands, [])
-
-    def test_abi_mismatch_refuses_restart_before_any_docker_command(self) -> None:
-        self.controller._asr_install_contract_probe = lambda: False
-        accepted, queued = self.controller.start_asr_restart()
         self.assertTrue(accepted)
         self.assertEqual(queued.phase, "queued")
-
         snapshot = self.wait_for_terminal()
-        self.assertEqual(snapshot.phase, "failed")
-        self.assertFalse(snapshot.retryable)
-        self.assertIn("install contract", snapshot.message)
-        self.assertEqual(self.docker.commands, [])
 
-    def test_import_failure_never_interrupts_the_running_asr_container(self) -> None:
-        self.docker.import_returncode = 1
-        accepted, _snapshot = self.controller.start_asr_restart()
+        self.assertEqual(snapshot.phase, "succeeded")
+        self.assertEqual(snapshot.message, "The ASR owner restarted.")
+        self.assertIsNone(snapshot.source_revision)
+        self.assertIsNone(snapshot.container_started_at)
+        self.assertIsNone(snapshot.before_pid)
+        self.assertIsNone(snapshot.after_pid)
+        self.assertEqual(
+            self.commands,
+            [[
+                str(self.root / "scripts" / "taskplanner"),
+                "restart",
+                "asr",
+                "--require-active-live",
+            ]],
+        )
+        self.assertFalse(any(command[0] == "docker" for command in self.commands))
+
+    def test_owner_failure_is_reported_without_a_second_restart_path(self) -> None:
+        self.returncode = 7
+
+        accepted, _queued = self.controller.start_asr_restart()
+
         self.assertTrue(accepted)
-
         snapshot = self.wait_for_terminal()
         self.assertEqual(snapshot.phase, "failed")
         self.assertTrue(snapshot.retryable)
-        self.assertFalse(self.docker.restarted)
-        self.assertFalse(
-            any(
-                command[:2] == ["docker", "restart"]
-                for command in self.docker.commands
-            )
+        self.assertEqual(snapshot.message, "The ASR owner restart failed.")
+        self.assertEqual(len(self.commands), 1)
+        self.assertEqual(self.commands[0][1:3], ["restart", "asr"])
+
+    def test_asr_restart_serializes_mode_changes_without_polling_sidecars(self) -> None:
+        self.release = threading.Event()
+        accepted, _queued = self.controller.start_asr_restart()
+        self.assertTrue(accepted)
+        self.assertTrue(self.started.wait(timeout=1))
+
+        accepted_transition, snapshot = self.controller.start_transition("replay")
+
+        self.assertFalse(accepted_transition)
+        self.assertIn("ASR node restart", snapshot.message)
+        self.assertEqual(len(self.commands), 1)
+        self.release.set()
+        self.assertEqual(self.wait_for_terminal().phase, "succeeded")
+
+
+class RuntimeLifecycleTests(unittest.TestCase):
+    """Fixed Debug lifecycle controls stay separate from generic owner APIs."""
+
+    def setUp(self) -> None:
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.root = Path(self.tempdir.name)
+        self.state_file = self.root / "active-runtime-mode.json"
+        self.state_file.write_text('{"mode":"live"}', encoding="utf-8")
+        self.commands: list[list[str]] = []
+        self.environments: list[dict[str, str]] = []
+
+        def command_runner(command: list[str], **kwargs: object):
+            self.commands.append(command)
+            environment = kwargs.get("env")
+            if isinstance(environment, dict):
+                self.environments.append(dict(environment))
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        self.controller = runtime_control.RuntimeController(
+            root=self.root,
+            state_file=self.state_file,
+            launcher=self.root / "scripts" / "taskplanner",
+            mode_running_probe=lambda _mode: True,
+            mode_contract_probe=lambda _mode: True,
+            running_modes_probe=lambda: {"live"},
+            transition_interlock_probe=lambda _mode: True,
+            command_runner=command_runner,
+        )
+        self.controller._ninfer_snapshot = lambda: runtime_control.NInferSnapshot(
+            available=True,
+            model_id="qwen3.6-35b-a3b",
+            model_state="loaded",
+            detail="ready",
         )
 
-    def test_preflight_purges_then_checked_hash_compiles_before_fresh_import(self) -> None:
-        runtime_control.preflight_asr_import(
-            self.docker.container_id, self.docker
+    def tearDown(self) -> None:
+        self.tempdir.cleanup()
+
+    def wait_for_terminal(self):
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            with self.controller._lock:
+                snapshot = self.controller._lifecycle_snapshot
+            if snapshot.phase in {"succeeded", "failed"}:
+                return snapshot
+            time.sleep(0.005)
+        self.fail("runtime lifecycle did not reach a terminal state")
+
+    def test_warm_restart_uses_the_existing_same_mode_launcher_path(self) -> None:
+        accepted, queued = self.controller.start_lifecycle(
+            "warm_restart", "22222222-2222-4222-8222-222222222222"
         )
 
-        command = self.docker.commands[-1]
+        self.assertTrue(accepted)
+        self.assertEqual(queued.phase, "queued")
+        self.assertEqual(self.wait_for_terminal().phase, "succeeded")
         self.assertEqual(
-            command[:-1],
+            self.commands,
+            [[str(self.root / "scripts" / "taskplanner"), "up", "live"]],
+        )
+        self.assertEqual(self.environments[0]["TASKPLANNER_RUNTIME_CONTROL_CHILD"], "1")
+        self.assertEqual(
+            self.environments[0]["TASKPLANNER_RUNTIME_EXPECTED_ACTIVE_MODE"], "live"
+        )
+
+    def test_clean_restart_keeps_the_supervisor_child_contract(self) -> None:
+        accepted, _queued = self.controller.start_lifecycle(
+            "clean_restart", "33333333-3333-4333-8333-333333333333"
+        )
+
+        self.assertTrue(accepted)
+        self.assertEqual(self.wait_for_terminal().phase, "succeeded")
+        self.assertEqual(
+            self.commands,
             [
-                "docker",
-                "exec",
-                self.docker.container_id,
-                "bash",
-                "-lc",
-                runtime_control.ASR_IMPORT_PROBE_SHELL,
-                "--",
+                [str(self.root / "scripts" / "taskplanner"), "down"],
+                [str(self.root / "scripts" / "taskplanner"), "up", "live"],
             ],
         )
-        probe_code = command[-1]
-        self.assertIn("importlib.util.cache_from_source", probe_code)
-        self.assertIn("py_compile.PycInvalidationMode.CHECKED_HASH", probe_code)
-        self.assertLess(
-            probe_code.index("cache_path.unlink"),
-            probe_code.index("py_compile.compile"),
-        )
-        self.assertLess(
-            probe_code.index("py_compile.compile"),
-            probe_code.index(
-                'importlib.import_module("integration_debug.operational_asr_node")'
-            ),
-        )
-        for filename in runtime_control.ASR_SOURCE_MANIFEST:
-            self.assertIn(f'"{filename}"', probe_code)
-        self.assertNotIn("glob(", probe_code)
-        self.assertNotIn("rglob(", probe_code)
+        self.assertTrue(all(
+            environment["TASKPLANNER_RUNTIME_CONTROL_CHILD"] == "1"
+            for environment in self.environments
+        ))
 
-    def test_ros_graph_probe_requires_unique_typed_topic_and_service(self) -> None:
-        runtime_control.verify_unique_asr_status_publisher(
-            self.docker.container_id, self.docker
+    def test_lifecycle_rejects_an_active_execution_request(self) -> None:
+        self.controller._transition_interlock_probe = lambda _mode: False
+
+        accepted, snapshot = self.controller.start_lifecycle(
+            "clean_restart", "44444444-4444-4444-8444-444444444444"
         )
 
-        self.docker.topic_graph_outputs = [
-            self.docker.topic_graph_outputs[0].replace(
-                "Publisher count: 1", "Publisher count: 2"
-            )
-        ]
-        with self.assertRaises(runtime_control.AsrRestartError):
-            runtime_control.verify_unique_asr_status_publisher(
-                self.docker.container_id, self.docker
-            )
-
-        clean_docker = FakeAsrDocker(self.root)
-        clean_docker.node_graph_outputs = [
-            clean_docker.node_graph_outputs[0].replace(
-                "    /input/asr/control: surgical_msgs/srv/AsrControl\n", ""
-            )
-        ]
-        with self.assertRaises(runtime_control.AsrRestartError):
-            runtime_control.verify_unique_asr_status_publisher(
-                clean_docker.container_id, clean_docker
-            )
-
-        self.docker.topic_graph_outputs = [FakeAsrDocker(self.root).topic_graph_outputs[0]]
-        self.docker.service_graph_outputs = [
-            self.docker.service_graph_outputs[0].replace(
-                "Services count: 1", "Services count: 2"
-            )
-        ]
-        with self.assertRaises(runtime_control.AsrRestartError):
-            runtime_control.verify_unique_asr_status_publisher(
-                self.docker.container_id, self.docker
-            )
-
-    def test_restart_retries_until_old_dds_publisher_disappears(self) -> None:
-        valid_topic = self.docker.topic_graph_outputs[0]
-        self.docker.topic_graph_outputs = [
-            valid_topic.replace("Publisher count: 1", "Publisher count: 2"),
-            valid_topic,
-        ]
-        accepted, _snapshot = self.controller.start_asr_restart()
-        self.assertTrue(accepted)
-
-        snapshot = self.wait_for_terminal()
-        self.assertEqual(snapshot.phase, "succeeded")
-        topic_probes = [
-            command
-            for command in self.docker.commands
-            if command[:2] == ["docker", "exec"]
-            and command[5] == runtime_control.ASR_TOPIC_GRAPH_PROBE_SHELL
-        ]
-        self.assertEqual(len(topic_probes), 2)
-
-    def test_persistent_duplicate_ros_endpoint_is_not_success(self) -> None:
-        self.controller._asr_graph_verify_timeout_sec = 0.01
-        self.controller._asr_graph_verify_poll_interval_sec = 0.005
-        self.docker.topic_graph_outputs = [
-            self.docker.topic_graph_outputs[0].replace(
-                "Publisher count: 1", "Publisher count: 2"
-            )
-        ]
-        accepted, _snapshot = self.controller.start_asr_restart()
-        self.assertTrue(accepted)
-
-        snapshot = self.wait_for_terminal()
+        self.assertFalse(accepted)
         self.assertEqual(snapshot.phase, "failed")
-        self.assertIn("unique on the ROS graph", snapshot.message)
-        self.assertIsNone(snapshot.after_pid)
+        self.assertIn("in flight", snapshot.message)
+        self.assertEqual(self.commands, [])
 
-    def test_graph_subprocess_timeout_respects_absolute_retry_deadline(self) -> None:
-        self.controller._asr_graph_verify_timeout_sec = 0.02
-        self.controller._asr_graph_verify_poll_interval_sec = 0.005
-        self.docker.graph_timeout = True
-        started = time.monotonic()
-        accepted, _snapshot = self.controller.start_asr_restart()
-        self.assertTrue(accepted)
+    def test_lifecycle_rejects_unknown_activity_for_live_restart(self) -> None:
+        self.controller._transition_interlock_probe = lambda _mode: None
 
-        snapshot = self.wait_for_terminal()
-        elapsed = time.monotonic() - started
+        accepted, snapshot = self.controller.start_lifecycle(
+            "warm_restart", "55555555-5555-4555-8555-555555555555"
+        )
+
+        self.assertFalse(accepted)
         self.assertEqual(snapshot.phase, "failed")
-        self.assertLess(elapsed, 0.25)
-
-    def test_unhealthy_new_pid_is_not_reported_as_success(self) -> None:
-        self.docker.after_health = "unhealthy"
-        accepted, _snapshot = self.controller.start_asr_restart()
-        self.assertTrue(accepted)
-
-        snapshot = self.wait_for_terminal()
-        self.assertEqual(snapshot.phase, "failed")
-        self.assertEqual(snapshot.before_pid, 101)
-        self.assertIsNone(snapshot.after_pid)
-        self.assertIn("did not become healthy", snapshot.message)
-
-    def test_source_change_during_preflight_fails_before_restart(self) -> None:
-        revisions = iter(["1" * 64, "2" * 64])
-        self.controller._asr_source_revision_probe = lambda: next(revisions)
-        accepted, _snapshot = self.controller.start_asr_restart()
-        self.assertTrue(accepted)
-
-        snapshot = self.wait_for_terminal()
-        self.assertEqual(snapshot.phase, "failed")
-        self.assertIn("changed during preflight", snapshot.message)
-        self.assertFalse(self.docker.restarted)
-
-    def test_source_revision_matches_node_manifest_algorithm(self) -> None:
-        package_dir = (
-            self.root / "src" / "integration_debug" / "integration_debug"
-        )
-        package_dir.mkdir(parents=True)
-        expected_digest = runtime_control.hashlib.sha256()
-        for index, filename in enumerate(runtime_control.ASR_SOURCE_MANIFEST):
-            content = f"source-{index}".encode("utf-8")
-            (package_dir / filename).write_bytes(content)
-            encoded_name = filename.encode("utf-8")
-            expected_digest.update(len(encoded_name).to_bytes(2, "big"))
-            expected_digest.update(encoded_name)
-            expected_digest.update(b"\x00present")
-            expected_digest.update(len(content).to_bytes(8, "big"))
-            expected_digest.update(content)
-
-        self.assertEqual(
-            runtime_control.asr_source_revision(self.root),
-            expected_digest.hexdigest(),
-        )
-
-    def _create_asr_install_contract_tree(self, name: str) -> Path:
-        root = self.root / name
-        for index, relative in enumerate(
-            runtime_control.ASR_ABI_CONTRACT_RELATIVE_PATHS
-        ):
-            path = root / relative
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(f"contract-{index}\n", encoding="utf-8")
-        unrelated = root / "src" / "unrelated" / "msg" / "Other.msg"
-        unrelated.parent.mkdir(parents=True)
-        unrelated.write_text("string value\n", encoding="utf-8")
-        shared_cmake = root / "src" / "surgical_msgs" / "CMakeLists.txt"
-        shared_cmake.parent.mkdir(parents=True, exist_ok=True)
-        shared_cmake.write_text("# unrelated interface list\n", encoding="utf-8")
-        install_root = root / "install" / "docker"
-        entrypoint = (
-            install_root
-            / "integration_debug"
-            / "lib"
-            / "integration_debug"
-            / "operational_asr_node"
-        )
-        entrypoint.parent.mkdir(parents=True)
-        entrypoint.write_text("#!/bin/sh\n", encoding="utf-8")
-        entrypoint.chmod(0o755)
-        (install_root / "setup.bash").write_text("# setup\n", encoding="utf-8")
-        return root
-
-    def test_asr_contract_bootstrap_then_ignores_unrelated_abi_edits(self) -> None:
-        root = self._create_asr_install_contract_tree("scoped-contract")
-        global_marker = (
-            root / "install" / "docker" / ".taskplanner-runtime-abi-contract-v1"
-        )
-        global_marker.write_text(
-            runtime_control.runtime_install_contract_fingerprint(root) + "\n",
-            encoding="utf-8",
-        )
-
-        self.assertTrue(runtime_control.ensure_asr_install_contract(root))
-        scoped_marker = (
-            root
-            / "install"
-            / "docker"
-            / runtime_control.ASR_ABI_CONTRACT_MARKER
-        )
-        self.assertTrue(scoped_marker.is_file())
-        self.assertTrue(runtime_control.asr_install_contract_matches_source(root))
-
-        unrelated = root / "src" / "unrelated" / "msg" / "Other.msg"
-        unrelated.write_text("string changed\n", encoding="utf-8")
-        shared_cmake = root / "src" / "surgical_msgs" / "CMakeLists.txt"
-        shared_cmake.write_text("# another unrelated interface\n", encoding="utf-8")
-        self.assertFalse(runtime_control.runtime_install_contract_matches_source(root))
-        self.assertTrue(runtime_control.ensure_asr_install_contract(root))
-
-        relevant = root / "src" / "surgical_msgs" / "srv" / "AsrControl.srv"
-        relevant.write_text("string changed\n---\nbool accepted\n", encoding="utf-8")
-        self.assertFalse(runtime_control.ensure_asr_install_contract(root))
-
-    def test_each_imported_asr_interface_and_package_dependency_is_scoped(self) -> None:
-        relevant_paths = (
-            "src/surgical_msgs/srv/AsrControl.srv",
-            "src/surgical_msgs/msg/SpeechUtterance.msg",
-            "src/surgical_msgs/package.xml",
-        )
-        for index, relative in enumerate(relevant_paths):
-            with self.subTest(relative=relative):
-                root = self._create_asr_install_contract_tree(f"relevant-{index}")
-                global_marker = (
-                    root
-                    / "install"
-                    / "docker"
-                    / ".taskplanner-runtime-abi-contract-v1"
-                )
-                global_marker.write_text(
-                    runtime_control.runtime_install_contract_fingerprint(root)
-                    + "\n",
-                    encoding="utf-8",
-                )
-                self.assertTrue(runtime_control.ensure_asr_install_contract(root))
-                (root / relative).write_text("changed\n", encoding="utf-8")
-                self.assertFalse(runtime_control.ensure_asr_install_contract(root))
-
-    def test_asr_contract_never_bootstraps_from_stale_global_marker(self) -> None:
-        root = self._create_asr_install_contract_tree("stale-global")
-        global_marker = (
-            root / "install" / "docker" / ".taskplanner-runtime-abi-contract-v1"
-        )
-        global_marker.write_text("0" * 64 + "\n", encoding="utf-8")
-
-        self.assertFalse(runtime_control.ensure_asr_install_contract(root))
-        self.assertFalse(
-            (
-                root
-                / "install"
-                / "docker"
-                / runtime_control.ASR_ABI_CONTRACT_MARKER
-            ).exists()
-        )
-
-    def test_container_resolution_rejects_zero_or_multiple_label_matches(self) -> None:
-        for output in ("", f"{'a' * 12}\n{'b' * 12}\n"):
-            with self.subTest(output=output):
-                runner = Mock(
-                    return_value=subprocess.CompletedProcess([], 0, output, "")
-                )
-                with self.assertRaises(runtime_control.AsrRestartError):
-                    runtime_control.resolve_asr_container(self.root, runner)
-
-                command = runner.call_args.args[0]
-                self.assertIn(
-                    "label=com.docker.compose.service=taskplanner-asr", command
-                )
-                self.assertIn("-a", command)
-                self.assertNotIn("status=running", command)
+        self.assertIn("activity is unavailable", snapshot.message)
+        self.assertEqual(self.commands, [])
 
 
 class RuntimeControlResponseTests(unittest.TestCase):

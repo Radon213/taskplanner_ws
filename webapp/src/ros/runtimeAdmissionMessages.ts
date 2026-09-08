@@ -35,7 +35,8 @@ export type IntegrationReadiness = {
   stampSec: number;
 };
 
-export type IntegrationReadinessBlockReason =
+/** Diagnostic classification only; it never admits or blocks a command. */
+export type IntegrationReadinessDiagnosticReason =
   | "missing"
   | "stale"
   | "bundle_mismatch"
@@ -75,12 +76,6 @@ export type ExecutionRouteState = {
   >;
   routeControlEnabled: boolean;
   activeRequestCount: number;
-};
-
-export type ExecutionRouteCommandResult = {
-  state: ExecutionRouteState;
-  /** The manager's stopped-state DT reset completed before the bridge switch. */
-  digitalTwinReset: boolean;
 };
 
 type RosString = {
@@ -429,38 +424,29 @@ export function normalizeExecutionRouteState(
   }
 }
 
-/**
- * Decode a route-command receipt. A route snapshot alone is not successful:
- * callers must still require `digitalTwinReset === true` before admitting it.
- */
+/** Decode the authoritative stopped-route change result. */
 export function normalizeExecutionRouteCommandResult(
   value: unknown,
-): ExecutionRouteCommandResult | null {
+): ExecutionRouteState | null {
   const raw = String(value ?? "").trim();
   if (!raw || raw.length > MAX_ROS_JSON_PAYLOAD_CHARS) return null;
   try {
     const payload = JSON.parse(raw) as Record<string, unknown>;
-    if (
-      !isBoundedRosPayload(payload)
-      || typeof payload.digital_twin_reset !== "boolean"
-    ) {
+    if (!isBoundedRosPayload(payload)) {
       return null;
     }
-    const state = normalizeExecutionRouteState({ data: raw });
-    return state
-      ? { state, digitalTwinReset: payload.digital_twin_reset }
-      : null;
+    return normalizeExecutionRouteState({ data: raw });
   } catch {
     return null;
   }
 }
 
-export function integrationReadinessBlockReason(
+export function integrationReadinessDiagnosticReason(
   readiness: IntegrationReadiness | null,
   receivedAt: number | null,
   expectedBundle: string,
   now = Date.now(),
-): IntegrationReadinessBlockReason | null {
+): IntegrationReadinessDiagnosticReason | null {
   if (!readiness || !receivedAt) return "missing";
   const receivedAgeMs = now - receivedAt;
   const sourceAgeMs = now - readiness.stampSec * 1_000;

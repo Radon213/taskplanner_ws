@@ -72,6 +72,9 @@ def _dialogue_node() -> RealVLMNode:
     node._gateway_info_last_revision = -1
     node._gateway_info_last_source_stamp_ns = 0
     node._gateway_info_timeout_sec = 3.0
+    # Focused dialogue tests do not load a ProcedureSpec; production resolves
+    # this through the active procedure bundle before accepting a hint.
+    node._canonical_tool_id = lambda value: str(value or "").strip()
     node._trigger_count = 0
     node._trigger_inference_for_public_speech = lambda: setattr(
         node,
@@ -246,7 +249,7 @@ def test_ninfer_missing_turn_ids_bind_to_claimed_turn_and_publish_once() -> None
     assert published[0].function_arguments_json == '{"tool_id":"T02"}'
 
 
-def test_ninfer_handover_intent_promotes_typed_function_and_delays_reply() -> None:
+def test_ninfer_handover_intent_never_creates_a_presentation_hint() -> None:
     node = _dialogue_node()
     node._provider_id = "ninfer"
     node._context_mode = "actor_log"
@@ -274,16 +277,12 @@ def test_ninfer_handover_intent_promotes_typed_function_and_delays_reply() -> No
         claimed_dialogue_turn_id=turn.turn_id,
     )
 
-    assert normalized["function_call"] == {
-        "turn_id": turn.turn_id,
-        "name": "request_tool_handover",
-        "arguments": {"tool_id": "T02"},
-    }
+    assert normalized["function_call"] is None
     assert normalized["humanoid_reply"] == {
         "turn_id": turn.turn_id,
         "text": "Adson 전달드리겠습니다.",
         "speak": True,
-        "timing": "on_function_accepted",
+        "timing": "immediate",
     }
     assert node._publish_humanoid_reply(
         normalized,
@@ -294,8 +293,8 @@ def test_ninfer_handover_intent_promotes_typed_function_and_delays_reply() -> No
         claimed_turn_id=turn.turn_id,
     )
     assert len(published) == 1
-    assert published[0].function_call_name == "request_tool_handover"
-    assert published[0].timing == "on_function_accepted"
+    assert published[0].function_call_name == ""
+    assert published[0].timing == "immediate"
 
 
 def test_ninfer_dialogue_adapter_adds_only_action_neutral_top_level_nulls() -> None:
@@ -309,6 +308,7 @@ def test_ninfer_dialogue_adapter_adds_only_action_neutral_top_level_nulls() -> N
     )
     payload.pop("function_call")
     payload.pop("humanoid_reply")
+    payload.pop("bed_robot_arm_group")
     payload["intent"] = ["none", "", 0.0]
 
     _raw, normalized = node._normalize_model_raw_text(
@@ -318,6 +318,69 @@ def test_ninfer_dialogue_adapter_adds_only_action_neutral_top_level_nulls() -> N
 
     assert normalized["function_call"] is None
     assert normalized["humanoid_reply"] is None
+    assert normalized["bed_robot_arm_group"] is None
+
+
+def test_ninfer_live_adapter_normalizes_missing_retraction_proposal_to_null() -> None:
+    node = RealVLMNode.__new__(RealVLMNode)
+    node._response_mode = "live"
+    node._provider_id = "ninfer"
+    node._context_mode = "actor_log"
+    payload = _v6_dialogue_payload(
+        function_call=None,
+        humanoid_reply=None,
+    )
+    payload.pop("bed_robot_arm_group")
+
+    _raw, normalized = node._normalize_model_raw_text(
+        json.dumps(payload),
+        claimed_dialogue_turn_id="41:run-1:u-1",
+    )
+
+    assert normalized["bed_robot_arm_group"] is None
+
+
+def test_ninfer_live_adapter_discards_incomplete_retraction_proposal() -> None:
+    node = RealVLMNode.__new__(RealVLMNode)
+    node._response_mode = "live"
+    node._provider_id = "ninfer"
+    node._context_mode = "actor_log"
+    payload = _v6_dialogue_payload(
+        function_call=None,
+        humanoid_reply=None,
+    )
+    payload["bed_robot_arm_group"] = {
+        "request_id": "retraction-1",
+        "group_id": "retraction",
+    }
+
+    _raw, normalized = node._normalize_model_raw_text(
+        json.dumps(payload),
+        claimed_dialogue_turn_id="41:run-1:u-1",
+    )
+
+    assert normalized["bed_robot_arm_group"] is None
+
+
+def test_non_ninfer_live_adapter_keeps_missing_retraction_proposal_strict() -> None:
+    node = RealVLMNode.__new__(RealVLMNode)
+    node._response_mode = "live"
+    node._provider_id = "lmstudio"
+    node._context_mode = "actor_log"
+    payload = _v6_dialogue_payload(
+        function_call=None,
+        humanoid_reply=None,
+    )
+    payload.pop("bed_robot_arm_group")
+
+    with pytest.raises(
+        SchemaValidationError,
+        match="schema v5 is missing fields: bed_robot_arm_group",
+    ):
+        node._normalize_model_raw_text(
+            json.dumps(payload),
+            claimed_dialogue_turn_id="41:run-1:u-1",
+        )
 
 
 def test_ninfer_dialogue_adapter_discards_only_known_extension_fields() -> None:
@@ -357,12 +420,12 @@ def test_ninfer_string_reply_is_bounded_and_bound_to_claimed_turn() -> None:
         claimed_dialogue_turn_id="41:run-1:u-1",
     )
 
-    assert normalized["function_call"]["arguments"] == {"tool_id": "T02"}
+    assert normalized["function_call"] is None
     assert normalized["humanoid_reply"] == {
         "turn_id": "41:run-1:u-1",
         "text": "Adson 전달드리겠습니다.",
         "speak": True,
-        "timing": "on_function_accepted",
+        "timing": "immediate",
     }
 
 
@@ -385,7 +448,7 @@ def test_ninfer_explicit_false_speak_is_never_overwritten() -> None:
     )
 
     assert normalized["humanoid_reply"]["speak"] is False
-    assert normalized["humanoid_reply"]["timing"] == "on_function_accepted"
+    assert normalized["humanoid_reply"]["timing"] == "immediate"
 
 
 def test_ninfer_low_confidence_intent_never_creates_a_function_call() -> None:
@@ -412,8 +475,35 @@ def test_ninfer_low_confidence_intent_never_creates_a_function_call() -> None:
     assert normalized["humanoid_reply"]["timing"] == "immediate"
 
 
+def test_ninfer_truncated_summary_keeps_complete_mayo_observation_without_actions() -> None:
+    """A tail-only NInfer omission must not erase earlier observational facts."""
+
+    node = RealVLMNode.__new__(RealVLMNode)
+    node._response_mode = "live"
+    node._provider_id = "ninfer"
+    node._context_mode = "actor_log"
+    payload = _v6_dialogue_payload(function_call=None, humanoid_reply=None)
+    payload["mayo"] = [["T04", "reuse", 0.8]]
+    # Match the production failure shape: a complete object through `u`, then
+    # the beginning of the final clinical-summary field.
+    prefix = {
+        key: value
+        for key, value in payload.items()
+        if key not in {"sum", "bed_robot_arm_group", "function_call", "humanoid_reply"}
+    }
+    raw_text = json.dumps(prefix, separators=(",", ":"))[:-1] + ',"sum":'
+
+    _raw, normalized = node._normalize_model_raw_text(raw_text)
+
+    assert normalized["sum"] == ""
+    assert normalized["mayo"] == [["T04", "reuse", 0.8]]
+    assert normalized["bed_robot_arm_group"] is None
+    assert normalized["function_call"] is None
+    assert normalized["humanoid_reply"] is None
+
+
 @pytest.mark.parametrize("confidence", [0.5, 1.0])
-def test_ninfer_handover_promotion_accepts_closed_confidence_bounds(
+def test_ninfer_handover_intent_never_promotes_at_any_confidence(
     confidence,
 ) -> None:
     payload = _v6_dialogue_payload(
@@ -427,11 +517,7 @@ def test_ninfer_handover_promotion_accepts_closed_confidence_bounds(
         claimed_turn_id="41:run-1:u-1",
     )
 
-    assert repaired["function_call"] == {
-        "turn_id": "41:run-1:u-1",
-        "name": "request_tool_handover",
-        "arguments": {"tool_id": "T02"},
-    }
+    assert repaired["function_call"] is None
 
 
 @pytest.mark.parametrize(
@@ -705,12 +791,7 @@ def test_function_call_reply_carries_same_turn_and_canonical_arguments() -> None
     assert message.turn_id == turn.turn_id
     assert message.function_call_name == "request_tool_handover"
     assert message.function_arguments_json == '{"tool_id":"T07"}'
-    assert message.function_request_id == (
-        stable_dialogue_reply_id(
-            "run-1", "u-1", gateway_instance_id="gateway-1"
-        )
-        + ":function"
-    )
+    assert message.function_request_id == ""
     assert message.timing == "on_function_accepted"
 
 

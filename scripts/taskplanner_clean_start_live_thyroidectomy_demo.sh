@@ -34,7 +34,8 @@ Usage:
 
 Actions:
   (default)    Restarts only the Live core. A healthy NInfer model remains
-               loaded; TTS/TV/HLS/Integrated Debug/local perception stay off.
+               loaded; the independent TTS owner is ensured present while
+               Integrated Debug/local perception stay off.
   --rebuild    Rebuilds once, then performs the same scoped warm restart.
   --dry-run    Prints the scoped warm-restart commands without changing state.
   --status     Shows Taskplanner-owned runtime status without restarting it.
@@ -175,9 +176,14 @@ export INPUT_PROFILE=external
 export EXECUTION_BACKEND=action
 export VITE_DEFAULT_RUNTIME_MODE=live
 export TASKPLANNER_LIVE_ENABLE_OPS=false
+# Debug remains an independent observer/control workspace.  This quick Live
+# shortcut must not silently pull its PipeWire and surgery-record prerequisites
+# into every warm restart; launch Debug explicitly when it is needed.
 export TASKPLANNER_LIVE_ENABLE_INTEGRATED_DEBUG=false
 export TASKPLANNER_LIVE_ENABLE_MULTICAM=false
-export TASKPLANNER_LIVE_ENABLE_TTS=false
+# Live always owns the independent Supertonic TTS observer.  Do not re-add a
+# toggle here: a missing audio device must surface in the owner status rather
+# than silently disabling deterministic execution announcements.
 # This desktop workflow owns one reviewed model runtime: NInfer with the
 # deployed Qwen3.6 35B A3B artifact.  Do not start the LM Studio/Unsloth
 # desktop control planes, and keep the vLLM manager in its unloaded state.
@@ -196,8 +202,6 @@ export TASKPLANNER_NINFER_AUTOLOAD_MODEL_ID=qwen3.6-35b-a3b
 export VLM_BASE_URL=http://127.0.0.1:8080
 export VLM_PROVIDER_ID=ninfer
 export VLM_MODEL_ID=qwen3.6-35b-a3b
-export RETRACTOR_VOICE_VLM_BASE_URL="${VLM_BASE_URL}"
-export RETRACTOR_VOICE_VLM_MODEL_ID="${VLM_MODEL_ID}"
 export PERCEPTION_PROVIDER=external_rfdetr_topics
 export PERCEPTION_LOCATION=remote
 export PERCEPTION_ENDPOINT=
@@ -205,13 +209,14 @@ export PERCEPTION_BACKEND=external
 export ENABLE_RFDETR_PERCEPTION=false
 export TASKPLANNER_RFDETR_SOURCE_HOST=192.168.1.7
 
-# Pin the exact public topics from the current VIPLab multicam/Kalibr process.
-# Do not rely on values inherited from a developer shell or a stale .env: a
-# Compose recreate must subscribe to the same transport topics as the UI.
+# Pin camera acquisition separately from the operator-view contract. The
+# planner still consumes the synchronized source frames, while CAM3/CAM4 in
+# the browser consume the remote final overlays. Do not inherit stale shell
+# values that could silently put raw pixels back on the operator surface.
 export VITE_EXTERNAL_CAM1_TOPIC=/synced/cam_1/color/image_raw/compressed
 export VITE_EXTERNAL_CAM2_TOPIC=/synced/cam_2/color/image_raw/compressed
-export VITE_EXTERNAL_CAM3_TOPIC=/synced/cam_3/color/image_raw/compressed
-export VITE_EXTERNAL_CAM4_TOPIC=/synced/cam_4/color/image_raw/compressed
+export VITE_EXTERNAL_CAM3_OPERATOR_OVERLAY_TOPIC=/perception/cam_3/overlay/compressed
+export VITE_EXTERNAL_CAM4_OPERATOR_OVERLAY_TOPIC=/perception/cam_4/overlay/compressed
 export VITE_EXTERNAL_FLIR_TOPIC=/synced/flir/color/image_raw/compressed
 export CAM3_INPUT_TOPIC=/synced/cam_3/color/image_raw/compressed
 export CAM4_INPUT_TOPIC=/synced/cam_4/color/image_raw/compressed

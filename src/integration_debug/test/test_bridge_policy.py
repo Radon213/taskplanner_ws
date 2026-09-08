@@ -1,19 +1,14 @@
+"""Research Debug bridge policy: broad read visibility, narrow write paths."""
+
 from integration_debug.bridge_policy import (
     DEBUG_ACTIONS_ALLOWLIST,
     DEBUG_CAPABILITY_CLASS_NAMES,
-    DEBUG_MULTICAM_SERVICES_ALLOWLIST,
-    DEBUG_MULTICAM_SUBSCRIBE_ALLOWLIST,
-    DEBUG_PERCEPTION_SUBSCRIBE_ALLOWLIST,
     DEBUG_ROSAPI_SERVICES_ALLOWLIST,
-    DEBUG_ROSAPI_TOPICS_GLOB,
     DEBUG_SERVICES_ALLOWLIST,
-    DEBUG_TF_SUBSCRIBE_ALLOWLIST,
-    DEBUG_TOPICS_ALLOWLIST,
     DEBUG_TOPICS_PUBLISH_ALLOWLIST,
     DEBUG_TOPICS_SUBSCRIBE_ALLOWLIST,
     MULTICAM_OBSERVER_ACTIONS_ALLOWLIST,
     MULTICAM_OBSERVER_CAPABILITY_CLASS_NAMES,
-    MULTICAM_OBSERVER_ROSAPI_TOPICS_GLOB,
     MULTICAM_OBSERVER_SERVICES_ALLOWLIST,
     MULTICAM_OBSERVER_TOPICS_PUBLISH_ALLOWLIST,
     MULTICAM_OBSERVER_TOPICS_SUBSCRIBE_ALLOWLIST,
@@ -24,154 +19,68 @@ from integration_debug.bridge_policy import (
 )
 
 
-def test_debug_rosbridge_policy_is_exact_and_has_only_readonly_rosapi_topics() -> None:
-    restricted = restrict_debug_rosbridge_protocol(
-        {
-            "topics_pub_glob": None,
-            "topics_sub_glob": None,
-            "services_glob": ["*"],
-            "actions_glob": ["*"],
-            "max_message_size": 1_000_000,
-        }
-    )
-
-    assert restricted["topics_pub_glob"] == list(
-        DEBUG_TOPICS_PUBLISH_ALLOWLIST
-    ) == ["/integration/debug/heartbeat"]
-    assert restricted["topics_sub_glob"] == list(DEBUG_TOPICS_SUBSCRIBE_ALLOWLIST)
-    assert set(DEBUG_MULTICAM_SUBSCRIBE_ALLOWLIST).issubset(restricted["topics_sub_glob"])
-    assert set(DEBUG_TF_SUBSCRIBE_ALLOWLIST).issubset(restricted["topics_sub_glob"])
-    assert set(DEBUG_PERCEPTION_SUBSCRIBE_ALLOWLIST).issubset(
-        restricted["topics_sub_glob"]
-    )
-    assert restricted["topics_glob"] == list(DEBUG_TOPICS_ALLOWLIST)
-    assert restricted["services_glob"] == list(DEBUG_SERVICES_ALLOWLIST)
-    assert set(DEBUG_MULTICAM_SERVICES_ALLOWLIST).issubset(restricted["services_glob"])
-    assert set(DEBUG_ROSAPI_SERVICES_ALLOWLIST).issubset(restricted["services_glob"])
-    assert restricted["actions_glob"] == list(DEBUG_ACTIONS_ALLOWLIST) == []
-    assert "/rosapi/*" not in restricted["services_glob"]
-    assert {
-        pattern for pattern in restricted["services_glob"] if pattern.startswith("/rosapi")
-    } == {"/rosapi/topics"}
-    assert restricted["max_message_size"] == 1_000_000
-
-
-def test_debug_tf_topics_are_exact_read_only_subscriptions() -> None:
-    restricted = restrict_debug_rosbridge_protocol({})
-    assert DEBUG_TF_SUBSCRIBE_ALLOWLIST == ("/tf_static", "/tf")
-    assert set(DEBUG_TF_SUBSCRIBE_ALLOWLIST).issubset(restricted["topics_sub_glob"])
-    assert set(DEBUG_TF_SUBSCRIBE_ALLOWLIST).isdisjoint(restricted["topics_pub_glob"])
-    assert "/tf*" not in restricted["topics_sub_glob"]
-
-
-def test_debug_rosbridge_policy_cannot_be_widened_by_input_parameters() -> None:
+def test_debug_observer_can_read_any_ros_topic_without_write_widening() -> None:
     restricted = restrict_debug_rosbridge_protocol(
         {
             "topics_pub_glob": ["*"],
-            "topics_sub_glob": ["*"],
-            "services_glob": ["*", "/rosapi/*"],
+            "topics_sub_glob": ["/arbitrary/topic"],
+            "services_glob": ["*"],
             "actions_glob": ["*"],
         }
     )
 
-    assert "*" not in restricted["topics_pub_glob"]
-    assert "*" not in restricted["topics_sub_glob"]
-    assert "*" not in restricted["topics_glob"]
-    assert "*" not in restricted["services_glob"]
-    assert restricted["actions_glob"] == []
+    assert DEBUG_TOPICS_SUBSCRIBE_ALLOWLIST == ("*",)
+    assert restricted["topics_sub_glob"] == ["*"]
+    assert restricted["topics_glob"] == ["*", "/integration/debug/heartbeat"]
+    assert restricted["topics_pub_glob"] == list(
+        DEBUG_TOPICS_PUBLISH_ALLOWLIST
+    ) == ["/integration/debug/heartbeat"]
+    assert restricted["services_glob"] == list(DEBUG_SERVICES_ALLOWLIST)
+    assert restricted["actions_glob"] == list(DEBUG_ACTIONS_ALLOWLIST) == []
 
 
-def test_debug_rosbridge_policy_excludes_live_runtime_endpoints() -> None:
-    restricted = restrict_debug_rosbridge_protocol({})
-    denied_topics = {
-        "/simulation/control_state",
-        "/sensors/surgeon/sentence",
-        "/surgery/context",
-    }
-    assert denied_topics.isdisjoint(restricted["topics_glob"])
-    assert "/integration/check_readiness" not in restricted["services_glob"]
-
-
-def test_debug_perception_surface_is_exactly_read_only() -> None:
-    restricted = restrict_debug_rosbridge_protocol({})
-    expected = {
-        "/surgery/perception/cam4/semantics/json",
-        "/surgery/perception/cam4/mayo_tool_observations",
-        "/surgery/perception/cam4/observations",
-        "/surgery/perception/cam4/tool_poses",
-        "/surgery/perception/cam4/blood_semantics/json",
-        "/surgery/perception/rfdetr/diagnostics/json",
-        "/surgery/perception/rfdetr/health",
-        "/perception/debug/final_overlay/compressed",
-        "/perception/debug/final_overlay/status",
-    }
-
-    assert set(DEBUG_PERCEPTION_SUBSCRIBE_ALLOWLIST) == expected
-    assert expected.issubset(restricted["topics_sub_glob"])
-    assert expected.isdisjoint(restricted["topics_pub_glob"])
-    assert "/surgery/*" not in restricted["topics_sub_glob"]
-    assert "/surgery/images/cam4/detection_overlay/compressed" not in expected
-    assert "/perception/cam_4/debug/hand/compressed" not in expected
-
-
-def test_debug_multicam_synced_patterns_remain_read_only() -> None:
-    restricted = restrict_debug_rosbridge_protocol({})
-    assert "/synced/*" in DEBUG_MULTICAM_SUBSCRIBE_ALLOWLIST
-    assert "/synced/*" in restricted["topics_sub_glob"]
-    assert "/synced/*" not in restricted["topics_pub_glob"]
-
-
-def test_browser_multicam_policies_are_synced_only() -> None:
-    debug_restricted = restrict_debug_rosbridge_protocol({})
-    observer_restricted = restrict_multicam_observer_rosbridge_protocol({})
-    for restricted in (debug_restricted, observer_restricted):
-        assert "/synced/*" in restricted["topics_sub_glob"]
-        assert "/preview/*" not in restricted["topics_sub_glob"]
-        assert "/camera/*" not in restricted["topics_sub_glob"]
-        assert "/flir_camera/*" not in restricted["topics_sub_glob"]
-
-
-def test_operational_debug_policy_denies_world_anchor_mutations() -> None:
+def test_debug_mutable_services_stay_at_the_interlocked_gateway() -> None:
     restricted = restrict_operational_debug_rosbridge_protocol(
         {"services_glob": ["*", "/world_anchor_node/*"]}
     )
+
     assert restricted["services_glob"] == list(
         OPERATIONAL_DEBUG_SERVICES_ALLOWLIST
-    ) == ["/integration/debug/command", "/rosapi/topics"]
-    assert set(DEBUG_MULTICAM_SERVICES_ALLOWLIST).isdisjoint(
+    )
+    assert "/integration/debug/command" in restricted["services_glob"]
+    assert set(DEBUG_ROSAPI_SERVICES_ALLOWLIST).issubset(
         restricted["services_glob"]
     )
     assert "*" not in restricted["services_glob"]
+    assert "/simulation/check_transition_ready" not in restricted["services_glob"]
 
 
-def test_browser_bridge_policies_deny_runtime_transition_interlocks() -> None:
-    transition_services = {
-        "/simulation/check_transition_ready",
-        "/simulation/reserve_transition",
-    }
-    for restricted in (
-        restrict_debug_rosbridge_protocol({}),
-        restrict_operational_debug_rosbridge_protocol({}),
-        restrict_multicam_observer_rosbridge_protocol({}),
-    ):
-        assert transition_services.isdisjoint(restricted["services_glob"])
-
-
-def test_multicam_rosapi_uses_the_same_bounded_topic_patterns() -> None:
-    assert DEBUG_ROSAPI_TOPICS_GLOB.startswith("[")
-    assert DEBUG_ROSAPI_TOPICS_GLOB.endswith("]")
-    for pattern in DEBUG_TOPICS_SUBSCRIBE_ALLOWLIST:
-        assert pattern in DEBUG_ROSAPI_TOPICS_GLOB
-
-
-def test_debug_rosbridge_has_only_browser_required_capabilities() -> None:
-    assert DEBUG_CAPABILITY_CLASS_NAMES == (
-        "Advertise",
-        "Publish",
-        "Subscribe",
-        "Defragment",
-        "CallService",
+def test_multicam_observer_is_graph_wide_but_strictly_read_only() -> None:
+    restricted = restrict_multicam_observer_rosbridge_protocol(
+        {
+            "topics_glob": ["/arbitrary/topic"],
+            "topics_pub_glob": ["*"],
+            "topics_sub_glob": ["/arbitrary/topic"],
+            "services_glob": ["*"],
+            "actions_glob": ["*"],
+        }
     )
+
+    assert MULTICAM_OBSERVER_TOPICS_SUBSCRIBE_ALLOWLIST == ("*",)
+    assert restricted["topics_glob"] == ["*"]
+    assert restricted["topics_sub_glob"] == ["*"]
+    assert restricted["topics_pub_glob"] == list(
+        MULTICAM_OBSERVER_TOPICS_PUBLISH_ALLOWLIST
+    ) == []
+    assert restricted["services_glob"] == list(
+        MULTICAM_OBSERVER_SERVICES_ALLOWLIST
+    ) == ["/multicam_observer/rosapi/topics"]
+    assert restricted["actions_glob"] == list(
+        MULTICAM_OBSERVER_ACTIONS_ALLOWLIST
+    ) == []
+
+
+def test_bridge_capabilities_do_not_expose_browser_action_protocols() -> None:
     forbidden = {
         "AdvertiseService",
         "ServiceResponse",
@@ -183,79 +92,8 @@ def test_debug_rosbridge_has_only_browser_required_capabilities() -> None:
         "UnadvertiseAction",
     }
     assert forbidden.isdisjoint(DEBUG_CAPABILITY_CLASS_NAMES)
-
-
-def test_multicam_observer_policy_is_strictly_read_only() -> None:
-    restricted = restrict_multicam_observer_rosbridge_protocol(
-        {
-            "topics_glob": ["*"],
-            "topics_pub_glob": ["*"],
-            "topics_sub_glob": ["*"],
-            "services_glob": ["*", "/rosapi/*"],
-            "actions_glob": ["*"],
-            "max_message_size": 1_000_000,
-        }
-    )
-
-    assert restricted["topics_glob"] == list(
-        MULTICAM_OBSERVER_TOPICS_SUBSCRIBE_ALLOWLIST
-    )
-    assert restricted["topics_sub_glob"] == list(
-        MULTICAM_OBSERVER_TOPICS_SUBSCRIBE_ALLOWLIST
-    )
-    assert restricted["topics_pub_glob"] == list(
-        MULTICAM_OBSERVER_TOPICS_PUBLISH_ALLOWLIST
-    ) == []
-    assert restricted["services_glob"] == list(
-        MULTICAM_OBSERVER_SERVICES_ALLOWLIST
-    ) == ["/multicam_observer/rosapi/topics"]
-    assert restricted["actions_glob"] == list(
-        MULTICAM_OBSERVER_ACTIONS_ALLOWLIST
-    ) == []
-    assert restricted["max_message_size"] == 1_000_000
-
-
-def test_multicam_observer_denies_every_mutating_endpoint() -> None:
-    restricted = restrict_multicam_observer_rosbridge_protocol({})
-    denied_services = {
-        "/integration/debug/command",
-        "/world_anchor_node/begin",
-        "/world_anchor_node/stop",
-        "/world_anchor_node/solve",
-        "/world_anchor_node/publish",
-        "/rosapi/topics",
-        "/rosapi/*",
-    }
-    assert denied_services.isdisjoint(restricted["services_glob"])
-    assert "/integration/debug/heartbeat" not in restricted["topics_glob"]
-    assert restricted["topics_pub_glob"] == []
-    assert restricted["actions_glob"] == []
-
-
-def test_multicam_observer_exposes_only_subscription_capabilities() -> None:
     assert MULTICAM_OBSERVER_CAPABILITY_CLASS_NAMES == (
         "Subscribe",
         "Defragment",
         "CallService",
     )
-    forbidden = {
-        "Advertise",
-        "Publish",
-        "AdvertiseService",
-        "ServiceResponse",
-        "UnadvertiseService",
-        "AdvertiseAction",
-        "ActionFeedback",
-        "ActionResult",
-        "SendActionGoal",
-        "UnadvertiseAction",
-    }
-    assert forbidden.isdisjoint(MULTICAM_OBSERVER_CAPABILITY_CLASS_NAMES)
-
-
-def test_multicam_observer_rosapi_is_namespaced_and_topic_filtered() -> None:
-    assert MULTICAM_OBSERVER_ROSAPI_TOPICS_GLOB.startswith("[")
-    assert MULTICAM_OBSERVER_ROSAPI_TOPICS_GLOB.endswith("]")
-    for pattern in MULTICAM_OBSERVER_TOPICS_SUBSCRIBE_ALLOWLIST:
-        assert pattern in MULTICAM_OBSERVER_ROSAPI_TOPICS_GLOB
-    assert "/multicam_node/*" in MULTICAM_OBSERVER_TOPICS_SUBSCRIBE_ALLOWLIST

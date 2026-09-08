@@ -7,19 +7,28 @@ uint8 COMMAND_START_RETRACTION=3
 uint8 COMMAND_ADJUST_RETRACTION=4
 uint8 COMMAND_CHANGE_TOOL=5
 uint8 COMMAND_STOP_RETRACTION=6
+# Deterministic suction uses the same retraction command endpoint. Keeping the
+# value named in the public IDL prevents clients from carrying a private 7.
+uint8 COMMAND_SUCTION=7
+# Remove/withdraw suction through the same endpoint.  This is intentionally
+# distinct from STOP_RETRACTION, which stops retractor motion rather than the
+# suction workflow.
+uint8 COMMAND_SUCTION_OUT=8
 
 uint8 TARGET_NONE=0
 uint8 TARGET_LEFT=1
 uint8 TARGET_RIGHT=2
+uint8 TARGET_BOTH=3
 
 # Request fields
 uint16 protocol_version
 string source_id
 string command_id
 uint8 command
-# For COMMAND_ADJUST_RETRACTION, TARGET_NONE (0) means both retractor arms;
-# TARGET_LEFT and TARGET_RIGHT select one arm.  The same distance_m is applied
-# independently to both arms when TARGET_NONE is used for an adjustment.
+# For COMMAND_ADJUST_RETRACTION, TARGET_LEFT and TARGET_RIGHT select one arm
+# and TARGET_BOTH (3) selects both retractor arms.  A positive distance_m pulls
+# farther and a negative distance_m releases by that magnitude.  The same
+# signed distance_m is applied independently to both arms for TARGET_BOTH.
 # COMMAND_FINISH_DIRECT_TEACH accepts TARGET_NONE/LEFT/RIGHT as an optional
 # target selector.  Other non-adjustment commands use TARGET_NONE.
 uint8 target_side

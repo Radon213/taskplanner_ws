@@ -119,18 +119,20 @@ caller-provided `command_id`, `command`, `target_side`, and `distance_m`.
 `PROTOCOL_VERSION_V1` is `1`. The supported commands are
 `COMMAND_START_DIRECT_TEACH`, `COMMAND_FINISH_DIRECT_TEACH`,
 `COMMAND_START_RETRACTION`, `COMMAND_ADJUST_RETRACTION`,
-`COMMAND_CHANGE_TOOL`, and `COMMAND_STOP_RETRACTION`.
+`COMMAND_CHANGE_TOOL`, `COMMAND_STOP_RETRACTION`, `COMMAND_SUCTION` (7), and
+`COMMAND_SUCTION_OUT` (8).
 
 For commands other than `COMMAND_ADJUST_RETRACTION`, callers send
 `distance_m=0.0`. `COMMAND_FINISH_DIRECT_TEACH` accepts `TARGET_NONE`,
 `TARGET_LEFT`, or `TARGET_RIGHT`; the value is passed as the optional finish
 target selector and the controller owns its per-arm interpretation. The other
 non-adjustment commands use `TARGET_NONE`. An adjustment sends `TARGET_LEFT`,
-`TARGET_RIGHT`, or `TARGET_NONE` and a metre distance. For an adjustment,
-`TARGET_NONE` is the peer contract's bilateral value: the same distance is
-applied once to each arm. For example, “both arms by 1 mm” is
-`target_side=TARGET_NONE, distance_m=0.001`, while 5 cm is
-`distance_m=0.050`.
+`TARGET_RIGHT`, or `TARGET_BOTH` and a metre distance. For an adjustment,
+`TARGET_BOTH` (3) applies the same distance once to each arm. For example,
+“both arms by 1 mm” is `target_side=TARGET_BOTH, distance_m=0.001`, while 5 cm is
+`distance_m=0.050`. Positive distances pull farther; negative distances release
+by the requested magnitude. Zero remains invalid for an adjustment. Suction
+commands use `TARGET_NONE` and `distance_m=0.0`.
 
 The Response contains `request_accepted`, `result_code`, `command_id`, and
 `message`. `RESULT_ACCEPTED` means the server accepted the Request;

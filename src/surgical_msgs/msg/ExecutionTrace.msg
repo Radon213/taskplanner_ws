@@ -6,6 +6,9 @@
 builtin_interfaces/Time stamp
 uint64 sequence
 string command_id
+# Immutable execution interval that owns this trace row. This is required for
+# observers because an Action/Service callback can arrive after a new run starts.
+string procedure_run_id
 string route
 string transport
 string endpoint

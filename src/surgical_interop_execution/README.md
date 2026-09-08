@@ -8,18 +8,50 @@ A stable next-tool decision, handover, unused held-tool return, and Mayo
 retrieval all map to the single `/surgery/tool_handover` Action. Retraction
 commands all map to the single `/surgery/retraction/command`
 `ExecuteRetractionCommand` Service. The adapter subscribes to controller-owned state on
-`/external/bed_robot_arms/status`. No suction-arm endpoint is exposed.
+`/external/bed_robot_arms/status`.
 
-The internal group envelope remains the inbound compatibility boundary. Only
+Exact researcher-owned commands such as `suction` do not enter through this
+legacy internal group envelope. They are catalog-routed directly to the same
+typed Service by `voice_command/command_router`; `COMMAND_SUCTION=7` is named
+in the public IDL, and suction withdrawal uses `COMMAND_SUCTION_OUT=8`. This
+bridge remains the compatibility adapter for
+BT-owned retraction workflow commands only.
+
+The direct router does not copy a launch-time retraction endpoint. It consumes
+the bridge-owned latched `/integration/execution_route/state` projection and
+uses its selected `retraction_service_name` atomically; no command is sent
+until a valid route state arrives. The transient-local projection also exposes
+`restart_allowed` and a bounded `restart_blocker`: they are computed only from
+the authoritative stopped state and this bridge's active Action/Service count.
+Endpoint readiness, controller contracts, camera/ASR/VLM status, and preflight
+telemetry are deliberately not restart blockers. Runtime endpoint changes use
+the same stopped/no-inflight boundary, swap the reviewed endpoint pair, and
+publish a new route revision without a Digital-Twin reset or preflight-ack
+round trip. Endpoint type/payload validation, controller availability,
+idempotency, Action cancel/result handling, and physical controller limits
+remain in the dispatch path.
+
+`spec_dir` is only this node's launch-time bootstrap.  Subsequent procedure
+selection belongs exclusively to ScenarioStore: the bridge receives its
+transient-local `/simulation/scenario_config` revision on every focused owner
+restart, validates the bundle path under the fixed bootstrap root and verifies
+the published digest, then swaps its local name/distance mapping at an
+authoritative paused or stopped boundary when this bridge and its execution
+proxy have no active Action or Service request.  A malformed, stale, or
+deferred notice leaves the last known-good mapping active.  It never resets the
+simulation, asks preflight for an acknowledgement, or changes endpoint
+routing; endpoint route changes remain stopped-only.
+
+The internal group envelope remains an inbound compatibility boundary. Only
 its `retraction` group is accepted. The bridge maps direct-teach start/end,
 retraction start/stop, generic tool change, and a losslessly representable
 single-side adjustment onto the Service command enum. The legacy Action's
 multi-arm, direction-vector, axis, arm-ID, and tool-ID fields do not exist in
 the Service. They are never silently dropped: multi-axis or non-lateral legacy
-adjustments are rejected locally. A left/right adjustment is sent as
-`TARGET_LEFT`/`TARGET_RIGHT`/`TARGET_NONE` plus metres (`5 cm = 0.050`).
-For an adjustment, `TARGET_NONE` is the peer-compatible bilateral value and
-applies the same distance independently to both retractor arms.
+adjustments are rejected locally. A left/right/bilateral adjustment is sent as
+`TARGET_LEFT`/`TARGET_RIGHT`/`TARGET_BOTH` plus metres (`5 cm = 0.050`).
+For an adjustment, `TARGET_BOTH` applies the same distance independently to
+both retractor arms.
 
 The Service response is admission only. `request_accepted=true` proves only
 that the controller received the request; it does not prove direct teach,

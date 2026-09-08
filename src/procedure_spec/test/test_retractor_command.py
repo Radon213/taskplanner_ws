@@ -196,6 +196,31 @@ def test_bilateral_adjustment_can_be_normalized_in_debug_state_bypass() -> None:
 
 
 @pytest.mark.parametrize(
+    ("transcript", "side", "distance_m"),
+    [
+        ("오른쪽 리트랙션 1cm 덜 당겨줘", RetractionTargetSide.RIGHT, -0.010),
+        ("왼쪽 5mm만 덜 땡겨줘", RetractionTargetSide.LEFT, -0.005),
+        ("양쪽으로 1mm씩 덜 당겨줘", RetractionTargetSide.BOTH, -0.001),
+        ("right retraction 1 cm pull less", RetractionTargetSide.RIGHT, -0.010),
+    ],
+)
+def test_less_pull_reuses_adjustment_with_negative_distance(
+    transcript: str,
+    side: RetractionTargetSide,
+    distance_m: float,
+) -> None:
+    normalized = normalize_retractor_command(
+        transcript,
+        RetractionState.RETRACTION_ACTIVE,
+    )
+
+    assert normalized.command is RetractionCommand.ADJUST_RETRACTION
+    assert normalized.target_side is side
+    assert normalized.distance_m == pytest.approx(distance_m)
+    assert normalized.reason.endswith("_less_pull")
+
+
+@pytest.mark.parametrize(
     ("transcript", "distance_m"),
     [
         ("오른쪽 다섯 센치 더", 0.050),

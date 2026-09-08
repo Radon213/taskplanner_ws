@@ -1,8 +1,9 @@
 """LLM-driven surgeon actor that is an upstream source of surgical cues.
 
-Unlike the rule actor, this node does not subscribe to the digital twin or
-simulation state. It advances from its own internal procedure state and only
-uses skill completion messages to keep timing aligned with the humanoid.
+Unlike the rule actor, this node does not subscribe to digital-twin or
+simulation state.  It uses the control-state lifecycle it already consumes as
+a local quiescent boundary for ScenarioStore configuration reloads, and uses
+skill completion messages to keep timing aligned with the humanoid.
 """
 
 from __future__ import annotations
@@ -17,18 +18,24 @@ from typing import Any
 import uuid
 
 from procedure_spec import compact_procedure_prompt, get_default_spec_dir, load_bundle
+from procedure_spec.scenario_consumer import (
+    ScenarioConfigConsumerBinding,
+    scenario_config_apply_is_safe,
+)
 import requests
 import rclpy
 from model_provider_registry import ModelProviderRegistry, force_disable_thinking
 from rcl_interfaces.msg import SetParametersResult
 from rclpy.node import Node
 from rclpy.parameter import Parameter
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import String
 from surgical_msgs.msg import (
     BedRobotArmGroupRequest,
     BedRobotArmGroupStatus,
     ModelCatalogEntry,
     ModelProviderStatus,
+    SimulationState,
     SpeechUtterance,
     SkillStatus,
     SurgeonActorEvent,
@@ -79,6 +86,9 @@ class LLMSurgeonActorNode(Node):
     def __init__(self) -> None:
         super().__init__("llm_surgeon_actor")
         self.declare_parameter("spec_dir", str(get_default_spec_dir()))
+        self.declare_parameter(
+            "scenario_config_topic", "/simulation/scenario_config"
+        )
         self.declare_parameter("base_url", "http://127.0.0.1:1234")
         self.declare_parameter("provider_id", os.environ.get("ACTOR_PROVIDER_ID", "auto"))
         self.declare_parameter("api_key", "")
@@ -146,6 +156,23 @@ class LLMSurgeonActorNode(Node):
         self._bed_group_states: dict[str, dict[str, Any]] = {}
         self._bed_group_status_stamp_ns: dict[str, int] = {}
         self._manual_override_mute_until_sec = 0.0
+        # This source remains independent of twin policy.  The retained
+        # ScenarioStore snapshot is used only to replace its authored prompt
+        # after a quiescent boundary, and can never point it outside the root
+        # selected at this process's launch.
+        self._scenario_config = ScenarioConfigConsumerBinding.from_spec_dir(
+            str(self.get_parameter("spec_dir").value)
+        )
+        self._scenario_config_topic = str(
+            self.get_parameter("scenario_config_topic").value
+        ).strip()
+        if not self._scenario_config_topic:
+            raise ValueError("scenario_config_topic must not be empty")
+        self._scenario_state_received = False
+        self._scenario_running = False
+        self._scenario_execution_state = ""
+        self._procedure_run_id = ""
+        self._scenario_initial_idle = True
 
         self._provider_model_selections: dict[str, str] = {}
         initial_base_url = str(self.get_parameter("base_url").value)
@@ -187,6 +214,22 @@ class LLMSurgeonActorNode(Node):
         )
 
         self.create_subscription(String, "/simulation/control_state", self._on_control, 20)
+        self.create_subscription(
+            SimulationState,
+            "/simulation/state",
+            self._on_simulation_state,
+            20,
+        )
+        self.create_subscription(
+            String,
+            self._scenario_config_topic,
+            self._on_scenario_config,
+            QoSProfile(
+                depth=1,
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            ),
+        )
         self.create_subscription(SkillStatus, "/skill/status", self._on_skill_status, 50)
         self.create_subscription(
             BedRobotArmGroupStatus,
@@ -361,6 +404,14 @@ class LLMSurgeonActorNode(Node):
         self._clear_interrupt_state(clear_cooldown=True)
 
     def _on_parameters_changed(self, params):
+        if any(parameter.name == "scenario_config_topic" for parameter in params):
+            return SetParametersResult(
+                successful=False,
+                reason=(
+                    "scenario_config_topic is process-lifetime; restart this "
+                    "simulation-input node to rebind it"
+                ),
+            )
         reload_required = False
         overrides = {parameter.name: parameter.value for parameter in params}
         spec_changed = "spec_dir" in overrides
@@ -445,6 +496,9 @@ class LLMSurgeonActorNode(Node):
             try:
                 self._load_parameters(overrides)
                 if spec_changed:
+                    binding = getattr(self, "_scenario_config", None)
+                    if binding is not None:
+                        binding.note_local_spec_dir(self._spec_dir)
                     self._last_lifecycle_control_signature = None
                     self._reset_runtime()
                 else:
@@ -452,6 +506,62 @@ class LLMSurgeonActorNode(Node):
             except Exception as exc:
                 return SetParametersResult(successful=False, reason=str(exc))
         return SetParametersResult(successful=True)
+
+    def _on_scenario_config(self, message: String) -> None:
+        """Stage ScenarioStore selection; this actor never selects or resets it."""
+
+        try:
+            if not self._scenario_config.stage(message.data):
+                return
+        except Exception as exc:
+            self.get_logger().warning(
+                f"LLM surgeon actor scenario config ignored: {exc}"
+            )
+            return
+        self._apply_pending_scenario_config_if_safe()
+
+    def _apply_pending_scenario_config_if_safe(self) -> None:
+        """Use the existing local parameter reload at a quiescent boundary."""
+
+        binding = getattr(self, "_scenario_config", None)
+        if binding is None:
+            return
+        snapshot = binding.pending_snapshot()
+        if snapshot is None or not scenario_config_apply_is_safe(
+            state_received=bool(getattr(self, "_scenario_state_received", False)),
+            scenario_running=bool(getattr(self, "_scenario_running", False)),
+            execution_state=getattr(self, "_scenario_execution_state", ""),
+            initial_idle=bool(getattr(self, "_scenario_initial_idle", False)),
+            local_busy=bool(getattr(self, "_active", False)),
+        ):
+            return
+        try:
+            resolved = binding.revalidate_pending()
+            if resolved is None:
+                return
+            snapshot, bundle = resolved
+        except Exception as exc:
+            binding.discard(snapshot)
+            self.get_logger().warning(
+                "LLM surgeon actor scenario config rejected before local swap: "
+                f"{exc}"
+            )
+            return
+        result = self.set_parameters_atomically(
+            [Parameter(name="spec_dir", value=bundle.spec_dir)]
+        )
+        if not bool(getattr(result, "successful", False)):
+            self.get_logger().warning(
+                "LLM surgeon actor scenario config local swap rejected: "
+                f"{getattr(result, 'reason', '') or 'unknown reason'}"
+            )
+            return
+        if not binding.commit(snapshot, bundle):
+            return
+        self.get_logger().info(
+            "LLM surgeon actor scenario revision applied locally: "
+            f"{snapshot.bundle_name}@{snapshot.revision}"
+        )
 
     def _headers(self) -> dict[str, str]:
         if not self._api_key:
@@ -752,6 +862,39 @@ class LLMSurgeonActorNode(Node):
             self._control_running = False
             self._manual_override_mute_until_sec = 0.0
             self._reset_runtime(start_phase_id)
+        if command in {"start", "start_actors", "resume"}:
+            self._scenario_state_received = True
+            self._scenario_running = True
+            self._scenario_execution_state = "running"
+            self._scenario_initial_idle = False
+        elif command == "pause":
+            self._scenario_state_received = True
+            self._scenario_running = True
+            self._scenario_execution_state = "paused"
+            self._scenario_initial_idle = True
+        elif command in {"stop", "reset"}:
+            self._scenario_state_received = True
+            self._scenario_running = False
+            self._scenario_execution_state = "stopped"
+            self._scenario_initial_idle = True
+        self._apply_pending_scenario_config_if_safe()
+
+    def _on_simulation_state(self, msg: SimulationState) -> None:
+        """Track the only run scope allowed to reach simulation UI outputs."""
+
+        self._scenario_state_received = True
+        self._scenario_running = bool(msg.running)
+        self._scenario_execution_state = str(msg.execution_state or "").strip()
+        self._scenario_initial_idle = not (
+            self._scenario_running
+            and self._scenario_execution_state.casefold() == "running"
+        )
+        self._procedure_run_id = (
+            str(msg.procedure_run_id or "").strip()
+            if not self._scenario_initial_idle
+            else ""
+        )
+        self._apply_pending_scenario_config_if_safe()
 
     def _reset_bed_robot_arm_group_states(self) -> None:
         bed_group_spec = self._spec.get_bed_robot_arm_group_spec()
@@ -2610,6 +2753,7 @@ class LLMSurgeonActorNode(Node):
     ) -> None:
         msg = SurgeonState()
         msg.stamp = self._stamp()
+        msg.procedure_run_id = str(self._procedure_run_id or "").strip()
         msg.procedure_id = self._spec.procedure_id
         msg.phase_id = self._current_phase_id
         msg.intent = intent
@@ -2649,6 +2793,7 @@ class LLMSurgeonActorNode(Node):
     ) -> None:
         msg = SurgeonLLMDecision()
         msg.stamp = self._stamp()
+        msg.procedure_run_id = str(self._procedure_run_id or "").strip()
         msg.model_id = self._model_id
         msg.raw_json = raw_json
         msg.accepted = bool(accepted)

@@ -1,4 +1,5 @@
 builtin_interfaces/Time stamp
+string procedure_run_id
 string procedure_id
 string filtered_phase
 float32 phase_confidence

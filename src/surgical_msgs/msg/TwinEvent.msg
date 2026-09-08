@@ -1,4 +1,6 @@
 builtin_interfaces/Time stamp
+# Immutable execution interval that owns this state-affecting event.
+string procedure_run_id
 string event_type
 string instrument_id
 string instance_id

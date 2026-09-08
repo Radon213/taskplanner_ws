@@ -1,22 +1,50 @@
 const fs = require("node:fs");
 const path = require("node:path");
 
-const source = fs.readFileSync(
+const bridgeSource = fs.readFileSync(
   path.resolve(__dirname, "..", "src", "hooks", "useRosBridge.ts"),
   "utf8",
 );
+const previewContractSource = fs.readFileSync(
+  path.resolve(__dirname, "..", "src", "ros", "cameraPreviewContracts.ts"),
+  "utf8",
+);
+const source = `${bridgeSource}\n${previewContractSource}`;
 
 const violations = [];
 
 for (const topic of [
   "/synced/cam_1/color/image_raw/compressed",
   "/synced/cam_2/color/image_raw/compressed",
-  "/synced/cam_3/color/image_raw/compressed",
-  "/synced/cam_4/color/image_raw/compressed",
+  "/perception/cam_3/overlay/compressed",
+  "/perception/cam_4/overlay/compressed",
   "/synced/flir/color/image_raw/compressed",
 ]) {
   if (!source.includes(topic)) {
-    violations.push(`Live camera fallback must use the synchronized source ${topic}`);
+    violations.push(`Live operator preview contract is missing ${topic}`);
+  }
+}
+
+for (const semanticVariable of [
+  "VITE_EXTERNAL_CAM3_OPERATOR_OVERLAY_TOPIC",
+  "VITE_EXTERNAL_CAM4_OPERATOR_OVERLAY_TOPIC",
+]) {
+  if (!bridgeSource.includes(semanticVariable)) {
+    violations.push(`Live operator overlay must be configurable through ${semanticVariable}`);
+  }
+}
+const operatorOverlaySemantics = previewContractSource.match(
+  /semantic: "operator_overlay"/g,
+) ?? [];
+if (operatorOverlaySemantics.length < 2) {
+  violations.push("CAM3/CAM4 operator overlays must retain explicit display semantics");
+}
+for (const forbiddenRawPreview of [
+  "/synced/cam_3/color/image_raw/compressed",
+  "/synced/cam_4/color/image_raw/compressed",
+]) {
+  if (previewContractSource.includes(forbiddenRawPreview)) {
+    violations.push(`Operator preview must not silently fall back to ${forbiddenRawPreview}`);
   }
 }
 
@@ -41,7 +69,7 @@ for (const qosContract of [
   }
 }
 
-const topicBlocks = [...source.matchAll(/new ROSLIB\.Topic\(\{([\s\S]*?)\}\)/g)]
+const topicBlocks = [...bridgeSource.matchAll(/new ROSLIB\.Topic\(\{([\s\S]*?)\}\)/g)]
   .map((match) => match[1])
   .filter((block) => block.includes('messageType: "sensor_msgs/msg/CompressedImage"'));
 

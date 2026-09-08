@@ -1,7 +1,7 @@
 import { expect, test } from "playwright/test";
 
 import {
-  integrationReadinessBlockReason,
+  integrationReadinessDiagnosticReason,
   normalizeExecutionRouteCommandResult,
   normalizeExecutionRouteState,
   normalizeIntegrationReadiness,
@@ -92,7 +92,7 @@ test("normalizes a self-consistent fresh readiness projection", () => {
   }));
   expect(readiness?.checklist).toHaveLength(2);
   expect(
-    integrationReadinessBlockReason(
+    integrationReadinessDiagnosticReason(
       readiness,
       NOW_MS,
       "thyroidectomy_v1",
@@ -171,14 +171,14 @@ test("rejects missing suppression and an unsuppressed virtual route", () => {
   expect(normalizeIntegrationReadiness(rosString(unsuppressedVirtual))).toBeNull();
 });
 
-test("keeps missing, stale, bundle mismatch, and not-ready blockers distinct", () => {
+test("keeps missing, stale, bundle mismatch, and not-ready diagnostics distinct", () => {
   const ready = normalizeIntegrationReadiness(rosString(readinessPayload()));
-  expect(integrationReadinessBlockReason(null, null, "thyroidectomy_v1", NOW_MS)).toBe("missing");
+  expect(integrationReadinessDiagnosticReason(null, null, "thyroidectomy_v1", NOW_MS)).toBe("missing");
   expect(
-    integrationReadinessBlockReason(ready, NOW_MS - 4_001, "thyroidectomy_v1", NOW_MS),
+    integrationReadinessDiagnosticReason(ready, NOW_MS - 4_001, "thyroidectomy_v1", NOW_MS),
   ).toBe("stale");
   expect(
-    integrationReadinessBlockReason(ready, NOW_MS, "other_bundle", NOW_MS),
+    integrationReadinessDiagnosticReason(ready, NOW_MS, "other_bundle", NOW_MS),
   ).toBe("bundle_mismatch");
 
   const blocked = normalizeIntegrationReadiness(rosString(readinessPayload({
@@ -188,7 +188,7 @@ test("keeps missing, stale, bundle mismatch, and not-ready blockers distinct", (
     missing: ["perception_input"],
   })));
   expect(
-    integrationReadinessBlockReason(blocked, NOW_MS, "thyroidectomy_v1", NOW_MS),
+    integrationReadinessDiagnosticReason(blocked, NOW_MS, "thyroidectomy_v1", NOW_MS),
   ).toBe("not_ready");
 });
 
@@ -220,25 +220,12 @@ test("rejects mismatched latched sources and physical claims on a virtual route"
   })))).toBeNull();
 });
 
-test("keeps route-command reset attestation explicit and fail closed", () => {
-  const accepted = normalizeExecutionRouteCommandResult(JSON.stringify({
-    ...routePayload(),
-    digital_twin_reset: true,
-  }));
-  expect(accepted?.digitalTwinReset).toBe(true);
-  expect(accepted?.state.revision).toBe(7);
+test("accepts a stopped-route receipt without a Digital Twin reset attestation", () => {
+  const accepted = normalizeExecutionRouteCommandResult(JSON.stringify(routePayload()));
+  expect(accepted?.revision).toBe(7);
 
-  const notReset = normalizeExecutionRouteCommandResult(JSON.stringify({
-    ...routePayload(),
-    digital_twin_reset: false,
-  }));
-  expect(notReset?.digitalTwinReset).toBe(false);
-  expect(notReset?.digitalTwinReset === true).toBe(false);
-
-  expect(normalizeExecutionRouteCommandResult(JSON.stringify(routePayload()))).toBeNull();
   expect(normalizeExecutionRouteCommandResult(JSON.stringify({
     ...routePayload({ selected_source: "unknown" }),
-    digital_twin_reset: true,
   }))).toBeNull();
 });
 

@@ -18,6 +18,7 @@ webapp/node_modules/
 webapp/dist/
 webapp/tsconfig.tsbuildinfo
 webapp/.vite/
+webapp/.taskplanner/
 
 # Validation and runtime artifacts
 reports/*.json

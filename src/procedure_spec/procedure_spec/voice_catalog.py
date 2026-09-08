@@ -51,9 +51,10 @@ def voice_catalog_id_for(
 ) -> str:
     """Return a stable, full SHA-256 procedure/voice-vocabulary binding ID.
 
-    The exact preimage is UTF-8 JSON generated with ``ensure_ascii=False``,
-    ``sort_keys=True``, and compact separators for a mapping containing the
-    procedure ID and each sorted tool ID with sorted normalized aliases.
+    The binding covers only procedure-local aliases and retraction vocabulary.
+    The command router owns installed command discovery and admission, so a
+    newly added Action, Service, or Topic never requires a scenario hash or
+    catalog migration.
     """
 
     payload = {
@@ -108,9 +109,8 @@ def load_voice_command_catalog(bundle_dir: str | Path) -> VoiceCommandCatalog:
     spec = load_bundle(bundle_path)
     aliases_by_tool: dict[str, list[str]] = {}
     alias_owners: dict[str, set[str]] = {}
-    scenario_policy = spec.get_scenario_policy()
     for instrument in spec.bundle.instruments:
-        if not scenario_policy.check_instrument_request(instrument.id).allowed:
+        if not instrument.requestable:
             continue
         tool_id = str(instrument.id).strip()
         aliases = [
@@ -150,8 +150,7 @@ def load_voice_command_catalog(bundle_dir: str | Path) -> VoiceCommandCatalog:
             dict.fromkeys(
                 str(command).strip()
                 for group in bed_robot_arm_groups.groups
-                if scenario_policy.check_group_enabled(group.id).allowed
-                and group.id == "retraction"
+                if group.enabled and group.id == "retraction"
                 for command in group.allowed_voice_commands
                 if str(command).strip()
             )

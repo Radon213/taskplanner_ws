@@ -28,17 +28,17 @@ def test_runtime_ngram_builder_excludes_unsupported_tool_targets_without_joining
     payload = runtime_prior.build_payload()
     metadata = payload["metadata"]
 
-    assert metadata["eligible_transition_count"] == 74
-    assert metadata["unsupported_transition_count"] == 34
+    assert metadata["eligible_transition_count"] == 82
+    assert metadata["unsupported_transition_count"] == 26
     assert metadata["history_boundary"] == "unsupported_or_unknown_handover_resets_suffix"
     assert payload["target"].endswith("regardless_of_elapsed_time")
 
 
 def test_runtime_ngram_builder_never_emits_nonrequestable_history_or_candidates() -> None:
     payload = runtime_prior.build_payload()
-    requestable = {"T02", "T04", "T07"}
+    requestable = {"T02", "T04", "T07", "T08"}
 
-    assert len(payload["rules"]) == 59
+    assert len(payload["rules"]) == 80
     for rule in payload["rules"]:
         assert set(rule["history"]).issubset(requestable)
         assert {outcome["tool"] for outcome in rule["outcomes"]}.issubset(

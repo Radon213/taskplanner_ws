@@ -1,21 +1,25 @@
-"""Immutable read-only rosbridge policy for institutional UI consumers.
+"""Immutable read-only policies for bounded browser rosbridge sidecars.
 
-The public bridge is deliberately smaller than the operator/debug bridges.  A
-client may only subscribe to the reviewed public projections and the five
-scenario-gated compressed camera aliases.  It cannot publish, advertise, call
-services, send Action goals, inspect rosapi, or widen this list with ROS
-parameters.
+The default public profile is deliberately smaller than the operator/debug
+bridges: it exposes reviewed projections and five scenario-gated compressed
+camera aliases.  The local-media profile is loopback-only and observes the
+five existing Live source topics without introducing relay aliases.  Neither
+profile can publish, advertise, call services, send Action goals, inspect
+rosapi, or widen its list with ROS parameters.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 import ipaddress
+import os
 from typing import Any
 from urllib.parse import urlsplit
 
 
-PUBLIC_STATE_TOPICS = (
+PUBLIC_RECEIPT_TOPIC = "/surgery/record/receipt"
+_PUBLIC_STATE_TOPICS = (
     "/surgery/gateway_info",
     "/surgery/catalog",
     "/surgery/context",
@@ -27,23 +31,105 @@ PUBLIC_STATE_TOPICS = (
     "/surgery/clinical_observations",
     "/surgery/health",
     "/surgery/events",
+    PUBLIC_RECEIPT_TOPIC,
 )
-PUBLIC_CAMERA_TOPICS = (
+_PUBLIC_CAMERA_TOPICS = (
     "/surgery/images/flir/compressed",
     "/surgery/images/cam4/compressed",
+    "/surgery/images/cam4/overlay/compressed",
     "/surgery/images/cam3/overlay/compressed",
     "/surgery/images/suction/overlay/compressed",
     "/surgery/images/right_ee/overlay/compressed",
 )
+
+# The browser's operational camera plane is deliberately local-only and uses
+# the existing Live source topics directly.  It is not exposed through the
+# public 9092 LAN proxy and it does not create relay aliases or a second ROS
+# image contract.  ``CompressedImage`` messages pass through rosbridge as
+# their existing JPEG bytes; this policy never decodes, resizes, or re-encodes
+# a frame.
+LOCAL_MEDIA_CAMERA_TOPICS = (
+    "/synced/cam_1/color/image_raw/compressed",
+    "/synced/cam_2/color/image_raw/compressed",
+    "/perception/cam_3/overlay/compressed",
+    "/perception/cam_4/overlay/compressed",
+    "/synced/flir/color/image_raw/compressed",
+)
+
+
+@dataclass(frozen=True)
+class BridgeProfile:
+    """One process-local rosbridge subscription surface.
+
+    Profiles change browser transport only; they do not add, rename, or
+    publish ROS topics.  Keeping the selection in this small policy module
+    lets the same bounded WebSocket implementation serve the LAN-public state
+    view and the loopback-only native-rate media view without duplicating a
+    rosbridge server.
+    """
+
+    name: str
+    contract: str
+    node_name: str
+    state_topics: tuple[str, ...]
+    camera_topics: tuple[str, ...]
+
+
+_BRIDGE_PROFILES = {
+    "public": BridgeProfile(
+        name="public",
+        contract="public-subscribe-v1",
+        node_name="public_read_only_rosbridge",
+        state_topics=_PUBLIC_STATE_TOPICS,
+        camera_topics=_PUBLIC_CAMERA_TOPICS,
+    ),
+    "local-media": BridgeProfile(
+        name="local-media",
+        contract="local-media-subscribe-v1",
+        node_name="local_media_rosbridge",
+        state_topics=(),
+        camera_topics=LOCAL_MEDIA_CAMERA_TOPICS,
+    ),
+}
+
+
+def resolve_bridge_profile(name: str | None) -> BridgeProfile:
+    """Return the one bounded bridge profile selected for this process."""
+
+    normalized = (name or "public").strip().lower()
+    try:
+        return _BRIDGE_PROFILES[normalized]
+    except KeyError as error:
+        supported = ", ".join(sorted(_BRIDGE_PROFILES))
+        raise ValueError(
+            f"unsupported bounded rosbridge profile {name!r}; expected one of {supported}"
+        ) from error
+
+
+# This is evaluated once per sidecar process.  The public service keeps the
+# default profile; only the dedicated loopback media service sets this
+# variable.  It is intentionally not a ROS parameter, so a browser cannot
+# widen a running server's topic surface.
+PUBLIC_BRIDGE_PROFILE = resolve_bridge_profile(
+    os.environ.get("TASKPLANNER_BOUNDED_ROSBRIDGE_PROFILE")
+)
+PUBLIC_STATE_TOPICS = PUBLIC_BRIDGE_PROFILE.state_topics
+PUBLIC_CAMERA_TOPICS = PUBLIC_BRIDGE_PROFILE.camera_topics
 PUBLIC_SUBSCRIBE_ALLOWLIST = PUBLIC_STATE_TOPICS + PUBLIC_CAMERA_TOPICS
 PUBLIC_CAPABILITY_CLASS_NAMES = ("Subscribe",)
 PUBLIC_ALLOWED_INCOMING_OPERATIONS = ("subscribe", "unsubscribe")
 PUBLIC_REJECTED_OPERATION = "__public_rejected__"
 PUBLIC_LOOPBACK_ADDRESS = "127.0.0.1"
 PUBLIC_BRIDGE_CONTRACT_HEADER = "X-Taskplanner-Bridge-Contract"
-PUBLIC_BRIDGE_CONTRACT = "public-subscribe-v1"
+PUBLIC_BRIDGE_CONTRACT = PUBLIC_BRIDGE_PROFILE.contract
+PUBLIC_BRIDGE_NODE_NAME = PUBLIC_BRIDGE_PROFILE.node_name
 PUBLIC_CAMERA_QUEUE_LENGTH = 1
-PUBLIC_CAMERA_MIN_THROTTLE_MS = 100
+# The media plane must preserve the camera owner's native cadence.  The current
+# Live sources run at 15 Hz, so a server-side floor of 100 ms would silently
+# clamp them to 10 Hz before a browser ever had a chance to render them.
+# Queue depth and per-topic egress coalescing, not an artificial timer, keep a
+# slow consumer bounded.
+PUBLIC_CAMERA_MIN_THROTTLE_MS = 0
 PUBLIC_CAMERA_COMPRESSION = "cbor"
 PUBLIC_ALLOWED_COMPRESSIONS = ("none", "cbor", "cbor-raw")
 PUBLIC_CAMERA_QOS = {
@@ -74,12 +160,26 @@ PUBLIC_MAX_OUTGOING_MESSAGE_BYTES = 4 * 1024 * 1024
 # frame; a four-item queue silently discarded gateway/context snapshots under
 # normal load and made a healthy monitor oscillate into HEALTH WARN.
 PUBLIC_MAX_OUTGOING_STATE_MESSAGE_BYTES = 256 * 1024
+# The terminal receipt carries the whole generated record as one deliberate,
+# durable String sample. Keep the exception topic-specific: all other state
+# messages retain the smaller state cap above.
+PUBLIC_MAX_OUTGOING_RECEIPT_MESSAGE_BYTES = 1_024 * 1_024
 # One complete state burst plus one latest frame for each reviewed camera.
 # Binary coalescing is per public camera topic, so this remains bounded while
 # allowing a five-panel viewer to retain one pending frame for every panel.
 PUBLIC_MAX_OUTGOING_QUEUE = len(PUBLIC_STATE_TOPICS) + len(PUBLIC_CAMERA_TOPICS)
 # This limit is per public camera topic, not a global binary-frame cap.
 PUBLIC_MAX_OUTGOING_BINARY_MESSAGES = 1
+
+
+def public_outgoing_message_limit(*, topic: str | None, binary: bool) -> int:
+    """Return the bounded egress cap for one already-authorized topic."""
+
+    if binary:
+        return PUBLIC_MAX_OUTGOING_MESSAGE_BYTES
+    if topic == PUBLIC_RECEIPT_TOPIC:
+        return PUBLIC_MAX_OUTGOING_RECEIPT_MESSAGE_BYTES
+    return PUBLIC_MAX_OUTGOING_STATE_MESSAGE_BYTES
 
 
 def parse_allowed_origins(raw: str) -> tuple[str, ...]:

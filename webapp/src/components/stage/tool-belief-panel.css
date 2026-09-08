@@ -1,0 +1,553 @@
+.tool-belief-panel {
+  container-name: tool-belief;
+  container-type: inline-size;
+  display: grid;
+  min-width: 0;
+  gap: 12px;
+  margin: 12px;
+  padding: 12px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-card);
+  background: var(--color-surface-raised);
+  box-shadow: var(--shadow-card);
+  color: var(--color-text);
+}
+
+.tool-belief-panel[data-stale="true"] {
+  border-color: color-mix(in srgb, var(--color-warning) 52%, var(--color-border));
+}
+
+.tool-belief-panel-header {
+  display: grid;
+  grid-template-columns: minmax(180px, auto) minmax(0, 1fr) auto;
+  min-width: 0;
+  align-items: center;
+  gap: 12px;
+}
+
+.tool-belief-panel-title {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 9px;
+}
+
+.tool-belief-panel-title > svg {
+  flex: 0 0 auto;
+  color: var(--color-accent-strong);
+}
+
+.tool-belief-panel-title > div {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.tool-belief-panel-title span {
+  color: var(--color-text-muted);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  line-height: 1.2;
+}
+
+.tool-belief-panel-title strong {
+  color: var(--color-text);
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1.25;
+}
+
+.tool-belief-panel-badges {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.tool-belief-panel-badges > span {
+  display: inline-flex;
+  max-inline-size: 100%;
+  min-height: 24px;
+  align-items: center;
+  padding: 3px 8px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-inner);
+  background: var(--color-surface-muted);
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+.tool-belief-panel-badges > .motion,
+.tool-belief-panel-badges > .stale {
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.tool-belief-panel-badges > .fixed {
+  border-color: color-mix(in srgb, var(--color-accent) 38%, var(--color-border));
+  color: var(--color-accent-strong);
+}
+
+.tool-belief-panel-badges > .enabled {
+  border-color: color-mix(in srgb, var(--color-success) 44%, var(--color-border));
+  color: var(--color-success-text);
+}
+
+.tool-belief-panel-badges > .disabled,
+.tool-belief-panel-badges > .unknown {
+  color: var(--color-text-muted);
+}
+
+.tool-belief-panel-badges > .motion,
+.tool-belief-panel-badges > .ignored,
+.tool-belief-panel-badges > .stale {
+  border-color: color-mix(in srgb, var(--color-warning) 44%, var(--color-border));
+  color: var(--color-warning-text);
+}
+
+.tool-belief-panel-badges > .stale svg {
+  flex: 0 0 auto;
+}
+
+.tool-belief-toggle {
+  display: inline-flex;
+  min-width: 88px;
+  min-height: 44px;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-inner);
+  background: var(--color-surface-muted);
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.2;
+  transition:
+    background var(--duration-fast) var(--ease-default),
+    border-color var(--duration-fast) var(--ease-default),
+    color var(--duration-fast) var(--ease-default);
+}
+
+.tool-belief-toggle:hover:not(:disabled) {
+  border-color: var(--color-accent);
+  color: var(--color-text);
+}
+
+.tool-belief-toggle[aria-pressed="true"] {
+  border-color: color-mix(in srgb, var(--color-accent) 55%, var(--color-border));
+  background: color-mix(in srgb, var(--color-accent) 14%, var(--color-surface-raised));
+  color: var(--color-accent-strong);
+}
+
+.tool-belief-toggle:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 3px;
+}
+
+.tool-belief-toggle:disabled {
+  cursor: wait;
+  opacity: 0.58;
+}
+
+.tool-belief-toggle[aria-busy="true"] svg {
+  animation: tool-belief-spin 0.9s linear infinite;
+}
+
+.tool-belief-control-feedback {
+  display: flex;
+  min-height: 32px;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-inner);
+  background: var(--color-surface-muted);
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.35;
+}
+
+.tool-belief-control-feedback.success {
+  border-color: color-mix(in srgb, var(--color-success) 44%, var(--color-border));
+  color: var(--color-success-text);
+}
+
+.tool-belief-control-feedback.error {
+  border-color: color-mix(in srgb, var(--color-danger) 48%, var(--color-border));
+  color: var(--color-danger-text);
+}
+
+.tool-belief-table-scroll {
+  min-width: 0;
+  overflow-x: auto;
+  overscroll-behavior-inline: contain;
+  scrollbar-width: thin;
+  -webkit-overflow-scrolling: touch;
+}
+
+.tool-belief-table-scroll:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 3px;
+}
+
+.tool-belief-table {
+  width: 100%;
+  min-width: 900px;
+  border-collapse: collapse;
+  table-layout: fixed;
+}
+
+.tool-belief-table caption {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  margin: -1px;
+  padding: 0;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  border: 0;
+  white-space: nowrap;
+}
+
+.tool-belief-table th,
+.tool-belief-table td {
+  min-width: 0;
+  border-top: 1px solid var(--color-border);
+  text-align: start;
+  vertical-align: middle;
+}
+
+.tool-belief-table thead th {
+  padding: 0 9px 6px;
+  border-top: 0;
+  color: var(--color-text-muted);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  line-height: 1.2;
+}
+
+.tool-belief-table tbody th,
+.tool-belief-table tbody td {
+  padding: 9px;
+}
+
+.tool-belief-table th:nth-child(1) { width: 18%; }
+.tool-belief-table th:nth-child(2) { width: 22%; }
+.tool-belief-table th:nth-child(3) { width: 13%; }
+.tool-belief-table th:nth-child(4) { width: 25%; }
+.tool-belief-table th:nth-child(5) { width: 22%; }
+
+.tool-belief-tool-identity {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.tool-belief-tool-identity strong,
+.tool-belief-tool-identity span {
+  display: block;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.tool-belief-tool-identity strong {
+  color: var(--color-text);
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.25;
+}
+
+.tool-belief-tool-identity span {
+  color: var(--color-text-muted);
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.2;
+}
+
+.tool-belief-primary-location {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.tool-belief-primary-location > span {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 4px;
+  overflow: hidden;
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tool-belief-primary-location > span svg {
+  flex: 0 0 auto;
+  color: var(--color-accent-strong);
+}
+
+.tool-belief-primary-location > strong {
+  color: var(--color-text);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.2;
+}
+
+.tool-belief-probability-track {
+  height: 4px;
+  overflow: hidden;
+  margin-top: 6px;
+  border-radius: var(--radius-inner);
+  background: var(--color-surface-muted);
+}
+
+.tool-belief-probability-track > span {
+  display: block;
+  width: var(--tool-belief-probability, 0%);
+  height: 100%;
+  border-radius: inherit;
+  background: var(--color-accent);
+  transition: width var(--duration-fast) var(--ease-default);
+}
+
+.tool-belief-status {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 5px;
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+.tool-belief-status.confirmed { color: var(--color-success-text); }
+.tool-belief-status.probable { color: var(--color-accent-strong); }
+.tool-belief-status.uncertain { color: var(--color-warning-text); }
+
+.tool-belief-alternatives {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.tool-belief-alternatives > span {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 6px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-inner);
+  background: var(--color-surface-muted);
+  color: var(--color-text-muted);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.2;
+}
+
+.tool-belief-alternatives > span strong {
+  color: var(--color-text-secondary);
+  font-size: inherit;
+  font-variant-numeric: tabular-nums;
+}
+
+.tool-belief-alternatives > .empty {
+  border-color: transparent;
+  background: transparent;
+  padding-inline: 0;
+}
+
+.tool-belief-evidence {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.tool-belief-freshness {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 4px;
+  overflow: hidden;
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tool-belief-source-list {
+  overflow: hidden;
+  color: var(--color-text-muted);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tool-belief-empty {
+  display: flex;
+  min-height: 54px;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  border: 1px dashed var(--color-border-strong);
+  border-radius: var(--radius-inner);
+  color: var(--color-text-muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.tool-belief-empty.off {
+  color: var(--color-text-secondary);
+}
+
+@keyframes tool-belief-spin {
+  to { transform: rotate(360deg); }
+}
+
+@media (max-width: 900px) {
+  .tool-belief-panel-header {
+    align-items: flex-start;
+    grid-template-columns: 1fr auto;
+  }
+
+  .tool-belief-panel-badges {
+    grid-column: 1 / -1;
+    grid-row: 2;
+    justify-content: flex-start;
+  }
+}
+
+/* The panel can live in a narrow stage column on a wide monitor.  Size the
+ * contents from that column, rather than the browser viewport. */
+@container tool-belief (max-width: 1040px) {
+  .tool-belief-panel-header {
+    align-items: flex-start;
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .tool-belief-panel-badges {
+    grid-column: 1 / -1;
+    grid-row: 2;
+    justify-content: flex-start;
+  }
+
+  .tool-belief-table {
+    min-width: 0;
+  }
+
+  .tool-belief-table th:nth-child(1) { width: 30%; }
+  .tool-belief-table th:nth-child(2) { width: 48%; }
+  .tool-belief-table th:nth-child(3) { width: 22%; }
+
+  .tool-belief-table th:nth-child(4),
+  .tool-belief-table td:nth-child(4),
+  .tool-belief-table th:nth-child(5),
+  .tool-belief-table td:nth-child(5) {
+    display: none;
+  }
+}
+
+@container tool-belief (max-width: 620px) {
+  .tool-belief-panel {
+    gap: 8px;
+    margin: 8px;
+    padding: 8px;
+  }
+
+  .tool-belief-panel-title {
+    gap: 6px;
+  }
+
+  .tool-belief-panel-title span,
+  .tool-belief-panel-badges > span {
+    font-size: 11px;
+  }
+
+  .tool-belief-panel-title strong {
+    font-size: 13px;
+  }
+
+  .tool-belief-toggle {
+    min-width: 72px;
+    min-height: 40px;
+    gap: 5px;
+    padding: 6px 8px;
+  }
+
+  .tool-belief-table thead th {
+    padding: 0 6px 4px;
+    font-size: 11px;
+  }
+
+  .tool-belief-table tbody th,
+  .tool-belief-table tbody td {
+    padding: 7px 6px;
+  }
+
+  .tool-belief-tool-identity span {
+    display: none;
+  }
+
+  .tool-belief-primary-location {
+    align-items: flex-start;
+    gap: 4px;
+  }
+
+  .tool-belief-primary-location > span {
+    overflow: visible;
+    text-overflow: clip;
+    white-space: normal;
+  }
+}
+
+@container tool-belief (max-width: 420px) {
+  .tool-belief-panel-header {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .tool-belief-toggle {
+    justify-self: start;
+  }
+
+  .tool-belief-panel-badges {
+    grid-column: 1;
+    grid-row: auto;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tool-belief-probability-track > span,
+  .tool-belief-toggle {
+    transition: none;
+  }
+
+  .tool-belief-toggle[aria-busy="true"] svg {
+    animation: none;
+  }
+}

@@ -13,6 +13,7 @@
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
   <exec_depend>rclpy</exec_depend>
+  <exec_depend>rosidl_runtime_py</exec_depend>
   <exec_depend>rosbridge_server</exec_depend>
   <exec_depend>python3-yaml</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
@@ -20,13 +21,11 @@
   <exec_depend>sensor_msgs</exec_depend>
   <exec_depend>std_msgs</exec_depend>
   <exec_depend>std_srvs</exec_depend>
-  <exec_depend>bt_orchestrator</exec_depend>
   <exec_depend>procedure_spec</exec_depend>
   <exec_depend>simulation_runtime</exec_depend>
   <exec_depend>surgical_interop_execution</exec_depend>
   <exec_depend>surgical_interop_msgs</exec_depend>
   <exec_depend>surgical_msgs</exec_depend>
-  <exec_depend>vlm_node</exec_depend>
 
   <test_depend>python3-pytest</test_depend>
 

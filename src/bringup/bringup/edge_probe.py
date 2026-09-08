@@ -29,7 +29,14 @@ class EdgeProbe(Node):
         self.create_subscription(VLMReducerDecision, "/vlm/reducer_decisions", self._on_vlm_reducer_decision, 20)
         self._tool_observation_pub = self.create_publisher(ToolObservation, "/vlm/tool_observations", 20)
         self._control_client = self.create_client(ControlSimulation, "/simulation/control")
-        self._override_client = self.create_client(InjectSurgeonOverride, "/simulation/inject_surgeon_override")
+        self._operational_override_client = self.create_client(
+            InjectSurgeonOverride,
+            "/simulation/operational_surgeon_override",
+        )
+        self._debug_override_client = self.create_client(
+            InjectSurgeonOverride,
+            "/simulation/inject_surgeon_override",
+        )
         self._select_bundle_client = self.create_client(SelectSimulationBundle, "/simulation/select_bundle")
         self._runtime_client = self.create_client(GetRuntimeState, "/btops/get_runtime_state")
         self._param_client = self.create_client(GetParameters, "/tree_executor/get_parameters")
@@ -49,7 +56,8 @@ class EdgeProbe(Node):
         while time.time() < deadline:
             ready = (
                 self._control_client.wait_for_service(timeout_sec=0.2)
-                and self._override_client.wait_for_service(timeout_sec=0.2)
+                and self._operational_override_client.wait_for_service(timeout_sec=0.2)
+                and self._debug_override_client.wait_for_service(timeout_sec=0.2)
                 and self._select_bundle_client.wait_for_service(timeout_sec=0.2)
                 and self._runtime_client.wait_for_service(timeout_sec=0.2)
                 and self._param_client.wait_for_service(timeout_sec=0.2)
@@ -99,6 +107,7 @@ class EdgeProbe(Node):
         requested_tool: str,
         ready_for_handover: bool = True,
         ready_for_retrieval: bool = False,
+        source: str = "operational",
     ):
         request = InjectSurgeonOverride.Request()
         request.event_type = event_type
@@ -107,7 +116,12 @@ class EdgeProbe(Node):
         request.ready_for_handover = bool(ready_for_handover)
         request.ready_for_retrieval = bool(ready_for_retrieval)
         request.clear_pending_requests = True
-        future = self._override_client.call_async(request)
+        client = (
+            self._operational_override_client
+            if source == "operational"
+            else self._debug_override_client
+        )
+        future = client.call_async(request)
         rclpy.spin_until_future_complete(self, future, timeout_sec=15.0)
         response = future.result()
         if response is None:
@@ -261,9 +275,13 @@ def main(argv: list[str] | None = None) -> int:
             raise RuntimeError(f"invalid event type was not rejected: {response}")
 
         probe.control("pause")
-        response = probe.inject_override(event_type="voice_request", requested_tool="retractor")
-        if response.success or response.message != "simulation paused; resume before injecting surgeon override":
-            raise RuntimeError(f"pause-state override was not rejected: {response}")
+        response = probe.inject_override(
+            event_type="voice_request",
+            requested_tool="retractor",
+            source="debug",
+        )
+        if not response.success:
+            raise RuntimeError(f"paused Debug override was not accepted: {response}")
         probe.control("resume")
         probe.wait_running_bundle("thyroidectomy")
 
@@ -272,8 +290,20 @@ def main(argv: list[str] | None = None) -> int:
             raise RuntimeError(f"running bundle switch without restart was not rejected: {response}")
 
         response = probe.select_bundle("nephrectomy", restart_if_running=True)
+        if response.success or "cannot switch bundle while simulation is running" not in response.message:
+            raise RuntimeError(
+                "running bundle switch with restart compatibility flag was not rejected: "
+                f"{response}"
+            )
+
+        # The configuration owner never restarts a live procedure.  A paused
+        # boundary is the explicit, observable hand-off point for a full
+        # scenario replacement; the legacy flag remains wire-compatible only.
+        probe.control("pause")
+        response = probe.select_bundle("nephrectomy", restart_if_running=False)
         if not response.success:
-            raise RuntimeError(f"running bundle restart failed: {response.message}")
+            raise RuntimeError(f"paused bundle selection failed: {response.message}")
+        probe.control("resume")
         probe.wait_running_bundle("nephrectomy", timeout_sec=35.0)
         probe.wait_blackboard_bool("bb.tool.retractor.active", False)
         probe.wait_blackboard_bool("bb.tool.cautery.active", False)

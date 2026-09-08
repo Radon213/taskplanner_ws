@@ -839,18 +839,29 @@ def test_voice_transcript_resolves_short_distinctive_tool_names():
     ("text", "expected_tool"),
     [
         ("Adsen forceps please", "T02"),
-        ("alice forceps please", "T03"),
         ("add some forceps please", "T02"),
-        ("procedure start; Alice forceps please", "T03"),
     ],
 )
-def test_explicit_voice_request_tolerates_unambiguous_asr_name_errors(
+def test_demo_explicit_voice_request_tolerates_unambiguous_asr_name_errors(
     text: str,
     expected_tool: str,
 ):
     twin = ORDigitalTwin(_thyroid_demo_spec())
 
     assert twin.resolve_explicit_voice_tool_request(text) == expected_tool
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "alice forceps please",
+        "procedure start; Alice forceps please",
+    ],
+)
+def test_standard_thyroidectomy_retains_allis_asr_name_tolerance(text: str):
+    twin = ORDigitalTwin(_thyroid_spec())
+
+    assert twin.resolve_explicit_voice_tool_request(text) == "T03"
 
 
 @pytest.mark.parametrize(
@@ -1055,60 +1066,6 @@ def test_voice_request_bypasses_only_vlm_and_phase_inference_guards():
     twin.set_safety_flag("duplicate_tool_holder", True)
 
     assert twin.handover_allowed() is False
-
-
-def test_legacy_raw_transcript_compatibility_can_create_request_when_enabled():
-    node = ORDigitalTwinNode.__new__(ORDigitalTwinNode)
-    node._twin = ORDigitalTwin(_thyroid_spec())
-    node._tool_predict_stability = {}
-    node._enable_legacy_raw_tool_handover_compatibility = True
-    published_events = []
-    published_world_states = []
-    node._publish_event = lambda event_type, **kwargs: published_events.append(
-        (event_type, kwargs)
-    )
-    node._publish_world_state = lambda: published_world_states.append(True)
-    node._stamp = lambda: SurgeonRequest().stamp
-
-    transcript = String()
-    transcript.data = "Bovie surgical cautery please"
-    node._on_request(transcript)
-
-    assert node._twin.state.explicit_request_tool == "T04"
-    assert published_events[0][0] == "VoiceTranscriptObserved"
-    assert published_events[0][1]["instrument_id"] == "T04"
-    assert published_world_states == [True]
-
-
-def test_legacy_raw_transcript_compatibility_can_start_cleanup_when_enabled():
-    node = ORDigitalTwinNode.__new__(ORDigitalTwinNode)
-    node._twin = ORDigitalTwin(_thyroid_spec())
-    node._twin.state.running = True
-    node._twin.state.execution_state = "running"
-    node._twin._set_lifecycle(
-        node._twin.instrument_states["T04#1"],
-        LIFECYCLE_SURGEON_OWNED,
-        location_type="surgeon_hand",
-        location_id="surgeon_hand",
-        confidence=1.0,
-    )
-    node._tool_predict_stability = {}
-    node._enable_legacy_raw_procedure_completion_compatibility = True
-    published_events = []
-    published_world_states = []
-    node._stamp = lambda: SurgeonRequest().stamp
-    node._publish_event = lambda event_type, **kwargs: published_events.append(
-        (event_type, kwargs)
-    )
-    node._publish_world_state = lambda: published_world_states.append(True)
-
-    transcript = String()
-    transcript.data = "네 마치겠습니다."
-    node._on_request(transcript)
-
-    assert node._twin.state.execution_state == "finishing"
-    assert published_events[0][1]["detail"]["command_type"] == "procedure_completion"
-    assert published_world_states == [True]
 
 
 def test_partial_task_completion_is_not_procedure_completion():

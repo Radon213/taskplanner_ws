@@ -35,8 +35,8 @@ requirePattern(
 );
 requirePattern(
   scenario,
-  /sameBundle[\s\S]{0,260}!fullyStopped\(state\)/,
-  "Same-bundle reload must remain locked until the scenario is fully stopped.",
+  /!pausedOrStopped\(state\)/,
+  "Bundle selection must be blocked only while the scenario is neither paused nor stopped.",
 );
 requirePattern(
   bridge,

@@ -24,6 +24,7 @@ import type {
   SpeechUtterance,
   SurgeonLLMDecision,
   SurgeonState,
+  TtsPlaybackStatus,
   VLMHealth,
   VLMReducerDecision,
   VLMResult,
@@ -39,17 +40,24 @@ import {
   type MissionCameraId,
 } from "../ros/missionSubscriptionPlan";
 import {
+  cameraPreviewContractsForMode,
+  externalCameraPreviewContracts,
+} from "../ros/cameraPreviewContracts";
+import { useLiveCameraMediaBridge } from "./useLiveCameraMediaBridge";
+import {
   rfdetrToolViewConfigs,
 } from "../ros/rfdetrObservationSources";
+import type { VlmRequestToolDetectionEvidence } from "../ros/toolObservationMessages";
 import {
-  normalizeTypedRfdetrToolDetections,
-  normalizeVlmRequestToolDetectionEvidence,
-  type TypedRfdetrToolDetections,
-  type TypedRfdetrToolViewId,
-  type VlmRequestToolDetectionEvidence,
-} from "../ros/toolObservationMessages";
+  createTypedRfdetrObservationStore,
+} from "../ros/typedRfdetrObservationStore";
 import {
-  integrationReadinessBlockReason,
+  appendOperationTrace,
+  emptyOperationTraceFeed,
+  resetOperationTraceFeed,
+  type OperationTraceFeed,
+} from "../presentation/operationPresentation";
+import {
   normalizeExecutionEndpointSource,
   normalizeExecutionRouteCommandResult,
   normalizeExecutionRouteState,
@@ -58,6 +66,7 @@ import {
   type ExecutionRouteState,
   type IntegrationReadiness,
 } from "../ros/runtimeAdmissionMessages";
+import { executionRouteSwitchBlockReason } from "../ros/executionRouteControl";
 import {
   isBoundedRosPayload,
   MAX_ROS_JSON_PAYLOAD_CHARS,
@@ -65,8 +74,42 @@ import {
 } from "../ros/rosMessageBounds";
 import {
   DEFAULT_LIVE_ASR_STATUS,
+  mergeExternalAsrTranscripts,
+  normalizeExternalAsrFinal,
   normalizeLiveAsrStatus,
 } from "../ros/liveAsrMessages";
+import {
+  normalizeTtsPlaybackStatus,
+  TTS_PLAYBACK_STATUS_TOPIC,
+} from "../ros/ttsPlaybackMessages";
+import {
+  activeToolPolicyStatus,
+  configureToolPolicySubscription,
+  normalizeToolPolicyStatus,
+  TOOL_POLICY_STATUS_TOPIC,
+  type ToolPolicyStatus,
+} from "../ros/toolPolicyMessages";
+import {
+  normalizeSurgeryRecordReceipt,
+  sameSurgeryRecordReceipt,
+  SURGERY_RECORD_RECEIPT_TOPIC,
+  type SurgeryRecordReceipt,
+} from "../ros/surgeryRecordMessages";
+import {
+  normalizeRosbagRecordingStatus,
+  ROSBAG_RECORDING_CONTROL_SERVICE,
+  ROSBAG_RECORDING_CONTROL_SERVICE_TYPE,
+  ROSBAG_RECORDING_STATUS_TOPIC,
+  sameRosbagRecordingStatus,
+  type RosbagRecordingStatus,
+} from "../ros/rosbagRecordingMessages";
+import {
+  createRosbagUiAuditMessage,
+  ROSBAG_UI_AUDIT_TOPIC,
+  serializeRosbagUiAuditMessage,
+  type RosbagUiAuditEventName,
+  type RosbagUiPresentation,
+} from "../ros/rosbagUiAuditMessages";
 import {
   BED_ROBOT_STATUS_MAX_AGE_MS,
   canonicalBedRobotProcedure,
@@ -78,7 +121,6 @@ import {
 import {
   assertSetParametersAccepted,
   boolParameter,
-  parseLegacyModelCatalogResponse,
   parseModelCatalogResponse,
   ROS_PARAMETER_BOOL,
   setParametersRequest,
@@ -86,6 +128,7 @@ import {
   type ModelCatalogProjection,
   type RosParameter,
 } from "../ros/modelCatalogMessages";
+import type { ToolBeliefRuntime, ToolBeliefSnapshot } from "../ros/toolBeliefMessages";
 import {
   EMPTY_SCENARIO_REVISION_STATE,
   SELECT_BUNDLE_SERVICE,
@@ -99,7 +142,6 @@ import {
 
 export {
   INTEGRATION_READINESS_MAX_AGE_MS,
-  integrationReadinessBlockReason,
   normalizeExecutionRouteState,
   normalizeIntegrationReadiness,
 } from "../ros/runtimeAdmissionMessages";
@@ -109,7 +151,6 @@ export type {
   ExecutionRouteSourceEndpointReadiness,
   ExecutionRouteState,
   IntegrationReadiness,
-  IntegrationReadinessBlockReason,
   IntegrationReadinessChecklistItem,
   IntegrationReadinessChecklistStatus,
 } from "../ros/runtimeAdmissionMessages";
@@ -119,11 +160,7 @@ export type {
   ScenarioRevisionState,
 } from "../ros/scenarioRevision";
 export { normalizeLiveAsrStatus } from "../ros/liveAsrMessages";
-export {
-  TYPED_RFDETR_STAGE_MAX_FRAME_SKEW_SEC,
-  normalizeTypedRfdetrToolDetections,
-  normalizeVlmRequestToolDetectionEvidence,
-} from "../ros/toolObservationMessages";
+export type { ToolBeliefSnapshot } from "../ros/toolBeliefMessages";
 export type {
   TypedRfdetrToolDetectionFrame,
   TypedRfdetrToolDetectionInstance,
@@ -138,6 +175,7 @@ export type {
 } from "../ros/toolObservationMessages";
 
 const DEFAULT_STATE: SimulationState = {
+  procedure_run_id: "",
   procedure_id: "",
   active_bundle: "",
   running: false,
@@ -168,6 +206,16 @@ const DEFAULT_STATE: SimulationState = {
   recent_events: [],
   layout_json: "",
 };
+
+// Model state is observational; one low-frequency refresh keeps it current
+// without creating a second fast polling lane for optional controls.
+const VLM_MODEL_REFRESH_MS = 15_000;
+// A start request is accepted asynchronously by the state core.  Keep the
+// operator-facing lifecycle responsive across the one or two stale idle
+// heartbeats that can already be in rosbridge when the click occurs.  This is
+// presentation only: the first non-idle authoritative frame still wins, and
+// an unsuccessful request restores the prior observed state immediately.
+const OPTIMISTIC_START_STATE_MAX_MS = 1_200;
 
 const AUTHORITATIVE_SIMULATION_EXECUTION_STATES = new Set([
   "idle",
@@ -243,6 +291,7 @@ const DEFAULT_SURGEON_LLM_DECISION: SurgeonLLMDecision = {
 };
 
 const DEFAULT_BT_DECISION: BTDecision = {
+  procedure_run_id: "",
   decision: "idle",
   selected_tool: "",
   selected_tool_lifecycle: "",
@@ -256,6 +305,7 @@ const DEFAULT_BT_DECISION: BTDecision = {
 
 const DEFAULT_SKILL_STATUS: SkillStatus = {
   command_id: "",
+  procedure_run_id: "",
   action: "",
   instrument_id: "",
   state: "",
@@ -288,6 +338,7 @@ const DEFAULT_VLM_HEALTH: VLMHealth = {
 };
 
 const DEFAULT_VLM_RESULT: VLMResult = {
+  procedure_run_id: "",
   source: "",
   schema_version: "",
   raw_json: "",
@@ -386,7 +437,7 @@ const DEFAULT_SHADOW_REPLAY_STATE: ShadowReplayState = {
 };
 
 export type ExecutionRouteTransition = {
-  state: "idle" | "switching" | "resetting" | "ready" | "failed";
+  state: "idle" | "switching" | "ready" | "failed";
   message: string;
 };
 
@@ -416,11 +467,30 @@ const EXECUTION_TRACE_STAGES = new Set([
   "completed",
   "failed",
   "canceled",
+  "cancelled",
   "unknown",
 ]);
 
 function boundedTraceText(value: unknown, maxLength: number): string {
   return typeof value === "string" ? value.trim().slice(0, maxLength) : "";
+}
+
+/** The UI accepts command/result telemetry only from this exact live interval. */
+function activeProcedureRunId(state: SimulationState): string {
+  return state.running && state.execution_state === "running"
+    ? boundedTraceText(state.procedure_run_id, 64)
+    : "";
+}
+
+function belongsToActiveProcedureRun(
+  message: object | null | undefined,
+  activeRunId: string,
+): boolean {
+  if (!activeRunId || !message || typeof message !== "object") return false;
+  return boundedTraceText(
+    (message as { procedure_run_id?: unknown }).procedure_run_id,
+    64,
+  ) === activeRunId;
 }
 
 /** Reject malformed transport telemetry instead of fabricating dispatch state. */
@@ -442,9 +512,11 @@ function normalizeExecutionTrace(message: unknown): ExecutionTrace | null {
     stamp: trace.stamp,
     sequence,
     command_id: boundedTraceText(trace.command_id, 128),
+    procedure_run_id: boundedTraceText(trace.procedure_run_id, 64),
     route: boundedTraceText(trace.route, 48),
     transport,
     endpoint: boundedTraceText(trace.endpoint, 192),
+    endpoint_source: boundedTraceText(trace.endpoint_source, 32),
     stage,
     dispatch_submitted: trace.dispatch_submitted,
     terminal: trace.terminal,
@@ -452,17 +524,16 @@ function normalizeExecutionTrace(message: unknown): ExecutionTrace | null {
     reason_code: boundedTraceText(trace.reason_code, 128),
     retraction_command: Number.isInteger(retractionCommand)
       && retractionCommand >= 1
-      && retractionCommand <= 6
+      && retractionCommand <= 8
       ? retractionCommand
       : 0,
     retraction_target_side: Number.isInteger(retractionTargetSide)
       && retractionTargetSide >= 0
-      && retractionTargetSide <= 2
+      && retractionTargetSide <= 3
       ? retractionTargetSide
       : 0,
     retraction_distance_m: Number.isFinite(retractionDistanceM)
-      && retractionDistanceM >= 0
-      && retractionDistanceM <= 1
+      && Math.abs(retractionDistanceM) <= 1
       ? retractionDistanceM
       : 0,
     receivedAt: Date.now(),
@@ -587,6 +658,10 @@ const ROSBRIDGE_PREVIEW_IMAGE_QOS = {
 // Keep queue_length=1 to discard stale work if a browser falls behind, while
 // leaving throttling disabled so the source's native 15 Hz reaches the stage.
 const CAMERA_FRAME_THROTTLE_MS = 0;
+// Typed detector messages carry lossless masks that the browser never renders.
+// Operator preview pixels remain native-rate on the isolated media lane; the
+// optional vector/status projection only needs a bounded latest-value cadence.
+const TYPED_RFDETR_UI_THROTTLE_MS = 100;
 const CAMERA_STALE_AFTER_MS = 3000;
 const RUNTIME_STATE_MAX_AGE_MS = 4000;
 // An idle SimulationState checkpoint can arrive about every 2.5 seconds once
@@ -598,42 +673,24 @@ const RUNTIME_STATE_INITIAL_TIMEOUT_MS = 8000;
 // operator in a permanent stale state.
 const RUNTIME_STATE_RECOVERY_TIMEOUT_MS = 4000;
 
-type RawCameraTopicMap = Record<"cam1" | "cam2" | "cam3" | "cam4" | "flir", string>;
-
-const INTERNAL_CAMERA_TOPICS: RawCameraTopicMap = {
-  cam1: "/surgery/images/cam1/compressed",
-  cam2: "/surgery/images/cam2/compressed",
-  cam3: "/surgery/images/cam3/compressed",
-  cam4: "/surgery/images/cam4/compressed",
-  flir: "/surgery/images/flir/compressed",
-};
-
-const EXTERNAL_CAMERA_TOPICS: RawCameraTopicMap = {
-  cam1: import.meta.env.VITE_EXTERNAL_CAM1_TOPIC?.trim()
-    || "/synced/cam_1/color/image_raw/compressed",
-  cam2: import.meta.env.VITE_EXTERNAL_CAM2_TOPIC?.trim()
-    || "/synced/cam_2/color/image_raw/compressed",
-  cam3: import.meta.env.VITE_EXTERNAL_CAM3_TOPIC?.trim()
-    || "/synced/cam_3/color/image_raw/compressed",
-  cam4: import.meta.env.VITE_EXTERNAL_CAM4_TOPIC?.trim()
-    || "/synced/cam_4/color/image_raw/compressed",
-  flir: import.meta.env.VITE_EXTERNAL_FLIR_TOPIC?.trim()
-    || "/synced/flir/color/image_raw/compressed",
-};
-
-function rawCameraTopicsForMode(runtimeMode: TaskplannerRuntimeMode): RawCameraTopicMap {
-  return runtimeMode === "live" || runtimeMode === "llm"
-    ? EXTERNAL_CAMERA_TOPICS
-    : INTERNAL_CAMERA_TOPICS;
-}
+const EXTERNAL_CAMERA_PREVIEW_CONTRACTS = externalCameraPreviewContracts({
+  cam1: import.meta.env.VITE_EXTERNAL_CAM1_TOPIC,
+  cam2: import.meta.env.VITE_EXTERNAL_CAM2_TOPIC,
+  cam3OperatorOverlay:
+    import.meta.env.VITE_EXTERNAL_CAM3_OPERATOR_OVERLAY_TOPIC,
+  cam4OperatorOverlay:
+    import.meta.env.VITE_EXTERNAL_CAM4_OPERATOR_OVERLAY_TOPIC,
+  flir: import.meta.env.VITE_EXTERNAL_FLIR_TOPIC,
+});
 
 function configurePreviewImageSubscription(topic: any): void {
   // roslib 1.4.1 does not expose rosbridge's per-subscription QoS option.
   // Decorate its connection command so the same preview QoS request is also
   // replayed after a WebSocket reconnect. This is used only for the five
   // browser-only physical-camera previews. Acquisition and perception keep
-  // their own independent subscriptions; this path only displays the latest
-  // frame from the VIPLab `/synced` contract.
+  // their own independent `/synced` subscriptions; CAM3/CAM4 display the
+  // remote final operator overlays without feeding those pixels back into the
+  // planner or VLM.
   const sendOnConnection = topic.callForSubscribeAndAdvertise.bind(topic);
   topic.callForSubscribeAndAdvertise = (request: Record<string, unknown>) => {
     sendOnConnection(
@@ -752,6 +809,12 @@ type RosServiceConnection = {
   callOnConnection: (message: Record<string, unknown>) => void;
 };
 
+type RosTopicPublisher = {
+  advertise?: () => void;
+  publish: (message: unknown) => void;
+  unadvertise?: () => void;
+};
+
 function unsubscribeWhileConnected(ros: any, topics: any[]): void {
   if (!ros?.isConnected || ros.socket?.readyState !== WebSocket.OPEN) return;
   topics.forEach((topic) => {
@@ -798,12 +861,29 @@ function isAuthoritativeInstrumentState(value: unknown): boolean {
     instrument.preposition_origin_location_type,
     instrument.preposition_origin_location_id,
     instrument.preposition_origin_lifecycle_stage,
+    instrument.mayo_placement_evidence,
+    instrument.mayo_evidence_source,
+  ];
+  const optionalUnitIntervals = [
+    instrument.mayo_reuse_confidence,
+    instrument.mayo_recovery_confidence,
+  ];
+  const optionalNonNegativeNumbers = [
+    instrument.mayo_reuse_stability_sec,
+    instrument.mayo_recovery_stability_sec,
   ];
   return requiredStrings.every(
     (field) => typeof field === "string" && field.trim().length > 0,
   ) &&
     optionalStrings.every(
       (field) => field === undefined || typeof field === "string",
+    ) &&
+    (instrument.procedure_future_use_expected === undefined || typeof instrument.procedure_future_use_expected === "boolean") &&
+    optionalUnitIntervals.every(
+      (field) => field === undefined || isFiniteUnitInterval(field),
+    ) &&
+    optionalNonNegativeNumbers.every(
+      (field) => field === undefined || isFiniteNonNegativeNumber(field),
     ) &&
     isFiniteUnitInterval(instrument.confidence) &&
     typeof instrument.contaminated === "boolean";
@@ -1057,14 +1137,57 @@ function runtimeStatusMessage(state: SimulationState): string {
   return "";
 }
 
+const DEFAULT_ROSBAG_UI_PRESENTATION: RosbagUiPresentation = {
+  language: "ko",
+  workspace: "mission",
+  stageSurgicalBedCamera: "flir",
+  stageSurgicalBedInspecting: false,
+  stageIndependentCamera: "cam1",
+  stageIndependentInspecting: false,
+  stageCam3Inspecting: false,
+  surgeryRecordVisible: false,
+  surgeryRecordTab: "record",
+};
+
+type RosbagUiAuditPublishOptions = {
+  value?: string;
+  bundle?: string;
+  startPhase?: string;
+  presentation?: RosbagUiPresentation;
+  allowWhenInactive?: boolean;
+};
+
+type RosbagPresentationReplayOptions = {
+  replayPresentationOnly?: boolean;
+  rosbagUiPresentation?: RosbagUiPresentation;
+};
+
 export function useRosBridge(
   runtimeMode: TaskplannerRuntimeMode,
   connectEnabled = true,
   connectionPending = false,
   connectionBlocked = false,
   observationProfile: MissionObservationProfile = "extended",
+  replayOptions: RosbagPresentationReplayOptions = {},
 ) {
+  const replayPresentationOnly = replayOptions.replayPresentationOnly === true;
+  const rosbagUiPresentation =
+    replayOptions.rosbagUiPresentation ?? DEFAULT_ROSBAG_UI_PRESENTATION;
   const subscriptionPlan = missionSubscriptionPlan(runtimeMode, observationProfile);
+  const cameraPreviewContracts = cameraPreviewContractsForMode(
+    runtimeMode,
+    EXTERNAL_CAMERA_PREVIEW_CONTRACTS,
+  );
+  // Live camera pixels have a dedicated, loopback-only latest-frame lane.
+  // It is read-only and deliberately remains available through a transient
+  // command/runtime-controller status check. The command/state bridge remains
+  // authoritative for every non-image topic.
+  const liveCameraMedia = useLiveCameraMediaBridge({
+    // A rosbag replay republishes the recorded camera topics on the regular
+    // rosbridge lane. Keep the production latest-frame bridge out of that
+    // read-only replay so the original recorded frames reach the stage.
+    enabled: runtimeMode === "live" && !replayPresentationOnly,
+  });
   const [url, setUrl] = useState(() => runtimeBridgeUrl(runtimeMode));
   const [transportConnected, setTransportConnected] = useState(false);
   const [connected, setConnected] = useState(false);
@@ -1073,9 +1196,10 @@ export function useRosBridge(
       connectEnabled ? "connecting" : connectionBlocked ? "blocked" : "offline",
     );
   const [bundle, setBundle] = useState("");
-  const [startPhase, setStartPhase] = useState("");
+  const [startPhase, setStartPhaseState] = useState("");
   const [simulationState, setSimulationState] = useState<SimulationState>(DEFAULT_STATE);
   const [worldState, setWorldState] = useState<WorldState>(DEFAULT_WORLD_STATE);
+  const [toolPolicyStatus, setToolPolicyStatus] = useState<ToolPolicyStatus | null>(null);
   const [externalBedRobotArmStatus, setExternalBedRobotArmStatus] =
     useState<ValidatedBedRobotArmStatus | null>(null);
   const [surgeonState, setSurgeonState] = useState<SurgeonState>(DEFAULT_SURGEON);
@@ -1085,7 +1209,10 @@ export function useRosBridge(
   const [skillStatusByCommand, setSkillStatusByCommand] = useState<
     Record<string, SkillStatus>
   >({});
-  const [executionTraces, setExecutionTraces] = useState<ExecutionTrace[]>([]);
+  const [executionTraceFeed, setExecutionTraceFeed] = useState<OperationTraceFeed>(
+    emptyOperationTraceFeed,
+  );
+  const executionTraces = executionTraceFeed.traces;
   const [vlmHealth, setVlmHealth] = useState<VLMHealth>(DEFAULT_VLM_HEALTH);
   const [inputSourceStatuses, setInputSourceStatuses] = useState<
     Record<string, InputSourceStatus>
@@ -1093,8 +1220,10 @@ export function useRosBridge(
   const [vlmResult, setVlmResult] = useState<VLMResult>(DEFAULT_VLM_RESULT);
   const [vlmRequestToolDetectionEvidence, setVlmRequestToolDetectionEvidence] =
     useState<VlmRequestToolDetectionEvidence | null>(null);
-  const [typedRfdetrToolDetections, setTypedRfdetrToolDetections] =
-    useState<TypedRfdetrToolDetections>({});
+  const [typedRfdetrObservationStore] = useState(
+    createTypedRfdetrObservationStore,
+  );
+  const [toolBeliefs, setToolBeliefs] = useState<ToolBeliefRuntime | null>(null);
   const [cam4ToolRequest, setCam4ToolRequest] =
     useState<Cam4ToolRequestObservation>(DEFAULT_CAM4_TOOL_REQUEST);
   const [vlmReducerDecisions, setVlmReducerDecisions] = useState<VLMReducerDecision[]>([]);
@@ -1133,6 +1262,12 @@ export function useRosBridge(
   const [liveAsrStatusBridgeUrl, setLiveAsrStatusBridgeUrl] = useState("");
   const [liveAsrControlPending, setLiveAsrControlPending] = useState("");
   const [liveAsrControlMessage, setLiveAsrControlMessage] = useState("");
+  const [ttsPlaybackStatus, setTtsPlaybackStatus] = useState<TtsPlaybackStatus | null>(null);
+  const [surgeryRecordReceipt, setSurgeryRecordReceipt] =
+    useState<SurgeryRecordReceipt | null>(null);
+  const [rosbagRecording, setRosbagRecording] = useState<RosbagRecordingStatus | null>(null);
+  const [rosbagRecordingControlPending, setRosbagRecordingControlPending] = useState("");
+  const [rosbagRecordingControlMessage, setRosbagRecordingControlMessage] = useState("");
   const [integrationReadiness, setIntegrationReadiness] =
     useState<IntegrationReadiness | null>(DEFAULT_INTEGRATION_READINESS);
   const [integrationReadinessReceivedAt, setIntegrationReadinessReceivedAt] =
@@ -1151,6 +1286,12 @@ export function useRosBridge(
 
   const rosRef = useRef<unknown>(null);
   const simulationStateRef = useRef<SimulationState>(DEFAULT_STATE);
+  const activeProcedureRunIdRef = useRef("");
+  const optimisticStartControlRef = useRef<{
+    runId: number;
+    previous: SimulationState;
+    expiresAt: number;
+  } | null>(null);
   const shadowReplayStateRef = useRef<ShadowReplayState>(
     DEFAULT_SHADOW_REPLAY_STATE,
   );
@@ -1166,6 +1307,9 @@ export function useRosBridge(
   const simulationStateReceivedAtRef = useRef(0);
   const shadowReplayStateReceivedAtRef = useRef(0);
   const pendingServiceCancelsRef = useRef(
+    new Set<(reason: string) => void>(),
+  );
+  const runtimeBoundServiceCancelsRef = useRef(
     new Set<(reason: string) => void>(),
   );
   const bundleDirtyRef = useRef(false);
@@ -1187,6 +1331,12 @@ export function useRosBridge(
   const liveAsrControlInFlightRef = useRef(false);
   const liveAsrStatusRef = useRef<LiveAsrStatus>(DEFAULT_LIVE_ASR_STATUS);
   const liveAsrStatusReceivedAtRef = useRef(0);
+  const surgeryRecordReceiptRef = useRef<SurgeryRecordReceipt | null>(null);
+  const rosbagRecordingRef = useRef<RosbagRecordingStatus | null>(null);
+  const rosbagRecordingControlRunIdRef = useRef(0);
+  const rosbagRecordingControlInFlightRef = useRef(false);
+  const rosbagRecordingAuditTopicRef = useRef<RosTopicPublisher | null>(null);
+  const rosbagUiPresentationRef = useRef<RosbagUiPresentation>(rosbagUiPresentation);
   const integrationReadinessRef = useRef<IntegrationReadiness | null>(
     DEFAULT_INTEGRATION_READINESS,
   );
@@ -1195,12 +1345,13 @@ export function useRosBridge(
   const executionRouteStateReceivedAtRef = useRef(0);
   const executionRouteRunIdRef = useRef(0);
   const pendingCameraFramesRef = useRef(
-    new Map<
-      (frame: CompressedImageFrame | null) => void,
-      CompressedImageFrame
-    >(),
+    new Map<(frame: CompressedImageFrame | null) => void, CompressedImageFrame>(),
   );
   const cameraFlushFrameRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    rosbagUiPresentationRef.current = rosbagUiPresentation;
+  }, [rosbagUiPresentation]);
 
   // A locally selected preview candidate must never replace the bundle that
   // the server says is active on the stage or execution projections.
@@ -1223,6 +1374,9 @@ export function useRosBridge(
     if (runtimeMode === "live") return;
     liveAsrControlRunIdRef.current += 1;
     liveAsrControlInFlightRef.current = false;
+    rosbagRecordingControlRunIdRef.current += 1;
+    rosbagRecordingControlInFlightRef.current = false;
+    rosbagRecordingRef.current = null;
     liveAsrStatusRef.current = DEFAULT_LIVE_ASR_STATUS;
     liveAsrStatusReceivedAtRef.current = 0;
     setLiveAsrStatus(DEFAULT_LIVE_ASR_STATUS);
@@ -1230,6 +1384,12 @@ export function useRosBridge(
     setLiveAsrStatusBridgeUrl("");
     setLiveAsrControlPending("");
     setLiveAsrControlMessage("");
+    setTtsPlaybackStatus(null);
+    surgeryRecordReceiptRef.current = null;
+    setSurgeryRecordReceipt(null);
+    setRosbagRecording(null);
+    setRosbagRecordingControlPending("");
+    setRosbagRecordingControlMessage("");
   }, [runtimeMode]);
 
   useEffect(() => {
@@ -1263,6 +1423,7 @@ export function useRosBridge(
     let runtimeStateFreshnessTimer: number | null = null;
     let runtimeStateInitialTimer: number | null = null;
     let runtimeStateRecoveryTimer: number | null = null;
+    let observedAsrFinals: LiveAsrStatus["finals"] = [];
     const generation = bridgeGenerationRef.current + 1;
     bridgeGenerationRef.current = generation;
     commandReadyGenerationRef.current = 0;
@@ -1279,9 +1440,14 @@ export function useRosBridge(
     bundleApplyRunIdRef.current += 1;
     liveAsrControlRunIdRef.current += 1;
     liveAsrControlInFlightRef.current = false;
+    rosbagRecordingControlRunIdRef.current += 1;
+    rosbagRecordingControlInFlightRef.current = false;
+    rosbagRecordingRef.current = null;
+    rosbagRecordingAuditTopicRef.current = null;
     liveAsrStatusRef.current = DEFAULT_LIVE_ASR_STATUS;
     liveAsrStatusReceivedAtRef.current = 0;
     executionRouteRunIdRef.current += 1;
+    activeProcedureRunIdRef.current = "";
     simulationStateRef.current = DEFAULT_STATE;
     shadowReplayStateRef.current = DEFAULT_SHADOW_REPLAY_STATE;
     integrationReadinessRef.current = DEFAULT_INTEGRATION_READINESS;
@@ -1296,20 +1462,26 @@ export function useRosBridge(
     setConnected(false);
     setRuntimeAuthorityStatus("connecting");
     setBundle("");
-    setStartPhase("");
+    setStartPhaseState("");
     setSimulationState(DEFAULT_STATE);
     setWorldState(DEFAULT_WORLD_STATE);
+    setToolPolicyStatus(null);
     setExternalBedRobotArmStatus(null);
     setSurgeonState(DEFAULT_SURGEON);
     setSurgeonLlmDecision(DEFAULT_SURGEON_LLM_DECISION);
     setBtDecision(DEFAULT_BT_DECISION);
     setSkillStatus(DEFAULT_SKILL_STATUS);
     setSkillStatusByCommand({});
+    setExecutionTraceFeed(emptyOperationTraceFeed());
     setVlmHealth(DEFAULT_VLM_HEALTH);
+    setTtsPlaybackStatus(null);
+    setRosbagRecording(null);
+    setRosbagRecordingControlPending("");
+    setRosbagRecordingControlMessage("");
     setInputSourceStatuses({});
     setVlmResult(DEFAULT_VLM_RESULT);
     setVlmRequestToolDetectionEvidence(null);
-    setTypedRfdetrToolDetections({});
+    typedRfdetrObservationStore.clear();
     setVlmReducerDecisions([]);
     setVlmHealthReceivedAt(null);
     setVlmResultReceivedAt(null);
@@ -1396,9 +1568,13 @@ export function useRosBridge(
       bundleApplyRunIdRef.current += 1;
       liveAsrControlRunIdRef.current += 1;
       liveAsrControlInFlightRef.current = false;
+      rosbagRecordingControlRunIdRef.current += 1;
+      rosbagRecordingControlInFlightRef.current = false;
+      rosbagRecordingRef.current = null;
       liveAsrStatusRef.current = DEFAULT_LIVE_ASR_STATUS;
       liveAsrStatusReceivedAtRef.current = 0;
       executionRouteRunIdRef.current += 1;
+      activeProcedureRunIdRef.current = "";
       for (const cancel of Array.from(pendingServiceCancelsRef.current)) {
         cancel(message);
       }
@@ -1414,15 +1590,20 @@ export function useRosBridge(
       setConnected(false);
       setRuntimeAuthorityStatus("reconnecting");
       setBundle("");
-      setStartPhase("");
+      setStartPhaseState("");
       setSimulationState(DEFAULT_STATE);
       setWorldState(DEFAULT_WORLD_STATE);
+      setToolPolicyStatus(null);
       setShadowReplayState(DEFAULT_SHADOW_REPLAY_STATE);
       setEvents([]);
       setVlmRequestToolDetectionEvidence(null);
-      setTypedRfdetrToolDetections({});
+      typedRfdetrObservationStore.clear();
       setSkillStatusByCommand({});
+      setExecutionTraceFeed((current) => resetOperationTraceFeed(current));
       setActionPending("");
+      setRosbagRecording(null);
+      setRosbagRecordingControlPending("");
+      setRosbagRecordingControlMessage("");
       setCam1Image(null);
       setCam2Image(null);
       setCam3Image(null);
@@ -1436,7 +1617,9 @@ export function useRosBridge(
       setLiveAsrStatus(DEFAULT_LIVE_ASR_STATUS);
       setLiveAsrStatusReceivedAt(null);
       setLiveAsrStatusBridgeUrl("");
+      observedAsrFinals = [];
       setLiveAsrControlPending("");
+      setTtsPlaybackStatus(null);
       setIntegrationReadiness(DEFAULT_INTEGRATION_READINESS);
       setIntegrationReadinessReceivedAt(null);
       setIntegrationReadinessBridgeUrl("");
@@ -1445,76 +1628,56 @@ export function useRosBridge(
       setExecutionRouteTransition({ state: "idle", message: "" });
       setActionMessage(message);
     };
-    const forceRuntimeStateReconnect = () => {
+    const markRuntimeStateUnavailable = () => {
       if (!isCurrentGeneration() || commandReadyGenerationRef.current === generation) return;
-      invalidateConnectedSnapshot(
-        "Fresh runtime state did not arrive. Reconnecting to the ROS bridge...",
-      );
-      try {
-        ros.close();
-      } finally {
-        scheduleReconnect();
+      setConnected(false);
+      setRuntimeAuthorityStatus("stale");
+      if (!actionInFlightRef.current) {
+        setActionMessage("ROS transport is online. Waiting for fresh runtime state...");
       }
     };
     const scheduleInitialRuntimeStateTimeout = () => {
       clearRuntimeStateInitialTimer();
       runtimeStateInitialTimer = window.setTimeout(() => {
         runtimeStateInitialTimer = null;
-        forceRuntimeStateReconnect();
+        markRuntimeStateUnavailable();
       }, RUNTIME_STATE_INITIAL_TIMEOUT_MS);
     };
     const scheduleRuntimeStateRecovery = () => {
       clearRuntimeStateRecoveryTimer();
       runtimeStateRecoveryTimer = window.setTimeout(() => {
         runtimeStateRecoveryTimer = null;
-        forceRuntimeStateReconnect();
+        markRuntimeStateUnavailable();
       }, RUNTIME_STATE_RECOVERY_TIMEOUT_MS);
     };
     let invalidRuntimeStateNotified = false;
     const invalidateRuntimeAuthority = (message: string) => {
       clearRuntimeStateFreshnessTimer();
       commandReadyGenerationRef.current = 0;
-      actionRunIdRef.current += 1;
-      actionInFlightRef.current = false;
       controlRunIdRef.current += 1;
       controlInFlightRef.current = false;
       priorityStopInFlightRef.current = false;
       bundleApplyRunIdRef.current += 1;
-      liveAsrControlRunIdRef.current += 1;
-      liveAsrControlInFlightRef.current = false;
-      liveAsrStatusRef.current = DEFAULT_LIVE_ASR_STATUS;
-      liveAsrStatusReceivedAtRef.current = 0;
       executionRouteRunIdRef.current += 1;
-      for (const cancel of Array.from(pendingServiceCancelsRef.current)) {
+      activeProcedureRunIdRef.current = "";
+      for (const cancel of Array.from(runtimeBoundServiceCancelsRef.current)) {
         cancel(message);
       }
       simulationStateReceivedAtRef.current = 0;
       shadowReplayStateReceivedAtRef.current = 0;
       simulationStateRef.current = DEFAULT_STATE;
       shadowReplayStateRef.current = DEFAULT_SHADOW_REPLAY_STATE;
-      integrationReadinessRef.current = DEFAULT_INTEGRATION_READINESS;
-      integrationReadinessReceivedAtRef.current = 0;
-      executionRouteStateRef.current = null;
-      executionRouteStateReceivedAtRef.current = 0;
       setConnected(false);
       setRuntimeAuthorityStatus("invalid");
       setBundle("");
-      setStartPhase("");
+      setStartPhaseState("");
       setSimulationState(DEFAULT_STATE);
       setWorldState(DEFAULT_WORLD_STATE);
+      setToolPolicyStatus(null);
       setShadowReplayState(DEFAULT_SHADOW_REPLAY_STATE);
       setSurgeonState(DEFAULT_SURGEON);
       setVlmRequestToolDetectionEvidence(null);
-      setTypedRfdetrToolDetections({});
-      setSkillStatusByCommand({});
-      setIntegrationReadiness(DEFAULT_INTEGRATION_READINESS);
-      setIntegrationReadinessReceivedAt(null);
-      setIntegrationReadinessBridgeUrl("");
-      setExecutionRouteState(null);
-      setExecutionRouteStateReceivedAt(null);
-      setExecutionRouteTransition({ state: "idle", message: "" });
-      setActionPending("");
-      setActionMessage(message);
+      if (!actionInFlightRef.current) setActionMessage(message);
       scheduleRuntimeStateRecovery();
     };
     const expireRuntimeState = () => {
@@ -1528,26 +1691,20 @@ export function useRosBridge(
         return;
       }
       commandReadyGenerationRef.current = 0;
-      actionRunIdRef.current += 1;
-      actionInFlightRef.current = false;
       controlRunIdRef.current += 1;
       controlInFlightRef.current = false;
       priorityStopInFlightRef.current = false;
       bundleApplyRunIdRef.current += 1;
-      liveAsrControlRunIdRef.current += 1;
-      liveAsrControlInFlightRef.current = false;
-      liveAsrStatusRef.current = DEFAULT_LIVE_ASR_STATUS;
-      liveAsrStatusReceivedAtRef.current = 0;
-      for (const cancel of Array.from(pendingServiceCancelsRef.current)) {
+      activeProcedureRunIdRef.current = "";
+      for (const cancel of Array.from(runtimeBoundServiceCancelsRef.current)) {
         cancel("Runtime state heartbeat expired before the service response arrived.");
       }
       setConnected(false);
       setRuntimeAuthorityStatus("stale");
       setVlmRequestToolDetectionEvidence(null);
-      setTypedRfdetrToolDetections({});
-      setSkillStatusByCommand({});
-      setActionPending("");
-      setActionMessage("Runtime state heartbeat expired. Waiting for a fresh state...");
+      if (!actionInFlightRef.current) {
+        setActionMessage("Runtime state heartbeat expired. Waiting for a fresh state...");
+      }
       if (runtimeMode === "shadow") {
         shadowReplayStateRef.current = DEFAULT_SHADOW_REPLAY_STATE;
         setShadowReplayState(DEFAULT_SHADOW_REPLAY_STATE);
@@ -1583,6 +1740,9 @@ export function useRosBridge(
       setRuntimeAuthorityStatus("waiting");
       setActionMessage("ROS bridge connected. Waiting for fresh runtime state...");
       scheduleInitialRuntimeStateTimeout();
+      // Observations belong to their owners, not to /simulation/state. A
+      // missing scenario heartbeat must not prevent camera/detector startup.
+      startHeavySubscriptions();
       if (reconnectTimerRef.current !== null) {
         window.clearTimeout(reconnectTimerRef.current);
         reconnectTimerRef.current = null;
@@ -1609,6 +1769,13 @@ export function useRosBridge(
       name: "/twin/world_state",
       messageType: "surgical_msgs/msg/WorldState",
     });
+    const toolPolicyTopic = new ROSLIB.Topic({
+      ros,
+      name: TOOL_POLICY_STATUS_TOPIC,
+      messageType: "std_msgs/msg/String",
+      queue_length: 1,
+    });
+    configureToolPolicySubscription(toolPolicyTopic);
     const bedRobotArmStatusTopic = new ROSLIB.Topic({
       ros,
       name: "/external/bed_robot_arms/status",
@@ -1680,52 +1847,65 @@ export function useRosBridge(
           messageType: "surgical_msgs/msg/VLMReducerDecision",
         })
       : null;
-    const rawCameraTopics = rawCameraTopicsForMode(runtimeMode);
     const useExternalPreviews = runtimeMode === "live" || runtimeMode === "llm";
-    const externalPreviewNames = new Set(Object.values(rawCameraTopics));
-    const rawCameraSet = new Set<MissionCameraId>(
-      activeSubscriptionPlan.rawCameras,
+    const externalPreviewNames = new Set(
+      Object.values(cameraPreviewContracts).map(({ topic }) => topic),
     );
-    const rawCameraSubscriptions = [
-      {
-        cameraId: "cam1" as const,
-        name: rawCameraTopics.cam1,
-        setter: setCam1Image,
-      },
-      {
-        cameraId: "cam2" as const,
-        name: rawCameraTopics.cam2,
-        setter: setCam2Image,
-      },
-      {
-        cameraId: "cam3" as const,
-        name: rawCameraTopics.cam3,
-        setter: setCam3Image,
-      },
-      {
-        cameraId: "cam4" as const,
-        name: rawCameraTopics.cam4,
-        setter: setCam4Image,
-      },
-      {
-        cameraId: "flir" as const,
-        name: rawCameraTopics.flir,
-        setter: setFlirImage,
-      },
-    ].filter(({ cameraId }) => rawCameraSet.has(cameraId));
+    const cameraPreviewSet = new Set<MissionCameraId>(
+      activeSubscriptionPlan.cameraPreviews,
+    );
+    // A Live operator no longer receives camera JPEGs through generic 9090.
+    // The dedicated 9095 lane owns those five subscriptions independently;
+    // Debug/replay/LLM keep their existing in-bridge preview behavior.
+    const cameraPreviewSubscriptions = runtimeMode === "live" && !replayPresentationOnly
+      ? []
+      : [
+          {
+            cameraId: "cam1" as const,
+            name: cameraPreviewContracts.cam1.topic,
+            setter: setCam1Image,
+          },
+          {
+            cameraId: "cam2" as const,
+            name: cameraPreviewContracts.cam2.topic,
+            setter: setCam2Image,
+          },
+          {
+            cameraId: "cam3" as const,
+            name: cameraPreviewContracts.cam3.topic,
+            setter: setCam3Image,
+          },
+          {
+            cameraId: "cam4" as const,
+            name: cameraPreviewContracts.cam4.topic,
+            setter: setCam4Image,
+          },
+          {
+            cameraId: "flir" as const,
+            name: cameraPreviewContracts.flir.topic,
+            setter: setFlirImage,
+          },
+        ].filter(({ cameraId }) => cameraPreviewSet.has(cameraId));
     const modelVisualSubscriptions = activeSubscriptionPlan.vlmModelVisual
       ? [{
         // This is the model-ready visual stream only. RF-DETR tool detections
         // reach the VLM as typed CAM3/CAM4 observation facts, not painted
         // detector pixels. Operator overlays remain on their own topics.
         name: "/taskplanner/internal/vlm/model_visual/compressed",
-        setter: setVlmCompositeImage,
       }]
       : [];
     const cameraSubscriptions = [
-      ...rawCameraSubscriptions,
-      ...modelVisualSubscriptions,
-    ].map(({ name, setter }) => {
+      ...cameraPreviewSubscriptions.map(({ name, setter }) => ({
+        kind: "stage-camera" as const,
+        name,
+        setter,
+      })),
+      ...modelVisualSubscriptions.map(({ name }) => ({
+        kind: "model-visual" as const,
+        name,
+      })),
+    ].map((subscription) => {
+      const { name } = subscription;
       const topic = new ROSLIB.Topic({
         ros,
         name,
@@ -1744,23 +1924,24 @@ export function useRosBridge(
           name,
         );
         if (!frame) return;
-        pendingCameraFramesRef.current.set(setter, frame);
-        if (cameraFlushFrameRef.current === null) {
-          cameraFlushFrameRef.current = window.requestAnimationFrame(() => {
-            cameraFlushFrameRef.current = null;
-            const pending = Array.from(
-              pendingCameraFramesRef.current.entries(),
-            );
-            pendingCameraFramesRef.current.clear();
-            for (const [applyFrame, nextFrame] of pending) {
-              applyFrame(nextFrame);
-            }
-          });
+        if (subscription.kind === "stage-camera") {
+          pendingCameraFramesRef.current.set(subscription.setter, frame);
+          if (cameraFlushFrameRef.current === null) {
+            cameraFlushFrameRef.current = window.requestAnimationFrame(() => {
+              cameraFlushFrameRef.current = null;
+              const pending = Array.from(pendingCameraFramesRef.current.entries());
+              pendingCameraFramesRef.current.clear();
+              for (const [applyFrame, nextFrame] of pending) applyFrame(nextFrame);
+            });
+          }
+          return;
         }
+        setVlmCompositeImage(frame);
       };
       return { topic, onMessage };
     });
     const cameraTopics = cameraSubscriptions.map(({ topic }) => topic);
+    let observationNormalizers: typeof import("../ros/toolObservationMessages") | null = null;
     const typedRfdetrToolObservationSubscriptions = rfdetrToolViewConfigs(
       activeSubscriptionPlan.rfdetrObservationSource,
     ).map(
@@ -1772,24 +1953,14 @@ export function useRosBridge(
           // Detector outputs are for display only. Keep the newest completed
           // observation instead of allowing a slow browser to accumulate its
           // mask-bearing upstream messages.
-          throttle_rate: CAMERA_FRAME_THROTTLE_MS,
+          throttle_rate: TYPED_RFDETR_UI_THROTTLE_MS,
           queue_length: ROSBRIDGE_IMAGE_QUEUE_LENGTH,
         });
         const onMessage = (message: unknown) => {
-          if (!isCurrentGeneration()) return;
-          const frame = normalizeTypedRfdetrToolDetections(message, config);
+          if (!isCurrentGeneration() || !observationNormalizers) return;
+          const frame = observationNormalizers.normalizeTypedRfdetrToolDetections(message, config);
           if (!frame) return;
-          startTransition(() => {
-            setTypedRfdetrToolDetections((current) => {
-              const previous = current[config.cameraId];
-              // A late DDS delivery must not repaint an older bounding box
-              // over a newer raw camera frame.
-              if (previous && frame.sourceStampSec <= previous.sourceStampSec) {
-                return current;
-              }
-              return { ...current, [config.cameraId]: frame };
-            });
-          });
+          typedRfdetrObservationStore.ingest(frame);
         };
         return { topic, onMessage };
       },
@@ -1836,6 +2007,41 @@ export function useRosBridge(
       name: "/input/asr/runtime_status",
       messageType: "std_msgs/msg/String",
     });
+    // CommandRouter republishes every admitted final on this observer-only
+    // lane. Keep it in the primary bridge as well as the isolated ASR bridge
+    // so operationPresentation can project the same sentence onto the stage.
+    const liveAsrObservedFinalTopic = new ROSLIB.Topic({
+      ros,
+      name: "/surgery/audio/observed_utterance",
+      messageType: "surgical_msgs/msg/SpeechUtterance",
+      queue_length: 20,
+    });
+    const ttsPlaybackStatusTopic = new ROSLIB.Topic({
+      ros,
+      name: TTS_PLAYBACK_STATUS_TOPIC,
+      messageType: "surgical_msgs/msg/TTSPlaybackStatus",
+      queue_length: 1,
+    });
+    const surgeryRecordReceiptTopic = new ROSLIB.Topic({
+      ros,
+      name: SURGERY_RECORD_RECEIPT_TOPIC,
+      messageType: "std_msgs/msg/String",
+      queue_length: 1,
+    });
+    const rosbagRecordingStatusTopic = new ROSLIB.Topic({
+      ros,
+      name: ROSBAG_RECORDING_STATUS_TOPIC,
+      messageType: "std_msgs/msg/String",
+      queue_length: 1,
+    });
+    const rosbagRecordingAuditTopic = runtimeMode === "live" && !replayPresentationOnly
+      ? new ROSLIB.Topic({
+          ros,
+          name: ROSBAG_UI_AUDIT_TOPIC,
+          messageType: "std_msgs/msg/String",
+          queue_length: 10,
+        })
+      : null;
     const integrationReadinessTopic = new ROSLIB.Topic({
       ros,
       name: "/integration/readiness",
@@ -1846,6 +2052,7 @@ export function useRosBridge(
       name: "/integration/execution_route/state",
       messageType: "std_msgs/msg/String",
     });
+    let toolBeliefTopic: { unsubscribe: () => void } | null = null;
 
     let heavySubscriptionsStarted = false;
     const startHeavySubscriptions = () => {
@@ -1860,11 +2067,27 @@ export function useRosBridge(
       cameraSubscriptions.forEach(({ topic, onMessage }) => {
         topic.subscribe(onMessage);
       });
-      typedRfdetrToolObservationSubscriptions.forEach(
-        ({ topic, onMessage }) => {
+      // Display-only geometry/context parsing is loaded after connection,
+      // outside the mission entry/control bundle. Subscribe only after it is
+      // ready so retained context is not lost or raw masks queued in JS.
+      void import("../ros/toolObservationMessages").then((normalizers) => {
+        if (!isCurrentGeneration()) return;
+        observationNormalizers = normalizers;
+        typedRfdetrToolObservationSubscriptions.forEach(({ topic, onMessage }) => {
           topic.subscribe(onMessage);
-        },
-      );
+        });
+        vlmRequestContextTopic?.subscribe((message: unknown) => {
+          if (!isCurrentGeneration()) return;
+          if (!belongsToActiveProcedureRun(message as object, activeProcedureRunIdRef.current)) return;
+          const parsed = normalizers.normalizeVlmRequestToolDetectionEvidence(message);
+          startTransition(() => setVlmRequestToolDetectionEvidence(parsed));
+        });
+      }).catch((error: unknown) => {
+        if (!isCurrentGeneration()) return;
+        typedRfdetrObservationStore.clear();
+        setVlmRequestToolDetectionEvidence(null);
+        console.warn("Optional tool-observation display could not load.", error);
+      });
     };
 
     simulationTopic.subscribe((message: unknown) => {
@@ -1885,8 +2108,43 @@ export function useRosBridge(
         !receivedState.running && receivedState.execution_state === "idle" && receivedState.recent_events.length
           ? { ...receivedState, recent_events: [] }
           : receivedState;
-      simulationStateRef.current = nextState;
-      setSimulationState(nextState);
+      if (runtimeMode !== "shadow") {
+        const nextRunId = activeProcedureRunId(nextState);
+        if (nextRunId !== activeProcedureRunIdRef.current) {
+          activeProcedureRunIdRef.current = nextRunId;
+          // Clear every presentation cache at *both* edges of a run.  A
+          // delayed status/trace is then additionally rejected by its typed
+          // procedure_run_id below; clearing alone is never treated as a
+          // correctness fence.
+          startTransition(() => {
+            setSurgeonState(DEFAULT_SURGEON);
+            setSurgeonLlmDecision(DEFAULT_SURGEON_LLM_DECISION);
+            setBtDecision(DEFAULT_BT_DECISION);
+            setSkillStatus(DEFAULT_SKILL_STATUS);
+            setSkillStatusByCommand({});
+            setExecutionTraceFeed(emptyOperationTraceFeed());
+            setEvents([]);
+            setVlmResult(DEFAULT_VLM_RESULT);
+            setVlmRequestToolDetectionEvidence(null);
+            setVlmReducerDecisions([]);
+          });
+        }
+      }
+      const optimisticStart = optimisticStartControlRef.current;
+      const preserveOptimisticStart = Boolean(
+        optimisticStart
+          && optimisticStart.runId === controlRunIdRef.current
+          && Date.now() < optimisticStart.expiresAt
+          && !nextState.running
+          && nextState.execution_state === "idle",
+      );
+      if (!preserveOptimisticStart) {
+        if (optimisticStart?.runId === controlRunIdRef.current) {
+          optimisticStartControlRef.current = null;
+        }
+        simulationStateRef.current = nextState;
+        setSimulationState(nextState);
+      }
       if (runtimeMode !== "shadow" && ros.isConnected) {
         commandReadyGenerationRef.current = generation;
         setConnected(true);
@@ -1901,6 +2159,11 @@ export function useRosBridge(
       startTransition(() => {
         setWorldState(normalizeWorldState(message));
       });
+    });
+    toolPolicyTopic.subscribe((message: unknown) => {
+      if (!isCurrentGeneration()) return;
+      const status = normalizeToolPolicyStatus(message);
+      startTransition(() => setToolPolicyStatus(status));
     });
     bedRobotArmStatusTopic.subscribe((message: unknown) => {
       if (!isCurrentGeneration()) return;
@@ -1939,6 +2202,7 @@ export function useRosBridge(
       if (receivedAt < suppressEventsUntilRef.current) return;
       eventSequenceRef.current += 1;
       const event = message as SimulationEvent;
+      if (!belongsToActiveProcedureRun(event, activeProcedureRunIdRef.current)) return;
       const eventWithUiId = {
         ...event,
         ui_id: [
@@ -1955,6 +2219,7 @@ export function useRosBridge(
     surgeonTopic.subscribe((message: unknown) => {
       if (!isCurrentGeneration()) return;
       if (!isBoundedRosPayload(message)) return;
+      if (!belongsToActiveProcedureRun(message as object, activeProcedureRunIdRef.current)) return;
       startTransition(() => {
         setSurgeonState(message as SurgeonState);
       });
@@ -1962,6 +2227,7 @@ export function useRosBridge(
     surgeonLlmDecisionTopic?.subscribe((message: unknown) => {
       if (!isCurrentGeneration()) return;
       if (!isBoundedRosPayload(message)) return;
+      if (!belongsToActiveProcedureRun(message as object, activeProcedureRunIdRef.current)) return;
       startTransition(() => {
         setSurgeonLlmDecision(message as SurgeonLLMDecision);
       });
@@ -1969,6 +2235,7 @@ export function useRosBridge(
     btDecisionTopic.subscribe((message: unknown) => {
       if (!isCurrentGeneration()) return;
       if (!isBoundedRosPayload(message)) return;
+      if (!belongsToActiveProcedureRun(message as object, activeProcedureRunIdRef.current)) return;
       startTransition(() => {
         setBtDecision(message as BTDecision);
       });
@@ -1977,6 +2244,7 @@ export function useRosBridge(
       if (!isCurrentGeneration()) return;
       if (!isBoundedRosPayload(message)) return;
       const status = message as SkillStatus;
+      if (!belongsToActiveProcedureRun(status, activeProcedureRunIdRef.current)) return;
       const commandId = typeof status.command_id === "string"
         ? status.command_id.trim()
         : "";
@@ -2001,15 +2269,9 @@ export function useRosBridge(
       if (!isCurrentGeneration()) return;
       const trace = normalizeExecutionTrace(message);
       if (!trace) return;
+      if (!belongsToActiveProcedureRun(trace, activeProcedureRunIdRef.current)) return;
       startTransition(() => {
-        setExecutionTraces((current) => {
-          if (current.some((entry) =>
-            entry.sequence === trace.sequence
-            && entry.command_id === trace.command_id
-            && entry.stage === trace.stage,
-          )) return current;
-          return [trace, ...current].slice(0, 32);
-        });
+        setExecutionTraceFeed((current) => appendOperationTrace(current, trace));
       });
     });
     vlmHealthTopic.subscribe((message: unknown) => {
@@ -2021,19 +2283,10 @@ export function useRosBridge(
     vlmResultTopic.subscribe((message: unknown) => {
       if (!isCurrentGeneration()) return;
       if (!isBoundedRosPayload(message)) return;
+      if (!belongsToActiveProcedureRun(message as object, activeProcedureRunIdRef.current)) return;
       startTransition(() => {
         setVlmResult(message as VLMResult);
         setVlmResultReceivedAt(Date.now());
-      });
-    });
-    vlmRequestContextTopic?.subscribe((message: unknown) => {
-      if (!isCurrentGeneration()) return;
-      // This is an observer-only display of the facts committed to the VLM
-      // request. A malformed context clears the prior evidence rather than
-      // making stale locations look current.
-      const parsed = normalizeVlmRequestToolDetectionEvidence(message);
-      startTransition(() => {
-        setVlmRequestToolDetectionEvidence(parsed);
       });
     });
     inputSourceStatusTopics.forEach((topic) => {
@@ -2098,12 +2351,12 @@ export function useRosBridge(
         if (runChanged || replayRewound) {
           setShadowTranscript([]);
           setEvents([]);
-          setExecutionTraces([]);
+          setExecutionTraceFeed((current) => resetOperationTraceFeed(current));
           setSkillStatusByCommand({});
           setVlmReducerDecisions([]);
           setVlmResult(DEFAULT_VLM_RESULT);
           setVlmRequestToolDetectionEvidence(null);
-          setTypedRfdetrToolDetections({});
+          typedRfdetrObservationStore.clear();
           setVlmResultReceivedAt(0);
           setVlmCompositeImage(null);
           setCam1Image(null);
@@ -2172,16 +2425,94 @@ export function useRosBridge(
       });
     });
     if (runtimeMode === "live") {
+      ttsPlaybackStatusTopic.subscribe((message: unknown) => {
+        if (!isCurrentGeneration()) return;
+        const parsed = normalizeTtsPlaybackStatus(message);
+        if (!parsed) return;
+        setTtsPlaybackStatus((current) => (
+          current && parsed.stampSec < current.stampSec ? current : parsed
+        ));
+      });
+      import("../ros/toolBeliefMessages").then((beliefMessages) => {
+        if (!isCurrentGeneration()) return;
+        toolBeliefTopic = beliefMessages.default(
+          ROSLIB.Topic,
+          ros,
+          isCurrentGeneration,
+          setToolBeliefs,
+        );
+      });
       liveAsrStatusTopic.subscribe((message: unknown) => {
         if (!isCurrentGeneration()) return;
-        const parsed = normalizeLiveAsrStatus(message);
-        if (!parsed) return;
+        const normalized = normalizeLiveAsrStatus(message);
+        if (!normalized) return;
+        const parsed = mergeExternalAsrTranscripts(
+          normalized,
+          null,
+          observedAsrFinals,
+        );
         const receivedAt = Date.now();
+        const hadPrimaryStatus = liveAsrStatusReceivedAtRef.current > 0;
+        const previousFinals = liveAsrStatusRef.current.finals;
+        const finalsChanged = previousFinals.length !== parsed.finals.length
+          || previousFinals.some((previous, index) => {
+            const next = parsed.finals[index];
+            return !next
+              || previous.stamp !== next.stamp
+              || previous.text !== next.text
+              || previous.response_latency_ms !== next.response_latency_ms
+              || previous.latency_basis !== next.latency_basis
+              || previous.latency_correlated !== next.latency_correlated;
+          });
         liveAsrStatusRef.current = parsed;
+        liveAsrStatusReceivedAtRef.current = receivedAt;
+        // The LiveAsrPanel reads its 10 Hz meter through an isolated socket.
+        // Keep this broad mission state quiet unless a new final needs to
+        // reach the operation presentation feed.
+        if (!hadPrimaryStatus || finalsChanged) {
+          setLiveAsrStatus(parsed);
+          setLiveAsrStatusReceivedAt(receivedAt);
+          setLiveAsrStatusBridgeUrl(url);
+        }
+      });
+      liveAsrObservedFinalTopic.subscribe((message: unknown) => {
+        if (!isCurrentGeneration()) return;
+        const final = normalizeExternalAsrFinal(message);
+        if (!final) return;
+        observedAsrFinals = [...observedAsrFinals, final].slice(-48);
+        const parsed = mergeExternalAsrTranscripts(
+          liveAsrStatusRef.current,
+          null,
+          observedAsrFinals,
+        );
+        liveAsrStatusRef.current = parsed;
+        const receivedAt = Date.now();
         liveAsrStatusReceivedAtRef.current = receivedAt;
         setLiveAsrStatus(parsed);
         setLiveAsrStatusReceivedAt(receivedAt);
         setLiveAsrStatusBridgeUrl(url);
+      });
+      surgeryRecordReceiptTopic.subscribe((message: unknown) => {
+        if (!isCurrentGeneration()) return;
+        const parsed = normalizeSurgeryRecordReceipt(message);
+        if (!parsed || sameSurgeryRecordReceipt(surgeryRecordReceiptRef.current, parsed)) {
+          return;
+        }
+        surgeryRecordReceiptRef.current = parsed;
+        startTransition(() => {
+          setSurgeryRecordReceipt(parsed);
+        });
+      });
+      rosbagRecordingStatusTopic.subscribe((message: unknown) => {
+        if (!isCurrentGeneration()) return;
+        const parsed = normalizeRosbagRecordingStatus(message);
+        if (!parsed || sameRosbagRecordingStatus(rosbagRecordingRef.current, parsed)) {
+          return;
+        }
+        rosbagRecordingRef.current = parsed;
+        startTransition(() => {
+          setRosbagRecording(parsed);
+        });
       });
       integrationReadinessTopic.subscribe((message: unknown) => {
         if (!isCurrentGeneration()) return;
@@ -2272,6 +2603,19 @@ export function useRosBridge(
     });
 
     rosRef.current = ros;
+    if (runtimeMode === "live" && rosbagRecordingAuditTopic) {
+      // Advertise before the manual recorder can start. That makes the small
+      // audit lane discoverable during rosbag2's first graph scan, so the
+      // snapshot emitted immediately after a successful manual start is not
+      // lost to discovery timing.
+      try {
+        rosbagRecordingAuditTopic.advertise();
+      } catch {
+        // Publishing remains best-effort observer telemetry and must never
+        // change the operator's normal control path.
+      }
+      rosbagRecordingAuditTopicRef.current = rosbagRecordingAuditTopic;
+    }
     connectionTimer = window.setTimeout(() => {
       connectionTimer = null;
       if (isCurrentGeneration()) ros.connect(url);
@@ -2286,9 +2630,15 @@ export function useRosBridge(
         priorityStopInFlightRef.current = false;
         liveAsrControlRunIdRef.current += 1;
         liveAsrControlInFlightRef.current = false;
+        rosbagRecordingControlRunIdRef.current += 1;
+        rosbagRecordingControlInFlightRef.current = false;
+        rosbagRecordingRef.current = null;
+        rosbagRecordingAuditTopicRef.current = null;
         liveAsrStatusRef.current = DEFAULT_LIVE_ASR_STATUS;
         liveAsrStatusReceivedAtRef.current = 0;
+        surgeryRecordReceiptRef.current = null;
         executionRouteRunIdRef.current += 1;
+        activeProcedureRunIdRef.current = "";
         simulationStateReceivedAtRef.current = 0;
         shadowReplayStateReceivedAtRef.current = 0;
         simulationStateRef.current = DEFAULT_STATE;
@@ -2302,9 +2652,10 @@ export function useRosBridge(
         setConnected(false);
         setRuntimeAuthorityStatus("offline");
         setSimulationState(DEFAULT_STATE);
-        setExecutionTraces([]);
+        setExecutionTraceFeed((current) => resetOperationTraceFeed(current));
         setSkillStatusByCommand({});
-        setTypedRfdetrToolDetections({});
+        typedRfdetrObservationStore.clear();
+        setToolBeliefs(null);
         setShadowReplayState(DEFAULT_SHADOW_REPLAY_STATE);
         setIntegrationReadiness(DEFAULT_INTEGRATION_READINESS);
         setIntegrationReadinessReceivedAt(null);
@@ -2312,6 +2663,11 @@ export function useRosBridge(
         setExecutionRouteState(null);
         setExecutionRouteStateReceivedAt(null);
         setExecutionRouteTransition({ state: "idle", message: "" });
+        setSurgeryRecordReceipt(null);
+        setRosbagRecording(null);
+        setRosbagRecordingControlPending("");
+        setRosbagRecordingControlMessage("");
+        setTtsPlaybackStatus(null);
         setActionPending("");
         setActorEnabledKnown(false);
         for (const cancel of Array.from(pendingServiceCancelsRef.current)) {
@@ -2326,6 +2682,7 @@ export function useRosBridge(
       unsubscribeWhileConnected(ros, [
         simulationTopic,
         worldTopic,
+        toolPolicyTopic,
         bedRobotArmStatusTopic,
         eventTopic,
         surgeonTopic,
@@ -2347,12 +2704,27 @@ export function useRosBridge(
         shadowGroundTruthTopic,
         ...(runtimeMode === "live"
           ? [
+              toolBeliefTopic,
               liveAsrStatusTopic,
+              liveAsrObservedFinalTopic,
+              ttsPlaybackStatusTopic,
+              surgeryRecordReceiptTopic,
+              rosbagRecordingStatusTopic,
               integrationReadinessTopic,
               executionRouteStateTopic,
             ]
           : []),
       ].filter(Boolean));
+      if (rosbagRecordingAuditTopic) {
+        try {
+          rosbagRecordingAuditTopic.unadvertise();
+        } catch {
+          // The bridge may already have closed its publisher socket.
+        }
+        if (rosbagRecordingAuditTopicRef.current === rosbagRecordingAuditTopic) {
+          rosbagRecordingAuditTopicRef.current = null;
+        }
+      }
       pendingCameraFramesRef.current.clear();
       if (cameraFlushFrameRef.current !== null) {
         window.cancelAnimationFrame(cameraFlushFrameRef.current);
@@ -2365,7 +2737,7 @@ export function useRosBridge(
       ros.close();
       if (rosRef.current === ros) rosRef.current = null;
     };
-  }, [connectEnabled, observationProfile, runtimeMode, url]);
+  }, [connectEnabled, observationProfile, replayPresentationOnly, runtimeMode, url]);
 
   useEffect(() => {
     const clearIfStale = (frame: CompressedImageFrame | null) =>
@@ -2381,17 +2753,7 @@ export function useRosBridge(
       // VLM model-visual frames are also operator-facing evidence. Do not
       // leave the last model input looking current after that publisher stops.
       setVlmCompositeImage(clearIfStale);
-      setTypedRfdetrToolDetections((current) => {
-        const staleCameraIds = (Object.keys(current) as TypedRfdetrToolViewId[])
-          .filter((cameraId) => {
-            const frame = current[cameraId];
-            return Boolean(frame && Date.now() - frame.receivedAt > CAMERA_STALE_AFTER_MS);
-          });
-        if (!staleCameraIds.length) return current;
-        const next = { ...current };
-        for (const cameraId of staleCameraIds) delete next[cameraId];
-        return next;
-      });
+      typedRfdetrObservationStore.expireOlderThan(CAMERA_STALE_AFTER_MS);
     }, 1000);
     return () => window.clearInterval(staleSweep);
   }, []);
@@ -2433,14 +2795,63 @@ export function useRosBridge(
     }
   }, [activeBundle]);
 
+  function publishRosbagUiAudit(
+    event: RosbagUiAuditEventName,
+    {
+      value = "",
+      bundle: selectedBundle = bundle,
+      startPhase: selectedStartPhase = startPhase,
+      presentation = rosbagUiPresentationRef.current,
+      allowWhenInactive = false,
+    }: RosbagUiAuditPublishOptions = {},
+  ) {
+    // Query-flag replay is a passive consumer of this same topic. It must
+    // never write an audit echo into the bag/bridge it is displaying.
+    if (replayPresentationOnly) return;
+    if (runtimeMode !== "live") return;
+    if (!allowWhenInactive && !rosbagRecordingRef.current?.recordingActive) return;
+    const topic = rosbagRecordingAuditTopicRef.current;
+    if (!topic) return;
+    const audit = createRosbagUiAuditMessage({
+      event,
+      value,
+      bundle: selectedBundle,
+      startPhase: selectedStartPhase,
+      transportConnected: Boolean(transportConnected),
+      presentation,
+    });
+    const payload = audit ? serializeRosbagUiAuditMessage(audit) : null;
+    if (!payload) return;
+    try {
+      topic.publish(new ROSLIB.Message({ data: payload }));
+    } catch {
+      // The audit lane is observational. A closing rosbridge must not affect
+      // the operator's selected bundle, phase, or planner control request.
+    }
+  }
+
   function setBundleSelection(nextBundle: string) {
+    if (replayPresentationOnly) return;
     bundleApplyRunIdRef.current += 1;
     bundlePreviewInFlightRef.current = false;
     bundleDirtyRef.current = true;
     setBundle(nextBundle);
+    publishRosbagUiAudit("bundle_selected", {
+      value: nextBundle,
+      bundle: nextBundle,
+    });
     updateScenarioRevision({
       ...EMPTY_SCENARIO_REVISION_STATE,
       bundleName: nextBundle,
+    });
+  }
+
+  function setStartPhaseSelection(nextPhase: string) {
+    if (replayPresentationOnly) return;
+    setStartPhaseState(nextPhase);
+    publishRosbagUiAudit("start_phase_selected", {
+      value: nextPhase,
+      startPhase: nextPhase,
     });
   }
 
@@ -2458,14 +2869,18 @@ export function useRosBridge(
     timeoutMs = 20000,
     options: { requireFreshRuntimeState?: boolean } = {},
   ) {
+    if (replayPresentationOnly) {
+      throw new Error("ROS bag presentation replay is read-only.");
+    }
     const requireFreshRuntimeState = options.requireFreshRuntimeState !== false;
     const generation = bridgeGenerationRef.current;
     const ros = rosRef.current as RosServiceConnection;
     if (
       !ros ||
       !ros.isConnected ||
-      commandReadyGenerationRef.current !== generation ||
-      (requireFreshRuntimeState && !runtimeStateIsFresh())
+      (requireFreshRuntimeState && (
+        commandReadyGenerationRef.current !== generation || !runtimeStateIsFresh()
+      ))
     ) {
       throw new Error("ROS bridge is waiting for a fresh runtime state.");
     }
@@ -2479,6 +2894,7 @@ export function useRosBridge(
       const cleanup = (handler: (message: RosServiceResponseMessage) => void) => {
         window.clearTimeout(timeout);
         pendingServiceCancelsRef.current.delete(cancel);
+        runtimeBoundServiceCancelsRef.current.delete(cancel);
         if (typeof ros.off === "function") {
           ros.off(serviceCallId, handler);
         } else if (typeof ros.removeListener === "function") {
@@ -2489,9 +2905,10 @@ export function useRosBridge(
         if (settled) return;
         if (
           generation !== bridgeGenerationRef.current ||
-          commandReadyGenerationRef.current !== generation ||
           rosRef.current !== ros ||
-          (requireFreshRuntimeState && !runtimeStateIsFresh())
+          (requireFreshRuntimeState && (
+            commandReadyGenerationRef.current !== generation || !runtimeStateIsFresh()
+          ))
         ) {
           cancel("ROS bridge changed before the service response arrived.");
           return;
@@ -2519,6 +2936,7 @@ export function useRosBridge(
         reject(new Error(reason));
       };
       pendingServiceCancelsRef.current.add(cancel);
+      if (requireFreshRuntimeState) runtimeBoundServiceCancelsRef.current.add(cancel);
       timeout = window.setTimeout(() => {
         cancel(`Timed out waiting for service response from ${name}`);
       }, timeoutMs);
@@ -2538,44 +2956,119 @@ export function useRosBridge(
     });
   }
 
+  async function controlRosbagRecording(enabled: boolean) {
+    if (replayPresentationOnly) {
+      return { accepted: false, message: "ROS bag presentation replay is read-only." };
+    }
+    if (runtimeMode !== "live") {
+      return { accepted: false, message: "ROS bag recording is available only in live integration mode." };
+    }
+    if (rosbagRecordingControlInFlightRef.current) {
+      return { accepted: false, message: "Another ROS bag recording request is still pending." };
+    }
+    const generation = bridgeGenerationRef.current;
+    if (url !== runtimeBridgeUrl(runtimeMode)) {
+      return { accepted: false, message: "ROS bridge is not ready for live recording control." };
+    }
+
+    rosbagRecordingControlInFlightRef.current = true;
+    const runId = rosbagRecordingControlRunIdRef.current + 1;
+    rosbagRecordingControlRunIdRef.current = runId;
+    const isCurrentRun = () =>
+      bridgeGenerationRef.current === generation
+      && rosbagRecordingControlRunIdRef.current === runId
+      && runtimeMode === "live"
+      && url === runtimeBridgeUrl(runtimeMode);
+    setRosbagRecordingControlPending(enabled ? "start" : "stop");
+    setRosbagRecordingControlMessage("");
+
+    try {
+      const response = await callService(
+        ROSBAG_RECORDING_CONTROL_SERVICE,
+        ROSBAG_RECORDING_CONTROL_SERVICE_TYPE,
+        { data: enabled },
+        30_000,
+        { requireFreshRuntimeState: false },
+      );
+      const accepted = response.success === true;
+      const fallback = enabled
+        ? "ROS bag recording started."
+        : "ROS bag recording stopped and saved.";
+      const message = typeof response.message === "string" && response.message.trim()
+        ? response.message.trim().slice(0, 1_024)
+        : fallback;
+      if (!accepted) throw new Error(message);
+      if (isCurrentRun()) {
+        if (enabled) {
+          // The explicit snapshot is independent of scenario lifecycle. It
+          // captures selections made before the manual recorder was enabled.
+          publishRosbagUiAudit("recording_ui_snapshot", { allowWhenInactive: true });
+          // rosbag2's graph discovery can still be settling when the control
+          // service acknowledges the request. Emit one bounded follow-up only
+          // after the retained status confirms that this same recorder is
+          // active, so the initial browser-local presentation is not missed.
+          window.setTimeout(() => {
+            if (
+              replayPresentationOnly ||
+              !isCurrentRun() ||
+              !rosbagRecordingRef.current?.recordingActive
+            ) {
+              return;
+            }
+            publishRosbagUiAudit("recording_ui_snapshot");
+          }, 1_000);
+        }
+        setRosbagRecordingControlMessage(message);
+      }
+      return { accepted: true, message };
+    } catch (error) {
+      const message = (error instanceof Error ? error.message : String(error)).slice(0, 1_024);
+      if (isCurrentRun()) setRosbagRecordingControlMessage(message);
+      return { accepted: false, message };
+    } finally {
+      if (isCurrentRun()) {
+        setRosbagRecordingControlPending("");
+        rosbagRecordingControlInFlightRef.current = false;
+      }
+    }
+  }
+
   useEffect(() => {
     let disposed = false;
     let refreshing = false;
-
-    if (!subscriptionPlan.modelControls) {
+    if (replayPresentationOnly) {
       setVlmModelOptions([]);
       setVlmProviderStatuses([]);
       setVlmModelSelection(null);
-      setVlmModelCatalogStatus("read-only in Production Live core");
+      setVlmModelCatalogStatus("ROS bag presentation replay");
+      return () => {
+        disposed = true;
+      };
+    }
+
+    if (!subscriptionPlan.modelStatusObservation) {
+      setVlmModelOptions([]);
+      setVlmProviderStatuses([]);
+      setVlmModelSelection(null);
+      setVlmModelCatalogStatus("VLM unknown");
       return () => {
         disposed = true;
       };
     }
 
     async function refreshVlmModels() {
-      if (!connected || refreshing) return;
+      if (!transportConnected || refreshing) return;
       refreshing = true;
       try {
-        let projection: ModelCatalogProjection;
-        try {
-          projection = parseModelCatalogResponse(
-            await callService(
-              "/real_vlm_node/list_model_catalog",
-              "surgical_msgs/srv/ListModelCatalog",
-              {},
-              10000,
-            ),
-          );
-        } catch {
-          projection = parseLegacyModelCatalogResponse(
-            await callService(
-              "/real_vlm_node/list_models",
-              "surgical_msgs/srv/ListModels",
-              {},
-              10000,
-            ),
-          );
-        }
+        const projection: ModelCatalogProjection = parseModelCatalogResponse(
+          await callService(
+            "/real_vlm_node/list_model_catalog",
+            "surgical_msgs/srv/ListModelCatalog",
+            {},
+            10000,
+            { requireFreshRuntimeState: false },
+          ),
+        );
         if (disposed) return;
         setVlmModelOptions(projection.models);
         setVlmProviderStatuses(projection.providers);
@@ -2583,22 +3076,22 @@ export function useRosBridge(
         setVlmModelCatalogStatus(projection.status);
       } catch (error) {
         if (disposed) return;
-        setVlmModelCatalogStatus(error instanceof Error ? error.message : "VLM model catalog unavailable.");
+        setVlmModelCatalogStatus(error instanceof Error ? error.message : "VLM unavailable");
       } finally {
         refreshing = false;
       }
     }
 
-    if (!connected) {
+    if (!transportConnected) {
       setVlmModelOptions([]);
       setVlmProviderStatuses([]);
       setVlmModelSelection(null);
       setVlmModelCatalogStatus(
         connectionBlocked
-          ? "ROS access blocked by runtime-contract mismatch"
-          : transportConnected || connectionPending
-            ? "ROS state pending"
-            : "ROS bridge offline",
+          ? "ROS mismatch"
+          : connectionPending
+            ? "ROS transport pending"
+            : "ROS offline",
       );
       return () => {
         disposed = true;
@@ -2610,7 +3103,7 @@ export function useRosBridge(
       if (document.visibilityState === "visible") void refreshVlmModels();
     };
     refreshWhenVisible();
-    const timer = window.setInterval(refreshWhenVisible, 5000);
+    const timer = window.setInterval(refreshWhenVisible, VLM_MODEL_REFRESH_MS);
     document.addEventListener("visibilitychange", refreshWhenVisible);
     return () => {
       disposed = true;
@@ -2618,11 +3111,12 @@ export function useRosBridge(
       document.removeEventListener("visibilitychange", refreshWhenVisible);
     };
   }, [
-    connected,
     connectionBlocked,
     connectionPending,
     subscriptionPlan.modelControls,
+    subscriptionPlan.modelStatusObservation,
     transportConnected,
+    replayPresentationOnly,
     url,
   ]);
 
@@ -2632,8 +3126,9 @@ export function useRosBridge(
     actorPolicyRevisionRef.current += 1;
     setActorEnabledKnown(false);
     if (
+      replayPresentationOnly ||
       !subscriptionPlan.modelControls ||
-      !connected ||
+      !transportConnected ||
       runtimeMode === "shadow"
     ) {
       return () => {
@@ -2651,6 +3146,7 @@ export function useRosBridge(
           "rcl_interfaces/srv/GetParameters",
           { names: ["enabled"] },
           10000,
+          { requireFreshRuntimeState: false },
         );
         if (disposed || revision !== actorPolicyRevisionRef.current) return;
         const values = Array.isArray(response.values) ? response.values : [];
@@ -2686,36 +3182,34 @@ export function useRosBridge(
       window.clearInterval(timer);
       document.removeEventListener("visibilitychange", refreshWhenVisible);
     };
-  }, [connected, runtimeMode, subscriptionPlan.modelControls, url]);
+  }, [replayPresentationOnly, runtimeMode, subscriptionPlan.modelControls, transportConnected, url]);
 
   useEffect(() => {
     let disposed = false;
     let refreshing = false;
+    if (replayPresentationOnly) {
+      setActorModelOptions([]);
+      setActorProviderStatuses([]);
+      setActorModelSelection(null);
+      setActorModelCatalogStatus("ROS bag presentation replay");
+      return () => {
+        disposed = true;
+      };
+    }
 
     async function refreshActorModels() {
-      if (!connected || refreshing) return;
+      if (!transportConnected || refreshing) return;
       refreshing = true;
       try {
-        let projection: ModelCatalogProjection;
-        try {
-          projection = parseModelCatalogResponse(
-            await callService(
-              "/surgeon_actor/list_model_catalog",
-              "surgical_msgs/srv/ListModelCatalog",
-              {},
-              10000,
-            ),
-          );
-        } catch {
-          projection = parseLegacyModelCatalogResponse(
-            await callService(
-              "/surgeon_actor/list_models",
-              "surgical_msgs/srv/ListModels",
-              {},
-              10000,
-            ),
-          );
-        }
+        const projection: ModelCatalogProjection = parseModelCatalogResponse(
+          await callService(
+            "/surgeon_actor/list_model_catalog",
+            "surgical_msgs/srv/ListModelCatalog",
+            {},
+            10000,
+            { requireFreshRuntimeState: false },
+          ),
+        );
         if (disposed) return;
         setActorModelOptions(projection.models);
         setActorProviderStatuses(projection.providers);
@@ -2731,7 +3225,7 @@ export function useRosBridge(
 
     if (
       !subscriptionPlan.modelControls ||
-      !connected ||
+      !transportConnected ||
       runtimeMode !== "llm"
     ) {
       setActorModelOptions([]);
@@ -2739,13 +3233,13 @@ export function useRosBridge(
       setActorModelSelection(null);
       setActorModelCatalogStatus(
         !subscriptionPlan.modelControls
-          ? "disabled in Production Live core"
+          ? "unavailable in Live"
           : runtimeMode !== "llm"
           ? "disabled in this runtime mode"
           : connectionBlocked
             ? "ROS access blocked by runtime-contract mismatch"
-            : transportConnected || connectionPending
-              ? "ROS state pending"
+            : connectionPending
+              ? "ROS transport pending"
               : "ROS bridge offline",
       );
       return () => {
@@ -2766,12 +3260,12 @@ export function useRosBridge(
       document.removeEventListener("visibilitychange", refreshWhenVisible);
     };
   }, [
-    connected,
     connectionBlocked,
     connectionPending,
     runtimeMode,
     subscriptionPlan.modelControls,
     transportConnected,
+    replayPresentationOnly,
     url,
   ]);
 
@@ -2784,6 +3278,7 @@ export function useRosBridge(
       "rcl_interfaces/srv/SetParameters",
       setParametersRequest(parameters),
       10000,
+      { requireFreshRuntimeState: false },
     );
     assertSetParametersAccepted(response, parameters.length);
   }
@@ -2823,6 +3318,41 @@ export function useRosBridge(
       simulationStateRef.current = next;
       return next;
     });
+  }
+
+  function showOptimisticStartState(runId: number) {
+    const previous = simulationStateRef.current;
+    const next: SimulationState = {
+      ...previous,
+      running: false,
+      execution_state: "starting",
+      // Preserve a more specific non-idle robot status when it exists.  The
+      // lifecycle label itself is enough to give the click immediate feedback.
+      robot_state: previous.robot_state === "idle" ? "starting" : previous.robot_state,
+      recent_events: [],
+    };
+    optimisticStartControlRef.current = {
+      runId,
+      previous,
+      expiresAt: Date.now() + OPTIMISTIC_START_STATE_MAX_MS,
+    };
+    simulationStateRef.current = next;
+    setSimulationState(next);
+  }
+
+  function clearOptimisticStartState(
+    runId: number,
+    { restore = false }: { restore?: boolean } = {},
+  ) {
+    const optimistic = optimisticStartControlRef.current;
+    if (!optimistic || optimistic.runId !== runId) return;
+    optimisticStartControlRef.current = null;
+    if (!restore || controlRunIdRef.current !== runId) return;
+    // Never overwrite an authoritative non-idle state that arrived while the
+    // Service call was in flight.
+    if (simulationStateRef.current.execution_state !== "starting") return;
+    simulationStateRef.current = optimistic.previous;
+    setSimulationState(optimistic.previous);
   }
 
   async function waitForControlTarget(
@@ -2953,7 +3483,7 @@ export function useRosBridge(
       setVlmReducerDecisions([]);
       setVlmResult(DEFAULT_VLM_RESULT);
       setVlmRequestToolDetectionEvidence(null);
-      setTypedRfdetrToolDetections({});
+      typedRfdetrObservationStore.clear();
       setSkillStatusByCommand({});
       setVlmResultReceivedAt(0);
       setVlmCompositeImage(null);
@@ -3046,9 +3576,12 @@ export function useRosBridge(
   async function applyBundle(targetBundle = bundle) {
     const selectedBundle = (targetBundle || bundle).trim();
     if (!selectedBundle) return;
+    publishRosbagUiAudit("bundle_apply_requested", {
+      value: selectedBundle,
+      bundle: selectedBundle,
+    });
     const currentRevision = scenarioRevisionRef.current;
     const initialAdmission = computeScenarioRevisionApplyAdmission({
-      runtimeMode,
       state: simulationStateRef.current,
       selectedBundle,
       revision: currentRevision,
@@ -3078,7 +3611,6 @@ export function useRosBridge(
       // State may change between preview and click. Re-evaluate immediately
       // before transport; the manager performs the final authoritative check.
       const admission = computeScenarioRevisionApplyAdmission({
-        runtimeMode,
         state: simulationStateRef.current,
         selectedBundle,
         revision: currentRevision,
@@ -3099,7 +3631,7 @@ export function useRosBridge(
           admission,
           expectedCandidateRevision,
         ),
-        admission.restartIfRunning ? 22000 : 12000,
+        12000,
       );
       const result = parseScenarioRevisionResult(response);
       if (bundleApplyRunIdRef.current !== applyRunId) return;
@@ -3111,7 +3643,11 @@ export function useRosBridge(
         result.success &&
         appliedRevisionMatches &&
         (
-          (result.applied && result.changed && result.disposition === "applied") ||
+          (
+            result.applied &&
+            result.changed &&
+            result.disposition === "applied"
+          ) ||
           (!result.applied && !result.changed && result.disposition === "unchanged")
         );
       if (!applyAccepted) {
@@ -3127,7 +3663,7 @@ export function useRosBridge(
       const appliedBundle = result.activeBundle;
       bundleDirtyRef.current = false;
       setBundle(appliedBundle);
-      setStartPhase("");
+      setStartPhaseState("");
       clearEventLog({ suppressMs: 500 });
       // Do not synthesize a hybrid state from the Service result. The next
       // complete /simulation/state frame owns bundle, layout and instruments.
@@ -3152,6 +3688,11 @@ export function useRosBridge(
   }
 
   async function control(command: ControlCommand) {
+    if (replayPresentationOnly) {
+      setActionMessage("ROS bag presentation replay is read-only.");
+      return;
+    }
+    publishRosbagUiAudit("planner_control_requested", { value: command });
     // Stop is intentionally a separate, high-priority planner lifecycle
     // request.  A Start Service can remain outstanding for 45 seconds, and a
     // blanket single-flight guard would otherwise swallow the operator's Stop
@@ -3163,6 +3704,8 @@ export function useRosBridge(
       priorityStopInFlightRef.current = true;
       const stopRunId = controlRunIdRef.current + 1;
       controlRunIdRef.current = stopRunId;
+      // A priority stop supersedes any locally projected Start immediately.
+      optimisticStartControlRef.current = null;
       // Let an earlier request settle on the transport, but make its late
       // result unable to mutate UI state or restart the displayed lifecycle.
       actionRunIdRef.current += 1;
@@ -3234,31 +3777,16 @@ export function useRosBridge(
     try {
       await runAction(label, async () => {
         if (command === "start") {
-          if (runtimeMode === "live") {
-            const blocker = integrationReadinessBlockReason(
-              integrationReadinessRef.current,
-              integrationReadinessReceivedAtRef.current || null,
-              simulationStateRef.current.active_bundle || bundle,
-            );
-            if (blocker) {
-              throw new Error(`Live integration start is blocked: ${blocker}.`);
-            }
-          }
           suppressEventsUntilRef.current = 0;
           clearEventLog();
-        }
-        if (command === "resume" && runtimeMode === "live") {
-          const blocker = integrationReadinessBlockReason(
-            integrationReadinessRef.current,
-            integrationReadinessReceivedAtRef.current || null,
-            simulationStateRef.current.active_bundle || bundle,
-          );
-          if (blocker) {
-            throw new Error(`Live integration resume is blocked: ${blocker}.`);
-          }
+          // The state core acknowledges Start asynchronously.  Project the
+          // accepted lifecycle locally before waiting for rosbridge's next
+          // state heartbeat so the button has instant, stable feedback.
+          showOptimisticStartState(controlRunId);
         }
         if (command === "reset") {
           clearEventLog({ suppressMs: 1200 });
+          optimisticStartControlRef.current = null;
         }
         await prepareShadowControl(command);
         if (controlRunIdRef.current !== controlRunId) return;
@@ -3308,6 +3836,9 @@ export function useRosBridge(
         if (controlRunIdRef.current !== controlRunId) return;
         await finalizeShadowControl(command, controlRunId);
         } catch (error) {
+          if (command === "start") {
+            clearOptimisticStartState(controlRunId, { restore: true });
+          }
           const message = error instanceof Error ? error.message : String(error);
           if (
             message.includes("Timed out waiting for service response") ||
@@ -3349,36 +3880,15 @@ export function useRosBridge(
   }
 
   function executionRouteSwitchBlocker(): string | null {
-    if (runtimeMode !== "live") {
-      return "Action/Service route selection is available only in live integration mode.";
-    }
-    if (!runtimeStateIsFresh() || !connected) {
-      return "Wait for a fresh live runtime state before changing the Action/Service route.";
-    }
-    const routeState = executionRouteStateRef.current;
-    if (!routeState || !routeState.routeControlEnabled) {
-      return "The live runtime has not confirmed stopped-state Action/Service route control.";
-    }
-    if (routeState.initializationState === "initializing") {
-      return "Wait for the selected Action/Service route to be acknowledged by the integration start check.";
-    }
-    if (actionInFlightRef.current || controlInFlightRef.current) {
-      return "Wait for the current runtime control request before changing the Action/Service route.";
-    }
-    const state = simulationStateRef.current;
-    const executionState = String(state.execution_state || "").trim().toLowerCase();
-    if (
-      state.running ||
-      !["idle", "halted", "completed", "terminated"].includes(executionState) ||
-      String(state.robot_state || "").trim().toLowerCase() !== "idle" ||
-      Boolean(state.active_robot_task_id) ||
-      state.cleaner_busy ||
-      state.pending_transition_tools.length > 0 ||
-      state.active_recovery_tools.length > 0
-    ) {
-      return "Stop planner execution and all active work before changing the Action/Service route.";
-    }
-    return null;
+    return executionRouteSwitchBlockReason({
+      runtimeMode,
+      connected,
+      runtimeStateFresh: runtimeStateIsFresh(),
+      routeState: executionRouteStateRef.current,
+      actionInFlight: actionInFlightRef.current,
+      controlInFlight: controlInFlightRef.current,
+      simulationState: simulationStateRef.current,
+    });
   }
 
   function commitExecutionRouteState(
@@ -3447,10 +3957,9 @@ export function useRosBridge(
           30000,
         );
         if (!isCurrentRouteRun()) return;
-        const commandResult = normalizeExecutionRouteCommandResult(
+        const resultState = normalizeExecutionRouteCommandResult(
           response.result_json,
         );
-        const resultState = commandResult?.state ?? null;
         const accepted = Boolean(response.accepted);
         const serverMessage = String(
           response.message ||
@@ -3462,7 +3971,6 @@ export function useRosBridge(
         if (
           !accepted ||
           !resultState ||
-          commandResult?.digitalTwinReset !== true ||
           resultState.selectedSource !== requestedSource ||
           resultState.retractionSource !== requestedRetractionSource ||
           resultState.revision <= currentRevision ||
@@ -3472,32 +3980,14 @@ export function useRosBridge(
             ? serverMessage
             : !resultState
               ? "The Action/Service route response did not contain a valid server state."
-              : commandResult?.digitalTwinReset !== true
-                ? "The Action/Service route did not confirm a completed digital-twin reset."
               : "The Action/Service route did not confirm the requested initialized state.";
           setExecutionRouteTransition({ state: "failed", message });
           throw new Error(message);
         }
 
         setExecutionRouteTransition({
-          state: "resetting",
-          message: "Resetting observer state for the selected Action/Service route.",
-        });
-        // The ROS-side route service has completed its stopped-state reset at
-        // this point. Clear only browser-held observer data; the next
-        // authoritative SimulationState and readiness heartbeat repopulate it.
-        clearEventLog({ suppressMs: 1500 });
-        setSkillStatus(DEFAULT_SKILL_STATUS);
-        setSkillStatusByCommand({});
-        setExecutionTraces([]);
-        integrationReadinessRef.current = DEFAULT_INTEGRATION_READINESS;
-        integrationReadinessReceivedAtRef.current = 0;
-        setIntegrationReadiness(DEFAULT_INTEGRATION_READINESS);
-        setIntegrationReadinessReceivedAt(null);
-        setIntegrationReadinessBridgeUrl("");
-        setExecutionRouteTransition({
           state: "ready",
-          message: "Action/Service route changed and initialized. Verify the fresh integration-start check before starting.",
+          message: "Action/Service route changed. Endpoint availability remains diagnostic until a request is sent.",
         });
         setActionMessage(serverMessage || "Action/Service route initialized.");
       } catch (error) {
@@ -3539,6 +4029,7 @@ export function useRosBridge(
             "surgical_msgs/srv/SelectModelProvider",
             selection,
             900000,
+            { requireFreshRuntimeState: false },
           );
           if (!Boolean(response.success)) {
             throw new Error(
@@ -3588,6 +4079,7 @@ export function useRosBridge(
             "surgical_msgs/srv/SelectModelProvider",
             selection,
             900000,
+            { requireFreshRuntimeState: false },
           );
           if (!Boolean(response.success)) {
             throw new Error(
@@ -3652,6 +4144,7 @@ export function useRosBridge(
           command,
         },
         900000,
+        { requireFreshRuntimeState: false },
       );
       if (!Boolean(response.success)) {
         throw new Error(String(response.message || `${roleLabel} runtime command failed.`));
@@ -3689,7 +4182,7 @@ export function useRosBridge(
   }
 
   async function setActorEnabled(enabled: boolean) {
-    if (!connected || !actorEnabledKnown || actionInFlightRef.current) return;
+    if (!transportConnected || !actorEnabledKnown || actionInFlightRef.current) return;
     const revision = actorPolicyRevisionRef.current + 1;
     actorPolicyRevisionRef.current = revision;
     await runAction(enabled ? "Enabling LLM surgeon" : "Disabling LLM surgeon", async () => {
@@ -3706,10 +4199,18 @@ export function useRosBridge(
     isCurrentRun: () => boolean,
   ) {
     if (!isCurrentRun()) return;
+    // A control response contains the local sidecar snapshot only. Preserve
+    // observed finals already received from CommandRouter so a start/stop or
+    // route-policy operation cannot blank the stage's latest speech.
+    const mergedStatus = mergeExternalAsrTranscripts(
+      status,
+      null,
+      liveAsrStatusRef.current.finals,
+    );
     const receivedAt = Date.now();
-    liveAsrStatusRef.current = status;
+    liveAsrStatusRef.current = mergedStatus;
     liveAsrStatusReceivedAtRef.current = receivedAt;
-    setLiveAsrStatus(status);
+    setLiveAsrStatus(mergedStatus);
     setLiveAsrStatusReceivedAt(receivedAt);
     setLiveAsrStatusBridgeUrl(url);
   }
@@ -3733,6 +4234,7 @@ export function useRosBridge(
         route_policy: routePolicy,
       },
       20000,
+      { requireFreshRuntimeState: false },
     );
     const accepted = Boolean(response.accepted);
     const message = String(
@@ -3747,7 +4249,7 @@ export function useRosBridge(
   }
 
   async function controlLiveAsr(
-    operation: "refresh_devices" | "set_route_policy" | "start" | "stop" | "restart_node",
+    operation: "refresh_devices" | "set_route_policy" | "set_input_mode" | "start" | "stop" | "restart_node",
     deviceId = -1,
     routePolicy = "",
   ): Promise<LiveAsrControlResult> {
@@ -3777,8 +4279,26 @@ export function useRosBridge(
     setLiveAsrControlPending(operation);
     setLiveAsrControlMessage("");
     try {
+      if (operation === "set_input_mode") {
+        const inputMode = routePolicy.trim().toLowerCase();
+        if (inputMode !== "utterance" && inputMode !== "tagged_sentence") {
+          throw new Error("ASR 입력 모드는 utterance 또는 tagged_sentence여야 합니다.");
+        }
+        const currentState = liveAsrStatusRef.current.state;
+        if (["STARTING", "LISTENING", "STOPPING"].includes(currentState)) {
+          throw new Error("ASR 마이크 세션을 중지한 뒤 입력 모드를 변경하세요.");
+        }
+        await setNodeParameters("speech_input_adapter", [
+          stringParameter("input_mode", inputMode),
+        ]);
+        const message = inputMode === "tagged_sentence"
+          ? "외부 토픽 입력 모드로 전환했습니다."
+          : "로컬 마이크 입력 모드로 전환했습니다.";
+        if (isCurrentRun()) setLiveAsrControlMessage(message);
+        return { accepted: true, message };
+      }
       if (operation === "restart_node") {
-        if (!connected) {
+        if (!transportConnected) {
           throw new Error("Live ROS bridge가 준비된 뒤 다시 시도하세요.");
         }
         const requestedAt = Date.now();
@@ -3840,7 +4360,6 @@ export function useRosBridge(
     !actionPending && Boolean(runtimeMessage) && (actionMessage === "Ready." || actionMessage === "ROS bridge connected.");
   const displayActionMessage = shouldPreferRuntimeMessage ? runtimeMessage : actionMessage;
   const scenarioRevisionAdmission = computeScenarioRevisionApplyAdmission({
-    runtimeMode,
     state: simulationState,
     selectedBundle: bundle,
     revision: scenarioRevision,
@@ -3863,10 +4382,11 @@ export function useRosBridge(
     bundle,
     setBundleSelection,
     startPhase,
-    setStartPhase,
+    setStartPhase: setStartPhaseSelection,
     activeBundle,
     simulationState,
     worldState,
+    toolPolicyStatus: activeToolPolicyStatus(toolPolicyStatus, simulationState),
     bedRobotArms: externalBedRobotArmStatus?.arms ?? [],
     surgeonState,
     surgeonLlmDecision,
@@ -3878,16 +4398,20 @@ export function useRosBridge(
     inputSourceStatuses,
     vlmResult,
     vlmRequestToolDetectionEvidence,
-    typedRfdetrToolDetections,
+    typedRfdetrObservationStore,
+    toolBeliefs,
     cam4ToolRequest,
     vlmReducerDecisions,
     vlmImage: vlmCompositeImage,
     vlmCompositeImage,
+    cameraMediaStore: liveCameraMedia.store,
+    cameraMediaConnected: liveCameraMedia.transportConnected,
     cam1Image,
     cam2Image,
     cam3Image,
     cam4Image,
     flirImage,
+    cameraPreviewContracts,
     vlmHealthReceivedAt,
     vlmResultReceivedAt,
     vlmModelOptions,
@@ -3912,6 +4436,11 @@ export function useRosBridge(
     liveAsrStatusReceivedAt: liveAsrStatusBridgeUrl === url ? liveAsrStatusReceivedAt : null,
     liveAsrControlPending,
     liveAsrControlMessage,
+    ttsPlaybackStatus,
+    surgeryRecordReceipt,
+    rosbagRecording,
+    rosbagRecordingControlPending,
+    rosbagRecordingControlMessage,
     integrationReadiness,
     integrationReadinessReceivedAt:
       integrationReadinessBridgeUrl === url
@@ -3931,6 +4460,8 @@ export function useRosBridge(
     controlActorModelRuntime,
     setActorEnabled,
     controlLiveAsr,
+    controlRosbagRecording,
+    publishRosbagUiAudit,
     configureExecutionRoute,
     selectShadowCase,
     configureShadowReplay,

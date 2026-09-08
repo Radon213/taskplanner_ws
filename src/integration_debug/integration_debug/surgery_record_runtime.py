@@ -1,4 +1,4 @@
-"""Post-operative surgery-record API test support for Debug Mode."""
+"""Shared bounded HTTPS transport for manual and operational surgery records."""
 
 from __future__ import annotations
 
@@ -164,6 +164,34 @@ def _decode_response(
     return _redact_response(normalized, secrets), safe_text
 
 
+def _archive_response_body(
+    raw: bytes, *, secrets: tuple[str, ...] = ()
+) -> tuple[bytes, str]:
+    """Return the full locally archivable response after credential redaction.
+
+    Browser and ROS projections intentionally have much smaller bounds.  This
+    helper is only for the private, operator-owned response archive and keeps
+    the existing one-mebibyte transport cap intact.  JSON is reformatted after
+    field-level redaction so reflected tokens cannot reach disk; non-JSON text
+    retains its full decoded body with the request API key removed.
+    """
+
+    text = raw.decode("utf-8", errors="replace")
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        return _redact_text(text, secrets).encode("utf-8"), ".txt"
+    safe_value = _redact_response(parsed, secrets)
+    rendered = json.dumps(
+        safe_value,
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+        default=str,
+    )
+    return f"{rendered}\n".encode("utf-8"), ".json"
+
+
 def _read_response(response: Any) -> bytes:
     raw = response.read(MAX_RESPONSE_BYTES + 1)
     if len(raw) > MAX_RESPONSE_BYTES:
@@ -198,7 +226,11 @@ def _is_timeout_error(exc: BaseException) -> bool:
 
 
 class SurgeryRecordRuntime:
-    """Discover local examples and run one non-overlapping API test at a time."""
+    """Run one secured, non-overlapping record submission at a time.
+
+    Manual Debug callers may scan authored example files. The operational
+    owner disables that unrelated scan and supplies generated timeline text.
+    """
 
     def __init__(
         self,
@@ -209,9 +241,15 @@ class SurgeryRecordRuntime:
         allowed_endpoints: tuple[str, ...] | list[str] | None = None,
         timeout_sec: float = DEFAULT_TIMEOUT_SEC,
         opener: Callable[..., Any] = _open_without_redirects,
+        scan_examples: bool = True,
+        response_archive_dir: str | Path | None = None,
+        require_nonempty_summary: bool = False,
     ) -> None:
         self._input_dir = Path(input_dir)
         self._api_key_file = Path(api_key_file) if api_key_file else None
+        self._response_archive_dir = (
+            Path(response_archive_dir) if response_archive_dir else None
+        )
         self._default_endpoint = validate_endpoint(default_endpoint)
         configured_endpoints = allowed_endpoints or (self._default_endpoint,)
         self._allowed_endpoints = tuple(
@@ -223,6 +261,10 @@ class SurgeryRecordRuntime:
             raise ValueError("default surgery-record endpoint must be allowlisted")
         self._timeout_sec = max(1.0, float(timeout_sec))
         self._opener = opener
+        # Manual/debug callers may use the generic documented receipt contract.
+        # The operational owner opts in because an empty `summary` is a known
+        # semantic generation failure even when the endpoint returns HTTP 201.
+        self._require_nonempty_summary = bool(require_nonempty_summary)
         self._lock = threading.RLock()
         self._cases: list[dict[str, Any]] = []
         self._state = "IDLE"
@@ -231,7 +273,8 @@ class SurgeryRecordRuntime:
         self._last_result: dict[str, Any] = {}
         self._history: deque[dict[str, Any]] = deque(maxlen=20)
         self._events: deque[dict[str, Any]] = deque(maxlen=80)
-        self.refresh_cases()
+        if scan_examples:
+            self.refresh_cases()
 
     def _read_api_key(self) -> str:
         path = self._api_key_file
@@ -326,7 +369,7 @@ class SurgeryRecordRuntime:
         content = payload.get("text", "")
         filename = "browser_input.txt"
         if case_id:
-            content, filename = self._read_case(case_id)
+            content, filename = self.load_case(case_id)
         fields = validate_request_fields(
             room_name=payload.get("room_name"),
             surgery_code=payload.get("surgery_code") or case_id,
@@ -384,6 +427,18 @@ class SurgeryRecordRuntime:
             self._events.clear()
         return rows
 
+    def wait_for_idle(self, timeout_sec: float) -> bool:
+        """Bound shutdown until an in-flight, non-retryable POST returns."""
+
+        deadline = time.monotonic() + max(0.0, float(timeout_sec))
+        while time.monotonic() < deadline:
+            with self._lock:
+                if self._state != "SUBMITTING":
+                    return True
+            time.sleep(0.05)
+        with self._lock:
+            return self._state != "SUBMITTING"
+
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             return {
@@ -406,6 +461,7 @@ class SurgeryRecordRuntime:
                     "max_response_text_bytes": MAX_RESPONSE_TEXT_BYTES,
                     "server_timeout_sec": self._timeout_sec,
                     "generated_record_body_returned": False,
+                    "require_nonempty_summary": self._require_nonempty_summary,
                     "result_lookup_defined": False,
                     "auto_retry": False,
                     "reconciliation_defined": False,
@@ -423,6 +479,48 @@ class SurgeryRecordRuntime:
             raise ValueError(f"example TXT is unavailable: {filename}")
         return path.read_text(encoding="utf-8"), filename
 
+    def load_case(self, case_id: str) -> tuple[str, str]:
+        """Load one validated, read-only timeline for an operational submission."""
+
+        return self._read_case(case_id)
+
+    def _archive_response(
+        self,
+        *,
+        request_id: Any,
+        raw: bytes,
+        secrets: tuple[str, ...],
+    ) -> str:
+        """Atomically save one full redacted response in the private archive."""
+
+        archive_dir = self._response_archive_dir
+        if archive_dir is None:
+            return ""
+        body, suffix = _archive_response_body(raw, secrets=secrets)
+        archive_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(archive_dir, 0o700)
+        request_component = re.sub(r"[^A-Za-z0-9_-]+", "_", str(request_id)).strip("_")
+        if not request_component:
+            request_component = uuid4().hex
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        final_path = archive_dir / f"{timestamp}--{request_component}{suffix}"
+        temporary = archive_dir / f".{final_path.name}.{uuid4().hex}.tmp"
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(body)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, final_path)
+        except Exception:
+            temporary.unlink(missing_ok=True)
+            raise
+        return final_path.name
+
     @staticmethod
     def _case_sort_key(name: str) -> tuple[int, str]:
         match = re.match(r"0704_(\d+)", name)
@@ -438,6 +536,8 @@ class SurgeryRecordRuntime:
         response_headers: dict[str, str] = {}
         response_json: dict[str, Any] | None = None
         response_text = ""
+        response_archive_name = ""
+        response_archive_error = ""
         transport_error = ""
         response_error = ""
         remote_state_unknown = False
@@ -457,16 +557,38 @@ class SurgeryRecordRuntime:
                 status = getattr(response, "status", None)
                 http_status = int(status if status is not None else response.getcode())
                 response_headers = _response_headers(response, secrets=secrets)
+                raw_response = _read_response(response)
                 response_json, response_text = _decode_response(
-                    _read_response(response), secrets=secrets
+                    raw_response, secrets=secrets
                 )
+                try:
+                    response_archive_name = self._archive_response(
+                        request_id=safe_request["request_id"],
+                        raw=raw_response,
+                        secrets=secrets,
+                    )
+                except OSError as archive_exc:
+                    response_archive_error = _redact_text(
+                        f"{type(archive_exc).__name__}: {archive_exc}", secrets
+                    )
         except HTTPError as exc:
             http_status = int(exc.code)
             response_headers = _response_headers(exc, secrets=secrets)
             try:
+                raw_response = _read_response(exc)
                 response_json, response_text = _decode_response(
-                    _read_response(exc), secrets=secrets
+                    raw_response, secrets=secrets
                 )
+                try:
+                    response_archive_name = self._archive_response(
+                        request_id=safe_request["request_id"],
+                        raw=raw_response,
+                        secrets=secrets,
+                    )
+                except OSError as archive_exc:
+                    response_archive_error = _redact_text(
+                        f"{type(archive_exc).__name__}: {archive_exc}", secrets
+                    )
             except ResponseTooLargeError as response_exc:
                 response_error = str(response_exc)
             finally:
@@ -496,14 +618,27 @@ class SurgeryRecordRuntime:
             and isinstance(data.get("receivedAt"), str)
             and bool(data["receivedAt"].strip())
         )
+        summary = data.get("summary") if isinstance(data, dict) else None
+        has_nonempty_summary = isinstance(summary, str) and bool(summary.strip())
+        empty_required_summary = (
+            self._require_nonempty_summary
+            and http_status == 201
+            and isinstance(response_json, dict)
+            and response_json.get("result") == "success"
+            and valid_receipt
+            and not has_nonempty_summary
+        )
         success = (
             not response_error
             and http_status == 201
             and isinstance(response_json, dict)
             and response_json.get("result") == "success"
             and valid_receipt
+            and not empty_required_summary
         )
-        if not response_error and http_status == 201 and not success:
+        if empty_required_summary:
+            response_error = "201 response is missing a nonempty generated summary"
+        elif not response_error and http_status == 201 and not success:
             response_error = "201 response does not match the documented receipt schema"
         error = (
             response_json.get("error", {})
@@ -529,6 +664,8 @@ class SurgeryRecordRuntime:
             "response_headers": response_headers,
             "response_json": response_json,
             "response_text": response_text if response_json is None else "",
+            "response_archive_name": response_archive_name,
+            "response_archive_error": response_archive_error,
             "receipt_id": str(data.get("id", "")) if isinstance(data, dict) else "",
             "received_at": (
                 str(data.get("receivedAt", "")) if isinstance(data, dict) else ""
@@ -536,6 +673,8 @@ class SurgeryRecordRuntime:
             "error_code": (
                 "RESPONSE_TOO_LARGE"
                 if response_error.startswith("response body exceeds")
+                else "EMPTY_GENERATED_SUMMARY"
+                if empty_required_summary
                 else "INVALID_RESPONSE"
                 if response_error
                 else str(error.get("code", ""))
@@ -546,7 +685,9 @@ class SurgeryRecordRuntime:
                 str(error.get("message", "")) if isinstance(error, dict) else ""
             ),
             "generated_record_body_returned": bool(
-                isinstance(data, dict)
+                has_nonempty_summary
+                if self._require_nonempty_summary
+                else isinstance(data, dict)
                 and any(
                     key in data
                     for key in ("summary", "note", "record", "report", "text")
@@ -579,5 +720,7 @@ class SurgeryRecordRuntime:
                     "duration_sec": duration,
                     "error_code": result["error_code"],
                     "transport_error": transport_error,
+                    "response_archive_name": response_archive_name,
+                    "response_archive_error": response_archive_error,
                 }
             )

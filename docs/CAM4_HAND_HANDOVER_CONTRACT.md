@@ -12,12 +12,17 @@ the following typed CAM4 topics by an identical `(stamp, frame_id)` header:
 ## Frozen positive tuple
 
 A frame is positive only when the two arrays contain exactly the same
-frame-local hand-index set and exactly one common Right-hand index has all of
-the following valid classifications:
+frame-local hand-index set, that set contains exactly one hand, and that one
+Right-hand index has all of the following valid classifications:
 
 - handedness: `Right` on both observations;
 - hand shape: `Open_Palm`;
 - palm facing: `PALM_UP`.
+
+A joined frame with two or more detected hands is always `UNKNOWN` for the
+implicit-request channel, even if only one of those hands otherwise matches
+the positive tuple. The same frame still keeps the independent Mayo-workspace
+occupancy block asserted.
 
 Both source timestamps and local monotonic receipt time must span at least
 `0.300 s`, with at least four joined samples. A source- or receipt-time gap over
@@ -29,7 +34,10 @@ silence longer than `0.400 s` is checked by a `0.100 s` watchdog and withdraws
 visibility within `0.500 s` worst case, but does not re-arm the episode. A continuously
 observed non-request pose must persist for `0.500 s`. Pause, stop, and
 completion/finishing withdraw the signal immediately; after pause/resume a
-fresh `0.500 s` release is mandatory before another episode.
+fresh `0.500 s` release is mandatory before another episode. Starting an
+active direct delivery also withdraws the current cue and ignores receiving-hand
+observations for the duration of that task. Completion does not re-arm the cue;
+a fresh `0.500 s` release is mandatory before another episode.
 
 ## Pinned perception provenance
 
@@ -59,12 +67,27 @@ right-hand instance IDs match and its type, lifecycle, and owner prove the
 right-hand slot. The Digital Twin's canonical generic `location=robot` /
 `location_type=robot` projection is accepted only together with
 `owner=robot_right_hand`; the detailed `robot_right_hand` location form is
-accepted as equivalent. Otherwise it may use the independently stabilized
-next-tool prediction. Normal availability, contamination, robot
+accepted as equivalent. Otherwise, only while the robot right hand is empty,
+it may use the reducer's current eligible rank-1 prediction even below the
+autonomous-preparation threshold. Normal availability, contamination, robot
 occupancy, execution-route, controller-readiness, deduplication, and completion
 checks remain in force before any command is sent. The direct branch is valid
-only while `execution_state == running`; a non-empty legacy
-`implicit_request_tool` fails closed.
+only while `execution_state == running` and no robot task is active; a non-empty
+legacy `implicit_request_tool` fails closed.
+
+The same pinned CAM4 gesture stream also supplies a separate pose-independent
+Mayo-workspace occupancy bit. Any detected hand blocks autonomous next-tool
+preparation, recovery, and Mayo-target manipulation. A live accepted open-palm
+request may nevertheless pick its current confirmed rank-1 `mayo_reuse` tool,
+and an active validated voice request may pick its confirmed Mayo instance.
+Both exceptions are limited to the Mayo-to-right-hand `prepare_tool` leg and
+recheck current request evidence at final dispatch. Clearing the general block
+requires a newer pinned empty frame while the
+RGB gesture detector's model/provenance health lease is valid. The hand-free
+state expires after `0.400 s` without another valid frame (checked by the same
+`0.100 s` watchdog), and detector-health loss re-latches occupancy. Empty
+frames must also satisfy the existing `0.500 s` maximum source age and future
+tolerance; delayed replay/backlog cannot create a hand-free lease.
 
 No VLM request context, prompt, response schema, procedure mock, or fallback
 contains a human-hand signal. Legacy `sg`, `gesture`, `hand_pose`,

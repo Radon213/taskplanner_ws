@@ -18,10 +18,12 @@ export type AsrRestartApiStatus = {
   request_id: string | null;
   message: string;
   retryable: boolean;
-  source_revision: string | null;
-  container_started_at: string | null;
-  before_pid: number | null;
-  after_pid: number | null;
+  // Older controllers may still include these diagnostics. The owner-restart
+  // flow no longer needs them, so accept a minimal response as well.
+  source_revision?: string | null;
+  container_started_at?: string | null;
+  before_pid?: number | null;
+  after_pid?: number | null;
 };
 
 const STATUS_BODY_MAX_CHARS = 64 * 1024;
@@ -29,17 +31,13 @@ const STATUS_MESSAGE_MAX_CHARS = 4_096;
 const HTTP_TIMEOUT_MS = 8_000;
 const POLL_INTERVAL_MS = 350;
 const RECONCILE_TIMEOUT_MS = 15_000;
-// Covers backend lock admission, import preflight, Docker's bounded restart,
-// health probe, and graph verification without allowing an indefinite UI wait.
-const COMPLETION_TIMEOUT_MS = 240_000;
+// The backend delegates to the same small owner command as the terminal. Keep
+// polling bounded, but do not model Docker/source/ROS-graph implementation
+// details in the browser.
+const COMPLETION_TIMEOUT_MS = 90_000;
 const HEARTBEAT_TIMEOUT_MS = 20_000;
 const CAPTURE_TIMEOUT_MS = 20_000;
 const STATUS_FRESH_MS = 5_000;
-const START_PROVENANCE_TOLERANCE_MS = 2_000;
-// The operational node and Docker StartedAt both use the ASR host's wall
-// clock. Keep provenance entirely within that clock domain: the dashboard may
-// be remote and its Date.now() can legitimately differ by minutes.
-const NODE_START_AFTER_CONTAINER_MAX_MS = 35_000;
 const REQUIRED_OUTPUT_MODE = "typed_utterance";
 const REQUIRED_OUTPUT_TOPIC = "/sensors/surgeon/utterance";
 const REQUEST_ID_PATTERN = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
@@ -76,8 +74,8 @@ function normalizeStatus(value: unknown): AsrRestartApiStatus | null {
   const jobId = raw.job_id;
   const requestId = raw.request_id ?? null;
   const message = raw.message;
-  const sourceRevision = raw.source_revision;
-  const containerStartedAt = raw.container_started_at;
+  const sourceRevision = raw.source_revision ?? null;
+  const containerStartedAt = raw.container_started_at ?? null;
   if (
     !PHASES.has(phase)
     || !Number.isSafeInteger(generation)
@@ -282,7 +280,7 @@ function hasSameRestoreSemantics(left: LiveAsrStatus, right: LiveAsrStatus): boo
     && left.recording_active === right.recording_active;
 }
 
-/** Confirm a new source-bearing process, then restore only fresh prior state. */
+/** Confirm the new ASR owner process, then restore only fresh prior state. */
 export async function hotRestartAsrNode({
   requestedAt,
   previousStatus,
@@ -349,24 +347,6 @@ export async function hotRestartAsrNode({
   if (!restartedStatus) {
     throw new Error(
       "새 ASR node_instance_id heartbeat를 20초 안에 받지 못했습니다. 코드 오류나 시작 로그를 확인하세요.",
-    );
-  }
-  if (!completed.source_revision || restartedStatus.source_revision !== completed.source_revision) {
-    throw new Error(
-      "호스트와 새 ASR heartbeat의 source_revision이 일치하지 않아 코드 반영을 확인할 수 없습니다.",
-    );
-  }
-  const containerStartedAtMs = Date.parse(completed.container_started_at ?? "");
-  const nodeStartedAtMs = restartedStatus.node_started_at_sec * 1_000;
-  if (
-    !Number.isFinite(containerStartedAtMs)
-    || !Number.isFinite(nodeStartedAtMs)
-    || nodeStartedAtMs <= 0
-    || nodeStartedAtMs < containerStartedAtMs - START_PROVENANCE_TOLERANCE_MS
-    || nodeStartedAtMs > containerStartedAtMs + NODE_START_AFTER_CONTAINER_MAX_MS
-  ) {
-    throw new Error(
-      "새 ASR heartbeat의 node_started_at_sec가 호스트 container_started_at 재시작 구간과 일치하지 않습니다.",
     );
   }
   requireLiveTypedOutputContract(restartedStatus);
@@ -470,7 +450,6 @@ export async function hotRestartAsrNode({
 
   requireLiveTypedOutputContract(restartedStatus);
 
-  const revisionCopy = ` · 코드 ${restartedStatus.source_revision.slice(0, 8)}`;
   const concurrentControlCopy = restorationSuppressed
     ? " · 재시작 대기 중 다른 ASR 제어를 감지해 이전 경로·마이크·녹음을 복원하지 않음"
     : "";
@@ -478,6 +457,6 @@ export async function hotRestartAsrNode({
   const recordingCopy = restoreRecording ? " · 녹화는 새 세그먼트로 복원됨" : "";
   return {
     status: restartedStatus,
-    message: `ASR 노드 새로 시작 완료${revisionCopy}${concurrentControlCopy}${captureCopy}${recordingCopy}`,
+    message: `ASR 노드 새로 시작 완료${concurrentControlCopy}${captureCopy}${recordingCopy}`,
   };
 }

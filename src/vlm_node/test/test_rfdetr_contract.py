@@ -32,11 +32,18 @@ from vlm_node.rfdetr_contract import (
     RFDETR_CAM4_OVERLAY_FRAME_MARKER,
     RFDETR_FLIR_SEGMENTED_FRAME_MARKER,
     append_rfdetr_frame_marker,
+    canonical_rfdetr_tool_label,
     frame_id_has_rfdetr_marker,
     parse_cam4_semantics_json,
     summarize_cam4_detections,
     summarize_rfdetr_tool_observations,
 )
+
+
+def test_typed_detector_label_adapter_normalizes_known_external_variants() -> None:
+    assert canonical_rfdetr_tool_label("Bipolar Forceps") == "Bipolar cautery"
+    assert canonical_rfdetr_tool_label(" mosquito ") == "Mosquito forceps"
+    assert canonical_rfdetr_tool_label("provider future label") == "provider future label"
 
 
 def _frame(stamp: float) -> BufferedFrame:

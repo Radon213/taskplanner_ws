@@ -16,22 +16,25 @@ Taskplanner is the sole publisher of every `/surgery/*` state topic in this
 contract. Partners subscribe; they must not create another publisher on the
 same name. The state Gateway is read-only and exposes no control service.
 
-The base Taskplanner runtime starts the state Gateway by default in live and
-simulation/LLM demonstration modes. The live integration wrapper additionally
-starts the five reviewed camera aliases by default:
+The managed Taskplanner runtime starts the state Gateway by default in Live and
+LLM Surgeon modes. The independently restartable projection owner also starts
+the five reviewed camera aliases by default:
 
 ```bash
 # Public state is enabled by default.
-ros2 launch bringup taskplanner_live.launch.py
+scripts/taskplanner up live
 
-# Explicit isolation escape hatch.
-ros2 launch bringup taskplanner_live.launch.py \
-  publish_shared_state:=false publish_camera_aliases:=false
+# Explicit isolation escape hatch for an already-running Live owner plane.
+PUBLISH_SHARED_STATE=false PUBLISH_CAMERA_ALIASES=false \
+  scripts/taskplanner restart projection live
 
 # Deliberate PHI-capable deployment opt-in; never use as a general default.
-ros2 launch bringup taskplanner_live.launch.py \
-  publish_shared_free_text:=true
+PUBLISH_SHARED_FREE_TEXT=true scripts/taskplanner restart projection live
 ```
+
+Set the same variables in `.env` before a cold start. The retained
+`taskplanner_live.launch.py` is a migration/reference source, not the managed
+runtime entry point.
 
 The corresponding environment defaults are:
 

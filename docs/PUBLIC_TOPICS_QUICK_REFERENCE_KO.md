@@ -40,6 +40,7 @@ ID/confidence는 계속 제공된다. 이 Gateway는 자유문장을 비식별�
 | `/surgery/clinical_observations` | `ClinicalObservationArray` | VLM 관찰 단계·도구·위치와 불확실성; summary는 별도 opt-in | 빈 배열 |
 | `/surgery/health` | `SurgeryHealth` | source별 unavailable/stale/error | 실제 상태 계속 발행 |
 | `/surgery/events` | `SurgeryEvent` | 단계/도구 등 상태 변화와 outcome, correlation ID | 발행하지 않음 |
+| `/surgery/record/receipt` | `std_msgs/msg/String` JSON | 생성 수술기록 원문과 HTTPS POST 종료 결과/서버 원문 응답; schema `taskplanner.surgery_record.receipt.v1` | 마지막 종료 결과만 durable |
 
 ## 대표 메시지 예시
 
@@ -190,7 +191,9 @@ Twin이 CAM4의 typed `/perception/cam_4/hand/gestures`,
 `/perception/cam_4/hand/facing`, `/perception/cam_4/hand/health`를 직접 검증하고,
 동일 source header의 정확한 `Right + Open_Palm + PALM_UP` 관측이 source time과
 receipt time 모두에서 최소 0.300초 연속될 때만 tool-agnostic handover evidence
-episode를 만든다. 이 evidence는 도구를
+episode를 만든다. 동일 프레임에 손이 2개 이상 검출되면 그중 하나가 해당 자세를
+만족하더라도 그 프레임은 암묵 요청 evidence로 사용하지 않으며, 별도의 Mayo
+점유 차단은 유지한다. 이 evidence는 도구를
 선택하지 않고, 공개 clinical observation으로 복사되지 않으며, 그 자체가 로봇
 명령이나 실행 승인이 아니다.
 
@@ -264,7 +267,7 @@ ros2 topic info /surgery/images/flir/compressed --verbose
 `surgical_interop_msgs` 0.5.0 설치가 필요하다.
 
 > **Native DDS 보안 경계 주의**: 현재 배포의 DDS subnet은 인증/ACL 경계가
-> 아니다. 같은 Domain 참가자는 공개 16개 endpoint뿐 아니라 내부 토픽도
+> 아니다. 같은 Domain 참가자는 공개 17개 endpoint뿐 아니라 내부 토픽도
 > 탐색·구독할 수 있고, 동일한 공개/내부 토픽 이름으로 위조 또는 충돌 샘플을
 > 발행할 수 있다. free-text suppression, 카메라 active gate, 9092 allowlist는
 > Taskplanner 소유 출력에만 적용되고 다른 DDS 참가자의 트래픽은 필터링하지
@@ -274,7 +277,7 @@ ros2 topic info /surgery/images/flir/compressed --verbose
 > Security의 identity, governance, permissions를 별도로 구축해야 한다.
 
 브라우저 UI는 `ws://<Taskplanner 유선 IP>:9092`에 연결한다. 9092는 별도
-512 MiB 제한 컨테이너이며 위 11개 공개 상태/event 토픽과 다섯 카메라 alias에 대한
+512 MiB 제한 컨테이너이며 위 12개 공개 상태/event/receipt 토픽과 다섯 카메라 alias에 대한
 `subscribe`만 허용한다. publish/service/Action/rosapi는 제공하지 않는다.
 Live, LLM 시연, Replay 모드 모두 같은 주소와 공개 토픽 계약을 유지한다.
 Replay의 내부 ROS graph는 격리 Domain/LOCALHOST에 남고 9092 전용 프록시만

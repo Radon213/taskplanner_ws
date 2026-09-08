@@ -10,10 +10,13 @@ from typing import Any, Mapping, Sequence
 import unicodedata
 
 from .procedure_prompt import PROMPT_FILE_NAMES, load_procedure_prompt
-from .scenario_policy import SCENARIO_RUNTIME_REQUIREMENT_KEYS
+from .scenario_policy import (
+    SCENARIO_RUNTIME_REQUIREMENT_KEYS,
+)
 
 
 _TOOL_ID_RE = re.compile(r"\bT\d{2}\b")
+_MAX_TOTAL_TOOL_CAPACITY = 64
 _FIELD_DEPLOYED_ROLE_NAMES = {
     "field_deployed",
     "fixed_retraction",
@@ -510,6 +513,105 @@ def _prompt_inventory(
     return inventory
 
 
+def _prompt_tool_populations(
+    prompt: dict[str, Any],
+    tool_ids: list[str],
+    inventory: Mapping[str, int],
+) -> dict[str, dict[str, int | bool]]:
+    """Resolve fixed legacy counts and optional exchangeable populations.
+
+    The compact v2 authoring shape is::
+
+        tool_population:
+          T02: {initial_count: 1, capacity: 3}
+
+    ``tool_inventory`` remains the v1 fixed-inventory source when no v2 entry
+    exists. A v2 entry intentionally overrides the initial count for its type.
+    """
+
+    populations: dict[str, dict[str, int | bool]] = {
+        tool_id: {
+            "initial_count": int(inventory[tool_id]),
+            "capacity": int(inventory[tool_id]),
+            "exchangeable": False,
+        }
+        for tool_id in tool_ids
+    }
+    raw_populations = prompt.get("tool_population", {})
+    if raw_populations in ({}, None):
+        return populations
+    if not isinstance(raw_populations, dict):
+        raise ValueError("procedure prompt tool_population must be a mapping.")
+
+    unknown_tools = sorted(
+        set(str(key) for key in raw_populations).difference(tool_ids)
+    )
+    if unknown_tools:
+        raise ValueError(
+            "procedure prompt tool_population references unknown tools: "
+            + ", ".join(unknown_tools)
+        )
+
+    required_keys = {"initial_count", "capacity"}
+    for tool_id, raw_population in raw_populations.items():
+        if not isinstance(raw_population, dict):
+            raise ValueError(
+                f"procedure prompt tool_population.{tool_id} must be a mapping."
+            )
+        missing_keys = sorted(required_keys.difference(raw_population))
+        if missing_keys:
+            raise ValueError(
+                f"procedure prompt tool_population.{tool_id} requires "
+                + " and ".join(missing_keys)
+                + "."
+            )
+        unexpected_keys = sorted(set(raw_population).difference(required_keys))
+        if unexpected_keys:
+            raise ValueError(
+                f"procedure prompt tool_population.{tool_id} has unsupported fields: "
+                + ", ".join(str(key) for key in unexpected_keys)
+            )
+
+        initial_count = raw_population["initial_count"]
+        capacity = raw_population["capacity"]
+        if isinstance(initial_count, bool) or not isinstance(initial_count, int):
+            raise ValueError(
+                f"procedure prompt tool_population.{tool_id}.initial_count "
+                "must be a non-negative integer."
+            )
+        if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity <= 0:
+            raise ValueError(
+                f"procedure prompt tool_population.{tool_id}.capacity "
+                "must be a positive integer."
+            )
+        if initial_count < 0:
+            raise ValueError(
+                f"procedure prompt tool_population.{tool_id}.initial_count "
+                "must be a non-negative integer."
+            )
+        if initial_count > capacity:
+            raise ValueError(
+                f"procedure prompt tool_population.{tool_id}.initial_count "
+                f"cannot exceed capacity {capacity}."
+            )
+        populations[str(tool_id)] = {
+            "initial_count": initial_count,
+            "capacity": capacity,
+            "exchangeable": True,
+        }
+
+    total_capacity = sum(
+        int(population["capacity"])
+        for population in populations.values()
+    )
+    if total_capacity > _MAX_TOTAL_TOOL_CAPACITY:
+        raise ValueError(
+            "procedure prompt total tool population capacity must be at most "
+            f"{_MAX_TOTAL_TOOL_CAPACITY}; got {total_capacity}."
+        )
+    return populations
+
+
 def _prompt_requestable_tools(
     prompt: dict[str, Any],
     tool_ids: list[str],
@@ -558,16 +660,11 @@ def _prompt_scenario_policy(prompt: dict[str, Any]) -> dict[str, Any]:
         raw = {}
     if not isinstance(raw, dict):
         raise ValueError("procedure prompt scenario_policy must be a mapping.")
-    unknown = sorted(
-        set(raw)
-        - set(_DEFAULT_SCENARIO_POLICY)
-        - {"requestable_tools", "runtime_requirements"}
-    )
-    if unknown:
-        raise ValueError(
-            "procedure prompt scenario_policy has unknown fields: "
-            + ", ".join(unknown)
-        )
+    known_fields = set(_DEFAULT_SCENARIO_POLICY) | {
+        "requestable_tools",
+        "runtime_requirements",
+        "extensions",
+    }
     result = {
         key: raw.get(key, default)
         for key, default in _DEFAULT_SCENARIO_POLICY.items()
@@ -579,23 +676,39 @@ def _prompt_scenario_policy(prompt: dict[str, Any]) -> dict[str, Any]:
                 "procedure prompt scenario_policy.runtime_requirements "
                 "must be a mapping."
             )
-        missing = sorted(
-            SCENARIO_RUNTIME_REQUIREMENT_KEYS - set(runtime_requirements)
-        )
-        unknown_runtime = sorted(
-            set(runtime_requirements) - SCENARIO_RUNTIME_REQUIREMENT_KEYS
-        )
-        if missing or unknown_runtime:
-            details = []
-            if missing:
-                details.append("missing: " + ", ".join(missing))
-            if unknown_runtime:
-                details.append("unknown: " + ", ".join(unknown_runtime))
-            raise ValueError(
-                "procedure prompt scenario_policy.runtime_requirements must "
-                "define the complete contract (" + "; ".join(details) + ")"
+        # Runtime requirements are optional feature preferences, not a global
+        # start contract.  Accept a partial mapping so a researcher can toggle
+        # one adapter without reproducing every static field.  Preserve future
+        # adapter keys below as scenario extensions instead of rejecting the
+        # whole prompt.
+        result["runtime_requirements"] = {
+            key: value
+            for key, value in runtime_requirements.items()
+            if key in SCENARIO_RUNTIME_REQUIREMENT_KEYS
+        }
+    extensions = raw.get("extensions", {})
+    if extensions is None:
+        extensions = {}
+    if not isinstance(extensions, dict):
+        raise ValueError("procedure prompt scenario_policy.extensions must be a mapping.")
+    result["extensions"] = {
+        **dict(extensions),
+        **{
+            key: value
+            for key, value in raw.items()
+            if key not in known_fields
+        },
+    }
+    if isinstance(runtime_requirements, dict):
+        runtime_extensions = {
+            key: value
+            for key, value in runtime_requirements.items()
+            if key not in SCENARIO_RUNTIME_REQUIREMENT_KEYS
+        }
+        if runtime_extensions:
+            result["extensions"].setdefault(
+                "runtime_requirements_extensions", runtime_extensions
             )
-        result["runtime_requirements"] = dict(runtime_requirements)
     return result
 
 
@@ -893,6 +1006,7 @@ def _build_mock_perception(
     rack_order: list[str],
     requestable_tools: set[str],
     initial_instrument_states: list[dict[str, Any]],
+    initial_inventory: Mapping[str, int],
 ) -> dict[str, Any]:
     first_phase = next(iter(phase_tools), "")
     home_location_by_tool = {
@@ -927,7 +1041,10 @@ def _build_mock_perception(
             "visible": True,
         }
         for index, tool_id in enumerate(rack_order)
-        if tool_id not in non_home_initial_tool_ids
+        if (
+            int(initial_inventory.get(tool_id, 0)) > 0
+            and tool_id not in non_home_initial_tool_ids
+        )
     ]
     stages: list[dict[str, Any]] = [
         {
@@ -987,6 +1104,11 @@ def build_raw_bundle_from_prompt(bundle_dir: str | Path, display_catalog: dict[s
     tool_voice_aliases = _prompt_tool_voice_aliases(prompt, tool_ids)
     _validate_prompt_tool_voice_alias_ownership(tools, tool_voice_aliases)
     tool_inventory = _prompt_inventory(prompt, tool_ids)
+    tool_populations = _prompt_tool_populations(
+        prompt,
+        tool_ids,
+        tool_inventory,
+    )
     requestable_tools = _prompt_requestable_tools(prompt, tool_ids)
     scenario_policy = _prompt_scenario_policy(prompt)
     rack_order, initial_instrument_states = _prompt_tool_placement(
@@ -1045,7 +1167,11 @@ def build_raw_bundle_from_prompt(bundle_dir: str | Path, display_catalog: dict[s
                         tool_voice_aliases.get(tool_id, ()),
                     ),
                     "category": _tool_category(tool_name),
-                    "inventory_count": tool_inventory[tool_id],
+                    "inventory_count": tool_populations[tool_id]["initial_count"],
+                    "inventory_capacity": tool_populations[tool_id]["capacity"],
+                    "exchangeable_population": tool_populations[tool_id][
+                        "exchangeable"
+                    ],
                     "requestable": tool_id in requestable_tools,
                     "role": _tool_category(tool_name),
                     "handover_profile": _handover_profile(_tool_category(tool_name), tool_name),
@@ -1070,6 +1196,10 @@ def build_raw_bundle_from_prompt(bundle_dir: str | Path, display_catalog: dict[s
             rack_order,
             requestable_tools,
             initial_instrument_states,
+            {
+                tool_id: int(population["initial_count"])
+                for tool_id, population in tool_populations.items()
+            },
         ),
         "bed_robot_arm_groups": prompt.get("bed_robot_arm_groups", {}),
         "display_catalog": display_catalog,

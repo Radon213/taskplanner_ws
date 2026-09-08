@@ -87,9 +87,9 @@ def render_markdown(
         "## Runtime",
         "",
         f"- Input frames: {runtime.get('input_image_count', 0)}",
-        f"- Source transcripts / admitted speech: "
+        f"- Source transcripts / router-observed utterances: "
         f"{runtime.get('source_transcript_count', 0)} / "
-        f"{runtime.get('admitted_speech_count', 0)}",
+        f"{runtime.get('observed_utterance_count', 0)}",
         f"- VLM results during input / total: "
         f"{runtime.get('vlm_result_during_input_count', 0)} / "
         f"{runtime.get('vlm_result_count', 0)} "

@@ -42,43 +42,64 @@ scripts/taskplanner up live --ensure-build
 
 The launcher pins `TASKPLANNER_RUNTIME_MODE=live`,
 `INPUT_PROFILE=external`, and `EXECUTION_BACKEND=action` as one contract. Do
-not recreate `taskplanner-runtime` with a bare `docker compose up`: the
-container rejects an unlabelled or inconsistent profile rather than silently
-starting mock mode under a stale Live UI marker. A controlled source deployment
-may use `config/integration.env.example`, which carries the same marker.
+not create an arbitrary subset of owner containers with a bare
+`docker compose up`: each owner rejects an unlabelled or inconsistent mode,
+and the launcher is the one place that selects the complete owner set. A
+controlled source deployment may use `config/integration.env.example`, which
+carries the same marker.
 
 The reviewed Production profile launches
 `TASKPLANNER_LIVE_DEFAULT_BUNDLE=thyroidectomy_demo` with `VLM_MODE=real`,
-`PERCEPTION_PROVIDER=external_rfdetr_topics`,
-`PERCEPTION_LOCATION=remote`, and an empty `PERCEPTION_ENDPOINT`. It does not
-start local RF-DETR/PNU inference or an HTTP perception bridge. That demo
-requires fresh, source-stamped CAM3 and CAM4 typed observations and a fresh
-executable ASR status before start; absent, stale, replayed, malformed,
-wrong-view, wrong-model, or unavailable inputs block admission.
-Robot execution also requires implemented external endpoints. The contract below
-is the request to the controller teams; it is not evidence of a running server.
+`PERCEPTION_PROVIDER=external_rfdetr_topics`, `PERCEPTION_LOCATION=remote`,
+and an empty `PERCEPTION_ENDPOINT`. It does not start local RF-DETR/PNU
+inference or an HTTP perception bridge. Camera, ASR, and VLM health are
+reported as diagnostics; they are not global scenario-start gates. Robot
+execution still requires an implemented external endpoint. The contract below
+is a request to controller teams, not evidence of a running server.
 
-## Live typed ASR input
+## Live ASR input modes
 
-Taskplanner Live fixes its input route to:
+Taskplanner Live keeps both ingress contracts available. The default is the
+external tagged-sentence mode; the existing typed microphone mode remains a
+runtime-selectable fallback through `SPEECH_INPUT_MODE` or the ASR panel.
+
+### Local typed microphone mode
+
+When `SPEECH_INPUT_MODE=utterance`, the route is:
 
 ```text
 /sensors/surgeon/utterance                         surgical_msgs/msg/SpeechUtterance
   -> speech_input_adapter (source metadata + final-text validation + dedupe)
   -> /surgery/audio/admitted_utterance              surgical_msgs/msg/SpeechUtterance
-  -> voice_command_resolver
+  -> CommandRouter (only deterministic command consumer)
+  -> catalog-selected typed Topic / Service / Action adapter
+  -> endpoint server
+
+CommandRouter
+  -> /surgery/audio/observed_utterance               read-only observers
+  -> VLM, UI, logs, TTS presentation
 ```
 
-`/input/asr/runtime_status` must be a fresh `taskplanner.asr.status.v1`
-document whose ASR is available and connected/ready. Publisher discovery alone
-is insufficient. The adapter is the only ASR owner; raw text never directly
-triggers an Action or Service.
+`/input/asr/runtime_status` reports ASR availability diagnostically. The
+adapter is the only ASR ingress owner; raw text never directly triggers an
+Action or Service.
 
-## Legacy sentence text input (Debug/replay only)
+### External tagged sentence mode
 
-`/sensors/surgeon/sentence` with `std_msgs/msg/String` is retained only for
-Debug/replay compatibility. It is not an admitted Live authority and must not
-be used to satisfy Live preflight.
+When `SPEECH_INPUT_MODE=tagged_sentence`, the external ASR publishes
+`[partial]` or `[final]` prefixed text to the same adapter. The adapter strips
+the marker, emits partial hypotheses on the read-only partial stream, and
+admits only `[final]` text to the normal typed command route:
+
+```text
+/sensors/surgeon/sentence                         std_msgs/msg/String
+  -> speech_input_adapter (tag parsing + dedupe)
+  -> /surgery/audio/partial_utterance              surgical_msgs/msg/SpeechUtterance (partial)
+  -> /surgery/audio/admitted_utterance              surgical_msgs/msg/SpeechUtterance (final)
+```
+
+The existing sentence-only compatibility mode remains available for isolated
+Debug/replay callers, but it is not the Live default.
 
 Topic:
 
@@ -94,29 +115,20 @@ std_msgs/msg/String
 
 Required producer behavior:
 
-- Publish exactly one complete sentence per message.
+- Prefix every message with exactly `[partial]` or `[final]`.
+- Publish one current hypothesis per message; only `[final]` is executable.
 - Publish only text attributed to the surgeon.
 - Do not publish partial hypotheses, token streams, or word-by-word updates.
 - Do not include phase labels, hidden actor state, or robot decisions.
-- Keep the publisher node alive while the integration runtime is active;
-  publisher discovery is part of the start preflight.
+- Keep the publisher node alive while this compatibility input is intentionally
+  in use. The optional integration observer can report publisher availability,
+  but that observation never authorizes or blocks a scenario start.
 
-The `sentence_input_adapter` trims whitespace, rejects empty messages, and
-suppresses the same normalized sentence for a short duplicate window. Receipt
-time is the observation time. Accepted text is republished as the compatibility
-topic:
-
-```text
-/surgery/audio/request_text  std_msgs/msg/String
-```
-
-Consumers must treat that compatibility topic as admitted public evidence, not
-as a command generated by the surgeon actor. Live uses `SpeechUtterance` as its
-source and preserves its required provenance metadata.
-
-The normative natural-language voice-command policy is
-[`VOICE_COMMAND_CONTRACT.md`](VOICE_COMMAND_CONTRACT.md). In particular,
-`/surgery/audio/request_text` is never a direct Action/Service trigger.
+The adapter trims whitespace, rejects empty messages, suppresses short-window
+duplicates, and constructs the same typed `SpeechUtterance` used by Live. Its
+only command output is `/surgery/audio/admitted_utterance`; it does not create
+a parallel raw-text execution route. Receipt time is the observation time for
+this compatibility input.
 
 Adapter activity:
 
@@ -124,52 +136,27 @@ Adapter activity:
 /input/speech/status  surgical_msgs/msg/InputSourceStatus
 ```
 
-For the legacy Debug/replay route its `modality` is `sentence_text`. Live reports
-typed ASR input and independently requires fresh executable ASR status through
-`/integration/readiness`.
+The selected external route reports `source_id=external_sentence_topic` and
+`modality=external_topic`. The local route reports
+`source_id=local_microphone` and `modality=microphone`. Live exposes typed ASR
+runtime status at `/input/asr/runtime_status`; the optional
+`/integration/readiness` observer reports that status diagnostically.
 
-### Natural-language voice resolution
+### Command routing
 
-The same single adapter output, `/surgery/audio/request_text`, is the only STT
-input to `voice_command_resolver`. Taskplanner does not start a second
-microphone/ASR owner. The adapter remains the source-level final-text
-deduplication point. A final transcript follows this bounded route:
+`CommandRouter` is the only subscriber that can execute an admitted utterance.
+It performs exact catalog matching and sends the matching typed request once.
+Catalog misses are non-executable; no observer, model, Digital Twin, or
+Behavior Tree gets a second chance to reinterpret the same utterance as a
+command.
 
-```text
-/sensors/surgeon/utterance (Live typed source)
-  -> speech_input_adapter (metadata + final-text validation + dedupe)
-  -> /surgery/audio/admitted_utterance
-  -> voice_command_resolver
-  -> /surgery/voice/intent (surgical_msgs/msg/VoiceCommandIntent; proposal only)
-  -> Digital Twin handover guard OR BT retraction guard
-  -> reviewed Action/Service admission
-```
+The router relays each admitted utterance unchanged to
+`/surgery/audio/observed_utterance`. VLM and other observers consume that
+read-only stream for dialogue and presentation only. The normative extension
+guide is [`VOICE_COMMAND_MODULARIZATION.md`](VOICE_COMMAND_MODULARIZATION.md).
 
-The resolver accepts natural Korean paraphrases, but emits only typed proposals.
-It may use a strict model function/candidate selector when available; its output
-is nevertheless grounded locally against transcript evidence and the active
-procedure catalog. Missing, repaired, ambiguous, risky, or unsupported meanings
-become `clarify`, `reject`, or `no_command`, never a controller call.
-
-Handover and retraction consumers must consume `/surgery/voice/intent`, rather
-than independently parse the raw transcript. The retraction contract has six
-canonical command values (`start_direct_teach`, `finish_direct_teach`,
-`start_retraction`, `adjust_retraction`, `change_tool`, and `stop_retraction`),
-but the current central natural-language resolver deliberately emits only the
-direct-teach lifecycle pair. A later family must first add complete physical
-slots and replay coverage; it never receives arm poses, unrepresentable
-polarity/direction, or a physical-completion assertion.
-
-The local retraction status topic below makes admission provenance explicit
-without repeating raw surgeon text:
-
-```text
-/bed_robot_arm_group/voice_normalization_status  std_msgs/msg/String (JSON)
-```
-
-Its `stage=service_admitted` is a correlated Service admission receipt, not a
-statement that a robot moved. Controller motion and safety remain
-controller-owned.
+Controller motion and safety remain controller-owned. A Service acceptance
+response is not evidence of physical completion.
 
 ## Vision Input
 
@@ -231,8 +218,9 @@ runtime:
 The VLM receives a bounded structured projection: class ID/name, bbox,
 observation point, confidence, optional depth, source timestamp, view, model and
 ontology version. Detector images, overlays, mask RLE and raw detector payloads
-are not VLM observations. Preflight separately validates both topic leases and
-mandatory provenance metadata, including a non-empty `model_version`. Production
+are not VLM observations. Optional integration diagnostics separately report
+both topic leases and mandatory provenance metadata, including a non-empty
+`model_version`. Production
 does not pin that value by default, so a provider checkpoint/version rollout
 does not stop planner admission. An exact version pin remains an explicit,
 temporary deployment override for incident isolation. An empty but otherwise
@@ -256,10 +244,13 @@ Digital Twin:
 ```
 
 Gesture and facing arrays must carry an identical source header and matching
-frame-local `hand_index` set. Only one validated `Right` hand classified as
-`Open_Palm` and faced `PALM_UP`, continuously fresh for at least 0.300 seconds
-in both source and receipt time, creates one tool-agnostic handover evidence
-episode. Missing, stale, asymmetric, ambiguous,
+frame-local `hand_index` set containing exactly one detected hand. That one
+validated `Right` hand must be classified as `Open_Palm` and faced `PALM_UP`,
+continuously fresh for at least 0.300 seconds in both source and receipt time,
+to create one tool-agnostic handover evidence episode. A frame with two or more
+detected hands is discarded from the implicit-request channel even when only
+one hand otherwise qualifies; it still asserts Mayo occupancy. Missing, stale,
+asymmetric, ambiguous,
 misaligned, unpinned, or unhealthy evidence fails closed. This evidence does
 not select an instrument, publish a robot command, or bypass reducer, Behavior
 Tree, Action admission, or downstream controller safety. It is not projected
@@ -287,10 +278,10 @@ the on-site package/ownership verification sequence.
 
 ## Requested Robot Endpoints
 
-The following are the new, direct implementation requests. Their names say what
-the robot must do; the old generic `/skill/execute` and
-`/bed_robot_arm_group/*/execute` contracts remain internal/legacy compatibility
-interfaces and are not the requested cross-institution API.
+The following are the direct implementation requests. Their names say what the
+robot must do; the retired generic `/skill/execute` and
+`/bed_robot_arm_group/*/execute` contracts are not runtime entry points or
+cross-institution APIs.
 
 ```text
 /surgery/tool_handover        surgical_interop_msgs/action/ExecuteToolHandover
@@ -311,6 +302,50 @@ reached, and holding persists until a later handover or the normal
 `return_unused_preposition` `robot -> mayo` Goal. The only location values are
 `tray`, `mayo`, `robot`, and `surgeon`; every
 other pair is invalid.
+
+Instance selection uses the same policy for system-predicted preparation and
+an explicit surgeon request. An exact matching tool already prepared in the
+robot's right hand is reused first. Otherwise, when eligible instances of the
+same instrument type exist on both Mayo and the tray, Taskplanner selects the
+Mayo instance before the tray instance. CAM4 hand detection blocks autonomous
+Mayo preparation/recovery and Mayo-target commands. A live accepted open-palm
+request may pick its confirmed rank-1 `mayo_reuse` instance, and a validated
+voice request keeps its confirmed Mayo supplier; both exceptions cover only the
+Mayo-to-right-hand `prepare_tool` leg and are rechecked at final dispatch. An
+uncommitted non-voice request already bound to Mayo is rebound to an eligible
+non-Mayo duplicate when the hand arrives without changing its request
+generation. Hand-free admission for every other Mayo command requires a
+continuously fresh, pinned empty gesture stream; detector-health loss or more
+than `0.400 s` of silence restores the fail-closed occupied state, and
+stale/future empty frames cannot clear it.
+If a
+different tool is already prepared in the right hand, Taskplanner first parks
+that held instance with a `robot -> mayo` Goal, but only while the pinned CAM4
+Mayo view is hand-free. While occupied, the replacement remains pending and no
+Mayo Goal is sent. Only after that parking transition completes does
+Taskplanner pick the newly selected tool. The
+controller's cancel-recovery `robot -> tray` result is a separate failure path,
+not the normal replacement destination.
+
+For a scenario-declared exchangeable population, a fresh admitted typed CAM4
+Mayo observation may activate one previously dormant logical instance, but
+never beyond `tool_population.capacity`. That activation is owned by the
+Digital Twin, preserves the separately addressable rack instance, and makes the
+new Mayo instance eligible for the same Mayo-first selection above. Generic VLM
+observations and the observation-only belief tracker cannot activate a control
+instance or move home inventory by themselves.
+
+The tool-transfer Action is single-flight regardless of request provenance. A
+new prediction, hand signal, or voice-backed explicit request never cancels or
+overlaps an active Goal, and no second Goal is admitted. Prediction and explicit
+request observations may remain upstream, but that is not execution admission.
+During an active direct delivery, the CAM4 receiving-hand cue is instead
+withdrawn and ignored; task completion does not re-arm it without a fresh
+`0.500 s` release. Any later retry or re-evaluation is permitted only after the
+active Goal's authoritative terminal result has entered WorldState. The
+execution bridge independently rejects any raced command with
+`tool_transfer_busy`.
+
 `instrument_id` carries the shared real name (for example
 `Bovie surgical cautery`), never an internal catalog code such as `T04`.
 Taskplanner also converts an internal instance such as `T04#1` to
@@ -345,6 +380,7 @@ uint8 COMMAND_STOP_RETRACTION=6
 uint8 TARGET_NONE=0
 uint8 TARGET_LEFT=1
 uint8 TARGET_RIGHT=2
+uint8 TARGET_BOTH=3
 uint16 protocol_version
 string source_id
 string command_id
@@ -369,7 +405,7 @@ string message
 | `source_id` | Calling client identifier. |
 | `command_id` | Caller-generated Request/Response correlation ID. |
 | `command` | One of the six documented `COMMAND_*` constants. |
-| `target_side` | `TARGET_NONE`, `TARGET_LEFT`, or `TARGET_RIGHT`; for adjustment, `TARGET_NONE` (0) means both arms and the same distance is applied per arm. Direct-teach finish accepts the three values as an optional target selector. |
+| `target_side` | `TARGET_NONE`, `TARGET_LEFT`, `TARGET_RIGHT`, or `TARGET_BOTH`; adjustment accepts `LEFT`, `RIGHT`, or `BOTH` (3), applying the same distance independently to both arms for `BOTH`. Direct-teach finish accepts `NONE`, `LEFT`, or `RIGHT` as an optional target selector. |
 | `distance_m` | Metres; a 5 cm adjustment is `0.050`. All non-adjustment commands use `0.0`. |
 
 `request_accepted` and `result_code` describe only whether the server admitted
@@ -451,7 +487,7 @@ goal-scoped robot-state report, and Taskplanner owns the public
 | `grasping` | Acquiring and verifying a stable grasp. |
 | `moving_to_target` | Moving the secured tool toward the Goal's target. |
 | `waiting_for_takeover` | Holding at the surgeon handover pose until takeover is confirmed. |
-| `placing` | Placing and releasing the tool on the tray. |
+| `placing` | Placing and releasing the tool on the Goal's Mayo or tray target. |
 | `holding` | Holding the selected tool stably on the robot (`tray -> robot` or `mayo -> robot`). |
 | `stopping` | A cancel was accepted and safe stopping is in progress. |
 | `retreating` | No grasp was confirmed; the robot is retreating while the tool remains at the source. |
@@ -607,11 +643,11 @@ Every public state, event, and observation carries an `evidence_status`:
   supplies it.
 - `UNKNOWN` or `REJECTED`: insufficient or rejected evidence.
 
-## Start Preflight
+## Optional integration diagnostics
 
 `/integration/check_readiness` uses `std_srvs/srv/Trigger`. It is enabled for a
 real external integration only after the relevant provider has agreed to the
-contract. It fails closed when:
+contract. It reports unavailable or stale dependencies, including:
 
 - the sentence topic has no publisher;
 - the required tool-handover Action, the active procedure's applicable
@@ -619,9 +655,16 @@ contract. It fails closed when:
   status publisher is unavailable;
 - real VLM mode is selected but RF-DETR has no fresh, aligned FLIR/CAM4 result.
 
-The current preflight verifies transport and perception readiness. Physical
-controller homing, E-stop, protective-stop, collision, and force limits remain
-the downstream controller's responsibility and must reject goals when unsafe.
+The launch-only observer switch is
+`enable_integration_preflight_diagnostics`. It defaults on for Live and off for
+Mock/LLM profiles; it has no legacy `require_integration_preflight` alias.
+
+This observer is read-only: its result must not block scenario lifecycle,
+voice procedure control, or typed Action/Service dispatch. The selected
+endpoint still performs its own type/range validation, endpoint availability,
+command-id idempotency, cancellation, and result handling. Physical controller
+homing, E-stop, protective-stop, collision, and force limits remain the
+downstream controller's responsibility and must reject goals when unsafe.
 
 ## Allowed Public Evidence
 
@@ -658,10 +701,11 @@ separate reducer/Behavior Tree decision and execution still uses the guarded
 
 ## Debug/replay sentence-only baseline
 
-With `VLM_MODE=voice_only`, a Debug/replay sentence request accepted by the
-speech adapter is resolved against the active procedure bundle and reaches the BT.
-All deterministic safety guards still apply. Probabilistic phase updates, tool
-prediction, and Mayo recovery remain unavailable until VLM evidence is healthy.
+A Debug/replay sentence compatibility input is converted by
+`speech_input_adapter` into the normal typed admitted utterance. `CommandRouter`
+then applies the same hot-reloadable catalog used by Live. VLM, Digital Twin,
+and BT are observers or independent workflow owners; none is a second
+speech-command admission path.
 
 ## Wired-LAN Checklist
 
@@ -671,15 +715,17 @@ prediction, and Mayo recovery remain unavailable until VLM evidence is healthy.
 4. Confirm host firewalls allow ROS 2 DDS UDP traffic on the integration NIC.
 5. Synchronize clocks with NTP or PTP.
 6. Verify `ros2 topic info -v` before starting a scenario.
-7. For Live, start the typed ASR producer and verify
-   `ros2 topic info -v /sensors/surgeon/utterance` plus a fresh executable
-   `/input/asr/runtime_status`; the legacy sentence topic is Debug/replay-only.
-8. Implement and validate only the requested controller endpoints applicable to
-   the scenario, then verify `/integration/check_readiness`.
-9. For the default Live demo, keep `VLM_MODE=real` and verify fresh
-   source-stamped canonical perception readiness before start.
-10. Add CAM1-CAM4 and FLIR, verify all five dashboard/debug inputs, then verify
-    fresh CAM4/FLIR RF-DETR readiness.
+7. For Live, inspect the selected ingress: typed microphone
+   `/sensors/surgeon/utterance` or external tagged
+   `/sensors/surgeon/sentence`, plus `/input/speech/status` and
+   `/input/asr/runtime_status`.
+8. Implement and validate only the controller endpoints needed for the planned
+   experiment. `/integration/check_readiness` is diagnostic, not a global start
+   gate.
+9. Inspect VLM and perception health when their observation is part of the
+   experiment; a deterministic catalog command does not wait for either one.
+10. Add CAM1-CAM4 and FLIR only when their dashboard/debug observation is
+    needed; source health remains independently visible.
 
 For routed networks, replace multicast discovery with a DDS discovery server
 or explicit peers. Do not expose DDS beyond the isolated integration network.

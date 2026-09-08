@@ -237,12 +237,58 @@ def test_managed_runtime_control_uses_provider_scoped_auth():
 
     assert result.success
     assert result.state == "loading"
+    assert registry.runtime_state("vllm", "managed-model") == (
+        "loading",
+        "Starting worker",
+    )
     assert captured == {
         "url": "http://127.0.0.1:8001/manager/load",
         "json": {"model_id": "managed-model"},
         "headers": {"Authorization": "Bearer secret"},
         "timeout": 1.5,
     }
+
+
+def test_manager_transition_override_clears_when_catalog_reports_ready():
+    """A local load acknowledgement must not shadow the ready catalog forever."""
+
+    live_state = {"value": "unloaded"}
+
+    def fake_get(_url, *, headers, timeout):
+        del headers, timeout
+        return FakeResponse(
+            {
+                "data": [
+                    {
+                        "id": "managed-model",
+                        "load_state": live_state["value"],
+                    }
+                ]
+            }
+        )
+
+    registry = ModelProviderRegistry(
+        [
+            ProviderConfig(
+                "vllm",
+                "vLLM",
+                "http://127.0.0.1:8001",
+                managed=True,
+            )
+        ],
+        request_get=fake_get,
+        request_post=lambda *args, **kwargs: FakeResponse(
+            {"state": "loading", "detail": "Starting worker"},
+            status_code=202,
+        ),
+    )
+
+    assert registry.control_runtime("vllm", "managed-model", "load").success
+    assert registry.probe("vllm").models[0].load_state == "loading"
+
+    live_state["value"] = "loaded"
+    assert registry.probe("vllm").models[0].load_state == "loaded"
+    assert registry.runtime_state("vllm", "managed-model") is None
 
 
 def test_ninfer_manager_uses_same_explicit_runtime_control_contract():

@@ -1,5 +1,7 @@
 builtin_interfaces/Time stamp
 string request_id
+# Immutable execution interval that owns this request.
+string procedure_run_id
 string group_id
 string operation
 string voice_text

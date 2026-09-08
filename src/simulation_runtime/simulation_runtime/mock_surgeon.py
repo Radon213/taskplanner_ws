@@ -7,9 +7,15 @@ import random
 import uuid
 
 from procedure_spec import get_default_spec_dir, load_bundle
+from procedure_spec.scenario_consumer import (
+    ScenarioConfigConsumerBinding,
+    scenario_config_apply_is_safe,
+)
 import rclpy
 from rcl_interfaces.msg import SetParametersResult
 from rclpy.node import Node
+from rclpy.parameter import Parameter
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import String
 from surgical_msgs.msg import (
     FilteredPhase,
@@ -40,7 +46,25 @@ class MockSurgeonNode(Node):
         super().__init__("mock_surgeon")
         self.declare_parameter("spec_dir", str(get_default_spec_dir()))
         self.declare_parameter("random_voice_enabled", True)
+        self.declare_parameter(
+            "scenario_config_topic", "/simulation/scenario_config"
+        )
         self._spec_dir = str(self.get_parameter("spec_dir").value)
+        # ScenarioStore owns selection.  This leaf keeps its filesystem scope
+        # fixed at launch so the retained topic can only select a sibling
+        # researcher-authored bundle, never an arbitrary local directory.
+        self._scenario_config = ScenarioConfigConsumerBinding.from_spec_dir(
+            self._spec_dir
+        )
+        self._scenario_config_topic = str(
+            self.get_parameter("scenario_config_topic").value
+        ).strip()
+        if not self._scenario_config_topic:
+            raise ValueError("scenario_config_topic must not be empty")
+        self._scenario_state_received = False
+        self._scenario_running = False
+        self._scenario_execution_state = ""
+        self._scenario_initial_idle = True
         self._random_voice_enabled = bool(self.get_parameter("random_voice_enabled").value)
         self._state_pub = self.create_publisher(SurgeonState, "/surgeon/state", 20)
         self._request_pub = self.create_publisher(SurgeonRequest, "/surgeon/request", 20)
@@ -68,6 +92,16 @@ class MockSurgeonNode(Node):
         self.create_subscription(SurgeonRequest, "/simulation/surgeon_override", self._on_override, 20)
         self.create_subscription(FilteredPhase, "/phase/filtered", self._on_phase, 20)
         self.create_subscription(SimulationState, "/simulation/state", self._on_simulation_state, 20)
+        self.create_subscription(
+            String,
+            self._scenario_config_topic,
+            self._on_scenario_config,
+            QoSProfile(
+                depth=1,
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            ),
+        )
 
     def _load_spec(self, spec_dir: str) -> None:
         self._spec = load_bundle(spec_dir)
@@ -89,11 +123,22 @@ class MockSurgeonNode(Node):
         self._last_stage_name = ""
 
     def _on_parameters_changed(self, params):
+        if any(parameter.name == "scenario_config_topic" for parameter in params):
+            return SetParametersResult(
+                successful=False,
+                reason=(
+                    "scenario_config_topic is process-lifetime; restart this "
+                    "simulation-input node to rebind it"
+                ),
+            )
         for parameter in params:
             if parameter.name == "spec_dir":
                 try:
                     self._spec_dir = str(parameter.value)
                     self._load_spec(self._spec_dir)
+                    binding = getattr(self, "_scenario_config", None)
+                    if binding is not None:
+                        binding.note_local_spec_dir(self._spec_dir)
                     self._last_lifecycle_control_signature = None
                 except Exception as exc:
                     return SetParametersResult(
@@ -108,6 +153,61 @@ class MockSurgeonNode(Node):
                     self._active_voice_text = ""
                     self._voice_hold_ticks = 0
         return SetParametersResult(successful=True)
+
+    def _on_scenario_config(self, message: String) -> None:
+        """Stage a retained ScenarioStore revision without selecting it here."""
+
+        try:
+            if not self._scenario_config.stage(message.data):
+                return
+        except Exception as exc:
+            self.get_logger().warning(
+                f"mock surgeon scenario config ignored: {exc}"
+            )
+            return
+        self._apply_pending_scenario_config_if_safe()
+
+    def _apply_pending_scenario_config_if_safe(self) -> None:
+        """Commit one staged revision through the actor's local reload path."""
+
+        binding = getattr(self, "_scenario_config", None)
+        if binding is None:
+            return
+        snapshot = binding.pending_snapshot()
+        if snapshot is None or not scenario_config_apply_is_safe(
+            state_received=bool(getattr(self, "_scenario_state_received", False)),
+            scenario_running=bool(getattr(self, "_scenario_running", False)),
+            execution_state=getattr(self, "_scenario_execution_state", ""),
+            initial_idle=bool(getattr(self, "_scenario_initial_idle", False)),
+            local_busy=bool(getattr(self, "_active", False)),
+        ):
+            return
+        try:
+            resolved = binding.revalidate_pending()
+            if resolved is None:
+                return
+            snapshot, bundle = resolved
+        except Exception as exc:
+            binding.discard(snapshot)
+            self.get_logger().warning(
+                f"mock surgeon scenario config rejected before local swap: {exc}"
+            )
+            return
+        result = self.set_parameters_atomically(
+            [Parameter(name="spec_dir", value=bundle.spec_dir)]
+        )
+        if not bool(getattr(result, "successful", False)):
+            self.get_logger().warning(
+                "mock surgeon scenario config local swap rejected: "
+                f"{getattr(result, 'reason', '') or 'unknown reason'}"
+            )
+            return
+        if not binding.commit(snapshot, bundle):
+            return
+        self.get_logger().info(
+            "mock surgeon scenario revision applied locally: "
+            f"{snapshot.bundle_name}@{snapshot.revision}"
+        )
 
     def _stage_for_tick(self, tick: int):
         cycle_tick = tick % self._scenario_length
@@ -146,6 +246,13 @@ class MockSurgeonNode(Node):
     def _publish_state(self, *, phase_id: str, intent: str, requested_tool: str, ready_for_handover: bool, ready_for_retrieval: bool, scripted: bool, scene_note: str, voice_text: str = "") -> None:
         state = SurgeonState()
         state.stamp = self.get_clock().now().to_msg()
+        state.procedure_run_id = (
+            str(self._world.procedure_run_id or "").strip()
+            if self._world is not None
+            and bool(self._world.running)
+            and str(self._world.execution_state or "").strip().lower() == "running"
+            else ""
+        )
         state.procedure_id = self._spec.procedure_id
         state.phase_id = phase_id
         state.intent = intent
@@ -429,6 +536,11 @@ class MockSurgeonNode(Node):
             self._clear_active_override()
             self._schedule_next_random_voice()
             self._override_queue.clear()
+        if command in {"start", "resume"}:
+            self._scenario_initial_idle = False
+        elif command in {"pause", "stop", "reset"}:
+            self._scenario_initial_idle = True
+        self._apply_pending_scenario_config_if_safe()
     def _on_override(self, msg: SurgeonRequest) -> None:
         if msg.event_type == "cancel_request":
             self._override_queue.clear()
@@ -444,6 +556,12 @@ class MockSurgeonNode(Node):
 
     def _on_simulation_state(self, msg: SimulationState) -> None:
         self._instrument_states = {instrument.instrument_id: instrument for instrument in msg.instrument_states}
+        self._scenario_state_received = True
+        self._scenario_running = bool(getattr(msg, "running", False))
+        self._scenario_execution_state = str(
+            getattr(msg, "execution_state", "") or ""
+        ).strip()
+        self._apply_pending_scenario_config_if_safe()
 
 
 def main() -> None:

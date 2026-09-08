@@ -203,6 +203,25 @@ class CameraAliasRelay(Node):
                 ),
             ),
             CameraAliasBinding(
+                name="cam4_overlay",
+                source_topic=self.resolve_topic_name(
+                    str(
+                        self.declare_parameter(
+                            "cam4_overlay_source_topic",
+                            "/perception/cam_4/overlay/compressed",
+                        ).value
+                    )
+                ),
+                public_topic=self.resolve_topic_name(
+                    str(
+                        self.declare_parameter(
+                            "cam4_overlay_public_topic",
+                            "/surgery/images/cam4/overlay/compressed",
+                        ).value
+                    )
+                ),
+            ),
+            CameraAliasBinding(
                 name="suction_overlay",
                 source_topic=self.resolve_topic_name(
                     str(

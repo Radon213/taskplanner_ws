@@ -23,8 +23,8 @@ setup(
         "console_scripts": [
             "surgical_interop_gateway = surgical_interop_gateway.node:main",
             "camera_alias_relay = surgical_interop_gateway.camera_alias_relay:main",
-            "monitor_media_gateway = surgical_interop_gateway.monitor_media_gateway:main",
             "public_rosbridge = surgical_interop_gateway.public_rosbridge:main",
+            "rosbag_ui_audit_rosbridge = surgical_interop_gateway.rosbag_ui_audit_rosbridge:main",
         ],
     },
 )

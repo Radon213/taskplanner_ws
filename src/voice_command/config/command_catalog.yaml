@@ -1,0 +1,59 @@
+# Research-owned command routing.  Edit this file and the command_router
+# reloads it in place; no Taskplanner-wide build or restart is required.
+schema: taskplanner.command-catalog.v1
+commands:
+  - name: suction
+    phrases:
+      - suction
+      - suction 시작
+      - suction 시작해
+      - suction 시작해줘
+      - suction 들어와
+      - suction 들어와줘
+      - suction 켜
+      - suction 켜줘
+      - suction start
+    command_id_prefix: suction-start
+    dispatch:
+      kind: service
+      type: surgical_interop_msgs/srv/ExecuteRetractionCommand
+      # The command producer never chooses an external or virtual controller
+      # route.  This fixed execution-owner proxy owns that selection and the
+      # in-flight Service lifecycle.
+      endpoint: /taskplanner/execution/retraction/command
+      payload:
+        protocol_version: 1
+        source_id: taskplanner
+        command_id: "{command_id}"
+        command: 7
+        target_side: 0
+        distance_m: 0.0
+
+  - name: suction_out
+    phrases:
+      - suction 빼
+      - suction 빼줘
+      - suction 빼 주세요
+      - suction 빠져
+      - suction 제거
+      - suction 제거해
+      - suction 제거해줘
+      - suction 종료
+      - suction 종료해
+      - suction 중지
+      - suction 꺼
+      - suction 꺼줘
+      - suction out
+      - suction stop
+    command_id_prefix: suction-out
+    dispatch:
+      kind: service
+      type: surgical_interop_msgs/srv/ExecuteRetractionCommand
+      endpoint: /taskplanner/execution/retraction/command
+      payload:
+        protocol_version: 1
+        source_id: taskplanner
+        command_id: "{command_id}"
+        command: 8
+        target_side: 0
+        distance_m: 0.0

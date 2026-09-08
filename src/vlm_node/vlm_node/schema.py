@@ -29,6 +29,29 @@ RETIRED_VLM_HAND_OUTPUT_FIELDS = frozenset(
 )
 
 
+# Kept beside the validator so a provider-boundary normalizer can distinguish
+# an omitted optional proposal from a complete proposal that must be validated
+# strictly.  This set is not an execution contract.
+BED_ROBOT_ARM_GROUP_REQUIRED_FIELDS = frozenset(
+    {
+        "request_id",
+        "group_id",
+        "operation",
+        "adjustment_mode",
+        "target_retractor_id",
+        "direction_frame",
+        "direction",
+        "axis",
+        "distance_mm",
+        "distance_origin",
+        "raw_distance_text",
+        "end_effector_profile",
+        "rationale",
+        "confidence",
+    }
+)
+
+
 def _reject_retired_vlm_hand_output_fields(
     payload: dict[str, Any],
     *,
@@ -315,22 +338,7 @@ def _validate_v4_bed_robot_arm_group(value: Any) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         raise SchemaValidationError("'bed_robot_arm_group' must be an object or null")
 
-    required = {
-        "request_id",
-        "group_id",
-        "operation",
-        "adjustment_mode",
-        "target_retractor_id",
-        "direction_frame",
-        "direction",
-        "axis",
-        "distance_mm",
-        "distance_origin",
-        "raw_distance_text",
-        "end_effector_profile",
-        "rationale",
-        "confidence",
-    }
+    required = BED_ROBOT_ARM_GROUP_REQUIRED_FIELDS
     missing = sorted(required - set(value))
     extra = sorted(set(value) - required)
     if missing:

@@ -124,14 +124,45 @@ def test_retraction_adjustment_enforces_the_five_centimetre_contract_limit() -> 
     )
     assert accepted["distance_m"] == 0.050
 
+    release = validate_retraction_command(
+        {
+            "command": "adjust_retraction",
+            "target_side": "right",
+            "distance_m": -0.010,
+        }
+    )
+    assert release["distance_m"] == -0.010
+
+    with pytest.raises(ValueError, match="non-zero"):
+        validate_retraction_command(
+            {
+                "command": "adjust_retraction",
+                "target_side": "right",
+                "distance_m": 0.0,
+            }
+        )
+
     with pytest.raises(ValueError, match=r"at most 0\.050"):
         validate_retraction_command(
             {
                 "command": "adjust_retraction",
                 "target_side": "right",
-                "distance_m": 0.051,
+                "distance_m": -0.051,
             }
         )
+
+
+@pytest.mark.parametrize("command", ["suction", "suction_out"])
+def test_suction_commands_are_zero_argument_retraction_service_commands(
+    command: str,
+) -> None:
+    assert validate_retraction_command(
+        {"command": command, "target_side": "none", "distance_m": 0.0}
+    ) == {
+        "command": command,
+        "target_side": "none",
+        "distance_m": 0.0,
+    }
 
 
 def test_bed_robot_status_requires_the_documented_procedure_layout() -> None:
@@ -292,10 +323,9 @@ def test_debug_config_exposes_exact_public_contract() -> None:
     )
     assert {(row["topic"], row["type"]) for row in config["inputs"]} == {
         ("/sensors/surgeon/sentence", "std_msgs/msg/String"),
-        ("/surgery/audio/request_text", "std_msgs/msg/String"),
         (
-            "/integration/debug/speech/status",
-            "surgical_msgs/msg/InputSourceStatus",
+            "/surgery/audio/observed_utterance",
+            "surgical_msgs/msg/SpeechUtterance",
         ),
         ("/integration/cv_contract/status", "std_msgs/msg/String"),
         ("/synced/cam_1/status", "std_msgs/msg/String"),
@@ -444,7 +474,6 @@ def test_operational_intervention_accepts_paused_or_fully_stopped_idle_state(
     ("overrides", "reason"),
     [
         ({"received": False}, "state is unavailable"),
-        ({"publisher_trusted": False}, "publisher is not trusted"),
         ({"age_sec": 3.1}, "state is stale"),
         (
             {"running": True, "execution_state": "running"},
@@ -458,10 +487,6 @@ def test_operational_intervention_accepts_paused_or_fully_stopped_idle_state(
             {"running": True, "execution_state": "idle"},
             "stopped state is inconsistent",
         ),
-        ({"active_robot_task_id": "task-17"}, "active robot task"),
-        ({"robot_state": "moving"}, "robot to become idle"),
-        ({"robot_state": "unknown"}, "robot to become idle"),
-        ({"cleaner_busy": True}, "cleaner to become idle"),
     ],
 )
 def test_operational_intervention_gate_fails_closed_with_stable_reason(
@@ -482,6 +507,47 @@ def test_operational_intervention_gate_fails_closed_with_stable_reason(
     values.update(overrides)
 
     assert reason in operational_runtime_intervention_block_reason(**values)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"active_robot_task_id": "task-17"},
+        {"robot_state": "moving"},
+        {"robot_state": "unknown"},
+        {"cleaner_busy": True},
+    ],
+)
+def test_paused_or_stopped_manual_intervention_does_not_recheck_mirrored_resources(
+    overrides: dict[str, object],
+) -> None:
+    values: dict[str, object] = {
+        "received": True,
+        "running": True,
+        "execution_state": "paused",
+        "active_robot_task_id": "",
+        "robot_state": "idle",
+        "cleaner_busy": False,
+        "publisher_trusted": True,
+        "age_sec": 0.1,
+        "max_age_sec": 3.0,
+    }
+    values.update(overrides)
+    assert operational_runtime_intervention_block_reason(**values) == ""
+
+
+def test_operational_intervention_requires_the_authoritative_state_publisher() -> None:
+    assert operational_runtime_intervention_block_reason(
+        received=True,
+        running=True,
+        execution_state="paused",
+        active_robot_task_id="",
+        robot_state="idle",
+        cleaner_busy=False,
+        publisher_trusted=False,
+        age_sec=0.1,
+        max_age_sec=3.0,
+    ) == "operational runtime state publisher is not authoritative"
 
 
 def test_admitted_command_keeps_only_the_paused_or_stopped_lifecycle_gate() -> None:

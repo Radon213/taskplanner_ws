@@ -40,6 +40,7 @@ def _record(
     time_sec: float,
     sequence: int,
     topic: str = "",
+    message_type: str = "test/msg/Type",
 ) -> dict:
     return {
         "schema": TRACE_SCHEMA,
@@ -47,7 +48,7 @@ def _record(
         "mode": "strict",
         "layer": layer,
         "topic": topic,
-        "message_type": "test/msg/Type",
+        "message_type": message_type,
         "payload": payload,
         "ros_time_sec": time_sec,
         "sequence": sequence,
@@ -69,7 +70,8 @@ def test_timeline_uses_only_source_transcript_and_schema_v4_clinical_summary() -
             {"data": "Adson 주세요"},
             time_sec=3.5,
             sequence=2,
-            topic="/surgery/audio/request_text",
+            topic="/surgery/audio/observed_utterance",
+            message_type="surgical_msgs/msg/SpeechUtterance",
         ),
         _record(
             "vlm_raw",

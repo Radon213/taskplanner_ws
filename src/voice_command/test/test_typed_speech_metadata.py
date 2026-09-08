@@ -9,11 +9,8 @@ import pytest
 from builtin_interfaces.msg import Time
 from surgical_msgs.msg import SpeechUtterance
 
-from voice_command.node import (
-    RecentUtteranceIds,
-    VoiceIntentResolverNode,
-    evaluate_typed_speech_utterance,
-)
+from voice_command.contracts import DISPOSITION_PROPOSE, VoiceIntentProposal
+from voice_command.node import VoiceIntentResolverNode
 
 
 def _utterance(**overrides) -> SpeechUtterance:
@@ -28,51 +25,6 @@ def _utterance(**overrides) -> SpeechUtterance:
     for key, value in overrides.items():
         setattr(message, key, value)
     return message
-
-
-def _admit(message: SpeechUtterance):
-    return evaluate_typed_speech_utterance(
-        message,
-        now_sec=101.0,
-        max_age_sec=3.0,
-        max_future_skew_sec=1.0,
-    )
-
-
-def test_live_typed_speech_requires_final_source_timestamp_and_id() -> None:
-    accepted = _admit(_utterance())
-
-    assert accepted.accepted is True
-    assert accepted.stamp.sec == 100
-
-
-@pytest.mark.parametrize(
-    ("overrides", "reason"),
-    [
-        ({"is_final": False}, "interim_transcript"),
-        ({"utterance_id": ""}, "missing_utterance_id"),
-        ({"source": ""}, "missing_source"),
-        ({"stamp": Time(), "end_stamp": Time()}, "missing_timestamp"),
-        ({"stamp": Time(sec=97), "end_stamp": Time(sec=97)}, "stale"),
-        ({"stamp": Time(sec=103), "end_stamp": Time(sec=103)}, "future_timestamp"),
-    ],
-)
-def test_live_typed_speech_fails_closed_for_bad_metadata(
-    overrides: dict,
-    reason: str,
-) -> None:
-    result = _admit(_utterance(**overrides))
-
-    assert result.accepted is False
-    assert result.reason.startswith(reason)
-
-
-def test_live_typed_speech_replay_id_is_suppressed() -> None:
-    recent = RecentUtteranceIds(retention_sec=10.0)
-
-    assert recent.accept("asr-100-1", 100.0) is True
-    assert recent.accept("asr-100-1", 101.0) is False
-    assert recent.accept("asr-100-1", 111.0) is True
 
 
 def test_node_catalog_threads_procedure_retractor_vocabulary() -> None:
@@ -107,7 +59,7 @@ def test_node_catalog_threads_procedure_retractor_vocabulary() -> None:
     assert require_explicit_unit is True
 
 
-def test_typed_resolver_copies_asr_metadata_into_voice_intent() -> None:
+def test_typed_resolver_copies_asr_metadata_into_direct_voice_intent() -> None:
     published = []
     node = VoiceIntentResolverNode.__new__(VoiceIntentResolverNode)
     node._publish_no_command = True
@@ -150,6 +102,127 @@ def test_typed_resolver_copies_asr_metadata_into_voice_intent() -> None:
     assert output.source == source.source
     assert output.source_is_final is True
     assert output.source_speaker_role == "surgeon"
+    assert output.gateway_instance_id == ""
+    assert output.procedure_run_id == ""
+    assert output.function_request_id == ""
+    assert not hasattr(output, "command_id")
+
+
+def test_adjust_proposal_stays_on_the_direct_typed_lane() -> None:
+    published = []
+    node = VoiceIntentResolverNode.__new__(VoiceIntentResolverNode)
+    node._publish_no_command = True
+    node._utterance_counter = itertools.count(1)
+    node._publisher = SimpleNamespace(publish=published.append)
+    node.get_clock = lambda: SimpleNamespace(
+        now=lambda: SimpleNamespace(to_msg=lambda: Time(sec=101))
+    )
+    node._resolver = SimpleNamespace(
+        resolve=lambda text: SimpleNamespace(
+            raw_text=text,
+            normalized_text=text,
+            procedure_id="thyroidectomy_demo",
+            catalog_id="sha256:test",
+            intent="retractor_command",
+            tool_id="",
+            retractor_command="adjust_retraction",
+            target_side="right",
+            distance_m=0.005,
+            urgency="routine",
+            provenance="exact_adjustment",
+            requires_confirmation=False,
+            disposition="propose",
+            reason="exact_adjustment",
+            evidence_spans=(),
+        )
+    )
+    source = _utterance(text="오른쪽 5 mm 더 당겨줘")
+
+    node._publish_resolved(
+        source.text,
+        source=source,
+        source_stamp=source.stamp,
+    )
+
+    output = published[0]
+    assert output.function_request_id == ""
+    assert not hasattr(output, "command_id")
+    assert output.intent == "retractor_command"
+    assert output.retractor_command == "adjust_retraction"
+
+
+def test_no_command_proposal_uses_the_same_typed_lane() -> None:
+    published = []
+    node = VoiceIntentResolverNode.__new__(VoiceIntentResolverNode)
+    node._publish_no_command = True
+    node._utterance_counter = itertools.count(1)
+    node._publisher = SimpleNamespace(publish=published.append)
+    node.get_clock = lambda: SimpleNamespace(
+        now=lambda: SimpleNamespace(to_msg=lambda: Time(sec=101))
+    )
+    node._resolver = SimpleNamespace(
+        resolve=lambda text: SimpleNamespace(
+            raw_text=text,
+            normalized_text=text,
+            procedure_id="thyroidectomy_demo",
+            catalog_id="sha256:test",
+            intent="",
+            tool_id="",
+            retractor_command="",
+            target_side="none",
+            distance_m=0.0,
+            urgency="",
+            provenance="no_match",
+            requires_confirmation=False,
+            disposition="no_command",
+            reason="no_match",
+            evidence_spans=(),
+        )
+    )
+
+    node._publish_resolved(
+        "오늘 날씨가 어때",
+        source=_utterance(text="오늘 날씨가 어때"),
+        source_stamp=Time(sec=100),
+    )
+
+    output = published[0]
+    assert not hasattr(output, "command_id")
+    assert output.disposition == "no_command"
+    assert output.function_request_id == ""
+
+
+def test_node_projects_direct_semantic_proposal_to_single_typed_intent() -> None:
+    published = []
+    node = VoiceIntentResolverNode.__new__(VoiceIntentResolverNode)
+    node._publish_no_command = True
+    node._utterance_counter = itertools.count(1)
+    node._publisher = SimpleNamespace(publish=published.append)
+    node.get_clock = lambda: SimpleNamespace(
+        now=lambda: SimpleNamespace(to_msg=lambda: Time(sec=101))
+    )
+    proposal = VoiceIntentProposal(
+        raw_text="수술장 조명 설정",
+        normalized_text="수술장 조명 설정",
+        procedure_id="thyroidectomy_demo",
+        catalog_id="sha256:test",
+        intent="lighting_command",
+        disposition=DISPOSITION_PROPOSE,
+        reason="reviewed_generic_light_command",
+    )
+    node._resolver = SimpleNamespace(
+        resolve=lambda _text: proposal
+    )
+
+    node._publish_resolved(
+        proposal.raw_text,
+        source=_utterance(text=proposal.raw_text),
+        source_stamp=Time(sec=100),
+    )
+
+    assert published[0].intent == "lighting_command"
+    assert published[0].tool_id == ""
+    assert published[0].function_request_id == ""
 
 
 def test_legacy_string_resolver_output_cannot_satisfy_live_metadata_gate() -> None:

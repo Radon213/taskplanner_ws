@@ -16,11 +16,9 @@ ROS_WORKSPACE_SERVICES = {
     "shadow-runner",
     "taskplanner-asr",
     "taskplanner-tts",
-    "taskplanner-runtime",
     "public-rosbridge",
+    "local-media-rosbridge",
     "multicam-observer",
-    "integration-debug",
-    "monitor-media-gateway",
 }
 
 NON_ROS_SERVICES = {
@@ -29,6 +27,7 @@ NON_ROS_SERVICES = {
     "integration-debug-lan-proxy",
     "public-rosbridge-lan-proxy",
     "integration-debug-tailscale-proxy",
+    "taskplanner-surgimate",
 }
 
 
@@ -66,6 +65,21 @@ def test_non_ros_services_do_not_inherit_image_entrypoint() -> None:
 
     for service_name in sorted(NON_ROS_SERVICES):
         assert services[service_name]["entrypoint"] == []
+
+
+def test_surgimate_isolated_sidecar_contract() -> None:
+    service = _resolved_services()["taskplanner-surgimate"]
+    assert service["profiles"] == ["owners"]
+    assert service["network_mode"] == "host"
+    assert service["read_only"] is True
+    assert service["restart"] == "no"
+    assert service["environment"]["HOST"] == "127.0.0.1"
+    assert service["environment"]["PORT"] == "5174"
+    assert service["command"] == ["node", "server.mjs"]
+    module_mount = service["volumes"][0]
+    assert module_mount["source"] == str(ROOT.parent / "modules" / "surgimate_0820")
+    assert module_mount["target"] == "/opt/surgimate"
+    assert module_mount["read_only"] is True
 
 
 def test_workspace_entrypoint_uses_isolated_container_install() -> None:

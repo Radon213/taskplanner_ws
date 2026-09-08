@@ -1,0 +1,27 @@
+tool_belief_tracker:
+  ros__parameters:
+    publish_period_sec: 0.2
+    health_freshness_sec: 1.5
+    exchangeable_instances: true
+    evidence_window_sec: 0.05
+    max_camera_evidence_dt_sec: 0.50
+    miss_half_life_sec: 3.0
+    unknown_slot_retire_sec: 10.0
+    robot_motion_positive_scale: 0.10
+    robot_motion_negative_scale: 0.1
+    robot_motion_grace_sec: 0.75
+    mayo_hand_positive_scale: 0.25
+    mayo_hand_negative_scale: 0.05
+    mayo_hand_grace_sec: 0.50
+    positive_gain: 3.0
+    confirm_threshold: 0.85
+    commit_dwell_sec: 0.50
+    probable_threshold: 0.55
+    commit_release_threshold: 0.45
+    commit_switch_margin: 0.10
+    identity_assignment_margin: 0.15
+    uv_memory_sec: 1.0
+    uv_match_radius_px: 90.0
+    uv_ambiguity_margin_px: 25.0
+    uv_relabel_scale: 0.40
+    uv_ambiguous_evidence_scale: 0.15

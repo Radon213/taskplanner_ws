@@ -75,11 +75,10 @@ if (!asrMessages.includes("recording_active")
   || !asrRestartControl.includes("녹화는 새 세그먼트로 복원됨")) {
   violations.push("ASR hot restart must restore an active recording as an explicit new segment");
 }
-if (!asrRestartControl.includes("containerStartedAtMs")
-  || !asrRestartControl.includes("nodeStartedAtMs")
-  || !asrRestartControl.includes("START_PROVENANCE_TOLERANCE_MS")
-  || !asrRestartControl.includes("NODE_START_AFTER_CONTAINER_MAX_MS")) {
-  violations.push("ASR restart proof must bind the node start time to the host container start window");
+if (!asrRestartControl.includes("const isNewInstance = Boolean(current.status.node_instance_id)")
+  || !asrRestartControl.includes("current.status.node_instance_id !== previousStatus.node_instance_id")
+  || !asrRestartControl.includes("current.receivedAt >= requestedAt && isNewInstance")) {
+  violations.push("ASR owner restart must wait for a fresh heartbeat from a new node instance");
 }
 if (asrRestartControl.includes("latestPlausibleStartMs")
   || asrRestartControl.includes("containerStartedAtMs < requestedAt")
@@ -103,7 +102,8 @@ if (!asrRestartControl.includes("const restoreRoutePolicy = previousStatusFresh"
 if (!asrRestartControl.includes("if (restoreRoutePolicy)")) {
   violations.push("ASR hot restart must preserve route policy for every fresh prior state");
 }
-if (!asrRestartControl.includes("const COMPLETION_TIMEOUT_MS = 240_000")) {
+const completionTimeout = Number(asrRestartControl.match(/const COMPLETION_TIMEOUT_MS\s*=\s*([\d_]+)/)?.[1]?.replaceAll("_", ""));
+if (!Number.isFinite(completionTimeout) || completionTimeout <= 75_000 || completionTimeout > 120_000) {
   violations.push("ASR restart polling must exceed the bounded backend worst-case duration");
 }
 for (const field of ["state", "connected", "route_policy", "device_id", "recording_active"]) {

@@ -12,9 +12,25 @@ setup(
         (
             f"share/{package_name}/launch",
             [
-                "launch/taskplanner_mock.launch.py",
-                "launch/taskplanner_live.launch.py",
+                # The retained composite launch sources are intentionally not
+                # installed. Managed runtime and probes use independent owner
+                # launches so a restart does not reconstruct the full graph.
                 "launch/taskplanner_shadow.launch.py",
+                "launch/taskplanner_operator_bridge.launch.py",
+                "launch/taskplanner_scenario.launch.py",
+                "launch/taskplanner_state_core.launch.py",
+                "launch/taskplanner_command.launch.py",
+                "launch/taskplanner_tool_state.launch.py",
+                "launch/taskplanner_perception.launch.py",
+                "launch/taskplanner_cam4_mayo.launch.py",
+                "launch/taskplanner_projection.launch.py",
+                "launch/taskplanner_execution.launch.py",
+                "launch/taskplanner_simulation_input.launch.py",
+                "launch/taskplanner_surgery_record.launch.py",
+                "launch/taskplanner_rosbag_recorder.launch.py",
+                "launch/taskplanner_debug_observer.launch.py",
+                "launch/taskplanner_debug_control.launch.py",
+                "launch/taskplanner_debug_virtual.launch.py",
             ],
         ),
         (

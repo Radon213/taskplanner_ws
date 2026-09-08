@@ -1,10 +1,6 @@
 import { useEffect, useId, useRef } from "react";
 import { createPortal } from "react-dom";
-import { AnimatePresence, useReducedMotion } from "framer-motion";
-import * as m from "framer-motion/m";
 import { ShieldAlert } from "lucide-react";
-
-import { quietFade, silk } from "../../motion-system";
 
 export type SafetyConfirmationDialogProps = {
   open: boolean;
@@ -27,7 +23,6 @@ export function SafetyConfirmationDialog({
   onClose,
   onConfirm,
 }: SafetyConfirmationDialogProps) {
-  const reducedMotion = useReducedMotion();
   const titleId = useId();
   const descriptionId = useId();
   const dialogRef = useRef<HTMLDivElement>(null);
@@ -96,28 +91,20 @@ export function SafetyConfirmationDialog({
   };
 
   return createPortal(
-    <AnimatePresence>
-      {open ? (
-        <m.div
-          animate={quietFade.animate}
+    open ? (
+        <div
           className="safety-dialog-backdrop"
           data-slot="safety-confirmation-backdrop"
-          exit={quietFade.exit}
-          initial={reducedMotion ? false : quietFade.initial}
           onMouseDown={(event) => {
             if (event.currentTarget === event.target) onClose();
           }}
-          transition={quietFade.transition}
         >
-          <m.div
-            animate={silk.entrance.animate}
+          <div
             aria-describedby={descriptionId}
             aria-labelledby={titleId}
             aria-modal="true"
             className="safety-dialog"
             data-slot="safety-confirmation-dialog"
-            exit={reducedMotion ? { opacity: 0 } : silk.exit.exit}
-            initial={reducedMotion ? false : silk.entrance.initial}
             onKeyDown={handleKeyDown}
             ref={dialogRef}
             role="alertdialog"
@@ -148,10 +135,9 @@ export function SafetyConfirmationDialog({
                 {confirmLabel}
               </button>
             </div>
-          </m.div>
-        </m.div>
-      ) : null}
-    </AnimatePresence>,
+          </div>
+        </div>
+      ) : null,
     document.body,
   );
 }

@@ -1,0 +1,98 @@
+/* Mission geometry has one owner. Keep panel colors and component styles in
+ * their own files; do not reintroduce late .mission-layout overrides in the
+ * legacy/global skin sheets. These are the former cascade's effective rules. */
+.mission-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-areas: "stage" "surgeon" "runtime" "timeline";
+  align-items: start;
+  gap: 16px;
+  margin-top: 16px;
+}
+
+.mission-layout.live-stage-expanded {
+  grid-template-areas: "stage" "runtime" "timeline";
+}
+
+.tool-belief-area {
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+}
+
+.stage-observer-area {
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  gap: 16px;
+}
+
+.operation-dispatch-area {
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+}
+
+.operation-dispatch-area > .operation-dispatch-feed,
+.tool-belief-area > .tool-belief-panel {
+  margin: 0;
+}
+
+.operation-dispatch-area > .operation-dispatch-feed {
+  grid-template-rows: auto minmax(0, 1fr);
+  min-height: 176px;
+  height: clamp(176px, 26vh, 264px);
+}
+
+.operation-dispatch-area .operation-dispatch-feed > ol {
+  min-height: 0;
+  max-height: none;
+}
+
+.mission-layout.live-stage-expanded .stage-area {
+  align-content: start;
+  gap: 16px;
+}
+
+@media (min-width: 1280px) {
+  .mission-layout {
+    grid-template-columns: minmax(600px, 1.58fr) minmax(250px, 0.48fr) minmax(300px, 0.56fr);
+    grid-template-areas: "stage surgeon runtime";
+    align-items: stretch;
+  }
+
+  .mission-layout.live-stage-expanded {
+    grid-template-columns: minmax(0, 1fr) minmax(300px, 0.56fr);
+    grid-template-areas: "stage runtime";
+  }
+}
+
+@media (min-width: 1440px) and (min-height: 850px) {
+  .mission-layout {
+    min-height: 0;
+    grid-template-rows: minmax(0, 1fr);
+    gap: 14px;
+    margin-top: 0;
+  }
+
+  .mission-layout.live-stage-expanded .stage-area {
+    grid-template-rows: minmax(0, 1fr) minmax(160px, 23vh);
+    align-content: stretch;
+    gap: 14px;
+  }
+
+  .stage-observer-area.with-tool-beliefs {
+    grid-template-columns: minmax(0, 0.92fr) minmax(0, 1.08fr);
+    gap: 14px;
+  }
+
+  .operation-dispatch-area > .operation-dispatch-feed {
+    grid-template-rows: auto minmax(0, 1fr);
+    min-height: 0;
+    height: 100%;
+  }
+
+  .operation-dispatch-area .operation-dispatch-feed > ol {
+    max-height: none;
+  }
+}

@@ -7,6 +7,7 @@ from difflib import SequenceMatcher
 import time
 
 import rclpy
+from rcl_interfaces.msg import SetParametersResult
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import String
@@ -64,8 +65,56 @@ class SpeechAdmission:
     text: str = ""
 
 
+@dataclass(frozen=True, slots=True)
+class TaggedSentence:
+    text: str
+    is_final: bool
+
+
 def normalize_sentence_text(text: str) -> str:
     return " ".join(str(text or "").strip().split())
+
+
+def parse_tagged_sentence(text: str) -> TaggedSentence | None:
+    """Parse the external ASR String contract without guessing finality.
+
+    Untagged text is rejected by the caller so a malformed partial can never
+    be promoted to an executable final sentence.
+    """
+
+    candidate = str(text or "").strip()
+    folded = candidate.casefold()
+    for marker, is_final in (("[partial]", False), ("[final]", True)):
+        if folded.startswith(marker):
+            return TaggedSentence(
+                text=normalize_sentence_text(candidate[len(marker) :]),
+                is_final=is_final,
+            )
+    return None
+
+
+def tagged_sentence_utterance(
+    tagged: TaggedSentence,
+    *,
+    stamp,
+    utterance_id: str,
+    source: str,
+) -> SpeechUtterance:
+    """Build a typed envelope using the local ROS receipt timestamp."""
+
+    message = SpeechUtterance()
+    message.stamp = stamp
+    message.start_stamp = stamp
+    message.end_stamp = stamp
+    message.utterance_id = str(utterance_id)
+    message.text = tagged.text
+    message.is_final = tagged.is_final
+    message.has_confidence = False
+    message.confidence = 0.0
+    message.speaker_role = "surgeon"
+    message.language = ""
+    message.source = str(source)
+    return message
 
 
 def normalize_tts_echo_text(text: str) -> str:
@@ -340,16 +389,25 @@ class RecentUtteranceIds:
 
 
 class SpeechInputAdapterNode(Node):
+    _INPUT_MODES = {"utterance", "sentence_text", "tagged_sentence"}
+
     def __init__(self) -> None:
         super().__init__("speech_input_adapter")
         self.declare_parameter("input_mode", "utterance")
         self.declare_parameter("input_topic", "/sensors/speech/utterance")
         self.declare_parameter("sentence_input_topic", "/sensors/surgeon/sentence")
-        self.declare_parameter("output_topic", "/surgery/audio/request_text")
-        # ``sentence_text`` is retained only for Debug/replay compatibility.
-        # A Live typed route must keep the ASR source envelope until the
-        # resolver has checked its timestamp and one-shot identifier.
-        self.declare_parameter("output_mode", "sentence_text")
+        self.declare_parameter(
+            "partial_output_topic",
+            "/surgery/audio/partial_utterance",
+        )
+        # ``sentence_text`` remains an explicitly selected compatibility mode
+        # for isolated replay tools only.  Its default has no command
+        # consumer, so a new adapter instance cannot silently recreate the
+        # removed raw-text command path.
+        self.declare_parameter("output_topic", "/surgery/audio/legacy_text")
+        # Keep the ASR source envelope on the normal route.  CommandRouter is
+        # the sole subscriber to this typed ingress.
+        self.declare_parameter("output_mode", "typed_utterance")
         self.declare_parameter(
             "typed_output_topic",
             "/surgery/audio/admitted_utterance",
@@ -376,9 +434,10 @@ class SpeechInputAdapterNode(Node):
         self.declare_parameter("tts_echo_similarity_threshold", 0.88)
 
         self._input_mode = str(self.get_parameter("input_mode").value).strip().lower()
-        if self._input_mode not in {"utterance", "sentence_text"}:
+        if self._input_mode not in self._INPUT_MODES:
             raise ValueError(
-                "input_mode must be either 'utterance' or 'sentence_text'"
+                "input_mode must be 'utterance', 'sentence_text', or "
+                "'tagged_sentence'"
             )
         self._output_mode = str(
             self.get_parameter("output_mode").value
@@ -390,11 +449,18 @@ class SpeechInputAdapterNode(Node):
             )
         if (
             self._output_mode == "typed_utterance"
-            and self._input_mode != "utterance"
+            and self._input_mode not in {"utterance", "tagged_sentence"}
         ):
             raise ValueError(
-                "typed_utterance output requires input_mode='utterance'; "
-                "String input has no ASR provenance to preserve"
+                "typed_utterance output requires input_mode='utterance' or "
+                "'tagged_sentence'"
+            )
+        if (
+            self._input_mode == "tagged_sentence"
+            and self._output_mode != "typed_utterance"
+        ):
+            raise ValueError(
+                "tagged_sentence input requires output_mode='typed_utterance'"
             )
         self._sentence_source_id = str(
             self.get_parameter("sentence_source_id").value
@@ -446,8 +512,15 @@ class SpeechInputAdapterNode(Node):
         self._last_detail = self._waiting_detail()
         self._last_observation_stamp = None
         self._last_accepted_monotonic = 0.0
+        self._tagged_sequence = 0
         self._lifecycle_control_state = "stopped"
         self._last_lifecycle_control_signature: tuple[str, str] | None = None
+
+        # Both ingress contracts stay subscribed for the lifetime of this
+        # lightweight adapter. The selected mode alone is admitted, so the UI
+        # can switch between a local typed microphone result and the external
+        # tagged String topic without recreating the node or losing history.
+        self.add_on_set_parameters_callback(self._on_parameters_changed)
 
         if self._output_mode == "typed_utterance":
             self._transcript_pub = self.create_publisher(
@@ -461,26 +534,32 @@ class SpeechInputAdapterNode(Node):
                 str(self.get_parameter("output_topic").value),
                 20,
             )
+        self._partial_pub = self.create_publisher(
+            SpeechUtterance,
+            str(self.get_parameter("partial_output_topic").value),
+            20,
+        )
         self._status_pub = self.create_publisher(
             InputSourceStatus,
             str(self.get_parameter("status_topic").value),
             10,
         )
-        if self._input_mode == "sentence_text":
-            self.create_subscription(
-                String,
-                str(self.get_parameter("sentence_input_topic").value),
-                self._on_sentence,
-                20,
-            )
-        else:
-            self.create_subscription(
-                SpeechUtterance,
-                str(self.get_parameter("input_topic").value),
-                self._on_utterance,
-                20,
-            )
-        if self._enable_tts_echo_guard and self._input_mode == "utterance":
+        self.create_subscription(
+            String,
+            str(self.get_parameter("sentence_input_topic").value),
+            self._on_sentence,
+            20,
+        )
+        self.create_subscription(
+            SpeechUtterance,
+            str(self.get_parameter("input_topic").value),
+            self._on_utterance,
+            20,
+        )
+        if (
+            self._enable_tts_echo_guard
+            and self._input_mode in {"utterance", "tagged_sentence"}
+        ):
             self.create_subscription(
                 TTSPlaybackStatus,
                 str(self.get_parameter("tts_playback_status_topic").value),
@@ -503,12 +582,50 @@ class SpeechInputAdapterNode(Node):
     def _now_sec(self) -> float:
         return self.get_clock().now().nanoseconds / 1_000_000_000.0
 
+    def _on_parameters_changed(self, parameters) -> SetParametersResult:
+        """Apply the selected ingress mode without restarting the adapter."""
+
+        next_mode = self._input_mode
+        for parameter in parameters:
+            if parameter.name != "input_mode":
+                continue
+            next_mode = str(parameter.value or "").strip().lower()
+            if next_mode not in SpeechInputAdapterNode._INPUT_MODES:
+                return SetParametersResult(
+                    successful=False,
+                    reason=(
+                        "input_mode must be 'utterance', 'sentence_text', or "
+                        "'tagged_sentence'"
+                    ),
+                )
+        if next_mode != self._input_mode:
+            self._input_mode = next_mode
+            self._recent_ids.clear()
+            self._recent_sentences.clear()
+            self._last_source = ""
+            self._last_observation_stamp = None
+            self._last_accepted_monotonic = 0.0
+            self._last_detail = self._waiting_detail()
+            self._publish_status()
+        return SetParametersResult(successful=True)
+
+    def _mode_source_id(self) -> str:
+        return (
+            self._sentence_source_id
+            if self._input_mode in {"sentence_text", "tagged_sentence"}
+            else "local_microphone"
+        )
+
     def _waiting_detail(self) -> str:
         if self._input_mode == "sentence_text":
             return "waiting_for_sentence_text"
+        if self._input_mode == "tagged_sentence":
+            return "waiting_for_tagged_sentence"
         return "waiting_for_final_surgeon_utterance"
 
     def _on_utterance(self, msg: SpeechUtterance) -> None:
+        if getattr(self, "_input_mode", "utterance") != "utterance":
+            return
         self._received_count += 1
         self._last_source = str(msg.source or "unknown")
         self._last_observation_stamp = (
@@ -587,9 +704,64 @@ class SpeechInputAdapterNode(Node):
         return (prefix + safe_reply_id)[:160]
 
     def _on_sentence(self, msg: String) -> None:
+        if getattr(self, "_input_mode", "tagged_sentence") not in {
+            "sentence_text",
+            "tagged_sentence",
+        }:
+            return
         self._received_count += 1
         self._last_source = self._sentence_source_id
-        self._last_observation_stamp = self.get_clock().now().to_msg()
+        receipt_stamp = self.get_clock().now().to_msg()
+        self._last_observation_stamp = receipt_stamp
+
+        if self._input_mode == "tagged_sentence":
+            tagged = parse_tagged_sentence(msg.data)
+            if tagged is None:
+                self._reject("missing_transcript_tag")
+                return
+            if not tagged.text:
+                self._reject(
+                    "empty_final_sentence"
+                    if tagged.is_final
+                    else "empty_partial_sentence"
+                )
+                return
+
+            now_monotonic = time.monotonic()
+            if tagged.is_final:
+                if not self._recent_sentences.accept(tagged.text, now_monotonic):
+                    self._reject("duplicate_sentence")
+                    return
+                if self._enable_tts_echo_guard:
+                    echo_reply_id = self._tts_echo_guard.matching_reply_id(
+                        tagged.text,
+                        now_monotonic=now_monotonic,
+                    )
+                    if echo_reply_id:
+                        self._reject(self._tts_echo_detail(echo_reply_id))
+                        return
+
+            self._tagged_sequence += 1
+            utterance = tagged_sentence_utterance(
+                tagged,
+                stamp=receipt_stamp,
+                utterance_id=(
+                    f"{self._sentence_source_id}-{receipt_stamp.sec}-"
+                    f"{receipt_stamp.nanosec}-{self._tagged_sequence}"
+                ),
+                source=self._sentence_source_id,
+            )
+            if tagged.is_final:
+                self._transcript_pub.publish(utterance)
+                self._last_detail = "accepted_final_tagged_sentence"
+            else:
+                self._partial_pub.publish(utterance)
+                self._last_detail = "accepted_partial_tagged_sentence"
+            self._accepted_count += 1
+            self._last_accepted_monotonic = now_monotonic
+            self._publish_status()
+            return
+
         sentence = normalize_sentence_text(msg.data)
         if not sentence:
             self._reject("empty_sentence")
@@ -685,9 +857,14 @@ class SpeechInputAdapterNode(Node):
 
         status = InputSourceStatus()
         status.stamp = self.get_clock().now().to_msg()
-        status.source_id = self._last_source
+        # These fields identify the selected ingress before the first message
+        # arrives. Gateway/UI observers must not infer mode from health or the
+        # last observed source, because an external source can be idle.
+        status.source_id = self._mode_source_id()
         status.modality = (
-            "sentence_text" if self._input_mode == "sentence_text" else "speech"
+            "external_topic"
+            if self._input_mode in {"sentence_text", "tagged_sentence"}
+            else "microphone"
         )
         status.state = state
         status.healthy = healthy

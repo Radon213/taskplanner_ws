@@ -31,6 +31,7 @@ from surgical_msgs.msg import (
     SimulationState,
     SkillCommand,
     SkillStatus,
+    SpeechUtterance,
     ToolObservation,
     TwinEvent,
     VLMHealth,
@@ -388,11 +389,13 @@ class ShadowTraceRecorderNode(Node):
             "std_msgs/msg/String",
             payload_transform=self._json_string_payload,
         )
+        # Record the one-way router observation rather than reviving the
+        # removed raw-text command compatibility topic.
         self._subscribe(
-            String,
-            "/surgery/audio/request_text",
+            SpeechUtterance,
+            "/surgery/audio/observed_utterance",
             "input_transcript",
-            "std_msgs/msg/String",
+            "surgical_msgs/msg/SpeechUtterance",
         )
         self._subscribe(
             String,

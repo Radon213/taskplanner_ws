@@ -62,6 +62,8 @@ enforce_runtime_mode_contract live
 [[ "${PERCEPTION_PROVIDER}/${PERCEPTION_LOCATION}" == "external_rfdetr_topics/remote" ]] || fail "Live perception placement drifted"
 [[ -z "${PERCEPTION_ENDPOINT}" && "${ENABLE_RFDETR_PERCEPTION}" == "false" ]] || fail "Live local detector was enabled"
 [[ "${CAM4_INPUT_TOPIC}" == "/synced/cam_4/color/image_raw/compressed" ]] || fail "Live synchronized camera contract drifted"
+[[ "${VITE_EXTERNAL_CAM3_OPERATOR_OVERLAY_TOPIC}" == "/perception/cam_3/overlay/compressed" ]] || fail "Live CAM3 operator overlay contract drifted"
+[[ "${VITE_EXTERNAL_CAM4_OPERATOR_OVERLAY_TOPIC}" == "/perception/cam_4/overlay/compressed" ]] || fail "Live CAM4 operator overlay contract drifted"
 
 enforce_runtime_mode_contract llm-surgeon
 [[ "${TASKPLANNER_RUNTIME_MODE}" == "llm-surgeon" ]] || fail "LLM Surgeon runtime marker drifted"
@@ -78,65 +80,83 @@ expected_profiles=(
   --profile dev
   --profile ops
   --profile lab
+  --profile owners
 )
 [[ "${TASKPLANNER_ALL_PROFILE_ARGS[*]}" == "${expected_profiles[*]}" ]] ||
   fail "all-profile order drifted"
 
 unset TASKPLANNER_LIVE_ENABLE_OPS TASKPLANNER_LIVE_ENABLE_MULTICAM
-unset TASKPLANNER_LIVE_ENABLE_TTS TASKPLANNER_LIVE_ENABLE_INTEGRATED_DEBUG
+unset TASKPLANNER_LIVE_ENABLE_INTEGRATED_DEBUG
 mode_uses_operational_asr_sidecar live || fail "Live must own operational ASR"
 ! mode_uses_operational_asr_sidecar replay || fail "Replay must not own operational ASR"
 ! mode_uses_ops_plane live || fail "Ops must be disabled by default"
 ! mode_uses_multicam_observer live || fail "Live multicam must be disabled by default"
-mode_uses_multicam_observer debug || fail "Debug must own its observer"
-! mode_uses_tts_sidecar live || fail "Live TTS must be disabled by default"
+! mode_uses_multicam_observer debug || fail "Standalone Debug must not start multicam"
+mode_uses_tts_sidecar live || fail "Live must own the independent TTS sidecar"
+! mode_uses_tts_sidecar replay || fail "Replay must not own the Live TTS sidecar"
 ! mode_requires_integrated_debug_observer live || fail "Integrated Debug must be disabled by default"
-taskplanner_same_mode_warm_restart_allowed live true false || fail "healthy same-mode Live warm restart rejected"
-! taskplanner_same_mode_warm_restart_allowed debug true false || fail "standalone Debug must keep its independent restart path"
-! taskplanner_same_mode_warm_restart_allowed live true true || fail "an explicit build must keep the full restart path"
-! taskplanner_same_mode_warm_restart_allowed live false false || fail "an unhealthy runtime must keep the full restart path"
-taskplanner_select_optional_recreate_args true
-[[ "${#TASKPLANNER_SELECTED_RECREATE_ARGS[@]}" == "0" ]] ||
-  fail "same-mode warm optional services must use plain Compose up"
-taskplanner_select_optional_recreate_args false
-[[ "${TASKPLANNER_SELECTED_RECREATE_ARGS[*]}" == "--force-recreate" ]] ||
-  fail "full transitions must retain forced optional-service recreation"
+for removed_selector in \
+  taskplanner_same_mode_warm_restart_allowed \
+  taskplanner_select_optional_recreate_args \
+  taskplanner_select_operational_warm_cleanup_services; do
+  ! declare -F "${removed_selector}" >/dev/null ||
+    fail "removed warm-restart selector remains callable: ${removed_selector}"
+done
+
+taskplanner_select_mode_build_roots live
+[[ "${TASKPLANNER_SELECTED_BUILD_ROOT_PACKAGES[*]}" == \
+  "bringup integration_debug taskplanner_bt_trees" ]] ||
+  fail "Live build roots drifted"
+taskplanner_select_mode_build_roots llm-surgeon
+[[ "${TASKPLANNER_SELECTED_BUILD_ROOT_PACKAGES[*]}" == \
+  "bringup taskplanner_bt_trees" ]] ||
+  fail "LLM Surgeon build roots drifted"
+taskplanner_select_mode_build_roots replay
+[[ "${TASKPLANNER_SELECTED_BUILD_ROOT_PACKAGES[*]}" == \
+  "bringup taskplanner_bt_trees" ]] ||
+  fail "Replay build roots drifted"
+taskplanner_select_mode_build_roots debug
+[[ "${TASKPLANNER_SELECTED_BUILD_ROOT_PACKAGES[*]}" == "bringup integration_debug" ]] ||
+  fail "Debug build roots drifted"
+! taskplanner_select_mode_build_roots invalid || fail "invalid build mode accepted"
 
 TASKPLANNER_LIVE_ENABLE_OPS=true
 mode_uses_ops_plane live || fail "explicit Live Ops selection ignored"
 mode_uses_multicam_observer live || fail "Ops must select multicam unless overridden"
 TASKPLANNER_LIVE_ENABLE_MULTICAM=false
 ! mode_uses_multicam_observer live || fail "explicit multicam=false ignored"
-TASKPLANNER_LIVE_ENABLE_TTS=true
-mode_uses_tts_sidecar live || fail "explicit Live TTS selection ignored"
 TASKPLANNER_LIVE_ENABLE_INTEGRATED_DEBUG=true
 mode_requires_integrated_debug_observer live || fail "explicit Integrated Debug selection ignored"
 
 taskplanner_select_debug_reset_services false
 assert_unique "${TASKPLANNER_SELECTED_RESET_SERVICES[@]}"
-assert_contains integration-debug "${TASKPLANNER_SELECTED_RESET_SERVICES[@]}"
+for debug_owner in taskplanner-debug-observer taskplanner-debug-control taskplanner-debug-virtual; do
+  assert_contains "${debug_owner}" "${TASKPLANNER_SELECTED_RESET_SERVICES[@]}"
+done
+assert_not_contains integration-debug "${TASKPLANNER_SELECTED_RESET_SERVICES[@]}"
 assert_not_contains multicam-observer "${TASKPLANNER_SELECTED_RESET_SERVICES[@]}"
 taskplanner_select_debug_reset_services true
 assert_unique "${TASKPLANNER_SELECTED_RESET_SERVICES[@]}"
 assert_contains multicam-observer "${TASKPLANNER_SELECTED_RESET_SERVICES[@]}"
 
 unset TASKPLANNER_LIVE_ENABLE_OPS TASKPLANNER_LIVE_ENABLE_MULTICAM
-unset TASKPLANNER_LIVE_ENABLE_TTS TASKPLANNER_LIVE_ENABLE_INTEGRATED_DEBUG
+unset TASKPLANNER_LIVE_ENABLE_INTEGRATED_DEBUG
 taskplanner_select_operational_reset_services live false false false
 assert_unique "${TASKPLANNER_SELECTED_RESET_SERVICES[@]}"
 for service in \
-  taskplanner-runtime public-rosbridge public-rosbridge-lan-proxy \
-  taskplanner-tts object-perception pnu-perception integration-debug \
-  multicam-observer monitor-media-gateway vllm-manager; do
+  public-rosbridge public-rosbridge-lan-proxy local-media-rosbridge \
+  object-perception pnu-perception \
+  taskplanner-debug-control taskplanner-debug-virtual \
+  multicam-observer vllm-manager; do
   assert_contains "${service}" "${TASKPLANNER_SELECTED_RESET_SERVICES[@]}"
 done
 assert_not_contains taskplanner-asr "${TASKPLANNER_SELECTED_RESET_SERVICES[@]}"
+assert_not_contains taskplanner-tts "${TASKPLANNER_SELECTED_RESET_SERVICES[@]}"
 
 taskplanner_select_operational_reset_services live true false false
 assert_unique "${TASKPLANNER_SELECTED_RESET_SERVICES[@]}"
 assert_contains taskplanner-asr "${TASKPLANNER_SELECTED_RESET_SERVICES[@]}"
 
-TASKPLANNER_LIVE_ENABLE_TTS=true
 TASKPLANNER_LIVE_ENABLE_MULTICAM=true
 taskplanner_select_operational_reset_services live false true true
 assert_unique "${TASKPLANNER_SELECTED_RESET_SERVICES[@]}"
@@ -151,32 +171,7 @@ for released in taskplanner-asr taskplanner-tts object-perception pnu-perception
 done
 
 unset TASKPLANNER_LIVE_ENABLE_OPS TASKPLANNER_LIVE_ENABLE_MULTICAM
-unset TASKPLANNER_LIVE_ENABLE_TTS TASKPLANNER_LIVE_ENABLE_INTEGRATED_DEBUG
-taskplanner_select_operational_warm_cleanup_services live false false false
-assert_unique "${TASKPLANNER_SELECTED_RESET_SERVICES[@]}"
-for preserved in taskplanner-runtime public-rosbridge shadow-runner taskplanner-asr; do
-  assert_not_contains "${preserved}" "${TASKPLANNER_SELECTED_RESET_SERVICES[@]}"
-done
-for released in \
-  taskplanner-tts object-perception pnu-perception multicam-observer \
-  integration-debug public-rosbridge-lan-proxy monitor-media-gateway \
-  vllm-manager; do
-  assert_contains "${released}" "${TASKPLANNER_SELECTED_RESET_SERVICES[@]}"
-done
-
-TASKPLANNER_LIVE_ENABLE_OPS=true
-TASKPLANNER_LIVE_ENABLE_MULTICAM=true
-TASKPLANNER_LIVE_ENABLE_TTS=true
-taskplanner_select_operational_warm_cleanup_services live true true true
-assert_unique "${TASKPLANNER_SELECTED_RESET_SERVICES[@]}"
-for preserved in \
-  taskplanner-asr taskplanner-tts object-perception pnu-perception \
-  multicam-observer integration-debug public-rosbridge-lan-proxy \
-  monitor-media-gateway; do
-  assert_not_contains "${preserved}" "${TASKPLANNER_SELECTED_RESET_SERVICES[@]}"
-done
-assert_contains vllm-manager "${TASKPLANNER_SELECTED_RESET_SERVICES[@]}"
-
+unset TASKPLANNER_LIVE_ENABLE_INTEGRATED_DEBUG
 assert_unique "${TASKPLANNER_DEBUG_FAILURE_CLEANUP_SERVICES[@]}"
 assert_unique "${TASKPLANNER_OPERATIONAL_FAILURE_CLEANUP_SERVICES[@]}"
 

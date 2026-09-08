@@ -44,6 +44,7 @@
 
 .surgeon-evidence-stack .stage-hand-handover-popup {
   gap: 4px 7px;
+  min-height: 58px;
   padding: 7px 8px;
 }
 
@@ -58,8 +59,17 @@
 }
 
 .surgeon-evidence-stack .stage-hand-handover-popup strong {
+  overflow: visible;
   font-size: 12px;
   line-height: 1.15;
+  text-overflow: clip;
+  white-space: normal;
+}
+
+/* The surgeon lane is narrow on a second monitor layout. Keep the direct
+   hand cue legible rather than reducing it to a clipped single-line badge. */
+.surgeon-evidence-stack.has-hand-handover {
+  overflow: visible;
 }
 
 @keyframes hand-handover-signal-in {

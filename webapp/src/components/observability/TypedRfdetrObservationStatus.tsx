@@ -1,14 +1,13 @@
 import { CheckCircle2, Clock3, Radio } from "lucide-react";
 
-import type {
-  TypedRfdetrToolDetectionFrame,
-  TypedRfdetrToolDetections,
-} from "../../hooks/useRosBridge";
+import type { TypedRfdetrToolDetectionFrame } from "../../hooks/useRosBridge";
+import { useTypedRfdetrObservation } from "../../hooks/useTypedRfdetrObservation";
 import { CONFIGURED_RFDETR_PRODUCER_HOST } from "../../ros/rfdetrObservationSources";
+import type { TypedRfdetrObservationStore } from "../../ros/typedRfdetrObservationStore";
 import type { Language } from "../../utils/display";
 
 function cameraStatus(
-  frame: TypedRfdetrToolDetectionFrame | undefined,
+  frame: TypedRfdetrToolDetectionFrame | null | undefined,
   language: Language,
 ) {
   if (!frame) {
@@ -35,12 +34,15 @@ function cameraStatus(
  * receipt and payload model_version remain separately visible.
  */
 export function TypedRfdetrObservationStatus({
-  detections,
+  observationStore,
   language,
 }: {
-  detections: TypedRfdetrToolDetections;
+  observationStore: TypedRfdetrObservationStore;
   language: Language;
 }) {
+  const cam3 = useTypedRfdetrObservation(observationStore, "cam3");
+  const cam4 = useTypedRfdetrObservation(observationStore, "cam4");
+  const detections = { cam3, cam4 };
   const views = (["cam3", "cam4"] as const).map((cameraId) => {
     const frame = detections[cameraId];
     return { cameraId, frame, status: cameraStatus(frame, language) };
