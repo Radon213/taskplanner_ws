@@ -53,6 +53,7 @@ from surgical_interop_msgs.msg import (
 )
 from std_msgs.msg import String
 from surgical_msgs.msg import (
+    ExecutionTrace,
     InputSourceStatus,
     SkillStatus,
     SpeechUtterance,
@@ -77,6 +78,7 @@ from .projections import (
     freshness_from_receipt,
     project_clinical_observation,
     project_context,
+    project_execution_trace,
     project_event,
     project_bed_robot_arm_state,
     project_instruments,
@@ -311,6 +313,12 @@ class SurgicalInteropGateway(Node):
         source_qos = _source_qos()
         self.create_subscription(WorldState, "/twin/world_state", self._on_world, source_qos)
         self.create_subscription(TwinEvent, "/twin/events", self._on_event, source_qos)
+        self.create_subscription(
+            ExecutionTrace,
+            "/surgery/execution_trace",
+            self._on_execution_trace,
+            source_qos,
+        )
         self.create_subscription(VLMResult, "/vlm/result", self._on_vlm_result, source_qos)
         self.create_subscription(VLMHealth, "/vlm/health", self._on_vlm_health, source_qos)
         self.create_subscription(
@@ -1002,53 +1010,80 @@ class SurgicalInteropGateway(Node):
             return
         try:
             projection = project_event(message)
-            now_monotonic_sec = self._monotonic()
-            with self._lock:
-                world, active = self._public_world_locked(now_monotonic_sec)
-                if not active or world is None or not self._procedure_run_id:
-                    return
-
-                event_stamp_sec = self._positive_source_stamp_sec(projection.stamp)
-                run_start_stamp_sec = self._procedure_run_start_source_stamp_sec
-                if (
-                    event_stamp_sec is not None
-                    and run_start_stamp_sec is not None
-                    and event_stamp_sec < run_start_stamp_sec
-                ):
-                    self.get_logger().warning(
-                        "ignored public event older than current procedure run: "
-                        f"event_stamp={event_stamp_sec:.9f} "
-                        f"run_start_stamp={run_start_stamp_sec:.9f}"
-                    )
-                    return
-
-                self._event_sequence += 1
-                public_event = SurgeryEvent()
-                public_event.stamp = self._stamp_or_now(projection.stamp)
-                public_event.sequence = self._event_sequence
-                public_event.schema_version = SCHEMA_VERSION
-                public_event.catalog_version = self._catalog_version
-                public_event.gateway_instance_id = self._gateway_instance_id
-                public_event.procedure_run_id = self._procedure_run_id
-                public_event.procedure_type = str(
-                    getattr(world, "procedure_id", "")
-                ).strip()
-                public_event.event_type = projection.event_type
-                public_event.subject_type = projection.subject_type
-                public_event.subject_id = projection.subject_id
-                public_event.phase = projection.phase
-                public_event.location_type = projection.location_type
-                public_event.location_id = projection.location_id
-                public_event.state = projection.state
-                public_event.correlation_id = projection.correlation_id
-                public_event.confidence = projection.confidence
-                public_event.evidence_status = projection.evidence_status
-                # Keep acceptance, run metadata capture, and publication under
-                # the lifecycle lock so an active->idle/new-run callback cannot
-                # interleave and relabel the event.
-                self._events_pub.publish(public_event)
+            self._publish_public_event(
+                projection,
+                str(getattr(message, "procedure_run_id", "")).strip(),
+            )
         except Exception as exc:  # pragma: no cover - defensive ROS boundary
             self.get_logger().error(f"Unable to publish public surgery event: {exc}")
+
+    def _on_execution_trace(self, message: ExecutionTrace) -> None:
+        """Project admitted suction execution into the public event stream."""
+
+        projection = project_execution_trace(message)
+        if projection is None:
+            return
+        try:
+            self._publish_public_event(
+                projection,
+                str(getattr(message, "procedure_run_id", "")).strip(),
+            )
+        except Exception as exc:  # pragma: no cover - defensive ROS boundary
+            self.get_logger().error(
+                f"Unable to publish public suction UI event: {exc}"
+            )
+
+    def _publish_public_event(self, projection: Any, source_run_id: str) -> None:
+        """Publish one run-scoped event after the common public gates."""
+
+        if not source_run_id:
+            return
+        now_monotonic_sec = self._monotonic()
+        with self._lock:
+            if source_run_id != self._procedure_run_id:
+                return
+            world, active = self._public_world_locked(now_monotonic_sec)
+            if not active or world is None or not self._procedure_run_id:
+                return
+
+            event_stamp_sec = self._positive_source_stamp_sec(projection.stamp)
+            run_start_stamp_sec = self._procedure_run_start_source_stamp_sec
+            if (
+                event_stamp_sec is not None
+                and run_start_stamp_sec is not None
+                and event_stamp_sec < run_start_stamp_sec
+            ):
+                self.get_logger().warning(
+                    "ignored public event older than current procedure run: "
+                    f"event_stamp={event_stamp_sec:.9f} "
+                    f"run_start_stamp={run_start_stamp_sec:.9f}"
+                )
+                return
+
+            self._event_sequence += 1
+            public_event = SurgeryEvent()
+            public_event.stamp = self._stamp_or_now(projection.stamp)
+            public_event.sequence = self._event_sequence
+            public_event.schema_version = SCHEMA_VERSION
+            public_event.catalog_version = self._catalog_version
+            public_event.gateway_instance_id = self._gateway_instance_id
+            public_event.procedure_run_id = self._procedure_run_id
+            public_event.procedure_type = str(
+                getattr(world, "procedure_id", "")
+            ).strip()
+            public_event.event_type = projection.event_type
+            public_event.subject_type = projection.subject_type
+            public_event.subject_id = projection.subject_id
+            public_event.phase = projection.phase
+            public_event.location_type = projection.location_type
+            public_event.location_id = projection.location_id
+            public_event.state = projection.state
+            public_event.correlation_id = projection.correlation_id
+            public_event.confidence = projection.confidence
+            public_event.evidence_status = projection.evidence_status
+            # Keep run metadata capture and publication under the lifecycle
+            # lock so an active->idle/new-run callback cannot relabel the event.
+            self._events_pub.publish(public_event)
 
     def _source_freshness(self, now_monotonic_sec: float) -> dict[str, Freshness]:
         with self._lock:

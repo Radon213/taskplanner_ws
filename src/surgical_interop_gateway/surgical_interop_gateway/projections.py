@@ -537,6 +537,45 @@ def project_event(event: Any) -> EventProjection:
     )
 
 
+def project_execution_trace(trace: Any) -> EventProjection | None:
+    """Project an admitted suction command into the public event contract.
+
+    ``ExecutionTrace`` remains an internal execution-observability message.
+    Only the two bounded suction commands cross the gateway, and only after a
+    Service admission response. The result uses the existing public
+    ``SurgeryEvent`` shape so no control payload or internal endpoint details
+    are exposed to UI clients.
+    """
+
+    if (
+        str(_value(trace, "route", "")).strip().lower() != "retraction"
+        or str(_value(trace, "transport", "")).strip().lower() != "service"
+        or str(_value(trace, "stage", "")).strip().lower() != "accepted"
+        or not bool(_value(trace, "dispatch_submitted", False))
+    ):
+        return None
+    try:
+        command = int(_value(trace, "retraction_command", 0))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if command not in {7, 8}:
+        return None
+
+    return EventProjection(
+        stamp=_value(trace, "stamp", None),
+        event_type="SuctionViewFocusChanged",
+        subject_type="camera",
+        subject_id="suction",
+        phase="",
+        location_type="",
+        location_id="",
+        state="active" if command == 7 else "inactive",
+        correlation_id=str(_value(trace, "command_id", "")).strip(),
+        confidence=1.0,
+        evidence_status="SERVICE_ADMISSION_ONLY",
+    )
+
+
 @dataclass(frozen=True)
 class ClinicalObservationProjection:
     stamp: Any

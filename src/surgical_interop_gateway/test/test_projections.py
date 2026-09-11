@@ -22,6 +22,7 @@ from surgical_interop_gateway.projections import (
     freshness_from_receipt,
     project_clinical_observation,
     project_context,
+    project_execution_trace,
     project_event,
     project_bed_robot_arm_state,
     project_instrument,
@@ -818,6 +819,76 @@ def _event_test_node(
     )
     node._stamp_or_now = lambda stamp: stamp or Time()
     return node, published
+
+
+def test_execution_trace_projects_only_admitted_suction_commands() -> None:
+    accepted = SimpleNamespace(
+        route="retraction",
+        transport="service",
+        stage="accepted",
+        dispatch_submitted=True,
+        retraction_command=7,
+        command_id="cmd-suction-1",
+        stamp=Time(sec=9),
+    )
+    projected = project_execution_trace(accepted)
+
+    assert projected is not None
+    assert projected.event_type == "SuctionViewFocusChanged"
+    assert projected.subject_type == "camera"
+    assert projected.subject_id == "suction"
+    assert projected.state == "active"
+    assert projected.correlation_id == "cmd-suction-1"
+    assert projected.evidence_status == "SERVICE_ADMISSION_ONLY"
+
+    restored = SimpleNamespace(**{**vars(accepted), "retraction_command": 8})
+    restored_projection = project_execution_trace(restored)
+    assert restored_projection is not None
+    assert restored_projection.state == "inactive"
+
+    assert project_execution_trace(
+        SimpleNamespace(**{**vars(accepted), "stage": "sent"})
+    ) is None
+    assert project_execution_trace(
+        SimpleNamespace(**{**vars(accepted), "retraction_command": 4})
+    ) is None
+
+
+def test_gateway_publishes_suction_focus_event_only_for_current_run() -> None:
+    node, published = _event_test_node(
+        running=True, received_at=8.0, now=9.0, source_stamp_sec=8
+    )
+
+    node._on_execution_trace(
+        SimpleNamespace(
+            route="retraction",
+            transport="service",
+            stage="accepted",
+            dispatch_submitted=True,
+            retraction_command=7,
+            command_id="cmd-suction-1",
+            procedure_run_id="run-test",
+            stamp=Time(sec=9),
+        )
+    )
+    assert len(published) == 1
+    assert published[0].event_type == "SuctionViewFocusChanged"
+    assert published[0].state == "active"
+    assert published[0].subject_id == "suction"
+
+    node._on_execution_trace(
+        SimpleNamespace(
+            route="retraction",
+            transport="service",
+            stage="accepted",
+            dispatch_submitted=True,
+            retraction_command=7,
+            command_id="cmd-old-run",
+            procedure_run_id="old-run",
+            stamp=Time(sec=9),
+        )
+    )
+    assert len(published) == 1
 
 
 def _health_mismatch_test_node():

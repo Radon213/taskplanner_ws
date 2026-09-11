@@ -197,6 +197,25 @@ episode를 만든다. 동일 프레임에 손이 2개 이상 검출되면 그중
 선택하지 않고, 공개 clinical observation으로 복사되지 않으며, 그 자체가 로봇
 명령이나 실행 승인이 아니다.
 
+### SurgiMate 석션 UI 이벤트
+
+`/surgery/execution_trace`는 공개 Bridge에 직접 노출하지 않는다. Gateway가 현재
+procedure run과 Service admission을 확인한 뒤 기존 공개 이벤트 토픽
+`/surgery/events`의 `SurgeryEvent` 형식으로 최소 정보만 변환한다.
+
+```yaml
+event_type: SuctionViewFocusChanged
+subject_type: camera
+subject_id: suction
+state: active | inactive  # 7=active, 8=inactive
+correlation_id: <command_id>
+evidence_status: SERVICE_ADMISSION_ONLY
+```
+
+`active` 수신 시 SurgiMate는 기관 UI 기준에 따라 `Suction Camera`로 전환하고
+3초 후 기존 화면으로 복귀한다. 이 이벤트는 Service admission 관찰값이며
+물리적 석션 장치 동작 완료를 의미하지 않는다.
+
 ### Event outcome
 
 ```yaml
